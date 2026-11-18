@@ -65,10 +65,11 @@ resolves as the latest on its own (#1182).
 
 The chart installs on OpenShift under its **default** SecurityContextConstraints:
 the control plane runs under plain `restricted-v2`, with no grant. It is the
-same chart, not a fork. Tested on OpenShift 5.0.0 (Kubernetes 1.36, OpenShift
-Local): every control-plane pod admitted by `restricted-v2`, the BIND9 and Kea
-agents by the chart's own SCCs, DNS and DHCP serving. OpenShift 4.22 has the
-same SCCs and is being verified. OKD is not tested.
+same chart, not a fork. Tested on OpenShift 5.0.0 (Kubernetes 1.36) and
+OpenShift 4.22.14 (Kubernetes 1.35), both on OpenShift Local, from the command
+line and through the web console's Helm install: every control-plane pod
+admitted by `restricted-v2`, the BIND9 and Kea agents by the chart's own SCCs,
+DNS and DHCP serving. OKD is not tested.
 
 ```bash
 helm install ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
@@ -134,7 +135,7 @@ The api, worker, beat, frontend, migrate Job, Postgres and Redis should show
   allows `NET_BIND_SERVICE`) can never be the SCC that admits them. Where
   cluster admins manage SCCs, set `openshift.scc.create: false`: the chart
   still creates the ServiceAccounts, and you grant an equivalent SCC to
-  `<fullname>-dns-agent` / `<fullname>-dhcp-agent` yourself (the certified profile does this, see below; `<fullname>` is
+  `<fullname>-dns-agent` / `<fullname>-dhcp-agent` yourself (see **If your cluster admins manage SCCs** below; `<fullname>` is
   `<release>-spatiumddi`, or the release name when it already contains
   `spatiumddi`). `anyuid` is not a substitute: it has no `seccompProfiles`, so it
   rejects every pod that sets `seccompProfile: RuntimeDefault`.
@@ -194,11 +195,18 @@ helm install ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
   -f values-openshift-certified.yaml
 ```
 
-It sets `openshift.scc.create: false`: certified charts do not create cluster-scoped
-security objects, so the profile never creates the agents' SecurityContextConstraints
-(the plain chart still does, by default). The control plane needs none and runs
-under `restricted-v2`; the DNS and DHCP agents need the cluster-admin step in
-**Certified profile: SCC prerequisite** below before you enable them.
+It keeps `openshift.scc.create: true`, so the chart creates the DNS and DHCP
+agents' SecurityContextConstraints exactly as the plain chart does (Red Hat
+confirmed that SCCs in a certified chart are acceptable). The control plane needs
+none and runs under `restricted-v2`; the agents are admitted by the chart's SCCs
+when you enable them. Creating an SCC needs cluster-scoped permissions, so a user
+who is admin of one namespace only cannot install with the agents on: Helm (and
+the web console's Helm install) stops before creating anything, with
+`securitycontextconstraints ... is forbidden ... at the cluster scope`. Where your
+cluster admins manage SCCs, or the installing user is a namespace admin, set
+`openshift.scc.create: false` and follow **If your cluster admins manage SCCs**
+below: a cluster admin applies the SCC files once, and the namespace admin can
+then install.
 
 It also sets `image.tagSuffix: -ubi` (appended to the tag of those four images; the
 agents' BIND9 and Kea included) and runs the bundled PostgreSQL and Redis from
@@ -218,8 +226,9 @@ The release runs Red Hat's `preflight check container` against each `-ubi` image
 (amd64, check only, never submitting); `.github/workflows/build-ubi-images.yml`
 does the same on a PR and weekly.
 
-**Certified profile: SCC prerequisite.** With `openshift.scc.create: false` the
-chart still renders the agents' ServiceAccounts (`<fullname>-dns-agent`,
+**If your cluster admins manage SCCs.** Set `openshift.scc.create: false` (with the
+certified profile or without it), for example `--set openshift.scc.create=false`
+after `-f values-openshift-certified.yaml`. The chart still renders the agents' ServiceAccounts (`<fullname>-dns-agent`,
 `<fullname>-dhcp-agent`, where `<fullname>` is `<release>-spatiumddi`, or the
 release name when it already contains `spatiumddi`) but no SCC, so an agent pod is
 admitted under `restricted-v2` and fails to start (`named` and `kea-dhcp4` cannot
@@ -279,10 +288,11 @@ oc delete scc spatiumddi-dns-agent spatiumddi-dhcp-agent
 oc delete clusterrole system:openshift:scc:spatiumddi-dns-agent system:openshift:scc:spatiumddi-dhcp-agent
 ```
 
-`openshift.workerNetRaw` is not covered by these files: with the certified profile it needs an SCC for the worker's ServiceAccount that you write yourself, or leave it off (the default).
+`openshift.workerNetRaw` is not covered by these files: with `openshift.scc.create: false` it needs an SCC for the worker's ServiceAccount that you write yourself, or leave it off (the default).
 
-The default install (without the certified profile) needs none of this: the chart
-creates the same SCCs, named `<fullname>-<namespace>-dns-agent` / `-dhcp-agent`.
+With the default `openshift.scc.create: true`, certified profile or not, none of this
+is needed: the chart creates the same SCCs, named
+`<fullname>-<namespace>-dns-agent` / `-dhcp-agent`.
 
 To run Red Hat's checks yourself, install
 [`openshift-preflight`](https://github.com/redhat-openshift-ecosystem/openshift-preflight)

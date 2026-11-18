@@ -33,7 +33,7 @@ Kubernetes it proves the check can see a pin at all, instead of passing because
 it parsed nothing.
 
 ``--external-sccs DIR`` is for a render with ``openshift.scc.create=false``
-(the certified profile, #3913): the agents' SCCs are applied by a cluster admin
+(admin-managed SCCs, #3913): the agents' SCCs are applied by a cluster admin
 from DIR (``charts/spatiumddi/files/openshift``), so the capability check treats
 each agent ServiceAccount as granted the SCCs in DIR for its component, and the
 render itself must contain no SCC, Role or RoleBinding of its own.

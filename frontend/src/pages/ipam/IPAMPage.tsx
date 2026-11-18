@@ -4224,40 +4224,49 @@ export function AddAddressModal({
         {/* DNS zone selector — only shown when zones are available */}
         {availableZones.length > 0 && (
           <Field label="DNS Zone">
-            {availableZones.length === 1 ? (
-              <p className="text-xs text-muted-foreground py-1">
-                <Globe2 className="inline h-3 w-3 mr-1" />
-                {availableZones[0].name.replace(/\.$/, "")}
-                {fqdnPreview && (
-                  <span className="ml-2 font-mono text-emerald-600 dark:text-emerald-400">
-                    → {fqdnPreview}
-                  </span>
-                )}
-              </p>
-            ) : (
-              <div className="space-y-1">
-                <select
-                  className={inputCls}
-                  value={dnsZoneId}
-                  onChange={(e) => {
-                    setDnsZoneId(e.target.value);
-                    setDnsZoneTouched(true);
-                  }}
+            {(control) =>
+              availableZones.length === 1 ? (
+                <p
+                  {...control}
+                  role="group"
+                  className="text-xs text-muted-foreground py-1"
                 >
-                  <ZoneOptions
-                    zones={availableZones}
-                    primaryId={effectiveDns?.dns_zone_id}
-                    additionalIds={effectiveDns?.dns_additional_zone_ids ?? []}
-                    noneOption="None (no DNS record)"
-                  />
-                </select>
-                {fqdnPreview && (
-                  <p className="text-xs font-mono text-emerald-600 dark:text-emerald-400">
-                    → {fqdnPreview}
-                  </p>
-                )}
-              </div>
-            )}
+                  <Globe2 className="inline h-3 w-3 mr-1" />
+                  {availableZones[0].name.replace(/\.$/, "")}
+                  {fqdnPreview && (
+                    <span className="ml-2 font-mono text-emerald-600 dark:text-emerald-400">
+                      → {fqdnPreview}
+                    </span>
+                  )}
+                </p>
+              ) : (
+                <div className="space-y-1">
+                  <select
+                    {...control}
+                    className={inputCls}
+                    value={dnsZoneId}
+                    onChange={(e) => {
+                      setDnsZoneId(e.target.value);
+                      setDnsZoneTouched(true);
+                    }}
+                  >
+                    <ZoneOptions
+                      zones={availableZones}
+                      primaryId={effectiveDns?.dns_zone_id}
+                      additionalIds={
+                        effectiveDns?.dns_additional_zone_ids ?? []
+                      }
+                      noneOption="None (no DNS record)"
+                    />
+                  </select>
+                  {fqdnPreview && (
+                    <p className="text-xs font-mono text-emerald-600 dark:text-emerald-400">
+                      → {fqdnPreview}
+                    </p>
+                  )}
+                </div>
+              )
+            }
           </Field>
         )}
         {/* Issue #25 — extra-zone picker for split-horizon publishing.
@@ -11227,21 +11236,16 @@ export function AddressSetsSubnetPanel({ subnet }: { subnet: Subnet }) {
         confirmLabel="Delete"
         loading={delSet.isPending}
         message={
-          <>
-            {confirmDel
-              ? `Delete address set "${confirmDel.name}"? Any permissions ` +
-                `granted on this set will no longer match. The IP addresses ` +
-                `themselves are not removed.`
-              : ""}
-            {delSet.isError && (
-              <p role="alert" className="mt-2 text-destructive">
-                {formatDialogError(
-                  delSet.error,
-                  "Failed to delete address set",
-                )}
-              </p>
-            )}
-          </>
+          confirmDel
+            ? `Delete address set "${confirmDel.name}"? Any permissions ` +
+              `granted on this set will no longer match. The IP addresses ` +
+              `themselves are not removed.`
+            : ""
+        }
+        error={
+          delSet.isError
+            ? formatDialogError(delSet.error, "Failed to delete address set")
+            : null
         }
         onConfirm={() => confirmDel && delSet.mutate(confirmDel.id)}
         onClose={() => {

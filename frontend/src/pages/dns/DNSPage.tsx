@@ -1298,10 +1298,7 @@ function GroupModalForm({
       setError("");
       qc.invalidateQueries({ queryKey: ["dns-groups"] });
     },
-    onError: (e: ApiError) => {
-      setConfirmRotate(false);
-      setError(formatApiError(e));
-    },
+    // A refusal stays in the open confirm (announced there).
   });
 
   const mut = useMutation({
@@ -1550,7 +1547,11 @@ function GroupModalForm({
           title="Rotate the group TSIG key?"
           confirmLabel="Rotate key"
           loading={rotateMut.isPending}
-          onClose={() => setConfirmRotate(false)}
+          error={rotateMut.error ? formatApiError(rotateMut.error) : null}
+          onClose={() => {
+            setConfirmRotate(false);
+            rotateMut.reset();
+          }}
           onConfirm={() => rotateMut.mutate(group.id)}
           message={
             <div className="space-y-2 text-sm">
@@ -2698,7 +2699,7 @@ function DnssecCard({
   const signingServers = info.data?.signing_servers ?? 0;
   const signingUnmanaged = info.data?.signing_unmanaged ?? false;
   const unmanagedNote =
-    "DNSSEC is not supported on Technitium in 1.0: SpatiumDDI signs once and never re-signs on a new server, a re-created zone or a lost volume (#1767). Use a BIND9 or PowerDNS group for signed zones.";
+    "DNSSEC is not supported on the agentless Technitium API driver: there is no agent to keep the zone signed on a new server, a re-created zone or a lost volume. Use an agent-managed Technitium, BIND9 or PowerDNS group for signed zones.";
   const busy =
     signMut.isPending || unsignMut.isPending || rolloverMut.isPending;
 
@@ -2733,7 +2734,7 @@ function DnssecCard({
       {signingUnmanaged && (
         <div className="rounded border border-amber-500/40 bg-amber-500/10 p-2 text-xs text-amber-700 dark:text-amber-300">
           {enabled
-            ? "DNSSEC not managed. This zone was signed on Technitium and keeps serving signed, but SpatiumDDI does not keep it signed: it is not re-signed on a new server, a re-created zone or a lost volume (#1767). You can still unsign it."
+            ? "DNSSEC not managed. This zone was signed through the Technitium API driver and keeps serving signed, but SpatiumDDI does not keep it signed: it is not re-signed on a new server, a re-created zone or a lost volume. You can still unsign it."
             : unmanagedNote}
         </div>
       )}
@@ -2868,7 +2869,7 @@ function DnssecCard({
                       disabled={busy}
                       onClick={() => rolloverMut.mutate(k.key_tag)}
                       className="rounded border px-1.5 py-0.5 text-[10px] hover:bg-accent disabled:opacity-50"
-                      title="Force a key rollover (BIND9 rndc dnssec -rollover)"
+                      title="Force a key rollover (BIND9 rndc dnssec -rollover, Technitium rolloverDnsKey)"
                       {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
                     >
                       Roll
@@ -4936,7 +4937,7 @@ export function ZoneDetailView({
             {zone.dnssec_unmanaged_warning && (
               <span
                 className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-amber-500/15 text-amber-700 dark:text-amber-300"
-                title="This zone was signed on Technitium. It keeps serving signed, but SpatiumDDI does not keep it signed: it is not re-signed on a new server, a re-created zone or a lost volume (#1767)."
+                title="This zone was signed through the Technitium API driver. It keeps serving signed, but SpatiumDDI does not keep it signed: it is not re-signed on a new server, a re-created zone or a lost volume."
               >
                 DNSSEC not managed
               </span>
@@ -5891,7 +5892,17 @@ export function ZoneDetailView({
                         >
                           Copy Value
                         </ContextMenuItem>
-                        {r.auto_generated ? (
+                        {r.pool_member_id ? (
+                          <>
+                            <ContextMenuSeparator />
+                            <ContextMenuItem
+                              disabled
+                              title="This record is rendered by a DNS pool's health-check pipeline, so it cannot be edited or deleted here. A superadmin manages the pool on the Pools tab."
+                            >
+                              Managed by a DNS pool — read-only
+                            </ContextMenuItem>
+                          </>
+                        ) : r.auto_generated ? (
                           <>
                             <ContextMenuSeparator />
                             <ContextMenuItem disabled>
@@ -6980,7 +6991,6 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
   const [confirmDelete, setConfirmDelete] = useState<DNSView | null>(null);
   // #4180 — the read-only detail modal a row click / Enter opens.
   const [detailId, setDetailId] = useState<string | null>(null);
-  const [error, setError] = useState("");
 
   const { data: viewsData, error: viewsError } = useQuery({
     queryKey: ["dns-views", group.id],
@@ -7024,13 +7034,7 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
       qc.invalidateQueries({ queryKey: ["dns-blocklists"] });
       setConfirmDelete(null);
     },
-    // Close the dialog on failure too — the error renders on the page
-    // behind it, so leaving the modal up hides the only explanation and
-    // reads as "Delete does nothing".
-    onError: (e: ApiError) => {
-      setError(formatApiError(e, "Delete failed"));
-      setConfirmDelete(null);
-    },
+    // A refusal stays in the open confirm (announced there).
   });
 
   return (
@@ -7042,7 +7046,6 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
         <button
           className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
           onClick={() => {
-            setError("");
             setCreating(true);
           }}
           {...permissionGate(can("write", "dns_group"), NEEDS_GROUP_WRITE)}
@@ -7139,7 +7142,6 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
                       aria-label="Edit view"
                       onClick={(e) => {
                         e.stopPropagation();
-                        setError("");
                         setEditing(v);
                       }}
                       {...permissionGate(
@@ -7155,7 +7157,6 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
                       aria-label="Delete view"
                       onClick={(e) => {
                         e.stopPropagation();
-                        setError("");
                         setConfirmDelete(v);
                       }}
                       {...permissionGate(
@@ -7207,8 +7208,6 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
         </div>
       )}
 
-      {error && <FormError className="mt-2">{error}</FormError>}
-
       {detailView && !editing && !confirmDelete && (
         <ViewDetailModal
           view={detailView}
@@ -7220,11 +7219,9 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
           canDelete={can("delete", "dns_group")}
           onClose={() => setDetailId(null)}
           onEdit={() => {
-            setError("");
             setEditing(detailView);
           }}
           onDelete={() => {
-            setError("");
             setConfirmDelete(detailView);
           }}
         />
@@ -7248,7 +7245,13 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
           confirmLabel="Delete view"
           tone="destructive"
           loading={delMut.isPending}
-          onClose={() => setConfirmDelete(null)}
+          error={
+            delMut.error ? formatApiError(delMut.error, "Delete failed") : null
+          }
+          onClose={() => {
+            setConfirmDelete(null);
+            delMut.reset();
+          }}
           onConfirm={() => delMut.mutate(confirmDelete.id)}
           message={
             <div className="space-y-2 text-sm">
@@ -7954,6 +7957,7 @@ export function AclsTab({ groupId }: { groupId: string }) {
           tone="destructive"
           onClose={() => setConfirmDelete(null)}
           loading={delMut.isPending}
+          error={deleteError || null}
           onConfirm={() => {
             setDeleteError("");
             delMut.mutate(confirmDelete.id);
@@ -7965,14 +7969,6 @@ export function AclsTab({ groupId }: { groupId: string }) {
                 cannot be deleted — the server refuses it, and the reason is
                 shown here. Remove the references first.
               </p>
-              {deleteError && (
-                <p
-                  role="alert"
-                  className="rounded border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-sm text-destructive"
-                >
-                  {deleteError}
-                </p>
-              )}
             </div>
           }
         />

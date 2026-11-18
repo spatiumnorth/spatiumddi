@@ -565,8 +565,16 @@ export function DICOMPage() {
         tone="destructive"
         confirmLabel="Delete"
         loading={delPeerMut.isPending}
+        error={
+          delPeerMut.error
+            ? formatApiError(delPeerMut.error, "Failed to delete association")
+            : null
+        }
         onConfirm={() => delPeer && delPeerMut.mutate(delPeer.id)}
-        onClose={() => setDelPeer(null)}
+        onClose={() => {
+          setDelPeer(null);
+          delPeerMut.reset();
+        }}
       />
       <ConfirmModal
         open={del !== null}
@@ -583,8 +591,19 @@ export function DICOMPage() {
         tone="destructive"
         confirmLabel="Delete"
         loading={delMut.isPending}
+        error={
+          delMut.error
+            ? formatApiError(
+                delMut.error,
+                "Failed to delete application entity",
+              )
+            : null
+        }
         onConfirm={() => del && delMut.mutate(del.id)}
-        onClose={() => setDel(null)}
+        onClose={() => {
+          setDel(null);
+          delMut.reset();
+        }}
       />
     </div>
   );

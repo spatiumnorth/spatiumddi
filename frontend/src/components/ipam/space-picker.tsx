@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { formatApiError, ipamApi, type IPSpace } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
+import { useFieldControl } from "@/components/ui/field";
 import { FormError } from "@/components/ui/form-error";
 
 // Dropdown + "+ New" shortcut used inside the integration-endpoint modals
@@ -31,11 +32,13 @@ export function IPSpacePicker({
     queryFn: () => ipamApi.listSpaces(),
   });
   const [showCreate, setShowCreate] = useState(false);
+  const fieldControl = useFieldControl();
 
   return (
     <>
       <div className="flex items-center gap-1">
         <select
+          {...fieldControl}
           className={selectCls}
           value={value}
           onChange={(e) => onChange(e.target.value)}

@@ -2,8 +2,8 @@
 #
 # Static copy of the SecurityContextConstraints the chart renders when
 # ``openshift.scc.create`` is true (templates/openshift.yaml, the
-# ``spatiumddi.openshiftScc`` helper), for installs that do not let the chart
-# create them (values-openshift-certified.yaml). A cluster admin applies it
+# ``spatiumddi.openshiftScc`` helper), for clusters whose admins manage SCCs
+# (``openshift.scc.create: false``). A cluster admin applies it
 # once, then grants it to the agent's ServiceAccount:
 #
 #   oc apply -f dns-agent-scc.yaml
