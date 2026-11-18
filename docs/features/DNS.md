@@ -1432,7 +1432,7 @@ cumulatively, one list per step. Each step waited 20 s, applied, then waited
 60 s. Resident figures are the daemon's `VmRSS` in MiB (the cgroup's
 `memory.current` and `anon` run about 50 MiB and 80 MiB lower), sampled every
 100 ms for the peak. Each point was run 3 times on fresh containers and the
-**median** is shown (all three were within about 5 % except where noted).
+**median** is shown (settled figures agreed within about 8 %; peaks vary more, as noted).
 Host: Intel i5-8500T, 6 cores, 15.5 GiB, Debian 13 (kernel 6.12), Docker
 29.9, shared with other jobs. Measured, not estimated.
 
@@ -1460,10 +1460,10 @@ Host: Intel i5-8500T, 6 cores, 15.5 GiB, Debian 13 (kernel 6.12), Docker
 - **The agent adds to it.** The process that applies the bundle peaked at
   218 MiB (190k entries) to 360 MiB (414k) in these runs, in the same
   container as the daemon in a real deployment.
-- **Sizing note.** For Technitium, budget about 150 MiB for the daemon at
+- **Sizing note.** For Technitium, budget about 100 MiB for the daemon at
   idle, plus about 2 kB per blocked name, plus the agent's apply peak
   (about 0.9 kB per name), plus 400 MiB headroom for the flush-and-import
-  peak. 414k names then comes to roughly 1.9 GiB.
+  peak. 414k names then comes to roughly 1.6 GiB.
 - **Not measured:** arm64, query load or cache fill, and Technitium's own
   list subscription (URL lists it downloads itself), which SpatiumDDI does
   not use. The control plane's memory warning is BIND9-only
