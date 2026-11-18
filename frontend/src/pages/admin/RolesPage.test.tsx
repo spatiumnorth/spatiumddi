@@ -186,4 +186,18 @@ describe("Roles: a role's dialog shows the grants it holds", () => {
     await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
     expect(update).toHaveBeenCalledWith(CUSTOM.id, { name: "NAT desk 2" });
   });
+
+  it("an untouched Save sends nothing and closes (#4452)", async () => {
+    const update = vi.fn(async () => ({}));
+    answers.rolesApi = { list: async () => [CUSTOM], update };
+    show(<RolesPage />);
+
+    const dialog = await openDialog(CUSTOM);
+    fireEvent.click(within(dialog).getByRole("button", { name: /^Save$/ }));
+
+    await waitFor(() =>
+      expect(screen.queryAllByRole("dialog")).toHaveLength(0),
+    );
+    expect(update).not.toHaveBeenCalled();
+  });
 });
