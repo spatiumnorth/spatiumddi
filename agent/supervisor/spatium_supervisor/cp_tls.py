@@ -189,6 +189,17 @@ def _in_cluster(host: str) -> bool:
     return host.endswith(".svc") or ".svc." in host or host.endswith(".cluster.local")
 
 
+def in_cluster_tls(url: str) -> bool:
+    """True for an ``https://`` URL that names an in-cluster Service (#4430).
+
+    Its certificate is the web-UI one the supervisor already pins, so it is
+    never pinned on first contact: an unpinned supervisor (the seed) lets the
+    handshake fail verification and :func:`try_repin` adopts the certificate
+    only if the appliance CA vouches for it."""
+    parts = urlsplit(url)
+    return parts.scheme.lower() == "https" and _in_cluster(parts.hostname or "")
+
+
 def tls_url(url: str) -> str | None:
     """The ``https://`` URL whose certificate governs requests to ``url``.
 

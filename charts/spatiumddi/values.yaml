@@ -151,6 +151,20 @@ applianceVersion: ""
 
 api:
   replicas: 2
+  # #4430 — a TLS listener in front of the api (a sidecar: the frontend's nginx
+  # image on :8443 serving ``secretName``, proxying to the api over the pod's
+  # loopback), added to both api Services as the ``https`` port. For the
+  # appliance supervisors' heartbeats, which verify it against the web-UI
+  # certificate they pin; off elsewhere, where no supervisor calls the api.
+  # The http port stays: the frontend, workers, role agents and older
+  # supervisors use it.
+  tlsListener:
+    enabled: false
+    port: 8443
+    secretName: spatium-appliance-tls
+    resources:
+      requests: { cpu: 20m, memory: 32Mi }
+      limits: { cpu: 500m, memory: 128Mi }
   priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class
   # #983 Phase 2 — user namespaces (Kubernetes 1.36 GA). UNSET by default.
   # REFUSED at render time while ``api.applianceHostMounts.enabled`` is on:

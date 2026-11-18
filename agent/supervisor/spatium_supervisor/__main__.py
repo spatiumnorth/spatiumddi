@@ -581,7 +581,11 @@ def main() -> int:
             session_token = load_session_token(cfg.state_dir)
             identity, _ = load_or_generate(cfg.state_dir)
             try:
-                with cp_tls.client(cfg.state_dir, effective_url) as client:
+                with cp_tls.client(
+                    cfg.state_dir,
+                    effective_url,
+                    first_contact=not cp_tls.in_cluster_tls(effective_url),
+                ) as client:
                     held = heartbeat_once(
                         cfg=cfg,
                         appliance_id=appliance_id,

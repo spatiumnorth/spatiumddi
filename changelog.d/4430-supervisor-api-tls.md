@@ -1,0 +1,3 @@
+### Changed
+
+- On a multi-node appliance control plane, the supervisor's heartbeat to the api now uses TLS. The api pod gains a `tls-proxy` sidecar that serves the web UI certificate on port 8443 (`api.tlsListener`, on for every appliance), and the supervisor verifies it against the certificate it already pins; rotation follows the existing signed pin set, with no new CA. There is no flag day: older supervisors keep using http on 8000, and a new supervisor whose node-local api pod has not been upgraded yet stays on node-local http until its first TLS heartbeat succeeds, after which it never downgrades. See "Node-local api traffic" in `docs/deployment/APPLIANCE.md`. The frontend's `/api` proxy, the worker, beat and the role agents are not covered yet (#4019). (#4430)

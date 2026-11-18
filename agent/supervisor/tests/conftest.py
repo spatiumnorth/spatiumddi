@@ -33,3 +33,15 @@ def _signing_mode_reset() -> None:
     from spatium_supervisor import cert_auth
 
     cert_auth._reset_signing_mode()
+
+
+@pytest.fixture(autouse=True)
+def _api_tls_upgrade_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#4430 — the in-cluster api is addressed over TLS unless the last attempt
+    found no listener. The older node-local tests are about WHICH Service is
+    used and how it fails over, not the scheme, so they run inside the
+    upgrade window (plain http); ``test_api_tls_4430`` leaves the window."""
+    from spatium_supervisor import heartbeat
+
+    monkeypatch.setitem(heartbeat._api_tls, "seen", False)
+    monkeypatch.setitem(heartbeat._api_tls, "http_until", float("inf"))

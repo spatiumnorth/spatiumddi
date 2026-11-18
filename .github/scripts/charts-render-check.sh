@@ -441,6 +441,7 @@ APPLIANCE_CP_HARD=(
     --set frontend.hostNetwork=true
     --set api.service.trafficDistribution=PreferSameNode
     --set api.service.nodeLocal=true
+    --set api.tlsListener.enabled=true
     --set api.autoscaling.enabled=false
 )
 for n in 1 3; do

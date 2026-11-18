@@ -11,7 +11,7 @@ being rolled on its node must not take that node's UI with it.
 
 Default: every file must have NO ``*-api-local`` Service. ``--present``: every
 file must have exactly one, with ``internalTrafficPolicy: Local``, the api selector and
-port 8000. Both: the frontend's ``API_UPSTREAM_HOST`` is the plain ``*-api``.
+ports 8000 + 8443 (the TLS sidecar, #4430, which is as appliance-only as the Service). Both: the frontend's ``API_UPSTREAM_HOST`` is the plain ``*-api``.
 
 Usage: chart-api-local-service.py [--present] <manifest.yaml> [...]
 """
@@ -56,8 +56,34 @@ def check(path: Path, present: bool) -> list[str]:
             problems.append(f"{path}: node-local api Service lacks internalTrafficPolicy: Local")
         if main and spec.get("selector") != main[0]["spec"].get("selector"):
             problems.append(f"{path}: node-local api Service selects different pods")
-        if [p.get("port") for p in spec.get("ports", [])] != [8000]:
-            problems.append(f"{path}: node-local api Service must expose 8000")
+        if [p.get("port") for p in spec.get("ports", [])] != [8000, 8443]:
+            problems.append(f"{path}: node-local api Service must expose 8000 and 8443 (#4430)")
+        for svc in main:
+            if [p.get("port") for p in svc["spec"].get("ports", [])] != [8000, 8443]:
+                problems.append(f"{path}: the api Service must expose 8000 and 8443 (#4430)")
+    # #4430 — the TLS sidecar is exactly as appliance-only as the Service.
+    sidecars = [
+        c
+        for d in docs
+        if d.get("kind") == "Deployment" and d["metadata"]["name"].endswith("-api")
+        for c in d["spec"]["template"]["spec"]["containers"]
+        if c.get("name") == "tls-proxy"
+    ]
+    conf = [
+        d
+        for d in docs
+        if d.get("kind") == "ConfigMap" and d["metadata"]["name"].endswith("-api-tls-conf")
+    ]
+    if present:
+        if len(sidecars) != 1 or len(conf) != 1:
+            problems.append(f"{path}: expected one api tls-proxy sidecar + its ConfigMap (#4430)")
+        else:
+            if not all(c.get("resources", {}).get("requests") for c in sidecars):
+                problems.append(f"{path}: the tls-proxy sidecar needs resource requests")
+            if "listen 8443 ssl" not in conf[0]["data"]["default.conf.template"]:
+                problems.append(f"{path}: the tls-proxy ConfigMap does not listen on 8443 ssl")
+    elif sidecars or conf:
+        problems.append(f"{path}: renders the api TLS sidecar it must not (#4430)")
     want = main[0]["metadata"]["name"] if main else ""
     for d in docs:
         if d.get("kind") != "Deployment" or not d["metadata"]["name"].endswith("-frontend"):

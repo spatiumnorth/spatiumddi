@@ -816,14 +816,16 @@ client-side.
 
 **Heartbeat targets.** A supervisor that is itself a control-plane
 cluster member heartbeats the **node-local api Service**
-(`spatium-control-spatiumddi-api-local.spatium.svc.cluster.local:8000`, #3645:
-only ever the api pod on its own node) rather than the seed node's IP it was
+(`spatium-control-spatiumddi-api-local.spatium.svc.cluster.local`, port 8443 over
+TLS since #4430, 8000 over http before; #3645: only ever the api pod on its own
+node) rather than the seed node's IP it was
 installed/promoted against. With no ready api pod on its node it falls back to
 its configured `CONTROL_PLANE_URL` over https (pinned certificate), so losing
 a node's api pod never strands a member's control plane and no plain http
 crosses the node LAN. The seed has no `CONTROL_PLANE_URL` (firstboot writes it
 empty on a control-plane install), so it falls back to the cluster-wide api
-Service, as before #3645: a path through another node's api pod beats none.
+Service (also on 8443, over TLS), as before #3645: a path through another
+node's api pod beats none.
 Off-cluster DNS/DHCP
 agents have no in-cluster DNS to resolve that name, so they keep using
 their configured `CONTROL_PLANE_URL` — which should be the **VIP** on an
@@ -850,8 +852,8 @@ a 4 s connect timeout, and after the first failed attempt the same heartbeat is
 re-sent to its `CONTROL_PLANE_URL` over https against the pinned certificate
 (`cp_tls`; the seed uses the cluster Service). It tries the local Service again
 once 60 s have passed, on its next heartbeat, and goes back to it when that
-lands. Plain http is therefore only ever node-local, except for the seed's
-fallback. The frontend's `/api` proxy is deliberately not on the
+lands. Plain http is therefore only ever node-local (and, since #4430, only
+inside the rolling-upgrade window below). The frontend's `/api` proxy is deliberately not on the
 node-local Service: the node-local path has no fallback there, so it would turn
 an api pod rolling on a node into a UI outage on that node. It keeps the
 cluster Service (`PreferSameNode`, #1805, so it uses the local pod while one is
@@ -860,6 +862,40 @@ the role agents, the worker and beat still reach the api over the
 cluster-wide Service, and the Postgres and Redis traffic is unencrypted too.
 On a network where the node LAN is not trusted, put a WireGuard-capable CNI
 under the cluster instead of relying on this alone.
+
+**TLS on the supervisor-to-api hop (#4430).** The api pod carries a second
+container, `tls-proxy` (the frontend's nginx image, so nothing new is
+shipped), that serves **the web UI certificate** on port 8443 and proxies to
+the api over the pod's own loopback (`api.tlsListener`, on for every
+appliance; both api Services gain an `https` port). It is the same
+`spatium-appliance-tls` Secret every node's frontend serves, so there is no
+second CA and no second rotation: a self-signed re-mint, an upload or an ACME
+renewal reaches the sidecar through the Secret (it reloads on the change, as
+the frontend does, #1173) and reaches supervisors through the signed pin set
+they already follow (`cp_tls`). A control-plane member's supervisor sends its
+heartbeat to `https://...-api-local...:8443`, verified against the pinned
+certificate, never with verification off. A member already holds that pin
+from registering over https; the seed has none, so its first TLS handshake
+fails verification and it adopts the certificate only if the appliance CA
+vouches for it. The api records the supervisor's own address (the sidecar
+passes it in `X-Forwarded-For`, which the api believes from a loopback peer
+only). The http port 8000 stays for the frontend, the worker, the role agents
+and older supervisors.
+
+**Upgrade window.** There is no flag day. An old supervisor keeps using http
+8000, which the new api still serves. A new supervisor whose node-local api
+pod has no TLS listener yet (a pod from before this change, mid rolling
+upgrade) has its TLS attempt fail to connect; it re-sends the same heartbeat
+over node-local http in that call, and stays on http for 5 minutes before
+asking again (log `supervisor.control_plane.api_tls_unavailable`). The first
+heartbeat that succeeds over TLS writes `tls/api-tls-seen` under the
+supervisor's state directory and ends the window for that node for good: after
+that a failing TLS attempt falls back to the pinned https `CONTROL_PLANE_URL`
+(or, on the seed, the cluster Service on 8443), never to plain http, and a
+certificate that does not verify is never retried over http. The cluster is
+done when every node's supervisor logs `supervisor.control_plane.api_tls_active`.
+Still plain http, and tracked in #4019: the frontend's `/api` proxy, the
+worker, beat and the role agents.
 
 ### Guided etcd restore (Phase 9b)
 
@@ -1616,7 +1652,7 @@ The fix:
   - **Frontend / core** (was `control-only`): control plane only.
   - **Application**: supervisor only; pairs against a remote control plane.
 - **Pairing codes** are kind-agnostic (no more `deployment_kind` field) with two flavours: ephemeral (single-use, short expiry) and persistent (multi-claim, optional max_claims, disable/enable, password-gated reveal).
-- **Ed25519 identity + mTLS**. The supervisor generates an Ed25519 keypair on first boot, submits the pubkey when claiming a pairing code, and gets an X.509 cert signed by the control plane's internal CA on admin approval. Cert lifetime is 90 days; the supervisor auto-renews. Every request the supervisor makes with the cert carries an Ed25519 signature over the method, the path and query string, a SHA-256 of the body, a nonce and a timestamp (±300 s), and the control plane accepts each signature once (recorded in Redis; if Redis is unreachable the check is skipped with a warning rather than stopping the fleet's heartbeats). Supervisors older than #3631 sign only the method, path and timestamp; that form is accepted while `APPLIANCE_LEGACY_SIGNATURE_ALLOWED` is true (the default) and logged per appliance as `appliance_cert_auth_legacy_signature`, so set it to `false` once those lines stop. Every heartbeat answer carries `X-Appliance-Signature-Versions: 2`; a supervisor that gets an answer without it (an older control plane, e.g. between a node's slot upgrade and the application roll) signs the older form until one carries it, and never falls back again in that process once it has. The heartbeat still accepts the session token as a fallback when the cert does not validate. Registration is signed too: the request carries the registering key's Ed25519 signature over a fresh timestamp and nonce, and re-registering an existing appliance (which returns a new session token) needs it. A supervisor that has reported it signs registrations is refused when it sends one unsigned; a supervisor from before that was added is accepted unsigned, and logged as `supervisor_register_unsigned`, while `APPLIANCE_LEGACY_SIGNATURE_ALLOWED` is true. On a multi-node control plane the supervisor-to-api hop inside the cluster is plain HTTP (it is not given TLS in this release); the join token is the only secret answered on it, and is sealed to a one-off key, but the request bodies a supervisor sends (heartbeat state, kubeconfig, join token it reports) are not encrypted on that hop.
+- **Ed25519 identity + mTLS**. The supervisor generates an Ed25519 keypair on first boot, submits the pubkey when claiming a pairing code, and gets an X.509 cert signed by the control plane's internal CA on admin approval. Cert lifetime is 90 days; the supervisor auto-renews. Every request the supervisor makes with the cert carries an Ed25519 signature over the method, the path and query string, a SHA-256 of the body, a nonce and a timestamp (±300 s), and the control plane accepts each signature once (recorded in Redis; if Redis is unreachable the check is skipped with a warning rather than stopping the fleet's heartbeats). Supervisors older than #3631 sign only the method, path and timestamp; that form is accepted while `APPLIANCE_LEGACY_SIGNATURE_ALLOWED` is true (the default) and logged per appliance as `appliance_cert_auth_legacy_signature`, so set it to `false` once those lines stop. Every heartbeat answer carries `X-Appliance-Signature-Versions: 2`; a supervisor that gets an answer without it (an older control plane, e.g. between a node's slot upgrade and the application roll) signs the older form until one carries it, and never falls back again in that process once it has. The heartbeat still accepts the session token as a fallback when the cert does not validate. Registration is signed too: the request carries the registering key's Ed25519 signature over a fresh timestamp and nonce, and re-registering an existing appliance (which returns a new session token) needs it. A supervisor that has reported it signs registrations is refused when it sends one unsigned; a supervisor from before that was added is accepted unsigned, and logged as `supervisor_register_unsigned`, while `APPLIANCE_LEGACY_SIGNATURE_ALLOWED` is true. The supervisor-to-api hop inside the cluster is TLS too (#4430, see **Node-local api traffic**): the api pod serves the web UI certificate on 8443 and the supervisor verifies it against the certificate it pins. The one remaining plain-http case is the rolling-upgrade window described there.
 - **Per-role nftables firewall**. The supervisor renders `/etc/nftables.d/spatium-role.nft` every heartbeat with always-open management rules (tcp/22, icmp echo, loopback) + per-role service ports (udp+tcp/53 for DNS; udp/67-68, plus udp/547 for DHCPv6, for DHCP; the Kea HA listener, scoped to the other HA members, when the DHCP group is an HA pair; tcp/179 for Looking Glass) + an operator-pasted override fragment. `nft -c -f` dry-run before live-swap rejects syntax errors without putting the firewall in a half-rendered state.
 - **Baked-in container images**. Every container image needed for any install role is baked in at release time as `/var/lib/rancher/k3s/agent/images/*.tar.zst`, which k3s imports into its containerd store at start; no boot ever reaches out to ghcr.io. Air-gapped installs are first-class.
 - **A/B slot upgrades and container upgrades are one unit**. A slot upgrade is also a container upgrade — operators can't get out of sync between OS and container versions.

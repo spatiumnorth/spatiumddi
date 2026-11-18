@@ -1,4 +1,5 @@
 {{- $kubeletCA := .Values.api.kubeletCA -}}
+{{- $tlsListener := .Values.api.tlsListener -}}
 {{- $cmp := "api" -}}
 apiVersion: apps/v1
 kind: Deployment
@@ -263,8 +264,48 @@ spec:
               readOnly: true
             {{- end }}
           {{- end }}
-      {{- if or .Values.api.applianceHostMounts.enabled $kubeletCA.enabled }}
+        {{- if $tlsListener.enabled }}
+        # #4430 — TLS in front of the api, for the supervisors' heartbeats. The
+        # frontend's nginx image terminates TLS on :8443 with the web-UI
+        # certificate (the Secret every node's frontend serves, so the pin
+        # the supervisors already keep covers it, and a rotation reaches both
+        # through the same Secret + the image's 40-tls-reload-watch.sh) and
+        # proxies to the api over the pod's own loopback. :8000 stays for the
+        # frontend, the workers, the role agents and older supervisors.
+        - name: tls-proxy
+          image: {{ include "spatiumddi.image" (merge (dict "imageName" "spatiumddi-frontend") .) }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: https
+              containerPort: 8443
+          volumeMounts:
+            - name: api-tls-conf
+              mountPath: /etc/nginx/templates/default.conf.template
+              subPath: default.conf.template
+              readOnly: true
+            # A directory mount, never subPath: the kubelet updates these files
+            # when the Secret changes, and the reload watcher acts on that.
+            - name: api-tls-cert
+              mountPath: /etc/nginx/tls
+              readOnly: true
+          readinessProbe:
+            tcpSocket:
+              port: https
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            {{- toYaml $tlsListener.resources | nindent 12 }}
+        {{- end }}
+      {{- if or .Values.api.applianceHostMounts.enabled $kubeletCA.enabled $tlsListener.enabled }}
       volumes:
+      {{- if $tlsListener.enabled }}
+        - name: api-tls-conf
+          configMap:
+            name: {{ include "spatiumddi.fullname" . }}-api-tls-conf
+        - name: api-tls-cert
+          secret:
+            secretName: {{ $tlsListener.secretName }}
+      {{- end }}
       {{- if $kubeletCA.enabled }}
         # #983 Phase 2 item 6 — the CA that signs kubelet SERVING certs,
         # which on k3s is its own ``server-ca`` and NOT the CA in the
@@ -359,6 +400,11 @@ spec:
     - name: http
       port: {{ .Values.api.service.port }}
       targetPort: http
+    {{- if $tlsListener.enabled }}
+    - name: https
+      port: {{ $tlsListener.port }}
+      targetPort: https
+    {{- end }}
 {{- if .Values.api.service.nodeLocal }}
 ---
 {{- /* #3645: the appliance's second api Service. internalTrafficPolicy: Local
@@ -384,6 +430,11 @@ spec:
     - name: http
       port: {{ .Values.api.service.port }}
       targetPort: http
+    {{- if $tlsListener.enabled }}
+    - name: https
+      port: {{ $tlsListener.port }}
+      targetPort: https
+    {{- end }}
 {{- end }}
 {{- if .Values.api.autoscaling.enabled }}
 ---
