@@ -57,6 +57,7 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `dhcp_static`     | Static / reserved leases                              |
 | `dhcp_client_class` | DHCP client classes                                 |
 | `audit_log`       | Audit log read                                        |
+| `ai_finding`      | Copilot Watch findings (#4405) — `read` gates the inbox, a finding's detail, the run log and the dashboard card; `write` gates acknowledge, dismiss (with an optional mute) and reopen. A wildcard `read` (the builtin Viewer) reads findings too. The Watch settings, Run now and Pause are superadmin-only |
 | `alert`           | Alert rules and alert events — `read` gates `GET /alerts/rules`, `/alerts/rules/{id}`, `/alerts/rule-types` and `/alerts/events` (they carry resource names). Writing rules, resolving events and forcing an evaluation stay superadmin-only |
 | `user`            | Users — **superadmin only** in practice               |
 | `group`           | Groups — admin required                               |
@@ -116,6 +117,17 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `e911_location`   | E911 dispatchable location (#972) — Emergency Response Locations, bindings, resolver lookups and the HELD / provisioning surfaces (`/api/v1/e911/`), behind the `network.e911` module |
 | `use_network_tools` | The Tools page (ping / traceroute / dig / whois and the rest), plus Wake-on-LAN sends |
 | `*`               | Wildcard — match any resource type                    |
+
+### Copilot Watch service identity (#4405)
+
+Copilot Watch runs unattended as a service user, `copilot-watch`
+(`auth_source = "service"`, no password, cannot log in, created on first use).
+It is a member of the group "Copilot Watch", which starts with the builtin
+Viewer role, so everything it reads goes through the same permission checks as
+a person. Narrow it by swapping that group's roles. A run is skipped
+(`principal_not_read_only`) if the group holds any action other than `read`.
+The service user cannot be edited, given a password or deleted from the Users
+page.
 
 ## Evaluation rules
 
@@ -401,6 +413,7 @@ starts at the server groups). The built-in roles keep what they had
 | `Compliance Editor` | `admin` on `conformity`, `read` on `audit_log`, `ip_space`, `ip_block`, `subnet`, `ip_address`, `dns_group`, `dns_zone`, `dns_record`, `dhcp_scope`, `alert` — for the team that authors / tunes conformity policies without touching operational config |
 | `Address Set Editor` | `admin` on `address_set` (#103); `read` on `alert` — delegated edit of a named IP slice within a subnet without subnet-wide write. Grant on a specific address-set id to scope a department admin to just their slice. Creating / resizing a set still requires write on the parent subnet. |
 | `Change Approver`  | `approve` + `read` on `change_request` (#62); `read` on `alert` — the second-person decision capability in the two-person approval workflow. Reading the queue needs no grant for your own rows (#1863): any signed-in user sees, and may cancel, the requests they made themselves; `read` widens nothing, and seeing every row takes `approve`. Approving a specific request *also* requires the underlying operation's permission (e.g. `delete,subnet`), enforced server-side. |
+| `Findings Analyst` | `read` + `write` on `ai_finding` (#4405); `read` on `alert` — triages Copilot Watch findings (acknowledge, dismiss, reopen) without any other access. Needs the `ai.watch` module on |
 | `Requester`        | `write` + `read` on `provisioning_request` (#696); `read` on `alert` — the low-privilege half of the request workflow, meant to be granted broadly (a whole department, not just the network team). Holders can ask for an IP / subnet / DNS record / DHCP reservation and see their own requests; they cannot provision anything, cannot see anyone else's requests, and cannot approve. The role carries no `read` on subnets, blocks, zones or scopes: grant `read` on the ones a department may request into, or submits are refused. |
 | `Appliance Operator` | `admin` on `appliance` (#134) and `certificate_store` (#3067); `read` on `alert` — runs the SpatiumDDI OS appliance on a node (TLS cert upload and ACME, the read-only releases catalogue, node-local slot apply and rollback, container start/stop/restart + live logs, host network + firewall config, maintenance mode, diagnostic bundle download) for ops staff who manage a node's lifecycle without full superadmin over the DDI data plane. **Fleet management still needs a superadmin** (#2620): the upgrade-image store, every Fleet member action (approve, role assignment, OS upgrade, reboot), MetalLB, the kube-api CIDRs and pairing codes. |
 

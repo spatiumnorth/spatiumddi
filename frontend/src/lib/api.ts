@@ -2854,11 +2854,7 @@ export const aiToolCatalogApi = {
 // files findings. It observes and advises; nothing here changes the DDI
 // configuration. Settings are superadmin-only; findings need read (and
 // write, to triage) on `ai_finding`.
-export type AIFindingState =
-  | "open"
-  | "acknowledged"
-  | "dismissed"
-  | "resolved";
+export type AIFindingState = "open" | "acknowledged" | "dismissed" | "resolved";
 export type AIFindingSeverity = "info" | "warning" | "critical";
 export type AIFindingVerdict = "useful" | "not_useful" | "wrong";
 
@@ -3043,7 +3039,8 @@ export interface AIFeedbackStat {
 }
 
 export const aiWatchApi = {
-  getConfig: () => api.get<AIWatchConfig>("/ai/watch/config").then((r) => r.data),
+  getConfig: () =>
+    api.get<AIWatchConfig>("/ai/watch/config").then((r) => r.data),
   updateConfig: (body: AIWatchConfigUpdate) =>
     api.put<AIWatchConfig>("/ai/watch/config", body).then((r) => r.data),
   setPaused: (paused: boolean, reason = "") =>

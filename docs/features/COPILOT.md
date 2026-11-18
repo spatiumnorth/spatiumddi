@@ -70,6 +70,53 @@ The per-category bullets below are a representative tour, not an exhaustive enum
 - Per-request usage tracked in `ai_chat_message`; pricing table covers the major hosted models; per-user daily token + cost caps; AI usage card on Platform Insights aggregates the last 7 days by provider + model
 - **Daily digest** — optional 0900 local Operator Copilot summary fired through audit-forward / SMTP / webhook channels
 
+## Copilot Watch (unattended findings, #4405)
+
+Copilot Watch is the one place the Copilot runs without a person asking.
+It is the `ai.watch` feature module: **off by default**, and it requires
+`ai.copilot`. Turn it on under Settings → Features, then configure it on
+**Copilot Watch → Settings** (superadmin only). Nothing runs until an
+operator enables it there.
+
+**What it does.** A background tick (once a minute, one run at a time across
+all workers) gathers a bounded evidence pack from alerts, conformity, DNS and
+DHCP server health and recent audit rows, lets the model use a read-only tool
+subset to look further, and records **findings**: a title, a severity, a
+plain explanation, and the evidence it rests on. It never changes anything.
+A finding is only kept if its evidence refs exist and still show a problem,
+and it closes by itself when that evidence clears. An install with nothing
+wrong in the evidence pack makes no model call at all.
+
+**When it runs.** Run now, a new or worse alert (after a debounce window),
+or a scheduled sweep (an interval in hours, default 24, 0 = off).
+
+**Which provider.** Watch uses the provider you pick, or the Copilot failover
+order. A hosted provider is refused unless "Allow a hosted provider" is on;
+an `openai_compat` provider counts as on-prem only when its **On-prem**
+checkbox is set (Settings → AI Providers). Editing its base URL clears the
+mark. Every refused run is still recorded as a skipped row with the reason.
+
+**Who it acts as.** The service user `copilot-watch` in the group "Copilot
+Watch", which starts with the Viewer role (see
+[PERMISSIONS.md](../PERMISSIONS.md)). A run is skipped if that group holds
+anything beyond read.
+
+**Cost guards.** A daily token and USD budget (the pause lifts itself at
+00:00 UTC), a runs-per-hour limit, a per-run round and token cap, and an
+automatic pause after three failed runs in a row (an operator resumes it).
+A local model with no price is bounded by tokens only.
+
+**Triage.** Findings are acknowledged, dismissed (optionally muted for N days
+or until unmuted) or reopened by anyone holding `write` on `ai_finding`
+(builtin role "Findings Analyst"); `read` on `ai_finding` sees them. The
+Settings tab lists mutes and shows how often findings are dismissed. Runs are
+kept 30 days. A Security-tab dashboard card shows open findings by severity.
+
+**MCP.** Four read tools (`find_ai_findings`, `get_ai_finding`,
+`find_ai_watch_runs`, `count_ai_findings`) let the Copilot chat read findings.
+
+Not in phase 1: a badge on alert rows and "Ask Copilot about this".
+
 ## Self-host with Ollama in five minutes
 
 ```bash

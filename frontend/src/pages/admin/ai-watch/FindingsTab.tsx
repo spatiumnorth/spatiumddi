@@ -264,8 +264,8 @@ export function FindingsTab() {
                   )}
 
                   <p className="text-xs text-muted-foreground">
-                    Written by {f.model || "a model"} from the evidence above
-                    ({f.confidence} confidence). First seen{" "}
+                    Written by {f.model || "a model"} from the evidence above (
+                    {f.confidence} confidence). First seen{" "}
                     {fmtWhen(f.first_seen_at)}.
                     {f.state_changed_by &&
                       ` ${f.state} by ${f.state_changed_by}${
@@ -305,9 +305,7 @@ export function FindingsTab() {
                       <button
                         type="button"
                         className={btnCls}
-                        onClick={() =>
-                          act.mutate({ kind: "reopen", id: f.id })
-                        }
+                        onClick={() => act.mutate({ kind: "reopen", id: f.id })}
                         disabled={act.isPending}
                         {...permissionGate(mayWrite, NEEDS_WRITE)}
                       >
@@ -384,8 +382,8 @@ function DismissModal({
       <div className="space-y-3 text-sm">
         <p className="break-words font-medium">{finding.title}</p>
         <p className="text-xs text-muted-foreground">
-          Dismissing removes the finding from the inbox. It does not change
-          the alerts or checks it was built from.
+          Dismissing removes the finding from the inbox. It does not change the
+          alerts or checks it was built from.
         </p>
         <div>
           <label

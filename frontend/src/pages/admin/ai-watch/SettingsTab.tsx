@@ -249,8 +249,8 @@ export function SettingsTab() {
             Allow a hosted provider
             <span className="block text-xs text-muted-foreground">
               Lets Copilot Watch send data to a provider that is not marked
-              on-prem. Alert text, server names, DNS names and client
-              hostnames then leave your network unattended, every run.
+              on-prem. Alert text, server names, DNS names and client hostnames
+              then leave your network unattended, every run.
             </span>
           </span>
         </label>
@@ -308,10 +308,10 @@ export function SettingsTab() {
           {usage.token_budget.toLocaleString()} tokens, $
           {Number(usage.cost_usd).toFixed(4)} of $
           {Number(usage.cost_budget_usd).toFixed(2)}, in {usage.runs} run
-          {usage.runs === 1 ? "" : "s"}. Both budgets are required. When
-          either is reached Copilot Watch pauses until 00:00 UTC and says so on
-          this page. A model that is not on the rate sheet (most local models)
-          has no known cost, so the token budget is what limits it.
+          {usage.runs === 1 ? "" : "s"}. Both budgets are required. When either
+          is reached Copilot Watch pauses until 00:00 UTC and says so on this
+          page. A model that is not on the rate sheet (most local models) has no
+          known cost, so the token budget is what limits it.
         </p>
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           <div>
@@ -381,14 +381,14 @@ export function SettingsTab() {
         <h2 className={h2Cls}>Identity</h2>
         <p className="text-xs text-muted-foreground">
           Copilot Watch runs as the built-in service identity{" "}
-          <code>{data.principal.username}</code>, which cannot sign in. It
-          reads what the roles of the <strong>{data.principal.group}</strong>{" "}
-          group allow, currently:{" "}
+          <code>{data.principal.username}</code>, which cannot sign in. It reads
+          what the roles of the <strong>{data.principal.group}</strong> group
+          allow, currently:{" "}
           {data.principal.roles.length
             ? data.principal.roles.join(", ")
             : "no roles, so nothing"}
-          . To narrow what it can see, give that group narrower read-only
-          roles under{" "}
+          . To narrow what it can see, give that group narrower read-only roles
+          under{" "}
           <Link to="/admin/groups" className="text-primary hover:underline">
             Groups
           </Link>
@@ -420,10 +420,10 @@ export function SettingsTab() {
           </button>
         </div>
         <p className="text-xs text-muted-foreground">
-          Read-only tools the model may use to look closer at what the
-          evidence names. Tools that change anything, stage a change or send
-          traffic outward are never offered and are not listed. The identity's
-          roles and the platform Tool Catalog narrow this further.
+          Read-only tools the model may use to look closer at what the evidence
+          names. Tools that change anything, stage a change or send traffic
+          outward are never offered and are not listed. The identity's roles and
+          the platform Tool Catalog narrow this further.
         </p>
         <div className="grid max-h-72 gap-x-4 gap-y-1 overflow-auto sm:grid-cols-2 lg:grid-cols-3">
           {data.tools.map((t) => (
@@ -488,8 +488,8 @@ function MutesSection() {
     <section className={sectionCls}>
       <h2 className={h2Cls}>Muted findings</h2>
       <p className="text-xs text-muted-foreground">
-        Findings dismissed with a mute. Copilot Watch does not file these
-        again while the mute holds.
+        Findings dismissed with a mute. Copilot Watch does not file these again
+        while the mute holds.
       </p>
       {remove.isError && (
         <div role="alert" className="text-sm text-destructive">
@@ -532,9 +532,9 @@ function FeedbackSection() {
     <section className={sectionCls}>
       <h2 className={h2Cls}>How useful the findings were</h2>
       <p className="text-xs text-muted-foreground">
-        Verdicts people left on findings, by finding kind and by the model
-        that wrote them. A kind or a model that keeps being marked wrong is
-        one to mute, narrow or replace.
+        Verdicts people left on findings, by finding kind and by the model that
+        wrote them. A kind or a model that keeps being marked wrong is one to
+        mute, narrow or replace.
       </p>
       <div className="overflow-x-auto">
         <table className="w-full min-w-[420px] text-left text-sm">
