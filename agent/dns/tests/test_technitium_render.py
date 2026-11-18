@@ -2653,7 +2653,7 @@ def _retire(
 def test_zone_dropped_from_the_bundle_is_deleted(tmp_path: Path) -> None:
     deleted, ledger = _retire(tmp_path, desired=["a.test"], ledger=["a.test", "gone.test"])
     assert deleted == ["gone.test"]
-    assert ledger == ["a.test"]
+    assert ledger == ["a.test"]  # already owned, so it stays
 
 
 def test_only_zones_in_the_ledger_are_candidates(tmp_path: Path) -> None:
@@ -2669,13 +2669,15 @@ def test_first_run_seeds_the_ledger_from_the_previous_render(tmp_path: Path) -> 
     the previous render, so it is still retired."""
     deleted, ledger = _retire(tmp_path, desired=["a.test"], previous=["a.test", "gone.test"])
     assert deleted == ["gone.test"]
-    assert ledger == ["a.test"]
+    # a.test was only in the previous render, never proven ours: the reconcile
+    # claims it once it creates it or it passes the ownership check (#4431).
+    assert ledger == []
 
 
 def test_first_run_without_history_deletes_nothing(tmp_path: Path) -> None:
     deleted, ledger = _retire(tmp_path, desired=["a.test", "b.test"])
     assert deleted == []
-    assert ledger == ["a.test", "b.test"]
+    assert ledger == []  # claimed by the reconcile, not by retirement (#4431)
 
 
 def test_failed_delete_is_retried_and_missing_zone_is_forgotten(tmp_path: Path) -> None:
