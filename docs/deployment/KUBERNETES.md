@@ -65,10 +65,11 @@ resolves as the latest on its own (#1182).
 
 The chart installs on OpenShift under its **default** SecurityContextConstraints:
 the control plane runs under plain `restricted-v2`, with no grant. It is the
-same chart, not a fork. Tested on OpenShift 5.0.0 (Kubernetes 1.36, OpenShift
-Local): every control-plane pod admitted by `restricted-v2`, the BIND9 and Kea
-agents by the chart's own SCCs, DNS and DHCP serving. OpenShift 4.22 has the
-same SCCs and is being verified. OKD is not tested.
+same chart, not a fork. Tested on OpenShift 5.0.0 (Kubernetes 1.36) and
+OpenShift 4.22.14 (Kubernetes 1.35), both on OpenShift Local, from the command
+line and through the web console's Helm install: every control-plane pod
+admitted by `restricted-v2`, the BIND9 and Kea agents by the chart's own SCCs,
+DNS and DHCP serving. OKD is not tested.
 
 ```bash
 helm install ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
@@ -198,9 +199,14 @@ It keeps `openshift.scc.create: true`, so the chart creates the DNS and DHCP
 agents' SecurityContextConstraints exactly as the plain chart does (Red Hat
 confirmed that SCCs in a certified chart are acceptable). The control plane needs
 none and runs under `restricted-v2`; the agents are admitted by the chart's SCCs
-when you enable them. Where your cluster admins manage SCCs instead, set
+when you enable them. Creating an SCC needs cluster-scoped permissions, so a user
+who is admin of one namespace only cannot install with the agents on: Helm (and
+the web console's Helm install) stops before creating anything, with
+`securitycontextconstraints ... is forbidden ... at the cluster scope`. Where your
+cluster admins manage SCCs, or the installing user is a namespace admin, set
 `openshift.scc.create: false` and follow **If your cluster admins manage SCCs**
-below.
+below: a cluster admin applies the SCC files once, and the namespace admin can
+then install.
 
 It also sets `image.tagSuffix: -ubi` (appended to the tag of those four images; the
 agents' BIND9 and Kea included) and runs the bundled PostgreSQL and Redis from
