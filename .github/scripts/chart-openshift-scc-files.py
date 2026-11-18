@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The shipped static SCC manifests must equal what the chart renders (#3913).
 
-``values-openshift-certified.yaml`` turns ``openshift.scc.create`` off, so a
+A cluster whose admins manage SCCs sets ``openshift.scc.create=false``, so a
 cluster admin applies ``charts/spatiumddi/files/openshift/*-scc.yaml`` by hand
 instead. Those files are copies of what the ``spatiumddi.openshiftScc`` helper
 renders; this fails when they drift, i.e. when the helper gains a capability,
