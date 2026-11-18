@@ -175,3 +175,21 @@ describe("Stale IPs report (#2521)", () => {
     expect(screen.queryByRole("dialog")).not.toBeNull();
   });
 });
+
+describe("Stale IPs report, address-set delegate (#3906)", () => {
+  it("offers Deprecate to a user holding a write grant on an address set", async () => {
+    await open([
+      ["read", "*"],
+      ["write", "address_set"],
+    ]);
+    expect(deprecateAll().disabled).toBe(false);
+    tick();
+    expect(
+      (
+        screen.getByRole("button", {
+          name: /Deprecate selected/,
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(false);
+  });
+});

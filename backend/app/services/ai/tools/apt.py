@@ -70,7 +70,7 @@ async def find_apt_settings(
     sources = [
         {
             "name": s.get("name", ""),
-            "uri": s.get("uri", ""),
+            "uri": mask_proxy_url(str(s.get("uri", ""))),
             "suites": s.get("suites", ""),
             "components": s.get("components", ""),
             "signed_by_key_id": s.get("signed_by_key_id", ""),

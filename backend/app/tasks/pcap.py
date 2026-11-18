@@ -28,6 +28,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.celery_app import celery_app
+from app.core.task_lock import single_flight
 from app.db import task_session
 from app.models.pcap import PacketCapture
 from app.models.settings import PlatformSettings
@@ -44,6 +45,7 @@ _STUCK_MARGIN_S = 120
 
 
 @celery_app.task(name="app.tasks.pcap.run_capture", bind=True, max_retries=0)
+@single_flight(lambda capture_id_str: capture_id_str)
 def run_capture_task(self: Any, capture_id_str: str) -> dict[str, str]:  # noqa: ARG001
     """Drive one server-vantage packet capture from start to finish."""
     capture_id = uuid.UUID(capture_id_str)

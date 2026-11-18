@@ -172,6 +172,28 @@ def _annotate(result: SearchResult, quality: int, matched: str | None) -> Search
     return result
 
 
+def _live_subnet_ids() -> Any:
+    """Subquery of subnet ids whose subnet and space are both live (#3825).
+
+    ``IPAddress`` has no ``SoftDeleteMixin``, so an address under a trashed
+    subnet is only hidden by its parent. Filtering after the per-type
+    ``LIMIT`` let 100+ trashed rows fill the fetch and hide every live match,
+    so the exclusion goes into the search statement itself, before the cut.
+    The parent stays a semi-join here rather than a join, for the plan reason
+    in :func:`_subnet_context`.
+    """
+    return (
+        select(Subnet.id)
+        .join(IPSpace, Subnet.space_id == IPSpace.id)
+        .where(Subnet.deleted_at.is_(None), IPSpace.deleted_at.is_(None))
+    )
+
+
+def _live_zone_ids() -> Any:
+    """Subquery of live DNS zone ids, for the same reason (#3825)."""
+    return select(DNSZone.id).where(DNSZone.deleted_at.is_(None))
+
+
 async def _subnet_context(db: AsyncSession, subnet_ids: set) -> dict:
     """Load the subnet → space breadcrumb for a set of subnet ids.
 
@@ -206,7 +228,7 @@ async def _subnet_context(db: AsyncSession, subnet_ids: set) -> dict:
 async def search_addresses(db: AsyncSession, s: QueryShape, limit: int) -> list[SearchResult]:
     # Single-table match; the subnet/space breadcrumb is a second query.
     # See :func:`_subnet_context` for why joining it here is a 20x slowdown.
-    stmt = select(IPAddress)
+    stmt = select(IPAddress).where(IPAddress.subnet_id.in_(_live_subnet_ids()))
 
     if s.is_ip:
         stmt = stmt.where(text("CAST(ip_address.address AS inet) = CAST(:q AS inet)")).params(
@@ -466,7 +488,10 @@ async def search_dns_records(db: AsyncSession, s: QueryShape, limit: int) -> lis
     # Single-table match, breadcrumb second — ``dns_record`` is the other
     # table that reaches millions of rows, and the same soft-delete-driven
     # nested loop that cost ``ip_address`` 20x applies to its zone join.
-    stmt = select(DNSRecord).where(_text_clauses(s.raw, DNSRecord.fqdn, DNSRecord.value))
+    stmt = select(DNSRecord).where(
+        DNSRecord.zone_id.in_(_live_zone_ids()),
+        _text_clauses(s.raw, DNSRecord.fqdn, DNSRecord.value),
+    )
     rank = sql_rank(s.raw, DNSRecord.fqdn, DNSRecord.value)
     rows = (await db.execute(_ranked(stmt, rank, limit, tiebreak=DNSRecord.fqdn))).all()
     if not rows:
@@ -1079,12 +1104,13 @@ async def search_custom_fields(db: AsyncSession, s: QueryShape, limit: int) -> l
     addr_fields = await _searchable_field_names(db, "ip_address")
     if addr_fields:
         stmt = select(IPAddress).where(
+            IPAddress.subnet_id.in_(_live_subnet_ids()),
             or_(
                 *[
                     c.ilike(like_pattern(s.raw), escape="\\")
                     for c in jsonb_cols(IPAddress, addr_fields)
                 ]
-            )
+            ),
         )
         stmt = _ranked(
             stmt,

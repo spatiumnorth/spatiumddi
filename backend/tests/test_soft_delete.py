@@ -166,13 +166,9 @@ async def test_restore_batch_atomic(client: AsyncClient, db_session: AsyncSessio
 async def test_restore_conflict_409(client: AsyncClient, db_session: AsyncSession) -> None:
     """Restoring a batch whose head row would clash returns 409.
 
-    Tested via DNSZone — the live ``uq_dns_zone_group_view_name``
-    constraint blocks a same-name zone create when the soft-deleted row
-    is still in the table, so we use a different group to stage the
-    clash. Two zones with the same name in different groups is fine at
-    the DB level (the unique constraint includes group_id), but the
-    soft-delete restore conflict check can flag any live equal-name
-    sibling.
+    Tested via DNSZone: a live zone of the same name in the same group
+    (the partial ``uq_dns_zone_group_view_name`` index covers live rows
+    only, #3824) is what the restore conflict check flags.
     """
     _, token = await _make_admin(db_session)
     headers = {"Authorization": f"Bearer {token}"}

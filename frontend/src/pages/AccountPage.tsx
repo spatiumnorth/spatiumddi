@@ -7,6 +7,7 @@ import { copyToClipboard } from "@/lib/clipboard";
 import { useSecretCloseGuard } from "@/hooks/useSecretCloseGuard";
 import { Modal } from "@/components/ui/modal";
 import { QrCode } from "@/components/QrCode";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -217,17 +218,17 @@ function MfaPanel() {
                   : "Set up authenticator"}
             </button>
             {reauth.isError && (
-              <p className="text-xs text-destructive">
+              <FormError className="text-xs text-destructive">
                 {formatApiError(
                   reauth.error,
                   "Could not start re-authentication",
                 )}
-              </p>
+              </FormError>
             )}
             {!askPassword && enrollBegin.isError && (
-              <p className="text-xs text-destructive">
+              <FormError className="text-xs text-destructive">
                 {formatApiError(enrollBegin.error, "Could not start set-up")}
-              </p>
+              </FormError>
             )}
           </div>
         ) : (
@@ -419,9 +420,9 @@ function EnrollModal({
         </ol>
 
         {error && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
             {error}
-          </div>
+          </FormError>
         )}
 
         <div className="flex justify-end gap-2 pt-1">
@@ -514,9 +515,9 @@ function PasswordCodePrompt({
               />
             </div>
             {error && (
-              <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+              <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
                 {error}
-              </div>
+              </FormError>
             )}
           </>
         )}
@@ -689,7 +690,9 @@ function EnrolPasswordModal({
           value={password}
           onChange={(e) => setPassword(e.target.value)}
         />
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
         <div className="flex justify-end gap-2">
           <button
             type="button"

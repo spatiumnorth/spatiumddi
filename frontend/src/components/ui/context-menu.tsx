@@ -1,6 +1,11 @@
 import * as React from "react";
 import * as ContextMenuPrimitive from "@radix-ui/react-context-menu";
 import { cn } from "@/lib/utils";
+import {
+  captureSuccessors,
+  returnFocus,
+  type FocusSuccessor,
+} from "./focus-return";
 
 export const ContextMenu = ContextMenuPrimitive.Root;
 
@@ -11,7 +16,15 @@ export const ContextMenu = ContextMenuPrimitive.Root;
 // menu opened was launched by it. A menu inside a dialog must not mistake its
 // own host dialog for one it opened. Module-level because Radix shows one
 // context menu at a time.
-let opened: { trigger: HTMLElement; before: Set<Element> } | null = null;
+let opened: {
+  trigger: HTMLElement;
+  before: Set<Element>;
+  /** The control that had focus as the menu opened (Shift+F10 on a row's
+   *  Edit button): a table row takes no focus, so this is where focus goes
+   *  back to (#3908). */
+  focused: HTMLElement | null;
+  successors: FocusSuccessor[];
+} | null = null;
 
 const modalDialogs = () =>
   Array.from(
@@ -21,7 +34,14 @@ const modalDialogs = () =>
   );
 
 function recordOpen(trigger: HTMLElement) {
-  opened = { trigger, before: new Set(modalDialogs()) };
+  const a = document.activeElement as HTMLElement | null;
+  const focused = a && a !== document.body ? a : null;
+  opened = {
+    trigger,
+    before: new Set(modalDialogs()),
+    focused,
+    successors: captureSuccessors(focused ?? trigger),
+  };
 }
 
 export const ContextMenuTrigger = React.forwardRef<
@@ -65,7 +85,7 @@ function handleCloseAutoFocus(e: Event) {
     obs.disconnect();
     const active = document.activeElement;
     const placed = active && active !== document.body && active.isConnected;
-    if (!placed && ctx.trigger.isConnected) ctx.trigger.focus();
+    if (!placed) returnFocus([ctx.focused, ctx.trigger], ctx.successors);
   });
   obs.observe(document.body, { childList: true, subtree: true });
 }

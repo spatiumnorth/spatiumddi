@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { ShieldCheck, Heart, Globe2, Loader2 } from "lucide-react";
 import { ipamApi, type Subnet, type IPSpace } from "@/lib/api";
+import { ListEmpty } from "@/components/ui/list-read-error";
 
 /**
  * Compliance dashboard. Three independent buckets keyed off the
@@ -17,15 +18,27 @@ import { ipamApi, type Subnet, type IPSpace } from "@/lib/api";
  * subnets the dashboard stays snappy.
  */
 export function CompliancePage() {
-  const { data: pci = [], isLoading: pciLoading } = useQuery({
+  const {
+    data: pci = [],
+    isLoading: pciLoading,
+    error: pciError,
+  } = useQuery({
     queryKey: ["compliance-subnets", "pci"],
     queryFn: () => ipamApi.listSubnets({ pci_scope: true }),
   });
-  const { data: hipaa = [], isLoading: hipaaLoading } = useQuery({
+  const {
+    data: hipaa = [],
+    isLoading: hipaaLoading,
+    error: hipaaError,
+  } = useQuery({
     queryKey: ["compliance-subnets", "hipaa"],
     queryFn: () => ipamApi.listSubnets({ hipaa_scope: true }),
   });
-  const { data: inet = [], isLoading: inetLoading } = useQuery({
+  const {
+    data: inet = [],
+    isLoading: inetLoading,
+    error: inetError,
+  } = useQuery({
     queryKey: ["compliance-subnets", "internet-facing"],
     queryFn: () => ipamApi.listSubnets({ internet_facing: true }),
   });
@@ -64,6 +77,7 @@ export function CompliancePage() {
             description="Subnets handling cardholder data per PCI DSS."
             subnets={pci}
             loading={pciLoading}
+            error={pciError}
             spaceById={spaceById}
             emptyHint="No subnets tagged PCI scope yet."
           />
@@ -73,6 +87,7 @@ export function CompliancePage() {
             description="Subnets handling electronic protected health information."
             subnets={hipaa}
             loading={hipaaLoading}
+            error={hipaaError}
             spaceById={spaceById}
             emptyHint="No subnets tagged HIPAA scope yet."
           />
@@ -82,6 +97,7 @@ export function CompliancePage() {
             description="Subnets reachable directly from the public internet."
             subnets={inet}
             loading={inetLoading}
+            error={inetError}
             spaceById={spaceById}
             emptyHint="No subnets tagged internet-facing yet."
           />
@@ -97,6 +113,7 @@ function ComplianceCard({
   description,
   subnets,
   loading,
+  error,
   spaceById,
   emptyHint,
 }: {
@@ -105,6 +122,7 @@ function ComplianceCard({
   description: string;
   subnets: Subnet[];
   loading: boolean;
+  error: unknown;
   spaceById: Map<string, IPSpace>;
   emptyHint: string;
 }) {
@@ -116,7 +134,7 @@ function ComplianceCard({
           <span className="text-sm font-semibold">{title}</span>
         </div>
         <span className="rounded bg-muted px-1.5 py-0.5 text-[11px] tabular-nums">
-          {loading ? "—" : subnets.length}
+          {loading || error ? "—" : subnets.length}
         </span>
       </div>
       <p className="border-b px-4 py-2 text-[11px] text-muted-foreground">
@@ -126,9 +144,11 @@ function ComplianceCard({
         <div className="flex items-center justify-center py-8">
           <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
         </div>
-      ) : subnets.length === 0 ? (
+      ) : subnets.length === 0 || error ? (
         <p className="px-4 py-6 text-center text-xs text-muted-foreground">
-          {emptyHint}
+          <ListEmpty error={error} what="subnets">
+            {emptyHint}
+          </ListEmpty>
         </p>
       ) : (
         <table className="w-full text-xs">
