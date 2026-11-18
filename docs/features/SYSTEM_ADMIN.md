@@ -378,11 +378,14 @@ Dashboard tiles showing platform-wide stats:
 - DHCP lease counts by server
 - DNS query rates by server
 - Recent audit log summary (top actors, most-changed resources)
-- Scheduled report configuration:
-  - Report type (utilization, expiring leases, unused IPs)
-  - Schedule (daily/weekly/monthly)
-  - Output format (PDF, CSV, JSON)
-  - Delivery method (email, webhook, S3)
+
+Reports are on demand today: the `/reports` page (top subnets by
+utilization, owners by IP count, most-modified resources; #47), the
+auditor-facing change report `GET /api/v1/audit/export.pdf` (#48), the
+IPAM PDF export `GET /api/v1/ipam/export.pdf` (#82) and the conformity
+PDF. **There is no scheduled report delivery yet**: nothing builds a
+report on a schedule or sends one by email, webhook or object storage.
+That is tracked as a planned feature ([#4494](https://github.com/spatiumnorth/spatiumddi/issues/4494)).
 
 ### 2.9 Backup and Restore
 
