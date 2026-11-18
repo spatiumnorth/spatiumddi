@@ -22,7 +22,9 @@ class _Resp:
         return self._body
 
 
-def _sync(tmp_path: Path, installed: list[dict[str, Any]], keys: list[dict[str, Any]]) -> str:
+def _sync(
+    tmp_path: Path, installed: list[dict[str, Any]], keys: list[dict[str, Any]]
+) -> str:
     sent: list[dict[str, Any]] = []
 
     def request(_t: str, _m: str, path: str, params: dict[str, Any]) -> _Resp:
@@ -45,7 +47,11 @@ def test_cluster_catalog_key_is_preserved(tmp_path: Path) -> None:
             "sharedSecret": "c2VjcmV0",
             "algorithmName": "hmac-sha256",
         },
-        {"keyName": "stale-key", "sharedSecret": "eA==", "algorithmName": "hmac-sha256"},
+        {
+            "keyName": "stale-key",
+            "sharedSecret": "eA==",
+            "algorithmName": "hmac-sha256",
+        },
     ]
     keys = [{"name": "spatium-default", "secret": "YWJj", "algorithm": "hmac-sha256"}]
     out = _sync(tmp_path, installed, keys).split("|")
@@ -58,7 +64,13 @@ def test_no_cluster_key_keeps_empty_set_clearing(tmp_path: Path) -> None:
     assert (
         _sync(
             tmp_path,
-            [{"keyName": "old", "sharedSecret": "eA==", "algorithmName": "hmac-sha256"}],
+            [
+                {
+                    "keyName": "old",
+                    "sharedSecret": "eA==",
+                    "algorithmName": "hmac-sha256",
+                }
+            ],
             [],
         )
         == ""
