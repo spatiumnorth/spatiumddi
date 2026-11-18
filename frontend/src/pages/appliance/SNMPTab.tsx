@@ -7,14 +7,14 @@ import { SNMPSection } from "@/components/SNMPSection";
 /**
  * Appliance → SNMP tab (issue #153).
  *
- * Thin wrapper around the shared ``SNMPSection`` component. The same
+ * Thin wrapper around the shared <code className="font-mono">SNMPSection</code> component. The same
  * form drives both the standalone Settings entry and this tab — but
  * the Appliance page is the canonical home because SNMP belongs
  * conceptually next to Releases / OS Versions / host-level config,
  * not down in IPAM / DNS / DHCP-flavoured Settings.
  *
  * Settings → Appliance → SNMP stays as a hidden alias for muscle-memory
- * + search — see ``SettingsPage`` SECTIONS for the entry that points
+ * + search — see <code className="font-mono">SettingsPage</code> SECTIONS for the entry that points
  * here.
  */
 export function SNMPTab() {
@@ -55,12 +55,15 @@ export function SNMPTab() {
         <h2 className="text-base font-semibold">SNMP</h2>
         <p className="mt-1 text-xs text-muted-foreground">
           snmpd runs at the OS level on every SpatiumDDI appliance host — local
-          + every registered remote agent. The rendered ``snmpd.conf`` ships
-          through the ConfigBundle long-poll, validated host-side via ``snmpd
-          -t`` before activation. v2c uses ``rocommunity`` per source CIDR; v3
-          uses ``createUser`` + USM (snmpd hashes passwords against its engineID
-          on apply — engineID rotates each reload, acceptable tradeoff for the
-          first cut). Disabled out of the box.
+          + every registered remote agent. The rendered{" "}
+          <code className="font-mono">snmpd.conf</code> ships through the
+          ConfigBundle long-poll, validated host-side via{" "}
+          <code className="font-mono">snmpd -t</code> before activation. v2c
+          uses <code className="font-mono">rocommunity</code> per source CIDR;
+          v3 uses <code className="font-mono">createUser</code> + USM (snmpd
+          hashes passwords against its engineID on apply — engineID rotates each
+          reload, acceptable tradeoff for the first cut). Disabled out of the
+          box.
         </p>
       </div>
       <SNMPSection

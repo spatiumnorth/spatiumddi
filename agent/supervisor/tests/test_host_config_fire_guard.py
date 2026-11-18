@@ -162,12 +162,12 @@ def test_health_reports_stuck_and_clears_on_apply(
     # Never fired → nothing to report.
     assert appliance_state.read_host_config_health() == {}
 
-    # Fired once, not yet applied → "retrying".
+    # Fired once, not yet applied → "applying" (#3818: not "retrying" yet).
     appliance_state._write_fire_state(
         appliance_state._fire_state_path(trigger), "h1", 1, datetime.now(UTC)
     )
     health = appliance_state.read_host_config_health()
-    assert health["ntp"]["state"] == "retrying"
+    assert health["ntp"]["state"] == "applying"
     assert health["ntp"]["attempts"] == 1
 
     # Many failed attempts → "failing".
@@ -320,7 +320,7 @@ def test_plane_turned_off_end_to_end(
     assert appliance_state._fire_host_config(trigger, applied, "", "disabled\n\n")
     assert trigger.exists()
     # Before the runner has consumed it: the plane is honestly pending.
-    assert appliance_state.read_host_config_health()[plane]["state"] == "retrying"
+    assert appliance_state.read_host_config_health()[plane]["state"] == "applying"
     # The runner applies 'off' and consumes the trigger.
     trigger.unlink()
     applied.write_text(off_sidecar)
@@ -343,7 +343,7 @@ def test_off_that_fails_backs_off_and_reports(
     trigger.unlink()  # runner failed: renamed to .failed, sidecar untouched
     assert not appliance_state._fire_host_config(trigger, applied, "", "disabled\n\n")
     health = appliance_state.read_host_config_health()
-    assert health["ssh"]["state"] == "retrying"
+    assert health["ssh"]["state"] == "applying"
     assert health["ssh"]["attempts"] == 1
 
 
@@ -357,7 +357,7 @@ def test_reverting_to_the_applied_config_clears_a_failed_fire(
     applied.write_text("hashA\n")
     assert appliance_state._fire_host_config(trigger, applied, "hashB", "x")
     trigger.unlink()  # runner failed
-    assert appliance_state.read_host_config_health()["ssh"]["state"] == "retrying"
+    assert appliance_state.read_host_config_health()["ssh"]["state"] == "applying"
     assert not appliance_state._fire_host_config(trigger, applied, "hashA", "x")
     assert appliance_state.read_host_config_health() == {}
     # Same for turning the plane off when 'off' is what is applied.
@@ -391,7 +391,7 @@ def test_timezone_cleared_forgets_a_failed_fire(
     applied.write_text("UTC\n")
     assert appliance_state.maybe_fire_timezone("Not/AZone")
     trigger.unlink()  # timedatectl refused it
-    assert appliance_state.read_host_config_health()["timezone"]["state"] == "retrying"
+    assert appliance_state.read_host_config_health()["timezone"]["state"] == "applying"
     assert not appliance_state.maybe_fire_timezone(None)
     assert appliance_state.read_host_config_health() == {}
 
@@ -416,3 +416,15 @@ def test_cluster_transition_ledger_counts_survive_the_reader(
     assert appliance_state._cluster_transition_should_fire(
         trigger, "other", max_attempts=3
     )
+
+
+def test_second_fire_reads_retrying_not_applying(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #3818: "retrying" is only for a hash fired again after the first
+    # apply did not land.
+    trigger, applied = _one_plane(monkeypatch, tmp_path)
+    appliance_state._write_fire_state(
+        appliance_state._fire_state_path(trigger), "h1", 2, datetime.now(UTC)
+    )
+    assert appliance_state.read_host_config_health()["ssh"]["state"] == "retrying"

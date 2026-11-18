@@ -56,9 +56,22 @@ RUN echo "apk snapshot ${APK_SNAPSHOT}" >/dev/null \
       'bind>=9.20.29-r0' 'bind-tools>=9.20.29-r0' \
       tini su-exec \
       python3 py3-pip \
-      libcap \
+      libcap jemalloc \
       ca-certificates tzdata \
       'libcrypto3>=3.5.7-r0' 'libssl3>=3.5.7-r0' \
+ && apk add --no-cache --virtual .jemalloc-build patchelf \
+ # #4192 -- Alpine's named is built without jemalloc, so it runs on musl's
+ # malloc, which never hands freed memory back: a second view's RPZ copy, or
+ # a removed view's, stayed resident until the container restarted. LD_PRELOAD
+ # and MALLOC_CONF cannot be the fix: musl ignores LD_PRELOAD, and jemalloc
+ # ignores MALLOC_CONF, in a binary carrying a file capability (AT_SECURE),
+ # and named carries one (setcap below). A DT_NEEDED entry and the
+ # /etc/malloc.conf symlink are honoured there. patchelf rewrites the file,
+ # which drops its capability, so it MUST come before setcap.
+ && patchelf --add-needed libjemalloc.so.2 /usr/sbin/named \
+ && ln -sfn "background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0" /etc/malloc.conf \
+ && apk del .jemalloc-build \
+ && ldd /usr/sbin/named | grep -q libjemalloc \
  && setcap cap_net_bind_service=+ep /usr/sbin/named \
  && addgroup -S spatium \
  && adduser -S -G spatium spatium \
@@ -81,7 +94,8 @@ RUN echo "apk snapshot ${APK_SNAPSHOT}" >/dev/null \
 
 COPY --from=agent-build /install /usr/local
 COPY agent/dns/images/bind9/entrypoint.sh /usr/local/bin/spatium-dns-entrypoint
-RUN chmod +x /usr/local/bin/spatium-dns-entrypoint
+COPY agent/dns/images/bind9/malloc-conf.sh /usr/local/bin/spatium-malloc-conf
+RUN chmod +x /usr/local/bin/spatium-dns-entrypoint /usr/local/bin/spatium-malloc-conf
 
 ARG PYTHON_VERSION
 ENV AGENT_DRIVER=bind9 \
@@ -113,3 +127,23 @@ ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/spatium-dns-entrypoint"]
 # "dev". Last, so a new version only rebuilds this layer.
 ARG APP_VERSION=dev
 ENV SPATIUM_AGENT_VERSION=${APP_VERSION}
+
+# #3913 — image metadata the OCI spec and Red Hat's preflight expect, plus the
+# project licence texts at /licenses. ``release`` is the image build number,
+# not the product version; ``version`` follows APP_VERSION from release.yml.
+ARG IMAGE_RELEASE=1
+COPY LICENSE NOTICE /licenses/
+LABEL name="dns-bind9" \
+      vendor="Spatium North Inc." \
+      version="${APP_VERSION:-dev}" \
+      release="${IMAGE_RELEASE}" \
+      summary="SpatiumDDI managed BIND9 DNS server" \
+      description="BIND9 authoritative and recursive DNS server with the SpatiumDDI agent, configured by the SpatiumDDI control plane." \
+      maintainer="Spatium North Inc. <https://www.spatiumddi.com/>" \
+      url="https://www.spatiumddi.com/" \
+      org.opencontainers.image.title="dns-bind9" \
+      org.opencontainers.image.vendor="Spatium North Inc." \
+      org.opencontainers.image.url="https://www.spatiumddi.com/" \
+      org.opencontainers.image.source="https://github.com/spatiumnorth/spatiumddi" \
+      org.opencontainers.image.documentation="https://www.spatiumddi.com/" \
+      org.opencontainers.image.licenses="Apache-2.0"

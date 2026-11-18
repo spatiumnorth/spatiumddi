@@ -173,7 +173,7 @@ const blockingList = {
   update_interval_hours: 24,
   block_mode: "nxdomain",
   sinkhole_ip: null,
-  feed_entries_are_wildcard: false,
+  feed_wildcard_mode: "never",
   enabled: true,
   last_synced_at: null,
   last_sync_status: null,

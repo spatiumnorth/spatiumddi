@@ -1528,6 +1528,25 @@ group (reverse zones are filtered out).
 `_sync_dns_record` for move / create / delete, so bulk re-homing an IP
 range to a different zone updates DNS in the same request.
 
+### ✅ 15.3a Where tags are set (#4107)
+
+Tags are free-form `key: value` pairs on spaces, blocks, subnets and
+addresses. You can set them in:
+
+- the **Tags** field of every single create / edit dialog: New / Edit IP
+  Space, New / Edit Block, New / Edit Subnet, Allocate IP and Edit IP. Rows of
+  key + value, add / remove; keys and values already in use are suggested
+  (only from rows you may read). Edit Subnet / Edit Block show tags inherited
+  from the block and space chain as placeholders;
+- **bulk edit** (merge, or "Replace all tags");
+- a subnet / block **template**'s tags (copied into the Tags field when the
+  template is picked);
+- **import** (CSV / JSON / XLSX) and the REST API / MCP.
+
+The update endpoints replace the whole `tags` object, so a dialog sends `tags`
+only when you changed it; an edit that leaves the field alone keeps the stored
+tags. Removing a row removes the key.
+
 ### ✅ 15.4 Bulk-Edit per-field opt-in
 
 Every field on the bulk-edit-IPs modal has a sibling checkbox. Unchecked

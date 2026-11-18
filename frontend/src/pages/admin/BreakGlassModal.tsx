@@ -29,6 +29,7 @@ import {
 import { cn } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 import { HeaderButton } from "@/components/ui/header-button";
+import { FormError } from "@/components/ui/form-error";
 
 // Must match BREAK_GLASS_PHRASE in backend feature_modules.py.
 const BREAK_GLASS_PHRASE = "BREAK GLASS";
@@ -179,7 +180,9 @@ export function BreakGlassModal({
           />
         </div>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2">
           <HeaderButton
