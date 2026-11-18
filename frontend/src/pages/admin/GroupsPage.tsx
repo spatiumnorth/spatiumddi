@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { FormError } from "@/components/ui/form-error";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Pencil, Plus, Trash2 } from "lucide-react";
 import {
@@ -248,7 +249,7 @@ function GroupModal({
             onTotp={setStepTotp}
           />
         )}
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        <FormError>{error}</FormError>
         <div className="flex justify-end gap-2 pt-2">
           <button
             onClick={onClose}
@@ -316,9 +317,9 @@ function DeleteModal({
           cannot be undone.
         </p>
         {mutation.isError && apiErrorStatus(mutation.error) !== 404 && (
-          <p className="text-xs text-destructive">
+          <FormError className="text-xs text-destructive">
             {formatApiError(mutation.error)}
-          </p>
+          </FormError>
         )}
         <div className="flex justify-end gap-2">
           <button

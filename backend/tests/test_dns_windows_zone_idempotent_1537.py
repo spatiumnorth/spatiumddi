@@ -57,12 +57,14 @@ def test_noop_markers_match_what_the_script_writes() -> None:
     """``apply_zone_change`` reads "no change" off these strings, so a
     reworded ``Write-Output`` would silently turn every converged answer
     back into a change (and its compensation back into a teardown)."""
+    # The message is a single-quoted literal, so its quotes are doubled in the
+    # script text and print as single quotes at run time.
     from app.drivers.dns.windows import _ZONE_NOOP_MARKERS
 
     create = _ps_apply_zone(_ZONE, "create")
     delete = _ps_apply_zone(_ZONE, "delete")
-    assert f"zone 'Example.Com' {_ZONE_NOOP_MARKERS[0]}" in create
-    assert f"zone 'Example.Com' {_ZONE_NOOP_MARKERS[1]}" in delete
+    assert f"zone ''Example.Com'' {_ZONE_NOOP_MARKERS[0]}" in create
+    assert f"zone ''Example.Com'' {_ZONE_NOOP_MARKERS[1]}" in delete
     # The change paths must not carry a marker.
     assert not any(m in "zone 'Example.Com' created" for m in _ZONE_NOOP_MARKERS)
     assert not any(m in "zone 'Example.Com' deleted" for m in _ZONE_NOOP_MARKERS)

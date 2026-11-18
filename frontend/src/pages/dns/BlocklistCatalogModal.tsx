@@ -19,6 +19,7 @@ import {
   type DNSBlockList,
   formatApiError,
 } from "@/lib/api";
+import { FormError } from "@/components/ui/form-error";
 
 type Tab = "profiles" | "feeds" | "templates";
 
@@ -273,7 +274,9 @@ export function BlocklistCatalogModal({ onClose }: { onClose: () => void }) {
           </>
         )}
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end pt-2">
           <button

@@ -333,7 +333,7 @@ async def list_captures(
 
     total = int((await db.execute(select(func.count()).select_from(base.subquery()))).scalar_one())
     stmt = (
-        base.order_by(PacketCapture.created_at.desc())
+        base.order_by(PacketCapture.created_at.desc(), PacketCapture.id)
         .limit(page_size)
         .offset((page - 1) * page_size)
     )

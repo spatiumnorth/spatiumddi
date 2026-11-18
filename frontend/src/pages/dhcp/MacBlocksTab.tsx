@@ -21,6 +21,7 @@ import {
 import { FreshRowError } from "@/components/FreshRowError";
 import { changedFields, useFreshRow } from "@/hooks/useFreshRow";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const REASON_LABELS: Record<DHCPMACBlockReason, string> = {
   rogue: "Rogue device",
@@ -191,7 +192,7 @@ export function MacBlocksTab({ groupId }: { groupId: string }) {
         {filtered.length === 0 ? (
           <p className="p-6 text-center text-sm text-muted-foreground">
             {blocks.length === 0
-              ? "No blocked MACs. Click 'Block MAC' to add one."
+              ? `No blocked MACs.${writeGate.disabled ? "" : " Click 'Block MAC' to add one."}`
               : "No blocks match the filter."}
           </p>
         ) : (
@@ -486,7 +487,9 @@ function MacBlockModalForm({ groupId, block, onClose }: MacBlockModalProps) {
             <span>Enabled</span>
           </label>
         </div>
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
         <Btns onClose={onClose} pending={mut.isPending} />
       </form>
     </Modal>
