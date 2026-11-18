@@ -57,6 +57,7 @@ from .register import (
     RegisterCodeRejected,
     RegisterDisabled,
     RegisterFatal,
+    RegisterProofRefused,
     RegisterThrottled,
     register,
 )
@@ -214,6 +215,7 @@ def _maybe_register(
     log: structlog.stdlib.BoundLogger,
     *,
     retry: RevokedReregisterRetry | None = None,
+    proof_retry: RevokedReregisterRetry | None = None,
 ) -> SupervisorConfig:
     """Run identity generation + register-if-needed in one shot. Logs
     its own status; never raises into the caller (the main loop
@@ -228,6 +230,9 @@ def _maybe_register(
 
     ``retry`` (#2789), when given, is told when the revoke recovery's
     self-bootstrap brings no code back, so the caller waits before asking again.
+    ``proof_retry`` (#4433) is told when the control plane refuses the
+    registration proof (clock skew, bad signature): the pairing code is kept
+    and the caller waits, with backoff, before presenting it again.
     """
     identity, generated = load_or_generate(cfg.state_dir)
     if generated:
@@ -360,6 +365,24 @@ def _maybe_register(
         # #1356 — the main loop calls us again on its next tick.
         log.warning("supervisor.register.throttled", reason=str(exc))
         return cfg
+    except RegisterProofRefused as exc:
+        # #4433 — the proof was refused, not the code. Keep the code: a
+        # clock that is corrected later registers by itself, with no
+        # spatium-pair. Wait (a minute, doubling to four) between attempts.
+        wait = proof_retry.defer() if proof_retry is not None else None
+        log.warning(
+            "supervisor.register.proof_refused",
+            reason=exc.reason,
+            retry_in_seconds=wait,
+            hint=(
+                "this appliance's clock differs from the control plane's by more "
+                "than 5 minutes: check NTP / the system time"
+                if exc.reason == "clock_skew"
+                else None
+            ),
+            detail=str(exc),
+        )
+        return cfg
     except RegisterCodeRejected as exc:
         # #1356 — drop the dead code instead of re-presenting it every tick:
         # each retry spends one of this address's registration attempts, so
@@ -394,6 +417,8 @@ def _maybe_register(
     # so the heartbeat loop can authenticate without a fresh register
     # call across supervisor restarts. Cleared when mTLS lands.
     save_session_token(cfg.state_dir, result.session_token)
+    if proof_retry is not None:
+        proof_retry.reset()
     log.info(
         "supervisor.register.persisted",
         appliance_id=result.appliance_id,
@@ -429,7 +454,8 @@ def main() -> int:
     # that brings no code back counts too, so the loop's first tick does not ask
     # again at once.
     reregister_retry = RevokedReregisterRetry()
-    cfg = _maybe_register(cfg, log, retry=reregister_retry)
+    proof_retry = RevokedReregisterRetry()
+    cfg = _maybe_register(cfg, log, retry=reregister_retry, proof_retry=proof_retry)
 
     # Issue #183 Phase 4 — k3s proxy thread. Daemon thread that
     # long-polls the control plane for queued kubeapi requests +
@@ -535,8 +561,10 @@ def main() -> int:
         # for the steady-state — cached_appliance_id short-circuits
         # ``_maybe_register`` on its first line.
         if appliance_id is None:
-            cfg = _maybe_register(cfg, log)
-            appliance_id = load_appliance_id(cfg.state_dir)
+            # #4433: not on every tick while the control plane refuses our proof.
+            if proof_retry.due():
+                cfg = _maybe_register(cfg, log, proof_retry=proof_retry)
+                appliance_id = load_appliance_id(cfg.state_dir)
         elif (
             approval_state.read_state(cfg.state_dir) == "revoked"
             and appliance_state.detect_appliance_variant() == "control-plane"
