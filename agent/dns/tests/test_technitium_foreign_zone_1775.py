@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import httpx
 import pytest
 
 from spatium_dns_agent.drivers.technitium import (
@@ -177,3 +178,43 @@ def test_a_wiped_state_dir_does_not_adopt_a_zone_a_previous_render_named(
     assert [r["name"] for r in fake.zones[FORWARD]] == [f"keep.{FORWARD}"]
     assert fake.soa_comments.get(FORWARD) != _OWNER_MARKER
     assert FORWARD not in json.loads((tmp_path / _MANAGED_ZONES_FILE).read_text())
+
+
+class _AbortingFake(_SoaFake):
+    """Raises on creating ``boom.test``, as a daemon timeout would."""
+
+    broken = True
+
+    def respond(self, path: str, params: dict, n: int) -> dict:
+        if self.broken and path == "zones/create" and params.get("zone") == "boom.test":
+            raise httpx.ReadTimeout("timed out")
+        return super().respond(path, params, n)
+
+
+def _pass(tmp_path: Path, fake: _SoaFake, zones: list[str]) -> TechnitiumDriver:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _seed_token(d)
+    d.daemon_running = lambda: True  # type: ignore[method-assign]
+    d._wait_for_api_up = lambda **_: None  # type: ignore[method-assign]
+    _install_fake_request(d, fake.respond)
+    d.render({"zones": [_zone(z, "primary") for z in zones], "options": {}, "tsig_keys": []})
+    d.validate()
+    d.swap_and_reload()
+    return d
+
+
+def test_an_aborted_pass_does_not_mark_a_hand_made_zone_as_ours(tmp_path: Path) -> None:
+    """#4431: the ledger was written before the ownership check ran."""
+    fake = _AbortingFake({FORWARD: "Primary"})
+    fake.zones[FORWARD] = _foreign().zones[FORWARD]
+    with pytest.raises(httpx.HTTPError):
+        _pass(tmp_path, fake, ["boom.test", FORWARD])
+    ledger = json.loads((tmp_path / _MANAGED_ZONES_FILE).read_text())
+    assert FORWARD not in ledger
+    # The next pass (the fault gone) still refuses to take it over.
+    fake.broken = False
+    d = _pass(tmp_path, fake, ["boom.test", FORWARD])
+    assert [r["name"] for r in fake.zones[FORWARD]] == [f"keep.{FORWARD}"]
+    assert not _deletes(fake)
+    assert any(FORWARD in r and "did not create" in r for r in d._refused_zones)
+

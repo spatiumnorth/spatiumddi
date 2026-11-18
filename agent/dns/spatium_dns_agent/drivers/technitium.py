@@ -2954,7 +2954,7 @@ class TechnitiumDriver(DriverBase):
                     reason="bundle_has_no_zone_list",
                     zones=sorted(managed - desired),
                 )
-            self._write_secret(path, json.dumps(sorted(managed | desired)))
+            self._write_secret(path, json.dumps(sorted(managed | self._already_owned(desired))))
             return
 
         named = {str(n).lower() for n in bundle_zone_names}
@@ -2978,7 +2978,37 @@ class TechnitiumDriver(DriverBase):
                 kept.add(zone)
                 log.warning("technitium_zone_retire_failed", zone=zone, error=error)
 
-        self._write_secret(path, json.dumps(sorted(desired | held | kept)))
+        # A zone new to the ledger is added by ``_ensure_zone_exists`` once the
+        # agent has created it or it passed the ownership check, never here
+        # (#4431): a pass that aborts before reaching a hand-made zone would
+        # otherwise leave it in the ledger, and the next pass would read it
+        # as ours and delete its records.
+        self._write_secret(path, json.dumps(sorted(self._already_owned(desired) | held | kept)))
+
+    def _already_owned(self, names: set[str]) -> set[str]:
+        """The names in ``names`` the ledger held before this pass.
+
+        An unreadable ledger (``_owned_before`` is ``None``) cannot say, and
+        does not block (see ``_zone_is_ours``), so every name counts.
+        """
+        if self._owned_before is None:
+            return set(names)
+        return {n for n in names if n in self._owned_before}
+
+    def _claim_zone(self, zone: str) -> None:
+        """Record a zone in the ledger: this agent created it or it passed the
+        ownership check (#1775, #4431)."""
+        path = self._managed_zones_path()
+        try:
+            names = {str(n).lower() for n in json.loads(path.read_text())}
+        except FileNotFoundError:
+            names = set()
+        except (OSError, ValueError, TypeError):
+            return
+        if zone.lower() in names:
+            return
+        names.add(zone.lower())
+        self._write_secret(path, json.dumps(sorted(names)))
 
     def _sync_tsig_keys(self, token: str, keys: list[dict[str, Any]]) -> None:
         """Publish the bundle's TSIG keys into Technitium's global settings.
@@ -4833,9 +4863,10 @@ class TechnitiumDriver(DriverBase):
             log.warning("technitium_owner_marker_failed", zone=zone, error=body.get("errorMessage"))
 
     def _disown_zone(self, zone: str) -> None:
-        """Drop a refused zone from the ledger ``_retire_dropped_zones`` just wrote.
+        """Drop a refused zone from the ledger.
 
-        Left in, the next pass would read it as ours and wipe its records.
+        Left in (an adopted zone from an older agent, say), the next pass
+        would read it as ours and wipe its records.
         """
         path = self._managed_zones_path()
         try:
@@ -4908,6 +4939,8 @@ class TechnitiumDriver(DriverBase):
                         "TECHNITIUM_ADOPT_EXISTING_ZONES=true on the agent to take it over"
                     )
                     raise _ZoneNotOwned(zone)
+                if check_owned:
+                    self._claim_zone(zone)
                 # The create params carry the zone's UPSTREAM (a
                 # secondary/stub's primaries, a forwarder's target), and
                 # create is a no-op once the zone exists. Without this,
@@ -4937,6 +4970,8 @@ class TechnitiumDriver(DriverBase):
                 f"{zone}: zone create: {body.get('errorMessage')}"
             )
             return False
+        if check_owned:
+            self._claim_zone(zone)
         if ztype == "Forwarder":
             # The create carried the first upstream only.
             self._sync_forwarder_records(token, zone, forwarder_specs, dnssec)
