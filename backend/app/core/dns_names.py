@@ -306,9 +306,10 @@ def classless_owner_error(record_type: str, owner: str, origin: str) -> str | No
     lowered = [x.lower() for x in labels]
     zone_lowered = [x.lower() for x in zone]
     # Only the part in front of the zone's own name counts: a classless zone
-    # carries a ``/`` in its name, and the records inside it do not.
+    # carries a ``/`` in its name, and the records inside it do not. At the
+    # apex ``own`` is 0 and nothing is in front of the zone's name (#4434).
     own = len(lowered) - len(zone_lowered)
-    relative = labels[:own] if own > 0 and lowered[own:] == zone_lowered else labels
+    relative = labels[:own] if own >= 0 and lowered[own:] == zone_lowered else labels
     if not any("/" in x for x in relative):
         return None
     if (
