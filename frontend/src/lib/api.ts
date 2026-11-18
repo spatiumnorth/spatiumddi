@@ -6228,6 +6228,10 @@ export interface DelegationPreview {
   existing_glue_records: DelegationRecord[];
   warnings: string[];
   child_apex_ns_count: number;
+  // The view the parent zone is pinned to; null renders in every view (#4389).
+  parent_view_name?: string | null;
+  // Rows that would sit beside a CNAME in the parent; apply refuses (#4388).
+  cname_conflicts?: string[];
 }
 
 export type DelegationPreviewResponse =
