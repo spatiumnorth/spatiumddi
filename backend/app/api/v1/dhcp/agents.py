@@ -2325,6 +2325,48 @@ async def _still_granted(
     return kept
 
 
+async def _drop_quiet_replays(
+    db: AsyncSession,
+    by_key: dict[tuple[Any, str], Any],
+    deferred: dict[tuple[Any, str], tuple[Any, str | None]],
+    server_id: str,
+) -> dict[tuple[Any, str], Any]:
+    """``by_key`` less the addresses whose DDNS would write nothing (#4438):
+    the quiet-renewal test the first pass applies, so a replayed batch of
+    renewals takes no zone locks. Read-only, on the rows the chunk holds."""
+    from app.services.dns.ddns import DDNSReadCache, ddns_lease_writes_nothing
+
+    if not by_key:
+        return by_key
+    reads = DDNSReadCache()
+    await reads.prefetch_generated(db, [row.id for row in by_key.values()])
+    kept = {}
+    for key, row in by_key.items():
+        subnet, client_hostname = deferred[key]
+        try:
+            quiet = await ddns_lease_writes_nothing(
+                db,
+                subnet=row.subnet or subnet,
+                ipam_row=row,
+                client_hostname=client_hostname,
+                row_hostname=row.hostname,
+                cache=reads,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # As the first pass: a bug in the reads is the full path.
+            _reraise_if_database_gone(exc)
+            logger.warning(
+                "dhcp_agent_lease_ddns_check_failed",
+                server=server_id,
+                ip=str(row.address),
+                error=str(exc),
+            )
+            quiet = False
+        if not quiet:
+            kept[key] = row
+    return kept
+
+
 async def _publish_deferred_ddns(
     db: AsyncSession,
     deferred: dict[tuple[Any, str], tuple[Any, str | None]],
@@ -2349,7 +2391,10 @@ async def _publish_deferred_ddns(
     hostname) that batch granted: a name is published only if this server's
     current lease for the address still carries both, read under the same
     locks. A later batch that renamed or reassigned the client has published
-    it, and its publish is the authoritative one."""
+    it, and its publish is the authoritative one.
+
+    A replay also skips what the first pass skipped (#4438): an address whose
+    DDNS would write nothing takes no zone lock."""
     pending = sorted(deferred, key=lambda k: (str(k[0]), k[1]))
     size = _DDNS_CHUNK_START
     try:
@@ -2406,6 +2451,7 @@ async def _publish_ddns_chunk(
         by_key = {(r.subnet_id, norm_ip(str(r.address))): r for r in rows}
         if grants is not None:
             by_key = await _still_granted(db, by_key, grants, server_id)
+            by_key = await _drop_quiet_replays(db, by_key, deferred, server_id)
         await lock_zones_for_addresses(
             db,
             publishing=[(by_key[k].subnet, by_key[k]) for k in by_key],

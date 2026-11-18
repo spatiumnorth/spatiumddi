@@ -413,3 +413,38 @@ async def test_a_chunk_that_runs_out_of_hold_leaves_the_rest_for_the_next(
     after, targets = await _chunk_serials(db_session, zone_id)
     assert len(targets) == len(ips), targets  # one chunk per name, each its own serial
     assert targets == sorted(set(targets)) and after == targets[-1] > before
+
+
+@pytest.mark.asyncio
+async def test_a_replayed_batch_of_quiet_renewals_takes_no_zone_lock_4438(
+    concurrent_client: AsyncClient,  # noqa: F811
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.api.v1.dhcp.agents as agents
+
+    subnet, _block = await _ddns_subnet(db_session)
+    peer_a, _peer_b = await _two_agents(db_session, [subnet])
+    zone_id = uuid.UUID(str(subnet.dns_zone_id))
+    events = [_ev(i) for i in _A_IPS[:5]]
+    first = await _post_with_id(concurrent_client, peer_a, events, uuid.uuid4().hex)
+    assert first.status_code == 200, first.text
+    renewal_id = uuid.uuid4().hex
+    renewed = await _post_with_id(concurrent_client, peer_a, events, renewal_id)
+    assert renewed.status_code == 200, renewed.text
+    before = await _a_records(db_session, zone_id)
+    assert len(before) == 5
+
+    locked: list[Any] = []
+    real = agents.lock_zones_for_addresses
+
+    async def _spy(db: Any, **kwargs: Any) -> Any:
+        if kwargs.get("publishing"):
+            locked.append(kwargs["publishing"])
+        return await real(db, **kwargs)
+
+    monkeypatch.setattr(agents, "lock_zones_for_addresses", _spy)
+    again = await _post_with_id(concurrent_client, peer_a, events, renewal_id)
+    assert again.json()["duplicate"] is True
+    assert not locked, locked
+    assert await _a_records(db_session, zone_id) == before
