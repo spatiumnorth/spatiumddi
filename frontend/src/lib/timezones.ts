@@ -1,33 +1,30 @@
+import { IANA_TIME_ZONES } from "./tzNames";
+
 /**
  * Time-zone validation shared by the wake-schedule dialog and the platform
  * time-zone field (#4409).
  *
  * ``Intl.supportedValuesOf("timeZone")`` is a list of *canonical* names:
  * Chromium leaves out "UTC" and "Etc/UTC", and every alias ("US/Pacific").
- * Checking membership of that list therefore refuses zones the API accepts,
- * UTC being the API's own default. Validity is asked of the engine instead,
- * through ``Intl.DateTimeFormat``, which resolves aliases too.
+ * Checking membership of that list alone refuses zones the API accepts,
+ * UTC being the API's own default.
  *
- * The API validates with ``zoneinfo.ZoneInfo``, which is case-sensitive and
- * has no offsets. ``Intl`` accepts both ("utc", "+01:00"), so those two are
- * refused here to keep the form from accepting what the API then 422s.
+ * The API validates with ``zoneinfo.ZoneInfo``: case-sensitive, no offsets.
+ * ``Intl`` folds case ("etc/utc", "us/pacific") and takes offsets
+ * ("+01:00"), so a name is accepted only when the engine knows it AND its
+ * exact spelling is one zoneinfo knows: the bundled tzdata name set, or the
+ * engine's own canonical list (zones newer than the bundle).
  */
 
 export function isValidTimeZone(name: string): boolean {
   const n = name.trim();
   if (n === "" || /^[+-]/.test(n)) return false;
   try {
-    const resolved = new Intl.DateTimeFormat("en-US", {
-      timeZone: n,
-    }).resolvedOptions().timeZone;
-    // Same name apart from case: Intl folds it, zoneinfo does not.
-    if (resolved.toLowerCase() === n.toLowerCase() && resolved !== n) {
-      return false;
-    }
-    return true;
+    new Intl.DateTimeFormat("en-US", { timeZone: n });
   } catch {
     return false;
   }
+  return IANA_TIME_ZONES.has(n) || timeZoneSuggestions().includes(n);
 }
 
 /** Autocomplete suggestions: the engine's list plus "UTC", UTC first. */

@@ -23,7 +23,17 @@ describe("isValidTimeZone (#4409)", () => {
   });
 
   it("refuses what the API's zoneinfo would", () => {
-    for (const z of ["", "  ", "Mars/Base", "garbage", "+01:00", "utc"]) {
+    for (const z of [
+      "",
+      "  ",
+      "Mars/Base",
+      "garbage",
+      "+01:00",
+      "utc",
+      "etc/utc",
+      "us/pacific",
+      "america/los_angeles",
+    ]) {
       expect(isValidTimeZone(z), z).toBe(false);
     }
   });
