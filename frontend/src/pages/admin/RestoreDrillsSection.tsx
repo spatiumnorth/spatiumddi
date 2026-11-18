@@ -527,6 +527,10 @@ function ScheduleDrillForm({
   const [enabled, setEnabled] = useState(target.drill_enabled);
   const [cron, setCron] = useState(target.drill_cron ?? DEFAULT_DRILL_CRON);
 
+  // An enabled drill with no schedule never fires (#4450); the server
+  // refuses it too, so stop it here with the reason.
+  const missingCron = enabled && cron.trim() === "";
+
   const save = useMutation({
     mutationFn: async () => {
       // Only what changed against what the dialog read. The cron is compared
@@ -591,6 +595,12 @@ function ScheduleDrillForm({
             placeholder="0 5 * * 0"
             className="mt-2 w-full rounded-md border bg-background px-2 py-1.5 font-mono text-sm"
           />
+          {missingCron && (
+            <p className="mt-1 text-xs text-rose-600 dark:text-rose-400">
+              Enter a schedule, or untick the switch above: an enabled drill
+              with no schedule never runs.
+            </p>
+          )}
           <p className="mt-1 text-xs text-muted-foreground">
             5-field UTC cron expression. Drills are far more expensive than
             backups — weekly against nightly backups is a sensible default.
@@ -613,7 +623,7 @@ function ScheduleDrillForm({
           </button>
           <button
             type="button"
-            disabled={save.isPending}
+            disabled={save.isPending || missingCron}
             onClick={() => save.mutate()}
             className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
