@@ -82,7 +82,9 @@ def _coerce_int(v: Any) -> int | None:
         return None
 
 
-def _row_to_subnet(row: dict[str, Any], skipped: set[str] | None = None) -> dict[str, Any]:
+def _row_to_subnet(
+    row: dict[str, Any], skipped: set[str] | None = None, *, unescape: bool = True
+) -> dict[str, Any]:
     """Coerce a generic row dict into a subnet dict with custom_fields.
 
     Columns in ``SUBNET_COMPUTED_COLUMNS`` are dropped (recorded in
@@ -92,14 +94,17 @@ def _row_to_subnet(row: dict[str, Any], skipped: set[str] | None = None) -> dict
     for raw_key, value in row.items():
         if raw_key is None:
             continue
-        key = unescape_cell(raw_key.strip())
+        key = unescape_cell(raw_key.strip()) if unescape else raw_key.strip()
         if not key:
             continue
         norm = key.lower()
         if value == "":
             value = None
-        # Undo the export's formula escape (every value cell it writes).
-        value = unescape_cell(value)
+        # Undo the export's formula escape (every value cell it writes) -- CSV
+        # and XLSX only: the JSON export never adds it, so a JSON value such as
+        # ``'-x`` is the operator's own text (#4448).
+        if unescape:
+            value = unescape_cell(value)
         if _norm_header(key) in SUBNET_COMPUTED_COLUMNS:
             if skipped is not None:
                 skipped.add(_norm_header(key))
@@ -147,7 +152,9 @@ def _row_has_address(row: dict[str, Any]) -> bool:
     return False
 
 
-def _row_to_address(row: dict[str, Any], skipped: set[str] | None = None) -> dict[str, Any]:
+def _row_to_address(
+    row: dict[str, Any], skipped: set[str] | None = None, *, unescape: bool = True
+) -> dict[str, Any]:
     """Coerce a generic row dict into an IPAddress dict with custom_fields.
 
     Recognises ``address`` / ``ip`` / ``ip_address`` as the canonical
@@ -164,14 +171,17 @@ def _row_to_address(row: dict[str, Any], skipped: set[str] | None = None) -> dic
     for raw_key, value in row.items():
         if raw_key is None:
             continue
-        key = unescape_cell(raw_key.strip())
+        key = unescape_cell(raw_key.strip()) if unescape else raw_key.strip()
         if not key:
             continue
         norm = key.lower().replace(" ", "_")
         if value == "":
             value = None
-        # Undo the export's formula escape (every value cell it writes).
-        value = unescape_cell(value)
+        # Undo the export's formula escape (every value cell it writes) -- CSV
+        # and XLSX only: the JSON export never adds it, so a JSON value such as
+        # ``'-x`` is the operator's own text (#4448).
+        if unescape:
+            value = unescape_cell(value)
         if norm in ADDRESS_COMPUTED_COLUMNS:
             if skipped is not None:
                 skipped.add(norm)
@@ -256,9 +266,13 @@ def parse_json(data: bytes) -> ParsedPayload:
             if not isinstance(item, dict):
                 continue
             if is_addresses:
-                payload.addresses.append(_row_to_address(item, payload.skipped_columns))
+                payload.addresses.append(
+                    _row_to_address(item, payload.skipped_columns, unescape=False)
+                )
             else:
-                payload.subnets.append(_row_to_subnet(item, payload.skipped_columns))
+                payload.subnets.append(
+                    _row_to_subnet(item, payload.skipped_columns, unescape=False)
+                )
         return payload
 
     if isinstance(decoded, dict):
@@ -270,9 +284,13 @@ def parse_json(data: bytes) -> ParsedPayload:
                 if not isinstance(item, dict):
                     continue
                 if key == "subnets":
-                    payload.subnets.append(_row_to_subnet(item, payload.skipped_columns))
+                    payload.subnets.append(
+                        _row_to_subnet(item, payload.skipped_columns, unescape=False)
+                    )
                 elif key == "addresses":
-                    payload.addresses.append(_row_to_address(item, payload.skipped_columns))
+                    payload.addresses.append(
+                        _row_to_address(item, payload.skipped_columns, unescape=False)
+                    )
                 else:
                     getattr(payload, key).append(dict(item))
         return payload

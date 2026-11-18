@@ -8,7 +8,6 @@ import {
   rolesApi,
   type AppRole,
   type PermissionEntry,
-  type RoleCreate,
   type RoleUpdate,
 } from "@/lib/api";
 import { zebraBodyCls } from "@/lib/utils";
@@ -187,25 +186,22 @@ function RoleForm({
   const [stepTotp, setStepTotp] = useState("");
 
   const mutation = useMutation({
-    mutationFn: () => {
-      const payload: RoleCreate | RoleUpdate = {
-        name,
-        description,
-        permissions,
-      };
-      return role
-        ? rolesApi.update(role.id, {
-            ...(changedFields(
-              {
-                name: role.name,
-                description: role.description,
-                permissions: role.permissions,
-              },
-              { name, description, permissions },
-            ) as RoleUpdate),
-            ...(needsStepUp ? stepUpBody(stepPassword, stepTotp) : {}),
-          })
-        : rolesApi.create(payload as RoleCreate);
+    mutationFn: async () => {
+      if (!role) return rolesApi.create({ name, description, permissions });
+      // Only what changed; an untouched Save sends nothing (#4452).
+      const diff = changedFields(
+        {
+          name: role.name,
+          description: role.description,
+          permissions: role.permissions,
+        },
+        { name, description, permissions },
+      ) as RoleUpdate;
+      if (Object.keys(diff).length === 0 && !needsStepUp) return null;
+      return rolesApi.update(role.id, {
+        ...diff,
+        ...(needsStepUp ? stepUpBody(stepPassword, stepTotp) : {}),
+      });
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["roles"] });
