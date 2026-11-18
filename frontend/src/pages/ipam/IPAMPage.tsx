@@ -334,7 +334,7 @@ export function ImportedChip({
       .includes("netbox");
   const label = fromNetbox ? "Imported from NetBox" : "Imported";
   const detail = Object.entries(fields)
-    .map(([k, v]) => `${k}: ${String(v)}`)
+    .map(([k, v]) => `${k}: ${customFieldDisplay(v)}`)
     .join(" · ");
   const clearMut = useMutation<IPBlock | Subnet, Error, void>({
     // The API replaces the whole custom_fields dict, so the dict to send is
