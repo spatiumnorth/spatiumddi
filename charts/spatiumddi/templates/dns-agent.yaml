@@ -41,6 +41,7 @@ stringData:
 {{- fail (printf "dnsAgents server %q: flavor %s does not yet run under OpenShift's restricted SCC (only bind9 does, #3852) — use flavor: bind9, or set global.platform=kubernetes if you have granted a permissive SCC yourself" $server.name $flavor) }}
 {{- end }}
 {{- $instance := include "spatiumddi.agentObjectName" (dict "root" $root "instance" (printf "dns-%s-%s" $flavor $server.name) "prefix" $root.Values.dnsAgents.prefixWithFullname) -}}
+{{- $replicas := include "spatiumddi.agentReplicas" (dict "kind" "dns" "server" $server) | int -}}
 {{- $storageClass := $server.storageClass | default $root.Values.dnsAgents.storageClass -}}
 {{- include "spatiumddi.checkAgentClaimClass" (dict "root" $root "name" $instance "class" $storageClass) -}}
 {{- /* Per-flavor image lookup (issue #127). dnsAgents.flavors.<flavor>
@@ -78,7 +79,7 @@ metadata:
     spatiumddi.org/dns-role: {{ $server.role | default "primary" }}
 spec:
   serviceName: {{ $instance }}-headless
-  replicas: 1
+  replicas: {{ $replicas }}
   selector:
     matchLabels:
       {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" "dns-agent") $root) | nindent 6 }}
@@ -89,6 +90,9 @@ spec:
         {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" "dns-agent") $root) | nindent 8 }}
         app.kubernetes.io/instance-name: {{ $server.name | quote }}
         spatiumddi.org/dns-flavor: {{ $flavor }}
+        {{- with (include "spatiumddi.agentGroupLabel" (dict "server" $server)) }}
+        {{ . }}
+        {{- end }}
     spec:
       {{- with (include "spatiumddi.priorityClassName" (dict "component" $root.Values.dnsAgents.priorityClassName "fallback" ($root.Values.global).servicePriorityClassName)) }}
       priorityClassName: {{ . | quote }}
@@ -101,12 +105,16 @@ spec:
       {{- if include "spatiumddi.isOpenShift" $root }}
       serviceAccountName: {{ include "spatiumddi.fullname" $root }}-dns-agent
       {{- end }}
-      {{- include "spatiumddi.agentAffinity" (dict "root" $root "component" "dns-agent" "override" $server.affinity) | nindent 6 }}
+      {{- include "spatiumddi.agentAffinity" (dict "root" $root "component" "dns-agent" "override" $server.affinity "required" $server.requiredAntiAffinity "entry" $server.name) | nindent 6 }}
+      {{- with (include "spatiumddi.agentSpread" (dict "root" $root "component" "dns-agent" "entry" $server.name "constraints" $server.topologySpreadConstraints)) }}
+      {{- . | nindent 6 }}
+      {{- end }}
       {{- /* Per-server placement. The spread above is only preferred, so
              after a node drain an agent moves and stays co-located; pin a
              server to a node (kubernetes.io/hostname) to keep one per node,
-             or give the server its own ``affinity`` (#3206, merged with
-             the spread). */}}
+             set requiredAntiAffinity: true for a hard one-per-node rule
+             across this entry's replicas (#4175), or give the server its
+             own ``affinity`` (#3206, merged with the spread). */}}
       {{- with $server.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -275,11 +283,12 @@ spec:
          kube-proxy SNATs every query to the node / CNI address, so
          per-client rate limits throttle the whole network at once and
          query logs, RPZ hits and ACLs all key on the wrong address.
-         Local is safe here because each server is its own StatefulSet
-         (replicas: 1): MetalLB announces the address only from the
-         node running that server's pod, which is where the traffic
-         has to land anyway. Set service.externalTrafficPolicy: Cluster
-         to opt back out. */}}
+         Local is safe here because traffic is only delivered to nodes
+         that run a ready pod of this server. At replicas: 1 MetalLB
+         announces the address from that pod's node; at replicas > 1
+         (#4175) BGP announces it from every node with a ready pod and
+         L2 mode from one of them. Set
+         service.externalTrafficPolicy: Cluster to opt back out. */}}
   externalTrafficPolicy: {{ (get $svc "externalTrafficPolicy") | default "Local" }}
   {{- with (get $svc "loadBalancerIP") }}
   loadBalancerIP: {{ . | quote }}
@@ -340,5 +349,29 @@ spec:
     - { name: dns-doq, port: {{ . }}, protocol: UDP }
     {{- end }}
 ---
+{{- if and (gt $replicas 1) (($server.podDisruptionBudget | default dict).enabled) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $instance }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "dns-agent") $root) | nindent 4 }}
+    app.kubernetes.io/instance-name: {{ $server.name | quote }}
+spec:
+  {{- /* #4175 — scoped to this entry's pods only (component + instance-name),
+         so entries' budgets never overlap and a drain is never blocked by a
+         budget that counts another entry's pods. */}}
+  {{- with ($server.podDisruptionBudget).minAvailable }}
+  minAvailable: {{ . }}
+  {{- else }}
+  maxUnavailable: {{ ($server.podDisruptionBudget).maxUnavailable | default 1 }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" "dns-agent") $root) | nindent 6 }}
+      app.kubernetes.io/instance-name: {{ $server.name | quote }}
+---
+{{- end }}
 {{- end }}
 {{- end }}

@@ -371,7 +371,7 @@ subcharts verbatim — any option those charts accept works here. See:
 | `dnsAgents.agentKey.existingSecret` | `""` | Carries `DNS_AGENT_KEY` (shared between flavors) |
 | `dnsAgents.prefixWithFullname` | `false` | #3209 — name the StatefulSet and Services `<fullname>-dns-<flavor>-<name>` instead of `dns-<flavor>-<name>`. Flipping it on a live install recreates the StatefulSet with new PVCs; see [upgrade note](#agent-object-names-3209) |
 | `dnsAgents.storageClass` | `""` | #3206 — StorageClass of both claims (`agent-state`, `dns-state`); unset = cluster default. Per server: `servers[].storageClass`. Setting it on an existing install needs a one-off step: [see below](#adopting-storageclass-on-an-existing-install) |
-| `dnsAgents.servers` | `[]` | One entry → one StatefulSet + Services. `flavor: bind9` (default), `powerdns`, or `technitium` |
+| `dnsAgents.servers` | `[]` | One entry → one StatefulSet + Services. `flavor: bind9` (default), `powerdns`, or `technitium`. `replicas: N` (#4175, default 1) runs N agents from the entry, each registering as its own server; with `requiredAntiAffinity`, `topologySpreadConstraints`, `podDisruptionBudget` (replicas > 1 only) and `groupLabel`. See `docs/deployment/KUBERNETES.md` section 3. DHCP entries accept `replicas: 1` only |
 | `dhcpAgents.enabled` | `false` |  |
 | `dhcpAgents.image.repository` | `ghcr.io/spatiumnorth/dhcp-kea` |  |
 | `dhcpAgents.agentKey.existingSecret` | `""` | Carries `SPATIUM_AGENT_KEY` |

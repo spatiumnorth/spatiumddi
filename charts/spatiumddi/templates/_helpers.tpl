@@ -390,13 +390,31 @@ preferred one-agent-per-node anti-affinity is MERGED into the per-server
 wins (an explicit opt-out). With no per-server ``affinity`` the block is the
 literal the templates always rendered.
 
-  {{- include "spatiumddi.agentAffinity" (dict "root" $root "component" "dns-agent" "override" $server.affinity) | nindent 6 }}
+``required: true`` (#4175, ``servers[].requiredAntiAffinity``) adds a REQUIRED
+one-per-node term scoped to this entry (``entry`` is the server name, matched
+on ``app.kubernetes.io/instance-name``), so the replicas of one entry can never
+share a node. It is appended to the entry's own ``podAntiAffinity`` when it
+supplies one, else it sits beside the chart's preferred component-wide term.
+
+  {{- include "spatiumddi.agentAffinity" (dict "root" $root "component" "dns-agent" "override" $server.affinity "required" $server.requiredAntiAffinity "entry" $server.name) | nindent 6 }}
 */}}
 {{- define "spatiumddi.agentAffinity" -}}
 {{- $override := default (dict) .override -}}
 {{- $label := dict "app.kubernetes.io/name" (include "spatiumddi.name" .root) "app.kubernetes.io/component" .component -}}
 affinity:
-{{- if $override }}
+{{- if .required }}
+  {{- $merged := deepCopy $override -}}
+  {{- $pa := deepCopy (default (dict) (get $merged "podAntiAffinity")) -}}
+  {{- if not (hasKey $merged "podAntiAffinity") -}}
+    {{- $term := dict "labelSelector" (dict "matchLabels" $label) "topologyKey" "kubernetes.io/hostname" -}}
+    {{- $_ := set $pa "preferredDuringSchedulingIgnoredDuringExecution" (list (dict "weight" 100 "podAffinityTerm" $term)) -}}
+  {{- end -}}
+  {{- $entryLabel := merge (dict "app.kubernetes.io/instance-name" (toString .entry)) $label -}}
+  {{- $req := dict "labelSelector" (dict "matchLabels" $entryLabel) "topologyKey" "kubernetes.io/hostname" -}}
+  {{- $_ := set $pa "requiredDuringSchedulingIgnoredDuringExecution" (append (default (list) (get $pa "requiredDuringSchedulingIgnoredDuringExecution")) $req) -}}
+  {{- $_ := set $merged "podAntiAffinity" $pa -}}
+  {{- toYaml $merged | nindent 2 }}
+{{- else if $override }}
   {{- $merged := deepCopy $override -}}
   {{- if not (hasKey $merged "podAntiAffinity") -}}
     {{- $term := dict "labelSelector" (dict "matchLabels" $label) "topologyKey" "kubernetes.io/hostname" -}}
@@ -414,6 +432,63 @@ affinity:
               app.kubernetes.io/component: {{ .component }}
           topologyKey: kubernetes.io/hostname
 {{- end }}
+{{- end -}}
+
+{{/*
+Agent entry helpers (#4175). ``servers[].replicas`` is the StatefulSet's replica
+count: an integer >= 1, default 1. Each replica registers as its own server (the
+pod name is its identity, its PVCs are its cached config) in the entry's group.
+A DHCP entry stays at 1: Kea HA needs exactly two peers that know each other's
+URLs, which N identical replicas of one entry cannot be given (declare two
+entries and wire the peers in the group instead).
+
+  {{- $replicas := include "spatiumddi.agentReplicas" (dict "kind" "dns" "server" $server) | int }}
+*/}}
+{{- define "spatiumddi.agentReplicas" -}}
+{{- $r := 1 -}}
+{{- if not (kindIs "invalid" .server.replicas) -}}{{- $r = .server.replicas -}}{{- end -}}
+{{- if not (or (kindIs "float64" $r) (kindIs "int64" $r) (kindIs "int" $r)) -}}
+{{- fail (printf "%sAgents server %q: replicas must be an integer >= 1 (got %v)" .kind .server.name $r) -}}
+{{- end -}}
+{{- $r = float64 $r -}}
+{{- if not (and (eq (floor $r) $r) (ge $r 1.0)) -}}
+{{- fail (printf "%sAgents server %q: replicas must be an integer >= 1 (got %v)" .kind .server.name $r) -}}
+{{- end -}}
+{{- if and (eq .kind "dhcp") (gt $r 1.0) -}}
+{{- fail (printf "dhcpAgents server %q: replicas > 1 is not supported — Kea HA needs exactly two peers that know each other's URLs, so a DHCP entry is a single pod; declare two entries and configure HA in the DHCP server group" .server.name) -}}
+{{- end -}}
+{{- int $r -}}
+{{- end -}}
+
+{{/*
+``topologySpreadConstraints:`` of an agent entry (#4175). A constraint without
+its own ``labelSelector`` gets one scoped to this entry, so the entry's replicas
+spread against each other rather than against every agent in the release. Emits
+nothing when the entry sets none.
+*/}}
+{{- define "spatiumddi.agentSpread" -}}
+{{- if .constraints -}}
+{{- $sel := dict "matchLabels" (dict "app.kubernetes.io/name" (include "spatiumddi.name" .root) "app.kubernetes.io/component" .component "app.kubernetes.io/instance-name" (toString .entry)) -}}
+{{- $out := list -}}
+{{- range .constraints -}}
+{{- $c := deepCopy . -}}
+{{- if not (hasKey $c "labelSelector") -}}{{- $_ := set $c "labelSelector" $sel -}}{{- end -}}
+{{- $out = append $out $c -}}
+{{- end -}}
+topologySpreadConstraints:
+{{- toYaml $out | nindent 2 }}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Optional group label on an agent's pods (#4175, ``servers[].groupLabel: true``):
+``spatiumddi.org/agent-group: <group>`` so a Service can select one group's
+agents across entries. The value is sanitised to a valid label value.
+*/}}
+{{- define "spatiumddi.agentGroupLabel" -}}
+{{- if .server.groupLabel -}}
+spatiumddi.org/agent-group: {{ regexReplaceAll "[^A-Za-z0-9_.-]+" (.server.group | default "default" | toString) "-" | trunc 63 | trimAll "-_." | quote }}
+{{- end -}}
 {{- end -}}
 
 {{/*

@@ -20,6 +20,7 @@ stringData:
 {{- range $server := .Values.dhcpAgents.servers }}
 {{- $flavor := $server.flavor | default "kea" -}}
 {{- $instance := include "spatiumddi.agentObjectName" (dict "root" $root "instance" (printf "dhcp-%s-%s" $flavor $server.name) "prefix" $root.Values.dhcpAgents.prefixWithFullname) -}}
+{{- $replicas := include "spatiumddi.agentReplicas" (dict "kind" "dhcp" "server" $server) | int -}}
 {{- $storageClass := $server.storageClass | default $root.Values.dhcpAgents.storageClass -}}
 {{- include "spatiumddi.checkAgentClaimClass" (dict "root" $root "name" $instance "class" $storageClass) -}}
 apiVersion: apps/v1
@@ -34,7 +35,7 @@ metadata:
     spatiumddi.org/dhcp-role: {{ $server.role | default "primary" }}
 spec:
   serviceName: {{ $instance }}-headless
-  replicas: 1
+  replicas: {{ $replicas }}
   selector:
     matchLabels:
       {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" "dhcp-agent") $root) | nindent 6 }}
@@ -45,6 +46,9 @@ spec:
         {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" "dhcp-agent") $root) | nindent 8 }}
         app.kubernetes.io/instance-name: {{ $server.name | quote }}
         spatiumddi.org/dhcp-flavor: {{ $flavor }}
+        {{- with (include "spatiumddi.agentGroupLabel" (dict "server" $server)) }}
+        {{ . }}
+        {{- end }}
     spec:
       {{- with (include "spatiumddi.priorityClassName" (dict "component" $root.Values.dhcpAgents.priorityClassName "fallback" ($root.Values.global).servicePriorityClassName)) }}
       priorityClassName: {{ . | quote }}
@@ -61,7 +65,10 @@ spec:
       {{- if include "spatiumddi.isOpenShift" $root }}
       serviceAccountName: {{ include "spatiumddi.fullname" $root }}-dhcp-agent
       {{- end }}
-      {{- include "spatiumddi.agentAffinity" (dict "root" $root "component" "dhcp-agent" "override" $server.affinity) | nindent 6 }}
+      {{- include "spatiumddi.agentAffinity" (dict "root" $root "component" "dhcp-agent" "override" $server.affinity "required" $server.requiredAntiAffinity "entry" $server.name) | nindent 6 }}
+      {{- with (include "spatiumddi.agentSpread" (dict "root" $root "component" "dhcp-agent" "entry" $server.name "constraints" $server.topologySpreadConstraints)) }}
+      {{- . | nindent 6 }}
+      {{- end }}
       {{- with $server.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -212,5 +219,29 @@ spec:
     - { name: dhcp-udp,  port: 67,   protocol: UDP }
     - { name: ctrl-http, port: 8000, protocol: TCP }
 ---
+{{- if and (gt $replicas 1) (($server.podDisruptionBudget | default dict).enabled) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $instance }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "dhcp-agent") $root) | nindent 4 }}
+    app.kubernetes.io/instance-name: {{ $server.name | quote }}
+spec:
+  {{- /* #4175 — scoped to this entry's pods only (component + instance-name),
+         so entries' budgets never overlap and a drain is never blocked by a
+         budget that counts another entry's pods. */}}
+  {{- with ($server.podDisruptionBudget).minAvailable }}
+  minAvailable: {{ . }}
+  {{- else }}
+  maxUnavailable: {{ ($server.podDisruptionBudget).maxUnavailable | default 1 }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" "dhcp-agent") $root) | nindent 6 }}
+      app.kubernetes.io/instance-name: {{ $server.name | quote }}
+---
+{{- end }}
 {{- end }}
 {{- end }}

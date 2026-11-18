@@ -1073,7 +1073,10 @@ service-container runs as a per-role-labelled `DaemonSet` instead.
   `AGENT_ROLES`); it does **not** wire up DNS-level replication.
 - **Not a Deployment**, because each server keeps per-replica
   persistent state (zone files, TSIG, agent identity) — replicas are
-  not fungible.
+  not fungible. An entry may still set `replicas: N` (#4175): each pod of
+  its StatefulSet registers as its own server (the pod name is the
+  identity, its PVCs hold its cached config); see
+  [`KUBERNETES.md`](KUBERNETES.md#3-managed-dns--dhcp-agents).
 - **Not a DaemonSet** in the umbrella chart, because placement is
   explicit (the appliance chart *does* use a DaemonSet, gated on a
   per-role node label).
