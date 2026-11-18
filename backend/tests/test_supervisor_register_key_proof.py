@@ -269,6 +269,54 @@ async def test_legacy_unsigned_reregister_of_signing_version_is_refused(
     assert await _unsigned_audit_rows(db_session) == []
 
 
+async def _stored(db: AsyncSession, aid: str) -> tuple[str | None, dict[str, Any]]:
+    import uuid
+
+    await db.rollback()
+    row = await db.get(Appliance, uuid.UUID(aid))
+    assert row is not None
+    await db.refresh(row)
+    return row.supervisor_version, dict(row.capabilities or {})
+
+
+@pytest.mark.asyncio
+async def test_unsigned_reregister_keeps_the_stored_version_and_capabilities(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    k, aid, _ = await _registered(db_session, client, signed=False)
+    await _set_version(db_session, aid, "1.0.0")
+    version, caps = await _stored(db_session, aid)
+    r = await client.post(
+        URL,
+        json=k.body(
+            "00000000",
+            supervisor_version="1.0.1",
+            capabilities={"supervisor_version": "1.0.1", "register_proof": True},
+        ),
+    )
+    assert r.status_code == 200, r.text
+    assert await _stored(db_session, aid) == (version, caps)
+    assert len(await _unsigned_audit_rows(db_session)) == 1
+    # The row stays in the legacy window: a second unsigned call still works.
+    assert (await client.post(URL, json=k.body("00000000"))).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_signed_reregister_updates_version_and_capabilities(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    k, aid, _ = await _registered(db_session, client, signed=False)
+    await _set_version(db_session, aid, "1.0.0")
+    r = await client.post(
+        URL,
+        json=k.body("00000000", supervisor_version="1.0.1", **k.proof()),
+    )
+    assert r.status_code == 200, r.text
+    version, caps = await _stored(db_session, aid)
+    assert version == "1.0.1"
+    assert caps.get("register_proof") is True
+
+
 @pytest.mark.asyncio
 async def test_unsigned_reregister_stops_when_the_attempt_budget_is_spent(
     db_session: AsyncSession, client: AsyncClient, monkeypatch: pytest.MonkeyPatch
