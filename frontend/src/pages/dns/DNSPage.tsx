@@ -3274,7 +3274,9 @@ function ZoneModalForm({
             disabled={!!zone}
           />
           {nameErr ? (
-            <p className="text-xs text-destructive mt-0.5">{nameErr}</p>
+            <p role="alert" className="text-xs text-destructive mt-0.5">
+              {nameErr}
+            </p>
           ) : (
             !zone && (
               <p className="text-xs text-muted-foreground mt-0.5">
@@ -13456,7 +13458,10 @@ export function SyncWithServersResultModal({
                                   </td>
                                   <td className="px-3 py-1">
                                     {item.error ? (
-                                      <span className="text-destructive">
+                                      <span
+                                        role="alert"
+                                        className="text-destructive"
+                                      >
                                         {item.error}
                                       </span>
                                     ) : item.push_errors.length > 0 ? (
