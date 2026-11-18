@@ -10,6 +10,7 @@ import { useCredentialReask } from "@/hooks/useCredentialReask";
  * (exponential-backoff retry + dead-letter state).
  */
 
+import { Field } from "@/components/ui/field";
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -50,26 +51,6 @@ import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
-
-function Field({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-      {hint && <p className="text-[11px] text-muted-foreground/80">{hint}</p>}
-    </div>
-  );
-}
 
 // ── Subscription editor ────────────────────────────────────────────────────
 
@@ -738,8 +719,9 @@ export function WebhooksPage() {
             <h1 className="text-xl font-semibold">Webhooks</h1>
             <p className="max-w-2xl text-xs text-muted-foreground">
               Typed-event subscriptions for downstream automation. Every enabled
-              subscription whose event-type filter matches receives one
-              HMAC-signed POST per event with exponential-backoff retry and a
+              subscription whose event-type filter matches receives one POST per
+              event, HMAC-signed when the subscription has a secret (unsigned
+              when it has none), with exponential-backoff retry and a
               dead-letter state. Distinct from the generic audit-forward webhook
               under Settings — that ships every audit row in your chosen wire
               format; this fires typed events shaped for code.

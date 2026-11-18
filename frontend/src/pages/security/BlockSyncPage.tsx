@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { Field } from "@/components/ui/field";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Network,
@@ -1288,24 +1289,3 @@ function ReconcilePreviewModal({
 }
 
 // ── Small labelled field ──────────────────────────────────────────────
-function Field({
-  label,
-  hint,
-  className,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  className?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className={`space-y-1 ${className ?? ""}`}>
-      <label className="block text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-      {hint && <p className="text-[11px] text-muted-foreground">{hint}</p>}
-    </div>
-  );
-}
