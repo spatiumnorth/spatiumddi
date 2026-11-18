@@ -1618,7 +1618,11 @@ class SettingsUpdate(BaseModel):
         """Validate IANA tz name on PUT. Empty string is allowed
         (clears the override). Non-empty must parse via
         ``zoneinfo.ZoneInfo`` — anything else 422s with a clean
-        message instead of waiting for the host runner to bounce."""
+        message instead of waiting for the host runner to bounce.
+
+        A legacy alias (``US/Pacific``) is stored as the canonical name the
+        appliance host applies (``America/Los_Angeles``): the host image has
+        no ``tzdata-legacy`` and would refuse the alias forever (#4416)."""
         if v is None or v == "":
             return v
         try:
@@ -1627,7 +1631,9 @@ class SettingsUpdate(BaseModel):
             ZoneInfo(v)
         except Exception as exc:  # noqa: BLE001 — surface the parse failure
             raise ValueError(f"timezone {v!r} is not a valid IANA tz name: {exc}") from exc
-        return v
+        from app.services.host_timezone import canonical_host_timezone  # noqa: PLC0415
+
+        return canonical_host_timezone(v)
 
     @field_validator("env_banner_bg", "env_banner_fg")
     @classmethod

@@ -197,6 +197,7 @@ from app.services.appliance.var_disk import (
     var_disk_reading,
 )
 from app.services.dhcp.ha_firewall import dhcp_ha_firewall_inputs
+from app.services.host_timezone import canonical_host_timezone
 from app.services.upgrades import shared_tags as upgrade_shared_tags
 from app.services.upgrades.safety import assert_no_upgrade_in_flight
 from app.services.upgrades.schema_rollback import check_release_can_run
@@ -3561,7 +3562,9 @@ async def _supervisor_heartbeat(
     metallb_bgp_peers = list(cfg_row.metallb_bgp_peers or []) if cfg_row else []
     metallb_bgp_advertisements = list(cfg_row.metallb_bgp_advertisements or []) if cfg_row else []
     # Issue #165 — operator-set timezone. Empty string = no override.
-    desired_timezone = (cfg_row.timezone or "") if cfg_row else ""
+    # Canonicalised again here: a legacy alias saved before #4416 is still
+    # in the column, and the host image would refuse it.
+    desired_timezone = canonical_host_timezone((cfg_row.timezone or "") if cfg_row else "")
     # #393 — appliance console mode (grubenv-driven, applies next reboot).
     desired_console_mode = (cfg_row.console_mode or "dashboard") if cfg_row else "dashboard"
     # Issue #346 — host-config blocks for snmp / chrony / lldp. Built from the

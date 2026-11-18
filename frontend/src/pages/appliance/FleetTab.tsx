@@ -4158,6 +4158,12 @@ export function ApplianceHostConfigHealthSection({
                       />
                       {h.state}
                     </span>
+                    {h.reason && (
+                      <div className="mt-1 text-[11px] text-rose-700 dark:text-rose-300">
+                        Host refused{h.requested ? ` "${h.requested}"` : ""}:{" "}
+                        {h.reason.replace(/_/g, " ")}
+                      </div>
+                    )}
                   </td>
                   <td className="px-3 py-1.5 text-muted-foreground">
                     {h.attempts}
