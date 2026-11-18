@@ -121,6 +121,7 @@ import {
   formatDialogError,
   tlsCertsApi,
   type DNSServerOptions,
+  type DNSTrustAnchor,
   type DNSServerGroup,
   type DNSServer,
   type DNSZone,
@@ -8367,6 +8368,176 @@ export function RevealedSecretModal({
 
 // ── Options Tab ───────────────────────────────────────────────────────────────
 
+/** Trust anchors for ``dnssec-validation yes`` (#3572). Adds and deletes go
+ *  straight to the API (they are their own rows, not part of the options
+ *  PUT); the server holds every rule, this only pre-checks the obvious. */
+function TrustAnchorEditor({
+  groupId,
+  anchors,
+  locked,
+  canWrite,
+}: {
+  groupId: string;
+  anchors: DNSTrustAnchor[];
+  locked: boolean;
+  canWrite: boolean;
+}) {
+  const qc = useQueryClient();
+  const [zone, setZone] = useState(".");
+  const [algorithm, setAlgorithm] = useState("8");
+  const [keyTag, setKeyTag] = useState("");
+  const [publicKey, setPublicKey] = useState("");
+  const [initialKey, setInitialKey] = useState(true);
+  const [localErr, setLocalErr] = useState<string | null>(null);
+  const refresh = () =>
+    qc.invalidateQueries({ queryKey: ["dns-options", groupId] });
+  const addMut = useMutation({
+    mutationFn: (d: Omit<DNSTrustAnchor, "id" | "added_at">) =>
+      dnsApi.addTrustAnchor(groupId, d),
+    onSuccess: () => {
+      refresh();
+      setKeyTag("");
+      setPublicKey("");
+    },
+  });
+  const delMut = useMutation({
+    mutationFn: (id: string) => dnsApi.deleteTrustAnchor(groupId, id),
+    onSuccess: refresh,
+  });
+  function add() {
+    setLocalErr(null);
+    const tag = Number(keyTag);
+    if (
+      keyTag.trim() === "" ||
+      !Number.isInteger(tag) ||
+      tag < 0 ||
+      tag > 65535
+    )
+      return setLocalErr("Key tag must be a whole number from 0 to 65535.");
+    const alg = Number(algorithm);
+    if (!Number.isInteger(alg) || alg < 1 || alg > 255)
+      return setLocalErr(
+        "Algorithm must be a DNSSEC algorithm number (1-255).",
+      );
+    if (!/^[A-Za-z0-9+/\s]+={0,2}$/.test(publicKey.trim()))
+      return setLocalErr("Public key must be the base64 DNSKEY public key.");
+    addMut.mutate({
+      zone_name: zone.trim() || ".",
+      algorithm: alg,
+      key_tag: tag,
+      public_key: publicKey.trim(),
+      is_initial_key: initialKey,
+    });
+  }
+  const err =
+    localErr ??
+    (addMut.isError
+      ? formatApiError(addMut.error, "Could not add the anchor")
+      : null);
+  return (
+    <div className="space-y-2 border-t pt-3" data-testid="trust-anchors">
+      <h5 className="text-xs font-medium">Trust anchors (BIND9)</h5>
+      {anchors.length === 0 ? (
+        <p className="text-xs text-muted-foreground">No trust anchors.</p>
+      ) : (
+        <ul className="space-y-1">
+          {anchors.map((a) => (
+            <li
+              key={a.id}
+              className="flex items-center justify-between gap-2 rounded border px-2 py-1 text-xs"
+            >
+              <span className="min-w-0 break-all">
+                <span className="font-mono">{a.zone_name}</span> · alg{" "}
+                {a.algorithm} · tag {a.key_tag} ·{" "}
+                {a.is_initial_key ? "initial-key" : "static-key"}
+              </span>
+              <button
+                type="button"
+                aria-label={`Delete trust anchor ${a.zone_name} ${a.key_tag}`}
+                disabled={delMut.isPending || !canWrite}
+                {...permissionGate(canWrite, NEEDS_SUPERADMIN)}
+                onClick={() => delMut.mutate(a.id)}
+                className="text-destructive hover:underline disabled:opacity-50"
+              >
+                Delete
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      {delMut.isError && (
+        <FormError>{formatApiError(delMut.error, "Delete failed")}</FormError>
+      )}
+      {locked ? (
+        <p className="text-xs text-muted-foreground">
+          Only BIND9 applies trust anchors; this group has a server that would
+          ignore them, so none can be added.
+        </p>
+      ) : (
+        <div className="space-y-2">
+          <div className="grid grid-cols-3 gap-2">
+            <Field label="Zone">
+              <input
+                className={inputCls}
+                value={zone}
+                onChange={(e) => setZone(e.target.value)}
+                placeholder="."
+              />
+            </Field>
+            <Field label="Algorithm">
+              <input
+                type="number"
+                min={1}
+                max={255}
+                className={inputCls}
+                value={algorithm}
+                onChange={(e) => setAlgorithm(e.target.value)}
+              />
+            </Field>
+            <Field label="Key tag">
+              <input
+                type="number"
+                min={0}
+                max={65535}
+                className={inputCls}
+                value={keyTag}
+                onChange={(e) => setKeyTag(e.target.value)}
+              />
+            </Field>
+          </div>
+          <Field label="Public key (base64 DNSKEY)">
+            <textarea
+              className={inputCls}
+              rows={2}
+              value={publicKey}
+              onChange={(e) => setPublicKey(e.target.value)}
+            />
+          </Field>
+          <label className="flex items-center gap-2 text-xs">
+            <input
+              type="checkbox"
+              className="h-4 w-4"
+              checked={initialKey}
+              onChange={(e) => setInitialKey(e.target.checked)}
+            />
+            initial-key (RFC 5011 managed; required for the root zone)
+          </label>
+          {err && <FormError>{err}</FormError>}
+          <button
+            type="button"
+            disabled={addMut.isPending || !canWrite}
+            {...permissionGate(canWrite, NEEDS_SUPERADMIN)}
+            onClick={add}
+            className="rounded-md border px-3 py-1 text-xs hover:bg-muted disabled:opacity-50"
+          >
+            {addMut.isPending ? "Adding…" : "Add trust anchor"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function OptionsTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
   // Server options take a superadmin (dns/router.py).
@@ -8431,6 +8602,25 @@ export function OptionsTab({ groupId }: { groupId: string }) {
     rendersBind9 &&
     (opts?.trust_anchors?.length ?? 0) === 0 &&
     opts?.dnssec_validation !== "yes";
+  // #3572: resolver-side lists the API refuses on a PowerDNS group (#2263 /
+  // #2264) and a Technitium group (#1763 / #2267). A control holding a stored
+  // non-default value stays enabled so it can be cleared.
+  const hasPdns = groupServers.some((s) => s.driver === "powerdns");
+  const hasTech = groupServers.some(
+    (s) => s.driver === "technitium" || s.driver === "technitium_api",
+  );
+  const nonBindWhy = hasPdns
+    ? "This group has a PowerDNS server, which has no such setting."
+    : "This group has a Technitium server, which has no such setting.";
+  const listLocked = {
+    blackhole: (hasPdns || hasTech) && (opts?.blackhole ?? []).length === 0,
+    allowNotify: hasTech && !hasPdns && (opts?.allow_notify ?? []).length === 0,
+    allowQueryCache:
+      (hasPdns || hasTech) &&
+      (opts?.allow_query_cache ?? []).join(",") === "localhost,localnets",
+  };
+  // Trust anchors are rendered by BIND9 only (#2266).
+  const anchorsLocked = groupServers.some((s) => s.driver !== "bind9");
   const techReason =
     "Not supported by Technitium: this group has a Technitium server, which cannot apply it.";
 
@@ -8445,6 +8635,13 @@ export function OptionsTab({ groupId }: { groupId: string }) {
   const [notifyEnabled, setNotifyEnabled] = useState("yes");
   const [allowQuery, setAllowQuery] = useState("any");
   const [allowTransfer, setAllowTransfer] = useState("none");
+  // #3572 — the BIND9 settings the API accepted but the form never showed.
+  const [alsoNotify, setAlsoNotify] = useState("");
+  const [allowNotify, setAllowNotify] = useState("");
+  const [allowQueryCache, setAllowQueryCache] = useState(
+    "localhost, localnets",
+  );
+  const [blackhole, setBlackhole] = useState("");
   const [queryLogEnabled, setQueryLogEnabled] = useState(false);
   const [responseLogEnabled, setResponseLogEnabled] = useState(false);
   const [queryLogChannel, setQueryLogChannel] = useState("file");
@@ -8503,6 +8700,10 @@ export function OptionsTab({ groupId }: { groupId: string }) {
     setNotifyEnabled(opts.notify_enabled);
     setAllowQuery(opts.allow_query.join(", "));
     setAllowTransfer(opts.allow_transfer.join(", "));
+    setAlsoNotify((opts.also_notify ?? []).join(", "));
+    setAllowNotify((opts.allow_notify ?? []).join(", "));
+    setAllowQueryCache((opts.allow_query_cache ?? []).join(", "));
+    setBlackhole((opts.blackhole ?? []).join(", "));
     setQueryLogEnabled(opts.query_log_enabled);
     setResponseLogEnabled(opts.response_log_enabled);
     setQueryLogChannel(opts.query_log_channel);
@@ -8685,6 +8886,10 @@ export function OptionsTab({ groupId }: { groupId: string }) {
       notify_enabled: notifyEnabled,
       allow_query: list(allowQuery),
       allow_transfer: list(allowTransfer),
+      also_notify: list(alsoNotify),
+      allow_notify: list(allowNotify),
+      allow_query_cache: list(allowQueryCache),
+      blackhole: list(blackhole),
       query_log_enabled: queryLogEnabled,
       // Only meaningful with query logging on; the API 422s the other
       // combination, so never send it (#914).
@@ -8736,6 +8941,10 @@ export function OptionsTab({ groupId }: { groupId: string }) {
         notify_enabled: o.notify_enabled,
         allow_query: o.allow_query,
         allow_transfer: o.allow_transfer,
+        also_notify: o.also_notify ?? [],
+        allow_notify: o.allow_notify ?? [],
+        allow_query_cache: o.allow_query_cache ?? [],
+        blackhole: o.blackhole ?? [],
         query_log_enabled: o.query_log_enabled,
         response_log_enabled: o.query_log_enabled && o.response_log_enabled,
         query_log_channel: o.query_log_channel,
@@ -9080,8 +9289,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
               auto — validate using built-in managed keys (recommended)
             </option>
             <option value="yes" disabled={dnssecYesLocked}>
-              yes — validate; only against trust anchors added via the API
-              (BIND9)
+              yes — validate; only against the trust anchors below (BIND9)
             </option>
             <option value="no">no — do not validate DNSSEC signatures</option>
           </select>
@@ -9089,15 +9297,20 @@ export function OptionsTab({ groupId }: { groupId: string }) {
         {dnssecYesLocked && (
           <p className="text-xs text-muted-foreground">
             &quot;yes&quot; needs a trust anchor first: BIND 9.20 will not load
-            it without one. Add an anchor with POST
-            /dns/groups/&#123;id&#125;/options/trust-anchors, or use
-            &quot;auto&quot; (BIND&apos;s built-in root key). A root
-            (&quot;.&quot;) anchor must be initial-key (is_initial_key: true,
-            the default): a static root anchor is refused, because BIND will not
-            load it beside &quot;auto&quot; and it stops validating at the next
-            root key rollover.
+            it without one. Add an anchor below, or use &quot;auto&quot;
+            (BIND&apos;s built-in root key). A root (&quot;.&quot;) anchor must
+            be initial-key (is_initial_key: true, the default): a static root
+            anchor is refused, because BIND will not load it beside
+            &quot;auto&quot; and it stops validating at the next root key
+            rollover.
           </p>
         )}
+        <TrustAnchorEditor
+          groupId={groupId}
+          anchors={opts?.trust_anchors ?? []}
+          locked={anchorsLocked}
+          canWrite={isSuperadmin}
+        />
         {(opts?.dnssec_warnings?.length ?? 0) > 0 && (
           <div className="mt-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
             {opts?.dnssec_warnings?.map((w) => (
@@ -9682,6 +9895,39 @@ export function OptionsTab({ groupId }: { groupId: string }) {
             <option value="no">no — disable zone change notifications</option>
           </select>
         </Field>
+        <Field label="also-notify (comma-separated addresses, optional port)">
+          <input
+            className={inputCls}
+            value={alsoNotify}
+            onChange={(e) => {
+              setAlsoNotify(e.target.value);
+              setDirty(true);
+            }}
+            placeholder="192.0.2.10, 192.0.2.11 port 5353"
+          />
+          <p className="text-xs text-muted-foreground">
+            Extra servers sent a NOTIFY for every zone in this group, on top of
+            the zone&apos;s NS records. A zone can add its own list. Blank =
+            none.
+          </p>
+        </Field>
+        <Field label="allow-notify (comma-separated CIDRs / ACL names)">
+          <input
+            className={inputCls}
+            value={allowNotify}
+            disabled={listLocked.allowNotify}
+            title={listLocked.allowNotify ? nonBindWhy : undefined}
+            onChange={(e) => {
+              setAllowNotify(e.target.value);
+              setDirty(true);
+            }}
+            placeholder="blank = only the zone's primaries"
+          />
+          <p className="text-xs text-muted-foreground">
+            Senders a secondary zone accepts NOTIFY from besides its configured
+            primaries. Blank = primaries only.
+          </p>
+        </Field>
       </div>
 
       <div className={card}>
@@ -9715,6 +9961,41 @@ export function OptionsTab({ groupId }: { groupId: string }) {
             }}
             placeholder="none"
           />
+        </Field>
+        <Field label="allow-query-cache (comma-separated CIDRs / ACL names)">
+          <input
+            className={inputCls}
+            value={allowQueryCache}
+            disabled={listLocked.allowQueryCache}
+            title={listLocked.allowQueryCache ? nonBindWhy : undefined}
+            onChange={(e) => {
+              setAllowQueryCache(e.target.value);
+              setDirty(true);
+            }}
+            placeholder="localhost, localnets"
+          />
+          <p className="text-xs text-muted-foreground">
+            Who may read answers out of the resolver cache (BIND9). The default
+            is localhost and localnets; allow-recursion above is what decides
+            who may ask for recursion.
+          </p>
+        </Field>
+        <Field label="blackhole (comma-separated CIDRs / ACL names)">
+          <input
+            className={inputCls}
+            value={blackhole}
+            disabled={listLocked.blackhole}
+            title={listLocked.blackhole ? nonBindWhy : undefined}
+            onChange={(e) => {
+              setBlackhole(e.target.value);
+              setDirty(true);
+            }}
+            placeholder="none"
+          />
+          <p className="text-xs text-muted-foreground">
+            Clients whose queries are dropped without any answer, and which this
+            server never queries. BIND9 only. Blank = none.
+          </p>
         </Field>
       </div>
 
