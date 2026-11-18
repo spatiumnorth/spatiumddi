@@ -1083,7 +1083,7 @@ Three exact error messages are **not** failures: `Cannot add record: record alre
 
 Zone **create** is Primary-only, matching `capabilities()["zone_types"]`, and refuses anything else rather than defaulting. Silently creating a Primary for a secondary/stub/forward zone would mint an *empty* authoritative zone on the operator's live server — the whole domain would start answering NXDOMAIN from a server that used to transfer or forward it. Delete is unrestricted: refusing to remove a secondary SpatiumDDI tracks would strand it.
 
-Technitium's own internal zones (`localhost`, the RFC 1918 reverse stubs) carry `internal: true` and are dropped.
+Technitium's own internal zones (`localhost` and the loopback / zero / broadcast reverse zones such as `127.in-addr.arpa`, `0.in-addr.arpa` and `255.in-addr.arpa`; never RFC 1918 ranges) carry `internal: true` and are dropped.
 
 ### 4C.7 Probe — and the endpoint that finally calls one
 

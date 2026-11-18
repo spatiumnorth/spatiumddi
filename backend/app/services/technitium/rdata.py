@@ -30,8 +30,13 @@ drifts.
 **The agent-side driver keeps its own copy** and always will:
 ``agent/dns/spatium_dns_agent/drivers/technitium.py`` is a separate Python
 package that ships in the agent image and cannot import from ``app``. Its
-``_normalize_rdata`` / ``_record_params`` are the same translation written
-for a different runtime. Do not delete either side thinking it is dead code.
+``_normalize_rdata`` / ``_record_params`` cover the same ground, written for
+a different runtime, but they are NOT guaranteed identical: the agent also
+honours a per-op ``rrset_action`` (this side picks ``overwrite`` from the
+RRset, never from that field), lower-cases name targets for a bundle that
+predates the zone-relative rule where this side leaves case alone, and its
+TXT read path has no pre-``characterStringsBase64`` ``text`` fallback. Do not
+delete either side thinking it is dead code.
 
 Nothing mechanically enforces that the two agree — the agent package is not
 importable from the backend test-suite, so a shared assertion is not

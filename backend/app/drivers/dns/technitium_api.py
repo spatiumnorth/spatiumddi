@@ -306,8 +306,8 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
         each running their own pagination loop — two loops against the same
         endpoint is how one of them ends up silently missing page 2.
 
-        Technitium's own internal zones (``localhost``, the RFC 1918 reverse
-        stubs) carry ``internal: true`` and are dropped here: mirroring them
+        Technitium's own internal zones (``localhost`` and the loopback / zero / broadcast
+        reverse zones) carry ``internal: true`` and are dropped here: mirroring them
         would mint rows for zones nobody manages.
         """
         api_url, token, verify = self._creds(creds)
