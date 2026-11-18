@@ -47,6 +47,24 @@ export function permissionMatch(
   return String(grantedId) === String(resourceId);
 }
 
+/** Mirror of the backend `explicit_grant_allows`: a superadmin, or a grant
+ *  whose `resource_type` is exactly `resourceType` (a `*` resource type does
+ *  not count). For surfaces the backend keeps out of wildcard reach, such as
+ *  the E911 resolution trail (#3598). */
+export function explicitGrantMatch(
+  grants: PermissionGrant[],
+  isSuperadmin: boolean,
+  action: string,
+  resourceType: string,
+): boolean {
+  if (isSuperadmin) return true;
+  return grants.some(
+    (g) =>
+      g.resource_type === resourceType &&
+      permissionMatch(g, action, resourceType, null),
+  );
+}
+
 /** Self-introspection of the calling credential's effective permissions.
  *
  * Single React Query subscription (cached 5 min, mirroring
@@ -65,6 +83,8 @@ export function usePermissions(): {
     resourceId?: string | null,
   ) => boolean;
   hasAnyGrantFor: (action: string, resourceType: string) => boolean;
+  /** Like `can` but a wildcard resource type does not satisfy it. */
+  canExplicit: (action: string, resourceType: string) => boolean;
   isSuperadmin: boolean;
   isLoading: boolean;
   /** The permissions read failed and there are no grants to answer from:
@@ -113,8 +133,19 @@ export function usePermissions(): {
     );
   }
 
+  function canExplicit(action: string, resourceType: string): boolean {
+    if (!query.data) return false;
+    return explicitGrantMatch(
+      query.data.grants,
+      isSuperadmin,
+      action,
+      resourceType,
+    );
+  }
+
   return {
     can,
+    canExplicit,
     hasAnyGrantFor,
     isSuperadmin,
     isLoading: query.isLoading,

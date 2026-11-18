@@ -114,8 +114,12 @@ export function E911Page() {
   const canQuery = ready && e911Enabled;
   const [tab, setTab] = useState<Tab>("locations");
   // The trail is per-person location history behind its own grant (#3598);
-  // the tab is not offered to an account that cannot read it.
-  const canReadTrail = usePermissions().can("read", "e911_resolution_log");
+  // the tab is not offered to an account that cannot read it. A wildcard
+  // grant does not count: the API needs one naming the type (or superadmin).
+  const canReadTrail = usePermissions().canExplicit(
+    "read",
+    "e911_resolution_log",
+  );
 
   if (ready && !e911Enabled) {
     return (

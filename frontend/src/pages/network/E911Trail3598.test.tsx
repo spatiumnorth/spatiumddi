@@ -18,6 +18,7 @@ import { MemoryRouter } from "react-router-dom";
 
 const trail = vi.fn();
 let grants = new Set<string>();
+let wildcard = false;
 
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
@@ -43,7 +44,23 @@ vi.mock("@/hooks/usePermissions", async () => {
   return {
     ...actual,
     usePermissions: () => ({
-      can: (_a: string, r: string) => grants.has(r),
+      can: (_a: string, r: string) => wildcard || grants.has(r),
+      canExplicit: (a: string, r: string) =>
+        actual.explicitGrantMatch(
+          [
+            ...(wildcard
+              ? [{ action: "read", resource_type: "*", resource_id: null }]
+              : []),
+            ...[...grants].map((g) => ({
+              action: "read",
+              resource_type: g,
+              resource_id: null,
+            })),
+          ] as never,
+          false,
+          a,
+          r,
+        ),
       isSuperadmin: false,
       isLoading: false,
     }),
@@ -88,9 +105,23 @@ afterEach(() => {
   cleanup();
   trail.mockReset();
   grants = new Set();
+  wildcard = false;
 });
 
 describe("E911 Trail tab", { timeout: 30000 }, () => {
+  it("is not offered to a wildcard read * grant (the Viewer)", () => {
+    wildcard = true;
+    renderPage();
+    expect(screen.queryByText("Trail")).toBeNull();
+  });
+
+  it("is offered to an explicit e911_resolution_log grant", () => {
+    grants = new Set(["e911_resolution_log"]);
+    trail.mockResolvedValue({ items: [], total: 0, limit: 50, offset: 0 });
+    renderPage();
+    expect(screen.getByText("Trail")).toBeTruthy();
+  });
+
   it("is not offered without read on e911_resolution_log", () => {
     grants = new Set(["e911_location"]);
     renderPage();
