@@ -78,6 +78,8 @@ const TZ_FALLBACK = [
   "Pacific/Honolulu",
 ] as const;
 
+const CANONICAL_TARGETS = new Set(Object.values(HOST_TZ_ALIASES));
+
 export function TimezoneSection({
   currentValue,
   isSuperadmin,
@@ -96,11 +98,14 @@ export function TimezoneSection({
     const I = Intl as IntlWithList;
     if (typeof I.supportedValuesOf === "function") {
       try {
-        // Drop the legacy aliases ICU spells (Asia/Calcutta ...): the host
-        // has no tzdata-legacy, so only the canonical names apply (#4416).
-        return I.supportedValuesOf("timeZone").filter(
-          (n) => !(n in HOST_TZ_ALIASES),
-        );
+        // Chromium spells some zones only by a legacy alias (Asia/Calcutta,
+        // Europe/Kiev ...) and the host has no tzdata-legacy, so map every
+        // entry to its canonical name rather than dropping it (#4416).
+        return [
+          ...new Set(
+            I.supportedValuesOf("timeZone").map(canonicalHostTimezone),
+          ),
+        ];
       } catch {
         return [...TZ_FALLBACK];
       }
@@ -126,7 +131,12 @@ export function TimezoneSection({
   const trimmed = tz.trim();
   // An alias is saved as its canonical name (the API does the same).
   const canonical = canonicalHostTimezone(trimmed);
-  const isValid = trimmed === "" || ianaList.includes(canonical);
+  // Never decide validity from the raw browser list: it may only carry the
+  // alias spelling of a zone (#4416).
+  const isValid =
+    trimmed === "" ||
+    ianaList.includes(canonical) ||
+    CANONICAL_TARGETS.has(canonical);
   const dirty = canonical !== currentValue.trim();
 
   return (

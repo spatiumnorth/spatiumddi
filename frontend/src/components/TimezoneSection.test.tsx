@@ -20,6 +20,7 @@ vi.mock("@/lib/api", () => ({
 import { TimezoneSection } from "./TimezoneSection";
 
 afterEach(() => {
+  vi.unstubAllGlobals();
   cleanup();
   update.mockClear();
 });
@@ -59,5 +60,59 @@ describe("TimezoneSection (#4416)", () => {
     ).map((o) => (o as HTMLOptionElement).value);
     expect(opts).not.toContain("Asia/Calcutta");
     expect(opts).not.toContain("US/Pacific");
+  });
+
+  describe("Chromium-style list with only legacy spellings", () => {
+    const stub = () => {
+      const real = Intl;
+      vi.stubGlobal("Intl", {
+        ...real,
+        DateTimeFormat: real.DateTimeFormat,
+        supportedValuesOf: () => [
+          "Asia/Calcutta",
+          "Europe/Kiev",
+          "Europe/Berlin",
+        ],
+      });
+    };
+
+    it("suggests the canonical names", () => {
+      stub();
+      mount();
+      const opts = Array.from(
+        document.querySelectorAll("#iana-timezones option"),
+      ).map((o) => (o as HTMLOptionElement).value);
+      expect(opts).toContain("Asia/Kolkata");
+      expect(opts).toContain("Europe/Kyiv");
+      expect(opts).toContain("Europe/Berlin");
+      expect(opts).not.toContain("Asia/Calcutta");
+      expect(opts).not.toContain("Europe/Kiev");
+    });
+
+    it.each([
+      ["Asia/Kolkata", "Asia/Kolkata"],
+      ["Asia/Calcutta", "Asia/Kolkata"],
+      ["Europe/Kyiv", "Europe/Kyiv"],
+    ])("saves %s as %s", async (typed, saved) => {
+      stub();
+      mount();
+      fireEvent.change(screen.getByPlaceholderText("UTC"), {
+        target: { value: typed },
+      });
+      fireEvent.click(screen.getByText("Save"));
+      await waitFor(() =>
+        expect(update).toHaveBeenCalledWith({ timezone: saved }),
+      );
+    });
+
+    it("still refuses a bogus name", () => {
+      stub();
+      mount();
+      fireEvent.change(screen.getByPlaceholderText("UTC"), {
+        target: { value: "Mars/Olympus" },
+      });
+      fireEvent.click(screen.getByText("Save"));
+      expect(update).not.toHaveBeenCalled();
+    });
   });
 });
