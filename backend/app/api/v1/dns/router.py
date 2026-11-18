@@ -3573,7 +3573,8 @@ class SyncFromServerResponse(BaseModel):
     zones_imported: list[str]
     # Discovered but deliberately not adopted: SpatiumDDI's own reserved
     # names, plus zones the driver reports as non-manageable (a Technitium
-    # Secondary / Stub / Forwarder — #810).
+    # Secondary / Stub / Forwarder — #810), and names the zone-name validator
+    # refuses (#4445).
     zones_skipped_system: list[str]
     # Zones present in SpatiumDDI but not on the server, that we pushed
     # over WinRM during this sync. Only populated for windows_dns+creds —
@@ -3718,20 +3719,28 @@ async def _sync_single_server(
                 continue
             is_reverse = bool(meta.get("is_reverse_lookup"))
             kind = _infer_zone_kind(name, is_reverse)
-            zone = DNSZone(
-                group_id=group_id,
-                name=name if name.endswith(".") else name + ".",
-                zone_type="primary",
-                kind=kind,
-                ttl=pull_ttl,
-                refresh=ZONE_DEFAULT_REFRESH,
-                retry=ZONE_DEFAULT_RETRY,
-                expire=ZONE_DEFAULT_EXPIRE,
-                minimum=ZONE_DEFAULT_MINIMUM,
-                primary_ns="",
-                admin_email="",
-                dnssec_enabled=False,
-            )
+            try:
+                zone = DNSZone(
+                    group_id=group_id,
+                    name=name if name.endswith(".") else name + ".",
+                    zone_type="primary",
+                    kind=kind,
+                    ttl=pull_ttl,
+                    refresh=ZONE_DEFAULT_REFRESH,
+                    retry=ZONE_DEFAULT_RETRY,
+                    expire=ZONE_DEFAULT_EXPIRE,
+                    minimum=ZONE_DEFAULT_MINIMUM,
+                    primary_ns="",
+                    admin_email="",
+                    dnssec_enabled=False,
+                )
+            except ValueError as exc:
+                # A name the zone-name validator refuses (a Route 53 ``\057``
+                # escape, an IDN label) is reported and skipped; it must not
+                # abort the sync of every other zone (#4445).
+                logger.warning("dns_sync_zone_name_rejected", zone=name, error=str(exc))
+                zones_skipped_system.append(name)
+                continue
             db.add(zone)
             await db.flush()  # column-default id must exist before the audit row reads it (#2006)
             zones_imported.append(name)
