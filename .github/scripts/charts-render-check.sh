@@ -266,6 +266,7 @@ UMBRELLA_ALL_ON=(
     --set api.serviceControlRBAC.enabled=true
     --set api.upgradeOrchestratorRBAC.enabled=true
     --set api.applianceHostMounts.enabled=true
+    --set api.tlsListener.enabled=true
     --set frontend.tls.enabled=true
     --set redis.auth.enabled=true
 )

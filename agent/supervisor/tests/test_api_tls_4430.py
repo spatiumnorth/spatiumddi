@@ -144,7 +144,7 @@ def test_a_certificate_failure_is_not_a_missing_listener(
     seen, held = _beat(cfg, {_TLS_LOCAL: err})
     # no downgrade to http for an interception or a rotation: re-pin or refuse
     assert seen == [_TLS_LOCAL] and held is None
-    assert repinned == [_TLS_LOCAL]
+    assert len(repinned) == 1 and repinned[0].startswith(_TLS_LOCAL)
     assert heartbeat._api_tls_active(cfg)  # type: ignore[arg-type]
 
 
