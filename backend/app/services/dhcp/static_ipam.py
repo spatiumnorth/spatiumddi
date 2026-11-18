@@ -926,6 +926,7 @@ async def remove_ipam_for_scope_statics(
     *,
     touched_subnets: set[uuid.UUID] | None = None,
     keep_bound: bool = False,
+    user: User | None = None,
 ) -> int:
     """DELETE the IPAM mirror of every reservation under ``scope_id``.
 
@@ -941,6 +942,8 @@ async def remove_ipam_for_scope_statics(
     are locked in one id-ordered pass rather than scope by scope; with none,
     this recounts what it freed before returning. ``keep_bound`` is passed through
     (see ``remove_ipam_for_static``): the soft delete keeps a bound address row.
+    ``user`` attributes the ``ip_address`` delete audit rows (#4447); ``None`` is
+    ``system``.
     """
     res = await db.execute(
         select(DHCPStaticAssignment)
@@ -951,7 +954,7 @@ async def remove_ipam_for_scope_statics(
     removed = 0
     for st in res.scalars().all():
         removed += await remove_ipam_for_static(
-            db, st, touched_subnets=touched, keep_bound=keep_bound
+            db, st, touched_subnets=touched, keep_bound=keep_bound, user=user
         )
     if touched_subnets is None:
         await recount_subnets_and_blocks(db, touched)
