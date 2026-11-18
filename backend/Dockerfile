@@ -209,6 +209,27 @@ COPY --chown=app:app . .
 ARG APP_VERSION=
 ENV APP_VERSION=${APP_VERSION}
 
+
+# #3913 — image metadata the OCI spec and Red Hat's preflight expect, plus the
+# project licence texts at /licenses. ``release`` is the image build number,
+# not the product version; ``version`` follows APP_VERSION from release.yml.
+ARG IMAGE_RELEASE=1
+COPY legal/LICENSE legal/NOTICE /licenses/
+LABEL name="spatiumddi-api" \
+      vendor="Spatium North Inc." \
+      version="${APP_VERSION:-dev}" \
+      release="${IMAGE_RELEASE}" \
+      summary="SpatiumDDI API, worker, beat and migrate image" \
+      description="FastAPI control plane for the SpatiumDDI DDI (DNS, DHCP, IPAM) platform. The same image runs the API, Celery worker, Celery beat and the migration job." \
+      maintainer="Spatium North Inc. <https://www.spatiumddi.com/>" \
+      url="https://www.spatiumddi.com/" \
+      org.opencontainers.image.title="spatiumddi-api" \
+      org.opencontainers.image.vendor="Spatium North Inc." \
+      org.opencontainers.image.url="https://www.spatiumddi.com/" \
+      org.opencontainers.image.source="https://github.com/spatiumnorth/spatiumddi" \
+      org.opencontainers.image.documentation="https://www.spatiumddi.com/" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
 USER app
 
 EXPOSE 8000

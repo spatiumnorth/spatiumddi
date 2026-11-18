@@ -140,7 +140,9 @@ describe.each(wrappers)("context menu focus (%s) (#2051)", (_n, wrap) => {
     await tick();
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(document.activeElement).toBe(row);
-    expect(live).toBe(before);
+    // Focus went back to a row that a refetch may remove (#4221): one
+    // bounded watcher (5 s) may follow it, never more.
+    expect(live - before).toBeLessThanOrEqual(1);
   });
 
   it("returns focus to the row when the item opens nothing", async () => {
@@ -197,6 +199,8 @@ describe.each(wrappers)("context menu focus (%s) (#2051)", (_n, wrap) => {
     await tick();
     expect(screen.getAllByRole("dialog")).toHaveLength(1);
     expect(document.activeElement).toBe(row);
-    expect(live).toBe(before);
+    // Focus went back to a row that a refetch may remove (#4221): one
+    // bounded watcher (5 s) may follow it, never more.
+    expect(live - before).toBeLessThanOrEqual(1);
   });
 });

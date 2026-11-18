@@ -32,7 +32,7 @@ from cryptography.x509.oid import ExtensionOID, NameOID
 from app.services.nettools.schemas import (
     PortTestResult,
     TlsCertResult,
-    is_blocked_target,
+    resolve_checked_target,
 )
 
 logger = structlog.get_logger(__name__)
@@ -123,20 +123,22 @@ async def test_port(host: str, port: int, protocol: str, timeout: float = 5.0) -
     blocked-range IP literal returns a clean ``state="error"`` rather
     than ever opening the socket.
     """
-    if is_blocked_target(host):
+    addr, err = await resolve_checked_target(host)
+    if addr is None:
         return PortTestResult(
             host=host,
             port=port,
             protocol=protocol if protocol in {"tcp", "udp"} else "tcp",
             state="error",
-            error=(
-                f"target {host!r} is in a blocked range (loopback / "
-                "link-local / cloud-metadata) and cannot be reached"
-            ),
+            error=err,
         )
+    # Connect to the address that passed the check, not the name.
     if protocol == "udp":
-        return await _test_udp(host, port, timeout)
-    return await _test_tcp(host, port, timeout)
+        result = await _test_udp(addr, port, timeout)
+    else:
+        result = await _test_tcp(addr, port, timeout)
+    result.host = host
+    return result
 
 
 # ── TLS certificate inspection ──────────────────────────────────────
@@ -233,23 +235,15 @@ async def inspect_tls_cert(
     # Defence in depth — block loopback / link-local / metadata literals
     # here too, since MCP callers reach this function without the REST
     # schema validation.
-    if is_blocked_target(host):
-        return TlsCertResult(
-            host=host,
-            port=port,
-            server_name=sni,
-            ok=False,
-            error=(
-                f"target {host!r} is in a blocked range (loopback / "
-                "link-local / cloud-metadata) and cannot be reached"
-            ),
-        )
+    addr, err = await resolve_checked_target(host)
+    if addr is None:
+        return TlsCertResult(host=host, port=port, server_name=sni, ok=False, error=err)
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
 
     try:
-        fut = asyncio.open_connection(host, port, ssl=ctx, server_hostname=sni)
+        fut = asyncio.open_connection(addr, port, ssl=ctx, server_hostname=sni)
         _reader, writer = await asyncio.wait_for(fut, timeout=timeout)
     except TimeoutError:
         return TlsCertResult(

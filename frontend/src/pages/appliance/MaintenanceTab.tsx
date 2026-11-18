@@ -13,6 +13,7 @@ import { applianceSystemApi, formatApiError } from "@/lib/api";
 import { isRefused } from "@/lib/refusal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { useApplianceAdminGate } from "@/hooks/useApplianceAdmin";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Phase 4f — Maintenance tab.
@@ -84,12 +85,12 @@ export function MaintenanceTab() {
 
       {/* A refused toggle or reboot used to say nothing (#1342). */}
       {(toggleMaint.isError || reboot.isError) && (
-        <div className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
+        <FormError className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
           {formatApiError(
             toggleMaint.error ?? reboot.error,
             "Maintenance action failed",
           )}
-        </div>
+        </FormError>
       )}
 
       {rebootUnderway && (

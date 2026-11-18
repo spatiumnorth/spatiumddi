@@ -146,6 +146,12 @@ if [ "$interface" != "any" ] && [ ! -e "/sys/class/net/$interface" ]; then
   exit 0
 fi
 [[ -z "$snaplen" || ! "$snaplen" =~ ^[0-9]+$ ]] && snaplen=256
+# The filter is an expression, never an option: refuse a leading '-'.
+bpf_trim="${bpf#"${bpf%%[![:space:]]*}"}"
+if [ "${bpf_trim:0:1}" = "-" ]; then
+  write_state "$cid" failed "" 0 "invalid capture filter"
+  exit 0
+fi
 
 # Free-space pre-check: refuse if free < max_bytes + 64 MiB headroom.
 want_mb=$(( ( ${max_bytes:-52428800} / 1048576 ) + 64 ))
@@ -161,7 +167,8 @@ argv=(tcpdump -n -U -i "$interface" -s "$snaplen" -w -)
 [ -n "$max_packets" ] && [[ "$max_packets" =~ ^[0-9]+$ ]] && argv+=(-c "$max_packets")
 # BPF filter is a single trailing argv element. Empty → omit.
 if [ -n "$bpf" ]; then
-  argv+=("$bpf")
+  # `--` ends option parsing so the filter can never be read as an option.
+  argv+=(-- "$bpf")
 fi
 
 log "starting capture $cid on $interface (snaplen=$snaplen dur=${max_duration_s:-none} pkts=${max_packets:-none} bytes=${max_bytes:-none})"
@@ -224,6 +231,8 @@ if [ "$bytes" -gt 0 ] || [ "$rc" -eq 0 ]; then
   log "capture $cid done: $bytes bytes, ${packets:-?} packets (reason=${stopped_reason:-eof})"
   write_state "$cid" done "${packets:-}" "$bytes" ""
 else
-  write_state "$cid" failed "" 0 "tcpdump exited ($rc) with no capture${err:+: $err}"
+  # Raw stderr goes to the journal only, never into the state file.
+  [ -n "$err" ] && log "tcpdump stderr: $err"
+  write_state "$cid" failed "" 0 "tcpdump exited ($rc) with no capture; see the host log"
 fi
 exit 0
