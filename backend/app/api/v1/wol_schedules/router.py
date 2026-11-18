@@ -824,8 +824,10 @@ async def list_calendars(
     rows = list((await db.execute(stmt)).scalars().all())
     out = [_to_calendar_read(r) for r in rows]
     # A schedule editor only needs the picker fields. The address and username
-    # go to callers who could fetch the calendar by id.
-    if not user_has_permission(current_user, "read", CALENDAR_TYPE):
+    # go to callers who could fetch the calendar by id: the same rule as
+    # ``get_calendar``'s gate (read on ``wol_calendar`` or on ``PERMISSION``),
+    # so the Network Editor's Edit dialog still opens filled in.
+    if not any(user_has_permission(current_user, "read", t) for t in (CALENDAR_TYPE, PERMISSION)):
         for item in out:
             item.url = ""
             item.username = None

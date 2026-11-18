@@ -53,3 +53,33 @@ async def test_calendar_list_hides_address_from_schedule_readers(
     r = await client.get("/api/v1/wake-scheduler/calendars", headers=cal)
     assert r.json()[0]["url"] == "https://cal.example/feed?token=abc"
     assert r.json()[0]["username"] == "svc"
+
+
+@pytest.mark.asyncio
+async def test_calendar_list_keeps_address_for_network_tools_callers(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The Network Editor reaches calendars through ``use_network_tools``.
+    It can read a calendar by id, so the list must not blank its address,
+    or the Edit dialog opens empty and the save drops the username."""
+    db_session.add(
+        WolCalendar(
+            name="cal",
+            kind="ical",
+            url="https://cal.example/feed?token=abc",
+            username="svc",
+        )
+    )
+    await db_session.flush()
+    tools = await _user_with(
+        db_session, [{"action": "admin", "resource_type": "use_network_tools"}]
+    )
+
+    r = await client.get("/api/v1/wake-scheduler/calendars", headers=tools)
+    assert r.status_code == 200, r.text
+    row = r.json()[0]
+    assert row["url"] == "https://cal.example/feed?token=abc"
+    assert row["username"] == "svc"
+
+    r = await client.get(f"/api/v1/wake-scheduler/calendars/{row['id']}", headers=tools)
+    assert r.status_code == 200, r.text
