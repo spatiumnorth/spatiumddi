@@ -48,29 +48,10 @@ export function plainRefusalBoxes(source: string, ternary = false): string[] {
   return out;
 }
 
-// Files that already drew a plain red box in the ternary shape when #4404
-// widened the scan to it. A baseline, not a licence: fix a file and delete it
-// from here; a file not listed must not gain one.
-const TERNARY_BASELINE = new Set([
-  "pages/admin/FactoryResetSection.tsx",
-  "pages/appliance/ClusterUpgradeTab.tsx",
-  "pages/appliance/FleetTab.tsx",
-  "pages/dhcp/DevicePoliciesTab.tsx",
-  "pages/dns/DNSPage.tsx",
-  "pages/dns/PropagationCheckModal.tsx",
-  "pages/network/CertificatesPage.tsx",
-  "pages/network/NetworkImportExportModal.tsx",
-  "pages/security/BlockSyncPage.tsx",
-  "pages/tools/WakeSchedulesPage.tsx",
-]);
-
 const found = new Map<string, string[]>();
 for (const f of files(SRC)) {
   const rel = relative(SRC, f);
-  const hits = plainRefusalBoxes(
-    readFileSync(f, "utf8"),
-    !TERNARY_BASELINE.has(rel),
-  );
+  const hits = plainRefusalBoxes(readFileSync(f, "utf8"), true);
   if (hits.length) found.set(rel, hits);
 }
 
