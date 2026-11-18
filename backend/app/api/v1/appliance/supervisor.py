@@ -78,6 +78,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.pre_body_auth import header_only
 from app.api.v1.appliance.cluster import VarDiskFinding
+from app.config import settings
 from app.core.agent_wake import (
     HOSTCONFIG_ALL,
     WAKE_TICK_SECONDS,
@@ -96,6 +97,7 @@ from app.core.auth_throttle import (
     refund_pairing_attempt,
 )
 from app.core.db_transient import is_transient_db_error
+from app.core.denial_audit import note_denial_audited
 from app.core.permissions import is_effective_superadmin, require_permission
 from app.core.responses import PlainTextStreamResponse
 from app.core.versions import is_installed_target, upgrade_direction
@@ -134,6 +136,10 @@ from app.services.appliance.ca import (
     generate_session_token,
     sign_supervisor_cert,
     verify_session_token,
+)
+from app.services.appliance.cert_auth import (
+    RegisterProofUnavailable,
+    verify_register_proof,
 )
 from app.services.appliance.cluster_dns_group import (
     cluster_dns_group_refusal,
@@ -534,6 +540,11 @@ class SupervisorCapabilities(BaseModel):
     # join token, so a promote of it is refused up front rather than left to
     # wait for a token that will not come.
     sealed_join_token: bool = False
+    # A supervisor that reports this signs its registration with its own key
+    # (``proof_*`` on the register request). Once a row has reported it, a
+    # re-registration without that signature is refused, so the older,
+    # unsigned form is accepted only for supervisors that never sent one.
+    register_proof: bool = False
 
 
 class SupervisorRoleRestore(BaseModel):
@@ -600,6 +611,11 @@ class SupervisorRegisterRequest(BaseModel):
     # Fleet row went away. Honoured only on a self-bootstrap (auto-approve)
     # registration; see ``_restore_supervisor_roles``.
     restore_roles: SupervisorRoleRestore | None = None
+    # The registering key's signature over a fresh timestamp and nonce
+    # (``cert_auth.register_proof_payload``). Absent from older supervisors.
+    proof_timestamp: str | None = Field(default=None, max_length=64)
+    proof_nonce: str | None = Field(default=None, max_length=64)
+    proof_signature: str | None = Field(default=None, max_length=256)
 
     @field_validator("pairing_code")
     @classmethod
@@ -1073,6 +1089,31 @@ async def supervisor_register(
     # 422s on a malformed pubkey shouldn't burn a real pairing code.
     pubkey_der, pubkey_fingerprint = _decode_pubkey(body.public_key_der_b64)
 
+    # A supervisor that signs its registration proves it holds the key. A
+    # signature that is present but wrong (or a repeat) is refused outright.
+    key_proven = False
+    if body.proof_signature is not None:
+        loaded_key = load_der_public_key(pubkey_der)
+        assert isinstance(loaded_key, Ed25519PublicKey)  # _decode_pubkey checked
+        try:
+            key_proven = await verify_register_proof(
+                loaded_key,
+                pubkey_fingerprint,
+                body.proof_timestamp or "",
+                body.proof_nonce or "",
+                body.proof_signature,
+            )
+        except RegisterProofUnavailable:
+            await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Registration is paused: the nonce store is unavailable. Retrying shortly.",
+                headers={"Retry-After": "30"},
+            ) from None
+        if not key_proven:
+            await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Registration refused.")
+
     submitted_hash = _hash_code(body.pairing_code)
     client_ip = _client_ip(request)
     now = datetime.now(UTC)
@@ -1089,6 +1130,22 @@ async def supervisor_register(
     existing_stmt = select(Appliance).where(Appliance.public_key_fingerprint == pubkey_fingerprint)
     existing = (await db.execute(existing_stmt)).scalar_one_or_none()
     if existing is not None:
+        # The row's owner is whoever holds the private key. A supervisor
+        # that has reported it signs its registrations is held to that; an
+        # older one (no signature) is accepted only while
+        # ``appliance_legacy_signature_allowed`` stays on, and logged.
+        if not key_proven:
+            if (existing.capabilities or {}).get(
+                "register_proof"
+            ) or not settings.appliance_legacy_signature_allowed:
+                await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+                raise HTTPException(status.HTTP_403_FORBIDDEN, "Registration refused.")
+            logger.warning(
+                "supervisor_register_unsigned",
+                appliance_id=str(existing.id),
+                ip=client_ip,
+                hint="this supervisor registers without a key signature; upgrade it",
+            )
         # Idempotent re-register. Touch last_seen_at so the heartbeat
         # path stays useful even before A2+ ships a separate
         # heartbeat endpoint. Update capabilities + supervisor_version
@@ -1099,6 +1156,8 @@ async def supervisor_register(
             existing.supervisor_version = body.supervisor_version
         if body.capabilities is not None:
             existing.capabilities = body.capabilities.model_dump()
+        if key_proven:
+            existing.capabilities = {**(existing.capabilities or {}), "register_proof": True}
         # Rotate the session token — supervisor must use the fresh one
         # for subsequent polls. Old cached tokens fail hash compare.
         # #411 — ALWAYS mint + return a fresh token, even for a cert'd
@@ -1292,7 +1351,10 @@ async def supervisor_register(
         public_key_der=pubkey_der,
         public_key_fingerprint=pubkey_fingerprint,
         supervisor_version=body.supervisor_version,
-        capabilities=(body.capabilities.model_dump() if body.capabilities else {}),
+        capabilities={
+            **(body.capabilities.model_dump() if body.capabilities else {}),
+            **({"register_proof": True} if key_proven else {}),
+        },
         session_token_hash=session_hash,
         paired_at=now,
         paired_from_ip=client_ip,
@@ -4532,6 +4594,7 @@ async def delete_appliance(
     if not current_user.hashed_password or not verify_password(
         body.password, current_user.hashed_password
     ):
+        note_denial_audited()
         db.add(
             AuditLog(
                 user_id=current_user.id,
@@ -4768,6 +4831,7 @@ async def permanent_delete_appliance(
     if not current_user.hashed_password or not verify_password(
         body.password, current_user.hashed_password
     ):
+        note_denial_audited()
         db.add(
             AuditLog(
                 user_id=current_user.id,

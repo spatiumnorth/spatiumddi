@@ -25,6 +25,7 @@ from app.core.demo_mode import forbid_in_demo_mode
 from app.core.header_credentials import header_secret
 from app.core.permissions import require_resource_permission
 from app.core.ssrf import assert_safe_target
+from app.core.stored_secret_guard import require_secret_with_destination_change
 from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace
@@ -334,6 +335,12 @@ async def update_instance(
         raise HTTPException(status_code=404, detail="NetBird instance not found")
 
     changes = body.model_dump(exclude_unset=True)
+    require_secret_with_destination_change(
+        t,
+        changes,
+        destination=["api_url"],
+        secrets={"api_key": t.api_key_encrypted},
+    )
     new_ipam = changes.get("ipam_space_id", t.ipam_space_id)
     new_dns = changes.get("dns_group_id", t.dns_group_id)
     if "ipam_space_id" in changes or "dns_group_id" in changes:

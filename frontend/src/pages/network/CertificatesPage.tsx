@@ -25,6 +25,7 @@ import {
   tlsStateCls,
 } from "@/lib/tls-cert-state";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -360,7 +361,9 @@ function CertTargetEditorModal({
         </div>
       </div>
 
-      {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
+      {error && (
+        <FormError className="mt-3 text-sm text-destructive">{error}</FormError>
+      )}
 
       <div className="mt-6 flex justify-end gap-2 border-t pt-3">
         <button
@@ -815,9 +818,16 @@ export function CertificatesPage() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["tls-certs"] }),
   });
 
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
   const removeOne = useMutation({
+    onMutate: () => setDeleteError(null),
     mutationFn: (id: string) => tlsCertsApi.remove(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["tls-certs"] }),
+    onError: (e: unknown) => {
+      setDeleteError(formatApiError(e, "Failed to delete TLS cert target"));
+      qc.invalidateQueries({ queryKey: ["tls-certs"] });
+    },
   });
 
   if (ready && !moduleOn) {
@@ -832,6 +842,11 @@ export function CertificatesPage() {
   return (
     <div className="h-full overflow-auto p-6">
       <div className="space-y-4">
+        {deleteError && (
+          <p role="alert" className="text-sm text-destructive">
+            {deleteError}
+          </p>
+        )}
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
             <h1 className="flex items-center gap-2 text-xl font-semibold">
@@ -946,8 +961,10 @@ export function CertificatesPage() {
                         setStateFilter("");
                         setSourceFilter("");
                       }}
+                      gate={writeGate}
+                      hint={`Click "New target" to add one.`}
                     >
-                      No targets yet — click "New target" to add one.
+                      No targets yet.
                     </ListEmpty>
                   </td>
                 </tr>

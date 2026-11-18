@@ -168,7 +168,9 @@ async def test_refresh_across_several_batches_adds_prunes_and_counts(
         .scalars()
         .all()
     )
-    assert all(r.is_wildcard and r.entry_type == "block" for r in rows if r.domain in added)
+    # Plain-domain feed lines are exact triggers under the default by_syntax
+    # mode (#4190); an adblock ||name^ line would be a wildcard.
+    assert all(not r.is_wildcard and r.entry_type == "block" for r in rows if r.domain in added)
 
     await db_session.refresh(bl)
     assert bl.entry_count == 10
