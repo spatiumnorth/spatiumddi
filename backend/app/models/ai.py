@@ -25,6 +25,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
+from sqlalchemy import text as sa_text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -91,6 +92,17 @@ class AIProvider(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # provider doesn't blow up after a tool rename — the admin sees the
     # stale entry in the modal and can clear it.
     enabled_tools: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    # The operator's statement that this endpoint runs on infrastructure
+    # they control (Ollama, vLLM, LM Studio ... on their own hosts), so
+    # what is sent to it does not leave their network. Copilot Watch
+    # (#4405) sends install data with nobody watching and, by default,
+    # uses only providers that carry this mark. The chat ignores it. Only
+    # an ``openai_compat`` provider can be marked: the other kinds are
+    # hosted services by definition. Cleared when ``base_url`` changes,
+    # since the statement was about the old endpoint.
+    is_on_prem: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
 
 
 CHAT_ROLES: tuple[str, ...] = ("system", "user", "assistant", "tool")

@@ -3,6 +3,13 @@ from app.models.acme_client import ACMEClientAccount, ACMEHTTPChallenge, ACMEOrd
 from app.models.address_set import ADDRESS_SET_RANGE_KINDS, AddressSet
 from app.models.agent_ingest import AgentIngestReceipt
 from app.models.ai import AIChatMessage, AIChatSession, AIProvider
+from app.models.ai_watch import (
+    AIFinding,
+    AIFindingFeedback,
+    AIFindingMute,
+    AIWatchConfig,
+    AIWatchRun,
+)
 from app.models.alerts import AlertEvent, AlertRule
 from app.models.appliance import (
     APPLIANCE_STATE_APPROVED,
@@ -173,7 +180,12 @@ __all__ = [
     "AddressSet",
     "AIChatMessage",
     "AIChatSession",
+    "AIFinding",
+    "AIFindingFeedback",
+    "AIFindingMute",
     "AIProvider",
+    "AIWatchConfig",
+    "AIWatchRun",
     "Base",
     "AuditChainCheckpoint",
     "AuditLog",

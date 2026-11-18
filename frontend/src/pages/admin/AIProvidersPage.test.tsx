@@ -36,6 +36,7 @@ const provider = (hasKey: boolean) => ({
   options: {},
   system_prompt_override: null,
   enabled_tools: null,
+  is_on_prem: false,
   created_at: "2026-10-23T00:00:00Z",
   modified_at: "2026-10-23T00:00:00Z",
 });

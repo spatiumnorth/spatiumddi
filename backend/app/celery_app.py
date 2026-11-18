@@ -226,6 +226,7 @@ celery_app = SpatiumCelery(
         "app.tasks.bgp_hijack_poll",
         "app.tasks.domain_whois_refresh",
         "app.tasks.ai_digest",
+        "app.tasks.ai_watch",
         "app.tasks.audit_chain_verify",
         "app.tasks.upgrade_orchestrator",
         "app.tasks.time_bound_grant_sweep",
@@ -305,6 +306,7 @@ celery_app.conf.update(
         "app.tasks.bgp_hijack_poll.*": {"queue": "default"},
         "app.tasks.domain_whois_refresh.*": {"queue": "default"},
         "app.tasks.ai_digest.*": {"queue": "default"},
+        "app.tasks.ai_watch.*": {"queue": "default"},
         "app.tasks.audit_chain_verify.*": {"queue": "default"},
         "app.tasks.time_bound_grant_sweep.*": {"queue": "default"},
         "app.tasks.change_request_expiry.*": {"queue": "default"},
@@ -788,6 +790,14 @@ celery_app.conf.update(
         "ai-daily-digest": {
             "task": "app.tasks.ai_digest.send_daily_digest",
             "schedule": crontab(hour=8, minute=0),
+        },
+        # Copilot Watch (#4405). Every 60 s; the task decides for itself
+        # whether a run is due (Run now, a debounced alert change, or the
+        # sweep interval) and returns at once when Watch is off, paused or
+        # idle. Gated on the default-off ``ai.watch`` module.
+        "ai-watch-tick": {
+            "task": "app.tasks.ai_watch.tick",
+            "schedule": schedule(run_every=60.0),
         },
         # Nightly at 02:00 UTC, walk the audit_log chain and verify
         # every row's hash. Issue #73. Read-only — never tries to

@@ -11,6 +11,7 @@ from app.api.v1.admin.postgres import router as postgres_router
 from app.api.v1.admin.redis import router as redis_admin_router
 from app.api.v1.admin.trash import router as trash_router
 from app.api.v1.ai import router as ai_router
+from app.api.v1.ai.watch import router as ai_watch_router
 from app.api.v1.alerts.router import router as alerts_router
 from app.api.v1.ansible import router as ansible_router
 from app.api.v1.api_tokens.router import router as api_tokens_router
@@ -120,6 +121,14 @@ api_v1_router.include_router(
     prefix="/ai",
     tags=["ai"],
     dependencies=[Depends(require_module("ai.copilot"))],
+)
+# Copilot Watch (#4405). Its own module, default off, which resolves on
+# only while ``ai.copilot`` is on (``requires=``), so this gate covers both.
+api_v1_router.include_router(
+    ai_watch_router,
+    prefix="/ai/watch",
+    tags=["ai-watch"],
+    dependencies=[Depends(require_module("ai.watch"))],
 )
 api_v1_router.include_router(agent_keys_router, prefix="/admin", tags=["admin-agent-keys"])
 api_v1_router.include_router(containers_router, prefix="/admin", tags=["admin-containers"])

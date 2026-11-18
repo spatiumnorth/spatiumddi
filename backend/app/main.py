@@ -215,6 +215,20 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "read", "resource_type": "alert"},
         ],
     ),
+    "Findings Analyst": (
+        "Read and triage Copilot Watch findings (#4405): see the Findings inbox "
+        "and the run history, and acknowledge, dismiss, reopen or leave feedback "
+        "on a finding. A holder sees every finding, including ones that quote "
+        "objects their other roles do not let them read, so grant it to people "
+        "who may see the whole install's problems. It confers nothing else: no "
+        "access to the Copilot Watch settings (superadmin only), and no change "
+        "to any DNS, DHCP or IPAM object.",
+        [
+            {"action": "read", "resource_type": "ai_finding"},
+            {"action": "write", "resource_type": "ai_finding"},
+            {"action": "read", "resource_type": "alert"},
+        ],
+    ),
     "Requester": (
         "Submit self-service requests for IP addresses, subnets, DNS records and "
         "DHCP reservations (#696). This is the LOW-privilege half of the workflow "
