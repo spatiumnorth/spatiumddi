@@ -179,10 +179,11 @@ async def test_stale_registration_signature_is_refused(
 
 @pytest.mark.asyncio
 async def test_supervisor_without_signing_still_re_registers_during_upgrade(
-    db_session: AsyncSession, client: AsyncClient
+    db_session: AsyncSession, client: AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A supervisor from before the signature existed keeps working."""
+    """With the upgrade-window opt-in (``legacy``), an older supervisor keeps working."""
     k, aid, tok = await _registered(db_session, client, signed=False)
+    monkeypatch.setattr(settings, "appliance_unsigned_register_allowed", "legacy")
     r = await client.post(URL, json=k.body("00000000"))
     assert r.status_code == 200, r.text
     assert r.json()["session_token"] != tok
@@ -234,6 +235,7 @@ async def test_legacy_unsigned_reregister_of_old_version_is_audited_and_spends_b
     old_version: str | None,
 ) -> None:
     k, aid, tok = await _registered(db_session, client, signed=False)
+    monkeypatch.setattr(settings, "appliance_unsigned_register_allowed", "legacy")
     await _set_version(db_session, aid, old_version)
     claims: list[str] = []
 
@@ -274,6 +276,7 @@ async def test_unsigned_reregister_stops_when_the_attempt_budget_is_spent(
     db_session: AsyncSession, client: AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     k, aid, _ = await _registered(db_session, client, signed=False)
+    monkeypatch.setattr(settings, "appliance_unsigned_register_allowed", "legacy")
     await _set_version(db_session, aid, "1.0.0")
 
     async def _claim(_ip: str) -> tuple[bool, int, int]:
@@ -290,10 +293,31 @@ async def test_register_setting_leaves_the_heartbeat_legacy_flag_alone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The two settings are independent: one default, one flag, each its own."""
-    assert settings.appliance_unsigned_register_allowed == "legacy"
     assert settings.appliance_legacy_signature_allowed is True
     monkeypatch.setattr(settings, "appliance_unsigned_register_allowed", "never")
     assert settings.appliance_legacy_signature_allowed is True
+
+
+def test_unsigned_register_default_is_never() -> None:
+    """1.1.0 refuses unsigned re-registration unless an operator opts back in."""
+    from app.config import Settings
+
+    assert Settings.model_fields["appliance_unsigned_register_allowed"].default == "never"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("old_version", ["1.0.0", "2026.09.04-1", None])
+async def test_unsigned_reregister_refused_by_default_even_for_an_old_supervisor(
+    db_session: AsyncSession, client: AsyncClient, old_version: str | None
+) -> None:
+    k, aid, _ = await _registered(db_session, client, signed=False)
+    await _set_version(db_session, aid, old_version)
+    before = await _token_hash(db_session, aid)
+    r = await client.post(URL, json=k.body("00000000"))
+    assert r.status_code == 403
+    assert "APPLIANCE_UNSIGNED_REGISTER_ALLOWED" in r.json()["detail"]
+    assert await _token_hash(db_session, aid) == before
+    assert await _unsigned_audit_rows(db_session) == []
 
 
 @pytest.mark.asyncio
