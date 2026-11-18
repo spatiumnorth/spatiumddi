@@ -659,7 +659,9 @@ async def list_flows(
         )
 
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
-    stmt = stmt.order_by(MulticastGroup.address.asc()).limit(limit).offset(offset)
+    stmt = (
+        stmt.order_by(MulticastGroup.address.asc(), MulticastGroup.id).limit(limit).offset(offset)
+    )
     rows = (await db.execute(stmt)).all()
     return AVFlowListResponse(
         items=[_flow_read(profile, group) for profile, group in rows],

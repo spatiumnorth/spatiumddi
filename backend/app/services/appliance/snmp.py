@@ -47,11 +47,24 @@ from app.models.settings import PlatformSettings
 
 logger = structlog.get_logger(__name__)
 
-# The first cut emits IPv4 + IPv6 listeners on the standard SNMP UDP
-# port. Operators who want to bind to a specific interface can
-# subclass this in a follow-up — global default is good enough for
-# the appliance shape.
-_AGENT_ADDRESS_LINE = "agentAddress udp:161,udp6:[::1]:161"
+# Listeners on the standard SNMP UDP port. IPv4 is always on all
+# addresses. IPv6 listens on all addresses only when an IPv6 source can
+# query (see ``_agent_address_line``); otherwise it stays on loopback.
+# The host firewall (scoped to snmp_allowed_sources) and the per-source
+# community lines are what restrict who gets an answer (#3813).
+_AGENT_ADDRESS_V4_ONLY = "agentAddress udp:161,udp6:[::1]:161"
+_AGENT_ADDRESS_DUAL = "agentAddress udp:161,udp6:161"
+
+
+def _agent_address_line(sources: list[Any]) -> str:
+    """``udp6:161`` when an IPv6 source is listed, or the list is empty
+    (any source may reach the port); an IPv4-only list keeps IPv6 on
+    loopback, so nothing new is exposed."""
+    canon = _valid_sources(list(sources))
+    if canon and not any(":" in c for c in canon):
+        return _AGENT_ADDRESS_V4_ONLY
+    return _AGENT_ADDRESS_DUAL
+
 
 # AgentX master socket (issue #2154). lldpd's "Expose via SNMP" toggle
 # (#348) runs ``lldpd -x``, which registers LLDP-MIB as an AgentX
@@ -152,7 +165,7 @@ def render_snmpd_conf(settings: PlatformSettings) -> str:
             )
             continue
         lines.append(f"{directive:<14} {value}")
-    lines.append(_AGENT_ADDRESS_LINE)
+    lines.append(_agent_address_line(list(settings.snmp_allowed_sources or [])))
     lines.append("")
 
     # Source scope for the host firewall rule (#2153), read by the host runner

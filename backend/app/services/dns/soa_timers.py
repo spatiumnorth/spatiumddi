@@ -44,6 +44,7 @@ logger = structlog.get_logger(__name__)
 
 AGENT_FEATURES_HEADER = "X-Spatium-Agent-Features"
 FEATURE_SOA_TIMERS = "soa-timers"
+FEATURE_SERVED_SERIALS = "served-serials"
 
 # What every BIND9 agent before #1171 wrote into every zone's SOA. Also the
 # zone defaults (``ZONE_DEFAULT_*``), so a zone left at them is shipped the same
@@ -65,6 +66,12 @@ def agent_features(header: str | None) -> frozenset[str]:
 
 def renders_soa_timers(header: str | None) -> bool:
     return FEATURE_SOA_TIMERS in agent_features(header)
+
+
+def reports_served_serials(header: str | None) -> bool:
+    """The agent reports a secondary / stub zone's served serial, and nothing
+    for one it holds no copy of (#3940), rather than the bundle's 0."""
+    return FEATURE_SERVED_SERIALS in agent_features(header)
 
 
 def served_soa_timers(zone: Any, group_serves: bool) -> dict[str, int]:
@@ -182,10 +189,12 @@ async def reconcile_soa_timers(db: AsyncSession, group_id: uuid.UUID) -> bool | 
 
 __all__ = [
     "AGENT_FEATURES_HEADER",
+    "FEATURE_SERVED_SERIALS",
     "FEATURE_SOA_TIMERS",
     "LITERAL_SOA_TIMERS",
     "agent_features",
     "reconcile_soa_timers",
     "renders_soa_timers",
+    "reports_served_serials",
     "served_soa_timers",
 ]

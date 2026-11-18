@@ -179,7 +179,7 @@ jobs:
       # reload verification and with it the whole apply. Proves named starts
       # and reloads with a held zone's stanza and no file, answers SERVFAIL
       # for it, applies every other change, and that the longest zones it can
-      # journal (248, 241 inline-signed) are served. Runs as `spatium`.
+      # load (248, 214 inline-signed, #3750) are served. Runs as `spatium`.
       - name: Long zone name check (bind9)
         if: matrix.flavor == 'bind9'
         run: |

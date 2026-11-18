@@ -199,4 +199,18 @@ describe("Aggregation suggestions popover", () => {
     expect(screen.queryByText("Aggregation candidates")).toBeNull();
     expect(document.activeElement).toBe(btn);
   });
+
+  it("closes on its Close button and returns focus to the badge (#3823)", async () => {
+    sessionStorage.clear();
+    wrap(<AggregationCandidatesBadge blockId="b2" />);
+    const user = userEvent.setup();
+    const btn = await screen.findByRole("button", {
+      name: /aggregation suggestion/,
+    });
+    btn.focus();
+    await user.keyboard("{Enter}");
+    await user.click(screen.getByRole("button", { name: "Close" }));
+    expect(screen.queryByText("Aggregation candidates")).toBeNull();
+    expect(document.activeElement).toBe(btn);
+  });
 });
