@@ -28,3 +28,26 @@ def synthesised_zone_error(zone: Any, op: str) -> str | None:
             f"to release the zone."
         )
     return None
+
+
+def unauthored_zone_error(zone: Any, op: str) -> str | None:
+    """Why no record can be ``op``ed in ``zone``, or None when it can (#3838).
+
+    Only a primary zone is one SpatiumDDI authors: a secondary's or a stub's
+    data is its masters', and a forward zone is a forwarders block with no zone
+    file. A record written there is stored and listed but served by nobody,
+    the rule IPAM already keeps (``sync_check.ipam_authors_zone``).
+    """
+    zone_type = zone.zone_type or "primary"
+    if zone_type == "primary":
+        return None
+    return (
+        f"Zone {zone.name!r} is a {zone_type} zone, not one SpatiumDDI serves as "
+        f"primary, so records cannot be {op}ed in it: "
+        + (
+            "it holds no records, queries are sent to its forwarders."
+            if zone_type == "forward"
+            else "its data comes from its masters, and a record written here would "
+            "be served by nobody."
+        )
+    )

@@ -140,7 +140,7 @@ describe("Edit Blocking List (#3365)", () => {
     block_mode: "nxdomain",
     sinkhole_ip: null,
     update_interval_hours: 24,
-    feed_entries_are_wildcard: true,
+    feed_wildcard_mode: "by_syntax",
     enabled: true,
   } as unknown as DNSBlockList;
   const fresh = { ...stale, category: "xp-other" } as DNSBlockList;

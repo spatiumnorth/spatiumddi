@@ -52,6 +52,7 @@ from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
 from app.core.crypto import encrypt_str
 from app.core.permissions import require_permission
+from app.core.stored_secret_guard import require_secret_with_destination_change
 from app.models.auth import Group, User
 from app.models.ipam import Subnet
 from app.models.wol_schedule import (
@@ -881,6 +882,12 @@ async def update_calendar(
         raise HTTPException(status_code=404, detail="Calendar not found")
 
     fields = body.model_dump(exclude_unset=True)
+    require_secret_with_destination_change(
+        row,
+        fields,
+        destination=("url",),
+        secrets={"password": row.password_encrypted},
+    )
     changed: list[str] = []
     # Non-nullable columns where an explicit null means "unchanged".
     non_nullable = {"name", "kind", "url", "enabled", "refresh_interval_minutes"}

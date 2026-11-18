@@ -124,6 +124,37 @@ describe("AI Providers for a Viewer (#2525)", () => {
   });
 });
 
+const priorityInput = () => screen.getByDisplayValue("100") as HTMLInputElement;
+
+describe("Edit AI provider saves only what changed (#4236)", () => {
+  async function open() {
+    state.superadmin = true;
+    state.refused = false;
+    state.hasKey = true;
+    updateProvider.mockClear();
+    renderPage();
+    fireEvent.click(await screen.findByLabelText("Edit provider"));
+    await screen.findByText(/API key/);
+  }
+
+  it("sends only the changed field", async () => {
+    await open();
+    fireEvent.change(priorityInput(), { target: { value: "50" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(updateProvider).toHaveBeenCalledTimes(1));
+    expect(updateProvider.mock.calls[0][1]).toEqual({ priority: 50 });
+  });
+
+  it("a Save with nothing changed sends nothing", async () => {
+    await open();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Save" })).toBeNull(),
+    );
+    expect(updateProvider).not.toHaveBeenCalled();
+  });
+});
+
 describe("Edit AI provider's API key (#2622)", () => {
   async function openEdit(hasKey: boolean) {
     state.superadmin = true;
@@ -140,7 +171,8 @@ describe("Edit AI provider's API key (#2622)", () => {
     const text = document.body.textContent ?? "";
     expect(text).not.toMatch(/clear to remove/i);
     expect(text).toMatch(/a key is stored/);
-    // Saved untouched: the key is not sent, so it is kept.
+    // Saved with another field changed: the key is not sent, so it is kept.
+    fireEvent.change(priorityInput(), { target: { value: "50" } });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(updateProvider).toHaveBeenCalledTimes(1));
     expect(updateProvider.mock.calls[0][1]).not.toHaveProperty("api_key");
