@@ -34,6 +34,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.appliance import supervisor as supervisor_mod
+from app.config import settings
 from app.models.appliance import (
     APPLIANCE_STATE_PENDING_APPROVAL,
     Appliance,
@@ -306,12 +307,15 @@ async def test_register_capabilities_round_trip_every_known_flag(
 
 @pytest.mark.asyncio
 async def test_register_is_idempotent_for_same_pubkey(
-    db_session: AsyncSession, client: AsyncClient
+    db_session: AsyncSession, client: AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Crash-recovery shape — supervisor restarts before persisting
     its appliance_id, retries with the SAME pubkey. Endpoint must
     short-circuit to "you already exist" rather than refusing
     (because the code is now ``used_at != None``)."""
+    # Unsigned re-registration is refused by default since #4352; this test
+    # covers the idempotent path itself, so pin the legacy window.
+    monkeypatch.setattr(settings, "appliance_unsigned_register_allowed", "legacy")
     await _enable_supervisor_registration(db_session)
     await _make_pairing_code(db_session, code="33333333")
     await db_session.commit()
@@ -372,13 +376,16 @@ async def test_register_is_idempotent_for_same_pubkey(
 
 @pytest.mark.asyncio
 async def test_reregister_mints_token_for_certd_row(
-    db_session: AsyncSession, client: AsyncClient
+    db_session: AsyncSession, client: AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """#411 — re-register-from-cache returns a FRESH session token even after
     the row has a cert (post-approval), so an approved supervisor that lost
     its token can recover it. Pre-#411 this returned "" for cert'd rows, which
     — once #400 C1 removed the approved-state heartbeat bypass — left such a
     box with no usable credential and 403'd every heartbeat."""
+    # Unsigned re-registration is refused by default since #4352; this test
+    # covers the idempotent path itself, so pin the legacy window.
+    monkeypatch.setattr(settings, "appliance_unsigned_register_allowed", "legacy")
     await _enable_supervisor_registration(db_session)
     await _make_pairing_code(db_session, code="55555555")
     await db_session.commit()
