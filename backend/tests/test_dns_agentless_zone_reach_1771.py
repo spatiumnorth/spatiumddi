@@ -201,3 +201,64 @@ async def test_sync_does_not_report_an_adopted_zone_as_pushed(
     body = await _sync(db_session, client, monkeypatch, drv)
     assert "a.test." in drv.created
     assert body["zones_pushed_to_server"] == []
+
+
+# --- retiring an auto reverse zone deletes only what SpatiumDDI created -----
+
+
+async def _auto_reverse(
+    db: AsyncSession, provider_cls: Any, *, preexisting: bool
+) -> tuple[Any, DNSZone]:
+    from .test_dns_auto_zone_agentless_1932 import REV, _autosync, _setup
+
+    if preexisting:
+        provider_cls.zones.add(REV)  # the operator's own zone, same name
+    subnet, _grp = await _setup(db, agentless=True)
+    await _autosync(db, subnet)
+    zone = (await db.execute(select(DNSZone).where(DNSZone.name == REV))).scalar_one()
+    await db.refresh(zone)
+    return subnet, zone
+
+
+async def test_retire_deletes_the_zone_spatiumddi_created(
+    db_session: AsyncSession,
+    provider: Any,  # noqa: F811
+) -> None:
+    from app.services.dns.reverse_zone import retire_auto_reverse_zones
+
+    from .test_dns_auto_zone_agentless_1932 import REV
+
+    subnet, zone = await _auto_reverse(db_session, provider, preexisting=False)
+    assert zone.agentless_created_server_ids  # the create changed the provider
+    await retire_auto_reverse_zones(db_session, subnet)
+    assert ("zone-delete", REV) in provider.log
+
+
+async def test_retire_leaves_a_same_named_zone_the_operator_had(
+    db_session: AsyncSession,
+    provider: Any,  # noqa: F811
+) -> None:
+    from app.services.dns.reverse_zone import retire_auto_reverse_zones
+
+    from .test_dns_auto_zone_agentless_1932 import REV
+
+    subnet, zone = await _auto_reverse(db_session, provider, preexisting=True)
+    assert not zone.agentless_created_server_ids  # adopted, not created
+    await retire_auto_reverse_zones(db_session, subnet)
+    assert ("zone-delete", REV) not in provider.log
+    assert REV in provider.zones
+
+
+async def test_retire_leaves_a_zone_that_predates_the_marker(
+    db_session: AsyncSession,
+    provider: Any,  # noqa: F811
+) -> None:
+    from app.services.dns.reverse_zone import retire_auto_reverse_zones
+
+    from .test_dns_auto_zone_agentless_1932 import REV
+
+    subnet, zone = await _auto_reverse(db_session, provider, preexisting=False)
+    zone.agentless_created_server_ids = None  # a row from before the column
+    await db_session.commit()
+    await retire_auto_reverse_zones(db_session, subnet)
+    assert ("zone-delete", REV) not in provider.log
