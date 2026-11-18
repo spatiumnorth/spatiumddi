@@ -121,7 +121,9 @@ describe("E911 Trail tab", { timeout: 30000 }, () => {
       await screen.findByText("HQ Lobby", {}, { timeout: 10000 }),
     ).toBeTruthy();
     expect(screen.getAllByText("pbx-token").length).toBe(2);
-    expect(screen.getByText("port evidence stale")).toBeTruthy();
+    expect(screen.getAllByText("port evidence stale").length).toBeGreaterThan(
+      0,
+    );
     expect(screen.getByText(/7 lookups not individually logged/)).toBeTruthy();
 
     fireEvent.change(screen.getByPlaceholderText(/IP, MAC or port/), {

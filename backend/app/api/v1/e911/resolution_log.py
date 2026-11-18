@@ -6,8 +6,9 @@
 Gated on its own ``e911_resolution_log`` resource type, NOT on
 ``e911_location``: the trail says who asked where which device is, so the PBX
 account that holds ``e911_location: read`` to do lookups must not be able to
-read other people's. No builtin role names it, so by default it is a
-superadmin (or a wildcard ``read *`` Viewer) read. Every read, including each
+read other people's. It needs a superadmin or a grant naming the type; a
+wildcard ``read *`` (the Viewer) does not reach it
+(``EXPLICIT_GRANT_ONLY_TYPES``). No builtin role names it. Every read, including each
 page of the list, writes an ``audit_log`` row. Nothing here writes the trail.
 """
 
@@ -22,7 +23,7 @@ from pydantic import BaseModel
 
 from app.api.deps import DB, CurrentUser
 from app.core.content_disposition import content_disposition
-from app.core.permissions import require_resource_permission
+from app.core.permissions import require_explicit_resource_permission
 from app.core.responses import CsvResponse
 from app.services.e911.resolution_trail import (
     EXPORT_ROW_CAP,
@@ -35,7 +36,7 @@ from app.services.e911.resolution_trail import (
 
 router = APIRouter(
     tags=["e911"],
-    dependencies=[Depends(require_resource_permission("e911_resolution_log"))],
+    dependencies=[Depends(require_explicit_resource_permission("e911_resolution_log"))],
 )
 
 

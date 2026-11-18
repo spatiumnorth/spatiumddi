@@ -191,6 +191,9 @@ async def test_rbac_matrix(client: AsyncClient, db_session: AsyncSession) -> Non
             403,
         ),
         "unrelated": ([{"action": "read", "resource_type": "subnet"}], False, 403),
+        # A wildcard read (the builtin Viewer) does not reach the trail.
+        "wildcard read": ([{"action": "read", "resource_type": "*"}], False, 403),
+        "wildcard all": ([{"action": "*", "resource_type": "*"}], False, 403),
     }
     for name, (perms, sup, want) in cases.items():
         _, h = await _user(db_session, perms, superadmin=sup)
@@ -279,3 +282,14 @@ async def test_default_tool_set_leaves_the_trail_tools_out() -> None:
     assert "find_e911_location" in eligible
     assert "find_e911_resolutions" not in eligible
     assert "count_e911_resolutions" not in eligible
+
+
+async def test_find_tool_refuses_a_wildcard_read(db_session: AsyncSession) -> None:
+    await _seed(db_session)
+    u, _ = await _user(db_session, [{"action": "read", "resource_type": "*"}])
+    await db_session.refresh(u, ["groups"])
+    with pytest.raises(ToolPermissionDenied):
+        await _call(db_session, u, "find_e911_resolutions", {})
+    g, _ = await _user(db_session, [{"action": "read", "resource_type": "e911_resolution_log"}])
+    await db_session.refresh(g, ["groups"])
+    assert await _call(db_session, g, "count_e911_resolutions", {}) == {"count": 4}

@@ -423,6 +423,70 @@ def _user_rbac_allows(
     return False
 
 
+#: Resource types a wildcard grant does NOT reach. Reading one needs a superadmin
+#: or a grant that names the type itself, so the builtin Viewer (``read *``) and
+#: any other wildcard role is refused. The E911 resolution trail holds per-call
+#: location history about named people (#3598), which a blanket read must not
+#: open.
+EXPLICIT_GRANT_ONLY_TYPES: frozenset[str] = frozenset({"e911_resolution_log"})
+
+
+def explicit_grant_allows(user: User, action: str, resource_type: str) -> bool:
+    """``user_has_permission`` without wildcard ``resource_type`` matching.
+
+    A superadmin passes. Anyone else needs a role permission or live time-bound
+    grant whose ``resource_type`` is exactly ``resource_type`` (a ``"*"``
+    resource type never counts) and whose action covers ``action``. An API
+    token's narrowing is still applied on top, via :func:`user_has_permission`.
+    """
+    if not user.is_active:
+        return False
+    if not user.is_superadmin:
+        named = False
+        for group in user.groups:
+            for role in group.roles:
+                for perm in role.permissions or []:
+                    if (
+                        isinstance(perm, dict)
+                        and perm.get("resource_type") == resource_type
+                        and _action_matches(perm.get("action", ""), action)
+                        and _resource_id_matches(perm.get("resource_id"), None)
+                    ):
+                        named = True
+        for grant in getattr(user, "_active_time_bound_grants", None) or []:
+            if (
+                getattr(grant, "resource_type", "") == resource_type
+                and _action_matches(getattr(grant, "action", ""), action)
+                and _resource_id_matches(getattr(grant, "resource_id", None), None)
+            ):
+                named = True
+        if not named:
+            return False
+    return user_has_permission(user, action, resource_type)
+
+
+def require_explicit_resource_permission(resource_type: str) -> Callable[..., Awaitable[User]]:
+    """Like :func:`require_resource_permission` (method-derived action) but the
+    grant must name ``resource_type`` (see :func:`explicit_grant_allows`)."""
+
+    async def _dep(
+        request: Request,
+        current_user: CurrentUser,
+        db: Annotated[AsyncSession, Depends(get_db)],
+    ) -> User:
+        action = action_for_request(request)
+        if explicit_grant_allows(current_user, action, resource_type):
+            return current_user
+        await _record_denial(db, current_user, request, action, resource_type, None)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Permission denied: need '{action}' on '{resource_type}'",
+        )
+
+    _dep.spatium_requires = ("method", [resource_type])  # type: ignore[attr-defined]
+    return _dep
+
+
 def effective_grants(user: User) -> list[dict]:
     """Assemble the deduped, effective permission triples ``user`` resolves to.
 
