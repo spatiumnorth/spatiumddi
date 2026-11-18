@@ -830,12 +830,8 @@ class DNSServerOptions(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # DNSSEC — auto | yes | no
     dnssec_validation: Mapped[str] = mapped_column(String(10), nullable=False, default="auto")
 
-    # The four ``gss_tsig_*`` columns (#3561) are no longer mapped: they were
-    # stored and never rendered. They stay in the database for one release so
-    # a rolling upgrade's old api pods, which still map them, keep serving
-    # (expand/contract, docs/DEVELOPMENT.md); ``gss_tsig_enabled`` carries a
-    # ``false`` server default, so inserts from this model still satisfy its
-    # NOT NULL. The contract migration that drops them comes in the next release.
+    # No ``gss_tsig_*`` columns: they were stored and never rendered, unmapped
+    # in #3561 and dropped in #3592 (migration ``d4a7c18e6b92``).
 
     # Notify — yes | no | explicit | master-only | primary-only
     notify_enabled: Mapped[str] = mapped_column(String(20), nullable=False, default="yes")

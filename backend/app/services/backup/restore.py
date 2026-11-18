@@ -70,6 +70,7 @@ from app.services.backup.crypto import BackupCryptoError, decrypt_secrets
 from app.services.backup.legacy_columns import (
     disabled_since,
     disabled_warning,
+    drop_readded_unmapped_columns,
     fold_dropped_plaintext_columns,
     selective_readd_sql,
 )
@@ -1430,6 +1431,13 @@ async def _apply_backup_restore_inner(
             f"their encrypted columns ({exc}). They are not read by the "
             "application; re-run the restore once the cause is fixed."
         )
+
+    # Phase 6c: the unmapped columns the same prelude re-added (nothing to
+    # fold; they only let the archive's COPY load). Non-fatal.
+    try:
+        await drop_readded_unmapped_columns(db_url)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("backup_restore_unmapped_columns_drop_failed", error=str(exc))
 
     # Phase 7: cross-install secret rewrap. Walks every Fernet-
     # encrypted column + the backup_target.config JSONB blob and
