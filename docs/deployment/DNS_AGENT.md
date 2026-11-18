@@ -996,9 +996,10 @@ Both must survive restarts → named volumes in Compose / PVCs in K8s.
 
 **One `StatefulSet` per `DNSServer` row** (umbrella chart,
 `charts/spatiumddi/templates/dns-agent.yaml`), not per group. Headless
-`Service` per StatefulSet (ClusterIP=None) plus an externally-exposed
-`Service` of type `LoadBalancer` or `NodePort` for DNS traffic (UDP/TCP
-53). On the appliance chart
+`Service` per StatefulSet (ClusterIP=None) plus a per-server `Service` for
+DNS traffic (UDP/TCP 53), `ClusterIP` by default (#3229) and `LoadBalancer`
+or `NodePort` when you opt in (see
+[Exposing DNS to clients](KUBERNETES.md#exposing-dns-to-clients)). On the appliance chart
 (`charts/spatiumddi-appliance/templates/dns-bind9.yaml`) the same
 service-container runs as a per-role-labelled `DaemonSet` instead.
 

@@ -170,6 +170,12 @@ Kea, and are unavailable. `restricted-v3` (4.22+) also requires `hostUsers:
 false`; set the per-workload `hostUsers` values where the chart offers them
 (api, worker, beat, redis).
 
+**Reaching DNS and DHCP from outside the cluster.** The Route is for the UI
+only: a Route carries HTTP and TLS, not DNS on 53 or DHCP on 67. Both need a
+`LoadBalancer` Service (MetalLB on bare metal), and DHCP also needs a relay or
+`hostNetwork`. See [Exposing DNS to clients](#exposing-dns-to-clients) and
+[Exposing DHCP to clients](#exposing-dhcp-to-clients).
+
 ---
 
 ## 2. Install
@@ -304,7 +310,7 @@ dnsAgents:
     - name: ns1
       role: primary
       group: internal-resolvers
-      service: { type: LoadBalancer }   # opt-in; see "Serving DNS on :53" below
+      service: { type: LoadBalancer }   # opt-in; see "Exposing DNS to clients" below
     # PowerDNS (issue #127 — ALIAS, LUA, online DNSSEC, catalog zones).
     # Lives in its own group: the control plane rejects mixed-driver
     # groups for those PowerDNS-only features.
@@ -312,15 +318,15 @@ dnsAgents:
       flavor: powerdns
       role: primary
       group: powerdns-edge
-      service: { type: LoadBalancer }   # opt-in; see "Serving DNS on :53" below
+      service: { type: LoadBalancer }   # opt-in; see "Exposing DNS to clients" below
     # Technitium (issue #746 — native DoT / DoH / DoQ with no sidecar,
-    # encrypted upstream forwarding, online DNSSEC, catalog zones both
-    # ways). Also its own group, same single-driver rule.
+    # encrypted upstream forwarding; no DNSSEC or catalog zones in 1.0).
+    # Also its own group, same single-driver rule.
     - name: tech1
       flavor: technitium
       role: primary
       group: technitium-edge
-      service: { type: LoadBalancer }   # opt-in; see "Serving DNS on :53" below
+      service: { type: LoadBalancer }   # opt-in; see "Exposing DNS to clients" below
 
 dhcpAgents:
   enabled: true
@@ -329,36 +335,13 @@ dhcpAgents:
   servers:
     - name: dhcp1
       role: primary
-      hostNetwork: true   # required for real DHCPv4 unless relay-only
+      service: { type: LoadBalancer }   # a relay target; see "Exposing DHCP to clients" below
 ```
 
-#### Serving DNS on :53 to clients (k3s and others)
-
 The agent Services default to `ClusterIP` (#3229), reachable in-cluster only.
-To answer clients on your LAN you must expose them, and on k3s the obvious
-choice is a trap: the bundled **servicelb** turns a `LoadBalancer` Service
-into an `svclb-*` pod with `hostPort: 53` on every node, and the CNI hostPort
-DNAT also captures the node's own resolver stub at `127.0.0.53:53`. The node
-then cannot resolve anything, so image pulls fail (`lookup ghcr.io: Try
-again`), local-path provisioning times out and the install never converges.
-UDP 67 for DHCP has the same mechanism.
-
-- **MetalLB** (recommended): start k3s with `--disable servicelb`, install
-  MetalLB, then set `service: { type: LoadBalancer }` on the DNS server with
-  a pool or `loadBalancerIP`. The VIP is announced by MetalLB, so nothing
-  binds :53 on the node.
-- **Another LB** (kube-vip, Cilium LB-IPAM, a cloud LB): same rule, disable
-  servicelb and make sure the implementation does not use hostPort 53.
-- **`NodePort`**: works behind your own forwarder or external load balancer,
-  but :53 is outside the NodePort range, so clients cannot use it directly.
-- **`hostNetwork`**: offered for DHCP only. Binding the node's own :53 would
-  collide with `systemd-resolved` on most distributions.
-
-Upgrading from a chart that defaulted to `LoadBalancer`: a server that never
-set `service.type` becomes `ClusterIP` and **releases its external IP**. Add
-`service: { type: LoadBalancer }` (with the same address) to each server that
-must keep serving clients before you upgrade. See the
-[chart README](https://github.com/spatiumnorth/spatiumddi/blob/main/charts/spatiumddi/README.md#exposing-dns-and-dhcp-to-clients).
+Getting client traffic to them is different for the two services, and each
+has its own section below: [Exposing DNS to clients](#exposing-dns-to-clients)
+and [Exposing DHCP to clients](#exposing-dhcp-to-clients).
 
 Pre-create the bootstrap PSK Secrets (or use `agentKey.value` inline for lab
 use only):
@@ -405,19 +388,307 @@ On an existing install, `kubectl delete sts <name> -n <ns> --cascade=orphan`
 with that command when it detects the change. See the chart README,
 [Adopting `storageClass` on an existing install](https://github.com/spatiumnorth/spatiumddi/blob/main/charts/spatiumddi/README.md#adopting-storageclass-on-an-existing-install).
 
-> **DHCPv4 needs broadcast reception on the client LAN.** Run the pod with
-> `hostNetwork: true`, or front it with a DHCP relay (option 82) pointed
-> at a LoadBalancer Service on UDP/67 you opted into. The static manifests under
-> `k8s/dhcp/` use that LoadBalancer Service: on a `NodePort` Service the
-> declared `port: 67` is in-cluster only, and the node-facing port is a
-> random 30000–32767 pick. Pinning it (`service.nodePort` in the chart)
-> only helps a relay that can forward to a non-standard port; most,
-> including `ip helper-address`, send to UDP/67 only.
-
 Per-server entry fields (`name`, `role`, `group`, `storage.*`, `storageClass`,
-`service.type`, `service.nodePort`, `hostNetwork`, `resources`, `nodeSelector`,
+`service.type`, `service.nodePort`, `hostNetwork`, the DNS-only `service.*`
+fields and `dotPort` / `dohPort` / `doqPort`, `resources`, `nodeSelector`,
 `tolerations`, `affinity`) are documented in the
 [chart README → Agents](https://github.com/spatiumnorth/spatiumddi/blob/main/charts/spatiumddi/README.md#agents) table.
+
+### Exposing DNS to clients
+
+**What a DNS agent serves.** The ports are the same for every flavor; which
+encrypted listeners exist depends on the flavor.
+
+| Port | Protocol | What | Flavors | In the Service |
+|---|---|---|---|---|
+| 53 | UDP | DNS | all | always |
+| 53 | TCP | DNS: truncated (TC) answers, large DNSSEC responses, AXFR / IXFR | all | always |
+| 853 (`dot_port`) | TCP | DNS-over-TLS | `bind9`, `technitium` | only with `servers[].dotPort` |
+| 443 (`doh_port`) | TCP | DNS-over-HTTPS, path `/dns-query` | `bind9`, `technitium` | only with `servers[].dohPort` |
+| 853 (`doq_port`) | UDP | DNS-over-QUIC | `technitium` only | only with `servers[].doqPort` |
+
+Both 53/udp and 53/tcp have to reach the server: a resolver that answers UDP
+but not TCP fails on the first response too large for one datagram. The chart
+puts both in one Service, so the address is the same for both.
+
+DoT, DoH and DoQ are off by default, and the listener ports are set on the
+server group (DNS → Server Groups → Options → Encrypted transports), not in
+the chart: see [DNS §20, Encrypted transports](../features/DNS.md).
+`dotPort` / `dohPort` / `doqPort` on a server only add the containerPort and
+Service port, so set them to the numbers you chose on the group. The chart
+refuses `doqPort` on any flavor but `technitium` (BIND9 has no QUIC listener)
+and `dotPort` / `dohPort` on `flavor: powerdns` (its DoT / DoH front is
+Docker Compose only). DoH on 443 is allowed on Kubernetes; pick another port
+(8443 is the usual choice) only if 443 on that address is already taken.
+
+**How to expose it.** The agent Services default to `ClusterIP` (#3229),
+reachable in-cluster only. Each server is its own single-replica StatefulSet
+with its own Service, so each server gets its own address; that is what you
+want for DNS, where clients are configured with two or more resolver
+addresses.
+
+- **`LoadBalancer` with a fixed address** (recommended). Set
+  `service.type: LoadBalancer`. The address is what you hand to clients, so
+  pin it: with MetalLB use the `metallb.universe.tf/loadBalancerIPs`
+  annotation (`service.annotations`), elsewhere `service.loadBalancerIP` or
+  your provider's own annotation. `service.loadBalancerSourceRanges`,
+  `service.ipFamilyPolicy` and `service.ipFamilies` are rendered when set.
+- **`NodePort`**. Port 53 is outside the NodePort range (30000–32767), so
+  clients cannot use it directly. It only works behind your own forwarder or
+  an external load balancer that listens on 53 and forwards to the node port.
+- **`hostNetwork`** is not offered for DNS agents. Binding the node's own :53
+  would collide with `systemd-resolved` on most distributions.
+
+```yaml
+dnsAgents:
+  enabled: true
+  agentKey:
+    existingSecret: spatium-dns-agent-key
+  servers:
+    - name: ns1
+      role: primary
+      group: internal-resolvers
+      service:
+        type: LoadBalancer
+        annotations:
+          metallb.universe.tf/loadBalancerIPs: 192.0.2.53
+        # externalTrafficPolicy: Local    # the chart's default for LoadBalancer
+        # loadBalancerSourceRanges: [10.0.0.0/8]
+      # Only when the group has DoT / DoH turned on, matching its ports:
+      # dotPort: 853
+      # dohPort: 443
+    - name: ns2
+      role: secondary
+      group: internal-resolvers
+      service:
+        type: LoadBalancer
+        annotations:
+          metallb.universe.tf/loadBalancerIPs: 192.0.2.54
+```
+
+**Client source addresses (`externalTrafficPolicy`).** A `LoadBalancer` DNS
+Service is rendered with `externalTrafficPolicy: Local` (#1548). Under
+`Cluster`, kube-proxy rewrites the source of every query to a node or CNI
+address, so ACLs and views match the wrong address, query logs and blocklist
+hits name the node instead of the client, and a per-client rate limit
+throttles the whole network at once. `Local` keeps the client address. Its
+cost is that only the node running the pod accepts traffic for the address.
+With one pod per Service that is no loss: MetalLB announces the address from
+that node only, and a cloud load balancer health-checks the other nodes out.
+While the pod is rescheduled the address answers nothing, which is why clients
+should have a second resolver. Set `service.externalTrafficPolicy: Cluster`
+to opt out. On a `NodePort` Service the field is rendered only when you set
+it.
+
+**UDP and TCP on one address.** One Service with 53/udp and 53/tcp is a
+mixed-protocol `LoadBalancer` Service. Kubernetes supports that on every
+version the chart runs on (it has been GA since 1.26), but the load balancer
+has to implement it too. MetalLB does. Some cloud load balancers do not, and
+leave the Service pending or serve one protocol only. The chart renders one
+Service per server, so on such a platform leave the server on `ClusterIP` and
+create your own two Services (one per protocol) with the same selector as
+the chart's Service (`kubectl get svc dns-bind9-ns1 -o yaml` shows it),
+sharing one address the way your provider documents.
+
+**k3s: do not use servicelb for port 53.** The bundled **servicelb** turns a
+`LoadBalancer` Service into an `svclb-*` pod with `hostPort: 53` on every
+node, and the CNI hostPort DNAT also captures the node's own resolver stub at
+`127.0.0.53:53`. The node then cannot resolve anything, so image pulls fail
+(`lookup ghcr.io: Try again`), local-path provisioning times out and the
+install never converges. UDP 67 for DHCP goes through the same mechanism.
+Start k3s with `--disable servicelb` and install MetalLB, or another
+implementation that does not use hostPort 53 (kube-vip, Cilium LB-IPAM). If
+servicelb already took the port, delete the Service and the `svclb-*`
+DaemonSet; `iptables -t nat -S CNI-HOSTPORT-DNAT | grep 'dports 53'` should
+then come back empty.
+
+**OpenShift.** A Route carries HTTP and TLS only, so the chart's Route serves
+the UI and nothing else: DNS needs a `LoadBalancer` Service exactly as above.
+On bare metal that means MetalLB (the MetalLB Operator); on a cloud install,
+the platform's load balancer. Nothing extra is needed for the port itself:
+the chart's DNS agent SCC already allows `NET_BIND_SERVICE`, and the pod
+binds :53 in its own network namespace (see [OpenShift](#openshift)). Only
+the `bind9` flavor runs there.
+
+**Check it.**
+
+```bash
+kubectl -n spatiumddi get svc dns-bind9-ns1     # EXTERNAL-IP is the address
+dig @192.0.2.53 www.example.com A               # UDP
+dig +tcp @192.0.2.53 www.example.com A          # TCP: must answer too
+dig @192.0.2.53 example.com AXFR                # from a host the zone allows transfers to
+
+# With DoT / DoH on, against the name in the certificate:
+kdig +tls @dns.example.com -p 853 www.example.com A
+dig +https=/dns-query @192.0.2.53 -p 443 www.example.com A
+```
+
+To confirm the client address survives, turn on query logging for the group
+and check that the logged client is your workstation, not a node or pod
+network address.
+
+Upgrading from a chart that defaulted to `LoadBalancer`: a server that never
+set `service.type` becomes `ClusterIP` and **releases its external IP**. Add
+`service: { type: LoadBalancer }` (with the same address) to each server that
+must keep serving clients before you upgrade. See the
+[chart README](https://github.com/spatiumnorth/spatiumddi/blob/main/charts/spatiumddi/README.md#exposing-dns-and-dhcp-to-clients).
+
+### Exposing DHCP to clients
+
+DHCP does not work like DNS. A client with no address sends its DISCOVER from
+`0.0.0.0` to the broadcast address `255.255.255.255`, UDP port 67, and the
+answer comes back to port 68. A broadcast stays on its own layer-2 segment:
+it is not routed into the cluster network, and neither kube-proxy nor a load
+balancer forwards it. So a Kea pod behind a Service, of any type, hears
+nothing from clients on a plain VLAN. There are two shapes that work.
+
+| Shape | Kea runs | Clients reach it through | Use when |
+|---|---|---|---|
+| **(a) Relayed** | on the pod network, behind a `LoadBalancer` Service on 67/udp | a DHCP relay on each client VLAN's gateway | the normal routed network: many VLANs, a central DHCP service |
+| **(b) Same segment** | with `hostNetwork: true` on a node attached to the client VLAN | the broadcast itself | a single flat network, a lab, or a site with no relay |
+
+#### (a) Behind a DHCP relay
+
+The router or layer-3 switch that is the gateway of each client VLAN runs a
+DHCP relay. It picks up the client's broadcast, writes its own address on
+that VLAN into the packet's `giaddr` field, and sends the packet as ordinary
+unicast UDP to port 67 of the DHCP server. Unicast is something a Service can
+carry, so a `LoadBalancer` Service works:
+
+```yaml
+dhcpAgents:
+  enabled: true
+  agentKey:
+    existingSecret: spatium-dhcp-agent-key
+  servers:
+    - name: dhcp1
+      role: primary
+      group: default
+      service: { type: LoadBalancer }
+```
+
+Then, on each client VLAN's gateway, point the relay at the Service's
+external address (`192.0.2.67` below):
+
+```text
+! Cisco IOS / IOS-XE, on each client SVI
+interface Vlan30
+ ip address 10.20.30.1 255.255.255.0
+ ip helper-address 192.0.2.67
+```
+
+Other platforms have the same function under another name: Arista EOS
+`ip helper-address` on the interface, Juniper Junos
+`forwarding-options dhcp-relay` with a `server-group`, Linux `dhcrelay`
+(`isc-dhcp-relay`) or a firewall's DHCP relay service.
+
+What has to be true for it to work:
+
+- **A scope for every relayed subnet.** Kea picks the subnet from `giaddr`,
+  so the server group needs a scope for each client subnet
+  (`10.20.30.0/24` above). If the relay's address is not inside the subnet it
+  relays for, list it under **Relay agents (giaddr)** on the scope.
+- **The group's Client reachability.** A pod-network server only ever sees
+  relayed traffic, which is what **Relay** (`dhcp_socket_mode: relay`) is
+  for. The default, **Direct**, also receives relayed packets, but needs raw
+  sockets. See [DHCP → Server Groups](../features/DHCP.md#dhcp-server-groups).
+- **The return path.** Kea answers a relayed request to `giaddr`, port 67,
+  not to the address the packet came from, so the server needs a route to
+  every relay address. The answer leaves the pod as ordinary egress traffic,
+  so its source address is whatever your CNI uses for pod egress (usually a
+  node address), not necessarily the LoadBalancer address. Firewalls between
+  the cluster and the relays must allow 67/udp from the relays to the
+  LoadBalancer address, and 67/udp from the cluster to every relay address.
+  A firewall or relay that only accepts answers from the address it forwarded
+  to may drop them; check with your CNI, or use shape (b), with the relay
+  pointed at the node, in that case.
+- **Renewals.** A client renews by unicast to the server address named in
+  its lease (option 54). If that address is not reachable from the client
+  VLAN, the client falls back to a broadcast at rebinding time, which the
+  relay forwards. Check which address your clients see as their DHCP server
+  before relying on unicast renewals.
+- **A stable address.** Relays are configured with the address, so it must
+  not change. The DHCP Service renders `service.type` and `service.nodePort`
+  only: unlike the DNS Service it takes no `annotations`, `loadBalancerIP` or
+  `externalTrafficPolicy` from values. Let the load balancer assign the
+  address from a pool (it keeps it for the life of the Service) and configure
+  the relays with what `kubectl get svc` shows, or pin it outside the chart.
+  `externalTrafficPolicy` stays at the Kubernetes default (`Cluster`), which
+  is harmless here because Kea uses `giaddr`, not the packet's source.
+- **`NodePort` is not a substitute.** `port: 67` on a NodePort Service is
+  in-cluster only; the node-facing port is a random 30000–32767 pick, or the
+  one you pin with `service.nodePort`. Most relays, `ip helper-address`
+  included, send to 67 only.
+- **k3s servicelb** breaks here the same way it does for DNS; see above.
+
+Only 67/udp is exposed. Kea's HA listener (TCP 8000) is on the headless
+Service only and is never published. For a pair, put two servers in one
+group in `hot-standby` or `load-balancing` mode, each with its own
+`LoadBalancer` Service, and configure **both** addresses on every relay (two
+`ip helper-address` lines); see
+[DHCP §14, Kea HA on a server group](../features/DHCP.md)
+for the group mode and the peer URLs.
+
+#### (b) On the same segment as the clients (`hostNetwork`)
+
+```yaml
+dhcpAgents:
+  enabled: true
+  agentKey:
+    existingSecret: spatium-dhcp-agent-key
+  servers:
+    - name: dhcp1
+      role: primary
+      group: default
+      hostNetwork: true
+      nodeSelector: { kubernetes.io/hostname: node-a }
+```
+
+With `hostNetwork: true` Kea binds UDP 67 on the node's own interfaces, so
+it hears broadcasts from every VLAN the node has an interface on, and a relay
+can also target the node's address directly. Keep the group's Client
+reachability on **Direct**. The pod still gets a `ClusterIP` Service, which
+plays no part in serving clients.
+
+This is the shape the SpatiumDDI appliance uses: its Kea runs with
+`hostNetwork`. On an appliance node with a second interface on a client
+network, a broadcast DISCOVER from that network was answered and the lease
+showed in SpatiumDDI. A request relayed by `dhcrelay` from another subnet was
+also answered, once the node had a route back to the relay's subnet: Kea
+replies to `giaddr`, so the node must be able to reach every relay address.
+
+It is rarely the right shape in a cluster: the node needs an interface on
+every client VLAN, the server is tied to that node (pin it with
+`nodeSelector`, because a pod rescheduled to another node serves a different
+set of segments), nothing else on the node may own UDP 67, and the pod gives
+up network isolation from the node. On OpenShift the chart's DHCP agent SCC
+gains `allowHostNetwork` / `allowHostPorts` as soon as any DHCP server sets
+`hostNetwork: true` (see [OpenShift](#openshift)); where cluster admins
+manage SCCs, that is an extra grant to ask for. Prefer shape (a) wherever the
+network has a relay, and for a site without one consider running the agent
+outside the cluster, next to the clients
+([`DOCKER.md` → Distributed Agent Deployments](DOCKER.md#10-distributed-agent-deployments)).
+
+#### Check it
+
+```bash
+kubectl -n spatiumddi get svc dhcp-kea-dhcp1          # EXTERNAL-IP: the relay target
+kubectl -n spatiumddi logs dhcp-kea-dhcp1-0 -f | grep -E 'DHCP4_PACKET_(RECEIVED|SEND)'
+```
+
+Renew a lease on a client in a relayed VLAN (`dhclient -v`, or
+`ipconfig /renew` on Windows) and watch the log: a `DHCP4_PACKET_RECEIVED`
+line for the DISCOVER, then a `DHCP4_PACKET_SEND` for the OFFER, and the
+lease on the group's Leases tab under DHCP. Packet logging is on by default
+(`kea_packet_logging` on the group). How to read the result:
+
+- **Nothing received**: the relay is not reaching the Service. Check the
+  helper address, routing to the LoadBalancer address, and the firewall
+  (67/udp towards the cluster).
+- **Received, nothing sent**: Kea has no scope matching the `giaddr`, or the
+  scope's pool is exhausted.
+- **Sent, but the client gets nothing**: the answer is lost on the way back
+  to the relay. Check 67/udp from the node addresses to the relay.
 
 ---
 
