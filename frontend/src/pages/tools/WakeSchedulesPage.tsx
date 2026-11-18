@@ -46,6 +46,7 @@ import {
 import { cn } from "@/lib/utils";
 import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { isValidTimeZone, timeZoneSuggestions } from "@/lib/timezones";
 
 // ─────────────────────────────────────────────────────────────────────
 // Scheduled Wake-on-LAN (#586 Phase 1) — Tools page.
@@ -1879,23 +1880,10 @@ const browserTz = (() => {
 })();
 
 function useIanaTimezones(): string[] {
-  return useMemo(() => {
-    type IntlWithList = typeof Intl & {
-      supportedValuesOf?: (key: "timeZone") => string[];
-    };
-    const I = Intl as IntlWithList;
-    if (typeof I.supportedValuesOf === "function") {
-      try {
-        return I.supportedValuesOf("timeZone");
-      } catch {
-        return ["UTC"];
-      }
-    }
-    return ["UTC"];
-  }, []);
+  return useMemo(() => timeZoneSuggestions(), []);
 }
 
-function WolScheduleModal({
+export function WolScheduleModal({
   existing,
   onClose,
   onSaved,
@@ -1976,7 +1964,7 @@ function WolScheduleModal({
 
   const [error, setError] = useState<string | null>(null);
   const ianaList = useIanaTimezones();
-  const tzValid = ianaList.includes(timezone.trim());
+  const tzValid = isValidTimeZone(timezone);
 
   const selector: WolTargetSelector = useMemo(
     () => ({
