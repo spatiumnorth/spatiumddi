@@ -1140,6 +1140,7 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
   const [clientIp, setClientIp] = useState<string>("");
   const [view, setView] = useState<string>("");
   const [rcode, setRcode] = useState<string>("");
+  const [answerSource, setAnswerSource] = useState<string>("");
 
   useEffect(() => {
     if (sources.length === 0) {
@@ -1169,6 +1170,7 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
       debouncedClientIp,
       view,
       rcode,
+      answerSource,
     ],
     queryFn: () =>
       logsApi.dnsQueries({
@@ -1180,6 +1182,7 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
         client_ip: debouncedClientIp.trim() || null,
         view: view.trim() || null,
         rcode: rcode.trim() || null,
+        answer_source: answerSource || null,
       }),
     enabled,
     staleTime: 5_000,
@@ -1260,6 +1263,24 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
             <option value="UNKNOWN">Unrecorded</option>
           </select>
         </label>
+        {/* Answer-source filter (#4251). Only servers whose log reports it
+            (PowerDNS Authoritative today) have values; BIND9 rows are all
+            "Not reported". */}
+        <label className="flex items-center gap-1.5 text-xs">
+          <span className="text-muted-foreground">Answered by</span>
+          <select
+            value={answerSource}
+            onChange={(e) => setAnswerSource(e.target.value)}
+            className="rounded-md border bg-background px-2 py-1 text-sm"
+          >
+            <option value="">Any</option>
+            <option value="authoritative">Authoritative</option>
+            <option value="cache">Cache</option>
+            <option value="forwarded">Forwarded</option>
+            <option value="recursion">Recursion</option>
+            <option value="unknown">Not reported</option>
+          </select>
+        </label>
         <label className="flex items-center gap-1.5 text-xs">
           <span className="inline-flex items-center gap-1 text-muted-foreground">
             <Calendar className="h-3 w-3" />
@@ -1285,7 +1306,13 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
         <MaxEventsPicker value={maxEvents} onChange={setMaxEvents} />
         <FilterSearch value={q} onChange={setQ} />
         <div className="ml-auto flex items-center gap-2">
-          {(q || qtype || clientIp || view || rcode || since) && (
+          {(q ||
+            qtype ||
+            clientIp ||
+            view ||
+            rcode ||
+            answerSource ||
+            since) && (
             <button
               type="button"
               onClick={() => {
@@ -1294,6 +1321,7 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
                 setClientIp("");
                 setView("");
                 setRcode("");
+                setAnswerSource("");
                 setSince("");
               }}
               title="Clear all filters"
@@ -1998,6 +2026,13 @@ function describeRcode(
   return { label: rcode, note: "" };
 }
 
+const ANSWER_SOURCE_LABELS: Record<string, string> = {
+  authoritative: "Authoritative",
+  cache: "Cache",
+  forwarded: "Forwarded",
+  recursion: "Recursion",
+};
+
 function DNSQueryDetailModal({
   row,
   onClose,
@@ -2056,6 +2091,29 @@ function DNSQueryDetailModal({
         </DetailField>
         <DetailField label="Answers" mono>
           {answers ?? <Missing />}
+        </DetailField>
+        <DetailField label="Answered by">
+          {row.answer_source ? (
+            <span data-testid="dns-answer-source" className="font-medium">
+              {ANSWER_SOURCE_LABELS[row.answer_source] ?? row.answer_source}
+              {row.answer_upstream && (
+                <span className="font-mono"> via {row.answer_upstream}</span>
+              )}
+            </span>
+          ) : (
+            <span
+              data-testid="dns-answer-source"
+              className="italic text-muted-foreground"
+            >
+              not reported
+            </span>
+          )}
+          {!row.answer_source && (
+            <span className="mt-0.5 block text-xs text-muted-foreground">
+              This server&apos;s log does not say whether the answer came from
+              cache, a zone it serves, or an upstream resolver.
+            </span>
+          )}
         </DetailField>
         <DetailField label="Flags" mono>
           {row.flags ?? <Missing />}

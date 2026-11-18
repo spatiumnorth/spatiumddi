@@ -3281,6 +3281,25 @@ omitting them, and the copilot tool spells the reason out in the field
 itself. A server with the toggle off shows one honest bar instead of an
 empty panel that reads as "no failures".
 
+### 21.3a How the answer was produced (issue #4251)
+
+`dns_query_log_entry.answer_source` (`authoritative` / `cache` /
+`forwarded` / `recursion`) and `answer_upstream` say how the server
+produced the answer. The details modal shows them as "Answered by" and
+the filter bar filters on them (`answer_source` on
+`POST /api/v1/logs/dns-queries`; the value `unknown` selects rows with none).
+
+| Driver | `answer_source` |
+|---|---|
+| PowerDNS Authoritative | yes, from its own per-query verdict: `packetcache HIT` is `cache`; a non-empty `N RR(s)` answer is `authoritative`. `0 RR(s)` is left unknown, since it is NXDOMAIN, NODATA or REFUSED and the line does not say which |
+| BIND9 | no. The `queries` and `responses` categories carry nothing about cache, zone or upstream (the trailing address is the interface the query arrived on). Reporting it needs dnstap, which the BIND image is not built with; tracked in #3580 |
+| Technitium, Windows DNS, cloud drivers | no query log shipped |
+
+`NULL` means the server did not say, never "authoritative": nothing is
+inferred from zone membership or the rcode. `answer_upstream` is stored
+and returned but no driver fills it yet; it is the slot for dnstap's
+forwarder / resolver addresses.
+
 ### 21.4 Individual RPZ hits
 
 `GET /api/v1/dns-threat/rpz/hits` returns the per-hit rows behind the
