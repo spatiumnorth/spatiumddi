@@ -1,7 +1,8 @@
 """spatiumddi#1255 — the lease-expiry sweep and BGP containment queries have indexes.
 
-Planner choice is not asserted from cost: ``enable_seqscan = off`` makes an
-unusable index the only way the assertion can fail.
+Planner choice is not asserted from cost: ``enable_seqscan = off`` (and, for
+the lease sweep, dropping the competing index in-transaction) makes a missing
+or unusable index the only way the assertion can fail.
 """
 
 from __future__ import annotations
@@ -25,6 +26,12 @@ async def _plan(db: AsyncSession, stmt) -> str:  # type: ignore[no-untyped-def]
 
 @pytest.mark.asyncio
 async def test_lease_expiry_sweep_uses_partial_index(db_session: AsyncSession) -> None:
+    # On an empty table the planner ties between this partial index and the
+    # plain ``ix_dhcp_lease_state`` and picks the latter. Dropping the rival
+    # inside the test's transaction (rolled back by ``db_session``) leaves the
+    # partial index as the only index able to serve the sweep, so the
+    # assertion fails if it is missing instead of depending on cost.
+    await db_session.execute(text("DROP INDEX ix_dhcp_lease_state"))
     stmt = select(DHCPLease.id).where(
         DHCPLease.state == "active", DHCPLease.expires_at < text("now()")
     )
