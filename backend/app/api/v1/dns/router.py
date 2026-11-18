@@ -135,7 +135,7 @@ from app.services.agents.daemon_state import is_not_serving
 from app.services.agents.spool_status import SpoolStatus
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteZoneArgs
-from app.services.api_token_scopes import read_only_post, token_outbound
+from app.services.api_token_scopes import read_only_post, token_outbound, token_write
 from app.services.appliance.group_names import (
     group_assigned_to_appliance,
     group_name_problem,
@@ -9179,6 +9179,7 @@ async def apply_template_preview(
     return _template_preview(zone, template, classified)
 
 
+@token_write("Creates the template's missing records in the zone and queues their DNS ops")
 @router.post(
     "/groups/{group_id}/zones/{zone_id}/apply-template",
     response_model=ApplyTemplateResult,

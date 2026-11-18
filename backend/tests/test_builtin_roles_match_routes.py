@@ -187,6 +187,8 @@ OPEN_DNS_DHCP_WRITES: frozenset[tuple[str, str]] = frozenset(
     }
     | {
         ("POST", f"{_DNS}/groups/{{group_id}}/zones/{{zone_id}}/records/bulk-delete"),
+        ("POST", f"{_DNS}/groups/{{group_id}}/zones/{{zone_id}}/apply-template"),
+        ("POST", f"{_DNS}/groups/{{group_id}}/zones/{{zone_id}}/apply-template/preview"),
         ("POST", f"{_DNS}/groups/{{group_id}}/zones/{{zone_id}}/delegate-from-parent"),
         ("POST", f"{_DNS}/groups/{{group_id}}/zones/{{zone_id}}/import/preview"),
         ("POST", f"{_DNS}/groups/{{group_id}}/zones/{{zone_id}}/import/spreadsheet/preview"),
