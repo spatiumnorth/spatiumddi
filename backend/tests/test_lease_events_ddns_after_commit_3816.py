@@ -416,6 +416,40 @@ async def test_a_chunk_that_runs_out_of_hold_leaves_the_rest_for_the_next(
 
 
 @pytest.mark.asyncio
+async def test_a_regrant_between_commit_and_publish_is_not_published_4439(
+    concurrent_client: AsyncClient,  # noqa: F811
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other member re-grants the address to another client after this
+    batch committed: the older client's name must not reach DNS."""
+    from sqlalchemy import update
+
+    import app.api.v1.dhcp.agents as agents
+    from app.models.dhcp import DHCPLease
+
+    subnet, _block = await _ddns_subnet(db_session)
+    peer_a, _peer_b = await _two_agents(db_session, [subnet])
+    zone_id = uuid.UUID(str(subnet.dns_zone_id))
+    ip = _A_IPS[0]
+    real = agents._publish_deferred_ddns
+
+    async def _regranted(*args: Any, **kwargs: Any) -> Any:
+        await db_session.execute(
+            update(DHCPLease)
+            .where(DHCPLease.ip_address == ip)
+            .values(hostname="host-b", mac_address="aa:bb:cc:00:00:99")
+        )
+        await db_session.commit()
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(agents, "_publish_deferred_ddns", _regranted)
+    resp = await _post(concurrent_client, peer_a, [_ev(ip, "host-a")])
+    assert resp.status_code == 200, resp.text
+    assert await _a_records(db_session, zone_id) == []
+
+
+@pytest.mark.asyncio
 async def test_a_replayed_batch_of_quiet_renewals_takes_no_zone_lock_4438(
     concurrent_client: AsyncClient,  # noqa: F811
     db_session: AsyncSession,

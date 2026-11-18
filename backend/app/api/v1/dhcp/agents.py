@@ -2053,6 +2053,10 @@ async def agent_lease_events(
 
     # ── IPAM mirror pass ────────────────────────────────────────────────
     deferred_ddns: dict[tuple[Any, str], tuple[Any, str | None]] = {}
+    # What each deferred name's last event granted (#4439), so the publish
+    # re-checks the address's current lease: the other HA member may re-grant
+    # it to another client between this commit and the publish.
+    deferred_grants: dict[tuple[Any, str], tuple[str | None, str | None]] = {}
     for idx, ev in enumerate(events):
         if idx in stale:
             continue  # replayed grant of a lease another client has superseded (#2391)
@@ -2110,7 +2114,9 @@ async def agent_lease_events(
             # transactions after this one commits. The last event of an
             # address names the hostname.
             if ipam_row is not None and ipam_row.auto_from_lease and idx not in ddns_quiet:
-                deferred_ddns[(subnet.id, norm_ip(ev.ip_address))] = (subnet, ev.hostname)
+                dkey = (subnet.id, norm_ip(ev.ip_address))
+                deferred_ddns[dkey] = (subnet, ev.hostname)
+                deferred_grants[dkey] = (ev.mac_address, ev.hostname)
 
             # Auto-profile (Phase 1: active layer). Subnet-level opt-in;
             # the service applies the refresh-window dedupe + per-subnet
@@ -2240,7 +2246,7 @@ async def agent_lease_events(
     # its row locks, and a batch without them never waits for that lock.
     await recount_subnets_and_blocks(db, recount_ids, audit_lock=False)
     await db.commit()
-    await _publish_deferred_ddns(db, deferred_ddns, server_id=server_id)
+    await _publish_deferred_ddns(db, deferred_ddns, server_id=server_id, grants=deferred_grants)
     return {"upserted": upserted}
 
 
@@ -2315,10 +2321,14 @@ async def _still_granted(
     for key, row in by_key.items():
         lease = current.get(key[1])
         mac, hostname = grants[key]
+        # A grant with no MAC (a v6 report before the hardware address is
+        # known, #1141) names the lease by hostname alone.
         if (
             lease is not None
-            and (str(lease.mac_address).lower() if lease.mac_address else None)
-            == (mac.lower() if mac else None)
+            and (
+                not mac
+                or (str(lease.mac_address).lower() if lease.mac_address else None) == mac.lower()
+            )
             and lease.hostname == hostname
         ):
             kept[key] = row
@@ -2387,11 +2397,12 @@ async def _publish_deferred_ddns(
     quiet renewal and publishes it. An agent replay of the batch is a
     duplicate by its receipt and writes nothing twice.
 
-    ``grants`` (the replay of a duplicate batch) maps each key to the (MAC,
-    hostname) that batch granted: a name is published only if this server's
-    current lease for the address still carries both, read under the same
-    locks. A later batch that renamed or reassigned the client has published
-    it, and its publish is the authoritative one.
+    ``grants`` maps each key to the (MAC, hostname) the batch's last event for
+    the address granted (the batch's own publish, #4439, and the replay of a
+    duplicate batch): a name is published only if this server's current lease
+    for the address still carries both, read under the same locks. A later
+    batch that renamed or reassigned the client (the other HA member's
+    re-grant) has published it, and its publish is the authoritative one.
 
     A replay also skips what the first pass skipped (#4438): an address whose
     DDNS would write nothing takes no zone lock."""
