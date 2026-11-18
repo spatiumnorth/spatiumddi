@@ -60,7 +60,9 @@ class StreamAuthGuard:
     request) and call :meth:`still_authorized` from the stream generator
     before each send. ``permission`` is an ``(action, resource_type)`` pair
     re-checked alongside authentication, or ``None`` for a stream that needs
-    only a signed-in caller.
+    only a signed-in caller. ``superadmin_only`` re-checks the superadmin flag
+    instead, for a stream whose route is superadmin-gated (#3761): a permission
+    pair would let a caller demoted mid-stream keep receiving it through a role.
     """
 
     def __init__(
@@ -69,9 +71,11 @@ class StreamAuthGuard:
         *,
         permission: tuple[str, str] | None,
         credential: str | None = None,
+        superadmin_only: bool = False,
     ) -> None:
         self._request = request
         self._permission = permission
+        self._superadmin_only = superadmin_only
         self._credential = credential if credential is not None else bearer_from_request(request)
         now = time.monotonic()
         # The route's dependency has just authorised the request, so the
@@ -98,9 +102,12 @@ class StreamAuthGuard:
                 user = await authenticate_bearer(
                     db, self._credential, self._request, record_activity=False
                 )
-                allowed = self._permission is None or user_has_permission(
-                    user, self._permission[0], self._permission[1]
-                )
+                if self._superadmin_only:
+                    allowed = bool(user.is_superadmin)
+                else:
+                    allowed = self._permission is None or user_has_permission(
+                        user, self._permission[0], self._permission[1]
+                    )
         except HTTPException as exc:
             logger.info(
                 "stream_auth_revoked",

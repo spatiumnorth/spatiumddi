@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import func, inspect, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import Select
 
@@ -51,6 +51,29 @@ class Page[T](BaseModel):
     page_size: int
 
 
+def with_pk_tiebreak(base: Select[Any]) -> Select[Any]:
+    """Return ``base`` with the first entity's primary key appended to its ORDER BY.
+
+    Offset paging is only stable when the ordering is total. A sort on a
+    non-unique column (``last_seen_at``, ``expired_at``, ``name``) leaves rows
+    that share a value free to land on either side of a page boundary from one
+    request to the next, so a client walking the pages skips or repeats rows
+    (#4149: 41 of ~3,900 leases "missing" while a Kea server was ingesting).
+    Ending the ordering in the primary key makes it total without changing the
+    requested sort. A no-op when the select has no ORDER BY (the caller asked
+    for no order) or already orders by every key column.
+    """
+    if not base._order_by_clauses:
+        return base
+    entity = base.column_descriptions[0].get("entity") if base.column_descriptions else None
+    if entity is None:
+        return base
+    pk_cols = list(inspect(entity).primary_key)
+    present = {getattr(c, "element", c) for c in base._order_by_clauses}
+    missing = [c for c in pk_cols if c not in present]
+    return base.order_by(*missing) if missing else base
+
+
 async def paginate(
     db: AsyncSession, base: Select[Any], *, page: int, page_size: int
 ) -> tuple[list[Any], int]:
@@ -60,9 +83,19 @@ async def paginate(
     counted with the ordering stripped (it's irrelevant to a count and lets
     Postgres skip the sort); the returned slice keeps the order and applies
     ``LIMIT``/``OFFSET``. Callers map the scalar rows to their response model.
+
+    The ORDER BY is made total with the entity's primary key (see
+    :func:`with_pk_tiebreak`). Offset paging over a set that is being written
+    can still move a row whose *sort key* changes between requests (a renewed
+    lease's ``last_seen_at``); that is inherent to offset paging, see
+    docs/API.md section 6.
     """
     total = (
         await db.execute(select(func.count()).select_from(base.order_by(None).subquery()))
     ).scalar_one()
-    rows = (await db.execute(base.limit(page_size).offset((page - 1) * page_size))).scalars().all()
+    rows = (
+        (await db.execute(with_pk_tiebreak(base).limit(page_size).offset((page - 1) * page_size)))
+        .scalars()
+        .all()
+    )
     return list(rows), total
