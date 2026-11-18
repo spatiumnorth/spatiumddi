@@ -15,6 +15,7 @@ import pathlib
 import pytest
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
+from alembic.script import ScriptDirectory
 from sqlalchemy import Connection, inspect, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -63,9 +64,14 @@ def _run(conn: Connection, fn_name: str) -> None:
         getattr(mod, fn_name)()
 
 
-def test_the_migration_is_chained_and_covers_exactly_the_four_columns() -> None:
+def test_the_migration_is_reachable_from_head_and_covers_exactly_the_four_columns() -> None:
     mod = _migration()
-    assert mod.down_revision == "b6d2e9f41a07"
+    script = ScriptDirectory(str(_PATH.parents[1]))
+    assert mod.revision in {r.revision for r in script.walk_revisions()}
+    assert len(script.get_heads()) == 1
+    assert script.get_revision(script.get_heads()[0]) is not None
+    ancestors = {r.revision for r in script.iterate_revisions(script.get_heads()[0], "base")}
+    assert mod.revision in ancestors
     assert set(mod._COLUMNS) == _COLUMNS
     assert {c for _t, c, _ty in DROPPED_UNMAPPED_COLUMNS} == _COLUMNS
 
