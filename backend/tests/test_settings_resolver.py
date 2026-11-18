@@ -117,6 +117,7 @@ async def test_put_resolver_persists_audits_wakes(
     assert rows[0].action == "update"
     assert rows[0].new_value["mode"] == "override"
     assert rows[0].new_value["servers"] == ["1.1.1.1", "9.9.9.9"]
+    assert "servers" in rows[0].changed_fields
 
 
 @pytest.mark.asyncio

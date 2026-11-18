@@ -34,6 +34,7 @@ import {
 } from "@/hooks/usePermissions";
 import { secondsFieldError, SYNC_INTERVAL_BOUNDS } from "@/lib/seconds";
 import { CredentialChip } from "@/components/CredentialChip";
+import { FormError } from "@/components/ui/form-error";
 
 // ── Setup guide ─────────────────────────────────────────────────────
 // One-shot snippet operators can paste into the Tailscale admin
@@ -725,7 +726,9 @@ function TenantModal({
           </label>
         </div>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 pt-2">
           <button

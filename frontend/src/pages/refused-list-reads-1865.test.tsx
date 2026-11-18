@@ -46,7 +46,13 @@ vi.mock("@/lib/api", async () => {
       listPolicies: () => lists.policies(),
     },
     vrfsApi: { ...actual.vrfsApi, list: () => lists.vrfs() },
-    requestsApi: { ...actual.requestsApi, list: () => lists.requests() },
+    requestsApi: {
+      ...actual.requestsApi,
+      listPage: async () => {
+        const items = await lists.requests();
+        return { items, total: items.length };
+      },
+    },
     kubernetesApi: {
       ...actual.kubernetesApi,
       listClusters: () => lists.clusters(),
