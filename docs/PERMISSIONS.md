@@ -114,6 +114,7 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `nat_mapping`     | NAT mappings (1:1, PAT, hide) recorded against IPAM addresses and subnets |
 | `dnsbl`           | DNS blocklist (DNSBL) reputation checks — the `/api/v1/dnsbl/` routes, behind the `security.dnsbl` module |
 | `e911_location`   | E911 dispatchable location (#972) — Emergency Response Locations, bindings, resolver lookups and the HELD / provisioning surfaces (`/api/v1/e911/`), behind the `network.e911` module |
+| `e911_resolution_log` | The E911 lookup trail (#3598) — who looked up which device's location, and what they were told (`/api/v1/e911/resolution-log`, the Trail tab, the `find_e911_resolutions` copilot tool). Per-person location history, so it is **separate from `e911_location`** and granted to no builtin role: only a superadmin or a wildcard `read` on `*` (the Viewer) reads it. Read-only; every read is audited |
 | `use_network_tools` | The Tools page (ping / traceroute / dig / whois and the rest), plus Wake-on-LAN sends |
 | `*`               | Wildcard — match any resource type                    |
 

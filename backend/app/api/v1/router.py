@@ -50,6 +50,7 @@ from app.api.v1.dnsbl import router as dnsbl_router
 from app.api.v1.docker import router as docker_router
 from app.api.v1.domains import router as domains_router
 from app.api.v1.e911 import router as e911_router
+from app.api.v1.e911.resolution_log import router as e911_resolution_log_router
 from app.api.v1.firewall_feeds.router import public_router as firewall_feeds_public_router
 from app.api.v1.firewall_feeds.router import router as firewall_feeds_router
 from app.api.v1.fortinet.router import router as fortinet_router
@@ -291,6 +292,14 @@ api_v1_router.include_router(
     prefix="/e911",
     tags=["e911"],
     dependencies=[Depends(require_module("network.e911")), Depends(wake_publishing)],
+)
+# The resolution trail (#3598) has its own permission, so it is its own router
+# rather than a route on the one gated on ``e911_location``.
+api_v1_router.include_router(
+    e911_resolution_log_router,
+    prefix="/e911",
+    tags=["e911"],
+    dependencies=[Depends(require_module("network.e911"))],
 )
 include_token_scoped(
     api_v1_router,

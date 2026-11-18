@@ -103,7 +103,7 @@ function Chip({
 
 // ── Page ─────────────────────────────────────────────────────────────
 
-type Tab = "locations" | "bindings" | "lookup";
+type Tab = "locations" | "bindings" | "lookup" | "trail";
 
 export function E911Page() {
   const { enabled, ready } = useFeatureModules();
@@ -113,6 +113,9 @@ export function E911Page() {
   // that 404s behind the module gate.
   const canQuery = ready && e911Enabled;
   const [tab, setTab] = useState<Tab>("locations");
+  // The trail is per-person location history behind its own grant (#3598);
+  // the tab is not offered to an account that cannot read it.
+  const canReadTrail = usePermissions().can("read", "e911_resolution_log");
 
   if (ready && !e911Enabled) {
     return (
@@ -157,6 +160,7 @@ export function E911Page() {
           { key: "locations" as Tab, label: "Locations" },
           { key: "bindings" as Tab, label: "Bindings" },
           { key: "lookup" as Tab, label: "Lookup" },
+          ...(canReadTrail ? [{ key: "trail" as Tab, label: "Trail" }] : []),
         ]}
         active={tab}
         onChange={setTab}
@@ -165,6 +169,7 @@ export function E911Page() {
       {tab === "locations" && <LocationsTab canQuery={canQuery} />}
       {tab === "bindings" && <BindingsTab canQuery={canQuery} />}
       {tab === "lookup" && <LookupTab canQuery={canQuery} />}
+      {tab === "trail" && canReadTrail && <TrailTab canQuery={canQuery} />}
     </div>
   );
 }
@@ -1189,6 +1194,220 @@ function BindingModal({
         </div>
       </form>
     </Modal>
+  );
+}
+
+// ── Trail ────────────────────────────────────────────────────────────
+
+function TrailTab({ canQuery }: { canQuery: boolean }) {
+  const [page, setPage] = useState(1);
+  const [identity, setIdentity] = useState("");
+  const [confidence, setConfidence] = useState<
+    "" | "observed" | "degraded" | "none"
+  >("");
+  const [since, setSince] = useState("");
+  const [until, setUntil] = useState("");
+  const [error, setError] = useState("");
+
+  // A date input yields a local day; the API takes an instant.
+  const filters = {
+    identity: identity || undefined,
+    confidence: confidence || undefined,
+    since: since ? new Date(`${since}T00:00:00`).toISOString() : undefined,
+    until: until ? new Date(`${until}T23:59:59`).toISOString() : undefined,
+  };
+
+  const query = useQuery({
+    queryKey: ["e911-trail", page, identity, confidence, since, until],
+    queryFn: () =>
+      e911Api.listResolutionLog({
+        ...filters,
+        limit: PAGE_SIZE,
+        offset: (page - 1) * PAGE_SIZE,
+      }),
+    enabled: canQuery,
+  });
+
+  const exportGate = permissionGate(
+    !isRefused(query.error),
+    "Requires read permission on e911_resolution_log",
+  );
+  const runExport = async () => {
+    setError("");
+    try {
+      await e911Api.downloadResolutionLog(filters);
+    } catch (e) {
+      setError(exportErrorMessage(e, "the lookup trail CSV"));
+    }
+  };
+
+  const items = query.data?.items ?? [];
+
+  return (
+    <div>
+      <p className="mb-3 text-sm text-muted-foreground">
+        Every location lookup: who asked, about which device, and what they were
+        told. Viewing this page is itself recorded in the audit log.
+      </p>
+      <div className="mb-3 flex min-w-0 flex-wrap items-center gap-2">
+        <div className="relative min-w-0 flex-1">
+          <Search className="absolute left-2 top-2.5 h-4 w-4 text-muted-foreground" />
+          <input
+            value={identity}
+            onChange={(e) => {
+              setIdentity(e.target.value);
+              setPage(1);
+            }}
+            placeholder="IP, MAC or port looked up…"
+            className="w-full rounded-md border bg-background py-1.5 pl-8 pr-2 text-sm"
+          />
+        </div>
+        <select
+          value={confidence}
+          onChange={(e) => {
+            setConfidence(e.target.value as typeof confidence);
+            setPage(1);
+          }}
+          aria-label="Outcome"
+          className="shrink-0 rounded-md border bg-background px-2 py-1.5 text-sm"
+        >
+          <option value="">Any outcome</option>
+          <option value="observed">Observed</option>
+          <option value="degraded">Degraded</option>
+          <option value="none">No location</option>
+        </select>
+        <input
+          type="date"
+          value={since}
+          onChange={(e) => {
+            setSince(e.target.value);
+            setPage(1);
+          }}
+          aria-label="From date"
+          className="shrink-0 rounded-md border bg-background px-2 py-1.5 text-sm"
+        />
+        <input
+          type="date"
+          value={until}
+          onChange={(e) => {
+            setUntil(e.target.value);
+            setPage(1);
+          }}
+          aria-label="To date"
+          className="shrink-0 rounded-md border bg-background px-2 py-1.5 text-sm"
+        />
+        <HeaderButton onClick={() => void query.refetch()}>
+          <RefreshCw className="h-4 w-4" /> Refresh
+        </HeaderButton>
+        <HeaderButton
+          onClick={() => void runExport()}
+          {...exportGate}
+          title="The lookups matching these filters, as CSV (the export is audited too)"
+        >
+          <Download className="h-4 w-4" /> CSV
+        </HeaderButton>
+      </div>
+
+      <FormError className="mb-2 text-sm text-rose-600">{error}</FormError>
+      {query.isError && (
+        <FormError className="mb-2 text-sm text-rose-600">
+          {formatApiError(query.error)}
+        </FormError>
+      )}
+
+      <div className="overflow-x-auto rounded-md border">
+        <table className="w-full min-w-[56rem] text-sm">
+          <thead className="bg-muted/50 text-left">
+            <tr>
+              <th className="px-3 py-2">Time</th>
+              <th className="px-3 py-2">Looked up</th>
+              <th className="px-3 py-2">Asked by</th>
+              <th className="px-3 py-2">Location returned</th>
+              <th className="px-3 py-2">Outcome</th>
+              <th className="px-3 py-2 text-right">Evidence age</th>
+            </tr>
+          </thead>
+          <tbody>
+            {query.isLoading && (
+              <tr>
+                <td
+                  colSpan={6}
+                  className="px-3 py-6 text-center text-muted-foreground"
+                >
+                  Loading…
+                </td>
+              </tr>
+            )}
+            {!query.isLoading && !query.isError && items.length === 0 && (
+              <tr>
+                <td
+                  colSpan={6}
+                  className="px-3 py-6 text-center text-muted-foreground"
+                >
+                  No lookups match.
+                </td>
+              </tr>
+            )}
+            {items.map((r) => (
+              <tr key={r.id} className="border-t align-top">
+                <td className="whitespace-nowrap px-3 py-2 tabular-nums">
+                  {new Date(r.queried_at).toLocaleString()}
+                </td>
+                <td className="px-3 py-2 font-mono text-xs">
+                  {r.identity_value}
+                  <span className="ml-1 text-muted-foreground">
+                    ({r.identity_kind})
+                  </span>
+                </td>
+                <td className="px-3 py-2">
+                  {r.actor_label ?? r.actor_id ?? r.actor_kind}
+                  <span className="ml-1 text-xs text-muted-foreground">
+                    {r.actor_kind}
+                    {r.source_ip ? ` · ${r.source_ip}` : ""}
+                  </span>
+                </td>
+                <td className="px-3 py-2">
+                  {r.kind === "counter" ? (
+                    <span className="text-muted-foreground">
+                      {r.suppressed_count} lookups not individually logged
+                    </span>
+                  ) : (
+                    <>
+                      {r.erl_name ?? "—"}
+                      {r.rule_matched && (
+                        <span className="ml-1 text-xs text-muted-foreground">
+                          via {E911_RULE_LABELS[r.rule_matched as E911RuleKind]}
+                        </span>
+                      )}
+                    </>
+                  )}
+                </td>
+                <td className="px-3 py-2">
+                  {r.confidence}
+                  {r.degraded_reason && (
+                    <div className="text-xs text-muted-foreground">
+                      {r.degraded_reason}
+                    </div>
+                  )}
+                </td>
+                <td className="px-3 py-2 text-right tabular-nums">
+                  {r.evidence_age_seconds != null
+                    ? `${r.evidence_age_seconds}s`
+                    : "—"}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <Pager
+        page={page}
+        total={query.data?.total ?? 0}
+        pageSize={PAGE_SIZE}
+        onChange={setPage}
+      />
+    </div>
   );
 }
 
