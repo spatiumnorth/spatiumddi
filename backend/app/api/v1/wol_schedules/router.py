@@ -52,7 +52,7 @@ from sqlalchemy.orm import selectinload
 from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
 from app.core.crypto import encrypt_str
-from app.core.permissions import require_any_resource_permission
+from app.core.permissions import require_any_resource_permission, user_has_permission
 from app.core.stored_secret_guard import require_secret_with_destination_change
 from app.models.auth import Group, User
 from app.models.ipam import Subnet
@@ -808,12 +808,13 @@ async def get_run(run_id: uuid.UUID, db: DB, current_user: CurrentUser) -> WakeR
 @router.get(
     "/calendars",
     response_model=list[WakeCalendarRead],
-    # Also ``wol_schedule``: the schedule editor's calendar picker lists them.
+    # Also ``wol_schedule``: the schedule editor's calendar picker lists them,
+    # without the address or username unless the caller can read calendars.
     dependencies=[Depends(_gate(CALENDAR_TYPE, RESOURCE_TYPE))],
 )
 async def list_calendars(
     db: DB,
-    current_user: CurrentUser,  # noqa: ARG001
+    current_user: CurrentUser,
     enabled: bool | None = Query(None),
 ) -> list[WakeCalendarRead]:
     stmt = select(WolCalendar)
@@ -821,7 +822,14 @@ async def list_calendars(
         stmt = stmt.where(WolCalendar.enabled.is_(enabled))
     stmt = stmt.order_by(WolCalendar.name.asc())
     rows = list((await db.execute(stmt)).scalars().all())
-    return [_to_calendar_read(r) for r in rows]
+    out = [_to_calendar_read(r) for r in rows]
+    # A schedule editor only needs the picker fields. The address and username
+    # go to callers who could fetch the calendar by id.
+    if not user_has_permission(current_user, "read", CALENDAR_TYPE):
+        for item in out:
+            item.url = ""
+            item.username = None
+    return out
 
 
 @router.post(
