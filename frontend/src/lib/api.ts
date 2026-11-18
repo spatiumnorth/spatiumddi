@@ -6073,7 +6073,7 @@ export interface DNSZone {
   // #1762 — signed on a group with more than one DNS server, each signing
   // with its own keys (validating resolvers SERVFAIL on the mismatch).
   dnssec_multi_signer?: boolean;
-  /** #1783 - signed on a Technitium group; SpatiumDDI won't keep it signed (#1767). */
+  /** Signed on an agentless Technitium API group; SpatiumDDI won't keep it signed. */
   dnssec_unmanaged_warning?: boolean;
   auto_tls_probe?: boolean;
   dnssec_policy_id?: string | null;
@@ -6228,6 +6228,10 @@ export interface DelegationPreview {
   existing_glue_records: DelegationRecord[];
   warnings: string[];
   child_apex_ns_count: number;
+  // The view the parent zone is pinned to; null renders in every view (#4389).
+  parent_view_name?: string | null;
+  // Rows that would sit beside a CNAME in the parent; apply refuses (#4388).
+  cname_conflicts?: string[];
 }
 
 export type DelegationPreviewResponse =
@@ -6498,7 +6502,7 @@ export interface ZoneDnssecInfo {
   // #1762 — see Zone.dnssec_multi_signer; signing_servers is the group's count.
   dnssec_multi_signer?: boolean;
   signing_servers?: number;
-  // #1783 - the group runs Technitium; sign / re-sign are refused (#1767).
+  // The group runs the agentless Technitium API driver; sign / re-sign are refused.
   signing_unmanaged?: boolean;
   dnssec_unmanaged_warning?: boolean;
 }
@@ -12107,6 +12111,30 @@ export const changeRequestsApi = {
     api
       .get<ChangeRequest[]>("/change-requests", { params })
       .then((r) => r.data),
+  // One window plus the number matching the filter (X-Total-Count), so the
+  // admin queue can say how many it did not draw (#4383). ``states`` is sent
+  // as the API's comma list.
+  listPage: (
+    params: Omit<ChangeRequestListParams, "state"> & {
+      states?: ChangeRequestState[];
+    } = {},
+  ) => {
+    const { states, ...rest } = params;
+    return api
+      .get<ChangeRequest[]>("/change-requests", {
+        params: {
+          ...rest,
+          ...(states?.length ? { state: states.join(",") } : {}),
+        },
+      })
+      .then((r) => {
+        const header = Number(r.headers?.["x-total-count"]);
+        return {
+          items: r.data,
+          total: Number.isFinite(header) ? header : r.data.length,
+        };
+      });
+  },
   get: (id: string) =>
     api.get<ChangeRequest>(`/change-requests/${id}`).then((r) => r.data),
   // No dedicated pending-count endpoint server-side — derive the badge from

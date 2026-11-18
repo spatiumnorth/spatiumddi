@@ -183,7 +183,7 @@ describe("Edit Zone (#3509)", () => {
       );
     }
     expect(screen.getByLabelText("Kind").tagName).toBe("SELECT");
-    expect(screen.getByLabelText("Customer (optional)").tagName).toBe("DIV");
+    expect(screen.getByLabelText("Customer (optional)").tagName).toBe("SELECT");
     expect(boxesNamedByNothing()).toEqual([]);
     expectLabelsSound();
   });

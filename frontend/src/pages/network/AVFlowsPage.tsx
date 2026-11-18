@@ -545,19 +545,16 @@ export function AVFlowsPage() {
               The multicast group itself is kept — it simply stops being an AV
               flow.
             </>
-            {deleteFlowMut.isError && (
-              <p role="alert" className="mt-2 text-destructive">
-                {formatApiError(
-                  deleteFlowMut.error,
-                  "Failed to delete AV flow",
-                )}
-              </p>
-            )}
           </>
         }
         tone="destructive"
         confirmLabel="Remove"
         loading={deleteFlowMut.isPending}
+        error={
+          deleteFlowMut.isError
+            ? formatApiError(deleteFlowMut.error, "Failed to delete AV flow")
+            : null
+        }
         onConfirm={() =>
           deleteFlow && deleteFlowMut.mutate(deleteFlow.group_id)
         }
@@ -576,19 +573,19 @@ export function AVFlowsPage() {
               Nothing cascades — groups and flows inside the range are
               untouched, they just stop being checkable against it.
             </>
-            {deleteRangeMut.isError && (
-              <p role="alert" className="mt-2 text-destructive">
-                {formatApiError(
-                  deleteRangeMut.error,
-                  "Failed to delete reserved range",
-                )}
-              </p>
-            )}
           </>
         }
         tone="destructive"
         confirmLabel="Delete"
         loading={deleteRangeMut.isPending}
+        error={
+          deleteRangeMut.isError
+            ? formatApiError(
+                deleteRangeMut.error,
+                "Failed to delete reserved range",
+              )
+            : null
+        }
         onConfirm={() => deleteRange && deleteRangeMut.mutate(deleteRange.id)}
         onClose={() => {
           setDeleteRange(null);
@@ -701,41 +698,50 @@ function FlowModal({
       >
         {mode === "create" ? (
           <Field label="Multicast group">
-            {ready && !multicastEnabled ? (
-              <p className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
-                The Multicast feature module is disabled, so there are no groups
-                to stamp. Enable it under Features & Integrations first.
-              </p>
-            ) : (
-              <>
-                <input
-                  className={inputCls}
-                  value={groupSearch}
-                  onChange={(e) => setGroupSearch(e.target.value)}
-                  placeholder="Filter groups by address or name…"
-                />
-                <select
-                  className={`${inputCls} mt-1`}
-                  value={groupId}
-                  onChange={(e) => setGroupId(e.target.value)}
-                  required
+            {(control) =>
+              ready && !multicastEnabled ? (
+                <p
+                  {...control}
+                  role="group"
+                  className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-400"
                 >
-                  <option value="">Select a multicast group…</option>
-                  {groups.map((g) => (
-                    <option key={g.id} value={g.id}>
-                      {g.address}
-                      {g.name ? ` — ${g.name}` : ""}
-                    </option>
-                  ))}
-                </select>
-                <p className="mt-1 text-[11px] text-muted-foreground">
-                  A group that already carries an AV profile is updated in
-                  place. Showing the first {groups.length} match
-                  {groups.length === 1 ? "" : "es"} — narrow the filter if the
-                  group you want is missing.
+                  The Multicast feature module is disabled, so there are no
+                  groups to stamp. Enable it under Features & Integrations
+                  first.
                 </p>
-              </>
-            )}
+              ) : (
+                <>
+                  <input
+                    aria-label="Filter multicast groups"
+                    className={inputCls}
+                    value={groupSearch}
+                    onChange={(e) => setGroupSearch(e.target.value)}
+                    placeholder="Filter groups by address or name…"
+                  />
+                  <select
+                    {...control}
+                    className={`${inputCls} mt-1`}
+                    value={groupId}
+                    onChange={(e) => setGroupId(e.target.value)}
+                    required
+                  >
+                    <option value="">Select a multicast group…</option>
+                    {groups.map((g) => (
+                      <option key={g.id} value={g.id}>
+                        {g.address}
+                        {g.name ? ` — ${g.name}` : ""}
+                      </option>
+                    ))}
+                  </select>
+                  <p className="mt-1 text-[11px] text-muted-foreground">
+                    A group that already carries an AV profile is updated in
+                    place. Showing the first {groups.length} match
+                    {groups.length === 1 ? "" : "es"} — narrow the filter if the
+                    group you want is missing.
+                  </p>
+                </>
+              )
+            }
           </Field>
         ) : (
           <Field label="Multicast group">

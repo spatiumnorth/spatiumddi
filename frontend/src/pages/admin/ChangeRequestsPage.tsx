@@ -21,8 +21,13 @@
  * + backend ``require_module`` both gate it).
  */
 
-import { useMemo, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import type { AxiosResponse } from "axios";
 import {
   Ban,
@@ -171,14 +176,23 @@ function fmtTime(iso: string | null): string {
 // it so an over-long note is never sent and refused as "decision_note: ..." (#3835).
 const DECISION_NOTE_MAX = 2000;
 
+// The 409 an Approve gets when the change's scope grew since it was requested
+// (#4381). The row cannot be approved again, so the page remembers it and
+// stops offering Approve; Reject (the approver's decision) stays.
+const SCOPE_CHANGED_PREFIX = "The change's scope changed";
+const SCOPE_CHANGED_NOTE =
+  "The change's scope changed since it was requested, so it can no longer be approved. Reject it; the requester can cancel it and submit it again.";
+
 function DecisionModal({
   cr,
   mode,
   onClose,
+  onScopeChanged,
 }: {
   cr: ChangeRequest;
   mode: "approve" | "reject";
   onClose: () => void;
+  onScopeChanged?: (id: string) => void;
 }) {
   const qc = useQueryClient();
   const [note, setNote] = useState("");
@@ -194,8 +208,13 @@ function DecisionModal({
       qc.invalidateQueries({ queryKey: ["change-requests"] });
       onClose();
     },
-    onError: (err) =>
-      setError(formatApiError(err, `Failed to ${mode} the request.`)),
+    onError: (err) => {
+      const message = formatApiError(err, `Failed to ${mode} the request.`);
+      if (mode === "approve" && message.startsWith(SCOPE_CHANGED_PREFIX)) {
+        onScopeChanged?.(cr.id);
+      }
+      setError(message);
+    },
   });
 
   const title =
@@ -291,12 +310,14 @@ function RequestRow({
   cr,
   canApprove,
   canCancel,
+  scopeChanged,
   onDecide,
   onCancel,
 }: {
   cr: ChangeRequest;
   canApprove: boolean;
   canCancel: boolean;
+  scopeChanged: boolean;
   onDecide: (cr: ChangeRequest, mode: "approve" | "reject") => void;
   onCancel: (cr: ChangeRequest) => void;
 }) {
@@ -315,6 +336,11 @@ function RequestRow({
         {cr.error && (
           <div className="mt-1 text-[11px] text-destructive break-words">
             {cr.error}
+          </div>
+        )}
+        {isPending && scopeChanged && (
+          <div className="mt-1 text-[11px] text-amber-600 dark:text-amber-400 break-words">
+            {SCOPE_CHANGED_NOTE}
           </div>
         )}
       </td>
@@ -348,11 +374,14 @@ function RequestRow({
                 <HeaderButton
                   variant="primary"
                   icon={Check}
-                  disabled={!cr.can_approve}
+                  disabled={!cr.can_approve || scopeChanged}
                   title={
-                    cr.can_approve
-                      ? undefined
-                      : (cr.approve_blocked_reason ?? "You cannot approve this")
+                    scopeChanged
+                      ? SCOPE_CHANGED_NOTE
+                      : cr.can_approve
+                        ? undefined
+                        : (cr.approve_blocked_reason ??
+                          "You cannot approve this")
                   }
                   onClick={() => onDecide(cr, "approve")}
                 >
@@ -388,6 +417,7 @@ function RequestTable({
   canApprove,
   isRequester,
   isSuperadmin,
+  scopeChanged,
   onDecide,
   onCancel,
   emptyText,
@@ -396,6 +426,7 @@ function RequestTable({
   canApprove: boolean;
   isRequester: (cr: ChangeRequest) => boolean;
   isSuperadmin: boolean;
+  scopeChanged: ReadonlySet<string>;
   onDecide: (cr: ChangeRequest, mode: "approve" | "reject") => void;
   onCancel: (cr: ChangeRequest) => void;
   emptyText: string;
@@ -428,6 +459,7 @@ function RequestTable({
               // request (#3834); only Cancel is offered on it.
               canApprove={canApprove && !isRequester(cr)}
               canCancel={isRequester(cr) || isSuperadmin}
+              scopeChanged={scopeChanged.has(cr.id)}
               onDecide={onDecide}
               onCancel={onCancel}
             />
@@ -869,6 +901,63 @@ function PoliciesTab() {
 
 // ── Page ─────────────────────────────────────────────────────────────────────
 
+const PAGE_SIZE = 100;
+
+type PagedRequests = ReturnType<typeof usePagedRequests>;
+
+// A paged read of the gate queue for the given states, newest first.
+function usePagedRequests(
+  states: ChangeRequestState[],
+  opts: { enabled?: boolean; refetchInterval?: (rows: number) => number } = {},
+) {
+  const q = useInfiniteQuery({
+    queryKey: ["change-requests", "list", states.join(",")],
+    queryFn: ({ pageParam }) =>
+      changeRequestsApi.listPage({
+        states,
+        limit: PAGE_SIZE,
+        offset: pageParam,
+      }),
+    initialPageParam: 0,
+    getNextPageParam: (last, all) => {
+      const loaded = all.reduce((n, p) => n + p.items.length, 0);
+      return last.items.length > 0 && loaded < last.total ? loaded : undefined;
+    },
+    enabled: opts.enabled,
+    refetchInterval: opts.refetchInterval
+      ? (query) =>
+          opts.refetchInterval!(
+            (query.state.data?.pages ?? []).reduce(
+              (n, p) => n + p.items.length,
+              0,
+            ),
+          )
+      : undefined,
+  });
+  const rows = (q.data?.pages ?? []).flatMap((p) => p.items);
+  const total = q.data?.pages[q.data.pages.length - 1]?.total ?? rows.length;
+  return { ...q, rows, total };
+}
+
+// "Showing the newest N of M" + Load more, so a cut list is never silent.
+function LoadMore({ q, noun }: { q: PagedRequests; noun: string }) {
+  if (!q.hasNextPage) return null;
+  return (
+    <div className="flex items-center justify-between gap-3 text-xs text-muted-foreground">
+      <span>
+        Showing the newest {q.rows.length} of {q.total} {noun} requests.
+      </span>
+      <HeaderButton
+        variant="secondary"
+        disabled={q.isFetchingNextPage}
+        onClick={() => void q.fetchNextPage()}
+      >
+        {q.isFetchingNextPage ? "Loading…" : "Load more"}
+      </HeaderButton>
+    </div>
+  );
+}
+
 export function ChangeRequestsPage() {
   const { can, isSuperadmin } = usePermissions();
   const canApprove = can("approve", "change_request");
@@ -880,29 +969,24 @@ export function ChangeRequestsPage() {
     mode: "approve" | "reject";
   } | null>(null);
   const [cancelTarget, setCancelTarget] = useState<ChangeRequest | null>(null);
+  // Requests whose Approve the server refused for a grown scope (#4381).
+  const [scopeChanged, setScopeChanged] = useState<ReadonlySet<string>>(
+    new Set(),
+  );
 
   const qc = useQueryClient();
 
-  const queueQuery = useQuery({
-    queryKey: ["change-requests", "pending"],
-    queryFn: () => changeRequestsApi.list({ state: "pending", limit: 500 }),
+  // Both tabs page the list with ``offset`` and read the total from
+  // X-Total-Count (#4383), as the Requests page does (#3937): a fixed window
+  // dropped the older requests with no word that they existed.
+  const queueQuery = usePagedRequests(["pending"], {
     // Adaptive poll (FleetTab pattern): tighter while anything is pending.
-    refetchInterval: (q) => ((q.state.data?.length ?? 0) > 0 ? 5000 : 20000),
+    refetchInterval: (rows) => (rows > 0 ? 5000 : 20000),
   });
 
-  const historyQuery = useQuery({
-    queryKey: ["change-requests", "history"],
-    queryFn: () => changeRequestsApi.list({ limit: 200 }),
+  const historyQuery = usePagedRequests(TERMINAL_STATES, {
     enabled: tab === "history",
   });
-
-  const historyRows = useMemo(
-    () =>
-      (historyQuery.data ?? []).filter((r) =>
-        TERMINAL_STATES.includes(r.state),
-      ),
-    [historyQuery.data],
-  );
 
   const cancelMutation = useMutation({
     mutationFn: (id: string) => changeRequestsApi.cancel(id),
@@ -950,9 +1034,9 @@ export function ChangeRequestsPage() {
                 )}
               >
                 {t}
-                {t === "queue" && (queueQuery.data?.length ?? 0) > 0 && (
+                {t === "queue" && queueQuery.total > 0 && (
                   <span className="ml-1.5 rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-600 dark:text-amber-400">
-                    {queueQuery.data?.length}
+                    {queueQuery.total}
                   </span>
                 )}
               </button>
@@ -964,30 +1048,34 @@ export function ChangeRequestsPage() {
             <p className="text-xs text-muted-foreground">Loading…</p>
           ) : (
             <RequestTable
-              rows={queueQuery.data ?? []}
+              rows={queueQuery.rows}
               canApprove={canApprove}
               isRequester={isRequester}
               isSuperadmin={isSuperadmin}
+              scopeChanged={scopeChanged}
               onDecide={(cr, mode) => setDecision({ cr, mode })}
               onCancel={setCancelTarget}
               emptyText="Nothing waiting for approval."
             />
           ))}
+        {tab === "queue" && <LoadMore q={queueQuery} noun="pending" />}
 
         {tab === "history" &&
           (historyQuery.isLoading ? (
             <p className="text-xs text-muted-foreground">Loading…</p>
           ) : (
             <RequestTable
-              rows={historyRows}
+              rows={historyQuery.rows}
               canApprove={false}
               isRequester={isRequester}
               isSuperadmin={isSuperadmin}
+              scopeChanged={scopeChanged}
               onDecide={(cr, mode) => setDecision({ cr, mode })}
               onCancel={setCancelTarget}
               emptyText="No decided requests yet."
             />
           ))}
+        {tab === "history" && <LoadMore q={historyQuery} noun="decided" />}
 
         {tab === "policies" && isSuperadmin && <PoliciesTab />}
       </div>
@@ -997,6 +1085,9 @@ export function ChangeRequestsPage() {
           cr={decision.cr}
           mode={decision.mode}
           onClose={() => setDecision(null)}
+          onScopeChanged={(id) =>
+            setScopeChanged((prev) => new Set(prev).add(id))
+          }
         />
       )}
 
@@ -1012,8 +1103,16 @@ export function ChangeRequestsPage() {
             operation will not run.
           </span>
         }
+        error={
+          cancelMutation.error
+            ? formatApiError(cancelMutation.error, "Cancel failed")
+            : null
+        }
         onConfirm={() => cancelTarget && cancelMutation.mutate(cancelTarget.id)}
-        onClose={() => setCancelTarget(null)}
+        onClose={() => {
+          setCancelTarget(null);
+          cancelMutation.reset();
+        }}
       />
     </div>
   );

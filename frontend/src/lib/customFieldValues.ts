@@ -25,11 +25,21 @@ export function multiSelectValue(value: unknown): string[] {
 }
 
 /**
- * A custom field's value as table / detail text: a multi_select list reads
- * comma-joined, anything else as typed.
+ * A custom field's value as table / detail text. The API stores any JSON, so:
+ * a list reads comma-joined (a multi_select), an object as compact JSON (the
+ * text the address detail, the CSV / XLSX and PDF exports and the search
+ * label use), anything else as typed. Never "[object Object]" (#4421).
  */
 export function customFieldDisplay(value: unknown): string {
-  return Array.isArray(value) ? value.join(", ") : String(value ?? "");
+  if (Array.isArray(value)) return value.map(customFieldDisplay).join(", ");
+  if (value !== null && typeof value === "object") {
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value ?? "");
 }
 
 /**

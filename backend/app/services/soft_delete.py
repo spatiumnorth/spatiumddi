@@ -1236,7 +1236,11 @@ async def default_conflict_check(db: AsyncSession, obj: Any) -> str | None:
 
                 try:
                     await _assert_no_overlapping_group_cidr(
-                        db, obj.group_id, subnet, exclude_scope_id=obj.id
+                        db,
+                        obj.group_id,
+                        subnet,
+                        exclude_scope_id=obj.id,
+                        restoring=True,
                     )
                 except HTTPException as exc:
                     return str(exc.detail)

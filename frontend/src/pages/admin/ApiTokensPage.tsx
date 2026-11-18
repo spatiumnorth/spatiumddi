@@ -162,34 +162,37 @@ function CreateTokenModal({
           label="Expires"
           hint="Long-lived tokens are a security risk — prefer a date unless you have a reason."
         >
-          <div className="flex items-center gap-3">
-            <label className="flex items-center gap-1.5 text-sm">
-              <input
-                type="radio"
-                checked={expiryMode === "days"}
-                onChange={() => setExpiryMode("days")}
-              />
-              <span>In</span>
-              <input
-                type="number"
-                min={1}
-                max={3650}
-                value={days}
-                onChange={(e) => setDays(Number(e.target.value))}
-                disabled={expiryMode !== "days"}
-                className={cn(inputCls, "w-20")}
-              />
-              <span>days</span>
-            </label>
-            <label className="flex items-center gap-1.5 text-sm">
-              <input
-                type="radio"
-                checked={expiryMode === "never"}
-                onChange={() => setExpiryMode("never")}
-              />
-              Never
-            </label>
-          </div>
+          {(control) => (
+            <div className="flex items-center gap-3">
+              <label className="flex items-center gap-1.5 text-sm">
+                <input
+                  type="radio"
+                  checked={expiryMode === "days"}
+                  onChange={() => setExpiryMode("days")}
+                />
+                <span>In</span>
+                <input
+                  {...control}
+                  type="number"
+                  min={1}
+                  max={3650}
+                  value={days}
+                  onChange={(e) => setDays(Number(e.target.value))}
+                  disabled={expiryMode !== "days"}
+                  className={cn(inputCls, "w-20")}
+                />
+                <span>days</span>
+              </label>
+              <label className="flex items-center gap-1.5 text-sm">
+                <input
+                  type="radio"
+                  checked={expiryMode === "never"}
+                  onChange={() => setExpiryMode("never")}
+                />
+                Never
+              </label>
+            </div>
+          )}
         </Field>
         <Field
           label="Scopes (optional)"
@@ -225,84 +228,91 @@ function CreateTokenModal({
           label="Bind to a resource (optional)"
           hint="Restrict this token to a single subnet or DNS zone — a leaked CI secret can't touch anything else. The binding can never exceed your own permissions."
         >
-          <div className="space-y-1.5">
-            <select
-              className={inputCls}
-              value={bindType}
-              onChange={(e) => {
-                setBindType(e.target.value as "none" | "subnet" | "dns_zone");
-                setBindResourceId("");
-                setBindGroupId("");
-              }}
-            >
-              <option value="none">No resource binding</option>
-              <option value="subnet">Subnet</option>
-              {(dnsOn || bindType === "dns_zone") && (
-                <option value="dns_zone">DNS zone</option>
-              )}
-            </select>
-            {bindType !== "none" && (
+          {(control) => (
+            <div className="space-y-1.5">
               <select
+                {...control}
                 className={inputCls}
-                value={bindAction}
-                onChange={(e) =>
-                  setBindAction(e.target.value as "read" | "write" | "admin")
-                }
+                value={bindType}
+                onChange={(e) => {
+                  setBindType(e.target.value as "none" | "subnet" | "dns_zone");
+                  setBindResourceId("");
+                  setBindGroupId("");
+                }}
               >
-                <option value="read">read</option>
-                <option value="write">write</option>
-                <option value="admin">admin</option>
+                <option value="none">No resource binding</option>
+                <option value="subnet">Subnet</option>
+                {(dnsOn || bindType === "dns_zone") && (
+                  <option value="dns_zone">DNS zone</option>
+                )}
               </select>
-            )}
-            {bindType === "subnet" && (
-              <select
-                className={inputCls}
-                value={bindResourceId}
-                onChange={(e) => setBindResourceId(e.target.value)}
-              >
-                <option value="">Select a subnet…</option>
-                {(subnetsQ.data ?? []).map((s) => (
-                  <option key={s.id} value={s.id}>
-                    {s.network}
-                    {s.name ? ` — ${s.name}` : ""}
-                  </option>
-                ))}
-              </select>
-            )}
-            {bindType === "dns_zone" && (
-              <>
+              {bindType !== "none" && (
                 <select
+                  aria-label="Binding access"
                   className={inputCls}
-                  value={bindGroupId}
-                  onChange={(e) => {
-                    setBindGroupId(e.target.value);
-                    setBindResourceId("");
-                  }}
+                  value={bindAction}
+                  onChange={(e) =>
+                    setBindAction(e.target.value as "read" | "write" | "admin")
+                  }
                 >
-                  <option value="">Select a DNS group…</option>
-                  {(dnsGroupsQ.data ?? []).map((g) => (
-                    <option key={g.id} value={g.id}>
-                      {g.name}
+                  <option value="read">read</option>
+                  <option value="write">write</option>
+                  <option value="admin">admin</option>
+                </select>
+              )}
+              {bindType === "subnet" && (
+                <select
+                  aria-label="Subnet to bind"
+                  className={inputCls}
+                  value={bindResourceId}
+                  onChange={(e) => setBindResourceId(e.target.value)}
+                >
+                  <option value="">Select a subnet…</option>
+                  {(subnetsQ.data ?? []).map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.network}
+                      {s.name ? ` — ${s.name}` : ""}
                     </option>
                   ))}
                 </select>
-                {bindGroupId && (
+              )}
+              {bindType === "dns_zone" && (
+                <>
                   <select
+                    aria-label="DNS group to bind"
                     className={inputCls}
-                    value={bindResourceId}
-                    onChange={(e) => setBindResourceId(e.target.value)}
+                    value={bindGroupId}
+                    onChange={(e) => {
+                      setBindGroupId(e.target.value);
+                      setBindResourceId("");
+                    }}
                   >
-                    <option value="">Select a zone…</option>
-                    {(zonesQ.data ?? []).map((z) => (
-                      <option key={z.id} value={z.id}>
-                        {z.name}
+                    <option value="">Select a DNS group…</option>
+                    {(dnsGroupsQ.data ?? []).map((g) => (
+                      <option key={g.id} value={g.id}>
+                        {g.name}
                       </option>
                     ))}
                   </select>
-                )}
-              </>
-            )}
-          </div>
+                  {bindGroupId && (
+                    <select
+                      aria-label="DNS zone to bind"
+                      className={inputCls}
+                      value={bindResourceId}
+                      onChange={(e) => setBindResourceId(e.target.value)}
+                    >
+                      <option value="">Select a zone…</option>
+                      {(zonesQ.data ?? []).map((z) => (
+                        <option key={z.id} value={z.id}>
+                          {z.name}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                </>
+              )}
+            </div>
+          )}
         </Field>
         <div className="rounded-md border bg-muted/20 p-3">
           <p className="mb-2 text-xs text-muted-foreground">
@@ -815,7 +825,6 @@ export function ApiTokensPage() {
       qc.invalidateQueries({ queryKey: ["api-tokens"] });
       setRevokeTarget(null);
     },
-    onError: () => setRevokeTarget(null),
   });
   const deleteMut = useMutation({
     mutationFn: (id: string) => apiTokensApi.delete(id),
@@ -1027,7 +1036,15 @@ export function ApiTokensPage() {
           tone="destructive"
           autoFocusCancel
           loading={revokeMut.isPending}
-          onClose={() => setRevokeTarget(null)}
+          error={
+            revokeMut.error
+              ? formatApiError(revokeMut.error, "Revoke failed")
+              : null
+          }
+          onClose={() => {
+            setRevokeTarget(null);
+            revokeMut.reset();
+          }}
           onConfirm={() => revokeTarget && revokeMut.mutate(revokeTarget)}
         />
         {confirmDelete && (
