@@ -22,6 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
+from app.services.custom_field_text import custom_field_json
 from app.services.ipam.host_name import current_fqdn
 
 Format = Literal["csv", "json", "xlsx"]
@@ -267,7 +268,7 @@ def _cf_cell(value: Any) -> Any:
     (#4282). Scalars go through ``_sanitize_cell`` unchanged. The importer reads
     JSON-looking text back into the same list / object."""
     if isinstance(value, (list, dict)):
-        return json.dumps(value, separators=(",", ":"), default=str)
+        return custom_field_json(value)
     return _sanitize_cell(value)
 
 

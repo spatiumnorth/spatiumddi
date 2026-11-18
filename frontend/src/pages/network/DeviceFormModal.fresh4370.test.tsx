@@ -5,7 +5,7 @@
  * sends only what the operator changed (#4370): a description, poll switch or
  * IP space another client stored since the list loaded is not put back.
  */
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   cleanup,
   fireEvent,
@@ -20,6 +20,7 @@ import type { NetworkDeviceRead } from "@/lib/api";
 const h = vi.hoisted(() => ({
   update: vi.fn(),
   get: vi.fn(),
+  spaces: vi.fn(),
 }));
 
 vi.mock("@/lib/api", async () => {
@@ -36,16 +37,21 @@ vi.mock("@/lib/api", async () => {
     },
     ipamApi: {
       ...actual.ipamApi,
-      listSpaces: () =>
-        Promise.resolve([
-          { id: "sp1", name: "space one" },
-          { id: "sp2", name: "space two" },
-        ]),
+      listSpaces: () => h.spaces(),
     },
   };
 });
 
 const { DeviceFormModal } = await import("./DeviceFormModal");
+
+const SPACES = [
+  { id: "sp1", name: "space one" },
+  { id: "sp2", name: "space two" },
+];
+
+beforeEach(() => {
+  h.spaces.mockImplementation(() => Promise.resolve(SPACES));
+});
 
 afterEach(() => {
   cleanup();
@@ -122,6 +128,30 @@ describe("network device Edit dialog (#4370)", { timeout: 30000 }, () => {
     const save = screen.getByRole("button", { name: "Save" });
     expect((save as HTMLButtonElement).disabled).toBe(false);
     fireEvent.click(save);
+    await waitFor(() => expect(h.update).toHaveBeenCalledTimes(1), {
+      timeout: 10000,
+    });
+    expect(h.update).toHaveBeenCalledWith("d1", {
+      poll_interval_seconds: 600,
+    });
+  });
+
+  it("a Save pressed before the IP spaces load still sends the edit (#4419)", async () => {
+    // The space list never answers: the picker's <select> has no option for
+    // the stored space, reads "", and the required attribute used to make the
+    // browser refuse the submit with no message and no request.
+    h.spaces.mockImplementation(() => new Promise(() => {}));
+    h.get.mockResolvedValue(NEWER);
+    open();
+    await screen.findByDisplayValue(
+      "changed elsewhere",
+      {},
+      { timeout: 10000 },
+    );
+    fireEvent.change(screen.getByDisplayValue("300"), {
+      target: { value: "600" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(h.update).toHaveBeenCalledTimes(1), {
       timeout: 10000,
     });

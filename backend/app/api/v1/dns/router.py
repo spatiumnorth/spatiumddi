@@ -3675,6 +3675,9 @@ async def _sync_single_server(
     # 1. Topology discovery (Path B for Windows / REST API for the rest).
     zones_on_server: list[str] = []
     zone_meta_by_name: dict[str, dict[str, Any]] = {}
+    # #1771 — a failed zone listing is not an empty server: step 3 must not
+    # read "nothing on the server" and create every zone in the group.
+    zone_pull_failed = False
     if topology_capable:
         try:
             discovered = await get_driver(server.driver).pull_zones_from_server(server)  # type: ignore[attr-defined]
@@ -3685,6 +3688,7 @@ async def _sync_single_server(
                 zones_on_server.append(name)
                 zone_meta_by_name[name] = z
         except Exception as exc:  # noqa: BLE001 — informational, keep going
+            zone_pull_failed = True
             logger.warning(
                 "dns.sync_from_server.pull_zones_failed",
                 server=str(server.id),
@@ -3759,7 +3763,11 @@ async def _sync_single_server(
     #    Windows DNS over WinRM + cloud DNS via provider API).
     zones_pushed_to_server: list[str] = []
     zones_push_to_server_errors: list[str] = []
-    if topology_capable:
+    if topology_capable and zone_pull_failed:
+        zones_push_to_server_errors.append(
+            "zone listing from the server failed, so no missing zone was pushed"
+        )
+    elif topology_capable:
         server_zone_set = {n for n in zones_on_server}
         driver = get_driver(server.driver)
         # Re-query zones after the import step so newly-imported rows
@@ -3770,7 +3778,11 @@ async def _sync_single_server(
             if bare in server_zone_set:
                 continue
             try:
-                await driver.apply_zone_change(server, zone, "create")
+                changed = await driver.apply_zone_change(server, zone, "create")
+                if changed is False:
+                    # Already on the server (a zone the listing hid from this
+                    # token): adopted, not pushed (#1771).
+                    continue
                 zones_pushed_to_server.append(bare)
                 db.add(
                     AuditLog(
@@ -8232,6 +8244,11 @@ class DelegationPreviewResponse(BaseModel):
     existing_glue_records: list[DelegationRecordPreview] = []
     warnings: list[str] = []
     child_apex_ns_count: int | None = None
+    # #4389 — the view the parent zone is pinned to (None: every view).
+    parent_view_name: str | None = None
+    # #4388 — rows the delegation would write beside a CNAME in the parent: the
+    # apply refuses (409) while any is listed.
+    cname_conflicts: list[str] = []
 
 
 @router.get("/groups/{group_id}/zones/{zone_id}/dnssec/info", response_model=ZoneDNSSECInfo)
@@ -9124,11 +9141,11 @@ async def get_delegation_preview(
     """Compute the NS + glue records needed to delegate this zone from its parent.
 
     Returns ``{has_parent: false}`` when no eligible parent zone exists in
-    the same group; otherwise the dict is the full preview shape from
+    the same group and view; otherwise the dict is the full preview shape from
     ``preview_to_dict`` plus ``has_parent: true``.
     """
     child = await _require_zone(group_id, zone_id, db, current_user)
-    parent = await find_parent_zone(db, group_id, child.name)
+    parent = await find_parent_zone(db, group_id, child.name, child.view_id)
     if parent is None:
         return DelegationPreviewResponse(has_parent=False)
     # #4258 — only a primary parent can take the NS + glue records; a secondary
@@ -9160,6 +9177,9 @@ async def apply_delegation(
 ) -> list[DNSRecord]:
     """Materialise the delegation records into the parent zone.
 
+    The parent is the one in the child's own view (#4389). A row that would sit
+    beside a CNAME in the parent is refused with 409 (#4388).
+
     Idempotent — records that already exist in the parent are skipped, so a
     second call after the first succeeds is a no-op. Each created record
     flows through ``enqueue_record_op`` so the parent zone's serial bumps
@@ -9171,7 +9191,7 @@ async def apply_delegation(
     # probed first, locked, and re-found: a parent that changed meanwhile is a
     # 409, not a write into the wrong zone.
     child = await _require_zone(group_id, zone_id, db, current_user)
-    parent = await find_parent_zone(db, group_id, child.name)
+    parent = await find_parent_zone(db, group_id, child.name, child.view_id)
     if parent is None:
         raise HTTPException(
             status_code=404,
@@ -9184,7 +9204,7 @@ async def apply_delegation(
     parent_id = parent.id
     await lock_zone_rows(db, [child.id, parent_id])
     child = await _require_zone(group_id, zone_id, db, current_user, lock="write")
-    parent = await find_parent_zone(db, group_id, child.name)
+    parent = await find_parent_zone(db, group_id, child.name, child.view_id)
     if parent is None:
         raise HTTPException(
             status_code=404,
@@ -9199,6 +9219,10 @@ async def apply_delegation(
         raise HTTPException(status_code=409, detail=reason)
     await db.refresh(parent)
     preview = await compute_delegation(db, parent, child)
+    if preview.cname_conflicts:
+        # #4388 — the record API's CNAME rule: the parent keeps its CNAME and
+        # nothing is written beside it.
+        raise HTTPException(status_code=409, detail=" ".join(preview.cname_conflicts))
     pending = preview.ns_records_to_create + preview.glue_records_to_create
     if not pending:
         return []
