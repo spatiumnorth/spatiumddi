@@ -78,17 +78,18 @@ def zone_state_in_sync(
     transferred (a transferred zone never serves 0) and not before: at 0 it
     holds no data and answers REFUSED / SERVFAIL (#1967, #3940). A BIND9 agent
     that cannot read the zone back reports nothing, which is not in sync
-    either. A BIND9 agent from before #3940 reports 0 for a secondary it never
-    read back, but its start-up report reads every zone from named, so a
-    secondary at a non-zero serial is served at it whichever agent says so;
-    a 0 from such an agent is "not reported", never synced. An agent that does
-    not declare ``served-serials`` (``reports_served_serials`` False, the
-    server's ``agent_reports_served_serials``; a rolling upgrade) cannot say
-    "holds no copy", so its 0 is unknown and reads as the old comparison with
-    the target, in sync (#4440). Other drivers compare with the target."""
+    either.
+    A BIND9 agent that does not declare ``served-serials`` (``reports_served_serials``
+    False, the server's ``agent_reports_served_serials``; a rolling upgrade) is
+    one from before #3940, and it reports the bundle's serial, 0, for every
+    secondary it holds (rc.3 ``served_zone_serials``, at start-up and after),
+    so its 0 is unknown, not "holds no copy": it reads as it always did,
+    against the target (#4440). PowerDNS read a secondary back from its API
+    before #3940, so its 0 always means "not transferred". Other drivers
+    compare with the target."""
     if (zone.zone_type or "primary") in ("secondary", "stub"):
         if driver in ("powerdns", "bind9"):
-            if not reports_served_serials:
+            if driver == "bind9" and not reports_served_serials:
                 return current != 0 or current == target
             return current != 0
         return current == target
