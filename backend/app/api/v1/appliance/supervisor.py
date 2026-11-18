@@ -1221,14 +1221,17 @@ async def supervisor_register(
         # Idempotent re-register. Touch last_seen_at so the heartbeat
         # path stays useful even before A2+ ships a separate
         # heartbeat endpoint. Update capabilities + supervisor_version
-        # since the supervisor may have upgraded between calls.
+        # since the supervisor may have upgraded between calls, but only
+        # when the request is signed: the stored version decides whether an
+        # unsigned re-register is still allowed, so an unsigned body must
+        # not be able to move it (the heartbeat reports it authenticated).
         existing.last_seen_at = now
         existing.last_seen_ip = client_ip
-        if body.supervisor_version:
-            existing.supervisor_version = body.supervisor_version
-        if body.capabilities is not None:
-            existing.capabilities = body.capabilities.model_dump()
         if key_proven:
+            if body.supervisor_version:
+                existing.supervisor_version = body.supervisor_version
+            if body.capabilities is not None:
+                existing.capabilities = body.capabilities.model_dump()
             existing.capabilities = {**(existing.capabilities or {}), "register_proof": True}
         # Rotate the session token — supervisor must use the fresh one
         # for subsequent polls. Old cached tokens fail hash compare.
