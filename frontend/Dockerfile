@@ -8,7 +8,7 @@
 # on one platform lacks the ``@rollup/rollup-linux-arm64-musl`` optional
 # dep needed when ``npm install`` runs on emulated arm64-musl — which
 # was the failure mode on the 2026.04.22-1 release build.
-FROM --platform=$BUILDPLATFORM node:22-alpine AS builder
+FROM --platform=$BUILDPLATFORM node:24.22.2-alpine AS builder
 
 # Release-pipeline version stamp. The release workflow passes the git
 # tag (e.g. ``2026.04.22-1``); local builds default to ``dev`` so

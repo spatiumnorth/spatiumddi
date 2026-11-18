@@ -274,6 +274,16 @@
       "note": "The one bake-array/chart-values pair the first pass of this manifest missed, and the pair where a divergence is worst: the appliance imports baked images into containerd and never pulls, so a chart naming a tag the bake did not save is ImagePullBackOff on an AIR-GAPPED box -- no error until the cluster is already offline and no network to recover over. `cnpg.imageName` in the umbrella chart and the CNPG_IMAGES entry must stay byte-identical."
     },
 
+    "node": {
+      "version": "24.22.2-alpine",
+      "pinned_in": [
+        { "path": "frontend/Dockerfile", "match": "FROM --platform=$BUILDPLATFORM node:{version} AS builder", "count": 1 },
+        { "path": "docs/THIRD_PARTY.md", "match": "| {version} |", "count": 1 }
+      ],
+      "upstream": { "kind": "dockerhub", "repo": "library/node", "track": "^24\\.[0-9]+\\.[0-9]+-alpine$" },
+      "note": "Frontend build stage; Node 24 is the Active LTS line (#2236). CI's two `setup-node` steps pin the bare version (24.22.2) and move with this. The tag is not digest-pinned, matching nginx beside it. Choose a release at least two weeks old."
+    },
+
     "nginx": {
       "version": "1.31.8-alpine",
       "pinned_in": [
