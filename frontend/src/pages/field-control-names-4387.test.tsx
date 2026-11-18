@@ -160,3 +160,35 @@ describe(
     });
   },
 );
+
+describe("the follow-up gaps (#4387)", { timeout: 15000 }, () => {
+  it("New API Token: every bind select has a name", async () => {
+    wrap(<ApiTokensPage />);
+    await open(/New Token/);
+    const bind = control("Bind to a resource (optional)", "SELECT");
+    fireEvent.change(bind, { target: { value: "subnet" } });
+    control("Binding access", "SELECT");
+    control("Subnet to bind", "SELECT");
+  });
+
+  it("New Role: each grant row's selects are named by row", async () => {
+    wrap(<RolesPage />);
+    await open(/New Role/);
+    fireEvent.click(screen.getByRole("button", { name: /Add row/ }));
+    control("Action, row 1", "SELECT");
+    control("Resource type, row 1", "SELECT");
+  });
+
+  it("a Field's function body that shows text keeps the label on that text", () => {
+    render(
+      <Field label="Shown">
+        {(c) => (
+          <p {...c} role="group">
+            just text
+          </p>
+        )}
+      </Field>,
+    );
+    expect(screen.getByLabelText("Shown").textContent).toBe("just text");
+  });
+});

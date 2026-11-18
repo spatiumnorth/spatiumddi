@@ -248,6 +248,7 @@ function CreateTokenModal({
               </select>
               {bindType !== "none" && (
                 <select
+                  aria-label="Binding access"
                   className={inputCls}
                   value={bindAction}
                   onChange={(e) =>
@@ -261,6 +262,7 @@ function CreateTokenModal({
               )}
               {bindType === "subnet" && (
                 <select
+                  aria-label="Subnet to bind"
                   className={inputCls}
                   value={bindResourceId}
                   onChange={(e) => setBindResourceId(e.target.value)}
@@ -277,6 +279,7 @@ function CreateTokenModal({
               {bindType === "dns_zone" && (
                 <>
                   <select
+                    aria-label="DNS group to bind"
                     className={inputCls}
                     value={bindGroupId}
                     onChange={(e) => {
@@ -293,6 +296,7 @@ function CreateTokenModal({
                   </select>
                   {bindGroupId && (
                     <select
+                      aria-label="DNS zone to bind"
                       className={inputCls}
                       value={bindResourceId}
                       onChange={(e) => setBindResourceId(e.target.value)}

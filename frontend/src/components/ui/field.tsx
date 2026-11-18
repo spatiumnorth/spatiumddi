@@ -63,7 +63,9 @@ const NONE: FieldControlProps = {};
  *
  *  The group names itself, but not the control inside it (#4387): the real
  *  control takes `useFieldControl()` (inside a component) or the function
- *  form of `children` (inline), which hand it `aria-labelledby`. */
+ *  form of `children` (inline), which hand it `aria-labelledby`. A function
+ *  body that sometimes shows text instead of a control spreads the same props
+ *  plus `role="group"` on that text, so the label still names something. */
 export function Field({
   label,
   hint,

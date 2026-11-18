@@ -660,7 +660,11 @@ function FlowModal({
           <Field label="Multicast group">
             {(control) =>
               ready && !multicastEnabled ? (
-                <p className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+                <p
+                  {...control}
+                  role="group"
+                  className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-400"
+                >
                   The Multicast feature module is disabled, so there are no
                   groups to stamp. Enable it under Features & Integrations
                   first.
@@ -668,6 +672,7 @@ function FlowModal({
               ) : (
                 <>
                   <input
+                    aria-label="Filter multicast groups"
                     className={inputCls}
                     value={groupSearch}
                     onChange={(e) => setGroupSearch(e.target.value)}

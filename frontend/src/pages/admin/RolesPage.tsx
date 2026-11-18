@@ -89,6 +89,7 @@ function PermissionEditor({
           className="grid grid-cols-[110px_1fr_1fr_32px] gap-2 items-center"
         >
           <select
+            aria-label={`Action, row ${idx + 1}`}
             className={inputCls}
             value={p.action}
             onChange={(e) => update(idx, { action: e.target.value })}
@@ -98,6 +99,7 @@ function PermissionEditor({
             ))}
           </select>
           <select
+            aria-label={`Resource type, row ${idx + 1}`}
             className={inputCls}
             value={p.resource_type}
             onChange={(e) => update(idx, { resource_type: e.target.value })}

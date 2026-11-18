@@ -4226,7 +4226,11 @@ export function AddAddressModal({
           <Field label="DNS Zone">
             {(control) =>
               availableZones.length === 1 ? (
-                <p className="text-xs text-muted-foreground py-1">
+                <p
+                  {...control}
+                  role="group"
+                  className="text-xs text-muted-foreground py-1"
+                >
                   <Globe2 className="inline h-3 w-3 mr-1" />
                   {availableZones[0].name.replace(/\.$/, "")}
                   {fqdnPreview && (
