@@ -1160,6 +1160,12 @@ class DHCPLease(UUIDPrimaryKeyMixin, Base):
         Index("ix_dhcp_lease_server_mac", "server_id", "mac_address"),
         Index("ix_dhcp_lease_server_duid", "server_id", "duid"),
         Index("ix_dhcp_lease_state", "state"),
+        # The expiry sweep's ``state = 'active' AND expires_at < cutoff`` (#1255).
+        Index(
+            "ix_dhcp_lease_active_expires_at",
+            "expires_at",
+            postgresql_where=sa_text("state = 'active'"),
+        ),
         # #2262 — one row per lease identity per server, matching
         # ``agents._lease_identity``: a DHCPv4 lease is (address, MAC), a
         # DHCPv6 lease (address, DUID, IAID). Deliberately NOT unique on
