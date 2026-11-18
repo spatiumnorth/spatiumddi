@@ -13,6 +13,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from spatium_dns_agent.drivers.technitium import TechnitiumDriver
 
 from .test_technitium_reconcile_churn import FakeTechnitium, _z
@@ -177,7 +179,12 @@ def test_collect_marks_unsigned_zone_incomplete(tmp_path: Path) -> None:
     assert d.dnssec_incomplete is True
 
 
-def test_rollover_op_calls_rollover_dnskey(tmp_path: Path) -> None:
+def test_rollover_op_calls_rollover_dnskey(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # release/1.0.1 refuses ops on a zone the agent does not own (#1775); the
+    # fake daemon's zone is not in the ledger, so opt in as the 1775 tests do.
+    monkeypatch.setenv("TECHNITIUM_ADOPT_EXISTING_ZONES", "true")
     fake = _DnssecFake(["example.com"], {"example.com": {"algo": 13, "nsec3": False}})
     d = _driver(tmp_path, fake)
     res = d.apply_record_op(
