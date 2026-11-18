@@ -163,7 +163,11 @@ Pick one of these instead:
   `--disable servicelb` so the two do not both claim the Service, and set
   `service: { type: LoadBalancer }` with the pool / address annotations shown
   in `values.yaml`. MetalLB announces a dedicated VIP, so nothing binds :53 on
-  the node.
+  the node. The DNS Service takes `service.annotations`,
+  `service.loadBalancerIP`, `service.loadBalancerSourceRanges`,
+  `service.externalTrafficPolicy` (default `Local` on a LoadBalancer),
+  `service.ipFamilyPolicy` and `service.ipFamilies`; the DHCP Service takes
+  `service.type` and `service.nodePort` only.
 - **Another LoadBalancer implementation** with `--disable servicelb` (kube-vip,
   Cilium LB-IPAM, ...). The same rule applies: whatever implements the
   Service must not use hostPort 53.
@@ -178,6 +182,14 @@ On a node where only the resolver stub is the problem, never expose :53 with
 servicelb; if you already did, delete the Service and the `svclb-*` DaemonSet,
 then `iptables -t nat -S CNI-HOSTPORT-DNAT | grep 'dports 53'` should come back
 empty.
+
+A `LoadBalancer` Service is enough for DNS. It is not enough for DHCP: client
+broadcasts do not reach a pod behind a Service, so DHCP needs a relay pointed
+at the Service address, or `hostNetwork`. Ports and protocols, a values
+example for each, and how to check the result are in the deployment guide:
+[Exposing DNS to clients](https://github.com/spatiumnorth/spatiumddi/blob/main/docs/deployment/KUBERNETES.md#exposing-dns-to-clients)
+and
+[Exposing DHCP to clients](https://github.com/spatiumnorth/spatiumddi/blob/main/docs/deployment/KUBERNETES.md#exposing-dhcp-to-clients).
 
 ### Running managed DNS agents
 
@@ -204,9 +216,9 @@ dnsAgents:
       role: primary
       group: powerdns-edge
       service: { type: LoadBalancer }   # opt-in, see "Exposing DNS and DHCP to clients"
-    # Technitium (third DNS driver — online DNSSEC, catalog zones both
-    # ways, and native DoT/DoH/DoQ listeners plus encrypted upstream
-    # forwarding with no dnsdist-style sidecar). Own group, same rule.
+    # Technitium (third DNS driver — native DoT/DoH/DoQ listeners plus
+    # encrypted upstream forwarding with no dnsdist-style sidecar; no
+    # DNSSEC or catalog zones in 1.0). Own group, same rule.
     - name: tdx1
       flavor: technitium
       role: primary
@@ -246,9 +258,14 @@ dhcpAgents:
   servers:
     - name: dhcp1
       role: primary
-      # hostNetwork: true required for real DHCPv4 unless relay-only.
-      hostNetwork: true
+      # Behind a DHCP relay (ip helper-address pointed at the Service):
+      service: { type: LoadBalancer }
+      # Or, on a node attached to the client VLAN, with no relay:
+      # hostNetwork: true
 ```
+
+Pick one of the two; see
+[Exposing DHCP to clients](https://github.com/spatiumnorth/spatiumddi/blob/main/docs/deployment/KUBERNETES.md#exposing-dhcp-to-clients).
 
 ### GitOps with `helm template` (Argo CD)
 
@@ -381,6 +398,10 @@ subcharts verbatim — any option those charts accept works here. See:
 
 Each server entry accepts `name`, `role`, `group`, `storage.agentState`,
 `storage.dnsState` (or `storage.keaState`), `service.type`,
+`service.annotations` / `service.loadBalancerIP` /
+`service.loadBalancerSourceRanges` / `service.externalTrafficPolicy` /
+`service.ipFamilyPolicy` / `service.ipFamilies` (DNS only),
+`dotPort` / `dohPort` / `doqPort` (DNS only; `doqPort` on `technitium` only),
 `service.nodePort` (DHCP only; pins the node-facing port of a NodePort
 DHCP Service, which is otherwise random. Only useful for a relay that can
 forward to a non-standard port: most, including `ip helper-address`, send

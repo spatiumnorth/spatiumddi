@@ -26,12 +26,14 @@ kubectl apply -f k8s/dhcp/kea-statefulset.yaml
 kubectl apply -f k8s/dhcp/service-dhcp.yaml
 ```
 
-DHCPv4 requires broadcast reception on the client LAN. In most clusters you
-either run the pod with `hostNetwork: true` or front it with a DHCP relay
-(option 82) pointed at a LoadBalancer Service on UDP/67. The stock
-manifests use that LoadBalancer Service: on a `NodePort` Service the
-declared `port: 67` is in-cluster only and the node-facing port is a
-random 30000–32767 pick, which a relay cannot target.
+A DHCPv4 client's broadcast never reaches a pod behind a Service. Either the
+gateway of each client VLAN relays to the server (`ip helper-address`), or the
+pod runs with `hostNetwork: true` on a node attached to the client VLAN. The
+stock manifests are the relay shape, a LoadBalancer Service on UDP/67: on a
+`NodePort` Service the declared `port: 67` is in-cluster only and the
+node-facing port is a random 30000–32767 pick, which a relay cannot target.
+Relay configuration, the return path and how to check it are in
+[Exposing DHCP to clients](../docs/deployment/KUBERNETES.md#exposing-dhcp-to-clients).
 
 
 ## Quick Start (single-node / dev)
@@ -391,6 +393,9 @@ The stock manifests in `k8s/dns/` and `k8s/dhcp/` still use
 UDP/53 or UDP/67 binds that host port on every node and captures the node's
 own resolver, so image pulls fail. Use MetalLB (with `--disable servicelb`)
 or another load balancer for those Services, not servicelb.
+Ports, fixed addresses, client source addresses and the DHCP relay shape are
+covered in [Exposing DNS to clients](../docs/deployment/KUBERNETES.md#exposing-dns-to-clients)
+and [Exposing DHCP to clients](../docs/deployment/KUBERNETES.md#exposing-dhcp-to-clients).
 Set `flavor: powerdns` or `flavor: technitium` on a server to pull the
 `ghcr.io/spatiumnorth/dns-powerdns` / `ghcr.io/spatiumnorth/dns-technitium`
 image instead of BIND9 — same `DNS_AGENT_KEY` bootstrap, image-baked
