@@ -1161,7 +1161,9 @@ function NewBlockModal({
                   >
                     <span className="font-medium">{d.target_name}</span>
                     {d.error ? (
-                      <span className="text-destructive">{d.error}</span>
+                      <span role="alert" className="text-destructive">
+                        {d.error}
+                      </span>
                     ) : d.to_add.length > 0 ? (
                       <span className="text-emerald-600 dark:text-emerald-400">
                         + {d.to_add.join(", ")}
@@ -1236,7 +1238,9 @@ function ReconcilePreviewModal({
           {diff === null ? (
             <p className="text-muted-foreground">Reading device…</p>
           ) : diff.error ? (
-            <p className="text-destructive">{diff.error}</p>
+            <p role="alert" className="text-destructive">
+              {diff.error}
+            </p>
           ) : diff.to_add.length === 0 && diff.to_remove.length === 0 ? (
             <p className="text-muted-foreground">
               Already in sync — nothing to change.

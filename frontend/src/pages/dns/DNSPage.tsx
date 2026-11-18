@@ -3274,7 +3274,9 @@ function ZoneModalForm({
             disabled={!!zone}
           />
           {nameErr ? (
-            <p className="text-xs text-destructive mt-0.5">{nameErr}</p>
+            <p role="alert" className="text-xs text-destructive mt-0.5">
+              {nameErr}
+            </p>
           ) : (
             !zone && (
               <p className="text-xs text-muted-foreground mt-0.5">
@@ -4558,8 +4560,15 @@ export function ZoneDetailView({
     // Forward zones don't host records, so no delegation work to do.
     enabled: zone.zone_type !== "forward" && !zone.tailscale_tenant_id,
   });
+  // #4388 — a row that would sit beside a CNAME in the parent is refused, so
+  // the item is shown disabled with the reason instead of inviting the press.
+  const delegateCnameConflict =
+    delegationPreview?.has_parent === true
+      ? (delegationPreview.cname_conflicts ?? []).join(" ")
+      : "";
   const showDelegateButton =
     delegationPreview?.has_parent === true &&
+    !delegateCnameConflict &&
     (delegationPreview.ns_records_to_create.length > 0 ||
       delegationPreview.glue_records_to_create.length > 0);
   // #4258 — the nearest parent is a secondary / stub: it cannot take the NS +
@@ -4567,7 +4576,7 @@ export function ZoneDetailView({
   const delegateRefusal =
     delegationPreview?.has_parent === false
       ? (delegationPreview.reason ?? null)
-      : null;
+      : delegateCnameConflict || null;
 
   // "Sync with server" — bi-directional additive sync against the zone's
   // primary authoritative server (any driver that can pull a zone). AXFR imports missing
@@ -13449,7 +13458,10 @@ export function SyncWithServersResultModal({
                                   </td>
                                   <td className="px-3 py-1">
                                     {item.error ? (
-                                      <span className="text-destructive">
+                                      <span
+                                        role="alert"
+                                        className="text-destructive"
+                                      >
                                         {item.error}
                                       </span>
                                     ) : item.push_errors.length > 0 ? (

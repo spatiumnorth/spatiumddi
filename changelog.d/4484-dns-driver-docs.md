@@ -1,0 +1,3 @@
+### Fixed
+
+- `docs/drivers/DNS_DRIVERS.md` described BIND9 as driven by the control plane over SSH with `rndc addzone` and a `named.conf.spatiumddi` include, and showed `BIND9DriverConfig` and `PowerDNSDriverConfig` classes the build does not have; it now describes the agent-local model (render, `named-checkconf`, swap, `rndc reconfig`) and the PowerDNS key file. Its two quotes of the driver registry now include the agentless `technitium_api` driver. `docs/ARCHITECTURE.md` now lists the agentless drivers the build has and says a group holding a DNSSEC-signed zone takes only one agent server. (#4484)
