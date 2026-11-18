@@ -160,4 +160,32 @@ describe("network device Edit dialog (#4370)", { timeout: 30000 }, () => {
     );
     expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
   });
+
+  it("v2c to v3 with a moved address clears the old community instead of 422ing (#4451)", async () => {
+    h.get.mockResolvedValue(OLD);
+    open();
+    fireEvent.change(
+      await screen.findByDisplayValue("192.0.2.10", {}, { timeout: 10000 }),
+      { target: { value: "192.0.2.99" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "v3" }));
+    fireEvent.change(screen.getByPlaceholderText("snmpv3-readonly"), {
+      target: { value: "monitor" },
+    });
+    expect(screen.getByText(/will be discarded on Save/)).toBeTruthy();
+    // authPriv is the default level: its keys are required, enter both.
+    const pw = Array.from(
+      document.querySelectorAll<HTMLInputElement>('input[type="password"]'),
+    );
+    for (const el of pw)
+      fireEvent.change(el, { target: { value: "k-12345678" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(h.update).toHaveBeenCalledTimes(1), {
+      timeout: 10000,
+    });
+    const body = h.update.mock.calls[0][1];
+    expect(body.ip_address).toBe("192.0.2.99");
+    expect(body.snmp_version).toBe("v3");
+    expect(body.community).toBe("");
+  });
 });
