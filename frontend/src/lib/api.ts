@@ -6198,6 +6198,57 @@ export interface ZoneTemplate {
   description: string;
   parameters: ZoneTemplateParameter[];
   record_count: number;
+  version?: string | null;
+  source?: string | null;
+}
+
+// Applying a template to an existing zone (#2183).
+export type ApplyTemplateStatus =
+  | "add"
+  | "present"
+  | "conflict"
+  | "unsupported";
+
+export interface ApplyTemplateItem {
+  name: string;
+  record_type: string;
+  value: string;
+  ttl: number | null;
+  priority: number | null;
+  weight: number | null;
+  port: number | null;
+  status: ApplyTemplateStatus;
+  reason: string | null;
+  existing_id: string | null;
+}
+
+export interface ApplyTemplatePreview {
+  zone_id: string;
+  zone_name: string;
+  template_id: string;
+  template_name: string;
+  template_version: string | null;
+  source: string | null;
+  items: ApplyTemplateItem[];
+  add: number;
+  present: number;
+  conflict: number;
+  unsupported: number;
+}
+
+export interface ApplyTemplateRequest {
+  template_id: string;
+  params: Record<string, string>;
+  skip_conflicts?: boolean;
+}
+
+export interface ApplyTemplateResult {
+  zone_id: string;
+  template_id: string;
+  created: number;
+  present: number;
+  skipped: ApplyTemplateItem[];
+  target_serial: number | null;
 }
 
 export interface ZoneTemplateCatalog {
@@ -6861,6 +6912,29 @@ export const dnsApi = {
   createZoneFromTemplate: (groupId: string, body: FromTemplateRequest) =>
     api
       .post<DNSZone>(`/dns/groups/${groupId}/zones/from-template`, body)
+      .then((r) => r.data),
+
+  previewApplyTemplate: (
+    groupId: string,
+    zoneId: string,
+    body: ApplyTemplateRequest,
+  ) =>
+    api
+      .post<ApplyTemplatePreview>(
+        `/dns/groups/${groupId}/zones/${zoneId}/apply-template/preview`,
+        body,
+      )
+      .then((r) => r.data),
+  applyTemplate: (
+    groupId: string,
+    zoneId: string,
+    body: ApplyTemplateRequest,
+  ) =>
+    api
+      .post<ApplyTemplateResult>(
+        `/dns/groups/${groupId}/zones/${zoneId}/apply-template`,
+        body,
+      )
       .then((r) => r.data),
 
   // TSIG keys (operator-managed named keys for RFC 2136 / AXFR auth)

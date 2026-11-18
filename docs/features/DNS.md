@@ -1831,6 +1831,50 @@ scope match the file for the records the operator owns, not the whole zone.
 The UI has no view picker and imports into the shared records; in a group
 with views it says so.
 
+### Apply a template to an existing zone (#2183)
+
+The zone-template catalog (`GET /api/v1/dns/zone-templates`) also feeds the
+zone's **Data ▾ → Apply template…** dialog, so a zone that already exists can
+take a template's records without typing them. Pick a template, fill its
+parameters, **Preview**, then **Apply**. Over REST:
+
+| | |
+|---|---|
+| Preview | `POST /api/v1/dns/groups/{gid}/zones/{zid}/apply-template/preview` with `{template_id, params, view_id?}`. Writes nothing. |
+| Apply | `POST …/zones/{zid}/apply-template` with the same body plus `skip_conflicts` (default `false`). 201 with `{created, present, skipped, target_serial}`. |
+
+Both need write on `dns_record` (and read, as the record list does); a token
+bound to other zones is refused with 403. The preview classifies each record:
+
+| Status | Meaning |
+|---|---|
+| `add` | New; apply writes it. |
+| `present` | An identical record exists (same view, name, type, value, priority / weight / port; TTL is not compared). Skipped, so applying twice writes nothing twice. |
+| `conflict` | A CNAME clash at that name (RFC 2181 §10.1, the rule the record API applies), or a second `v=spf1` / `v=DMARC1` / `v=STSv1` / `v=TLSRPTv1` TXT at a name that already holds a different one. Shown with the existing record; never overwritten. |
+| `unsupported` | A DNS server in the zone's group cannot carry it (for example CAA on a provider without it), or it is a LUA record and the caller is not a superadmin. |
+
+Apply refuses with a 409 listing the problems while any record is a
+`conflict` or `unsupported`, unless `skip_conflicts` is true, which writes the
+`add` records and leaves the rest alone. Every record goes through the record
+API's validators (owner and value rules, the BIND `check-names` rule,
+absolute-target rule, driver gates). The write is the bulk-create path: one
+serial bump, one dispatch to the group's servers (agent wake), and one
+`apply_template` audit row carrying the template id, version, parameters and
+counts, in the same transaction as the records.
+
+Catalog entries may carry a `version` and a `source` (the RFC the records come
+from). Built-in templates added with this feature: **CAA** (RFC 8659),
+**MTA-STS** (RFC 8461) and **TLS-RPT** (RFC 8460). The Copilot has two
+read-only tools, `find_zone_templates` and `preview_zone_template`; there is
+deliberately no apply tool, because a multi-record write is the shape the
+Copilot does not get a commit for.
+
+Not part of this: remembering which records a template created (re-apply with
+new parameters, remove template), merging an `include:` into an existing SPF
+record, list-valued parameters (one SRV per DC), and the vendor mail
+templates (Microsoft 365, Google Workspace), which wait for vendor-sourced
+values.
+
 ### Spreadsheet import / export — CSV and XLSX (#2139)
 
 The zone file is right for moving a zone between servers. For editing many

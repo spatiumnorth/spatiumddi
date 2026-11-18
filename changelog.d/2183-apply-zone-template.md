@@ -1,0 +1,3 @@
+### Added
+
+- A record template can be applied to a zone that already exists: Data > Apply template on the zone page (or `POST .../zones/{id}/apply-template/preview` and `.../apply-template`). The preview classifies every record as add, already present, conflict (a CNAME clash, or a second SPF / DMARC / MTA-STS / TLS-RPT record at a name that has one) or unsupported by the group's DNS servers, and writes nothing; apply writes only the new records through the normal record path, as one audited operation, and applying again adds nothing twice. It needs write on DNS records. The catalog gains CAA, MTA-STS and TLS-RPT templates, each with a version and an RFC source, and the Copilot gets read-only `find_zone_templates` and `preview_zone_template` tools. (#2183)

@@ -60,6 +60,10 @@ class ZoneTemplate:
     description: str
     parameters: list[TemplateParameter]
     records: list[TemplateRecord]
+    #: Catalog-author revision and the RFC / vendor page the records come from
+    #: (#2183). Optional: the original templates carry neither.
+    version: str | None = None
+    source: str | None = None
 
     @property
     def max_record_count(self) -> int:
@@ -88,6 +92,8 @@ def list_templates() -> list[ZoneTemplate]:
                 name=t["name"],
                 category=t["category"],
                 description=t["description"],
+                version=t.get("version"),
+                source=t.get("source"),
                 parameters=[
                     TemplateParameter(
                         key=p["key"],

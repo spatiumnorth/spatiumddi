@@ -1992,3 +1992,100 @@ async def list_blocklist_templates(
             "not enforce them."
         ),
     }
+
+
+# ── find_zone_templates / preview_zone_template (#2183) ───────────────
+
+
+class FindZoneTemplatesArgs(BaseModel):
+    search: str | None = Field(
+        default=None, description="Substring match on the template id, name or category."
+    )
+
+
+@register_tool(
+    name="find_zone_templates",
+    permission=("read", "dns_zone"),
+    description=(
+        "List the DNS record templates an operator can apply to a zone (mail "
+        "hardening, Active Directory, CAA, web ...): id, name, category, "
+        "description, the parameters each takes, how many records it writes, "
+        "and its version and source (the RFC the records come from). Use to "
+        "answer 'which templates exist?' before preview_zone_template."
+    ),
+    args_model=FindZoneTemplatesArgs,
+    category="dns",
+    module="core.dns",
+)
+async def find_zone_templates(
+    db: AsyncSession, user: User, args: FindZoneTemplatesArgs
+) -> list[dict[str, Any]]:
+    from app.services.dns.zone_templates import list_templates  # noqa: PLC0415
+
+    needle = (args.search or "").strip().lower()
+    return [
+        {
+            "id": t.id,
+            "name": t.name,
+            "category": t.category,
+            "description": t.description,
+            "record_count": t.max_record_count,
+            "version": t.version,
+            "source": t.source,
+            "parameters": [
+                {"key": p.key, "label": p.label, "required": p.required, "default": p.default}
+                for p in t.parameters
+            ],
+        }
+        for t in list_templates()
+        if not needle or needle in f"{t.id} {t.name} {t.category}".lower()
+    ]
+
+
+class PreviewZoneTemplateArgs(BaseModel):
+    zone_id: uuid.UUID = Field(description="UUID of the existing zone.")
+    template_id: str = Field(description="A template id from find_zone_templates.")
+    params: dict[str, str] = Field(default_factory=dict, description="Template parameters, by key.")
+
+
+@register_tool(
+    name="preview_zone_template",
+    honours_token_binding=True,
+    permission=("read", "dns_record"),
+    description=(
+        "Preview applying a record template to an existing zone. Read-only: "
+        "nothing is written. Each record the template would write is "
+        "classified add / present (an identical record exists) / conflict "
+        "(a CNAME clash, or a second SPF / DMARC / MTA-STS / TLS-RPT record "
+        "at a name that has one) / unsupported (a DNS server in the zone's "
+        "group cannot carry it). Applying it is an operator action in the "
+        "zone's Apply template dialog; this tool cannot apply."
+    ),
+    args_model=PreviewZoneTemplateArgs,
+    category="dns",
+    module="core.dns",
+)
+async def preview_zone_template(
+    db: AsyncSession, user: User, args: PreviewZoneTemplateArgs
+) -> dict[str, Any]:
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    from app.api.v1.dns.router import (  # noqa: PLC0415
+        ApplyTemplateRequest,
+        _classify_template_for_zone,
+        _template_preview,
+    )
+
+    zone = await db.get(DNSZone, args.zone_id)
+    if zone is None or not token_allows_zone(user, args.zone_id):
+        return {"error": "zone not found"}
+    try:
+        template, classified = await _classify_template_for_zone(
+            db,
+            zone,
+            ApplyTemplateRequest(template_id=args.template_id, params=args.params),
+            user,
+        )
+    except HTTPException as exc:
+        return {"error": str(exc.detail)}
+    return _template_preview(zone, template, classified).model_dump(mode="json")

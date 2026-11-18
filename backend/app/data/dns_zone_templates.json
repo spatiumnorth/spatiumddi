@@ -227,6 +227,136 @@
       "description": "Empty zone with no preset records. Pair with external-dns running in your cluster; it will create A / CNAME / TXT records here as Ingress and LoadBalancer services come and go.",
       "parameters": [],
       "records": []
+    },
+    {
+      "id": "caa",
+      "name": "CAA - certificate authority authorization",
+      "category": "Security",
+      "version": "1",
+      "source": "https://www.rfc-editor.org/rfc/rfc8659",
+      "description": "Restricts which certificate authority may issue certificates for the zone apex (RFC 8659). Optionally restricts wildcard issuance to another CA and sets an incident-report mailbox.",
+      "parameters": [
+        {
+          "key": "ca_domain",
+          "label": "CA domain name",
+          "type": "string",
+          "required": true,
+          "default": "letsencrypt.org",
+          "placeholder": "letsencrypt.org",
+          "hint": "The identifier your CA publishes for CAA (Let's Encrypt: letsencrypt.org)."
+        },
+        {
+          "key": "wildcard_ca",
+          "label": "Wildcard CA domain (optional)",
+          "type": "string",
+          "required": false,
+          "placeholder": "letsencrypt.org",
+          "hint": "Adds an issuewild record for this CA. Leave blank to let the issue record cover wildcards too."
+        },
+        {
+          "key": "iodef",
+          "label": "Incident report URL (optional)",
+          "type": "string",
+          "required": false,
+          "placeholder": "mailto:security@example.com",
+          "hint": "An iodef record: a mailto: or https: URL a CA reports policy violations to."
+        }
+      ],
+      "records": [
+        {
+          "name": "@",
+          "record_type": "CAA",
+          "value": "0 issue \"{{ca_domain}}\"",
+          "ttl": 3600
+        },
+        {
+          "name": "@",
+          "record_type": "CAA",
+          "value": "0 issuewild \"{{wildcard_ca}}\"",
+          "ttl": 3600,
+          "skip_if_empty": [
+            "wildcard_ca"
+          ]
+        },
+        {
+          "name": "@",
+          "record_type": "CAA",
+          "value": "0 iodef \"{{iodef}}\"",
+          "ttl": 3600,
+          "skip_if_empty": [
+            "iodef"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "mta-sts",
+      "name": "MTA-STS policy",
+      "category": "Mail",
+      "version": "1",
+      "source": "https://www.rfc-editor.org/rfc/rfc8461",
+      "description": "The _mta-sts TXT record that announces an MTA-STS policy (RFC 8461) and, optionally, the mta-sts host that serves the policy file over HTTPS. The policy file itself (/.well-known/mta-sts.txt) is not DNS and is yours to publish.",
+      "parameters": [
+        {
+          "key": "policy_id",
+          "label": "Policy id",
+          "type": "string",
+          "required": true,
+          "placeholder": "20261118T000000",
+          "hint": "1-32 letters or digits. Change it whenever the policy file changes, so senders re-fetch it."
+        },
+        {
+          "key": "policy_host",
+          "label": "Policy web host (optional)",
+          "type": "string",
+          "required": false,
+          "placeholder": "web.example.com.",
+          "hint": "Creates mta-sts as a CNAME to the host that serves the policy file. Leave blank if mta-sts already resolves to it."
+        }
+      ],
+      "records": [
+        {
+          "name": "_mta-sts",
+          "record_type": "TXT",
+          "value": "v=STSv1; id={{policy_id}}",
+          "ttl": 3600
+        },
+        {
+          "name": "mta-sts",
+          "record_type": "CNAME",
+          "value": "{{policy_host}}",
+          "ttl": 3600,
+          "skip_if_empty": [
+            "policy_host"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "tls-rpt",
+      "name": "TLS-RPT reporting",
+      "category": "Mail",
+      "version": "1",
+      "source": "https://www.rfc-editor.org/rfc/rfc8460",
+      "description": "The _smtp._tls TXT record that asks sending mail servers for SMTP TLS reports (RFC 8460).",
+      "parameters": [
+        {
+          "key": "rua",
+          "label": "Report address",
+          "type": "string",
+          "required": true,
+          "placeholder": "mailto:tlsrpt@example.com",
+          "hint": "A mailto: or https: URI that receives the reports."
+        }
+      ],
+      "records": [
+        {
+          "name": "_smtp._tls",
+          "record_type": "TXT",
+          "value": "v=TLSRPTv1; rua={{rua}}",
+          "ttl": 3600
+        }
+      ]
     }
   ]
 }
