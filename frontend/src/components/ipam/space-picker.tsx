@@ -26,7 +26,7 @@ export function IPSpacePicker({
   onChange: (id: string) => void;
   required?: boolean;
 }) {
-  const { data: spaces = [] } = useQuery<IPSpace[]>({
+  const { data: spaces = [], isPending } = useQuery<IPSpace[]>({
     queryKey: ["spaces"],
     queryFn: () => ipamApi.listSpaces(),
   });
@@ -42,6 +42,10 @@ export function IPSpacePicker({
           required={required}
         >
           <option value="">— select —</option>
+          {/* A stored value stays selected until the list arrives. Without
+              this option the select reads "" and a required form refuses to
+              submit (#4419). */}
+          {isPending && value && <option value={value}>Loading…</option>}
           {spaces.map((s) => (
             <option key={s.id} value={s.id}>
               {s.name}
