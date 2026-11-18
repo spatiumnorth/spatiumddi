@@ -61,7 +61,7 @@ from app.services.ipam.address_create_rules import (
     take_address_row,
 )
 from app.services.ipam.probe_policy import check_probe_target
-from app.services.nmap import NmapArgError, build_argv
+from app.services.nmap import NmapArgError, build_argv, resolve_target
 from app.services.pcap import (
     PcapArgError,
     build_pcap_argv,
@@ -1064,6 +1064,7 @@ async def _preview_run_nmap_scan(
 
     try:
         argv = build_argv(target, args.preset, args.port_spec, args.extra_args)
+        await resolve_target(target)
     except NmapArgError as exc:
         return PreviewResult(
             ok=False,
@@ -1116,6 +1117,7 @@ async def _apply_run_nmap_scan(
     # Re-validate at apply time too — argv builder gates dangerous flags.
     try:
         build_argv(target, args.preset, args.port_spec, args.extra_args)
+        await resolve_target(target)
     except NmapArgError as exc:
         raise ValueError(f"nmap arg validation failed: {exc}") from exc
 
