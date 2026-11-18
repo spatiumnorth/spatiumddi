@@ -1264,8 +1264,8 @@ def test_sync_tsig_keys_wire_format(tmp_path: Path) -> None:
             {"name": "k2", "secret": "s2", "algorithm": "HMAC-SHA512"},
         ],
     )
-    assert calls[0][2] == "settings/set"
-    assert calls[0][3]["tsigKeys"] == "k1|s1|hmac-sha256|k2|s2|hmac-sha512"
+    assert calls[-1][2] == "settings/set"
+    assert calls[-1][3]["tsigKeys"] == "k1|s1|hmac-sha256|k2|s2|hmac-sha512"
 
 
 def test_sync_tsig_keys_drops_unsupported_algorithm(tmp_path: Path) -> None:
@@ -1278,7 +1278,7 @@ def test_sync_tsig_keys_drops_unsupported_algorithm(tmp_path: Path) -> None:
             {"name": "good", "secret": "s", "algorithm": "hmac-sha256"},
         ],
     )
-    assert calls[0][3]["tsigKeys"] == "good|s|hmac-sha256"
+    assert calls[-1][3]["tsigKeys"] == "good|s|hmac-sha256"
 
 
 def test_get_zone_records_filters_daemon_managed_apex(tmp_path: Path) -> None:
@@ -2478,7 +2478,7 @@ def test_empty_tsig_key_set_is_pushed(tmp_path: Path) -> None:
     d = TechnitiumDriver(state_dir=tmp_path)
     calls = _install_fake_request(d, lambda *_: {"status": "ok"})
     d._sync_tsig_keys("t", [])
-    assert calls and calls[0][3]["tsigKeys"] == ""
+    assert calls and calls[-1][3]["tsigKeys"] == ""
 
 
 def test_doh_path_override_warns_because_it_is_unsupported(tmp_path: Path) -> None:
@@ -4275,7 +4275,7 @@ def test_every_algorithm_technitium_accepts_is_installed(tmp_path: Path, algorit
     d = TechnitiumDriver(state_dir=tmp_path)
     calls = _install_fake_request(d, lambda *_: {"status": "ok"})
     d._sync_tsig_keys("t", [{"name": "k", "secret": "s", "algorithm": algorithm}])
-    assert calls[0][3]["tsigKeys"] == f"k|s|{algorithm}"
+    assert calls[-1][3]["tsigKeys"] == f"k|s|{algorithm}"
 
 
 def test_hmac_sha224_is_not_installed_or_pinned_and_is_reported(tmp_path: Path) -> None:
