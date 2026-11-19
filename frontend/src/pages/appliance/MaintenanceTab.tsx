@@ -84,7 +84,7 @@ export function MaintenanceTab() {
       </div>
 
       {/* A refused toggle or reboot used to say nothing (#1342). */}
-      {(toggleMaint.isError || reboot.isError) && (
+      {(toggleMaint.isError || (reboot.isError && !confirmReboot)) && (
         <FormError className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
           {formatApiError(
             toggleMaint.error ?? reboot.error,
@@ -211,7 +211,16 @@ export function MaintenanceTab() {
         }
         confirmLabel="Reboot now"
         tone="destructive"
-        onClose={() => !reboot.isPending && setConfirmReboot(false)}
+        error={
+          reboot.error
+            ? formatApiError(reboot.error, "Maintenance action failed")
+            : null
+        }
+        onClose={() => {
+          if (reboot.isPending) return;
+          setConfirmReboot(false);
+          reboot.reset();
+        }}
         onConfirm={() => reboot.mutate()}
         loading={reboot.isPending}
       />
