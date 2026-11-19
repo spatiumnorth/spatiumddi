@@ -212,6 +212,42 @@ case "$os_family" in
       echo "::warning::could not query the apt index in ${image}; availability unknown"
     fi
     ;;
+  redhat | centos | rocky | almalinux)
+    # #3913 — the Red Hat UBI variants. ``microdnf repoquery --available``
+    # lists what the image's own repositories (the UBI ones) can install, as
+    # ``name-[epoch:]version-release.arch``. Red Hat publishes an advisory and
+    # its packages together, so a gap between the two is rare, but the same
+    # rule applies as for apk and apt: a fix the index offers is a FAIL (a
+    # rebuild cures it), one it does not yet offer is a DEFER.
+    #
+    # Fails closed like the others: ``--refresh`` forces a metadata fetch, and
+    # an offline probe exits non-zero (an empty answer would otherwise read as
+    # "nothing newer, so DEFER" for every finding at once). Names are filtered
+    # to rpm's own character class before they reach the shell; a name outside
+    # it is dropped and then fails as unverifiable, never published.
+    pkgs=$(printf '%s\n' "$findings" \
+      | awk -F '\t' '$1 == "os-pkgs" && $2 ~ /^[A-Za-z0-9][A-Za-z0-9+._-]*$/ { print $2 }' \
+      | sort -u | tr '\n' ' ')
+    if [ -z "$pkgs" ]; then
+      probe_ok=1
+    elif pol=$(docker run --rm --user 0 --entrypoint sh "$image" -c "
+           microdnf repoquery --refresh --available ${pkgs} 2>/dev/null"); then
+      if [ -n "$pol" ]; then
+        probe_ok=1
+        # name-[E:]V-R.arch -> "name<TAB>E:V-R", epoch spelled out (0 when
+        # absent) so one comparator handles every row; the newest per name wins.
+        available=$(printf '%s\n' "$pol" | sed -nE '
+          s/\.(x86_64|aarch64|noarch|i686|ppc64le|s390x)$//
+          s/^(.+)-(([0-9]+):)?([^-]+)-([^-]+)$/\1\t\3\t\4-\5/p' \
+          | awk -F '\t' '{ e = ($2 == "" ? "0" : $2); print $1 "\t" e ":" $3 }' \
+          | sort -t "$(printf '\t')" -k1,1 -k2,2V | awk -F '\t' '{ last[$1] = $2 } END { for (p in last) print p "\t" last[p] }')
+      else
+        echo "::warning::'microdnf repoquery' printed nothing in ${image}; availability unknown"
+      fi
+    else
+      echo "::warning::could not query the rpm index in ${image}; availability unknown"
+    fi
+    ;;
   *)
     echo "::warning::no package-index probe for '${os_family:-unknown}'; availability unknown"
     ;;
@@ -244,6 +280,19 @@ version_compare() {
           if dpkg --compare-versions "$a" gt "$b"; then echo ">"
           elif dpkg --compare-versions "$a" eq "$b"; then echo "="
           else echo "<"; fi
+        done'
+      ;;
+    redhat | centos | rocky | almalinux)
+      # rpm's own vercmp (a Lua function in ``rpm --eval``). It compares plain
+      # version strings, so both sides carry an explicit epoch first: a fixed
+      # version Trivy prints without one means epoch 0.
+      docker run --rm -i --user 0 --entrypoint sh "$image" -c '
+        norm() { case "$1" in *:*) printf "%s" "$1" ;; *) printf "0:%s" "$1" ;; esac; }
+        while read -r a b; do
+          a=$(norm "$a"); b=$(norm "$b")
+          case $(rpm --eval "%{lua:print(rpm.vercmp(\"$a\", \"$b\"))}") in
+            1) echo ">" ;; 0) echo "=" ;; *) echo "<" ;;
+          esac
         done'
       ;;
   esac
@@ -288,7 +337,7 @@ while IFS=$'\t' read -r class pkg installed fixed id sev; do
         # `apt-get upgrade` forever, and telling the operator to rebuild
         # would be an instruction that provably does nothing.
         reason="the index offers ${offered} — rebuild the package layer"
-        if [ "$os_family" != "alpine" ]; then
+        if [ "$os_family" = "debian" ] || [ "$os_family" = "ubuntu" ]; then
           by_upgrade=$(upgrade_offers "$pkg")
           held=yes
           if [ -n "$by_upgrade" ]; then

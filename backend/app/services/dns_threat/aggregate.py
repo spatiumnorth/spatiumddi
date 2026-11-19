@@ -14,8 +14,9 @@ log lines (agents batch and can lag), and safe to run far more often
 than the bucket width — the alternative, a trailing rolling window,
 would produce overlapping rows that nothing could sensibly key on.
 
-Rows are streamed ordered by client so grouping never holds more than
-one client's queries in memory: a busy resolver can put six figures of
+Rows are streamed (server-side cursor, ``yield_per`` batches) ordered by
+client so grouping never holds more than one client's queries in
+memory: a busy resolver can put six figures of
 lines into a single hour, and this runs on the worker alongside
 everything else.
 """
@@ -82,6 +83,10 @@ DGA_ALERTING_SCORE = 80.0
 # gone.
 RAW_LOG_RETENTION_HOURS = 24
 
+# Rows fetched per round trip from the server-side cursor in
+# ``aggregate_window``. Memory is one batch plus one client's rows.
+STREAM_BATCH_ROWS = 2000
+
 # Set after the first backfill sweep of this process. See run_aggregation.
 _backfill_attempted = False
 
@@ -119,6 +124,12 @@ async def aggregate_window(
         # one client's rows arrive together, so only that client's
         # queries are ever held in memory.
         .order_by(DNSQueryLogEntry.client_ip)
+        # Without ``yield_per`` an ORM-column select drains the whole
+        # cursor into a list (``orm/loading.py`` ``_raw_all_rows``) even
+        # under ``db.stream`` — the hour's rows all sat in worker memory
+        # and a busy hour OOM-killed it (#4275). ``yield_per`` implies
+        # ``stream_results`` and caps the fetch at one batch.
+        .execution_options(yield_per=STREAM_BATCH_ROWS)
     )
 
     written = 0

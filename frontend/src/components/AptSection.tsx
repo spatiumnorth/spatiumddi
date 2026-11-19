@@ -17,6 +17,7 @@ import {
   type AptValidateResponse,
   type PlatformSettings,
 } from "@/lib/api";
+import { SettingsRow } from "@/components/SettingsRow";
 import { Toggle } from "@/components/ui/toggle";
 import { cn } from "@/lib/utils";
 
@@ -41,28 +42,6 @@ interface AuthEdit {
   login: string;
   password_set: boolean;
   password: string;
-}
-
-function Field({
-  label,
-  description,
-  children,
-}: {
-  label: string;
-  description?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="flex items-start justify-between gap-8 py-3">
-      <div className="max-w-xl">
-        <div className="text-sm font-medium">{label}</div>
-        {description && (
-          <div className="text-xs text-muted-foreground">{description}</div>
-        )}
-      </div>
-      <div className="flex-shrink-0">{children}</div>
-    </div>
-  );
 }
 
 export function AptSection({
@@ -247,7 +226,7 @@ export function AptSection({
         </p>
       </div>
 
-      <Field
+      <SettingsRow
         label="Manage APT with SpatiumDDI"
         description="Off (default) — the appliance keeps Debian's baked sources.list, untouched. On — SpatiumDDI renders /etc/apt/sources.list.d/spatiumddi.list (+ proxy / auth / keyrings) from the config below and neutralises the baked sources.list. The original is backed up and restored if you turn this off."
       >
@@ -259,7 +238,7 @@ export function AptSection({
           }}
           disabled={ro}
         />
-      </Field>
+      </SettingsRow>
 
       {/* ── Sources ── */}
       <div className="border-t pt-3">
@@ -619,7 +598,7 @@ export function AptSection({
         </div>
       </div>
 
-      <Field
+      <SettingsRow
         label="Unattended security upgrades"
         description="When on, the appliance's daily unattended-upgrades run installs security patches automatically. Turn off for air-gapped sites until you've pointed at a reachable mirror."
       >
@@ -631,7 +610,7 @@ export function AptSection({
           }}
           disabled={ro}
         />
-      </Field>
+      </SettingsRow>
 
       {/* ── Unattended-upgrades policy (issue #164) ── */}
       <div className="space-y-2 border-t pt-3">
@@ -673,7 +652,7 @@ export function AptSection({
         />
       </div>
 
-      <Field
+      <SettingsRow
         label="Automatic reboot after upgrades"
         description="Reboot automatically when an installed update requires it. Off by default — a surprise reboot is risky for a DDI appliance serving DNS / DHCP."
       >
@@ -685,9 +664,9 @@ export function AptSection({
           }}
           disabled={ro}
         />
-      </Field>
+      </SettingsRow>
 
-      <Field
+      <SettingsRow
         label="Reboot time"
         description="HH:MM (24-hour) for the automatic reboot, when enabled."
       >
@@ -701,7 +680,7 @@ export function AptSection({
             mark();
           }}
         />
-      </Field>
+      </SettingsRow>
 
       {/* ── Validation result ── */}
       {validation && (

@@ -8,6 +8,7 @@
 // #1596. On create there is no stored value to protect, so the hidden fields
 // keep going out as `null` exactly as before.
 
+import { hasOptions } from "@/lib/customFieldValues";
 import type {
   BlocklistWildcardMode,
   CustomField,
@@ -53,7 +54,11 @@ export function blocklistPayload(
 /** DNS pool health check: the target port is hidden for `none` and `icmp`,
  *  TLS verification is shown only for `https`. */
 export function poolHealthCheckFields(
-  f: { hcType: DNSPoolWrite["hc_type"]; hcPort: number; hcVerifyTls: boolean },
+  f: {
+    hcType: DNSPoolWrite["hc_type"];
+    hcPort: number | null;
+    hcVerifyTls: boolean;
+  },
   editing: boolean,
 ): Pick<DNSPoolWrite, "hc_target_port" | "hc_verify_tls"> {
   const out: Pick<DNSPoolWrite, "hc_target_port" | "hc_verify_tls"> = {};
@@ -122,7 +127,7 @@ export interface CustomFieldForm {
   description: string;
 }
 
-/** Custom field, create: every column, `options` null unless `select`. */
+/** Custom field, create: every column, `options` null unless `select` / `multi_select`. */
 export function customFieldCreatePayload(
   form: CustomFieldForm,
 ): Omit<CustomField, "id"> {
@@ -131,7 +136,7 @@ export function customFieldCreatePayload(
     name: form.name,
     label: form.label,
     field_type: form.field_type,
-    options: form.field_type === "select" ? splitOptions(form.options) : null,
+    options: hasOptions(form.field_type) ? splitOptions(form.options) : null,
     is_required: form.is_required,
     is_searchable: form.is_searchable,
     default_value: form.default_value || null,
@@ -141,13 +146,13 @@ export function customFieldCreatePayload(
 }
 
 /** Custom field, edit: resource type, name and type are fixed once created,
- *  and the options list is shown only for `select` fields. */
+ *  and the options list is shown only for `select` / `multi_select` fields. */
 export function customFieldUpdatePayload(
   form: CustomFieldForm,
 ): Partial<Omit<CustomField, "id" | "resource_type" | "name" | "field_type">> {
   return {
     label: form.label,
-    ...(form.field_type === "select"
+    ...(hasOptions(form.field_type)
       ? { options: splitOptions(form.options) }
       : {}),
     is_required: form.is_required,

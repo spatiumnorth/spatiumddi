@@ -170,22 +170,36 @@ async def test_create_stores_the_credentials_encrypted(
 async def test_update_merges_over_the_stored_credentials(
     db_session: AsyncSession, client: AsyncClient
 ) -> None:
-    """Changing only the URL must not wipe the token.
+    """An edit that leaves the URL alone must not wipe the token.
 
     The modal renders every credential field blank on edit — credentials are
     never returned — and tells the operator blank means "keep". A full
-    replace turned "fix the port in the URL" into "delete the token", and the
-    server then 422s on save for the token it just discarded.
+    replace turned a settings edit into "delete the token", and the server
+    then 422s on save for the token it just discarded. A new URL is another
+    destination, so it needs the token again (and then merges over the rest).
     """
     token = await _admin(db_session)
     group = await _group(db_session)
     server = await _server(db_session, group, _CREDS)
     await db_session.commit()
+    url = f"/api/v1/dns/groups/{group.id}/servers/{server.id}"
 
     resp = await client.put(
-        f"/api/v1/dns/groups/{group.id}/servers/{server.id}",
+        url,
         headers=_h(token),
         json={"cloud_credentials": {"api_url": "https://dns.example.test:5380"}},
+    )
+    assert resp.status_code == 422, resp.text
+
+    resp = await client.put(
+        url,
+        headers=_h(token),
+        json={
+            "cloud_credentials": {
+                "api_url": "https://dns.example.test:5380",
+                "api_token": "tok-original",
+            }
+        },
     )
     assert resp.status_code == 200, resp.text
 

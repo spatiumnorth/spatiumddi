@@ -1,4 +1,5 @@
 import { ListReadError } from "@/components/ui/list-read-error";
+import { ServerDeleteAgentNote } from "@/pages/serverDeleteAgentNote";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { humanTime } from "../network/_shared";
 import { useNavigate, useSearchParams } from "react-router-dom";
@@ -63,6 +64,7 @@ import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import { ConfigApplyChip } from "@/components/ConfigApplyChip";
 import { DaemonStateChip } from "@/components/DaemonStateChip";
 import { DuplicateAgentChip } from "@/components/DuplicateAgentChip";
+import { AgentMemoryCell } from "@/components/AgentMemoryCell";
 import { SpoolChip } from "@/components/SpoolChip";
 import { CreateScopeModal } from "./CreateScopeModal";
 import { CreateClientClassModal } from "./CreateClientClassModal";
@@ -1255,6 +1257,7 @@ function GroupServersList({
                   </div>
                 </div>
                 <div className="flex items-center gap-1 flex-shrink-0">
+                  <AgentMemoryCell server={s} className="mr-2" />
                   {s.maintenance_mode ? (
                     <button
                       type="button"
@@ -3751,6 +3754,9 @@ export function DHCPPage() {
     mutationFn: (id: string) => dhcpApi.deleteServer(id),
     onSuccess: (_, id) => {
       qc.invalidateQueries({ queryKey: ["dhcp-servers"] });
+      // Logs offers and validates a pick against this list (#4234).
+      qc.invalidateQueries({ queryKey: ["logs-agent-sources"] });
+      qc.invalidateQueries({ queryKey: ["logs-sources"] });
       if (selection?.type === "server" && selection.server.id === id)
         setSelection(null);
       setDelServer(null);
@@ -3880,7 +3886,12 @@ export function DHCPPage() {
       {delServer && (
         <DeleteConfirmModal
           title="Delete DHCP Server"
-          description={deleteServerDescription(delServer.name)}
+          description={
+            <>
+              {deleteServerDescription(delServer.name)}
+              <ServerDeleteAgentNote />
+            </>
+          }
           onConfirm={() => deleteServerMut.mutate(delServer.id)}
           onClose={() => {
             setDelServer(null);

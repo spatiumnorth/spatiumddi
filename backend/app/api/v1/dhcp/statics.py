@@ -18,6 +18,7 @@ from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.dns_names import validate_optional_hostname
 from app.core.permissions import require_resource_permission
 from app.core.update_nulls import changed_keys, resolve_update_changes, snapshot
+from app.models.audit import AuditLog
 from app.models.dhcp import DHCPScope, DHCPStaticAssignment
 from app.models.ipam import Subnet
 from app.services.dhcp.normalize import canonical_duid, norm_duid, norm_ip, norm_mac
@@ -277,7 +278,7 @@ async def create_static(
     await db.flush()
     await push_static_change(db, st, action="create")
     collect_wake(dhcp_group_channel(scope.group_id))
-    await upsert_ipam_for_static(db, scope, st)
+    await upsert_ipam_for_static(db, scope, st, user=user)
     await _recount_subnet(db, scope.subnet_id)
     write_audit(
         db,
@@ -355,7 +356,7 @@ async def update_static(
         return st
     await push_static_change(db, st, action="update", prev_mac=prev_mac, prev_ip=prev_ip)
     collect_wake(dhcp_group_channel(scope.group_id))
-    await upsert_ipam_for_static(db, scope, st, action="update")
+    await upsert_ipam_for_static(db, scope, st, action="update", user=user)
     await _recount_subnet(db, scope.subnet_id)
     write_audit(
         db,
@@ -381,7 +382,8 @@ async def delete_static(static_id: uuid.UUID, db: DB, user: CurrentUser) -> None
     if scope is not None:
         collect_wake(dhcp_group_channel(scope.group_id))
     await push_static_change(db, st, action="delete")
-    handovers = await detach_ipam_for_static(db, st)
+    ip_audits: list[AuditLog] = []
+    handovers = await detach_ipam_for_static(db, st, user=user, audits=ip_audits)
     write_audit(
         db,
         user=user,
@@ -397,4 +399,5 @@ async def delete_static(static_id: uuid.UUID, db: DB, user: CurrentUser) -> None
     if scope is not None:
         await _recount_subnet(db, scope.subnet_id)
     await publish_handover_ddns(db, handovers)
+    db.add_all(ip_audits)
     await db.commit()
