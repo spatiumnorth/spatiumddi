@@ -38,6 +38,7 @@ import {
   formatApiError,
   formatDialogError,
 } from "@/lib/api";
+import { customFieldDisplay } from "@/lib/customFieldValues";
 import { cn } from "@/lib/utils";
 import { isDefaultGatewayHostname } from "@/lib/gatewayDns";
 import { GatewayHostnameNote } from "@/components/GatewayHostnameNote";
@@ -618,9 +619,7 @@ export function IPDetailModal({
                         <td className="px-2 py-1 break-words">
                           {v === null || v === undefined || v === ""
                             ? dash(null)
-                            : typeof v === "object"
-                              ? JSON.stringify(v)
-                              : String(v)}
+                            : customFieldDisplay(v)}
                         </td>
                       </tr>
                     ))}

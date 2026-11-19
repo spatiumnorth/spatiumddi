@@ -73,6 +73,7 @@ from app.services.agents.instance_ownership import (
     parse_agent_instance,
     refuse_registration,
 )
+from app.services.agents.memory_status import apply_reported_memory
 from app.services.agents.server_gone import refresh_agent_server
 from app.services.agents.spool_status import apply_reported_spool
 from app.services.appliance.lldp import lldp_bundle
@@ -220,6 +221,10 @@ class AgentHeartbeatRequest(BaseModel):
     # than 422-ing the heartbeat. Absent (None) on a pre-#1077 agent, which
     # leaves the stored value untouched.
     spool: dict[str, Any] | None = None
+    # #4193 — the agent's actual memory use (container used / peak / limit, Kea's
+    # and the agent's RSS). Loose dict, validated by ``apply_reported_memory``;
+    # see the DNS heartbeat model. Absent on an older agent.
+    memory: dict[str, Any] | None = None
     # Bound the ACK list so a malformed / hostile heartbeat can't pin memory.
     ops_ack: list[dict[str, Any]] = Field(default_factory=list, max_length=5000)
     failed_ops_count: int = 0
@@ -1280,6 +1285,10 @@ async def _apply_heartbeat_reports(
     apply_reported_status(server, body.config, agent_kind="dhcp", server_id=str(server.id))
     # #1077 — spool state. Only written when the heartbeat carries it.
     apply_reported_spool(server, body.spool, agent_kind="dhcp", server_id=str(server.id))
+    # #4193 — actual memory use, plus a sample for the history.
+    await apply_reported_memory(
+        db, server, body.memory, sample_model=DHCPMetricSample, agent_kind="dhcp"
+    )
     # #1067 — the daemon state (the DHCP agent ships it as ``daemon`` and, from
     # the same dict, the top-level ``status``; ``daemon`` is the source). Same
     # gap as the DNS side: declared, accepted, never read.
@@ -2044,6 +2053,10 @@ async def agent_lease_events(
 
     # ── IPAM mirror pass ────────────────────────────────────────────────
     deferred_ddns: dict[tuple[Any, str], tuple[Any, str | None]] = {}
+    # What each deferred name's last event granted (#4439), so the publish
+    # re-checks the address's current lease: the other HA member may re-grant
+    # it to another client between this commit and the publish.
+    deferred_grants: dict[tuple[Any, str], tuple[str | None, str | None]] = {}
     for idx, ev in enumerate(events):
         if idx in stale:
             continue  # replayed grant of a lease another client has superseded (#2391)
@@ -2101,7 +2114,9 @@ async def agent_lease_events(
             # transactions after this one commits. The last event of an
             # address names the hostname.
             if ipam_row is not None and ipam_row.auto_from_lease and idx not in ddns_quiet:
-                deferred_ddns[(subnet.id, norm_ip(ev.ip_address))] = (subnet, ev.hostname)
+                dkey = (subnet.id, norm_ip(ev.ip_address))
+                deferred_ddns[dkey] = (subnet, ev.hostname)
+                deferred_grants[dkey] = (ev.mac_address, ev.hostname)
 
             # Auto-profile (Phase 1: active layer). Subnet-level opt-in;
             # the service applies the refresh-window dedupe + per-subnet
@@ -2231,7 +2246,7 @@ async def agent_lease_events(
     # its row locks, and a batch without them never waits for that lock.
     await recount_subnets_and_blocks(db, recount_ids, audit_lock=False)
     await db.commit()
-    await _publish_deferred_ddns(db, deferred_ddns, server_id=server_id)
+    await _publish_deferred_ddns(db, deferred_ddns, server_id=server_id, grants=deferred_grants)
     return {"upserted": upserted}
 
 
@@ -2306,12 +2321,58 @@ async def _still_granted(
     for key, row in by_key.items():
         lease = current.get(key[1])
         mac, hostname = grants[key]
+        # A grant with no MAC (a v6 report before the hardware address is
+        # known, #1141) names the lease by hostname alone.
         if (
             lease is not None
-            and (str(lease.mac_address).lower() if lease.mac_address else None)
-            == (mac.lower() if mac else None)
+            and (
+                not mac
+                or (str(lease.mac_address).lower() if lease.mac_address else None) == mac.lower()
+            )
             and lease.hostname == hostname
         ):
+            kept[key] = row
+    return kept
+
+
+async def _drop_quiet_replays(
+    db: AsyncSession,
+    by_key: dict[tuple[Any, str], Any],
+    deferred: dict[tuple[Any, str], tuple[Any, str | None]],
+    server_id: str,
+) -> dict[tuple[Any, str], Any]:
+    """``by_key`` less the addresses whose DDNS would write nothing (#4438):
+    the quiet-renewal test the first pass applies, so a replayed batch of
+    renewals takes no zone locks. Read-only, on the rows the chunk holds."""
+    from app.services.dns.ddns import DDNSReadCache, ddns_lease_writes_nothing
+
+    if not by_key:
+        return by_key
+    reads = DDNSReadCache()
+    await reads.prefetch_generated(db, [row.id for row in by_key.values()])
+    kept = {}
+    for key, row in by_key.items():
+        subnet, client_hostname = deferred[key]
+        try:
+            quiet = await ddns_lease_writes_nothing(
+                db,
+                subnet=row.subnet or subnet,
+                ipam_row=row,
+                client_hostname=client_hostname,
+                row_hostname=row.hostname,
+                cache=reads,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # As the first pass: a bug in the reads is the full path.
+            _reraise_if_database_gone(exc)
+            logger.warning(
+                "dhcp_agent_lease_ddns_check_failed",
+                server=server_id,
+                ip=str(row.address),
+                error=str(exc),
+            )
+            quiet = False
+        if not quiet:
             kept[key] = row
     return kept
 
@@ -2336,11 +2397,15 @@ async def _publish_deferred_ddns(
     quiet renewal and publishes it. An agent replay of the batch is a
     duplicate by its receipt and writes nothing twice.
 
-    ``grants`` (the replay of a duplicate batch) maps each key to the (MAC,
-    hostname) that batch granted: a name is published only if this server's
-    current lease for the address still carries both, read under the same
-    locks. A later batch that renamed or reassigned the client has published
-    it, and its publish is the authoritative one."""
+    ``grants`` maps each key to the (MAC, hostname) the batch's last event for
+    the address granted (the batch's own publish, #4439, and the replay of a
+    duplicate batch): a name is published only if this server's current lease
+    for the address still carries both, read under the same locks. A later
+    batch that renamed or reassigned the client (the other HA member's
+    re-grant) has published it, and its publish is the authoritative one.
+
+    A replay also skips what the first pass skipped (#4438): an address whose
+    DDNS would write nothing takes no zone lock."""
     pending = sorted(deferred, key=lambda k: (str(k[0]), k[1]))
     size = _DDNS_CHUNK_START
     try:
@@ -2397,6 +2462,7 @@ async def _publish_ddns_chunk(
         by_key = {(r.subnet_id, norm_ip(str(r.address))): r for r in rows}
         if grants is not None:
             by_key = await _still_granted(db, by_key, grants, server_id)
+            by_key = await _drop_quiet_replays(db, by_key, deferred, server_id)
         await lock_zones_for_addresses(
             db,
             publishing=[(by_key[k].subnet, by_key[k]) for k in by_key],
@@ -2821,6 +2887,7 @@ async def agent_log_entries(
         db.add(
             DHCPLogEntry(
                 server_id=server.id,
+                server_name=server.name,
                 ts=parsed.ts,
                 severity=parsed.severity,
                 code=parsed.code,

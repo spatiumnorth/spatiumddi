@@ -157,9 +157,9 @@ async def create_prompt(body: PromptCreate, current_user: CurrentUser, db: DB) -
 async def get_prompt(prompt_id: uuid.UUID, current_user: CurrentUser, db: DB) -> PromptResponse:
     row = await db.get(AIPrompt, prompt_id)
     if row is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prompt not found")
     if not row.is_shared and row.created_by_user_id != current_user.id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prompt not found")
     return _to_response(row, is_owner=row.created_by_user_id == current_user.id)
 
 
@@ -172,7 +172,7 @@ async def update_prompt(
 ) -> PromptResponse:
     row = await db.get(AIPrompt, prompt_id)
     if row is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prompt not found")
     is_owner = row.created_by_user_id == current_user.id
     # Resolve effective-superadmin once — it walks the RBAC group→role graph,
     # and this handler gates on it three times (#354 review).
@@ -216,7 +216,7 @@ async def update_prompt(
 async def delete_prompt(prompt_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
     row = await db.get(AIPrompt, prompt_id)
     if row is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prompt not found")
     is_owner = row.created_by_user_id == current_user.id
     if not (is_effective_superadmin(current_user) or is_owner):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)

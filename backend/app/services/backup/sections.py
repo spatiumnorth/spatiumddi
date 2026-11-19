@@ -583,6 +583,26 @@ def cascade_closure(tables: Iterable[str]) -> set[str]:
     return out
 
 
+def also_restored_by_section(key: str) -> dict[str, list[str]]:
+    """What a selective restore of ``key`` replaces OUTSIDE that section.
+
+    ``{other section key: [table, ...]}`` for every table in
+    :func:`cascade_closure` of the section's own tables that the section
+    does not own. Tables no section claims are grouped under ``""``. This is
+    the same closure the restore truncates and reloads, so the warning the
+    UI shows cannot drift from what the restore does (#4333).
+    """
+    section = SECTIONS_BY_KEY.get(key)
+    if section is None:
+        return {}
+    own = set(section.tables)
+    out: dict[str, list[str]] = {}
+    for table in sorted(cascade_closure(own) - own):
+        owner = section_for_table(table)
+        out.setdefault(owner.key if owner else "", []).append(table)
+    return out
+
+
 def assert_catalog_covers_models(known_tables: set[str]) -> list[str]:
     """Compare the catalog against the set of tables actually
     declared by the SQLAlchemy models. Returns a list of tables

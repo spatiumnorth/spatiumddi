@@ -127,6 +127,13 @@ class ACMEAccountResponse(BaseModel):
     username: str
     fulldomain: str
     zone_id: uuid.UUID
+    zone_in_trash: bool = Field(
+        False,
+        description=(
+            "True while the account's zone sits in the Trash. The account is kept "
+            "(it goes with the zone's purge) and can be revoked, but /update refuses it."
+        ),
+    )
     description: str
     allowed_source_cidrs: list[str] | None
     last_used_at: datetime | None
@@ -234,6 +241,9 @@ async def list_accounts(db: DB) -> list[ACMEAccountResponse]:
         select(ACMEAccount)
         .options(selectinload(ACMEAccount.zone))
         .order_by(ACMEAccount.created_at.desc())
+        # The zone's own load is a SELECT the soft-delete filter would
+        # empty for a zone in the Trash (#4335); ``r.zone`` must stay set.
+        .execution_options(include_deleted=True)
     )
     rows = (await db.execute(stmt)).scalars().all()
     return [
@@ -243,6 +253,7 @@ async def list_accounts(db: DB) -> list[ACMEAccountResponse]:
             username=r.username,
             fulldomain=acme_svc.fulldomain_of(r, r.zone),
             zone_id=r.zone_id,
+            zone_in_trash=r.zone.deleted_at is not None,
             description=r.description,
             allowed_source_cidrs=list(r.allowed_source_cidrs) if r.allowed_source_cidrs else None,
             last_used_at=r.last_used_at,
@@ -272,6 +283,7 @@ async def revoke_account(
             select(ACMEAccount)
             .where(ACMEAccount.id == account_id)
             .options(selectinload(ACMEAccount.zone))
+            .execution_options(include_deleted=True)  # a trashed zone must still load (#4335)
         )
     ).scalar_one_or_none()
     if account is None:
@@ -280,8 +292,10 @@ async def revoke_account(
             detail="ACME account not found",
         )
     # Delete any live TXT records at this subdomain before removing
-    # the row (this enqueues the right DDNS removals too).
-    await acme_svc.apply_txt_delete(db, account)
+    # the row (this enqueues the right DDNS removals too). A zone in the
+    # Trash is not written to: its records are in the Trash with it.
+    if account.zone.deleted_at is None:
+        await acme_svc.apply_txt_delete(db, account)
     fulldomain = acme_svc.fulldomain_of(account, account.zone)
     await db.execute(delete(ACMEAccount).where(ACMEAccount.id == account_id))
     db.add(
@@ -333,6 +347,12 @@ async def _auth_acme(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="invalid credentials",
+        )
+    if account.zone.deleted_at is not None:
+        # The zone is in the Trash: nothing may be written to it (#4335).
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="the account's DNS zone is in the Trash",
         )
     client_ip = trusted_ip
     if not acme_svc.client_ip_allowed(account, client_ip):

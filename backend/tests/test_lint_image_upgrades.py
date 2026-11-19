@@ -226,6 +226,49 @@ def test_an_empty_or_unreadable_image_list_raises_rather_than_passing(
         _run(lint, monkeypatch, tmp_path, _GOOD_DOCKERFILE, images=images)
 
 
+def test_a_ubi_image_passes(
+    lint: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The Red Hat UBI variants (#3913): ``microdnf upgrade`` behind ``RPM_SNAPSHOT``."""
+    body = textwrap.dedent("""\
+        FROM registry.access.redhat.com/ubi9/ubi-minimal:9.9 AS runtime
+        ARG RPM_SNAPSHOT=dev
+        RUN echo "rpm snapshot ${RPM_SNAPSHOT}" >/dev/null \\
+            && microdnf upgrade -y \\
+            && microdnf install -y python3.12
+        """)
+    assert _run(lint, monkeypatch, tmp_path, body) == 0
+
+
+def test_a_ubi_image_without_its_snapshot_arg_is_reported(
+    lint: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    body = textwrap.dedent("""\
+        FROM registry.access.redhat.com/ubi9/ubi-minimal:9.9
+        RUN microdnf upgrade -y && microdnf install -y python3.12
+        """)
+    assert _run(lint, monkeypatch, tmp_path, body) == 1
+
+
+def test_the_ubi_list_is_linted_too(
+    lint: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """``images-ubi.json`` sits beside ``images.json``; an image listed there with a
+    Dockerfile that never upgrades must fail the same lint."""
+    (tmp_path / ".github").mkdir(parents=True)
+    (tmp_path / ".github" / "images.json").write_text(_IMAGES)
+    (tmp_path / ".github" / "images-ubi.json").write_text(
+        '[{"image": "demo-ubi", "context": ".", "file": "./Dockerfile.ubi", "target": ""}]'
+    )
+    (tmp_path / "Dockerfile").write_text(_GOOD_DOCKERFILE)
+    (tmp_path / "Dockerfile.ubi").write_text(
+        "FROM registry.access.redhat.com/ubi9/ubi-minimal:9.9\nRUN microdnf install -y tini\n"
+    )
+    monkeypatch.setattr(lint, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(lint, "IMAGES", tmp_path / ".github" / "images.json")
+    assert lint.main() == 1
+
+
 def test_the_real_tree_passes(lint: types.ModuleType) -> None:
     """The linter against the repo it ships in — every image the nightly and
     the release build. Skipped in the dev container, which copies only
