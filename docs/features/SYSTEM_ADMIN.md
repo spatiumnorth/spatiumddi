@@ -378,11 +378,14 @@ Dashboard tiles showing platform-wide stats:
 - DHCP lease counts by server
 - DNS query rates by server
 - Recent audit log summary (top actors, most-changed resources)
-- Scheduled report configuration:
-  - Report type (utilization, expiring leases, unused IPs)
-  - Schedule (daily/weekly/monthly)
-  - Output format (PDF, CSV, JSON)
-  - Delivery method (email, webhook, S3)
+
+Reports are on demand today: the `/reports` page (top subnets by
+utilization, owners by IP count, most-modified resources; #47), the
+auditor-facing change report `GET /api/v1/audit/export.pdf` (#48), the
+IPAM PDF export `GET /api/v1/ipam/export.pdf` (#82) and the conformity
+PDF. **There is no scheduled report delivery yet**: nothing builds a
+report on a schedule or sends one by email, webhook or object storage.
+That is tracked as a planned feature ([#4494](https://github.com/spatiumnorth/spatiumddi/issues/4494)).
 
 ### 2.9 Backup and Restore
 
@@ -810,7 +813,7 @@ The restore endpoint is superadmin-only. Operators must type the literal phrase 
 
 Selecting "Selective restore" on the modal reveals a section checklist driven by `GET /backup/sections`. The checklist auto-ticks every non-volatile selectable section the first time the operator flips into selective mode; volatile sections (DHCP leases, DNS query log, DHCP activity log, nmap scan history, metric samples, Celery scratch) stay unticked by default but can be ticked individually. `platform_internal` is forced-on (alembic_version + oui_vendor are install-state, not user data, so they always ride along).
 
-The UI surfaces a TRUNCATE-CASCADE warning on the selective panel because the restore necessarily reaches past the ticked sections: rows in *non-selected* sections that reference wiped data via foreign key are cascade-truncated, and since #781 are **restored from the archive** rather than left empty. The restore response reports the widened set as `cascade_widened_tables`.
+The UI surfaces a TRUNCATE-CASCADE warning on the selective panel because the restore necessarily reaches past the ticked sections: rows in *non-selected* sections that reference wiped data via foreign key are cascade-truncated, and since #781 are **restored from the archive** rather than left empty. The restore response reports the widened set as `cascade_widened_tables`. The picker names that set **before** the restore runs: each entry of `GET /backup/sections` carries `also_restores` (other sections' tables the section's restore also replaces), computed from the same `cascade_closure` the restore uses, and the panel unions it over the ticked sections (#4333).
 
 #### Cross-install rewrap counters
 

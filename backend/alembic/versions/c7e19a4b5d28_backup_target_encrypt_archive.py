@@ -8,7 +8,7 @@ Defaults FALSE, so no existing target changes under a running schedule. The
 API defaults it to TRUE for a target created after this lands.
 
 Revision ID: c7e19a4b5d28
-Revises: b6d2e9f41a07
+Revises: d8b3f6a1c274
 Create Date: 2026-11-13
 """
 
@@ -16,7 +16,7 @@ from alembic import op
 import sqlalchemy as sa
 
 revision = "c7e19a4b5d28"
-down_revision = "b6d2e9f41a07"
+down_revision = "d8b3f6a1c274"
 branch_labels = None
 depends_on = None
 

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Field } from "@/components/ui/field";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ListEmpty } from "@/components/ui/list-read-error";
 import {
@@ -16,6 +17,7 @@ import {
 
 import {
   firewallFeedsApi,
+  formatApiError,
   type FirewallFeed,
   type FirewallFeedCreate,
   type FirewallFeedTokenResult,
@@ -295,8 +297,16 @@ export function FirewallFeedsPage() {
         tone="destructive"
         confirmLabel="Rotate token"
         loading={rotateMut.isPending}
+        error={
+          rotateMut.error
+            ? formatApiError(rotateMut.error, "Rotate failed")
+            : null
+        }
         onConfirm={() => rotate && rotateMut.mutate(rotate.id)}
-        onClose={() => setRotate(null)}
+        onClose={() => {
+          setRotate(null);
+          rotateMut.reset();
+        }}
       />
       {del && (
         <DeleteFeedModal
@@ -751,23 +761,6 @@ function CopyableValue({ value, mono }: { value: string; mono?: boolean }) {
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
-
-function Field({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="block text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-    </div>
-  );
-}
 
 function errMsg(e: unknown, fallback: string): string {
   const ae = e as {

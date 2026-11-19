@@ -71,12 +71,12 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
-# The AE Value Representation is 16 **bytes** — not 16 characters, and
-# not an alphanumeric-only repertoire. Per PS3.5:
+# The AE Value Representation is 16 characters of printable ASCII — not
+# an alphanumeric-only repertoire. Per PS3.5:
 #
-#   * maximum length 16 bytes;
-#   * the default character repertoire excluding backslash (0x5C) and
-#     all control characters;
+#   * maximum length 16 (ASCII, so characters == bytes);
+#   * the default character repertoire (0x20-0x7E) excluding backslash
+#     (0x5C); control characters and non-ASCII are refused;
 #   * spaces are LEGAL but non-significant (they are padding), so
 #     leading/trailing space is trimmed on the way in;
 #   * an all-space value is explicitly forbidden.
