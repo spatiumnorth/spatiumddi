@@ -201,6 +201,20 @@ _SPECS: list[tuple[str, str, str, list[ParamSpec]]] = [
     ),
     (a.RULE_TYPE_DECOM_EXPIRING, "Subnet decommission approaching", "IPAM", [_expiry()]),
     (
+        a.RULE_TYPE_SUBNET_CAPACITY_FORECAST,
+        "Subnet projected to fill up",
+        "IPAM",
+        [
+            _days(
+                "Days until full",
+                a._CAPACITY_FORECAST_DEFAULT_DAYS,
+                "Fires when the last 30 days of utilisation history trend to 100% "
+                "within this many days. Needs 14+ daily snapshots; no forecast for "
+                "a flat or falling trend. History is kept 90 days.",
+            )
+        ],
+    ),
+    (
         a.RULE_TYPE_IP_FREE_BUT_RESPONDING,
         "IP marked free but responding",
         "IPAM",

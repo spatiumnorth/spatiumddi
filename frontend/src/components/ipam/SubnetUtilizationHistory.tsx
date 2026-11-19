@@ -29,6 +29,13 @@ export function SubnetUtilizationHistory({ subnetId }: { subnetId: string }) {
     queryFn: () => ipamApi.getUtilizationHistory(subnetId, days),
   });
 
+  const { data: forecast } = useQuery({
+    queryKey: ["subnet-capacity-forecast"],
+    queryFn: () => ipamApi.getCapacityForecasts(),
+    staleTime: 60_000,
+    select: (rows) => rows.find((r) => r.subnet_id === subnetId) ?? null,
+  });
+
   const points = (data ?? []).map((p) => ({
     t: new Date(p.sampled_at).toLocaleDateString(undefined, {
       month: "short",
@@ -63,6 +70,13 @@ export function SubnetUtilizationHistory({ subnetId }: { subnetId: string }) {
           ))}
         </div>
       </div>
+      {forecast && (
+        <div className="border-b px-4 py-2 text-xs text-muted-foreground">
+          {forecast.days_to_full === 0
+            ? "Full now and still growing."
+            : `Trends to 100% on ${forecast.forecast_full_date} at the current rate (${forecast.days_to_full} days, +${forecast.slope_percent_per_day.toFixed(2)} points/day over the last 30 days).`}
+        </div>
+      )}
       <div className="h-44 px-2 py-3">
         {isLoading ? (
           <div className="flex h-full items-center justify-center text-xs text-muted-foreground">

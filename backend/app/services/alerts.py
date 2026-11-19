@@ -496,6 +496,13 @@ _POSTGRES_INSTANCE_RULE_NAME = "PostgreSQL instance not Ready or not streaming"
 # segment for retirement and forgot" failure mode.
 RULE_TYPE_DECOM_EXPIRING = "decom_expiring"
 
+# Issue #43 — capacity forecasting. Subject = subnet. Fires when the
+# least-squares trend of a subnet's daily utilisation history projects it to
+# reach 100 % within ``threshold_days`` (default 90). Severity is the rule's
+# own, so the two-tier "180 d warning / 90 d critical" setup is two rules.
+RULE_TYPE_SUBNET_CAPACITY_FORECAST = "subnet_capacity_forecast"
+_CAPACITY_FORECAST_DEFAULT_DAYS = 90
+
 # DNS query-behaviour anomalies — issue #371. Subject = dns_server. Evaluated
 # on the 60 s tick against the per-server ``dns_metric_sample`` rcode deltas
 # the agents already report (no new collection). Both reuse the generic
@@ -802,6 +809,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_APPLIANCE_HEARTBEAT_STALE,
         RULE_TYPE_POSTGRES_INSTANCE_UNHEALTHY,
         RULE_TYPE_DECOM_EXPIRING,
+        RULE_TYPE_SUBNET_CAPACITY_FORECAST,
         RULE_TYPE_DNS_NXDOMAIN_SPIKE,
         RULE_TYPE_DNS_QUERY_RATE_SPIKE,
         RULE_TYPE_DNS_RATE_LIMIT_DROPPING,
@@ -5668,6 +5676,34 @@ async def _matching_decom_expiring_subjects(
     return matches
 
 
+async def _matching_subnet_capacity_forecast_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+) -> list[tuple[str, str, str]]:
+    """``[(subject_id, display, message)]`` for ``subnet_capacity_forecast``
+    (issue #43): subnets whose utilisation trend reaches 100 % within
+    ``rule.threshold_days``. One batched regression for every subnet."""
+    from app.services.ipam.capacity_forecast import compute_capacity_forecasts
+
+    threshold_days = (
+        int(rule.threshold_days)
+        if rule.threshold_days is not None
+        else _CAPACITY_FORECAST_DEFAULT_DAYS
+    )
+    matches: list[tuple[str, str, str]] = []
+    for f in await compute_capacity_forecasts(db):
+        if f.days_to_full > threshold_days:
+            continue
+        display = f.network + (f" — {f.name}" if f.name else "")
+        message = (
+            f"Subnet {display} is projected to be full in {f.days_to_full} day(s) "
+            f"({f.forecast_full_date.isoformat()}; now {f.utilization_percent:.1f}%, "
+            f"+{f.slope_percent_per_day:.2f} points/day, threshold {_thr(threshold_days)} d)"
+        )
+        matches.append((str(f.subnet_id), display, message))
+    return matches
+
+
 async def _matching_service_resource_orphaned_subjects(
     db: AsyncSession,
     rule: AlertRule,  # noqa: ARG001 — symmetry with sibling evaluators
@@ -8719,6 +8755,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
             elif rule.rule_type == RULE_TYPE_DECOM_EXPIRING:
                 expiring = await _matching_decom_expiring_subjects(db, rule, now)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in expiring]
+                subject_type = "subnet"
+            elif rule.rule_type == RULE_TYPE_SUBNET_CAPACITY_FORECAST:
+                base = await _matching_subnet_capacity_forecast_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
                 subject_type = "subnet"
             elif rule.rule_type == RULE_TYPE_TLS_CERT_EXPIRING:
                 expiring = await _matching_tls_cert_expiring_subjects(db, rule, now)
