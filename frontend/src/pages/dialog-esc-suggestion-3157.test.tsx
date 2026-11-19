@@ -1,0 +1,251 @@
+/**
+ * @vitest-environment jsdom
+ *
+ * An Esc on a suggestion reached with Tab belongs to the open list, not to
+ * the dialog around it (#3157, on top of #2720's Esc in the field).
+ */
+import { useState } from "react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { MemoryRouter } from "react-router-dom";
+
+vi.mock("@/lib/api", () => ({
+  tagsApi: {
+    listKeys: () => Promise.resolve({ keys: ["env", "site"] }),
+    listValues: () => Promise.resolve({ values: [] }),
+  },
+  dhcpApi: {
+    listOptionCodes: () =>
+      Promise.resolve([
+        { code: 1, name: "subnet-mask", description: "Subnet mask" },
+        { code: 2, name: "time-offset", description: "Time offset" },
+      ]),
+  },
+  searchApi: {
+    types: () => Promise.resolve([]),
+    search: () =>
+      Promise.resolve({
+        results: [
+          {
+            type: "ip_address",
+            id: "ip1",
+            display: "10.0.0.1",
+            hostname: "h1",
+            subnet_network: "10.0.0.0/24",
+            space_name: "default",
+          },
+        ],
+      }),
+  },
+}));
+
+import { DHCPOptionsEditor } from "@/pages/dhcp/DHCPOptionsEditor";
+import { IPAddressPicker } from "@/components/IPAddressPicker";
+import { TagFilterChips } from "@/components/TagFilterChips";
+import { Modal } from "@/components/ui/modal";
+
+afterEach(cleanup);
+
+function wrap(ui: React.ReactElement) {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(
+    <QueryClientProvider client={qc}>
+      <MemoryRouter>{ui}</MemoryRouter>
+    </QueryClientProvider>,
+  );
+}
+
+function OptionsDialog({ onClose }: { onClose: () => void }) {
+  const [v, setV] = useState<
+    { code: number; name?: string; value: string | string[] }[]
+  >([]);
+  return (
+    <Modal title="New Option Template" onClose={onClose}>
+      <input aria-label="name" />
+      <DHCPOptionsEditor value={v} onChange={setV} />
+    </Modal>
+  );
+}
+
+function PickerDialog({ onClose }: { onClose: () => void }) {
+  const [id, setId] = useState<string | null>(null);
+  return (
+    <Modal title="New thing" onClose={onClose}>
+      <IPAddressPicker value={id} onChange={setId} />
+    </Modal>
+  );
+}
+
+function TagDialog({ onClose }: { onClose: () => void }) {
+  const [tags, setTags] = useState<string[]>([]);
+  return (
+    <Modal title="Wake schedule" onClose={onClose}>
+      <TagFilterChips value={tags} onChange={setTags} />
+    </Modal>
+  );
+}
+
+describe("Esc on a suggestion reached with Tab (#3157)", () => {
+  it("DHCP option list: closes the list, the dialog stays", async () => {
+    const onClose = vi.fn();
+    const user = userEvent.setup();
+    wrap(<OptionsDialog onClose={onClose} />);
+    await user.type(screen.getByLabelText("name"), "tmpl");
+    await user.click(screen.getByRole("button", { name: /Custom options/ }));
+    await user.click(screen.getByRole("button", { name: /Add custom option/ }));
+    const box = screen.getByPlaceholderText("Search code or name…");
+    await user.click(box);
+    await screen.findByText("subnet-mask");
+    expect(document.activeElement).toBe(box);
+    await user.tab();
+    expect(document.activeElement).toBe(
+      screen.getByText("subnet-mask").closest("button"),
+    );
+    await user.keyboard("{Escape}");
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.queryByText("subnet-mask")).toBeNull();
+    expect((screen.getByLabelText("name") as HTMLInputElement).value).toBe(
+      "tmpl",
+    );
+    await user.keyboard("{Escape}");
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  async function openOptionList(onClose: () => void) {
+    const user = userEvent.setup();
+    wrap(<OptionsDialog onClose={onClose} />);
+    await user.click(screen.getByRole("button", { name: /Custom options/ }));
+    await user.click(screen.getByRole("button", { name: /Add custom option/ }));
+    const box = screen.getByPlaceholderText("Search code or name…");
+    await user.click(box);
+    await screen.findByText("subnet-mask");
+    return { user, box };
+  }
+
+  it("DHCP option list: Shift+Tab out closes the list; Esc then closes the dialog (#3486)", async () => {
+    const onClose = vi.fn();
+    const { user } = await openOptionList(onClose);
+    await user.tab({ shift: true });
+    expect(screen.queryByText("subnet-mask")).toBeNull();
+    await user.keyboard("{Escape}");
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("DHCP option list: Tab out past the list closes it (#3486)", async () => {
+    const onClose = vi.fn();
+    const { user } = await openOptionList(onClose);
+    await user.tab(); // into the first suggestion: list stays open
+    expect(screen.queryByText("subnet-mask")).not.toBeNull();
+    await user.tab(); // second suggestion
+    await user.tab(); // out of the list, onto the value field
+    expect(screen.queryByText("subnet-mask")).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("DHCP option list: a mouse click on a suggestion still picks it (#3486)", async () => {
+    const onClose = vi.fn();
+    const { user, box } = await openOptionList(onClose);
+    await user.click(screen.getByText("time-offset"));
+    expect((box as HTMLInputElement).value).toBe("2 — time-offset");
+    expect(screen.queryByText("subnet-mask")).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("DHCP option list: a click on another suggestion after Tab picks the clicked one (#3486)", async () => {
+    const onClose = vi.fn();
+    const { user, box } = await openOptionList(onClose);
+    await user.tab(); // focus on the first suggestion
+    await user.click(screen.getByText("time-offset"));
+    expect((box as HTMLInputElement).value).toBe("2 — time-offset");
+  });
+
+  it("DHCP option list: a press inside the list off a suggestion keeps it open (#3486)", async () => {
+    const onClose = vi.fn();
+    const { user, box } = await openOptionList(onClose);
+    const list = document.getElementById(box.getAttribute("aria-controls")!)!;
+    // A browser moves focus to the body on a press of a non-focusable spot
+    // (jsdom does not), which would blur the search with no related target
+    // and close the list; the list must cancel that press.
+    expect(fireEvent.mouseDown(list)).toBe(false);
+    await user.click(list);
+    expect(screen.queryByText("subnet-mask")).not.toBeNull();
+    expect(document.activeElement).toBe(box);
+  });
+
+  it("DHCP option search is a combobox that names its list (#3486)", async () => {
+    const onClose = vi.fn();
+    const { user, box } = await openOptionList(onClose);
+    expect(box.getAttribute("role")).toBe("combobox");
+    expect(box.getAttribute("aria-expanded")).toBe("true");
+    const list = document.getElementById(box.getAttribute("aria-controls")!);
+    expect(list?.textContent).toContain("subnet-mask");
+    await user.keyboard("{Escape}");
+    expect(box.getAttribute("aria-expanded")).toBe("false");
+    expect(box.hasAttribute("aria-controls")).toBe(false);
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("IP picker: Shift+Tab out closes the list; a click on a result still picks it (#3486)", async () => {
+    const onClose = vi.fn();
+    const user = userEvent.setup();
+    wrap(<PickerDialog onClose={onClose} />);
+    const box = screen.getByPlaceholderText(/Search by IP/);
+    await user.type(box, "10.0");
+    await screen.findByText("h1 · 10.0.0.0/24 · default");
+    await user.tab({ shift: true });
+    expect(screen.queryByText("h1 · 10.0.0.0/24 · default")).toBeNull();
+    await user.click(box);
+    await screen.findByText("h1 · 10.0.0.0/24 · default");
+    await user.click(screen.getByText("10.0.0.1"));
+    expect((box as HTMLInputElement).value).toContain("10.0.0.1");
+    expect(screen.queryByText("h1 · 10.0.0.0/24 · default")).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("tag filter: Shift+Tab out closes the list (#3486)", async () => {
+    const onClose = vi.fn();
+    const user = userEvent.setup();
+    wrap(<TagDialog onClose={onClose} />);
+    await user.click(screen.getByPlaceholderText(/Filter by tag/));
+    await screen.findByText("env");
+    await user.tab({ shift: true });
+    expect(screen.queryByText("env")).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("IP picker: closes the list, the dialog stays", async () => {
+    const onClose = vi.fn();
+    const user = userEvent.setup();
+    wrap(<PickerDialog onClose={onClose} />);
+    await user.type(screen.getByPlaceholderText(/Search by IP/), "10.0");
+    await screen.findByText("h1 · 10.0.0.0/24 · default");
+    await user.tab();
+    expect(document.activeElement).toBe(
+      screen.getByText("10.0.0.1").closest("button"),
+    );
+    await user.keyboard("{Escape}");
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.queryByText("h1 · 10.0.0.0/24 · default")).toBeNull();
+    await user.keyboard("{Escape}");
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("tag filter: closes the list, the dialog stays", async () => {
+    const onClose = vi.fn();
+    const user = userEvent.setup();
+    wrap(<TagDialog onClose={onClose} />);
+    await user.click(screen.getByPlaceholderText(/Filter by tag/));
+    await screen.findByText("env");
+    await user.tab();
+    expect(document.activeElement).toBe(
+      screen.getByText("env").closest("button"),
+    );
+    await user.keyboard("{Escape}");
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.queryByText("env")).toBeNull();
+    await user.keyboard("{Escape}");
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+});

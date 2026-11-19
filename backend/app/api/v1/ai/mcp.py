@@ -3,7 +3,7 @@
 JSON-RPC 2.0 over HTTP, mirroring the MCP spec's "Streamable HTTP"
 transport. Wave 2 implements the minimum viable surface — operators
 can connect Claude Desktop / Cursor / any MCP-speaking client and
-call SpatiumDDI's read-only tools.
+call SpatiumDDI's non-mutating tools.
 
 Methods supported:
     initialize        — protocol handshake
@@ -18,11 +18,22 @@ Methods deliberately NOT supported in Wave 2 (return method-not-found):
 Auth:
     The same auth surface as every other ``/api/v1/*`` route — session
     JWT for browser clients, API tokens for external MCP clients.
-    External clients use a token with the ``read`` scope (Wave 2 tools
-    are all read-only). The scope helper in ``app/services/api_token_scopes``
-    has been extended to allow POST to ``/api/v1/mcp/*`` under ``read``
-    so this works without a dedicated MCP scope. Phase 3 adds an
-    ``mcp:write`` scope when write tools land.
+    External clients use a token with the ``read`` scope: the scope helper
+    in ``app/services/api_token_scopes`` admits POST to ``/api/v1/ai/mcp``
+    under ``read``, because this transport never dispatches a write or
+    ``propose_*`` tool. A ``read`` token never makes SpatiumDDI send
+    traffic outward (#3302), so for a scoped token the tools registered
+    ``outbound=True`` (probes, live pulls from managed servers, off-prem
+    lookups) are neither advertised nor callable, unless the token also
+    holds the write scope that covers the tool's REST equivalent
+    (``Tool.outbound_scope``) — the same tokens the REST route admits. A
+    session or an unrestricted token keeps them all.
+
+    Authentication is not authorization (GHSA-4wrc-78rq-vgcg): the
+    advertised and callable set is the same effective set the in-app chat
+    uses (Tool Catalog × ``default_enabled`` × enabled feature modules),
+    narrowed to the tools the caller's own permissions allow, and
+    ``ToolRegistry.call`` re-checks each tool's declared permission.
 """
 
 from __future__ import annotations
@@ -35,12 +46,21 @@ from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel
 
 from app.api.deps import DB, CurrentUser
+from app.api.token_binding import honours_token_binding
+from app.models.auth import User
+from app.models.settings import PlatformSettings
+from app.services import feature_modules as fm_svc
 from app.services.ai.tools import (
     REGISTRY,
+    Tool,
     ToolArgumentError,
     ToolDisabled,
     ToolNotFound,
+    ToolPermissionDenied,
+    effective_tool_names,
+    is_rate_limit_refusal,
 )
+from app.services.api_token_scopes import scopes_allow_outbound_tool
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -80,23 +100,63 @@ def _err(req_id: int | str | None, code: int, message: str, data: Any = None) ->
     return {"jsonrpc": "2.0", "id": req_id, "error": payload}
 
 
-def _mcp_tools() -> list[Any]:
-    """The tools the MCP transport exposes — genuinely read-only only.
+def _token_scopes(request: Request) -> list[str]:
+    """The API token's scopes for this request (#3302); ``[]`` when there
+    are none to apply.
 
-    SECURITY (#400, M1): ``REGISTRY.read_only()`` keys off the ``writes``
-    flag, but every ``propose_*`` tool is registered ``writes=False``
-    (the propose call itself only previews + persists a proposal row;
-    the mutation runs later through the C2-gated /apply endpoint). We
-    therefore additionally drop ``propose_*`` tools so the MCP surface
-    never previews/stages a write either. ``tools/list`` (advertised
-    set) and ``tools/call`` (dispatch gate) both consume this single
-    source of truth so they can never drift apart.
+    The token gate stashes them on ``request.state``. A session never sets
+    it, and an unrestricted token stores ``[]``: both keep every tool.
     """
-    return [t for t in REGISTRY.read_only() if not t.name.startswith("propose_")]
+    return list(getattr(request.state, "api_token_scopes", None) or [])
 
 
-def _mcp_tool_names() -> set[str]:
-    return {t.name for t in _mcp_tools()}
+async def _mcp_tool_names(db: Any, *, token_scopes: list[str]) -> set[str]:
+    """The tools the MCP transport may dispatch — genuinely read-only only.
+
+    SECURITY (GHSA-4wrc-78rq-vgcg): the same effective set the in-app chat
+    resolves — the operator's Tool Catalog over each tool's
+    ``default_enabled``, minus tools whose feature module is off — so a
+    tool the operator disabled (or never enabled) is not reachable here
+    either. Previously MCP exposed every non-write tool.
+
+    SECURITY (#400, M1): ``effective_tool_names`` keys off the ``writes``
+    flag, but every ``propose_*`` tool is registered ``writes=False`` (the
+    propose call itself only previews + persists a proposal row; the
+    mutation runs later through the C2-gated /apply endpoint). We therefore
+    additionally drop ``propose_*`` tools so the MCP surface never
+    previews/stages a write either. ``tools/list`` (advertised set) and
+    ``tools/call`` (dispatch gate) both consume this single source of truth
+    so they can never drift apart.
+
+    SECURITY (#3302): for a scoped API token (``token_scopes`` non-empty)
+    the ``outbound=True`` tools are dropped too, unless the token holds the
+    tool's ``outbound_scope`` — a probe, a live pull from a managed server or
+    an off-prem lookup is traffic a ``read`` token never causes, matching
+    ``@token_outbound`` on the REST side.
+    """
+    platform_settings = await db.get(PlatformSettings, 1)
+    platform_enabled = platform_settings.ai_tools_enabled if platform_settings is not None else None
+    effective = effective_tool_names(
+        platform_enabled=platform_enabled,
+        provider_enabled=None,
+        enabled_modules=await fm_svc.get_enabled_modules(db),
+    )
+    names = {n for n in effective if not n.startswith("propose_")}
+    if token_scopes:
+        names = {
+            n
+            for n in names
+            if (t := REGISTRY.get(n)) is not None
+            and (not t.outbound or scopes_allow_outbound_tool(token_scopes, t.outbound_scope))
+        }
+    return names
+
+
+async def _mcp_tools(db: Any, user: User, *, token_scopes: list[str]) -> list[Tool]:
+    """The tools ``tools/list`` advertises to ``user``: the effective set,
+    narrowed to the ones the caller's permissions allow."""
+    names = await _mcp_tool_names(db, token_scopes=token_scopes)
+    return REGISTRY.callable_by(user, [t for t in REGISTRY.read_only() if t.name in names])
 
 
 # Standard JSON-RPC error codes
@@ -108,7 +168,8 @@ _INTERNAL_ERROR = -32603
 
 
 @router.get("")
-async def mcp_get(current_user: CurrentUser) -> dict[str, Any]:
+@honours_token_binding
+async def mcp_get(request: Request, current_user: CurrentUser, db: DB) -> dict[str, Any]:
     """A bare GET on ``/mcp`` returns server info — useful for browser
     sanity-checks and for Streamable-HTTP clients that probe for
     server identity without going through ``initialize``. Auth is
@@ -117,12 +178,15 @@ async def mcp_get(current_user: CurrentUser) -> dict[str, Any]:
     return {
         "server": _SERVER_INFO,
         "protocol_version": _PROTOCOL_VERSION,
-        "available_tools": len(_mcp_tools()),
+        "available_tools": len(
+            await _mcp_tools(db, current_user, token_scopes=_token_scopes(request))
+        ),
         "transport": "streamable_http",
     }
 
 
 @router.post("")
+@honours_token_binding
 async def mcp_post(
     request: Request, current_user: CurrentUser, db: DB
 ) -> dict[str, Any] | list[dict[str, Any]]:
@@ -145,12 +209,15 @@ async def mcp_post(
             detail="Request body is not valid JSON.",
         ) from None
 
+    token_scopes = _token_scopes(request)
     if isinstance(raw, list):
-        return [await _dispatch_one(item, db, current_user) for item in raw]
-    return await _dispatch_one(raw, db, current_user)
+        return [
+            await _dispatch_one(item, db, current_user, token_scopes=token_scopes) for item in raw
+        ]
+    return await _dispatch_one(raw, db, current_user, token_scopes=token_scopes)
 
 
-async def _dispatch_one(raw: Any, db: Any, user: Any) -> dict[str, Any]:
+async def _dispatch_one(raw: Any, db: Any, user: Any, *, token_scopes: list[str]) -> dict[str, Any]:
     try:
         req = JSONRPCRequest.model_validate(raw)
     except Exception:
@@ -198,7 +265,12 @@ async def _dispatch_one(raw: Any, db: Any, user: Any) -> dict[str, Any]:
         if method == "tools/list":
             return _ok(
                 req.id,
-                {"tools": [t.to_mcp_tool() for t in _mcp_tools()]},
+                {
+                    "tools": [
+                        t.to_mcp_tool()
+                        for t in await _mcp_tools(db, user, token_scopes=token_scopes)
+                    ]
+                },
             )
 
         if method == "tools/call":
@@ -210,15 +282,20 @@ async def _dispatch_one(raw: Any, db: Any, user: Any) -> dict[str, Any]:
                     _INVALID_PARAMS,
                     "tools/call requires string `name`",
                 )
-            # SECURITY (#400, M1): the MCP transport only advertises the
-            # read-only tool set via tools/list, so tools/call must refuse
-            # anything outside it. Passing effective={MCP tool names} makes
-            # the registry raise ToolDisabled for write/propose tools —
-            # without this, a read-scoped API-token client could invoke any
-            # registered tool (including propose_* proposals) by name.
+            # SECURITY (#400, M1 + GHSA-4wrc-78rq-vgcg): tools/call must
+            # refuse anything outside the advertised set. Passing
+            # effective={MCP tool names} makes the registry raise
+            # ToolDisabled for write / propose / catalog-disabled /
+            # module-disabled tools — and, for a scoped token, outbound
+            # tools (#3302) — and the registry itself enforces each tool's
+            # declared permission against the caller.
             try:
                 result = await REGISTRY.call(
-                    name, arguments, db=db, user=user, effective=_mcp_tool_names()
+                    name,
+                    arguments,
+                    db=db,
+                    user=user,
+                    effective=await _mcp_tool_names(db, token_scopes=token_scopes),
                 )
             except ToolNotFound as exc:
                 return _err(
@@ -228,12 +305,21 @@ async def _dispatch_one(raw: Any, db: Any, user: Any) -> dict[str, Any]:
                 )
             except ToolDisabled as exc:
                 # A registered tool the MCP surface doesn't expose (write /
-                # propose). Report it as method-not-found so we don't leak
+                # propose / outbound for a scoped token). Report it as
+                # method-not-found so we don't leak
                 # the existence of tools outside the advertised set.
                 return _err(
                     req.id,
                     _METHOD_NOT_FOUND,
                     f"tool not found: {exc.name!r}",
+                )
+            except ToolPermissionDenied as exc:
+                # An MCP tool-execution failure, reported in-band the way the
+                # spec asks (``isError``) — the REST analogue is a 403.
+                logger.info("mcp_tool_denied", tool=name, user_id=str(user.id))
+                return _ok(
+                    req.id,
+                    {"content": [{"type": "text", "text": str(exc)}], "isError": True},
                 )
             except ToolArgumentError as exc:
                 return _err(
@@ -262,7 +348,9 @@ async def _dispatch_one(raw: Any, db: Any, user: Any) -> dict[str, Any]:
                             "text": json.dumps(result, default=str),
                         }
                     ],
-                    "isError": False,
+                    # A network tool past the caller's per-user budget did
+                    # not run; report it in-band as a failed call.
+                    "isError": is_rate_limit_refusal(result),
                 },
             )
 

@@ -48,6 +48,9 @@ class PoolDef:
     pool_type: str = "dynamic"  # dynamic | excluded | reserved | pd
     name: str = ""
     class_restriction: str | None = None
+    # Reserved, never rendered (#1689): Kea has no per-pool lifetime and no
+    # driver reads this. The API refuses a non-null value; the field stays
+    # so old rows still load and the bundle ETag does not shift on upgrade.
     lease_time_override: int | None = None
     options_override: dict[str, Any] | None = None
     # DHCPv6 prefix delegation (issue #368) — only for pool_type == "pd".
@@ -75,12 +78,25 @@ class StaticAssignmentDef:
 
 @dataclass(frozen=True)
 class ClientClassDef:
-    """A client class with a match expression and option overrides."""
+    """A client class with a match expression and option overrides.
+
+    ``address_family`` (``ipv4`` | ``ipv6`` | ``dual``) says which daemons the
+    class renders into (#1229). ``options_v4`` / ``options_v6`` are the parts
+    of ``options`` each daemon gets — all of them for a single-family class,
+    split by what each option is valid in for a ``dual`` one (#1295). The
+    control plane computes the split because only it holds the option tables.
+    """
 
     name: str
     match_expression: str = ""
     description: str = ""
     options: dict[str, Any] = field(default_factory=dict)
+    address_family: str = "ipv4"
+    options_v4: dict[str, Any] = field(default_factory=dict)
+    options_v6: dict[str, Any] = field(default_factory=dict)
+
+    def in_family(self, family: str) -> bool:
+        return self.address_family in (family, "dual")
 
 
 @dataclass(frozen=True)
@@ -178,8 +194,6 @@ class ScopeDef:
     options: dict[str, Any] = field(default_factory=dict)
     pools: tuple[PoolDef, ...] = ()
     statics: tuple[StaticAssignmentDef, ...] = ()
-    ddns_enabled: bool = False
-    ddns_hostname_policy: str = "client"
     is_active: bool = True
     # "ipv4" → Dhcp4 rendering, "ipv6" → Dhcp6 rendering. Defaults to "ipv4"
     # so legacy bundles (before address_family existed) keep working.
@@ -201,6 +215,13 @@ class ScopeDef:
     # must test ``is not None`` rather than truthiness.
     lease_cache_threshold: float | None = None
     lease_cache_max_age: int | None = None
+    # #2731: the names (in ``ConfigBundle.pxe_classes``) of the classes of the
+    # PXE profile bound to this scope, in evaluation order. Kea evaluates them
+    # for this subnet's clients only. Rendered for the whole server instead, a
+    # profile bound to one scope booted the PXE clients of every scope on it.
+    # Empty (the default) = no PXE class answers this scope. v4 scopes only,
+    # like the classes themselves.
+    pxe_class_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -257,10 +278,17 @@ class FailoverConfig:
     mode: str  # load-balancing | hot-standby
     this_server_name: str  # name used in the local peer's "this-server-name"
     peers: tuple[dict[str, Any], ...]  # [{name, url, role, auto-failover}, ...]
-    heartbeat_delay_ms: int = 10000
+    heartbeat_delay_ms: int = 2000
     max_response_delay_ms: int = 60000
     max_ack_delay_ms: int = 10000
     max_unacked_clients: int = 5
+    # The group's HA peer credential (PEM), present only once every Kea
+    # member's agent renders it — see ``services/dhcp/ha_peer_auth.py``. Part
+    # of the ETag via ``asdict``, so a rotation (or the gate opening) reaches
+    # every peer. ``repr=False`` keeps the key out of any repr of the bundle.
+    tls_ca_pem: str | None = field(default=None, repr=False)
+    tls_cert_pem: str | None = field(default=None, repr=False)
+    tls_key_pem: str | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -424,6 +452,12 @@ class DHCPDriver(ABC):
     """
 
     name: str = "abstract"
+    # #1347 — how this driver spells a raw option code, and so which raw keys
+    # it serves: ``"code"`` reads ``code:NN`` and drops ``opt-NN``; ``"opt"``
+    # (Windows) reads ``opt-NN`` and drops ``code:NN``. Declared here rather
+    # than decided in a router, so a new driver states its own spelling
+    # instead of silently getting Kea's.
+    raw_option_spelling: str = "code"
 
     @abstractmethod
     def render_config(self, bundle: ConfigBundle) -> str:

@@ -21,16 +21,33 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 
+import structlog
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.dns_names import contains_control_chars
+from app.core.dns_names import contains_control_chars, primary_ns_error, structured_rdata_error
+from app.drivers.dns import is_agentless
 from app.models.audit import AuditLog
 from app.models.auth import User
-from app.models.dns import DNSRecord, DNSServer, DNSServerGroup, DNSView, DNSZone
+from app.models.dns import DNSRecord, DNSServer, DNSServerGroup, DNSView, DNSZone, servable_ttl
 from app.services.dns.named_conf_validation import split_zone_forwarders
-from app.services.dns.record_ops import enqueue_record_ops_bulk, record_op_payload
+from app.services.dns.new_object_defaults import load_dns_defaults
+from app.services.dns.record_ops import (
+    enqueue_record_ops_bulk,
+    record_op_payload,
+    resolve_primary_server,
+)
+from app.services.dns.view_collisions import RenderGuard
+from app.services.dns.zone_apex import apex_name_length_error
+from app.services.dns_import.soa_mailbox import (
+    admin_email_warning,
+    importable_admin_email,
+    is_admin_email_warning,
+)
+from app.services.ipam.zone_binding import prune_zone_ids
 
+from . import cname_check
+from .apex_ns import ApexNsPolicy, group_names, is_apex_ns_warning, replace_apex_ns
 from .canonical import (
     ConflictAction,
     ImportedZone,
@@ -38,6 +55,8 @@ from .canonical import (
     ImportSource,
     ZoneConflict,
 )
+
+logger = structlog.get_logger(__name__)
 
 
 @dataclass
@@ -50,6 +69,8 @@ class CommitZoneResult:
     records_created: int = 0
     records_deleted: int = 0
     error: str | None = None
+    # Records dropped rather than stored, each with its reason (#2089).
+    skipped_records: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -169,14 +190,38 @@ async def _build_records_for_zone(
 
     rows: list[DNSRecord] = []
     skipped: list[str] = []
-    for r in parsed.records:
+    cname_refused = cname_check.cname_skips(parsed)  # #2089
+    # #4155 — a record BIND's check-names refuses would make named-checkzone
+    # reject the whole zone; the record API 422s it, so the import skips it.
+    names_refused = cname_check.names_skips(parsed)
+    for idx, r in enumerate(parsed.records):
         if r.record_type == "SOA":
+            continue
+        if idx in names_refused:
+            skipped.append(cname_check.describe_skip(parsed, idx, names_refused[idx]))
+            continue
+        if idx in cname_refused:
+            skipped.append(cname_check.describe_skip(parsed, idx, cname_refused[idx]))
             continue
         if contains_control_chars(r.name) or contains_control_chars(r.value):
             skipped.append(
                 f"{r.name or '@'} {r.record_type}: dropped — control character "
                 "in the record name or value"
             )
+            continue
+        # #2502 — rdata the agent would write verbatim and BIND would refuse
+        # is dropped here, not stored: one such row quarantines the server's
+        # whole config bundle.
+        rdata_err = structured_rdata_error(
+            r.record_type,
+            r.value,
+            priority=r.priority,
+            weight=r.weight,
+            port=r.port,
+            origin=zone_fqdn,
+        )
+        if rdata_err is not None:
+            skipped.append(f"{r.name or '@'} {r.record_type}: dropped — {rdata_err}")
             continue
         # FQDN is "<label>.<zone_fqdn>" with the apex label "@"
         # collapsing to just the zone fqdn.
@@ -192,7 +237,9 @@ async def _build_records_for_zone(
                 fqdn=fqdn.lower(),
                 record_type=r.record_type,
                 value=r.value,
-                ttl=r.ttl,
+                # #2073 — a source can carry a TTL no server serves (an
+                # uploaded PowerDNS export with -1); it inherits the $TTL.
+                ttl=servable_ttl(r.ttl),
                 priority=r.priority,
                 weight=r.weight,
                 port=r.port,
@@ -205,6 +252,11 @@ async def _build_records_for_zone(
     return rows, skipped
 
 
+def _timer(value: int | None, default: int) -> int:
+    servable = servable_ttl(value)
+    return default if servable is None else servable
+
+
 def _zone_kwargs_from_parsed(
     parsed: ImportedZone,
     *,
@@ -213,6 +265,7 @@ def _zone_kwargs_from_parsed(
     target_view_id: uuid.UUID | None,
     source: ImportSource,
     now: datetime,
+    default_ttl: int = 3600,
 ) -> dict[str, Any]:
     """Translate one parsed zone into kwargs for ``DNSZone(...)``.
 
@@ -224,19 +277,29 @@ def _zone_kwargs_from_parsed(
     """
 
     soa = parsed.soa
+    primary_ns = soa.primary_ns.rstrip(".") if soa and soa.primary_ns else ""
+    if primary_ns_error(primary_ns) is not None:
+        # #2075 — the source server served this MNAME but BIND's check-names
+        # would refuse it here and stop the whole group applying. Leave it
+        # unset: the renderer then uses the zone's own NS records.
+        primary_ns = ""
     return dict(
         group_id=target_group_id,
         view_id=target_view_id,
         name=name,
         zone_type=parsed.zone_type,
         kind=parsed.kind,
-        ttl=soa.ttl if soa else 3600,
-        refresh=soa.refresh if soa else 86400,
-        retry=soa.retry if soa else 7200,
-        expire=soa.expire if soa else 3600000,
-        minimum=soa.minimum if soa else 3600,
-        primary_ns=soa.primary_ns.rstrip(".") if soa and soa.primary_ns else "",
-        admin_email=soa.admin_email.rstrip(".") if soa and soa.admin_email else "",
+        # #2073 — a value outside 0..2^31-1 (negative, or past int4 in an
+        # uploaded export) falls back to the default rather than being
+        # stored for BIND to refuse the zone over, or 500ing the commit.
+        ttl=_timer(soa.ttl if soa else None, default_ttl),
+        refresh=_timer(soa.refresh if soa else None, 86400),
+        retry=_timer(soa.retry if soa else None, 7200),
+        expire=_timer(soa.expire if soa else None, 3600000),
+        minimum=_timer(soa.minimum if soa else None, 3600),
+        primary_ns=primary_ns,
+        # #3673 — held to Add Zone's rule; the preview warned if it was dropped.
+        admin_email=importable_admin_email(soa.admin_email if soa else None)[0],
         last_serial=soa.serial if soa else 0,
         forwarders=parsed.forwarders or [],
         forward_only=parsed.zone_type == "forward",
@@ -258,6 +321,7 @@ async def _create_zone_at(
     overwrote_records: int,
     audit_action: str,
     audit_extra: dict[str, Any] | None = None,
+    source_server_id: uuid.UUID | None = None,
 ) -> CommitZoneResult:
     """Build the DNSZone + DNSRecord rows + audit log for one parsed
     zone and commit them in one transaction.
@@ -276,10 +340,29 @@ async def _create_zone_at(
         target_view_id=target_view_id,
         source=source,
         now=now,
+        # #3087 — the source's own TTL wins; the stored default fills in
+        # only where it carried none (a forward / stub zone, no SOA).
+        default_ttl=(await load_dns_defaults(db)).ttl,
     )
+    if zone_kwargs["zone_type"] == "primary":
+        # #3672 — a zone whose apex names would pass 253 characters is never
+        # served; fail this zone only, in words, rather than store it.
+        apex_err = apex_name_length_error(
+            target_name,
+            zone_kwargs["primary_ns"],
+            zone_kwargs["admin_email"],
+            [(r.name, r.record_type, r.value) for r in parsed.records],
+        )
+        if apex_err is not None:
+            raise ValueError(apex_err)
+    # #2275 — the slot being empty is not enough: a zone with no view renders
+    # into every view, so it must not land beside a same-name pinned zone (and
+    # vice versa). Raising fails this zone only; the caller rolls it back.
+    render_guard = await RenderGuard.capture(db, target_group_id, [target_name])
     zone = DNSZone(**zone_kwargs)
     db.add(zone)
     await db.flush()  # populate zone.id for the FK
+    await render_guard.check(db, f"import zone {target_name!r}", error=ValueError)
 
     record_rows, skipped_records = await _build_records_for_zone(
         db,
@@ -311,7 +394,31 @@ async def _create_zone_at(
     # importer always creates the zone fresh (overwrites delete + recreate),
     # so ``last_serial`` was just seeded from the parsed SOA and already
     # describes the state these records belong to.
-    if record_rows:
+    #
+    # #1456 — the exception is a live pull from an agentless server (cloud,
+    # Windows DNS) landing in a zone whose primary IS that server: the
+    # records were just read from it, so a create op would only push them
+    # back (a provider refuses the duplicate at best, stores it at worst).
+    # A renamed zone is not on that server under its new name, so it still
+    # gets its ops.
+    pushed_back_to_source = False
+    if (
+        record_rows
+        and source_server_id is not None
+        and target_name == _normalize_fqdn(parsed.name).lower()
+    ):
+        primary = await resolve_primary_server(db, zone)
+        pushed_back_to_source = (
+            primary is not None and primary.id == source_server_id and is_agentless(primary.driver)
+        )
+    if pushed_back_to_source:
+        logger.info(
+            "dns_import_record_ops_skipped",
+            zone=target_name,
+            records=records_created,
+            reason="records were pulled from the zone's primary",
+        )
+    elif record_rows:
         await db.flush()  # populate record PKs before snapshotting payloads
         await enqueue_record_ops_bulk(
             db,
@@ -332,6 +439,8 @@ async def _create_zone_at(
         "records_created": records_created,
         "skipped_record_types": parsed.skipped_record_types,
     }
+    if parsed.apex_ns_replaced:
+        audit_meta["apex_ns_replaced"] = parsed.apex_ns_replaced
     if skipped_records:
         audit_meta["records_skipped_unsafe"] = skipped_records
     if overwrote_records:
@@ -367,6 +476,7 @@ async def _create_zone_at(
         zone_id=str(zone.id),
         records_created=records_created,
         records_deleted=overwrote_records,
+        skipped_records=skipped_records,
     )
 
 
@@ -396,6 +506,7 @@ async def _delete_zone(db: AsyncSession, zone: DNSZone) -> int:
     ).scalar_one() or 0
     await db.delete(zone)
     await db.flush()
+    await prune_zone_ids(db, [zone.id])
     return int(n)
 
 
@@ -411,6 +522,7 @@ async def _commit_one_zone(
     has_conflict: bool,
     current_user: User,
     now: datetime,
+    source_server_id: uuid.UUID | None = None,
 ) -> CommitZoneResult:
     """Apply one parsed zone with the operator-supplied action.
 
@@ -467,6 +579,7 @@ async def _commit_one_zone(
             source=source,
             current_user=current_user,
             now=now,
+            source_server_id=source_server_id,
             overwrote_records=0,
             audit_action="create",
             audit_extra=audit_extra,
@@ -485,6 +598,7 @@ async def _commit_one_zone(
                 source=source,
                 current_user=current_user,
                 now=now,
+                source_server_id=source_server_id,
                 overwrote_records=0,
                 audit_action="create",
             )
@@ -506,6 +620,7 @@ async def _commit_one_zone(
                 source=source,
                 current_user=current_user,
                 now=now,
+                source_server_id=source_server_id,
                 overwrote_records=0,
                 audit_action="create",
             )
@@ -519,6 +634,7 @@ async def _commit_one_zone(
             source=source,
             current_user=current_user,
             now=now,
+            source_server_id=source_server_id,
             overwrote_records=records_deleted,
             audit_action="update",
         )
@@ -537,6 +653,7 @@ async def _commit_one_zone(
         source=source,
         current_user=current_user,
         now=now,
+        source_server_id=source_server_id,
         overwrote_records=0,
         audit_action="create",
     )
@@ -550,6 +667,7 @@ async def commit_import(
     target_view_id: uuid.UUID | None,
     conflict_actions: dict[str, tuple[ConflictAction, str | None]],
     current_user: User,
+    apex_ns_policy: ApexNsPolicy = "keep",
 ) -> CommitResult:
     """Apply ``preview`` to the DB inside per-zone savepoints.
 
@@ -605,12 +723,42 @@ async def commit_import(
         .all()
     )
     bind9_target = not drivers or "bind9" in drivers
-    warnings = list(preview.warnings)
+    # The CNAME-rule warnings are recomputed below from the zones as committed.
+    warnings = [w for w in preview.warnings if not cname_check.is_cname_warning(w)]
+    # #1892 — "replace" swaps an imported apex NS naming a host outside the
+    # group for the group's own servers; "keep" (default) imports it as is.
+    apex_names = await group_names(db, target_group_id) if apex_ns_policy == "replace" else None
 
     now = datetime.now(UTC)
     results: list[CommitZoneResult] = []
 
     for parsed in preview.zones:
+        if apex_names is not None:
+            parsed, change, apex_warning = replace_apex_ns(parsed, apex_names)
+            if apex_warning:
+                warnings.append(apex_warning)
+            if change is not None:
+                # The plan's preview warning said to commit with "replace";
+                # done, so it no longer belongs in the result.
+                warnings = [w for w in warnings if not is_apex_ns_warning(w, parsed.name)]
+        if parsed.soa is not None and parsed.soa.primary_ns:
+            mname = parsed.soa.primary_ns.rstrip(".")
+            if mname and primary_ns_error(mname) is not None:
+                # #2075 — _zone_kwargs_from_parsed leaves it unset; say so.
+                warnings.append(
+                    f"Zone {parsed.name!r}: SOA primary name {parsed.soa.primary_ns!r} "
+                    "is not a fully qualified host name and was not imported; the "
+                    "zone's first apex NS record is served as the SOA primary name instead"
+                )
+        if parsed.soa is not None and parsed.soa.admin_email:
+            _, mail_reason = importable_admin_email(parsed.soa.admin_email)
+            if mail_reason is not None and not any(
+                is_admin_email_warning(w, parsed.name) for w in warnings
+            ):
+                # #3673 — a plan that did not come through the preview's check.
+                warnings.append(
+                    admin_email_warning(parsed.name, parsed.soa.admin_email, mail_reason)
+                )
         if bind9_target and parsed.forwarders:
             kept, dropped = split_zone_forwarders(parsed.forwarders)
             if dropped:
@@ -631,6 +779,13 @@ async def commit_import(
             action, rename_to = entry
         has_conflict = target_name in conflicting
 
+        # A SAVEPOINT per zone, so a failed zone is undone without a session
+        # rollback: that expires every loaded object, ``current_user`` among
+        # them, and the next access to it (the next zone's audit row, the
+        # route's log line) is lazy IO outside the greenlet, a 500 after the
+        # zones before it were committed (#2275 made a refusal here routine).
+        # A zone that succeeds commits, which ends the savepoint with the rest.
+        zone_sp = await db.begin_nested()
         try:
             result = await _commit_one_zone(
                 db,
@@ -643,15 +798,24 @@ async def commit_import(
                 has_conflict=has_conflict,
                 current_user=current_user,
                 now=now,
+                source_server_id=preview.source_server_id,
             )
+            if zone_sp.is_active:  # skipped, or failed without raising
+                await zone_sp.commit()
         except Exception as exc:  # noqa: BLE001 — operator-facing error capture
-            await db.rollback()
+            if zone_sp.is_active:
+                await zone_sp.rollback()
+            else:
+                await db.rollback()
             result = CommitZoneResult(
                 zone_name=parsed.name,
                 action_taken="failed",
                 error=str(exc),
             )
         results.append(result)
+        warnings.extend(
+            f"Zone {parsed.name!r}: record not imported, {why}" for why in result.skipped_records
+        )
 
     return CommitResult(
         target_group_id=target_group_id,

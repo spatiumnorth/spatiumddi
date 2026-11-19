@@ -158,7 +158,9 @@ def test_confirm_says_reinstall_when_var_is_kept():
 
 def test_rsync_feeds_the_gauge():
     assert "--info=progress2" in CODE
-    i = CODE.index("--info=progress2")
+    # The rsync lives in _copy_live_root (#2256); do_install pipes it into
+    # the gauge loop, so read the block that follows that call.
+    i = CODE.index("        _copy_live_root \\")
     blk = CODE[i:i + 1400]
     # A bash read loop, NOT awk. Debian ships mawk, which buffers its
     # input on a non-newline RS and block-buffers its output to a pipe —

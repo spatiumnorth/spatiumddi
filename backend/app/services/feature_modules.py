@@ -41,7 +41,8 @@ from typing import Final
 
 import structlog
 from fastapi import Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import literal_column, select
+from sqlalchemy import table as sa_table
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -70,6 +71,17 @@ class ModuleSpec:
     # router mounted and a sidebar row visible, pointing at a subsystem
     # the operator has turned off.
     requires: tuple[str, ...] = ()
+    # #2100 — a default-OFF module that resolves ON, absent an operator
+    # override, on an install whose named table already holds a row. This
+    # is how a module carved out of an existing always-on surface ships
+    # default-off WITHOUT hiding that surface from the installs that use
+    # it, and without seeding a ``feature_module`` row (#1069 forbids
+    # that: a row means "an operator changed this", and a seeded one makes
+    # the catalog default dead code). Only consulted while no override row
+    # exists, so an operator's choice always wins, in both directions.
+    # ``default_enabled`` stays the FRESH-install value and is what
+    # ``tests/test_feature_module_defaults.py`` pins.
+    default_on_if_rows_in: str | None = None
 
 
 # Stable dotted-name ids. A new module appends here and does NOT seed a
@@ -127,6 +139,25 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         group="Network",
         description="Autonomous-system records with RDAP holder + RPKI ROA enrichment.",
         default_enabled=False,
+    ),
+    # Default-OFF (#1069), with ``default_on_if_rows_in`` (#2325). A Domain row
+    # triggers off-prem RDAP lookups, so a fresh install ships with the module
+    # off and makes no such call. But Domains was ungated before this module
+    # existed, so an upgraded install already tracking registrations has rows
+    # and no ``feature_module`` row (a migration may not seed one). The same
+    # shape as ``ipam.nat`` (#2100) covers that: with no operator override the
+    # module resolves ON iff ``domain`` holds a row, so those pages and the
+    # expiry tracking keep working. Consequence, stated rather than hidden:
+    # an operator who wants zero egress on an upgraded install turns it off
+    # explicitly (a row wins), and on a fresh install enables it to create
+    # the first Domain (docs/PRIVACY.md §3.3).
+    ModuleSpec(
+        id="network.domains",
+        label="Domains",
+        group="Network",
+        description="Domain registration records — registrar, expiry, DNSSEC and nameserver drift. Each row is refreshed from public RDAP registries (an off-prem lookup of the domain name) on creation and every 24 h. Off on a fresh install (nothing is sent), but on by default wherever Domain records already exist; turn this off to stop all of that traffic and hide the Domains pages and API.",
+        default_enabled=False,
+        default_on_if_rows_in="domain",
     ),
     ModuleSpec(
         id="network.circuit",
@@ -355,9 +386,10 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
             "The DNS subsystem as a whole — zones, records, views, server "
             "groups, blocklists and the DNS dashboard panels. Turn it off "
             "on an IPAM-only or DHCP-only install to put the entire DNS "
-            "surface away; every DNS feature below depends on it. Agent "
-            "registration and config polling are deliberately unaffected, "
-            "and disabling is refused while any DNS server or zone exists."
+            "surface away; every DNS feature below depends on it. Disabling "
+            "is refused while any DNS server or zone exists. While it is "
+            "off, new agents cannot register; agents already registered "
+            "keep heartbeating and polling their config."
         ),
     ),
     # DNS — togglable extras under the Settings → Import surface and
@@ -372,7 +404,7 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         id="dns.import",
         label="DNS configuration import",
         group="DNS",
-        description="One-shot import from BIND9 / Windows DNS / PowerDNS into SpatiumDDI's native zones + records. Settings → Import → DNS surface; sources gate behind their own credential / file-upload step.",
+        description="One-shot import from BIND9 / Windows DNS / PowerDNS into SpatiumDDI's native zones + records. Run it from Administration → Import → DNS; each source asks for its own credentials or file upload.",
         requires=("core.dns",),
     ),
     # Dynamic-update (RFC 2136) ACLs on zones (issue #641). Lets an
@@ -402,9 +434,10 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
             "reservations, leases, client classes and the DHCP dashboard "
             "panels, plus the DHCP affordances inside IPAM. Turn it off on "
             "a DNS-only or IPAM-only install; every DHCP feature below "
-            "depends on it. Agent registration and config polling are "
-            "deliberately unaffected, and disabling is refused while any "
-            "DHCP server or scope exists."
+            "depends on it. Disabling is refused while any DHCP server or "
+            "scope exists. While it is off, new agents cannot register; "
+            "agents already registered keep heartbeating and polling "
+            "their config."
         ),
     ),
     # DHCP — sister importer to ``dns.import`` (issue #129). One-shot
@@ -417,7 +450,7 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         id="dhcp.import",
         label="DHCP configuration import",
         group="DHCP",
-        description="One-shot import from Kea / Windows DHCP / ISC dhcpd.conf into SpatiumDDI's native scopes + pools + reservations + classes. Settings → Import → DHCP surface; sources gate behind their own credential / file-upload step.",
+        description="One-shot import from Kea / Windows DHCP / ISC dhcpd.conf into SpatiumDDI's native scopes + pools + reservations + classes. Run it from Administration → Import → DHCP; each source asks for its own credentials or file upload.",
         requires=("core.dhcp",),
     ),
     # IPAM — NetBox read-only one-shot migration importer (issue #36).
@@ -456,7 +489,42 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         id="ipam.import.netbox",
         label="NetBox import",
         group="IPAM",
-        description="One-shot migration import of prefixes / IP addresses / VLANs / VRFs / tenants / sites from a NetBox instance into native IPAM rows. Settings → Import → NetBox surface; connection + token are supplied per-import (never persisted).",
+        description="One-shot migration import of prefixes / IP addresses / VLANs / VRFs / tenants / sites from a NetBox instance into native IPAM rows. Run it from Administration → Import → NetBox; the connection and token are supplied per import and never stored.",
+    ),
+    # IPAM — NAT mappings (#2100). Operator-curated 1:1 / PAT / hide-NAT
+    # cross-reference data: the NAT Mappings page, the /ipam/nat-mappings
+    # routes, the Dashboard count and the NAT panels + badges on subnet / IP
+    # detail.
+    #
+    # Default-OFF (#1069): most installs never record a NAT binding, and the
+    # surface was always-on only because it predates the module catalog. But
+    # it predates the catalog, so an install upgraded with mappings already
+    # in it must keep seeing them — and seeding a row to say so is exactly
+    # what #1069 forbids. ``default_on_if_rows_in`` covers that: with no
+    # operator override, the module resolves ON iff ``nat_mapping`` holds a
+    # row. The consequence, stated rather than hidden: a firewall mirror
+    # writing the first NAT row on a fresh install turns the surface on,
+    # because data now exists for it to show; and deleting the last mapping
+    # turns it back off unless the operator has enabled it explicitly.
+    #
+    # Deliberately NO ``requires=`` link from the PAN-OS / Fortinet / Meraki
+    # mirrors: they keep writing ``nat_mapping`` provenance rows while this is
+    # off, so turning it on later shows a current picture rather than a gap.
+    # Disabling is allowed with rows present — the data is hidden, not lost.
+    ModuleSpec(
+        id="ipam.nat",
+        label="NAT mappings",
+        group="IPAM",
+        description=(
+            "Operator-curated 1:1 / PAT / hide-NAT mappings between internal and "
+            "external addresses — the NAT Mappings page, the Dashboard count and "
+            "the NAT panels on subnet and IP detail. Off on a fresh install, but "
+            "on by default wherever NAT mappings already exist. Turning it off "
+            "hides the data without deleting it, and the PAN-OS, Fortinet and "
+            "Meraki mirrors keep recording NAT rules while it is off."
+        ),
+        default_enabled=False,
+        default_on_if_rows_in="nat_mapping",
     ),
     # Integrations — read-only mirrors of external orchestrators.
     # Default-disabled: each one needs operator-supplied credentials
@@ -465,10 +533,10 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
     # integration's sidebar entry + REST surface appear; the actual
     # poll only starts once the operator configures a target.
     #
-    # The matching ``PlatformSettings.integration_*_enabled`` columns
-    # are kept in lock-step by the toggle endpoint (Celery beat tasks
-    # gate on them and we don't want to fan out the read-feature_module
-    # change across every reconciler in one PR).
+    # The module is the integration's ONLY on/off switch (#2196 / #2197):
+    # its beat sweep, its alerts and its dashboard panels all ask
+    # ``is_module_enabled``. See ``INTEGRATION_SETTINGS_MIRROR`` below for
+    # what the ``PlatformSettings.integration_*_enabled`` columns are now.
     ModuleSpec(
         id="integrations.kubernetes",
         label="Kubernetes",
@@ -563,7 +631,7 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         id="appliance.firewall",
         label="Fleet Firewall",
         group="Appliance",
-        description="Declarative per-role, fleet-wide appliance firewall policy compiled to nftables. DISCOVERY/STAGING only — enforcement is a separate master switch (Settings → firewall_enabled, default OFF). Enabling this module does NOT apply any firewall.",
+        description="Declarative per-role, fleet-wide appliance firewall policy compiled to nftables. DISCOVERY/STAGING only — enforcement is a separate master switch (the Enforcement card under Appliance → Firewall → Policies; default OFF). Enabling this module does NOT apply any firewall.",
     ),
     # Security — embedded ACME client for the Web UI TLS cert (#438).
     # Default-ENABLED deliberately: the module is the DISCOVERY toggle so
@@ -575,7 +643,7 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         id="security.certificates",
         label="Certificates (ACME / Let's Encrypt)",
         group="Security",
-        description="Embedded RFC 8555 ACME client that issues a CA-trusted Web UI TLS cert from Let's Encrypt, solving the DNS-01 challenge through SpatiumDDI's own managed DNS zones. Discovery toggle only — issuance is RBAC-gated and requires an explicit operator opt-in (Settings → acme_enabled).",
+        description="Embedded RFC 8555 ACME client that issues CA-trusted TLS certs from Let's Encrypt — the Web UI cert on an appliance, and DoT / DoH certs on every install — solving the DNS-01 challenge through SpatiumDDI's own managed DNS zones. Discovery toggle only — issuance is RBAC-gated and requires an explicit operator opt-in: registering an ACME account, under Appliance → Fleet → TLS certificates (Web UI Certificate on an appliance host) → Issue via Let's Encrypt.",
     ),
     # Default-OFF (#1069): armed, this reaches out and opens TLS connections
     # to endpoints on a schedule, and its discovery half can mint its own
@@ -694,17 +762,33 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         id="security.dnsbl",
         label="DNSBL / RBL reputation monitoring",
         group="Security",
-        description="Check every public-facing IP SpatiumDDI knows (public IPAM addresses, internet-facing subnets, NAT/PAT egress addresses, and operator-pinned IPs) against the major DNS blocklists (Spamhaus ZEN, Barracuda, SpamCop, SORBS, …) on a daily reversed-octet sweep — catching mail-deliverability / reputation problems before users report them. Discovery toggle only: no external DNS queries run until you enable the sweep (Settings → dnsbl_monitoring_enabled) and turn on at least one list.",
+        description="Check every public-facing IP SpatiumDDI knows (public IPAM addresses, internet-facing subnets, NAT/PAT egress addresses, and operator-pinned IPs) against the major DNS blocklists (Spamhaus ZEN, Barracuda, SpamCop, SORBS, …) on a daily reversed-octet sweep — catching mail-deliverability / reputation problems before users report them. Discovery toggle only: no external DNS queries run until you enable the sweep (Administration → DNS Blocklists → Enable daily sweep) and turn on at least one list.",
         default_enabled=False,
         requires=("core.dns",),
     ),
 )
 
-# Map a feature_module id to the ``PlatformSettings`` column whose
-# ``True``/``False`` value mirrors it. The toggle endpoint writes both
-# sides in the same transaction so reconciler tasks (which gate on the
-# settings column) see the change without a separate migration. New
-# integrations register here in the same PR that adds them.
+# Every integration module, mapped to the ``PlatformSettings`` column that
+# mirrors it.
+#
+# The MODULE is authoritative (#2196 / #2197). Each integration's beat sweep,
+# its alert subjects and both dashboard surfaces ask ``is_module_enabled`` for
+# the module id here — nothing in the application reads these columns. They
+# used to be the gate, kept in step by the toggle endpoint, and that was two
+# sources of truth that drifted two ways: a module turned on before
+# ``PlatformSettings(1)`` existed skipped the mirror for good, and Fortinet
+# and Meraki were never in this map at all, so their periodic sync never ran
+# on any install. A reader that consults the module cannot drift from it.
+#
+# The columns survive only as a derived copy, rewritten wholesale by
+# ``sync_integration_settings_mirror`` on every toggle and at API startup, for
+# anything outside the app that still reads them (a SQL report, a build older
+# than this change after a downgrade). ``GET /settings`` reports the module
+# state, not the column, and ``PUT /settings`` writes the module.
+#
+# Every ``integrations.*`` module must appear here — pinned by
+# ``tests/test_integration_module_gates.py`` — so a twelfth integration cannot
+# silently ship without a gate or a settings-API field.
 INTEGRATION_SETTINGS_MIRROR: Final[dict[str, str]] = {
     "integrations.kubernetes": "integration_kubernetes_enabled",
     "integrations.docker": "integration_docker_enabled",
@@ -715,6 +799,13 @@ INTEGRATION_SETTINGS_MIRROR: Final[dict[str, str]] = {
     "integrations.opnsense": "integration_opnsense_enabled",
     "integrations.netbird": "integration_netbird_enabled",
     "integrations.paloalto": "integration_panos_enabled",
+    "integrations.fortinet": "integration_fortinet_enabled",
+    "integrations.meraki": "integration_meraki_enabled",
+}
+
+# The reverse view: settings-API field name -> module id.
+INTEGRATION_FIELD_TO_MODULE: Final[dict[str, str]] = {
+    col: mid for mid, col in INTEGRATION_SETTINGS_MIRROR.items()
 }
 
 MODULES_BY_ID: Final[dict[str, ModuleSpec]] = {m.id: m for m in MODULES}
@@ -739,6 +830,10 @@ def is_known(module_id: str) -> bool:
 _CACHE_TTL_S: Final[float] = 5.0
 _cache_loaded_at: float = 0.0
 _cached_enabled: set[str] = set()
+# The catalog the cached set was resolved against. A verdict computed under a
+# different ``MODULES`` (the suite swaps defaults per test; #2395) must not
+# answer for this one, TTL or not.
+_cached_for: object = None
 
 
 def invalidate_cache() -> None:
@@ -779,30 +874,90 @@ def _resolve_with_parents(
     return all(_resolve_with_parents(parent, own, seen) for parent in spec.requires)
 
 
+async def _table_has_rows(db: AsyncSession, table_name: str) -> bool:
+    """``SELECT 1 FROM <table> LIMIT 1`` — stops at the first row, not a COUNT.
+
+    ``table()`` builds a lightweight clause with a properly quoted
+    identifier, so the catalog does not have to import the model (and the
+    model graph) just to ask whether a table is empty.
+    """
+    probe = sa_table(table_name)
+    found: object = (
+        await db.execute(select(literal_column("1")).select_from(probe).limit(1))
+    ).first()
+    return found is not None
+
+
+@dataclass(frozen=True)
+class ModuleStates:
+    """Per-module state before ``requires`` resolution.
+
+    ``own`` is what each module resolves to on its own: the operator's
+    override row when one exists, else ``defaults``. ``defaults`` is the
+    EFFECTIVE default for this install — the catalog's ``default_enabled``,
+    except where ``default_on_if_rows_in`` has turned it on (#2100).
+    """
+
+    own: dict[str, bool]
+    defaults: dict[str, bool]
+
+
+async def load_module_states(db: AsyncSession, *, probe_overridden: bool = False) -> ModuleStates:
+    """Read the override rows and resolve every module's own state.
+
+    The single place a module's state is derived, so the gate
+    (``get_enabled_modules``) and the list endpoint the frontend resolves
+    from cannot disagree — if they did, the sidebar would show a row whose
+    page 404s. The data-presence probe runs only for a module that declares
+    one AND has no override row, so the gate pays nothing for it once an
+    operator has chosen. ``probe_overridden`` runs it regardless, so
+    ``defaults`` is exact for a module that HAS an override — the Settings
+    page needs that to tell "overridden" from "at its default"; ``own``
+    is the same either way.
+    """
+    rows = (await db.execute(select(FeatureModule))).scalars().all()
+    overrides: dict[str, bool] = {row.id: row.enabled for row in rows}
+
+    defaults: dict[str, bool] = {}
+    for spec in MODULES:
+        default = spec.default_enabled
+        if (
+            not default
+            and spec.default_on_if_rows_in
+            and (probe_overridden or spec.id not in overrides)
+        ):
+            default = await _table_has_rows(db, spec.default_on_if_rows_in)
+        defaults[spec.id] = default
+
+    own = {spec.id: overrides.get(spec.id, defaults[spec.id]) for spec in MODULES}
+    return ModuleStates(own=own, defaults=defaults)
+
+
 async def get_enabled_modules(db: AsyncSession) -> set[str]:
     """Return the set of currently-enabled module ids.
 
     Resolved as:
         for each module in the catalog:
             if a DB override exists, honour it
-            else honour the catalog's default_enabled
+            else honour the effective default (``load_module_states``)
         then drop any module whose ``requires`` chain is not fully
         enabled (#1068).
+
+    Cached for ``_CACHE_TTL_S``, which also bounds the data-presence probe
+    behind ``default_on_if_rows_in`` to one cheap query per worker per TTL.
+    A first row written elsewhere (a mirror in a Celery worker) is picked up
+    at the next expiry.
     """
-    global _cache_loaded_at, _cached_enabled
+    global _cache_loaded_at, _cached_enabled, _cached_for
     now = time.monotonic()
-    if now - _cache_loaded_at < _CACHE_TTL_S and _cached_enabled:
+    if now - _cache_loaded_at < _CACHE_TTL_S and _cached_enabled and _cached_for is MODULES:
         return _cached_enabled
 
-    rows = (await db.execute(select(FeatureModule))).scalars().all()
-    overrides: dict[str, bool] = {row.id: row.enabled for row in rows}
-
-    own: dict[str, bool] = {
-        spec.id: overrides.get(spec.id, spec.default_enabled) for spec in MODULES
-    }
+    own = (await load_module_states(db)).own
     enabled = {mid for mid in own if _resolve_with_parents(mid, own)}
 
     _cached_enabled = enabled
+    _cached_for = MODULES
     _cache_loaded_at = now
     return enabled
 
@@ -848,6 +1003,42 @@ async def set_module_enabled(
     )
     row = (await db.execute(stmt)).scalar_one()
     return row
+
+
+async def integration_flags(db: AsyncSession) -> dict[str, bool]:
+    """Every integration's on/off state, keyed by its settings-API field.
+
+    Read from the module state (uncached), so ``GET /settings`` and the
+    module list cannot disagree within the cache TTL.
+    """
+    own = (await load_module_states(db)).own
+    return {
+        col: _resolve_with_parents(mid, own) for mid, col in INTEGRATION_SETTINGS_MIRROR.items()
+    }
+
+
+async def sync_integration_settings_mirror(db: AsyncSession) -> bool:
+    """Rewrite every ``integration_*_enabled`` column from module state.
+
+    Get-or-creates ``PlatformSettings(1)``: skipping a missing row is what
+    left #2196's flags false for good. Idempotent; returns whether any column
+    changed. The caller commits. Nothing in the app reads these columns (see
+    ``INTEGRATION_SETTINGS_MIRROR``) — this keeps the derived copy honest.
+    """
+    from app.models.settings import PlatformSettings  # noqa: PLC0415
+
+    flags = await integration_flags(db)
+    ps = await db.get(PlatformSettings, 1)
+    if ps is None:
+        ps = PlatformSettings(id=1)
+        db.add(ps)
+        await db.flush()
+    changed = False
+    for col, value in flags.items():
+        if getattr(ps, col) != value:
+            setattr(ps, col, value)
+            changed = True
+    return changed
 
 
 # ── FastAPI dependency ─────────────────────────────────────────────────

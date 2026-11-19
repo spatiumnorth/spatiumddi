@@ -18,12 +18,12 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
 
-from app.api.v1.dhcp.agents import _auth_agent
+from app.api.v1.dhcp.agents import _auth_agent, insert_ipam_mirror_row
 from app.core.security import create_access_token, hash_password
 from app.main import app
 from app.models.alerts import AlertRule
 from app.models.audit import AuditLog
-from app.models.auth import User
+from app.models.auth import Group, Role, User
 from app.models.dhcp import DHCPLease, DHCPMACBlock, DHCPServer, DHCPServerGroup
 from app.models.feature_module import FeatureModule
 from app.models.ipam import IPAddress, IPBlock, IpMacHistory, IPSpace, MACAllowlist, Subnet
@@ -761,3 +761,177 @@ async def test_duplicate_allowlist_returns_409(
         json={"mac_address": "3c:5a:b4:ab:cd:ef", "note": "again"},
     )
     assert dup.status_code == 409, dup.text
+
+
+async def test_mac_sightings_existing_row_matches_without_insert(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2651 — a known IP updates its row in place; no failing INSERT/savepoint."""
+
+    server, subnet = await _seed_dhcp(db_session)
+    await _enable_watch(db_session)
+    row = IPAddress(subnet_id=subnet.id, address="10.41.1.90", status="allocated")
+    db_session.add(row)
+    await db_session.commit()
+    # Drop the identity map so the handler re-reads ``address`` as the
+    # IPv4Address asyncpg decodes (the str we just wrote would mask the bug).
+    db_session.expire(row)
+
+    calls: list[object] = []
+    real = insert_ipam_mirror_row
+
+    async def spy(db, candidate):  # type: ignore[no-untyped-def]
+        calls.append(candidate)
+        return await real(db, candidate)
+
+    monkeypatch.setattr("app.api.v1.dhcp.agents.insert_ipam_mirror_row", spy)
+    app.dependency_overrides[_auth_agent] = lambda: (server, {})
+    try:
+        resp = await client.post(
+            "/api/v1/dhcp/agents/mac-sightings",
+            json={"sightings": [{"mac_address": "3c:5a:b4:5e:e0:09", "ip_address": "10.41.1.90"}]},
+        )
+    finally:
+        app.dependency_overrides.pop(_auth_agent, None)
+    assert resp.status_code == 200, resp.text
+    assert calls == []
+    await db_session.refresh(row)
+    assert row.last_seen_method == "l2_sniff"
+
+
+# ── #3302 — block needs write on dhcp_mac_block as well as ip_address ─────
+
+
+async def _user_with(db: AsyncSession, perms: list[dict]) -> str:
+    u = User(
+        username=f"u-{uuid.uuid4().hex[:6]}",
+        email=f"{uuid.uuid4().hex[:6]}@x.com",
+        display_name="U",
+        hashed_password=hash_password("x"),
+    )
+    db.add(u)
+    await db.flush()
+    role = Role(name=f"r-{uuid.uuid4().hex[:6]}", description="", permissions=perms)
+    db.add(role)
+    await db.flush()
+    group = Group(name=f"g-{uuid.uuid4().hex[:6]}", description="")
+    group.roles = [role]
+    group.users = [u]
+    db.add(group)
+    await db.flush()
+    await db.commit()
+    return create_access_token(str(u.id))
+
+
+_IP_WRITE = {"action": "write", "resource_type": "ip_address"}
+_MAC = "3c:5a:b4:de:ad:31"
+
+
+async def _block_count(db: AsyncSession) -> int:
+    rows = await db.execute(select(DHCPMACBlock).where(DHCPMACBlock.mac_address == _MAC))
+    return len(rows.scalars().all())
+
+
+async def test_block_without_dhcp_grant_is_refused_and_audited(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    await _enable_watch(db_session)
+    g = DHCPServerGroup(name=f"g-{uuid.uuid4().hex[:6]}")
+    db_session.add(g)
+    token = await _user_with(db_session, [_IP_WRITE])
+    for body in ({"group_id": str(g.id)}, {}):
+        resp = await client.post(
+            "/api/v1/new-devices/block",
+            headers=_hdr(token),
+            json={"mac_address": _MAC, **body},
+        )
+        assert resp.status_code == 403, resp.text
+    assert await _block_count(db_session) == 0
+    denied = (
+        (
+            await db_session.execute(
+                select(AuditLog).where(
+                    AuditLog.resource_type == "dhcp_mac_block", AuditLog.result == "denied"
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(denied) == 2
+
+
+async def test_block_with_both_grants_succeeds(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    await _enable_watch(db_session)
+    g = DHCPServerGroup(name=f"g-{uuid.uuid4().hex[:6]}")
+    db_session.add(g)
+    token = await _user_with(
+        db_session, [_IP_WRITE, {"action": "write", "resource_type": "dhcp_mac_block"}]
+    )
+    resp = await client.post(
+        "/api/v1/new-devices/block", headers=_hdr(token), json={"mac_address": _MAC}
+    )
+    assert resp.status_code == 200, resp.text
+    assert await _block_count(db_session) == 1
+
+
+async def test_block_all_groups_refused_when_one_group_is_not_writable(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    await _enable_watch(db_session)
+    g1 = DHCPServerGroup(name=f"g-{uuid.uuid4().hex[:6]}")
+    g2 = DHCPServerGroup(name=f"g-{uuid.uuid4().hex[:6]}")
+    db_session.add_all([g1, g2])
+    await db_session.flush()
+    token = await _user_with(
+        db_session,
+        [
+            _IP_WRITE,
+            {"action": "write", "resource_type": "dhcp_mac_block", "resource_id": str(g1.id)},
+        ],
+    )
+    resp = await client.post(
+        "/api/v1/new-devices/block", headers=_hdr(token), json={"mac_address": _MAC}
+    )
+    assert resp.status_code == 403, resp.text
+    assert await _block_count(db_session) == 0
+    # The one group the grant names is still blockable on its own.
+    resp = await client.post(
+        "/api/v1/new-devices/block",
+        headers=_hdr(token),
+        json={"mac_address": _MAC, "group_id": str(g1.id)},
+    )
+    assert resp.status_code == 200, resp.text
+    assert await _block_count(db_session) == 1
+
+
+async def test_trashed_subnet_leaves_the_new_devices_views_3492(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#3492: a subnet in the Trash takes its sightings out of the list, the
+    ``?subnet_id=`` filter, and the summary counts; restoring brings them back."""
+    await _enable_watch(db_session)
+    subnet = await _make_subnet(db_session)
+    ip = await _ip(db_session, subnet, "10.40.1.80", status="allocated")
+    await record_mac_observation(db_session, ip.id, "3c:5a:b4:de:ad:80", source="manual")
+    _u, token = await _superadmin(db_session)
+    await db_session.commit()
+
+    async def _views() -> tuple[int, int, int]:
+        h = _hdr(token)
+        plain = (await client.get("/api/v1/new-devices/sightings", headers=h)).json()["total"]
+        scoped = (
+            await client.get(f"/api/v1/new-devices/sightings?subnet_id={subnet.id}", headers=h)
+        ).json()["total"]
+        summ = (await client.get("/api/v1/new-devices/summary", headers=h)).json()
+        return plain, scoped, summ["new_count"]
+
+    assert await _views() == (1, 1, 1)
+    subnet.deleted_at = datetime.now(UTC)
+    await db_session.commit()
+    assert await _views() == (0, 0, 0)
+    subnet.deleted_at = None
+    await db_session.commit()
+    assert await _views() == (1, 1, 1)

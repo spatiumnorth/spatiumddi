@@ -24,8 +24,11 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from app.api.deps import DB, SuperAdmin
+from app.api.pre_body_auth import PreBodyAuthRoute
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.models.dhcp import DHCPServer
+from app.services.api_token_scopes import read_only_post, token_write
+from app.services.dhcp.option_validation import canonical_domain_options
 from app.services.dhcp_import import (
     CommitResult,
     IscImportError,
@@ -33,6 +36,10 @@ from app.services.dhcp_import import (
     WindowsDHCPImportError,
     commit_import,
     detect_conflicts,
+    drop_invalid_options,
+    drop_invalid_pools,
+    drop_invalid_reservations,
+    drop_unservable_hostnames,
     parse_isc_config,
     parse_kea_config,
     parse_windows_dhcp_server,
@@ -48,7 +55,10 @@ from app.services.dhcp_import.canonical import (
 )
 
 logger = structlog.get_logger(__name__)
-router = APIRouter()
+# Every body route here checks the login from the request headers before
+# the body is read, JSON routes included (app.api.pre_body_auth): these
+# routes carry body allowances above the app-wide cap (app.core.body_limit).
+router = APIRouter(route_class=PreBodyAuthRoute)
 
 _MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
@@ -76,6 +86,7 @@ class ImportedClientClassOut(BaseModel):
     name: str
     match_expression: str = ""
     description: str = ""
+    address_family: Literal["ipv4", "ipv6", "dual"] = "ipv4"
     options: dict = Field(default_factory=dict)
     supported: bool = True
     warning: str | None = None
@@ -197,9 +208,14 @@ def _scope_to_pydantic(s: ImportedScope) -> ImportedScopeOut:
         min_lease_time=s.min_lease_time,
         max_lease_time=s.max_lease_time,
         is_active=s.is_active,
-        options=dict(s.options),
+        # #2924 — the domain options in the DNS form commit stores, so the
+        # preview shows what the scope will hold.
+        options=canonical_domain_options(s.options),
         pools=[ImportedPoolOut(**p.__dict__) for p in s.pools],
-        reservations=[ImportedReservationOut(**r.__dict__) for r in s.reservations],
+        reservations=[
+            ImportedReservationOut(**{**r.__dict__, "options": canonical_domain_options(r.options)})
+            for r in s.reservations
+        ],
         ddns_enabled=s.ddns_enabled,
         ddns_hostname_policy=s.ddns_hostname_policy,
         v6_address_mode=s.v6_address_mode,
@@ -213,7 +229,10 @@ def _preview_to_pydantic(p: ImportPreview) -> PreviewOut:
     return PreviewOut(
         source=p.source,
         scopes=[_scope_to_pydantic(s) for s in p.scopes],
-        client_classes=[ImportedClientClassOut(**c.__dict__) for c in p.client_classes],
+        client_classes=[
+            ImportedClientClassOut(**{**c.__dict__, "options": canonical_domain_options(c.options)})
+            for c in p.client_classes
+        ],
         conflicts=[ScopeConflictOut(**c.__dict__) for c in p.conflicts],
         warnings=list(p.warnings),
         unsupported=list(p.unsupported),
@@ -358,12 +377,24 @@ async def _attach_conflicts(
         target_group_id=target_group_id,
         ipam_space_id=ipam_space_id,
     )
+    # #3335 — a reservation outside its subnet is never stored; say so here.
+    # First, so a dropped reservation is not also named for its hostname.
+    preview.warnings.extend(drop_invalid_reservations(preview.scopes))
+    # #2919 — the preview shows what the commit will store.
+    preview.warnings.extend(drop_unservable_hostnames(preview.scopes))
+    # #3037 — Kea / ISC drop a bad pool at parse; this covers Windows too.
+    preview.warnings.extend(drop_invalid_pools(preview.scopes))
+    # #3730 — an option the scope API refuses is never stored; say so here.
+    preview.warnings.extend(drop_invalid_options(preview.scopes, preview.client_classes))
+    preview.total_pools = sum(len(s.pools) for s in preview.scopes)
+    preview.total_reservations = sum(len(s.reservations) for s in preview.scopes)
 
 
 # ── Kea endpoints ────────────────────────────────────────────────────
 
 
 @router.post("/kea/preview", response_model=PreviewOut)
+@read_only_post
 async def kea_preview(
     current_user: SuperAdmin,
     db: DB,
@@ -401,6 +432,7 @@ async def kea_commit(current_user: SuperAdmin, db: DB, body: CommitIn = Body(...
 
 
 @router.post("/isc/preview", response_model=PreviewOut)
+@read_only_post
 async def isc_preview(
     current_user: SuperAdmin,
     db: DB,
@@ -467,6 +499,7 @@ async def windows_servers(_: SuperAdmin, db: DB) -> list[WindowsDHCPServerOption
 
 
 @router.post("/windows/preview", response_model=PreviewOut)
+@token_write("Live WinRM pull from a Windows DHCP server with stored credentials (outbound)")
 async def windows_preview(
     current_user: SuperAdmin, db: DB, body: WindowsDHCPPreviewIn = Body(...)
 ) -> PreviewOut:

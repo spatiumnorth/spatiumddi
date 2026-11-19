@@ -197,8 +197,10 @@ If a bundled store lands, the intended shape is **Loki** (aggregation) +
 ### Log Retention
 
 For the **shipped** surfaces, retention is per-table and short — the
-agent-pushed query/activity logs are pruned at 24 h (see § 4½.3) since
-they're operator triage, not analytics. The audit log (§ 5) lives in
+agent-pushed query/activity logs are pruned at 24 h by default (see
+§ 4½.3) since they're operator triage, not analytics. Every retention
+window is a setting (Settings → Data Retention; table in
+[`SYSTEM_ADMIN.md` §2.7](features/SYSTEM_ADMIN.md#27-audit-log-and-data-retention)). The audit log (§ 5) lives in
 PostgreSQL and is not auto-pruned. Long-term log retention belongs in
 an external store (Loki / a SIEM) fed from the stdout streams.
 
@@ -326,6 +328,30 @@ Shared helpers (`ServerPicker` / `MaxEventsPicker` / `FilterSearch` / `RefreshBu
 
 Two additional tabs on the same Logs page, sourced from in-container agents instead of WinRM.
 
+**One server, a group, or all of them (#2120).** Both tabs read a merged,
+newest-first list across a set of servers. The picker offers **All servers**,
+then per server group a **`<Group> (all N servers)`** entry followed by that
+group's servers. The three reads behind the tabs —
+`POST /logs/dns-queries`, `POST /logs/dns-queries/analytics` and
+`POST /logs/dhcp-activity` — take an optional `server_id` and an optional
+`group_id`: `server_id` reads that server, `group_id` every agent server in
+that DNS or DHCP server group, neither every agent server. Every row carries
+the `server_id` and `server_name` that logged it, and the results grid shows a
+**Server** column whenever more than one server is selected. The analytics
+panels roll up across the whole selection, so a group behind one
+load-balanced address shows its real top names and top clients. The response
+echoes the scope plus `server_ids`, the servers the read actually covered.
+
+The filter is a request, not an authorisation: the set it selects is always
+intersected with the servers the caller may read (see
+[`PERMISSIONS.md`](PERMISSIONS.md) — a `read` grant on `server` may be scoped
+to one server or to one server group). A group the caller can read none of
+answers 403; "all" answers with whatever the caller can read.
+`GET /logs/agent-sources` lists only readable servers, with `group_id` /
+`group_name`. The Copilot tools `find_dns_queries`, `query_dns_query_log` and
+`query_dhcp_activity_log` take the same `server_id` / `group_id` and go
+through the same resolution (`app/services/logs/agent_logs.py`).
+
 ### 4½.1 DNS Queries tab
 
 **Source.** BIND9's `query-log` channel. The control-plane template (`backend/app/drivers/dns/templates/bind9/named.conf.j2`) renders a `logging { channel queries_channel { file "/var/log/named/queries.log" versions 5 size 50m; ... }; category queries { queries_channel; }; };` block when `DNSServerOptions.query_log_enabled` is on. PowerDNS feeds the same pipeline, but from a **different file**: the agent's `start_daemon` redirects `pdns_server`'s stderr into `<state_dir>/pdns.log` (inside the agent's own state dir, so the unprivileged `spatium` user can write it) and passes that explicit path to `QueryLogShipper`, gated on `log-dns-queries=yes` + `loglevel` ≥ 6. That is the file to inspect, mount or override with `DNS_QUERY_LOG_PATH` on a PowerDNS agent — not `/var/log/named/queries.log`. The control plane dispatches parsing by `server.driver`, so the one ingest endpoint accepts either format.
@@ -343,9 +369,9 @@ Two additional tabs on the same Logs page, sourced from in-container agents inst
 1. BIND9 writes lines to `/var/log/named/queries.log` (path is templated; agents respect `DNS_QUERY_LOG_PATH` env override).
 2. The DNS agent's `QueryLogShipper` thread (`agent/dns/spatium_dns_agent/query_log_shipper.py`) tails the file like `tail -F`, batches up to 200 lines or 5 s of activity (whichever first), and POSTs to `POST /api/v1/dns/agents/query-log-entries`.
 3. The control plane parses each line into `DNSQueryLogEntry` rows (`backend/app/services/logs/bind9_parser.py`) — timestamp, client IP+port, qname, qclass, qtype, flags, view. The original raw line is preserved alongside.
-4. UI calls `POST /logs/dns-queries` with filters (`q` substring, `qtype`, `client_ip`, `since`, `max_events`); newest first.
+4. UI calls `POST /logs/dns-queries` with a scope (`server_id` / `group_id` / neither) and filters (`q` substring, `qtype`, `client_ip`, `since`, `max_events`); newest first.
 
-**Filters.** Server picker, qtype (A / AAAA / MX / …), client IP, datetime-`since`, max events, raw-substring search.
+**Filters.** Server / group / all picker, qtype (A / AAAA / MX / …), client IP, datetime-`since`, max events, raw-substring search.
 
 **Resilience.** File-not-yet-present (operator hasn't enabled `query_log_enabled`) is silent — the shipper sleeps + re-checks. Inode-change rotation is detected and the file re-opened. Control-plane errors drop the batch (logs are triage data, not durable). Buffer is capped at 5000 lines; older half is trimmed if the control plane stays unreachable.
 
@@ -357,15 +383,15 @@ Two additional tabs on the same Logs page, sourced from in-container agents inst
 
 **Parser fields.** Severity (`DEBUG` / `INFO` / `WARN` / `ERROR` / `FATAL`), Kea log code (`DHCP4_LEASE_ALLOC`, `DHCP4_LEASE_DECLINE`, `DHCP4_PACKET_PROCESS_STARTED`, etc), MAC address (after `hwtype=N`), lease IP, transaction id. Lines that don't match the regex still get stored with the raw text — Kea has hundreds of log codes and we only structure-parse the most common shape.
 
-**Filters.** Server picker, severity, log code (free-form text — operators paste e.g. `DHCP4_LEASE_ALLOC`), MAC, IP, datetime-since, max events, raw substring.
+**Filters.** Server / group / all picker, severity, log code (free-form text — operators paste e.g. `DHCP4_LEASE_ALLOC`), MAC, IP, datetime-since, max events, raw substring.
 
 ### 4½.3 Storage + retention
 
 Two narrow tables (`dns_query_log_entry`, `dhcp_log_entry`) with composite indexes on `(server_id, ts)`. Migration `d8c5f12a47b9_query_log_entries`. FK cascade drops a server's rows when the server is removed.
 
-Retention is a nightly Celery task (`app.tasks.prune_logs.prune_log_entries`) that deletes rows older than 24 h. This is *operator triage*, not analytics — for longer history, ship to Loki / a SIEM.
+Retention is an hourly (:05 UTC) Celery task (`app.tasks.prune_logs.prune_log_entries`; a fixed `crontab`, because beat keeps no state and a 24 h interval restarted with every beat restart, #4174) that deletes rows older than `log_retention_hours` (default 24 h, 1–168 h, Settings → Data Retention; the cap stays until #2185 replaces the single `DELETE` with partition drops). This is *operator triage*, not analytics — for longer history, ship to Loki / a SIEM.
 
-**Outage backlog (#1077).** Agents spool the batches the control plane could not accept and replay them on reconnect, with the lines' original timestamps — so a maintenance window fills in rather than leaving a hole. The ingest endpoints skip lines already older than the 24 h window (reported as `expired` in the response) instead of inserting rows the next prune deletes, and the agents drop spooled log batches older than `AGENT_SPOOL_LOG_MAX_AGE_HOURS` themselves. Replays are deduplicated per batch (`batch_id` → `agent_ingest_receipt`, 35-day retention, pruned by the same nightly task). While an agent is draining a backlog the DNS / DHCP server row shows an amber **Replaying … backlog** chip; if its spool hit the cap, a red **Spool trimmed** chip and the `agent_spool_trimmed` alert (§9.1). See [`DNS_AGENT.md` §3](deployment/DNS_AGENT.md).
+**Outage backlog (#1077).** Agents spool the batches the control plane could not accept and replay them on reconnect, with the lines' original timestamps — so a maintenance window fills in rather than leaving a hole. The ingest endpoints skip lines already older than the `log_retention_hours` window (reported as `expired` in the response) instead of inserting rows the next prune deletes, and the agents drop spooled log batches older than `AGENT_SPOOL_LOG_MAX_AGE_HOURS` themselves. Replays are deduplicated per batch (`batch_id` → `agent_ingest_receipt`, 35-day retention, pruned by the same nightly task). While an agent is draining a backlog the DNS / DHCP server row shows an amber **Replaying … backlog** chip; if its spool hit the cap, a red **Spool trimmed** chip and the `agent_spool_trimmed` alert (§9.1). See [`DNS_AGENT.md` §3](deployment/DNS_AGENT.md).
 
 **Why so short?** Query logs are a firehose. A busy resolver doing 100 qps writes 8.6M rows per day; even 24 h of that is significant. Anyone needing days of history should run Loki alongside and the agent push can coexist with stdout shipping.
 
@@ -403,7 +429,7 @@ Available at `/admin/audit`:
 - Same filtering and live-tail as the log viewer
 - Additional filters: `action`, `resource_type`, `result`
 - Diff view for updates: shows old vs. new value side-by-side
-- Non-deletable — no delete button, enforced at DB level (trigger prevents DELETE)
+- Non-deletable and non-editable — no delete button, and DB triggers refuse DELETE and UPDATE. Tamper-evident, not tamper-proof: the database owner can drop the triggers, which the `audit_log_immutable` conformity check reports
 
 ### 5.1 External forwarding
 
@@ -428,6 +454,17 @@ inside `after_flush`, then in `after_commit` schedules one
 `asyncio.create_task` per (row, target) pair so slow collectors
 don't serialize the queue.
 
+**Redaction (#2015).** `old_value`, `new_value` and `error_detail`
+are forwarded with the same redaction the audit API applies on read
+(`app/services/audit_redact.py`): a value under a credential-shaped
+key arrives as `[redacted]`, and a credential-shaped string (a JWT,
+a Fernet token, a PEM private key) is replaced wherever it appears.
+Booleans and integers are kept, so a writer's `smtp_password_set`
+flag still arrives. The redaction is applied in `_deliver_to_target`,
+the one function every target kind sends through, and on a copy: the
+stored audit row is unchanged. Typed-event webhook deliveries are
+redacted the same way.
+
 **Transports.**
 - **Syslog UDP** — `socket.sendto`, fire-and-forget, one syscall.
 - **Syslog TCP** — `asyncio.open_connection`, 5 s connect timeout.
@@ -437,9 +474,18 @@ don't serialize the queue.
 - **HTTP webhook** — `httpx.AsyncClient`, 5 s timeout,
   `Content-Type: application/json`, optional `Authorization`
   header sent verbatim. The `webhook_flavor` column picks between
-  generic JSON, **Slack** (`mrkdwn` block), **Teams**
-  (`MessageCard`), and **Discord** (`embed`) so chat-channel
-  delivery doesn't need a separate adapter. For the chat flavors the
+  generic JSON, **Slack** (`mrkdwn` block), **Teams** (Adaptive
+  Card 1.4 in a `{"type": "message", "attachments": […]}` envelope),
+  and **Discord** (`embed`) so chat-channel delivery doesn't need a
+  separate adapter. For Teams, create the URL with the **Workflows**
+  app in the channel (template *Send webhook alerts to a channel*, or
+  a flow that starts with *When a Teams webhook request is received*);
+  the old Office 365 "Incoming Webhook" connector
+  (`…webhook.office.com/webhookb2/…`) has been retired and no longer
+  delivers (#1504). A Workflows webhook answers `202 Accepted` before
+  the flow runs, so **Test** reports success even when the flow then
+  fails to post the card; check the flow's run history in Power
+  Automate if nothing appears in the channel. For the chat flavors the
   URL is the credential (anyone holding it can post into the
   channel), so the URL and the header are **write-only secrets**
   (#1502): Fernet-encrypted at rest (`url_encrypted`,
@@ -483,13 +529,21 @@ deliver JSON and ignore this setting.
 | Format | Use case |
 |---|---|
 | `rfc5424_json` | Default. Modern SIEMs (Splunk, Elastic, Graylog) auto-parse the JSON body after the RFC 5424 header. |
-| `rfc5424_cef` | ArcSight + many commercial SIEMs. `CEF:0\|SpatiumDDI\|SpatiumDDI\|1.0\|<rtype:action>\|<display>\|<sev>` header + `act=`/`suser=`/`cs1=…` extensions. CEF severity mapped as info=3, error=6, denied=9. |
+| `rfc5424_cef` | ArcSight + many commercial SIEMs. `CEF:0\|SpatiumDDI\|SpatiumDDI\|1.0\|<rtype:action>\|<display>\|<sev>` header + `act=`/`suser=`/`cs1=…` extensions. CEF severity mapped as info=3, error=6, denied=9 (a failed sign-in is 9). |
 | `rfc5424_leef` | IBM QRadar native format. LEEF 2.0 with `^` field delimiter (safer over UDP than the default tab). |
 | `rfc3164` | Legacy BSD syslog: `<PRI>Mmm dd HH:MM:SS host tag: <JSON>`. For collectors that don't speak RFC 5424. |
 | `json_lines` | Bare JSON per line — no syslog framing. For raw Logstash / Fluentd / Vector inputs. |
 
 **Severity mapping** (RFC 5424): `result="success"` → 6 info,
-`result="denied"` → 4 warn, `result="failed"` / `"error"` → 3 err.
+`result="denied"` / `"forbidden"` → 4 warn, `result="failed"` /
+`"failure"` / `"error"` → 3 err — except that a **failed sign-in**
+(`action="login"`, `result="failure"`: bad password, bad MFA code, locked
+or disabled account) ranks with `denied`, so 4 warn, CEF / LEEF 9, and it
+clears every `min_severity` threshold including `denied`. A sign-in the
+system could not *evaluate* (the LDAP / RADIUS / TACACS+ server timed out
+or errored) is audited `error` and stays 3 err. Before #1874, `failure`
+and `forbidden` both fell through to info, so a target filtered above
+info dropped every failed sign-in.
 Facility is per-target and configurable 0–23 (default 16 = local0).
 
 **Three payload shapes go through one delivery path**, and until #1031
@@ -688,7 +742,16 @@ spatiumddi_api_request_duration_seconds{method, path_template} (histogram)
 spatiumddi_api_active_requests (gauge)
 ```
 
-Plus two counters declared but not yet wired to a call site (read zero):
+The DNS agent config long-poll (#1111) adds three counters, labelled
+`family="dns"` (the DHCP long-poll does not count yet):
+
+```
+spatiumddi_agent_bundle_served_total{family, outcome}   # full / not_modified / client_gone
+spatiumddi_agent_bundle_inline_renders_total{family}
+spatiumddi_agent_bundle_inline_failures_total{family}
+```
+
+Plus two counters declared but not yet wired to a call site (no samples):
 
 ```
 spatiumddi_auth_login_total{method, result}   # planned — method=local/ldap/oidc
@@ -739,16 +802,31 @@ The control plane stores deltas in two small tables —
 `dns_metric_sample(server_id, bucket_at, queries_total, noerror,
 nxdomain, servfail, recursion)` and `dhcp_metric_sample(server_id,
 bucket_at, discover, offer, request, ack, nak, decline, release,
-inform, receive_drop, socket_drop)`. Retention is enforced by the
-`prune_metric_samples` Celery task (daily, default 7 days).
+inform, receive_drop, socket_drop, queue_evicted)`. Retention is enforced by the
+`prune_metric_samples` Celery task (daily at 02:45 UTC), which deletes samples older
+than `metric_retention_days` (default 7 days, 1–365, Settings → Data
+Retention).
 
-Two of those DHCP columns are about packets *not* handled, and they do not
-come from the same place or mean the same thing (issue #980).
-`socket_drop` is the kernel's per-socket `sk_drops` from `/proc/net/udp`,
-read by the agent directly: packets discarded because Kea's receive buffer
-was full, so Kea never saw them and no counter it keeps can report them.
+Three of those DHCP columns are about packets *not* handled, and they do not
+come from the same place or mean the same thing (issues #980, #2889).
+`socket_drop` is the kernel's per-socket `sk_drops` on the sockets Kea
+serves from, read by the agent directly. Normally those are the DHCP-port
+UDP sockets in `/proc/net/udp`. With `dhcp-socket-type: raw`, kea-dhcp4
+serves from AF_PACKET sockets, relayed traffic included. Their drops are
+read through sock_diag, in place of its UDP :67 fallback, whose copies Kea
+discards (#1283). Either way, these are packets the kernel discarded because
+Kea's receive buffer was full. Kea never saw them, so no counter it keeps can
+report them.
 On a node short of CPU only this one moves, and it is the one the alert
 and the dashboard treat as loss.
+
+`queue_evicted` (#2889) is loss as well: DHCPv4 requests Kea read and then
+evicted from its full multi-threading packet queue during a burst. Kea keeps
+no statistic for it, so the agent derives it from DHCPv4 arrivals at Kea's
+intake (counted by a BPF-filtered `AF_PACKET` socket of its own), less the
+DHCPv4 share of `socket_drop`, less `pkt4-received`. The alert and the
+dashboard add it to `socket_drop`. See
+[`DHCP.md` §4c](features/DHCP.md#counting-what-the-queue-evicts-2889).
 
 `receive_drop` is Kea's own `pkt4/6-receive-drop` — packets it read and then
 discarded — and is **context, not a fault**: it counts deliberate drops too.
@@ -756,8 +834,12 @@ Verified against kea-dhcp4 3.0.3, a client matching a `DROP` client-class
 increments it once per packet, and a `DROP` class is exactly what the shipped
 DHCP MAC blocklist renders. See [`DHCP.md` §4c](features/DHCP.md).
 
-**Both are nullable, and NULL means UNMEASURED.** An agent older than #980,
-or one whose runtime cannot read `/proc/net/udp`, reports no `socket_drop`.
+**All three are nullable, and NULL means UNMEASURED.** `queue_evicted` is
+also NULL when the agent cannot open a raw socket, on a DHCPv6-only server,
+and for the bucket in which its counting socket reopened. (The minute in
+which the agent starts or Kea restarts has no bucket at all, for any counter.) An agent older than #980,
+or one whose runtime cannot read `/proc/net/udp` (or, in raw mode, Kea's
+AF_PACKET sockets), reports no `socket_drop`.
 Readers must render that as unknown — a 0 would say "this server has dropped
 nothing", which is exactly the false reassurance #980 was filed about. The
 ingest endpoint therefore stores an omitted field as NULL rather than
@@ -906,9 +988,23 @@ All services expose:
 - Returns `503` only if the process should be restarted
 
 **`GET /health/ready`** — Readiness probe
-- Checks: DB connectivity, Redis connectivity, required config present
+- Checks: DB connectivity, the schema at the head the image expects, Redis connectivity
 - Returns `200 {"status": "ok", "checks": {...}}` if ready to serve traffic
 - Returns `503` with failed check details if not ready
+- A schema a newer release migrated (the mixed-version window of a rolling
+  upgrade) keeps a pod that has already been ready at its own head in service
+  while every table and column its models map is present (read once per
+  revision): `checks.schema` reads `ok: …` naming both revisions (#2777). One
+  missing answers `503`, `checks.schema` naming the revisions, the first
+  missing tables and columns and their count; a read that fails or times out
+  answers `503` and is tried again at the next probe. A schema behind the
+  image, an unstamped one, or a newer one on a pod that was never ready
+  answers `503`.
+- Logs `readiness_schema_mismatch` (warning) once per change of what
+  readiness answers, with `expected`, `actual`, `ahead`, `serving` and
+  `detail`, plus `missing` (the first 20) and `missing_count` when a newer
+  schema lacks what the image uses; `readiness_schema_at_head` (info) on the
+  way back
 
 **`GET /health/startup`** — Startup probe (for Kubernetes slow-start containers)
 - Same as readiness but used only during initial startup
@@ -917,7 +1013,9 @@ All services expose:
 - Unlike `/health/ready` (which returns a single binary verdict for
   orchestrator probes), this endpoint enumerates each control-plane
   piece so the UI can show a per-component status dot.
-- Response: `200 {"status": "ok"|"degraded", "components": [...]}`.
+- Response: `200 {"status": "ok"|"degraded", "components": [...]}` to a
+  signed-in caller. An anonymous caller gets `{"status": ...}` only —
+  enough for an uptime monitor, and nothing about the stack (#2935).
   Individual component failures **never** make the endpoint itself
   fail — the caller always gets a 200 with the rollup so a single
   flaky component doesn't blank the dashboard card.
@@ -1003,14 +1101,39 @@ once — they serve different audiences.
 Operator-authored rules stored in the `alert_rule` table. The
 evaluator (`backend/app/services/alerts.py:evaluate_all`) runs on a
 60 s Celery beat tick; `POST /api/v1/alerts/evaluate` forces an
-immediate pass. Each match opens an `alert_event` row (partial
-index on `(rule_id, subject_type, subject_id) WHERE resolved_at IS
-NULL` keeps dedup O(1)); events resolve automatically when the
-subject clears. Delivery reuses the **Audit Event Forwarding**
-syslog + webhook targets — one SIEM destination for both audit and
-alerts.
+immediate pass. Each match opens an `alert_event` row (a UNIQUE
+partial index on `(rule_id, subject_type, subject_id) WHERE
+resolved_at IS NULL` keeps dedup O(1) and allows one open event per
+rule and subject); events resolve automatically when the subject
+clears. Delivery reuses the **Audit Event Forwarding** syslog +
+webhook targets — one SIEM destination for both audit and alerts.
 
-Rule types shipped today:
+A pass is built to fail safely (#2261). Each rule runs in its own
+savepoint, so a rule whose query errors or times out is logged as
+`alert_rule_eval_failed` and skipped while the rest of the pass
+completes. Events are delivered only **after** the pass commits them,
+so a failed or retried pass never pages for an event that is not in
+the database. A queued delivery is stamped on the event
+(`delivery_pending_since`) and claimed by a committed conditional
+update before it is sent, so no two senders ever send it. A worker
+killed between the commit and the send leaves the stamp set; every
+pass ends by re-sending any delivery stamped more than 10 minutes
+earlier (`alert_redelivering_stranded`), unless the event has since
+resolved or its rule was disabled. Passes are
+serialised by an advisory lock; a pass that starts while another is
+running (a slow tick, a Celery retry, or **Evaluate now**) logs
+`alert_evaluate_skipped_locked` and returns zero counts. The
+conformity evaluator follows the same rules.
+
+Rule types described on this page. Most of the build's `RULE_TYPES` (in
+`backend/app/services/alerts.py`) have a row below.
+`GET /api/v1/alerts/rule-types` lists every type whose feature module is
+enabled, with its parameters, and some are documented on their own feature page
+instead (for example `dhcp_pool_exhaustion` in DHCP.md, `stale_ip_count` in
+IPAM.md). Among those with no row below are `tls_cert_expiring` and the other
+`tls_cert_*` rules, `secret_expiring`, `new_mac_seen`, `rogue_dhcp`,
+`restore_drill_failed`, `schema_behind_head` and the `dns_*_suspected`
+threat-analytics rules.
 
 | Type | Fires when |
 |---|---|
@@ -1027,13 +1150,34 @@ Rule types shipped today:
 | `service_term_expiring` / `service_resource_orphaned` | Service-catalog alerts (#94). Orphan-sweep walks `network_service_resource` join rows whose target was deleted. |
 | `compliance_change` | Audit-log scanner rule type (#105). One event per mutation against a classification-flagged subnet (or descendant IP / DHCP scope). Params: `classification` (one of `pci_scope` / `hipaa_scope` / `internet_facing`) and `change_scope` (one of `any_change` / `create` / `delete`). Watermark column on the rule baselines to `now()` on first run so historical audit history doesn't retro-page operators. Resource resolution falls back to `audit_log.old_value.subnet_id` for delete actions where the live row no longer exists. Three disabled seed rules ship at first boot (PCI / HIPAA / internet-facing). Auto-resolves after 24 h. |
 | `node_pressure` | A cluster node reports sustained resource stalling through **PSI** (Pressure Stall Information, Kubernetes 1.36+, #983 Phase 2). Subject is the node NAME — cluster nodes have no row in this database. Reads `avg300` out of the kubelet Summary API the Cluster screen already fetches, so there is no new collector. Note that alert evaluation runs in the **Celery worker**, so this needs `worker.serviceAccount.enabled` (a narrow `nodes` + `nodes/stats` grant) or the rule evaluates to nothing while appearing enabled. A cluster the worker cannot read is treated as UNKNOWN and holds open events rather than resolving them — returning "no matches" on a kubeapi blip would close the alarm and re-open it a minute later, flapping notifications through exactly the incident it reports. The kernel's own 5-minute rolling average is what makes "sustained" need no state on our side. **Warning** when CPU or memory `some` stalling holds at or above `threshold_percent` (default 50); **critical** when memory `full` stalling — every runnable task blocked — holds at or above a fixed 1%. The two do not share a knob on purpose: `some` at 20% is a busy node, `full` at 20% is a node that did no work for a fifth of five minutes. CPU `full` is not evaluated at all (the kernel reports it as 0 at node level by definition). A node whose kubelet reports NO PSI never matches — null is UNRECORDED, not zero — so the rule is silent on a pre-1.36 fleet and is seeded **enabled** because of it. This is the alarm #980 needed: the appliance dropped relayed DHCP under CPU pressure with every dashboard green, because utilisation cannot tell a node at 70% CPU with a run queue from one without. |
+| `agent_daemon_degraded` | A DNS or DHCP server's daemon is not serving and has not been for 5 minutes (#1067). Subject is the **server** (`dns_server:<id>` / `dhcp_server:<id>`). Three sources feed the same `daemon_status` columns, and the message names which one spoke (#2962). **The agent's own report** (`Agent reported: …`): a daemon whose start is deferred, or whose control socket is unreachable. **The supervisor, from the kubelet's container state** (`Supervisor reported: …`), for the cases where the agent dies with its container and cannot say so: an `OOMKilled` termination (`oom_killed:`, #2018 / #2023); a **crash loop** whatever the termination reason (`crash_loop:`, #2961), meaning the container restarted at least 3 times **within 15 minutes**, is not a healthy pod and has not stayed up 10 minutes, with the in-window count, the lifetime restart count, last termination reason and exit code in the text (a kubelet records an OOM group kill as `Error` / 137 once the pod is in CrashLoopBackOff, so the OOM verdict alone misses it). The in-window count is measured by the control plane from successive supervisor heartbeats (a backend-owned `restart_history` on each `role_health` entry), never from the kubelet's lifetime `restartCount`: every node reboot and slot upgrade adds one restart to every container, so a lifetime count says how often the node rebooted, and right after a reboot a container is restarted, recently ended and not yet ready; and an **agent silent under a live supervisor** (`agent_unreachable:`, #2961), meaning no agent heartbeat for 3 minutes while the appliance's supervisor still reports the container, counted only over time the control plane could have heard the agent: from the latest of its last heartbeat, the container's current start, and the start of the supervisor's current unbroken run of heartbeats (a backend-owned `heard_since` on the entry; a gap over 2 minutes starts a new run), so a rebooted node or a control plane that was itself down never counts its own absence as the agent's. The 5-minute grace runs from the start of the state: the kill, the moment the third restart in the window was seen, or the start of the silence as just defined. One restart, a reboot, or a brief blip never fires. Paused (maintenance) and disabled servers are skipped. A health sweep that reads a server `unreachable` also sets a stale `daemon_status=ok` to NULL (unknown) rather than leaving a green the agent can no longer vouch for. Auto-resolves when the agent reports `ok` after the container has stayed up for 10 minutes. Seeded **enabled**. |
+| `appliance_heartbeat_stale` | An approved appliance's supervisor has not heartbeated for 5 minutes (**critical** after 30) (#2259). Subject is the **appliance** (its UUID). Fleet and every other appliance rule show the node's LAST reported roles, service health, firewall and storage state, so a node whose supervisor died keeps looking healthy; this is the alarm for the silence itself, and the only one that covers control-plane and observer-only nodes. The 5 min threshold sits above the Fleet UI's ~3-heartbeat (90 s) greying so a reboot or slot upgrade does not page. Pending / revoked appliances and rows that never heartbeated are skipped. Auto-resolves on the next heartbeat. Seeded **enabled**; cannot fire on an install with no appliances. |
+| `postgres_instance_unhealthy` | An instance of the appliance's CNPG PostgreSQL cluster has not been Ready, or a standby has not been streaming WAL from the current primary, for 5 minutes; **critical** after 15 (#2856). Subject is the **instance** (its pod name), and the message names its node. CNPG's readiness probe passes for a standby that is up but not replicating, so CNPG reports "Cluster in healthy state" 3/3 while a standby loops on removed WAL: in a three-node failover drill that held for more than 10 minutes with every alert quiet. Streaming is read from `pg_stat_replication` on the primary, which the api and worker already connect to: a standby with no WAL sender there is not streaming. The app's role is not in `pg_monitor`, so it sees each sender's name but not its `state`; a connected sender whose state is hidden is unverified and not flagged, a visible state other than `streaming` is. A supervisor `looping` / `stuck` verdict (#2765), when a supervisor ships one in `cluster_health.postgres_instances`, counts too. The verdict is the one the Cluster → Overview database row uses, so a degraded row and this rule describe the same fact. No streaming verdict is made mid-switchover (`targetPrimary` differs from `currentPrimary`). The 5-minute clock is kept per instance in Redis, so it survives the finding changing (not Ready, then Ready but looping); a not-Ready pod's own Ready transition time is used when it is earlier. Pods that cannot be listed, a `pg_stat_replication` that cannot be read while standbys exist, or an unreadable clock are UNKNOWN and hold open events rather than resolving them. Inert off the appliance and on a Postgres that is not a CNPG cluster; a single-node appliance can only match on its one instance not being Ready. Auto-resolves when the instance recovers. Seeded **enabled**. |
 | `cluster_dns_degraded` | The k3s cluster's DNS (CoreDNS) is down, thinner than the appliance targets, co-located on one node, or not answering (#985). Subject is the **cluster** — CoreDNS is cluster-scoped, and which node a replica sits on is already in the message. Every pod resolves `*.svc.cluster.local` through it (the api reaches Postgres and Redis that way), so a failure here surfaces later as unrelated components failing to start. Reads the same cluster-health snapshot the Cluster → Overview card renders, so there is no new collector and no new RBAC. **Warning** when fewer replicas are ready than `ensure_coredns_ha` targets (`min(nodes, 2)`), or when the ready replicas share a node — two replicas on one node is not HA, and Kubernetes never rebalances running pods (#633). **Critical** when no replica is ready, or when the live resolve probe fails. The probe is the load-bearing half: replica counts say the pods exist, the probe says the path works, and `ready 2 / spread ok / probe failed` is a real and distinct state pointing at kube-proxy or the CNI rather than at CoreDNS. It needs no RBAC (it is a DNS query from the pod) and therefore runs even in the **worker**, whose ServiceAccount deliberately cannot list pods cluster-wide — so the rule still fires there on a probe failure, and the worker is a genuine second vantage rather than a claimed one. A replica view that cannot be read is UNKNOWN and holds open events rather than resolving them; null is never treated as zero. Seeded **enabled**, and inert off the appliance. |
 | `appliance_storage_degraded` | An appliance's software RAID (md) array or multipath map has lost redundancy (#999 Part A). Subject is the **appliance**. The supervisor reads `/proc/mdstat` + `/sys/block` out of the host through its privileged / `hostPID` window and folds the reading into the same `cluster_health` JSONB the #402 host partitions ride, so there is no new heartbeat field, no column and no migration. **Severity keys off redundancy remaining, never off the state string** — `2 of 3` in a three-way mirror and `1 of 2` in a pair both report `degraded`, and only the second has nothing left to lose. **Critical** when an array is down to the members it needs to serve at all, when it has failed outright, or when a multipath map has no paths at all. A map with exactly ONE path is deliberately **not** alarmed on: nothing knows whether it ever had more, and the installer explicitly permits installing to a single-path LUN — so a count-based alarm there would be critical forever, turn the console verdict red forever, and be clearable by no action, which is how an alarm gets muted before the night it matters. The count is on every screen for an operator who knows what it should be. **Warning** when redundancy is reduced but a further loss is survivable, or when some SCSI paths report a fault while others remain. A **scrub or resync on an intact array is deliberately not an event** — it is shown on all three screens with its progress, and nothing more. #999 asked for it as "informational, auto-clears", which would be right if `info` were quiet BY DEFAULT; it is not, because `min_severity` is nullable and NULL forwards everything — so on a stock install an `info` event notifies exactly like a critical one. (#999 originally gave a second reason that no longer holds: delivery filtered `min_severity` against `payload["result"]`, a key alert payloads never carry, so a target with a threshold received *nothing* and `info` could not be muted at all. #1031 fixed that. What has not changed is the default, and a finding that is quiet only for operators who went and configured it is not quiet.) Debian runs `checkarray` monthly by cron, so that row would mail every operator with an array, every month, about their array working correctly, which is how an alarm gets muted before the night it matters. The rebuild that DOES matter never reaches that branch anyway: an array with a member out of sync reports `degraded` and is classified on redundancy like any other. An assembled array that will not report its member count is a **warning**, one that failed to *assemble* (`array_state=inactive`) is **critical** whatever its member count says, and an IMSM/DDF metadata `container` is skipped entirely — it is permanently inactive on a healthy box and would raise an alert nothing could clear. A reading that **disappears** is not a recovery either: an appliance with an open event and no current reading is re-matched at its existing severity, so an A/B rollback to a pre-#999 supervisor holds the alarm instead of resolving it. **Multipath is under-sensitive by construction and says so**: the only per-path signal available without the device-mapper ioctl is the path's SCSI `device/state`, which stays `running` when multipathd's checker fails a path, so a map that has quietly lost half its paths produces no finding — which is why every surface renders a finding-less multipath map in a NEUTRAL style rather than the green an md array earns. Revoked appliances are skipped; so are supervisors too old to report storage, because no `storage` key is UNKNOWN and not a clean bill of health. Classified by one function (`services/appliance/storage_health.evaluate_storage`) shared with the `find_appliance_storage` copilot tool and both dashboard surfaces, so a chip cannot read "clean" while the alert reads "degraded". Seeded **enabled** — it is silent on an appliance with no arrays, which is every appliance until somebody builds one. |
+| `appliance_disk_usage` | An appliance's `/var` data partition is filling (#2240). Subject is the **appliance**. `/var` holds Postgres, the container images and the logs. Reads the `host_disk_partitions` every supervisor already reports inside `cluster_health` (#402), the reading behind the Cluster overview's node cards and the upgrade pre-flight's headroom check, so there is no new collector, field or migration. **Warning** at `threshold_percent` (default 80); **critical** at a fixed 87% used, whatever the threshold. The two do not share a knob on purpose: `/var` is ext4 with the default 5% reserved for root, and the supervisor counts that reserve as free (`blocks - bfree`), so in those terms the kubelet's `nodefs.available<5%` (`eviction-hard` in the appliance's k3s config) and `image-gc-high-threshold=95` both begin at about 89.8% used, where the kubelet starts evicting pods, the control plane's among them. The critical sits a few points before that line rather than on it: the evaluator runs every 60 s on 30 s heartbeats, so a critical on the line would arrive after the first evictions. A seven-node cluster loaded towards a million devices filled `/var` (23 GiB of a 40 GiB disk) to 88 to 91% on every node with no alert raised. Only `/var` is judged: the root slot is a read-only image and the ESP a fixed boot partition. A supervisor that reports no usable `/var` never matches (UNKNOWN, not healthy). A reading that **disappears**, or one older than 10 minutes (the node stopped heartbeating; `appliance_heartbeat_stale` reports that), opens nothing new and holds an open event at its severity rather than resolving it. Revoked and unapproved appliances are skipped. Auto-resolves once usage is 5 points below the threshold (the #2778 resolve margin). Seeded **enabled** at 80% at startup, like the other infrastructure rules: disable it rather than delete it, because a deleted seeded rule is created again at the next restart. |
 | `agent_spool_trimmed` | A DNS or DHCP agent's durable push spool (#1077) hit its size cap (`AGENT_SPOOL_MAX_BYTES`, default 256 MiB) during a control-plane outage and discarded its **oldest** queued batches — part of the outage's logs, metrics or lease events will never arrive. Subject is `agent` with a `dns_server:<id>` / `dhcp_server:<id>` subject id, the same shape as `agent_config_rejected`. Reads the `spool_status` the heartbeat stored; no probing. Fires while the reported `last_trim_at` is within the last 24 h and auto-resolves after that (trim counters are cumulative, so there is no "recovered" report to key off). **Critical** when `lease_events` were among the streams trimmed — Kea lease events are the only way the control plane learns about agent-managed leases, so a trimmed one is a lease with no IPAM mirror and no DDNS record until the client renews or the agent's lease snapshot reconciles it; **warning** otherwise. NULL (an agent too old to report a spool, or an agentless driver) never matches. Seeded **enabled**. |
+| `dns_memory_pressure` | A BIND9 server group's estimated named memory has reached 80 % of the smallest memory limit its agents report (#3551) — or of the shipped 2 GiB DNS pod limit when none has reported one. Each DNS view that applies a blocklist loads its own copy of it (BIND cannot share a response-policy zone between views), so adding a view to a group subscribed to a large list can OOM-kill every agent in it. Subject is the `dns_server_group`. The estimate is the one the group, view and blocking-list responses carry ([`DNS.md` §2](features/DNS.md#what-a-view-costs-in-memory-3551)), so the alert and the banner agree. **Warning** from 80 %, **critical** from 100 %. Seeded **enabled**. |
+| `dns_agent_duplicate_instance` | Two live DNS agent processes share one server identity (#2044) — usually a cloned VM or a copied agent state directory that kept the same `agent_id`. The control plane serves only the most recent process and answers the other's config polls with `409`; the refused agent keeps serving a configuration that no longer changes while heartbeating normally. Subject is `agent` with a `dns_server:<id>` subject id. Reads the duplicate-episode columns the config long-poll writes when it refuses a poll; no probing. Fires once refusals have gone on for 2 minutes (so an overlapping rollout's old pod, refused once before it exits, does not) and auto-resolves 10 minutes after the last one. A replacement agent, whose predecessor never polls again, is never refused. Warning. Seeded **enabled**, once, by migration `f4c2a8e61b93` (not at startup), so deleting it is final. |
+| `dhcp_agent_duplicate_instance` | Two live DHCP agent processes share one server identity (#3143) — usually a cloned Kea VM or a copied agent state directory that kept the same `agent_id`. Same rules as `dns_agent_duplicate_instance`: the control plane serves only the most recent process and answers the other's config polls and registrations with `409`, mints it no token and never rotates one for it, so the owner's token stays valid; the refused agent keeps Kea on a configuration that no longer changes while heartbeating normally. Subject is `agent` with a `dhcp_server:<id>` subject id. Reads the duplicate-episode columns the long-poll and registration write when they refuse; no probing. Fires once refusals have gone on for 2 minutes and auto-resolves 10 minutes after the last one. Kea HA peers have their own identities and are never refused. Warning. Seeded **enabled**, once, by migration `833ee80c8c6b` (not at startup), so deleting it is final. |
+| `dns_blocklist_feed_stale` | An enabled feed-sourced blocklist whose refresh has not **succeeded** within 3 x its `update_interval_hours` (#2313). Judged from `last_success_at` (`last_synced_at` also moves on failure); a feed that never succeeded is measured from its creation. Servers keep enforcing the entries the list last had. Subject is `dns_blocklist`. **Warning**. Skips manual-only (interval 0) and disabled lists; assignment to a group is not a condition. The message carries a fixed reason, never the stored fetch error or any URL. Auto-resolves on the next good refresh. Seeded **enabled**. |
+| `dns_pool_health_stale` | An enabled DNS pool with at least one enabled member whose health verdict (`last_check_at`) is older than 3 x the pool's check interval (floor 30 s, the health-check task's own cadence) (#2312). Pools **fail open**: a member last seen healthy is still rendered, so a stopped dispatcher leaves a member that died since in the answer set. Subject is `dns_pool`, one event per pool. **Warning**. Auto-resolves when the pool is checked again. Every alert rule is evaluated by the Celery worker, so a stopped worker stops the health checks AND this alert; a stopped worker is reported by the platform health components `celery-workers` / `celery-beat` instead. Seeded **enabled**. |
+| `dnssec_multi_signer` | A DNSSEC-signed zone whose server group has more than one agent DNS server (BIND9 / PowerDNS / Technitium — **disabled servers count**, since a disabled agent still receives and serves the bundle) (#1762). Each server signs with keys it generated, so the zone is served with several DNSKEY sets against the one DS published at the parent, and validating resolvers SERVFAIL on whichever server it does not match. Signing and every operator server-add are refused on such a group; this rule covers what cannot be refused — zones signed before the rule, and an agent that auto-registered (`AGENT_GROUP`) into a signed group. Subject is `dns_zone`. **Critical**. Auto-resolves when the zone is unsigned or the group is back to one server. Seeded **enabled**. |
+| `backup_failed` | The last finished run of an enabled backup target with a schedule failed (#1262). Subject is the **backup target**. Auto-resolves when its next run succeeds. A run in progress neither opens nor resolves it, so a target failing every night holds one event. The message leaves out the run's error text, because driver errors can name hosts, paths or buckets and alert payloads leave the install; the error is on the Backup page and in the audit log. Manual-only and disabled targets are not watched. Severity **warning**. Seeded **enabled**. |
+| `backup_stale` | An enabled backup target with a schedule has had no successful run within N scheduled runs plus one hour (#1262). N is `threshold_percent`, used as a count, default 2. Counted from the last success (`last_run_at` when the last run succeeded, otherwise the newest `backup_target_run_success` audit row), but never from before the schedule was set or changed, so a new schedule gets its first run first. Catches backups that stopped running at all: worker or beat down, or a run left `in_progress` by a dead process, which the sweep then skips for good. A run in progress for less than two hours holds the event; an older one counts as no run. Severity **critical**. Seeded **enabled**. Same decision as the `get_backup_health` copilot tool. |
 
 Admin UI lives at `/admin/alerts` — rules CRUD + live events viewer
 (15 s refetch) + per-event `Resolve` to manually silence a known-
 noisy event.
+
+A manual `Resolve` sticks (#2498): the event is stamped
+`last_observed_value.resolved_by = "manual"`, and while its subject keeps
+matching, the evaluator opens no new event and delivers nothing. Once the
+subject stops matching, the suppression ends, so a later re-match opens a
+fresh event. Same semantics as the conformity engine below; the
+evaluator's own auto-resolve is unchanged. This covers the threshold-style
+rules evaluated by the shared loop; the rule types with their own
+evaluator (transition-once, latch and similar) keep their own handling.
 
 Conformity evaluations (#106) also feed this surface: a
 `ConformityPolicy` can pin `fail_alert_rule_id`, and a `pass→fail`
@@ -1041,6 +1185,20 @@ transition on a (policy, resource) pair opens an `AlertEvent` row
 against the named alert rule with `subject_type="conformity"` so
 operators see drift in the same dashboard. Configure the wiring in
 the policy edit modal at `/admin/conformity`.
+
+The conformity engine, not the alert evaluator, closes these events
+(#2277). An open event resolves when its (policy, resource) next
+evaluates `pass` or `not_applicable`, when the resource is deleted or
+drops out of the policy's target filter, when the policy is disabled
+or deleted, and at its next evaluation once the policy's alert rule is
+cleared or switched (a failure still in progress then pages once on
+the new rule). A `warn` result or a check that raised holds the event
+open. The resolved
+event's `last_observed_value.resolution` says why (`passed`,
+`not_applicable`, `out_of_scope`, `policy_disabled`, `policy_deleted`,
+`alert_rule_changed`). A later re-failure opens a new event and pages
+again. An event you resolve by hand while the resource is still failing
+stays resolved until the resource passes and then fails again.
 
 ### 9.1a BGP prefix-hijack monitoring (#527)
 
@@ -1110,40 +1268,53 @@ automatically. MCP: `find_bgp_hijacks` / `count_bgp_hijacks` /
 
 ### 9.2 Prometheus alerting rules (external)
 
-Reference Prometheus alerting rules for the `spatiumddi_*` metrics
-(a perf-testing Prometheus config already lives under
-`perf/dashboards/prometheus/`):
+The control plane's `/metrics` registry declares eight `spatiumddi_*` series
+(beside the client library's standard `process_*` and `python_*`). Six carry
+samples today; the two `auth` counters are declared but nothing increments
+them yet, so they carry no samples, and the agent-bundle counters only ever
+see `family="dns"`:
 
-| Alert | Condition | Severity |
+| Series | Type | Labels |
 |---|---|---|
-| `DHCPServerOffline` | `dhcp_server_status == 0` for 2m | critical |
-| `DHCPSyncStale` | `time() - dhcp_sync_last_success > 900` | warning |
-| `DHCPPoolNearExhaustion` | `pool_utilization > 90` | warning |
-| `DNSServerOffline` | `dns_server_status == 0` for 2m | critical |
-| `SubnetNearExhaustion` | `subnet_utilization > 90` | warning |
-| `SubnetExhausted` | `subnet_utilization > 99` | critical |
-| `APIHighErrorRate` | `rate(requests[5m]{status=~"5.."})/rate(requests[5m]) > 0.05` | warning |
-| `DBReplicationLag` | `replication_lag > 30` | warning |
-| `CeleryQueueBacklog` | `queue_length > 100` for 5m | warning |
-| `BackupFailed` | Checked via Celery task failure metric | critical |
+| `spatiumddi_api_requests_total` | counter | `method`, `path_template`, `status_code` |
+| `spatiumddi_api_request_duration_seconds` | histogram | `method`, `path_template` |
+| `spatiumddi_api_active_requests` | gauge | |
+| `spatiumddi_auth_login_total` | counter (no samples yet) | `method`, `result` |
+| `spatiumddi_auth_token_usage_total` | counter (no samples yet) | `scope` |
+| `spatiumddi_agent_bundle_served_total` | counter | `family`, `outcome` |
+| `spatiumddi_agent_bundle_inline_renders_total` | counter | `family` |
+| `spatiumddi_agent_bundle_inline_failures_total` | counter | `family` |
+
+For example, an API error-rate alert is
+`sum(rate(spatiumddi_api_requests_total{status_code=~"5.."}[5m])) / sum(rate(spatiumddi_api_requests_total[5m])) > 0.05`
+(a perf-testing Prometheus config already lives under
+`perf/dashboards/prometheus/`).
+
+**Planned, not emitted yet.** There are no Prometheus series for DHCP / DNS
+server status, DHCP sync age, pool or subnet utilization, database
+replication lag, Celery queue length or task failures, so the usual rules
+over them (server offline, pool near exhaustion, replication lag, queue
+backlog, failed backups) cannot be written against `/metrics` today. Use
+the in-product alert rules above (`server_unreachable`, `subnet_utilization`,
+`dhcp_pool_exhaustion`, `backup_failed`, ...) for those conditions. Exporting
+them as series is tracked in
+[#2146](https://github.com/spatiumnorth/spatiumddi/issues/2146) and
+[#1267](https://github.com/spatiumnorth/spatiumddi/issues/1267).
 
 
 ## DNS Agent Telemetry
 
 See [`docs/deployment/DNS_AGENT.md`](deployment/DNS_AGENT.md) §4 for the full protocol.
 
-### Metrics (scraped from the control plane)
+### Metrics
 
-| Metric | Type | Labels | Purpose |
-|---|---|---|---|
-| `spatium_dns_agent_up` | gauge | `server_id`, `flavor` | 1 if last heartbeat within 90s |
-| `spatium_dns_agent_config_lag_seconds` | gauge | `server_id` | Age of the applied config etag |
-| `spatium_dns_zone_serial` | gauge | `server_id`, `zone` | Last reported SOA serial |
-| `spatium_dns_failed_ops_total` | counter | `server_id` | RecordOps that exhausted retries |
-| `spatium_dns_agent_token_rotations_total` | counter | `server_id` | JWT rotations per server |
-
-Agents are egress-only and do **not** expose a scrape endpoint — all metrics
-are derived from the heartbeat body on the control plane.
+The control plane emits no per-agent Prometheus series yet (no agent-up,
+config-lag, zone-serial, failed-op or token-rotation metric). The same facts
+are on the server row in the console and in the API: heartbeat age and
+status, the applied config etag and apply status, per-server zone serials
+(`DNSServerZoneState`) and queued record ops. Agents are egress-only and do
+**not** expose a scrape endpoint; the control plane derives everything from
+the heartbeat body. Agent-level series are part of #2146.
 
 ### Logs
 
@@ -1152,6 +1323,55 @@ Agent logs are structured JSON (non-negotiable #7) and include the canonical
 
 - `dns_agent_registered` — bootstrap complete
 - `dns_agent_token_rotated` — JWT rotation
-- `dns_agent_config_applied` — new config etag applied
-- `dns_agent_op_failed` — RecordOp failed (attempt <= 5)
 - `dns_agent_stale_sweep` — control-plane Celery task marked servers unreachable
+
+---
+
+## Reference summaries — dashboards, Platform Insights, alert delivery, webhooks
+
+_Moved here from the README feature tour (#3410), so the detail stays in the documentation._
+
+### Dashboard-at-a-glance
+
+nine sub-tabs: Overview / IPAM / DNS / DHCP / **Network** (ASN drift + RPKI expiry + circuit alerts + service orphans) / **Integrations** (per-mirror counts + last-sync staleness) / **Security** (lockout state + active sessions + audit-chain status + MFA enrolment) / **Compliance** (PCI / HIPAA / internet-facing flag counts) / **Conformity** (per-framework status + auditor PDF download).
+
+- Platform health card (API / Postgres / Redis / workers / beat)
+- Live DNS query rate + DHCP traffic charts — self-contained, no Prometheus needed
+  - Sources: BIND9 statistics-channels + Kea `statistic-get-all`
+- Subnet utilization heatmap
+- Live activity feed
+
+### Platform Insights admin page
+
+native diagnostics, no extra agents.
+
+- Postgres: DB size, cache hit ratio, WAL position, slow queries via `pg_stat_statements`, table sizes, idle-in-transaction watch
+- Containers: per-container CPU / memory / network / IO from the local Docker socket
+
+### Alerts + audit forwarding
+
+multi-target delivery with pluggable wire formats.
+
+- Rule-based alerts framework (subnet utilization, server unreachable)
+- Multi-target syslog (UDP / TCP / TLS), HTTP webhook, SMTP email, Slack / Teams / Discord chat
+- Wire formats: RFC 5424 JSON, CEF, LEEF, RFC 3164, JSON lines
+- Per-target filters
+
+### Typed-event webhooks
+
+curated automation surface for downstream consumers.
+
+- 144 typed events covering every resource × verb (e.g. `subnet.created`, `dns.zone.updated`, `ip.created`)
+- HMAC-SHA256 signed POSTs with reserved `X-SpatiumDDI-*` headers
+- Outbox-backed at-least-once delivery with exponential backoff + dead-letter
+- Per-subscription manual retry, custom headers, and one-time secret reveal
+
+### Compliance change alerts
+
+reactive: catch every mutation against PCI / HIPAA / internet-facing scope.
+
+- New `compliance_change` rule type with two params: `classification` (which Subnet flag the rule watches) and `change_scope` (`any_change` / `create` / `delete`)
+- Audit-log scanner runs on the existing 60 s alert tick. Watermark column on the rule baselines to `now()` on first run so historical audit history doesn't retro-page operators when a rule is first enabled
+- Resolves IP-address / DHCP-scope audit rows back to their parent subnet for classification lookup; deletes fall back to `audit_log.old_value.subnet_id` so a delete still resolves the originating subnet
+- One event per matching audit row, auto-resolves after 24 h, fans through the existing audit-forward syslog / webhook / SMTP targets
+- Three disabled seed rules ship at first boot: PCI scope changes, HIPAA scope changes, internet-facing scope changes — operator opts in by toggling enabled

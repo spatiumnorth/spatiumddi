@@ -35,6 +35,8 @@ import json
 import os
 import re
 import subprocess
+import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -244,7 +246,8 @@ def _current_slot_from_cmdline() -> str | None:
 
     Mirror of the api-side ``services/appliance/slot.py`` helper; kept
     independent so the agent doesn't pull in the backend package. The
-    PARTLABEL of the booted slot maps to ``slot_a`` or ``slot_b``.
+    PARTLABEL of the booted slot (on a mirrored install, the md array's
+    slot name) maps to ``slot_a`` or ``slot_b``.
 
     Reads ``/run/udev/data/b<major>:<minor>`` files directly instead of
     shelling out to lsblk — lsblk inside a container without
@@ -276,14 +279,21 @@ def _current_slot_from_cmdline() -> str | None:
             continue
         # ``S:`` lines are symlinks udev creates under /dev/disk/. We
         # pull PARTLABEL + UUID from the matching subdirectory prefix.
-        _props, links = _udev_properties(entry)
-        partlabel: str | None = None
+        props, links = _udev_properties(entry)
+        # #3172 — on a mirrored install (#999) the root filesystem is an md
+        # array, which has no PARTLABEL: its by-partlabel links sit on the
+        # member partitions, its by-uuid link on the array. The array is
+        # named after its slot instead (``mdadm --create /dev/md/root_a``),
+        # which udev records as MD_DEVNAME and the ``md/root_a`` link.
+        partlabel: str | None = props.get("MD_DEVNAME") or None
         matches_uuid = False
         for value in links:
             if value.startswith("disk/by-partlabel/"):
                 # Last segment is the PARTLABEL (preserving GPT case
                 # would matter for downstream consumers, but we only
                 # compare case-insensitively to root_a / root_b).
+                partlabel = value.rsplit("/", 1)[-1]
+            elif value.startswith("md/") and partlabel is None:
                 partlabel = value.rsplit("/", 1)[-1]
             elif value.startswith("disk/by-uuid/"):
                 if value.rsplit("/", 1)[-1].lower() == root_uuid:
@@ -315,6 +325,125 @@ def _durable_default_from_grubenv() -> str | None:
     return None
 
 
+# #1747 — a power loss right after a write can leave a host sidecar with its
+# length extended but its data blocks unwritten: it reads back as NUL bytes,
+# or as a prefix followed by NULs. Postgres refuses U+0000 in a text value,
+# so one NUL in anything the heartbeat carries makes the api answer 422 to
+# EVERY heartbeat from the node and its Fleet row freezes. So every
+# free-text value read off a slot-upgrade sidecar goes through
+# ``_scrub_text``, and a state file that does not parse (all NULs, empty,
+# truncated) reads as unknown, never as a state.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+_SLOT_STATES = ("ready", "in-flight", "done", "failed")
+
+
+def _scrub_text(text: str) -> str:
+    """Drop NUL and every C0 control character except ``\\n`` and ``\\t``
+    (``\\r`` too: ``splitlines`` already splits on it)."""
+    return _CONTROL_CHARS_RE.sub("", text)
+
+
+def _scrub_json(value: object) -> object:
+    """``_scrub_text`` applied to every string in a decoded JSON value."""
+    if isinstance(value, str):
+        return _scrub_text(value)
+    if isinstance(value, list):
+        return [_scrub_json(v) for v in value]
+    if isinstance(value, dict):
+        return {_scrub_text(str(k)): _scrub_json(v) for k, v in value.items()}
+    return value
+
+
+def _read_slot_state_word() -> str | None:
+    """The first word of the .state sidecar, scrubbed, or None when it is
+    not one of the four states (empty, NUL-filled, garbage). Raises OSError
+    like ``read_text``."""
+    parts = _scrub_text(_HOST_SLOT_STATE.read_text(encoding="utf-8", errors="replace")).split(
+        maxsplit=1
+    )
+    return parts[0] if parts and parts[0] in _SLOT_STATES else None
+
+
+def _write_sidecar_durable(path: Path, text: str) -> None:
+    """Overwrite ``path`` in place and fsync it (#1747).
+
+    In place, not temp file + rename, deliberately: release-state is a
+    sticky directory and the host runner owns these files as root, so this
+    unprivileged process may write them (0660, shared gid) but can never
+    replace them by rename. The truncate-then-write is not atomic: a power
+    loss inside it can still leave the file empty or NUL-filled. The fsync
+    narrows that window to this call, and the readers are the real safety
+    net — an unparseable state reads as unknown, and the clear paths below
+    heal it. The host runners use temp + fsync + rename + directory fsync
+    (``atomic_write`` in the bash runners, ``_write_progress`` in
+    spatium-upgrade-slot)."""
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+# #1825 — a trigger that lands while systemd is in a ``daemon-reload`` is
+# never seen: the reload re-creates the path watch, and ``PathChanged=`` does
+# not fire for a file already there when it comes back (systemd.path(5)).
+# When the watcher sees it the runner writes ``.state`` within milliseconds,
+# so a trigger still unclaimed after this long was missed.
+_PICKUP_GRACE_SECONDS = 30
+_last_rearm_at = 0.0
+
+
+def _pending_trigger_since() -> datetime | None:
+    """When the slot-upgrade trigger was written, if the runner has not
+    claimed it: no ``.state``, or one older than the trigger (an earlier
+    run's). The runner's first act makes ``.state`` newer and its last
+    renames the trigger away, so a running or finished apply is never
+    pending."""
+    try:
+        trig = _TRIGGER_FILE.stat().st_mtime_ns
+    except OSError:
+        return None
+    try:
+        state = _HOST_SLOT_STATE.stat().st_mtime_ns
+    except FileNotFoundError:
+        state = None
+    except OSError:
+        return None
+    if state is not None and state >= trig:
+        return None
+    return datetime.fromtimestamp(trig / 1e9, UTC)
+
+
+def _rearm_missed_trigger(since: datetime) -> None:
+    """#1825 — re-fire ``PathChanged=`` for a trigger the watcher missed.
+
+    Open for write and close without writing: IN_CLOSE_WRITE on the watched
+    file, mtime (and so the reaper's clock) unchanged. No O_CREAT, so a
+    trigger consumed since it was read as pending is not re-created empty;
+    O_NOFOLLOW, so a symlink is not opened through. At most once per grace
+    window. A trigger this process cannot open (the api's per-box apply) is
+    logged and left to the reaper; the api re-arms its own.
+    """
+    global _last_rearm_at
+    now = time.time()
+    waited = now - since.timestamp()
+    if waited < _PICKUP_GRACE_SECONDS or now - _last_rearm_at < _PICKUP_GRACE_SECONDS:
+        return
+    _last_rearm_at = now
+    try:
+        fd = os.open(_TRIGGER_FILE, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return  # consumed since it was read as pending
+    except OSError as exc:
+        log.warning(
+            "supervisor.slot_upgrade.trigger_rearm_failed",
+            waited_seconds=int(waited),
+            error=str(exc),
+        )
+        return
+    os.close(fd)
+    log.warning("supervisor.slot_upgrade.trigger_rearmed", waited_seconds=int(waited))
+
+
 def _last_upgrade_state_from_sidecar() -> tuple[str | None, datetime | None]:
     """Read ``state stamp`` from the .state sidecar the host-side
     runner maintains. Returns (state, when) or (None, None) when no
@@ -337,16 +466,27 @@ def _last_upgrade_state_from_sidecar() -> tuple[str | None, datetime | None]:
     work" signal instead of an empty cell that visually looks like
     "agent hasn't reported yet". ``None`` is reserved for genuinely-
     unknown rows (docker / k8s / pre-8f-2).
+
+    #1825 — a trigger the runner has not claimed reads ``in-flight``,
+    stamped with when it was written, so ``_reap_stale_inflight`` ends it
+    if it is never picked up (before, the Fleet chip read the previous
+    run's state and a missed fleet trigger blocked re-fire for good). One
+    still unclaimed after the pickup grace is re-armed.
     """
+    pending = _pending_trigger_since()
+    if pending is not None:
+        if (datetime.now(UTC) - pending).total_seconds() <= _STALE_INFLIGHT_SECONDS:
+            _rearm_missed_trigger(pending)
+        return "in-flight", pending
     if not _HOST_SLOT_STATE.exists():
         return "ready", None
     try:
-        text = _HOST_SLOT_STATE.read_text(encoding="utf-8", errors="replace").strip()
+        text = _scrub_text(_HOST_SLOT_STATE.read_text(encoding="utf-8", errors="replace")).strip()
     except OSError:
         return None, None
     parts = text.split(maxsplit=1)
     state = parts[0] if parts else None
-    if state not in ("ready", "in-flight", "done", "failed"):
+    if state not in _SLOT_STATES:
         return None, None
     stamp = None
     if len(parts) > 1:
@@ -406,17 +546,15 @@ def _reap_stale_inflight(
         threshold_seconds=_STALE_INFLIGHT_SECONDS,
     )
     try:
-        _HOST_SLOT_STATE.write_text(f"failed {now.isoformat()}\n", encoding="utf-8")
+        _write_sidecar_durable(_HOST_SLOT_STATE, f"failed {now.isoformat()}\n")
     except OSError:
         # Couldn't persist — report failed for this tick anyway; the next
         # heartbeat re-derives the same stale condition and retries.
         return "failed", now
     try:
-        _SLOT_UPGRADE_PROGRESS.write_text(
-            json.dumps(
-                {"step": "failed", "pct": None, "detail": reason, "at": now.isoformat()}
-            ),
-            encoding="utf-8",
+        _write_sidecar_durable(
+            _SLOT_UPGRADE_PROGRESS,
+            json.dumps({"step": "failed", "pct": None, "detail": reason, "at": now.isoformat()}),
         )
     except OSError:
         # Cosmetic breadcrumb only — the durable "failed" .state written
@@ -447,6 +585,22 @@ _TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/slot-upgrade-pendin
 # ``failed`` on every reboot. Separate filenames = one runner per trigger.
 _REBOOT_TRIGGER_FILE = Path(
     "/var/lib/spatiumddi-host/release-state/reboot-pending-fleet"
+)
+# #1446 — the boot a fleet reboot trigger was last written in. The control
+# plane keeps delivering ``reboot_requested`` until a heartbeat arrives from
+# a different boot, so between writing the trigger and the host going down,
+# heartbeats still carry it. Without this marker each of those would
+# re-write the trigger the runner had just moved aside, and a trigger left
+# behind by the shutdown would make the NEXT request a no-op (the
+# ``exists()`` check below), which is the "reboot cleared, nothing happened"
+# failure this issue is about.
+_REBOOT_FIRED_BOOT_MARKER = Path(
+    "/var/lib/spatiumddi-host/release-state/reboot-fleet-fired-boot"
+)
+# #3008 — written by the console's F9 ("<boot_id>\n") when it cancels a
+# reboot. The heartbeat reports it so the control plane retires the request.
+_REBOOT_CANCEL_MARKER = Path(
+    "/var/lib/spatiumddi-host/release-state/reboot-cancelled"
 )
 # Issue #386 Part B — fire-once marker. Records the last
 # ``desired_slot_image_url`` the supervisor wrote a trigger for, so a
@@ -504,6 +658,19 @@ _SET_NEXT_BOOT_TRIGGER_FILE = Path(
 _SET_DEFAULT_TRIGGER_FILE = Path(
     "/var/lib/spatiumddi-host/release-state/slot-set-default-pending"
 )
+# #3284: the Boot once this supervisor last fired: ``<slot> <boot_id>``. The
+# control plane keeps ``desired_next_boot_slot`` on every heartbeat response
+# until the node reports that slot as its ``current_slot``, and the host runner
+# renames the trigger away when it finishes, so trigger presence alone re-ran
+# set-next-boot on every heartbeat before the reboot, and after a trial of the
+# slot fell back it armed the failed slot again. One request is one run; the
+# record goes when a response carries no request (``forget_set_next_boot_fire``).
+_SET_NEXT_BOOT_FIRED_MARKER = Path(
+    "/var/lib/spatiumddi-host/release-state/slot-set-next-boot-fired"
+)
+# A kernel boot id. Anything else in the record (a power cut can leave NUL
+# bytes, #1747) is read as no boot, so it never reaches a heartbeat.
+_BOOT_ID_FORMAT = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 # Issue #153 — SNMP config rollout. The trigger file carries the
 # rendered snmpd.conf body so the host runner doesn't need to re-
 # render. The hash sidecar lets the agent skip re-firing after an
@@ -652,12 +819,37 @@ _CLUSTER_JOIN_STATE_SIDECAR = Path(
 # transition target — so re-driving against a different seed starts with a
 # fresh budget. ``reset_cluster_join_attempts()`` clears both ledgers
 # whenever the control plane stops asking for a role change.
-_CLUSTER_JOIN_MAX_ATTEMPTS = 3
+#
+# #1212 — a JOIN's re-fires are spaced too, and its ceiling is high enough
+# that its attempts outlast the backend's retry window. The backend keeps a
+# transiently failed member's desired role for 15 minutes (#961) so that the
+# join is retried once the path to the seed is back. The supervisor used to
+# re-fire on every heartbeat, with a ceiling of three and no spacing. An
+# attempt against an unreachable seed fails in ~20 s, so all three landed in
+# the first ~2.5 minutes of an outage and the rest of the window went unused:
+# a member whose path came back four minutes in stayed a standalone node.
+#
+# The next join against the same target now waits
+# ``_cluster_join_retry_delay_s()`` after the last fire, measured from the
+# ledger's timestamp: one minute, two, then every four. The first retry
+# still comes a minute after the first attempt; that is the retry #961's
+# concurrent-promote race needs. Eight attempts take about 23 minutes, past
+# the window, so for a transient failure the backend's clear, not this
+# ceiling, now ends the retries. The ceiling stays the backstop for a
+# control plane that never processes the failure: 8 wipes over ~23 minutes,
+# where it used to be 3 in ~2.5.
+_CLUSTER_JOIN_MAX_ATTEMPTS = 8
+_CLUSTER_JOIN_RETRY_BASE_S = 60.0
+_CLUSTER_JOIN_RETRY_MAX_S = 240.0
+# The leave is exactly as destructive, but the backend clears a failed
+# leave's desired role at once, so there is no window to span: it keeps the
+# original ceiling and no spacing.
+_CLUSTER_LEAVE_MAX_ATTEMPTS = 3
 
 # #590 — "this terminal verdict has already been delivered" marker.
 #
 # The .state sidecar is written by the ROOT host runner and lives in a
-# 1777-sticky dir, so this unprivileged supervisor cannot delete it — it
+# sticky dir, so this unprivileged supervisor cannot delete it — it
 # would otherwise keep re-reporting a stale ``failed`` from a previous
 # episode. Now that the backend CLEARS the desired-state on a reported
 # ``failed`` (instead of re-firing the join forever), a stale re-report
@@ -672,6 +864,14 @@ _CLUSTER_JOIN_MAX_ATTEMPTS = 3
 # reports again. Owned by the supervisor, so rewriting is permitted.
 _CLUSTER_JOIN_STATE_CONSUMED = Path(
     "/var/lib/spatiumddi-host/release-state/cluster-join.state.consumed"
+)
+# #1903 — which promote the sidecar's verdict belongs to. ``<id>\t<fire_ns>``,
+# written when a join trigger is armed: the control plane's transition id and
+# the wall clock of the fire. A verdict in the sidecar proves that id only when
+# its mtime is at or after the fire — an older ``ready`` is a previous
+# membership's (a Replace-evicted box that is still up keeps one for ever).
+_CLUSTER_JOIN_TRANSITION = Path(
+    "/var/lib/spatiumddi-host/release-state/cluster-join.transition"
 )
 # ONLY ``failed`` is retired — never ``ready`` / ``left``.
 #
@@ -713,6 +913,49 @@ _CLUSTER_RESTORE_STATE_SIDECAR = Path(
 _HOST_PATCHES_LEDGER = Path(
     "/var/lib/spatiumddi-host/release-state/host-patches-applied.json"
 )
+
+
+_NIGHTLY_INSTALLED_RE = re.compile(
+    r"^0\.0\.0-nightly-(\d{4})(\d{2})(\d{2})(?:\+[0-9A-Za-z.-]+)?$"
+)
+_NIGHTLY_DAY_RE = re.compile(
+    r"^(?:nightly-(\d{4})\.?(\d{2})\.?(\d{2})|0\.0\.0-nightly-(\d{4})(\d{2})(\d{2}))$"
+)
+
+
+def _night(match: re.Match[str] | None) -> tuple[int, int, int] | None:
+    if match is None:
+        return None
+    y, m, d = (int(g) for g in match.groups() if g is not None)
+    try:
+        datetime(y, m, d)
+    except ValueError:
+        return None
+    return (y, m, d)
+
+
+def installed_is_target(installed: str | None, target: str | None) -> bool:
+    """#3026 — is the booted slot already the build ``target`` names?
+
+    A release installs under its own tag, and a full nightly version
+    (``0.0.0-nightly-YYYYMMDD+<sha>``) names one build: equal strings. A
+    nightly's tag is ``nightly-YYYY.MM.DD`` (or ``nightly-YYYYMMDD``, or the
+    version with no ``+<sha>``), which names a night, so any build of that
+    night matches. A string compare never matched it, so a finished nightly
+    upgrade was fired again over the rollback slot.
+
+    A copy of ``app.core.versions.is_installed_target`` (separate package);
+    the backend's ``test_nightly_upgrade_cleared_3026.py`` loads this module
+    and runs both over the same cases, so they cannot drift.
+    """
+    installed = (installed or "").strip()
+    target = (target or "").strip()
+    if not installed or not target:
+        return False
+    if installed == target:
+        return True
+    night = _night(_NIGHTLY_INSTALLED_RE.match(installed))
+    return night is not None and night == _night(_NIGHTLY_DAY_RE.match(target))
 
 
 def maybe_fire_fleet_upgrade(
@@ -776,7 +1019,9 @@ def maybe_fire_fleet_upgrade(
         )
         return False
     installed = read_installed_version()
-    if installed and installed == desired_version:
+    # Never fire a target the booted slot already is: the write goes to the
+    # INACTIVE slot, i.e. the only rollback (#3026).
+    if installed_is_target(installed, desired_version):
         return False
     # Fire-once: skip if we already wrote a trigger for this exact
     # desired-state (same URL incl. nonce).
@@ -827,7 +1072,7 @@ def clear_fleet_upgrade_marker() -> None:
     """#386 Part B — the control plane reports no upgrade desired
     (cleared via the Cancel button, or never set). Drop the fire-once
     marker so a future Apply of the same URL re-fires, and reset a stale
-    ``failed`` state back to ``ready`` so a cancelled failure stops
+    ``failed`` (or unreadable, #1747) state back to ``ready`` so a cancelled failure stops
     sticking on the Fleet chip. No-op off-appliance, and never touches
     an in-flight apply (trigger file present)."""
     if detect_deployment_kind() != "appliance":
@@ -841,16 +1086,34 @@ def clear_fleet_upgrade_marker() -> None:
     if _TRIGGER_FILE.exists():
         return
     try:
-        if _HOST_SLOT_STATE.exists():
-            parts = _HOST_SLOT_STATE.read_text(encoding="utf-8").split(maxsplit=1)
-            if parts and parts[0] == "failed":
-                _HOST_SLOT_STATE.write_text(
-                    f"ready {datetime.now(UTC).isoformat()}\n", encoding="utf-8"
-                )
+        # #1747 — an unparseable state (NUL-filled by a power loss) is as
+        # stuck as a failed one, and with no trigger present nothing else
+        # will ever rewrite it.
+        if _HOST_SLOT_STATE.exists() and _read_slot_state_word() in ("failed", None):
+            _write_sidecar_durable(_HOST_SLOT_STATE, f"ready {datetime.now(UTC).isoformat()}\n")
     except OSError:
         # Best-effort heal — if the state sidecar can't be read/rewritten
         # the chip just keeps its last value; the next apply overwrites it.
         pass
+
+
+def _runner_owns_progress() -> bool:
+    """#2021 — is the progress sidecar a running or staged apply's?
+
+    True while the runner is applying (``.state`` in-flight and the trigger,
+    if any, claimed) or has staged the slot (``.state`` done with a
+    ``reboot-pending`` progress carrying the #2007 staged identity). False
+    on any doubt, which keeps the #786 reset."""
+    try:
+        word = _read_slot_state_word() if _HOST_SLOT_STATE.exists() else None
+    except OSError:
+        return False
+    if word == "in-flight":
+        return _pending_trigger_since() is None
+    if word == "done":
+        progress = _read_slot_upgrade_progress() or {}
+        return progress.get("step") == "reboot-pending" and bool(progress.get("staged_boot_id"))
+    return False
 
 
 def apply_clear_upgrade_command() -> bool:
@@ -878,6 +1141,17 @@ def apply_clear_upgrade_command() -> bool:
     if detect_deployment_kind() != "appliance":
         return False
 
+    # #2021 — decided BEFORE the trigger goes, because "claimed" is read off
+    # the trigger's mtime: a runner that has claimed it (``.state`` in-flight
+    # and newer than the trigger) is applying, and one that has staged the
+    # slot has armed next-boot. Neither is undone by this command, so their
+    # progress is not this command's to reset: wiping it blanked the Fleet
+    # stepper for the rest of a running apply (the runner only rewrites it
+    # at its next step, which during a long ``dd`` is minutes away), and
+    # wiping a staged ``reboot-pending`` breadcrumb strands the #2007
+    # settle, which keys on it, at ``done`` forever.
+    keep_progress = _runner_owns_progress()
+
     reset = False
     for path in (_TRIGGER_FILE, _FIRED_URL_MARKER):
         try:
@@ -897,24 +1171,23 @@ def apply_clear_upgrade_command() -> bool:
     # and the supervisor's stale-in-flight reaper — so a mid-apply Cancel
     # could leave a truncated image with nothing recording the failure.
     try:
-        if _HOST_SLOT_STATE.exists():
-            current = _HOST_SLOT_STATE.read_text(encoding="utf-8").split(maxsplit=1)
-            if current and current[0] == "failed":
-                _HOST_SLOT_STATE.write_text(
-                    f"ready {datetime.now(UTC).isoformat()}\n", encoding="utf-8"
-                )
-                reset = True
+        # #1747 — an unparseable state (NUL-filled by a power loss) is stuck
+        # too: it is not ``in-flight``, so no crash detector keys on it, and
+        # leaving it would keep this clear from ever being acknowledged.
+        if _HOST_SLOT_STATE.exists() and _read_slot_state_word() in ("failed", None):
+            _write_sidecar_durable(_HOST_SLOT_STATE, f"ready {datetime.now(UTC).isoformat()}\n")
+            reset = True
     except OSError as exc:
         log.warning("supervisor.clear_upgrade.state_reset_failed", error=str(exc))
 
-    # OVERWRITE rather than unlink. release-state is mode 1777 (sticky) and
-    # this file is root-owned (the host runner writes it); a non-owner can
-    # never unlink it, but the runner now publishes it 0666 so an in-place
-    # write succeeds. An empty object reads as "no progress" to every
+    # OVERWRITE rather than unlink. release-state is sticky (1770 root:2770)
+    # and this file is root-owned (the host runner writes it); a non-owner
+    # can never unlink it, but the runner publishes it 0660 to gid 2770,
+    # which this process carries, so an in-place write succeeds. An empty object reads as "no progress" to every
     # consumer, which is what a cleared upgrade should show.
     try:
-        if _SLOT_UPGRADE_PROGRESS.exists():
-            _SLOT_UPGRADE_PROGRESS.write_text("{}\n", encoding="utf-8")
+        if _SLOT_UPGRADE_PROGRESS.exists() and not keep_progress:
+            _write_sidecar_durable(_SLOT_UPGRADE_PROGRESS, "{}\n")
             reset = True
     except OSError as exc:
         log.warning("supervisor.clear_upgrade.progress_reset_failed", error=str(exc))
@@ -1023,12 +1296,19 @@ def _read_fire_state(fire_state_file: Path) -> tuple[str, int, datetime | None]:
     """Read ``<hash>\\t<attempts>\\t<iso>`` → (hash, attempts, when).
     Missing / malformed → ``("", 0, None)``."""
     try:
-        text = fire_state_file.read_text(encoding="utf-8").strip()
+        # Strip only the line ending: a full ``.strip()`` also eats the
+        # leading tab of an EMPTY-hash line (``\t1\t<iso>``), shifting every
+        # field left so attempts parsed as the hash (#2053).
+        text = fire_state_file.read_text(encoding="utf-8").rstrip("\r\n")
     except OSError:
         return "", 0, None
-    parts = text.split("\t")
-    if not parts or not parts[0]:
+    if not text:
         return "", 0, None
+    # Strip each FIELD, never the line: the hash is hex (or empty), the
+    # attempts an int and the time ISO, none of which carries whitespace,
+    # so a hand edit's stray space can't make the time unparseable or the
+    # hash a value no applied sidecar will ever equal.
+    parts = [p.strip() for p in text.split("\t")]
     try:
         attempts = int(parts[1]) if len(parts) > 1 else 0
     except ValueError:
@@ -1093,8 +1373,9 @@ def _write_owner_only(tmp: Path, payload: str) -> None:
     The host-config trigger files can carry decrypted secrets — the SNMP
     community, APT private-mirror passwords + GPG armour (#155), the syslog
     forwarding CA material (#156), the SSH config (#157), and the k3s join
-    token (#272) — and they land in the 1777-sticky ``release-state`` dir
-    that any unprivileged host user can list. A plain ``write_text`` then
+    token (#272) — and they land in the shared ``release-state`` dir, which
+    every host account could list while it was 1777 (GHSA-h2j9-qrg7-grfw)
+    and the api pod still can. A plain ``write_text`` then
     ``chmod(0o600)`` left a window where the file existed at the umask
     default (typically 0644, world-readable) before the chmod landed, so a
     local user could race-open the ``.new`` temp and read the secret.
@@ -1127,6 +1408,29 @@ def _write_owner_only(tmp: Path, payload: str) -> None:
         fh.write(payload)
 
 
+def _forget_superseded_fire(trigger_file: Path, applied_hash: str) -> None:
+    """Drop a fire-state ledger that names a config nobody wants any more.
+
+    Reached when the desired config already equals the applied one. If the
+    ledger names a DIFFERENT hash, that fire was superseded — typically a
+    save the runner could not apply, then reverted by the operator to what
+    the host already runs. Nothing will ever fire for it again, so without
+    this ``read_host_config_health`` would compare the dead hash against the
+    applied sidecar on every heartbeat and report the plane ``retrying``
+    until some unrelated save (#2053). Forgetting it costs nothing: no fire
+    is due, so there is no backoff to remember."""
+    fire_state = _fire_state_path(trigger_file)
+    fhash, attempts, when = _read_fire_state(fire_state)
+    if fhash == applied_hash or (not fhash and not attempts and when is None):
+        return  # converged, or never fired
+    try:
+        fire_state.unlink()
+    except OSError:
+        # Best-effort, like every fire-state write: a ledger we could not
+        # remove is retried on the next heartbeat.
+        pass
+
+
 def _fire_host_config(
     trigger_file: Path,
     applied_hash_sidecar: Path,
@@ -1142,6 +1446,7 @@ def _fire_host_config(
     (+ any plane-specific guard, e.g. the SSH lockout refusal)."""
     applied_hash = _read_release_state_line(applied_hash_sidecar) or ""
     if config_hash == applied_hash:
+        _forget_superseded_fire(trigger_file, applied_hash)
         return False  # already applied — idempotent no-op
     if trigger_file.exists():
         return False  # path unit hasn't consumed the last trigger — don't stack
@@ -1155,7 +1460,7 @@ def _fire_host_config(
         tmp = trigger_file.with_suffix(".new")
         # The payload can carry decrypted secrets (SNMP community, APT
         # GPG armour + private-mirror passwords #155, syslog CA #156, the
-        # SSH config #157) and lands in the 1777-sticky release-state dir.
+        # SSH config #157) and lands in the shared, sticky release-state dir.
         # Create it owner-only atomically — see _write_owner_only — so no
         # window exists where another unprivileged host user could read it.
         _write_owner_only(tmp, payload)
@@ -1177,22 +1482,31 @@ def read_host_config_health() -> dict[str, dict[str, object]]:
         {"ntp": {"state": "failing", "attempts": 7, "at": "<iso>"}, ...}
 
     ``state`` is ``failing`` once the same hash has been fired
-    ``_HOSTCFG_FAILING_ATTEMPTS`` times (apply keeps failing), else
-    ``retrying``. A plane whose applied-hash matches its last-fired hash
+    ``_HOSTCFG_FAILING_ATTEMPTS`` times (apply keeps failing), ``retrying``
+    after a second fire (the first apply did not land), and ``applying``
+    for the first fire — in flight, no failure reported yet (#3818). A plane whose applied-hash matches its last-fired hash
     (success) — or that was never fired — is omitted, so a healthy box
     reports ``{}`` (which clears any stale server-side entry)."""
     out: dict[str, dict[str, object]] = {}
     for name, trigger, applied_sidecar in _HOST_CONFIG_PLANES:
         fhash, attempts, when = _read_fire_state(_fire_state_path(trigger))
-        if not fhash:
-            continue  # never fired → nothing to report
+        if not fhash and when is None and attempts == 0:
+            continue  # never fired → nothing to report (an empty hash that
+            # WAS fired, i.e. a plane turned off, carries attempts/when)
         applied = _read_release_state_line(applied_sidecar) or ""
         if applied == fhash:
             continue  # last-fired config is applied → healthy, omit
+        # First fire of a hash: the runner has not yet had a chance to fail
+        # (a retry needs the 60 s backoff to elapse), so say "applying",
+        # not "retrying" (#3818).
+        if attempts >= _HOSTCFG_FAILING_ATTEMPTS:
+            state = "failing"
+        elif attempts >= 2:
+            state = "retrying"
+        else:
+            state = "applying"
         out[name] = {
-            "state": (
-                "failing" if attempts >= _HOSTCFG_FAILING_ATTEMPTS else "retrying"
-            ),
+            "state": state,
             "attempts": attempts,
             "at": when.isoformat() if when else None,
         }
@@ -1286,6 +1600,129 @@ def prune_all_trigger_sidecars(keep: int = 5) -> None:
         _prune_host_config_sidecars(trigger, keep)
 
 
+def _next_entry_from_grubenv() -> str | None:
+    """``next_entry`` from grubenv: the slot ``grub-reboot`` armed for the
+    next boot, ``""`` once GRUB has consumed it (the rendered grub.cfg
+    clears it and ``save_env``s on every boot that honours it), or None
+    when grubenv cannot be read."""
+    try:
+        text = _HOST_GRUBENV.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        line = line.rstrip("\x00").strip()
+        if line.startswith("next_entry="):
+            return line.split("=", 1)[1].strip()
+    return ""
+
+
+def _settle_staged_upgrade(
+    state: str | None,
+    state_at: datetime | None,
+    current_slot: str | None,
+    is_trial_boot: bool | None,
+) -> tuple[str | None, datetime | None]:
+    """#2007 — settle a staged upgrade the node has already rebooted past.
+
+    The host runner ends a successful apply at state ``done`` with progress
+    ``reboot-pending`` and nothing ever moved them: the runner is not
+    running when the node comes back, so the heartbeat kept re-publishing
+    "upgrade staged — reboot to boot the new slot" for a reboot that had
+    already happened. Fleet, the API and MCP all read that.
+
+    "Has the node rebooted since staging" is answered without clocks: the
+    runner records the kernel ``boot_id`` it staged under, and a different
+    one now is a reboot. Comparing uptime against the wall-clock stamp
+    would be wrong whenever the clock was stepped between the two (a node
+    that staged before chrony synced), and a wrong answer here hides a
+    reboot the operator still has to do. A progress file from a runner
+    older than #2007 carries no ``boot_id``; for that one transition
+    upgrade the consumed ``next_entry`` in grubenv stands in.
+
+    Once rebooted, and only on a committed boot (not a trial, which is
+    still waiting on firstboot's commit, and not an unknown one):
+
+    * running the slot the runner staged → ``ready``: the upgrade took;
+    * running any other slot → ``failed``, with a progress line saying so.
+      GRUB fell back, or the trial was never committed and the next boot
+      reverted. Clearing that to ``ready`` would report an upgrade that
+      did not take effect as finished.
+
+    Without a recorded slot (the pre-#2007 runner) the second case cannot
+    be told apart and settles ``ready``; that runner only ever stages the
+    upgrade INTO this code, and a node that reverts from it is running the
+    old supervisor, which has no settle at all.
+
+    Persisted to the sidecars (group-writable since #786, the same in-place
+    write the #421 reaper uses) so the answer survives a supervisor restart.
+    """
+    if state != "done":
+        return state, state_at
+    progress = _read_slot_upgrade_progress() or {}
+    if progress.get("step") != "reboot-pending":
+        return state, state_at
+    staged_boot = progress.get("staged_boot_id")
+    if isinstance(staged_boot, str) and staged_boot:
+        now_boot = read_boot_id()
+        if now_boot is None or now_boot == staged_boot:
+            return state, state_at
+    else:
+        armed = _next_entry_from_grubenv()
+        if armed is None or armed:
+            return state, state_at
+    if is_trial_boot is not False:
+        return state, state_at
+    staged_slot = progress.get("staged_slot")
+    if staged_slot not in ("slot_a", "slot_b"):
+        staged_slot = None
+    if staged_slot is not None and current_slot is None:
+        return state, state_at
+    if _TRIGGER_FILE.exists():
+        # A new apply was fired since the state was read; it owns the
+        # sidecars from here.
+        return state, state_at
+    now = datetime.now(UTC)
+    reverted = staged_slot is not None and current_slot != staged_slot
+    new_state = "failed" if reverted else "ready"
+    log.info(
+        "supervisor.slot_upgrade.staged_upgrade_settled",
+        result=new_state,
+        staged_slot=staged_slot,
+        current_slot=current_slot,
+    )
+    try:
+        _write_sidecar_durable(_HOST_SLOT_STATE, f"{new_state} {now.isoformat()}\n")
+    except OSError:
+        # Best-effort: the in-memory answer still corrects this heartbeat;
+        # the next one re-derives the same condition and retries the write.
+        pass
+    if reverted:
+        detail = (
+            f"rolled back: staged {staged_slot} but the node booted {current_slot}. "
+            "The new slot did not come up (GRUB fell back, or its trial boot was "
+            "not committed), so this node is still on the previous version."
+        )
+        try:
+            _write_sidecar_durable(
+                _SLOT_UPGRADE_PROGRESS,
+                json.dumps(
+                    {
+                        "step": "failed",
+                        "pct": None,
+                        "detail": detail,
+                        "at": now.isoformat(),
+                        "reverted": True,
+                        "staged_slot": staged_slot,
+                    }
+                ),
+            )
+        except OSError:
+            # The durable "failed" state above is what every reader keys
+            # off; a missed breadcrumb only loses the explanation.
+            pass
+    return new_state, now
+
+
 def _read_slot_upgrade_log_tail(lines: int = 40, max_chars: int = 8000) -> str:
     """#386 Part C — last ``lines`` of the host slot-upgrade.log, capped
     at ``max_chars``. Empty string when the log is unreadable / absent
@@ -1294,7 +1731,9 @@ def _read_slot_upgrade_log_tail(lines: int = 40, max_chars: int = 8000) -> str:
         text = _SLOT_UPGRADE_LOG.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
-    tail = "\n".join(text.splitlines()[-lines:])
+    # #1747 — NULs from an unwritten tail (power loss) made the api 422
+    # every heartbeat; scrub before slicing so the cap counts what is sent.
+    tail = "\n".join(_scrub_text(text).splitlines()[-lines:])
     return tail[-max_chars:] if len(tail) > max_chars else tail
 
 
@@ -1303,10 +1742,70 @@ def _read_slot_upgrade_progress() -> dict[str, object] | None:
     writes to the progress sidecar (step / pct / detail / at). None when
     absent / unreadable / malformed."""
     try:
-        data = json.loads(_SLOT_UPGRADE_PROGRESS.read_text(encoding="utf-8"))
+        data = json.loads(_SLOT_UPGRADE_PROGRESS.read_text(encoding="utf-8", errors="replace"))
     except (OSError, ValueError):
+        # NUL-filled or truncated by a power loss (#1747): unknown, not a crash.
         return None
-    return data if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        return None
+    return {_scrub_text(str(k)): _scrub_json(v) for k, v in data.items()}
+
+
+def read_boot_id() -> str | None:
+    """This boot's kernel boot id, or None when it cannot be read."""
+    try:
+        value = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return value or None
+
+
+def read_reboot_cancel() -> str | None:
+    """#3008 — the boot id a reboot was cancelled in from the console, or None.
+    Only a cancel from THIS boot counts."""
+    try:
+        boot = _REBOOT_CANCEL_MARKER.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return boot if boot and boot == read_boot_id() else None
+
+
+def _clear_reboot_cancel() -> None:
+    """Empty the cancel marker in place. The console writes it as root in the
+    sticky release-state dir, so this process can never unlink or rename over
+    it; the console publishes it 0660 to the dir's shared gid so it can be
+    truncated, and an empty marker reads as no cancel. ``O_NOFOLLOW`` so a
+    name planted by another writer of the dir is never followed."""
+    try:
+        fd = os.open(_REBOOT_CANCEL_MARKER, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+    except OSError:
+        return
+    os.close(fd)
+
+
+def ack_reboot_cancel(sent: str | None, reboot_requested: bool | None) -> None:
+    """#3008 — retire the console's cancel once the control plane has.
+
+    ``sent`` is the boot id THIS heartbeat reported (None when it reported
+    none), ``reboot_requested`` what the response said (None when it said
+    nothing). Only a response that carried the report AND answers that no
+    reboot is requested proves the request is retired; then the cancel marker
+    is emptied and the once-per-boot fire marker dropped, so a new Fleet
+    request in this boot can fire. Anything else — an older api that ignores
+    the report, a boot-id mismatch, a cancel written while the heartbeat was in
+    flight — keeps both: the fire marker is what stops the request still on
+    the row from rebooting the node the operator just cancelled."""
+    if not sent or reboot_requested is not False:
+        return
+    if read_reboot_cancel() != sent:
+        return
+    _clear_reboot_cancel()
+    try:
+        _REBOOT_FIRED_BOOT_MARKER.unlink()
+    except OSError:
+        # Absent (a console-started reboot was cancelled, nothing was fired)
+        # or not ours to remove: nothing to re-arm either way.
+        pass
 
 
 def maybe_fire_reboot(reboot_requested: bool) -> bool:
@@ -1319,15 +1818,26 @@ def maybe_fire_reboot(reboot_requested: bool) -> bool:
     ``/var/lib/spatiumddi-host/release-state`` bind mount only exist
     on a SpatiumDDI appliance — but defence in depth is cheap.
 
-    Returns True if a trigger was fired, False otherwise. Idempotent —
-    if the trigger file already exists (host runner hasn't picked it
-    up yet) we skip rather than stacking writes.
+    Returns True if a trigger was fired, False otherwise. Fires at most
+    once per boot (#1446): the control plane keeps sending the request
+    until a heartbeat comes from a new boot, so every heartbeat between the
+    write and the shutdown carries it again.
     """
     if detect_deployment_kind() != "appliance":
         return False
     if not reboot_requested:
         return False
-    if _REBOOT_TRIGGER_FILE.exists():
+    boot_id = read_boot_id()
+    try:
+        fired_in = _REBOOT_FIRED_BOOT_MARKER.read_text(encoding="utf-8").strip()
+    except OSError:
+        fired_in = ""
+    # #1446 — once per boot. A trigger already written in THIS boot is the
+    # host going down; a trigger left over from an EARLIER boot is stale (the
+    # runner never consumed it) and is rewritten, so PathChanged fires.
+    if boot_id and fired_in == boot_id:
+        return False
+    if _REBOOT_TRIGGER_FILE.exists() and not boot_id:
         return False
     try:
         _REBOOT_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -1340,6 +1850,11 @@ def maybe_fire_reboot(reboot_requested: bool) -> bool:
             encoding="utf-8",
         )
         tmp.replace(_REBOOT_TRIGGER_FILE)
+        if boot_id:
+            _REBOOT_FIRED_BOOT_MARKER.write_text(boot_id + "\n", encoding="utf-8")
+        # #3008 — a cancel made before this fire is not a cancel of it:
+        # reported on, it would have the control plane retire this request.
+        _clear_reboot_cancel()
         return True
     except OSError:
         return False
@@ -1363,6 +1878,10 @@ def maybe_fire_timezone(desired_timezone: str | None) -> bool:
     if detect_deployment_kind() != "appliance":
         return False
     if not desired_timezone or not desired_timezone.strip():
+        # No override wanted, so a fire that never landed is moot (#2053).
+        _forget_superseded_fire(
+            _TZ_TRIGGER_FILE, _read_release_state_line(_TZ_APPLIED_HASH_FILE) or ""
+        )
         return False
     desired = desired_timezone.strip()
     # #387 — fire through the shared bounded-retry guard. The "applied
@@ -1431,6 +1950,7 @@ def maybe_fire_console_mode(desired_console_mode: str | None) -> bool:
     except OSError:
         applied = "0"
     if applied == desired:
+        _forget_superseded_fire(_VERBOSE_TRIGGER_FILE, applied)
         return False
     return _fire_host_config(
         _VERBOSE_TRIGGER_FILE, _VERBOSE_APPLIED_FILE, desired, desired + "\n"
@@ -1469,6 +1989,48 @@ def read_slot_versions() -> tuple[str | None, str | None]:
     return slot_a, slot_b
 
 
+def _read_set_next_boot_fired() -> tuple[str | None, str | None]:
+    """(slot, boot id) of the Boot once this supervisor last fired (#3284),
+    or ``(None, None)`` when there is no record or it does not parse."""
+    try:
+        parts = _SET_NEXT_BOOT_FIRED_MARKER.read_text(encoding="utf-8", errors="replace").split()
+    except OSError:
+        return None, None
+    if not parts or parts[0] not in ("slot_a", "slot_b"):
+        return None, None
+    boot = parts[1] if len(parts) > 1 and _BOOT_ID_FORMAT.fullmatch(parts[1]) else None
+    return parts[0], boot
+
+
+def forget_set_next_boot_fire() -> None:
+    """#3284: the control plane holds no Boot once for this node any more
+    (it booted the slot, a reboot spent the request, or none was made), so
+    the next request is a new one and fires."""
+    try:
+        _SET_NEXT_BOOT_FIRED_MARKER.unlink(missing_ok=True)
+    except OSError:
+        # Not ours to remove, or the mount is gone: the record stays and the
+        # next request for the same slot waits for a later forget.
+        pass
+
+
+def read_set_next_boot_ran() -> tuple[str | None, str | None]:
+    """#3284: (slot, boot id) of the Boot once this node has run for the
+    standing request, once the runner has taken its trigger; ``(None,
+    None)`` while the trigger is still there, or when nothing was fired.
+
+    The boot id is the one it ran in. The heartbeat reports both, and the
+    control plane retires the request when it ran in an earlier boot than
+    the heartbeat's: the reboot in between spent it, whether the trial of
+    the slot booted or fell back.
+    """
+    if detect_deployment_kind() != "appliance":
+        return None, None
+    if _SET_NEXT_BOOT_TRIGGER_FILE.exists():
+        return None, None
+    return _read_set_next_boot_fired()
+
+
 def maybe_fire_set_next_boot(
     desired_slot: str | None,
     current_slot: str | None,
@@ -1484,9 +2046,16 @@ def maybe_fire_set_next_boot(
     tick).
 
     Strict appliance-only gate (mirrors ``maybe_fire_reboot``). Empty
-    intent or invalid slot literal → skip. Idempotent via trigger-
-    file presence; the host runner renames the trigger to .done /
-    .failed on completion.
+    intent or invalid slot literal → skip. A trigger fired in this boot is
+    the runner's; the host runner renames it to .done / .failed on
+    completion. One left by an earlier boot is written over (#3283).
+
+    #3284: fires once per request. The response carries the request on
+    every heartbeat until the slot boots, so a run already fired for this
+    slot (recorded in ``_SET_NEXT_BOOT_FIRED_MARKER``, kept across reboots)
+    is not fired again: not on the heartbeats before the reboot, and not
+    after a trial of the slot fell back. The record is forgotten when a
+    response carries no request.
     """
     if detect_deployment_kind() != "appliance":
         return False
@@ -1494,7 +2063,26 @@ def maybe_fire_set_next_boot(
         return False
     if current_slot == desired_slot:
         return False
+    boot_id = read_boot_id()
+    fired_slot, fired_boot = _read_set_next_boot_fired()
     if _SET_NEXT_BOOT_TRIGGER_FILE.exists():
+        # #3283: a trigger fired in this boot is the runner's; it renames it
+        # away when it finishes. One from an earlier boot never will be: a
+        # reboot cut its run, ``PathChanged=`` does not fire for a file that
+        # is already there when the watch starts, and every later request
+        # skipped here, so no Boot once ran on the node again. Write the
+        # request over it: the rename onto the watched path is a change the
+        # watch sees. Without a boot id this boot cannot be told from the one
+        # that wrote it, so the trigger is left alone.
+        if not boot_id or fired_boot == boot_id:
+            return False
+        log.warning(
+            "supervisor.slot_set_next_boot.stale_trigger_replaced",
+            fired_slot=fired_slot,
+            fired_boot_id=fired_boot,
+            desired_slot=desired_slot,
+        )
+    elif fired_slot == desired_slot:
         return False
     try:
         _SET_NEXT_BOOT_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -1505,9 +2093,22 @@ def maybe_fire_set_next_boot(
         # metachars reach the runner.
         tmp.write_text(desired_slot + "\n", encoding="utf-8")
         tmp.replace(_SET_NEXT_BOOT_TRIGGER_FILE)
-        return True
     except OSError:
         return False
+    _record_set_next_boot_fire(desired_slot, boot_id)
+    return True
+
+
+def _record_set_next_boot_fire(slot: str, boot_id: str | None) -> None:
+    """#3284: record the Boot once just fired, after its trigger and never
+    before (a record of a fire that never happened would swallow the
+    request). Renamed into place, so it is whole or absent."""
+    try:
+        tmp = _SET_NEXT_BOOT_FIRED_MARKER.with_suffix(".new")
+        tmp.write_text(f"{slot} {boot_id or ''}\n", encoding="utf-8")
+        tmp.replace(_SET_NEXT_BOOT_FIRED_MARKER)
+    except OSError as exc:
+        log.warning("supervisor.slot_set_next_boot.fire_record_failed", error=str(exc))
 
 
 def maybe_fire_set_default(
@@ -1651,7 +2252,22 @@ def _join_target_fingerprint(server_url: str, join_token: str) -> str:
     return digest.hexdigest()[:16]
 
 
-def _cluster_transition_should_fire(trigger_file: Path, fingerprint: str) -> bool:
+def _cluster_join_retry_delay_s(attempts: int) -> float:
+    """#1212 — how long after fire number ``attempts`` (>= 1) the next join
+    against the same target may fire: 60 s, 120 s, then 240 s each time."""
+    return min(
+        _CLUSTER_JOIN_RETRY_BASE_S * (2 ** max(0, attempts - 1)),
+        _CLUSTER_JOIN_RETRY_MAX_S,
+    )
+
+
+def _cluster_transition_should_fire(
+    trigger_file: Path,
+    fingerprint: str,
+    *,
+    max_attempts: int,
+    retry_delay_s: Callable[[int], float] | None = None,
+) -> bool:
     """#590 — bound the number of times a DESTRUCTIVE cluster transition
     re-fires against the same target.
 
@@ -1661,27 +2277,48 @@ def _cluster_transition_should_fire(trigger_file: Path, fingerprint: str) -> boo
     backend's clear-on-failed is the primary brake; this is the backstop
     for a control plane that never processes the failure.
 
+    #1212 — with ``retry_delay_s``, a re-fire against the same target also
+    waits ``retry_delay_s(attempts)`` after the last fire the ledger
+    recorded, so the attempts spread across the backend's retry window
+    instead of being spent in its first minutes. A ledger stamped in the
+    future (the clock stepped back) never holds a fire back: the ceiling
+    still bounds it.
+
     Reuses the module's hash-keyed fire-state ledger (``_read_fire_state``
     / ``_write_fire_state``), the same one the host-config planes use for
     their re-fire backoff. Budget is per fingerprint: a transition against
     a different target starts over.
     """
     fire_state = _fire_state_path(trigger_file)
-    prev_fingerprint, attempts, _last_at = _read_fire_state(fire_state)
+    prev_fingerprint, attempts, last_at = _read_fire_state(fire_state)
     if prev_fingerprint != fingerprint:
-        attempts = 0
-    if attempts >= _CLUSTER_JOIN_MAX_ATTEMPTS:
+        attempts, last_at = 0, None
+    if attempts >= max_attempts:
         log.error(
             "supervisor.cluster_transition.attempt_ceiling_reached",
             trigger=trigger_file.name,
             attempts=attempts,
-            max_attempts=_CLUSTER_JOIN_MAX_ATTEMPTS,
+            max_attempts=max_attempts,
             detail=(
                 "refusing to re-fire the destructive transition; see "
                 "/var/log/spatiumddi/cluster-join.log, then re-drive it to retry"
             ),
         )
         return False
+    if retry_delay_s is not None and attempts and last_at is not None:
+        if last_at.tzinfo is None:
+            last_at = last_at.replace(tzinfo=UTC)
+        elapsed = (datetime.now(UTC) - last_at).total_seconds()
+        wait = retry_delay_s(attempts) - elapsed
+        if elapsed >= 0 and wait > 0:
+            log.info(
+                "supervisor.cluster_transition.retry_deferred",
+                trigger=trigger_file.name,
+                attempts=attempts,
+                max_attempts=max_attempts,
+                next_attempt_in_s=round(wait),
+            )
+            return False
     return True
 
 
@@ -1725,10 +2362,103 @@ def reset_cluster_join_attempts() -> None:
     _reset_cluster_transition_attempts(_CLUSTER_LEAVE_TRIGGER_FILE)
 
 
+def _read_cluster_join_transition() -> tuple[str, int] | None:
+    """``(transition_id, fire_ns)`` of the last join this node fired, or None."""
+    try:
+        raw = _CLUSTER_JOIN_TRANSITION.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    tid, _, fire = raw.partition("\t")
+    try:
+        return (tid, int(fire)) if tid else None
+    except ValueError:
+        return None
+
+
+def cluster_join_verdict_proves(transition_id: str | None) -> bool:
+    """Whether the sidecar's current verdict was written by the join fired for
+    ``transition_id`` (#1903): that id was recorded at fire time and the sidecar
+    has been written since."""
+    if not transition_id:
+        return False
+    fired = _read_cluster_join_transition()
+    sidecar = _read_cluster_join_sidecar()
+    if fired is None or sidecar is None:
+        return False
+    return fired[0] == transition_id and sidecar[2] >= fired[1]
+
+
+# #1903 — how much older than the promote a same-seed ``ready`` must be before
+# the supervisor treats it as a previous membership's and fires the join over
+# it. The two ages are taken a heartbeat's latency apart, so a margin keeps a
+# ``ready`` written around the promote on the side of "report, don't act".
+_CLUSTER_JOIN_STALE_MARGIN_S = 10.0
+
+
+def cluster_join_state_age_s() -> float | None:
+    """Seconds since the host runner last wrote the join sidecar, on THIS node's
+    clock (#1903). None when there is no sidecar, or when its mtime is in the
+    future (the clock stepped back): an age we cannot trust proves nothing."""
+    if detect_deployment_kind() != "appliance":
+        return None
+    sidecar = _read_cluster_join_sidecar()
+    if sidecar is None:
+        return None
+    age_ns = time.time_ns() - sidecar[2]
+    if age_ns < 0:
+        return None
+    return age_ns / 1e9
+
+
+def _cluster_join_ready_predates_promote(
+    transition_id: str | None, transition_age_s: float | None
+) -> bool:
+    """Whether the sidecar's verdict PROVABLY predates the promote naming
+    ``transition_id`` (#1903) — the only case in which the join may be fired over
+    a ``ready`` for the same seed.
+
+    Proof needs both ages: the control plane's (seconds since the promote) and
+    this node's (seconds since the runner wrote the sidecar), each a duration on
+    its own clock. Anything less is ambiguous and the answer is no: a re-fire
+    over a working membership is what the #590 guard exists to prevent, and a
+    node joined by a supervisor that predates the fire record (upgraded before
+    its ``ready`` was applied) holds no record for the id while its ``ready`` is
+    perfectly fresh."""
+    if not transition_id or transition_age_s is None:
+        return False
+    try:
+        promote_age = float(transition_age_s)
+    except (TypeError, ValueError):
+        return False
+    if cluster_join_verdict_proves(transition_id):
+        return False
+    age = cluster_join_state_age_s()
+    if age is None:
+        return False
+    return age > promote_age + _CLUSTER_JOIN_STALE_MARGIN_S
+
+
+def reported_cluster_transition_id(desired_transition_id: str | None) -> str | None:
+    """The ``cluster_transition_id`` a heartbeat reports with the join state
+    (#1903): the id of the join fired, or ``""`` when the verdict being reported
+    is not that join's. None only off-appliance. Read from the fire record, not
+    from the heartbeat response, because the report is built before the response
+    that carries the new promote's id has been read."""
+    if detect_deployment_kind() != "appliance":
+        return None
+    fired = _read_cluster_join_transition()
+    sidecar = _read_cluster_join_sidecar()
+    if fired is None or sidecar is None or sidecar[2] < fired[1]:
+        return ""
+    return fired[0]
+
+
 def maybe_fire_cluster_join(
     desired_cluster_role: str | None,
     server_url: str | None,
     join_token: str | None,
+    transition_id: str | None = None,
+    transition_age_s: float | None = None,
 ) -> bool:
     """Write the cluster-join trigger when the control plane asks this
     node to join the k3s control-plane cluster as a server.
@@ -1784,18 +2514,31 @@ def maybe_fire_cluster_join(
     if state == "joining":
         # Runner is mid-flight: it renames the trigger BEFORE it finishes.
         return False
-    if state == "ready" and (target or "") == server_url:
+    if (
+        state == "ready"
+        and (target or "") == server_url
+        and not _cluster_join_ready_predates_promote(transition_id, transition_age_s)
+    ):
         # Already a member of this exact seed. The backend clears the
         # desired-state once it sees the ``ready`` heartbeat; until then,
-        # firing again would wipe the identity we just built.
+        # firing again would wipe the identity we just built. (#1903 — unless
+        # the ``ready`` provably predates the promote now asking: a box Replace
+        # evicted that is still up keeps one for ever, and skipping on it left
+        # a re-promote with no join. Ambiguity keeps the skip.)
         return False
     # Failure ceiling. The runner renames a failed trigger out of the way, so
     # trigger-file presence alone can't stop a doomed join from re-wiping this
     # node's k3s state on every heartbeat. Budget is per target: a promote
     # against a different seed (or a re-promote after the ledger is reset)
-    # starts over.
+    # starts over. #1212 — re-fires against the same target are spaced
+    # (1, 2, then 4 minutes apart), so they cover the backend's retry window.
     fingerprint = _join_target_fingerprint(server_url, join_token)
-    if not _cluster_transition_should_fire(_CLUSTER_JOIN_TRIGGER_FILE, fingerprint):
+    if not _cluster_transition_should_fire(
+        _CLUSTER_JOIN_TRIGGER_FILE,
+        fingerprint,
+        max_attempts=_CLUSTER_JOIN_MAX_ATTEMPTS,
+        retry_delay_s=_cluster_join_retry_delay_s,
+    ):
         return False
     try:
         _CLUSTER_JOIN_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -1804,7 +2547,7 @@ def maybe_fire_cluster_join(
         )
         # The join token is a control-plane-admin-equivalent secret; write
         # it owner-only atomically (see _write_owner_only) so it can't be
-        # read by another unprivileged user out of the 1777-sticky dir.
+        # read by another writer of the shared, sticky release-state dir.
         _write_owner_only(tmp, f"{_CLUSTER_JOIN_CONFIRM}\n{server_url}\n{join_token}\n")
         tmp.replace(_CLUSTER_JOIN_TRIGGER_FILE)
     except OSError:
@@ -1813,6 +2556,13 @@ def maybe_fire_cluster_join(
     # dir) must not block the join — the backend's clear-on-failed is the
     # primary brake; this is the backstop.
     _record_cluster_transition_fire(_CLUSTER_JOIN_TRIGGER_FILE, fingerprint)
+    if transition_id:
+        try:
+            tmp = _CLUSTER_JOIN_TRANSITION.with_name(_CLUSTER_JOIN_TRANSITION.name + ".new")
+            _write_owner_only(tmp, f"{transition_id}\t{time.time_ns()}\n")
+            tmp.replace(_CLUSTER_JOIN_TRANSITION)
+        except OSError:
+            log.warning("supervisor.cluster_join.transition_record_failed")
     return True
 
 
@@ -1828,10 +2578,12 @@ def maybe_fire_cluster_leave(desired_cluster_role: str | None) -> bool:
     #590 — the leave is exactly as destructive as the join (``do_leave``
     runs the same full ``backup_and_wipe_identity`` + k3s restart) and the
     runner renames a failed leave trigger to ``.failed.<ts>`` just like the
-    join. So it gets the same per-target attempt ceiling; without it a
-    demote that can never come Ready re-wipes this node's k3s state on
-    every heartbeat, forever, whenever the control plane isn't around to
-    clear the desired-state.
+    join. So it gets the same kind of per-target attempt ceiling (its own,
+    ``_CLUSTER_LEAVE_MAX_ATTEMPTS``, with none of the join's #1212 retry
+    spacing: the backend clears a failed leave at once, so there is no
+    window to spread attempts across); without it a demote that can never
+    come Ready re-wipes this node's k3s state on every heartbeat, forever,
+    whenever the control plane isn't around to clear the desired-state.
     """
     if detect_deployment_kind() != "appliance":
         return False
@@ -1849,7 +2601,9 @@ def maybe_fire_cluster_leave(desired_cluster_role: str | None) -> bool:
     # A leave has no target coordinates, so the whole operation is one
     # fingerprint — the budget bounds "this node's demote", period.
     fingerprint = "leave"
-    if not _cluster_transition_should_fire(_CLUSTER_LEAVE_TRIGGER_FILE, fingerprint):
+    if not _cluster_transition_should_fire(
+        _CLUSTER_LEAVE_TRIGGER_FILE, fingerprint, max_attempts=_CLUSTER_LEAVE_MAX_ATTEMPTS
+    ):
         return False
     try:
         _CLUSTER_LEAVE_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -2951,9 +3705,17 @@ def read_host_disk_partitions() -> list[dict[str, object]]:
     """statvfs the reachable host partitions → used/total bytes per mount.
 
     Powers the Cluster → Overview node cards (#402). Each entry:
-    ``{"mount", "label", "total_bytes", "used_bytes"}`` — ``df``-style, where
-    ``used = (blocks - free) * fragment_size``. Returns the partitions that
-    could be statvfs'd (skips any whose mount isn't present in this pod).
+    ``{"mount", "label", "total_bytes", "used_bytes", "available_bytes"}`` —
+    ``df``-style, where ``used = (blocks - free) * fragment_size``. Returns
+    the partitions that could be statvfs'd (skips any whose mount isn't
+    present in this pod).
+
+    ``available_bytes`` is ``f_bavail``: what a non-root writer can still
+    use, which is what the kubelet's ``nodefs.available`` eviction signal
+    measures (#2400). It is NOT ``total - used``: ext4 reserves 5 % for
+    root by default (the installer's ``mkfs.ext4`` keeps that default), so
+    on a 15 GB ``/var`` ``total - used`` overstates the kubelet's headroom
+    by ~750 MB — the difference between "fine" and "evicting".
     """
     out: list[dict[str, object]] = []
     for mount, label, path in _DISK_TARGETS:
@@ -2971,6 +3733,7 @@ def read_host_disk_partitions() -> list[dict[str, object]]:
                 "label": label,
                 "total_bytes": int(total),
                 "used_bytes": int(used),
+                "available_bytes": int(st.f_bavail * st.f_frsize),
             }
         )
     return out
@@ -4079,6 +4842,10 @@ def collect() -> dict[str, object]:
     # upgrade is in-flight / failed / awaiting-reboot (done). For idle
     # appliances ship empty so a stale tail/progress is cleared; None
     # off-appliance so the backend leaves the columns alone.
+    if is_appliance:
+        last_state, last_state_at = _settle_staged_upgrade(
+            last_state, last_state_at, current_slot, is_trial_boot
+        )
     _show_progress = is_appliance and last_state in ("in-flight", "failed", "done")
     if not is_appliance:
         last_upgrade_log_tail = None
@@ -4091,6 +4858,9 @@ def collect() -> dict[str, object]:
         last_upgrade_progress = {}
 
     slot_a_version, slot_b_version = read_slot_versions()
+    next_boot_ran_slot, next_boot_ran_boot_id = (
+        read_set_next_boot_ran() if is_appliance else (None, None)
+    )
     cluster_health = read_cluster_health() if is_appliance else None
     # #402 — fold host disk partitions into the cluster_health dict (stored
     # verbatim by the backend; no schema change). Only on appliance hosts;
@@ -4167,6 +4937,18 @@ def collect() -> dict[str, object]:
         "slot_a_version": slot_a_version,
         "slot_b_version": slot_b_version,
         "is_trial_boot": is_trial_boot,
+        # #1446 — which boot this heartbeat comes from. The control plane
+        # retires a reboot request when a heartbeat arrives from a
+        # different boot, instead of on a 15 s stopwatch that could expire
+        # before the request was ever delivered.
+        "boot_id": read_boot_id() if is_appliance else None,
+        # #3008 — a console F9 cancelled a reboot in this boot.
+        "reboot_cancelled_boot_id": read_reboot_cancel() if is_appliance else None,
+        # #3284: the Boot once this node ran for the standing request and the
+        # boot it ran in. Run in an earlier boot than ``boot_id``, it was spent
+        # by the reboot since, and the control plane retires the request.
+        "next_boot_ran_slot": next_boot_ran_slot,
+        "next_boot_ran_boot_id": next_boot_ran_boot_id,
         "last_upgrade_state": last_state,
         "last_upgrade_state_at": last_state_at.isoformat() if last_state_at else None,
         # #386 Part C — full upgrade status for the Fleet UI.
@@ -4243,6 +5025,9 @@ def collect() -> dict[str, object]:
         "k3s_join_token": read_k3s_join_token() if is_appliance else None,
         "cluster_join_state": (read_cluster_join_state()[0] if is_appliance else None),
         "cluster_join_reason": (read_cluster_join_state()[1] if is_appliance else None),
+        # #1903 — which promote that verdict belongs to; see the function.
+        "cluster_transition_id": reported_cluster_transition_id(None),
+        "cluster_join_state_age_s": cluster_join_state_age_s() if is_appliance else None,
         # #272 Phase 7b — the node's real routable InternalIP. The
         # promote endpoint builds the k3s join URL from the seed's
         # node_ip; ``last_seen_ip`` is the supervisor POD IP (10.42.x.x),

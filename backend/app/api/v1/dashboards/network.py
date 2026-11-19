@@ -24,11 +24,12 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy import func, select
 
-from app.api.deps import DB, CurrentUser  # noqa: F401 — auth via dep
+from app.api.deps import DB, CurrentUser
+from app.core.permissions import require_any_permission, user_has_permission
 from app.models.asn import ASN, ASNRpkiRoa
 from app.models.circuit import Circuit
 from app.models.network_service import NetworkService, NetworkServiceResource
@@ -82,6 +83,20 @@ class OverlayImpactRow(BaseModel):
     note: str
 
 
+class NetworkWithheld(BaseModel):
+    """Which panels the server emptied because the caller may not read them.
+
+    A withheld panel's counts are zeros and its lists empty; this is what
+    tells that apart from a real all-clear (#3449). ASN drift and the RPKI
+    KPIs share the ``manage_asns`` grant, so both ride ``asn``.
+    """
+
+    asn: bool = False
+    circuit: bool = False
+    service: bool = False
+    overlay: bool = False
+
+
 class NetworkDashboardSummary(BaseModel):
     """Headline counts + top-N detail rows per panel.
 
@@ -92,6 +107,8 @@ class NetworkDashboardSummary(BaseModel):
 
     generated_at: datetime
 
+    withheld: NetworkWithheld = NetworkWithheld()
+
     asn_drift_count: int
     rpki_expiring_count: int
     rpki_expired_count: int
@@ -99,6 +116,12 @@ class NetworkDashboardSummary(BaseModel):
     # distinguish a real all-clear from stale or absent data (#942).
     rpki_total_count: int
     rpki_last_checked_at: datetime | None
+    # ROAs whose certificate lifetime is actually known (#3557). Only a
+    # source in ``_LIFETIME_VALIDITY_SOURCES`` that ships ``notAfter`` fills
+    # it; neither Cloudflare's dump nor RIPE's export does, so 0 here means
+    # the expiring / expired counts are not measured, not that nothing
+    # expires.
+    rpki_expiry_known_count: int
     circuit_term_expiring_count: int
     circuit_status_changed_count: int
     service_orphan_count: int
@@ -135,11 +158,29 @@ async def _resolve_asn_number(db: Any, asn_id: Any) -> int | None:
 # ── Route ───────────────────────────────────────────────────────────
 
 
-@router.get("/network/summary", response_model=NetworkDashboardSummary)
-async def network_summary(
-    db: DB, current_user: CurrentUser  # noqa: ARG001 — auth via DI
-) -> NetworkDashboardSummary:
-    """Single-shot rollup for the Network dashboard tab."""
+@router.get(
+    "/network/summary",
+    response_model=NetworkDashboardSummary,
+    # The rollup draws on ASNs, circuits, services and overlays, so it needs
+    # read on at least one of the resource types those routers gate on.
+    dependencies=[
+        Depends(
+            require_any_permission(
+                ("read", "manage_asns"),
+                ("read", "circuit"),
+                ("read", "network_service"),
+                ("read", "overlay_network"),
+            )
+        )
+    ],
+)
+async def network_summary(db: DB, current_user: CurrentUser) -> NetworkDashboardSummary:
+    """Single-shot rollup for the Network dashboard tab.
+
+    Each panel is filled only for a caller who may read its resource type
+    through that resource's own router; the others come back empty, so the
+    rollup never shows more than those routes would.
+    """
     now = datetime.now(UTC)
 
     # ASN drift — count + detail.
@@ -191,6 +232,18 @@ async def network_summary(
     rpki_last_checked_at = (
         await db.execute(select(func.max(ASNRpkiRoa.last_checked_at)))
     ).scalar_one()
+    from app.models.settings import PlatformSettings  # noqa: PLC0415
+    from app.tasks.rpki_roa_refresh import _LIFETIME_VALIDITY_SOURCES  # noqa: PLC0415
+
+    ps = await db.get(PlatformSettings, 1)
+    rpki_source = ((ps.rpki_roa_source if ps is not None else None) or "cloudflare").lower()
+    rpki_expiry_known_count = 0
+    if rpki_source in _LIFETIME_VALIDITY_SOURCES:
+        rpki_expiry_known_count = (
+            await db.execute(
+                select(func.count()).select_from(ASNRpkiRoa).where(ASNRpkiRoa.valid_to.is_not(None))
+            )
+        ).scalar_one()
     rpki_expiring: list[RpkiRoaRow] = []
     for r in expiring_rows[:_DETAIL_LIMIT]:
         asn_number = await _resolve_asn_number(db, r.asn_id)
@@ -218,7 +271,7 @@ async def network_summary(
                 select(Circuit)
                 .where(Circuit.deleted_at.is_(None))
                 .where(Circuit.term_end_date.is_not(None))
-                .where(Circuit.term_end_date <= today)
+                .where(Circuit.term_end_date < today)  # end date is inclusive
                 .where(Circuit.status != "decom")
             )
         )
@@ -352,13 +405,14 @@ async def network_summary(
     overlay_impact = overlay_impact[:_DETAIL_LIMIT]
     overlay_impacted_count = sum(1 for _ in overlay_impact)
 
-    return NetworkDashboardSummary(
+    summary = NetworkDashboardSummary(
         generated_at=now,
         asn_drift_count=asn_drift_count,
         rpki_expiring_count=len(expiring_rows),
         rpki_expired_count=len(expired_rows),
         rpki_total_count=rpki_total_count,
         rpki_last_checked_at=rpki_last_checked_at,
+        rpki_expiry_known_count=rpki_expiry_known_count,
         circuit_term_expiring_count=circuit_term_expiring_count,
         circuit_status_changed_count=circuit_status_changed_count,
         service_orphan_count=service_orphan_count,
@@ -369,3 +423,37 @@ async def network_summary(
         orphan_services=orphan_services,
         overlay_impact=overlay_impact,
     )
+    return _mask_unreadable_panels(summary, current_user)
+
+
+def _mask_unreadable_panels(summary: NetworkDashboardSummary, user: Any) -> NetworkDashboardSummary:
+    """Empty every panel ``user`` may not read (ASN + RPKI share ``manage_asns``).
+
+    Each emptied panel is flagged in ``summary.withheld`` so a client never
+    reads the zeros as an all-clear (#3449).
+    """
+    summary.withheld = NetworkWithheld()
+    if not user_has_permission(user, "read", "manage_asns"):
+        summary.withheld.asn = True
+        summary.asn_drift_count = 0
+        summary.asn_drift = []
+        summary.rpki_expiring_count = 0
+        summary.rpki_expired_count = 0
+        summary.rpki_total_count = 0
+        summary.rpki_last_checked_at = None
+        summary.rpki_expiry_known_count = 0
+        summary.rpki_expiring = []
+    if not user_has_permission(user, "read", "circuit"):
+        summary.withheld.circuit = True
+        summary.circuit_term_expiring_count = 0
+        summary.circuit_status_changed_count = 0
+        summary.circuit_alerts = []
+    if not user_has_permission(user, "read", "network_service"):
+        summary.withheld.service = True
+        summary.service_orphan_count = 0
+        summary.orphan_services = []
+    if not user_has_permission(user, "read", "overlay_network"):
+        summary.withheld.overlay = True
+        summary.overlay_impacted_count = 0
+        summary.overlay_impact = []
+    return summary

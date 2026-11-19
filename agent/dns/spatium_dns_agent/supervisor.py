@@ -22,8 +22,9 @@ from .drivers.bind9 import Bind9Driver
 from .drivers.powerdns import PowerDNSDriver
 from .drivers.technitium import TechnitiumDriver
 from .heartbeat import HeartbeatClient
-from .ingest import IngestWorker
+from .ingest import IngestWorker, PowerDNSIngestWorker
 from .metrics import MetricsPoller
+from .oom_watch import STABLE_SECONDS, OomWatch, cgroup_memory_limit_bytes, is_oom_status
 from .query_log_shipper import QueryLogShipper
 from .spool import SpoolManager
 from .sync import SyncLoop
@@ -78,9 +79,16 @@ def build_spool_manager(cfg: AgentConfig) -> SpoolManager:
     return manager
 
 
-def _clear_deferred_status(heartbeat) -> None:
+def _clear_deferred_status(heartbeat, oom: OomWatch | None = None) -> None:
     if heartbeat.daemon_status.get("reason") == DEFERRED_DAEMON_STATUS["reason"]:
-        heartbeat.daemon_status = {"status": "ok"}
+        # An OOM record (#1725) outlives the deferral: the daemon being
+        # launched is not the daemon surviving its config.
+        oom_status = oom.daemon_status() if oom is not None else None
+        heartbeat.daemon_status = oom_status or {"status": "ok"}
+
+
+#: The process each daemon-managing driver supervises, for the OOM reason.
+_DAEMON_NAMES = {"bind9": "named", "powerdns": "pdns_server", "technitium": "Technitium"}
 
 
 def _select_driver(cfg: AgentConfig) -> DriverBase:
@@ -106,7 +114,25 @@ def run(cfg: AgentConfig) -> int:
     driver = _select_driver(cfg)
     spools = build_spool_manager(cfg)
     heartbeat = HeartbeatClient(cfg, token_ref, driver=driver, spool_manager=spools)
-    syncer = SyncLoop(cfg, token_ref, driver, heartbeat)
+    # #4139 — name this process to the control plane BEFORE the sync loop's
+    # boot apply below, so the server stops reading the previous process's
+    # ``ok`` at once rather than at the first poll after the apply.
+    heartbeat.announce()
+    # #1725 — the OOM-kill baseline is read before anything can start the
+    # daemon (the sync loop's cache bootstrap below may), so a kill during
+    # that first apply still counts.
+    oom = OomWatch(
+        cfg.state_dir,
+        daemon=_DAEMON_NAMES.get(cfg.driver, cfg.driver),
+        limit_bytes=cgroup_memory_limit_bytes(),
+    )
+    syncer = SyncLoop(cfg, token_ref, driver, heartbeat, oom_watch=oom)
+    # The daemon was killed by the container's memory limit on an earlier
+    # run: say so from the first heartbeat on, so a crash loop does not read
+    # ``ok`` between restarts. A verdict the sync bootstrap set stands.
+    oom_status = oom.daemon_status()
+    if oom_status is not None and not heartbeat.daemon_status:
+        heartbeat.daemon_status = oom_status
 
     # Spawn daemon before threads so the first poll can reload it if needed
     driver.start_daemon()
@@ -134,8 +160,8 @@ def run(cfg: AgentConfig) -> int:
         query_log = QueryLogShipper(cfg, token_ref, spool=spools.get("query_log"))
         rndc_status = RndcStatusPoller(cfg, token_ref)
         # Ingest-back for externally-injected DDNS records (issue #641).
-        # BIND9 only — AXFRs dynamic zones from loopback and ships unknown
-        # records to the control plane.
+        # AXFRs dynamic zones from loopback and ships unknown records to
+        # the control plane. (PowerDNS runs its own variant, #1524.)
         ingest = IngestWorker(cfg, token_ref)
         threads.extend(
             [
@@ -156,8 +182,16 @@ def run(cfg: AgentConfig) -> int:
         query_log = QueryLogShipper(
             cfg, token_ref, path=pdns_log_path, spool=spools.get("query_log")
         )
+        # Ingest-back for externally-injected DDNS records (issues #641 /
+        # #1524) — reads dynamic zones back over the loopback REST API
+        # and ships unknown records to the control plane, closing the
+        # loop the BIND9 worker already closed via AXFR.
+        ingest = PowerDNSIngestWorker(cfg, token_ref)
         threads.append(
             threading.Thread(target=query_log.run, name="query-log", daemon=True),
+        )
+        threads.append(
+            threading.Thread(target=ingest.run, name="ingest", daemon=True),
         )
     # technitium: no query-log thread in v1 — Technitium's query logging is
     # API/DB-backed (``/api/logs/query*``), not a tailable text file like
@@ -214,6 +248,7 @@ def run(cfg: AgentConfig) -> int:
     # after ``start_daemon`` deferred), not from the tick that first noticed
     # it: the re-log then reads 1, 2, 4, 8 … s, the schedule's own numbers.
     loop_started = time.monotonic()
+    up_since: float | None = None
     waiting = False
     waiting_ticks = 0
     while not stopping.is_set():
@@ -244,7 +279,16 @@ def run(cfg: AgentConfig) -> int:
                     )
                     waiting = False
                     waiting_ticks = 0
-                    _clear_deferred_status(heartbeat)
+                    _clear_deferred_status(heartbeat, oom)
+                # #1725 — the OOM record clears only once the daemon has stayed
+                # up longer than a crash loop's back-off.
+                if up_since is None:
+                    up_since = time.monotonic()
+                elif oom.record and time.monotonic() - up_since >= STABLE_SECONDS:
+                    log.info("dns_daemon_oom_record_cleared", stable_s=STABLE_SECONDS)
+                    oom.clear()
+                    if is_oom_status(heartbeat.daemon_status):
+                        heartbeat.daemon_status = {"status": "ok"}
                 # #1067 — a daemon that is up, and about which nothing else has
                 # been said, is ``ok``. Until now a normal boot (rendered config
                 # present, ``named`` started at once) left ``daemon_status`` as
@@ -269,13 +313,30 @@ def run(cfg: AgentConfig) -> int:
                     driver.daemon_restarting() or driver.daemon_running()
                 ):
                     log.error("dns_daemon_exited", driver=cfg.driver)
+                    # #2019 — the agent outlived the daemon: a watched death,
+                    # the evidence a bundle needs before it is quarantined
+                    # (an unexplained end of the whole process is not).
+                    # #3552 — and whether the OOM killer did it, so the
+                    # restarted agent names it on the apply verdict too (the
+                    # cgroup counter does not survive the container restart).
+                    oom_killed = oom.fired()
+                    syncer.note_daemon_death(oom_killed=oom_killed)
+                    if oom_killed:
+                        # Persisted before the exit, so the restarted agent
+                        # reports it (#1725).
+                        oom.note_daemon_killed()
                     return 2
             elif driver.daemon_restarting():
                 pass  # ``daemon_pid`` cleared mid-restart: not a deferred start
             else:
                 if not waiting:
                     waiting = True
-                    heartbeat.daemon_status = dict(DEFERRED_DAEMON_STATUS)
+                    # #2019 — a start the sync loop deferred on purpose (the
+                    # cached bundle held back after the daemon died on it)
+                    # already carries the reason; "no bundle yet" would hide it.
+                    reason = str(heartbeat.daemon_status.get("reason") or "")
+                    if not reason.startswith("config_apply_"):
+                        heartbeat.daemon_status = dict(DEFERRED_DAEMON_STATUS)
                 waiting_ticks += 1
                 if wait_log_due(waiting_ticks):
                     log.info(
@@ -285,15 +346,19 @@ def run(cfg: AgentConfig) -> int:
                         note="start_daemon spawned nothing (no rendered config yet); "
                         "the sync loop launches the daemon after the first bundle",
                     )
-        # If any critical thread died (e.g. the sync loop dropped its
-        # token after a 401/404 and self-stopped), exit so the container
-        # orchestrator restarts us — bootstrap then re-registers from
-        # PSK with a fresh empty token cache.
+        # If any critical thread died, exit so the container orchestrator
+        # restarts us. A 401/404 is not a death: the sync and heartbeat
+        # threads re-register in process (#2052), so the daemon serving from
+        # cache is never taken down for one.
         dead = [t.name for t in threads if not t.is_alive()]
         if dead and not stopping.is_set():
             log.error("dns_agent_thread_died", threads=dead)
+            # #2019 — the agent chose this exit; whatever bundle is still
+            # settling did not kill the daemon, so it is not counted as a death.
+            syncer.note_orderly_exit()
             return 2
 
+    syncer.note_orderly_exit()
     log.info("dns_agent_exiting")
     return 0
 

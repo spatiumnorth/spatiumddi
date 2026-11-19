@@ -226,11 +226,16 @@ async def test_agent_based_stale_delete_keeps_the_row_only_when_the_op_failed(
     await db_session.commit()
 
     real = record_ops.enqueue_record_ops_batch
+    # The handler loads the stale records without an ORDER BY, so which
+    # record the first op belongs to is up to Postgres. Remember the one
+    # that failed rather than assuming it is ids[0].
+    failed_names: list[str] = []
 
     async def _first_fails(db, z, ops):  # noqa: ANN001
         rows = await real(db, z, ops)
         rows[0].state = "failed"
         rows[0].last_error = "REFUSED"
+        failed_names.append(rows[0].record["name"])
         return rows
 
     # ``_apply_dns_sync`` imports the name locally at call time, so the module
@@ -249,4 +254,4 @@ async def test_agent_based_stale_delete_keeps_the_row_only_when_the_op_failed(
 
     db_session.expire_all()
     left = (await db_session.execute(select(DNSRecord).where(DNSRecord.id.in_(ids)))).scalars()
-    assert [r.id for r in left] == [ids[0]]
+    assert [r.name for r in left] == failed_names

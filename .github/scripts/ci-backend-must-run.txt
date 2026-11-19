@@ -55,6 +55,10 @@ agent/dhcp/spatium_dhcp_agent/metrics.py
 # that its output still goes through app.openapi()'s wrapper.
 scripts/export_openapi.py
 
+# test_seed_demo_templates.py (#1465) pins that the demo seeder's IPAM template
+# payloads validate against the API's own request model.
+scripts/seed_demo.py
+
 # test_merge_test_durations.py (#1019) loads the shard-durations merge the
 # aggregator runs, and pins that a partial or malformed shard file is refused
 # rather than published as the file the next release balances the shards with.
@@ -67,6 +71,18 @@ scripts/merge_test_durations.py
 # scan test above requires every declared read to be covered here, and a
 # future widening of the deny-list must not silently drop this one.
 scripts/lint_versions.py
+
+# test_lint_docs_drift.py (#3414) loads the weekly docs drift check and pins
+# one failure per check kind plus the refusals (empty inventory, dead
+# allowlist entry, missing manifest) over a synthetic tree. It never reads the
+# real diagrams, which are known to carry drift while #3413 fixes them.
+scripts/lint_docs_drift.py
+
+# test_check_blocklist_catalog.py (#3522) loads the monthly blocklist-catalog
+# feed check (and, through it, backend/app/services/dns_blocklist_parse.py)
+# and pins one finding per failure shape -- dead URL, HTML page, shrunken,
+# reformatted, skip share, upstream diff -- over fixtures, with no network.
+scripts/check_blocklist_catalog.py
 
 # test_lint_workflow_shell.py (#1036) loads the workflow shell-status guard
 # and pins it against the real pre-fix trivy-scheduled.yml body, plus the
@@ -85,6 +101,11 @@ scripts/lint_image_upgrades.py
 # published, the previous release across the CalVer → SemVer switch, and
 # whether a tag becomes :latest.
 scripts/release_version.py
+
+# test_changelog_assemble.py loads the script that folds changelog
+# fragments into CHANGELOG.md (#2431): release prep runs it, and
+# release.yml's --pending gate calls it.
+scripts/changelog_assemble.py
 
 # test_format_release_notes.py loads the release-body formatter and pins the
 # two ways it can break a release: notes over GitHub's 125,000-character body
@@ -145,6 +166,58 @@ docs/PRIVACY.md
 # the application root rather than under /api/, so without one it falls through
 # to the SPA `location /` and a PBX asking where a phone is gets index.html
 # with a 200 — unreachable in production while every backend test passes.
-# Editing either must therefore run the suite that contains that assertion.
+# `test_acme_client.py` (#3061) asserts the same of the ACME http-01 challenge
+# location. Editing either must therefore run the suite that contains that assertion.
 frontend/default.conf.template
+
+# test_frontend_proxy_trust.py (#1868) executes the FRONTEND_TRUSTED_PROXY_CIDRS renderer
+# and pins that every proxy_set_header X-Forwarded-Proto in both shipped nginx
+# templates goes through the trust map rather than overwriting an outer
+# proxy's value with $scheme.
+frontend/16-trusted-proxies.envsh
+# test_frontend_http_port_3852.py (#3852) executes the listen-port renderer the template uses.
+frontend/14-http-port.envsh
+# test_frontend_ipv6_2308.py (#2308) executes the IPv6 renderer the same templates use.
+frontend/17-ipv6.envsh
 charts/spatiumddi/templates/frontend-tls-config.yaml
+
+# test_ipam_bulk_allocate_template_vectors_2071.py (#2071) runs the server's
+# bulk-allocate hostname rule over the vectors the console's live preview is
+# tested against; editing them must run the backend half, or the two sides
+# could disagree with only the frontend job noticing.
+frontend/src/lib/bulk-allocate-template.vectors.json
+# test_delete_cascade_copy_4143.py (#4143) walks the FK cascade graph against
+# the delete dialogs' registry.
+frontend/src/lib/delete-cascade.json
+
+# test_grant_vocabulary_covers_routes_3119.py (#3119) checks that the grant
+# vocabulary the role editor offers holds every resource type the routes,
+# copilot tools and search providers check. Dropping a type there is a
+# frontend-only edit, so without this the backend half would not run on it.
+frontend/src/lib/permissionVocabulary.ts
+
+# test_frontend_tls_reload_1173.py (#1173) executes the frontend's TLS reload
+# watcher, and checks the Dockerfile copies it in and the chart's frontend
+# Deployment no longer rolls on a certificate change.
+frontend/40-tls-reload-watch.sh
+frontend/Dockerfile
+charts/spatiumddi/templates/frontend.yaml
+
+# test_rolling_upgrade_redis_master_2815.py (#2815) reads the worker's
+# liveness probe from both manifests: it must run app.worker_liveness with a
+# broker grace that stays bounded, and the two must agree.
+charts/spatiumddi/templates/worker.yaml
+k8s/base/worker.yaml
+
+# test_api_graceful_shutdown.py (#2944) pins uvicorn's graceful-shutdown
+# timeout below every grace period that stops the api: the manifests, the chart
+# template and the compose files.
+charts/spatiumddi/templates/api.yaml
+k8s/base/api.yaml
+docker-compose.yml
+docker-compose.dev.yml
+
+# test_check_contributors.py runs the weekly README Contributors check's
+# script as a subprocess, so editing it (or its ignore list) must run it.
+.github/scripts/check_contributors.py
+.github/contributors-ignore.txt

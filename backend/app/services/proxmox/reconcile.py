@@ -41,7 +41,22 @@ from app.core.crypto import decrypt_str
 from app.models.audit import AuditLog
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.proxmox import ProxmoxNode
-from app.services.integration_ownership import owned_by_other_integration, owning_integration
+from app.services._mirror_hostname import normalize_desired_hostname
+from app.services.dns.record_ops import retract_address_dns
+from app.services.integration_ownership import (
+    SpaceRelease,
+    address_taken,
+    addresses_in_space,
+    drop_wrapper_block,
+    gateway_changed,
+    move_stays_in_space,
+    owned_addresses_in_space,
+    owned_by_other_integration,
+    owning_integration,
+    refuse_sync_into_trashed_space,
+    retire_vanished_subnet,
+)
+from app.services.ipam.utilization import counts_toward_utilization
 from app.services.proxmox.client import (
     ProxmoxClient,
     ProxmoxClientError,
@@ -85,6 +100,9 @@ class _DesiredAddress:
     description: str
     mac: str | None = None
 
+    def __post_init__(self) -> None:
+        normalize_desired_hostname(self)
+
 
 @dataclass
 class ReconcileSummary:
@@ -109,7 +127,16 @@ class ReconcileSummary:
     addresses_updated: int = 0
     addresses_deleted: int = 0
     skipped_no_subnet: int = 0
+    # #1559 — per-pass counts of guests whose config fetch failed and
+    # PVE nodes skipped as not-online (with include_stopped armed).
+    # Non-zero means the guest read was incomplete, so the address
+    # absence-delete was skipped for the pass.
+    unreadable_guests: int = 0
+    unreadable_nodes: int = 0
     warnings: list[str] = field(default_factory=list)
+    # #2577 — what this sync released outside the target's IP space
+    # (``integration_ownership.release_outside_space``).
+    released: SpaceRelease = field(default_factory=SpaceRelease)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -208,7 +235,7 @@ async def _recompute_subnet_utilization(db: AsyncSession, subnet_id: Any) -> Non
             select(func.count())
             .select_from(IPAddress)
             .where(IPAddress.subnet_id == subnet_id)
-            .where(IPAddress.status != "available")
+            .where(counts_toward_utilization())
         )
         or 0
     )
@@ -563,8 +590,13 @@ async def _apply_blocks_and_subnets(
             if vnet_name in extant_vnet_names:
                 used_wrapper_cidrs.add(net_str)
                 continue
-        await db.delete(row)
-        summary.subnets_deleted += 1
+        # #1558 / #3532: a blind delete cascades to every address and DHCP
+        # scope (live or in Trash) on the subnet. Hand it back (un-claim)
+        # when it carries operator content; either way it is audited.
+        if await retire_vanished_subnet(db, row, "proxmox_node_id", warnings=summary.warnings):
+            summary.subnets_updated += 1
+        else:
+            summary.subnets_deleted += 1
 
     for net_str, d in desired_map.items():
         # Issue #177: an operator subnet at this exact CIDR wins. We
@@ -640,7 +672,7 @@ async def _apply_blocks_and_subnets(
             # whatever's already there alone. Operators who manually
             # set the correct upstream gateway on a Proxmox-mirrored
             # subnet shouldn't see it cleared on every sync.
-            if d.gateway and existing.gateway != d.gateway:
+            if gateway_changed(existing.gateway, d.gateway):
                 existing.gateway = d.gateway
                 changed = True
             if existing.total_ips != expected_total:
@@ -655,9 +687,7 @@ async def _apply_blocks_and_subnets(
     for net_str, wrapper in node_owned_wrappers.items():
         if net_str in used_wrapper_cidrs:
             continue
-        refs = await db.execute(select(Subnet).where(Subnet.block_id == wrapper.id))
-        if refs.scalar_one_or_none() is None:
-            await db.delete(wrapper)
+        if await drop_wrapper_block(db, wrapper, "proxmox_node_id", warnings=summary.warnings):
             summary.blocks_deleted += 1
 
 
@@ -676,6 +706,7 @@ async def _apply_addresses(
         .all()
     )
     subnets = list(subnet_rows)
+    space_subnet_ids = {s.id for s in subnets}
 
     # Dedupe by address — a guest with multiple IPs on the same NIC
     # will show up once per IP, but two NICs bridged to the same VLAN
@@ -699,11 +730,9 @@ async def _apply_addresses(
     # with a counter bump so the operator can see the conflict.
     desired_addrs = list(desired_map.keys())
     if desired_addrs:
-        existing = (
-            (await db.execute(select(IPAddress).where(IPAddress.address.in_(desired_addrs))))
-            .scalars()
-            .all()
-        )
+        # #2577 — adoption candidates come from this target's own space
+        # only. The same address in another space is a different host.
+        existing = await addresses_in_space(db, node.ipam_space_id, desired_addrs)
         for row in existing:
             if row.proxmox_node_id == node.id:
                 continue  # already ours
@@ -723,11 +752,18 @@ async def _apply_addresses(
                 row.user_modified_at = datetime.now(UTC)
         await db.flush()
 
-    res = await db.execute(select(IPAddress).where(IPAddress.proxmox_node_id == node.id))
-    current = {str(a.address): a for a in res.scalars().all()}
+    # #2577 — the rows we may update, move and absence-delete: ours AND in
+    # our space. One carrying our FK in another space is released first (#2577).
+    current = {
+        str(a.address): a
+        for a in await owned_addresses_in_space(
+            db, "proxmox_node_id", node.id, node.ipam_space_id, summary=summary
+        )
+    }
 
     dirty_subnets: set[Any] = {s.id for s in subnets if s.proxmox_node_id == node.id}
 
+    gone: list[IPAddress] = []
     for addr, row in current.items():
         if addr not in desired_map:
             dirty_subnets.add(row.subnet_id)
@@ -739,8 +775,12 @@ async def _apply_addresses(
                 row.proxmox_node_id = None
                 summary.addresses_updated += 1
             else:
-                await db.delete(row)
+                gone.append(row)
                 summary.addresses_deleted += 1
+    # #3200 — one retraction for the whole sweep, before the deletes flush.
+    await retract_address_dns(db, [r.id for r in gone])
+    for row in gone:
+        await db.delete(row)
 
     for addr, d in desired_map.items():
         subnet = _find_subnet_for_ip(subnets, d.address)
@@ -753,6 +793,23 @@ async def _apply_addresses(
             # subnet_id is factual (where the address lives); always
             # update regardless of the user-modified lock.
             if row.subnet_id != subnet.id:
+                # #2577 — never re-parent a row across IP spaces.
+                if not move_stays_in_space(row.subnet_id, space_subnet_ids):
+                    summary.warnings.append(
+                        f"address {addr}: current subnet is outside this target's "
+                        f"IP space; not moving"
+                    )
+                    continue
+                # A row another integration (or Proxmox endpoint) owns
+                # may already sit at the target (subnet, address); the
+                # move would hit ``uq_ip_address_subnet_address`` and
+                # roll back the whole sweep. Leave our row where it is.
+                if await address_taken(db, subnet.id, d.address, exclude_id=row.id):
+                    summary.warnings.append(
+                        f"address {addr}: subnet {subnet.network} already has a row "
+                        f"for it; not moving"
+                    )
+                    continue
                 dirty_subnets.add(row.subnet_id)
                 row.subnet_id = subnet.id
                 changed = True
@@ -776,6 +833,12 @@ async def _apply_addresses(
                 dirty_subnets.add(subnet.id)
                 summary.addresses_updated += 1
         else:
+            # Phase 1 claimed every row it may claim; one still sitting
+            # at this (subnet, address) is owned by another integration
+            # or Proxmox endpoint (warned there). Inserting next to it
+            # would hit ``uq_ip_address_subnet_address``.
+            if await address_taken(db, subnet.id, d.address):
+                continue
             db.add(
                 IPAddress(
                     subnet_id=subnet.id,
@@ -1035,8 +1098,14 @@ def _build_discovery_payload(
 
 async def reconcile_node(db: AsyncSession, node: ProxmoxNode) -> ReconcileSummary:
     summary = ReconcileSummary(ok=False)
+    # #2577 — a target whose IP space is in Trash syncs nothing: it would
+    # rebuild its rows as live rows inside the trashed space.
+    if await refuse_sync_into_trashed_space(db, node, summary):
+        return summary
 
     token_secret = ""
+    unreadable_guests: list[str] = []
+    unreadable_nodes: list[str] = []
     if node.token_secret_encrypted:
         try:
             token_secret = decrypt_str(node.token_secret_encrypted)
@@ -1070,6 +1139,13 @@ async def reconcile_node(db: AsyncSession, node: ProxmoxNode) -> ReconcileSummar
             all_guests: list[Any] = []
             for n in pve_nodes:
                 if n.status != "online":
+                    # #1559 — with include_stopped armed, a not-online
+                    # node's (stopped) guests are part of the desired
+                    # set; skipping the node silently would read as
+                    # "all its guests are gone" to the absence-delete.
+                    # Count it as an incomplete read instead.
+                    if node.include_stopped:
+                        unreadable_nodes.append(n.node)
                     continue
                 all_networks.extend(await client.list_networks(n.node))
                 if node.mirror_vms:
@@ -1080,6 +1156,7 @@ async def reconcile_node(db: AsyncSession, node: ProxmoxNode) -> ReconcileSummar
                     all_guests.extend(
                         await client.list_lxc(n.node, include_stopped=node.include_stopped)
                     )
+            unreadable_guests = list(getattr(client, "unreadable_guests", []) or [])
     except ProxmoxClientError as exc:
         summary.error = str(exc)
         node.last_sync_error = summary.error
@@ -1098,8 +1175,44 @@ async def reconcile_node(db: AsyncSession, node: ProxmoxNode) -> ReconcileSummar
         node, all_networks, all_guests, sdn_subnets, sdn_vnets
     )
 
-    await _apply_blocks_and_subnets(db, node, desired_subnets, summary, sdn_vnets)
-    await _apply_addresses(db, node, desired_addresses, summary)
+    # #1559 — when a whole node was not read, its bridge networks are
+    # unknown too, so the subnet absence-delete (whose cascade would
+    # sweep the node's guest addresses with it) is unsafe as well.
+    if unreadable_nodes:
+        logger.warning(
+            "proxmox_reconcile_subnet_pass_skipped_incomplete_read",
+            node=str(node.id),
+            unreadable_nodes=unreadable_nodes,
+        )
+    else:
+        await _apply_blocks_and_subnets(db, node, desired_subnets, summary, sdn_vnets)
+    # #1559 — a guest (or, with include_stopped, a whole node) that could
+    # not be read this pass is indistinguishable from "guest gone" in the
+    # desired set, and its addresses cannot be identified individually —
+    # the config that carries them is exactly what failed. So when any
+    # read was incomplete, skip the address pass entirely (creates AND
+    # deletes) rather than absence-deleting rows for guests that never
+    # went anywhere. They converge again on the next healthy pass.
+    summary.unreadable_guests = len(unreadable_guests)
+    summary.unreadable_nodes = len(unreadable_nodes)
+    if unreadable_guests or unreadable_nodes:
+        summary.warnings.append(
+            "incomplete guest read "
+            f"({len(unreadable_guests)} guest config(s) failed: "
+            f"{', '.join(unreadable_guests) or 'none'}; "
+            f"{len(unreadable_nodes)} node(s) not online: "
+            f"{', '.join(unreadable_nodes) or 'none'}) — address "
+            "absence-delete skipped for this pass so unreadable guests "
+            "keep their mirrored addresses"
+        )
+        logger.warning(
+            "proxmox_reconcile_address_pass_skipped_incomplete_read",
+            node=str(node.id),
+            unreadable_guests=unreadable_guests,
+            unreadable_nodes=unreadable_nodes,
+        )
+    else:
+        await _apply_addresses(db, node, desired_addresses, summary)
 
     node.last_synced_at = datetime.now(UTC)
     node.last_sync_error = None
@@ -1119,6 +1232,8 @@ async def reconcile_node(db: AsyncSession, node: ProxmoxNode) -> ReconcileSummar
             resource_id=str(node.id),
             resource_display=node.name,
             new_value={
+                # #2577 — what the sync released outside the target's IP space.
+                "released": summary.released.as_dict(),
                 "blocks": {
                     "created": summary.blocks_created,
                     "deleted": summary.blocks_deleted,
@@ -1134,6 +1249,8 @@ async def reconcile_node(db: AsyncSession, node: ProxmoxNode) -> ReconcileSummar
                     "updated": summary.addresses_updated,
                     "deleted": summary.addresses_deleted,
                     "skipped_no_subnet": summary.skipped_no_subnet,
+                    "unreadable_guests": summary.unreadable_guests,
+                    "unreadable_nodes": summary.unreadable_nodes,
                 },
             },
         )
@@ -1142,6 +1259,7 @@ async def reconcile_node(db: AsyncSession, node: ProxmoxNode) -> ReconcileSummar
     summary.ok = True
     logger.info(
         "proxmox_reconcile_ok",
+        **summary.released.log_fields(),
         node=str(node.id),
         pve_version=summary.pve_version,
         cluster=summary.cluster_name,

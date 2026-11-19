@@ -31,11 +31,14 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.celery_app import celery_app
 from app.config import settings
+from app.db import task_connect_args
 from app.drivers.dns import get_driver
 from app.models.audit import AuditLog
 from app.models.dns import DNSServer, DNSZone
 from app.models.settings import PlatformSettings
 from app.services.feature_modules import is_module_enabled
+from app.tasks._interval_gate import interval_skip
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -46,10 +49,13 @@ async def _run_sync() -> dict[str, Any]:
     # Deferred imports — keep celery-worker startup light and avoid pulling
     # in the FastAPI router graph.
     from app.services.dns.pull_from_server import (  # noqa: PLC0415
+        non_authoritative_reason,
         sync_zone_with_server,
     )
 
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
     try:
@@ -64,14 +70,9 @@ async def _run_sync() -> dict[str, Any]:
 
             now = datetime.now(UTC)
             interval = timedelta(minutes=max(1, ps.dns_pull_from_server_interval_minutes))
-            if ps.dns_pull_from_server_last_run_at is not None:
-                elapsed = now - ps.dns_pull_from_server_last_run_at
-                if elapsed < interval:
-                    return {
-                        "status": "skipped",
-                        "reason": "interval_not_elapsed",
-                        "wait_seconds": int((interval - elapsed).total_seconds()),
-                    }
+            skip = interval_skip(now, ps.dns_pull_from_server_last_run_at, interval)
+            if skip is not None:
+                return skip
 
             zones = list((await db.execute(select(DNSZone))).scalars().all())
 
@@ -84,15 +85,24 @@ async def _run_sync() -> dict[str, Any]:
             errors: list[str] = []
 
             for zone in zones:
+                # #3758 — forward / stub zones aren't held authoritatively.
+                if non_authoritative_reason(zone) is not None:
+                    continue
                 # Resolve primary for this zone's group and check driver
                 # supports the sync path. Skip silently otherwise —
                 # agent-based drivers just aren't in scope for this
                 # scheduler today.
                 primary_res = await db.execute(
-                    select(DNSServer).where(
+                    select(DNSServer)
+                    .where(
                         DNSServer.group_id == zone.group_id,
                         DNSServer.is_primary.is_(True),
                     )
+                    # A group holding two primaries (#2276's heal racing a
+                    # promotion) must mis-pick, not raise MultipleResultsFound
+                    # out of the whole sweep. Same cap every other lookup uses.
+                    .order_by(DNSServer.created_at, DNSServer.id)
+                    .limit(1)
                 )
                 primary = primary_res.scalar_one_or_none()
                 if primary is None:
@@ -177,6 +187,7 @@ async def _run_sync() -> dict[str, Any]:
 # Celery task name kept stable for backward-compatibility with any deployed
 # beat schedule / in-flight messages from the pull-only era.
 @celery_app.task(name="app.tasks.dns_pull.auto_pull_dns_from_servers", bind=True)
+@module_gated("core.dns")
 def auto_pull_dns_from_servers(self: object) -> dict[str, Any]:  # type: ignore[type-arg]
     """Celery beat entrypoint — fires every 60 s; the task itself checks
     the platform-settings gate and the per-run interval. Runs the full

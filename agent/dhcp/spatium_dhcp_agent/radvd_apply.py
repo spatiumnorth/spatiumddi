@@ -1,9 +1,9 @@
 """Write + reload the managed radvd.conf on the DHCP agent (issue #524).
 
 The control plane renders the full ``radvd.conf`` text and ships it in the DHCP
-ConfigBundle (``radvd_conf``). This module writes it atomically to the managed
-path and asks a running radvd to re-read it (SIGHUP). radvd management is
-opt-in: nothing happens unless ``RADVD_MANAGED=1`` (radvd needs CAP_NET_RAW +
+ConfigBundle (``radvd_conf``). This module stages it, validates it with ``radvd -c``, then
+atomically swaps it into the managed path and asks a running radvd to re-read
+it (SIGHUP). radvd management is opt-in: nothing happens unless ``RADVD_MANAGED=1`` (radvd needs CAP_NET_RAW +
 CAP_NET_ADMIN to emit RAs, and most deployments don't run it), matching the
 default-off posture of the passive sniffers.
 
@@ -46,6 +46,13 @@ def _atomic_write(path: Path, text: str) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(text)
     tmp.replace(path)
+
+
+def _discard(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        log.warning("radvd_staged_cleanup_failed", path=str(path), error=str(exc))
 
 
 def _validate(path: Path) -> bool:
@@ -134,12 +141,23 @@ def apply_radvd(radvd_conf: str | None) -> None:
         _stop()
         return
     path = _config_path()
+    # Stage next to the live file (same filesystem → atomic rename), validate
+    # the STAGED copy, and only then swap it in: a rejected config must never
+    # replace a working one, or radvd would load it on its next start.
+    staged = path.with_name(path.name + ".staged")
     try:
-        _atomic_write(path, radvd_conf)
+        _atomic_write(staged, radvd_conf)
+    except OSError as exc:
+        log.warning("radvd_write_failed", path=str(staged), error=str(exc))
+        return
+    if not _validate(staged):
+        _discard(staged)
+        return
+    try:
+        staged.replace(path)
     except OSError as exc:
         log.warning("radvd_write_failed", path=str(path), error=str(exc))
-        return
-    if not _validate(path):
+        _discard(staged)
         return
     log.info("radvd_config_written", path=str(path))
     _reload()

@@ -38,6 +38,8 @@ import { HeaderButton } from "@/components/ui/header-button";
 import { ListReadError } from "@/components/ui/list-read-error";
 import { pollUnlessRefused } from "@/lib/refusal";
 import { errMsg, inputCls } from "@/pages/dhcp/_shared";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 // Relative "time ago" for the sync/pushed columns. Cheap, no dependency.
 function timeAgo(iso: string): string {
@@ -60,6 +62,13 @@ const PUSH_STATUS_STYLE: Record<BlockPushStatus, string> = {
 };
 
 export function BlockSyncPage() {
+  // #1341 — a read-only user is offered no write it would be refused:
+  // the router asks admin on 'manage_block_sync'.
+  const perms = usePermissions();
+  const adminGate = permissionGate(
+    perms.can("admin", "manage_block_sync"),
+    "Requires admin permission on block sync",
+  );
   const qc = useQueryClient();
 
   const [showArm, setShowArm] = useState<BlockTarget | null>(null);
@@ -182,6 +191,7 @@ export function BlockSyncPage() {
             setPageError(null);
             setShowNewBlock(true);
           }}
+          {...adminGate}
         >
           New block
         </HeaderButton>
@@ -441,7 +451,8 @@ export function BlockSyncPage() {
                           <button
                             type="button"
                             onClick={() => setLiftTarget(b)}
-                            className="inline-flex items-center gap-1 rounded border border-destructive/40 px-2 py-1 text-destructive hover:bg-destructive/10"
+                            className="inline-flex items-center gap-1 rounded border border-destructive/40 px-2 py-1 text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
+                            {...adminGate}
                           >
                             <Ban className="h-3 w-3" />
                             Lift
@@ -844,9 +855,9 @@ function ArmTargetModal({
         )}
 
         {error && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
             {error}
-          </div>
+          </FormError>
         )}
 
         <div className="flex justify-end gap-2 pt-2">
@@ -936,7 +947,11 @@ function RevealModal({
               placeholder="or 6-digit code"
               className={`${inputCls} font-mono`}
             />
-            {error && <p className="text-xs text-destructive">{error}</p>}
+            {error && (
+              <FormError className="text-xs text-destructive">
+                {error}
+              </FormError>
+            )}
             <div className="flex justify-end gap-2 pt-1">
               <button
                 type="button"
@@ -1158,9 +1173,9 @@ function NewBlockModal({
         </div>
 
         {error && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
             {error}
-          </div>
+          </FormError>
         )}
 
         <div className="flex justify-end gap-2 pt-1">

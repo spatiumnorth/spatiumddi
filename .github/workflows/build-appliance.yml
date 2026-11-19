@@ -57,6 +57,14 @@ on:
         required: false
         type: string
         default: amd64
+      ref:
+        description: >-
+          Commit or branch to build. Empty = the caller's own commit (what
+          release.yml and the main nightly want); nightly.yml passes the sha
+          of a release branch here (#3950).
+        required: false
+        type: string
+        default: ""
       artifact_retention_days:
         description: Retention for the appliance-artifacts upload.
         required: false
@@ -99,6 +107,34 @@ jobs:
       slot_name: ${{ steps.slot.outputs.slot_name }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+      # #3950 — a caller-supplied ref must be a full commit sha that is on a
+      # protected branch (main, or release/* under the protect-release
+      # ruleset), so this build — and the caches it writes — can only ever
+      # run reviewed code. An empty ref is the caller's own commit, as before.
+      - name: Refuse a ref that is not on a protected branch
+        if: inputs.ref != ''
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::ref '${REF}' is not a full commit sha"
+            exit 1
+          fi
+          if [ "$(git rev-parse HEAD)" != "$REF" ]; then
+            echo "::error::checked-out HEAD is not ${REF}"
+            exit 1
+          fi
+          on=$(git branch -r --contains "$REF" --format '%(refname:short)' \
+                 | grep -E '^origin/(main|release/[0-9]+\.[0-9]+\.[0-9]+)$' || true)
+          if [ -z "$on" ]; then
+            echo "::error::${REF} is on neither main nor a release/X.Y.Z branch"
+            exit 1
+          fi
+          echo "building ${REF}, on: ${on//$'\n'/ }"
       - name: Log in to GHCR
         uses: docker/login-action@v4
         with:
@@ -125,7 +161,7 @@ jobs:
           {
               echo "APPLIANCE_VERSION=\"${VERSION}\""
               echo "BUILD_TIME=\"$(date -u -Iseconds)\""
-              echo "GIT_SHA=\"${GITHUB_SHA}\""
+              echo "GIT_SHA=\"$(git rev-parse HEAD)\""
               # #1026 — the architecture this rootfs is built FOR, which
               # is what ``spatium-upgrade-slot`` compares against the
               # running node's own ``uname -m`` before it writes a slot.
@@ -149,7 +185,7 @@ jobs:
         # on PATH before the chart-bake step.
         uses: azure/setup-helm@v5
         with:
-          version: v4.3.0
+          version: v4.3.1
       - name: Fetch k3s binary + airgap tarball
         run: |
           set -euo pipefail
@@ -204,19 +240,31 @@ jobs:
           # built a single ``docker-overlay.img`` overlay file via a
           # docker:dind sandbox is gone (no docker on the appliance
           # post-Phase-7).
-          # ``sudo -E`` preserves SPATIUMDDI_VERSION + BAKE_SOURCE +
-          # the two #1026 platform vars from the job env. Without ``-E``, sudo strips them and
-          # bake-images.sh falls back to its ``SPATIUMDDI_VERSION=dev``
-          # / ``BAKE_SOURCE=local`` defaults — which then fails on the
-          # runner with "no local image found" because no :dev tags
-          # exist (the runner pulls from ghcr, not local).
+          # The job env (SPATIUMDDI_VERSION, BAKE_SOURCE and the two
+          # #1026 platform vars) is handed to the script through ``env``,
+          # not ``sudo -E``. Ubuntu 26.04 runners ship sudo-rs, which
+          # ignores ``-E`` ("preserving the entire environment is not
+          # supported"); the script then falls back to its
+          # ``SPATIUMDDI_VERSION=dev`` / ``BAKE_SOURCE=local`` defaults and
+          # fails with "no local image found", since the runner pulls from
+          # ghcr and has no :dev tags. ``env`` sets them itself, under
+          # classic sudo and sudo-rs alike.
           #
           # ``DOCKER_CONFIG=$HOME/.docker`` re-points root's docker CLI
           # at the runner-user's ``~/.docker/config.json`` where the
           # docker/login-action step above stamped the GHCR creds. Our
           # ghcr.io/spatiumnorth/* images are private; without this redirect
           # root would docker-pull anonymously and 401 on every image.
-          sudo DOCKER_CONFIG="$HOME/.docker" -E appliance/scripts/bake-images.sh
+          sudo env \
+            DOCKER_CONFIG="$HOME/.docker" \
+            SPATIUMDDI_VERSION="$SPATIUMDDI_VERSION" \
+            BAKE_SOURCE="$BAKE_SOURCE" \
+            DOCKER_DEFAULT_PLATFORM="$DOCKER_DEFAULT_PLATFORM" \
+            BAKE_SAVE_PLATFORM="$BAKE_SAVE_PLATFORM" \
+            ${APPLIANCE_ARCH:+APPLIANCE_ARCH="$APPLIANCE_ARCH"} \
+            ${ALLOW_STALE_IMAGES:+ALLOW_STALE_IMAGES="$ALLOW_STALE_IMAGES"} \
+            ${STALE_MAX_AGE_S:+STALE_MAX_AGE_S="$STALE_MAX_AGE_S"} \
+            appliance/scripts/bake-images.sh
           echo "→ Baked image tarballs:"
           ls -lh appliance/mkosi.extra/var/lib/rancher/k3s/agent/images/*.tar.zst
           echo "→ Total size:"

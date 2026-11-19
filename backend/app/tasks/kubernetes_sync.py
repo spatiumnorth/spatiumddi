@@ -3,7 +3,7 @@
 Fires every 30 s from Celery Beat — the cluster-level minimum interval.
 Iterates every enabled ``KubernetesCluster`` and runs the per-cluster
 reconciler when its individual ``sync_interval_seconds`` has elapsed.
-Gated overall by ``PlatformSettings.integration_kubernetes_enabled`` so
+Gated overall by the ``integrations.kubernetes`` feature module (#2196) so
 flipping the global toggle off pauses all clusters without touching
 their rows.
 
@@ -23,12 +23,13 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.celery_app import celery_app
 from app.config import settings
+from app.db import task_connect_args
 from app.models.kubernetes import KubernetesCluster
-from app.models.settings import PlatformSettings
+from app.services.feature_modules import is_module_enabled
+from app.services.integration_sync_failure import record_sync_crash
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
-
-_PLATFORM_SINGLETON_ID = 1
 
 
 async def _run_sweep() -> dict[str, Any]:
@@ -39,12 +40,13 @@ async def _run_sweep() -> dict[str, Any]:
         reconcile_cluster,
     )
 
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
-            ps = await db.get(PlatformSettings, _PLATFORM_SINGLETON_ID)
-            if ps is None or not ps.integration_kubernetes_enabled:
+            if not await is_module_enabled(db, "integrations.kubernetes"):
                 return {"status": "disabled"}
 
             rows = (
@@ -56,6 +58,9 @@ async def _run_sweep() -> dict[str, Any]:
                 .scalars()
                 .all()
             )
+            # A per-cluster rollback (below) expires every ORM object on the
+            # shared session, so walk ids and re-fetch each cluster (#333).
+            cluster_ids = [cluster.id for cluster in rows]
 
             now = datetime.now(UTC)
             ran = 0
@@ -64,20 +69,35 @@ async def _run_sweep() -> dict[str, Any]:
             err_count = 0
             errors: list[str] = []
 
-            for cluster in rows:
+            for cluster_id in cluster_ids:
+                cluster = await db.get(KubernetesCluster, cluster_id)
+                if cluster is None:
+                    continue
                 if cluster.last_synced_at is not None:
                     elapsed = now - cluster.last_synced_at
                     if elapsed < timedelta(seconds=cluster.sync_interval_seconds):
                         skipped_interval += 1
                         continue
+                cluster_name = cluster.name  # a failed flush expires cluster
                 try:
                     summary = await reconcile_cluster(db, cluster)
                 except Exception as exc:  # noqa: BLE001 — one cluster shouldn't poison the sweep
                     err_count += 1
-                    errors.append(f"{cluster.name}: {exc}")
+                    # A crash leaves the shared session in a failed
+                    # transaction; roll back so the next cluster still syncs.
+                    await db.rollback()
+                    crash = await record_sync_crash(
+                        db,
+                        KubernetesCluster,
+                        cluster_id,
+                        resource_type="kubernetes_cluster",
+                        action="kubernetes.reconcile",
+                        exc=exc,
+                    )
+                    errors.append(f"{cluster_name}: {crash}")
                     logger.warning(
                         "k8s_reconcile_crash",
-                        cluster=str(cluster.id),
+                        cluster=str(cluster_id),
                         error=str(exc),
                     )
                     continue
@@ -108,17 +128,35 @@ async def _run_one(cluster_id: str) -> dict[str, Any]:
         reconcile_cluster,
     )
 
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
             cluster = await db.get(KubernetesCluster, _uuid.UUID(cluster_id))
             if cluster is None:
                 return {"status": "not_found"}
-            summary = await reconcile_cluster(db, cluster)
+            row_id = cluster.id
+            try:
+                summary = await reconcile_cluster(db, cluster)
+            except Exception as exc:  # noqa: BLE001 — record it, don't lose it (#2141)
+                await db.rollback()
+                crash = await record_sync_crash(
+                    db,
+                    KubernetesCluster,
+                    row_id,
+                    resource_type="kubernetes_cluster",
+                    action="kubernetes.reconcile",
+                    exc=exc,
+                )
+                logger.warning("kubernetes_sync_now_crash", target=str(row_id), error=crash)
+                return {"status": "error", "error": crash}
             return {
                 "status": "ok" if summary.ok else "error",
                 "error": summary.error,
+                # #2577 — what the sync released outside the target's IP space.
+                "released": summary.released.as_dict(),
                 "node_count": summary.node_count,
                 "blocks_created": summary.blocks_created,
                 "blocks_deleted": summary.blocks_deleted,
@@ -139,6 +177,7 @@ async def _run_one(cluster_id: str) -> dict[str, Any]:
     name="app.tasks.kubernetes_sync.sweep_kubernetes_clusters",
     bind=True,
 )
+@module_gated("integrations.kubernetes")
 def sweep_kubernetes_clusters(self: Any) -> dict[str, Any]:  # noqa: ARG001
     """Beat-fired sweep — runs the reconciler against every enabled
     cluster whose interval has elapsed."""

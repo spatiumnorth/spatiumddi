@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { AlertTriangle, Layers, Loader2 } from "lucide-react";
 
+import { ListReadError } from "@/components/ui/list-read-error";
 import { backupApi, type BackupSection } from "@/lib/api";
 
 /**
@@ -35,11 +36,15 @@ export function BackupSectionsPicker({
   onModeChange,
   selected,
   onChange,
+  selectiveDisabledReason,
 }: {
   mode: "full" | "selective";
   onModeChange: (m: "full" | "selective") => void;
   selected: string[];
   onChange: (next: string[]) => void;
+  /** When set, the Selective option is disabled and this says why
+   *  (#2222) — e.g. the archive's dump format is not known yet. */
+  selectiveDisabledReason?: string | null;
 }) {
   const sectionsQ = useQuery({
     queryKey: ["backup-sections"],
@@ -89,16 +94,25 @@ export function BackupSectionsPicker({
             install with the archive&rsquo;s contents.
           </span>
         </label>
-        <label className="flex items-start gap-2 text-xs">
+        <label
+          className="flex items-start gap-2 text-xs"
+          title={selectiveDisabledReason ?? undefined}
+        >
           <input
             type="radio"
             checked={mode === "selective"}
+            disabled={!!selectiveDisabledReason}
             onChange={() => onModeChange("selective")}
             className="mt-0.5"
           />
-          <span>
+          <span className={selectiveDisabledReason ? "opacity-60" : undefined}>
             <strong>Selective restore</strong> — pick which sections to replace;
             the rest stay untouched.
+            {selectiveDisabledReason && (
+              <span className="mt-0.5 block text-[11px]">
+                {selectiveDisabledReason}
+              </span>
+            )}
           </span>
         </label>
       </div>
@@ -120,8 +134,11 @@ export function BackupSectionsPicker({
               Loading catalog…
             </div>
           ) : sectionsQ.isError ? (
-            <div className="text-xs text-destructive">
-              Failed to load section catalog.
+            <div className="text-xs">
+              <ListReadError
+                error={sectionsQ.error}
+                what="the backup section catalog"
+              />
             </div>
           ) : (
             <ul className="space-y-1">

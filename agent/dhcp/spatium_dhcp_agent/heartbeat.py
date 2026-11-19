@@ -5,18 +5,28 @@ from __future__ import annotations
 import os
 import random
 import threading
+import time
+from collections.abc import Callable
 from typing import Any
 
 import httpx
 import structlog
 
 from . import __version__, kea_ctrl
+from .bootstrap import reauthenticate
 from .cache import save_token
 from .config import AgentConfig
 from .config_apply import ApplyStatus
+from .ha_tls import AGENT_CAPABILITIES
+from .instance import AGENT_INSTANCE, AGENT_INSTANCE_HEADER
+from .oom_watch import OomWatch
 from .spool import SpoolManager
 
 log = structlog.get_logger(__name__)
+
+# How long a control plane that refused ``capabilities`` (it predates the
+# field) is left alone before the field is offered again.
+CAPABILITIES_RETRY_SECONDS = 600.0
 
 
 class HeartbeatClient:
@@ -30,6 +40,9 @@ class HeartbeatClient:
         self.token_ref = token_ref
         self._stop = threading.Event()
         self.daemon_status: dict[str, Any] = {}
+        # #2023 — the supervisor sets this. A standing OOM record outranks
+        # ``daemon_status`` on the wire (see ``_wire_daemon``).
+        self.oom_watch: OomWatch | None = None
         # #882 — set by SyncLoop (constructed after this object, assigns itself
         # in). Rides the heartbeat's ``config`` field so the control plane can
         # tell a Kea that is up but running a REVERTED config apart from one
@@ -49,15 +62,29 @@ class HeartbeatClient:
         # model is ``extra="forbid"`` and predates #1077. Dropping the field
         # keeps the agent's liveness signal alive across the version skew.
         self._spool_field_unsupported = False
+        # #3782 — what the spool cannot count: events read from Kea but not
+        # yet delivered or spooled. Set by the supervisor to the lease
+        # watcher's ``pending_status``; merged into the ``lease_events``
+        # stream and the rollup below. Extra keys are ignored by a control
+        # plane that predates them.
+        self.pending_provider: Callable[[], dict[str, Any]] | None = None
+        # Same skew handling for ``capabilities``, with one difference: it is
+        # what opens the HA peer-credential gate, so the field is offered
+        # again every CAPABILITIES_RETRY_SECONDS rather than dropped for the
+        # life of the process. During a rolling upgrade this agent can come up
+        # while an older api pod still answers, and the control plane is then
+        # upgraded under it without the agent re-registering — a latched drop
+        # would keep the gate shut until something restarted the agent.
+        self._capabilities_retry_at = 0.0
 
     def stop(self) -> None:
         self._stop.set()
 
-    def _client(self) -> httpx.Client:
+    def _client(self, timeout: float = 15.0) -> httpx.Client:
         return httpx.Client(
             base_url=self.cfg.control_plane_url,
             verify=self.cfg.httpx_verify(),
-            timeout=15.0,
+            timeout=timeout,
         )
 
     def _kea_version(self) -> str | None:
@@ -77,16 +104,61 @@ class HeartbeatClient:
             self._kea_version_cached = kea_ctrl.version_get(self.cfg.kea_control_socket)
         return self._kea_version_cached
 
-    def send_once(self) -> None:
+    def _wire_daemon(self) -> dict[str, Any]:
+        """The ``daemon`` field to send: an OOM record (#2023) when one
+        stands, else the sync loop's own status.
+
+        An overlay rather than a ``daemon_status`` assignment because the sync
+        loop writes ``{"status": "ok"}`` after every good reload, and a Kea
+        that was just killed reloads fine: an assignment would be erased on the
+        next apply, and an apply succeeding says nothing about whether Kea then
+        survives its config."""
+        oom = self.oom_watch.daemon_status() if self.oom_watch is not None else None
+        return oom if oom is not None else self.daemon_status
+
+    def announce(self) -> None:
+        """Name this process to the control plane before the boot apply (#4139).
+
+        The first heartbeat of a new process, sent before the sync loop's
+        bootstrap apply. Its ``X-Spatium-Agent-Instance`` makes the control
+        plane take the server over from the previous process and retire that
+        process's stale ``ok`` now, instead of at the first config poll, which
+        comes only after the boot apply. Best effort and short: with the
+        control plane down the agent boots from its cache at once
+        (non-negotiable #5), and a control plane that predates this simply
+        records an ordinary heartbeat.
+        """
+        try:
+            self.send_once(announce=True)
+        except Exception as exc:  # noqa: BLE001 — never costs the boot
+            log.warning("dhcp_agent_announce_failed", error=str(exc))
+
+    def _spool_with_pending(self, spool: dict[str, Any]) -> dict[str, Any]:
+        """Fold the in-memory lease backlog (#3782) into the spool report."""
+        if self.pending_provider is None:
+            return spool
+        try:
+            pending = self.pending_provider()
+        except Exception as exc:  # noqa: BLE001 — telemetry must never cost liveness
+            log.warning("heartbeat_pending_status_failed", error=str(exc))
+            return spool
+        streams = spool.get("streams")
+        if isinstance(streams, dict) and isinstance(streams.get("lease_events"), dict):
+            streams["lease_events"].update(pending)
+        spool.update(pending)
+        return spool
+
+    def send_once(self, *, announce: bool = False) -> None:
         # Drain queued op acks (queued by SyncLoop when bundle includes pending_ops).
         ops_ack: list[dict] = []
         while self.pending_acks:
             ops_ack.append(self.pending_acks.pop(0))
+        daemon = self._wire_daemon()
         body: dict[str, Any] = {
             "agent_version": __version__,
             "pid": os.getpid(),
-            "status": self.daemon_status.get("status", "ok"),
-            "daemon": self.daemon_status,
+            "status": daemon.get("status", "ok"),
+            "daemon": daemon,
             # #882 — last config-apply verdict. The server's request model has
             # declared a ``config`` field since the beginning; until now the
             # DHCP agent never sent one and the handler never read one.
@@ -99,11 +171,13 @@ class HeartbeatClient:
             # node-at-a-time upgrade across that boundary breaks HA mid-run.
             # None = daemon not up yet / didn't answer; the control plane must
             # treat that as "unknown", never as "old".
-            "kea_version": self._kea_version(),
+            "kea_version": None if announce else self._kea_version(),
         }
+        if time.monotonic() >= self._capabilities_retry_at:
+            body["capabilities"] = list(AGENT_CAPABILITIES)
         if self.spool_manager is not None and not self._spool_field_unsupported:
             try:
-                body["spool"] = self.spool_manager.status()
+                body["spool"] = self._spool_with_pending(self.spool_manager.status())
             except Exception as exc:  # noqa: BLE001 — telemetry must never cost liveness
                 log.warning("heartbeat_spool_status_failed", error=str(exc))
         # #170 Wave C1 — slot / deployment / upgrade-state telemetry
@@ -111,13 +185,29 @@ class HeartbeatClient:
         # supervisor's heartbeat (one producer instead of three).
         # The DHCP service container drops the host bind mounts in C1
         # so it can no longer read those signals anyway.
+        sent_token = self.token_ref[0]
         try:
-            with self._client() as c:
+            with (self._client(timeout=3.0) if announce else self._client()) as c:
                 resp = c.post(
                     "/api/v1/dhcp/agents/heartbeat",
                     json=body,
-                    headers={"Authorization": f"Bearer {self.token_ref[0]}"},
+                    headers=self._auth_headers(),
                 )
+                if (
+                    resp.status_code == 422
+                    and "capabilities" in body
+                    and "capabilities" in resp.text
+                ):
+                    log.warning("heartbeat_capabilities_field_unsupported")
+                    self._capabilities_retry_at = (
+                        time.monotonic() + CAPABILITIES_RETRY_SECONDS
+                    )
+                    body.pop("capabilities")
+                    resp = c.post(
+                        "/api/v1/dhcp/agents/heartbeat",
+                        json=body,
+                        headers=self._auth_headers(),
+                    )
                 if resp.status_code == 422 and "spool" in body and "spool" in resp.text:
                     log.warning("heartbeat_spool_field_unsupported")
                     self._spool_field_unsupported = True
@@ -125,7 +215,7 @@ class HeartbeatClient:
                     resp = c.post(
                         "/api/v1/dhcp/agents/heartbeat",
                         json=body,
-                        headers={"Authorization": f"Bearer {self.token_ref[0]}"},
+                        headers=self._auth_headers(),
                     )
             if resp.status_code == 200:
                 data = resp.json()
@@ -135,15 +225,24 @@ class HeartbeatClient:
                     save_token(self.cfg.state_dir, rotated)
                     log.info("dhcp_agent_token_rotated")
             elif resp.status_code in (401, 404):
-                # Token invalidated or server row deleted — clear token and
-                # exit so supervisor restarts the container (→ re-bootstrap).
+                # Token invalidated or server row deleted (#2052): re-register
+                # from the PSK in this thread. Stopping it made the supervisor
+                # exit the container and take Kea down with the agent.
                 log.warning("heartbeat_will_rebootstrap", status=resp.status_code)
-                save_token(self.cfg.state_dir, "")
-                self._stop.set()
+                reauthenticate(self.cfg, self.token_ref, sent_token)
             else:
                 log.warning("heartbeat_failed", status=resp.status_code)
         except httpx.HTTPError as e:
             log.warning("heartbeat_http_error", error=str(e))
+
+    def _auth_headers(self) -> dict[str, str]:
+        # #3143 — the process id, so the control plane can keep a displaced
+        # process's daemon / config reports off the server row and skip its
+        # token rotation.
+        return {
+            "Authorization": f"Bearer {self.token_ref[0]}",
+            AGENT_INSTANCE_HEADER: AGENT_INSTANCE,
+        }
 
     def run(self) -> None:
         while not self._stop.is_set():

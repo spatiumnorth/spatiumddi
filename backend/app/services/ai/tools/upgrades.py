@@ -18,6 +18,7 @@ access only.
 
 from __future__ import annotations
 
+import uuid
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -45,10 +46,20 @@ class FindUpgradePreflightArgs(BaseModel):
         min_length=1,
         max_length=64,
     )
+    slot_image_id: uuid.UUID | None = Field(
+        default=None,
+        description=(
+            "The uploaded upgrade image the Plan would name. The disk "
+            "checks then size the need from its size and skip the room "
+            "for an image the mirror already holds, as the Plan does; "
+            "without it they judge a 4 GiB image."
+        ),
+    )
 
 
 @register_tool(
     name="find_upgrade_preflight",
+    permission="superadmin",
     description=(
         "Run pre-flight safety checks for a multi-node rolling upgrade to "
         "the given target version (superadmin only, read-only). Returns "
@@ -77,7 +88,9 @@ async def find_upgrade_preflight(
 ) -> dict[str, Any]:
     if (err := _superadmin_gate(user)) is not None:
         return err
-    report = await preflight.run_all(target_version=args.target_version)
+    report = await preflight.run_all(
+        target_version=args.target_version, slot_image_id=args.slot_image_id
+    )
     return report.to_dict()
 
 
@@ -102,6 +115,7 @@ class FindUpgradeRunsArgs(BaseModel):
 
 @register_tool(
     name="find_upgrade_runs",
+    permission="superadmin",
     description=(
         "List recent SystemUpgradeRun rows from the multi-node rolling-"
         "upgrade orchestrator (superadmin only, read-only). Each row "
@@ -163,6 +177,7 @@ class FindUpgradeLeaseArgs(BaseModel):
 
 @register_tool(
     name="find_upgrade_lease",
+    permission="superadmin",
     description=(
         "Read the cluster-wide rolling-upgrade single-upgrader Lease "
         "state (superadmin only, read-only). Mirrors the "

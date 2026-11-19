@@ -33,7 +33,8 @@ Target resolution reuses the one shared resolver
 surfaces (REST preview + beat runner + MCP), non-negotiables #1 / #13. It
 enforces the schedule owner's readable-subnet scope at resolve time
 (non-negotiable #3), so a schedule can never wake hosts in subnets its owner
-has lost read access to.
+has lost read access to, nor any host once the owner lacks the type-level
+``write`` on ``subnet`` the manual wake route needs (#3461).
 """
 
 from __future__ import annotations
@@ -51,6 +52,7 @@ from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
 from app.core.crypto import encrypt_str
 from app.core.permissions import require_permission
+from app.core.stored_secret_guard import require_secret_with_destination_change
 from app.models.auth import Group, User
 from app.models.ipam import Subnet
 from app.models.wol_schedule import (
@@ -61,6 +63,7 @@ from app.models.wol_schedule import (
     WolSchedule,
 )
 from app.services import wol
+from app.services.api_token_scopes import read_only_post
 from app.services.wol_scheduler.gating import gate_verdict, load_gate_calendar_events
 from app.services.wol_scheduler.resolver import (
     SKIP_NO_MAC,
@@ -654,6 +657,7 @@ async def run_now(schedule_id: uuid.UUID, db: DB, current_user: CurrentUser) -> 
     response_model=TargetPreviewRead,
     dependencies=[Depends(require_permission("read", PERMISSION))],
 )
+@read_only_post
 async def preview_schedule_targets(
     schedule_id: uuid.UUID, db: DB, current_user: CurrentUser
 ) -> TargetPreviewRead:
@@ -705,6 +709,7 @@ async def preview_schedule_targets(
     response_model=TargetPreviewRead,
     dependencies=[Depends(require_permission("read", PERMISSION))],
 )
+@read_only_post
 async def preview_selector(
     body: TargetPreviewRequest, db: DB, current_user: CurrentUser
 ) -> TargetPreviewRead:
@@ -877,6 +882,12 @@ async def update_calendar(
         raise HTTPException(status_code=404, detail="Calendar not found")
 
     fields = body.model_dump(exclude_unset=True)
+    require_secret_with_destination_change(
+        row,
+        fields,
+        destination=("url",),
+        secrets={"password": row.password_encrypted},
+    )
     changed: list[str] = []
     # Non-nullable columns where an explicit null means "unchanged".
     non_nullable = {"name", "kind", "url", "enabled", "refresh_interval_minutes"}

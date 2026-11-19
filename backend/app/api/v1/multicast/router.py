@@ -48,8 +48,8 @@ from sqlalchemy import func, or_, select
 from app.api.deps import DB, CurrentUser
 from app.api.v1._common import BulkDeleteResponse
 from app.api.v1.ownership._audit import write_audit
-from app.core.permissions import require_resource_permission
-from app.models.ipam import IPAddress, IPSpace
+from app.core.permissions import require_permission, require_resource_permission
+from app.models.ipam import IPSpace
 from app.models.multicast import (
     MEMBERSHIP_ROLES,
     MEMBERSHIP_SOURCES,
@@ -62,6 +62,8 @@ from app.models.multicast import (
 )
 from app.models.network import NetworkDevice
 from app.models.vrf import VRF
+from app.services.api_token_scopes import read_only_post
+from app.services.ipam.live_address import get_live_address
 from app.services.multicast.auto_block import ensure_enclosing_block
 from app.services.tags import apply_tag_filter
 
@@ -647,7 +649,9 @@ async def list_groups(
     stmt = apply_tag_filter(stmt, MulticastGroup.tags, tag)
 
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
-    stmt = stmt.order_by(MulticastGroup.address.asc()).limit(limit).offset(offset)
+    stmt = (
+        stmt.order_by(MulticastGroup.address.asc(), MulticastGroup.id).limit(limit).offset(offset)
+    )
     rows = (await db.execute(stmt)).scalars().all()
     return MulticastGroupListResponse(
         items=[MulticastGroupRead.model_validate(r) for r in rows],
@@ -898,7 +902,7 @@ async def add_membership(
     user: CurrentUser,
 ) -> MulticastMembershipRead:
     group = await _get_group(db, group_id)
-    if (await db.get(IPAddress, body.ip_address_id)) is None:
+    if (await get_live_address(db, body.ip_address_id)) is None:
         raise HTTPException(status_code=422, detail="ip_address_id not found")
 
     # Catch the unique-triplet violation with a clean 409 instead of
@@ -1135,7 +1139,11 @@ async def _build_bulk_candidates(
 @router.post(
     "/groups/bulk-allocate/preview",
     response_model=MulticastBulkAllocatePreviewResponse,
+    # ``@read_only_post`` relaxes the router gate to ``read``; the preview
+    # still needs what the bulk-allocate commit needs (#3302).
+    dependencies=[Depends(require_permission("write", "multicast"))],
 )
+@read_only_post
 async def bulk_allocate_preview(
     body: MulticastBulkAllocateRequest, db: DB, _: CurrentUser
 ) -> MulticastBulkAllocatePreviewResponse:

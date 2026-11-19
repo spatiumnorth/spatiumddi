@@ -3,7 +3,7 @@
      preserveAspectRatio="xMidYMid meet"
      font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
   <title>DNS zone tree — namespace hierarchy with view scoping</title>
-  <desc>Zones are managed as a tree mirroring the DNS namespace, from the root through com. and in-addr.arpa.; split-horizon zones carry a badge showing whether they render into one view or every view.</desc>
+  <desc>Zones are managed as a tree mirroring the DNS namespace, from the root through com. and in-addr.arpa.; split-horizon zones carry a badge showing whether they render into one view or every view (a NULL-view zone with view-scoped records renders only in those views).</desc>
 
   <defs>
     <linearGradient id="dnsv-surface" x1="0" y1="0" x2="0" y2="1">
@@ -110,5 +110,5 @@
 
   <rect x="56" y="556" width="78" height="20" rx="10" fill="url(#dnsv-allviews)"/>
   <text x="95" y="570" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">all views</text>
-  <text x="204" y="570" font-size="11" fill="#475569">— view_id is NULL, so the zone renders into every view</text>
+  <text x="204" y="570" font-size="11" fill="#475569">— view_id is NULL and no record is view-scoped, so the zone renders into every view</text>
 </svg>

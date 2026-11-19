@@ -258,13 +258,15 @@ def test_global_zone_renders_into_every_view(tmp_path: Path) -> None:
     drv = Bind9Driver(state_dir=tmp_path)
     drv.render(bundle)
     zdir = tmp_path / "rendered.new" / "zones"
-    assert (zdir / "internal" / "global.example.db").exists()
-    assert (zdir / "external" / "global.example.db").exists()
-    for v in ("internal", "external"):
-        assert (
-            "shared 300 IN A 198.51.100.5"
-            in (zdir / v / "global.example.db").read_text()
-        )
+    conf = (tmp_path / "rendered.new" / "named.conf").read_text()
+    # #3551 — identical copies load once: the first view defines the zone,
+    # the later one references it with ``in-view`` and has no file.
+    assert (
+        "shared 300 IN A 198.51.100.5"
+        in (zdir / "internal" / "global.example.db").read_text()
+    )
+    assert not (zdir / "external" / "global.example.db").exists()
+    assert 'zone "global.example." { in-view "internal"; };' in conf
 
 
 # ── #920: the control plane's own transfers select a view by key ────────────
@@ -323,7 +325,7 @@ def test_view_transfer_keys_are_defined_and_granted_but_never_for_updates(
 ) -> None:
     Bind9Driver(state_dir=tmp_path).render(_keyed_bundle())
     conf = (tmp_path / "rendered.new" / "named.conf").read_text()
-    view_key_file = tmp_path / "tsig" / "view-transfer.key"
+    view_key_file = tmp_path / "rendered" / "tsig" / "view-transfer.key"
 
     # Defined at global scope, above the first view that names them.
     include = f'include "{view_key_file}";'
@@ -343,8 +345,8 @@ def test_view_transfer_keys_live_in_their_own_0600_file(tmp_path: Path) -> None:
     """ddns.key's first key is the loopback identity the record-op path and
     the ingest worker sign with, so the view keys never go into it."""
     Bind9Driver(state_dir=tmp_path).render(_keyed_bundle())
-    view_key_file = tmp_path / "tsig" / "view-transfer.key"
-    ddns_key_file = tmp_path / "tsig" / "ddns.key"
+    view_key_file = tmp_path / "rendered.new" / "tsig" / "view-transfer.key"
+    ddns_key_file = tmp_path / "rendered.new" / "tsig" / "ddns.key"
 
     assert view_key_file.stat().st_mode & 0o777 == 0o600
     text = view_key_file.read_text()
@@ -383,19 +385,19 @@ def test_a_bundle_without_view_transfer_keys_renders_exactly_as_before(
     assert "match-clients { any; };" in conf
     assert "view-transfer.key" not in conf
     assert 'allow-transfer { key "spatium-grp"; };' in conf
-    assert not (tmp_path / "tsig" / "view-transfer.key").exists()
+    assert not (tmp_path / "rendered.new" / "tsig" / "view-transfer.key").exists()
 
 
 def test_the_view_key_file_goes_when_the_views_do(tmp_path: Path) -> None:
     """No secret outlives the config that needed it."""
     drv = Bind9Driver(state_dir=tmp_path)
     drv.render(_keyed_bundle())
-    assert (tmp_path / "tsig" / "view-transfer.key").exists()
+    assert (tmp_path / "rendered.new" / "tsig" / "view-transfer.key").exists()
 
     flat = _split_horizon_bundle()
     flat["tsig_keys"] = [dict(_GROUP_KEY)]
     flat["views"] = []
     flat["zones"] = [_zone("example.com.", None, [])]
     drv.render(flat)
-    assert not (tmp_path / "tsig" / "view-transfer.key").exists()
+    assert not (tmp_path / "rendered.new" / "tsig" / "view-transfer.key").exists()
     assert "view-transfer.key" not in (tmp_path / "rendered.new" / "named.conf").read_text()

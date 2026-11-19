@@ -12,6 +12,10 @@ Requires=etc.mount
 
 [Service]
 Type=oneshot
+# GHSA-h2j9-qrg7-grfw — act only on a trigger written by root, the
+# supervisor or the api; anything else is renamed aside and the unit
+# skips cleanly. See spatiumddi-trigger-guard.
+ExecCondition=/usr/local/bin/spatiumddi-trigger-guard /var/lib/spatiumddi/release-state/lldp-config-pending
 ExecStart=/usr/local/bin/spatiumddi-lldp-reload
 # No Install section — only invoked by the matching .path unit, never
 # directly enabled at boot.

@@ -29,6 +29,7 @@ import pytest
 
 from spatium_dns_agent.config_apply import ConfigApplyError
 from spatium_dns_agent.drivers import bind9
+from spatium_dns_agent.drivers.base import HeldZone
 from spatium_dns_agent.drivers.bind9 import (
     Bind9Driver,
     _serial_at_least,
@@ -75,6 +76,7 @@ class Script:
 def fast(monkeypatch: pytest.MonkeyPatch) -> None:
     """No real waiting: one poll, then the verdict."""
     monkeypatch.setattr(bind9, "_ZONE_LOAD_TIMEOUT_S", 0.0)
+    monkeypatch.setattr(bind9, "_ZONE_DUMP_TIMEOUT_S", 0.0)
     monkeypatch.setattr(bind9, "_NAMED_START_TIMEOUT_S", 0.0)
     monkeypatch.setattr(bind9, "_SIGHUP_SETTLE_S", 0.0)
     monkeypatch.setattr(bind9.time, "sleep", lambda _s: None)
@@ -190,27 +192,151 @@ def test_validate_checks_every_zone_on_a_first_render(
     assert sorted(c[-2] for c in run.verbs("named-checkzone")) == ["a.test", "b.test"]
 
 
-def test_a_zone_named_cannot_load_fails_validation(tmp_path: Path, monkeypatch) -> None:
-    new = _stage(tmp_path)
-    _zone(new, "bad.test", 2)
-    _all_tools(monkeypatch)
+def _refusing(new: Path, *refused: str) -> Callable[[list[str]], tuple[int, str, str]]:
+    """named-checkzone refuses the zones named in ``refused``, as BIND 9.20 words it."""
 
     def answer(cmd: list[str]) -> tuple[int, str, str]:
-        if Path(cmd[0]).name == "named-checkzone":
+        if Path(cmd[0]).name == "named-checkzone" and cmd[-2] in refused:
+            z = cmd[-2]
             return (
                 1,
-                f"dns_rdata_fromtext: {new}/zones/bad.test.db:6: near '999.1.1.1': bad dotted quad\n"
-                "zone bad.test/IN: not loaded due to errors.\n",
+                (
+                    f"dns_rdata_fromtext: {new}/zones/{z}.db:6: near '999.1.1.1': "
+                    f"bad dotted quad\nzone {z}/IN: not loaded due to errors.\n"
+                ),
                 "",
             )
         return (0, "", "")
 
+    return answer
+
+
+def test_a_new_zone_named_cannot_load_is_held_back_not_failed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """#1403: one refused zone no longer fails the apply, and with it every
+    other change in the bundle. A zone with no live copy is left out of the
+    staged tree (named answers SERVFAIL for it) and reported."""
+    new = _stage(tmp_path)
+    _zone(new, "bad.test", 2)
+    _zone(new, "good.test", 1)
+    _all_tools(monkeypatch)
+    monkeypatch.setattr(subprocess, "run", Script(_refusing(new, "bad.test")))
+
+    drv = Bind9Driver(tmp_path)
+    drv.validate()
+
+    assert not (new / "zones" / "bad.test.db").exists()
+    assert (new / "zones" / "good.test.db").exists()
+    assert drv.held_back == (
+        HeldZone(
+            "bad.test",
+            None,
+            "dns_rdata_fromtext: zones/bad.test.db:6: near '999.1.1.1': bad dotted quad",
+            False,
+        ),
+    ), "the staging path is noise in an operator message"
+
+
+def test_a_refused_edit_keeps_the_copy_named_serves(tmp_path: Path, monkeypatch) -> None:
+    """An existing zone whose new file is refused keeps its live copy, so
+    the swap leaves it byte-identical; the other zone's edit goes through."""
+    new = _stage(tmp_path)
+    live = tmp_path / "rendered"
+    kept = _zone(live, "edited.test", 1, view="internal").read_bytes()
+    _zone(new, "edited.test", 2, view="internal", extra="www IN A 999.1.1.1\n")
+    _zone(live, "other.test", 1, view="internal")
+    staged_other = _zone(new, "other.test", 2, view="internal").read_bytes()
+    _all_tools(monkeypatch)
+    monkeypatch.setattr(subprocess, "run", Script(_refusing(new, "edited.test")))
+
+    drv = Bind9Driver(tmp_path)
+    drv.validate()
+
+    assert (new / "zones/internal/edited.test.db").read_bytes() == kept
+    assert (new / "zones/internal/other.test.db").read_bytes() == staged_other
+    assert [(h.zone, h.view, h.served) for h in drv.held_back] == [
+        ("edited.test", "internal", True)
+    ]
+    assert "bad dotted quad" in drv.held_back[0].reason
+
+
+def test_every_validate_starts_with_nothing_held(tmp_path: Path, monkeypatch) -> None:
+    new = _stage(tmp_path)
+    _zone(new, "bad.test", 2)
+    _all_tools(monkeypatch)
+    monkeypatch.setattr(subprocess, "run", Script(_refusing(new, "bad.test")))
+    drv = Bind9Driver(tmp_path)
+    drv.validate()
+    assert drv.held_back
+
+    _zone(new, "bad.test", 3)
+    monkeypatch.setattr(subprocess, "run", Script(lambda cmd: (0, "", "")))
+    drv.validate()
+    assert drv.held_back == ()
+
+
+def test_a_checker_that_times_out_still_fails_the_apply(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A timeout is no verdict on the zone: holding it back would leave a
+    zone that may be fine off the config, with nothing retrying it."""
+    new = _stage(tmp_path)
+    _zone(new, "big.test", 1)
+    _all_tools(monkeypatch)
+
+    def answer(cmd: list[str]) -> tuple[int, str, str]:
+        if Path(cmd[0]).name == "named-checkzone":
+            raise subprocess.TimeoutExpired(cmd, 300)
+        return (0, "", "")
+
     monkeypatch.setattr(subprocess, "run", Script(answer))
-    with pytest.raises(RuntimeError) as exc:
+    with pytest.raises(subprocess.TimeoutExpired):
         Bind9Driver(tmp_path).validate()
-    message = str(exc.value)
-    assert "bad.test" in message and "bad dotted quad" in message
-    assert str(new) not in message, "the staging path is noise in an operator message"
+
+
+def test_held_zones_are_neither_reloaded_nor_verified(
+    tmp_path: Path, monkeypatch, fast
+) -> None:
+    """After the swap, the held zones are the ones named is left alone with:
+    the kept copy did not change, and the new zone has no file to load."""
+    new = _stage(tmp_path)
+    live = tmp_path / "rendered"
+    (live / "named.conf").parent.mkdir(parents=True, exist_ok=True)
+    (live / "named.conf").write_text("options {};\n")
+    _zone(live, "kept.test", 1)
+    _zone(new, "kept.test", 2, extra="www IN A 999.1.1.1\n")
+    _zone(new, "fresh.test", 1, extra="www IN A 999.1.1.1\n")
+    _zone(live, "lab.test", 1)
+    _zone(new, "lab.test", 2)
+    _all_tools(monkeypatch)
+    refuse = _refusing(new, "kept.test", "fresh.test")
+
+    def answer(cmd: list[str]) -> tuple[int, str, str]:
+        if "zonestatus" in cmd:
+            # named serves the copy on disk: the live file's serial.
+            zname = cmd[cmd.index("zonestatus") + 1]
+            view = cmd[cmd.index("in") + 1] if "in" in cmd else None
+            serial = _soa_serial(live / bind9._zone_rel(zname, view))
+            if serial is None:
+                return (1, "", "rndc: 'zonestatus' failed: zone not loaded\n")
+            return (0, f"serial: {serial}\n", "")
+        return refuse(cmd)
+
+    run = Script(answer)
+    monkeypatch.setattr(subprocess, "run", run)
+    drv = Bind9Driver(tmp_path)
+    drv.daemon_pid = 4242
+    monkeypatch.setattr(drv, "daemon_running", lambda: True)
+
+    drv.validate()
+    drv.swap_and_reload()
+
+    rndc = [c for c in run.calls if Path(c[0]).name == "rndc"]
+    named = {c[c.index(verb) + 1] for c in rndc for verb in
+             ("freeze", "reload", "thaw", "zonestatus") if verb in c}
+    assert named == {"lab.test"}
+    assert sorted(h.zone for h in drv.held_back) == ["fresh.test", "kept.test"]
 
 
 def test_validate_fails_closed_without_named_checkzone(
@@ -349,14 +475,22 @@ def test_only_changed_zones_are_verified(tmp_path: Path, monkeypatch, fast) -> N
     _zone(prev_live, "same.test", 1)
     _zone(prev_live, "edited.test", 1)
     _all_tools(monkeypatch)
-    run = Script(
-        lambda cmd: (0, "serial: 2\n", "") if "zonestatus" in cmd else (0, "", "")
-    )
+    serving = {"edited.test": 1}
+
+    def answer(cmd: list[str]) -> tuple[int, str, str]:
+        if "reload" in cmd:
+            serving[cmd[-1]] = 2
+        if "zonestatus" in cmd:
+            return (0, f"serial: {serving[cmd[-1]]}\n", "")
+        return (0, "", "")
+
+    run = Script(answer)
     monkeypatch.setattr(subprocess, "run", run)
 
     drv.swap_and_reload()
 
-    # Once before the reload, once after: only the zone that changed.
+    # Once frozen before the swap (#1407), once after the reload: only the zone
+    # that changed.
     assert [c[-1] for c in run.calls if "zonestatus" in c] == ["edited.test", "edited.test"]
 
 
@@ -501,8 +635,10 @@ def test_the_real_named_checkzone_refuses_a_broken_zone(tmp_path: Path) -> None:
     new = _stage(tmp_path)
     _zone(new, "bad.test", 2, extra="www IN A 999.1.1.1\n")
     _zone(new, "good.test", 1, extra="www IN A 192.0.2.1\nns1 IN A 192.0.2.53\n")
-    with pytest.raises(RuntimeError, match="bad.test.*bad dotted quad"):
-        Bind9Driver(tmp_path)._check_zone_files(new)
+    drv = Bind9Driver(tmp_path)
+    drv._check_zone_files(new)
+    assert [h.zone for h in drv.held_back] == ["bad.test"]
+    assert "bad dotted quad" in drv.held_back[0].reason
 
 
 @pytest.mark.skipif(
@@ -538,5 +674,7 @@ def test_the_real_named_checkzone_refuses_an_ns_without_an_address(
         "$TTL 300\n@ IN SOA ns1.nons.test. h.nons.test. ( 1 3600 600 86400 300 )\n"
         "@ IN NS ns1.nons.test.\n"
     )
-    with pytest.raises(RuntimeError, match="has no address records"):
-        Bind9Driver(tmp_path)._check_zone_files(new)
+    drv = Bind9Driver(tmp_path)
+    drv._check_zone_files(new)
+    assert [h.zone for h in drv.held_back] == ["nons.test"]
+    assert "has no address records" in drv.held_back[0].reason

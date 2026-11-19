@@ -63,6 +63,14 @@ export interface Shortcut {
    * adding another described-only row.
    */
   describedOnly?: boolean;
+  /**
+   * The grant the binding's handler requires: met when the user holds
+   * `action` on ANY of `resourceTypes`. The overlay hides the row from a
+   * user who doesn't, because the handler stands down for them and a
+   * keycap that does nothing reads as a broken shortcut (#3103). Keep it
+   * identical to the check the handler makes.
+   */
+  requires?: { action: string; resourceTypes: string[] };
 }
 
 export interface ShortcutGroup {
@@ -210,6 +218,13 @@ export const ADD_DNS_RECORD: Shortcut = {
   id: "dns-add-record",
   combos: [{ key: "n" }],
   description: "Add a record to the open zone",
+  // The handler's `canWriteRecords` in DNSPage.tsx (#2529): write on
+  // dns_record alone since #3100, so a role that writes zones but not
+  // records is not offered a key that does nothing (#3167).
+  requires: {
+    action: "write",
+    resourceTypes: ["dns_record"],
+  },
 };
 
 export const SHORTCUT_GROUPS: ShortcutGroup[] = [

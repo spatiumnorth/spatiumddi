@@ -18,6 +18,8 @@ from typing import Any, Protocol
 
 import structlog
 
+from app.services.agents.container_oom import ContainerOomKill
+
 logger = structlog.get_logger(__name__)
 
 STATUS_OK = "ok"
@@ -31,6 +33,19 @@ VALID_STATUSES = frozenset({STATUS_OK, STATUS_REVERTED, STATUS_REVERT_FAILED, ST
 #: read surface — the alert rule, the server-list chip, the MCP tool —
 #: filters on this set rather than re-listing the strings.
 FAILED_STATUSES = frozenset({STATUS_REVERTED, STATUS_REVERT_FAILED, STATUS_NO_PREVIOUS})
+
+# An agent that applied a bundle but had some zones refused by its daemon
+# (PowerDNS takes zones one at a time) reports ``reverted`` with an error that
+# starts with this prefix, since there is no "partial" status. Nothing was
+# rolled back and every other zone is served, so the alert must not say it
+# was. Mirrors the DNS agent's ``sync.PARTIAL_APPLY_PREFIX``.
+PARTIAL_APPLY_PREFIX = "partial apply: "
+
+
+def is_partial_apply(status: str | None, error: str | None) -> bool:
+    """True for a ``reverted`` verdict that is really a partial apply."""
+    return status == STATUS_REVERTED and (error or "").startswith(PARTIAL_APPLY_PREFIX)
+
 
 #: Severity per status. A revert is a warning: the daemon is healthy and
 #: serving, just not what was asked for. The other two are critical —
@@ -51,11 +66,59 @@ _MAX_ETAG = 128
 _MAX_STATUS = 20
 
 
+#: ``reason`` values a DNS agent sends on a verdict about a death during an
+#: apply (#3552), mirrored from the agent's ``config_apply``. ``oom``: the agent
+#: has evidence the container's OOM killer did it. ``daemon_died``: it does not
+#: know what did, and the kubelet may (a group kill took the agent with the
+#: daemon, so the agent saw nothing). Absent: not a death verdict, or an older
+#: agent. None of them means "not out of memory".
+REASON_OOM = "oom"
+REASON_DAEMON_DIED = "daemon_died"
+
+
+def format_oom_error(limit: int | str | None, detail: str | None) -> str:
+    """The operator-facing text for an OOM-killed apply, with the agent's own
+    detail appended. Stored in ``config_apply_error`` so the chip, banner,
+    alert and MCP tool all say it without a column per surface. ``limit`` is
+    bytes from the agent's cgroup, or the kubelet's own spelling (``"2Gi"``)."""
+    text: str | None = None
+    if isinstance(limit, str):
+        text = limit.strip()[:32] or None
+    elif isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
+        gib = limit / (1 << 30)
+        text = f"{gib:g} GiB" if gib >= 1 else f"{limit // (1 << 20)} MiB"
+    if text:
+        head = f"out of memory while applying config (limit {text})"
+    else:
+        head = "out of memory while applying config"
+    return f"{head}: {detail}" if detail else head
+
+
 class _HasConfigApplyColumns(Protocol):
     config_apply_status: str | None
     config_apply_error: str | None
     config_failed_etag: str | None
     config_apply_at: datetime | None
+
+
+def forget_stale_ok(server: _HasConfigApplyColumns) -> bool:
+    """A new agent process no longer inherits its predecessor's ``ok`` (#4139).
+
+    ``ok`` is the previous process's word about the config IT applied. A
+    restarted agent has applied nothing yet, and the control plane only hears
+    its verdict on a heartbeat up to a heartbeat interval later; until then
+    the row would read converged even when the restart then fails to apply.
+    NULL is the convention for "nothing current to say" (UNKNOWN, #882): no
+    chip, no alert. Only ``ok`` is retired; a failure verdict stays until the
+    new process replaces it with its own. Returns whether it wrote.
+    """
+    if server.config_apply_status != STATUS_OK:
+        return False
+    server.config_apply_status = None
+    server.config_apply_error = None
+    server.config_failed_etag = None
+    server.config_apply_at = None
+    return True
 
 
 def _clip(value: Any, limit: int) -> str | None:
@@ -73,8 +136,14 @@ def apply_reported_status(
     *,
     agent_kind: str,
     server_id: str,
+    container_oom: ContainerOomKill | None = None,
 ) -> None:
     """Persist ``reported`` onto ``server``'s config-apply columns.
+
+    ``container_oom``: the kubelet's current OOM kill of the server's
+    container (#3552), when there is one. It names a ``daemon_died`` verdict
+    out of memory: that verdict is about the previous process's end, and the
+    container's last termination IS that end.
 
     ``reported`` is the heartbeat's ``config`` field. Three shapes matter
     and are handled differently:
@@ -104,6 +173,14 @@ def apply_reported_status(
         )
         return
 
+    # ``ok`` with no etag is not a verdict: it is an agent's pre-first-apply
+    # placeholder (#2258) -- nothing has been applied, so nothing converged.
+    # Storing it would paint a green chip on a server whose /config fetch may
+    # never succeed, and undo the NULL a server move resets to (#934). Older
+    # agents in the field still send it. NULL stays UNKNOWN (#882).
+    if status == STATUS_OK and not _clip(reported.get("etag"), _MAX_ETAG):
+        return
+
     previous = server.config_apply_status
     server.config_apply_status = status
     # Cleared as a group on ``ok``: the error and the failed etag describe a
@@ -114,7 +191,19 @@ def apply_reported_status(
         server.config_apply_error = None
         server.config_failed_etag = None
     else:
-        server.config_apply_error = _clip(reported.get("error"), _MAX_ERROR)
+        error = _clip(reported.get("error"), _MAX_ERROR)
+        reason = _clip(reported.get("reason"), 16)
+        if reason == REASON_OOM:
+            raw_limit = reported.get("memory_limit_bytes")
+            limit = (
+                raw_limit
+                if isinstance(raw_limit, int) and not isinstance(raw_limit, bool)
+                else None
+            )
+            error = _clip(format_oom_error(limit, error), _MAX_ERROR)
+        elif reason == REASON_DAEMON_DIED and container_oom is not None:
+            error = _clip(format_oom_error(container_oom.memory_limit, error), _MAX_ERROR)
+        server.config_apply_error = error
         server.config_failed_etag = _clip(reported.get("failed_etag"), _MAX_ETAG)
     server.config_apply_at = datetime.now(UTC)
 

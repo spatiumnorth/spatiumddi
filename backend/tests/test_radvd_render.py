@@ -125,6 +125,115 @@ def test_render_radvd_conf_stanza() -> None:
     assert "DNSSL example.com {};" in text
 
 
+def test_render_uses_real_radvd_keywords() -> None:
+    """GHSA-6235-5gh6-4hr2: ``AdvMaxInterval`` is not a radvd keyword."""
+    ra = build_ra_config(_scope(ra_max_interval=300), _subnet("2001:db8::/64"))
+    assert ra is not None
+    text = render_radvd_conf([ra])
+    assert "MaxRtrAdvInterval 300;" in text
+    assert "AdvMaxInterval" not in text
+
+
+_INJECTIONS = [
+    "x.example {}; }; interface eth9 { AdvSendAdvert on; prefix 2001:db8:bad::/64 {};",
+    "a.example\nb.example",
+    "a b.example",
+    'a".example',
+    "a;b.example",
+    "a{b.example",
+]
+
+
+def test_dnssl_injection_is_dropped_from_subnet_domain() -> None:
+    for payload in _INJECTIONS:
+        sc = _scope()
+        ra = build_ra_config(sc, _subnet("2001:db8::/64", domain=payload))
+        assert ra is not None
+        assert ra.dnssl == ()
+        text = render_radvd_conf([ra])
+        assert "DNSSL" not in text
+        assert text.count("interface ") == 1
+
+
+def test_dnssl_injection_is_dropped_from_scope_options() -> None:
+    sc = _scope(options={"domain-search": ["ok.example", _INJECTIONS[0]]})
+    ra = build_ra_config(sc, _subnet("2001:db8::/64"))
+    assert ra is not None
+    assert ra.dnssl == ("ok.example",)
+
+
+def test_render_revalidates_even_a_hand_built_config() -> None:
+    from app.drivers.dhcp.base import RAConfigDef
+
+    bad = RAConfigDef(
+        subnet_cidr="2001:db8::/64",
+        interface="eth0",
+        managed_flag=True,
+        other_flag=True,
+        router_lifetime=1800,
+        max_interval=600,
+        prefix_on_link=True,
+        prefix_autonomous=True,
+        prefix_valid_lifetime=86400,
+        prefix_preferred_lifetime=14400,
+        rdnss=("2001:db8::1", "::1 {}; }; interface eth9 {"),
+        dnssl=("ok.example", _INJECTIONS[0]),
+    )
+    text = render_radvd_conf([bad])
+    assert "eth9" not in text
+    assert "RDNSS 2001:db8::1 {};" in text
+    assert "DNSSL ok.example {};" in text
+
+
+def test_bad_interface_name_never_reaches_the_file() -> None:
+    for iface in (
+        "eth0 { AdvSendAdvert on; }; interface eth9",
+        "a\nb",
+        "eth0;",
+        "x" * 16,
+        "..",
+        '"',
+    ):
+        ra = build_ra_config(_scope(ra_interface=iface), _subnet("2001:db8::/64"))
+        assert ra is not None
+        text = render_radvd_conf([ra])
+        assert "eth9" not in text
+        assert "interface " not in text or text.count("interface ") == 1
+        assert iface not in text
+
+
+def test_api_rejects_injection_in_interface_and_subnet_domain() -> None:
+    import pytest
+    from pydantic import ValidationError
+
+    from app.api.v1.dhcp.scopes import ScopeCreate, ScopeUpdate
+    from app.api.v1.ipam.router import SubnetCreate, SubnetUpdate
+
+    for bad in ("eth0 {", "a;b", "a\nb", "x" * 16, "e th"):
+        with pytest.raises(ValidationError):
+            ScopeCreate(ra_interface=bad)
+        with pytest.raises(ValidationError):
+            ScopeUpdate(ra_interface=bad)
+    assert ScopeCreate(ra_interface="eth0.100").ra_interface == "eth0.100"
+    assert ScopeCreate(ra_interface="").ra_interface == ""
+    assert ScopeUpdate().ra_interface is None
+
+    for bad in _INJECTIONS:
+        with pytest.raises(ValidationError):
+            SubnetUpdate(domain_name=bad)
+        with pytest.raises(ValidationError):
+            SubnetCreate(
+                space_id=uuid.uuid4(),
+                block_id=uuid.uuid4(),
+                network="2001:db8::/64",
+                domain_name=bad,
+            )
+    assert SubnetUpdate(domain_name="lab.example").domain_name == "lab.example"
+    # Not config syntax, and accepted before this fix: must stay accepted.
+    assert SubnetUpdate(domain_name="ad_site.example").domain_name == "ad_site.example"
+    assert SubnetUpdate(domain_name=None).domain_name is None
+
+
 def test_render_radvd_conf_empty() -> None:
     assert render_radvd_conf([]) == ""
 

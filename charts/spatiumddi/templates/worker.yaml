@@ -9,7 +9,7 @@ metadata:
     {{- include "spatiumddi.componentLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
 spec:
   replicas: {{ .Values.worker.replicas }}
-  {{- include "spatiumddi.deploymentStrategy" (dict "mode" .Values.worker.podAntiAffinity "replicas" .Values.worker.replicas) | nindent 2 }}
+  {{- include "spatiumddi.deploymentStrategy" (dict "mode" .Values.worker.podAntiAffinity "replicas" .Values.worker.replicas "root" $ "deployment" (printf "%s-worker" (include "spatiumddi.fullname" .)) "container" "worker") | nindent 2 }}
   selector:
     matchLabels:
       {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 6 }}
@@ -31,7 +31,24 @@ spec:
         seccompProfile:
           type: {{ . }}
       {{- end }}
-      terminationGracePeriodSeconds: 60
+      # #1754 — 90 s, not 60: a warm shutdown mid-result-write inside a Redis
+      # no-master window was measured at 54.5 s and 59.2 s. The estimate
+      # (WORKER_TERMINATION_GRACE_S in app/celery_app.py, pinned by
+      # tests/test_celery_redis_transport.py) must stay under this value.
+      terminationGracePeriodSeconds: {{ .Values.worker.terminationGracePeriodSeconds | default 90 }}
+      # #1754 — bound the resolver. Socket timeouts do not cover getaddrinfo,
+      # and while a dead node's CoreDNS pod is still behind the cluster DNS
+      # Service each lookup stalled ~20 s (glibc default timeout:5 attempts:2,
+      # x2 search-list candidates). timeout:2 attempts:2 makes that ~8 s.
+      # ndots is deliberately NOT set here: leaving it out keeps Kubernetes'
+      # default of 5. The cost (a cold external lookup over 4 s fails once)
+      # and the arithmetic are in app/celery_app.py next to DNS_LOOKUP_STALL_S.
+      dnsConfig:
+        options:
+          - name: timeout
+            value: "2"
+          - name: attempts
+            value: "2"
       {{- if .Values.worker.serviceAccount.enabled }}
       # #983 Phase 2 — alert evaluation runs HERE, not in the api, so the
       # node_pressure rule needs the worker to be able to read the kubelet
@@ -48,12 +65,34 @@ spec:
         - name: worker
           image: {{ include "spatiumddi.image" (merge (dict "imageName" "spatiumddi-api") .) }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          {{- if .Values.worker.netRawCapability }}
-          # NET_RAW unlocks nmap raw-socket scans (SYN, ``-O`` OS
-          # detection) for the device-profiling auto-nmap path. The
-          # image already grants the cap to the nmap binary via setcap;
-          # this line keeps it in the pod bounding set so restricted
-          # PSA / OpenShift-SCC clusters don't drop it.
+          {{- if include "spatiumddi.isOpenShift" . }}
+          {{- if .Values.openshift.workerNetRaw }}
+          # #3852 — OpenShift: NET_RAW is not in restricted-v2's allowed set,
+          # and CRI-O's default capability set does not carry it. The image's
+          # nmap carries net_raw + net_bind_service as FILE capabilities, and
+          # the kernel refuses to exec it unless BOTH are in the bounding set,
+          # so both are added. The pod is bound to a SCC that allows exactly
+          # these (openshift.yaml); without ``openshift.workerNetRaw`` the
+          # worker runs under plain restricted-v2 and nmap raw scans are off.
+          securityContext:
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_RAW", "NET_BIND_SERVICE"]
+            # Explicit, not left to the SCC: restricted-v2 also allows
+            # NET_BIND_SERVICE, and if admission picked it, its default
+            # (false) would set no_new_privs and the kernel would ignore the
+            # file capabilities. ``true`` makes restricted-v2 refuse the pod, so
+            # only the agents' SCC admits it. The uid stays non-root.
+            allowPrivilegeEscalation: true
+          {{- end }}
+          {{- else if .Values.worker.netRawCapability }}
+          # #3952 — opt-in, off by default. The image's nmap carries
+          # net_raw as a FILE capability, which works only while NET_RAW
+          # is in the bounding set. containerd's default set already has
+          # it, so this line matters only on a runtime whose set does not
+          # (CRI-O outside OpenShift). Adding it makes Pod Security
+          # ``baseline`` and ``restricted`` REFUSE the pod at admission,
+          # so the namespace must be ``privileged`` (or exempted).
           securityContext:
             capabilities:
               add: ["NET_RAW"]
@@ -65,10 +104,26 @@ spec:
             - worker
             - --loglevel=info
             - --concurrency={{ .Values.worker.concurrency }}
+            # --without-mingle (#1669): mingle's startup handshake syncs revoked-task
+            # lists between workers, and SpatiumDDI never revokes a task. On a
+            # reconnect mid-failover it can hit a dead Sentinel, and celery treats
+            # that OperationalError as unrecoverable and exits the worker.
+            - --without-mingle
+            # --without-heartbeat --without-gossip (#1669): the heartbeat publishes
+            # every 2 s from the worker's event loop, and with no Redis master it
+            # sits in kombu's reconnect for as long as the outage lasts, so a
+            # SIGTERM is never acted on and the pod runs out its grace period.
+            # Nothing reads worker heartbeats or events (no flower, no event
+            # receiver), gossip only consumes those heartbeats, and the liveness
+            # probe's ``inspect ping`` is a remote-control call that needs neither.
+            - --without-heartbeat
+            - --without-gossip
             - -Q
             - {{ .Values.worker.queues | quote }}
           env:
             {{- include "spatiumddi.commonEnv" . | nindent 12 }}
+            {{- include "spatiumddi.sharedEnv" . | nindent 12 }}
+            {{- include "spatiumddi.slotImageMirrorClientEnv" . | nindent 12 }}
             # #989 item 3 — the node this replica runs on. SCHEDULED
             # backups run here, and a removable destination is
             # node-local: without this the worker cannot say which node
@@ -95,11 +150,29 @@ spec:
               command:
                 - sh
                 - -c
-                - celery -A app.celery_app inspect ping -d "celery@${HOSTNAME}" --timeout 5 >/dev/null 2>&1
+                # #2815 — app.worker_liveness wraps the same ping, but a failure
+                # while the probe cannot reach the broker either is the
+                # broker's (a Sentinel failover; a split vote left no master
+                # for ~128 s) and is not counted for --grace seconds after the
+                # last good ping. A worker that does not answer on a healthy
+                # broker still fails at once. Bound: grace + 5 x 30 s = 7.5
+                # min after the last good ping, whatever the broker does.
+                - python -m app.worker_liveness --grace 300 >/dev/null
             initialDelaySeconds: 30
             periodSeconds: 30
-            timeoutSeconds: 10
-            failureThreshold: 3
+            # 15, not 10: the probe is the app import (~1.3 s) plus a bounded
+            # broker connect (5 s) plus the ping (5 s). One that overruns
+            # counts as a failure whatever the broker is doing.
+            timeoutSeconds: 15
+            # 5 x 30 s (was 3): the ping is a broker round trip, so it fails
+            # after a Redis master is lost with its node until Sentinel has
+            # promoted a replica AND the worker has noticed its dead sockets
+            # (kernel keepalive, ~25 s; celery_app.py) and reconnected: about
+            # 30-60 s in a blackholed-master test (#1669). 3 misses (60-90 s)
+            # left little margin; 150 s still catches a wedged worker.
+            # #2815 — counted only once the broker grace above is spent, or
+            # at once when the broker answers and the worker does not.
+            failureThreshold: 5
           resources:
             {{- toYaml .Values.worker.resources | nindent 12 }}
           {{- if or .Values.api.applianceHostMounts.enabled $kubeletCA.enabled }}
@@ -116,6 +189,11 @@ spec:
             # shared hostPath (firstboot chowns it 1000:1000).
             - name: pcaps
               mountPath: /var/lib/spatiumddi/pcaps
+            # #2400 — upgrade-image store. The reclaim beat task deletes an
+            # image every node has committed to; the api writes the same
+            # hostPath (firstboot chowns it 1000:1000).
+            - name: slot-images
+              mountPath: /var/lib/spatiumddi/slot-images
             # #1160 — local-volume backup archives. The worker WRITES every
             # scheduled run here; the api lists / downloads / restores from
             # the same hostPath (firstboot chowns it 1000:1000).
@@ -146,6 +224,11 @@ spec:
         - name: pcaps
           hostPath:
             path: {{ .Values.api.applianceHostMounts.pcapsDir }}
+            type: DirectoryOrCreate
+        # #2400 — upgrade-image store (shared with the api).
+        - name: slot-images
+          hostPath:
+            path: {{ .Values.api.applianceHostMounts.slotImagesDir }}
             type: DirectoryOrCreate
         # #1160 — local-volume backup archives (shared with the api).
         - name: backups

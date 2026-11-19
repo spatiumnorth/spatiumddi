@@ -12,9 +12,11 @@ Two shapes:
   migrations added survived and broke the replay (#1363).
 * **Selective restore** (``sections`` given) — TRUNCATE CASCADE + a
   data-only reload, over the **FK-cascade closure** of the selected
-  sections' tables. The closure matters because CASCADE empties every
-  table holding a foreign key into a truncated one; restoring only the
-  selection deleted the difference (#781).
+  sections' tables, both in one transaction (#1693). The closure matters
+  because CASCADE empties every table holding a foreign key into a
+  truncated one; restoring only the selection deleted the difference
+  (#781). The closure's foreign keys are set aside for the load and put
+  back, checked, before it commits, so it needs no superuser.
 
 Safety rails:
 
@@ -32,9 +34,10 @@ Safety rails:
   archive this build cannot migrate forward is refused with the
   database still intact. ``allow_newer_schema`` overrides it for the
   A/B-rollback case.
-* The data replay itself is atomic — clearing and replay run in one
-  ``psql --single-transaction``, and a ``pg_restore`` that fails part way
-  never lets psql reach end of input and commit. What is *not* atomic is the restore as
+* The data replay itself is atomic — clearing (or, for a selective
+  restore, emptying) and replay run in one ``psql --single-transaction``,
+  and a ``pg_restore`` that fails part way never lets psql reach end of
+  input and commit. What is *not* atomic is the restore as
   a whole: the post-replay secret rewrap walks 65 columns/fields
   committing one at a time, so it can leave a half-migrated credential
   store. That is reported rather than hidden — see ``RewrapOutcome``'s
@@ -47,11 +50,13 @@ import asyncio
 import os
 import secrets
 import tempfile
+import zlib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import asyncpg
 import structlog
 
 from app.services.backup.archive import (
@@ -62,6 +67,12 @@ from app.services.backup.archive import (
     extract_archive_members,
 )
 from app.services.backup.crypto import BackupCryptoError, decrypt_secrets
+from app.services.backup.legacy_columns import (
+    disabled_since,
+    disabled_warning,
+    fold_dropped_plaintext_columns,
+    selective_readd_sql,
+)
 from app.services.backup.migrations import (
     MigrationOutcome,
     maybe_upgrade_after_restore,
@@ -73,6 +84,7 @@ from app.services.backup.rewrap import (
     RewrapOutcome,
     rewrap_secrets,
 )
+from app.services.backup.targets.base import PRE_RESTORE_KEEP_LAST_N, PRE_RESTORE_PREFIX
 
 logger = structlog.get_logger(__name__)
 
@@ -82,6 +94,20 @@ CONFIRM_PHRASE = "RESTORE-FROM-BACKUP"
 # the dispatcher below routes to psql or pg_restore based on the
 # manifest's ``dump_format`` field.
 SUPPORTED_FORMAT_VERSIONS = {1, 2}
+
+
+def format_version_refusal(fmt_version: object) -> str | None:
+    """Why the restore refuses this ``format_version``, or None. Shared with
+    the manifest preview (#2949) so the console and the restore agree."""
+    if fmt_version in SUPPORTED_FORMAT_VERSIONS:
+        return None
+    return (
+        f"unsupported backup format_version: {fmt_version!r} "
+        f"(this build expects one of {sorted(SUPPORTED_FORMAT_VERSIONS)}). "
+        f"Upgrade SpatiumDDI before restoring this archive."
+    )
+
+
 PRE_RESTORE_DIR = Path("/var/lib/spatiumddi/backups")
 
 # A replay can run a while on a hefty install; same envelope as pg_dump so
@@ -119,6 +145,9 @@ class RestoreOutcome:
     # destination agent and produces *new* DS records the operator
     # must re-publish to the parent registrar.
     warnings: list[str] = field(default_factory=list)
+    # Backup targets whose ``in_progress`` claim came back inside the
+    # archive and was settled (#2097). Empty when none.
+    reconciled_backup_targets: list[dict[str, Any]] = field(default_factory=list)
 
 
 async def _terminate_other_db_connections(pg_env: dict[str, str]) -> None:
@@ -128,14 +157,20 @@ async def _terminate_other_db_connections(pg_env: dict[str, str]) -> None:
     which is fine — psql itself opens a brand-new connection on the
     next call.
 
+    It spares one other: the connection holding the restore lock
+    (#1648). Ending it would release the lock in the middle of the
+    replay and let a second restore in (#1571). It holds no table, so
+    it is in nobody's way.
+
     Failures here are logged but non-fatal; if the pool drops are
     enough on their own (no other connections present) the replay
     proceeds normally.
     """
-    full_env = {**os.environ, **pg_env}
+    full_env = _pg_subprocess_env(pg_env)  # allowlisted env, not the full api env (#1572)
     sql = (
         "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-        "WHERE datname = current_database() AND pid <> pg_backend_pid();"
+        "WHERE datname = current_database() AND pid <> pg_backend_pid() "
+        f"AND pid NOT IN ({_RESTORE_LOCK_HOLDERS_SQL});"
     )
     proc = await asyncio.create_subprocess_exec(
         "psql",
@@ -181,9 +216,75 @@ async def _terminate_other_db_connections(pg_env: dict[str, str]) -> None:
 # recreates everything that should exist. Names are captured as text up
 # front, because a CASCADE drop removes later rows' objects and a regclass of
 # a dropped oid renders as a bare number.
-_CLEAR_PUBLIC_SCHEMA_SQL = """\
--- One NOTICE per cascaded constraint would otherwise bury the error, if any.
-SET client_min_messages = warning;
+#
+# Before that block, ``_LOCK_PUBLIC_TABLES_SQL`` takes every table at once. The
+# drops lock as they go, and every lock is held to the end of the transaction,
+# while the appliance keeps working: the api, worker and agents reconnect the
+# moment ``_terminate_other_db_connections`` has run. A session that read a
+# table the drops had not reached yet and then waited for one they had already
+# dropped closed a cycle when the drops reached the table it held, and
+# PostgreSQL aborted the replay: "deadlock detected" at the clearing block's
+# last line, a 400, nothing restored. So the lock block first ends the sessions
+# of this role that came back and hold one of the tables, then takes every
+# table in one ``LOCK TABLE``, inside a subtransaction: if a session that
+# slipped in between still closes a cycle and PostgreSQL picks this side, only
+# the attempt is rolled back, and it is tried again. Waits on anything else
+# (autovacuum, which the deadlock check cancels after ``deadlock_timeout``; a
+# long reader of another role) are waited out, as the drops always did.
+_LOCK_PUBLIC_TABLES_SQL = """\
+DO $lock$
+DECLARE
+    tables text;
+    attempts integer := 0;
+BEGIN
+    -- Tables only: a LOCK on a view also locks whatever the view reads, wherever
+    -- it lives, and a sequence cannot be LOCKed. The product has no views, and
+    -- its sequences are only used through their tables' INSERTs.
+    SELECT string_agg(format('%I.%I', n.nspname, c.relname), ', ' ORDER BY c.relname)
+    INTO tables
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public'
+      AND c.relkind IN ('r', 'p')
+      AND NOT EXISTS (
+          SELECT 1 FROM pg_depend d
+          WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e'
+      );
+    IF tables IS NULL THEN
+        RETURN;
+    END IF;
+    LOOP
+        -- Only this role's sessions: ending another role's (a superuser's) is
+        -- refused with an ERROR, which would end the restore instead.
+        PERFORM pg_terminate_backend(h.pid, 1000)
+        FROM (
+            SELECT DISTINCT l.pid
+            FROM pg_locks l
+            JOIN pg_class c ON c.oid = l.relation
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_stat_activity a ON a.pid = l.pid
+            WHERE l.granted
+              AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+              AND n.nspname = 'public'
+              AND l.pid <> pg_backend_pid()
+              AND a.usename = current_user
+        ) h;
+        BEGIN
+            EXECUTE 'LOCK TABLE ' || tables || ' IN ACCESS EXCLUSIVE MODE';
+            RETURN;
+        EXCEPTION WHEN deadlock_detected THEN
+            -- The attempt's locks went with its subtransaction.
+            attempts := attempts + 1;
+            IF attempts >= 10 THEN
+                RAISE;
+            END IF;
+        END;
+    END LOOP;
+END
+$lock$;
+"""
+
+_DROP_PUBLIC_SCHEMA_SQL = """\
 DO $clear$
 DECLARE
     r record;
@@ -249,6 +350,13 @@ END
 $clear$;
 """
 
+_CLEAR_PUBLIC_SCHEMA_SQL = (
+    # One NOTICE per cascaded constraint would otherwise bury the error, if any.
+    "SET client_min_messages = warning;\n"
+    + _LOCK_PUBLIC_TABLES_SQL
+    + _DROP_PUBLIC_SCHEMA_SQL
+)
+
 _REPLAY_CHUNK_BYTES = 64 * 1024
 
 
@@ -303,15 +411,21 @@ async def _saw_token(stream: asyncio.StreamReader, token: bytes) -> bool:
     return seen
 
 
-async def _replay_clean(source, db_url: str, *, producer=None) -> None:
+async def _replay_clean(
+    source, db_url: str, *, producer=None, prelude: str | None = None, postlude: str = ""
+) -> None:
     r"""Clear the schema and replay a SQL script, in ONE transaction (#1363).
 
     ``source`` yields the script's bytes: a plain dump read from disk, or
     ``pg_restore``'s script output for a custom-format archive (``producer``
     is that process, so its failure can be told apart). Everything reaches
     ``psql --single-transaction`` through stdin as one script, prefixed by
-    :data:`_CLEAR_PUBLIC_SCHEMA_SQL` — one ``-f -`` rather than several
-    ``-f`` files, because only psql 15+ wraps several in one transaction.
+    ``prelude`` — one ``-f -`` rather than several ``-f`` files, because only
+    psql 15+ wraps several in one transaction. The prelude is
+    :data:`_CLEAR_PUBLIC_SCHEMA_SQL` for a full restore (read when called, not
+    bound at import); a selective restore passes its own, which empties only
+    the tables it reloads (#1693), and a ``postlude`` that runs after the
+    script, in the same transaction.
 
     The script is streamed, not staged: an install's dump can be larger than
     the api pod's scratch space. The cost of streaming is that psql reaching
@@ -326,6 +440,8 @@ async def _replay_clean(source, db_url: str, *, producer=None) -> None:
     the pipe proves nothing, since psql can leave early with exit 0 (a
     ``\q``) while a small script still fits in the pipe.
     """
+    if prelude is None:
+        prelude = _CLEAR_PUBLIC_SCHEMA_SQL
     pg_env, _dbname = _pg_env_from_url(db_url)
     await _terminate_other_db_connections(pg_env)
     psql = await asyncio.create_subprocess_exec(
@@ -376,7 +492,7 @@ async def _replay_clean(source, db_url: str, *, producer=None) -> None:
         the dump into nothing before reporting the error.
         """
         try:
-            stdin.write(_CLEAR_PUBLIC_SCHEMA_SQL.encode("utf-8"))
+            stdin.write(prelude.encode("utf-8"))
             await stdin.drain()
             async for chunk in source:
                 if psql_gone():
@@ -384,7 +500,7 @@ async def _replay_clean(source, db_url: str, *, producer=None) -> None:
                 stdin.write(chunk)
                 await stdin.drain()
             # On its own line: the script need not end with a newline.
-            stdin.write(b"\n\\echo " + token + b"\n")
+            stdin.write(b"\n" + postlude.encode("utf-8") + b"\\echo " + token + b"\n")
             await stdin.drain()
         except (BrokenPipeError, ConnectionResetError):
             return False
@@ -496,97 +612,264 @@ async def _run_pg_restore(dump_path: Path, db_url: str) -> None:
         await _stop(producer)
 
 
-async def _truncate_tables(tables: list[str], db_url: str) -> None:
-    """``TRUNCATE … RESTART IDENTITY CASCADE`` for the supplied
-    table list. Used by selective restore — we wipe the selected
-    sections' tables before pg_restore re-loads their data.
+# #1693 — the foreign keys of the tables a selective restore reloads are set
+# aside for the load and put back before it commits, all in its one
+# transaction. ``pg_restore --data-only`` loads tables in the archive's order,
+# not in foreign-key order, and no order could do: ``ip_address`` and
+# ``dns_record`` (with ``nmap_scan``), and ``asn`` and ``provider``, reference
+# each other. ``--disable-triggers`` got past that by turning the foreign keys'
+# triggers off, which PostgreSQL allows only a superuser, and the appliance
+# connects as the app role, which owns the tables but is not one. Dropping a
+# foreign key and adding it back needs only ownership, and adding it back
+# checks every row it covers, which the disabled triggers never did: rows
+# pointing at something that no longer exists end the restore with the
+# constraint named, and the transaction rolls back.
+#
+# The definitions are read with an empty search_path, so they name every
+# table with its schema: ``pg_restore``'s script empties the search_path
+# before the put-back runs. The temporary table goes with the transaction.
+_SET_ASIDE_FOREIGN_KEYS_SQL = """\
+SELECT pg_catalog.set_config('search_path', '', false);
+CREATE TEMPORARY TABLE spatium_restore_fkey ON COMMIT DROP AS
+SELECT format('%I.%I', n.nspname, c.relname) AS tbl,
+       k.conname,
+       pg_catalog.pg_get_constraintdef(k.oid) AS def
+FROM pg_catalog.pg_constraint k
+JOIN pg_catalog.pg_class c ON c.oid = k.conrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE k.contype = 'f'
+  -- A partition's copy of its parent's key goes with the parent's, and
+  -- dropping one directly is an ERROR. The product has no partitions.
+  AND k.conparentid = 0
+  AND n.nspname = 'public'
+  AND c.relname = ANY ({tables});
+DO $setaside$
+DECLARE
+    r record;
+BEGIN
+    FOR r IN SELECT tbl, conname FROM pg_temp.spatium_restore_fkey ORDER BY tbl, conname LOOP
+        EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', r.tbl, r.conname);
+    END LOOP;
+END
+$setaside$;
+"""
 
-    CASCADE is intentional: when an operator restores "DNS only"
-    onto an install where IPAM rows reference DNS rows, the
-    cascading DELETE wipes those references too. Without CASCADE
-    the TRUNCATE would fail with a FK constraint error and the
-    operator would have to know the dependency graph in advance.
-    The restore UI warns about this up front.
-    """
-    if not tables:
-        return
-    pg_env, _dbname = _pg_env_from_url(db_url)
-    full_env = {**os.environ, **pg_env}
-    quoted = ", ".join(f'"{t}"' for t in tables)
-    cmd = [
-        "psql",
-        "--set=ON_ERROR_STOP=1",
-        "--single-transaction",
-        f"--command=TRUNCATE TABLE {quoted} RESTART IDENTITY CASCADE",
-    ]
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        env=full_env,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+# ``tables`` is the closure ``sections.cascade_closure`` computes from the
+# models' foreign keys, and the TRUNCATE's CASCADE follows the DATABASE's. A
+# foreign key a migration created and no model declares would let the CASCADE
+# empty a table this restore does not reload, and that table's rows would be
+# gone with nothing reporting it: the #781 loss, back through a gap nothing
+# checks. So before anything is emptied, the closure is worked out again from
+# the catalog, and a table it reaches outside ``tables`` refuses the restore,
+# naming the table, with nothing changed.
+_REFUSE_A_WIDER_CASCADE_SQL = """\
+DO $closure$
+DECLARE
+    beyond text;
+BEGIN
+    WITH RECURSIVE reached(oid) AS (
+        SELECT c.oid
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND c.relname = ANY ({tables})
+        UNION
+        SELECT k.conrelid
+        FROM pg_catalog.pg_constraint k
+        JOIN reached r ON r.oid = k.confrelid
+        WHERE k.contype = 'f' AND k.conparentid = 0
     )
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
-    except TimeoutError as exc:
-        proc.kill()
-        await proc.wait()
-        raise BackupRestoreError("TRUNCATE timed out (>5 min)") from exc
-    if proc.returncode != 0:
-        msg = (stderr.decode(errors="replace") or stdout.decode(errors="replace"))[:1500]
-        raise BackupRestoreError(f"TRUNCATE failed (exit {proc.returncode}): {msg}")
+    SELECT string_agg(format('%I.%I', n.nspname, c.relname), ', '
+                      ORDER BY n.nspname, c.relname)
+    INTO beyond
+    FROM reached r
+    JOIN pg_catalog.pg_class c ON c.oid = r.oid
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE NOT (n.nspname = 'public' AND c.relname = ANY ({tables}));
+    IF beyond IS NOT NULL THEN
+        RAISE EXCEPTION 'selective restore: TRUNCATE ... CASCADE would also empty %, '
+            'which this restore does not reload (a foreign key the models do not '
+            'declare); nothing was changed', beyond;
+    END IF;
+END
+$closure$;
+"""
+
+_PUT_BACK_FOREIGN_KEYS_SQL = """\
+DO $putback$
+DECLARE
+    r record;
+BEGIN
+    FOR r IN SELECT tbl, conname, def FROM pg_temp.spatium_restore_fkey ORDER BY tbl, conname LOOP
+        EXECUTE format('ALTER TABLE %s ADD CONSTRAINT %I %s', r.tbl, r.conname, r.def);
+    END LOOP;
+END
+$putback$;
+"""
+
+# ``TRUNCATE … RESTART IDENTITY`` sends every sequence the emptied tables own
+# back to its start, and ``pg_restore --data-only --table`` reloads their rows
+# but never their sequences. Left there, each sequence hands out values its
+# restored rows already hold: ``audit_log.seq`` has a unique index, so every
+# audited write after a restore of ``audit`` (a login is one) failed with a
+# duplicate key and answered 409, and a restore of ``dns`` did the same to the
+# DHCP log ingest. So after the load, still in its one transaction, each
+# sequence a reloaded table owns (a serial's or an identity's) is set to the
+# largest value its column now holds, unless that is below where the sequence
+# already stands (``setval`` would refuse one under the sequence's minimum).
+# An empty table keeps the fresh start.
+_PUT_SEQUENCES_PAST_THEIR_ROWS_SQL = """\
+DO $sequences$
+DECLARE
+    r record;
+BEGIN
+    FOR r IN
+        SELECT format('%I.%I', sn.nspname, s.relname) AS seq,
+               format('%I.%I', n.nspname, c.relname) AS tbl,
+               a.attname AS col
+        FROM pg_catalog.pg_depend d
+        JOIN pg_catalog.pg_class s ON s.oid = d.objid AND s.relkind = 'S'
+        JOIN pg_catalog.pg_namespace sn ON sn.oid = s.relnamespace
+        JOIN pg_catalog.pg_class c ON c.oid = d.refobjid
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = d.refobjsubid
+        WHERE d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+          AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
+          AND d.deptype IN ('a', 'i')
+          AND n.nspname = 'public'
+          AND c.relname = ANY ({tables})
+        ORDER BY 1
+    LOOP
+        EXECUTE format(
+            'SELECT pg_catalog.setval(%L, m) FROM (SELECT max(%I) AS m FROM %s) AS t '
+            'WHERE m >= (SELECT last_value FROM %s)',
+            r.seq, r.col, r.tbl, r.seq
+        );
+    END LOOP;
+END
+$sequences$;
+"""
 
 
-async def _run_pg_restore_data_only(dump_path: Path, db_url: str, tables: list[str]) -> None:
-    """``pg_restore --data-only --disable-triggers --table=…``.
+def _sql_text_array(values: list[str]) -> str:
+    """``ARRAY['a', 'b']::text[]`` with each value quoted as a literal."""
+    return "ARRAY[" + ", ".join("'" + v.replace("'", "''") + "'" for v in values) + "]::text[]"
 
-    Used by selective restore. ``--data-only`` skips schema
-    commands (the tables already exist after TRUNCATE);
-    ``--disable-triggers`` lets the COPY apply rows in any order
-    without triggering FK checks mid-load (we re-enable triggers
-    when the transaction commits). ``--single-transaction`` keeps
-    the load atomic.
 
-    Important: pg_restore --table is repeatable; we pass each
-    table separately so the operator can pick a subset cleanly.
+def _selective_prelude(tables: list[str]) -> str:
+    """What a selective replay runs before the archive's rows, in the same
+    transaction: take the locks the way the full restore's clearing does,
+    then ``TRUNCATE … RESTART IDENTITY CASCADE`` the tables it reloads.
+
+    CASCADE is intentional: when an operator restores "DNS only" onto an
+    install where IPAM rows reference DNS rows, the cascading DELETE wipes
+    those references too, and ``tables`` is already the FK-cascade closure
+    that gets them back (#781).
+
+    The locks come first for the reason they do in a full restore (#1648):
+    the api, worker and agents reconnect the moment
+    :func:`_terminate_other_db_connections` has run, and the emptying now
+    holds its locks until the load commits, so a session that read one of
+    these tables and then waited on another would otherwise close a cycle
+    with it and end the restore in "deadlock detected". Setting the foreign
+    keys aside also locks the tables they point into, which the lock block
+    has already taken.
+
+    Before the TRUNCATE, a CASCADE that would reach past ``tables`` is
+    refused (:data:`_REFUSE_A_WIDER_CASCADE_SQL`). Last, the foreign keys of
+    ``tables`` are set aside (:data:`_SET_ASIDE_FOREIGN_KEYS_SQL`) after the
+    TRUNCATE, whose CASCADE follows them.
+    """
+    quoted = ", ".join(f'"public"."{t}"' for t in tables)
+    array = _sql_text_array(tables)
+    return (
+        # One NOTICE per cascaded table would otherwise bury the error, if any.
+        "SET client_min_messages = warning;\n"
+        + _LOCK_PUBLIC_TABLES_SQL
+        + _REFUSE_A_WIDER_CASCADE_SQL.format(tables=array)
+        + f"TRUNCATE TABLE {quoted} RESTART IDENTITY CASCADE;\n"
+        + _SET_ASIDE_FOREIGN_KEYS_SQL.format(tables=array)
+        # An archive taken before a contract migration still names the
+        # columns it dropped; put them back so its COPY loads. The restore
+        # folds and drops them again after the migration step.
+        + selective_readd_sql(tables)
+    )
+
+
+def _selective_postlude(tables: list[str]) -> str:
+    """What a selective replay runs after the archive's rows, before its one
+    transaction commits: put the foreign keys back, which checks every row
+    loaded (:data:`_PUT_BACK_FOREIGN_KEYS_SQL`), then set each sequence the
+    reloaded tables own past their rows
+    (:data:`_PUT_SEQUENCES_PAST_THEIR_ROWS_SQL`)."""
+    return _PUT_BACK_FOREIGN_KEYS_SQL + _PUT_SEQUENCES_PAST_THEIR_ROWS_SQL.format(
+        tables=_sql_text_array(tables)
+    )
+
+
+async def _run_selective_restore(dump_path: Path, db_url: str, tables: list[str]) -> None:
+    """Empty ``tables`` and reload their rows from a custom-format archive,
+    in ONE transaction (#1693).
+
+    ``tables`` is the selected sections' FK-cascade closure. ``pg_restore
+    --data-only --table=…`` turns their rows into a script (``--file=-``,
+    which never connects), and :func:`_replay_clean` runs it through one
+    ``psql --single-transaction`` after :func:`_selective_prelude` has
+    emptied them and set their foreign keys aside, then puts the foreign
+    keys back, which checks every row loaded, and sets the sequences the
+    TRUNCATE restarted past the rows it reloaded (:func:`_selective_postlude`).
+
+    Nothing here needs a superuser. ``--disable-triggers`` did: it emits
+    ``ALTER TABLE … DISABLE TRIGGER ALL``, which PostgreSQL refuses to the
+    app role an appliance connects as on any table with a foreign key, so
+    every selective restore on an appliance failed (#1693).
+
+    The emptying used to be a psql transaction of its own, which committed
+    before the load started, so a load that failed for any reason left every
+    table in the closure empty: ``alembic_version`` among them, which leaves
+    the api not ready, so the operator could not reach the restore page to
+    undo it. Now a failed load rolls the emptying back with it, and the
+    database is as it was.
+
+    ``pg_restore --table`` is repeatable; each table is passed on its own.
     """
     if not tables:
         raise BackupRestoreError("selective restore: no tables to load")
-    pg_env, dbname = _pg_env_from_url(db_url)
-    await _terminate_other_db_connections(pg_env)
-    full_env = {**os.environ, **pg_env}
     cmd = [
         "pg_restore",
-        "--dbname",
-        dbname,
         "--data-only",
-        "--disable-triggers",
         "--no-owner",
         "--no-acl",
-        "--single-transaction",
-        "--exit-on-error",
+        "--file=-",
     ]
     for table in tables:
         cmd.extend(["--table", table])
     cmd.append(str(dump_path))
-    proc = await asyncio.create_subprocess_exec(
+    producer = await asyncio.create_subprocess_exec(
         *cmd,
-        env=full_env,
+        # Script mode never connects, so it gets no connection credentials.
+        env=_pg_subprocess_env({}),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+    stdout = producer.stdout
+    assert stdout is not None
+
+    async def script():
+        while chunk := await stdout.read(_REPLAY_CHUNK_BYTES):
+            yield chunk
+
     try:
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=_PG_RESTORE_TIMEOUT_SECONDS
+        await _replay_clean(
+            script(),
+            db_url,
+            producer=producer,
+            prelude=_selective_prelude(tables),
+            postlude=_selective_postlude(tables),
         )
-    except TimeoutError as exc:
-        proc.kill()
-        await proc.wait()
-        raise BackupRestoreError(
-            f"pg_restore --data-only exceeded {_PG_RESTORE_TIMEOUT_SECONDS}s timeout"
-        ) from exc
-    if proc.returncode != 0:
-        msg = (stderr.decode(errors="replace") or stdout.decode(errors="replace"))[:1500]
-        raise BackupRestoreError(f"pg_restore --data-only failed (exit {proc.returncode}): {msg}")
+    finally:
+        # As in _run_pg_restore: reap the producer on a failure before the
+        # replay owned it.
+        await _stop(producer)
 
 
 async def _write_pre_restore_safety_dump(db) -> str | None:
@@ -596,9 +879,14 @@ async def _write_pre_restore_safety_dump(db) -> str | None:
     archive use that constant. The intent is "let the operator roll
     back via a SQL replay if Phase 1a's hard-overwrite was a
     mistake," not "long-term forensic vault."
+
+    Because that passphrase is public, filesystem permissions are the
+    only protection for the SECRET_KEY inside: the directory is 0700
+    (tightened if it already existed looser) and the file is created
+    0600 up front, never written world-readable and chmod'd after.
     """
     try:
-        PRE_RESTORE_DIR.mkdir(parents=True, exist_ok=True)
+        PRE_RESTORE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     except (PermissionError, OSError) as exc:
         logger.warning(
             "pre_restore_safety_dir_unavailable",
@@ -606,15 +894,34 @@ async def _write_pre_restore_safety_dump(db) -> str | None:
             error=str(exc),
         )
         return None
+    try:
+        os.chmod(PRE_RESTORE_DIR, 0o700)
+    except OSError as exc:
+        # A directory this process doesn't own (a root-owned volume shared
+        # through fsGroup) can't be tightened. That must not cost the
+        # operator the rollback copy: the file below is still created 0600.
+        logger.warning(
+            "pre_restore_safety_dir_chmod_failed",
+            path=str(PRE_RESTORE_DIR),
+            error=str(exc),
+        )
     timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-    out_path = PRE_RESTORE_DIR / f"pre-restore-{timestamp}.zip"
+    # Random suffix + O_EXCL (#1571): the name had one-second
+    # resolution and was written with an overwriting write, so two
+    # restores in the same second overwrote the FIRST rollback copy
+    # with the second — destroying exactly the copy the first
+    # restore might need. O_EXCL makes a residual collision fail
+    # this dump (soft-fail path below) instead of overwriting.
+    out_path = PRE_RESTORE_DIR / f"pre-restore-{timestamp}-{secrets.token_hex(3)}.zip"
     try:
         archive_bytes, _filename = await build_backup_archive(
             db,
             passphrase="pre-restore-safety",
             passphrase_hint="auto pre-restore safety dump (issue #117 Phase 1a)",
         )
-        out_path.write_bytes(archive_bytes)
+        fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(archive_bytes)
     except (BackupArchiveError, OSError) as exc:
         logger.warning(
             "pre_restore_safety_dump_failed",
@@ -622,7 +929,44 @@ async def _write_pre_restore_safety_dump(db) -> str | None:
             error=str(exc),
         )
         return None
+    _prune_pre_restore_safety_dumps(keep=out_path)
     return str(out_path)
+
+
+def _prune_pre_restore_safety_dumps(*, keep: Path) -> None:
+    """Keep the newest ``PRE_RESTORE_KEEP_LAST_N`` safety dumps in
+    ``PRE_RESTORE_DIR`` and delete the rest.
+
+    Each dump holds the SECRET_KEY under a passphrase anyone can read in
+    this file, so old copies are not harmless clutter. A target's
+    retention already prunes them when a local-volume target points at
+    this directory; without one they used to accumulate. Runs only after
+    a new dump is written, never removes ``keep`` (the dump just taken),
+    and only touches regular files named like a safety dump. A failure to
+    delete is logged and does not fail the restore.
+    """
+    try:
+        dumps = [
+            p
+            for p in PRE_RESTORE_DIR.iterdir()
+            if p.name.startswith(PRE_RESTORE_PREFIX)
+            and p.name.endswith(".zip")
+            and not p.is_symlink()
+            and p.is_file()
+        ]
+        dumps.sort(key=lambda p: (p.stat().st_mtime, p.name), reverse=True)
+    except OSError as exc:
+        logger.warning("pre_restore_safety_prune_failed", path=str(PRE_RESTORE_DIR), error=str(exc))
+        return
+    # The dump just written counts first whatever its mtime says, so a
+    # clock step cannot make the prune delete it.
+    ordered = [keep] + [p for p in dumps if p != keep]
+    for dump in ordered[max(PRE_RESTORE_KEEP_LAST_N, 1) :]:
+        try:
+            dump.unlink()
+            logger.info("pre_restore_safety_dump_pruned", path=str(dump))
+        except OSError as exc:
+            logger.warning("pre_restore_safety_prune_failed", path=str(dump), error=str(exc))
 
 
 async def _collect_post_restore_warnings(db_url: str) -> list[str]:
@@ -638,7 +982,7 @@ async def _collect_post_restore_warnings(db_url: str) -> list[str]:
     much registrar work is queued up.
     """
     pg_env, _dbname = _pg_env_from_url(db_url)
-    full_env = {**os.environ, **pg_env}
+    full_env = _pg_subprocess_env(pg_env)  # allowlisted env, not the full api env (#1572)
     sql = (
         "SELECT z.name FROM dns_zone z "
         "JOIN dns_server_group g ON g.id = z.group_id "
@@ -683,7 +1027,127 @@ async def _collect_post_restore_warnings(db_url: str) -> list[str]:
     ]
 
 
-async def apply_backup_restore(
+#: Session-level Postgres advisory lock serialising restores (#1571).
+#: Neither restore endpoint took any lock, so two concurrent restores
+#: interleaved their schema clear and replay — each replaying over
+#: the other's half-cleared schema. Fixed key (this is a whole-install
+#: operation, there is only ever one restore at a time), derived from
+#: a label rather than hand-picked so it cannot collide with the
+#: crc32-based per-resource keys elsewhere by accident.
+_RESTORE_LOCK_KEY = zlib.crc32(b"spatiumddi:backup-restore") - 2**31
+
+#: The backend holding the restore lock, if any: the running restore's own
+#: lock connection, which ``_terminate_other_db_connections`` must not end
+#: (#1648). ``pg_locks`` shows a bigint key as its high half in ``classid``
+#: and its low half in ``objid``, with ``objsubid`` 1. ``pid IS NOT NULL``
+#: keeps a prepared transaction's lock from turning ``NOT IN`` into NULL.
+_RESTORE_LOCK_HOLDERS_SQL = (
+    "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted "
+    "AND pid IS NOT NULL AND objsubid = 1 "
+    f"AND ((classid::bigint << 32) | objid::bigint) = {_RESTORE_LOCK_KEY} "
+    "AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
+)
+
+
+async def restore_lock_held(db) -> bool:
+    """True while a restore holds the install-wide restore lock (#2097).
+
+    A read of ``pg_locks``, not a ``pg_try_advisory_lock``: taking the lock,
+    even for an instant, would refuse a restore that started in that instant
+    as "already in progress". Nothing here blocks or changes state.
+
+    The lock is held from before the replay until after the restore has
+    settled the run claims its archive carried, so a caller that sees it
+    free has either run before the replay or after the settle — never in the
+    window between the replay's commit and the settle, where a restored
+    claim reads as two hours old with nothing behind it.
+    """
+    from sqlalchemy import text  # noqa: PLC0415
+
+    return bool(await db.scalar(text(f"SELECT EXISTS ({_RESTORE_LOCK_HOLDERS_SQL})")))
+
+
+async def apply_backup_restore(db, *, db_url: str, **kwargs: Any) -> RestoreOutcome:
+    """Restore under the install-wide advisory lock (#1571).
+
+    ``pg_try_advisory_lock`` is non-blocking on purpose: a second
+    restore is refused immediately with an operator-readable error
+    rather than queued behind a replay that disposes the connection
+    pool mid-flight.
+
+    The lock is session-level, so it belongs to the connection that
+    took it. That is a connection of its own, opened here and held for
+    the whole restore (#1648). It used to be ``db``'s, but a session
+    hands its connection back to the pool at every commit, and the rest
+    of the restore ran on whatever connection it checked out next. With
+    others idle in the pool that was a different one, where the unlock
+    found nothing to release: the lock stayed behind on an idle pooled
+    connection and refused every later restore as "already in
+    progress", a second restore whose session checked out the holder got
+    in while the first ran, and Phase 4's pool dispose dropped the lock
+    before the replay. Nothing in the restore can take this connection
+    away: it is not in the pool Phase 4 disposes, and
+    ``_terminate_other_db_connections`` spares the lock's holder.
+    Ending it releases the lock on every path, a cancelled request
+    included, and a process that dies mid-restore releases it with its
+    connection — it cannot wedge restores the way a row-based mutex
+    could.
+    """
+    if db is None:  # unit tests drive the phases with stubs
+        return await _apply_backup_restore_inner(db, db_url=db_url, **kwargs)
+    # asyncpg takes ``postgresql://``, not SQLAlchemy's dialect URL (as the
+    # rewrap does); the bounds are the app engine's (``app.db``).
+    lock_conn = await asyncpg.connect(
+        dsn=db_url.replace("postgresql+asyncpg://", "postgresql://", 1),
+        timeout=5,
+        command_timeout=30,
+        server_settings={"application_name": "spatiumddi-restore-lock"},
+    )
+    try:
+        if not await lock_conn.fetchval("SELECT pg_try_advisory_lock($1)", _RESTORE_LOCK_KEY):
+            raise BackupRestoreError(
+                "another restore is already in progress on this install — "
+                "wait for it to finish before starting a second one"
+            )
+        try:
+            return await _apply_backup_restore_inner(db, db_url=db_url, **kwargs)
+        finally:
+            try:
+                released = await lock_conn.fetchval(
+                    "SELECT pg_advisory_unlock($1)", _RESTORE_LOCK_KEY
+                )
+            except Exception:  # noqa: BLE001 — ending the connection releases it anyway
+                logger.warning("backup_restore_advisory_unlock_failed", exc_info=True)
+            else:
+                if not released:
+                    # Only if this connection lost the lock mid-restore, so
+                    # the restore it guarded may not have run alone.
+                    logger.error("backup_restore_advisory_lock_lost")
+    finally:
+        # terminate(), not close(): close() awaits the server's goodbye, and
+        # a request cancelled again meanwhile (an anyio cancel scope cancels
+        # at every await) leaves the socket open, and the lock on it.
+        # terminate() drops the socket at once; the server ends the session,
+        # and the lock with it if the unlock never ran.
+        lock_conn.terminate()
+
+
+def _schema_override_warning(direction_error: str) -> str:
+    """The warning a restore made with ``allow_newer_schema`` leads its
+    outcome with: the refusal it overrode, and what the api does on a
+    schema newer than this build (#781, #2777)."""
+    return (
+        "Schema-direction check OVERRIDDEN: " + direction_error + " Restoring "
+        "anyway because allow_newer_schema was set. The database's "
+        "alembic_version may now be ahead of this build. An api pod that starts "
+        "or restarts on it stays unready (/health/ready answers 503), and one "
+        "already serving keeps serving only while every table and column this "
+        "build uses is still in the database. Upgrade to a build at or past the "
+        "archive's head."
+    )
+
+
+async def _apply_backup_restore_inner(
     db,
     *,
     archive_bytes: bytes,
@@ -701,8 +1165,9 @@ async def apply_backup_restore(
     overwrite of every table). When ``sections`` is a non-empty
     list of section keys (from
     :mod:`app.services.backup.sections`) → **selective restore**:
-    TRUNCATE CASCADE followed by
-    ``pg_restore --data-only --disable-triggers --table=…``, over the
+    TRUNCATE CASCADE followed by ``pg_restore --data-only --table=…`` with
+    the tables' foreign keys set aside and put back, in one
+    transaction (#1693), over the
     **FK-cascade closure** of the selected sections' tables rather than
     the selection alone. ``platform_internal`` is always included
     (alembic_version + oui_vendor pin install state). Selective
@@ -740,18 +1205,18 @@ async def apply_backup_restore(
     # Phase 1: parse + validate the archive, fail fast if it's
     # malformed, before taking the destructive safety dump path.
     manifest, db_bytes, dump_format, secrets_enc = extract_archive_members(archive_bytes)
-    fmt_version = manifest.get("format_version")
-    if fmt_version not in SUPPORTED_FORMAT_VERSIONS:
-        raise BackupRestoreError(
-            f"unsupported backup format_version: {fmt_version!r} "
-            f"(this build expects one of {sorted(SUPPORTED_FORMAT_VERSIONS)}). "
-            f"Upgrade SpatiumDDI before restoring this archive."
-        )
+    version_refusal = format_version_refusal(manifest.get("format_version"))
+    if version_refusal is not None:
+        raise BackupRestoreError(version_refusal)
 
     # Phase 2: passphrase verify. Decrypt secrets.enc up front so
     # we fail with "wrong passphrase" before deleting anything.
+    # The PBKDF2 derivation is ~0.3 s of CPU by design; run it off
+    # the event loop so a restore can't stall the api (#1568).
     try:
-        secrets_payload = decrypt_secrets(secrets_enc, passphrase=passphrase)
+        secrets_payload = await asyncio.to_thread(
+            decrypt_secrets, secrets_enc, passphrase=passphrase
+        )
     except BackupCryptoError as exc:
         raise BackupRestoreError(str(exc)) from exc
 
@@ -770,8 +1235,13 @@ async def apply_backup_restore(
         raise BackupRestoreError(direction_error)
     if direction_error and allow_newer_schema:
         # The refusal exists because ``alembic_version`` ending up ahead
-        # of the running code trips the api's strict schema-head
-        # readiness gate. That is a real failure — but making it
+        # of the running code keeps this build's api out of service. An
+        # api pod that starts on such a database is refused: readiness
+        # answers 503 on a newer schema until the process has been Ready
+        # at its own head, and wait-for-migrate holds new pods back. A pod
+        # already in service keeps serving only while every table and
+        # column its image uses is present, and readiness fails once one
+        # is missing (#2777). That is a real failure, but making it
         # absolute removed the A/B-rollback path, where an operator who
         # rolled back *because* the new build broke is told to upgrade
         # into the build they just escaped (#781).
@@ -785,13 +1255,31 @@ async def apply_backup_restore(
             detail=direction_error,
             manifest_schema_version=manifest.get("schema_version"),
         )
-        schema_override_warning = (
-            "Schema-direction check OVERRIDDEN: " + direction_error + " Restoring "
-            "anyway because allow_newer_schema was set. The database's "
-            "alembic_version may now be ahead of this build, which the api's "
-            "schema-head readiness gate rejects — upgrade to a build at or past "
-            "the archive's head, or expect /health/ready to fail."
+        schema_override_warning = _schema_override_warning(direction_error)
+
+    # Phase 2c (#1575): selective-restore shape checks. Both refusals
+    # below are knowable from the parsed archive + the caller's section
+    # list alone, so they run HERE — before the Phase 3 safety dump
+    # writes a full-size archive to disk and Phase 4 disposes the
+    # connection pool. They used to sit in Phase 5, after both, so every
+    # invalid selective attempt paid for a safety dump and a pool cycle
+    # and got refused anyway.
+    selective = bool(sections)
+    if selective and dump_format != "custom":
+        raise BackupRestoreError(
+            "selective restore needs an archive whose database dump is in "
+            "pg_dump's custom format (dump_format=custom). This archive is "
+            "plain SQL — only full restore is supported."
         )
+    if selective:
+        from app.services.backup.sections import SECTIONS_BY_KEY  # noqa: PLC0415
+
+        unknown_sections = [k for k in sections or [] if k not in SECTIONS_BY_KEY]
+        if unknown_sections:
+            raise BackupRestoreError(
+                f"unknown section keys: {unknown_sections}. Call GET /backup/sections "
+                "for the catalog."
+            )
 
     # Phase 3: pre-restore safety dump. Soft-fails — if the api
     # container can't write to ``/var/lib/spatiumddi/backups`` (no
@@ -817,22 +1305,18 @@ async def apply_backup_restore(
 
     # Phase 5: replay. Three paths:
     #  - selective restore (sections supplied) — TRUNCATE +
-    #    ``pg_restore --data-only --disable-triggers --table=…``.
-    #    Requires custom format; plain archives can't be selective.
+    #    ``pg_restore --data-only --table=…``, foreign keys set aside and
+    #    put back, in one transaction. Requires custom format; plain
+    #    archives can't be selective.
     #  - full restore against custom format → ``pg_restore``.
     #  - full restore against plain format → ``psql``. Phase 1
     #    archives stay restorable through this path forever.
-    selective = bool(sections)
+    # ``selective`` and the two selective-shape refusals (plain format,
+    # unknown section keys) are decided in Phase 2c, before the safety
+    # dump and the pool disposal (#1575).
     restored_sections: list[str] | None = None
     restored_tables: list[str] | None = None
     cascade_widened: list[str] = []
-
-    if selective and dump_format != "custom":
-        raise BackupRestoreError(
-            "selective restore needs an archive whose database dump is in "
-            "pg_dump's custom format (dump_format=custom). This archive is "
-            "plain SQL — only full restore is supported."
-        )
 
     with tempfile.TemporaryDirectory(prefix="spatium-restore-") as tmpdir:
         if selective:
@@ -840,18 +1324,11 @@ async def apply_backup_restore(
             # restore module's import graph for callers that don't
             # touch selective.
             from app.services.backup.sections import (  # noqa: PLC0415
-                SECTIONS_BY_KEY,
                 cascade_closure,
                 tables_for_sections,
             )
 
             requested = list(sections or [])
-            unknown = [k for k in requested if k not in SECTIONS_BY_KEY]
-            if unknown:
-                raise BackupRestoreError(
-                    f"unknown section keys: {unknown}. Call GET /backup/sections "
-                    "for the catalog."
-                )
             # ``platform_internal`` (alembic_version + oui_vendor)
             # always rides along — the schema head pin + the OUI
             # cache are install-state, not user-data, and a
@@ -889,10 +1366,9 @@ async def apply_backup_restore(
 
             dump_path = Path(tmpdir) / "database.dump"
             dump_path.write_bytes(db_bytes)
-            # Step 1: wipe the selection + everything CASCADE reaches.
-            await _truncate_tables(restored_tables, db_url)
-            # Step 2: data-only re-load of that same closure.
-            await _run_pg_restore_data_only(dump_path, db_url, restored_tables)
+            # Empty the selection + everything CASCADE reaches, and reload
+            # that same closure, in one transaction (#1693).
+            await _run_selective_restore(dump_path, db_url, restored_tables)
         elif dump_format == "custom":
             dump_path = Path(tmpdir) / "database.dump"
             dump_path.write_bytes(db_bytes)
@@ -924,6 +1400,37 @@ async def apply_backup_restore(
             error=f"migration step aborted: {exc}",
         )
 
+    # Phase 6b: a selective restore of an archive taken before a contract
+    # migration re-added the plaintext secret columns that migration dropped
+    # (see ``_selective_prelude``). Encrypt whatever they hold into their
+    # empty ``*_encrypted`` columns and drop them again, leaving each target
+    # written into disabled with an audit row, as the migration does. Before
+    # the rewrap: the values are encrypted under this install's key, which
+    # the rewrap recognises and leaves alone. Non-fatal, like the steps
+    # around it.
+    fold_warning: str | None = None
+    try:
+        fold = await fold_dropped_plaintext_columns(db_url)
+        disabled_names = [t.display for t in fold.disabled]
+        # The upgrade step's migration runs the same fold (a full restore, or
+        # a selective one whose archive sits before the drop) and records it
+        # only in the audit log; name those targets too.
+        try:
+            for name in await disabled_since(db_url, started):
+                if name not in disabled_names:
+                    disabled_names.append(name)
+        except Exception as exc:  # noqa: BLE001 — a report, not the fold
+            logger.warning("backup_restore_disabled_targets_scan_failed", error=str(exc))
+        if disabled_names:
+            fold_warning = disabled_warning(disabled_names)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("backup_restore_legacy_plaintext_fold_failed", error=str(exc))
+        fold_warning = (
+            "Plaintext columns from an older archive could not be folded into "
+            f"their encrypted columns ({exc}). They are not read by the "
+            "application; re-run the restore once the cause is fixed."
+        )
+
     # Phase 7: cross-install secret rewrap. Walks every Fernet-
     # encrypted column + the backup_target.config JSONB blob and
     # re-encrypts with the destination install's key. No-op when
@@ -932,33 +1439,43 @@ async def apply_backup_restore(
     # Runs AFTER the alembic upgrade so the schema is at the local
     # code's expected shape (encrypted columns may have moved /
     # been renamed across migrations).
+    from app.config import credential_key_writes_deferred  # noqa: PLC0415
     from app.config import settings as _settings  # noqa: PLC0415
 
-    try:
-        rewrap_outcome = await rewrap_secrets(
-            db_url=db_url,
-            source_secret_key=secrets_payload.get("platform_secret_key", "") or "",
-            source_credential_key=secrets_payload.get("platform_credential_encryption_key", "")
-            or "",
-            dest_secret_key=_settings.secret_key,
-            dest_credential_key=_settings.credential_encryption_key or "",
-        )
-    except Exception as exc:  # noqa: BLE001
-        # Rewrap failure shouldn't blow away the whole restore —
-        # the data is in. Log loudly + surface in the response so
-        # the operator knows to apply the recovered SECRET_KEY
-        # manually.
-        #
-        # ``rewrap_secrets`` now absorbs walk failures itself and returns
-        # a partial outcome with ``aborted=True``, precisely so the
-        # counters survive; this branch is the backstop for something
-        # raised before it could (a bad key pair, say). A fresh
-        # ``RewrapOutcome()`` is honest HERE — nothing was walked — but it
-        # was NOT honest when it also swallowed a mid-walk abort (#781).
-        logger.error("backup_restore_rewrap_failed", error=str(exc))
+    if "platform_secret_key" not in secrets_payload:
+        # An exclude-secrets archive carries no key, and every value it
+        # would have decrypted was scrubbed from the dump: nothing to rewrap.
         rewrap_outcome = RewrapOutcome()
-        rewrap_outcome.aborted = True
-        rewrap_outcome.failures.append({"reason": f"rewrap-aborted: {exc}"})
+    else:
+        try:
+            rewrap_outcome = await rewrap_secrets(
+                db_url=db_url,
+                source_secret_key=secrets_payload.get("platform_secret_key", "") or "",
+                source_credential_key=secrets_payload.get("platform_credential_encryption_key", "")
+                or "",
+                dest_secret_key=_settings.secret_key,
+                dest_credential_key=_settings.credential_encryption_key or "",
+                # #1358 — honour the same write deferral as app.core.crypto.
+                dest_defer_dedicated_writes=credential_key_writes_deferred(
+                    _settings.credential_key_since, _settings.version
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Rewrap failure shouldn't blow away the whole restore —
+            # the data is in. Log loudly + surface in the response so
+            # the operator knows to apply the recovered SECRET_KEY
+            # manually.
+            #
+            # ``rewrap_secrets`` now absorbs walk failures itself and returns
+            # a partial outcome with ``aborted=True``, precisely so the
+            # counters survive; this branch is the backstop for something
+            # raised before it could (a bad key pair, say). A fresh
+            # ``RewrapOutcome()`` is honest HERE — nothing was walked — but it
+            # was NOT honest when it also swallowed a mid-walk abort (#781).
+            logger.error("backup_restore_rewrap_failed", error=str(exc))
+            rewrap_outcome = RewrapOutcome()
+            rewrap_outcome.aborted = True
+            rewrap_outcome.failures.append({"reason": f"rewrap-aborted: {exc}"})
 
     # Phase 4d (issue #127): scan the restored DB for PowerDNS
     # DNSSEC-enabled zones and surface a registrar-republish
@@ -969,9 +1486,50 @@ async def apply_backup_restore(
         logger.warning("backup_restore_warning_scan_failed", error=str(exc))
         post_warnings = []
 
+    # #2097 — the archive holds its own run's ``in_progress`` claim. Settle
+    # it now, or the target refuses Run now and sits off its schedule until
+    # the 2 h reap marks a run that succeeded as failed. Needs the
+    # backup-target table to have been restored.
+    reconciled: list[dict[str, Any]] = []
+    if restored_tables is None or "backup_target" in restored_tables:
+        try:
+            from sqlalchemy.ext.asyncio import (  # noqa: PLC0415
+                async_sessionmaker,
+                create_async_engine,
+            )
+            from sqlalchemy.pool import NullPool  # noqa: PLC0415
+
+            from app.db import _json_serializer, task_connect_args  # noqa: PLC0415
+            from app.services.backup.runner import (  # noqa: PLC0415
+                reconcile_restored_run_claims,
+            )
+
+            # The database the restore just wrote (``db_url``), as every
+            # other phase uses — not the app's pooled engine, which Phase 4
+            # disposed and which need not point at the same database.
+            reconcile_engine = create_async_engine(
+                db_url,
+                poolclass=NullPool,
+                json_serializer=_json_serializer,
+                connect_args=task_connect_args(),
+            )
+            try:
+                async with async_sessionmaker(reconcile_engine, expire_on_commit=False)() as rdb:
+                    reconciled = await reconcile_restored_run_claims(rdb, manifest=manifest)
+            finally:
+                await reconcile_engine.dispose()
+        except Exception as exc:  # noqa: BLE001 — the data is in; the 2 h reap still backstops
+            logger.warning("backup_restore_reconcile_failed", error=str(exc))
+            post_warnings.append(
+                "Could not settle backup targets left 'in progress' by the restored "
+                f"archive ({exc}); they free themselves after 2 hours."
+            )
+
     # The override is the first thing an operator should read back.
     if schema_override_warning:
         post_warnings.insert(0, schema_override_warning)
+    if fold_warning:
+        post_warnings.append(fold_warning)
 
     # Say plainly that the restore reached past the ticked sections.
     # An operator who picked "DNS" and finds their IPAM rows reverted
@@ -1035,4 +1593,5 @@ async def apply_backup_restore(
         migration=migration_outcome,
         rewrap=rewrap_outcome,
         warnings=post_warnings,
+        reconciled_backup_targets=reconciled,
     )

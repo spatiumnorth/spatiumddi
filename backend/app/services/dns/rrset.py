@@ -43,8 +43,11 @@ plane sees no ``rrset`` and falls back to the previous ``rrset_action``
 semantics.
 
 The two callers that set ``rrset_action`` themselves — DNS pools and the
-Windows-cutover TTL pre-flight — are deliberately NOT stamped, and keep the
-per-RR semantics they already had. See :func:`stamp_rrsets_for_ops` for why a
+Windows-cutover TTL pre-flight — are deliberately NOT stamped on the AGENT
+path, and keep the per-RR semantics they already had. On the agentless path
+an ``update`` + ``add`` op (a pool TTL change; the pre-flight's siblings) IS
+stamped (#1983), because ``RecordChange`` has no ``rrset_action`` and an
+unstamped one would reach the driver as a single-value replace. See :func:`stamp_rrsets_for_ops` for why a
 whole-RRset write is the wrong shape for the pool re-point pair specifically.
 
 Known bound: an op carries the RRset as of the moment it was ENQUEUED. Ops
@@ -58,11 +61,7 @@ structural re-render, converges it. Making it airtight would mean re-resolving
 the set at dispatch time in ``agent_config``, which costs a query per op per
 bundle for a failure-path edge.
 
-This is the agent path only. The agentless drivers (Windows DNS, and the cloud
-providers) never see the field: ``enqueue_record_op`` stamps after it has
-branched, so their op rows do not claim an RRset write nobody performed.
-Windows DNS has its own whole-RRset collapse in ``drivers/dns/windows.py``;
-that is a separate fix.
+The agentless drivers receive the set too (#783), as ``RecordChange.rrset``.
 """
 
 from __future__ import annotations
@@ -72,7 +71,7 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.dns import DNSRecord, DNSZone
+from app.models.dns import ZONE_DEFAULT_TTL, DNSRecord, DNSZone, servable_ttl
 
 # Ops that describe an RRset. Everything else on the record-op queue is
 # zone-level (``dnssec_sign`` / ``dnssec_unsign`` / ``dnssec_rollover``) and
@@ -244,8 +243,11 @@ def _rrset_payload(members: list[dict[str, Any]], zone_ttl: int | None) -> dict[
     an RRset has ONE TTL, so members that disagree resolve to the lowest — the
     conservative direction, since it only shortens caching.
     """
-    default_ttl = 3600 if zone_ttl is None else zone_ttl
-    ttls = [default_ttl if m.get("ttl") is None else m["ttl"] for m in members]
+    # #2073 — a TTL stored negative before the API bounded it counts as unset.
+    zone_default = servable_ttl(zone_ttl)
+    default_ttl = ZONE_DEFAULT_TTL if zone_default is None else zone_default
+    stored = [servable_ttl(m.get("ttl")) for m in members]
+    ttls = [default_ttl if t is None else t for t in stored]
     return {
         "ttl": min(ttls) if ttls else default_ttl,
         "members": [{k: v for k, v in m.items() if k not in ("ttl", "id")} for m in members],
@@ -256,6 +258,8 @@ async def stamp_rrsets_for_ops(
     db: AsyncSession,
     zone: DNSZone,
     ops: list[dict[str, Any]],
+    *,
+    agentless: bool = False,
 ) -> None:
     """Stamp every op in a batch with the RRset that should exist once the
     WHOLE batch has been applied. Payloads are mutated in place.
@@ -282,8 +286,26 @@ async def stamp_rrsets_for_ops(
     calls on one serial. Stamping those would make the pair order-dependent —
     the delete's set is computed before the row is mutated, so applying it
     after the create would drop the new address.
+
+    ``agentless=True`` (#1983) additionally stamps an ``update`` op carrying
+    ``rrset_action="add"``. The agentless drivers have no per-RR ``add``
+    (``RecordChange`` carries no ``rrset_action``), so an unstamped one reaches
+    them as a single-value replace and the last value written wins. Two callers
+    emit that shape: a DNS pool TTL change (one ``update`` per member, which on
+    an agentless group left the pool answering with its last member only) and
+    the cutover TTL pre-flight's siblings (which never reach an agentless
+    server: the pre-flight refuses an agentless primary). Stamping folds the
+    whole batch, so every op of a name carries the same final set. The
+    old-agent reason for opting out does not apply to drivers that live in
+    this codebase. A pool's ``create`` (``add``) and ``delete_value`` ops are
+    still left alone, for the order-dependence reason above.
     """
-    stampable = [o for o in ops if not (o["record"].get("rrset_action") or "")]
+    stampable = [
+        o
+        for o in ops
+        if not (o["record"].get("rrset_action") or "")
+        or (agentless and o["op"] == "update" and o["record"].get("rrset_action") == "add")
+    ]
     keys = {k for o in stampable if (k := rrset_target(o["op"], o["record"])) is not None}
     if not keys:
         return

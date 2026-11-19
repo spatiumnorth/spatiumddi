@@ -23,7 +23,7 @@ from app.api.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE, MAX_PAGE_SIZE, Page
 from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp._mac import canonicalize_mac
 from app.core.agent_wake import collect_wake, dhcp_group_channel
-from app.core.permissions import require_permission
+from app.core.permissions import refuse_and_audit, require_permission, user_has_permission
 from app.models.auth import User
 from app.models.dhcp import DHCPMACBlock, DHCPServerGroup
 from app.models.ipam import IPAddress, IpMacHistory, MACAllowlist, Subnet
@@ -237,7 +237,7 @@ async def list_sightings(
     base = (
         select(IpMacHistory, IPAddress, Subnet)
         .join(IPAddress, IPAddress.id == IpMacHistory.ip_address_id)
-        .outerjoin(Subnet, Subnet.id == IPAddress.subnet_id)
+        .join(Subnet, Subnet.id == IPAddress.subnet_id)
         .where(and_(*conds))
     )
     total = (
@@ -245,7 +245,7 @@ async def list_sightings(
     ).scalar_one()
     rows = (
         await db.execute(
-            base.order_by(IpMacHistory.first_seen.desc())
+            base.order_by(IpMacHistory.first_seen.desc(), IpMacHistory.id)
             .limit(page_size)
             .offset((page - 1) * page_size)
         )
@@ -285,7 +285,7 @@ async def _load_sighting_out(db: DB, sighting_id: uuid.UUID) -> SightingOut:
         await db.execute(
             select(IpMacHistory, IPAddress, Subnet)
             .join(IPAddress, IPAddress.id == IpMacHistory.ip_address_id)
-            .outerjoin(Subnet, Subnet.id == IPAddress.subnet_id)
+            .join(Subnet, Subnet.id == IPAddress.subnet_id)
             .where(IpMacHistory.id == sighting_id)
         )
     ).first()
@@ -445,6 +445,66 @@ async def block_mac(body: BlockBody, db: DB, user: WriteUser, request: Request) 
     With ``block_upstream=True`` (#601) it *also* pushes an L2 quarantine to
     every armed UniFi target through the active block-sync surface — closing
     the "device self-assigns a static IP and walks past the DHCP block" gap."""
+    from app.services.feature_modules import is_module_enabled
+
+    # #2134 — with DHCP off there is no DHCP half to perform. Refuse it
+    # rather than quietly writing nothing (``/dhcp/*`` answers 404 for the
+    # same reason). The upstream quarantine does not depend on DHCP, so a
+    # ``block_upstream`` request carries on without the DHCP half.
+    dhcp_on = await is_module_enabled(db, "core.dhcp")
+    if not dhcp_on:
+        if body.group_id is not None:
+            raise HTTPException(
+                status_code=422,
+                detail="DHCP is turned off (core.dhcp); a DHCP server group cannot be blocked.",
+            )
+        if not body.block_upstream:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "DHCP is turned off (core.dhcp), so there is no DHCP block to "
+                    "write. Set block_upstream to quarantine the MAC upstream."
+                ),
+            )
+        if not await is_module_enabled(db, "security.block_sync"):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "DHCP is turned off (core.dhcp) and the active block-sync "
+                    "module (security.block_sync) is off too; nothing to block with."
+                ),
+            )
+        # With DHCP on, the upstream half is best-effort because the DHCP
+        # block has already landed. Here it is the whole action, so the
+        # helper's silent skips would answer 200 having done nothing; say
+        # why instead.
+        from app.services.block_sync.reconcile import applicable_targets_for_kind
+
+        if not user_has_permission(user, "admin", "manage_block_sync"):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "DHCP is turned off (core.dhcp), so blocking is an upstream "
+                    "quarantine only, which needs the manage_block_sync permission."
+                ),
+            )
+        if not await applicable_targets_for_kind(db, "mac"):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "DHCP is turned off (core.dhcp) and no armed block-sync target "
+                    "accepts MAC blocks; nothing to quarantine the device with."
+                ),
+            )
+        upstream_created, upstream_cr = await _maybe_block_upstream(db, user, request, body)
+        return BlockResult(
+            mac_address=body.mac_address,
+            blocked_group_ids=[],
+            already_blocked_group_ids=[],
+            upstream_block_created=upstream_created,
+            upstream_change_request_id=upstream_cr,
+        )
+
     if body.group_id is not None:
         group_ids = [body.group_id]
         if await db.get(DHCPServerGroup, body.group_id) is None:
@@ -453,6 +513,39 @@ async def block_mac(body: BlockBody, db: DB, user: WriteUser, request: Request) 
         group_ids = list((await db.execute(select(DHCPServerGroup.id))).scalars().all())
         if not group_ids:
             raise HTTPException(status_code=409, detail="no DHCP server groups to block in")
+
+    # #3302 — the DHCP half writes ``dhcp_mac_block`` rows, which the canonical
+    # ``/dhcp/server-groups/{id}/mac-blocks`` route gates on that resource type.
+    # ``write ip_address`` alone must not reach them. Checked per group (so a
+    # grant scoped to one group's id counts), and every target group must pass:
+    # with ``group_id`` omitted a partial application would leave a MAC blocked
+    # in some groups and not others while the caller believed it was fleet-wide,
+    # so the request is refused whole rather than silently narrowed.
+    denied_groups = [
+        gid
+        for gid in group_ids
+        if not user_has_permission(user, "write", "dhcp_mac_block", str(gid))
+    ]
+    if denied_groups:
+        await refuse_and_audit(
+            db,
+            user,
+            request,
+            action="create",
+            resource_type="dhcp_mac_block",
+            resource_id=body.mac_address,
+            resource_display=body.mac_address,
+            reason="write dhcp_mac_block required",
+            detail=(
+                "Blocking a MAC needs write permission on dhcp_mac_block"
+                + (
+                    "."
+                    if body.group_id is not None
+                    else f" in every DHCP server group ({len(denied_groups)} of "
+                    f"{len(group_ids)} not permitted); pass group_id for one you may block in."
+                )
+            ),
+        )
 
     already = {
         r[0]
@@ -517,7 +610,6 @@ async def _maybe_block_upstream(
     module is on, the caller holds ``manage_block_sync``, and a target is
     armed. Routes through the two-person approval gate like the dedicated
     block-sync surface — returns ``(created, change_request_id)``."""
-    from app.core.permissions import user_has_permission
     from app.services.ai.operations import get_operation
     from app.services.ai.operations_risky import CreateNetworkBlockArgs
     from app.services.approvals.gate import gate_or_execute

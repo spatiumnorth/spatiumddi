@@ -19,7 +19,9 @@ tree may have changed between preview and commit):
    the parent. Chain-resize is too easy to blow a silent hole in the tree.
 5. **No overlap with siblings or cousins.** Scan the **entire IPSpace**,
    not just siblings under the same parent — a cousin under a different
-   block in the same space could still collide.
+   block in the same space could still collide. The resource's own
+   ancestor blocks contain it, so they are left out; rule 4 speaks for
+   them (#3382).
 6. **Block resize: children must still fit.** Mathematically redundant
    (old ⊂ new ⇒ children ⊂ new) but re-checked as a belt-and-braces.
 7. **Space immutable.** ``space_id`` never changes during a resize.
@@ -32,11 +34,12 @@ Side-effects committed atomically with the CIDR change:
   because they represent user intent (e.g. ``anycast-vip``). Rows with
   ``dns_record_id IS NOT NULL`` are classified as renamed by
   ``_load_boundary_placeholders`` and therefore never reach the delete
-  loop — no DNS cleanup is needed here.
+  loop — no DNS cleanup is needed here. The old default ``gateway`` row of
+  a moved gateway does carry an auto PTR, so it is retracted first (#3723).
 * Update ``Subnet.network``, ``total_ips``, ``utilization_percent``, and
   optionally ``gateway`` (via ``move_gateway_to_first_usable``).
 * Re-create default-named placeholder rows at the **new** boundaries.
-* Call ``ensure_reverse_zone_for_subnet`` so any new reverse-zone
+* Call ``ensure_reverse_zones_for_subnet`` so any new reverse-zone
   coverage is backfilled — this is idempotent if the zone already exists.
 * Bump the DHCP ``config_etag`` + enqueue an ``apply_config`` op for any
   agent-based DHCP server that serves a scope on this subnet. Agentless
@@ -90,6 +93,16 @@ from app.models.dhcp import (
 from app.models.dns import DNSRecord
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.services.dhcp.config_bundle import build_config_bundle
+from app.services.ipam.subnet_boundary import (
+    boundary_addresses,
+    boundary_host_conflicts,
+    ensure_boundary_rows,
+)
+from app.services.ipam.subnet_placeholders import (
+    add_gateway_row,
+    gateway_target_problem,
+    registry_referenced_ip_ids,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -216,6 +229,16 @@ def _total_ips(net: IPNetwork) -> int:
     return net.num_addresses - 2
 
 
+def _display_total_ips(net: IPNetwork) -> int:
+    """The subnet's true size for a preview. ``_total_ips`` clamps IPv6 to
+    BIGINT for storage, so two sizes both past 2^63 read as equal and a
+    /64 -> /63 growth as no change (#3322). Never stored; the API saturates
+    its int field and carries this exact figure as a string beside it."""
+    if isinstance(net, ipaddress.IPv6Network):
+        return net.num_addresses
+    return _total_ips(net)
+
+
 def _broadcast_or_none(net: IPNetwork) -> str | None:
     """IPv4 prefixlen ≤ 30 gets a broadcast IP; v4 /31+/32 and IPv6 do not."""
     if isinstance(net, ipaddress.IPv4Network) and net.prefixlen <= 30:
@@ -269,7 +292,7 @@ async def _try_advisory_lock(db: AsyncSession, resource_id: uuid.UUID, namespace
 # ── Shared validation ────────────────────────────────────────────────────────
 
 
-def _validate_grow(old_net: IPNetwork, new_net: IPNetwork) -> None:
+def _validate_grow(old_net: IPNetwork, new_net: IPNetwork, *, _what: str = "subnet") -> None:
     if isinstance(old_net, ipaddress.IPv4Network) != isinstance(new_net, ipaddress.IPv4Network):
         raise ResizeError(
             "Address family change is not supported (v4 ↔ v6). Create a new "
@@ -280,7 +303,7 @@ def _validate_grow(old_net: IPNetwork, new_net: IPNetwork) -> None:
         raise ResizeError(
             "Resize is grow-only — the new CIDR must have a smaller prefix "
             f"length (shorter mask) than the current /{old_net.prefixlen}. "
-            "To reduce a subnet, delete it and recreate at the smaller size.",
+            f"To reduce a {_what}, delete it and recreate at the smaller size.",
             status_code=422,
         )
     if not old_net.subnet_of(new_net):  # type: ignore[arg-type]
@@ -423,6 +446,12 @@ async def _overlap_conflicts_space_blocks(
     strict superset of the old and therefore of the old's descendants
     (that containment is re-validated in commit with the recursive CTE
     "child_outside_new_cidr" check).
+
+    Its ancestors are excluded too (#3382). Each one contains the block,
+    so each overlaps any CIDR the block can grow to, and counting them
+    refused every nested block's growth with its own parent named as the
+    obstacle. Whether the new CIDR still fits inside the parent is
+    ``_parent_containment_conflicts_block``'s question, asked on its own.
     """
     q = (
         "SELECT id, network FROM ip_block "
@@ -442,6 +471,21 @@ async def _overlap_conflicts_space_blocks(
             "      INNER JOIN descendants d ON b.parent_block_id = d.id"
             "  )"
             "  SELECT id FROM descendants"
+            ")"
+        )
+        # ...and every ancestor, walking parent_block_id up to the root.
+        # The root's NULL parent is filtered out: one NULL in a NOT IN
+        # list would hide every overlap. UNION stops on a cyclic chain.
+        q += (
+            " AND id NOT IN ("
+            "  WITH RECURSIVE ancestors AS ("
+            "    SELECT parent_block_id AS id FROM ip_block"
+            "      WHERE id = CAST(:exclude_id AS uuid)"
+            "    UNION"
+            "    SELECT b.parent_block_id FROM ip_block b"
+            "      INNER JOIN ancestors a ON b.id = a.id"
+            "  )"
+            "  SELECT id FROM ancestors WHERE id IS NOT NULL"
             ")"
         )
         params["exclude_id"] = str(exclude_block_id)
@@ -548,6 +592,14 @@ async def _parent_containment_conflicts_block(
 # ── Placeholder row helpers ──────────────────────────────────────────────────
 
 
+async def _subnet_rows(db: AsyncSession, subnet_id: uuid.UUID) -> list[IPAddress]:
+    return list(
+        (await db.execute(select(IPAddress).where(IPAddress.subnet_id == subnet_id)))
+        .scalars()
+        .all()
+    )
+
+
 async def _load_boundary_placeholders(
     db: AsyncSession, subnet_id: uuid.UUID, old_net: IPNetwork
 ) -> tuple[list[IPAddress], list[IPAddress]]:
@@ -592,6 +644,18 @@ async def _load_boundary_placeholders(
         else:
             default_named.append(row)
     return default_named, renamed
+
+
+async def _gateway_target_in_use(
+    db: AsyncSession, subnet: Subnet, target: str, old_gateway: str | None
+) -> bool:
+    """True when the new gateway cannot sit on ``target``: a host, lease or
+    discovered row holds it (#2413). Same rule as Edit Subnet
+    (``gateway_target_problem``, #3709): no row, a ``reserved`` row (kept as the
+    gateway's) and an ``available`` row (a free slot, taken over) are fine."""
+    if old_gateway is not None and str(ipaddress.ip_address(old_gateway)) == target:
+        return False
+    return await gateway_target_problem(db, subnet, target) is not None
 
 
 # ── Preview: subnets ─────────────────────────────────────────────────────────
@@ -652,7 +716,7 @@ async def preview_subnet_resize(
             new_network_ip="",
             old_broadcast_ip=_broadcast_or_none(old_net),
             new_broadcast_ip=None,
-            total_ips_before=_total_ips(old_net),
+            total_ips_before=_display_total_ips(old_net),
             total_ips_after=0,
             gateway_current=str(subnet.gateway) if subnet.gateway else None,
             gateway_suggested_new_first_usable=None,
@@ -694,10 +758,26 @@ async def preview_subnet_resize(
             )
         )
         conflicts.extend(await _parent_containment_conflicts_subnet(db, subnet, new_net))
+        conflicts.extend(
+            ResizeConflict(
+                type="host_on_new_boundary", detail=d.replace(" first.", " before resizing.")
+            )
+            for d in boundary_host_conflicts(
+                await _subnet_rows(db, subnet.id),
+                [new_net],
+                kind=subnet.kind,
+                already=boundary_addresses(old_net, subnet.kind),
+            )
+        )
 
     # Placeholder classification — independent of conflicts so the UI can
     # show the distribution even when the preview is otherwise blocked.
     default_named, renamed = await _load_boundary_placeholders(db, subnet.id, old_net)
+    # A row a registry record names is kept by the commit (#3958), so the
+    # preview lists it as kept, not as "will be replaced".
+    _kept = await registry_referenced_ip_ids(db, [r.id for r in default_named])
+    renamed = renamed + [r for r in default_named if r.id in _kept]
+    default_named = [r for r in default_named if r.id not in _kept]
     placeholders_default_named = [
         {
             "ip": str(row.address),
@@ -769,20 +849,20 @@ async def preview_subnet_resize(
         ) or 0
 
     # Reverse-zone coverage — compute the aligned zone names for old and
-    # new to surface what will be backfilled. ``compute_reverse_zone_name``
+    # new to surface what will be backfilled. ``compute_reverse_zone_names``
     # is idempotent; nothing here writes anything.
-    from app.services.dns.reverse_zone import compute_reverse_zone_name
+    from app.services.dns.reverse_zone import compute_reverse_zone_names
 
     try:
-        old_rev = compute_reverse_zone_name(canonical_old)
+        old_rev = compute_reverse_zone_names(canonical_old)
     except ValueError:
-        old_rev = ""
+        old_rev = []
     try:
-        new_rev = compute_reverse_zone_name(canonical_new)
+        new_rev = compute_reverse_zone_names(canonical_new)
     except ValueError:
-        new_rev = ""
-    reverse_existing = [old_rev] if old_rev else []
-    reverse_will_create = [new_rev] if new_rev and new_rev != old_rev else []
+        new_rev = []
+    reverse_existing = list(old_rev)
+    reverse_will_create = [n for n in new_rev if n not in set(old_rev)]
 
     # Warnings (non-blocking).
     if pool_count:
@@ -818,6 +898,22 @@ async def preview_subnet_resize(
             )
         )
 
+    if move_gateway_to_first_usable:
+        fu_preview = _first_usable(new_net)
+        if fu_preview is not None and await _gateway_target_in_use(
+            db, subnet, fu_preview, str(subnet.gateway) if subnet.gateway else None
+        ):
+            conflicts.append(
+                ResizeConflict(
+                    type="gateway_move_target_in_use",
+                    detail=(
+                        f"Cannot move gateway to {fu_preview}: an address row already "
+                        "exists there. Free or move it, or uncheck 'Move gateway to new "
+                        "first-usable IP'."
+                    ),
+                )
+            )
+
     return SubnetResizePreview(
         old_cidr=canonical_old,
         new_cidr=canonical_new,
@@ -826,8 +922,8 @@ async def preview_subnet_resize(
         new_network_ip=str(new_net.network_address),
         old_broadcast_ip=_broadcast_or_none(old_net),
         new_broadcast_ip=_broadcast_or_none(new_net),
-        total_ips_before=_total_ips(old_net),
-        total_ips_after=_total_ips(new_net),
+        total_ips_before=_display_total_ips(old_net),
+        total_ips_after=_display_total_ips(new_net),
         gateway_current=str(subnet.gateway) if subnet.gateway else None,
         gateway_suggested_new_first_usable=_first_usable(new_net),
         placeholders_default_named=placeholders_default_named,
@@ -885,7 +981,7 @@ async def preview_block_resize(
             network_address_shifts=False,
             old_network_ip=str(old_net.network_address),
             new_network_ip="",
-            total_ips_before=int(min(old_net.num_addresses, _BIGINT_MAX)),
+            total_ips_before=old_net.num_addresses,
             total_ips_after=0,
             child_blocks_count=0,
             child_subnets_count=0,
@@ -895,14 +991,17 @@ async def preview_block_resize(
         )
 
     try:
-        _validate_grow(old_net, new_net)
+        _validate_grow(old_net, new_net, _what="block")
     except ResizeError as exc:
         conflicts.append(ResizeConflict(type="validation", detail=str(exc)))
 
     canonical_new = str(new_net)
 
     if not conflicts:
-        # Space-wide block overlap (not limited to siblings) + subnet overlap.
+        # The parent's edge, then space-wide block overlap (not limited to
+        # siblings; the block's ancestors left out) + subnet overlap, in
+        # the order the commit refuses them.
+        conflicts.extend(await _parent_containment_conflicts_block(db, block, new_net))
         conflicts.extend(
             await _overlap_conflicts_space_blocks(
                 db,
@@ -919,7 +1018,6 @@ async def preview_block_resize(
                 block_id=block.id,
             )
         )
-        conflicts.extend(await _parent_containment_conflicts_block(db, block, new_net))
 
     # Walk the full descendant tree (recursive CTE) — for the count summary
     # and to confirm every child still fits. Mathematically old ⊂ new
@@ -933,6 +1031,7 @@ async def preview_block_resize(
                 UNION ALL
                 SELECT b.id, b.network, b.name FROM ip_block b
                     INNER JOIN descendants d ON b.parent_block_id = d.id
+                    WHERE b.deleted_at IS NULL
             )
             SELECT id, network, name FROM descendants
                 WHERE id != CAST(:bid AS uuid)
@@ -951,9 +1050,11 @@ async def preview_block_resize(
                 UNION ALL
                 SELECT b.id FROM ip_block b
                     INNER JOIN descendants d ON b.parent_block_id = d.id
+                    WHERE b.deleted_at IS NULL
             )
             SELECT s.id, s.network, s.name FROM subnet s
                 WHERE s.block_id IN (SELECT id FROM descendants)
+                    AND s.deleted_at IS NULL
             """),
         {"bid": str(block.id)},
     )
@@ -1013,8 +1114,8 @@ async def preview_block_resize(
         network_address_shifts=(str(new_net.network_address) != str(old_net.network_address)),
         old_network_ip=str(old_net.network_address),
         new_network_ip=str(new_net.network_address),
-        total_ips_before=int(min(old_net.num_addresses, _BIGINT_MAX)),
-        total_ips_after=int(min(new_net.num_addresses, _BIGINT_MAX)),
+        total_ips_before=old_net.num_addresses,
+        total_ips_after=new_net.num_addresses,
         child_blocks_count=len(child_blocks),
         child_blocks=child_blocks,
         child_subnets_count=len(child_subnets),
@@ -1048,13 +1149,14 @@ async def commit_subnet_resize(
        ``_load_boundary_placeholders`` and never reach this loop.
     4. Mutate the CIDR / totals / gateway.
     5. Re-create default-named placeholder rows at the new boundaries.
-    6. ``ensure_reverse_zone_for_subnet`` — idempotent backfill.
+    6. ``ensure_reverse_zones_for_subnet`` — idempotent backfill.
     7. Bump DHCP config bundles on any agent-based server serving a scope
        on this subnet. Skip agentless (Windows DHCP read-only) drivers.
     8. Update block utilization rollup.
     """
     # Lazy import to avoid the router → service → router cycle.
     from app.api.v1.ipam.router import (
+        _sync_dns_record,
         _update_block_utilization,
         _update_utilization,
     )
@@ -1080,6 +1182,16 @@ async def commit_subnet_resize(
             "has no usable host range.",
             status_code=422,
         )
+
+    if move_gateway_to_first_usable:
+        fu_commit = _first_usable(new_net)
+        if fu_commit is not None and await _gateway_target_in_use(
+            db, subnet, fu_commit, str(subnet.gateway) if subnet.gateway else None
+        ):
+            raise ResizeError(
+                f"Cannot move gateway to {fu_commit}: an address row already exists there.",
+                status_code=409,
+            )
 
     overlap = await _overlap_conflicts_space_subnets(
         db,
@@ -1114,6 +1226,21 @@ async def commit_subnet_resize(
     parent_conflicts = await _parent_containment_conflicts_subnet(db, subnet, new_net)
     if parent_conflicts:
         raise ResizeError(parent_conflicts[0].detail, status_code=422)
+    # Only a boundary the resize moves onto a host is refused: a host already
+    # on the old network address (skip_auto_addresses, or an IPv6 subnet from
+    # before #506) stays where it was when the network address does not move.
+    host_conflicts = boundary_host_conflicts(
+        await _subnet_rows(db, subnet.id),
+        [new_net],
+        kind=subnet.kind,
+        already=boundary_addresses(old_net, subnet.kind),
+    )
+    if host_conflicts:
+        raise ResizeError(
+            "Resize blocked: "
+            + "; ".join(d.replace(" first.", " before resizing.") for d in host_conflicts),
+            status_code=409,
+        )
 
     # Snapshot old state for audit + summary.
     old_gateway = str(subnet.gateway) if subnet.gateway else None
@@ -1124,6 +1251,10 @@ async def commit_subnet_resize(
     # IS NOT NULL`` into ``renamed`` (preserved), so ``default_named`` is
     # guaranteed to have no attached DNS records here.
     default_named, _renamed = await _load_boundary_placeholders(db, subnet.id, old_net)
+    # A row a registry record (E911 binding, device) is keyed to is the
+    # operator's, whatever its name: it is kept (#3958).
+    _registry_kept = await registry_referenced_ip_ids(db, [r.id for r in default_named])
+    default_named = [r for r in default_named if r.id not in _registry_kept]
     placeholders_deleted = 0
     if replace_default_placeholders:
         for row in default_named:
@@ -1141,43 +1272,55 @@ async def commit_subnet_resize(
 
     # 3. Re-create default-named placeholder rows at the new boundaries.
     placeholders_created = 0
-    is_v6 = isinstance(new_net, ipaddress.IPv6Network)
-    if replace_default_placeholders and new_net.prefixlen < 31:
-        # Only emit the rows that are "missing" — a renamed placeholder at
-        # the new boundary would still be covered by the rows we preserved
-        # above. Guard against accidentally creating a duplicate at the
-        # same address.
-        existing_addr_rows = (
-            (await db.execute(select(IPAddress.address).where(IPAddress.subnet_id == subnet.id)))
-            .scalars()
-            .all()
+    if replace_default_placeholders:
+        # Same rows, same thresholds as create_subnet (#506, #2976).
+        placeholders_created += await ensure_boundary_rows(
+            db,
+            subnet.id,
+            new_net,
+            current_user.id if current_user is not None else None,
+            kind=subnet.kind,
         )
-        existing_addrs = {str(a) for a in existing_addr_rows}
+        await db.flush()
 
-        if str(new_net.network_address) not in existing_addrs:
-            db.add(
-                IPAddress(
-                    subnet_id=subnet.id,
-                    address=str(new_net.network_address),
-                    status="network",
-                    description="Network address",
-                    created_by_user_id=(current_user.id if current_user is not None else None),
+    # 3b. A moved gateway is reserved the way create_subnet reserves a new
+    # subnet's gateway, so Next available never offers it to a host (#2413).
+    # The old default "Gateway" row is retired with the other default rows;
+    # a renamed / DNS-bearing one, or one a registry record (E911 binding, device)
+    # is keyed to, is the operator's and is kept (#3958).
+    gateway_row: IPAddress | None = None
+    if move_gateway_to_first_usable and subnet.gateway and str(subnet.gateway) != old_gateway:
+        new_gateway = str(subnet.gateway)
+        if replace_default_placeholders and old_gateway:
+            old_row = await db.scalar(
+                select(IPAddress).where(
+                    IPAddress.subnet_id == subnet.id,
+                    IPAddress.address == old_gateway,
+                    IPAddress.status == "reserved",
+                    IPAddress.hostname == "gateway",
+                    IPAddress.description == "Gateway",
+                    IPAddress.dns_record_id.is_(None),
                 )
+                # Locked before the sync takes its zones: an address row comes
+                # before a zone row (``app.services.lock_order``), as a
+                # permanent zone delete takes them (#3691).
+                .with_for_update()
             )
-            placeholders_created += 1
-        if not is_v6:
-            bcast = str(new_net.broadcast_address)
-            if bcast not in existing_addrs:
-                db.add(
-                    IPAddress(
-                        subnet_id=subnet.id,
-                        address=bcast,
-                        status="broadcast",
-                        description="Broadcast address",
-                        created_by_user_id=(current_user.id if current_user is not None else None),
-                    )
-                )
-                placeholders_created += 1
+            if old_row is not None and not await registry_referenced_ip_ids(db, [old_row.id]):
+                # Retract its auto A / PTR first, as Edit Subnet's gateway
+                # move does (#3709): a bare delete leaves the PTR served.
+                # The sync takes the zones it writes in id order (#3617).
+                await _sync_dns_record(db, old_row, subnet, action="delete")
+                await db.delete(old_row)
+        # None when a reserved row already holds the address: kept as the
+        # gateway's. An available row is taken over (#3709).
+        gateway_row = await add_gateway_row(
+            db,
+            subnet,
+            new_gateway,
+            created_by_user_id=(current_user.id if current_user is not None else None),
+            user=current_user,
+        )
         await db.flush()
 
     # 4. Recompute utilization on this subnet and roll the parent block chain.
@@ -1194,9 +1337,12 @@ async def commit_subnet_resize(
     # returns None (not raises) for the legitimate "no DNS group
     # configured" case; any exception therefore represents a real issue
     # the operator needs to see.
-    from app.services.dns.reverse_zone import ensure_reverse_zone_for_subnet
+    from app.services.dns.reverse_zone import ensure_reverse_zones_for_subnet
 
-    await ensure_reverse_zone_for_subnet(db, subnet, current_user)
+    await ensure_reverse_zones_for_subnet(db, subnet, current_user)
+    if gateway_row is not None:
+        # Same as create_subnet: the gateway placeholder's A / PTR (#2413).
+        await _sync_dns_record(db, gateway_row, subnet, backfill_reverse_zone=False)
 
     # 6. Notify agent-based DHCP servers with a scope on this subnet.
     dhcp_servers_notified = await _bump_dhcp_bundles_for_subnet(db, subnet.id)
@@ -1322,14 +1468,22 @@ async def commit_block_resize(
 
     old_net = _parse_cidr(str(block.network), label="block")
     new_net = _parse_cidr(new_cidr, label="new CIDR")
-    _validate_grow(old_net, new_net)
+    _validate_grow(old_net, new_net, _what="block")
     canonical_new = str(new_net)
     canonical_old = str(old_net)
+
+    # The parent's edge first: growth past it is refused by the check that
+    # names it, whatever else stands in the new range (#3382).
+    parent_conflicts = await _parent_containment_conflicts_block(db, block, new_net)
+    if parent_conflicts:
+        raise ResizeError(parent_conflicts[0].detail, status_code=422)
 
     # Space-wide block overlap — a block growing can collide with a
     # cousin under a different parent, not just a same-level sibling.
     # Descendant blocks are excluded because old ⊂ new guarantees they
-    # stay inside (belt-and-braces check below confirms).
+    # stay inside (belt-and-braces check below confirms); ancestors
+    # because they contain the block, and the parent check above has
+    # already held the new CIDR inside the parent.
     block_overlap = await _overlap_conflicts_space_blocks(
         db,
         block.space_id,
@@ -1354,9 +1508,6 @@ async def commit_block_resize(
             "New CIDR overlaps an existing subnet: " + "; ".join(c.detail for c in subnet_overlap),
             status_code=409,
         )
-    parent_conflicts = await _parent_containment_conflicts_block(db, block, new_net)
-    if parent_conflicts:
-        raise ResizeError(parent_conflicts[0].detail, status_code=422)
 
     # Belt-and-braces: every descendant must still fit.
     descendants = await db.execute(
@@ -1367,6 +1518,7 @@ async def commit_block_resize(
                 UNION ALL
                 SELECT b.id, b.network FROM ip_block b
                     INNER JOIN descendants d ON b.parent_block_id = d.id
+                    WHERE b.deleted_at IS NULL
             )
             SELECT network FROM descendants WHERE id != CAST(:bid AS uuid)
             """),
@@ -1386,9 +1538,11 @@ async def commit_block_resize(
                 UNION ALL
                 SELECT b.id FROM ip_block b
                     INNER JOIN descendants d ON b.parent_block_id = d.id
+                    WHERE b.deleted_at IS NULL
             )
             SELECT s.network FROM subnet s
                 WHERE s.block_id IN (SELECT id FROM descendants)
+                    AND s.deleted_at IS NULL
             """),
         {"bid": str(block.id)},
     )

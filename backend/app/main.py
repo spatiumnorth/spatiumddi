@@ -1,15 +1,18 @@
 import asyncio
 import re
 import uuid
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Sequence
 from contextlib import asynccontextmanager, suppress
+from typing import Any
 
 import structlog
 import structlog.contextvars
 from fastapi import Depends, FastAPI, Request, Response
+from fastapi.exception_handlers import http_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.api.acme_well_known import router as acme_well_known_router
 from app.api.docs import install_api_docs
@@ -17,9 +20,11 @@ from app.api.health import router as health_router
 from app.api.v1.e911.held_router import router as e911_held_router
 from app.api.v1.router import api_v1_router
 from app.config import settings
+from app.core.body_limit import RequestBodyLimitMiddleware
+from app.core.denial_audit import audit_unrecorded_denial
 from app.core.maintenance_mode import MaintenanceModeMiddleware
 from app.core.openapi_compat import collapse_nullable_unions
-from app.core.request_meta import TrustedProxyMiddleware
+from app.core.request_meta import LoggingTrustedHostMiddleware, TrustedProxyMiddleware
 from app.log import configure_logging
 from app.metrics import PrometheusMiddleware, metrics_endpoint
 from app.services.feature_modules import require_module
@@ -180,6 +185,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "admin", "resource_type": "site"},
             {"action": "admin", "resource_type": "provider"},
             {"action": "admin", "resource_type": "network_service"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
     "Address Set Editor": (
@@ -192,6 +198,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         "ownership without subnet write.",
         [
             {"action": "admin", "resource_type": "address_set"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
     "Change Approver": (
@@ -205,6 +212,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         [
             {"action": "approve", "resource_type": "change_request"},
             {"action": "read", "resource_type": "change_request"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
     "Requester": (
@@ -219,21 +227,45 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         [
             {"action": "write", "resource_type": "provisioning_request"},
             {"action": "read", "resource_type": "provisioning_request"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
     "DNS Editor": (
-        "Full CRUD on DNS zones, records, server groups, blocklists, and pools.",
+        "Create, edit and delete DNS zones, records, views and ACLs, and the "
+        "entries and exceptions of existing blocklists; manage the TLS "
+        "certificate store DoT / DoH / DoQ serve from (upload, CSR, Let's "
+        "Encrypt, delete — not activating one as the Web UI certificate); "
+        "read DNS server groups and their servers and options, TSIG keys "
+        "(never their secrets), DNSSEC policies, zones, records, views, ACLs, "
+        "blocklists and GSLB pools. Not readable without read on servers, "
+        "which this role does not hold: the DNS query log and its analytics, "
+        "Top DNS clients, the DNS threat views and the Windows event log. "
+        "Changes to infrastructure stay superadmin-only: server groups, "
+        "servers and their options, TSIG keys, DNSSEC signing and policies, "
+        "dynamic-update ACLs, blocklist subscriptions and assignments, GSLB "
+        "pools (their health checks probe the network), zone moves and the "
+        "importers.",
         [
             {"action": "admin", "resource_type": "dns_group"},
             {"action": "admin", "resource_type": "dns_zone"},
             {"action": "admin", "resource_type": "dns_record"},
             {"action": "admin", "resource_type": "dns_blocklist"},
-            {"action": "admin", "resource_type": "manage_dns_pools"},
+            {"action": "admin", "resource_type": "certificate_store"},
+            {"action": "read", "resource_type": "manage_dns_pools"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
     "DHCP Editor": (
-        "Full CRUD on DHCP servers, scopes, pools, statics, client classes, "
-        "option templates, and MAC blocks.",
+        "Create, edit and delete DHCP scopes, pools, static assignments, "
+        "client classes and device policies, option templates, phone and PXE "
+        "profiles, and MAC blocks; acknowledge rogue-responder and "
+        "router-advertisement findings; read DHCP servers, server groups, "
+        "scopes, pools, static assignments, leases and lease history. Not "
+        "readable without read on servers, which this role does not hold: "
+        "the DHCP activity log, the Windows DHCP audit log and the Windows "
+        "event log. Changes to infrastructure stay superadmin-only: DHCP "
+        "servers and server groups, failover relationships, server sync / "
+        "pause / approval, lease deletion and the importers.",
         [
             {"action": "admin", "resource_type": "dhcp_server"},
             {"action": "admin", "resource_type": "dhcp_scope"},
@@ -242,6 +274,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "admin", "resource_type": "dhcp_client_class"},
             {"action": "admin", "resource_type": "dhcp_option_template"},
             {"action": "admin", "resource_type": "dhcp_mac_block"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
     "Network Editor": (
@@ -278,6 +311,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "admin", "resource_type": "provider"},
             {"action": "admin", "resource_type": "tls_cert"},
             {"action": "admin", "resource_type": "dnsbl"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
     "Auditor": (
@@ -287,39 +321,65 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         "verify the underlying evidence without making changes.",
         [
             {"action": "read", "resource_type": "conformity"},
-            {"action": "read", "resource_type": "audit"},
+            {"action": "read", "resource_type": "audit_log"},
+            # The spaces and blocks a subnet sits in: until #3058 any IPAM
+            # read opened them, and the IPAM tree starts there.
+            {"action": "read", "resource_type": "ip_space"},
+            {"action": "read", "resource_type": "ip_block"},
             {"action": "read", "resource_type": "subnet"},
             {"action": "read", "resource_type": "ip_address"},
+            # The group a zone sits in and the records it holds: until #3073
+            # any DNS read opened them, and the DNS tree starts at the group.
+            {"action": "read", "resource_type": "dns_group"},
             {"action": "read", "resource_type": "dns_zone"},
+            {"action": "read", "resource_type": "dns_record"},
             {"action": "read", "resource_type": "dhcp_scope"},
             {"action": "read", "resource_type": "tls_cert"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
     "Compliance Editor": (
         "Full CRUD on conformity policies (issue #106) plus read on the "
-        "underlying resources (subnets / IPs / zones / scopes) so the "
+        "underlying resources (spaces / blocks / subnets / IPs / zones / "
+        "scopes) so the "
         "compliance team can author + tune policies without touching "
         "operational config.",
         [
             {"action": "admin", "resource_type": "conformity"},
-            {"action": "read", "resource_type": "audit"},
+            {"action": "read", "resource_type": "audit_log"},
+            # The spaces and blocks a subnet sits in: until #3058 any IPAM
+            # read opened them, and the IPAM tree starts there.
+            {"action": "read", "resource_type": "ip_space"},
+            {"action": "read", "resource_type": "ip_block"},
             {"action": "read", "resource_type": "subnet"},
             {"action": "read", "resource_type": "ip_address"},
+            # The group a zone sits in and the records it holds: until #3073
+            # any DNS read opened them, and the DNS tree starts at the group.
+            {"action": "read", "resource_type": "dns_group"},
             {"action": "read", "resource_type": "dns_zone"},
+            {"action": "read", "resource_type": "dns_record"},
             {"action": "read", "resource_type": "dhcp_scope"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
     "Appliance Operator": (
-        "Full control of the SpatiumDDI OS appliance management surface: "
-        "TLS cert upload, release manager, "
-        "container start/stop/restart + live logs, host network + "
-        "firewall config, maintenance mode, diagnostic bundle download. "
-        "Intended for ops staff who manage the appliance lifecycle "
-        "without needing full superadmin over the DDI data plane. "
-        "Granted ``admin`` on resource_type=appliance; superadmin "
-        "always bypasses anyway.",
+        "Runs the SpatiumDDI OS appliance on this node: TLS cert upload "
+        "and ACME, the read-only releases catalogue, node-local slot "
+        "apply and rollback, container start/stop/restart + live logs, "
+        "host network + firewall config, maintenance mode, diagnostic "
+        "bundle download. Fleet management is NOT included and still "
+        "needs a superadmin: the upgrade-image store, every Fleet member "
+        "action (approve, role assignment, OS upgrade, reboot), "
+        "MetalLB, the kube-api CIDRs and pairing codes. Intended for ops "
+        "staff who manage a node's lifecycle without superadmin over the "
+        "DDI data plane. Granted ``admin`` on resource_type=appliance; "
+        "superadmin always bypasses anyway. Also granted ``admin`` on "
+        "resource_type=certificate_store, which the TLS store's routes now "
+        "check (#3067) — ``admin`` on ``appliance`` still opens them too.",
         [
             {"action": "admin", "resource_type": "appliance"},
+            {"action": "admin", "resource_type": "certificate_store"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
 }
@@ -405,6 +465,13 @@ def _log_backup_section_catalog_gap() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     configure_logging()
+    # #3015 — startup runs inside uvicorn's Server.capture_signals, so its
+    # SIGTERM handler is installed by now: wrap it so long-polls end the
+    # moment a stop begins rather than after uvicorn's graceful-shutdown cut.
+    from app.core import shutdown as _shutdown  # noqa: PLC0415
+
+    _shutdown.reset()
+    _shutdown.install_signal_hook()
     logger.info("startup", service="api", version=settings.version, debug=settings.debug)
     await _seed_default_admin()
     await _seed_builtin_roles()
@@ -472,6 +539,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_schema_behind_head_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("schema_behind_head_alert_rule_seed_skipped", reason=str(exc))
+    # acme-manual-renewal alert rule — singleton, enabled by default
+    # (#1529). Fires when the ACME renewal sweep must skip a cert whose
+    # issuance shape needs a person (manual DNS-01). Idempotent seed.
+    try:
+        from app.services.alerts import seed_acme_manual_renewal_alert_rule  # noqa: PLC0415
+
+        await seed_acme_manual_renewal_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("acme_manual_renewal_alert_rule_seed_skipped", reason=str(exc))
     # Record the schema head this release runs at (#1227), so a later
     # rollback to it can be checked before the switch rather than after.
     # Only once the schema is at head; never blocks startup.
@@ -525,6 +601,28 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_agent_spool_trimmed_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("agent_spool_trimmed_alert_rule_seed_skipped", reason=str(exc))
+    # DNS group memory-pressure alert rule — singleton, ENABLED by default
+    # (issue #3551). Silent unless a BIND9 group's estimated named memory
+    # nears its agents' limit. Idempotent.
+    try:
+        from app.services.alerts import (  # noqa: PLC0415
+            seed_dns_memory_pressure_alert_rule,
+        )
+
+        await seed_dns_memory_pressure_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("dns_memory_pressure_alert_rule_seed_skipped", reason=str(exc))
+    # DNSSEC multi-signer alert rule — singleton, ENABLED by default
+    # (issue #1762). Silent unless a signed zone sits on a group with more than
+    # one DNS server, each signing with its own keys. Idempotent.
+    try:
+        from app.services.alerts import (  # noqa: PLC0415
+            seed_dnssec_multi_signer_alert_rule,
+        )
+
+        await seed_dnssec_multi_signer_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("dnssec_multi_signer_alert_rule_seed_skipped", reason=str(exc))
     # Uncoordinated DHCP scope alert rule — singleton, ENABLED by default
     # (issue #1110). Silent unless two servers already serve one scope
     # without coordinating. Idempotent.
@@ -536,6 +634,40 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_dhcp_scope_uncoordinated_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("dhcp_scope_uncoordinated_alert_rule_seed_skipped", reason=str(exc))
+    # Relay-VIP direct-socket alert rule — singleton, ENABLED by default
+    # (issue #2899). Silent unless a MetalLB DHCP relay VIP fronts a group in
+    # direct (raw socket) mode. Idempotent.
+    try:
+        from app.services.alerts import (  # noqa: PLC0415
+            seed_dhcp_relay_vip_direct_socket_alert_rule,
+        )
+
+        await seed_dhcp_relay_vip_direct_socket_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("dhcp_relay_vip_direct_socket_alert_rule_seed_skipped", reason=str(exc))
+    # Stale blocklist feed alert rule — singleton, ENABLED by default
+    # (issue #2313). Silent unless a feed list stopped refreshing. Idempotent.
+    try:
+        from app.services.alerts import (  # noqa: PLC0415
+            seed_dns_blocklist_feed_stale_alert_rule,
+        )
+
+        await seed_dns_blocklist_feed_stale_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("dns_blocklist_feed_stale_alert_rule_seed_skipped", reason=str(exc))
+    # Stale DNS pool health alert rule — singleton, ENABLED by default
+    # (issue #2312). Silent unless a pool's health checks stopped. Idempotent.
+    try:
+        from app.services.alerts import (  # noqa: PLC0415
+            seed_dns_pool_health_stale_alert_rule,
+        )
+
+        await seed_dns_pool_health_stale_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("dns_pool_health_stale_alert_rule_seed_skipped", reason=str(exc))
+    # The ``secret_expiring`` rule (#2138) is NOT seeded here: it is inserted
+    # once by migration c8e2a5f71d39, so an operator who deletes it keeps it
+    # deleted. A startup seed would re-create it on every restart.
     # Agent daemon-not-serving alert rule — singleton, ENABLED by default
     # (issue #1067). Fires when an agent has reported a daemon that is not
     # ``ok`` for longer than a bundle normally takes to arrive. Idempotent.
@@ -567,14 +699,22 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_dns_record_op_failed_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("dns_record_op_failed_alert_rule_seed_skipped", reason=str(exc))
+    # The ``dns_agent_duplicate_instance`` rule (#2044) is NOT seeded here: it
+    # is inserted once by migration f4c2a8e61b93, so an operator who deletes
+    # it keeps it deleted (the #2138 pattern). Its DHCP twin,
+    # ``dhcp_agent_duplicate_instance`` (#3143), is seeded the same way, by
+    # migration 833ee80c8c6b.
     # Node resource-pressure (PSI) alert rule — singleton, ENABLED by default
     # (issue #983 Phase 2). Cannot fire on a kubelet below 1.36, which reports
     # no PSI at all, so enabling it everywhere is silent until it is real.
     try:
         from app.services.alerts import (  # noqa: PLC0415
+            seed_appliance_disk_usage_alert_rule,
+            seed_appliance_heartbeat_alert_rule,
             seed_appliance_storage_alert_rule,
             seed_cluster_dns_alert_rule,
             seed_node_pressure_alert_rule,
+            seed_postgres_instance_alert_rule,
         )
 
         await seed_node_pressure_alert_rule()
@@ -582,6 +722,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # Storage redundancy (#999 Part A) — cannot fire on an appliance
         # with no arrays, or on a supervisor too old to report them.
         await seed_appliance_storage_alert_rule()
+        # /var filling (#2240): silent below 80%, and on a supervisor that
+        # does not report /var.
+        await seed_appliance_disk_usage_alert_rule()
+        # Silent supervisor (#2259) — cannot fire with no appliances.
+        await seed_appliance_heartbeat_alert_rule()
+        # PostgreSQL instance not Ready / not streaming (#2856) — inert off
+        # the appliance and on a healthy cluster.
+        await seed_postgres_instance_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("node_pressure_alert_rule_seed_skipped", reason=str(exc))
     # DHCP packet-loss alert rule — singleton, ENABLED by default (issue
@@ -699,6 +847,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_restore_drill_failed_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("restore_drill_alert_rule_seed_skipped", reason=str(exc))
+    # Scheduled-backup failed / stale alert rules (#1262), ENABLED. Silent
+    # until a backup target has a schedule.
+    try:
+        from app.services.alerts import seed_backup_alert_rules  # noqa: PLC0415
+
+        await seed_backup_alert_rules()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("backup_alert_rules_seed_skipped", reason=str(exc))
     try:
         from app.services.alerts import seed_dns_tunneling_alert_rule  # noqa: PLC0415
 
@@ -746,20 +902,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             logger.info("multicast_blocks_backfilled", created=n)
     except Exception as exc:  # noqa: BLE001
         logger.debug("multicast_block_backfill_skipped", reason=str(exc))
-    # Demo-mode lockdown — force the restricted feature modules off
-    # and mirror the integration toggles into PlatformSettings so the
-    # beat reconcilers stop. Idempotent; failure-tolerant. The PATCH
+    # Demo-mode lockdown — force the restricted feature modules off,
+    # which stops the integration beat reconcilers (they gate on the
+    # module, #2196). Idempotent; failure-tolerant. The PATCH
     # endpoint refuses to re-enable any restricted module while
     # ``DEMO_MODE=1`` is in effect (see app.core.demo_mode).
     if settings.demo_mode:
         try:
-            from sqlalchemy import select  # noqa: PLC0415
-
             from app.core.demo_mode import (  # noqa: PLC0415
                 DEMO_RESTRICTED_MODULES,
             )
             from app.db import AsyncSessionLocal  # noqa: PLC0415
-            from app.models.settings import PlatformSettings  # noqa: PLC0415
             from app.services import feature_modules as fm_svc  # noqa: PLC0415
 
             async with AsyncSessionLocal() as session:
@@ -767,13 +920,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                     if not fm_svc.is_known(module_id):
                         continue
                     await fm_svc.set_module_enabled(session, module_id, False, user_id=None)
-                    mirror = fm_svc.INTEGRATION_SETTINGS_MIRROR.get(module_id)
-                    if mirror is not None:
-                        ps = await session.scalar(
-                            select(PlatformSettings).where(PlatformSettings.id == 1)
-                        )
-                        if ps is not None:
-                            setattr(ps, mirror, False)
                 await session.commit()
             fm_svc.invalidate_cache()
             logger.info(
@@ -782,6 +928,23 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("demo_mode_lockdown_skipped", reason=str(exc))
+
+    # #2196 — bring the derived ``PlatformSettings.integration_*_enabled``
+    # copy in line with the feature modules that own those switches. An
+    # install upgraded from a build where the two drifted (a module turned on
+    # before the settings row existed; Fortinet / Meraki never mirrored) is
+    # corrected here. Nothing in the app reads the columns any more, so this
+    # is housekeeping, not a gate: idempotent, failure-tolerant.
+    try:
+        from app.db import AsyncSessionLocal  # noqa: PLC0415
+        from app.services import feature_modules as fm_svc  # noqa: PLC0415
+
+        async with AsyncSessionLocal() as session:
+            if await fm_svc.sync_integration_settings_mirror(session):
+                await session.commit()
+                logger.info("integration_settings_mirror_reconciled")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("integration_settings_mirror_reconcile_skipped", reason=str(exc))
 
     # #272 Phase 7c — periodic self-signed cert SAN reconcile. On a
     # multi-node appliance control plane the shared Web UI cert must
@@ -792,6 +955,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # keep it to one cheap query per tick + a single regenerate per
     # membership change. Appliance-mode only.
     cert_reconcile_task: asyncio.Task[None] | None = None
+    cert_deploy_task: asyncio.Task[None] | None = None
     if settings.appliance_mode:
 
         async def _cert_reconcile_loop() -> None:
@@ -812,12 +976,85 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
         cert_reconcile_task = asyncio.create_task(_cert_reconcile_loop())
 
+        # #1895 — the Celery worker cannot patch the TLS Secret, so a
+        # Let's Encrypt cert it issues / renews is deployed here: on a
+        # Redis wake from the worker, and on a 60 s tick as the safety net
+        # for a missed wake (or an api that was down when it fired).
+        async def _cert_deploy_loop() -> None:
+            from app.core.agent_wake import (  # noqa: PLC0415
+                APPLIANCE_CERT_DEPLOY,
+                WakeResult,
+                wake_subscription,
+            )
+            from app.services.appliance.bootstrap import (  # noqa: PLC0415
+                sync_active_cert_to_secret,
+            )
+
+            while True:
+                try:
+                    async with wake_subscription([APPLIANCE_CERT_DEPLOY]) as sub:
+                        result = await sub.wait(60.0)
+                    if result is WakeResult.UNAVAILABLE:
+                        await asyncio.sleep(30)  # Redis down: tick-only
+                    out = await sync_active_cert_to_secret()
+                    if out.get("status") not in ("in-sync", "locked", "no-active-cert"):
+                        logger.info("appliance_cert_deploy_sync", **out)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("appliance_cert_deploy_sync_failed", error=str(exc))
+                    await asyncio.sleep(30)
+
+        cert_deploy_task = asyncio.create_task(_cert_deploy_loop())
+
+    # #2868 — orphan sweep of THIS pod's pcaps directory. A capture file
+    # sits on the node (hostPath) or in the pod (no hostPath) that wrote
+    # it, while delete / prune unlink only where they happen to run, so a
+    # file held elsewhere outlives its row. The api writes appliance-vantage
+    # uploads; the worker runs its own pass for the captures it writes
+    # (``start_worker_sweep``). Not appliance-gated: the sweep only deletes
+    # files no packet_capture row names, which is correct on every shape.
+    async def _pcap_orphan_loop() -> None:
+        from app.db import AsyncSessionLocal  # noqa: PLC0415
+        from app.services.pcap.orphan_sweep import (  # noqa: PLC0415
+            INITIAL_DELAY_SECONDS,
+            SWEEP_INTERVAL_SECONDS,
+            sweep_orphans,
+        )
+
+        await asyncio.sleep(INITIAL_DELAY_SECONDS)
+        while True:
+            try:
+                async with AsyncSessionLocal() as sweep_db:
+                    await sweep_orphans(sweep_db)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("pcap_orphan_sweep_failed", where="api", error=str(exc))
+            await asyncio.sleep(SWEEP_INTERVAL_SECONDS)
+
+    pcap_orphan_task: asyncio.Task[None] = asyncio.create_task(_pcap_orphan_loop())
+
     yield
+    _shutdown.request_shutdown()
 
     if cert_reconcile_task is not None:
         cert_reconcile_task.cancel()
         with suppress(asyncio.CancelledError):
             await cert_reconcile_task
+    if cert_deploy_task is not None:
+        cert_deploy_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await cert_deploy_task
+    pcap_orphan_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await pcap_orphan_task
+    from app.services import after_commit_dispatch  # noqa: PLC0415
+
+    await after_commit_dispatch.shutdown()
+    from app.db import dispose_probe_engine  # noqa: PLC0415
+
+    await dispose_probe_engine()
     logger.info("shutdown", service="api")
 
 
@@ -892,14 +1129,19 @@ def create_app() -> FastAPI:
         # pages load them from a CDN, which the web tier's CSP refuses.
         docs_url=None,
         redoc_url=None,
-        openapi_url="/api/openapi.json",
+        # #2935 — /api/openapi.json is served by install_api_docs() too, to
+        # signed-in callers only. FastAPI's own route would serve the whole
+        # API surface and the exact version to anyone. ``app.openapi()`` is
+        # unaffected, so the release asset (#903) is generated as before.
+        openapi_url=None,
         lifespan=lifespan,
     )
 
     # Middleware (outermost first). Note Starlette wraps in REVERSE add
     # order: the LAST-added middleware runs outermost. So the request
-    # flows in as TrustedHost → CORS → Prometheus → Maintenance →
-    # RequestContext, and the response unwinds the other way.
+    # flows in as RequestBodyLimit → TrustedProxy → TrustedHost → CORS →
+    # Prometheus → Maintenance → RequestContext, and the response unwinds
+    # the other way.
     app.add_middleware(RequestContextMiddleware)
 
     # Maintenance mode (issue #57). Added AFTER RequestContextMiddleware so
@@ -942,8 +1184,9 @@ def create_app() -> FastAPI:
         # error (#865). Without this the header is present on the wire but
         # the JS layer can't read it under CORS — for a cross-origin
         # frontend the feature would silently degrade to the dead end it
-        # fixes.
-        expose_headers=["X-Total-Count", "X-Adoption-Required"],
+        # fixes. ``X-Stepup-Required`` marks a 403 that wants the operator
+        # step-up, so a dialog can prompt and resubmit (#1412).
+        expose_headers=["X-Total-Count", "X-Adoption-Required", "X-Stepup-Required"],
     )
 
     # SECURITY (#400 / L3): Host-header allow-list. Added LAST so — given
@@ -955,7 +1198,7 @@ def create_app() -> FastAPI:
     # lock the API to their real hostnames. (TrustedHostMiddleware
     # short-circuits ``["*"]`` so there's no per-request cost when open.)
     app.add_middleware(
-        TrustedHostMiddleware,
+        LoggingTrustedHostMiddleware,
         allowed_hosts=settings.trusted_hosts_list,
     )
 
@@ -966,6 +1209,11 @@ def create_app() -> FastAPI:
     # resolved values. uvicorn runs with --no-proxy-headers for this to see
     # the real peer (backend/Dockerfile).
     app.add_middleware(TrustedProxyMiddleware, trusted=settings.trusted_proxy_networks)
+
+    # #2780 — cap every request body. Added last so it runs outermost: an
+    # oversized body is refused (413) before any other middleware, route or
+    # dependency reads a byte of it. See app.core.body_limit.
+    app.add_middleware(RequestBodyLimitMiddleware, max_bytes=settings.max_request_body_bytes)
 
     # Routes
     app.include_router(health_router)
@@ -1013,6 +1261,15 @@ def create_app() -> FastAPI:
         OperationalError as SAOperationalError,
     )
 
+    @app.exception_handler(StarletteHTTPException)
+    async def _http_exception_audited(request: Request, exc: StarletteHTTPException) -> Response:
+        """The stock HTTPException response, plus (#3644) a ``denied`` audit row
+        for a 403 decided inside a handler, which writes none of its own. The
+        row is skipped when a gate or ``refuse_and_audit`` already wrote one."""
+        if exc.status_code == 403:
+            await audit_unrecorded_denial(request, exc.detail)
+        return await http_exception_handler(request, exc)
+
     @app.exception_handler(SAInterfaceError)
     @app.exception_handler(SAOperationalError)
     async def _transient_db_connection(request: Request, exc: Exception) -> Response:
@@ -1026,6 +1283,17 @@ def create_app() -> FastAPI:
             or "server closed the connection unexpectedly" in text
         )
         if not is_connection_closed:
+            from app.core.dependency_down import (  # noqa: PLC0415
+                dependency_down_response,
+                is_dependency_down,
+            )
+
+            # A disconnect SQLAlchemy flagged (``connection_invalidated``) or
+            # the old primary's "shutting down" during a failover (#3017),
+            # in words this message match does not know: the same 503 every
+            # other dependency-down path answers.
+            if is_dependency_down(exc):
+                return dependency_down_response(request.method, request.url.path, exc, logger)
             # Some other InterfaceError — let it fall through to
             # the unhandled-exception path so it gets captured.
             raise exc
@@ -1065,59 +1333,61 @@ def create_app() -> FastAPI:
     # Not captured to the diagnostics surface on purpose: the capture opens
     # a database session, and during the outage that is another 5 s connect
     # timeout in front of the 503. The warning line carries the route.
+    from sqlalchemy.exc import PendingRollbackError as SAPendingRollbackError  # noqa: PLC0415
     from sqlalchemy.exc import TimeoutError as SAPoolTimeoutError  # noqa: PLC0415
 
-    # The dependency-down exceptions this converts to 503. asyncpg's pre-ping
-    # times out as a bare ``TimeoutError``; a fresh checkout onto the not-yet-
-    # listening new primary raises ``ConnectionError`` (``ConnectionRefusedError``
-    # is a subclass); the pool's own checkout timeout is ``sqlalchemy.exc
-    # .TimeoutError``. All observed live on nightly-2026.09.12's partition rig
-    # while CNPG promoted a new primary.
-    _dependency_down = (TimeoutError, ConnectionError, SAPoolTimeoutError)
+    from app.core.dependency_down import (  # noqa: PLC0415
+        dependency_down_response,
+        is_dependency_down,
+        is_only_dependency_down,
+    )
 
-    def _dependency_down_response(request: Request, error_class: str, detail: str) -> Response:
-        from fastapi.responses import JSONResponse  # noqa: PLC0415
-
-        logger.warning(
-            "dependency_unavailable",
-            method=request.method,
-            path=request.url.path,
-            error_class=error_class,
-            error=detail[:200],
-        )
-        return JSONResponse(
-            status_code=503,
-            content={
-                "detail": (
-                    "A backend dependency did not answer in time "
-                    "(database failover or restart in progress). Retry."
-                )
-            },
-            headers={"Retry-After": "2"},
-        )
+    # The classification (timeouts, connection errors, the pool checkout
+    # timeout, network-unreachable OSErrors by errno, an invalidated-connection
+    # PendingRollbackError) lives in ``app.core.dependency_down`` so the
+    # maintenance-mode middleware and ``get_db``'s cleanup, which run outside
+    # these handlers, agree with it (#3017).
+    def _dependency_down_response(request: Request, exc: BaseException) -> Response:
+        return dependency_down_response(request.method, request.url.path, exc, logger)
 
     @app.exception_handler(TimeoutError)
     @app.exception_handler(ConnectionError)
     @app.exception_handler(SAPoolTimeoutError)
     async def _dependency_unavailable(request: Request, exc: Exception) -> Response:
-        return _dependency_down_response(request, type(exc).__name__, str(exc))
+        return _dependency_down_response(request, exc)
 
-    # The same timeout sometimes arrives WRAPPED. SQLAlchemy's asyncpg driver
-    # runs the connection on an anyio task group, so a pre-ping timeout can
-    # surface as an ``ExceptionGroup`` rather than a bare ``TimeoutError`` —
-    # observed on ``GET /appliance/cluster/health`` on the partition rig
-    # (``ExceptionGroup`` over one ``TimeoutError`` from ``asyncpg _async_ping``).
-    # A group whose leaves are ALL dependency-down errors is the same 503; a
-    # group carrying anything else re-raises unchanged so a real bug still
-    # reaches the 500 path and the diagnostics capture.
+    # A plain OSError is dependency-down only for an unreachable host or
+    # network (EHOSTUNREACH / ENETUNREACH are not ConnectionError subclasses)
+    # AND only when the database driver raised it; any other OSError, a disk
+    # error or an outbound call's unreachable target, re-raises to the 500
+    # path it had before #3017.
+    @app.exception_handler(OSError)
+    async def _dependency_unavailable_oserror(request: Request, exc: OSError) -> Response:
+        if not is_dependency_down(exc):
+            raise exc
+        return _dependency_down_response(request, exc)
+
+    # A session whose connection was invalidated mid-request. Only that shape;
+    # the flush-failure PendingRollbackError is a logic error and re-raises.
+    @app.exception_handler(SAPendingRollbackError)
+    async def _dependency_unavailable_pending_rollback(
+        request: Request, exc: SAPendingRollbackError
+    ) -> Response:
+        if not is_dependency_down(exc):
+            raise exc
+        return _dependency_down_response(request, exc)
+
+    # The same errors sometimes arrive WRAPPED. SQLAlchemy's asyncpg driver
+    # runs the connection on an anyio task group, so they can surface as an
+    # ``ExceptionGroup`` rather than bare (observed on ``GET
+    # /appliance/cluster/health``). A group whose leaves are ALL dependency-down
+    # is the same 503; a group carrying anything else re-raises unchanged so a
+    # real bug still reaches the 500 path and the diagnostics capture.
     @app.exception_handler(ExceptionGroup)
     async def _dependency_unavailable_group(request: Request, exc: ExceptionGroup) -> Response:
-        matched, rest = exc.split(_dependency_down)
-        if rest is not None or matched is None:
+        if not is_only_dependency_down(exc):
             raise exc
-        leaves = getattr(matched, "exceptions", ())
-        first = leaves[0] if leaves else exc
-        return _dependency_down_response(request, type(first).__name__, str(first))
+        return _dependency_down_response(request, exc)
 
     from sqlalchemy.exc import DBAPIError as SADBAPIError  # noqa: PLC0415
     from sqlalchemy.exc import IntegrityError as SAIntegrityError  # noqa: PLC0415
@@ -1126,6 +1396,8 @@ def create_app() -> FastAPI:
         FOREIGN_KEY_VIOLATION,
         classify_foreign_key_violation,
         extract_detail,
+        unique_violation_constraint,
+        unique_violation_message,
     )
 
     # A unique violation (SQLSTATE 23505) is the data conflicting.
@@ -1207,7 +1479,11 @@ def create_app() -> FastAPI:
         )
         return JSONResponse(
             status_code=409,
-            content={"detail": "The request conflicts with existing data."},
+            content={
+                "detail": unique_violation_message(
+                    extract_detail(exc), unique_violation_constraint(exc)
+                )
+            },
         )
 
     @app.exception_handler(SADBAPIError)
@@ -1223,11 +1499,20 @@ def create_app() -> FastAPI:
         arrive as bare DBAPIError), so the discriminator is the error itself:
         SQLSTATE class 22 is "data exception" by definition, and asyncpg's
         client-side bind failures subclass asyncpg.exceptions.DataError.
-        Anything else (ProgrammingError — OUR query is wrong; transient
-        connection errors — their own handler above, which wins by being the
-        more specific registered class) re-raises unchanged."""
+        A database that went away mid-statement (a disconnect, or the old
+        primary's 57P01 / 25006 during a failover, which the asyncpg adapter
+        hands up as a bare DBAPIError) is the dependency-down 503 (#3017).
+        Anything else (ProgrammingError — OUR query is wrong) re-raises
+        unchanged."""
         from fastapi.responses import JSONResponse  # noqa: PLC0415
 
+        # A connection SQLAlchemy flagged as a disconnect, or the old
+        # primary's "shutting down" / read-only answer, is the database
+        # being away mid-statement (#3017): the 503, not a 500. It is checked
+        # first because this handler is the one Starlette picks for every
+        # DBAPIError subclass, OperationalError and InterfaceError included.
+        if is_dependency_down(exc):
+            return _dependency_down_response(request, exc)
         orig = getattr(exc, "orig", None)
         sqlstate = str(getattr(orig, "sqlstate", "") or "")
         is_data = sqlstate.startswith("22") or any(
@@ -1251,6 +1536,49 @@ def create_app() -> FastAPI:
     # permission / validation errors raise typed HTTPException
     # subclasses that FastAPI's own machinery turns into 4xx
     # responses without ever hitting this path.
+    # FastAPI's stock 422 handler runs ``jsonable_encoder(exc.errors())``, and
+    # for a body that is not valid JSON the error's ``input`` is the raw
+    # ``bytes``, which the encoder decodes strictly as UTF-8 - so a body that
+    # is not UTF-8 (sent with a non-JSON or empty Content-Type) raised
+    # UnicodeDecodeError inside the handler: a 500 and a Diagnostics row for
+    # what is a client error (#2677). Same response as the stock handler;
+    # only ``bytes`` are decoded leniently (identical for valid UTF-8).
+    def _safe_errors(value: Any) -> Any:
+        if isinstance(value, bytes | bytearray):
+            return bytes(value).decode("utf-8", errors="backslashreplace")
+        if isinstance(value, dict):
+            return {k: _safe_errors(v) for k, v in value.items()}
+        if isinstance(value, list | tuple):
+            return [_safe_errors(v) for v in value]
+        return value
+
+    # The submitted value is never echoed back (#3639): ``input`` carries
+    # whatever the client sent for the failing field - a passphrase, key or
+    # token among them - and ``ctx.error`` is the validator's exception, which
+    # can quote it. Neither is part of the documented 422 shape (``loc`` /
+    # ``msg`` / ``type`` say what is wrong and where), and no client reads them.
+    def _without_submitted_values(errors: Sequence[Any]) -> list[Any]:
+        cleaned: list[Any] = []
+        for err in errors:
+            item = {k: v for k, v in err.items() if k != "input"}
+            ctx = item.get("ctx")
+            if isinstance(ctx, dict):
+                item["ctx"] = {k: v for k, v in ctx.items() if k != "error"}
+            cleaned.append(item)
+        return cleaned
+
+    @app.exception_handler(RequestValidationError)
+    async def _request_validation_422(request: Request, exc: RequestValidationError) -> Response:
+        from fastapi.encoders import jsonable_encoder  # noqa: PLC0415
+        from fastapi.responses import JSONResponse  # noqa: PLC0415
+
+        return JSONResponse(
+            status_code=422,
+            content={
+                "detail": jsonable_encoder(_safe_errors(_without_submitted_values(exc.errors())))
+            },
+        )
+
     @app.exception_handler(Exception)
     async def _capture_unhandled(request: Request, exc: Exception) -> Response:
         # Lazy imports — keep app boot-time import graph small + avoid
@@ -1258,10 +1586,21 @@ def create_app() -> FastAPI:
         # base which Alembic also imports at migration time).
         from fastapi.responses import JSONResponse  # noqa: PLC0415
 
+        from app.core.dependency_down import (  # noqa: PLC0415
+            dependency_down_response,
+            is_only_dependency_down,
+        )
         from app.db import AsyncSessionLocal  # noqa: PLC0415
         from app.services.diagnostics import (  # noqa: PLC0415
             record_unhandled_exception_async,
         )
+
+        # Anything that reaches the last-resort handler from OUTSIDE the
+        # ExceptionMiddleware (a middleware's own database read) and is purely
+        # a dependency-down error is still the 503, and must not try a
+        # diagnostics capture: that needs the database that is away (#3017).
+        if is_only_dependency_down(exc):
+            return dependency_down_response(request.method, request.url.path, exc, logger)
 
         # The id RequestContextMiddleware generated, not only one the client
         # sent (#1201): this used to read the request header alone, so a

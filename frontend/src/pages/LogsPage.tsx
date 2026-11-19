@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { useSearchParams } from "react-router-dom";
+import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import {
   Activity,
   AlertTriangle,
@@ -8,13 +11,14 @@ import {
   Calendar,
   ChevronDown,
   ChevronRight,
+  Copy,
   FileClock,
   Info,
+  Maximize2,
   RefreshCw,
   Search,
   ScrollText,
   ShieldAlert,
-  Server,
   XCircle,
 } from "lucide-react";
 import {
@@ -26,7 +30,18 @@ import {
   type DNSQueryLogRow,
   type LogEventRow,
   type LogSource,
+  formatApiError,
 } from "@/lib/api";
+import { Modal } from "@/components/ui/modal";
+import { AgentLogScopePicker } from "@/components/AgentLogScopePicker";
+import {
+  type AgentLogSelection,
+  defaultSelection,
+  selectionHost,
+  selectionIsValid,
+  selectionToScope,
+} from "@/lib/agent-log-scope";
+import { copyToClipboard } from "@/lib/clipboard";
 import { cn } from "@/lib/utils";
 import { DNSThreatTab } from "./logs/DNSThreatTab";
 
@@ -75,6 +90,11 @@ const TABS: readonly Tab[] = [
   "audit",
 ] as const;
 
+const DHCP_TABS: ReadonlySet<Tab> = new Set<Tab>(["dhcp-activity", "audit"]);
+// The DNS tabs read the DNS query log / threat scores, so they exist only
+// while core.dns is on (#2135).
+const DNS_TABS: ReadonlySet<Tab> = new Set<Tab>(["dns-queries", "dns-threat"]);
+
 export function LogsPage() {
   // ``?tab=`` entry point so other surfaces can deep-link a specific
   // tab — the Security dashboard's DNS-tunneling card needs to land on
@@ -83,8 +103,40 @@ export function LogsPage() {
   // shareable and survives a refresh.
   const [searchParams, setSearchParams] = useSearchParams();
   const requested = searchParams.get("tab") as Tab | null;
-  const tab: Tab =
-    requested && TABS.includes(requested) ? requested : "dns-queries";
+  // #2130 — the DHCP tabs read DHCP logs, so they exist only while core.dhcp
+  // is on. A deep link to one with it off (or before the module set has
+  // loaded) lands on DNS Queries, not on a tab that is not there.
+  const { enabled: moduleEnabled, ready: modulesReady } = useFeatureModules();
+  const dhcpOn = modulesReady && moduleEnabled("core.dhcp");
+  const dnsOn = modulesReady && moduleEnabled("core.dns");
+  // #2135 — the same for the DNS tabs. Their buttons stay up until the module
+  // set has loaded (DNS Queries is the default and a bar with no tabs in it
+  // blinks); only the tab BODIES, which fire the queries, wait.
+  const dnsTabsShown = !modulesReady || dnsOn;
+  const wanted: Tab | null =
+    requested && TABS.includes(requested) ? requested : null;
+  // Only the Event Log tab is valid with neither module on, so every other
+  // landing (a deep link, or none) waits for the module set rather than
+  // mounting a tab, and firing its query, for a moment first.
+  const awaitingModules = !modulesReady && wanted !== "events";
+  const tabAllowed = (t: Tab) =>
+    (dnsOn || !DNS_TABS.has(t)) && (dhcpOn || !DHCP_TABS.has(t));
+  // With DNS off the default is the first tab that still exists, and with
+  // both off that is the Event Log: a valid tab, never a blank page.
+  const fallbackTab: Tab = dnsOn
+    ? "dns-queries"
+    : dhcpOn
+      ? "dhcp-activity"
+      : "events";
+  // Until the module set has loaded nothing is known to be off, so the tab
+  // the URL asks for (or DNS Queries, the usual default) stays highlighted
+  // rather than flicking to the Event Log for a moment; the bodies below
+  // still wait, so nothing is read before the answer is in.
+  const tab: Tab = !modulesReady
+    ? (wanted ?? "dns-queries")
+    : wanted && tabAllowed(wanted)
+      ? wanted
+      : fallbackTab;
   const setTab = (next: Tab) => {
     const params = new URLSearchParams(searchParams);
     params.set("tab", next);
@@ -98,6 +150,7 @@ export function LogsPage() {
   const {
     data: sources,
     isLoading: sourcesLoading,
+    error: sourcesError,
     refetch: refetchSources,
   } = useQuery({
     queryKey: ["logs-sources"],
@@ -108,6 +161,7 @@ export function LogsPage() {
   const {
     data: agentSources,
     isLoading: agentSourcesLoading,
+    error: agentSourcesError,
     refetch: refetchAgentSources,
   } = useQuery({
     queryKey: ["logs-agent-sources"],
@@ -142,7 +196,7 @@ export function LogsPage() {
   const hasAgents = !!agentSources && agentSources.length > 0;
 
   if (!hasWindows && !hasAgents) {
-    return <EmptyLogsState />;
+    return <EmptyLogsState error={sourcesError ?? agentSourcesError} />;
   }
 
   function refreshAll() {
@@ -175,29 +229,35 @@ export function LogsPage() {
           </button>
         </div>
         <div className="mt-3 flex flex-wrap gap-1 border-b -mb-4">
-          <TabButton
-            active={tab === "dns-queries"}
-            onClick={() => setTab("dns-queries")}
-            icon={Search}
-            label="DNS Queries"
-            hint="BIND9 / PowerDNS query log (client → name → qtype). Requires query_log_enabled on the server group."
-            count={dnsAgentSources.length || undefined}
-          />
-          <TabButton
-            active={tab === "dns-threat"}
-            onClick={() => setTab("dns-threat")}
-            icon={ShieldAlert}
-            label="DNS Threat"
-            hint="Per-client tunneling / exfiltration scoring over the query log. Requires the security.dns_threat module (default off — it reads query content)."
-          />
-          <TabButton
-            active={tab === "dhcp-activity"}
-            onClick={() => setTab("dhcp-activity")}
-            icon={Activity}
-            label="DHCP Activity"
-            hint="Kea DHCPv4 activity (DISCOVER / OFFER / REQUEST / ACK, lease alloc, declines)"
-            count={dhcpAgentSources.length || undefined}
-          />
+          {dnsTabsShown && (
+            <TabButton
+              active={tab === "dns-queries"}
+              onClick={() => setTab("dns-queries")}
+              icon={Search}
+              label="DNS Queries"
+              hint="BIND9 / PowerDNS query log (client → name → qtype). Requires query_log_enabled on the server group."
+              count={dnsAgentSources.length || undefined}
+            />
+          )}
+          {dnsTabsShown && (
+            <TabButton
+              active={tab === "dns-threat"}
+              onClick={() => setTab("dns-threat")}
+              icon={ShieldAlert}
+              label="DNS Threat"
+              hint="Per-client tunneling / exfiltration scoring over the query log. Requires the security.dns_threat module (default off — it reads query content)."
+            />
+          )}
+          {dhcpOn && (
+            <TabButton
+              active={tab === "dhcp-activity"}
+              onClick={() => setTab("dhcp-activity")}
+              icon={Activity}
+              label="DHCP Activity"
+              hint="Kea DHCPv4 activity (DISCOVER / OFFER / REQUEST / ACK, lease alloc, declines)"
+              count={dhcpAgentSources.length || undefined}
+            />
+          )}
           <TabButton
             active={tab === "events"}
             onClick={() => setTab("events")}
@@ -206,27 +266,35 @@ export function LogsPage() {
             hint="Windows DNS/DHCP service events (scope load, zone transfer, auth)"
             count={hasWindows ? sources?.length : undefined}
           />
-          <TabButton
-            active={tab === "audit"}
-            onClick={() => setTab("audit")}
-            icon={FileClock}
-            label="DHCP Audit"
-            hint="Windows DHCP per-lease events (grants, renewals, releases)"
-            count={
-              sources?.filter((s) => s.server_kind === "dhcp").length ||
-              undefined
-            }
-          />
+          {dhcpOn && (
+            <TabButton
+              active={tab === "audit"}
+              onClick={() => setTab("audit")}
+              icon={FileClock}
+              label="DHCP Audit"
+              hint="Windows DHCP per-lease events (grants, renewals, releases)"
+              count={
+                sources?.filter((s) => s.server_kind === "dhcp").length ||
+                undefined
+              }
+            />
+          )}
         </div>
       </div>
 
-      {tab === "dns-queries" && <DNSQueriesTab sources={dnsAgentSources} />}
-      {tab === "dns-threat" && <DNSThreatTab />}
-      {tab === "dhcp-activity" && (
+      {tab === "dns-queries" && dnsOn && !awaitingModules && (
+        <DNSQueriesTab sources={dnsAgentSources} />
+      )}
+      {tab === "dns-threat" && dnsOn && !awaitingModules && <DNSThreatTab />}
+      {tab === "dhcp-activity" && dhcpOn && !awaitingModules && (
         <DHCPActivityTab sources={dhcpAgentSources} />
       )}
-      {tab === "events" && <EventLogTab sources={tabSources} />}
-      {tab === "audit" && <DhcpAuditTab sources={tabSources} />}
+      {tab === "events" && !awaitingModules && (
+        <EventLogTab sources={tabSources} />
+      )}
+      {tab === "audit" && dhcpOn && !awaitingModules && (
+        <DhcpAuditTab sources={tabSources} />
+      )}
     </div>
   );
 }
@@ -268,7 +336,7 @@ function TabButton({
   );
 }
 
-function EmptyLogsState() {
+function EmptyLogsState({ error }: { error?: unknown }) {
   return (
     <div className="flex h-full flex-col">
       <div className="border-b px-6 py-4">
@@ -280,11 +348,21 @@ function EmptyLogsState() {
       <div className="flex flex-1 items-center justify-center p-10">
         <div className="max-w-md rounded-lg border border-dashed p-10 text-center">
           <ScrollText className="mx-auto mb-3 h-10 w-10 text-muted-foreground/30" />
-          <p className="text-sm font-medium">No log sources yet</p>
-          <p className="mt-2 text-xs text-muted-foreground">
-            Register a Windows DNS or DHCP server with WinRM credentials
-            configured and its logs will appear here.
-          </p>
+          {error ? (
+            <p className="text-sm">
+              <ListEmpty error={error} what="log sources">
+                No log sources yet
+              </ListEmpty>
+            </p>
+          ) : (
+            <>
+              <p className="text-sm font-medium">No log sources yet</p>
+              <p className="mt-2 text-xs text-muted-foreground">
+                Register a Windows DNS or DHCP server with WinRM credentials
+                configured and its logs will appear here.
+              </p>
+            </>
+          )}
         </div>
       </div>
     </div>
@@ -784,14 +862,7 @@ function RefreshButton({
 }
 
 function QueryErrorBanner({ query }: { query: { error: unknown } }) {
-  const detail =
-    (
-      query.error as
-        | {
-            response?: { data?: { detail?: string } };
-          }
-        | undefined
-    )?.response?.data?.detail ?? String(query.error);
+  const detail = formatApiError(query.error, String(query.error));
   return (
     <div className="m-6 rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
       <p className="font-medium">Query failed</p>
@@ -805,7 +876,7 @@ function QueryingIndicator({ host }: { host: string | undefined }) {
     <div className="flex h-full items-center justify-center">
       <div className="flex items-center gap-2 text-sm text-muted-foreground">
         <RefreshCw className="h-4 w-4 animate-spin" />
-        Querying {host}…
+        Querying {host ?? "servers"}…
       </div>
     </div>
   );
@@ -1013,36 +1084,6 @@ function formatTime(iso: string): string {
 
 // ── Agent server picker ───────────────────────────────────────────
 
-function AgentServerPicker({
-  sources,
-  value,
-  onChange,
-}: {
-  sources: AgentLogSource[];
-  value: string | null;
-  onChange: (v: string) => void;
-}) {
-  return (
-    <label className="flex items-center gap-1.5 text-xs">
-      <span className="inline-flex items-center gap-1 text-muted-foreground">
-        <Server className="h-3 w-3" />
-        Server
-      </span>
-      <select
-        value={value ?? ""}
-        onChange={(e) => onChange(e.target.value)}
-        className="rounded-md border bg-background px-2 py-1 text-sm"
-      >
-        {sources.map((s) => (
-          <option key={s.server_id} value={s.server_id}>
-            {s.server_name} ({s.host})
-          </option>
-        ))}
-      </select>
-    </label>
-  );
-}
-
 function EmptyAgentTab({
   kind,
   drivers,
@@ -1065,9 +1106,32 @@ function EmptyAgentTab({
 
 // ── DNS Queries tab (BIND9 query log) ────────────────────────────
 
+// Grid templates as whole literals so Tailwind sees them. The `_server`
+// variant adds a Server column after Time, shown whenever the read covers
+// more than one server (a group or "All servers", #2120).
+const DNS_COLS = "grid-cols-[20px_160px_140px_60px_70px_120px_95px_80px_1fr]";
+const DNS_COLS_SERVER =
+  "grid-cols-[20px_160px_130px_140px_60px_70px_120px_95px_80px_1fr]";
+const DHCP_COLS = "grid-cols-[20px_160px_70px_180px_140px_120px_1fr]";
+const DHCP_COLS_SERVER =
+  "grid-cols-[20px_160px_130px_70px_180px_140px_120px_1fr]";
+
+/** Whether a response merged more than one server. */
+function coversManyServers(data: { server_ids?: string[] } | undefined) {
+  return (data?.server_ids?.length ?? 0) > 1;
+}
+
+function ServerCell({ name }: { name: string }) {
+  return (
+    <span className="truncate font-mono text-[11px]" title={name}>
+      {name}
+    </span>
+  );
+}
+
 function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
-  const [serverId, setServerId] = useState<string | null>(
-    sources[0]?.server_id ?? null,
+  const [selection, setSelection] = useState<AgentLogSelection | null>(() =>
+    defaultSelection(sources),
   );
   const [maxEvents, setMaxEvents] = useState(200);
   const [since, setSince] = useState<string>("");
@@ -1079,37 +1143,41 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
 
   useEffect(() => {
     if (sources.length === 0) {
-      setServerId(null);
+      setSelection(null);
       return;
     }
-    if (!serverId || !sources.some((s) => s.server_id === serverId)) {
-      setServerId(sources[0].server_id);
+    if (!selectionIsValid(selection, sources)) {
+      setSelection(defaultSelection(sources));
     }
-  }, [sources, serverId]);
+  }, [sources, selection]);
+  const scope = selection ? selectionToScope(selection) : {};
 
   const sinceIso = since ? new Date(since).toISOString() : null;
-  const enabled = !!serverId;
+  const enabled = !!selection;
+  // A partial address filters as you type; wait for a pause so each
+  // keystroke is not its own request (#3171).
+  const debouncedClientIp = useDebouncedValue(clientIp);
 
   const dnsQueriesQuery = useQuery({
     queryKey: [
       "logs-dns-queries",
-      serverId,
+      selection,
       maxEvents,
       sinceIso,
       q,
       qtype,
-      clientIp,
+      debouncedClientIp,
       view,
       rcode,
     ],
     queryFn: () =>
       logsApi.dnsQueries({
-        server_id: serverId!,
+        ...scope,
         max_events: maxEvents,
         since: sinceIso,
         q: q.trim() || null,
         qtype: qtype.trim() || null,
-        client_ip: clientIp.trim() || null,
+        client_ip: debouncedClientIp.trim() || null,
         view: view.trim() || null,
         rcode: rcode.trim() || null,
       }),
@@ -1122,10 +1190,10 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
   // Analytics rollups — keyed off (server_id, since) only so per-keystroke
   // filter changes (qtype / client_ip / q) don't refetch the entire summary.
   const analyticsQuery = useQuery({
-    queryKey: ["logs-dns-queries-analytics", serverId, sinceIso],
+    queryKey: ["logs-dns-queries-analytics", selection, sinceIso],
     queryFn: () =>
       logsApi.dnsQueryAnalytics({
-        server_id: serverId!,
+        ...scope,
         since: sinceIso,
         limit: 10,
       }),
@@ -1136,9 +1204,10 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
   });
 
   const events = dnsQueriesQuery.data?.events ?? [];
-  const selected = useMemo(
-    () => sources.find((s) => s.server_id === serverId),
-    [serverId, sources],
+  const showServer = coversManyServers(dnsQueriesQuery.data);
+  const selectedHost = useMemo(
+    () => selectionHost(selection, sources),
+    [selection, sources],
   );
 
   if (sources.length === 0) {
@@ -1149,10 +1218,10 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
     <>
       {/* Filter bar */}
       <div className="flex flex-wrap items-center gap-3 border-b bg-muted/20 px-6 py-3">
-        <AgentServerPicker
+        <AgentLogScopePicker
           sources={sources}
-          value={serverId}
-          onChange={setServerId}
+          value={selection}
+          onChange={setSelection}
         />
         <label className="flex items-center gap-1.5 text-xs">
           <span className="text-muted-foreground">QType</span>
@@ -1253,7 +1322,7 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
 
       {dnsQueriesQuery.isError && <QueryErrorBanner query={dnsQueriesQuery} />}
       {dnsQueriesQuery.isFetching && events.length === 0 && (
-        <QueryingIndicator host={selected?.host} />
+        <QueryingIndicator host={selectedHost} />
       )}
       {!dnsQueriesQuery.isError &&
         !dnsQueriesQuery.isFetching &&
@@ -1261,8 +1330,17 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
 
       {events.length > 0 && (
         <div className="flex-1 overflow-auto">
-          <div className="grid grid-cols-[160px_140px_60px_70px_120px_95px_80px_1fr] gap-x-3 border-b bg-muted/30 px-6 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+          <div
+            className={cn(
+              "grid gap-x-3 border-b bg-muted/30 px-6 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground",
+              showServer ? DNS_COLS_SERVER : DNS_COLS,
+            )}
+          >
+            <span>
+              <span className="sr-only">Details</span>
+            </span>
             <span>Time</span>
+            {showServer && <span>Server</span>}
             <span>Client</span>
             <span>QType</span>
             <span>QClass</span>
@@ -1273,7 +1351,13 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
           </div>
           <div className="divide-y text-xs">
             {events.map((row) => (
-              <DNSQueryRow key={row.id} row={row} />
+              <DNSQueryRow
+                key={row.id}
+                row={row}
+                showServer={showServer}
+                onFilterClient={(ip) => setClientIp(ip)}
+                onFilterQname={(name) => setQ(name)}
+              />
             ))}
           </div>
           {dnsQueriesQuery.data?.truncated && (
@@ -1482,15 +1566,42 @@ function RcodeCell({
   );
 }
 
-function DNSQueryRow({ row }: { row: DNSQueryLogRow }) {
+export function DNSQueryRow({
+  row,
+  showServer = false,
+  onFilterClient,
+  onFilterQname,
+}: {
+  row: DNSQueryLogRow;
+  /** Render the Server column (#2120) — the read merged several servers. */
+  showServer?: boolean;
+  onFilterClient?: (ip: string) => void;
+  onFilterQname?: (qname: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
   return (
-    <div className="grid grid-cols-[160px_140px_60px_70px_120px_95px_80px_1fr] items-baseline gap-x-3 px-6 py-1 hover:bg-muted/40">
+    <div
+      className={cn(
+        "grid items-baseline gap-x-3 px-6 py-1 hover:bg-muted/40",
+        showServer ? DNS_COLS_SERVER : DNS_COLS,
+      )}
+    >
+      <RowDetailsButton onClick={() => setOpen(true)} />
+      {open && (
+        <DNSQueryDetailModal
+          row={row}
+          onClose={() => setOpen(false)}
+          onFilterClient={onFilterClient}
+          onFilterQname={onFilterQname}
+        />
+      )}
       <span
         className="font-mono tabular-nums text-muted-foreground"
         title={row.ts}
       >
         {formatTime(row.ts)}
       </span>
+      {showServer && <ServerCell name={row.server_name} />}
       <span
         className="truncate font-mono text-[11px]"
         title={
@@ -1527,8 +1638,8 @@ function DNSQueryRow({ row }: { row: DNSQueryLogRow }) {
 // ── DHCP Activity tab (Kea log) ───────────────────────────────────
 
 function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
-  const [serverId, setServerId] = useState<string | null>(
-    sources[0]?.server_id ?? null,
+  const [selection, setSelection] = useState<AgentLogSelection | null>(() =>
+    defaultSelection(sources),
   );
   const [maxEvents, setMaxEvents] = useState(200);
   const [since, setSince] = useState<string>("");
@@ -1540,39 +1651,42 @@ function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
 
   useEffect(() => {
     if (sources.length === 0) {
-      setServerId(null);
+      setSelection(null);
       return;
     }
-    if (!serverId || !sources.some((s) => s.server_id === serverId)) {
-      setServerId(sources[0].server_id);
+    if (!selectionIsValid(selection, sources)) {
+      setSelection(defaultSelection(sources));
     }
-  }, [sources, serverId]);
+  }, [sources, selection]);
+  const scope = selection ? selectionToScope(selection) : {};
 
   const sinceIso = since ? new Date(since).toISOString() : null;
-  const enabled = !!serverId;
+  const enabled = !!selection;
+  const debouncedMac = useDebouncedValue(mac);
+  const debouncedIp = useDebouncedValue(ip);
 
   const activityQuery = useQuery({
     queryKey: [
       "logs-dhcp-activity",
-      serverId,
+      selection,
       maxEvents,
       sinceIso,
       q,
       severity,
       code,
-      mac,
-      ip,
+      debouncedMac,
+      debouncedIp,
     ],
     queryFn: () =>
       logsApi.dhcpActivity({
-        server_id: serverId!,
+        ...scope,
         max_events: maxEvents,
         since: sinceIso,
         q: q.trim() || null,
         severity: severity.trim() || null,
         code: code.trim() || null,
-        mac_address: mac.trim() || null,
-        ip_address: ip.trim() || null,
+        mac_address: debouncedMac.trim() || null,
+        ip_address: debouncedIp.trim() || null,
       }),
     enabled,
     staleTime: 5_000,
@@ -1581,9 +1695,10 @@ function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
   });
 
   const events = activityQuery.data?.events ?? [];
-  const selected = useMemo(
-    () => sources.find((s) => s.server_id === serverId),
-    [serverId, sources],
+  const showServer = coversManyServers(activityQuery.data);
+  const selectedHost = useMemo(
+    () => selectionHost(selection, sources),
+    [selection, sources],
   );
 
   if (sources.length === 0) {
@@ -1593,10 +1708,10 @@ function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
   return (
     <>
       <div className="flex flex-wrap items-center gap-3 border-b bg-muted/20 px-6 py-3">
-        <AgentServerPicker
+        <AgentLogScopePicker
           sources={sources}
-          value={serverId}
-          onChange={setServerId}
+          value={selection}
+          onChange={setSelection}
         />
         <label className="flex items-center gap-1.5 text-xs">
           <span className="text-muted-foreground">Severity</span>
@@ -1671,7 +1786,7 @@ function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
 
       {activityQuery.isError && <QueryErrorBanner query={activityQuery} />}
       {activityQuery.isFetching && events.length === 0 && (
-        <QueryingIndicator host={selected?.host} />
+        <QueryingIndicator host={selectedHost} />
       )}
       {!activityQuery.isError &&
         !activityQuery.isFetching &&
@@ -1679,8 +1794,17 @@ function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
 
       {events.length > 0 && (
         <div className="flex-1 overflow-auto">
-          <div className="grid grid-cols-[160px_70px_180px_140px_120px_1fr] gap-x-3 border-b bg-muted/30 px-6 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+          <div
+            className={cn(
+              "grid gap-x-3 border-b bg-muted/30 px-6 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground",
+              showServer ? DHCP_COLS_SERVER : DHCP_COLS,
+            )}
+          >
+            <span>
+              <span className="sr-only">Details</span>
+            </span>
             <span>Time</span>
+            {showServer && <span>Server</span>}
             <span>Severity</span>
             <span>Code</span>
             <span>MAC</span>
@@ -1689,7 +1813,7 @@ function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
           </div>
           <div className="divide-y text-xs">
             {events.map((row) => (
-              <DHCPActivityRow key={row.id} row={row} />
+              <DHCPActivityRow key={row.id} row={row} showServer={showServer} />
             ))}
           </div>
           {activityQuery.data?.truncated && (
@@ -1704,7 +1828,15 @@ function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
   );
 }
 
-function DHCPActivityRow({ row }: { row: DHCPActivityLogRow }) {
+export function DHCPActivityRow({
+  row,
+  showServer = false,
+}: {
+  row: DHCPActivityLogRow;
+  /** Render the Server column (#2120) — the read merged several servers. */
+  showServer?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
   const sevCls =
     row.severity === "ERROR" || row.severity === "FATAL"
       ? "text-destructive"
@@ -1714,13 +1846,23 @@ function DHCPActivityRow({ row }: { row: DHCPActivityLogRow }) {
           ? "text-muted-foreground/60"
           : "text-foreground";
   return (
-    <div className="grid grid-cols-[160px_70px_180px_140px_120px_1fr] items-baseline gap-x-3 px-6 py-1 hover:bg-muted/40">
+    <div
+      className={cn(
+        "grid items-baseline gap-x-3 px-6 py-1 hover:bg-muted/40",
+        showServer ? DHCP_COLS_SERVER : DHCP_COLS,
+      )}
+    >
+      <RowDetailsButton onClick={() => setOpen(true)} />
+      {open && (
+        <DHCPActivityDetailModal row={row} onClose={() => setOpen(false)} />
+      )}
       <span
         className="font-mono tabular-nums text-muted-foreground"
         title={row.ts}
       >
         {formatTime(row.ts)}
       </span>
+      {showServer && <ServerCell name={row.server_name} />}
       <span className={cn("font-mono text-[11px]", sevCls)}>
         {row.severity ?? <span className="text-muted-foreground/40">—</span>}
       </span>
@@ -1746,5 +1888,247 @@ function DHCPActivityRow({ row }: { row: DHCPActivityLogRow }) {
         {row.raw}
       </span>
     </div>
+  );
+}
+
+// ── Row detail modals (#2246) ─────────────────────────────────────
+//
+// The grid rows truncate client / qname / raw to keep one line per
+// event, and a hover ``title`` is not selectable, not usable on touch
+// and clipped by the browser for long lines. The details button opens
+// every field of the row untruncated, with the raw line copyable.
+
+function RowDetailsButton({ onClick }: { onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-label="Show row details"
+      title="Show row details"
+      className="self-center rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+    >
+      <Maximize2 className="h-3 w-3" />
+    </button>
+  );
+}
+
+function formatFullTimestamp(iso: string): string {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return `${iso} (local: ${d.toLocaleString(undefined, { hour12: false })})`;
+}
+
+function Missing() {
+  return <span className="text-muted-foreground/50">—</span>;
+}
+
+function DetailField({
+  label,
+  children,
+  mono,
+}: {
+  label: string;
+  children: React.ReactNode;
+  mono?: boolean;
+}) {
+  return (
+    <>
+      <dt className="text-xs font-medium text-muted-foreground">{label}</dt>
+      <dd className={cn("min-w-0 break-all text-sm", mono && "font-mono")}>
+        {children}
+      </dd>
+    </>
+  );
+}
+
+function RawLineBlock({ raw }: { raw: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <div className="mt-4">
+      <div className="mb-1 flex items-center justify-between">
+        <span className="text-xs font-medium text-muted-foreground">
+          Raw line
+        </span>
+        <button
+          type="button"
+          onClick={() => {
+            // Shared helper: falls back to execCommand on plain-http
+            // origins, where navigator.clipboard is undefined. On
+            // failure the line stays selectable in the block below.
+            void copyToClipboard(raw).then((ok) => {
+              if (!ok) return;
+              setCopied(true);
+              window.setTimeout(() => setCopied(false), 1500);
+            });
+          }}
+          className="inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] hover:bg-accent"
+        >
+          <Copy className="h-3 w-3" />
+          {copied ? "Copied" : "Copy"}
+        </button>
+      </div>
+      <pre
+        data-testid="raw-line"
+        className="whitespace-pre-wrap break-all rounded-md border bg-muted/40 p-2 font-mono text-[11px]"
+      >
+        {raw}
+      </pre>
+    </div>
+  );
+}
+
+/** Same wording as ``RcodeCell``, spelled out for the detail view. */
+function describeRcode(
+  rcode: string | null,
+  answers: number | null,
+): { label: string; note: string } {
+  if (!rcode) {
+    return {
+      label: "not recorded",
+      note: "Response logging is off for this server group, so the outcome was never recorded. This does NOT mean the query succeeded.",
+    };
+  }
+  if (rcode === "NOERROR" && answers === 0) {
+    return {
+      label: "NODATA",
+      note: "NOERROR with no answer records — the name exists but has no record of this type.",
+    };
+  }
+  return { label: rcode, note: "" };
+}
+
+function DNSQueryDetailModal({
+  row,
+  onClose,
+  onFilterClient,
+  onFilterQname,
+}: {
+  row: DNSQueryLogRow;
+  onClose: () => void;
+  onFilterClient?: (ip: string) => void;
+  onFilterQname?: (qname: string) => void;
+}) {
+  const rcode = row.rcode ?? null;
+  const answers = row.answer_count ?? null;
+  const result = describeRcode(rcode, answers);
+  const client = row.client_ip
+    ? `${row.client_ip}${row.client_port ? `#${row.client_port}` : ""}`
+    : null;
+  return (
+    <Modal title="DNS query details" onClose={onClose} wide>
+      <dl className="grid grid-cols-[110px_1fr] gap-x-4 gap-y-2">
+        <DetailField label="Timestamp" mono>
+          {formatFullTimestamp(row.ts)}
+        </DetailField>
+        <DetailField label="Server" mono>
+          {row.server_name || <Missing />}
+        </DetailField>
+        <DetailField label="Client" mono>
+          {client ?? <Missing />}
+        </DetailField>
+        <DetailField label="View" mono>
+          {row.view ?? <Missing />}
+        </DetailField>
+        <DetailField label="QName" mono>
+          {row.qname ?? <Missing />}
+        </DetailField>
+        <DetailField label="QType" mono>
+          {row.qtype ?? <Missing />}
+        </DetailField>
+        <DetailField label="QClass" mono>
+          {row.qclass ?? <Missing />}
+        </DetailField>
+        <DetailField label="Result">
+          <span
+            data-testid="dns-result"
+            className={cn(
+              rcode ? "font-mono font-medium" : "italic text-muted-foreground",
+            )}
+          >
+            {result.label}
+          </span>
+          {result.note && (
+            <span className="mt-0.5 block text-xs text-muted-foreground">
+              {result.note}
+            </span>
+          )}
+        </DetailField>
+        <DetailField label="Answers" mono>
+          {answers ?? <Missing />}
+        </DetailField>
+        <DetailField label="Flags" mono>
+          {row.flags ?? <Missing />}
+        </DetailField>
+      </dl>
+      <RawLineBlock raw={row.raw} />
+      {((onFilterClient && row.client_ip) || (onFilterQname && row.qname)) && (
+        <div className="mt-4 flex flex-wrap justify-end gap-2">
+          {onFilterClient && row.client_ip && (
+            <button
+              type="button"
+              onClick={() => {
+                onFilterClient(row.client_ip!);
+                onClose();
+              }}
+              className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-xs hover:bg-accent/50"
+            >
+              <Search className="h-3.5 w-3.5" />
+              Filter by client
+            </button>
+          )}
+          {onFilterQname && row.qname && (
+            <button
+              type="button"
+              onClick={() => {
+                onFilterQname(row.qname!);
+                onClose();
+              }}
+              className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-xs hover:bg-accent/50"
+            >
+              <Search className="h-3.5 w-3.5" />
+              Filter by qname
+            </button>
+          )}
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+function DHCPActivityDetailModal({
+  row,
+  onClose,
+}: {
+  row: DHCPActivityLogRow;
+  onClose: () => void;
+}) {
+  return (
+    <Modal title="DHCP activity details" onClose={onClose} wide>
+      <dl className="grid grid-cols-[110px_1fr] gap-x-4 gap-y-2">
+        <DetailField label="Timestamp" mono>
+          {formatFullTimestamp(row.ts)}
+        </DetailField>
+        <DetailField label="Server" mono>
+          {row.server_name || <Missing />}
+        </DetailField>
+        <DetailField label="Severity" mono>
+          {row.severity ?? <Missing />}
+        </DetailField>
+        <DetailField label="Log code" mono>
+          {row.code ?? <Missing />}
+        </DetailField>
+        <DetailField label="MAC" mono>
+          {row.mac_address ?? <Missing />}
+        </DetailField>
+        <DetailField label="IP" mono>
+          {row.ip_address ?? <Missing />}
+        </DetailField>
+        <DetailField label="Transaction ID" mono>
+          {row.transaction_id ?? <Missing />}
+        </DetailField>
+      </dl>
+      <RawLineBlock raw={row.raw} />
+    </Modal>
   );
 }

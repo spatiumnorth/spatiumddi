@@ -5,9 +5,8 @@ record name against several public resolvers in parallel and surface
 per-resolver results + RTT so an operator can see at a glance whether
 a recently-edited record has propagated everywhere it should.
 
-Lives at ``/api/v1/dns/tools/...`` and rides the existing DNS
-permission gate (operators with read on dns_zone / dns_record can
-fire these — they're query-only).
+Lives at ``/api/v1/dns/tools/...``. Each route needs the method's action
+on ``dns_record`` (#3073): they look records up, and are query-only.
 """
 
 from __future__ import annotations
@@ -23,13 +22,22 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
 
 from app.api.deps import CurrentUser
-from app.core.permissions import require_any_resource_permission
+from app.api.token_binding import honours_token_binding
+from app.core.permissions import require_route_types
+from app.services.api_token_scopes import token_write
 from app.services.nettools.schemas import assert_target_allowed
+
+# Route templates relative to the ``/dns`` mount, as the DNS router's map.
+_DNS_TOOLS_ROUTE_TYPES: dict[str, tuple[str, ...]] = {
+    "POST /tools/propagation-check": ("dns_record",),
+    "GET /tools/default-resolvers": ("dns_record",),
+}
+_DNS_TOOLS_GATE = require_route_types(_DNS_TOOLS_ROUTE_TYPES, "/dns")
 
 router = APIRouter(
     prefix="/tools",
     tags=["dns-tools"],
-    dependencies=[Depends(require_any_resource_permission("dns_group", "dns_zone", "dns_record"))],
+    dependencies=[Depends(_DNS_TOOLS_GATE)],
 )
 
 
@@ -191,6 +199,8 @@ async def _query_one(
 
 
 @router.post("/propagation-check", response_model=PropagationCheckResult)
+@honours_token_binding
+@token_write("Sends DNS queries to public resolvers (outbound)")
 async def propagation_check(
     body: PropagationCheckRequest, current_user: CurrentUser
 ) -> PropagationCheckResult:
@@ -230,6 +240,7 @@ async def propagation_check(
 
 
 @router.get("/default-resolvers", response_model=list[dict[str, str]])
+@honours_token_binding
 async def list_default_resolvers(
     current_user: CurrentUser,
 ) -> list[dict[str, str]]:

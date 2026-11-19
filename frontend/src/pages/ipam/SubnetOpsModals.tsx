@@ -25,7 +25,9 @@ import {
   MODAL_BACKDROP_CLS,
   useModalDialog,
 } from "@/components/ui/use-draggable-modal";
+import { permissionGate } from "@/hooks/usePermissions";
 import { cn } from "@/lib/utils";
+import { formatCount } from "@/lib/format-count";
 import {
   formatApiError,
   ipamApi,
@@ -37,6 +39,7 @@ import {
   type SplitSubnetPreviewResponse,
   type Subnet,
 } from "@/lib/api";
+import { FormError } from "@/components/ui/form-error";
 
 // ── Shared bits ───────────────────────────────────────────────────────────
 
@@ -132,11 +135,49 @@ function ModalShell({
 // request, renders one row per candidate, with a "Use this" button that
 // calls onPickCidr (the parent wires this into the create-subnet modal).
 
+/**
+ * Family + prefix Find Free starts on (#3324). An IPv6 block starts on IPv6:
+ * /64, the usual subnet, or one step below a block already /64 or longer,
+ * held to the /126 the server accepts. An IPv4 block longer than /24 starts
+ * one step below itself, held to /30, since a /24 cannot fit in it (#3712).
+ * Anything else (no block, an IPv4 block of /24 or shorter) keeps the IPv4
+ * /24 the dialog has always opened on.
+ */
+function startingSearch(blockCidr?: string): {
+  family: 4 | 6;
+  prefix: number;
+} {
+  const blockPrefix = Number(blockCidr?.split("/")[1]);
+  if (blockCidr?.includes(":") && Number.isInteger(blockPrefix)) {
+    return { family: 6, prefix: Math.min(Math.max(64, blockPrefix + 1), 126) };
+  }
+  if (Number.isInteger(blockPrefix) && blockPrefix > 24) {
+    return { family: 4, prefix: Math.min(blockPrefix + 1, 30) };
+  }
+  return { family: 4, prefix: 24 };
+}
+
+/** Why an empty answer is certain: the block is smaller than the size asked (#3712). */
+function tooSmallNote(
+  blockCidr: string | undefined,
+  prefix: number,
+  family: 4 | 6,
+): string {
+  const blockPrefix = Number(blockCidr?.split("/")[1]);
+  if (!blockCidr || !Number.isInteger(blockPrefix)) return "";
+  if (blockCidr.includes(":") !== (family === 6)) return "";
+  if (blockPrefix <= prefix) return "";
+  return ` This block is a /${blockPrefix}, smaller than a /${prefix}, so nothing of that size fits.`;
+}
+
 export function FindFreeModal({
   space,
   onClose,
   onPickCidr,
   defaultBlockId,
+  defaultBlockLabel,
+  defaultBlockCidr,
+  canCreate = true,
 }: {
   space: IPSpace;
   onClose: () => void;
@@ -144,9 +185,23 @@ export function FindFreeModal({
   onPickCidr?: (cidr: string, parentBlockId: string) => void;
   /** When set, the search is pre-scoped to this block. */
   defaultBlockId?: string;
+  /** The scoped block's CIDR (or name), so the dialog says what it searches. */
+  defaultBlockLabel?: string;
+  /** The scoped block's CIDR; sets the family and a prefix it can hold (#3324). */
+  defaultBlockCidr?: string;
+  /** False for a caller who may not create a subnet (#3391): the search is a
+   *  read and stays, "Create subnet here" is disabled with the reason. */
+  canCreate?: boolean;
 }) {
-  const [prefixLength, setPrefixLength] = useState(24);
-  const [addressFamily, setAddressFamily] = useState<4 | 6>(4);
+  // Opened from a block the search covers that block only, not the space (#2419).
+  const scope = defaultBlockId
+    ? defaultBlockLabel
+      ? `block ${defaultBlockLabel}`
+      : "this block"
+    : null;
+  const start = startingSearch(defaultBlockCidr);
+  const [prefixLength, setPrefixLength] = useState(start.prefix);
+  const [addressFamily, setAddressFamily] = useState<4 | 6>(start.family);
   const [count, setCount] = useState(5);
   const [submitted, setSubmitted] = useState<FindFreeRequest | null>(null);
 
@@ -168,7 +223,11 @@ export function FindFreeModal({
 
   return (
     <ModalShell
-      title={`Find free space in ${space.name}`}
+      title={
+        scope
+          ? `Find free space in ${scope}`
+          : `Find free space in ${space.name}`
+      }
       onClose={onClose}
       footer={
         <button
@@ -229,8 +288,8 @@ export function FindFreeModal({
 
       {!submitted && (
         <p className="text-xs text-muted-foreground">
-          Pick a prefix length and run the search to find unused CIDRs in this
-          space.
+          Pick a prefix length and run the search to find unused CIDRs in{" "}
+          {defaultBlockId ? "this block" : "this space"}.
         </p>
       )}
       {submitted && isLoading && (
@@ -239,9 +298,9 @@ export function FindFreeModal({
         </div>
       )}
       {submitted && isError && (
-        <div className="rounded border border-red-300 bg-red-50 p-3 text-xs text-red-800 dark:border-red-900 dark:bg-red-900/20 dark:text-red-200">
+        <FormError className="rounded border border-red-300 bg-red-50 p-3 text-xs text-red-800 dark:border-red-900 dark:bg-red-900/20 dark:text-red-200">
           {formatApiError(error)}
-        </div>
+        </FormError>
       )}
       {data && (
         <>
@@ -252,7 +311,14 @@ export function FindFreeModal({
           )}
           {data.candidates.length === 0 && !data.summary?.warning && (
             <p className="text-xs text-muted-foreground">
-              No free CIDRs of /{prefixLength} found in this space.
+              No free CIDRs of /{submitted?.prefix_length ?? prefixLength} found
+              in {defaultBlockId ? "this block" : "this space"} (IPv
+              {submitted?.address_family ?? addressFamily}).
+              {tooSmallNote(
+                defaultBlockCidr,
+                submitted?.prefix_length ?? prefixLength,
+                submitted?.address_family ?? addressFamily,
+              )}
             </p>
           )}
           {data.candidates.length > 0 && (
@@ -277,7 +343,7 @@ export function FindFreeModal({
                         {c.parent_block_cidr}
                       </td>
                       <td className="px-2 py-1.5 text-xs">
-                        {c.free_addresses ?? "—"}
+                        {formatCount(c.free_addresses_exact, c.free_addresses)}
                       </td>
                       <td className="px-2 py-1.5 text-right">
                         {onPickCidr && (
@@ -287,7 +353,11 @@ export function FindFreeModal({
                               onPickCidr(c.cidr, c.parent_block_id);
                               onClose();
                             }}
-                            className="rounded border px-2 py-0.5 text-xs hover:bg-accent"
+                            className="rounded border px-2 py-0.5 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                            {...permissionGate(
+                              canCreate,
+                              "Requires write permission on subnets",
+                            )}
                           >
                             Create subnet here
                           </button>
@@ -348,6 +418,7 @@ export function SplitSubnetModal({
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
       qc.invalidateQueries({ queryKey: ["subnet", subnet.id] });
       onCommitted?.();
       onClose();
@@ -425,9 +496,9 @@ export function SplitSubnetModal({
       </div>
 
       {error && (
-        <div className="rounded border border-red-300 bg-red-50 p-3 text-xs text-red-800 dark:border-red-900 dark:bg-red-900/20 dark:text-red-200">
+        <FormError className="rounded border border-red-300 bg-red-50 p-3 text-xs text-red-800 dark:border-red-900 dark:bg-red-900/20 dark:text-red-200">
           {error}
-        </div>
+        </FormError>
       )}
 
       {preview && (
@@ -554,6 +625,7 @@ export function MergeSubnetModal({
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
       onCommitted?.();
       onClose();
     },
@@ -643,9 +715,9 @@ export function MergeSubnetModal({
       )}
 
       {error && (
-        <div className="rounded border border-red-300 bg-red-50 p-3 text-xs text-red-800 dark:border-red-900 dark:bg-red-900/20 dark:text-red-200">
+        <FormError className="rounded border border-red-300 bg-red-50 p-3 text-xs text-red-800 dark:border-red-900 dark:bg-red-900/20 dark:text-red-200">
           {error}
-        </div>
+        </FormError>
       )}
 
       {preview && (

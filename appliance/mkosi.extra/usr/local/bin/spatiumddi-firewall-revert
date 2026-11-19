@@ -30,6 +30,23 @@
 
 set -eu
 
+# Writes stdin to $1, a file in the release-state directory. The api and the
+# supervisor can create names in that directory and this runs as root, so a
+# redirect onto the name would follow a symlink planted there. Instead a temp
+# file is created exclusively (mktemp) next to it and renamed over the name:
+# whatever was at the name, a symlink included, is replaced, never written
+# through. -T: a directory at the name fails the rename instead of receiving
+# the file. $2 = mode, default 0644.
+state_write() {
+    local _dst="$1" _tmp
+    _tmp=$(mktemp "$(dirname -- "$_dst")/.$(basename -- "$_dst").XXXXXX") || return 1
+    if cat > "$_tmp" && chmod "${2:-0644}" "$_tmp" && mv -fT -- "$_tmp" "$_dst"; then
+        return 0
+    fi
+    rm -f -- "$_tmp"
+    return 1
+}
+
 STATE=/var/lib/spatiumddi/release-state
 REVERT_DEADLINE=$STATE/firewall-revert-deadline
 CONFIRM_FILE=$STATE/firewall-confirm
@@ -42,7 +59,14 @@ LAST_GOOD_WEBUI_SENTINEL=$STATE/firewall-webui-sentinel.last-good
 # ruleset nobody confirmed — the one posture this whole plane exists to
 # make impossible.
 LAST_GOOD_SSH_SENTINEL=$STATE/firewall-ssh-sentinel.last-good
-LOCK=$STATE/firewall.lock
+# Serialises revert ticks. In /run (root-only), not release-state: the api
+# and the supervisor can create names in release-state and this runs as root,
+# so opening a lock file there for write would follow a symlink planted at its
+# name and create or truncate any host file. Nothing outside this script has
+# ever taken the lock, so moving it changes no coordination. Not the
+# release-state directory itself either: spatium-power-action holds that one,
+# and the api reads it as "a reboot is under way".
+LOCK="${SPATIUM_FIREWALL_REVERT_LOCK:-/run/spatiumddi-firewall-revert.lock}"
 APPLIED_HASH=$STATE/firewall-applied-hash
 APPLIED_STATUS=$STATE/firewall-applied-status
 DROP_IN=/etc/nftables.d/spatium-role.nft
@@ -58,16 +82,30 @@ NFT_MAIN=/etc/nftables.conf
 
 log() { printf '[spatiumddi-firewall-revert] %s\n' "$*"; }
 
+# The deadline, the snapshot and the sentinel states are written by
+# spatium-firewall-reload, which runs as root, so they are files this script's
+# own uid owns. One that is not (or is a symlink) was put there by something
+# else that can write in release-state, and is not acted on: it would decide
+# whether the firewall is rewritten, and with what. Owned by this uid in the
+# sticky directory, nobody else can replace it after the check.
+own_file() {  # $1 = path
+    [ -f "$1" ] && [ ! -L "$1" ] && [ "$(stat -c %u -- "$1" 2>/dev/null)" = "$(id -u)" ]
+}
+
 # Fast path: nothing armed → nothing to do (the common case every 15s).
 [ -r "$REVERT_DEADLINE" ] || exit 0
 
-# Serialise against the supervisor's confirm write (shared lockfile) so a
-# confirm and a revert can't interleave. Skip this tick if we can't take it.
+# One revert at a time. Skip this tick if we can't take it.
 exec 9>"$LOCK" || exit 0
 flock -n 9 || exit 0
 
 # Re-read under the lock — a confirm/revert may have cleared it meanwhile.
 [ -r "$REVERT_DEADLINE" ] || exit 0
+if ! own_file "$REVERT_DEADLINE"; then
+    rm -f "$REVERT_DEADLINE"
+    log "ignored and removed $REVERT_DEADLINE: not a regular file written by this host's runner"
+    exit 0
+fi
 
 # Confirmed good → clear the window, keep the tested ruleset.
 if [ -e "$CONFIRM_FILE" ]; then
@@ -86,7 +124,7 @@ if [ "$now" -lt "$deadline" ]; then
 fi
 
 # Deadline passed, no confirm → revert.
-if [ ! -r "$LAST_GOOD" ]; then
+if [ ! -r "$LAST_GOOD" ] || ! own_file "$LAST_GOOD"; then
     # No snapshot to restore — clear the stale window rather than leave a
     # partial state (shouldn't happen: a test-apply always snapshots first).
     rm -f "$REVERT_DEADLINE"
@@ -101,7 +139,8 @@ log "test-apply NOT confirmed before deadline — reverting to last-good"
 cp -f "$LAST_GOOD" "$DROP_IN"
 # Restore one sentinel to the state captured at test time.
 restore_sentinel_state() {
-    _state=$(cat "$1" 2>/dev/null || echo "")
+    _state=""
+    own_file "$1" && _state=$(cat "$1" 2>/dev/null || echo "")
     _file="$2"; _retired="$3"
     case "$_state" in
         present)
@@ -132,11 +171,11 @@ restore_sentinel_state "$LAST_GOOD_WEBUI_SENTINEL" "$WEBUI_SENTINEL" "$WEBUI_SEN
 restore_sentinel_state "$LAST_GOOD_SSH_SENTINEL" "$SSH_SENTINEL" "$SSH_SENTINEL_RETIRED"
 
 if nft -c -f "$NFT_MAIN" 2>/tmp/nft-revert.err && nft -f "$NFT_MAIN" 2>>/tmp/nft-revert.err; then
-    sha256sum "$DROP_IN" | cut -d' ' -f1 > "$APPLIED_HASH" 2>/dev/null || true
-    printf 'reverted\n' > "$APPLIED_STATUS"
+    sha256sum "$DROP_IN" | cut -d' ' -f1 | state_write "$APPLIED_HASH" 2>/dev/null || true
+    printf 'reverted\n' | state_write "$APPLIED_STATUS"
     log "reverted to last-good ruleset"
 else
-    printf 'error:revert\n' > "$APPLIED_STATUS"
+    printf 'error:revert\n' | state_write "$APPLIED_STATUS"
     log "REVERT FAILED on nft apply — manual intervention needed:"
     sed 's/^/[spatiumddi-firewall-revert]  /' /tmp/nft-revert.err 2>/dev/null || true
 fi

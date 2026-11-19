@@ -186,6 +186,15 @@ class ACMEOrder(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
     )
 
+    # #3067 — whether a successful fresh issue makes the cert the sole
+    # active (Web UI) certificate, deploying it to nginx. True is what
+    # issuance always did; a certificate-store-only caller (no ``admin`` on
+    # ``appliance``) issuing a DoT / DoH / DoQ cert sets it false. A renewal
+    # never changes ``is_active`` either way.
+    activate_on_issue: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=sa_text("true")
+    )
+
 
 class ACMEHTTPChallenge(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """A pending http-01 challenge token → key-authorization mapping (#438

@@ -18,14 +18,21 @@ import {
 
 import {
   backupTargetsApi,
+  formatApiError,
   type BackupArchiveListing,
   type BackupTarget,
   type BackupTargetCreate,
   type BackupTargetKind,
   type BackupTargetUpdate,
 } from "@/lib/api";
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { useModalDialog } from "@/components/ui/use-draggable-modal";
+import { ListReadError } from "@/components/ui/list-read-error";
 import { BackupSectionsPicker } from "./BackupSectionsPicker";
+import { FormError } from "@/components/ui/form-error";
+import { FreshRowError } from "@/components/FreshRowError";
+import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
+import { disabledBecause } from "@/hooks/usePermissions";
 
 /**
  * Backup Targets section on the Backup admin page (issue #117
@@ -52,6 +59,39 @@ const CRON_PRESETS: { label: string; value: string }[] = [
   { label: "Monthly 1st 03:00 UTC", value: "0 3 1 * *" },
 ];
 
+// Config keys that decide where a stored credential is sent (#4135); the
+// same list the API compares before accepting an edit.
+const BACKUP_DESTINATION_KEYS = [
+  "host",
+  "port",
+  "server",
+  "url",
+  "endpoint_url",
+];
+
+// Settings the API reads as numbers (#3946). The form holds every value as
+// text; a whole number in one of these goes out as a number, anything else
+// as typed so the API refuses it by name.
+const NUMERIC_CONFIG_FIELDS = new Set([
+  "port",
+  "object_lock_days",
+  "version",
+  "uid",
+  "gid",
+  "timeout_s",
+]);
+
+function typedConfig(config: Record<string, string>): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(config).map(([k, v]) => [
+      k,
+      NUMERIC_CONFIG_FIELDS.has(k) && /^\d+$/.test(v.trim())
+        ? Number(v.trim())
+        : v,
+    ]),
+  );
+}
+
 export function BackupTargetsSection() {
   const qc = useQueryClient();
   const targetsQ = useQuery({
@@ -68,9 +108,8 @@ export function BackupTargetsSection() {
         <div>
           <h2 className="text-sm font-semibold">Scheduled targets</h2>
           <p className="text-xs text-muted-foreground">
-            Build backups on a cron schedule and write them to a local volume, a
-            network share or an object store. Add target lists every destination
-            kind this build supports.
+            Build backups on a cron schedule and write them to a destination.
+            Add target lists every destination kind this build supports.
           </p>
         </div>
         <button
@@ -89,13 +128,14 @@ export function BackupTargetsSection() {
           Loading…
         </div>
       ) : targetsQ.isError ? (
-        <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
-          Failed to load backup targets.
+        <div className="rounded-md border border-dashed px-3 py-2 text-xs">
+          <ListReadError error={targetsQ.error} what="backup targets" />
         </div>
       ) : (targetsQ.data ?? []).length === 0 ? (
         <div className="rounded-md border border-dashed px-3 py-4 text-center text-xs text-muted-foreground">
           No backup targets configured. Click <strong>Add target</strong> to
-          schedule a recurring backup to a local volume.
+          schedule a recurring backup; its <strong>Kind</strong> list shows
+          every destination it can write to.
         </div>
       ) : (
         <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
@@ -113,9 +153,9 @@ export function BackupTargetsSection() {
       )}
 
       {editing && (
-        <TargetFormModal
+        <EditableTargetForm
           mode={editing.mode}
-          existing={editing.mode === "edit" ? editing.target : undefined}
+          row={editing.mode === "edit" ? editing.target : undefined}
           onClose={() => setEditing(null)}
           onSaved={() => {
             qc.invalidateQueries({ queryKey: ["backup-targets"] });
@@ -199,6 +239,19 @@ function TargetRow({
                     )
                   </code>
                 )}
+                {target.last_run_node && (
+                  <span
+                    title={
+                      target.kind === "local_volume"
+                        ? "A local volume is per node on a multi-node appliance: this archive is on this node's disk, and only this node's api can list, download or restore it."
+                        : "The node whose pod wrote this archive."
+                    }
+                  >
+                    {" "}
+                    on node{" "}
+                    <code className="font-mono">{target.last_run_node}</code>
+                  </span>
+                )}
               </span>
             )}
             {target.retention_keep_last_n != null && (
@@ -234,6 +287,11 @@ function TargetRow({
             }
             onClick={() => runMut.mutate()}
             disabled={!target.enabled || runMut.isPending}
+            disabledReason={
+              target.enabled
+                ? undefined
+                : "Target is disabled; enable it in Edit to run a backup."
+            }
           />
           <IconButton
             title="Test connection"
@@ -267,6 +325,25 @@ function TargetRow({
           />
         </div>
       </div>
+      {/* A refused request (403, 404, 409 …) never reaches the ``data``
+          panels below; show the API's reason (#2203). */}
+      {(
+        [
+          [runMut, "run failed"],
+          [testMut, "test failed"],
+          [deleteMut, "delete failed"],
+        ] as const
+      ).map(([m, fallback]) =>
+        m.isError ? (
+          <div
+            key={fallback}
+            className="border-t bg-destructive/5 px-3 py-1.5 text-xs text-destructive"
+          >
+            <ServerCrash className="mr-1 inline h-3.5 w-3.5" />
+            {formatApiError(m.error, fallback)}
+          </div>
+        ) : null,
+      )}
       {testMut.data && (
         <div
           className={`border-t px-3 py-1.5 text-xs ${
@@ -307,6 +384,13 @@ function TargetRow({
             <>
               <CheckCircle2 className="mr-1 inline h-3.5 w-3.5" />
               wrote <code className="font-mono">{runMut.data.filename}</code>
+              {runMut.data.node_name && (
+                <>
+                  {" "}
+                  on node{" "}
+                  <code className="font-mono">{runMut.data.node_name}</code>
+                </>
+              )}
               {runMut.data.bytes != null && (
                 <>
                   {" — "}
@@ -390,66 +474,102 @@ function ArchiveList({
           Loading…
         </div>
       ) : q.isError ? (
-        <div className="text-destructive">
-          {(q.error as Error)?.message || "failed to list"}
-        </div>
-      ) : (q.data ?? []).length === 0 ? (
-        <div className="text-muted-foreground">
-          No archives at this destination yet.
+        <div className="break-words text-destructive">
+          {formatApiError(q.error, "failed to list")}
         </div>
       ) : (
-        <ul className="space-y-1">
-          {(q.data ?? []).map((a: BackupArchiveListing) => (
-            <li
-              key={a.filename}
-              className="flex items-center gap-2 rounded border bg-background px-2 py-1"
+        <>
+          {q.data?.note && (
+            // #1838 — on a multi-node appliance a local volume is one
+            // node's disk; the server says whose, and where the last
+            // run's archive went if it is not in this list.
+            <div
+              role="note"
+              className="mb-1 rounded border border-amber-500/40 bg-amber-500/5 px-2 py-1 text-amber-700 dark:text-amber-300"
             >
-              <code className="flex-1 truncate font-mono">{a.filename}</code>
-              <span className="text-muted-foreground">
-                {(a.size_bytes / 1024 / 1024).toFixed(2)} MB
-              </span>
-              <span className="text-muted-foreground">
-                {new Date(a.created_at).toLocaleString()}
-              </span>
-              <button
-                type="button"
-                onClick={() => downloadMut.mutate(a.filename)}
-                disabled={
-                  downloadMut.isPending && downloadMut.variables === a.filename
-                }
-                title="Download to your computer"
-                className="rounded p-1 hover:bg-accent disabled:opacity-50"
-              >
-                {downloadMut.isPending &&
-                downloadMut.variables === a.filename ? (
-                  <Loader2 className="h-3 w-3 animate-spin" />
-                ) : (
-                  <Download className="h-3 w-3" />
-                )}
-              </button>
-              <button
-                type="button"
-                onClick={() => setRestoring(a.filename)}
-                title="Restore from this archive"
-                className="rounded p-1 hover:bg-primary/10"
-              >
-                <RefreshCw className="h-3 w-3 text-primary" />
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  if (confirm(`Delete archive ${a.filename}?`)) {
-                    deleteMut.mutate(a.filename);
-                  }
-                }}
-                title="Delete"
-                className="rounded p-1 hover:bg-destructive/10"
-              >
-                <Trash2 className="h-3 w-3 text-destructive" />
-              </button>
-            </li>
-          ))}
-        </ul>
+              {q.data.note}
+            </div>
+          )}
+          {(q.data?.archives ?? []).length === 0 ? (
+            <div className="text-muted-foreground">
+              No archives at this destination yet.
+            </div>
+          ) : (
+            <ul className="space-y-1">
+              {(q.data?.archives ?? []).map((a: BackupArchiveListing) => (
+                <li
+                  key={a.filename}
+                  className="flex items-center gap-2 rounded border bg-background px-2 py-1"
+                >
+                  <code className="min-w-0 flex-1 truncate font-mono">
+                    {a.filename}
+                  </code>
+                  {a.node_name && (
+                    <span
+                      className="shrink-0 text-muted-foreground"
+                      title="The node whose disk holds this archive"
+                    >
+                      node <code className="font-mono">{a.node_name}</code>
+                    </span>
+                  )}
+                  <span className="text-muted-foreground">
+                    {(a.size_bytes / 1024 / 1024).toFixed(2)} MB
+                  </span>
+                  <span className="text-muted-foreground">
+                    {new Date(a.created_at).toLocaleString()}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => downloadMut.mutate(a.filename)}
+                    disabled={
+                      downloadMut.isPending &&
+                      downloadMut.variables === a.filename
+                    }
+                    title="Download to your computer"
+                    className="rounded p-1 hover:bg-accent disabled:opacity-50"
+                  >
+                    {downloadMut.isPending &&
+                    downloadMut.variables === a.filename ? (
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                    ) : (
+                      <Download className="h-3 w-3" />
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setRestoring(a.filename)}
+                    title="Restore from this archive"
+                    className="rounded p-1 hover:bg-primary/10"
+                  >
+                    <RefreshCw className="h-3 w-3 text-primary" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (confirm(`Delete archive ${a.filename}?`)) {
+                        deleteMut.mutate(a.filename);
+                      }
+                    }}
+                    title="Delete"
+                    className="rounded p-1 hover:bg-destructive/10"
+                  >
+                    <Trash2 className="h-3 w-3 text-destructive" />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </>
+      )}
+      {downloadMut.isError && (
+        <FormError className="mt-1 break-words text-destructive">
+          {formatApiError(downloadMut.error, "download failed")}
+        </FormError>
+      )}
+      {deleteMut.isError && (
+        <FormError className="mt-1 break-words text-destructive">
+          {formatApiError(deleteMut.error, "delete failed")}
+        </FormError>
       )}
       {restoring && (
         <RestoreFromArchiveModal
@@ -481,6 +601,26 @@ function RestoreFromArchiveModal({
   const [confirm, setConfirm] = useState("");
   const [mode, setMode] = useState<"full" | "selective">("full");
   const [sections, setSections] = useState<string[]>([]);
+  // The archive's dump format, read once for the archive picked (#2222):
+  // a selective restore needs pg_dump's custom format and the API refuses
+  // a plain-SQL archive, so the modal knows before offering it.
+  const previewQ = useQuery({
+    queryKey: ["backup-target-archive-preview", targetId, filename],
+    queryFn: () => backupTargetsApi.previewArchiveManifest(targetId, filename),
+    retry: false,
+    staleTime: Infinity,
+  });
+  const selectiveDisabledReason = previewQ.isLoading
+    ? "Checking the archive's database dump format…"
+    : previewQ.isError
+      ? "The archive could not be read, so a selective restore is not offered."
+      : previewQ.data?.selective_restore_supported
+        ? null
+        : "Selective restore needs a custom-format database dump. This archive's dump is " +
+          (previewQ.data?.dump_format === "plain"
+            ? "plain SQL (an older build, or Exclude secrets diagnostic mode, wrote it)"
+            : "not in a recognised format") +
+          " — use Full restore.";
   const restoreMut = useMutation({
     mutationFn: () =>
       backupTargetsApi.restoreFromArchive(targetId, {
@@ -492,11 +632,19 @@ function RestoreFromArchiveModal({
     onSuccess,
   });
 
+  // The restore's own refusals (missing member, unsupported format_version,
+  // a schema this install cannot place), read from the preview (#3287).
+  const restoreRefused = previewQ.data?.restorable === false;
+  // A failed preview reads the same archive the restore does, so the restore
+  // may meet the same failure. Apply stays available (a preview-only error,
+  // e.g. a timeout, must not strand a disaster restore) but the modal says so.
+  const previewFailed = previewQ.isError;
   const canSubmit =
     passphrase.length >= 8 &&
     confirm === "RESTORE-FROM-BACKUP" &&
     !restoreMut.isPending &&
-    (mode !== "selective" || sections.length > 0);
+    !restoreRefused &&
+    (mode !== "selective" || (!selectiveDisabledReason && sections.length > 0));
 
   const { dialogProps, titleProps } = useModalDialog(onClose);
 
@@ -539,6 +687,26 @@ function RestoreFromArchiveModal({
             </>
           )}
         </div>
+        {restoreRefused && (
+          <div
+            role="alert"
+            className="mb-3 rounded-md border border-red-500/40 bg-red-500/5 px-3 py-2 text-xs text-red-700 dark:text-red-300"
+          >
+            This archive cannot be restored:{" "}
+            {previewQ.data?.restore_refusal ?? "the restore refuses it"}
+          </div>
+        )}
+        {previewFailed && (
+          <div
+            role="alert"
+            className="mb-3 break-words rounded-md border border-red-500/40 bg-red-500/5 px-3 py-2 text-xs text-red-700 dark:text-red-300"
+          >
+            The archive could not be read:{" "}
+            {formatApiError(previewQ.error, "preview failed")}. A restore reads
+            the same archive again and may fail the same way before changing
+            anything; Full restore is still offered.
+          </div>
+        )}
         <form
           className="space-y-3"
           onSubmit={(e) => {
@@ -551,6 +719,7 @@ function RestoreFromArchiveModal({
             onModeChange={setMode}
             selected={sections}
             onChange={setSections}
+            selectiveDisabledReason={selectiveDisabledReason}
           />
           <Field label="Passphrase" required>
             <input
@@ -585,9 +754,9 @@ function RestoreFromArchiveModal({
             />
           </Field>
           {restoreMut.isError && (
-            <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
-              {(restoreMut.error as Error)?.message || "restore failed"}
-            </div>
+            <FormError className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+              {formatApiError(restoreMut.error, "restore failed")}
+            </FormError>
           )}
           {restoreMut.data && (
             <div className="rounded-md border border-emerald-500/30 bg-emerald-500/5 px-3 py-2 text-xs text-emerald-700 dark:text-emerald-300">
@@ -624,6 +793,43 @@ function RestoreFromArchiveModal({
   );
 }
 
+// Edit reads the target when it opens (#4236): the row the list holds can be
+// 30 s old and the form is seeded once. Save then sends only what changed.
+function EditableTargetForm({
+  mode,
+  row,
+  onClose,
+  onSaved,
+}: {
+  mode: "create" | "edit";
+  row?: BackupTarget;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const qc = useQueryClient();
+  const fresh = useFreshRow<BackupTarget>(row, () =>
+    refetchRow<BackupTarget>(qc, [["backup-targets"]], row!.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit backup target"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return (
+    <TargetFormModal
+      mode={mode}
+      existing={fresh.row}
+      onClose={onClose}
+      onSaved={onSaved}
+    />
+  );
+}
+
 // ── Target form modal ─────────────────────────────────────────────────
 
 function TargetFormModal({
@@ -649,7 +855,10 @@ function TargetFormModal({
   const [enabled, setEnabled] = useState(existing?.enabled ?? true);
   const [config, setConfig] = useState<Record<string, string>>(() =>
     Object.fromEntries(
-      Object.entries(existing?.config ?? {}).map(([k, v]) => [k, String(v)]),
+      Object.entries(existing?.config ?? {}).map(([k, v]) => [
+        k,
+        v == null ? "" : String(v),
+      ]),
     ),
   );
   // ``existing.config`` redacts secret fields to ``"<set>"`` so
@@ -710,6 +919,31 @@ function TargetFormModal({
     () => kindsQ.data?.find((k) => k.kind === kind),
     [kindsQ.data, kind],
   );
+  // #4135 — a moved host / port / server / URL needs every stored secret of
+  // this destination entered again (the same keys the API compares).
+  const secretFieldNames = (kindMeta?.config_fields ?? [])
+    .filter((f) => f.secret)
+    .map((f) => f.name);
+  const destKeys = Object.keys(config).filter((k) =>
+    BACKUP_DESTINATION_KEYS.includes(k),
+  );
+  const reask = useCredentialReask(
+    Object.fromEntries(destKeys.map((k) => [k, config[k]])),
+    mode === "edit" && existing
+      ? Object.fromEntries(destKeys.map((k) => [k, existing.config?.[k] ?? ""]))
+      : null,
+    () =>
+      setConfig((prev) => {
+        const next = { ...prev };
+        for (const n of secretFieldNames) next[n] = "";
+        return next;
+      }),
+  );
+  const mustEnter = (name: string) =>
+    mode === "edit" &&
+    reask.asks(Boolean(existing?.config?.[name])) &&
+    !(config[name] ?? "").trim();
+  const missingSecret = secretFieldNames.some(mustEnter);
   // A kind with no listing and no delete is write-only whatever the
   // operator picks — the server forces it, so the form shows the real
   // resulting state rather than a choice that gets silently overridden.
@@ -723,7 +957,7 @@ function TargetFormModal({
         name,
         description,
         enabled,
-        config,
+        config: typedConfig(config),
         passphrase_hint: passphraseHint,
         schedule_cron: trimmedCron === "" ? null : trimmedCron,
         // A write-only target never prunes, and the API refuses the
@@ -751,17 +985,51 @@ function TargetFormModal({
         } as BackupTargetCreate;
         return backupTargetsApi.create(body);
       }
-      const body: BackupTargetUpdate = { ...sharedFields };
+      // The eight top-level fields go only when changed against what the
+      // dialog read (#4236), so one another client set since is not put back.
+      const { config: _cfg, ...topLevel } = sharedFields;
+      void _cfg;
+      const body: BackupTargetUpdate = changedFields(
+        {
+          name: existing!.name,
+          description: existing!.description,
+          enabled: existing!.enabled,
+          passphrase_hint: existing!.passphrase_hint,
+          schedule_cron: existing!.schedule_cron,
+          retention_keep_last_n: existing!.retention_keep_last_n,
+          retention_keep_days: existing!.retention_keep_days,
+          write_only: existing!.write_only,
+        },
+        topLevel,
+      );
+      // Send only the settings the operator changed (#3947): the form holds
+      // text, so echoing an untouched one would turn a stored null or number
+      // into text and record a change nobody made. The API merges the rest
+      // from what is stored. A blank secret means "keep".
+      const secretNames = new Set(
+        (kindMeta?.config_fields ?? [])
+          .filter((f) => f.secret)
+          .map((f) => f.name),
+      );
+      const changed: Record<string, string> = {};
+      for (const [k, v] of Object.entries(config)) {
+        const stored = existing!.config?.[k];
+        if (v === (stored == null ? "" : String(stored))) continue;
+        if (secretNames.has(k) && v === "") continue;
+        changed[k] = v;
+      }
+      if (Object.keys(changed).length > 0) body.config = typedConfig(changed);
       if (passphrase.length > 0) {
         if (passphrase.length < 8) {
           throw new Error("passphrase must be at least 8 characters");
         }
         body.passphrase = passphrase;
       }
+      if (Object.keys(body).length === 0) return null;
       return backupTargetsApi.update(existing!.id, body);
     },
     onSuccess: onSaved,
-    onError: (err: Error) => setError(err.message || "save failed"),
+    onError: (err: Error) => setError(formatApiError(err, "save failed")),
   });
 
   const { dialogProps, titleProps } = useModalDialog(onClose);
@@ -800,6 +1068,8 @@ function TargetFormModal({
             <input
               type="text"
               value={name}
+              required
+              maxLength={120}
               onChange={(e) => setName(e.target.value)}
               className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
               autoFocus
@@ -809,6 +1079,7 @@ function TargetFormModal({
             <input
               type="text"
               value={description}
+              maxLength={500}
               onChange={(e) => setDescription(e.target.value)}
               className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
             />
@@ -851,27 +1122,50 @@ function TargetFormModal({
               );
             }
             const isSecretInEdit = f.secret && mode === "edit";
+            // Say a secret is set only when one is stored: the API reads an
+            // unset secret back as "" and a set one as a sentinel (#3289).
+            const isSecretStored =
+              isSecretInEdit && Boolean(existing?.config?.[f.name]);
+            const askAgain = f.secret && mustEnter(f.name);
             return (
               <Field
                 key={f.name}
                 label={f.label}
-                required={f.required && !isSecretInEdit}
-                help={f.description}
+                required={(f.required && !isSecretInEdit) || askAgain}
+                help={askAgain ? reask.hint : f.description}
               >
-                <input
-                  type={f.type === "password" || f.secret ? "password" : "text"}
-                  value={config[f.name] ?? ""}
-                  onChange={(e) =>
-                    setConfig({ ...config, [f.name]: e.target.value })
-                  }
-                  placeholder={
-                    isSecretInEdit
-                      ? "(set — leave empty to keep, type to replace)"
-                      : undefined
-                  }
-                  autoComplete={f.secret ? "new-password" : undefined}
-                  className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-                />
+                {f.multiline ? (
+                  // A PEM key, a known_hosts file or one header per line:
+                  // an <input> folds every line break into a space, so the
+                  // value is a textarea and goes out byte for byte (#2199).
+                  <MultilineConfigField
+                    name={f.name}
+                    masked={f.type === "password" || f.secret}
+                    stored={isSecretStored && !askAgain}
+                    value={config[f.name] ?? ""}
+                    onChange={(v) => setConfig({ ...config, [f.name]: v })}
+                  />
+                ) : (
+                  <input
+                    type={
+                      f.type === "password" || f.secret ? "password" : "text"
+                    }
+                    value={config[f.name] ?? ""}
+                    onChange={(e) =>
+                      setConfig({ ...config, [f.name]: e.target.value })
+                    }
+                    required={askAgain}
+                    placeholder={
+                      askAgain
+                        ? reask.placeholder
+                        : isSecretStored
+                          ? "(set — leave empty to keep, type to replace)"
+                          : undefined
+                    }
+                    autoComplete={f.secret ? "new-password" : undefined}
+                    className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                  />
+                )}
               </Field>
             );
           })}
@@ -1011,7 +1305,7 @@ function TargetFormModal({
               Keep the last
               <input
                 type="number"
-                min={0}
+                min={1}
                 max={10000}
                 value={retentionLastN}
                 onChange={(e) => setRetentionLastN(e.target.value)}
@@ -1029,7 +1323,7 @@ function TargetFormModal({
               Keep archives newer than
               <input
                 type="number"
-                min={0}
+                min={1}
                 max={10000}
                 value={retentionDays}
                 onChange={(e) => setRetentionDays(e.target.value)}
@@ -1050,9 +1344,9 @@ function TargetFormModal({
           </label>
 
           {error && (
-            <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+            <FormError className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
               {error}
-            </div>
+            </FormError>
           )}
 
           <div className="flex items-center justify-end gap-2 pt-1">
@@ -1065,7 +1359,7 @@ function TargetFormModal({
             </button>
             <button
               type="submit"
-              disabled={saveMut.isPending}
+              disabled={saveMut.isPending || missingSecret}
               className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
             >
               {saveMut.isPending
@@ -1119,11 +1413,14 @@ function IconButton({
   icon,
   onClick,
   disabled,
+  disabledReason,
 }: {
   title: string;
   icon: React.ReactNode;
   onClick: () => void;
   disabled?: boolean;
+  /** Why it is disabled when that is not obvious; replaces the title. */
+  disabledReason?: string;
 }) {
   return (
     <button
@@ -1132,6 +1429,7 @@ function IconButton({
       disabled={disabled}
       title={title}
       className="rounded p-1 hover:bg-accent disabled:opacity-50"
+      {...disabledBecause(!!disabledReason, disabledReason ?? "")}
     >
       {icon}
     </button>
@@ -1158,5 +1456,104 @@ function Field({
       {children}
       {help && <p className="mt-1 text-[11px] text-muted-foreground">{help}</p>}
     </label>
+  );
+}
+
+/**
+ * A config value made of lines. A secret one (PEM key, service-account JSON)
+ * is never placed in a text control (#3643): a CSS mask leaves the clear text
+ * in the DOM and the accessibility tree, and in form history / spellcheck.
+ * It is taken from a file picker or the clipboard straight into state and the
+ * page shows only a status line (line count) with Replace / Clear actions. A
+ * stored secret is write-only: the API returns a sentinel, shown as "Set".
+ * The value is sent byte for byte, line breaks included. A non-secret
+ * multi-line value (known_hosts, headers) stays an ordinary textarea.
+ */
+function MultilineConfigField({
+  name,
+  masked,
+  stored,
+  value,
+  onChange,
+}: {
+  name: string;
+  masked: boolean;
+  stored: boolean;
+  value: string;
+  onChange: (v: string) => void;
+}) {
+  const [err, setErr] = useState<string | null>(null);
+  if (!masked) {
+    return (
+      <textarea
+        name={name}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        rows={4}
+        spellCheck={false}
+        autoCapitalize="off"
+        autoCorrect="off"
+        autoComplete="off"
+        wrap="off"
+        className="w-full rounded-md border bg-background px-3 py-1.5 font-mono text-xs focus:outline-none focus:ring-2 focus:ring-ring"
+      />
+    );
+  }
+  const lines = value ? value.split("\n").length : 0;
+  const btn =
+    "rounded-md border px-2 py-1 text-xs hover:bg-muted focus:outline-none focus:ring-2 focus:ring-ring";
+  return (
+    <div className="space-y-1" data-secret-field={name}>
+      <div className="flex flex-wrap items-center gap-2 text-xs">
+        <span className="text-muted-foreground" role="status">
+          {value
+            ? `New value ready (${lines} line${lines === 1 ? "" : "s"}, hidden)`
+            : stored
+              ? "Set — stored encrypted, never shown"
+              : "Not set"}
+        </span>
+        <label className={`${btn} cursor-pointer`}>
+          {value || stored ? "Replace from file…" : "Choose file…"}
+          <input
+            type="file"
+            data-secret-file={name}
+            className="sr-only"
+            onChange={async (e) => {
+              const f = e.target.files?.[0];
+              e.target.value = "";
+              if (!f) return;
+              try {
+                onChange(await f.text());
+                setErr(null);
+              } catch {
+                setErr("Could not read that file.");
+              }
+            }}
+          />
+        </label>
+        <button
+          type="button"
+          className={btn}
+          onClick={async () => {
+            try {
+              onChange(await navigator.clipboard.readText());
+              setErr(null);
+            } catch {
+              setErr("Clipboard access was refused; use a file instead.");
+            }
+          }}
+        >
+          Paste from clipboard
+        </button>
+        {value && (
+          <button type="button" className={btn} onClick={() => onChange("")}>
+            Clear
+          </button>
+        )}
+      </div>
+      {err && (
+        <FormError className="text-[11px] text-destructive">{err}</FormError>
+      )}
+    </div>
   );
 }

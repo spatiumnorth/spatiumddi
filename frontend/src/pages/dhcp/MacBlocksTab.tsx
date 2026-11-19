@@ -1,9 +1,11 @@
 import { useMemo, useState } from "react";
+import { fromLocalInputValue, toLocalInputValue } from "@/lib/localTime";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
 
 import {
   dhcpApi,
+  formatApiError,
   type DHCPMACBlock,
   type DHCPMACBlockReason,
   type DHCPMACBlockWrite,
@@ -16,6 +18,10 @@ import {
   errMsg,
   DeleteConfirmModal,
 } from "./_shared";
+import { FreshRowError } from "@/components/FreshRowError";
+import { changedFields, useFreshRow } from "@/hooks/useFreshRow";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const REASON_LABELS: Record<DHCPMACBlockReason, string> = {
   rogue: "Rogue device",
@@ -33,12 +39,19 @@ const REASON_COLORS: Record<DHCPMACBlockReason, string> = {
   other: "bg-muted text-muted-foreground",
 };
 
-function ReasonPill({ reason }: { reason: DHCPMACBlockReason }) {
+// New Devices stores the operator's free text as the reason, so the stored
+// value can be outside the five codes (#3083): show it as typed.
+function isKnownReason(reason: string): reason is DHCPMACBlockReason {
+  return Object.prototype.hasOwnProperty.call(REASON_LABELS, reason);
+}
+
+function ReasonPill({ reason }: { reason: string }) {
+  const known = isKnownReason(reason);
   return (
     <span
-      className={`inline-flex items-center rounded px-1.5 py-0.5 text-[11px] font-medium ${REASON_COLORS[reason]}`}
+      className={`inline-flex items-center rounded px-1.5 py-0.5 text-[11px] font-medium ${known ? REASON_COLORS[reason] : REASON_COLORS.other}`}
     >
-      {REASON_LABELS[reason]}
+      {known ? REASON_LABELS[reason] : reason}
     </span>
   );
 }
@@ -85,6 +98,16 @@ function StatusPill({ block }: { block: DHCPMACBlock }) {
 }
 
 export function MacBlocksTab({ groupId }: { groupId: string }) {
+  // #1339, #1861 — writes take write, deletes delete, on ``dhcp_mac_block``.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "dhcp_mac_block"),
+    "Requires write permission on DHCP MAC blocks",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "dhcp_mac_block"),
+    "Requires delete permission on DHCP MAC blocks",
+  );
   const qc = useQueryClient();
   const { data: blocks = [], isFetching } = useQuery({
     queryKey: ["dhcp-mac-blocks", groupId],
@@ -158,7 +181,8 @@ export function MacBlocksTab({ groupId }: { groupId: string }) {
         </button>
         <button
           onClick={() => setShowCreate(true)}
-          className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90"
+          className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+          {...writeGate}
         >
           <Plus className="h-3 w-3" /> Block MAC
         </button>
@@ -168,7 +192,7 @@ export function MacBlocksTab({ groupId }: { groupId: string }) {
         {filtered.length === 0 ? (
           <p className="p-6 text-center text-sm text-muted-foreground">
             {blocks.length === 0
-              ? "No blocked MACs. Click 'Block MAC' to add one."
+              ? `No blocked MACs.${writeGate.disabled ? "" : " Click 'Block MAC' to add one."}`
               : "No blocks match the filter."}
           </p>
         ) : (
@@ -259,15 +283,19 @@ export function MacBlocksTab({ groupId }: { groupId: string }) {
                     <td className="whitespace-nowrap px-3 py-2 text-right">
                       <button
                         onClick={() => setEdit(b)}
-                        className="rounded p-1 text-muted-foreground hover:text-foreground"
+                        className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                         title="Edit"
+                        aria-label="Edit"
+                        {...writeGate}
                       >
                         <Pencil className="h-3.5 w-3.5" />
                       </button>
                       <button
                         onClick={() => setDel(b)}
-                        className="rounded p-1 text-muted-foreground hover:text-destructive"
+                        className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                         title="Delete"
+                        aria-label="Delete"
+                        {...deleteGate}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>
@@ -295,33 +323,58 @@ export function MacBlocksTab({ groupId }: { groupId: string }) {
           title="Unblock MAC"
           description={`Remove the block on ${del.mac_address}? The device will immediately be able to request leases again.`}
           onConfirm={() => delMut.mutate(del.id)}
-          onClose={() => setDel(null)}
+          onClose={() => {
+            delMut.reset();
+            setDel(null);
+          }}
           isPending={delMut.isPending}
+          error={
+            delMut.isError
+              ? formatApiError(delMut.error, "Delete failed")
+              : null
+          }
         />
       )}
     </div>
   );
 }
 
-function MacBlockModal({
-  groupId,
-  block,
-  onClose,
-}: {
+type MacBlockModalProps = {
   groupId: string;
   block?: DHCPMACBlock;
   onClose: () => void;
-}) {
+};
+
+// Edit reads the block fresh on open and Save sends only what changed
+// (#3365): the clicked row comes from a list loaded earlier.
+export function MacBlockModal(props: MacBlockModalProps) {
+  const fresh = useFreshRow(props.block, () =>
+    dhcpApi
+      .listMacBlocks(props.groupId)
+      .then((rows) => rows.find((b) => b.id === props.block!.id)),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit MAC Block"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <MacBlockModalForm {...props} block={fresh.row} />;
+}
+
+function MacBlockModalForm({ groupId, block, onClose }: MacBlockModalProps) {
   const qc = useQueryClient();
   const editing = !!block;
   const [mac, setMac] = useState(block?.mac_address ?? "");
-  const [reason, setReason] = useState<DHCPMACBlockReason>(
-    block?.reason ?? "other",
-  );
+  const [reason, setReason] = useState<string>(block?.reason ?? "other");
   const [description, setDescription] = useState(block?.description ?? "");
   const [enabled, setEnabled] = useState(block?.enabled ?? true);
   const [expiresAt, setExpiresAt] = useState(
-    block?.expires_at ? block.expires_at.slice(0, 16) : "",
+    toLocalInputValue(block?.expires_at),
   );
   const [error, setError] = useState("");
 
@@ -331,12 +384,29 @@ function MacBlockModal({
         reason,
         description,
         enabled,
-        expires_at: expiresAt ? new Date(expiresAt).toISOString() : null,
+        expires_at: fromLocalInputValue(expiresAt),
       };
       if (!editing) data.mac_address = mac;
-      return editing
-        ? dhcpApi.updateMacBlock(groupId, block!.id, data)
-        : dhcpApi.createMacBlock(groupId, data);
+      if (!editing) return dhcpApi.createMacBlock(groupId, data);
+      const diff = changedFields(
+        {
+          reason: block!.reason,
+          description: block!.description ?? "",
+          enabled: block!.enabled,
+          expires_at: block!.expires_at ?? null,
+        },
+        {
+          ...data,
+          // An untouched expiry keeps its stored instant (the input only
+          // carries minutes), so it is not sent back.
+          expires_at:
+            expiresAt === toLocalInputValue(block!.expires_at)
+              ? (block!.expires_at ?? null)
+              : data.expires_at,
+        },
+      );
+      if (Object.keys(diff).length === 0) return Promise.resolve(block!);
+      return dhcpApi.updateMacBlock(groupId, block!.id, diff);
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["dhcp-mac-blocks", groupId] });
@@ -377,8 +447,13 @@ function MacBlockModal({
           <select
             className={inputCls}
             value={reason}
-            onChange={(e) => setReason(e.target.value as DHCPMACBlockReason)}
+            onChange={(e) => setReason(e.target.value)}
           >
+            {/* The stored free text stays offered after another reason is
+                picked, so the operator can go back to it (#3083). */}
+            {block && !isKnownReason(block.reason) && (
+              <option value={block.reason}>{block.reason}</option>
+            )}
             {Object.entries(REASON_LABELS).map(([k, v]) => (
               <option key={k} value={k}>
                 {v}
@@ -412,7 +487,9 @@ function MacBlockModal({
             <span>Enabled</span>
           </label>
         </div>
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
         <Btns onClose={onClose} pending={mut.isPending} />
       </form>
     </Modal>

@@ -36,8 +36,12 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _VERSIONS = _REPO_ROOT / "backend" / "app" / "core" / "versions.py"
 
 # A CalVer release tag always carries its ``-N``: the bare date is what
-# versions.py accepts from a reporting build, not what a tag may be.
-_CALVER_TAG = re.compile(r"^\d{4}\.\d{2}\.\d{2}-\d+$")
+# versions.py accepts from a reporting build, not what a tag may be. N
+# starts at 1 and has no leading zero: ``2026.10.07-01`` parses to the same
+# release as ``-1``, and the chart-version rewrite would publish both as
+# chart ``2026.10.7-1`` (#1182), the same reason SemVer tags refuse
+# ``1.0.0-rc.01``.
+_CALVER_TAG = re.compile(r"^\d{4}\.\d{2}\.\d{2}-[1-9]\d*$")
 # SemVer, with no leading zeros (SemVer §2 for the version, §9 for numeric
 # pre-release identifiers) and no build metadata (``+`` is not legal in an
 # image tag). The leading-zero rule keeps a CalVer date that lost its ``-N``

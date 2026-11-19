@@ -28,14 +28,15 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
-from app.core.auth_throttle import login_rate_limited
+from app.api.stepup import refuse_if_stepup_blocked
+from app.core.agent_wake import publish_wake
+from app.core.auth_throttle import login_rate_limited, record_stepup_password_failure
 from app.core.demo_mode import DEMO_RESTRICTED_MODULES, is_demo_mode
 from app.core.permissions import is_effective_superadmin
 from app.core.request_meta import get_trusted_client_ip
 from app.models.audit import AuditLog
 from app.models.dhcp import DHCPScope, DHCPServer
 from app.models.dns import DNSServer, DNSZone
-from app.models.feature_module import FeatureModule
 from app.models.settings import PlatformSettings
 from app.services import feature_modules as fm_svc
 from app.services.account_lockout import LockoutPolicy, is_locked, register_failure
@@ -49,6 +50,7 @@ from app.services.ai.operations_control import (
     is_controls_protected,
     maybe_gate_control,
 )
+from app.services.dhcp.agent_wake_targets import dhcp_group_channels_with_scopes
 from app.services.reauth import ReauthOutcome, reverify_operator
 
 logger = structlog.get_logger(__name__)
@@ -116,7 +118,10 @@ class FeatureModuleEntry(BaseModel):
     """Catalog entry + current state. ``label`` / ``group`` /
     ``description`` come from the in-process catalog so the UI doesn't
     need to know about it separately. ``default_enabled`` lets the
-    Settings page show a "default" badge for transparency."""
+    Settings page show a "default" badge for transparency. It is the
+    EFFECTIVE default on this install: a module with
+    ``default_on_if_rows_in`` reports true once its table holds data
+    (#2100), so "overridden" keeps meaning "an operator chose this"."""
 
     id: str
     label: str
@@ -143,8 +148,9 @@ class FeatureModuleToggleBody(BaseModel):
 
 @router.get("/feature-modules", response_model=list[FeatureModuleEntry])
 async def list_feature_modules(db: DB, current_user: CurrentUser) -> list[FeatureModuleEntry]:
-    rows = (await db.execute(select(FeatureModule))).scalars().all()
-    overrides: dict[str, bool] = {row.id: row.enabled for row in rows}
+    # The same derivation the route gate uses (#2100), so the frontend's
+    # ``resolveEnabled`` resolves exactly what ``require_module`` enforces.
+    states = await fm_svc.load_module_states(db, probe_overridden=True)
 
     return [
         FeatureModuleEntry(
@@ -152,8 +158,8 @@ async def list_feature_modules(db: DB, current_user: CurrentUser) -> list[Featur
             label=spec.label,
             group=spec.group,
             description=spec.description,
-            default_enabled=spec.default_enabled,
-            enabled=overrides.get(spec.id, spec.default_enabled),
+            default_enabled=states.defaults[spec.id],
+            enabled=states.own[spec.id],
             requires=list(spec.requires),
         )
         for spec in fm_svc.MODULES
@@ -219,16 +225,12 @@ async def toggle_feature_module(
             )
 
     row = await fm_svc.set_module_enabled(db, module_id, body.enabled, user_id=current_user.id)
-    # Mirror the toggle into the matching ``PlatformSettings`` column
-    # for integrations. The Celery beat reconcilers gate on those
-    # columns directly; keeping both sides in lock-step lets the
-    # reconciler stop / start without touching every task. Non-
-    # integration ids skip this branch.
-    settings_col = fm_svc.INTEGRATION_SETTINGS_MIRROR.get(module_id)
-    if settings_col is not None:
-        ps = await db.get(PlatformSettings, 1)
-        if ps is not None:
-            setattr(ps, settings_col, body.enabled)
+    # Refresh the derived ``PlatformSettings.integration_*_enabled`` copy.
+    # Nothing in the app gates on it any more — the sweeps, alerts and
+    # dashboards read the module (#2196 / #2197) — and the helper creates
+    # the settings row when it is missing rather than skipping the write.
+    if module_id in fm_svc.INTEGRATION_SETTINGS_MIRROR:
+        await fm_svc.sync_integration_settings_mirror(db)
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -277,13 +279,23 @@ async def toggle_feature_module(
 
     await db.commit()
     fm_svc.invalidate_cache()
+    # #2040 — the DHCP bundle is gated on modules (``network.e911`` emits
+    # options 99 / 123, ``ipv6.router_advertisements`` the radvd config), and a
+    # toggle of a parent re-resolves its children, so wake every DHCP group
+    # that serves a scope on any toggle. This router carries no
+    # ``wake_publishing`` collector, so publish after the commit directly. A
+    # poll parked on another api replica reads that replica's module cache
+    # (``_CACHE_TTL_S``); if the wake beats its expiry the poll parks again and
+    # converges on the next tick, which is the behaviour before the wake.
+    await publish_wake(*await dhcp_group_channels_with_scopes(db))
 
+    states = await fm_svc.load_module_states(db, probe_overridden=True)
     return FeatureModuleEntry(
         id=spec.id,
         label=spec.label,
         group=spec.group,
         description=spec.description,
-        default_enabled=spec.default_enabled,
+        default_enabled=states.defaults[spec.id],
         enabled=row.enabled,
         requires=list(spec.requires),
     )
@@ -498,7 +510,24 @@ async def break_glass(
             f"Confirmation phrase must be exactly {BREAK_GLASS_PHRASE!r}",
         )
 
-    # 3. Password / TOTP re-confirmation (#408 pattern).
+    # 3. Password / TOTP re-confirmation (#408 pattern). The shared budget gate
+    # first (#1413): this endpoint keeps its own break-glass audit row and
+    # lockout counter, so it uses the gate rather than require_operator_stepup,
+    # but a wrong answer spends the same per-account step-up budget.
+    try:
+        await refuse_if_stepup_blocked(current_user)
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+            _break_glass_audit(
+                db,
+                user=current_user,
+                kind=body.kind,
+                result="forbidden",
+                new_value={"reason": "stepup_blocked"},
+                action=_BREAK_GLASS_ACTION_DENIED,
+            )
+            await db.commit()
+        raise
     outcome = reverify_operator(current_user, password=body.password, totp_code=body.totp_code)
     if outcome is not ReauthOutcome.OK:
         reason = "mfa_required" if outcome is ReauthOutcome.MFA_REQUIRED else "bad_credential"
@@ -508,6 +537,8 @@ async def break_glass(
         if outcome is ReauthOutcome.BAD_CREDENTIAL:
             settings_row = await db.get(PlatformSettings, 1)
             register_failure(current_user, LockoutPolicy.from_row(settings_row))
+            if body.password or body.totp_code:
+                await record_stepup_password_failure(current_user.id)
         _break_glass_audit(
             db,
             user=current_user,

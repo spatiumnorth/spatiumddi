@@ -1,5 +1,7 @@
+import { useOwnershipModules } from "@/hooks/useOwnershipModules";
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
 import {
   circuitsApi,
@@ -11,7 +13,9 @@ import {
   type CircuitStatus,
   type CircuitUpdate,
   type TransportClass,
+  formatApiError,
 } from "@/lib/api";
+import { formatDateOnly, termDaysLeft } from "@/lib/localTime";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal, ModalTabs } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
@@ -21,9 +25,12 @@ import { SavedViewsMenu } from "@/components/SavedViewsMenu";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import {
   CustomerChip,
+  MissingCustomerOption,
   ProviderChip,
   SiteChip,
 } from "@/components/ownership/pickers";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -93,9 +100,7 @@ function StatusBadge({ status }: { status: CircuitStatus }) {
 
 function TermBadge({ termEnd }: { termEnd: string | null }) {
   if (!termEnd) return <span className="text-muted-foreground/50">—</span>;
-  const days = Math.floor(
-    (new Date(termEnd).getTime() - Date.now()) / (24 * 3600 * 1000),
-  );
+  const days = termDaysLeft(termEnd);
   let cls =
     "bg-emerald-100 text-emerald-700 dark:bg-emerald-950/30 dark:text-emerald-400";
   let label = `${days}d`;
@@ -111,7 +116,7 @@ function TermBadge({ termEnd }: { termEnd: string | null }) {
   return (
     <span className="inline-flex items-center gap-2">
       <span className="text-[11px] tabular-nums text-muted-foreground">
-        {new Date(termEnd).toLocaleDateString()}
+        {formatDateOnly(termEnd)}
       </span>
       <span
         className={cn(
@@ -142,13 +147,14 @@ function formatCost(cost: string | null, currency: string): string {
 
 type EditorTab = "general" | "endpoints" | "term" | "notes";
 
-function CircuitEditorModal({
+export function CircuitEditorModal({
   existing,
   onClose,
 }: {
   existing: CircuitRead | null;
   onClose: () => void;
 }) {
+  const own = useOwnershipModules();
   const qc = useQueryClient();
   const [tab, setTab] = useState<EditorTab>("general");
 
@@ -205,11 +211,13 @@ function CircuitEditorModal({
     queryKey: ["customers", "all"],
     queryFn: () => customersApi.list({ limit: 500 }),
     staleTime: 60_000,
+    enabled: own.customer,
   });
   const sitesQ = useQuery({
     queryKey: ["sites", "all"],
     queryFn: () => sitesApi.list({ limit: 500 }),
     staleTime: 60_000,
+    enabled: own.site,
   });
   const providers = providersQ.data?.items ?? [];
   const customers = customersQ.data?.items ?? [];
@@ -246,11 +254,7 @@ function CircuitEditorModal({
       onClose();
     },
     onError: (e: unknown) => {
-      const err = e as {
-        message?: string;
-        response?: { data?: { detail?: string } };
-      };
-      setError(err?.response?.data?.detail ?? err?.message ?? "Save failed");
+      setError(formatApiError(e, "Save failed"));
     },
   });
 
@@ -316,23 +320,29 @@ function CircuitEditorModal({
               ))}
             </select>
           </div>
-          <div>
-            <label className="text-xs font-medium text-muted-foreground">
-              Customer (optional)
-            </label>
-            <select
-              className={inputCls}
-              value={customerId ?? ""}
-              onChange={(e) => setCustomerId(e.target.value || null)}
-            >
-              <option value="">— None —</option>
-              {customers.map((c) => (
-                <option key={c.id} value={c.id}>
-                  {c.name}
-                </option>
-              ))}
-            </select>
-          </div>
+          {own.customer && (
+            <div>
+              <label className="text-xs font-medium text-muted-foreground">
+                Customer (optional)
+              </label>
+              <select
+                className={inputCls}
+                value={customerId ?? ""}
+                onChange={(e) => setCustomerId(e.target.value || null)}
+              >
+                <option value="">— None —</option>
+                <MissingCustomerOption
+                  customerId={customerId}
+                  list={customersQ}
+                />
+                {customers.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
           <div>
             <label className="text-xs font-medium text-muted-foreground">
               Transport class
@@ -406,24 +416,26 @@ function CircuitEditorModal({
               <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
                 A-end
               </div>
-              <div>
-                <label className="text-xs font-medium text-muted-foreground">
-                  Site
-                </label>
-                <select
-                  className={inputCls}
-                  value={aSiteId ?? ""}
-                  onChange={(e) => setASiteId(e.target.value || null)}
-                >
-                  <option value="">— None —</option>
-                  {sites.map((s) => (
-                    <option key={s.id} value={s.id}>
-                      {s.name}
-                      {s.code ? ` (${s.code})` : ""}
-                    </option>
-                  ))}
-                </select>
-              </div>
+              {own.site && (
+                <div>
+                  <label className="text-xs font-medium text-muted-foreground">
+                    Site
+                  </label>
+                  <select
+                    className={inputCls}
+                    value={aSiteId ?? ""}
+                    onChange={(e) => setASiteId(e.target.value || null)}
+                  >
+                    <option value="">— None —</option>
+                    {sites.map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {s.name}
+                        {s.code ? ` (${s.code})` : ""}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
               <div>
                 <label className="text-xs font-medium text-muted-foreground">
                   Subnet UUID (optional)
@@ -444,24 +456,26 @@ function CircuitEditorModal({
               <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
                 Z-end
               </div>
-              <div>
-                <label className="text-xs font-medium text-muted-foreground">
-                  Site
-                </label>
-                <select
-                  className={inputCls}
-                  value={zSiteId ?? ""}
-                  onChange={(e) => setZSiteId(e.target.value || null)}
-                >
-                  <option value="">— None —</option>
-                  {sites.map((s) => (
-                    <option key={s.id} value={s.id}>
-                      {s.name}
-                      {s.code ? ` (${s.code})` : ""}
-                    </option>
-                  ))}
-                </select>
-              </div>
+              {own.site && (
+                <div>
+                  <label className="text-xs font-medium text-muted-foreground">
+                    Site
+                  </label>
+                  <select
+                    className={inputCls}
+                    value={zSiteId ?? ""}
+                    onChange={(e) => setZSiteId(e.target.value || null)}
+                  >
+                    <option value="">— None —</option>
+                    {sites.map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {s.name}
+                        {s.code ? ` (${s.code})` : ""}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
               <div>
                 <label className="text-xs font-medium text-muted-foreground">
                   Subnet UUID (optional)
@@ -502,7 +516,7 @@ function CircuitEditorModal({
               onChange={(e) => setTermEnd(e.target.value)}
             />
             <p className="mt-0.5 text-[11px] text-muted-foreground/80">
-              Drives the future expiring-soon alert rule.
+              Drives the circuit_term_expiring alert rule.
             </p>
           </div>
           <div>
@@ -551,7 +565,9 @@ function CircuitEditorModal({
         </div>
       )}
 
-      {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
+      {error && (
+        <FormError className="mt-3 text-sm text-destructive">{error}</FormError>
+      )}
 
       <div className="mt-6 flex justify-end gap-2 border-t pt-3">
         <button
@@ -577,6 +593,17 @@ function CircuitEditorModal({
 // ── Page ────────────────────────────────────────────────────────────
 
 export function CircuitsPage() {
+  // #1340 — a read-only user is offered no write it would be refused:
+  // the circuit router asks write (delete) on 'circuit'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "circuit"),
+    "Requires write permission on circuits",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "circuit"),
+    "Requires delete permission on circuits",
+  );
   const qc = useQueryClient();
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<CircuitStatus | "">("");
@@ -653,17 +680,27 @@ export function CircuitsPage() {
     [items, selectedIds],
   );
 
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
   const bulkDelete = useMutation({
+    onMutate: () => setDeleteError(null),
     mutationFn: (ids: string[]) => circuitsApi.bulkDelete(ids),
     onSuccess: () => {
       setSelectedIds(new Set());
       qc.invalidateQueries({ queryKey: ["circuits"] });
     },
+    onError: (e: unknown) =>
+      setDeleteError(formatApiError(e, "Failed to delete circuits")),
   });
 
   const removeOne = useMutation({
+    onMutate: () => setDeleteError(null),
     mutationFn: (id: string) => circuitsApi.remove(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["circuits"] }),
+    onError: (e: unknown) => {
+      setDeleteError(formatApiError(e, "Failed to delete circuit"));
+      qc.invalidateQueries({ queryKey: ["circuits"] });
+    },
   });
 
   function toggle(id: string) {
@@ -683,13 +720,18 @@ export function CircuitsPage() {
   return (
     <div className="h-full overflow-auto p-6">
       <div className="space-y-4">
+        {deleteError && (
+          <p role="alert" className="text-sm text-destructive">
+            {deleteError}
+          </p>
+        )}
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
             <h1 className="text-xl font-semibold">WAN circuits</h1>
             <p className="text-sm text-muted-foreground">
               Carrier-supplied transport pipes — provider, class, bandwidth,
-              endpoints, contract term + cost. Foundation for the future MPLS
-              service catalog and SD-WAN overlay routing roadmap items.
+              endpoints, contract term + cost. Circuits feed the service catalog
+              (MPLS L3VPN, SD-WAN) and the SD-WAN overlays.
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-2">
@@ -709,6 +751,7 @@ export function CircuitsPage() {
               variant="primary"
               icon={Plus}
               onClick={() => setShowNew(true)}
+              {...writeGate}
             >
               New circuit
             </HeaderButton>
@@ -786,6 +829,7 @@ export function CircuitsPage() {
                   onConfirm: () => bulkDelete.mutate(ids),
                 });
               }}
+              {...deleteGate}
             >
               Delete selected
             </HeaderButton>
@@ -835,7 +879,28 @@ export function CircuitsPage() {
                     className="px-3 py-6 text-center text-muted-foreground"
                     colSpan={13}
                   >
-                    No circuits yet — click "New circuit" to add one.
+                    <ListEmpty
+                      error={query.error}
+                      what="circuits"
+                      filtered={
+                        search !== "" ||
+                        statusFilter !== "" ||
+                        transportFilter !== "" ||
+                        providerFilter !== "" ||
+                        tagFilters.length > 0
+                      }
+                      onClearFilters={() => {
+                        setSearch("");
+                        setStatusFilter("");
+                        setTransportFilter("");
+                        setProviderFilter("");
+                        setTagFilters([]);
+                      }}
+                      gate={writeGate}
+                      hint={`Click "New circuit" to add one.`}
+                    >
+                      No circuits yet.
+                    </ListEmpty>
                   </td>
                 </tr>
               )}
@@ -900,14 +965,17 @@ export function CircuitsPage() {
                     <button
                       type="button"
                       title="Edit"
+                      aria-label="Edit"
                       onClick={() => setEditing(c)}
-                      className="ml-1 rounded p-1 hover:bg-muted"
+                      className="ml-1 rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                      {...writeGate}
                     >
                       <Pencil className="h-3.5 w-3.5" />
                     </button>
                     <button
                       type="button"
                       title="Delete"
+                      aria-label="Delete"
                       onClick={() => {
                         setConfirm({
                           title: "Delete circuit",
@@ -916,7 +984,8 @@ export function CircuitsPage() {
                           onConfirm: () => removeOne.mutate(c.id),
                         });
                       }}
-                      className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10"
+                      className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
+                      {...deleteGate}
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                     </button>

@@ -52,16 +52,23 @@ describe("core nav ordering", () => {
 
 describe("module tags on sub-groups are live, not decorative", () => {
   it("the DNS sub-group empties out when core.dns is off", () => {
-    const on = new Set(["core.dhcp", "governance.requests"]);
+    const on = new Set(["core.dhcp", "governance.requests", "network.domains"]);
     const remaining = labels(dnsSectionNav, on);
-    // Domains is deliberately ungated — a registrar record outlives any
-    // zone we serve — so it is the one entry that must survive.
+    // Domains is not gated on core.dns — a registrar record outlives any
+    // zone we serve — so it survives while its own module (#2325) is on.
     expect(remaining).toEqual(["Domains"]);
+    expect(labels(dnsSectionNav, new Set(["core.dhcp"]))).toEqual([]);
     expect(remaining).not.toContain("DNS Pools");
     expect(remaining).not.toContain("DNSSEC Policies");
   });
 
-  it("the IPAM sub-group is ungated and never empties", () => {
-    expect(labels(coreIpamNav, new Set()).length).toBe(coreIpamNav.length);
+  it("the IPAM sub-group loses only NAT Mappings when ipam.nat is off (#2100)", () => {
+    const off = labels(coreIpamNav, new Set());
+    expect(off).not.toContain("NAT Mappings");
+    // Everything else under IPAM is ungated, so the heading never empties.
+    expect(off.length).toBe(coreIpamNav.length - 1);
+    expect(labels(coreIpamNav, new Set(["ipam.nat"]))).toContain(
+      "NAT Mappings",
+    );
   });
 });

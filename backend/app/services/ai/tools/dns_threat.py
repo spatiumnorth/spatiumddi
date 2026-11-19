@@ -31,6 +31,7 @@ from app.models.auth import User
 from app.models.dns_threat import DNSClientWindow
 from app.services.ai.tools.base import register_tool
 from app.services.dns_threat.aggregate import INTERESTING_SCORE
+from app.services.logs.ip_filter import InvalidLogFilter
 
 
 class FindSuspiciousDNSClientsArgs(BaseModel):
@@ -53,6 +54,7 @@ class FindSuspiciousDNSClientsArgs(BaseModel):
 
 @register_tool(
     name="find_suspicious_dns_clients",
+    permission=("read", "server"),
     description=(
         "Find DNS clients whose query behaviour scores as tunneling / "
         "exfiltration (issue #699). DNS tunneling hides payload in the "
@@ -147,6 +149,7 @@ class DNSThreatSummaryArgs(BaseModel):
 
 @register_tool(
     name="get_dns_threat_summary",
+    permission=("read", "server"),
     description=(
         "One-shot rollup of DNS tunneling analytics over a trailing "
         "window (issue #699): how many client windows were scored, how "
@@ -193,6 +196,7 @@ class FindDNSThreatMutesArgs(BaseModel):
 
 @register_tool(
     name="find_dns_threat_mutes",
+    permission=("read", "server"),
     description=(
         "List DNS clients an operator has reviewed and muted, with the "
         "reason, who muted them and when it expires. Use before "
@@ -256,6 +260,7 @@ class FindBeaconingClientsArgs(BaseModel):
 
 @register_tool(
     name="find_beaconing_clients",
+    permission=("read", "server"),
     description=(
         "Find DNS clients querying one name on a metronomic cadence — "
         "the rhythm of a C2 callback (issue #699). Each row carries the "
@@ -335,6 +340,7 @@ class FindDGAClientsArgs(BaseModel):
 
 @register_tool(
     name="find_dga_clients",
+    permission=("read", "server"),
     description=(
         "Find DNS clients that queried a crop of algorithmically-"
         "generated domain names — how malware locates its "
@@ -408,6 +414,7 @@ class FindRPZOffendersArgs(BaseModel):
 
 @register_tool(
     name="find_rpz_offenders",
+    permission=("read", "server"),
     description=(
         "Find which clients keep reaching for domains the blocklists "
         "block (issue #699). This is ground truth, NOT a heuristic — "
@@ -455,6 +462,7 @@ async def find_rpz_offenders(
 
 @register_tool(
     name="get_rpz_block_summary",
+    permission=("read", "server"),
     description=(
         "Blocklist activity rollup: how many lookups were blocked, how "
         "many distinct clients and names, which feeds fired, and the "
@@ -487,7 +495,7 @@ class FindRPZHitsArgs(BaseModel):
     hours: int = Field(default=24, ge=1, le=24 * 30, description="Trailing window in hours.")
     limit: int = Field(default=50, ge=1, le=500)
     client_ip: str | None = Field(
-        default=None, description="Only hits from this client IP address."
+        default=None, description="Client IP: whole address, CIDR, or leading part (e.g. 10.1.)."
     )
     qname_contains: str | None = Field(
         default=None, max_length=255, description="Substring match on the blocked domain."
@@ -503,6 +511,7 @@ class FindRPZHitsArgs(BaseModel):
 
 @register_tool(
     name="find_rpz_hits",
+    permission=("read", "server"),
     description=(
         "The INDIVIDUAL blocked lookups, newest first — not a rollup "
         "(issue #914). find_rpz_offenders says a client has N blocked "
@@ -522,22 +531,17 @@ async def find_rpz_hits(
 ) -> list[dict[str, Any]]:
     from app.services.dns_threat import rpz as rpz_service  # noqa: PLC0415
 
-    client_ip: str | None = None
-    if args.client_ip:
-        # An INET comparison raises on a malformed literal, so the model's
-        # own answer ("no such client") is returned instead of a 500 that
-        # reads to the copilot as a broken tool.
-        try:
-            client_ip = str(ipaddress.ip_address(args.client_ip.strip()))
-        except ValueError:
-            return [{"result": f"{args.client_ip!r} is not an IP address"}]
-
-    rows = await rpz_service.recent_hits(
-        db,
-        hours=args.hours,
-        limit=args.limit,
-        client_ip=client_ip,
-        qname_contains=args.qname_contains,
-        include_passthru=args.include_passthru,
-    )
+    # A value that cannot be an address is answered as text rather than a
+    # 500 that reads to the copilot as a broken tool.
+    try:
+        rows = await rpz_service.recent_hits(
+            db,
+            hours=args.hours,
+            limit=args.limit,
+            client_ip=args.client_ip,
+            qname_contains=args.qname_contains,
+            include_passthru=args.include_passthru,
+        )
+    except InvalidLogFilter as exc:
+        return [{"result": exc.detail}]
     return [{**r, "ts": r["ts"].isoformat() if r.get("ts") else None} for r in rows]

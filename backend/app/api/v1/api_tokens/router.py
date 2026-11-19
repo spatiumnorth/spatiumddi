@@ -23,24 +23,33 @@ we can add them later without a migration.
   tell live tokens from dead ones.
 - Revocation is soft (``is_active=False``). Hard delete is allowed
   too — both just reject future calls with 401.
+- Re-enabling an inactive token is superadmin-only and needs the
+  operator step-up; so does widening a token's scopes. Renaming,
+  narrowing scopes and revoking need neither.
 """
 
 from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime, timedelta
+from typing import Literal
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import delete, select
 
 from app.api.deps import DB, CurrentUser
 from app.api.stepup import require_operator_stepup
-from app.core.permissions import is_effective_superadmin, user_has_permission
+from app.config import settings
+from app.core.permissions import (
+    is_effective_superadmin,
+    refuse_and_audit,
+    user_has_permission,
+)
 from app.core.security import generate_api_token
 from app.models.appliance import ApplianceCertificate
 from app.models.audit import AuditLog
-from app.models.auth import APIToken
+from app.models.auth import APIToken, User
 from app.models.dns import DNSZone
 from app.models.ipam import Subnet
 from app.services.api_token_scopes import validate_resource_grant_shape, validate_scopes
@@ -93,6 +102,9 @@ class ApiTokenCreate(BaseModel):
         return validate_scopes(v)
 
 
+TokenStatus = Literal["active", "revoked", "expired", "owner_disabled", "password_change_required"]
+
+
 class ApiTokenResponse(BaseModel):
     """Safe-to-list representation — no hash, no raw token."""
 
@@ -104,6 +116,24 @@ class ApiTokenResponse(BaseModel):
     scopes: list[str] = Field(default_factory=list)
     resource_grants: list[dict] = Field(default_factory=list)
     user_id: uuid.UUID | None
+    # Whose token this is (#2443), which a superadmin sees across users.
+    # None only for an ownerless token.
+    owner_username: str | None = None
+    owner_display_name: str | None = None
+    # False when the owner account is disabled: auth refuses every call with
+    # the token (403) whatever its own is_active says (#3431). None only for
+    # an ownerless token, so a client can read None as "no owner", never as
+    # "not looked up".
+    owner_is_active: bool | None = None
+    # True when the owner must change their password: auth refuses every call
+    # with the token (403) until they do (#3784).
+    owner_password_change_required: bool | None = None
+    # The EFFECTIVE state — what the token will actually do at auth, derived
+    # at serialisation (no column). "active" | "revoked" | "expired" |
+    # "owner_disabled" | "password_change_required"; ``blocked_reason`` is
+    # the operator-readable sentence, None when active.
+    status: TokenStatus = "active"
+    blocked_reason: str | None = None
     expires_at: datetime | None
     last_used_at: datetime | None
     is_active: bool
@@ -116,6 +146,38 @@ class ApiTokenResponse(BaseModel):
     def _grants_default(cls, v: object) -> list[dict]:
         # The column is nullable; surface NULL as an empty list on the wire.
         return v if isinstance(v, list) else []
+
+
+_BLOCKED_REASONS = {
+    "revoked": "The token was revoked.",
+    "expired": "The token has expired.",
+    "owner_disabled": "The owner account is disabled.",
+    "password_change_required": (
+        "The owner must change their password; every call with this token is "
+        "refused (403) until they do."
+    ),
+}
+
+
+def apply_effective_status(row: ApiTokenResponse) -> ApiTokenResponse:
+    """Fill ``status`` / ``blocked_reason`` in the order auth refuses them."""
+    exp = row.expires_at
+    if exp is not None and exp.tzinfo is None:
+        exp = exp.replace(tzinfo=UTC)
+    st: TokenStatus
+    if not row.is_active:
+        st = "revoked"
+    elif exp is not None and exp <= datetime.now(UTC):
+        st = "expired"
+    elif row.owner_is_active is False:
+        st = "owner_disabled"
+    elif row.owner_password_change_required:
+        st = "password_change_required"
+    else:
+        st = "active"
+    row.status = st
+    row.blocked_reason = _BLOCKED_REASONS.get(st)
+    return row
 
 
 class ApiTokenCreateResponse(ApiTokenResponse):
@@ -137,7 +199,13 @@ class ApiTokenUpdate(BaseModel):
     # Operators can rotate the scope list on an existing token —
     # tighten ("oops, this token shouldn't be writing DNS") without
     # rotating the secret. Empty list explicitly clears restriction.
+    # Narrowing is free; widening needs the step-up (see update_token).
     scopes: list[str] | None = None
+    # The caller's step-up, needed only when the update re-enables an
+    # inactive token or widens its scopes. A token outlives the session that
+    # edits it, as at create time (#1355).
+    stepup_password: str | None = None
+    stepup_totp_code: str | None = None
 
     @field_validator("scopes")
     @classmethod
@@ -184,6 +252,25 @@ async def _validate_resource_grants(db: DB, current_user: CurrentUser, grants: l
             )
 
 
+def scopes_widen(old: list[str] | None, new: list[str]) -> bool:
+    """Whether replacing ``old`` with ``new`` lets the token do more.
+
+    An empty list means no scope restriction at all, so clearing a non-empty
+    list widens, and a non-empty list that is not a subset of the old one adds
+    a scope. Going from unrestricted to any list, or dropping scopes, narrows.
+    """
+    old_set = set(old or [])
+    new_set = set(new)
+    if not old_set:
+        return False
+    if not new_set:
+        return True
+    return not new_set <= old_set
+
+
+_STEPUP_FIELDS = ("stepup_password", "stepup_totp_code")
+
+
 def _resolve_expiry(body: ApiTokenCreate) -> datetime | None:
     if body.expires_at is not None:
         # Normalise naive datetimes to UTC so DB comparisons don't
@@ -224,12 +311,26 @@ class EnrolmentContext(BaseModel):
 
 
 @router.get("", response_model=list[ApiTokenResponse])
-async def list_tokens(db: DB, current_user: CurrentUser) -> list[APIToken]:
-    """List tokens owned by the caller. Superadmin sees everyone's."""
-    stmt = select(APIToken).order_by(APIToken.created_at.desc())
+async def list_tokens(db: DB, current_user: CurrentUser) -> list[ApiTokenResponse]:
+    """List tokens owned by the caller. Superadmin sees everyone's, each
+    row naming its owner."""
+    stmt = (
+        select(APIToken, User)
+        .outerjoin(User, User.id == APIToken.user_id)
+        .order_by(APIToken.created_at.desc())
+    )
     if not is_effective_superadmin(current_user):
         stmt = stmt.where(APIToken.user_id == current_user.id)
-    return list((await db.execute(stmt)).scalars().all())
+    out: list[ApiTokenResponse] = []
+    for token, owner in (await db.execute(stmt)).all():
+        row = ApiTokenResponse.model_validate(token)
+        if owner is not None:
+            row.owner_username = owner.username
+            row.owner_display_name = owner.display_name or None
+            row.owner_is_active = owner.is_active
+            row.owner_password_change_required = owner.password_change_required
+        out.append(apply_effective_status(row))
+    return out
 
 
 @router.post("", response_model=ApiTokenCreateResponse, status_code=201)
@@ -255,8 +356,27 @@ async def create_token(
     # entropy to be useful to an attacker.
     display_prefix = raw[:10]
     expires_at = _resolve_expiry(body)
+    if expires_at is not None and expires_at <= datetime.now(UTC):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="expires_at must be in the future",
+        )
     # Resource grants (#374): existence + "can't exceed yourself" checks.
     await _validate_resource_grants(db, current_user, body.resource_grants)
+    # #3432 — disabling an account revokes its tokens under a lock on the
+    # account row. Re-read ``is_active`` under a share lock here: the caller
+    # was authenticated before that disable may have committed, and a token
+    # inserted after the disable read the account's tokens would stay live
+    # and work again once the account is re-enabled.
+    owner_active = (
+        await db.execute(
+            select(User.is_active).where(User.id == current_user.id).with_for_update(read=True)
+        )
+    ).scalar_one_or_none()
+    if not owner_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="User account is disabled"
+        )
     token = APIToken(
         name=body.name,
         description=body.description,
@@ -271,6 +391,7 @@ async def create_token(
         is_active=True,
     )
     db.add(token)
+    await db.flush()  # column-default id must exist before the audit row reads it (#2006)
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -278,7 +399,7 @@ async def create_token(
             auth_source=current_user.auth_source,
             action="create",
             resource_type="api_token",
-            resource_id=str(token.id) if token.id else "?",
+            resource_id=str(token.id),
             resource_display=body.name,
             result="success",
             new_value={
@@ -306,6 +427,12 @@ async def create_token(
         "last_used_at": token.last_used_at,
         "is_active": token.is_active,
         "created_at": token.created_at,
+        "owner_username": current_user.username,
+        "owner_display_name": current_user.display_name or None,
+        "owner_is_active": True,
+        "owner_password_change_required": current_user.password_change_required,
+        "status": "active",
+        "blocked_reason": None,
         "token": raw,
     }
 
@@ -331,8 +458,11 @@ async def enrolment_context(db: DB, current_user: CurrentUser) -> EnrolmentConte
     there is an active ``ApplianceCertificate``, which is the row deployed to
     the TLS secret the frontend serves. On a Compose or plain-Kubernetes
     install an external proxy or ingress terminates TLS with a certificate
-    this process has never seen, and there is no row: the honest answer is
-    ``None``, not a guess. A fingerprint that does not match the wire would
+    this process has never seen, and nothing is deployed: the honest answer
+    is ``None``, not a guess. A row there is not evidence — the certificate
+    store holds DoT / DoH certs on every install type, and an ACME issue
+    marks its cert active wherever it runs (#3061) — so off an appliance the
+    row is not consulted at all. A fingerprint that does not match the wire would
     make the client report a mismatch on a correct setup, which trains
     operators to click through the one warning this exists to make meaningful.
     """
@@ -341,17 +471,19 @@ async def enrolment_context(db: DB, current_user: CurrentUser) -> EnrolmentConte
     # shadowed by the UUID path param and 422 on the literal segment.
     del current_user  # auth-only dependency; the answer is not per-user
 
-    row = (
-        (
-            await db.execute(
-                select(ApplianceCertificate)
-                .where(ApplianceCertificate.is_active.is_(True))
-                .limit(1)
+    row = None
+    if settings.appliance_mode:
+        row = (
+            (
+                await db.execute(
+                    select(ApplianceCertificate)
+                    .where(ApplianceCertificate.is_active.is_(True))
+                    .limit(1)
+                )
             )
+            .scalars()
+            .first()
         )
-        .scalars()
-        .first()
-    )
 
     if row is None or not row.fingerprint_sha256:
         return EnrolmentContext(
@@ -381,20 +513,84 @@ async def get_token(
     token_id: uuid.UUID,
     db: DB,
     current_user: CurrentUser,
-) -> APIToken:
+) -> ApiTokenResponse:
     token = await _require_owned(token_id, db, current_user)
-    return token
+    return await _with_owner(db, token)
 
 
 @router.patch("/{token_id}", response_model=ApiTokenResponse)
 async def update_token(
     token_id: uuid.UUID,
     body: ApiTokenUpdate,
+    request: Request,
     db: DB,
     current_user: CurrentUser,
-) -> APIToken:
+) -> ApiTokenResponse:
+    """Rename, describe, revoke, re-enable or re-scope a token.
+
+    Re-enabling an inactive token is superadmin-only and needs the step-up;
+    widening its scopes needs the step-up. Everything else needs neither.
+    """
     token = await _require_owned(token_id, db, current_user)
-    changes = body.model_dump(exclude_none=True)
+    changes = body.model_dump(exclude_none=True, exclude=set(_STEPUP_FIELDS))
+    reenables = changes.get("is_active") is True and not token.is_active
+    widens = "scopes" in changes and scopes_widen(token.scopes, changes["scopes"])
+    # Both checks run before anything is written. An inactive token was
+    # revoked by someone; bringing it back is a superadmin decision, and an
+    # owner who needs access again mints a new token (which needs the step-up).
+    if reenables and not is_effective_superadmin(current_user):
+        await refuse_and_audit(
+            db,
+            current_user,
+            request,
+            action="update",
+            resource_type="api_token",
+            resource_id=str(token.id),
+            resource_display=token.name,
+            reason="reenable_requires_superadmin",
+            detail=(
+                "Only a superadmin can re-enable an inactive API token. "
+                "Create a new token instead."
+            ),
+        )
+    # An expired token stays refused at auth whatever is_active says, so
+    # re-enabling it would report success and change nothing (#3120). The
+    # update payload carries no expiry, so the only way back is a new token.
+    if reenables and token.expires_at is not None and token.expires_at <= datetime.now(UTC):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "This API token has expired, so re-enabling it would not let it "
+                "authenticate. Create a new token instead."
+            ),
+        )
+    # A disabled owner's tokens are refused at auth (403) whatever is_active
+    # says, so re-enabling would report success and change nothing (#3431).
+    if reenables and token.user_id is not None:
+        owner_active = (
+            await db.execute(select(User.is_active).where(User.id == token.user_id))
+        ).scalar_one_or_none()
+        if owner_active is False:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "The owner account is disabled, so re-enabling this API token "
+                    "would not let it authenticate. Re-enable the owner first, "
+                    "then create a new token."
+                ),
+            )
+    stepup_method: str | None = None
+    if reenables or widens:
+        stepup_method = await require_operator_stepup(
+            db,
+            current_user,
+            password=body.stepup_password,
+            totp_code=body.stepup_totp_code,
+            action="update",
+            resource_type="api_token",
+            resource_id=str(token.id),
+            resource_display=token.name,
+        )
     for k, v in changes.items():
         setattr(token, k, v)
     db.add(
@@ -408,12 +604,12 @@ async def update_token(
             resource_display=token.name,
             result="success",
             changed_fields=list(changes.keys()),
-            new_value=changes,
+            new_value=({**changes, "stepup_method": stepup_method} if stepup_method else changes),
         )
     )
     await db.commit()
     await db.refresh(token)
-    return token
+    return await _with_owner(db, token)
 
 
 @router.delete("/{token_id}", status_code=204)
@@ -438,6 +634,22 @@ async def delete_token(
     )
     await db.execute(delete(APIToken).where(APIToken.id == token_id))
     await db.commit()
+
+
+async def _with_owner(db: DB, token: APIToken) -> ApiTokenResponse:
+    """The single-token response with the owner fields the list fills, so a
+    GET or PATCH does not read as "owner state unknown" (#3431)."""
+    row = ApiTokenResponse.model_validate(token)
+    if token.user_id is not None:
+        owner = (
+            await db.execute(select(User).where(User.id == token.user_id))
+        ).scalar_one_or_none()
+        if owner is not None:
+            row.owner_username = owner.username
+            row.owner_display_name = owner.display_name or None
+            row.owner_is_active = owner.is_active
+            row.owner_password_change_required = owner.password_change_required
+    return apply_effective_status(row)
 
 
 async def _require_owned(token_id: uuid.UUID, db: DB, current_user: CurrentUser) -> APIToken:

@@ -31,6 +31,7 @@ from app.services.firewall_mirror import (
     apply_objects,
     apply_subnets,
 )
+from app.services.integration_ownership import refuse_sync_into_trashed_space
 from app.services.panos.client import (
     PANOSClient,
     PANOSClientError,
@@ -107,6 +108,10 @@ def _to_address(ls: _PANLease) -> MirrorAddress:
 
 async def reconcile_firewall(db: AsyncSession, fw: PANOSFirewall) -> MirrorSummary:
     summary = MirrorSummary(ok=False)
+    # #2577 — a target whose IP space is in Trash syncs nothing: it would
+    # rebuild its rows as live rows inside the trashed space.
+    if await refuse_sync_into_trashed_space(db, fw, summary):
+        return summary
 
     api_key = ""
     if fw.api_key_encrypted:
@@ -193,6 +198,8 @@ async def reconcile_firewall(db: AsyncSession, fw: PANOSFirewall) -> MirrorSumma
             resource_id=str(fw.id),
             resource_display=fw.name,
             new_value={
+                # #2577 — what the sync released outside the target's IP space.
+                "released": summary.released.as_dict(),
                 "objects": {
                     "created": summary.objects_created,
                     "updated": summary.objects_updated,
@@ -221,6 +228,7 @@ async def reconcile_firewall(db: AsyncSession, fw: PANOSFirewall) -> MirrorSumma
     summary.ok = True
     logger.info(
         "panos_reconcile_ok",
+        **summary.released.log_fields(),
         firewall=str(fw.id),
         version=summary.sw_version,
         objects=summary.object_count,

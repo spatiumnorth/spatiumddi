@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ipaddress
 import uuid
 from datetime import datetime
 from typing import Any
@@ -11,16 +10,19 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 
-from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp._mac import canonicalize_mac
 from app.api.v1.dhcp.scopes import validate_dhcp_options
 from app.core.agent_wake import collect_wake, dhcp_group_channel
-from app.core.dns_names import validate_hostname
+from app.core.dns_names import validate_optional_hostname
 from app.core.permissions import require_resource_permission
+from app.core.update_nulls import changed_keys, resolve_update_changes, snapshot
 from app.models.dhcp import DHCPScope, DHCPStaticAssignment
 from app.models.ipam import Subnet
+from app.services.dhcp.normalize import norm_duid, norm_ip, norm_mac
 from app.services.dhcp.option_validation import normalize_options
+from app.services.dhcp.static_conflicts import check_static_conflicts as _conflict_check
 from app.services.dhcp.static_ipam import (
     detach_ipam_for_static,
     publish_handover_ddns,
@@ -38,11 +40,11 @@ def _validate_optional_hostname(v: str | None) -> str | None:
     """Reservation hostname is optional; validate the RFC 1123 form when set.
 
     Operator-entered (not client-supplied), so a malformed value is rejected
-    rather than sanitized (issue #597). ``""`` / ``None`` pass through.
+    rather than sanitized (issue #597). ``None`` passes through; a blank or
+    whitespace-only value becomes ``""`` (no hostname) rather than being kept
+    verbatim, where the IPAM mirror would publish it as a record owner.
     """
-    if v is None or v.strip() == "":
-        return v
-    return validate_hostname(v)
+    return validate_optional_hostname(v)
 
 
 def _no_scope_move(v: uuid.UUID | None) -> uuid.UUID | None:
@@ -159,64 +161,34 @@ class StaticResponse(BaseModel):
         return str(v) if v is not None else v
 
 
-async def _conflict_check(
-    db, scope: DHCPScope, ip: str, mac: str, exclude_id: uuid.UUID | None = None
-) -> None:
-    """Conflict: same MAC on same group (across scopes), IP inside a reserved/dynamic pool on another scope+group."""
-    # MAC dup across every scope served by the same group
-    same_mac = await db.execute(
-        select(DHCPStaticAssignment)
-        .join(DHCPScope, DHCPStaticAssignment.scope_id == DHCPScope.id)
-        .where(
-            DHCPScope.group_id == scope.group_id,
-            DHCPStaticAssignment.mac_address == mac,
-        )
-    )
-    for row in same_mac.scalars().all():
-        if exclude_id is not None and row.id == exclude_id:
-            continue
-        raise HTTPException(
-            status_code=409,
-            detail=f"MAC {mac} already reserved in this group in scope {row.scope_id}",
-        )
+def _comparable(field: str, v: Any) -> Any:
+    """The form of a static's field that a no-op update is detected in (#3076).
 
-    try:
-        ip_addr = ipaddress.ip_address(ip)
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=f"Invalid IP: {e}") from e
+    Spellings of one value compare equal: a MAC in any case or separator, an
+    address in any IP notation (the column is INET, so it reads back as an
+    ``ipaddress`` object), a hostname with or without its root dot or capitals,
+    a DUID with or without separators, and ``None`` / ``""`` for the optional
+    text fields.
+    """
+    if v is None or (isinstance(v, str) and v.strip() == ""):
+        return None
+    if isinstance(v, (dict, list)):
+        return v
+    text = str(v).strip()
+    if field == "mac_address":
+        return norm_mac(text)
+    if field == "ip_address":
+        return norm_ip(text.split("/", 1)[0])
+    if field == "duid":
+        return norm_duid(text)
+    if field == "hostname":
+        return text.rstrip(".").lower()
+    return text
 
-    # The reservation's IP must fall inside the scope's subnet. Kea renders the
-    # reservation *nested inside* that subnet's stanza
-    # (``"subnet4": [{"subnet": "<cidr>", "reservations": [...]}]``) and Windows
-    # keys reservations by the scope's network address, so an out-of-CIDR
-    # reservation ships structurally invalid config to the backend. Catch it
-    # here as a legible 422 instead of a downstream agent failure (#619).
-    subnet_row = await db.get(Subnet, scope.subnet_id)
-    if subnet_row is not None:
-        try:
-            network = ipaddress.ip_network(str(subnet_row.network), strict=False)
-        except ValueError:  # pragma: no cover — a malformed subnet CIDR can't be validated against
-            network = None
-        if network is not None and ip_addr not in network:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    f"IP {ip} is outside the scope's subnet {network}. "
-                    "A reservation must fall inside the subnet its scope serves."
-                ),
-            )
 
-    # NOTE: a reservation whose IP lands inside a *dynamic* pool is explicitly
-    # allowed. Pinning a MAC inside the range is the standard idiom on every
-    # driver we ship — Kea honours it (default ``reservations-out-of-pool:
-    # false`` runs the in-pool check and won't hand the address to another
-    # client), FortiGate renders ``reserved-address`` independently of
-    # ``ip-range``, and Windows *requires* the reservation to fall inside the
-    # scope's StartRange–EndRange (which is derived from the dynamic pool). The
-    # old in-pool 409 had no driver basis, its "exclude it first" workaround was
-    # a no-op or actively harmful, and it looked like it broke Windows statics
-    # outright (#631). Pool occupancy accounts for these reservations separately
-    # (``services/dhcp/pool_occupancy.py``).
+def _same_value(field: str, current: Any, sent: Any) -> bool:
+    """True when ``sent`` is the stored ``current`` value, however spelled."""
+    return bool(_comparable(field, current) == _comparable(field, sent))
 
 
 @router.get("/scopes/{scope_id}/statics", response_model=list[StaticResponse])
@@ -232,13 +204,34 @@ async def list_statics(
     return list(res.scalars().all())
 
 
+async def _recount_subnet(db: DB, subnet_id: uuid.UUID) -> None:
+    """Refresh the cached allocated counts a static's IPAM mirror changed.
+
+    The mirror row counts toward the subnet's ``allocated_ips`` and its
+    block's rollup; without this they stay stale until the hourly recount
+    (#2533). Flush first so the counts see the mirror write, and again
+    before the block sums the subnet's new count.
+    """
+    from app.api.v1.ipam.router import (  # noqa: PLC0415
+        _update_block_utilization,
+        _update_utilization,
+    )
+
+    await db.flush()
+    await _update_utilization(db, subnet_id)
+    await db.flush()
+    subnet = await db.get(Subnet, subnet_id)
+    if subnet is not None:
+        await _update_block_utilization(db, subnet.block_id)
+
+
 @router.post(
     "/scopes/{scope_id}/statics",
     response_model=StaticResponse,
     status_code=status.HTTP_201_CREATED,
 )
 async def create_static(
-    scope_id: uuid.UUID, body: StaticCreate, db: DB, user: SuperAdmin
+    scope_id: uuid.UUID, body: StaticCreate, db: DB, user: CurrentUser
 ) -> DHCPStaticAssignment:
     scope = await db.get(DHCPScope, scope_id)
     if scope is None:
@@ -262,6 +255,7 @@ async def create_static(
     await push_static_change(db, st, action="create")
     collect_wake(dhcp_group_channel(scope.group_id))
     await upsert_ipam_for_static(db, scope, st)
+    await _recount_subnet(db, scope.subnet_id)
     write_audit(
         db,
         user=user,
@@ -278,7 +272,7 @@ async def create_static(
 
 @router.put("/statics/{static_id}", response_model=StaticResponse)
 async def update_static(
-    static_id: uuid.UUID, body: StaticUpdate, db: DB, user: SuperAdmin
+    static_id: uuid.UUID, body: StaticUpdate, db: DB, user: CurrentUser
 ) -> DHCPStaticAssignment:
     st = await db.get(DHCPStaticAssignment, static_id)
     if st is None:
@@ -291,7 +285,13 @@ async def update_static(
     # relocate a reservation's IP via Set-).
     prev_mac = str(st.mac_address)
     prev_ip = str(st.ip_address)
-    changes = body.model_dump(exclude_none=True)
+    # #1563 — explicit null clears client_id / duid / options_override /
+    # ip_address_id; null for a NOT NULL column is a 422.
+    changes = resolve_update_changes(
+        body,
+        clearable={"client_id", "duid", "options_override", "ip_address_id"},
+        non_nullable={"ip_address", "mac_address", "hostname", "description", "tags"},
+    )
     if changes.get("options_override"):
         changes["options_override"] = normalize_options(changes["options_override"])
         await validate_dhcp_options(
@@ -301,16 +301,27 @@ async def update_static(
             address_family=scope.address_family or "ipv4",
             previous=st.options_override or {},
         )
+    # #3076 — a field sent back at the value the row already holds is not a
+    # change. A dialog opened on a stale row resends every field, and writing
+    # them through would revert whatever another surface (an IPAM inline
+    # edit) stored since.
+    changes = {k: v for k, v in changes.items() if not _same_value(k, getattr(st, k), v)}
     new_ip = changes.get("ip_address", str(st.ip_address))
     new_mac = changes.get("mac_address", str(st.mac_address))
     if "ip_address" in changes or "mac_address" in changes:
         await _conflict_check(db, scope, new_ip, new_mac, exclude_id=st.id)
+    before = snapshot(st, changes)
     for k, v in changes.items():
         setattr(st, k, v)
     await db.flush()
+    if not changes:
+        # Nothing differs from what is stored: no push, no IPAM / DNS write.
+        await db.refresh(st)
+        return st
     await push_static_change(db, st, action="update", prev_mac=prev_mac, prev_ip=prev_ip)
     collect_wake(dhcp_group_channel(scope.group_id))
     await upsert_ipam_for_static(db, scope, st, action="update")
+    await _recount_subnet(db, scope.subnet_id)
     write_audit(
         db,
         user=user,
@@ -318,8 +329,8 @@ async def update_static(
         resource_type="dhcp_static_assignment",
         resource_id=str(st.id),
         resource_display=f"{st.mac_address}->{st.ip_address}",
-        changed_fields=list(changes.keys()),
-        new_value=body.model_dump(mode="json", exclude_none=True),
+        changed_fields=changed_keys(before, changes),
+        new_value=body.model_dump(mode="json", exclude_unset=True),
     )
     await db.commit()
     await db.refresh(st)
@@ -327,7 +338,7 @@ async def update_static(
 
 
 @router.delete("/statics/{static_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_static(static_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
+async def delete_static(static_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
     st = await db.get(DHCPStaticAssignment, static_id)
     if st is None:
         raise HTTPException(status_code=404, detail="Static assignment not found")
@@ -348,5 +359,7 @@ async def delete_static(static_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     # #1274 — a row handed to a live lease gets its DDNS back, but only once
     # the reservation is gone: DDNS lets a reservation's hostname win.
     await db.flush()
+    if scope is not None:
+        await _recount_subnet(db, scope.subnet_id)
     await publish_handover_ddns(db, handovers)
     await db.commit()

@@ -63,8 +63,9 @@ describe("NotFoundPage", () => {
     expect(
       screen.getByRole("link", { name: /back to dashboard/i }),
     ).toHaveProperty("pathname", "/dashboard");
+    // The page is Features & Integrations, beside Settings, not in it (#1395).
     expect(
-      screen.getByRole("link", { name: /settings → features/i }),
+      screen.getByRole("link", { name: /features & integrations/i }),
     ).toHaveProperty("pathname", "/admin/features");
   });
 

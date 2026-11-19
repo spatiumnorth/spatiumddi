@@ -3,9 +3,16 @@ import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Pencil, Plus, Trash2 } from "lucide-react";
 
-import { asnsApi, type BGPPeering, type BGPRelationshipType } from "@/lib/api";
+import {
+  asnsApi,
+  formatApiError,
+  type BGPPeering,
+  type BGPRelationshipType,
+} from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { cn } from "@/lib/utils";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -134,11 +141,7 @@ function PeeringFormModal({
       onClose();
     },
     onError: (e: unknown) => {
-      const err = e as {
-        response?: { data?: { detail?: string } };
-        message?: string;
-      };
-      setError(err?.response?.data?.detail ?? err?.message ?? "Save failed");
+      setError(formatApiError(e, "Save failed"));
     },
   });
 
@@ -261,7 +264,9 @@ function PeeringFormModal({
             placeholder="Free-form notes — IXP / circuit ID / contract tag…"
           />
         </div>
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
         <div className="flex justify-end gap-2 pt-2">
           <button
             type="button"
@@ -288,6 +293,16 @@ function PeeringFormModal({
 
 export function PeeringsTab({ asnId }: { asnId: string }) {
   const qc = useQueryClient();
+  // #2518 — the router asks write (delete) on 'manage_asns', as the ASN list does.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "manage_asns"),
+    "Requires write permission on ASNs",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "manage_asns"),
+    "Requires delete permission on ASNs",
+  );
   const { data: peerings = [] } = useQuery({
     queryKey: ["asn-peerings", asnId],
     queryFn: () => asnsApi.listPeerings({ asn_id: asnId }),
@@ -306,8 +321,8 @@ export function PeeringsTab({ asnId }: { asnId: string }) {
       <div className="flex items-center justify-between">
         <p className="text-xs text-muted-foreground">
           Operator-curated BGP relationships involving this ASN. Direction shown
-          from this AS's perspective: ``→ outbound`` = this AS is the local
-          side; ``← inbound`` = the counterparty is.
+          from this AS's perspective: <code>→ outbound</code> = this AS is the
+          local side; <code>← inbound</code> = the counterparty is.
         </p>
         <button
           type="button"
@@ -315,7 +330,8 @@ export function PeeringsTab({ asnId }: { asnId: string }) {
             setEditing(null);
             setShowForm(true);
           }}
-          className="inline-flex items-center gap-1 rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-accent"
+          className="inline-flex items-center gap-1 rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-accent disabled:opacity-50"
+          {...writeGate}
         >
           <Plus className="h-4 w-4" />
           Add Peering
@@ -379,7 +395,9 @@ export function PeeringsTab({ asnId }: { asnId: string }) {
                             setShowForm(true);
                           }}
                           title="Edit"
-                          className="rounded p-1 hover:bg-accent"
+                          aria-label="Edit"
+                          className="rounded p-1 hover:bg-accent disabled:opacity-50"
+                          {...writeGate}
                         >
                           <Pencil className="h-3.5 w-3.5" />
                         </button>
@@ -399,7 +417,9 @@ export function PeeringsTab({ asnId }: { asnId: string }) {
                           }}
                           disabled={deleteMut.isPending}
                           title="Delete"
+                          aria-label="Delete"
                           className="rounded p-1 text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30 disabled:opacity-50"
+                          {...deleteGate}
                         >
                           <Trash2 className="h-3.5 w-3.5" />
                         </button>

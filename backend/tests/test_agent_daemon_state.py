@@ -156,11 +156,17 @@ def test_null_is_unknown_not_unhealthy() -> None:
 # every agent change without pulling agent/ into this suite's CI gate (#821).
 _AGENT_REASONS = [
     ("start deferred, no bundle yet", False),  # dns supervisor.py
+    # dns oom_watch.py (#1725): named killed by the container's memory limit
+    (
+        "oom_killed: named was killed for exceeding the container's 2 GiB memory limit",
+        False,
+    ),
     ("config_apply_reverted: named-checkconf failed", True),  # dns + dhcp sync.py
     ("config_apply_revert_failed: rndc reconfig failed", True),  # dns sync.py
     ("config_apply_no_previous: named-checkconf failed", True),  # dns sync.py
     ("dhcp4_config_rejected: pool 10.0.0.0/24 is not part of the subnet", True),
     ("dhcp6_config_rejected: unknown option", True),
+    ("config_apply_unvalidated: dhcp4: kea-dhcp4 -t timed out after 30s", True),  # dhcp
     ("dhcp4_socket_unreachable: [Errno 111] Connection refused", False),
     ("dhcp6_socket_unreachable: [Errno 2] No such file or directory", False),
 ]

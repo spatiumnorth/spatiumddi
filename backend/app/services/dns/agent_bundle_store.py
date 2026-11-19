@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import gzip
 import json
+import struct
 import uuid
+import zlib
 from datetime import datetime
 from typing import Any
 
@@ -34,6 +36,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.core.versions import canonical_version
 from app.models.dns import DNSAgentBundle, DNSServer
 
 logger = structlog.get_logger(__name__)
@@ -61,7 +64,53 @@ _MAX_ERROR = 2000
 # replaces a newer render during a rolling upgrade (which the ``app_version``
 # equality check before #1185 did every 30 s), and a release that leaves the
 # renderer alone re-renders nothing.
-RENDERER_REVISION = 1
+#
+# 2 (#1171): every zone copy carries its SOA timers.
+# 3 (#1373): a zone's serial left the structural fingerprint of a group
+#   without views.
+# 4 (#1373): a group's zones are listed by name, not in the order Postgres
+#   happened to read them.
+# 5 (#1171, #1373): 4 with #1171's later change, which serves a zone's own SOA
+#   timers only once the group's last BIND9 agent renders them.
+# 6 (#1513): a Technitium server's bundle carries ``svcb_target_rule``, and
+#   its SVCB / HTTPS targets the trailing dot migration a3d9e5c17b42 wrote.
+# 7 (#1759): a Technitium server's bundle also carries ``name_target_rule``, and
+#   its CNAME / DNAME / NS / PTR / MX / SRV / NAPTR targets the trailing dot
+#   migration d6b2f81a3c57 wrote.
+# 8 (#1523): the bundle ships the NOTIFY fields (server options
+#   ``notify_enabled`` / ``also_notify`` / ``allow_notify`` and the zone
+#   ``allow_query`` / ``also_notify`` / ``notify_enabled`` overrides).
+# 9 (#1786): a BIND9 server's bundle carries ``allow_recursion`` (the agent now
+#   renders ``allow-recursion``).
+# 10 (#1817): the BIND9 agent renders ``allow_recursion`` literally and its
+#   stored default is local + private networks (migration b8e41c7a2d95).
+# 11 (#1706): with views, the group's blocklist zone is no longer shipped into
+#   a group whose every view already carries the group's lists in its own.
+# 12 (#2157): a BIND9 bundle's RPZ zones carry ``rpz_sha256``, the content hash
+#   the agent keys its "this RPZ file is unchanged, hard-link it" decision on.
+#   Bundles without a blocklist, and every non-BIND9 bundle, are byte-identical
+#   to 11's, so the re-render this bump forces moves no ETag for them.
+# 13 (#2124): a ``sinkhole`` entry whose list names an address carries
+#   ``sinkhole_ip`` (the agent renders it as A + AAAA local data). It is part
+#   of the entry, so it is inside ``rpz_sha256`` too.
+# 14 (#2264): a BIND9 server's bundle carries a non-default ``allow_query_cache``
+#   (the agent now renders ``allow-query-cache``); unchanged for default groups.
+# 15 (#2835): the legacy group key in ``tsig_keys`` carries ``loopback: true``,
+#   which the BIND9 agent reads to grant that key (alone) the SOA its record ops
+#   now carry under ``update-policy``. Unchanged for a group without that key;
+#   for one with it the ETag moves once, so every agent re-renders at the
+#   upgrade instead of at the group's first change.
+# 16 (#3560, #3609): a BIND9 group stored at ``dnssec_validation: yes`` with no
+#   trust anchor renders ``auto``, and a stored static root anchor renders as
+#   ``initial-key``. Unchanged for every other group; for one in either state
+#   the ETag moves once, so a group BIND refused before the upgrade converges at
+#   the upgrade instead of at its first change.
+# 17 (#3638): a zone pinned to a view renders into that view alone among the
+#   operator views, even when one of its records names another view (left by
+#   a re-pin or a restore). Unchanged for every other zone; a group holding
+#   such a zone stops serving it in the other view at the upgrade instead of
+#   at its next change.
+RENDERER_REVISION = 17
 
 
 def _serves(revision: int | None) -> bool:
@@ -80,27 +129,63 @@ def is_current(server: DNSServer) -> bool:
     )
 
 
+#: How a body is serialised on the wire. These are Starlette
+#: ``JSONResponse.render``'s kwargs, not ``json.dumps``'s defaults (#958):
+#: compact separators, raw UTF-8, no bare ``NaN``. ``default=str`` matches
+#: what ``_compute_etag`` hashes, so the body and the ETag stay consistent.
+#: The streamed render (#1662) encodes each batch of blocklist entries with
+#: these same kwargs.
+WIRE_JSON: dict[str, Any] = {
+    "ensure_ascii": False,
+    "allow_nan": False,
+    "separators": (",", ":"),
+    "default": str,
+}
+
+_GZIP_LEVEL = 6
+
+
 def encode_body(body: Any) -> bytes:
     """Serialise ``body`` (a JSON value — the bundle body, or the ops page)
-    exactly as the route sends it on the wire.
-
-    These are Starlette ``JSONResponse.render``'s kwargs, not ``json.dumps``'s
-    defaults (#958): compact separators, raw UTF-8, no bare ``NaN``.
-    ``default=str`` matches what ``_compute_etag`` hashes, so the body and
-    the ETag stay consistent.
-    """
-    return json.dumps(
-        body,
-        ensure_ascii=False,
-        allow_nan=False,
-        separators=(",", ":"),
-        default=str,
-    ).encode("utf-8")
+    exactly as the route sends it on the wire (``WIRE_JSON``)."""
+    return json.dumps(body, **WIRE_JSON).encode("utf-8")
 
 
 def compress_body(body_json: bytes) -> bytes:
     """gzip at rest. ``mtime=0`` keeps the bytes deterministic for one input."""
-    return gzip.compress(body_json, compresslevel=6, mtime=0)
+    return gzip.compress(body_json, compresslevel=_GZIP_LEVEL, mtime=0)
+
+
+class BodyWriter:
+    """A body gzipped as it is written (#1662), so that a render never holds
+    the whole of it uncompressed.
+
+    ``finish()`` returns exactly ``compress_body`` of everything written: the
+    header ``gzip.compress`` writes for this level and ``mtime=0``, one raw
+    deflate stream at the same level (its output does not depend on how the
+    input is split), then the CRC-32 and length trailer.
+    ``tests/test_dns_agent_bundle_blocklist_stream_1662.py`` pins the bytes.
+    """
+
+    _HEADER = gzip.compress(b"", compresslevel=_GZIP_LEVEL, mtime=0)[:10]
+
+    def __init__(self) -> None:
+        self._deflate = zlib.compressobj(_GZIP_LEVEL, zlib.DEFLATED, -zlib.MAX_WBITS)
+        self._parts: list[bytes] = [self._HEADER]
+        self._crc = 0
+        self.size = 0
+
+    def write(self, data: bytes) -> None:
+        self._crc = zlib.crc32(data, self._crc)
+        self.size += len(data)
+        out = self._deflate.compress(data)
+        if out:
+            self._parts.append(out)
+
+    def finish(self) -> bytes:
+        self._parts.append(self._deflate.flush())
+        self._parts.append(struct.pack("<LL", self._crc, self.size & 0xFFFFFFFF))
+        return b"".join(self._parts)
 
 
 async def current(db: AsyncSession, server: DNSServer) -> DNSAgentBundle | None:
@@ -131,13 +216,21 @@ async def newest(db: AsyncSession, server: DNSServer) -> DNSAgentBundle | None:
     """
     if server.bundle_watermark is None or not _serves(server.bundle_renderer_revision):
         return None
+    # populate_existing (#2040): the long-poll calls this once per pass on one
+    # session while still holding the previous pass's row, and a newer
+    # renderer revision re-renders a watermark IN PLACE (same id, ``store``).
+    # Without it the identity map hands back the old ETag and snapshot, so the
+    # poll compares against an ETag that no longer exists and the render
+    # reaches the agent only at the long-poll timeout.
     return (
         await db.execute(
-            select(DNSAgentBundle).where(
+            select(DNSAgentBundle)
+            .where(
                 DNSAgentBundle.server_id == server.id,
                 DNSAgentBundle.dirty_watermark == server.bundle_watermark,
                 DNSAgentBundle.renderer_revision >= RENDERER_REVISION,
             )
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
 
@@ -164,12 +257,18 @@ async def store(
     etag: str,
     structural_etag: str,
     ships_ops: bool,
-    body_json: bytes,
+    body_gz: bytes,
+    body_bytes: int,
     records: int,
     render_ms: int,
     rendered_by: str,
+    packed_blocklists: bool = False,
 ) -> DNSAgentBundle | None:
     """Insert one rendered bundle and mirror it onto the server row.
+
+    ``body_gz`` is the body already compressed (``compress_body``, or a
+    ``BodyWriter`` the render streamed it into, #1662) and ``body_bytes`` its
+    uncompressed length.
 
     Returns ``None`` — and writes nothing — when a row for
     ``(server, dirty_watermark)`` from this renderer revision or a newer one
@@ -183,8 +282,8 @@ async def store(
     back. The render counter is incremented in SQL so it is exact under
     that race.
     """
-    body_gz = compress_body(body_json)
-    app_version = settings.version
+    # The same spelling GET /version reports (#2354).
+    app_version = canonical_version(settings.version, settings.app_version)
     payload: dict[str, Any] = {
         "snapshot_at": snapshot_at,
         "visible_xacts": visible_xacts,
@@ -192,13 +291,14 @@ async def store(
         "structural_etag": structural_etag,
         "ships_ops": ships_ops,
         "body": body_gz,
-        "body_bytes": len(body_json),
+        "body_bytes": body_bytes,
         "body_gzip_bytes": len(body_gz),
         "records": records,
         "render_ms": render_ms,
         "rendered_by": rendered_by,
         "app_version": app_version,
         "renderer_revision": RENDERER_REVISION,
+        "packed_blocklists": packed_blocklists,
     }
     insert_stmt = pg_insert(DNSAgentBundle).values(
         id=uuid.uuid4(), server_id=server.id, dirty_watermark=dirty_watermark, **payload
@@ -225,6 +325,28 @@ async def store(
         return None
     new_id, built_at = inserted
 
+    # ONE statement for every write to the server row (#2031). A second UPDATE
+    # of a row this transaction already updated re-runs the row's foreign-key
+    # checks even though no key changed (Postgres fires them whenever the old
+    # version is the transaction's own), taking FOR KEY SHARE on the parent
+    # rows — the server's group and appliance. A transaction that holds one of
+    # those FOR UPDATE and then wants the server row (an agent registration's
+    # SOA-timer switch marking the group's bundles at commit, an appliance
+    # role save) queues behind the first UPDATE, and the second then queues
+    # behind it: 40P01. Written once, the row is only ever locked, never
+    # re-checked, so the render never waits on a parent.
+    #
+    # The render counters always move; the mirror columns only move forward
+    # (``advances``), so a slow render that finishes after a newer one cannot
+    # roll the served bundle back.
+    advances = or_(
+        DNSServer.bundle_watermark.is_(None),
+        DNSServer.bundle_watermark <= dirty_watermark,
+    )
+
+    def _if_advancing(value: Any, column: Any) -> Any:
+        return case((advances, value), else_=column)
+
     await db.execute(
         update(DNSServer)
         .where(DNSServer.id == server.id)
@@ -233,31 +355,24 @@ async def store(
             bundle_render_status=RENDER_STATUS_OK,
             bundle_render_error=None,
             bundle_render_at=func.now(),
-        )
-    )
-    await db.execute(
-        update(DNSServer)
-        .where(
-            DNSServer.id == server.id,
-            or_(
-                DNSServer.bundle_watermark.is_(None),
-                DNSServer.bundle_watermark <= dirty_watermark,
+            bundle_watermark=_if_advancing(dirty_watermark, DNSServer.bundle_watermark),
+            bundle_etag=_if_advancing(etag, DNSServer.bundle_etag),
+            bundle_built_at=_if_advancing(built_at, DNSServer.bundle_built_at),
+            bundle_rendered_by=_if_advancing(rendered_by, DNSServer.bundle_rendered_by),
+            bundle_app_version=_if_advancing(app_version, DNSServer.bundle_app_version),
+            bundle_renderer_revision=_if_advancing(
+                RENDERER_REVISION, DNSServer.bundle_renderer_revision
             ),
-        )
-        .values(
-            bundle_watermark=dirty_watermark,
-            bundle_etag=etag,
-            bundle_built_at=built_at,
-            bundle_rendered_by=rendered_by,
-            bundle_app_version=app_version,
-            bundle_renderer_revision=RENDERER_REVISION,
             # Caught up: nothing is waiting. Still behind — changes landed
             # while this render ran — restart the clock from now, so the
             # stalled-render alert measures time without a render landing,
             # not the length of a write storm that renders keep up with.
-            bundle_dirty_at=case(
-                (DNSServer.bundle_dirty_seq <= dirty_watermark, None),
-                else_=func.now(),
+            bundle_dirty_at=_if_advancing(
+                case(
+                    (DNSServer.bundle_dirty_seq <= dirty_watermark, None),
+                    else_=func.now(),
+                ),
+                DNSServer.bundle_dirty_at,
             ),
         )
     )
@@ -272,7 +387,7 @@ async def store(
         etag=etag,
         structural_etag=structural_etag,
         records=records,
-        body_bytes=len(body_json),
+        body_bytes=body_bytes,
         body_gzip_bytes=len(body_gz),
         render_ms=render_ms,
         rendered_by=rendered_by,
@@ -327,6 +442,8 @@ async def record_failure(db: AsyncSession, server_id: uuid.UUID, error: str) -> 
 
 __all__ = [
     "RENDERER_REVISION",
+    "WIRE_JSON",
+    "BodyWriter",
     "DYNAMIC_KEYS",
     "RENDERED_BY_API",
     "RENDERED_BY_WORKER",

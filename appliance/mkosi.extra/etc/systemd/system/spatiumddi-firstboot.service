@@ -14,6 +14,13 @@ ConditionKernelCommandLine=!boot=live
 # readyz wait at the end of firstboot.
 After=network-online.target spatium-etc-reconcile.service
 Wants=network-online.target
+# #1910 — firstboot's state is in the /etc overlay's upper: the .env it
+# created on the first boot and the role-config it reads. On a boot whose
+# etc.mount failed it ran against the slot's bare /etc, generated a fresh
+# .env "(first boot)" with new secrets and skipped every role-config step.
+# Like k3s, it needs the overlay.
+Requires=etc.mount
+After=etc.mount
 
 [Service]
 Type=oneshot

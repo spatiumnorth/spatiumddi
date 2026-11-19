@@ -8,11 +8,19 @@ metadata:
   labels:
     {{- include "spatiumddi.componentLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
 spec:
+  {{- /* #3111: while the autoscaler is on (the default) it alone sets the count.
+         Helm 4 applies server-side, and a rendered count made helm an owner of
+         the field the autoscaler writes through the scale subresource: once it
+         had scaled, every helm upgrade failed on .spec.replicas (and under Helm
+         3 each upgrade reset the count to api.replicas). With the autoscaler off
+         (the appliance) helm sets it from api.replicas, as before. */}}
+  {{- if not .Values.api.autoscaling.enabled }}
   replicas: {{ .Values.api.replicas }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 6 }}
-  {{- include "spatiumddi.deploymentStrategy" (dict "mode" .Values.api.podAntiAffinity "replicas" .Values.api.replicas) | nindent 2 }}
+  {{- include "spatiumddi.deploymentStrategy" (dict "mode" .Values.api.podAntiAffinity "replicas" .Values.api.replicas "root" $ "deployment" (printf "%s-api" (include "spatiumddi.fullname" .)) "container" "api") | nindent 2 }}
   template:
     metadata:
       labels:
@@ -26,11 +34,24 @@ spec:
       {{- with (include "spatiumddi.priorityClassName" (dict "component" .Values.api.priorityClassName "fallback" (.Values.global).priorityClassName)) }}
       priorityClassName: {{ . | quote }}
       {{- end }}
-      {{- with (include "spatiumddi.seccompProfileType" $) }}
+      {{- $seccompType := include "spatiumddi.seccompProfileType" $ }}
+      {{- if or $seccompType .Values.api.applianceHostMounts.enabled }}
       securityContext:
+        {{- with $seccompType }}
         seccompProfile:
           type: {{ . }}
+        {{- end }}
+        {{- if .Values.api.applianceHostMounts.enabled }}
+        # GHSA-h2j9-qrg7-grfw — the host's release-state trigger directory
+        # is 1770 root:<hostGroupGid>, no longer world-writable, so the api
+        # (uid 1000) needs this gid to keep writing the slot-upgrade,
+        # rollback, reboot and maintenance triggers.
+        supplementalGroups:
+          - {{ .Values.api.applianceHostMounts.hostGroupGid }}
+        {{- end }}
       {{- end }}
+      # #2944 — the image's uvicorn runs --timeout-graceful-shutdown 20, below
+      # this, so lifespan shutdown (engine dispose) runs before the SIGKILL.
       terminationGracePeriodSeconds: 30
       {{- if .Values.api.serviceAccount.enabled }}
       # Phase 11 wave 4 (#183) — the api uses kubeapi for two things
@@ -52,19 +73,24 @@ spec:
         - name: api
           image: {{ include "spatiumddi.image" (merge (dict "imageName" "spatiumddi-api") .) }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if not (include "spatiumddi.isOpenShift" .) }}
           # Pin the runtime uid/gid to the image's ``app`` user (1000) so the
           # slot-images hostPath — chowned 1000:1000 by spatiumddi-firstboot
           # (#415) — is writable regardless of any cluster-level PodSecurity
           # default. Matches the image USER directive: a no-op on a normal
           # deploy, deterministic belt-and-braces on the appliance.
+          {{- /* #3852: omitted on OpenShift — its restricted SCC assigns the uid from the namespace's range and REFUSES a pinned one. */}}
           securityContext:
             runAsUser: 1000
             runAsGroup: 1000
+          {{- end }}
           ports:
             - name: http
               containerPort: 8000
           env:
             {{- include "spatiumddi.commonEnv" . | nindent 12 }}
+            {{- include "spatiumddi.sharedEnv" . | nindent 12 }}
+            {{- include "spatiumddi.slotImageMirrorClientEnv" . | nindent 12 }}
             {{- if $kubeletCA.enabled }}
             - name: SPATIUM_KUBELET_CA_PATH
               value: {{ $kubeletCA.mountPath | quote }}
@@ -88,29 +114,23 @@ spec:
             - name: APPLIANCE_EXTRA_CERT_SANS
               value: {{ .Values.frontend.controlPlaneVIP | quote }}
             {{- end }}
-            {{- if .Values.slotImageMirror.enabled }}
-            # #296 Phase B — when the mirror Deployment is on, the api's
-            # slot-image upload + download + delete handlers proxy byte
-            # ops to the mirror Service instead of touching local FS.
-            # See backend/app/api/v1/appliance/slot_images.py for the
-            # branching logic. The URL is the mirror's ClusterIP Service,
-            # in-cluster reachable from every api replica; the X-Mirror-
-            # Auth shared secret defends against in-cluster cross-pod
-            # forgery on top of the network isolation.
-            - name: SLOT_IMAGE_MIRROR_URL
-              value: "http://{{ include "spatiumddi.fullname" . }}-slot-image-mirror.{{ .Release.Namespace }}.svc:8000"
-            - name: SLOT_IMAGE_MIRROR_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "spatiumddi.fullname" . }}-slot-image-mirror-auth
-                  key: secret
-            {{- end }}
             {{- if .Values.api.serviceControl.enabled }}
             # #890 — opt-in lifecycle control (Settings → Services). Pair
             # with ``api.serviceControlRBAC.enabled`` or the api can see
             # the capability but kubeapi refuses every list and patch.
             - name: SERVICE_CONTROL_ENABLED
               value: "true"
+            {{- end }}
+            {{- with .Values.api.databasePool }}
+            {{- if not (kindIs "invalid" .size) }}
+            # #2156 — the pool per pod; see api.databasePool in values.yaml.
+            - name: DATABASE_POOL_SIZE
+              value: {{ .size | quote }}
+            {{- end }}
+            {{- if not (kindIs "invalid" .maxOverflow) }}
+            - name: DATABASE_MAX_OVERFLOW
+              value: {{ .maxOverflow | quote }}
+            {{- end }}
             {{- end }}
             {{- with .Values.api.env }}
             {{- toYaml . | nindent 12 }}
@@ -327,12 +347,44 @@ metadata:
     {{- include "spatiumddi.componentLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
 spec:
   type: {{ .Values.api.service.type }}
+  {{- /* #1805: see api.service.trafficDistribution in values.yaml (empty by
+         default; the appliance sets PreferSameNode). The PreferSameNode feature
+         is on by default from Kubernetes 1.34; older API servers refuse it. */}}
+  {{- if and .Values.api.service.trafficDistribution (semverCompare ">=1.34.0-0" .Capabilities.KubeVersion.Version) }}
+  trafficDistribution: {{ .Values.api.service.trafficDistribution }}
+  {{- end }}
   selector:
     {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
   ports:
     - name: http
       port: {{ .Values.api.service.port }}
       targetPort: http
+{{- if .Values.api.service.nodeLocal }}
+---
+{{- /* #3645: the appliance's second api Service. internalTrafficPolicy: Local
+       answers only from an api pod on the CALLER's node, so a caller that
+       sends plain http (the supervisor's heartbeat, the frontend's /api proxy)
+       never puts it on the node LAN. With no ready api pod on the node the
+       connection is refused rather than routed to another node; the
+       supervisor then falls back to its pinned https URL. The main Service
+       above is unchanged, for the workers, the role agents and the probes. */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "spatiumddi.fullname" . }}-api-local
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
+spec:
+  type: ClusterIP
+  internalTrafficPolicy: Local
+  selector:
+    {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.api.service.port }}
+      targetPort: http
+{{- end }}
 {{- if .Values.api.autoscaling.enabled }}
 ---
 apiVersion: autoscaling/v2
@@ -356,10 +408,15 @@ spec:
         target:
           type: Utilization
           averageUtilization: {{ .Values.api.autoscaling.targetCPUUtilizationPercentage }}
+    {{- /* #3110: memory only when asked for. A process's memory does not fall as
+           replicas are added, so a passed memory target holds the autoscaler at
+           maxReplicas (see api.autoscaling in values.yaml). */}}
+    {{- with .Values.api.autoscaling.targetMemoryUtilizationPercentage }}
     - type: Resource
       resource:
         name: memory
         target:
           type: Utilization
-          averageUtilization: {{ .Values.api.autoscaling.targetMemoryUtilizationPercentage }}
+          averageUtilization: {{ . }}
+    {{- end }}
 {{- end }}

@@ -117,5 +117,21 @@ def test_report_renders_the_generator_block_in_both_renderers(tmp_path):
            "profile_key": {}, "generator": slo["generator"]}
     builtin = collect._render_markdown_builtin(ctx)
     assert "late 300" in builtin and "REFUSED 606,138" in builtin
+    # a summary from before the resend counters: unknown, never a fabricated 0
+    assert "after a resend —" in builtin and "in flight at stop —" in builtin
     ctx["generator"] = None
     assert "_No orchestrator shard summary" in collect._render_markdown_builtin(ctx)
+
+
+def test_report_shows_how_many_leases_needed_a_resend(tmp_path):
+    """A round now runs ≈60 s before it is a timeout, so the report says how
+    many handshakes got their lease only after a resend, and how many rounds
+    were still open when the shard stopped."""
+    run = {"shard": 0, "counters": {"dora_sent": 10050, "dora_ack": 10000, "timeout": 0,
+                                    "nak": 0, "dora_ack_resent": 44, "dora_in_flight": 3}}
+    slo = collect.build_slo_results(rundata(tmp_path, [run]))
+    h = slo["generator"]["handshake"]
+    assert h["acked_after_resend"] == 44 and h["acked_without_resend"] == 9956
+    md = "\n".join(collect._generator_lines(slo["generator"]))
+    assert "without a resend 9,956 (99.56%)" in md
+    assert "after a resend 44" in md and "in flight at stop 3" in md

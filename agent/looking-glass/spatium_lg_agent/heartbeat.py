@@ -35,6 +35,7 @@ import httpx
 import structlog
 
 from . import __version__
+from .bootstrap import reauthenticate
 from .cache import save_token
 from .config import AgentConfig
 from .config_apply import ApplyStatus
@@ -103,6 +104,7 @@ class HeartbeatClient:
             # a config the control plane no longer believes is live.
             "config": self.config_apply.as_dict(),
         }
+        sent_token = self.token_ref[0]
         try:
             with self._client() as c:
                 resp = c.post(
@@ -118,12 +120,11 @@ class HeartbeatClient:
                     save_token(self.cfg.state_dir, rotated)
                     log.info("lg_agent_token_rotated")
             elif resp.status_code in (401, 404):
-                # Token invalidated or collector row deleted — clear token
-                # and exit so supervisor restarts the container (→
-                # re-bootstrap). Mirrors DHCP/DNS's 401/404 recovery.
+                # Token invalidated or collector row deleted (#2052):
+                # re-register from the PSK in this thread; stopping it made
+                # the supervisor exit the container.
                 log.warning("heartbeat_will_rebootstrap", status=resp.status_code)
-                save_token(self.cfg.state_dir, "")
-                self._stop.set()
+                reauthenticate(self.cfg, self.token_ref, sent_token)
             else:
                 log.warning("heartbeat_failed", status=resp.status_code)
         except httpx.HTTPError as e:

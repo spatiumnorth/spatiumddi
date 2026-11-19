@@ -40,7 +40,21 @@ from app.core.crypto import decrypt_str
 from app.models.audit import AuditLog
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.opnsense import OPNsenseRouter
-from app.services.integration_ownership import owned_by_other_integration, owning_integration
+from app.services._mirror_hostname import normalize_desired_hostname
+from app.services.dns.record_ops import retract_address_dns
+from app.services.integration_ownership import (
+    SpaceRelease,
+    addresses_in_space,
+    drop_wrapper_block,
+    gateway_changed,
+    move_stays_in_space,
+    owned_addresses_in_space,
+    owned_by_other_integration,
+    owning_integration,
+    refuse_sync_into_trashed_space,
+    retire_vanished_subnet,
+)
+from app.services.ipam.utilization import counts_toward_utilization
 from app.services.opnsense.client import (
     OPNsenseClient,
     OPNsenseClientError,
@@ -84,6 +98,9 @@ class _DesiredAddress:
     mac: str | None = None
     auto_from_lease: bool = False
 
+    def __post_init__(self) -> None:
+        normalize_desired_hostname(self)
+
 
 @dataclass
 class ReconcileSummary:
@@ -108,6 +125,9 @@ class ReconcileSummary:
     addresses_deleted: int = 0
     skipped_no_subnet: int = 0
     warnings: list[str] = field(default_factory=list)
+    # #2577 — what this sync released outside the target's IP space
+    # (``integration_ownership.release_outside_space``).
+    released: SpaceRelease = field(default_factory=SpaceRelease)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -182,7 +202,7 @@ async def _recompute_subnet_utilization(db: AsyncSession, subnet_id: Any) -> Non
             select(func.count())
             .select_from(IPAddress)
             .where(IPAddress.subnet_id == subnet_id)
-            .where(IPAddress.status != "available")
+            .where(counts_toward_utilization())
         )
         or 0
     )
@@ -359,29 +379,20 @@ async def _apply_blocks_and_subnets(
     used_wrapper_cidrs: set[str] = set()
 
     # Delete router-owned subnets that disappeared upstream — but only
-    # when no non-OPNsense IPAddress rows still live in them. IPAddress
-    # → Subnet is ON DELETE CASCADE with no soft-delete, so a blind
-    # delete here would also sweep operator-created rows and the rows
-    # _apply_addresses deliberately un-claimed (opnsense_router_id=None).
-    # If any such survivor exists we un-claim the subnet (leave it as a
+    # when nothing operator-made hangs off them. IPAddress and DHCPScope
+    # → Subnet are ON DELETE CASCADE, so a blind delete here would also
+    # sweep operator-created addresses, the rows _apply_addresses
+    # deliberately un-claimed (opnsense_router_id=None), and any DHCP
+    # scope on the subnet, live or in Trash (#3532). When any such
+    # content exists we un-claim the subnet (leave it as a
     # manually-managed entry) instead, mirroring the wrapper-block guard
     # below and the address-level un-claim in _apply_addresses.
     for net_str, row in current_subnets.items():
         if net_str in desired_map:
             continue
-        surviving_foreign = await db.scalar(
-            select(func.count())
-            .select_from(IPAddress)
-            .where(IPAddress.subnet_id == row.id)
-            .where(IPAddress.opnsense_router_id.is_(None))
-        )
-        if surviving_foreign:
-            # Operator / other-owned addresses still depend on this
-            # subnet — don't cascade-delete them. Hand the subnet back.
-            row.opnsense_router_id = None
+        if await retire_vanished_subnet(db, row, "opnsense_router_id", warnings=summary.warnings):
             summary.subnets_updated += 1
         else:
-            await db.delete(row)
             summary.subnets_deleted += 1
 
     for net_str, d in desired_map.items():
@@ -445,7 +456,7 @@ async def _apply_blocks_and_subnets(
             if existing.description != d.description:
                 existing.description = d.description
                 changed = True
-            if d.gateway and existing.gateway != d.gateway:
+            if gateway_changed(existing.gateway, d.gateway):
                 existing.gateway = d.gateway
                 changed = True
             if existing.total_ips != expected_total:
@@ -460,9 +471,7 @@ async def _apply_blocks_and_subnets(
     for net_str, wrapper in router_owned_wrappers.items():
         if net_str in used_wrapper_cidrs:
             continue
-        refs = await db.execute(select(Subnet).where(Subnet.block_id == wrapper.id))
-        if refs.scalar_one_or_none() is None:
-            await db.delete(wrapper)
+        if await drop_wrapper_block(db, wrapper, "opnsense_router_id", warnings=summary.warnings):
             summary.blocks_deleted += 1
 
 
@@ -474,6 +483,9 @@ async def _apply_addresses(
     router: OPNsenseRouter,
     desired: list[_DesiredAddress],
     summary: ReconcileSummary,
+    *,
+    protect_leases: bool = False,
+    protect_reservations: bool = False,
 ) -> None:
     subnet_rows = (
         (await db.execute(select(Subnet).where(Subnet.space_id == router.ipam_space_id)))
@@ -481,6 +493,7 @@ async def _apply_addresses(
         .all()
     )
     subnets = list(subnet_rows)
+    space_subnet_ids = {s.id for s in subnets}
 
     # Dedupe by address. A reservation + a lease on the same IP collapse
     # to one desired row; the first-seen wins (reservations are added
@@ -510,18 +523,9 @@ async def _apply_addresses(
         # legitimate row in its own space (and Phase 1 could stamp the FK
         # onto a foreign-space row). Join through Subnet → space_id keeps
         # both the claim and the unclaimable guard inside our space.
-        existing = (
-            (
-                await db.execute(
-                    select(IPAddress)
-                    .join(Subnet, IPAddress.subnet_id == Subnet.id)
-                    .where(Subnet.space_id == router.ipam_space_id)
-                    .where(IPAddress.address.in_(desired_addrs))
-                )
-            )
-            .scalars()
-            .all()
-        )
+        # The shared helper is the one every reconciler uses since #2577,
+        # which found this fix had been applied here and nowhere else.
+        existing = await addresses_in_space(db, router.ipam_space_id, desired_addrs)
         for row in existing:
             if row.opnsense_router_id == router.id:
                 continue  # already ours
@@ -542,13 +546,34 @@ async def _apply_addresses(
                 row.user_modified_at = datetime.now(UTC)
         await db.flush()
 
-    res = await db.execute(select(IPAddress).where(IPAddress.opnsense_router_id == router.id))
-    current = {str(a.address): a for a in res.scalars().all()}
+    # #2577 — the rows we may update, move and absence-delete: ours AND in
+    # our space. One carrying our FK in another space is released first (#2577).
+    current = {
+        str(a.address): a
+        for a in await owned_addresses_in_space(
+            db, "opnsense_router_id", router.id, router.ipam_space_id, summary=summary
+        )
+    }
 
     dirty_subnets: set[Any] = {s.id for s in subnets if s.opnsense_router_id == router.id}
 
+    gone: list[IPAddress] = []
     for addr, row in current.items():
         if addr not in desired_map:
+            # #1556 — a category whose backend REFUSED the API user
+            # (403) contributed nothing to ``desired`` this pass, so its
+            # rows' absence proves nothing. Freeze them (no delete, no
+            # un-claim) for this pass, mirroring the Cloud reconciler's
+            # ``allow_delete`` partial-pull guard. The all-404 case is
+            # untouched: an absent backend sets no protection, and its
+            # rows are deleted as before. Lease rows are identified by
+            # ``auto_from_lease``; reservation rows by ``reserved``
+            # status (interface-gateway rows share that status but are
+            # in ``desired_map`` whenever their interface still exists).
+            if protect_leases and row.auto_from_lease:
+                continue
+            if protect_reservations and row.status == "reserved" and not row.auto_from_lease:
+                continue
             dirty_subnets.add(row.subnet_id)
             if row.user_modified_at is not None:
                 # Operator has invested edits — un-claim, leave the row
@@ -556,8 +581,12 @@ async def _apply_addresses(
                 row.opnsense_router_id = None
                 summary.addresses_updated += 1
             else:
-                await db.delete(row)
+                gone.append(row)
                 summary.addresses_deleted += 1
+    # #3200 — one retraction for the whole sweep, before the deletes flush.
+    await retract_address_dns(db, [r.id for r in gone])
+    for row in gone:
+        await db.delete(row)
 
     for addr, d in desired_map.items():
         # A row at this address is owned by another firewall / integration
@@ -574,6 +603,13 @@ async def _apply_addresses(
             changed = False
             # subnet_id is factual — always update.
             if row.subnet_id != subnet.id:
+                # #2577 — never re-parent a row across IP spaces.
+                if not move_stays_in_space(row.subnet_id, space_subnet_ids):
+                    summary.warnings.append(
+                        f"address {addr}: current subnet is outside this target's "
+                        f"IP space; not moving"
+                    )
+                    continue
                 dirty_subnets.add(row.subnet_id)
                 row.subnet_id = subnet.id
                 changed = True
@@ -667,6 +703,10 @@ def _warn_on_dhcp_backends(
 
 async def reconcile_router(db: AsyncSession, router: OPNsenseRouter) -> ReconcileSummary:
     summary = ReconcileSummary(ok=False)
+    # #2577 — a target whose IP space is in Trash syncs nothing: it would
+    # rebuild its rows as live rows inside the trashed space.
+    if await refuse_sync_into_trashed_space(db, router, summary):
+        return summary
 
     api_secret = ""
     if router.api_secret_encrypted:
@@ -715,6 +755,26 @@ async def reconcile_router(db: AsyncSession, router: OPNsenseRouter) -> Reconcil
     leases = lease_result.leases if lease_result is not None else []
     reservations = reservation_result.reservations if reservation_result is not None else []
     _warn_on_dhcp_backends(router, lease_result, reservation_result, summary)
+    # #1556 — any 403 in a category freezes that category's rows for
+    # this pass (see _apply_addresses). ``sources_found == []`` caused
+    # purely by refusals is covered by the same check: every refused
+    # backend lands in ``sources_forbidden``.
+    leases_refused = lease_result is not None and bool(lease_result.sources_forbidden)
+    reservations_refused = reservation_result is not None and bool(
+        reservation_result.sources_forbidden
+    )
+    if leases_refused:
+        summary.warnings.append(
+            "DHCP leases: a backend refused the API user — absence-delete is "
+            "suspended for mirrored lease rows this pass so they are frozen, "
+            "not deleted, until access is restored"
+        )
+    if reservations_refused:
+        summary.warnings.append(
+            "static reservations: a backend refused the API user — absence-delete "
+            "is suspended for mirrored reservation rows this pass so they are "
+            "frozen, not deleted, until access is restored"
+        )
     if not interfaces:
         # Every mirrored address needs an enclosing subnet, and subnets
         # come only from interfaces — so zero interfaces silently zeroes
@@ -738,7 +798,14 @@ async def reconcile_router(db: AsyncSession, router: OPNsenseRouter) -> Reconcil
     )
 
     await _apply_blocks_and_subnets(db, router, desired_subnets, summary)
-    await _apply_addresses(db, router, desired_addresses, summary)
+    await _apply_addresses(
+        db,
+        router,
+        desired_addresses,
+        summary,
+        protect_leases=leases_refused,
+        protect_reservations=reservations_refused,
+    )
 
     router.last_synced_at = datetime.now(UTC)
     router.last_sync_error = None
@@ -758,6 +825,8 @@ async def reconcile_router(db: AsyncSession, router: OPNsenseRouter) -> Reconcil
             resource_id=str(router.id),
             resource_display=router.name,
             new_value={
+                # #2577 — what the sync released outside the target's IP space.
+                "released": summary.released.as_dict(),
                 "blocks": {
                     "created": summary.blocks_created,
                     "deleted": summary.blocks_deleted,
@@ -782,6 +851,7 @@ async def reconcile_router(db: AsyncSession, router: OPNsenseRouter) -> Reconcil
     summary.ok = True
     logger.info(
         "opnsense_reconcile_ok",
+        **summary.released.log_fields(),
         router=str(router.id),
         firmware=summary.firmware_version,
         interfaces=summary.interface_count,

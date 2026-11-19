@@ -55,6 +55,8 @@ class AnnouncedPrefixesArgs(BaseModel):
 
 @register_tool(
     name="asn_announced_prefixes",
+    outbound=True,
+    permission=("read", "manage_asns"),
     description=(
         "Prefixes currently announced by an AS, sourced from "
         "RIPEstat. Returns a list of CIDRs with first-seen / "
@@ -83,6 +85,8 @@ class IxpPresenceArgs(BaseModel):
 
 @register_tool(
     name="asn_ixp_presence",
+    outbound=True,
+    permission=("read", "manage_asns"),
     description=(
         "IXP membership rollup for an AS, sourced from PeeringDB. "
         "Each row is one peering port at one IX (IX name, city, "
@@ -111,6 +115,8 @@ class PeeringProfileArgs(BaseModel):
 
 @register_tool(
     name="asn_peering_profile",
+    outbound=True,
+    permission=("read", "manage_asns"),
     description=(
         "PeeringDB network record for an AS — registered org name, "
         "info_type (Content / NSP / Cable/DSL/ISP / Enterprise / "
@@ -144,6 +150,8 @@ class PrefixOriginArgs(BaseModel):
 
 @register_tool(
     name="prefix_origin",
+    outbound=True,
+    permission=("read", "manage_asns"),
     description=(
         "For a given IP or CIDR, return the originating AS(es) plus "
         "the enclosing prefix and announcement state, sourced from "
@@ -180,6 +188,8 @@ class RoutingHistoryArgs(BaseModel):
 
 @register_tool(
     name="prefix_routing_history",
+    outbound=True,
+    permission=("read", "manage_asns"),
     description=(
         "Timeline of origin-AS changes for an IP or prefix, sourced "
         "from RIPEstat. Returns events ordered oldest → newest with "

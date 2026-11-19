@@ -5,8 +5,10 @@ Pools live under a zone; members live under a pool. The actual
 apply-state service and flagged with ``pool_member_id`` — this router
 only manages the pool config + member roster + manual triggers.
 
-Permission gate: ``manage_dns_pools`` (admin-only). Seeded into the
-existing "DNS Editor" builtin role at startup.
+Permission gate: ``manage_dns_pools`` on the router, and every write is
+superadmin-only on top: creating a pool arms control-plane health checks
+that probe its members, so pools are infrastructure rather than everyday
+DNS data (#1861). The built-in "DNS Editor" role holds ``read`` on it.
 """
 
 from __future__ import annotations
@@ -25,12 +27,35 @@ from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.agent_wake import collect_wake, dns_group_channel
 from app.core.dns_names import validate_record_owner
 from app.core.permissions import require_resource_permission
+from app.core.update_nulls import resolve_update_changes
 from app.models.audit import AuditLog
 from app.models.dns import DNSPool, DNSPoolMember, DNSZone
 from app.models.ownership import Site
-from app.services.dns.pool_apply import apply_pool_state
+from app.services.api_token_scopes import token_write
+from app.services.dns import technitium_api_scope
+from app.services.dns.pool_apply import apply_pool_state, withdraw_member_records
+from app.services.dns.pool_health_staleness import (
+    is_member_check_stale,
+    member_check_age_seconds,
+)
+from app.services.dns.zone_synthesis import unauthored_zone_error
 
 logger = structlog.get_logger(__name__)
+
+
+async def _refuse_on_technitium_api(db: DB, group_id: uuid.UUID) -> None:
+    """422 pool create / membership on an experimental technitium_api group (#1784).
+
+    The driver writes an A/AAAA rrset one record per call; a pool's members
+    collapse to one of them. Existing pools on such a group keep serving and
+    show a warning on the group; only NEW pools and members are refused.
+    """
+    if await technitium_api_scope.group_is_technitium_api(db, group_id):
+        raise technitium_api_scope.refusal(
+            "DNS pools are not supported; the members of a pool collapse to a "
+            "single record on the Technitium server (#1769)."
+        )
+
 
 router = APIRouter(
     tags=["dns-pools"],
@@ -95,6 +120,11 @@ class PoolMemberResponse(BaseModel):
     last_check_state: str
     last_check_at: datetime | None
     last_check_error: str | None
+    # The verdict is older than 3 x the pool's check interval: the health-check
+    # dispatcher has stopped refreshing it, but a ``healthy`` member is still
+    # served (fail-open). ``check_age_seconds`` is None when never checked (#2312).
+    check_stale: bool = False
+    check_age_seconds: int | None = None
     consecutive_failures: int
     consecutive_successes: int
     created_at: datetime
@@ -212,6 +242,13 @@ async def _assert_site_exists(db: DB, site_id: uuid.UUID | None) -> None:
         raise HTTPException(status_code=404, detail=f"Site {site_id} not found")
 
 
+def _member_response(m: DNSPoolMember, pool: DNSPool) -> PoolMemberResponse:
+    out = PoolMemberResponse.model_validate(m, from_attributes=True)
+    out.check_stale = is_member_check_stale(pool, m)
+    out.check_age_seconds = member_check_age_seconds(m)
+    return out
+
+
 def _pool_to_response(p: DNSPool) -> PoolResponse:
     return PoolResponse(
         id=p.id,
@@ -235,9 +272,7 @@ def _pool_to_response(p: DNSPool) -> PoolResponse:
         hc_healthy_threshold=p.hc_healthy_threshold,
         next_check_at=p.next_check_at,
         last_checked_at=p.last_checked_at,
-        members=[
-            PoolMemberResponse.model_validate(m, from_attributes=True) for m in (p.members or [])
-        ],
+        members=[_member_response(m, p) for m in (p.members or [])],
         created_at=p.created_at,
         modified_at=p.modified_at,
     )
@@ -377,8 +412,13 @@ async def create_pool(
     zone = await db.get(DNSZone, zone_id)
     if zone is None or zone.group_id != group_id:
         raise HTTPException(status_code=404, detail="Zone not found")
+    await _refuse_on_technitium_api(db, group_id)
     if zone.zone_type == "forward":
         raise HTTPException(status_code=400, detail="Pools are not supported on forward zones")
+    # #3838 — a pool's A/AAAA rows would be served by nobody in a secondary / stub.
+    unauthored = unauthored_zone_error(zone, "pool")
+    if unauthored is not None:
+        raise HTTPException(status_code=422, detail=unauthored)
     # Pools render A/AAAA records, which only belong in a forward zone.
     # Reverse (in-addr.arpa / ip6.arpa) zones hold PTR records, so a pool
     # there could never render a valid record — reject it defensively
@@ -437,9 +477,38 @@ async def update_pool(
     pool = await db.get(DNSPool, pool_id)
     if pool is None:
         raise HTTPException(status_code=404, detail="Pool not found")
-    payload = body.model_dump(exclude_none=True)
+    # #1563 — explicit null clears hc_target_port; null for a NOT NULL
+    # column is a 422.
+    payload = resolve_update_changes(
+        body,
+        clearable={"hc_target_port"},
+        non_nullable={
+            "name",
+            "description",
+            "ttl",
+            "enabled",
+            "hc_type",
+            "hc_path",
+            "hc_method",
+            "hc_verify_tls",
+            "hc_expected_status_codes",
+            "hc_interval_seconds",
+            "hc_timeout_seconds",
+            "hc_unhealthy_threshold",
+            "hc_healthy_threshold",
+        },
+    )
+    # Fields the renderer reads: enabled gates every record, ttl stamps them.
+    rrset_changed = any(k in payload and getattr(pool, k) != payload[k] for k in ("enabled", "ttl"))
     for k, v in payload.items():
         setattr(pool, k, v)
+    if rrset_changed:
+        # Don't wait for the next health-check tick (which skips disabled
+        # pools entirely). Record ops collect_wake the group channel.
+        await db.refresh(pool, ["members"])
+        await apply_pool_state(db, pool)
+    # #3503: audited after the reconcile, whose serial bumps must take the zone
+    # row before the audit row's flush takes the audit-chain lock.
     db.add(
         AuditLog(
             user_id=user.id,
@@ -462,6 +531,13 @@ async def delete_pool(pool_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     pool = await db.get(DNSPool, pool_id)
     if pool is None:
         raise HTTPException(status_code=404, detail="Pool not found")
+    # #1966 — withdraw every member's rendered record (row + delete op)
+    # before the pool goes. Members and records would otherwise vanish via
+    # the FK ``ON DELETE CASCADE`` with no op, and the agent would keep
+    # serving every address until something else reconciled the zone.
+    await withdraw_member_records(db, pool, list(pool.members))
+    # #3503: audited after the reconcile, whose serial bumps must take the zone
+    # row before the audit row's flush takes the audit-chain lock.
     db.add(
         AuditLog(
             user_id=user.id,
@@ -474,19 +550,12 @@ async def delete_pool(pool_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
             result="success",
         )
     )
-    # Members + the rendered DNSRecord rows cascade via FK ON DELETE CASCADE.
-    # The records the pool created don't need explicit RFC 2136 deletes
-    # here — the next health-check pass on a now-empty pool would bump
-    # the zone serial, and AXFR pull would catch the deletion. Cleaner:
-    # explicitly enqueue deletes via apply_pool_state before destroying
-    # the rows.
-    pool.members = []  # detach so apply emits deletes
-    await apply_pool_state(db, pool)
     await db.delete(pool)
     await db.commit()
 
 
 @router.post("/pools/{pool_id}/check-now", response_model=PoolResponse)
+@token_write("Writes the pool's next_check_at to queue a health check, and an audit row")
 async def check_pool_now(pool_id: uuid.UUID, db: DB, user: SuperAdmin) -> PoolResponse:
     """Force ``next_check_at`` to ``now`` so the next dispatcher tick fires.
 
@@ -532,6 +601,7 @@ async def add_member(
     pool = await db.get(DNSPool, pool_id)
     if pool is None:
         raise HTTPException(status_code=404, detail="Pool not found")
+    await _refuse_on_technitium_api(db, pool.group_id)
     clash = await db.execute(
         select(DNSPoolMember).where(
             DNSPoolMember.pool_id == pool_id,
@@ -674,19 +744,6 @@ async def update_member(
         member.last_check_error = None
         member.consecutive_successes = 0
         member.consecutive_failures = 0
-    db.add(
-        AuditLog(
-            user_id=user.id,
-            user_display_name=user.display_name,
-            auth_source=user.auth_source,
-            action="dns.pool.member.update",
-            resource_type="dns_pool_member",
-            resource_id=str(member.id),
-            resource_display=member.address,
-            result="success",
-        )
-    )
-
     # Reconcile on any rrset-affecting change (address or enabled);
     # weight is advisory today but cheap to include if/when weighted
     # rendering lands. Don't make the operator wait for the next
@@ -708,6 +765,21 @@ async def update_member(
                 # after this handler's ``db.commit()``.
                 collect_wake(dns_group_channel(pool.group_id))
 
+    # #3503: audited after the reconcile, whose serial bumps must take the zone
+    # row before the audit row's flush takes the audit-chain lock.
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            user_display_name=user.display_name,
+            auth_source=user.auth_source,
+            action="dns.pool.member.update",
+            resource_type="dns_pool_member",
+            resource_id=str(member.id),
+            resource_display=member.address,
+            result="success",
+        )
+    )
+
     await db.commit()
     await db.refresh(member)
     return PoolMemberResponse.model_validate(member, from_attributes=True)
@@ -718,6 +790,15 @@ async def delete_member(member_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     member = await db.get(DNSPoolMember, member_id)
     if member is None:
         raise HTTPException(status_code=404, detail="Pool member not found")
+    # #1966 — withdraw the member's rendered record (row + delete op) while
+    # the member still exists. Deleting the member first lets the
+    # ``dns_record.pool_member_id`` FK cascade remove the record row without
+    # any op, and the agent keeps serving the address.
+    pool = await db.get(DNSPool, member.pool_id)
+    if pool is not None:
+        await withdraw_member_records(db, pool, [member])
+    # #3503: audited after the reconcile, whose serial bumps must take the zone
+    # row before the audit row's flush takes the audit-chain lock.
     db.add(
         AuditLog(
             user_id=user.id,
@@ -730,11 +811,5 @@ async def delete_member(member_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
             result="success",
         )
     )
-    # Make sure the rendered DNSRecord row goes away before the FK
-    # cascade fires (so we get a proper enqueue_record_op delete).
-    pool = await db.get(DNSPool, member.pool_id)
-    if pool is not None:
-        pool.members = [m for m in pool.members if m.id != member.id]
-        await apply_pool_state(db, pool)
     await db.delete(member)
     await db.commit()

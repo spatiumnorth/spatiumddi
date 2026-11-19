@@ -33,7 +33,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.alerts import AlertEvent, AlertRule
@@ -110,7 +110,26 @@ CATEGORY_SUPERVISOR_FAILED = "supervisor_reported_failed"
 CATEGORY_CONVERGENCE_TIMEOUT = "node_did_not_rejoin"
 CATEGORY_CHART_BUMP = "chart_bump_failed"
 CATEGORY_UNCORDON_FAIL = "uncordon_fail"
+CATEGORY_MIRROR_NOT_READY = "slot_image_mirror_not_ready"
+CATEGORY_RELEASE_FAILED = "release_failed"
 CATEGORY_OTHER = "other"
+
+
+def release_failure(steps: list[Any]) -> tuple[str, list[str]] | None:
+    """The failed ``release_node`` compensation (#1542), if the chain ran
+    one that did not succeed: ``(error, stuck)`` where ``stuck`` names what
+    is still held (``cordon`` / ``maintenance_window``). ``steps`` are the
+    per-node step records, as ``StepResult`` objects or their progress
+    dicts. None when no compensation ran or it succeeded."""
+    for s in reversed(steps):
+        get = s.get if isinstance(s, dict) else lambda k, _s=s: getattr(_s, k, None)
+        if get("name") != "release_node":
+            continue
+        if get("ok"):
+            return None
+        detail = get("detail") or {}
+        return (get("error") or "unknown", list(detail.get("stuck") or []))
+    return None
 
 
 def classify_per_node_failure(
@@ -128,12 +147,23 @@ def classify_per_node_failure(
     """
     if failed_at == "preflight":
         return CATEGORY_PREFLIGHT
+    if failed_at == "mirror_ready":
+        return CATEGORY_MIRROR_NOT_READY
     if failed_at == "cordon":
         return CATEGORY_CORDON_FAIL
     if failed_at == "verify_primary_moved":
         return CATEGORY_PRIMARY_NOT_MOVED
     if failed_at == "drain":
         return CATEGORY_DRAIN_STUCK
+    if failed_at in ("stage", "reboot"):
+        # The apply failed on the host before it staged the slot, or never
+        # finished staging it. Either way the node was not rebooted. A
+        # ``stage`` failure comes before the cordon (#1463), so the node is
+        # also still in service; ``reboot`` waits the same way for a run
+        # resumed there.
+        if error and "supervisor reported upgrade failed" in error:
+            return CATEGORY_SUPERVISOR_FAILED
+        return CATEGORY_OTHER
     if failed_at == "health_gate":
         # health_gate has three failure modes — split by the error.
         if error and "supervisor reported upgrade failed" in error:
@@ -177,22 +207,31 @@ def operator_hint(category: str) -> str:
         )
     if category == CATEGORY_DRAIN_STUCK:
         return (
-            "Drain timed out — a workload pod blocked eviction. Check "
-            "PodDisruptionBudgets + per-pod status; once unblocked, abort + "
-            "plan a fresh run (drain doesn't auto-retry mid-run)."
+            "Drain timed out — a workload pod blocked eviction, or was evicted "
+            "but never left the node (the step's error counts both; a node "
+            "whose kubelet is down removes nothing, #1804). Check "
+            "PodDisruptionBudgets, per-pod status and the node's Ready "
+            "condition; once unblocked, abort + "
+            "plan a fresh run (drain doesn't auto-retry mid-run). "
+            "The new slot is already staged and armed for this node's next "
+            "boot (#1463), so an unplanned reboot boots it."
         )
     if category == CATEGORY_CORDON_FAIL:
         return (
             "kubectl cordon failed — likely an RBAC issue. Verify the api "
             "ServiceAccount has cluster-scoped patch on nodes "
-            "(api.upgradeOrchestratorRBAC.enabled=true in chart values)."
+            "(api.upgradeOrchestratorRBAC.enabled=true in chart values). "
+            "The new slot is already staged and armed for this node's next "
+            "boot (#1463), so an unplanned reboot boots it."
         )
     if category == CATEGORY_PRIMARY_NOT_MOVED:
         return (
             "CNPG primary didn't switch off the cordoned node within the "
             "switchover timeout. Check Cluster.status + replica replay lag; "
             "the cordon-triggered switchover only works with a caught-up "
-            "replica."
+            "replica. "
+            "The new slot is already staged and armed for this node's next "
+            "boot (#1463), so an unplanned reboot boots it."
         )
     if category == CATEGORY_AUTO_REVERTED:
         return (
@@ -225,6 +264,21 @@ def operator_hint(category: str) -> str:
             "failed (Deployment rollout / migrate Job). Forward-fix: helm "
             "rollback the chart, debug, re-apply the bump."
         )
+    if category == CATEGORY_MIRROR_NOT_READY:
+        return (
+            "The slot-image mirror, which serves the uploaded image to every "
+            "node, had no Ready pod, so this node was not told to fetch and is "
+            "still in service. Its volume pins it to one node: check that node "
+            "is up and uncordoned and read the mirror pod's events, then plan "
+            "the upgrade again."
+        )
+    if category == CATEGORY_RELEASE_FAILED:
+        return (
+            "The upgrade failed AND the automatic release of the node failed, "
+            "so the node is left held. Release it by hand: ``kubectl uncordon`` "
+            "the node and/or patch the CNPG Cluster's "
+            "nodeMaintenanceWindow.inProgress to false, as named above."
+        )
     if category == CATEGORY_UNCORDON_FAIL:
         return (
             "Node upgraded cleanly but uncordon / maintenance-window clear "
@@ -248,6 +302,7 @@ async def emit_upgrade_failed_alert(
     failed_node: str | None,
     failed_at_step: str | None,
     category: str,
+    stuck: list[str] | None = None,
 ) -> AlertEvent | None:
     """Open an AlertEvent against the cluster-upgrade-failed rule.
 
@@ -275,6 +330,8 @@ async def emit_upgrade_failed_alert(
     if failed_at_step:
         message_parts.append(f"at step {failed_at_step!r}")
     message_parts.append(f"({category}).")
+    if stuck:
+        message_parts.append(f"Still held after the failed release: {', '.join(stuck)}.")
     message_parts.append(hint)
     message = " ".join(message_parts)
 
@@ -287,7 +344,24 @@ async def emit_upgrade_failed_alert(
         "hint": hint,
         "last_error": run.last_error,
     }
+    if stuck:
+        detail["stuck"] = stuck
 
+    # #2261 — one OPEN event per (rule, subject) is now a unique index. A
+    # run that fails, is resumed and fails again still pages for the second
+    # failure: the earlier event is resolved first, rather than the insert
+    # tripping the index and taking the orchestrator's transaction with it.
+    now = datetime.now(UTC)
+    await db.execute(
+        update(AlertEvent)
+        .where(
+            AlertEvent.rule_id == rule.id,
+            AlertEvent.subject_type == "system_upgrade_run",
+            AlertEvent.subject_id == str(run.id),
+            AlertEvent.resolved_at.is_(None),
+        )
+        .values(resolved_at=now)
+    )
     evt = AlertEvent(
         rule_id=rule.id,
         subject_type="system_upgrade_run",
@@ -295,10 +369,26 @@ async def emit_upgrade_failed_alert(
         subject_display=f"upgrade → {run.target_version}",
         severity=rule.severity,
         message=message,
-        fired_at=datetime.now(UTC),
+        fired_at=now,
         last_observed_value=detail,
     )
     db.add(evt)
+    # #1576 — deliver to forward targets; the generic evaluator skips
+    # externally-driven rule types, so without this the event only
+    # ever showed in-app. Caller still owns the commit. Delivery
+    # failures must not break the orchestrator's failure transition.
+    try:
+        await db.flush()
+        from app.services import alerts as alert_service  # noqa: PLC0415
+        from app.services import audit_forward  # noqa: PLC0415
+
+        targets = await audit_forward._load_targets()  # noqa: SLF001
+        ds, dw, dm = await alert_service._deliver(rule, evt, targets)  # noqa: SLF001
+        evt.delivered_syslog = ds
+        evt.delivered_webhook = dw
+        evt.delivered_smtp = dm
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("upgrade_failed_alert_delivery_failed", run_id=str(run.id), error=str(exc))
     logger.info(
         "upgrade_failed_alert_emitted",
         run_id=str(run.id),

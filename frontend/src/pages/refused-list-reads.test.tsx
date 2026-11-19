@@ -154,7 +154,9 @@ describe("a refused list read says it was refused, never that the list is empty"
   it("Tools › Network Tools: the run-from appliances", async () => {
     lists.appliances.mockRejectedValue(refusal());
     show(<NetworkToolsPage />);
-    await screen.findByText(/permission/i);
+    // The page may also show its own "run the network tools" refusal (#3256),
+    // so look for the appliances refusal by its own words, not any "permission".
+    await screen.findByText(/permission to see the Fleet appliances/i);
     expect(screen.queryByText(/no appliances online/)).toBeNull();
   });
 

@@ -16,13 +16,21 @@ before reaching this layer):
   truncate of ``audit_log`` itself.
 
 The destructive SQL runs against a short-lived asyncpg connection
-rather than the SQLAlchemy session — TRUNCATE … CASCADE has weird
-interactions with the async session's identity map, and we want
-the schema-level TRUNCATE semantics (resets sequences) anyway.
+rather than the SQLAlchemy session — TRUNCATE takes an ACCESS
+EXCLUSIVE lock that fights the async session's pooled connections.
+
+It never uses ``TRUNCATE … CASCADE`` (#1835): that empties every table
+with a foreign key into the truncated one whatever the key's ``ON
+DELETE`` rule, so a Tools reset emptied every IP address, DNS record
+and DHCP static. See :mod:`app.services.factory_reset.fk_graph`. The
+whole reset runs in ONE transaction, so a refusal part-way (a
+``RESTRICT`` key from a table the reset does not cover) rolls every
+section back rather than leaving half an install wiped.
 """
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -33,10 +41,24 @@ import structlog
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services.factory_reset.fk_graph import (
+    FK_EDGES_SQL,
+    FKEdge,
+    blocking_count_queries,
+    delete_order,
+    dependent_count_queries,
+    edges_from_rows,
+    truncatable,
+)
 from app.services.factory_reset.sections import (
+    AUTH_RBAC_CASCADE_DEPENDENTS,
     FACTORY_SECTIONS_BY_KEY,
     FactorySection,
     expand_everything,
+)
+from app.services.ipam.zone_binding import (
+    prune_dead_group_ids_asyncpg,
+    prune_dead_zone_ids_asyncpg,
 )
 
 logger = structlog.get_logger(__name__)
@@ -44,6 +66,23 @@ logger = structlog.get_logger(__name__)
 COOLDOWN_HOURS = 6
 RESET_LOCK_KEY = "spatium:factory_reset:in_progress"
 RESET_LOCK_TTL_SECONDS = 600
+
+# #3479: the wipe's own locks. Its TRUNCATE takes ACCESS EXCLUSIVE locks, in
+# the order the section lists its tables, on tables the agents' polls, the
+# worker and the beat read all the time. A reader holding one makes the wipe
+# wait for it, with no bound. A reader that holds a table the wipe has not
+# reached yet, and then queues for one the wipe already holds, closes a
+# deadlock that Postgres resolves by ending one side, often the wipe: the
+# endpoint answered a bare 500 with nothing wiped. So every lock wait of the
+# wipe is bounded, and a deadlock or a wait past the bound rolls the whole
+# transaction back (nothing is deleted) and runs it again. When the tables
+# stay busy through every attempt the reset is refused with a 409 that says
+# so. A wait outlasts Postgres's default deadlock_timeout (1 s), so a
+# deadlock is detected, not timed out, and the attempts together stay well
+# inside the time an operator waits on the answer.
+WIPE_LOCK_TIMEOUT_MS = 10_000
+WIPE_ATTEMPTS = 3
+WIPE_RETRY_DELAY_S = 1.0
 
 
 class FactoryResetError(Exception):
@@ -54,6 +93,22 @@ class FactoryResetMutexError(FactoryResetError):
     """Raised when another long-running operation prevents the reset
     from starting (HTTP 409). The message names the blocker so
     operators know what to wait on.
+    """
+
+
+class FactoryResetBusyError(FactoryResetMutexError):
+    """Raised when other sessions kept the tables the wipe needs busy
+    through every attempt: each attempt waited past
+    :data:`WIPE_LOCK_TIMEOUT_MS` for a lock, or was ended by a deadlock
+    (HTTP 409, like any other mutex refusal: try again). Nothing has been
+    deleted when this is raised; every attempt's transaction rolled back.
+    """
+
+
+class FactoryResetBlockedError(FactoryResetError):
+    """Raised when a table the reset does not cover still holds a
+    ``RESTRICT`` / ``NO ACTION`` foreign key into one it would wipe
+    (HTTP 409). Nothing has been deleted when this is raised.
     """
 
 
@@ -202,16 +257,104 @@ async def preview_factory_reset(
                 count = await _table_count(db, table)
                 preview.table_counts[table] = count
                 preview.affected_rows += count
+            await _add_cascade_preview(db, section, preview)
         elif section.kind == "auth_rbac":
             counts = await _auth_rbac_counts(db, calling_user_id)
             preview.table_counts = counts
             preview.affected_rows = sum(counts.values())
             preview.notes.append("calling superadmin + built-in roles preserved")
+            if AUTH_RBAC_CASCADE_DEPENDENTS:
+                preview.notes.append(
+                    "rows owned by a deleted user go with it: "
+                    + ", ".join(AUTH_RBAC_CASCADE_DEPENDENTS)
+                )
         elif section.kind == "settings_reset":
             preview.affected_rows = 1
             preview.notes.append("platform_settings row reverted to model defaults")
         previews.append(preview)
+    blockers = await _preview_blockers(db, targets)
+    if blockers and previews:
+        previews[0].notes.append("REFUSED until cleared: " + "; ".join(blockers))
     return previews
+
+
+async def _load_edges_sa(db: AsyncSession) -> list[FKEdge]:
+    res = await db.execute(text(FK_EDGES_SQL))
+    return edges_from_rows(res.mappings().all())
+
+
+async def _present_tables_sa(db: AsyncSession) -> set[str]:
+    res = await db.execute(text("SELECT tablename FROM pg_tables WHERE schemaname='public'"))
+    return {r[0] for r in res.all()}
+
+
+def _dependent_count_sql(
+    section: FactorySection, edges: list[FKEdge], present: set[str]
+) -> dict[str, str]:
+    """Per dependent table, the SQL counting exactly the rows a wipe of
+    ``section.tables`` removes through CASCADE keys (see
+    :func:`.fk_graph.dependent_count_queries`)."""
+    own = [t for t in section.tables if t in present]
+    return {dep: sql for dep, sql in dependent_count_queries(edges, own).items() if dep in present}
+
+
+async def _dependent_counts_sa(
+    db: AsyncSession, section: FactorySection, edges: list[FKEdge], present: set[str]
+) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for dep, sql in _dependent_count_sql(section, edges, present).items():
+        try:
+            out[dep] = int((await db.execute(text(sql))).scalar() or 0)
+        except Exception as exc:  # noqa: BLE001
+            logger.info("factory_reset_dependent_count_failed", table=dep, error=str(exc))
+            await db.rollback()
+    return out
+
+
+async def _add_cascade_preview(
+    db: AsyncSession, section: FactorySection, preview: SectionPreview
+) -> None:
+    edges = await _load_edges_sa(db)
+    present = await _present_tables_sa(db)
+    counts = await _dependent_counts_sa(db, section, edges, present)
+    nonzero = {t: n for t, n in counts.items() if n}
+    if nonzero:
+        total = sum(nonzero.values())
+        preview.affected_rows += total
+        for t, n in nonzero.items():
+            preview.table_counts[f"{t} (cascade)"] = n
+        preview.notes.append(
+            f"includes {total} row(s) in other tables that cannot exist "
+            "without these (foreign keys with ON DELETE CASCADE)"
+        )
+
+
+async def _preview_blockers(db: AsyncSession, targets: list[FactorySection]) -> list[str]:
+    """Human-readable list of references that would make the reset
+    fail: rows outside the wipe holding a ``RESTRICT`` / ``NO ACTION``
+    key to a row it removes. Empty when nothing blocks it."""
+    wiped = [t for s in targets if s.kind == "truncate" for t in s.tables]
+    if not wiped:
+        return []
+    edges = await _load_edges_sa(db)
+    present = await _present_tables_sa(db)
+    out: list[str] = []
+    for e, sql in blocking_count_queries(edges, [t for t in wiped if t in present]):
+        if e.child not in present:
+            continue
+        try:
+            n = int((await db.execute(text(sql))).scalar() or 0)
+        except Exception as exc:  # noqa: BLE001
+            logger.info("factory_reset_blocker_count_failed", table=e.child, error=str(exc))
+            await db.rollback()
+            continue
+        if n:
+            owner = next(
+                (s.label for s in FACTORY_SECTIONS_BY_KEY.values() if e.child in s.tables), None
+            )
+            hint = f" (reset {owner} with it, or first)" if owner else ""
+            out.append(f"{n} {e.child} row(s) still reference {e.parent}{hint}")
+    return out
 
 
 async def _table_count(db: AsyncSession, table: str) -> int:
@@ -281,6 +424,14 @@ async def apply_factory_reset(
     await _ensure_no_backup_in_flight(db)
     await _ensure_cooldown_clear(db)
 
+    # Refuse BEFORE anything is deleted when a table the reset does not
+    # cover holds a RESTRICT key into one it would wipe.
+    blockers = await _preview_blockers(db, targets)
+    if blockers:
+        raise FactoryResetBlockedError(
+            "cannot reset: " + "; ".join(blockers) + " — reset or remove those first"
+        )
+
     # Snapshot pre-wipe counts for the audit row.
     previews = await preview_factory_reset(
         db, section_keys=section_keys, calling_user_id=calling_user_id
@@ -303,13 +454,12 @@ async def apply_factory_reset(
         await global_engine.dispose()
 
         dsn = _pg_dsn(db_url)
-        conn = await asyncpg.connect(dsn=dsn)
         try:
-            for section in targets:
-                count = await _execute_section(conn, section, calling_user_id=calling_user_id)
-                deleted_total += count
-        finally:
-            await conn.close()
+            deleted_total = await _wipe(dsn, targets, calling_user_id=calling_user_id)
+        except asyncpg.ForeignKeyViolationError as exc:
+            raise FactoryResetBlockedError(
+                f"cannot reset: {exc} — nothing was deleted; reset the referencing data first"
+            ) from exc
 
         # Audit anchor — fresh session because the old one was
         # disposed. The anchor row carries all the diagnostic info
@@ -341,58 +491,142 @@ async def apply_factory_reset(
     )
 
 
-async def _execute_section(
+async def _wipe(dsn: str, targets: list[FactorySection], *, calling_user_id: UUID) -> int:
+    """Run every target's wipe in ONE transaction on a short-lived asyncpg
+    connection: a failure part-way rolls every section back instead of
+    leaving half an install wiped. Returns :func:`_execute_sections`'s count.
+
+    #3479: every lock wait in the transaction is bounded by
+    :data:`WIPE_LOCK_TIMEOUT_MS`. An attempt that another session's locks
+    ended (a deadlock, or a wait past the bound) deleted nothing, so it is run
+    again, up to :data:`WIPE_ATTEMPTS` times, and then refused with
+    :class:`FactoryResetBusyError`. Any other error is raised as it is.
+    """
+    attempt = 1
+    while True:
+        conn = await asyncpg.connect(dsn=dsn)
+        try:
+            async with conn.transaction():
+                await conn.execute(f"SET LOCAL lock_timeout = {int(WIPE_LOCK_TIMEOUT_MS)}")
+                return await _execute_sections(conn, targets, calling_user_id=calling_user_id)
+        except (asyncpg.DeadlockDetectedError, asyncpg.LockNotAvailableError) as exc:
+            reason = str(exc).splitlines()[0]
+            logger.warning(
+                "factory_reset_tables_busy",
+                attempt=attempt,
+                attempts=WIPE_ATTEMPTS,
+                error=reason,
+            )
+            if attempt >= WIPE_ATTEMPTS:
+                raise FactoryResetBusyError(
+                    f"other work kept the tables this reset wipes busy ({reason}) through "
+                    f"{WIPE_ATTEMPTS} attempts, so nothing was deleted; try again in a minute"
+                ) from exc
+        finally:
+            await conn.close()
+        attempt += 1
+        await asyncio.sleep(WIPE_RETRY_DELAY_S)
+
+
+async def _execute_sections(
     conn: asyncpg.Connection,
-    section: FactorySection,
+    targets: list[FactorySection],
     *,
     calling_user_id: UUID,
 ) -> int:
-    """Dispatch to the per-kind handler. Returns approximate
-    deleted-row count (best effort; TRUNCATE doesn't return a
-    row count from Postgres).
+    """Run every target inside the caller's transaction. Returns the
+    approximate deleted-row count (own rows + cascade dependents).
+
+    All ``truncate`` sections are planned TOGETHER: ``Everything`` runs
+    IPAM before Integrations, but an integration's ``ip_space`` key is
+    ``RESTRICT``, so the order has to come from the foreign keys, not
+    from the section list.
     """
-    if section.kind == "truncate":
-        return await _execute_truncate(conn, section)
-    if section.kind == "auth_rbac":
-        return await _execute_auth_rbac(conn, calling_user_id=calling_user_id)
-    if section.kind == "settings_reset":
-        return await _execute_settings_reset(conn)
-    raise FactoryResetError(f"unhandled section kind: {section.kind!r}")
-
-
-async def _execute_truncate(conn: asyncpg.Connection, section: FactorySection) -> int:
-    """Run ``TRUNCATE TABLE … RESTART IDENTITY CASCADE`` over every
-    table in the section that exists on this install. Tables that
-    aren't present (optional integration / feature module) are
-    skipped silently.
-    """
-    # Pre-flight inventory so a missing table doesn't poison the
-    # transaction (TRUNCATE on nonexistent table aborts the whole
-    # tx).
-    rows = await conn.fetch("""
-        SELECT tablename FROM pg_tables WHERE schemaname='public'
-        """)
-    present = {r["tablename"] for r in rows}
-    targets = [t for t in section.tables if t in present]
-    if not targets:
-        return 0
-
-    # Pre-count for the operator-facing total. TRUNCATE doesn't
-    # return a count; we approximate.
     deleted = 0
-    for t in targets:
-        try:
-            row = await conn.fetchrow(f'SELECT COUNT(*) AS n FROM "{t}"')
-            deleted += int(row["n"] if row else 0)
-        except Exception:  # noqa: BLE001
-            pass
+    truncate_sections = [s for s in targets if s.kind == "truncate"]
+    if truncate_sections:
+        deleted += await _execute_truncate_sections(conn, truncate_sections)
+    for section in targets:
+        if section.kind == "auth_rbac":
+            deleted += await _execute_auth_rbac(conn, calling_user_id=calling_user_id)
+        elif section.kind == "settings_reset":
+            deleted += await _execute_settings_reset(conn)
+        elif section.kind != "truncate":
+            raise FactoryResetError(f"unhandled section kind: {section.kind!r}")
+    return deleted
 
-    quoted = ", ".join(f'"{t}"' for t in targets)
-    await conn.execute(f"TRUNCATE TABLE {quoted} RESTART IDENTITY CASCADE")
+
+async def _execute_truncate_sections(
+    conn: asyncpg.Connection, sections: list[FactorySection]
+) -> int:
+    """Wipe the tables of every section in ``sections`` without
+    ``CASCADE`` (#1835):
+
+    * tables nothing outside the wipe references are ``TRUNCATE``d
+      (fast on the big log tables) — a plain TRUNCATE refuses rather
+      than reach into a referencing table;
+    * the rest are ``DELETE``d children-first, so ``ON DELETE SET
+      NULL`` keys (``ip_address.last_profile_scan_id``,
+      ``dns_record.ip_address_id`` …) null and the referencing row
+      survives.
+
+    Tables absent from this install (optional modules) are skipped.
+    """
+    edges = edges_from_rows(await conn.fetch(FK_EDGES_SQL))
+    rows = await conn.fetch("SELECT tablename FROM pg_tables WHERE schemaname='public'")
+    present = {r["tablename"] for r in rows}
+
+    # Pre-count for the operator-facing total (own rows + the rows
+    # CASCADE keys will take with them).
+    # Each count runs in its own SAVEPOINT: a failed statement would
+    # otherwise abort the whole reset transaction and every DELETE
+    # after it would fail with "current transaction is aborted".
+    async def _count(sql: str) -> int:
+        try:
+            async with conn.transaction():
+                return int(await conn.fetchval(sql) or 0)
+        except asyncpg.PostgresError as exc:
+            logger.info("factory_reset_count_failed", sql=sql, error=str(exc))
+            return 0
+
+    deleted = 0
+    for section in sections:
+        for t in section.tables:
+            if t in present:
+                deleted += await _count(f'SELECT COUNT(*) FROM "{t}"')
+        for sql in _dependent_count_sql(section, edges, present).values():
+            deleted += await _count(sql)
+
+    wanted = [t for s in sections for t in s.tables if t in present]
+    wanted = list(dict.fromkeys(wanted))
+    if not wanted:
+        return 0
+    can_truncate = truncatable(edges, wanted)
+    to_truncate = [t for t in wanted if t in can_truncate]
+    to_delete = delete_order(edges, [t for t in wanted if t not in can_truncate])
+
+    if to_truncate:
+        quoted = ", ".join(f'"{t}"' for t in to_truncate)
+        # Deliberately NOT CASCADE: nothing outside this list may be
+        # touched (``truncatable`` guarantees nothing references it).
+        await conn.execute(f"TRUNCATE TABLE {quoted} RESTART IDENTITY")
+    for t in to_delete:
+        await conn.execute(f'DELETE FROM "{t}"')
+    if "dns_server_group" in wanted:
+        # IPAM names DNS groups in a JSONB id list with no foreign key, so a
+        # DNS reset that keeps IPAM would leave every ``dns_group_ids`` entry
+        # naming a group that is gone (#3433).
+        await prune_dead_group_ids_asyncpg(conn)
+    if "dns_zone" in wanted:
+        # IPAM names zones in text / JSONB columns with no foreign key, so a
+        # DNS reset that keeps IPAM would leave every binding naming a zone
+        # that is gone (#3443).
+        await prune_dead_zone_ids_asyncpg(conn)
     logger.info(
-        "factory_reset_section_truncated",
-        section=section.key,
-        tables=targets,
+        "factory_reset_sections_wiped",
+        sections=[s.key for s in sections],
+        truncated=to_truncate,
+        deleted_from=to_delete,
         rows=deleted,
     )
     return deleted
@@ -535,6 +769,8 @@ def verify_user_password(user: Any, plaintext: str) -> bool:
 
 __all__ = [
     "COOLDOWN_HOURS",
+    "FactoryResetBlockedError",
+    "FactoryResetBusyError",
     "FactoryResetCooldownError",
     "FactoryResetError",
     "FactoryResetMutexError",

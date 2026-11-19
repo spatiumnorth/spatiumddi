@@ -59,11 +59,52 @@ def test_v2c_renders_rocommunity_for_each_source() -> None:
     assert "rocommunity s3cret 192.168.1.0/24" in text
     # IPv6 source uses the v6-specific directive
     assert "rocommunity6 s3cret fd00::/8" in text
-    # sysContact / sysLocation get double-quoted
-    assert 'sysContact     "ops@example.com"' in text
-    assert 'sysLocation    "Datacenter A, Rack 12"' in text
-    # Standard agent listen line
-    assert "agentAddress udp:161,udp6:[::1]:161" in text
+    # sysContact / sysLocation are written bare: snmpd serves the rest of
+    # the line literally, so quotes would reach the NMS.
+    assert "sysContact     ops@example.com" in text
+    assert "sysLocation    Datacenter A, Rack 12" in text
+    # An IPv6 source is listed, so snmpd must listen for IPv6 beyond ::1 (#3813)
+    assert "agentAddress udp:161,udp6:161\n" in text
+    assert "udp6:[::1]" not in text
+
+
+def test_ipv4_only_sources_keep_ipv6_on_loopback() -> None:
+    s = PlatformSettings()
+    s.snmp_enabled = True
+    s.snmp_version = "v2c"
+    s.snmp_community_encrypted = encrypt_str("s3cret")
+    s.snmp_allowed_sources = ["10.0.0.0/8"]
+    assert "agentAddress udp:161,udp6:[::1]:161" in render_snmpd_conf(s)
+
+
+def test_empty_sources_listen_on_all_ipv6() -> None:
+    s = PlatformSettings()
+    s.snmp_enabled = True
+    s.snmp_version = "v2c"
+    s.snmp_allowed_sources = []
+    assert "agentAddress udp:161,udp6:161\n" in render_snmpd_conf(s)
+
+
+def test_renders_agentx_master_for_subagents() -> None:
+    """Issue #2154 — this renderer REPLACES Debian's stock snmpd.conf, which
+    is where ``master agentx`` used to come from. Without it snmpd never
+    takes the AgentX master role and ``lldpd -x`` (LLDP → Expose via SNMP)
+    has nothing to register LLDP-MIB with: the toggle saves, lldpd runs,
+    and lldpRemTable is never served. Emitted for every version and
+    whatever the LLDP settings say — it is a root-only local socket."""
+    for version in ("v2c", "v3"):
+        s = _bare_settings()
+        s.snmp_enabled = True
+        s.snmp_version = version
+        lines = render_snmpd_conf(s).splitlines()
+        assert "master agentx" in lines
+        assert "agentXSocket /run/agentx/master" in lines
+        # Root-only socket + directory: the only subagent is lldpd, whose
+        # monitor keeps CAP_DAC_OVERRIDE, so nothing needs group access.
+        assert "agentXPerms 0600 0700" in lines
+        # The master role is a unix socket, never a TCP listener — no
+        # ``tcp:`` agentXSocket that the host firewall would have to open.
+        assert not any(ln.startswith("agentXSocket tcp") for ln in lines)
 
 
 def test_v2c_empty_community_emits_no_rocommunity_lines() -> None:
@@ -191,21 +232,45 @@ def test_snmp_bundle_has_stable_keys() -> None:
     assert off_bundle["config_hash"] == ""
 
 
-def test_sys_contact_with_quote_is_escaped() -> None:
-    """Defensive — the quote routine has to escape ``"`` to avoid
-    blowing up snmpd's parser when an operator pastes an awkward
-    contact string."""
+def _sys_text_conf(contact: str, location: str) -> str:
     s = _bare_settings()
     s.snmp_enabled = True
     s.snmp_version = "v2c"
     s.snmp_community_encrypted = encrypt_str("c")
     s.snmp_allowed_sources = ["10.0.0.0/8"]
-    s.snmp_sys_contact = 'someone "with quotes"'
+    s.snmp_sys_contact = contact
+    s.snmp_sys_location = location
+    return render_snmpd_conf(s)
 
-    text = render_snmpd_conf(s)
-    # The quoted form should escape the embedded quotes; snmpd reads
-    # a single double-quoted string.
-    assert r'"someone \"with quotes\""' in text
+
+def test_sys_text_is_written_unquoted_and_verbatim() -> None:
+    """snmpd serves the rest of a sysContact/sysLocation line as-is (#2773),
+    so quoting or escaping would reach the NMS as part of the value."""
+    contact = 'A2 NOC "night shift" O\'Brien <noc@example.test>'
+    text = _sys_text_conf(contact, "a2 lab rack 4")
+    lines = text.splitlines()
+    assert f"sysContact     {contact}" in lines
+    assert "sysLocation    a2 lab rack 4" in lines
+    assert '\\"' not in text
+
+
+def test_sys_text_keeps_backslash_and_mid_value_hash() -> None:
+    text = _sys_text_conf(r"ops\team #1", "rack #4")
+    assert r"sysContact     ops\team #1" in text.splitlines()
+    assert "sysLocation    rack #4" in text.splitlines()
+
+
+def test_sys_text_surrounding_whitespace_is_dropped() -> None:
+    text = _sys_text_conf("  padded  ", "x")
+    assert "sysContact     padded" in text.splitlines()
+
+
+def test_sys_text_starting_with_hash_is_omitted_not_emitted() -> None:
+    """A leading ``#`` makes snmpd read the whole line as a comment."""
+    text = _sys_text_conf("#oncall", "ok")
+    assert "sysContact     #oncall" not in text
+    assert "# sysContact OMITTED" in text
+    assert "sysLocation    ok" in text.splitlines()
 
 
 def test_disabled_master_toggle_renders_no_config() -> None:
@@ -491,3 +556,51 @@ def test_settings_validator_still_trims_and_accepts_normal_names() -> None:
     from app.api.v1.settings.router import SNMPV3UserUpdate
 
     assert SNMPV3UserUpdate(username="  monitoring-ro_1  ").username == "monitoring-ro_1"
+
+
+# ── #2153: the firewall source scope rides the body, so the hash covers it ──
+
+
+def _scoped(sources: list[str], version: str = "v2c") -> PlatformSettings:
+    s = _bare_settings()
+    s.snmp_enabled = True
+    s.snmp_version = version
+    s.snmp_community_encrypted = encrypt_str("s3cret")
+    s.snmp_v3_users = []
+    s.snmp_allowed_sources = sources
+    return s
+
+
+def test_sources_marker_is_rendered_for_v2c_and_v3() -> None:
+    for version in ("v2c", "v3"):
+        text = render_snmpd_conf(_scoped(["10.0.0.0/8", "fd00::/8"], version))
+        assert "# spatium-snmp-sources: 10.0.0.0/8,fd00::/8\n" in text
+    assert "# spatium-snmp-sources:\n" in render_snmpd_conf(_scoped([]))
+
+
+def test_config_hash_changes_when_only_the_source_list_changes() -> None:
+    a = snmp_bundle(_scoped(["10.0.0.0/8"], "v3"))
+    b = snmp_bundle(_scoped(["10.0.0.0/8", "192.0.2.0/24"], "v3"))
+    assert a["config_hash"] != b["config_hash"]
+
+
+def test_unparseable_stored_source_is_published_as_invalid_not_dropped() -> None:
+    text = render_snmpd_conf(_scoped(["10.0.0.0/8", "garbage"]))
+    assert "# spatium-snmp-sources: !invalid\n" in text
+
+
+def test_v3_comment_no_longer_claims_sources_are_ignored() -> None:
+    s = _scoped(["10.0.0.0/8"], "v3")
+    s.snmp_v3_users = [
+        {
+            "username": "noauth_user",
+            "auth_protocol": "none",
+            "auth_pass_enc": None,
+            "priv_protocol": "none",
+            "priv_pass_enc": None,
+        }
+    ]
+    text = render_snmpd_conf(s)
+    assert "rouser noauth_user" in text  # the note is only emitted with users
+    assert "ignores snmp_allowed_sources" not in text
+    assert "enforced by the host firewall" in text

@@ -16,7 +16,15 @@
  */
 
 import { describe, expect, it, vi, afterEach } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+} from "@testing-library/react";
+import { useState } from "react";
+import { Modal } from "./modal";
 import { HeaderMenu, type HeaderMenuItem } from "./header-menu";
 
 afterEach(cleanup);
@@ -50,6 +58,108 @@ describe("open / close", () => {
     // without it, Escape drops focus to <body> and the next Tab
     // restarts from the top of the page.
     expect(document.activeElement).toBe(trigger);
+  });
+
+  it("closes on Escape after a mouse open, focus still on the trigger (#2047)", () => {
+    render(<HeaderMenu label="Zone" items={[item()]} />);
+    const trigger = screen.getByRole("button", { name: /Zone/ });
+    trigger.focus();
+    openMenu();
+    // Mouse open: focus never moved into the panel.
+    expect(document.activeElement).toBe(trigger);
+    fireEvent.keyDown(trigger, { key: "Escape" });
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it("closes on Escape pressed on <body> and does not reach a window handler", () => {
+    const onWindow = vi.fn();
+    window.addEventListener("keydown", onWindow);
+    render(<HeaderMenu label="Zone" items={[item()]} />);
+    openMenu();
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    window.removeEventListener("keydown", onWindow);
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(onWindow).not.toHaveBeenCalled();
+  });
+
+  it("does not swallow Escape while the menu is closed", () => {
+    const onWindow = vi.fn();
+    window.addEventListener("keydown", onWindow);
+    render(<HeaderMenu label="Zone" items={[item()]} />);
+    const trigger = screen.getByRole("button", { name: /Zone/ });
+    trigger.focus();
+    fireEvent.keyDown(trigger, { key: "Escape" });
+    window.removeEventListener("keydown", onWindow);
+    expect(onWindow).toHaveBeenCalledOnce();
+  });
+
+  it("leaves an Escape that ends an IME composition alone", () => {
+    const onWindow = vi.fn();
+    window.addEventListener("keydown", onWindow);
+    render(<HeaderMenu label="Zone" items={[item()]} />);
+    openMenu();
+    fireEvent.keyDown(document.body, { key: "Escape", isComposing: true });
+    window.removeEventListener("keydown", onWindow);
+    expect(screen.getByRole("menu")).toBeTruthy();
+    expect(onWindow).toHaveBeenCalledOnce();
+  });
+
+  it("does not take an Escape from a layer that has focus outside the menu", () => {
+    // A palette or overlay opened by a shortcut while the menu was open:
+    // its Esc is its own, and focus must not jump back behind it.
+    const onWindow = vi.fn();
+    window.addEventListener("keydown", onWindow);
+    render(
+      <>
+        <HeaderMenu label="Zone" items={[item()]} />
+        <input aria-label="palette" />
+      </>,
+    );
+    openMenu();
+    const input = screen.getByLabelText("palette");
+    // The click left focus on <body> (jsdom, like Safari, does not focus
+    // a clicked button), so no focusout reaches the menu and it stays
+    // open: this is the backstop guard on its own.
+    act(() => input.focus());
+    expect(screen.getByRole("menu")).toBeTruthy();
+    fireEvent.keyDown(input, { key: "Escape" });
+    window.removeEventListener("keydown", onWindow);
+    expect(onWindow).toHaveBeenCalledOnce();
+    expect(document.activeElement).toBe(input);
+  });
+
+  it("closes when focus leaves for another control", () => {
+    render(
+      <>
+        <HeaderMenu label="Zone" items={[item()]} />
+        <HeaderMenu label="Data" items={[item({ key: "b", label: "Beta" })]} />
+      </>,
+    );
+    const zone = screen.getByRole("button", { name: /Zone/ });
+    const data = screen.getByRole("button", { name: /Data/ });
+    zone.focus();
+    openMenu("Zone");
+    // Tab to the next menu's trigger, open it from the keyboard: only one
+    // menu is ever open, so one Esc can never close two.
+    act(() => data.focus());
+    expect(screen.queryByRole("menu")).toBeNull();
+    fireEvent.keyDown(data, { key: "Enter" });
+    expect(screen.getAllByRole("menu")).toHaveLength(1);
+    fireEvent.keyDown(data, { key: "Escape" });
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(document.activeElement).toBe(data);
+  });
+
+  it("removes its Escape listener when unmounted while open", () => {
+    const onWindow = vi.fn();
+    window.addEventListener("keydown", onWindow);
+    const { unmount } = render(<HeaderMenu label="Zone" items={[item()]} />);
+    openMenu();
+    unmount();
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    window.removeEventListener("keydown", onWindow);
+    expect(onWindow).toHaveBeenCalledOnce();
   });
 
   it("closes on an outside mousedown", () => {
@@ -251,5 +361,153 @@ describe("badge", () => {
   it("shows no badge by default", () => {
     render(<HeaderMenu label="Zone" items={[item()]} />);
     expect(screen.queryByLabelText(/missing/)).toBeNull();
+  });
+});
+
+describe("focus return for a dialog opened from an item (#3485)", () => {
+  // A dialog that opens only after an async read mounts once the menu item
+  // is gone; the trigger must already hold focus or the dialog records
+  // <body> as its opener and closing it strands the keyboard.
+  // jsdom keeps a detached element as activeElement; a browser drops focus
+  // on <body> the moment the focused node leaves the document.
+  const dropDetachedFocus = () => {
+    const a = document.activeElement as HTMLElement | null;
+    if (a && a !== document.body && !a.isConnected) a.blur();
+  };
+
+  function AsyncHarness({ sync }: { sync?: boolean }) {
+    const [open, setOpen] = useState(false);
+    return (
+      <>
+        <HeaderMenu
+          label="Zone"
+          items={[
+            item({
+              onSelect: () =>
+                sync
+                  ? setOpen(true)
+                  : void new Promise((r) => setTimeout(r, 2)).then(() => {
+                      dropDetachedFocus();
+                      setOpen(true);
+                    }),
+            }),
+          ]}
+        />
+        {open && (
+          <Modal title="Dlg" onClose={() => setOpen(false)}>
+            <button type="button">Cancel</button>
+          </Modal>
+        )}
+      </>
+    );
+  }
+
+  for (const sync of [false, true]) {
+    it(`returns focus to the trigger (${sync ? "sync" : "after an async read"})`, async () => {
+      render(<AsyncHarness sync={sync} />);
+      const trigger = screen.getByRole("button", { name: /Zone/ });
+      fireEvent.keyDown(trigger, { key: "Enter" });
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 5));
+      });
+      const menuItem = screen.getByRole("menuitem", { name: /Alpha/ });
+      menuItem.focus();
+      fireEvent.click(menuItem);
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 5));
+      });
+      expect(screen.getByRole("dialog")).toBeTruthy();
+      fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 5));
+      });
+      expect(screen.queryByRole("dialog")).toBeNull();
+      expect(document.activeElement).toBe(trigger);
+    });
+  }
+
+  it("lets an item that moves focus itself keep it", () => {
+    function Harness() {
+      return (
+        <>
+          <HeaderMenu
+            label="Zone"
+            items={[
+              item({
+                onSelect: () => document.getElementById("target")?.focus(),
+              }),
+            ]}
+          />
+          <input id="target" aria-label="Target" />
+        </>
+      );
+    }
+    render(<Harness />);
+    openMenu();
+    const menuItem = screen.getByRole("menuitem", { name: /Alpha/ });
+    menuItem.focus();
+    fireEvent.click(menuItem);
+    expect(document.activeElement).toBe(screen.getByLabelText("Target"));
+  });
+
+  it("leaves focus on a checkbox item, which keeps the menu open", () => {
+    const onSelect = vi.fn();
+    render(
+      <HeaderMenu
+        label="Zone"
+        items={[item({ key: "c", label: "Include", checked: false, onSelect })]}
+      />,
+    );
+    openMenu();
+    const box = screen.getByRole("menuitemcheckbox", { name: /Include/ });
+    box.focus();
+    fireEvent.click(box);
+    expect(onSelect).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("menu")).toBeTruthy();
+    expect(document.activeElement).toBe(box);
+  });
+
+  it("returns to a trigger inside a dialog, which stays open (#3483)", async () => {
+    function Nested() {
+      const [inner, setInner] = useState(false);
+      return (
+        <Modal title="Outer" onClose={() => {}}>
+          <HeaderMenu
+            label="Zone"
+            items={[
+              item({
+                onSelect: () =>
+                  void new Promise((r) => setTimeout(r, 2)).then(() => {
+                    dropDetachedFocus();
+                    setInner(true);
+                  }),
+              }),
+            ]}
+          />
+          {inner && (
+            <Modal title="Inner" onClose={() => setInner(false)}>
+              <button type="button">Cancel</button>
+            </Modal>
+          )}
+        </Modal>
+      );
+    }
+    render(<Nested />);
+    const trigger = screen.getByRole("button", { name: /Zone/ });
+    fireEvent.click(trigger);
+    const menuItem = screen.getByRole("menuitem", { name: /Alpha/ });
+    menuItem.focus();
+    fireEvent.click(menuItem);
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 5));
+    });
+    expect(screen.getAllByRole("dialog")).toHaveLength(2);
+    const dialogs = screen.getAllByRole("dialog");
+    fireEvent.keyDown(dialogs[dialogs.length - 1], { key: "Escape" });
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 5));
+    });
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+    expect(document.activeElement).toBe(trigger);
   });
 });

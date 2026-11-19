@@ -22,6 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
+from app.services.ipam.host_name import current_fqdn
 
 Format = Literal["csv", "json", "xlsx"]
 
@@ -62,6 +63,20 @@ class ExportBundle:
     blocks: list[dict[str, Any]]
     subnets: list[dict[str, Any]]
     addresses: list[dict[str, Any]]
+    # What the caller asked for, not whether any address rows turned up:
+    # the CSV shape follows the request so a scope with no addresses does
+    # not silently change table (#2420).
+    include_addresses: bool = False
+
+
+def _true_total_ips(subnet: Subnet) -> int:
+    """The subnet's real size. ``Subnet.total_ips`` is clamped to BIGINT
+    (2^63 - 1) for IPv6, which exported a /64 as that cap and a /63 as the
+    same number (#3322); an IPv6 row is sized from its CIDR instead."""
+    net = ipaddress.ip_network(str(subnet.network), strict=False)
+    if net.version == 6:
+        return net.num_addresses
+    return subnet.total_ips
 
 
 def _dt(value: datetime | None) -> str | None:
@@ -136,6 +151,7 @@ async def _collect(
             "name": b.name,
             "description": b.description,
             "utilization_percent": b.utilization_percent,
+            "allocated_ips": b.allocated_ips,
             "custom_fields": b.custom_fields or {},
         }
         for b in blocks_raw
@@ -151,7 +167,7 @@ async def _collect(
             "vlan_id": s.vlan_id,
             "vxlan_id": s.vxlan_id,
             "status": s.status,
-            "total_ips": s.total_ips,
+            "total_ips": _true_total_ips(s),
             "allocated_ips": s.allocated_ips,
             "utilization_percent": s.utilization_percent,
             "custom_fields": s.custom_fields or {},
@@ -171,7 +187,7 @@ async def _collect(
                     "address": str(a.address),
                     "status": a.status,
                     "hostname": a.hostname,
-                    "fqdn": a.fqdn,
+                    "fqdn": current_fqdn(a.hostname, a.fqdn),
                     "mac_address": str(a.mac_address) if a.mac_address else None,
                     "description": a.description,
                     "last_seen_at": _dt(a.last_seen_at),
@@ -184,6 +200,7 @@ async def _collect(
         blocks=blocks_payload,
         subnets=subnets_payload,
         addresses=addresses_payload,
+        include_addresses=include_addresses,
     )
 
 
@@ -224,6 +241,21 @@ def _sanitize_cell(value: Any) -> Any:
     return value
 
 
+def _xlsx_number(value: Any) -> Any:
+    """An integer past 2^53 goes into XLSX as text. A spreadsheet number is a
+    double, so openpyxl writes 2^64 as ``1.844674407370955E+19`` -- an IPv6
+    /64's size off by 2048 (#3322). Text keeps every digit."""
+    if isinstance(value, int) and not isinstance(value, bool) and abs(value) > 2**53:
+        return str(value)
+    return value
+
+
+# Public names for the other spreadsheet exporters (the DNS zone records sheet,
+# #2139), so the escape stays one rule rather than a copy per exporter.
+FORMULA_TRIGGERS = _FORMULA_TRIGGERS
+sanitize_cell = _sanitize_cell
+
+
 # ── Serialisers ────────────────────────────────────────────────────────────────
 
 
@@ -248,14 +280,15 @@ def _addresses_to_csv(addresses: list[dict[str, Any]]) -> bytes:
 
 
 def _to_csv(bundle: ExportBundle) -> bytes:
-    # When the caller asked for addresses, emit an addresses-only CSV.
-    # CSV is a single-table format, so we pick the table that carries the
-    # data the user was after — and crucially this matches the header
-    # shape accepted by ``POST /ipam/import/addresses/commit`` so the
-    # export round-trips through the importer without column renaming.
-    # Broader scopes (block / space) should use JSON or XLSX if they
-    # need both subnet metadata *and* addresses in the same file.
-    if bundle.addresses:
+    # CSV is a single-table format. With "Include IP addresses" ticked it
+    # is the address table ONLY — the header shape
+    # ``POST /ipam/import/addresses/commit`` accepts, so the export
+    # round-trips through the importer (extra subnet columns would land in
+    # the importer's custom fields). Subnet metadata for a block / space
+    # scope comes from the CSV without the box, or JSON / XLSX / PDF,
+    # which carry both (#2420). Keyed on the request, not on whether any
+    # address rows exist, so the shape never flips with the data.
+    if bundle.include_addresses:
         return _addresses_to_csv(bundle.addresses)
 
     buf = io.StringIO()
@@ -310,7 +343,7 @@ def _to_xlsx(bundle: ExportBundle) -> bytes:
     headers = SUBNET_COLUMNS + cf_keys
     ws.append(headers)
     for row in bundle.subnets:
-        base = [_sanitize_cell(row.get(k)) for k in SUBNET_COLUMNS]
+        base = [_xlsx_number(_sanitize_cell(row.get(k))) for k in SUBNET_COLUMNS]
         cf = row.get("custom_fields") or {}
         ws.append(base + [_sanitize_cell(cf.get(k)) for k in cf_keys])
 

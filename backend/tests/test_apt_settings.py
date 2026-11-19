@@ -377,7 +377,7 @@ async def test_put_then_get_redacts_secrets(client: AsyncClient, db_session):
     assert len(rows) == 1
     nv = rows[0].new_value or {}
     assert nv.get("managed") is True
-    assert nv.get("gpg_key_count") == 1
+    assert len(nv.get("gpg_keys")) == 1
     blob = repr(nv)
     assert "s3cret" not in blob and "PGP PUBLIC KEY" not in blob
 
@@ -449,3 +449,155 @@ async def test_put_rejects_a_double_quote_in_unattended_entries(client: AsyncCli
     )
     assert ok.status_code == 200, ok.text
     assert ok.json()["apt_unattended_blocklist"] == [r"linux-image-\d"]
+
+
+# ── GHSA-j77h-pqg7-h2g4 — proxy URL credentials never leave the server ──
+
+_PROXY_WITH_CREDS = "http://bob:hunter2@proxy.lan:3128/"
+
+
+async def _viewer(db: AsyncSession) -> str:
+    u = User(
+        username=f"viewer-{uuid.uuid4().hex[:8]}",
+        email=f"{uuid.uuid4().hex[:6]}@x.com",
+        display_name="Viewer",
+        hashed_password=hash_password("x"),
+        is_superadmin=False,
+    )
+    db.add(u)
+    await db.flush()
+    return create_access_token(str(u.id))
+
+
+async def _store_proxy(db: AsyncSession, http: str, https: str = "") -> PlatformSettings:
+    settings = await db.get(PlatformSettings, 1)
+    if settings is None:
+        settings = PlatformSettings(id=1)
+        db.add(settings)
+    settings.apt_proxy_http = http
+    settings.apt_proxy_https = https
+    await db.flush()
+    return settings
+
+
+async def test_get_settings_masks_proxy_credentials(client: AsyncClient, db_session):
+    await _store_proxy(db_session, _PROXY_WITH_CREDS, "https://tok3n@proxy.lan:3129")
+    r = await client.get("/api/v1/settings", headers=_hdr(await _viewer(db_session)))
+    assert r.status_code == 200, r.text
+    assert "hunter2" not in r.text and "bob" not in r.text and "tok3n" not in r.text
+    body = r.json()
+    # The host stays visible: "which proxy?" is a real question, the
+    # credential is not part of the answer.
+    assert body["apt_proxy_http"] == "http://***@proxy.lan:3128/"
+    assert body["apt_proxy_https"] == "https://***@proxy.lan:3129"
+
+
+async def test_get_settings_leaves_a_credential_free_proxy_alone(client: AsyncClient, db_session):
+    await _store_proxy(db_session, "http://proxy.lan:3128/")
+    _, token = await _superadmin(db_session)
+    body = (await client.get("/api/v1/settings", headers=_hdr(token))).json()
+    assert body["apt_proxy_http"] == "http://proxy.lan:3128/"
+
+
+async def test_put_of_the_masked_value_keeps_the_stored_credential(client: AsyncClient, db_session):
+    await _store_proxy(db_session, _PROXY_WITH_CREDS)
+    _, token = await _superadmin(db_session)
+    h = _hdr(token)
+    masked = (await client.get("/api/v1/settings", headers=h)).json()["apt_proxy_http"]
+
+    # The form re-sends what it was shown.
+    r = await client.put("/api/v1/settings", headers=h, json={"apt_proxy_http": masked})
+    assert r.status_code == 200, r.text
+    assert "hunter2" not in r.text
+    settings = await db_session.get(PlatformSettings, 1)
+    await db_session.refresh(settings)
+    assert settings.apt_proxy_http == _PROXY_WITH_CREDS
+
+    # A path-only edit while leaving the mask keeps the credential.
+    r = await client.put(
+        "/api/v1/settings", headers=h, json={"apt_proxy_http": "http://***@proxy.lan:3128/other"}
+    )
+    assert r.status_code == 200, r.text
+    await db_session.refresh(settings)
+    assert settings.apt_proxy_http == "http://bob:hunter2@proxy.lan:3128/other"
+
+    # Moving the host / port with the mask left in is refused, nothing stored.
+    for moved in ("http://***@proxy2.lan:3128/other", "http://***@proxy.lan:8080/other"):
+        r = await client.put("/api/v1/settings", headers=h, json={"apt_proxy_http": moved})
+        assert r.status_code == 422, r.text
+        assert "re-enter" in r.text and "hunter2" not in r.text
+        await db_session.refresh(settings)
+        assert settings.apt_proxy_http == "http://bob:hunter2@proxy.lan:3128/other"
+
+    # A real new credential replaces it; clearing still clears.
+    r = await client.put(
+        "/api/v1/settings", headers=h, json={"apt_proxy_http": "http://amy:pw2@proxy2.lan:8080/"}
+    )
+    assert r.status_code == 200, r.text
+    await db_session.refresh(settings)
+    assert settings.apt_proxy_http == "http://amy:pw2@proxy2.lan:8080/"
+    r = await client.put("/api/v1/settings", headers=h, json={"apt_proxy_http": ""})
+    assert r.status_code == 200, r.text
+    await db_session.refresh(settings)
+    assert settings.apt_proxy_http == ""
+
+
+async def test_put_of_a_masked_proxy_with_an_ambiguous_host_part_is_refused(
+    client: AsyncClient, db_session
+):
+    await _store_proxy(
+        db_session, "http://bob:hunter2@proxy.lan:3128", "https://tok3n@proxy.lan:3129"
+    )
+    _, token = await _superadmin(db_session)
+    h = _hdr(token)
+    for field, base in (
+        ("apt_proxy_http", "http://***@proxy.lan:3128"),
+        ("apt_proxy_https", "https://***@proxy.lan:3129"),
+    ):
+        for sep in ("?", "#", "\\"):
+            r = await client.put(
+                "/api/v1/settings", headers=h, json={field: f"{base}{sep}@other.lan:3128"}
+            )
+            assert r.status_code == 422, (field, sep, r.text)
+            assert "hunter2" not in r.text and "tok3n" not in r.text
+    settings = await db_session.get(PlatformSettings, 1)
+    await db_session.refresh(settings)
+    assert settings.apt_proxy_http == "http://bob:hunter2@proxy.lan:3128"
+    assert settings.apt_proxy_https == "https://tok3n@proxy.lan:3129"
+    r = await client.put(
+        "/api/v1/settings", headers=h, json={"apt_proxy_http": "http://***@proxy.lan:3128"}
+    )
+    assert r.status_code == 200, r.text
+
+
+async def test_put_of_a_mask_with_no_stored_credential_is_refused(client: AsyncClient, db_session):
+    await _store_proxy(db_session, "http://proxy.lan:3128/")
+    _, token = await _superadmin(db_session)
+    r = await client.put(
+        "/api/v1/settings",
+        headers=_hdr(token),
+        json={"apt_proxy_http": "http://***@proxy.lan:3128/"},
+    )
+    assert r.status_code == 422, r.text
+
+
+async def test_find_apt_settings_masks_proxy_credentials(db_session):
+    from app.services.ai.tools.apt import FindAptSettingsArgs, find_apt_settings
+
+    await _store_proxy(db_session, _PROXY_WITH_CREDS, "https://tok3n@proxy.lan:3129")
+    user, _ = await _superadmin(db_session)
+    out = await find_apt_settings(db_session, user, FindAptSettingsArgs())
+    assert out["proxy_http"] == "http://***@proxy.lan:3128/"
+    assert out["proxy_https"] == "https://***@proxy.lan:3129"
+    assert "hunter2" not in repr(out) and "tok3n" not in repr(out)
+
+
+async def test_support_bundle_settings_drop_proxy_credentials(db_session):
+    from app.services.support_bundle.collect import collect_platform_settings
+    from app.services.support_bundle.scrub import Scrubber
+
+    # A token-only userinfo has no ``user:pass`` shape for the bundle's
+    # text rule to catch, and the unscrubbed mode keeps hostnames.
+    await _store_proxy(db_session, "http://tok3n@proxy.lan:3128/", _PROXY_WITH_CREDS)
+    out = await collect_platform_settings(db_session, Scrubber(enabled=False))
+    assert "tok3n" not in out and "hunter2" not in out

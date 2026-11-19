@@ -16,7 +16,7 @@ Two things went wrong with it, and the second is the reason this matters:
   field, on the one screen a fresh install cannot navigate away from.
 
 The floor is now non-emptiness only. It cannot collide with a policy minimum
-(the settings validator clamps that to 6..128), so every length verdict comes
+(the settings validator clamps that to 6..72), so every length verdict comes
 from one place and arrives in one shape.
 """
 

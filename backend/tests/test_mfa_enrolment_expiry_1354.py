@@ -58,6 +58,7 @@ def _budget(monkeypatch: pytest.MonkeyPatch) -> tuple[list[object], dict[str, bo
     """Stand-in budget. ``failures`` holds one entry per attempt still
     counted: begin records a wrong password, verify claims up front and
     refunds a right code, so either way only wrong answers remain."""
+    import app.api.stepup as stepup_mod
     import app.api.v1.auth.router as auth_router
 
     failures: list[object] = []
@@ -79,8 +80,8 @@ def _budget(monkeypatch: pytest.MonkeyPatch) -> tuple[list[object], dict[str, bo
         failures.remove(user_id)
 
     monkeypatch.setattr(auth_router, "record_stepup_password_failure", _record)
-    monkeypatch.setattr(auth_router, "stepup_password_blocked", _blocked)
-    monkeypatch.setattr(auth_router, "claim_stepup_attempt", _claim)
+    monkeypatch.setattr(stepup_mod, "stepup_password_blocked", _blocked)
+    monkeypatch.setattr(stepup_mod, "claim_stepup_attempt", _claim)
     monkeypatch.setattr(auth_router, "refund_stepup_attempt", _refund)
     return failures, blocked
 
@@ -120,7 +121,7 @@ async def test_an_expired_enrolment_cannot_be_verified(
     user, headers = await _user(db_session)
     secret = generate_secret()
     minted = int(time.time() - PENDING_ENROLMENT_TTL.total_seconds() - 60)
-    user.totp_secret_encrypted = _fernet().encrypt_at_time(secret.encode(), minted)
+    user.totp_secret_encrypted = _fernet()[0].encrypt_at_time(secret.encode(), minted)
     await db_session.commit()
 
     status = await client.get("/api/v1/auth/mfa/status", headers=headers)

@@ -28,7 +28,7 @@ from typing import Any
 
 import structlog
 
-from app.services.appliance import k8s
+from app.services.appliance import k8s, postgres_instances
 
 logger = structlog.get_logger(__name__)
 
@@ -107,6 +107,45 @@ def _age_seconds(iso: str | None) -> int | None:
     except ValueError:
         return None
     return int((datetime.now(UTC) - dt).total_seconds())
+
+
+# #2945 — a restart counts as "recent" when a container's previous instance
+# ended inside this window. Same 15 minutes as the appliance console's RST
+# verdict (#2928, ``_RST_WINDOW_S``); keep the two in step. The lifetime
+# ``restartCount`` only ever grows and every node reboot adds one to every
+# pod on the node, so judging on it leaves a healthy cluster amber forever.
+RECENT_RESTART_WINDOW_S = 900
+# A finishedAt this far in the future is clock skew and still reads as
+# just-now; further out it is ignored so a fast node clock cannot pin it.
+_RESTART_SKEW_S = 60
+
+
+def _recent_restarts(pod_status: dict[str, Any], now: datetime) -> tuple[int, str | None]:
+    """(containers that restarted in the window, latest such finishedAt).
+
+    Stateless: read straight off ``lastState.terminated.finishedAt``, which
+    the pod status carries, so it is right on any api replica.
+    """
+    count = 0
+    latest: tuple[datetime, str] | None = None
+    for cs in pod_status.get("containerStatuses") or []:
+        if not int(cs.get("restartCount") or 0):
+            continue
+        raw = ((cs.get("lastState") or {}).get("terminated") or {}).get("finishedAt")
+        if not raw:
+            continue
+        try:
+            dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        age = (now - dt).total_seconds()
+        if -_RESTART_SKEW_S <= age <= RECENT_RESTART_WINDOW_S:
+            count += 1
+            if latest is None or dt > latest[0]:
+                latest = (dt, str(raw))
+    return count, latest[1] if latest else None
 
 
 # ── per-resource extractors ────────────────────────────────────────────────
@@ -657,6 +696,150 @@ def cluster_unavailable(detail: str) -> dict[str, Any]:
     return _unavailable(detail)
 
 
+def _ready_since(pod: dict[str, Any]) -> str | None:
+    """When the pod's ``Ready`` condition last changed — for a pod that is
+    not Ready, how long it has been that way."""
+    for c in (pod.get("status") or {}).get("conditions") or []:
+        if c.get("type") == "Ready":
+            return c.get("lastTransitionTime")
+    return None
+
+
+def _pod_role(pod: dict[str, Any]) -> str | None:
+    """CNPG's own role label: ``cnpg.io/instanceRole`` (CNPG >= 1.24) or the
+    legacy ``role``. ``primary`` / ``replica``, or None when absent."""
+    labels = (pod.get("metadata") or {}).get("labels") or {}
+    return labels.get("cnpg.io/instanceRole") or labels.get("role")
+
+
+def _instance_rows(pods: list[dict[str, Any]], current_primary: str | None) -> list[dict[str, Any]]:
+    """One row per CNPG instance pod (#2856), primary first.
+
+    ``role`` comes from the Cluster's ``status.currentPrimary`` when it was
+    read, and from the pod's own role label otherwise.
+    """
+    rows: list[dict[str, Any]] = []
+    for p in pods:
+        name = (p.get("metadata") or {}).get("name") or "?"
+        ready_n, total_n = _ready_counts(p)
+        ready = total_n > 0 and ready_n == total_n
+        if current_primary:
+            role = "primary" if name == current_primary else "standby"
+        else:
+            role = "primary" if _pod_role(p) == "primary" else "standby"
+        rows.append(
+            {
+                "name": name,
+                "node": (p.get("spec") or {}).get("nodeName"),
+                "role": role,
+                "ready": ready,
+                "ready_since": _ready_since(p),
+                "streaming": None,
+            }
+        )
+    rows.sort(key=lambda r: (r["role"] != "primary", r["name"]))
+    return rows
+
+
+def _apply_cnpg_instances(
+    workloads: list[dict[str, Any]],
+    clusters: set[tuple[str, str]],
+    components: set[str],
+    instance_pods: list[dict[str, Any]] | None = None,
+) -> None:
+    """Take the database row's verdict from CNPG, not a pod count (#1387).
+
+    A pod count cannot see what CNPG wants. A join Job that failed for good
+    leaves only ``Failed`` pods, which are skipped, so a cluster that wants
+    three instances read 2/2 healthy indefinitely; and during first
+    bootstrap, while ``-initdb`` runs and no instance pod exists, there was
+    no database row at all. So for one CNPG Cluster the row reads
+    ``status.readyInstances`` of ``spec.instances`` (the check the rolling
+    upgrade already makes, ``safety.check_cnpg_instances_ready``), and
+    ``source`` says which. When the Cluster cannot be read (a 403, a non-CNPG
+    install, or more than one Cluster) the pod rollup stands, marked
+    ``source: "pods"``.
+    """
+    # The component CNPG's pods roll up under (``database`` from CNPG's own
+    # app.kubernetes.io/component label), not a hard-coded name.
+    if len(components) != 1:
+        return
+    comp = next(iter(components))
+    row = next((w for w in workloads if w["component"] == comp), None)
+    if row is not None:
+        row["source"] = "pods"
+    if len(clusters) != 1:
+        return
+    name, namespace = next(iter(clusters))
+    try:
+        status_code, body = k8s.get_cnpg_cluster(name, namespace=namespace or None)
+    except k8s.KubeapiUnavailableError:
+        status_code, body = 0, None
+    if status_code != 200 or not body:
+        # The pod count stands; the per-instance view still comes from the
+        # pods, with roles read off CNPG's own pod labels.
+        _attach_instances(row, instance_pods or [], None, None)
+        return
+    wanted = int((body.get("spec") or {}).get("instances") or 0)
+    if wanted <= 0:
+        _attach_instances(row, instance_pods or [], None, None)
+        return
+    ready = int((body.get("status") or {}).get("readyInstances") or 0)
+    if row is None:
+        row = {
+            "component": comp,
+            "kind": "Cluster",
+            "ready": 0,
+            "total": 0,
+            "restarts": 0,
+            "recent_restarts": 0,
+            "last_restart_at": None,
+            "jobs_running": 0,
+        }
+        workloads.append(row)
+    row["ready"] = min(ready, wanted)
+    row["total"] = wanted
+    row["source"] = "cnpg"
+    if ready >= wanted and not row.get("jobs_running"):
+        row["status"] = "healthy"
+    elif ready > 0:
+        row["status"] = "degraded"
+    else:
+        row["status"] = "down"
+    cstatus = body.get("status") or {}
+    _attach_instances(
+        row,
+        instance_pods or [],
+        cstatus.get("currentPrimary"),
+        cstatus.get("targetPrimary"),
+    )
+
+
+def _attach_instances(
+    row: dict[str, Any] | None,
+    pods: list[dict[str, Any]],
+    current_primary: str | None,
+    target_primary: str | None,
+) -> None:
+    """Per-instance rows + the kube-only findings on the database row (#2856).
+
+    CNPG counts a standby that is Ready but not replicating as a healthy
+    instance, so the row's ready / total cannot say "a standby is stuck".
+    The instances can: a not-Ready one is found here, and the router (and
+    the alert) add the streaming half from ``pg_stat_replication`` — see
+    :mod:`app.services.appliance.postgres_instances`.
+    """
+    if row is None or not pods:
+        return
+    instances = _instance_rows(pods, current_primary)
+    row["instances"] = instances
+    row["current_primary"] = current_primary or next(
+        (i["name"] for i in instances if i["role"] == "primary"), None
+    )
+    row["target_primary"] = target_primary
+    postgres_instances.apply(row, None)
+
+
 def get_cluster_health() -> dict[str, Any]:
     """Gather a full cluster-health snapshot. Synchronous (stdlib kubeapi).
 
@@ -806,17 +989,32 @@ def get_cluster_health() -> dict[str, Any]:
     # Job pods still running per component (#1213): a CNPG
     # ``postgresql-N-join`` pod means an instance is still being created.
     jobs_running: dict[str, int] = {}
+    # #1387 — the CNPG Clusters behind the database pods, from the label CNPG
+    # puts on every pod it runs (instances, and its initdb / join Jobs).
+    cnpg_clusters: set[tuple[str, str]] = set()
+    cnpg_components: set[str] = set()
+    # #2856 — the instance pods themselves (not the initdb / join Jobs), for
+    # the per-instance verdict on the database row.
+    cnpg_instance_pods: list[dict[str, Any]] = []
+    now_utc = datetime.now(UTC)
     for p in pods_raw:
         meta = p.get("metadata") or {}
         status = p.get("status") or {}
         ns = meta.get("namespace") or ""
         name = meta.get("name") or "?"
+        cnpg_name = (meta.get("labels") or {}).get("cnpg.io/cluster")
+        if cnpg_name:
+            cnpg_clusters.add((str(cnpg_name), ns))
+            cnpg_components.add(_pod_component(p))
         phase = status.get("phase") or "Unknown"
+        if cnpg_name and _pod_owner_kind(p) != "Job" and phase not in ("Succeeded", "Failed"):
+            cnpg_instance_pods.append(p)
         pods_by_phase[phase] = pods_by_phase.get(phase, 0) + 1
         if phase == "Running":
             pods_running += 1
         ready_n, total_n = _ready_counts(p)
         restarts = sum(c.get("restartCount", 0) for c in status.get("containerStatuses") or [])
+        recent, last_restart = _recent_restarts(status, now_utc)
         cpu_u, mem_u = pod_usage.get((ns, name), (None, None))
         comp = _pod_component(p)
         owner = _pod_owner_kind(p)
@@ -847,10 +1045,23 @@ def get_cluster_health() -> dict[str, Any]:
             continue
         agg = rollup.setdefault(
             comp,
-            {"component": comp, "kind": owner, "ready": 0, "total": 0, "restarts": 0},
+            {
+                "component": comp,
+                "kind": owner,
+                "ready": 0,
+                "total": 0,
+                "restarts": 0,
+                "recent_restarts": 0,
+                "last_restart_at": None,
+            },
         )
         agg["total"] += 1
         agg["restarts"] += restarts
+        agg["recent_restarts"] += recent
+        if last_restart and (
+            agg["last_restart_at"] is None or last_restart > agg["last_restart_at"]
+        ):
+            agg["last_restart_at"] = last_restart
         fully_ready = (total_n > 0 and ready_n == total_n) or phase == "Succeeded"
         if fully_ready:
             agg["ready"] += 1
@@ -869,6 +1080,7 @@ def get_cluster_health() -> dict[str, Any]:
         else:
             wstatus = "down"
         workloads.append({**agg, "jobs_running": n_jobs, "status": wstatus})
+    _apply_cnpg_instances(workloads, cnpg_clusters, cnpg_components, cnpg_instance_pods)
     workloads.sort(
         key=lambda w: (
             (

@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Copy, Pencil, Plus, Trash2 } from "lucide-react";
 import {
   formatApiError,
+  formatDialogError,
   rolesApi,
   type AppRole,
   type PermissionEntry,
@@ -11,37 +12,30 @@ import {
 } from "@/lib/api";
 import { zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { StepUpSection } from "@/components/StepUpSection";
+import { isStepUpRequired, stepUpBody } from "@/lib/stepup";
 import { ResourceIdPicker } from "@/components/ownership/ResourceIdPicker";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import {
+  GRANT_ACTIONS,
+  GRANT_RESOURCE_TYPES,
+} from "@/lib/permissionVocabulary";
+import { FormError } from "@/components/ui/form-error";
 
-// Mirror of docs/PERMISSIONS.md — keep these in sync.
-const ACTIONS = ["read", "write", "delete", "admin", "*"] as const;
-const RESOURCE_TYPES = [
-  "*",
-  "ip_space",
-  "ip_block",
-  "subnet",
-  "ip_address",
-  "address_set",
-  "vlan",
-  "dns_group",
-  "dns_zone",
-  "dns_record",
-  "dns_blocklist",
-  "dhcp_server",
-  "dhcp_scope",
-  "dhcp_pool",
-  "dhcp_static",
-  "dhcp_client_class",
-  "audit_log",
-  "user",
-  "group",
-  "role",
-  "auth_provider",
-  "custom_field",
-  "manage_ipam_templates",
-  "settings",
-  "api_token",
-] as const;
+// What a new grant row offers: the shared vocabulary (lib/permissionVocabulary).
+// A role can hold more than these lists name — the built-in roles do
+// (`appliance`, …) — so each select also offers the value its row holds
+// (`withHeld`), and shows it (#1394).
+const ACTIONS = GRANT_ACTIONS;
+const RESOURCE_TYPES = GRANT_RESOURCE_TYPES;
+
+/** A list's options plus the value a grant holds, when the list does not
+ * name it. A controlled select whose value is not among its options shows
+ * the first option instead, so a role's dialog showed `admin · *` for its
+ * `admin · appliance` grant (#1394). */
+function withHeld(list: readonly string[], held: string): string[] {
+  return list.includes(held) ? [...list] : [...list, held];
+}
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -111,7 +105,7 @@ function PermissionEditor({
             value={p.action}
             onChange={(e) => update(idx, { action: e.target.value })}
           >
-            {ACTIONS.map((a) => (
+            {withHeld(ACTIONS, p.action).map((a) => (
               <option key={a}>{a}</option>
             ))}
           </select>
@@ -120,7 +114,7 @@ function PermissionEditor({
             value={p.resource_type}
             onChange={(e) => update(idx, { resource_type: e.target.value })}
           >
-            {RESOURCE_TYPES.map((t) => (
+            {withHeld(RESOURCE_TYPES, p.resource_type).map((t) => (
               <option key={t}>{t}</option>
             ))}
           </select>
@@ -147,9 +141,13 @@ function PermissionEditor({
 function RoleModal({
   role,
   onClose,
+  canEdit = true,
 }: {
   role: AppRole | null;
   onClose: () => void;
+  /** #1341 — false for a caller without `admin` on `role`: the modal
+   *  shows the role read-only, as it does a built-in one. */
+  canEdit?: boolean;
 }) {
   const qc = useQueryClient();
   const [name, setName] = useState(role?.name ?? "");
@@ -158,6 +156,11 @@ function RoleModal({
     role?.permissions ?? [],
   );
   const [error, setError] = useState<string | null>(null);
+  // #1412 — shown once the server says this change makes someone a
+  // superadmin; the dialog cannot work that out itself.
+  const [needsStepUp, setNeedsStepUp] = useState(false);
+  const [stepPassword, setStepPassword] = useState("");
+  const [stepTotp, setStepTotp] = useState("");
 
   const mutation = useMutation({
     mutationFn: () => {
@@ -167,7 +170,10 @@ function RoleModal({
         permissions,
       };
       return role
-        ? rolesApi.update(role.id, payload as RoleUpdate)
+        ? rolesApi.update(role.id, {
+            ...(payload as RoleUpdate),
+            ...(needsStepUp ? stepUpBody(stepPassword, stepTotp) : {}),
+          })
         : rolesApi.create(payload as RoleCreate);
     },
     onSuccess: () => {
@@ -175,14 +181,16 @@ function RoleModal({
       onClose();
     },
     onError: (err: unknown) => {
-      const msg =
-        (err as { response?: { data?: { detail?: unknown } } })?.response?.data
-          ?.detail ?? "Failed to save role";
-      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      if (isStepUpRequired(err)) {
+        setNeedsStepUp(true);
+        setError(null);
+        return;
+      }
+      setError(formatDialogError(err, "Failed to save role"));
     },
   });
 
-  const readOnly = role?.is_builtin ?? false;
+  const readOnly = (role?.is_builtin ?? false) || !canEdit;
 
   return (
     <Modal
@@ -193,8 +201,9 @@ function RoleModal({
       <div className="space-y-3">
         {readOnly && (
           <p className="rounded-md bg-muted px-3 py-2 text-xs text-muted-foreground">
-            Built-in roles cannot be edited directly. Clone this role to make a
-            customised copy.
+            {role?.is_builtin
+              ? "Built-in roles cannot be edited directly. Clone this role to make a customised copy."
+              : "View only: editing a role requires admin permission on roles."}
           </p>
         )}
         <Field label="Name">
@@ -217,7 +226,18 @@ function RoleModal({
         <fieldset disabled={readOnly} className="disabled:opacity-60">
           <PermissionEditor value={permissions} onChange={setPermissions} />
         </fieldset>
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {needsStepUp && (
+          <StepUpSection
+            reason="This change makes members of the groups holding this role superadmins. Confirm it's you to save it."
+            password={stepPassword}
+            onPassword={setStepPassword}
+            totp={stepTotp}
+            onTotp={setStepTotp}
+          />
+        )}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
         <div className="flex justify-end gap-2 pt-2">
           <button
             onClick={onClose}
@@ -231,7 +251,11 @@ function RoleModal({
                 setError(null);
                 mutation.mutate();
               }}
-              disabled={!name || mutation.isPending}
+              disabled={
+                !name ||
+                mutation.isPending ||
+                (needsStepUp && !stepPassword && !stepTotp)
+              }
               className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
             >
               {mutation.isPending ? "Saving…" : "Save"}
@@ -254,10 +278,7 @@ function CloneModal({ role, onClose }: { role: AppRole; onClose: () => void }) {
       onClose();
     },
     onError: (err: unknown) => {
-      const msg =
-        (err as { response?: { data?: { detail?: unknown } } })?.response?.data
-          ?.detail ?? "Clone failed";
-      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setError(formatDialogError(err, "Clone failed"));
     },
   });
 
@@ -272,7 +293,9 @@ function CloneModal({ role, onClose }: { role: AppRole; onClose: () => void }) {
             autoFocus
           />
         </Field>
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
         <div className="flex justify-end gap-2 pt-2">
           <button
             onClick={onClose}
@@ -321,9 +344,9 @@ function DeleteModal({
         </p>
         {/* A refused or failed delete says so; the dialog stays (#1344). */}
         {mutation.isError && (
-          <p className="text-xs text-destructive">
+          <FormError className="text-xs text-destructive">
             {formatApiError(mutation.error)}
-          </p>
+          </FormError>
         )}
         <div className="flex justify-end gap-2">
           <button
@@ -346,6 +369,12 @@ function DeleteModal({
 }
 
 export function RolesPage() {
+  // #1341 — every role write takes `admin` on `role` (roles/router.py).
+  const canAdmin = usePermissions().can("admin", "role");
+  const adminGate = permissionGate(
+    canAdmin,
+    "Requires admin permission on roles",
+  );
   const [showCreate, setShowCreate] = useState(false);
   const [editRole, setEditRole] = useState<AppRole | null>(null);
   const [cloneRole, setCloneRole] = useState<AppRole | null>(null);
@@ -372,7 +401,8 @@ export function RolesPage() {
           </div>
           <button
             onClick={() => setShowCreate(true)}
-            className="flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+            className="flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+            {...adminGate}
           >
             <Plus className="h-3.5 w-3.5" />
             New Role
@@ -429,14 +459,16 @@ export function RolesPage() {
                       <button
                         onClick={() => setEditRole(role)}
                         className="rounded p-1 text-muted-foreground hover:text-foreground"
-                        title={role.is_builtin ? "View" : "Edit"}
+                        title={role.is_builtin || !canAdmin ? "View" : "Edit"}
                       >
                         <Pencil className="h-3.5 w-3.5" />
                       </button>
                       <button
                         onClick={() => setCloneRole(role)}
-                        className="rounded p-1 text-muted-foreground hover:text-foreground"
+                        className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                         title="Clone"
+                        aria-label="Clone"
+                        {...adminGate}
                       >
                         <Copy className="h-3.5 w-3.5" />
                       </button>
@@ -449,6 +481,8 @@ export function RolesPage() {
                             ? "Built-in roles cannot be deleted"
                             : "Delete"
                         }
+                        aria-label="Delete"
+                        {...adminGate}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>
@@ -465,7 +499,11 @@ export function RolesPage() {
         <RoleModal role={null} onClose={() => setShowCreate(false)} />
       )}
       {editRole && (
-        <RoleModal role={editRole} onClose={() => setEditRole(null)} />
+        <RoleModal
+          role={editRole}
+          onClose={() => setEditRole(null)}
+          canEdit={canAdmin}
+        />
       )}
       {cloneRole && (
         <CloneModal role={cloneRole} onClose={() => setCloneRole(null)} />

@@ -461,6 +461,19 @@ surface filters by `origin`, so neither queue ever renders the other's
 rows. `justification` is the requester's free-text "why" and is NULL on
 gate rows, which carry the policy-derived `risk_reason` instead.
 
+When the operation refuses at approve time, the row ends `failed` with the
+reason in `error`, after its `approved` stamp, and the approve answers 200,
+so the requester can read why (#2911). That covers the re-run preview
+refusing (the target is gone, the subnet is no longer empty) and `apply()`
+raising a 4xx (a conflict that appeared after submit), a 5xx, or any other
+error. Two outcomes leave the row `pending` instead. A permission error
+about the approver answers 403, because a different approver may still
+approve. And on a gate row, a re-run preview that still succeeds but
+describes a different scope from the one the approver reviewed answers 409,
+since the change is still possible but is not what was approved. A portal
+row has no such check, because its preview names what the allocator would
+pick at that moment.
+
 ---
 
 ## 10. Observability + audit
@@ -476,8 +489,18 @@ Files: [`audit.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend
 ### Audit log (append-only + hash chain)
 
 `AuditLog` (table `audit_log`) is the append-only record of every
-mutation. It is **never** deleted application-side, and a DB-level
-trigger blocks `DELETE` as a second guard (issue #73).
+mutation. It is **never** updated or deleted application-side, and
+DB-level row triggers refuse both as a second guard: `audit_log_no_delete`
+(`BEFORE DELETE`, issue #73) and `audit_log_no_update` (`BEFORE UPDATE`,
+issue #2315). `TRUNCATE` is not guarded, since the selective restore of
+the `audit` section truncates the table before reloading it.
+
+This makes the table **tamper-evident, not tamper-proof**: the database
+owner can disable or drop a trigger. The built-in conformity policy
+"Audit log is reachable and append-only" (check `audit_log_immutable`)
+reads `pg_trigger` and fails, naming the trigger, when either guard is
+missing, disabled, or altered. A migration that ever has to rewrite rows
+must disable `audit_log_no_update` for its duration.
 
 Tamper-evidence is a hash chain: each row carries a monotonic
 `BigInteger seq` (assigned from `audit_log_seq_seq`), a `row_hash`, and a
@@ -486,7 +509,10 @@ Tamper-evidence is a hash chain: each row carries a monotonic
 a SQLAlchemy `before_flush` listener that takes a Postgres advisory lock
 to serialize "look up previous row → hash → append", so concurrent
 inserts can't interleave and break the chain. `prev_hash` is NULL only on
-the first row. A nightly `verify_chain` task re-walks and validates it.
+the first row. A nightly task validates it with `verify_chain`, a keyset
+walk in pages, resuming from the singleton `audit_chain_checkpoint` row
+(last verified `seq` + hash) and re-walking the whole chain at least weekly
+(#2286).
 
 Each row records *who* (`user_id`, `user_display_name`, `auth_source`,
 `source_ip`, `user_agent`), *what* (`action`, `resource_type`,

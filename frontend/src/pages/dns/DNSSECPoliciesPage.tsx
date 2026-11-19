@@ -2,11 +2,19 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { KeyRound, Pencil, Plus, Trash2 } from "lucide-react";
 
-import { dnsApi, type DNSSECPolicy } from "@/lib/api";
+import { dnsApi, formatApiError, type DNSSECPolicy } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
 import { Modal } from "@/components/ui/modal";
+import { FreshRowError } from "@/components/FreshRowError";
+import { changedFields, useFreshRow } from "@/hooks/useFreshRow";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
 import { cn } from "@/lib/utils";
+import { FormError } from "@/components/ui/form-error";
 
 const ALGORITHMS = [
   "ecdsap256sha256",
@@ -46,6 +54,8 @@ export function DNSSECPoliciesPage() {
   });
 
   const rows = policies.data ?? [];
+  // The policy routes take a superadmin whatever the grants (#1879).
+  const gate = permissionGate(usePermissions().isSuperadmin, NEEDS_SUPERADMIN);
 
   return (
     <div className="flex min-w-0 flex-1 flex-col gap-4 p-4">
@@ -60,7 +70,11 @@ export function DNSSECPoliciesPage() {
             on <code>default</code> for BIND&rsquo;s built-in policy.
           </p>
         </div>
-        <HeaderButton variant="primary" onClick={() => setCreating(true)}>
+        <HeaderButton
+          variant="primary"
+          onClick={() => setCreating(true)}
+          {...gate}
+        >
           <Plus className="h-4 w-4" /> New policy
         </HeaderButton>
       </div>
@@ -120,6 +134,8 @@ export function DNSSECPoliciesPage() {
                           onClick={() => setEditing(p)}
                           className="rounded border p-1 hover:bg-accent"
                           title="Edit"
+                          aria-label="Edit"
+                          {...gate}
                         >
                           <Pencil className="h-3.5 w-3.5" />
                         </button>
@@ -128,6 +144,8 @@ export function DNSSECPoliciesPage() {
                           onClick={() => setToDelete(p)}
                           className="rounded border border-destructive/40 p-1 text-destructive hover:bg-destructive/10"
                           title="Delete"
+                          aria-label="Delete"
+                          {...gate}
                         >
                           <Trash2 className="h-3.5 w-3.5" />
                         </button>
@@ -171,13 +189,32 @@ export function DNSSECPoliciesPage() {
   );
 }
 
-function PolicyModal({
-  existing,
-  onClose,
-}: {
+type PolicyModalProps = {
   existing: DNSSECPolicy | null;
   onClose: () => void;
-}) {
+};
+
+// Edit reads the policy fresh on open and Save sends only what changed (#3365).
+export function PolicyModal(props: PolicyModalProps) {
+  const fresh = useFreshRow(props.existing ?? undefined, () =>
+    dnsApi
+      .listDnssecPolicies()
+      .then((rows) => rows.find((r) => r.id === props.existing!.id)),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit DNSSEC policy"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <PolicyModalForm {...props} existing={fresh.row ?? null} />;
+}
+
+function PolicyModalForm({ existing, onClose }: PolicyModalProps) {
   const qc = useQueryClient();
   const [name, setName] = useState(existing?.name ?? "");
   const [description, setDescription] = useState(existing?.description ?? "");
@@ -187,7 +224,6 @@ function PolicyModal({
   const [kskLife, setKskLife] = useState(existing?.ksk_lifetime_days ?? 0);
   const [zskLife, setZskLife] = useState(existing?.zsk_lifetime_days ?? 90);
   const [nsec3, setNsec3] = useState(existing?.nsec3 ?? false);
-  const [iterations, setIterations] = useState(existing?.nsec3_iterations ?? 0);
   const [saltLen, setSaltLen] = useState(existing?.nsec3_salt_length ?? 0);
   const [optout, setOptout] = useState(existing?.nsec3_optout ?? false);
   const [error, setError] = useState<string | null>(null);
@@ -200,11 +236,27 @@ function PolicyModal({
         ksk_lifetime_days: kskLife,
         zsk_lifetime_days: zskLife,
         nsec3,
-        nsec3_iterations: iterations,
+        nsec3_iterations: 0,
         nsec3_salt_length: saltLen,
         nsec3_optout: optout,
       };
-      if (existing) return dnsApi.updateDnssecPolicy(existing.id, body);
+      if (existing) {
+        const diff = changedFields(
+          {
+            description: existing.description ?? "",
+            algorithm: existing.algorithm,
+            ksk_lifetime_days: existing.ksk_lifetime_days,
+            zsk_lifetime_days: existing.zsk_lifetime_days,
+            nsec3: existing.nsec3,
+            nsec3_iterations: existing.nsec3_iterations ?? 0,
+            nsec3_salt_length: existing.nsec3_salt_length,
+            nsec3_optout: existing.nsec3_optout,
+          },
+          { ...body },
+        );
+        if (Object.keys(diff).length === 0) return Promise.resolve(existing);
+        return dnsApi.updateDnssecPolicy(existing.id, diff);
+      }
       return dnsApi.createDnssecPolicy({ ...body, name });
     },
     onSuccess: () => {
@@ -212,8 +264,7 @@ function PolicyModal({
       onClose();
     },
     onError: (e: unknown) => {
-      const err = e as { response?: { data?: { detail?: string } } };
-      setError(err?.response?.data?.detail ?? "Save failed");
+      setError(formatApiError(e, "Save failed"));
     },
   });
 
@@ -299,10 +350,12 @@ function PolicyModal({
               Iterations
               <input
                 type="number"
-                min={0}
                 className={cn(inputCls, "mt-1")}
-                value={iterations}
-                onChange={(e) => setIterations(Number(e.target.value))}
+                value={0}
+                readOnly
+                disabled
+                aria-label="Iterations"
+                title="BIND 9.20 only accepts 0 (RFC 9276)"
               />
             </label>
             <label className="block text-xs font-medium text-muted-foreground">
@@ -310,6 +363,7 @@ function PolicyModal({
               <input
                 type="number"
                 min={0}
+                max={255}
                 className={cn(inputCls, "mt-1")}
                 value={saltLen}
                 onChange={(e) => setSaltLen(Number(e.target.value))}
@@ -325,12 +379,16 @@ function PolicyModal({
             </label>
           </div>
         )}
-        {nsec3 && iterations > 0 && (
-          <p className="text-[11px] text-amber-600 dark:text-amber-400">
-            RFC 9276 recommends iterations 0 + salt length 0 for NSEC3.
+        {nsec3 && (
+          <p className="text-[11px] text-muted-foreground">
+            Iterations are fixed at 0: BIND 9.20 refuses any other value (RFC
+            9276), and a refused policy stops the whole server group&rsquo;s
+            config from applying.
           </p>
         )}
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
         <div className="flex justify-end gap-2">
           <button
             type="button"

@@ -27,6 +27,20 @@ import {
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { HeaderButton } from "@/components/ui/header-button";
+import { ListReadError } from "@/components/ui/list-read-error";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
+
+/** Every import route (preview, test and commit) takes a superadmin, so the
+ *  controls that start one say so rather than letting a Viewer fill in the
+ *  form and be refused (#1940's DNS importer, #2523). Commit is reachable
+ *  only from a successful preview. */
+function useImportGate(): { disabled?: boolean; title?: string } {
+  return permissionGate(usePermissions().isSuperadmin, NEEDS_SUPERADMIN);
+}
 
 type TabId = DHCPImportSource;
 
@@ -51,7 +65,7 @@ const TABS: TabDef[] = [
     label: "Kea",
     short: "kea-dhcp4.conf / kea-dhcp6.conf",
     description:
-      "Upload a Kea JSON config from a non-managed daemon. The importer strips Kea's comment extensions, walks every Dhcp4 subnet4 / Dhcp6 subnet6 and maps pools, reservations, option-data, and client-classes into the canonical shape. HA / host-cache / lease-cmds hook config is not carried across — set HA up at the SpatiumDDI server-group level post-import.",
+      "Upload a Kea JSON config from a non-managed daemon. The importer strips Kea's comment extensions, walks every Dhcp4 subnet4 / Dhcp6 subnet6 (including those under shared-networks, which are flattened) and maps pools, reservations, option-data, and client-classes into the canonical shape. HA / host-cache / lease-cmds hook config is not carried across — set HA up at the SpatiumDDI server-group level post-import.",
   },
   {
     id: "windows_dhcp",
@@ -268,6 +282,7 @@ function ImportTab({ source }: { source: DHCPImportSource }) {
             blocks={blocksQ.data ?? []}
             servers={serversQ.data ?? []}
             serversLoading={serversQ.isLoading}
+            serversError={serversQ.error}
             onPreview={() => {
               setState((s) => ({ ...s, phase: "previewing", error: null }));
               previewMut.mutate();
@@ -299,10 +314,7 @@ function ImportTab({ source }: { source: DHCPImportSource }) {
 }
 
 function extractError(err: unknown): string {
-  return (
-    (err as { response?: { data?: { detail?: string } } })?.response?.data
-      ?.detail ?? formatApiError(err)
-  );
+  return formatApiError(err);
 }
 
 // ── configure source + target ────────────────────────────────────────
@@ -316,6 +328,7 @@ function ConfigureForm({
   blocks,
   servers,
   serversLoading,
+  serversError,
   onPreview,
   previewing,
 }: {
@@ -327,6 +340,7 @@ function ConfigureForm({
   blocks: { id: string; name: string; network: string }[];
   servers: WindowsDHCPServerOption[];
   serversLoading: boolean;
+  serversError: unknown;
   onPreview: () => void;
   previewing: boolean;
 }) {
@@ -337,6 +351,7 @@ function ConfigureForm({
     ? Boolean(state.file)
     : Boolean(state.serverId);
   const canPreview = sourceReady && Boolean(state.groupId) && !previewing;
+  const gate = useImportGate();
   const eligibleServers = servers.filter((s) => s.has_credentials);
 
   return (
@@ -408,9 +423,11 @@ function ConfigureForm({
                 <option value="">
                   {serversLoading
                     ? "Loading…"
-                    : eligibleServers.length === 0
-                      ? "— no eligible servers —"
-                      : "— select —"}
+                    : serversError
+                      ? "— servers unavailable —"
+                      : eligibleServers.length === 0
+                        ? "— no eligible servers —"
+                        : "— select —"}
                 </option>
                 {servers.map((srv) => (
                   <option
@@ -423,6 +440,14 @@ function ConfigureForm({
                   </option>
                 ))}
               </select>
+              {serversError ? (
+                <p className="mt-1 text-xs">
+                  <ListReadError
+                    error={serversError}
+                    what="the servers to import from"
+                  />
+                </p>
+              ) : null}
             </div>
           )}
 
@@ -514,7 +539,8 @@ function ConfigureForm({
           icon={previewing ? Loader2 : isFileSource ? Upload : ServerIcon}
           iconClassName={previewing ? "animate-spin" : undefined}
           onClick={onPreview}
-          disabled={!canPreview}
+          disabled={!canPreview || !!gate.disabled}
+          title={gate.title}
         >
           {previewing
             ? isFileSource
@@ -529,7 +555,7 @@ function ConfigureForm({
 
 // ── preview + commit ──────────────────────────────────────────────────
 
-function PreviewPanel({
+export function PreviewPanel({
   preview,
   decisions,
   setDecisions,
@@ -615,10 +641,14 @@ function PreviewPanel({
                     <td className="px-3 py-2 font-mono text-xs">
                       {sc.subnet_cidr}
                       {sc.parse_warnings.length > 0 && (
-                        <div className="mt-0.5 text-[10px] text-amber-600 dark:text-amber-400">
-                          {sc.parse_warnings.length} note
-                          {sc.parse_warnings.length === 1 ? "" : "s"}
-                        </div>
+                        <ul
+                          aria-label={`Notes for ${sc.subnet_cidr}`}
+                          className="mt-1 max-w-md list-disc space-y-0.5 pl-4 font-sans text-[11px] text-amber-700 [overflow-wrap:anywhere] dark:text-amber-400"
+                        >
+                          {sc.parse_warnings.map((w, i) => (
+                            <li key={i}>{w}</li>
+                          ))}
+                        </ul>
                       )}
                     </td>
                     <td className="px-3 py-2 text-xs">{sc.address_family}</td>

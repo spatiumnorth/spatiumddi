@@ -3,6 +3,8 @@ import { Link, useLocation } from "react-router-dom";
 import { ShieldAlert } from "lucide-react";
 
 import { applianceSystemApi, versionApi } from "@/lib/api";
+import { usePermissions } from "@/hooks/usePermissions";
+import { isRefused } from "@/lib/refusal";
 
 /**
  * Phase 4f — maintenance-mode banner.
@@ -19,6 +21,10 @@ import { applianceSystemApi, versionApi } from "@/lib/api";
  */
 export function MaintenanceBanner() {
   const location = useLocation();
+  // The probe behind this banner is `read` on `appliance`; a user without it
+  // is refused every 15 s and each refusal is an audited `denied` row (#1864).
+  // It never asks, so the banner is simply not theirs to see.
+  const canRead = usePermissions().can("read", "appliance");
 
   const version = useQuery({
     queryKey: ["version"],
@@ -28,18 +34,20 @@ export function MaintenanceBanner() {
   const sys = useQuery({
     queryKey: ["appliance", "system", "info"],
     queryFn: applianceSystemApi.info,
-    enabled: !!version.data?.appliance_mode,
+    enabled: !!version.data?.appliance_mode && canRead,
     // Poll a bit faster than the wizard banner — operators who flip
     // the toggle deserve immediate feedback in the global UI.
     refetchInterval: (q) =>
-      q.state.data?.maintenance_mode || version.data?.appliance_mode
-        ? 15_000
-        : false,
+      isRefused(q.state.error)
+        ? false
+        : q.state.data?.maintenance_mode || version.data?.appliance_mode
+          ? 15_000
+          : false,
     staleTime: 10_000,
   });
 
   if (!version.data?.appliance_mode) return null;
-  if (!sys.data?.maintenance_mode) return null;
+  if (!canRead || !sys.data?.maintenance_mode) return null;
   // No need to nag when the operator is on the page that disables it.
   if (location.pathname.startsWith("/appliance")) return null;
 

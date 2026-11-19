@@ -26,6 +26,19 @@ services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    # #3932 — end a session whose client has gone: a dead client's open
+    # transaction must not hold a migration's lock for hours. Reload-only;
+    # see docs/deployment/DOCKER.md.
+    command:
+      - postgres
+      - -c
+      - idle_in_transaction_session_timeout=1h
+      - -c
+      - tcp_keepalives_idle=60
+      - -c
+      - tcp_keepalives_interval=10
+      - -c
+      - tcp_keepalives_count=6
     networks:
       - spatiumddi
     environment:
@@ -73,6 +86,9 @@ services:
       # minimal — see backend/Dockerfile.
       target: dev
     restart: unless-stopped
+    # #2944 — above the image's uvicorn --timeout-graceful-shutdown (20 s) so
+    # lifespan shutdown runs before the kill; Docker's default is 10 s.
+    stop_grace_period: 30s
     networks:
       - spatiumddi
     ports:
@@ -148,7 +164,7 @@ services:
     restart: unless-stopped
     networks:
       - spatiumddi
-    command: celery -A app.celery_app worker --loglevel=info --concurrency=4 -Q ipam,dns,dhcp,default,bundles
+    command: celery -A app.celery_app worker --loglevel=info --concurrency=4 --without-mingle --without-heartbeat --without-gossip -Q ipam,dns,dhcp,default,bundles
     env_file: .env
     environment:
       # Dev only: boot on the .env.example placeholder SECRET_KEY with a
@@ -164,6 +180,8 @@ services:
       # sweep so it has to write the same files the api reads
       # back from the "list archives" endpoint.
       - spatium_backups:/var/lib/spatiumddi/backups
+      # Upgrade-image store (issue #2400) — the reclaim beat task runs here.
+      - spatium_slot_images:/var/lib/spatiumddi/slot-images
     # Docker integration — the worker runs the reconcile tasks, so it
     # needs the host socket too. Uncomment alongside the matching
     # entries on the api service above.
@@ -229,8 +247,8 @@ services:
   frontend:
     image: spatiumddi-frontend:dev
     build:
-      context: ./frontend
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: frontend/Dockerfile
     restart: unless-stopped
     networks:
       - spatiumddi
@@ -238,6 +256,15 @@ services:
       - "${HTTP_PORT:-8077}:80"
     depends_on:
       - api
+    # #1868 — the reverse proxy in front of this container, if any (its
+    # address, or the network it connects from). The frontend nginx then takes
+    # the real client address and scheme from that proxy's X-Forwarded-For /
+    # -Proto instead of overwriting them. EMPTY (unset) = trust no proxy,
+    # today's behaviour. Separate from the api's TRUSTED_PROXY_CIDRS on
+    # purpose: the api's peer is this container, the frontend's is the proxy.
+    # docs/deployment/REVERSE_PROXY.md.
+    environment:
+      FRONTEND_TRUSTED_PROXY_CIDRS: ${FRONTEND_TRUSTED_PROXY_CIDRS:-}
 
   # ── Migrations (runs once at startup) ──────────────────────────────────────
   migrate:
@@ -270,6 +297,10 @@ services:
       context: .
       dockerfile: agent/dns/images/bind9/Dockerfile
     restart: unless-stopped
+    # #1725 — a memory ceiling. named plus the agent hold a large RPZ
+    # (~580k entries per zone is ~2-3.5 GB), and without a limit one big
+    # blocklist takes the host's RAM. Raise it for bigger lists (docs/features/DNS.md).
+    mem_limit: ${DNS_BIND9_MEM_LIMIT:-2g}
     networks:
       - spatiumddi
     environment:

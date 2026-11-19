@@ -43,7 +43,7 @@ Both IP blocks and subnets are displayed in a **tree view** in the UI, mirroring
 
 ### Tree Features
 - Expand/collapse nodes
-- Utilization color-coded bars (green < 70%, amber 70–90%, red > 90%)
+- Utilization color-coded bars and dots: amber from Settings' Warning Threshold (default 80%), red from its Critical Threshold (default 95%); the Subnets list and the Dashboard's capacity figures use the same two thresholds
 - Right-click context menu: Create child block, Create subnet, Edit, Delete
 - Drag nodes to reorganize (with validation — child must fit inside parent CIDR)
 - Free space visualization: show unallocated ranges within a block
@@ -80,8 +80,8 @@ Subnet
   -- Status / Metadata
   status: enum(active, deprecated, reserved, quarantine)
   utilization_percent: float (computed)
-  total_ips: int (computed)
-  allocated_ips: int (computed)
+  total_ips: int (computed — usable addresses; IPv4 network + broadcast excluded)
+  allocated_ips: int (computed — non-available rows, excluding the IPv4 network / broadcast placeholders, so allocated ≤ total)
   
   -- Custom Fields (see section 6)
   custom_fields: JSONB
@@ -509,17 +509,17 @@ ad-hoc wake raises no alert: alerting is keyed on a schedule subject, and an ad-
 run has none.
 
 **ACTIVE probes run from the SERVER vantage only**, regardless of the schedule's *wake*
-vantage. The appliance command channel (`agent_cmd`) is an in-memory, per-replica
-dispatch the **api** process owns; the verify task runs in the **Celery worker**, and
-there is no worker→supervisor result-return path today. So for an appliance-vantage
+vantage. The appliance command channel (`agent_cmd`) is Redis-backed (#3706), so the
+**Celery worker** can reach a supervisor and read its reply, but the verify probe is not
+wired onto it yet. So for an appliance-vantage
 wake, an active probe still runs from the control plane: correct when the api/worker
 can reach the target segment (routed ICMP / directed broadcast), and a false-negative
 (unverified) — never a false wake — when it can't. **`seen` sidesteps this entirely**:
 it is a pure DB read, so it verifies hosts on segments the worker cannot reach at all,
 provided some other subsystem (an SNMP poll of the local switch, a DHCP lease)
 observed them — which is why `auto` is the sensible default on a segmented network.
-**Appliance-vantage *active* verify** (a worker→supervisor result channel) remains the
-named follow-up, alongside the
+**Appliance-vantage *active* verify** (running the probe over the command channel, which
+the worker can now reach) remains the named follow-up, alongside the
 deferred [auto-resolve on-segment appliance from the target subnet] and the
 [scheduled-shutdown companion] below.
 
@@ -538,17 +538,15 @@ originates:
   command channel). **This is the preferred path** when an appliance is on the
   segment — it needs no router changes at all.
 
-  > ⚠️ **Scheduled fires can't use appliance vantage yet.** The appliance
-  > command channel (`agent_cmd`) is an **in-memory, per-replica** queue that the
-  > supervisor long-polls off the **api** process, but a scheduled fire runs in
-  > the **Celery beat worker** — a different process — so its enqueue never
-  > reaches the supervisor and the wake records per-host delivery failures (it is
-  > not silent, but it does not send). This is the same agent_cmd limitation the
-  > verify probe hits above; the fix is the tracked worker→supervisor
-  > Redis-backed multi-replica dispatch. **Until then, for a *scheduled* wake to a
-  > remote segment use server vantage + the router directed-broadcast config
-  > (below), or trigger the appliance-vantage wake interactively via "Run now"
-  > (which originates in the api process and reaches the supervisor).**
+  > **Scheduled fires can use appliance vantage.** The appliance command channel
+  > (`agent_cmd`) rides Redis (#3706): the command is queued per appliance and the
+  > reply returns on a per-request list, so a scheduled fire in the **Celery beat
+  > worker**, or an interactive wake on any api replica, reaches the target
+  > appliance's supervisor whichever replica its long-poll is parked on, and the
+  > worker waits for the reply (30 s) like any other caller. Delivery is at most
+  > once. If Redis is unreachable the channel degrades to a per-process queue, which
+  > only serves a single api replica — a scheduled fire then records per-host
+  > delivery failures rather than sending.
 
 #### Stagger auto-tuning (Phase 3)
 
@@ -810,6 +808,8 @@ CustomFieldDefinition
 
 Custom fields are exposed under the `custom_fields` JSONB key on all resource objects. They are validated against their `CustomFieldDefinition` on write.
 
+**Required fields (#2478).** A definition marked Required is enforced on IP block and subnet writes (create, allocate-subnet and update); a request that leaves one empty is refused with 422 naming it. A value inherited from the block chain above the row counts. The rule is deliberately narrow so that making a field Required later does not lock existing rows: a **create** needs every Required field; an **update** is checked only when the request sends `custom_fields`, and then only for a field it sends or the row already holds a value for. So a block or subnet that never had the field can still be renamed or saved untouched, but it cannot be given the field empty, and a value it holds cannot be blanked. Select fields always show an empty choice (not pickable for a Required field with nothing to inherit), and the New / Edit dialogs apply the same rule before sending. IP spaces and addresses are not covered yet, and neither are subnets a template's child layout carves.
+
 ---
 
 ## 7. Import / Export
@@ -817,13 +817,13 @@ Custom fields are exposed under the `custom_fields` JSONB key on all resource ob
 ### IP Range Import
 
 Supported input formats:
-- **CSV**: columns: `network`, `name`, `gateway`, `vlan_id`, `description` + any custom field columns
+- **CSV**: columns: `network`, `name`, `gateway`, `vlan_id`, `description` + any custom field columns. `\n`, `\r\n` and a bare `\r` (classic Mac) line endings are all read; a CSV the reader cannot read is a 422 with its reason (#1637)
 - **JSON**: array of subnet objects (matches API schema)
 - **IPAM vendor exports**: generic CSV (network, name, gateway, vlan_id), SolarWinds IPAM CSV, Netbox JSON
 
 Import behavior:
 - **Dry run first**: always show a preview table of what will be created/updated before committing
-- **Conflict handling**: `skip` / `update` / `error` on existing networks (selectable per import)
+- **Conflict handling**: `skip` / `overwrite` / `fail` on existing networks (selectable per import)
 - **Parent detection**: automatically places imported subnets under the correct block in the hierarchy
 - **Custom fields**: mapped by column name / JSON key
 
@@ -832,6 +832,7 @@ Import behavior:
 - Export a block, subnet, or entire space
 - Formats: CSV, JSON, Excel (`.xlsx`)
 - Includes: all subnet metadata + utilization + custom fields + IP address list (optional)
+- **What each format holds with "Include IP addresses" ticked (#2420):** JSON and XLSX carry the subnet metadata *and* the address list (XLSX as separate sheets); PDF keeps its subnet table and appends the addresses. **CSV is the address list only** (`subnet,address,status,hostname,fqdn,mac_address,description,last_seen_at` + custom fields), the shape the address importer reads, so it round-trips. For subnet metadata in CSV, download it with the box unticked. The CSV follows the box, not whether the scope happens to hold addresses
 
 ### DNS Zone Import / Export
 
@@ -966,7 +967,9 @@ the 60 s alert tick.
 
 **Operator surface.** `GET /new-devices/{summary,sightings,allowlist}` +
 acknowledge / baseline-import / allowlist / block actions
-(`/api/v1/new-devices`, gated on `read`/`write` `ip_address`). The
+(`/api/v1/new-devices`, gated on `read`/`write` `ip_address`; **Block** additionally needs `write` `dhcp_mac_block` in every
+target DHCP group, and is refused whole (403, audited `denied`) otherwise
+— with `group_id` omitted that means every group). The
 **Tools → New Devices** review queue lists sightings with one-click
 **Acknowledge / Add to allowlist / Block** (block creates a
 `DHCPMACBlock` — arpwatch with teeth). Run a **baseline import** when
@@ -1005,7 +1008,10 @@ hand-picked set, or `all_matching=true` with the report filter to
 deprecate every matching row in one shot (capped at `MAX_BULK_DEPRECATE`
 = 5000; the response `capped` flag tells the operator to re-run for the
 remainder). System placeholders and DHCP mirrors are skipped even if an
-id slips through. The page lives at **Stale IPs** in the sidebar.
+id slips through. **Deprecating does not free the address (#2421):** a
+`deprecated` row is a retained record, so it still counts as allocated on
+its subnet and Next available never offers it. Delete the row to give the
+address back. The page lives at **Stale IPs** in the sidebar.
 
 **Hygiene alert.** A `stale_ip_count` alert rule fires when any subnet
 holds at least `threshold_percent` (re-used as a raw count) allocated
@@ -1045,8 +1051,8 @@ enabled-gate + interval. Each sweep writes one summary audit row.
 
 ## 9. Utilization Tracking
 
-- `Subnet.utilization_percent` is computed and stored (updated on every IP change + on schedule)
-- `IPBlock.utilization_percent` is computed by rolling up child subnet utilization
+- `Subnet.utilization_percent` is computed and stored (updated on every IP change + on schedule). It is `allocated_ips / total_ips` over the subnet's **usable** addresses: an IPv4 subnet shorter than /31 leaves its network and broadcast addresses out of both figures, so a full /29 reads 6 / 6, 100% (#2411). A host is refused (409) on those two addresses even when the subnet was made with skip auto addresses and holds no rows for them (#3321); the Copilot / request-portal create and the address import refuse it too. Rows recorded from the wire (DHCP lease mirrors, discovery, integrations) are not refused, and a host stored there before #3321 stays, so such a subnet can still read over its total. Bulk allocate takes over an `available` row in its range as Next available does, and refuses (422) a range covering such an edge address (#3319). An IPv6 subnet keeps its whole range, so its `network` placeholder row counts.
+- `IPBlock.utilization_percent` is the share of the block's **whole CIDR** in use (#2982). `total_ips` is the CIDR size (clamped to 2^63 - 1 for huge IPv6 blocks). `allocated_ips` rolls up every descendant subnet's `allocated_ips` **plus that subnet's non-usable addresses** — network and broadcast for IPv4 below /31, the network address for IPv6 below /127, nothing for /31, /32, /127 and /128 — each counted once even when a row already sits on it. So a /30 block holding one full /30 subnet reads 4 / 4, 100%, while the subnet itself reads 2 / 2. A block is clamped to its CIDR size and never reads over 100%. Both counters are rewritten on every write under the block and by the hourly `recount_ipam_utilization` sweep.
 - Alerts are configured in the notification system when utilization exceeds thresholds (default: warn at 80%, critical at 95%)
 
 ---
@@ -1118,7 +1124,7 @@ The left-side IPAM menu expands into a unified tree view. There are no separate 
   <img src="../assets/diagrams/ipam-tree-ui.svg" alt="Combined IPAM tree navigator" width="900"/>
 </p>
 
-Clicking a subnet opens its IP address list panel on the right. The IP address list is **collapsible** — useful for large subnets (e.g., WiFi /16) where listing every IP is slow. A toggle "Show IP list" defaults based on subnet size (auto-collapse if > 1000 IPs).
+Clicking a subnet opens its IP address list panel on the right. Unallocated ranges inside the subnet appear there as gap rows; for large subnets (larger than a /16) free ranges are hidden by default behind a "Hide free ranges" toggle.
 
 ### Subnet Column Customization
 
@@ -1133,7 +1139,7 @@ The same column customization applies to IP address lists, DHCP scope lists, and
 ### Gateway Auto-Assignment
 
 When creating a subnet, the **first usable IP** (network address + 1) is automatically designated as the gateway (`status = reserved`, `description = "Gateway"`). This can be:
-- Changed to any other IP in the subnet
+- Changed to any other IP in the subnet. Editing the gateway (Edit Subnet, or the subnet import's `overwrite`) follows New Subnet's rules: the network and broadcast address are refused with a 422, the new address gets its own reserved `Gateway` row (so Next available never offers it) and its PTR, and the old default `Gateway` row is retired with its PTR — a renamed or otherwise operator-owned row is kept. An address that already holds a `reserved` row (the router recorded as a reservation) keeps that row; any other row there (a host, a DHCP lease, a discovered address) refuses the move with a 409 naming it, as Resize does. A subnet made without placeholder rows (`skip_auto_addresses`, /31, multicast) gets no gateway row, as on New Subnet (#3317, #3318)
 - Deleted if no gateway is needed (e.g., transit link)
 - Overridden during import
 
@@ -1444,6 +1450,8 @@ This maps to the `PlatformSettings` singleton model defined in `SYSTEM_ADMIN.md 
 - Show a **Purge** (Trash) button that permanently deletes after a confirmation modal
 - `DELETE /ipam/addresses/{id}?permanent=true` hard-deletes immediately
 
+The address's host record and PTR are deleted when it becomes an orphan, and re-created on Restore. Its DNS aliases are **withdrawn, not deleted** (#2604): they leave the served zone, sit in Trash under one deletion batch per address, and come back on Restore, a CNAME re-pointed at the address's current name. A record that took an alias's name while the address was an orphan makes the Restore a 409 naming it. The trash retention purge leaves these aliases alone while the address is still an orphan; purging or permanently deleting the address deletes them for good. An address restored with no hostname leaves its aliases withdrawn.
+
 Note: the current implementation uses `status = "orphan"` instead of a `deleted_at` column. The spec's "Show deleted toggle" and "recycle bin" concept can be revisited in a future density pass.
 
 ### ✅ 14.9 IP Space Table View (Click-Through)
@@ -1519,6 +1527,25 @@ group (reverse zones are filtered out).
 `POST /api/v1/ipam/addresses/bulk-edit` routes each selected IP through
 `_sync_dns_record` for move / create / delete, so bulk re-homing an IP
 range to a different zone updates DNS in the same request.
+
+### ✅ 15.3a Where tags are set (#4107)
+
+Tags are free-form `key: value` pairs on spaces, blocks, subnets and
+addresses. You can set them in:
+
+- the **Tags** field of every single create / edit dialog: New / Edit IP
+  Space, New / Edit Block, New / Edit Subnet, Allocate IP and Edit IP. Rows of
+  key + value, add / remove; keys and values already in use are suggested
+  (only from rows you may read). Edit Subnet / Edit Block show tags inherited
+  from the block and space chain as placeholders;
+- **bulk edit** (merge, or "Replace all tags");
+- a subnet / block **template**'s tags (copied into the Tags field when the
+  template is picked);
+- **import** (CSV / JSON / XLSX) and the REST API / MCP.
+
+The update endpoints replace the whole `tags` object, so a dialog sends `tags`
+only when you changed it; an edit that leaves the field alone keeps the stored
+tags. Removing a row removes the key.
 
 ### ✅ 15.4 Bulk-Edit per-field opt-in
 
@@ -1656,9 +1683,10 @@ POST requires ``write`` on subnet / ip_block):
     ``replace_default_placeholders``.
 - Affected counts: IPs in subnet, DHCP scopes / pools / static
   assignments, auto-generated DNS records, active leases.
-- Reverse zones: which already exist for the old CIDR, which will be
-  created for the new CIDR (``ensure_reverse_zone_for_subnet`` is
-  called idempotently on commit).
+- Reverse zones: the old CIDR's set and the zones the new CIDR adds —
+  one per ``/24`` it spans, so growing a ``/24`` to a ``/22`` lists
+  three (#1840; ``ensure_reverse_zones_for_subnet`` is called
+  idempotently on commit).
 - ``conflicts`` — non-empty means the commit will 4xx; the UI disables
   the confirm button.
 - ``warnings`` — non-blocking items (DHCP pools won't auto-expand, the
@@ -1692,9 +1720,9 @@ and ``resource_display`` ``"{old_cidr} → {new_cidr}"``.
   ``config_etag``, and enqueues a pending ``apply_config`` op (mirroring
   the subnet-delete path). Agentless drivers (Windows DHCP read-only)
   are skipped — they have no write surface.
-- ``ensure_reverse_zone_for_subnet`` runs after the CIDR mutation so any
-  new reverse-zone coverage is created. Idempotent when the zone
-  already exists.
+- ``ensure_reverse_zones_for_subnet`` runs after the CIDR mutation so the
+  reverse zones for the new range are created. Idempotent for the zones
+  that already exist.
 - Forward A/AAAA and PTR records for IPs inside the old CIDR are *not*
   touched — their values and names are unchanged by a grow.
 
@@ -1769,6 +1797,22 @@ submit re-checks fresh.
 - PTR collisions — every IP gets at most one PTR, handled separately
   by the Sync DNS classifier.
 - Empty MAC / empty hostname — nothing to collide with.
+
+**A record an operator already wrote is adopted, not duplicated.** When an
+address's A / AAAA or PTR would be identical (same zone, name, type and
+value) to a record a person wrote by hand, IPAM links the address to that
+row and creates no `auto_generated` copy ([#1867](https://github.com/spatiumnorth/spatiumddi/issues/1867)).
+This is the same rule the record API applies with its 409 on a duplicate
+(#1230), and it holds on every path that publishes records: allocation,
+bulk-edit DNS zone, DDNS from a lease and Sync DNS. The adopted row stays the
+operator's (`auto_generated` false, no `ip_address_id`), so deleting the
+address or expiring the lease leaves it served. A record with the same name
+but another value is a different record and still gets its own, and a
+generated record belonging to another address is never adopted. Renaming
+an address onto a name and value the operator wrote retracts IPAM's own row
+and adopts theirs; renaming an adopted address away writes a new record for
+IPAM and leaves the operator's alone. Sync DNS counts an adopted record as
+present, not missing.
 
 ### ✅ 15.12 DHCP Pool Awareness in IP Listing & Allocation
 
@@ -1894,28 +1938,49 @@ Three IP enrichment columns landed in `2026.04.26-1` via migration
 
 ### ✅ 15.15 Subnet operations — find-free / split / merge
 
-Three preview-then-commit endpoints, all with typed-CIDR
-confirmation gates and pg advisory locks held through commit:
+Three endpoints. Find free is a read that mutates nothing; split and
+merge are preview-then-commit, with typed-CIDR confirmation gates and pg
+advisory locks held through commit:
 
 - `POST /ipam/spaces/{id}/find-free` — walks the IPBlock tree for
   unallocated CIDRs of the requested prefix length. Optional
   `parent_block_id` scope (Find Free… on the block detail
   pre-restricts to that block) and a `min_free_addresses` filter.
+  Each candidate carries `free_addresses` (its usable host count, as
+  the subnet would hold) and the filter compares against it.
+  "Create subnet here" files the subnet under the block the row names
+  (which may be a child of the searched block).
+  Opened from a block, the dialog's title, hint and empty state say it
+  searches that block, not the space.
   Service layer in `app.services.ipam.free_space`.
 
 - `POST /ipam/subnets/{id}/split/preview` + `/commit` — break a
   subnet into 2^k aligned children at a longer prefix. Preview
   reports the prospective children + any IP-address conflicts
   (rows that wouldn't fit cleanly into one child or the other);
-  commit refuses if the typed CIDR doesn't match. Service in
-  `app.services.ipam.subnet_split`.
+  commit refuses if the typed CIDR doesn't match. A host sitting on
+  a child's network or broadcast address (e.g. .127 / .128 of a /24
+  split into /25s) is a `host_on_child_boundary` conflict naming the
+  address, and the commit refuses it; the preview also warns that
+  every client needs the new netmask. Children inherit
+  the parent's compliance and discovery settings (PCI / HIPAA scope,
+  internet-facing, role, do-not-probe, kind, customer, site, discovery
+  and split-horizon); integration ownership and import provenance are
+  not carried, and the preview warns when the parent has any. Service
+  in `app.services.ipam.subnet_split`.
 
 - `POST /ipam/subnets/{id}/merge/preview` + `/commit` — collapse
   contiguous siblings back into one supernet via
   `ipaddress.collapse_addresses`. Preview reports the prospective
   merged CIDR + any conflicts. Single-source gateways are
   preserved; differing source gateways are nulled (operator must
-  re-set). Service in `app.services.ipam.subnet_merge`.
+  re-set). PCI scope, HIPAA scope, internet-facing and do-not-probe
+  are the safe union (true when any source has it, and the preview
+  says so); sources that disagree on kind, customer or site are a
+  conflict; any other disagreeing setting (role, discovery, tags, custom
+  fields, VXLAN ID, domain, DNS servers, ...) is a
+  preview warning naming each value and the target's value is kept. Service in
+  `app.services.ipam.subnet_merge`.
 
 UI surfaces all three on the subnet-detail header, *and* via the
 bulk-action toolbar on the block- and space-level subnet tables:
@@ -1941,6 +2006,13 @@ its records).
   "move to Trash. You can restore from Admin → Trash within 30
   days." Hard-delete is reachable via the Permanent button on the
   Trash row.
+- A trashed subnet stops publishing: the auto-generated A / AAAA / PTR
+  records IPAM wrote for its addresses (gateway PTR included) are
+  retracted through the record-op queue and trashed under the same
+  batch, so a Restore re-asserts them (#1906). Records in a reverse
+  zone that goes to Trash with the subnet ride that zone; records in
+  a zone that stays (a /24 reverse zone kept for a sibling /25, the
+  forward zone) are what this covers. Hand-made records are untouched.
 - IP addresses are deliberately NOT soft-deletable — they
   cascade-delete with their parent subnet, and the parent subnet
   is the recoverable unit.
@@ -1992,11 +2064,28 @@ WAN IP, a peer's NAT endpoint).
   on either side).
 - **Per-subnet listing** — `GET /ipam/nat-mappings/by-subnet/{id}`
   uses Postgres `inet <<= cidr` containment to find every mapping
-  whose internal IP falls inside a subnet's CIDR.
+  whose internal or external IP falls inside a subnet's CIDR, plus
+  every hide-NAT mapping pinned to the subnet as its source (#2617).
 
 UI: clicking the NAT badge on an IP row opens a modal listing
 every mapping for that IP; new "NAT" tab on the subnet detail
 shows every mapping touching the subnet's CIDR.
+
+**Feature module `ipam.nat` (#2100).** The whole surface (the
+NAT Mappings page, the routes above, the Dashboard card and the
+subnet / IP detail NAT tab, badges and dialog) can be turned off
+under Settings → Features. While it is off the routes answer 404,
+but the rows are kept, and the PAN-OS / Fortinet / Meraki mirrors
+keep writing them. The module ships off, but with no operator
+override it resolves **on** whenever `nat_mapping` holds a row
+(`ModuleSpec.default_on_if_rows_in`), so an install that already
+uses NAT keeps it after upgrade without a seeded `feature_module`
+row. An operator's choice always wins. Two consequences follow
+from "on when there is data": on a fresh install a firewall
+mirror's first NAT rule turns the surface on, and deleting the
+last mapping on an install that never set the toggle turns it
+off. The NAT Mappings page then says the feature is off and links
+to Settings → Features. Turning it on there pins it on.
 
 ### ✅ 15.19 VXLAN ID surface in the UI
 
@@ -2172,3 +2261,190 @@ speak for themselves.
 - **DNS zone link must resolve.** Setting `dns_zone_id` on a subnet
   requires the zone to exist *in the subnet's configured view* —
   linking a zone from a different view returns `404`.
+
+---
+
+## 17. Network entities and discovery — reference summaries
+
+_Moved here from the README feature tour (#3410), so the detail stays in the documentation. Each entry is the short operational description: what is stored, how it behaves, where the seams are._
+
+### Hierarchical IP management
+
+spaces, blocks, subnets, addresses in a visual tree.
+
+- IPv4 + full IPv6 auto-allocation (EUI-64 / random /128 / sequential)
+- Per-IP role: host / loopback / anycast / vip / vrrp / secondary / gateway
+- Reservation TTL with auto-expiry
+- Per-IP MAC observation history
+- **Bulk allocate** a contiguous range with a name template
+  (`dhcp-{n}` / `host-{oct3}-{oct4}` / `web-{n:03d}`) — preview
+  → commit, capped at 1024 IPs, skips dynamic DHCP pools, detects
+  FQDN collisions, optionally creates A + PTR records
+- **IP table polish** — sticky column headers, shift-click range
+  select, "Seen" recency dot per row (alive / stale / cold /
+  never), subtle gap markers between non-contiguous IPs so a
+  deleted hole doesn't go unnoticed
+
+### Subnet planner + planning tools
+
+design CIDR hierarchies before applying them.
+
+- `/ipam/plans` — draggable multi-level CIDR design surface (root + nested children, arbitrary depth)
+- Saved as `SubnetPlan` rows, validated live as the operator edits, applied in a single transaction
+- Per-node DNS-group / DHCP-group / gateway bindings (null = inherit, explicit = set + flip inherit off)
+- CIDR calculator at `/tools/cidr` — pure client-side IPv4 + IPv6 breakdown
+- Address planner — packs `{count, prefix_len}` requests into free space using largest-prefix-first ordering
+- Aggregation suggestion banner — surfaces clean-merge opportunities (10.0.0.0/24 + 10.0.1.0/24 → /23)
+- Free-space treemap toggleable from the Allocation map header — surfaces fragmentation hidden in the 1-D band
+
+### NAT mapping cross-reference
+
+operator-curated rules with FK links to IPAM.
+
+- 1:1 / PAT / hide-NAT supported
+- Per-IP modal lists every mapping that touches the address
+- Per-subnet "NAT" tab uses Postgres CIDR containment to find every mapping crossing into the subnet's range
+
+### Multicast group registry
+
+IPv4 + IPv6 multicast groups as first-class entities.
+
+- RFC 5771 IANA registry seeded as platform-provided rows (e.g. `224.0.0.1` All-Hosts, `224.0.0.5` OSPF, …)
+- Operator catalog of business-defined groups (per-IPSpace) with description, owner, scope (link-local / admin-local / org-local / global)
+- **PIM rendezvous-point domains** — `pim_rp_domain` table tracking RP routers + group ranges they serve
+- **IPAM tree integration** — creating a group in an IPSpace auto-creates the enclosing `224.0.0.0/4` (v4) or `ff00::/8` (v6) IPBlock when none exists; a startup hook backfills blocks for pre-existing groups so the upgrade is seamless
+- **Tree rendering** — multicast IPBlocks render with a violet 📡 Radio icon in both the tree row and BlockDetailView identity row; inside a multicast block, a "Multicast Groups" panel surfaces the streams whose addresses fall within the block's CIDR (queries `multicast_group` directly — no mirror IPAddress rows)
+- **Click-through** opens the multicast page pre-scoped to the IPSpace via `?space=<uuid>`
+- **Bulk-allocate** from RFC 2365 admin-scoped ranges with name templating
+- Per-IP collision conformity check — flags addresses that overlap a known multicast registration before allocation
+
+### ASN management
+
+first-class autonomous-system entity.
+
+- Data model: `asn` table with BigInteger `number` (full 32-bit range), auto-derived `kind` (public / private per RFC 6996 + RFC 7300), auto-derived `registry` (RIR — arin / ripe / apnic / lacnic / afrinic) from a hand-curated IANA delegation snapshot
+- **RDAP holder refresh** — per-RIR routing via IANA bootstrap; per-row Refresh button + scheduled hourly task (`asn_whois_interval_hours`, default 24 h)
+- **RPKI ROA pull** — Cloudflare or RIPE NCC source (operator-tunable via `rpki_roa_source`); cached for 5 min in-memory so a sweep of 50 ASNs makes one HTTP call; per-row Refresh RPKI button
+- **Holder-drift diff viewer** — `previous_holder` persisted on every refresh so the WHOIS tab can render a side-by-side without consulting the audit log
+- **Alert rules** — `asn_holder_drift`, `asn_whois_unreachable`, `rpki_roa_expiring`, `rpki_roa_expired`
+- **BGP Footprint tab** — what the *rest of the internet* sees for this AS, alongside what you've recorded. RIPEstat supplies announced prefixes, prefix-overview and routing history; PeeringDB supplies the peering profile and IXP presence. Read-only, REST + MCP, with an in-process TTL cache (RIPEstat 6 h, PeeringDB 24 h) so an open tab doesn't hammer either service
+- Detail page tabs: WHOIS · RPKI ROAs · **BGP Footprint** · BGP Monitoring · Learned Routes (only when the Looking Glass module is on) · BGP Peering · Communities · IP Spaces / Blocks · Alert History
+
+### BGP peering + communities
+
+operator-curated relationship graph + community catalog.
+
+- **Peerings** — `bgp_peering` table with `peer | customer | provider | sibling`; both endpoints FK ON DELETE CASCADE; unique on `(local, peer, relationship_type)`. Form lets the operator pick either side as "local"; modal normalises to canonical shape on submit
+- **`Router.local_asn_id` FK** — stamps which AS a router originates routes from
+- **Communities catalog** — 7 RFC 1997 / 7611 / 7999 well-knowns seeded as platform rows (no-export, no-advertise, no-export-subconfed, local-as, graceful-shutdown, blackhole, accept-own); per-AS catalog with `kind` validation (`standard` / `regular` `ASN:N` / `large` `ASN:N:M`)
+- "Use on this AS" button per standard row pre-fills the form with the well-known value
+
+### VRFs as first-class entities
+
+replaces the freeform `vrf_name` / `route_distinguisher` / `route_targets` text fields on IPSpace.
+
+- Data model: `vrf` table with name, description, optional `asn_id` FK, RD (with format validation), split import / export RT lists, tags, custom_fields
+- `ip_space.vrf_id` + `ip_block.vrf_id` FKs ON DELETE SET NULL
+- **Cross-cutting RD / RT validator** — each `ASN:N` entry whose ASN portion does not match `vrf.asn.number` produces a non-blocking warning; `vrf_strict_rd_validation` toggle escalates to 422
+- `IPBlock.vrf_warning` flags when a block's pinned VRF differs from its parent space's VRF (intentional in hub-and-spoke designs but worth a heads-up)
+- **VRF picker** on the New / Edit IPSpace and Create / Edit IPBlock modals (replaces the freeform text inputs)
+- Migration backfills existing freeform values into VRF rows so nothing is lost
+
+### Domain registration tracking
+
+distinct from DNSZone (records SpatiumDDI serves vs. registry-side metadata).
+
+- Data model: `domain` table tracking registrar / registrant / expiry / DNSSEC status / nameservers
+- **RDAP refresh** — TLD → RDAP-base lookup driven by the IANA bootstrap registry (`data.iana.org/rdap/dns.json`), cached 6 h; routes `.com` → `rdap.verisign.com/com/v1/`, etc.
+- **Nameserver drift** — operator-pinned expected list vs. registry-advertised list, with a side-by-side diff panel
+- **Alert rules** — `domain_expiring` (severity escalation around `threshold_days`), `domain_nameserver_drift`, `domain_registrar_changed`, `domain_dnssec_status_changed`
+- Per-row expiry countdown badges (green > 90 d / amber 30–90 d / red < 30 d / dark-red expired)
+- **Explicit `dns_zone.domain_id` linkage** with sub-zone suffix-match fallback — `test.example.com` shows up under `example.com`'s linked-zones tab; `example.com.au` correctly does NOT
+
+### Customer / Site / Provider
+
+three first-class logical ownership rows that cross-cut IPAM / DNS / DHCP / Network.
+
+- **`Customer`** — soft-deletable; account number / contact info / status (active / inactive / decommissioning) / tags
+- **`Site`** — hierarchical via `parent_site_id`; unique-per-parent `code` (NULLS NOT DISTINCT for top-level deduping); kinds (datacenter / branch / pop / colo / cloud_region / customer_premise) + free-form region label
+- **`Provider`** — kinds (transit / peering / carrier / cloud / registrar / sdwan_vendor) + optional `default_asn_id` FK
+- **Cross-reference FKs** added on subnet / ip_block / ip_space / vrf / dns_zone / asn / network_device / domain / circuit / network_service / overlay_network — every column is `ON DELETE SET NULL` so re-tagging is safe and operators never lose data
+- Shared `CustomerPicker` / `SitePicker` / `ProviderPicker` (with optional kind filter) + matching Chip components plug into every IPAM / DNS / circuit / overlay create + edit modal
+
+### WAN circuits
+
+carrier-supplied logical pipe distinct from the equipment that lights it up.
+
+- Data model: `circuit` table with `provider_id` (RESTRICT), optional `customer_id` (SET NULL), 4 endpoint refs (a/z-end site + subnet, all SET NULL), `transport_class` enum (mpls / internet_broadband / fiber_direct / wavelength / lte / satellite / direct_connect_aws / express_route_azure / interconnect_gcp), asymmetric `bandwidth_mbps_down` / `bandwidth_mbps_up`, `term_start_date` / `term_end_date`, `monthly_cost` + 3-letter ISO 4217 currency
+- **Soft-deletable** — `status='decom'` is the operator-visible end-of-life flag; row stays restorable for "what carrier did Site-X use in 2024?" audits
+- List page at `/network/circuits` with bulk-action table + tabbed editor modal (General / Endpoints / Term + cost / Notes) + colour-coded term-end badge
+- **Alert rules** — `circuit_term_expiring` (severity escalates around `threshold_days`), `circuit_status_changed` (only fires on `suspended` / `decom` transitions; auto-resolves after 7 d)
+
+### Service catalog
+
+bundles network resources into a customer-deliverable.
+
+- `NetworkService` is one row per thing the operator delivers; polymorphic `NetworkServiceResource` join row binds to VRF / Subnet / IPBlock / DNSZone / DHCPScope / Circuit / Site / OverlayNetwork
+- **Kinds in v1**: `mpls_l3vpn` (with hard at-most-one-VRF rule + soft warnings for missing VRF, fewer than 2 edge sites, edge subnet's enclosing block in a different VRF) and `custom`. `sdwan` lit up alongside the SD-WAN overlay roadmap. Future kinds reserved in the column: `mpls_l2vpn` / `vpls` / `evpn` / `dia` / `hosted_dns` / `hosted_dhcp`
+- **Kind-aware `/summary` endpoint** — L3VPN view returns canonical VRF + edge sites + edge circuits + edge subnets + warnings
+- **Reverse lookup** — `GET /by-resource/{kind}/{id}` returns every service referencing a given resource
+- **Alert rules** — `service_term_expiring` (mirrors circuit shape), `service_resource_orphaned` (sweep over join rows whose target was deleted; auto-resolves on detach)
+- List page at `/network/services` (bulk-action table) + tabbed editor modal (General / Resources / Term + cost / Notes / Summary)
+
+### SD-WAN overlays
+
+vendor-neutral source of truth for overlay topology and routing-policy intent.
+
+- Vendor config push (vManage / Meraki Dashboard / FortiManager / Versa Director) and real-time path telemetry are **explicitly out of scope** — those stay NCM / observability concerns
+- Data model: `overlay_network` (six kinds: sdwan / ipsec_mesh / wireguard_mesh / dmvpn / vxlan_evpn / gre_mesh), `overlay_site` (m2m binding sites with role hub / spoke / transit / gateway, edge device, loopback subnet, ordered `preferred_circuits` jsonb — first wins, fall through on outage), `routing_policy` (priority + match-kind + match-value + action + action-target + enabled), `application_category` (curated SaaS catalog seeded with 33 well-known apps — Office365 / Teams / Zoom / Slack / Salesforce / GitHub / AWS / Azure / GCP / SIP voice / OpenAI / Anthropic / …)
+- **`/topology` endpoint** — nodes (sites + roles + device + loopback + preferred-circuits) + edges (site pairs whose `preferred_circuits` lists overlap; `shared_circuits` is the intersection so the UI can colour by transport class) + policies
+- **`/simulate` endpoint** — pure read-only what-if; body specifies `down_circuits`, response shows per-site fallback resolution + per-policy effective-target with `impacted` flag and human-readable note
+- List page at `/network/overlays` + detail page with five tabs: Overview / Topology (SVG circular layout with role-coloured nodes + transport-coloured edges) / Sites / Policies (priority-ordered with per-kind editors) / Simulate
+
+### SNMP discovery
+
+v1 / v2c / v3 polling via standard MIBs.
+
+- MIBs walked: IF-MIB, IP-MIB, Q-BRIDGE-MIB, LLDP-MIB
+- Surfaces interfaces, ARP, FDB, LLDP neighbours
+- Per-IP switch-port + VLAN visibility in IPAM
+- Neighbours tab on each device
+
+### Nmap scanner
+
+on-demand scans from the browser.
+
+- Per-IP "Scan with Nmap" launcher · per-subnet "Scan with nmap"
+  in the IPAM Tools dropdown (pre-fills CIDR target +
+  `subnet_sweep` preset) · standalone `/tools/nmap` page for
+  ad-hoc targets
+- Presets: quick, service+version, **service+OS**, OS,
+  default-scripts, **subnet_sweep** (-sn ping sweep capped at
+  /16 worth of hosts), UDP top-100, aggressive, custom
+- Live SSE output streams while the scan runs; results render
+  single-host or multi-host (CIDR) summaries
+- **Stamp alive hosts → IPAM** action on a CIDR scan claims
+  responding IPs as `discovered` rows with `last_seen_at` set;
+  `Copy alive IPs` for clipboard handoff
+- History page with bulk-delete (cancels in-flight scans + drops
+  terminal ones) and a 3-tab right panel (Live / History / Last
+  result) that auto-switches as a scan completes
+
+### Device profiling
+
+answer "what kind of device is on every IP" without
+
+asking. Two layers feeding one consolidated panel in the IP detail modal.
+- **Passive — DHCP fingerprinting.** scapy `AsyncSniffer` thread on the DHCP
+  agent reads option-55 / option-60 / option-77 / client-id from every
+  DISCOVER + REQUEST, batches per-MAC, ships to the control plane
+- **Enrichment — fingerbank.** Optional API key in Settings → IPAM →
+  Device Profiling turns raw signatures into Type / Class / Manufacturer
+  (`HP iLO`, `Aruba AP`, `Cisco IP Phone 8841`, `iOS device`, …); 7-day
+  cache; works offline-degraded
+- **Active — auto-nmap on new DHCP lease.** Per-subnet opt-in toggle picks a
+  preset; refresh-window dedupe (default 30 days) means churning Wi-Fi
+  leases don't fan out; per-subnet 4-scan concurrency cap
+- **"Re-profile now"** button on the IP detail modal for ad-hoc rescan
+- Default-off everywhere — IDS-aware (nmap is loud; passive collection
+  needs `cap_add: NET_RAW`)

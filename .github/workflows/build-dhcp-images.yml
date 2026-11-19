@@ -29,6 +29,8 @@ on:
       # change guaranteed to need the proof was the one change that
       # could not get it.
       - ".github/workflows/build-dhcp-images.yml"
+      # #3464 — the shared Trivy install step this lane scans with.
+      - ".github/actions/install-trivy/**"
   workflow_dispatch:
 
 # Read-only (#1022): this workflow builds and scans, it never publishes.
@@ -83,9 +85,15 @@ jobs:
           cache-from: type=gha,scope=dhcp-${{ matrix.flavor }}
           cache-to: type=gha,mode=max,scope=dhcp-${{ matrix.flavor }}
 
+      # get.trivy.dev, which trivy-action's own setup downloads from,
+      # is gone (#3464): install from the GitHub release instead.
+      - name: Install Trivy
+        uses: ./.github/actions/install-trivy
+
       - name: Trivy scan
         uses: aquasecurity/trivy-action@v0.36.0
         with:
+          skip-setup-trivy: true
           # Reference the locally-loaded image from the PR build
           # step above. Same fix as build-dns-images.yml — the
           # previous ``ghcr.io/...:${{ github.sha }}`` reference

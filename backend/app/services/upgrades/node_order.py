@@ -59,6 +59,8 @@ def pick_node_order(
 def next_node_to_upgrade(
     plan_order: list[str],
     completed_nodes: Iterable[str],
+    *,
+    defer: str | None = None,
 ) -> str | None:
     """Pick the next node from the plan that hasn't been completed yet.
 
@@ -66,11 +68,41 @@ def next_node_to_upgrade(
     time; ``completed_nodes`` is whatever the SystemUpgradeRun row's
     ``progress.per_node`` keys carry for runs that succeeded.
 
+    ``defer`` names a node to take last: the node the drive's own worker
+    runs on. Draining it evicts the worker running the drive, so it is
+    upgraded only after every other node, by a drive handed to a worker
+    elsewhere (#1449).
+
     Returns ``None`` when every node in the plan has completed — the
     orchestrator transitions to ``state='succeeded'`` then.
     """
     done = set(completed_nodes)
-    for name in plan_order:
-        if name not in done:
+    remaining = [name for name in plan_order if name not in done]
+    for name in remaining:
+        if name != defer:
             return name
-    return None
+    return remaining[0] if remaining else None
+
+
+def drain_order(
+    plan_order: list[str],
+    completed_nodes: Iterable[str],
+    *,
+    current: str,
+    defer: str | None = None,
+) -> list[str]:
+    """The nodes still to upgrade, in the order they will actually drain:
+    ``current`` (the node being driven now) first, then the plan order with
+    ``defer`` (the drive's own node, see ``next_node_to_upgrade``) moved to
+    the end, which is where ``next_node_to_upgrade`` will take it.
+
+    #2870 — the Redis master move steers Sentinel to the replica on the node
+    that drains LAST, so plan order alone is not enough: the drive's own node
+    drains last whatever its place in the plan. A later Lease takeover by a
+    worker on another node (#2809) can still reorder the tail; the steering
+    is a best-effort guess, never a correctness property."""
+    done = set(completed_nodes)
+    rest = [n for n in plan_order if n not in done and n != current]
+    if defer is not None and defer in rest:
+        rest = [n for n in rest if n != defer] + [defer]
+    return [current, *rest]

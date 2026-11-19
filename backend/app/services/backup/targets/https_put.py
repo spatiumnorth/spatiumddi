@@ -60,6 +60,8 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 
+from app.core.exc_text import describe_exc
+from app.core.header_credentials import header_credential_problem
 from app.core.ssrf import SSRFBlockedError, assert_safe_target
 from app.services.backup.targets.base import (
     ArchiveListing,
@@ -69,6 +71,8 @@ from app.services.backup.targets.base import (
     DestinationConfigError,
     UnsupportedOperationError,
     safe_filename,
+    safe_url,
+    scrub_url,
 )
 
 #: Generous, matching the WebDAV driver: a multi-GB archive over a slow
@@ -160,6 +164,17 @@ def _parse_extra_headers(config: dict[str, Any]) -> dict[str, str]:
         # reaching this with one would mean a bug above.
         if any(c in value for c in "\r\n"):
             raise DestinationConfigError(f"'extra_headers' value for {name!r} contains a newline")
+        # httpx encodes header names and values as ASCII and raises
+        # UnicodeEncodeError (not an httpx error) on anything else, which
+        # escaped the probe as a 500 and a scheduled run with the row left
+        # ``in_progress`` (#1913).
+        name_problem = header_credential_problem(name, "header name")
+        if name_problem:
+            raise DestinationConfigError(f"'extra_headers': {name_problem}")
+        if not all(c.isascii() and c.isprintable() for c in value):
+            raise DestinationConfigError(
+                f"'extra_headers' value for {name!r} must be printable ASCII"
+            )
         out[name] = value
     return out
 
@@ -260,6 +275,7 @@ class HttpsPutDestination(BackupDestination):
             name="extra_headers",
             label="Extra headers",
             type="text",
+            multiline=True,
             required=False,
             description="Optional, one 'Name: value' per line.",
         ),
@@ -271,6 +287,17 @@ class HttpsPutDestination(BackupDestination):
             description="'true' (default). Set 'false' only for self-signed labs.",
         ),
     )
+
+    def unused_secret_fields(self, config: dict[str, Any]) -> frozenset[str]:
+        # Auth ``none`` sends no credential; one left stored would be
+        # carried silently and come back into use if auth is switched
+        # back (#3289).
+        try:
+            if _auth_mode(config) == "none":
+                return frozenset({"credential"})
+        except DestinationConfigError:
+            pass  # a bad ``auth`` is validate_config's to report
+        return frozenset()
 
     # ── validation ────────────────────────────────────────────────────
 
@@ -289,6 +316,18 @@ class HttpsPutDestination(BackupDestination):
             raise DestinationConfigError("'username' is required when auth is 'basic'")
         if mode == "header" and not config.get("header_name"):
             raise DestinationConfigError("'header_name' is required when auth is 'header'")
+        if mode in ("bearer", "header"):
+            # Sent as a header value: printable ASCII, no inner whitespace
+            # (#1913). Surrounding whitespace is dropped when it is sent.
+            problem = header_credential_problem(str(config.get("credential")).strip(), "credential")
+            if problem:
+                raise DestinationConfigError(problem)
+        if mode == "header":
+            problem = header_credential_problem(
+                str(config.get("header_name")).strip(), "header name"
+            )
+            if problem:
+                raise DestinationConfigError(problem)
 
     async def validate_config_network(self, config: dict[str, Any]) -> None:
         """Resolve the URL and refuse an SSRF pivot.
@@ -332,7 +371,7 @@ class HttpsPutDestination(BackupDestination):
     def _headers(self, config: dict[str, Any], *, content_type: str) -> dict[str, str]:
         headers = {"Content-Type": content_type}
         mode = _auth_mode(config)
-        credential = config.get("credential") or ""
+        credential = (config.get("credential") or "").strip()
         if mode == "bearer":
             headers["Authorization"] = f"Bearer {credential}"
         elif mode == "header":
@@ -368,7 +407,9 @@ class HttpsPutDestination(BackupDestination):
                 # SecretFieldError)``, leaving the row stamped
                 # ``in_progress``, which the schedule sweep skips forever:
                 # that target's backups stop permanently and silently.
-                raise BackupDestinationError(f"{method} to {url} failed: {exc}") from exc
+                raise BackupDestinationError(
+                    f"{method} to {safe_url(url)} failed: {scrub_url(describe_exc(exc), url)}"
+                ) from exc
 
     # ── operations ────────────────────────────────────────────────────
 
@@ -385,14 +426,17 @@ class HttpsPutDestination(BackupDestination):
         )
         if resp.status_code in (301, 302, 303, 307, 308):
             raise BackupDestinationError(
-                f"receiver redirected to {resp.headers.get('location', '?')!r}. Redirects "
+                f"receiver redirected to {safe_url(resp.headers.get('location', '?'))!r}. Redirects "
                 "are not followed here, because that would re-send the archive and its "
                 "credential to an address the SSRF guard never checked — point the URL "
                 "at the final location instead."
             )
         if resp.status_code // 100 != 2:
             raise BackupDestinationError(
-                f"{_method(config)} to {url} returned {resp.status_code}: {resp.text[:300]}"
+                f"{_method(config)} to {safe_url(url)} returned {resp.status_code}: "
+                # A receiver can echo the request URL, credential included,
+                # in its error body.
+                f"{scrub_url(resp.text, url)[:300]}"
             )
 
     async def list_archives(self, *, config: dict[str, Any]) -> list[ArchiveListing]:
@@ -408,7 +452,9 @@ class HttpsPutDestination(BackupDestination):
         """
         return []
 
-    async def download(self, *, config: dict[str, Any], filename: str) -> bytes:
+    async def download(
+        self, *, config: dict[str, Any], filename: str, max_bytes: int | None = None
+    ) -> bytes:
         raise UnsupportedOperationError(
             "the https_put destination is one-way: it can send an archive to the "
             "receiver but cannot read one back. Restore from the receiver's own "
@@ -489,7 +535,7 @@ class HttpsPutDestination(BackupDestination):
             return {
                 "ok": False,
                 "error": (
-                    f"the receiver redirected to {resp.headers.get('location', '?')!r}. "
+                    f"the receiver redirected to {safe_url(resp.headers.get('location', '?'))!r}. "
                     "Redirects are not followed (that would re-send the archive and its "
                     "credential to an unchecked address) — configure the final URL."
                 ),
@@ -506,7 +552,7 @@ class HttpsPutDestination(BackupDestination):
             # and wonder what wrote it.
             "probe_retained": True,
             "detail": (
-                f"{method} to {url} returned {resp.status_code}. This destination cannot "
+                f"{method} to {safe_url(url)} returned {resp.status_code}. This destination cannot "
                 f"delete, so the 16-byte probe object {probe_name!r} is left on the "
                 "receiver — remove it there if it is in the way."
             ),

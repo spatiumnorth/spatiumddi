@@ -73,11 +73,19 @@ def configure_logging(
 
     renderer: structlog.types.Processor
     if settings.log_format == "json":
-        exc_processors: list[structlog.types.Processor] = [structlog.processors.dict_tracebacks]
+        # show_locals=False: the default ``dict_tracebacks`` renders every
+        # frame's local variables, so a failed restore logged the backup
+        # passphrase and the database password. Type, message and frames stay.
+        exc_processors: list[structlog.types.Processor] = [
+            structlog.processors.ExceptionRenderer(
+                structlog.tracebacks.ExceptionDictTransformer(show_locals=False)
+            )
+        ]
         renderer = structlog.processors.JSONRenderer()
     else:
         exc_processors = []
-        renderer = structlog.dev.ConsoleRenderer()
+        # The default formatter is rich's, which also shows locals.
+        renderer = structlog.dev.ConsoleRenderer(exception_formatter=structlog.dev.plain_traceback)
 
     handler: logging.StreamHandler[TextIO]
     if logfile:

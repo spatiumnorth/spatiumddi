@@ -1,5 +1,8 @@
+import { useModuleOn } from "@/hooks/useModuleOn";
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
+import { pollUnlessRefused } from "@/lib/refusal";
 import {
   Check,
   Cloud,
@@ -27,6 +30,13 @@ import { HeaderButton } from "@/components/ui/header-button";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { IPSpacePicker } from "@/components/ipam/space-picker";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
+import { secondsFieldError, CLOUD_SYNC_INTERVAL_BOUNDS } from "@/lib/seconds";
+import { FormError } from "@/components/ui/form-error";
 
 // ── Provider metadata ───────────────────────────────────────────────
 
@@ -94,11 +104,22 @@ gcloud iam service-accounts keys create key.json \\
 // ── Page ─────────────────────────────────────────────────────────────
 
 export function CloudPage() {
+  // #1340 — every write on this integration takes a superadmin (its
+  // router's create / update / delete / sync / test handlers take
+  // SuperAdmin), so a read-only user is offered none of them.
+  const superadminGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const qc = useQueryClient();
-  const { data: endpoints = [], isFetching } = useQuery({
+  const {
+    data: endpoints = [],
+    isFetching,
+    error: listError,
+  } = useQuery({
     queryKey: ["cloud-endpoints"],
     queryFn: cloudApi.listEndpoints,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
 
   const [showCreate, setShowCreate] = useState(false);
@@ -172,6 +193,7 @@ export function CloudPage() {
               variant="primary"
               icon={Plus}
               onClick={() => setShowCreate(true)}
+              {...superadminGate}
             >
               Add account
             </HeaderButton>
@@ -184,11 +206,14 @@ export function CloudPage() {
           {endpoints.length === 0 ? (
             <div className="p-8 text-center">
               <p className="text-sm text-muted-foreground">
-                No cloud accounts configured yet.
+                <ListEmpty error={listError} what="cloud accounts">
+                  No cloud accounts configured yet.
+                </ListEmpty>
               </p>
               <button
                 onClick={() => setShowCreate(true)}
-                className="mt-3 inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
+                className="mt-3 inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                {...superadminGate}
               >
                 <Plus className="h-3 w-3" /> Add account
               </button>
@@ -297,6 +322,8 @@ export function CloudPage() {
                             }
                             className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-50"
                             title="Test connection"
+                            aria-label="Test connection"
+                            {...superadminGate}
                           >
                             <TestTube2 className="h-3.5 w-3.5" />
                           </button>
@@ -307,6 +334,8 @@ export function CloudPage() {
                             }
                             className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-50"
                             title="Sync now"
+                            aria-label="Sync now"
+                            {...superadminGate}
                           >
                             <RotateCw
                               className={`h-3.5 w-3.5 ${
@@ -318,15 +347,19 @@ export function CloudPage() {
                           </button>
                           <button
                             onClick={() => setEdit(ep)}
-                            className="rounded p-1 text-muted-foreground hover:text-foreground"
+                            className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                             title="Edit"
+                            aria-label="Edit"
+                            {...superadminGate}
                           >
                             <Pencil className="h-3.5 w-3.5" />
                           </button>
                           <button
                             onClick={() => setDel(ep)}
-                            className="rounded p-1 text-muted-foreground hover:text-destructive"
+                            className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                             title="Delete"
+                            aria-label="Delete"
+                            {...superadminGate}
                           >
                             <Trash2 className="h-3.5 w-3.5" />
                           </button>
@@ -357,8 +390,10 @@ export function CloudPage() {
               Remove the cloud account{" "}
               <span className="font-semibold">{del.name}</span>? This only
               affects SpatiumDDI — nothing on the {PROVIDER_LABEL[del.provider]}{" "}
-              side changes. All IPAM rows mirrored from this account (subnets +
-              addresses) will be removed via the FK cascade.
+              side changes. Only rows that were purely mirrored are removed.
+              Anything you added yourself (addresses, DHCP scopes, reservations,
+              edited rows, custom fields) is kept and detached from this
+              integration.
             </>
           ) : (
             ""
@@ -381,9 +416,13 @@ function EndpointModal({
   const qc = useQueryClient();
   const editing = !!endpoint;
 
+  // DNS off (#2135): no /dns/groups read and no picker. The stored
+  // dns_group_id is sent back untouched, so saving here cannot clear it.
+  const dnsOn = useModuleOn("core.dns");
   const { data: dnsGroups = [] } = useQuery<DNSServerGroup[]>({
     queryKey: ["dns-groups"],
     queryFn: () => dnsApi.listGroups(),
+    enabled: dnsOn,
   });
 
   const [provider, setProvider] = useState<CloudProvider>(
@@ -405,7 +444,7 @@ function EndpointModal({
     endpoint?.mirror_stopped_instances ?? false,
   );
   const [syncInterval, setSyncInterval] = useState(
-    endpoint?.sync_interval_seconds ?? 300,
+    String(endpoint?.sync_interval_seconds ?? 300),
   );
 
   // AWS credentials
@@ -501,7 +540,7 @@ function EndpointModal({
           dns_group_id: dnsGroupId || null,
           mirror_load_balancers: mirrorLoadBalancers,
           mirror_stopped_instances: mirrorStoppedInstances,
-          sync_interval_seconds: syncInterval,
+          sync_interval_seconds: Number(syncInterval.trim()),
         };
         if (Object.keys(creds).length > 0) update.credentials = creds;
         return cloudApi.updateEndpoint(endpoint!.id, update);
@@ -519,7 +558,7 @@ function EndpointModal({
         dns_group_id: dnsGroupId || null,
         mirror_load_balancers: mirrorLoadBalancers,
         mirror_stopped_instances: mirrorStoppedInstances,
-        sync_interval_seconds: syncInterval,
+        sync_interval_seconds: Number(syncInterval.trim()),
       };
       return cloudApi.createEndpoint(create);
     },
@@ -551,6 +590,17 @@ function EndpointModal({
       <form
         onSubmit={(e) => {
           e.preventDefault();
+          // #2110 — "1h" and an empty field are refused, not read as 1 / the default.
+          const intervalError = secondsFieldError(
+            "Sync interval",
+            syncInterval,
+            CLOUD_SYNC_INTERVAL_BOUNDS,
+          );
+          if (intervalError) {
+            setError(intervalError);
+            return;
+          }
+          setError("");
           saveMut.mutate();
         }}
         className="space-y-3"
@@ -786,20 +836,22 @@ function EndpointModal({
         </div>
 
         <div className="grid grid-cols-2 gap-3">
-          <Field label="DNS server group (optional)">
-            <select
-              className={inputCls}
-              value={dnsGroupId ?? ""}
-              onChange={(e) => setDnsGroupId(e.target.value)}
-            >
-              <option value="">— none —</option>
-              {dnsGroups.map((g) => (
-                <option key={g.id} value={g.id}>
-                  {g.name}
-                </option>
-              ))}
-            </select>
-          </Field>
+          {dnsOn && (
+            <Field label="DNS server group (optional)">
+              <select
+                className={inputCls}
+                value={dnsGroupId ?? ""}
+                onChange={(e) => setDnsGroupId(e.target.value)}
+              >
+                <option value="">— none —</option>
+                {dnsGroups.map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.name}
+                  </option>
+                ))}
+              </select>
+            </Field>
+          )}
           <Field
             label="Regions"
             hint="Comma-separated. Leave blank to use the provider default region set."
@@ -819,7 +871,7 @@ function EndpointModal({
             className={inputCls}
             value={syncInterval}
             min={60}
-            onChange={(e) => setSyncInterval(parseInt(e.target.value) || 300)}
+            onChange={(e) => setSyncInterval(e.target.value)}
           />
         </Field>
 
@@ -856,7 +908,9 @@ function EndpointModal({
           </label>
         </div>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 pt-2">
           <button

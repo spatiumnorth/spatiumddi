@@ -10,9 +10,13 @@ being enforced.
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 from pathlib import Path
 
-from spatium_dns_agent.drivers.bind9 import Bind9Driver
+import pytest
+
+from spatium_dns_agent.drivers.bind9 import Bind9Driver, sinkhole_rdatas
 
 
 def _render(tmp_path: Path, entries: list[dict], exceptions: list[str] | None = None) -> list[str]:
@@ -42,7 +46,10 @@ def test_block_and_sinkhole_rdata(tmp_path: Path) -> None:
         ],
     )
     assert "ads.example.test CNAME ." in lines
-    assert "drop.example.test CNAME rpz-drop." in lines
+    # #2124 — local data, never ``rpz-drop`` (which answers nothing).
+    assert "drop.example.test A 0.0.0.0" in lines
+    assert "drop.example.test AAAA ::" in lines
+    assert not any("rpz-drop" in line for line in lines)
 
 
 def test_redirect_to_hostname_is_a_cname(tmp_path: Path) -> None:
@@ -272,3 +279,277 @@ def test_a_dropped_redirect_leaves_the_owner_free(tmp_path: Path) -> None:
         ],
     )
     assert lines == ["dup.example.test CNAME ."]
+
+
+def test_streamed_file_is_byte_identical_to_the_joined_render(tmp_path: Path) -> None:
+    """#1109 Part 3 — the renderer streams to disk instead of building
+    ``"\\n".join(lines) + "\\n"``. The bytes must not change: this pins the
+    exact file the old implementation produced for an input covering
+    wildcards, both redirect shapes, a dropped redirect, a case-variant
+    duplicate across lists, an excepted entry and exceptions."""
+    entries = [
+        {"domain": "Ads.Example.test.", "action": "block", "is_wildcard": True},
+        {"domain": "ads.example.test", "action": "block", "block_mode": "sinkhole"},
+        {"domain": "sink.test", "block_mode": "sinkhole"},
+        {
+            "domain": "redir.test",
+            "action": "redirect",
+            "target": "safe.example.",
+            "is_wildcard": True,
+        },
+        {"domain": "redir-ip.test", "action": "redirect", "target": "192.0.2.7"},
+        {"domain": "bad.test", "action": "redirect", "target": "has space"},
+        {"domain": "excepted.test", "action": "block"},
+    ]
+    out = tmp_path / "sub" / "rpz.zone"
+    Bind9Driver(state_dir=tmp_path)._write_rpz_zone_file(
+        out,
+        {
+            "rpz_zone_name": "z.rpz.",
+            "entries": entries,
+            "exceptions": ["excepted.test", "Excepted.test.", "ok.test"],
+        },
+    )
+    expected = (
+        "$TTL 60\n"
+        "@ IN SOA localhost. root.localhost. ( 1 3600 600 86400 60 )\n"
+        "@ IN NS localhost.\n"
+        "Ads.Example.test CNAME .\n"
+        "*.Ads.Example.test CNAME .\n"
+        "sink.test A 0.0.0.0\n"
+        "sink.test AAAA ::\n"
+        "redir.test CNAME safe.example.\n"
+        "*.redir.test CNAME safe.example.\n"
+        "redir-ip.test A 192.0.2.7\n"
+        "excepted.test CNAME rpz-passthru.\n"
+        "*.excepted.test CNAME rpz-passthru.\n"
+        "ok.test CNAME rpz-passthru.\n"
+        "*.ok.test CNAME rpz-passthru.\n"
+    )
+    assert out.read_bytes() == expected.encode()
+
+
+# ── #2124: sinkhole answers with an address, never by dropping the query ─────
+
+
+def test_sinkhole_without_an_address_answers_the_unspecified_addresses(
+    tmp_path: Path,
+) -> None:
+    """``rpz-drop`` sent no response, so every blocked lookup hung for the
+    client's resolver timeout. A sinkhole answers at once, in both
+    families, with 0.0.0.0 / :: when the list names no address."""
+    lines = _render(
+        tmp_path,
+        [
+            {
+                "domain": "ads.example.test",
+                "action": "block",
+                "block_mode": "sinkhole",
+                "is_wildcard": True,
+            }
+        ],
+    )
+    assert lines == [
+        "ads.example.test A 0.0.0.0",
+        "ads.example.test AAAA ::",
+        "*.ads.example.test A 0.0.0.0",
+        "*.ads.example.test AAAA ::",
+    ]
+
+
+def test_sinkhole_reads_the_lists_ipv4_address(tmp_path: Path) -> None:
+    """The bundle's ``sinkhole_ip`` used to be ignored by this renderer."""
+    lines = _render(
+        tmp_path,
+        [
+            {
+                "domain": "ads.example.test",
+                "action": "block",
+                "block_mode": "sinkhole",
+                "sinkhole_ip": "192.0.2.53",
+            }
+        ],
+    )
+    assert lines == ["ads.example.test A 192.0.2.53", "ads.example.test AAAA ::"]
+
+
+def test_sinkhole_reads_the_lists_ipv6_address(tmp_path: Path) -> None:
+    lines = _render(
+        tmp_path,
+        [
+            {
+                "domain": "ads.example.test",
+                "action": "block",
+                "block_mode": "sinkhole",
+                "sinkhole_ip": "2001:DB8::0:53",
+            }
+        ],
+    )
+    assert lines == ["ads.example.test A 0.0.0.0", "ads.example.test AAAA 2001:db8::53"]
+
+
+def test_an_unusable_sinkhole_address_falls_back_rather_than_breaking_the_zone(
+    tmp_path: Path,
+) -> None:
+    """A legacy row the API never validated must not reach the rdata: BIND
+    would refuse the whole zone (#878)."""
+    lines = _render(
+        tmp_path,
+        [
+            {
+                "domain": "ads.example.test",
+                "action": "block",
+                "block_mode": "sinkhole",
+                "sinkhole_ip": "not an ip",
+            }
+        ],
+    )
+    assert lines == ["ads.example.test A 0.0.0.0", "ads.example.test AAAA ::"]
+    assert sinkhole_rdatas("not an ip")[1] is False
+    assert sinkhole_rdatas(None) == (("A 0.0.0.0", "AAAA ::"), True)
+
+
+def test_a_legacy_refused_mode_renders_nxdomain(tmp_path: Path) -> None:
+    """``refused`` has no RPZ action; it always rendered NXDOMAIN here."""
+    lines = _render(
+        tmp_path,
+        [{"domain": "r.example.test", "action": "block", "block_mode": "refused"}],
+    )
+    assert lines == ["r.example.test CNAME ."]
+
+
+def test_two_sinkhole_lists_with_different_addresses_keep_one_owner(
+    tmp_path: Path,
+) -> None:
+    """An A beside a different A is a second RRset member, not a collision
+    BIND rejects — but it would answer two addresses for one name. First
+    writer wins, as for any other differing pair."""
+    lines = _render(
+        tmp_path,
+        [
+            {
+                "domain": "d.example.test",
+                "action": "block",
+                "block_mode": "sinkhole",
+                "sinkhole_ip": "192.0.2.1",
+            },
+            {
+                "domain": "d.example.test",
+                "action": "block",
+                "block_mode": "sinkhole",
+                "sinkhole_ip": "192.0.2.2",
+            },
+            {"domain": "d.example.test", "action": "block", "block_mode": "nxdomain"},
+        ],
+    )
+    assert lines == ["d.example.test A 192.0.2.1", "d.example.test AAAA ::"]
+
+
+_CHECKZONE = shutil.which("named-checkzone")
+
+
+@pytest.mark.skipif(_CHECKZONE is None, reason="named-checkzone is not installed")
+def test_every_block_mode_renders_a_zone_bind_loads(tmp_path: Path) -> None:
+    """The rendered zone must load: one bad line takes the whole list down."""
+    out = tmp_path / "rpz.zone"
+    Bind9Driver(state_dir=tmp_path)._write_rpz_zone_file(
+        out,
+        {
+            "rpz_zone_name": "spatium-blocklist.rpz.",
+            "entries": [
+                {
+                    "domain": "nx.example.test",
+                    "action": "block",
+                    "block_mode": "nxdomain",
+                    "is_wildcard": True,
+                },
+                {
+                    "domain": "sink.example.test",
+                    "action": "block",
+                    "block_mode": "sinkhole",
+                    "is_wildcard": True,
+                },
+                {
+                    "domain": "sink4.example.test",
+                    "action": "block",
+                    "block_mode": "sinkhole",
+                    "sinkhole_ip": "192.0.2.53",
+                },
+                {
+                    "domain": "sink6.example.test",
+                    "action": "block",
+                    "block_mode": "sinkhole",
+                    "sinkhole_ip": "2001:db8::53",
+                    "is_wildcard": True,
+                },
+                {
+                    "domain": "bad.example.test",
+                    "action": "block",
+                    "block_mode": "sinkhole",
+                    "sinkhole_ip": "nope",
+                },
+                {
+                    "domain": "old.example.test",
+                    "action": "block",
+                    "block_mode": "refused",
+                },
+            ],
+            "exceptions": ["ok.example.test"],
+        },
+    )
+    res = subprocess.run(
+        [_CHECKZONE, "spatium-blocklist.rpz", str(out)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_feed_exception_shipped_only_as_its_own_carve_out(tmp_path: Path) -> None:
+    """#2123 / #2124: an AdGuard-style feed ``@@``-excepts ``x.example.test``,
+    which the operator's manual list blocks. The control plane leaves it out
+    of the exceptions, so the agent still blocks it; the feed's own
+    carve-out ``c.feed.test`` renders as a passthru."""
+    out = tmp_path / "rpz.zone"
+    Bind9Driver(state_dir=tmp_path)._write_rpz_zone_file(
+        out,
+        {
+            "rpz_zone_name": "z.rpz.",
+            "entries": [
+                {"domain": "x.example.test", "action": "block"},
+                {"domain": "feed.test", "action": "block", "is_wildcard": True},
+            ],
+            "exceptions": ["c.feed.test"],
+        },
+    )
+    text = out.read_text()
+    assert "x.example.test CNAME .\n" in text
+    assert "c.feed.test CNAME rpz-passthru.\n" in text
+    assert "x.example.test CNAME rpz-passthru." not in text
+
+
+def test_subdomain_only_entry_renders_as_written_and_leaves_the_apex(tmp_path: Path) -> None:
+    """Adblock ``.name^`` (#4037) is stored as ``*.name`` with no wildcard flag:
+    one RPZ line, subdomains only; the apex keeps resolving."""
+    lines = _render(
+        tmp_path,
+        [{"domain": "*.sub.example.test", "action": "block", "block_mode": "nxdomain",
+          "is_wildcard": False}],
+    )
+    assert lines == ["*.sub.example.test CNAME ."]
+
+
+def test_a_subdomain_only_entry_is_not_emitted_beside_its_exception(tmp_path: Path) -> None:
+    """An exception for ``N`` emits ``*.N`` as passthru; a ``*.N`` block would be
+    a second CNAME on that owner and BIND would reject the whole zone."""
+    lines = _render(
+        tmp_path,
+        [{"domain": "*.sub.example.test", "action": "block", "block_mode": "nxdomain",
+          "is_wildcard": False}],
+        ["sub.example.test"],
+    )
+    assert lines == [
+        "sub.example.test CNAME rpz-passthru.",
+        "*.sub.example.test CNAME rpz-passthru.",
+    ]

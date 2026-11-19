@@ -33,6 +33,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -93,7 +94,14 @@ class NetworkService(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base)
 
     __tablename__ = "network_service"
     __table_args__ = (
-        UniqueConstraint("customer_id", "name", name="uq_network_service_customer_name"),
+        # Partial, so a soft-deleted service stops holding its name (#2738).
+        Index(
+            "uq_network_service_customer_name",
+            "customer_id",
+            "name",
+            unique=True,
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
         Index("ix_network_service_customer_id", "customer_id"),
         Index("ix_network_service_kind", "kind"),
         Index("ix_network_service_status", "status"),

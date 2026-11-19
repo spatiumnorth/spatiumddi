@@ -9,7 +9,7 @@ with HMAC-signed POSTs + exponential-backoff retry + a dead-letter
 state.
 
 Mapping is from ``(AuditLog.action, AuditLog.resource_type)`` to a
-typed event name like ``subnet.created`` / ``ip.allocated``. Audit
+typed event name like ``subnet.created`` / ``ip.created``. Audit
 rows whose ``(action, resource_type)`` pair doesn't map to a known
 event type are silently skipped — this surface is for typed
 automation, not raw audit forwarding (which has its own pipeline).
@@ -38,13 +38,13 @@ from typing import Any
 
 import structlog
 from sqlalchemy import event, select
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.pool import NullPool
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import settings as _app_settings
 from app.models.audit import AuditLog
 from app.models.event_subscription import EventOutbox, EventSubscription
+from app.services import dispatch_db
 from app.services.after_commit_dispatch import dispatch
+from app.services.audit_redact import redact_audit_value
 
 logger = structlog.get_logger(__name__)
 
@@ -188,6 +188,8 @@ _SPECIAL_EVENT_MAP: dict[tuple[str, str], str] = {
     ("upgrade.failed", "system_upgrade_run"): "system.upgrade.failed",
     ("upgrade.node_failed", "system_upgrade_run"): "system.upgrade.failed",
     ("upgrade.chart_bump_failed", "system_upgrade_run"): "system.upgrade.failed",
+    # #1710 — the run could not hold the shared charts' image tag.
+    ("upgrade.shared_tag_hold_failed", "system_upgrade_run"): "system.upgrade.failed",
     ("upgrade.post_upgrade_verify_failed", "system_upgrade_run"): "system.upgrade.failed",
     # Approval workflow lifecycle (#62). The service layer writes plain-verb
     # audit actions (requested / approved / …); without these explicit
@@ -220,6 +222,31 @@ _SPECIAL_EVENT_MAP: dict[tuple[str, str], str] = {
     ("first_seen", "ip_mac_observation"): "device.first_seen",
     ("acknowledged", "ip_mac_observation"): "device.acknowledged",
 }
+
+
+# Audit rows recording a refused request (a route permission gate or a
+# handler invariant) — the action did not happen, so no event describes it.
+# A denylist rather than a ``== "success"`` allowlist: ``error`` / ``accepted``
+# / ``ok`` rows are written by paths that did commit a change (e.g. a DNS
+# write with a provider warning), and subscribers still need those.
+_REFUSED_RESULTS = frozenset({"denied", "forbidden"})
+
+
+def _records_refusal(row: AuditLog) -> bool:
+    """True when ``row`` records a request that was refused, not an action.
+
+    Besides the ``denied`` / ``forbidden`` rows, a sign-in that did not
+    succeed is a refusal too: ``login`` rows carry ``failure`` (bad
+    credentials, locked account) or ``error`` (an external provider
+    answered no / could not be reached). Those are written for anonymous
+    callers, and would otherwise reach every subscribe-to-everything
+    webhook as ``auth.user.login`` / ``auth.provider.login``. ``failure``
+    cannot join the denylist itself: ``backup_target_run_failed`` writes
+    it for a run that really failed, which is ``system.backup_failed``.
+    """
+    if row.result in _REFUSED_RESULTS:
+        return True
+    return row.action == "login" and row.result != "success"
 
 
 def _audit_to_event_type(action: str, resource_type: str) -> str | None:
@@ -259,8 +286,11 @@ def _serialize_audit(row: AuditLog, event_type: str) -> dict[str, Any]:
         },
         "action": row.action,
         "result": row.result,
-        "old_value": row.old_value,
-        "new_value": row.new_value,
+        # Redacted as the audit API redacts them (#2009 / #2015): this
+        # body is persisted in ``event_outbox`` and POSTed to a receiver
+        # outside the box. The stored audit row itself is not modified.
+        "old_value": redact_audit_value(row.old_value),
+        "new_value": redact_audit_value(row.new_value),
         "changed_fields": list(row.changed_fields or []),
     }
 
@@ -281,24 +311,16 @@ def _subscription_matches(sub: EventSubscription, event_type: str) -> bool:
 
 @asynccontextmanager
 async def _ephemeral_session() -> AsyncIterator[AsyncSession]:
-    """Short-lived engine + session used by the after-commit publisher.
+    """Session on the shared, capped dispatch engine (#2782) -- see
+    ``app.services.dispatch_db``. Not a fresh engine per commit: that put
+    no ceiling on the connections this hook could hold."""
+    async with dispatch_db.session() as session:
+        yield session
 
-    Why a fresh engine per dispatch — see
-    ``audit_forward._ephemeral_session``: in FastAPI we'd pin to the
-    request loop, in Celery the loop is per-task. NullPool keeps the
-    connection lifetime explicit; the cost is one fresh
-    connection/dispatch which is fine for audit-rate write volumes.
-    """
-    engine = create_async_engine(
-        _app_settings.database_url,
-        poolclass=NullPool,
-        echo=False,
-    )
-    try:
-        async with AsyncSession(engine, expire_on_commit=False) as session:
-            yield session
-    finally:
-        await engine.dispose()
+
+# Nothing to publish to: no enabled subscription. Invalidated by the webhook
+# routes; a subscription created on another process is seen within the TTL.
+subscriptions_cache = dispatch_db.NegativeCache()
 
 
 # ── Outbox writer ──────────────────────────────────────────────────────────
@@ -315,6 +337,8 @@ async def _publish_outbox_rows(snapshots: list[dict[str, Any]]) -> None:
     """
     if not snapshots:
         return
+    if subscriptions_cache.known_empty():
+        return
     try:
         async with _ephemeral_session() as session:
             res = await session.execute(
@@ -322,6 +346,7 @@ async def _publish_outbox_rows(snapshots: list[dict[str, Any]]) -> None:
             )
             subs = list(res.scalars().all())
             if not subs:
+                subscriptions_cache.mark_empty()
                 return
 
             now = datetime.now(UTC)
@@ -376,6 +401,8 @@ def _register_session_listener() -> None:
             return
         snapshots = getattr(session, _PENDING_ATTR, None) or []
         for row in new_audits:
+            if _records_refusal(row):
+                continue
             event_type = _audit_to_event_type(row.action, row.resource_type)
             if event_type is None:
                 continue

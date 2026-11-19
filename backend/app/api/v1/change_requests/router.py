@@ -52,6 +52,7 @@ from app.services.ai.operations_control import (
     is_controls_protected,
     maybe_gate_control,
 )
+from app.services.api_token_scopes import enforce_operation_token_scope
 from app.services.approvals.policy import (
     GATEABLE_ACTIONS,
     GATEABLE_RESOURCE_TYPES,
@@ -60,6 +61,7 @@ from app.services.approvals.policy import (
 from app.services.approvals.service import (
     ChangeRequestStateError,
     DecisionError,
+    approval_refusal,
     approve_change_request,
     get_change_request,
     list_change_requests,
@@ -95,6 +97,12 @@ class ChangeRequestResponse(BaseModel):
     executed_at: datetime | None
     created_at: datetime
     modified_at: datetime
+    # Whether the CALLER may approve this row, asked of the same check the
+    # approve endpoint makes (#4189); the server stays authoritative. False on
+    # a row that is no longer pending. ``approve_blocked_reason`` is the
+    # server's own refusal text when a pending row is refused.
+    can_approve: bool = False
+    approve_blocked_reason: str | None = None
 
 
 class DecisionBody(BaseModel):
@@ -146,8 +154,11 @@ class ApprovalPolicyUpdate(BaseModel):
 # ── Serialisers ──────────────────────────────────────────────────────────────
 
 
-def _cr_to_response(cr: ChangeRequest) -> ChangeRequestResponse:
+def _cr_to_response(cr: ChangeRequest, viewer: User) -> ChangeRequestResponse:
+    refusal = approval_refusal(viewer, cr) if cr.state == "pending" else None
     return ChangeRequestResponse(
+        can_approve=cr.state == "pending" and refusal is None,
+        approve_blocked_reason=str(refusal) if refusal is not None else None,
         id=cr.id,
         operation=cr.operation,
         resource_type=cr.resource_type,
@@ -254,17 +265,6 @@ def _validate_gateable(action: str | None, resource_type: str | None) -> None:
             )
 
 
-def _require_read(user: CurrentUser) -> None:
-    """Reads on the queue need ``read,change_request`` (or superadmin)."""
-    if is_effective_superadmin(user):
-        return
-    if not user_has_permission(user, "read", RESOURCE_TYPE_CHANGE_REQUEST):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Permission denied: need 'read' on '{RESOURCE_TYPE_CHANGE_REQUEST}'",
-        )
-
-
 def _can_see_all_change_requests(user: User) -> bool:
     """READ RULE (#1): who may see EVERY change request (not just their own).
 
@@ -280,6 +280,10 @@ def _can_see_all_change_requests(user: User) -> bool:
     only the rows they themselves requested (``requested_by_user_id ==
     caller.id``). The list endpoint forces that scope; get/{id} 404s on a row
     the caller may not see (404, not 403, so existence isn't confirmed).
+
+    ``read`` on ``change_request`` is NOT a precondition (#1863): the scope is
+    the gate. An editor whose write a policy queued holds no such grant, and
+    still has to see — and be able to cancel — the request it made.
     """
     return is_effective_superadmin(user) or user_has_permission(
         user, "approve", RESOURCE_TYPE_CHANGE_REQUEST
@@ -306,7 +310,9 @@ async def list_requests(
     ALWAYS scoped to their own requests regardless of the ``mine`` flag — a
     plain ``{read, change_request}`` holder can never enumerate the platform
     queue (which leaks args / preview / target / requester / approver)."""
-    _require_read(current_user)
+    # No ``read`` gate (#1863): the own-rows scope below IS the access rule.
+    # A requester whose write a policy queued holds no ``read,change_request``
+    # (only Change Approver does), yet must see — and cancel — its own row.
     if _can_see_all_change_requests(current_user):
         scope_user_id = current_user.id if mine else None
     else:
@@ -324,7 +330,7 @@ async def list_requests(
         limit=max(1, min(limit, 500)),
         offset=max(0, offset),
     )
-    return [_cr_to_response(r) for r in rows]
+    return [_cr_to_response(r, current_user) for r in rows]
 
 
 # ── Approval policies (operator-tunable rules) ─────────────────────────────
@@ -508,7 +514,7 @@ async def delete_policy(
 
 @router.get("/{cr_id}", response_model=ChangeRequestResponse)
 async def get_request(cr_id: uuid.UUID, current_user: CurrentUser, db: DB) -> ChangeRequestResponse:
-    _require_read(current_user)
+    # No ``read`` gate (#1863) — the 404 below is the access rule.
     cr = await get_change_request(db, cr_id)
     # READ RULE (#1): 404 (not 403) unless the caller is the requester, holds
     # approve, or is a superadmin — so a non-eligible caller can't even confirm
@@ -524,7 +530,7 @@ async def get_request(cr_id: uuid.UUID, current_user: CurrentUser, db: DB) -> Ch
         )
     ):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-    return _cr_to_response(cr)
+    return _cr_to_response(cr, current_user)
 
 
 async def _assert_gate_row(db: DB, cr_id: uuid.UUID) -> None:
@@ -566,31 +572,39 @@ async def approve_request(
     3. Approver holds ``{approve, change_request}``.
     4. Approver holds the underlying operation's ``required_permission`` —
        they can't rubber-stamp a delete they couldn't perform themselves.
-    5. The operation's ``preview()`` re-runs under the approver; a stale
-       request (target gone / now non-empty / synthesised) does NOT execute
-       (409, left ``pending`` so the requester can cancel).
+    5. The operation's ``preview()`` re-runs under the approver. If it
+       refuses (target gone / now non-empty / synthesised), the operation
+       does NOT execute and the row ends ``failed`` with the reason (200,
+       #2911). A refusal about the approver — a target that exists but
+       they cannot reach — answers 403 and the row stays ``pending`` for
+       another approver (#2934). If it still succeeds but its scope
+       differs from what the approver reviewed, the approve answers 409 and
+       the row stays ``pending``: the requester can cancel and re-submit.
     6. ``apply()`` dispatches under the **approver's** identity; the audit
        ``executed`` row carries the approver as actor and the requester id
-       in ``old_value.requested_by``. A client 4xx raised by ``apply()``
-       leaves the row ``pending`` and surfaces the status; a server fault
-       marks it ``failed``.
+       in ``old_value.requested_by``. If ``apply()`` refuses — a 4xx, a 5xx
+       or any other exception — the row is stamped ``approved`` then
+       ``failed`` with the reason in ``error`` and the call answers 200
+       (#2911), so the requester can read why. The one exception is a
+       permission error about this approver: 403, left ``pending``, since a
+       different approver may still approve.
     """
     await _assert_gate_row(db, cr_id)
     note = body.decision_note if body is not None else None
 
     # Delegate to the single two-person spine (services/approvals/service.py)
     # so this HTTP path and the AI propose→apply path enforce the IDENTICAL
-    # invariants (#5 fail-closed on a deleted requester, #11 client-4xx from
-    # apply leaves the row pending, #13 expiry routes through the audited
-    # mark_expired, #14 mark_failed carries the requester id, #15 guarded
-    # rollback). DecisionError subclasses carry the right HTTP status.
+    # invariants (#5 fail-closed on a deleted requester, #2911 every apply
+    # refusal but a permission error ends failed, #13 expiry routes through
+    # the audited mark_expired, #14 mark_failed carries the requester id,
+    # #15 guarded rollback). DecisionError subclasses carry the right HTTP status.
     try:
         cr = await approve_change_request(
             db, cr_id, approver=current_user, request=request, note=note
         )
     except DecisionError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-    return _cr_to_response(cr)
+    return _cr_to_response(cr, current_user)
 
 
 @router.post("/{cr_id}/reject", response_model=ChangeRequestResponse)
@@ -612,7 +626,7 @@ async def reject_request(
         )
     except DecisionError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-    return _cr_to_response(cr)
+    return _cr_to_response(cr, current_user)
 
 
 @router.post("/{cr_id}/cancel", response_model=ChangeRequestResponse)
@@ -629,6 +643,7 @@ async def cancel_request(
     # #696 — gate rows only; a portal row is cancelled via /requests.
     if cr is None or cr.origin != "gate":
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    enforce_operation_token_scope(request, cr.operation)  # #3302
     is_requester = (
         cr.requested_by_user_id is not None and current_user.id == cr.requested_by_user_id
     )
@@ -647,7 +662,7 @@ async def cancel_request(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     await db.commit()
     await db.refresh(cr)
-    return _cr_to_response(cr)
+    return _cr_to_response(cr, current_user)
 
 
 __all__ = ["router"]

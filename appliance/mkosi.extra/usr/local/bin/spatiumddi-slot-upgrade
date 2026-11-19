@@ -39,18 +39,62 @@ TRIGGER="${SPATIUM_SLOT_TRIGGER:-/var/lib/spatiumddi/release-state/slot-upgrade-
 PROGRESS="${SPATIUM_SLOT_PROGRESS:-/var/lib/spatiumddi/release-state/slot-upgrade.progress}"
 
 # The supervisor container runs unprivileged (``su-exec spatium``) while
-# these sidecars are written by THIS script as root, into a mode-1777
-# (sticky) directory. A non-owner therefore gets EACCES overwriting a
-# root-owned 0644 file and EPERM unlinking it — so every supervisor-side
-# reset of a failed upgrade silently no-op'd (#786). Publish them 0666 so
-# an in-place overwrite works. Content is non-secret state the api already
-# republishes to the operator; the sticky bit still stops unlink-by-others.
+# these sidecars are written by THIS script as root, into a sticky
+# directory. A non-owner therefore gets EACCES overwriting a root-owned
+# 0644 file and EPERM unlinking it — so every supervisor-side reset of a
+# failed upgrade silently no-op'd (#786). Publish them group-writable to
+# the spatium-host gid the supervisor and api carry, so an in-place
+# overwrite works; the sticky bit still stops unlink-by-others. They were
+# 0666 until GHSA-h2j9-qrg7-grfw, which let any local account forge the
+# upgrade status the Fleet UI shows.
+SIDECAR_GID="${SPATIUM_HOST_GID:-2770}"
+#
+# Only a regular file this script owns is re-moded: chgrp and chmod follow a
+# symlink, and a file at that name that is not root's (atomic_write failed,
+# and a pod put something there) could be swapped for one between the check
+# and the chmod. A root-owned file in the sticky directory cannot be.
 publish_sidecar() {  # $1 = path
-    chmod 0666 "$1" 2>/dev/null || true
+    [ -f "$1" ] && [ ! -L "$1" ] || return 0
+    [ "$(stat -c %u -- "$1" 2>/dev/null)" = "$(id -u)" ] || return 0
+    chgrp "$SIDECAR_GID" "$1" 2>/dev/null || true
+    chmod 0660 "$1" 2>/dev/null || true
 }
 LOG_DIR="${SPATIUM_SLOT_LOG_DIR:-/var/log/spatiumddi}"
 LOG="$LOG_DIR/slot-upgrade.log"
 UPGRADE_SLOT_BIN="${SPATIUM_UPGRADE_SLOT_BIN:-/usr/local/bin/spatium-upgrade-slot}"
+
+# #1747 — a power loss right after a write must never leave a state file
+# full of NUL bytes (extended length, unwritten data): the supervisor ships
+# these on every heartbeat and Postgres refuses U+0000, so the api would
+# 422 every heartbeat from the node for good. Durable write = temp file in
+# the SAME directory, fsync it, rename over the target, fsync the directory.
+# ``sync FILE`` (coreutils >= 8.24) fsyncs just that path; a plain ``sync``
+# is the fallback when it is unavailable.
+fsync_path() {  # $@ = paths
+    sync "$@" 2>/dev/null || sync 2>/dev/null || true
+}
+atomic_write() {  # $1 = target path, $2 = content (a newline is appended)
+    local target="$1" tmp
+    tmp=$(mktemp "${target}.XXXXXX") || return 1
+    # mktemp makes 0600; keep the target's mode + group (the supervisor reads
+    # these as a different user), else the world-readable default. The api
+    # and the supervisor can create names in release-state and this runs as
+    # root, so the target may be a symlink planted there: its referent is not
+    # consulted, and the rename (-T) replaces whatever is at the name rather
+    # than moving the file into a directory a link points at.
+    if [ -f "$target" ] && [ ! -L "$target" ]; then
+        chmod --reference="$target" "$tmp" 2>/dev/null || chmod 0644 "$tmp" 2>/dev/null || true
+        chgrp --reference="$target" "$tmp" 2>/dev/null || true
+    else
+        chmod 0644 "$tmp" 2>/dev/null || true
+    fi
+    if printf '%s\n' "$2" > "$tmp" && fsync_path "$tmp" && mv -fT "$tmp" "$target"; then
+        fsync_path "$(dirname "$target")"
+    else
+        rm -f "$tmp" 2>/dev/null || true
+        return 1
+    fi
+}
 
 # #421 — a slot-upgrade apply that dies or stalls part-way must never
 # leave the state stuck at "in-flight" forever. Three guards work
@@ -78,20 +122,39 @@ echo "[$(date -Iseconds)] === spatiumddi-slot-upgrade fired ==="
 
 # Structured progress for the Fleet UI. Best-effort — never abort the
 # upgrade on a progress-write hiccup.
-write_progress() {  # $1 = step, $2 = human detail
-    local detail
+write_progress() {  # $1 = step, $2 = human detail, $3 = extra JSON members
+    local detail extra=""
     detail=$(printf '%s' "${2:-}" | tr -d '"\\\r\n')
-    printf '{"step":"%s","pct":null,"detail":"%s","at":"%s"}' \
-        "$1" "$detail" "$(date -Iseconds)" > "${PROGRESS}.new" 2>/dev/null \
-        && mv "${PROGRESS}.new" "$PROGRESS" 2>/dev/null || true
+    [ -n "${3:-}" ] && extra=",$3"
+    atomic_write "$PROGRESS" "$(printf '{"step":"%s","pct":null,"detail":"%s","at":"%s"%s}' \
+        "$1" "$detail" "$(date -Iseconds)" "$extra")" 2>/dev/null || true
     publish_sidecar "$PROGRESS"
+}
+
+# #2007 — what the supervisor needs to settle reboot-pending once the node
+# comes back: the boot this was staged under (a different boot_id later is
+# a reboot, with no clock involved) and the slot set-next-boot armed (so a
+# boot that lands anywhere else reads as a rollback, not a success). Both
+# are omitted when unreadable; the supervisor then leaves the state alone.
+GRUBENV_FILE="${SPATIUM_GRUBENV:-/boot/efi/grub/grubenv}"
+BOOT_ID_FILE="${SPATIUM_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
+staged_identity_json() {
+    local slot boot out=""
+    slot=$(sed -n 's/^next_entry=//p' "$GRUBENV_FILE" 2>/dev/null | head -n 1 || true)
+    case "$slot" in slot_a|slot_b) out="\"staged_slot\":\"$slot\"" ;; esac
+    boot=$(tr -cd '0-9a-f-' 2>/dev/null < "$BOOT_ID_FILE" || true)
+    if [ -n "$boot" ]; then
+        [ -n "$out" ] && out="$out,"
+        out="$out\"staged_boot_id\":\"$boot\""
+    fi
+    printf '%s' "$out"
 }
 
 # #421 — keep the coarse in-flight stamp fresh while we work. Best-effort:
 # a transient write hiccup must not kill the ticker subshell under set -e
 # (a dead ticker would let the supervisor falsely reap a live apply).
 mark_inflight() {
-    echo "in-flight $(date -Iseconds)" > "${TRIGGER}.state" 2>/dev/null || true
+    atomic_write "${TRIGGER}.state" "in-flight $(date -Iseconds)" 2>/dev/null || true
     publish_sidecar "${TRIGGER}.state"
 }
 
@@ -124,10 +187,10 @@ fail() {  # $1 = human reason
     stop_inflight_ticker  # before the terminal write so it can't be reverted
     echo
     echo "  ✗ $1"
-    echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+    atomic_write "${TRIGGER}.state" "failed $(date -Iseconds)"
     publish_sidecar "${TRIGGER}.state"
     write_progress "failed" "$1"
-    mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" 2>/dev/null || true
+    mv -T "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" 2>/dev/null || true
     exit 1
 }
 
@@ -147,12 +210,17 @@ on_exit() {
         if [ "$st" = "in-flight" ]; then
             echo
             echo "  ✗ runner exited (rc=$rc) without writing a terminal state"
-            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+            atomic_write "${TRIGGER}.state" "failed $(date -Iseconds)"
     publish_sidecar "${TRIGGER}.state"
             write_progress "failed" "runner exited (rc=$rc) without completing"
-            [ -f "$TRIGGER" ] && mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" 2>/dev/null || true
+            [ -f "$TRIGGER" ] && mv -T "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" 2>/dev/null || true
         fi
     fi
+    # #1747 — every exit from the apply region (done, fail, abrupt) gets the
+    # log tail and the trigger's terminal rename onto the disk: a rolling
+    # upgrade reboots the node seconds after "done", and #1747's power loss
+    # came 2.5 s after the reboot request.
+    fsync_path "$LOG" "$(dirname "$TRIGGER")"
 }
 
 if [ ! -f "$TRIGGER" ]; then
@@ -182,7 +250,7 @@ done < <(tail -n +2 "$TRIGGER")
 
 if [ -z "$IMAGE_SRC" ]; then
     echo "  ERROR: trigger file empty, aborting"
-    mv "$TRIGGER" "${TRIGGER}.invalid.$(date +%s)"
+    mv -T "$TRIGGER" "${TRIGGER}.invalid.$(date +%s)"
     exit 1
 fi
 
@@ -192,7 +260,7 @@ case "$IMAGE_SRC" in
     https://*|http://*|/*)  ;;
     *)
         echo "  ERROR: image src must be http(s):// or absolute path: $IMAGE_SRC"
-        mv "$TRIGGER" "${TRIGGER}.invalid.$(date +%s)"
+        mv -T "$TRIGGER" "${TRIGGER}.invalid.$(date +%s)"
         exit 1
         ;;
 esac
@@ -201,7 +269,7 @@ if [ -n "$CHECKSUM_SRC" ]; then
         https://*|http://*|/*)  ;;
         *)
             echo "  ERROR: checksum src must be http(s):// or absolute path: $CHECKSUM_SRC"
-            mv "$TRIGGER" "${TRIGGER}.invalid.$(date +%s)"
+            mv -T "$TRIGGER" "${TRIGGER}.invalid.$(date +%s)"
             exit 1
             ;;
     esac
@@ -210,7 +278,7 @@ if [ -n "$EXPECTED_SHA256" ]; then
     case "$EXPECTED_SHA256" in
         *[!0-9a-fA-F]*)
             echo "  ERROR: sha256 directive is not hex: $EXPECTED_SHA256"
-            mv "$TRIGGER" "${TRIGGER}.invalid.$(date +%s)"
+            mv -T "$TRIGGER" "${TRIGGER}.invalid.$(date +%s)"
             exit 1
             ;;
     esac
@@ -231,7 +299,7 @@ if [ -n "$INSECURE" ] && [ -z "$EXPECTED_SHA256" ]; then
     echo "  ERROR: insecure-tls requires an out-of-band 'sha256=<hex>'"
     echo "         directive — a 'checksum=' sidecar over the same"
     echo "         unverified channel provides no real protection."
-    mv "$TRIGGER" "${TRIGGER}.invalid.$(date +%s)"
+    mv -T "$TRIGGER" "${TRIGGER}.invalid.$(date +%s)"
     exit 1
 fi
 
@@ -239,10 +307,13 @@ fi
 # don't rename it (the .path unit fires on close-after-write, not on
 # every read) but we do touch a sibling marker + progress. From here on
 # we're in the apply region: arm the abrupt-exit trap and start the
-# liveness ticker (#421).
+# liveness ticker (#421). The trap is armed BEFORE the in-flight stamp
+# (#2424): armed after it, a SIGTERM in between left the state at
+# in-flight with nothing to record the failure. on_exit acts only on an
+# in-flight state, so arming it first changes no other path.
+trap on_exit EXIT
 mark_inflight
 write_progress "queued" "starting slot upgrade"
-trap on_exit EXIT
 start_inflight_ticker
 
 APPLY_ARGS=("apply" "$IMAGE_SRC")
@@ -260,18 +331,20 @@ timeout --kill-after=30 "$APPLY_TIMEOUT_SECONDS" \
 if [ "$apply_rc" -eq 0 ]; then
     echo
     echo "  apply succeeded — calling set-next-boot"
+    fsync_path "$LOG"  # #1747 — the log line a power loss must not blank
     write_progress "arming" "arming next-boot"
     if "$UPGRADE_SLOT_BIN" set-next-boot; then
         echo
         echo "  ✓ next-boot armed. Operator needs to reboot to switch slots."
         stop_inflight_ticker  # before the terminal write so it can't be reverted
-        echo "done $(date -Iseconds)" > "${TRIGGER}.state"
+        atomic_write "${TRIGGER}.state" "done $(date -Iseconds)"
         publish_sidecar "${TRIGGER}.state"
-        write_progress "reboot-pending" "upgrade staged — reboot to boot the new slot"
+        write_progress "reboot-pending" "upgrade staged — reboot to boot the new slot" \
+            "$(staged_identity_json)"
         # Parity with every other terminal mv: never let a rename race
         # (e.g. supervisor already reaped the trigger) abort under set -e
         # after the correct terminal state is already on disk (#421).
-        mv "$TRIGGER" "${TRIGGER}.done.$(date +%s)" 2>/dev/null || true
+        mv -T "$TRIGGER" "${TRIGGER}.done.$(date +%s)" 2>/dev/null || true
     else
         fail "set-next-boot failed (image is written but next-boot not armed)"
     fi
@@ -291,6 +364,10 @@ else
     # the path to the image is stable again is the whole remedy.
     elif [ "$apply_rc" -eq 6 ]; then
         fail "apply failed: the image download was interrupted and did not complete after retries (rc=6) — nothing was written to the inactive slot; retry the upgrade (see slot-upgrade.log)"
+    # rc=7 is #2400: staging the image on /var would leave it under the
+    # kubelet's eviction margin (15% free), which evicts the control plane.
+    elif [ "$apply_rc" -eq 7 ]; then
+        fail "apply refused: not enough free space on /var to stage the image without the kubelet evicting the control plane (rc=7) — nothing was downloaded or written; free space on /var and retry (see slot-upgrade.log for the numbers)"
     else
         fail "apply failed (rc=${apply_rc}) — see slot-upgrade.log for the cause (download / verify / write / architecture)"
     fi

@@ -27,6 +27,7 @@ from typing import Any
 
 import httpx
 
+from app.drivers.dns._caa import caa_key, caa_presentation, parse_caa
 from app.drivers.dns._cloud_base import (
     CloudDNSDriverBase,
     CloudDNSError,
@@ -145,6 +146,31 @@ class VultrDNSDriver(CloudDNSDriverBase):
             return ""
         return rel
 
+    @staticmethod
+    def _srv_data(record: RecordData) -> str:
+        """Compose Vultr's SRV ``data`` string from the split columns.
+
+        Vultr's record model has a ``priority`` field of its own but no
+        weight / port fields (#1526): its API docs say to omit the
+        priority from ``data``, so the SRV data string is
+        ``"<weight> <port> <target>"``.
+        """
+        weight = record.weight if record.weight is not None else 0
+        port = record.port if record.port is not None else 0
+        return f"{weight} {port} {record.value}"
+
+    @staticmethod
+    def _split_srv_data(data: str) -> tuple[str, int | None, int | None]:
+        """Split Vultr's SRV ``data`` into ``(target, weight, port)``.
+
+        Inverse of :meth:`_srv_data`. A value that doesn't parse is
+        returned verbatim with ``None`` fields rather than failing the pull.
+        """
+        parts = (data or "").strip().split(None, 2)
+        if len(parts) == 3 and all(p.isascii() and p.isdigit() for p in parts[:2]):
+            return parts[2].strip(), int(parts[0]), int(parts[1])
+        return (data or "").strip(), None, None
+
     # ── Zone reads ──────────────────────────────────────────────────────
     async def _list_zones(self, server: Any, creds: dict[str, Any]) -> list[CloudDNSZone]:
         token = self._token(creds)
@@ -208,13 +234,24 @@ class VultrDNSDriver(CloudDNSDriverBase):
                     priority = rec.get("priority")
                     if rec.get("type") not in ("MX", "SRV"):
                         priority = None
+                    value = rec["data"]
+                    if rec.get("type") == "CAA":
+                        value = caa_presentation(value)
+                    weight: int | None = None
+                    port: int | None = None
+                    if rec.get("type") == "SRV":
+                        # Priority is Vultr's own field; weight/port ride
+                        # inside the data string (#1526).
+                        value, weight, port = self._split_srv_data(value)
                     records.append(
                         RecordData(
                             name=self._relativize(rec.get("name", ""), zone_fqdn),
                             record_type=rec["type"],
-                            value=rec["data"],
+                            value=value,
                             ttl=ttl,
                             priority=priority,
+                            weight=weight,
+                            port=port,
                         )
                     )
                 cursor = self._next_cursor(body)
@@ -223,12 +260,59 @@ class VultrDNSDriver(CloudDNSDriverBase):
         return records
 
     # ── Record writes ───────────────────────────────────────────────────
+    @staticmethod
+    def _data(rec: RecordData) -> str:
+        if rec.record_type.upper() == "SRV":
+            return VultrDNSDriver._srv_data(rec)
+        if rec.record_type.upper() == "CAA":
+            # Vultr keeps the CAA record in its one ``data`` field in zone-file
+            # form, ``<flags> <tag> "<value>"`` (#2959). Sources: Vultr's own
+            # external-dns webhook (github.com/vultr/external-dns-vultr-webhook,
+            # internal/vultr/vultr_test.go fixture ``Data: 0 issue
+            # "letsencrypt.org"``) and DNSControl's Vultr provider
+            # (providers/vultr/vultrProvider.go writes ``%v %s "%s"`` and reads
+            # the same string back). The API docs page itself is not
+            # machine-readable, so these two are the evidence.
+            return caa_presentation(rec.value)
+        return rec.value
+
+    @staticmethod
+    def record_value_refusal(record_type: str, value: str) -> str | None:
+        """Why Vultr cannot hold this record value, or None (#2959).
+
+        Checked by the record API before a record is stored. DNSControl's
+        Vultr provider (providers/vultr/auditrecords.go, "Last verified
+        2026-07-26") refuses a CAA whose value is empty or contains
+        whitespace, because Vultr does not round-trip it. A value needing a
+        presentation escape (``"``, ``\\``, or a byte outside printable
+        ASCII) is refused too: DNSControl writes the value inside the quotes
+        unescaped, and how Vultr reads an escape inside a CAA value is not
+        documented, so the record could be stored as something else."""
+        if record_type.upper() != "CAA":
+            return None
+        parsed = parse_caa(value)
+        if parsed is None:
+            return None  # sent as typed, as before; Vultr's own answer stands
+        raw = parsed[2]
+        if not raw:
+            return "Vultr: a CAA record with an empty value cannot be stored."
+        if any(b in b" \t\r\n" for b in raw):
+            return "Vultr: a CAA value containing whitespace cannot be stored on Vultr."
+        if any(b in (0x22, 0x5C) or not 0x20 < b < 0x7F for b in raw):
+            return (
+                "Vultr: a CAA value containing a quote, a backslash or a "
+                "non-printable/non-ASCII byte cannot be stored reliably on Vultr."
+            )
+        return None
+
     def _record_payload(self, change: RecordChange) -> dict[str, Any]:
         rec = change.record
         payload: dict[str, Any] = {
             "name": self._relative_name(rec.name),
             "type": rec.record_type,
-            "data": rec.value,
+            # SRV: weight/port have no Vultr fields — they ride in data
+            # (priority stays in its own field, omitted from data) (#1526).
+            "data": self._data(rec),
             # Vultr's "automatic" TTL is the sentinel 0.
             "ttl": _TTL_AUTO if rec.ttl is None else rec.ttl,
         }
@@ -269,7 +353,10 @@ class VultrDNSDriver(CloudDNSDriverBase):
                     continue
                 if (rec.get("name") or "") != name:
                     continue
-                if rec.get("data") != content:
+                if record_type == "CAA":
+                    if caa_key(rec.get("data") or "") != caa_key(content or ""):
+                        continue
+                elif rec.get("data") != content:
                     continue
                 if priority is not None and rec.get("priority") != priority:
                     continue
@@ -296,7 +383,7 @@ class VultrDNSDriver(CloudDNSDriverBase):
                     label,
                     payload["name"],
                     change.record.record_type,
-                    change.record.value,
+                    payload["data"],
                     priority=change.record.priority,
                 )
                 if rid is None:
@@ -318,7 +405,7 @@ class VultrDNSDriver(CloudDNSDriverBase):
                     label,
                     payload["name"],
                     change.record.record_type,
-                    change.record.value,
+                    payload["data"],
                     priority=change.record.priority,
                 )
                 if rid is None:
@@ -331,7 +418,15 @@ class VultrDNSDriver(CloudDNSDriverBase):
             raise CloudDNSError(f"Vultr: unsupported record op {change.op!r}")
 
     # ── Zone writes ─────────────────────────────────────────────────────
-    async def _apply_zone(self, server: Any, creds: dict[str, Any], zone: Any, op: str) -> None:
+    async def _apply_zone(
+        self,
+        server: Any,
+        creds: dict[str, Any],
+        zone: Any,
+        op: str,
+        *,
+        managed_records: list[RecordData] | None = None,
+    ) -> None:
         token = self._token(creds)
         label = self._zone_label(getattr(zone, "name", ""))
         async with self._client(token) as client:
@@ -345,6 +440,10 @@ class VultrDNSDriver(CloudDNSDriverBase):
 
             if op == "delete":
                 resp = await client.delete(f"/domains/{label}")
+                if getattr(resp, "status_code", 0) == 404:
+                    # Already gone at the provider; deleting it is done
+                    # (#1889, as #1537).
+                    return
                 self._unwrap(resp)
                 return
 

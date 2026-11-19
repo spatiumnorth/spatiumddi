@@ -119,6 +119,7 @@ class FindE911LocationArgs(BaseModel):
 
 @register_tool(
     name="find_e911_location",
+    permission=("read", "e911_location"),
     description=(
         "Resolve a phone's dispatchable location (which building, floor and "
         "room it is in) from its IP, MAC, or LLDP chassis+port. Use this for "
@@ -196,6 +197,7 @@ class FindERLsArgs(BaseModel):
 
 @register_tool(
     name="find_erls",
+    permission=("read", "e911_location"),
     description=(
         "List Emergency Response Locations — the dispatchable locations a 911 "
         "call can report — with their civic address, ELINs, how many network "
@@ -277,6 +279,7 @@ class CountUnboundVoiceSubnetsArgs(BaseModel):
 
 @register_tool(
     name="count_e911_unbound_voice_subnets",
+    permission=("read", "e911_location"),
     description=(
         "Count and list the voice subnets that cannot reach an Emergency "
         "Response Location by any rule — their own binding, their VLAN's, or "

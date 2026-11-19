@@ -14,11 +14,13 @@ create, and the Copilot).
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterable
+from types import SimpleNamespace
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.dns import DNSRecord
+from app.models.dns import DNSRecord, DNSServer, DNSZone
 
 
 async def find_identical_record(
@@ -57,6 +59,57 @@ async def find_identical_record(
     if exclude_id is not None:
         stmt = stmt.where(DNSRecord.id != exclude_id)
     return (await db.execute(stmt.limit(1))).scalars().first()
+
+
+async def zone_target_readings(
+    db: AsyncSession, zone_ids: Iterable[uuid.UUID]
+) -> dict[uuid.UUID, tuple[str, bool]]:
+    """Per zone, its name and whether a dot-less name target is read RELATIVE
+    to it (#2045).
+
+    A PTR target written without its trailing dot means two different things
+    depending on the server: BIND9, both Technitium drivers and Windows Path A
+    read it as a zone file does (``db1.example.com`` in a reverse zone is
+    ``db1.example.com.<zone>.``), while the cloud providers and Windows Path B
+    take it as given (see ``targets_are_relative``, #1794). PowerDNS refuses
+    the dot-less spelling outright, so it is never served as the absolute
+    name either. The reading is relative unless EVERY server in the zone's
+    group takes the name as given: one server serving the relative name is a
+    wrong answer on that server. A group with no server reads it as BIND9
+    does, the default driver.
+    """
+    from app.services.dns.pull_from_server import targets_are_relative  # noqa: PLC0415
+
+    ids = list(set(zone_ids))
+    if not ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(DNSZone.id, DNSZone.name, DNSServer.driver, DNSServer.credentials_encrypted)
+            .select_from(DNSZone)
+            .outerjoin(DNSServer, DNSServer.group_id == DNSZone.group_id)
+            .where(DNSZone.id.in_(ids))
+        )
+    ).all()
+    names: dict[uuid.UUID, str] = {}
+    relative: dict[uuid.UUID, bool] = {}
+    for zid, zname, driver, creds in rows:
+        names[zid] = zname
+        if driver is None:  # outer join: a group with no server
+            relative.setdefault(zid, True)
+            continue
+        server = SimpleNamespace(driver=driver, credentials_encrypted=creds)
+        relative[zid] = relative.get(zid, False) or targets_are_relative(server)
+    return {zid: (names[zid], relative[zid]) for zid in names}
+
+
+def ptr_target_key(value: str, zone_name: str, *, relative: bool) -> str:
+    """A PTR target as the zone's servers serve it, for comparison (#2045):
+    lower case (DNS names compare case-insensitively) and absolute, with a
+    dot-less target expanded against the zone when ``relative``."""
+    from app.services.dns.pull_from_server import _normalize_value  # noqa: PLC0415
+
+    return _normalize_value("PTR", value, zone_name, relative_targets=relative)
 
 
 def describe_identical(existing: DNSRecord) -> str:

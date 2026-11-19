@@ -9,6 +9,10 @@ Read-only (Phase A):
     GET   /lease                           — current mutex state for
                                               surfacing "an upgrade is
                                               in flight" on the Fleet UI.
+    POST  /lease/force-release             — superadmin: free a Lease a
+                                              dead drive left held
+                                              (#1707); refused while the
+                                              holder still renews.
 
 State-machine endpoints (Phase D):
 
@@ -37,13 +41,17 @@ import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from app.api.deps import DB, CurrentUser
+from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.v1._common import add_trigger_audit
+from app.core.celery_dispatch import dispatch
 from app.core.permissions import require_permission
+from app.services.api_token_scopes import token_write
 from app.services.appliance.slot_image_target import (
     SlotImageResolutionError,
     SlotImageTarget,
     new_refire_nonce,
     resolve_slot_image_target,
+    slot_image_url_problem,
 )
 from app.services.upgrades import mutex, orchestrator, preflight
 
@@ -84,13 +92,17 @@ class LeaseStateOut(BaseModel):
     dependencies=[Depends(require_permission("read", "appliance"))],
     summary="Run pre-flight safety checks for a rolling upgrade to <target>",
 )
-async def get_preflight(target: str) -> PreflightReportOut:
+async def get_preflight(target: str, slot_image_id: uuid.UUID | None = None) -> PreflightReportOut:
+    """``slot_image_id`` is the uploaded image the Plan will name (#1919): the
+    disk checks then size the need from it and apply the "already on the
+    mirror" exemption, as the Plan's own preflight does. Without it they
+    judge the 4 GiB default, so a preview could refuse what Plan accepts."""
     if not target or len(target) > 64:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             "target must be a 1-64 char release tag (e.g. 2026.06.01-1 or 1.0.0)",
         )
-    report = await preflight.run_all(target_version=target)
+    report = await preflight.run_all(target_version=target, slot_image_id=slot_image_id)
     return PreflightReportOut(**report.to_dict())
 
 
@@ -101,6 +113,35 @@ async def get_preflight(target: str) -> PreflightReportOut:
     summary="Current state of the cluster-wide upgrade mutex",
 )
 async def get_lease_state() -> LeaseStateOut:
+    state = mutex.get_state()
+    return LeaseStateOut(
+        held=state.held,
+        holder=state.holder,
+        renew_time=state.renew_time,
+        transitions=state.transitions,
+        expired=state.expired,
+    )
+
+
+@router.post(
+    "/lease/force-release",
+    response_model=LeaseStateOut,
+    summary="Free the upgrade Lease a dead drive left held",
+)
+async def post_force_release_lease(current_user: SuperAdmin, db: DB) -> LeaseStateOut:
+    """Abort leaves the Lease to the drive it stopped (#1707), so a drive
+    that died holds it until it lapses (10 min). This frees it sooner. It
+    is refused (409) while the holder still renews it, since that drive is
+    alive and still changing the cluster. Superadmin only, and audited."""
+    try:
+        await orchestrator.force_release_lease(
+            db,
+            actor_user_id=current_user.id,
+            actor_display=current_user.display_name,
+            actor_source=current_user.auth_source,
+        )
+    except orchestrator.LeaseForceReleaseRefused as exc:
+        raise HTTPException(exc.status, str(exc)) from exc
     state = mutex.get_state()
     return LeaseStateOut(
         held=state.held,
@@ -173,9 +214,11 @@ class PlanRequest(BaseModel):
         default="",
         max_length=128,
         description=(
-            "Name of the CNPG Cluster CR. Empty disables CNPG-related "
-            "steps for non-CNPG deploys; on the appliance shape this is "
-            "the chart's ``<release>-postgresql`` resource."
+            "Name of the CNPG Cluster CR. Empty detects it from the "
+            "database connection (the chart's ``<cluster>-rw`` Service, "
+            "confirmed by reading the Cluster); a deploy with no CNPG "
+            "cluster detects nothing and skips the CNPG-related steps. On "
+            "the appliance shape it is the chart's ``<release>-postgresql``."
         ),
     )
     cnpg_namespace: str | None = Field(
@@ -187,23 +230,15 @@ class PlanRequest(BaseModel):
     @field_validator("slot_image_url")
     @classmethod
     def _validate_slot_image_url(cls, v: str | None) -> str | None:
-        # Review polish — catch operator typos at plan time rather than
-        # surfacing a confusing "unsupported scheme" error 30 min into
-        # the rolling upgrade when the host runner finally tries to
-        # GET the URL. Only http(s) is accepted; file:// + s3:// are
-        # deliberately not supported by spatium-upgrade-slot apply.
+        # Catch it at plan time rather than as a node's stage step waiting
+        # out its whole timeout: the supervisor fetches only https:// (and
+        # file://) and refuses anything else with a log line and no trigger
+        # (#1752). One rule, shared with the resolver every scheduler uses.
         if v is None:
             return v
-        from urllib.parse import urlparse  # noqa: PLC0415
-
-        try:
-            parsed = urlparse(v)
-        except ValueError as exc:
-            raise ValueError(f"slot_image_url is not a parseable URL: {exc}") from exc
-        if parsed.scheme not in ("http", "https"):
-            raise ValueError(f"slot_image_url scheme must be http or https, got {parsed.scheme!r}")
-        if not parsed.netloc:
-            raise ValueError("slot_image_url must include a host")
+        problem = slot_image_url_problem(v)
+        if problem:
+            raise ValueError(problem)
         return v
 
     @model_validator(mode="after")
@@ -278,6 +313,7 @@ def _row_to_schema(run: Any) -> UpgradeRunOut:
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="Plan a rolling upgrade — preflight + node enumeration",
 )
+@token_write("Writes a planned upgrade run row and runs preflight against the fleet")
 async def post_plan(
     body: PlanRequest,
     request: Request,
@@ -373,12 +409,44 @@ async def post_start(run_id: uuid.UUID, current_user: CurrentUser, db: DB) -> Up
             status.HTTP_409_CONFLICT,
             f"cannot start a run in state {run.state!r}; use /resume for halted runs",
         )
+    # #1512 — a running run whose driver is alive holds the upgrade lease.
+    # Enqueueing another drive (a second click, a second tab, an API or MCP
+    # caller) used to start a second loop beside it; the drive itself now
+    # refuses that too, but answering here tells the caller why. A running
+    # run with no live lease is a dead driver's, and Start resumes it.
+    if run.state == "running":
+        lease = mutex.get_state()
+        if lease.held and (lease.holder or "").startswith("<"):
+            # #1713 — the Lease could not be read: whether a drive holds it
+            # is unknown, which is not a reason to enqueue a second one.
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                f"the upgrade Lease could not be read ({lease.holder}); retry shortly",
+            )
+        if lease.held:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"this run is already being driven ({lease.holder}); it carries on by itself",
+            )
 
     # Inline import — keeps the celery dep off the api boot path for
     # docker-compose deploys that don't run a worker.
     from app.tasks.upgrade_orchestrator import drive_upgrade_run  # noqa: PLC0415
 
-    drive_upgrade_run.delay(str(run.id))
+    # #2303 — record WHO started the run before enqueueing: the orchestrator's
+    # own ``upgrade.started`` row is written on the worker and says "system".
+    add_trigger_audit(
+        db,
+        current_user,
+        resource_type="system_upgrade_run",
+        resource_id=run.id,
+        resource_display=run.target_version,
+        action="upgrade.start_requested",
+        new_value={"state": run.state},
+    )
+    await db.commit()
+
+    await dispatch(drive_upgrade_run, str(run.id))
     logger.info(
         "upgrade_run_enqueued",
         run_id=str(run.id),
@@ -428,7 +496,7 @@ async def post_resume(run_id: uuid.UUID, current_user: CurrentUser, db: DB) -> U
     # Re-enqueue the orchestrator celery task to pick up from progress.
     from app.tasks.upgrade_orchestrator import drive_upgrade_run  # noqa: PLC0415
 
-    drive_upgrade_run.delay(str(run.id))
+    await dispatch(drive_upgrade_run, str(run.id))
     return _row_to_schema(run)
 
 

@@ -20,11 +20,14 @@ of every driver into the router.
 
 from __future__ import annotations
 
+import math
 import re
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 #: The archive names SpatiumDDI writes. Every driver filters its listing
 #: with this so a destination shared with unrelated files stays clean.
@@ -39,6 +42,24 @@ from typing import Any
 #: (``spatiumddi-backup-x/y.zip``) would otherwise be listed, picked as
 #: ``latest``, counted by retention, and fail every download / delete.
 ARCHIVE_NAME_RE = re.compile(r"^(spatiumddi-backup-|pre-restore-)[^/\\\x00-\x1f\x7f]*\.zip$")
+
+#: Prefix of the pre-restore safety dumps ``restore`` writes into the
+#: same directory a local-volume target is usually pointed at.
+PRE_RESTORE_PREFIX = "pre-restore-"
+
+#: How many safety dumps retention keeps. They are rollback copies,
+#: not backups: they get their OWN small allowance (#1574) so they
+#: neither consume the target's configured keep count nor pile up
+#: without bound.
+PRE_RESTORE_KEEP_LAST_N = 3
+
+
+def is_pre_restore_archive(filename: str) -> bool:
+    """True for a pre-restore safety dump, as opposed to a real backup
+    archive. The two share a listing (and, on the recommended
+    local-volume path, a directory) but not a passphrase, a retention
+    policy, or a meaning for "latest" (#1574)."""
+    return filename.startswith(PRE_RESTORE_PREFIX)
 
 
 def safe_filename(filename: str) -> str:
@@ -81,6 +102,17 @@ class DestinationConfigError(BackupDestinationError):
     the API side."""
 
 
+class ArchiveNotFoundError(BackupDestinationError):
+    """The named archive is not at the destination (#1838).
+
+    A subclass so every existing ``except BackupDestinationError`` still
+    catches it. It exists so the api can tell a miss from a destination
+    failure: on a multi-node appliance a ``local_volume`` miss usually
+    means the archive is on another node's disk, and the api, which can
+    read the database, appends which node.
+    """
+
+
 class InvalidArchiveNameError(BackupDestinationError):
     """The archive name is not a single plain path component (#1243).
 
@@ -116,6 +148,58 @@ class UnsupportedOperationError(BackupDestinationError):
     """
 
 
+class ArchiveTooLargeError(BackupDestinationError):
+    """The archive is larger than the ``max_bytes`` its caller allowed.
+
+    Raised by a driver's ``download`` as soon as it knows — from a stat
+    before reading where the destination offers one, otherwise as the
+    running total passes the cap — so an oversized archive is never read
+    into memory whole. A subclass so every existing ``except
+    BackupDestinationError`` still catches it; the API layer catches it
+    first and answers 413.
+    """
+
+    def __init__(self, filename: str, max_bytes: int, size_bytes: int | None = None) -> None:
+        self.filename = filename
+        self.max_bytes = max_bytes
+        self.size_bytes = size_bytes
+        size = f"{size_bytes} bytes" if size_bytes is not None else f"more than {max_bytes} bytes"
+        super().__init__(
+            f"archive {filename!r} is {size}, which exceeds the "
+            f"{max_bytes}-byte cap for destination downloads"
+        )
+
+
+#: Chunk size for :func:`read_capped`. Large enough that a multi-GB read
+#: is not dominated by call overhead, small enough that overshooting the
+#: cap by one chunk costs nothing.
+DOWNLOAD_CHUNK_BYTES = 1024 * 1024
+
+
+def check_size(filename: str, size_bytes: int, max_bytes: int | None) -> None:
+    """Raise :class:`ArchiveTooLargeError` when ``size_bytes`` passes the cap."""
+    if max_bytes is not None and size_bytes > max_bytes:
+        raise ArchiveTooLargeError(filename, max_bytes, size_bytes)
+
+
+def read_capped(read: Callable[[int], bytes], *, filename: str, max_bytes: int | None) -> bytes:
+    """Read a file-like object to EOF through ``read(n)``, stopping with
+    :class:`ArchiveTooLargeError` once more than ``max_bytes`` arrived.
+
+    ``max_bytes=None`` reads to EOF uncapped. A ``bytearray`` collects the
+    chunks so the peak is one copy plus one chunk, not two copies.
+    """
+    out = bytearray()
+    while True:
+        chunk = read(DOWNLOAD_CHUNK_BYTES)
+        if not chunk:
+            break
+        out += chunk
+        if max_bytes is not None and len(out) > max_bytes:
+            raise ArchiveTooLargeError(filename, max_bytes)
+    return bytes(out)
+
+
 @dataclass(frozen=True)
 class ArchiveListing:
     """One archive present at a destination."""
@@ -123,6 +207,10 @@ class ArchiveListing:
     filename: str
     size_bytes: int
     created_at: datetime
+    #: The cluster node whose disk holds the archive, for a node-local
+    #: destination (``local_volume`` on the appliance, #1838); ``None``
+    #: for every network destination, where there is no such thing.
+    node_name: str | None = None
 
 
 #: ``ConfigFieldSpec.type`` value for prose that renders without an input.
@@ -153,6 +241,47 @@ class ConfigFieldSpec:
     required: bool = True
     description: str | None = None
     secret: bool = False  # hide from list responses
+    #: The value is made of LINES (a PEM key, a known_hosts file, one
+    #: header per line). The form renders a multi-line control for it,
+    #: masked when ``secret`` is also set. A one-line input cannot hold a
+    #: line break at all — the browser folds each one into a space — so a
+    #: field whose meaning depends on its lines and is rendered as an input
+    #: silently becomes a different value (#2199).
+    multiline: bool = False
+
+
+def safe_url(url: str) -> str:
+    """``scheme://host[:port]/path`` only, for error messages.
+
+    A receiver URL can carry its credential in the query string (a
+    presigned ``X-Amz-Signature``) or in userinfo (``user:pass@``), and an
+    error message reaches ``last_run_error``, the audit log and the logs.
+    """
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        if ":" in host:
+            host = f"[{host}]"
+        if parts.port:
+            host += f":{parts.port}"
+    except ValueError:
+        return "<unparseable url>"
+    if not parts.scheme or not host:
+        return "<unparseable url>"
+    return f"{parts.scheme}://{host}{parts.path}"
+
+
+def scrub_url(text: str, *urls: str) -> str:
+    """``text`` with each full URL in ``urls`` replaced by :func:`safe_url`
+    — for a library exception message that echoes the URL it was given."""
+    for url in urls:
+        if url:
+            text = text.replace(url, safe_url(url))
+            # a caller may have appended a trailing slash to what the
+            # library echoed back
+            if url.endswith("/"):
+                text = text.replace(url.rstrip("/"), safe_url(url).rstrip("/"))
+    return text
 
 
 def config_field_specs(driver: BackupDestination) -> tuple[ConfigFieldSpec, ...]:
@@ -165,6 +294,46 @@ def config_field_specs(driver: BackupDestination) -> tuple[ConfigFieldSpec, ...]
     because a consumer forgot to branch on the type.
     """
     return tuple(f for f in driver.config_fields if f.type != NOTICE_FIELD_TYPE)
+
+
+#: Text-typed fields whose value may legitimately arrive as a JSON number.
+#: Every other text / password field must be a string.
+NUMERIC_TEXT_FIELDS = frozenset({"port", "object_lock_days", "version", "uid", "gid", "timeout_s"})
+
+
+def check_config_value_types(driver: BackupDestination, config: dict[str, Any]) -> None:
+    """Refuse a config value of the wrong JSON type (#3845), naming the field.
+
+    ``config`` is free-form JSON, and the drivers' ``validate_config`` call
+    string methods (``.strip()``) on optional fields such as ``mode``, so a
+    boolean or object there raised ``AttributeError`` and answered 500.
+    Checked once here, for every driver, rather than field by field.
+    Absent and ``null`` stay legal; the driver decides whether they are
+    required.
+    """
+    for spec in config_field_specs(driver):
+        value = config.get(spec.name)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            if spec.name in NUMERIC_TEXT_FIELDS and value.strip():
+                try:
+                    int(value)
+                except ValueError:
+                    raise DestinationConfigError(f"{spec.name!r} must be a whole number") from None
+            continue
+        if (
+            spec.name in NUMERIC_TEXT_FIELDS
+            and isinstance(value, int | float)
+            and not isinstance(value, bool)
+        ):
+            # A whole, finite number only: ``int(inf)`` raises OverflowError
+            # in the drivers' parses (a 500) and ``int(21.5)`` silently
+            # becomes 21 (#3946).
+            if isinstance(value, float) and (not math.isfinite(value) or value != int(value)):
+                raise DestinationConfigError(f"{spec.name!r} must be a whole number")
+            continue
+        raise DestinationConfigError(f"{spec.name!r} must be a string")
 
 
 class BackupDestination(ABC):
@@ -190,6 +359,20 @@ class BackupDestination(ABC):
     #: an operator cannot configure a retention policy that could only
     #: ever fail silently every night.
     inherently_write_only: bool = False
+
+    #: Auth modes of the "Set ONE of ..." kind (#3289). Each entry is one
+    #: mode, as the tuple of secret fields that belong to it. An update
+    #: that supplies a new value for one mode's field replaces the other
+    #: modes' stored secrets, because the client hands the driver every
+    #: secret that is stored and would go on using the one left behind.
+    #: Supplying two modes in one update is refused.
+    secret_alternatives: tuple[tuple[str, ...], ...] = ()
+
+    def unused_secret_fields(self, config: dict[str, Any]) -> frozenset[str]:
+        """Secret fields the merged ``config`` no longer uses (#3289), to
+        be dropped from storage. Default: none.
+        """
+        return frozenset()
 
     @abstractmethod
     def validate_config(self, config: dict[str, Any]) -> None:
@@ -228,12 +411,19 @@ class BackupDestination(ABC):
         """
 
     @abstractmethod
-    async def download(self, *, config: dict[str, Any], filename: str) -> bytes:
+    async def download(
+        self, *, config: dict[str, Any], filename: str, max_bytes: int | None = None
+    ) -> bytes:
         """Fetch + return the archive bytes for ``filename``. The
         restore-from-destination flow streams these straight into
         :func:`app.services.backup.restore.apply_backup_restore`
         without ever materialising the file on the api / worker
         container's local disk.
+
+        ``max_bytes`` bounds what the driver will hold in memory: past it
+        the driver raises :class:`ArchiveTooLargeError` instead of
+        returning. Every caller passes ``MAX_ARCHIVE_BYTES``; ``None``
+        (uncapped) exists only for the driver-level tests.
         """
 
     @abstractmethod
@@ -286,6 +476,7 @@ def list_destination_kinds() -> list[dict[str, Any]]:
                         "required": f.required,
                         "description": f.description,
                         "secret": f.secret,
+                        "multiline": f.multiline,
                     }
                     for f in d.config_fields
                 ],

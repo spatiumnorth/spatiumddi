@@ -104,6 +104,7 @@ from app.models.dns import (
     DNSServer,
     DNSServerGroup,
     DNSServerOptions,
+    DNSTrustAnchor,
     DNSTSIGKey,
     DNSView,
     DNSZone,
@@ -140,6 +141,7 @@ _SERVER_GROUP_COLUMNS: tuple[str, ...] = ("group_id", "driver", "host", "is_prim
 # DNSServer columns only the server's OWN bundle reads.
 _SERVER_SELF_COLUMNS: tuple[str, ...] = (
     "is_enabled",
+    "zone_resync_seq",
     "desired_appliance_version",
     "desired_slot_image_url",
     "reboot_requested",
@@ -156,6 +158,7 @@ _CONTRIBUTORS: tuple[type, ...] = (
     *_GROUP_MODELS,
     *_ZONE_MODELS,
     DNSAclEntry,
+    DNSTrustAnchor,
     *_GLOBAL_MODELS,
 )
 
@@ -169,12 +172,25 @@ _ALWAYS_BOOKKEEPING: frozenset[str] = frozenset({"created_at", "modified_at", "u
 _NOT_RENDERED: dict[type, frozenset[str]] = {
     # The agents' /dnssec-state report stamps these after every structural
     # reload; the DS set is for the operator and the registrar, not BIND.
-    DNSZone: frozenset({"dnssec_synced_at", "dnssec_ds_records", "last_pushed_at"}),
+    # ``agentless_create_due_at`` is the #1932 provider-create marker, which
+    # only the agentless dispatch reads.
+    DNSZone: frozenset(
+        {"dnssec_synced_at", "dnssec_ds_records", "last_pushed_at", "agentless_create_due_at"}
+    ),
+    # #1932 — read only by the reverse-zone auto-create, never rendered.
+    DNSServerGroup: frozenset({"auto_reverse_zones_at_provider"}),
     # The 30 s pool health check (``tasks.dns_pool_healthcheck``).
     DNSPool: frozenset({"last_checked_at", "next_check_at"}),
     # Feed refresh bookkeeping; the entries themselves are their own rows.
     DNSBlockList: frozenset(
-        {"last_synced_at", "last_sync_status", "last_sync_error", "entry_count"}
+        {
+            "last_synced_at",
+            "last_sync_status",
+            "last_sync_error",
+            "last_success_at",
+            "entry_count",
+            "feed_parse_skipped",
+        }
     ),
 }
 # Models where the bundle reads a small, known set of columns: only these
@@ -201,6 +217,9 @@ class Affected:
     servers: set[uuid.UUID] = field(default_factory=set)
     zones: set[uuid.UUID] = field(default_factory=set)
     acls: set[uuid.UUID] = field(default_factory=set)
+    # DNSServerOptions ids whose trust anchors changed (an anchor carries no
+    # group_id of its own) — resolved to the options row's group.
+    options: set[uuid.UUID] = field(default_factory=set)
     # Sites whose subnet set changed — resolved to the groups whose pools
     # have a member scoped to one of them.
     sites: set[uuid.UUID] = field(default_factory=set)
@@ -208,7 +227,13 @@ class Affected:
 
     def is_empty(self) -> bool:
         return not (
-            self.groups or self.servers or self.zones or self.acls or self.sites or self.everyone
+            self.groups
+            or self.servers
+            or self.zones
+            or self.acls
+            or self.options
+            or self.sites
+            or self.everyone
         )
 
 
@@ -313,6 +338,10 @@ def collect_affected(session: Any) -> Affected:
             changed, old = _changed(obj, "zone_id")
             if changed:
                 aff.zones.update(v for v in old if v is not None)
+        elif isinstance(obj, DNSTrustAnchor):
+            oid = getattr(obj, "server_options_id", None)
+            if oid is not None:
+                aff.options.add(oid)
         elif isinstance(obj, DNSAclEntry):
             aid = getattr(obj, "acl_id", None)
             if aid is not None:
@@ -347,6 +376,16 @@ def _resolve(session: Any, aff: Affected) -> tuple[set[uuid.UUID], bool]:
         groups.update(
             g
             for g in conn.execute(select(DNSAcl.group_id).where(DNSAcl.id.in_(list(aff.acls))))
+            .scalars()
+            .all()
+            if g is not None
+        )
+    if aff.options:
+        groups.update(
+            g
+            for g in conn.execute(
+                select(DNSServerOptions.group_id).where(DNSServerOptions.id.in_(list(aff.options)))
+            )
             .scalars()
             .all()
             if g is not None
@@ -506,6 +545,72 @@ async def mark_bundles_dirty(
     if aff.is_empty():
         return []
     return sorted(await db.run_sync(lambda session: _collect(session, aff)))
+
+
+async def mark_integration_dns_released(
+    db: AsyncSession, *, own_fk: str, target_id: uuid.UUID
+) -> list[uuid.UUID]:
+    """Mark the DNS groups an integration target's rows live in, before its delete (#2288).
+
+    ``DNSZone`` / ``DNSRecord`` carry CASCADE FKs to the Kubernetes cluster,
+    Tailscale tenant and NetBird instance that own them, so deleting the target
+    removes them in the database — the listener never sees an ORM delete and the
+    stored bundle would stay "current", with every agent still serving the
+    names. The reconcilers retract these rows with ORM ``db.delete`` and no
+    ``DNSRecordOp`` (bundle-dirty is the delivery path), so this does the
+    equivalent: collect the groups of the owned zones and of the zones holding
+    owned records, mark them in the caller's transaction, and wake their
+    agents. It also prunes the owned zones' ids from IPAM (#3443), since the
+    cascade removes them where ``prune_zone_ids`` cannot see it. Call it BEFORE ``db.delete(target)``; ``own_fk`` is the shared
+    column name (``kubernetes_cluster_id`` / ``tailscale_tenant_id`` /
+    ``netbird_instance_id``).
+    """
+    from app.core.agent_wake import collect_wake, dns_group_channel
+
+    zone_col = getattr(DNSZone, own_fk, None)
+    rec_col = getattr(DNSRecord, own_fk, None)
+    if rec_col is None:
+        raise ValueError(f"{own_fk} is not a DNS ownership column")
+    groups: set[uuid.UUID] = set()
+    if zone_col is not None:
+        groups.update(
+            (await db.execute(select(DNSZone.group_id).where(zone_col == target_id)))
+            .scalars()
+            .all()
+        )
+        # The cascade removes the zones (Trash rows too) out from under IPAM,
+        # which names them in text / JSONB columns with no foreign key (#3443).
+        from app.services.ipam.zone_binding import prune_zone_ids  # noqa: PLC0415
+
+        await prune_zone_ids(
+            db,
+            (
+                await db.execute(
+                    select(DNSZone.id)
+                    .where(zone_col == target_id)
+                    .execution_options(include_deleted=True)
+                )
+            )
+            .scalars()
+            .all(),
+        )
+    groups.update(
+        (
+            await db.execute(
+                select(DNSZone.group_id)
+                .join(DNSRecord, DNSRecord.zone_id == DNSZone.id)
+                .where(rec_col == target_id)
+                .distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not groups:
+        return []
+    for gid in groups:
+        collect_wake(dns_group_channel(gid))
+    return await mark_bundles_dirty(db, group_ids=groups)
 
 
 # ── Enqueue after commit ───────────────────────────────────────────────────

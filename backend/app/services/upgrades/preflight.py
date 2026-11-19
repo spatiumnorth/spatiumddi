@@ -50,6 +50,7 @@ What we **don't** check here that Phases C/D will own:
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import uuid
 from dataclasses import asdict, dataclass
@@ -60,14 +61,25 @@ import structlog
 from sqlalchemy import select, text
 
 from app.config import settings
-from app.core.versions import includes_release, parse_release
+from app.core.exc_text import describe_http_exc
+from app.core.versions import (
+    canonical_version,
+    includes_release,
+    is_installed_target,
+    parse_release,
+)
 from app.db import AsyncSessionLocal
 from app.models.appliance import (
     APPLIANCE_STATE_APPROVED,
     CLUSTER_ROLE_PRIMARY,
     Appliance,
+    ApplianceUpgradeImage,
 )
-from app.services.upgrades import mutex
+from app.models.dhcp import HA_MODES, DHCPServer, DHCPServerGroup
+from app.models.dns import DNSServer
+from app.services.appliance import var_disk
+from app.services.appliance.ownership import k8s_node_name, orchestrated_server_condition
+from app.services.upgrades import kubeapi_retry, mutex
 
 logger = structlog.get_logger(__name__)
 
@@ -97,8 +109,10 @@ class PreflightResult:
     detail: dict[str, Any]
 
 
-# The skip-release warning's threshold, in days between two CalVer tags.
+# The skip-release warning's thresholds: days between two CalVer tags,
+# and major versions between two SemVer ones (#1182).
 _SKIP_RELEASE_WARN_DAYS = 90
+_SKIP_RELEASE_WARN_MAJORS = 1
 
 # How old the newest successful backup may be before the pre-upgrade backup
 # row warns (#1227). A day, matching the common nightly schedule.
@@ -108,15 +122,58 @@ _PRE_UPGRADE_BACKUP_MAX_AGE_HOURS = 24
 # ── Individual checks ─────────────────────────────────────────────────
 
 
-def check_inflight_conflict(*, namespace: str | None = None) -> PreflightResult:
+def check_inflight_conflict(
+    *,
+    namespace: str | None = None,
+    own_holder: str | None = None,
+    retry_budget_s: float = 0.0,
+) -> PreflightResult:
     """Refuses if another upgrade is already in flight cluster-wide.
 
     Reads the ``spatium-upgrade-lock`` Lease; if it's held + not
     expired we ``fail`` with the holder's identity. An expired lease
     is fine (the previous holder crashed before releasing — we'll
     take over on acquire).
+
+    ``own_holder`` is the identity of the run asking. The orchestrator
+    takes the lease at Start and then runs this preflight again for every
+    node, so without it each run failed its own first node on the lease
+    it had just taken (#1445).
     """
-    state = mutex.get_state(namespace=namespace)
+    state = mutex.get_state(namespace=namespace, retry_budget_s=retry_budget_s)
+    if state.held and not state.expired and own_holder and state.holder == own_holder:
+        return PreflightResult(
+            name="inflight_conflict",
+            level="ok",
+            message="the upgrade lease is held by this run",
+            detail={"holder": state.holder, "transitions": state.transitions},
+        )
+    if own_holder and state.holder == mutex.UNREACHABLE_HOLDER:
+        # #1713 — the kubeapi did not answer the read. The run asking holds
+        # the Lease by its own renewals, which stop the drive if it is lost;
+        # failing its node on a read nobody answered would fail the run on
+        # the reboot blip that follows every node.
+        return PreflightResult(
+            name="inflight_conflict",
+            level="warn",
+            message="the upgrade lease could not be read; this run's renewals hold it",
+            detail={"holder": state.holder},
+        )
+    if state.holder == mutex.UNREACHABLE_HOLDER:
+        # #2779 — the kubeapi did not answer the lease read (after the read's
+        # own retries). That is not another run holding the lease: say the API
+        # could not be reached, so the operator checks it instead of hunting a
+        # run that does not exist.
+        return PreflightResult(
+            name="kubeapi_unreachable",
+            level="fail",
+            message=(
+                "the Kubernetes API did not answer the read of the upgrade lease "
+                f"({mutex.LEASE_NAME}), so whether another upgrade is in flight is "
+                "unknown; check the control-plane nodes and retry"
+            ),
+            detail={"read": "get_lease", "lease": mutex.LEASE_NAME, "holder": state.holder},
+        )
     if state.held and not state.expired:
         return PreflightResult(
             name="inflight_conflict",
@@ -184,9 +241,27 @@ async def check_replication_lag(*, threshold_bytes: int = 16 * 1024) -> Prefligh
             message="no streaming replicas (single-node shape)",
             detail={"replicas": []},
         )
+    # #1445 — ``pg_stat_replication`` shows a replica's ``state`` and LSNs
+    # only to a superuser or a member of ``pg_monitor``; to anyone else the
+    # row is there but those columns are NULL. The app's role is neither on
+    # the appliance (CNPG manages it and reverts a manual GRANT), so every
+    # replica read as "not streaming" and the preflight refused to start a
+    # healthy cluster's upgrade. A NULL state is unverified, not broken.
+    unverified = [r for r in replicas if r["state"] is None]
+    if len(unverified) == len(replicas):
+        return PreflightResult(
+            name="replication_lag",
+            level="warn",
+            message=(
+                f"{len(replicas)} replica(s) connected; their streaming state "
+                "is not visible to the app's database role (needs pg_monitor), "
+                "so it was not verified"
+            ),
+            detail={"replicas": replicas, "unverified": True},
+        )
     streaming = [r for r in replicas if r["state"] == "streaming"]
     lagging = [r for r in streaming if r["lag_bytes"] > threshold_bytes]
-    not_streaming = [r for r in replicas if r["state"] != "streaming"]
+    not_streaming = [r for r in replicas if r["state"] is not None and r["state"] != "streaming"]
     if not_streaming:
         return PreflightResult(
             name="replication_lag",
@@ -275,19 +350,209 @@ def check_disk_headroom(
     )
 
 
+# A node whose last heartbeat is older than this has a /var reading that no
+# longer says anything about now (#1234). The supervisor heartbeats every
+# ~30 s, so ten minutes is many missed beats, not jitter.
+_NODE_DISK_REPORT_MAX_AGE_SECONDS = 10 * 60
+
+
+def _node_var_free_bytes(cluster_health: Any) -> int | None:
+    """Free bytes on a node's ``/var`` from its reported partitions.
+
+    ``None`` = no usable reading (key absent, entry absent, malformed) —
+    UNKNOWN, never zero and never "plenty". Read through
+    :func:`var_disk.var_disk_reading`, which prefers the kubelet's own
+    measure (``available_bytes``, statvfs f_bavail) over ``total - used``,
+    which counts ext4's root reserve as free (#2400).
+    """
+    reading = var_disk.var_disk_reading(cluster_health)
+    return reading.free_bytes if reading is not None else None
+
+
+def judge_node_disk_headroom(
+    nodes: list[Any],
+    *,
+    need_bytes: int,
+    now: datetime,
+    max_age_seconds: int = _NODE_DISK_REPORT_MAX_AGE_SECONDS,
+) -> PreflightResult:
+    """Judge each appliance node's reported ``/var`` headroom (#1234).
+
+    ``spatium-upgrade-slot`` stages the slot image under the NODE's
+    ``/var``, so the api pod's own filesystem says nothing about whether a
+    member can take the upgrade. ``fail`` names every node short of
+    ``need_bytes``; a node with no reading, or one older than
+    ``max_age_seconds``, is ``warn`` and named (NULL = unknown, never ok).
+    """
+    short: list[dict[str, Any]] = []
+    unknown: list[dict[str, Any]] = []
+    checked: list[dict[str, Any]] = []
+    for n in nodes:
+        label = getattr(n, "hostname", None) or str(getattr(n, "id", "?"))
+        seen = getattr(n, "last_seen_at", None)
+        if seen is not None and seen.tzinfo is None:
+            seen = seen.replace(tzinfo=UTC)
+        free = _node_var_free_bytes(getattr(n, "cluster_health", None))
+        if free is None:
+            unknown.append({"node": label, "reason": "no /var disk report"})
+            continue
+        if seen is None or (now - seen).total_seconds() > max_age_seconds:
+            unknown.append({"node": label, "reason": "disk report is stale", "free_bytes": free})
+            continue
+        entry = {"node": label, "free_bytes": free}
+        checked.append(entry)
+        if free < need_bytes:
+            short.append(entry)
+    detail: dict[str, Any] = {
+        "needed_bytes": need_bytes,
+        "nodes": checked,
+        "short": short,
+        "unverified": unknown,
+    }
+    gib = 1024**3
+    if short:
+        names = ", ".join(f"{e['node']} ({e['free_bytes'] // gib} GiB free)" for e in short)
+        return PreflightResult(
+            name="disk_headroom",
+            level="fail",
+            message=(
+                f"/var too small on {names}; need {need_bytes // gib} GiB "
+                "(slot image + margin) — free space before upgrading"
+            ),
+            detail=detail,
+        )
+    if unknown:
+        names = ", ".join(f"{e['node']} ({e['reason']})" for e in unknown)
+        return PreflightResult(
+            name="disk_headroom",
+            level="warn",
+            message=f"/var headroom unverified on {names}",
+            detail=detail,
+        )
+    return PreflightResult(
+        name="disk_headroom",
+        level="ok",
+        message=f"/var has room on all {len(checked)} node(s) (need {need_bytes // gib} GiB)",
+        detail=detail,
+    )
+
+
+async def check_node_disk_headroom(
+    *,
+    nodes: list[str] | None = None,
+    target_version: str | None = None,
+    slot_image_size_bytes: int = 4 * 1024 * 1024 * 1024,
+    safety_margin_bytes: int = 1 * 1024 * 1024 * 1024,
+) -> PreflightResult:
+    """Per-node ``/var`` headroom for appliance fleets (#1234).
+
+    ``nodes`` narrows the judgement to those hostnames (matched as k8s Node names):
+    a rolling run's chain passes the nodes it has still to upgrade. Upgrading
+    a node shrinks its ``/var`` (it keeps the old slot's images beside the
+    new ones), and a node the run has finished, or an approved row that is
+    not part of the run, never stages this image; judging them failed the
+    run's own next node (ddi-pg, nightly-20261012: both upgraded nodes short,
+    the node left to upgrade with 8 GiB free). A named node with no row is
+    unverified (``warn``). Plan passes no ``nodes`` and judges every row.
+
+    ``target_version`` leaves out the rows that already report it, Plan and
+    chain alike: such a node stages nothing (the chain's ``mirror_ready`` and
+    ``stage`` skip a node whose ``installed_appliance_version`` is the
+    target). So a new Plan after a failed run, which is the way out of it, is
+    not refused on the nodes that run already upgraded. They are named in
+    ``detail.on_target``.
+
+    Falls back to :func:`check_disk_headroom` (the api container's own
+    ``/var``) when there are no approved appliance rows — docker-compose /
+    plain k8s — which is the only place that check is meaningful.
+    """
+    try:
+        async with AsyncSessionLocal() as db:
+            rows = list(
+                (
+                    await db.execute(
+                        select(Appliance).where(
+                            Appliance.state == APPLIANCE_STATE_APPROVED,
+                            Appliance.deployment_kind == "appliance",
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+    except Exception as e:  # pragma: no cover - DB unavailable is its own signal
+        logger.warning("preflight_node_disk_query_failed", error=str(e))
+        return PreflightResult(
+            name="disk_headroom",
+            level="warn",
+            message="Could not read per-node disk reports — check /var headroom manually.",
+            detail={"error": str(e)},
+        )
+    if not rows:
+        return check_disk_headroom(
+            slot_image_size_bytes=slot_image_size_bytes,
+            safety_margin_bytes=safety_margin_bytes,
+        )
+    need = slot_image_size_bytes + safety_margin_bytes
+    missing: list[str] = []
+    if nodes is not None:
+        # #1757 — the Node name k3s gives a host is its lowercased hostname.
+        wanted = {k8s_node_name(n) for n in nodes}
+        rows = [r for r in rows if k8s_node_name(r.hostname) in wanted]
+        missing = sorted(wanted - {k8s_node_name(r.hostname) for r in rows})
+    on_target: list[str] = []
+    if target_version:
+        on_target = sorted(
+            r.hostname or str(r.id)
+            for r in rows
+            if is_installed_target(r.installed_appliance_version, target_version)
+        )
+        rows = [
+            r
+            for r in rows
+            if not is_installed_target(r.installed_appliance_version, target_version)
+        ]
+    result = judge_node_disk_headroom(rows, need_bytes=need, now=datetime.now(UTC))
+    detail = {**result.detail, "on_target": on_target} if target_version else result.detail
+    if missing and result.level != "fail":
+        unknown = [{"node": n, "reason": "no appliance row"} for n in missing]
+        names = ", ".join(f"{e['node']} ({e['reason']})" for e in unknown)
+        return PreflightResult(
+            name="disk_headroom",
+            level="warn",
+            message=f"/var headroom unverified on {names}",
+            detail={**detail, "unverified": detail["unverified"] + unknown},
+        )
+    if not on_target:
+        return result
+    message = result.message
+    if result.level == "ok":
+        message = (
+            f"{message}; already on {target_version}, nothing to stage: {', '.join(on_target)}"
+        )
+    return PreflightResult(name="disk_headroom", level=result.level, message=message, detail=detail)
+
+
 async def check_mirror_disk_headroom(
     *,
+    slot_image_id: uuid.UUID | None = None,
     slot_image_size_bytes: int = 4 * 1024 * 1024 * 1024,
     safety_margin_bytes: int = 1 * 1024 * 1024 * 1024,
 ) -> PreflightResult:
     """Mirror node has room for the slot image + a safety margin.
 
+    #1709 — ``slot_image_id`` is the run's target when it is an uploaded
+    image. An upload streams its bytes to the mirror, so when the mirror is
+    short of the full need the check asks it (a HEAD, as the re-upload
+    presence check does) whether it already holds that image; if it does,
+    only the margin is needed. An external URL, an image the mirror does not
+    hold, or a presence check that fails keep the full need.
+
     Phase B-only check — only fires when ``settings.slot_image_mirror_url``
     is set. Queries the mirror's ``/api/v1/appliance/internal/slot-
     images/_/disk-usage`` endpoint over the in-cluster Service to get
-    the real PVC volume's free space; ``check_disk_headroom`` above
-    looks at the api pod's /var which isn't where the slot image
-    actually lands in mirror mode.
+    the real PVC volume's free space; ``check_node_disk_headroom`` above
+    covers each node's /var (#1234), which is not the mirror's volume.
 
     On docker-compose / non-mirror shapes returns ``ok`` with detail
     noting "no mirror configured" so the operator-facing report still
@@ -318,7 +583,7 @@ async def check_mirror_disk_headroom(
         return PreflightResult(
             name="mirror_disk_headroom",
             level="warn",
-            message=f"could not reach mirror Service: {exc}",
+            message=f"could not reach mirror Service: {describe_http_exc(exc)}",
             detail={"url": url, "error": str(exc)},
         )
     if resp.status_code != 200:
@@ -332,6 +597,11 @@ async def check_mirror_disk_headroom(
     free = int(body.get("free_bytes") or 0)
     total = int(body.get("total_bytes") or 0)
     need = slot_image_size_bytes + safety_margin_bytes
+    on_mirror: bool | None = None
+    if free < need and slot_image_id is not None:
+        on_mirror = await _mirror_holds_image(slot_image_id)
+        if on_mirror:
+            need = safety_margin_bytes
     if free < need:
         return PreflightResult(
             name="mirror_disk_headroom",
@@ -345,19 +615,60 @@ async def check_mirror_disk_headroom(
                 "needed_bytes": need,
                 "total_bytes": total,
                 "path": body.get("path"),
+                "slot_image_id": str(slot_image_id) if slot_image_id else None,
+                "target_on_mirror": on_mirror,
             },
+        )
+    message = f"mirror: {free // (1024**3)} GiB free (need {need // (1024**3)} GiB)"
+    if on_mirror:
+        message = (
+            f"mirror: {free // (1024**3)} GiB free; the target is already on the mirror, "
+            f"so it needs only the {need // (1024**3)} GiB margin"
         )
     return PreflightResult(
         name="mirror_disk_headroom",
         level="ok",
-        message=(f"mirror: {free // (1024**3)} GiB free " f"(need {need // (1024**3)} GiB)"),
+        message=message,
         detail={
             "free_bytes": free,
             "needed_bytes": need,
             "total_bytes": total,
             "path": body.get("path"),
+            "slot_image_id": str(slot_image_id) if slot_image_id else None,
+            "target_on_mirror": on_mirror,
         },
     )
+
+
+async def _mirror_holds_image(image_id: uuid.UUID) -> bool | None:
+    """Does the slot-image mirror hold ``image_id``'s bytes? True / False,
+    or None when it could not tell (unreachable, or an answer other than
+    200 / 404). A HEAD costs headers, not the 1-4 GiB body (#1709)."""
+    import httpx  # noqa: PLC0415
+
+    from app.api.v1.appliance.slot_image_mirror import mirror_auth_token  # noqa: PLC0415
+
+    url = (
+        f"{settings.slot_image_mirror_url.rstrip('/')}"
+        f"/api/v1/appliance/internal/slot-images/{image_id}"
+    )
+    headers = {"X-Mirror-Auth": mirror_auth_token("get", image_id)}
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+            resp = await client.head(url, headers=headers)
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "preflight_mirror_presence_unreachable", image_id=str(image_id), error=str(exc)
+        )
+        return None
+    if resp.status_code == 200:
+        return True
+    if resp.status_code == 404:
+        return False
+    logger.warning(
+        "preflight_mirror_presence_unexpected", image_id=str(image_id), status=resp.status_code
+    )
+    return None
 
 
 def check_version_path(
@@ -382,11 +693,14 @@ def check_version_path(
       the target, which is a rollback and fails.
     * Skip-release: warn when two CalVer tags are more than 90 days
       apart. We don't refuse because the appliance supports it via two
-      rolling upgrades back to back, but the operator should know. A
-      jump that involves a SemVer version has no dates to compare, so
-      it gets no such warning (#1182).
+      rolling upgrades back to back, but the operator should know.
+      SemVer tags carry no date, so between two SemVer releases the
+      same warning fires when the jump crosses more than one major
+      version (1.x to 3.x): 1.x to 2.x is the normal path, and minor
+      and patch jumps never warn (#1182). The switch from CalVer to
+      SemVer is never a skip.
     """
-    current = current_version or settings.version or "dev"
+    current = current_version or canonical_version(settings.version, settings.app_version) or "dev"
     base_detail: dict[str, Any] = {"current": current, "target": target_version}
     target = parse_release(target_version)
     if target is None:
@@ -433,20 +747,37 @@ def check_version_path(
             ),
             detail=base_detail,
         )
-    if running.tagged_on is None or target.tagged_on is None:
-        # At least one side is SemVer: there is no date to measure a gap
-        # with. What should count as skipping releases under SemVer is
-        # still open (#1182); until then the jump is reported as forward.
-        crossing = running.tagged_on is not None
+    if running.tagged_on is not None and target.tagged_on is None:
+        # The bridge to 1.0.0 (or later): every SemVer release is newer
+        # than every CalVer one, and there is no date on the SemVer side
+        # to measure a gap with.
         return PreflightResult(
             name="version_path",
             level="ok",
-            message=(
-                "forward jump across the switch from CalVer to SemVer"
-                if crossing
-                else f"forward jump from {current} to {target_version}"
-            ),
+            message="forward jump across the switch from CalVer to SemVer",
             detail={**base_detail, "gap_days": None},
+        )
+    if target.tagged_on is None:
+        # Both SemVer (a target newer than a SemVer release is SemVer
+        # too). key is (1, major, minor, patch, pre).
+        majors = target.key[1] - running.key[1]
+        detail = {**base_detail, "gap_days": None, "gap_majors": majors}
+        if majors > _SKIP_RELEASE_WARN_MAJORS:
+            return PreflightResult(
+                name="version_path",
+                level="warn",
+                message=(
+                    f"target {target_version} is {majors} major versions newer "
+                    f"than current {current}; consider stopping at each major "
+                    "version in between"
+                ),
+                detail=detail,
+            )
+        return PreflightResult(
+            name="version_path",
+            level="ok",
+            message=f"forward jump from {current} to {target_version}",
+            detail=detail,
         )
     gap_days = (target.tagged_on - running.tagged_on).days
     if gap_days > _SKIP_RELEASE_WARN_DAYS:
@@ -467,7 +798,7 @@ def check_version_path(
     )
 
 
-def check_quorum() -> PreflightResult:
+def check_quorum(retry_budget_s: float = 0.0) -> PreflightResult:
     """Cluster size is odd + ≥ 3 + every node Ready.
 
     Reads the kubeapi via the existing SA mount. On docker-compose
@@ -499,7 +830,12 @@ def check_quorum() -> PreflightResult:
     label = "spatium.io/role=appliance"
     path = f"/api/v1/nodes?labelSelector={quote(label)}"
     try:
-        status, body = k8s._request("GET", path)  # noqa: SLF001
+        # #2767 — a refused connection while one API server restarts is retried.
+        status, body = kubeapi_retry.read_with_retry_blocking(
+            lambda: k8s._request("GET", path),  # noqa: SLF001
+            what="quorum_node_list",
+            budget_s=retry_budget_s,
+        )
     except k8s.KubeapiUnavailableError as exc:
         return PreflightResult(
             name="quorum",
@@ -603,25 +939,111 @@ class PreflightReport:
         }
 
 
+_DEFAULT_SLOT_IMAGE_BYTES = 4 * 1024 * 1024 * 1024
+
+# #1919 — what a node's /var must take for an image of ``size_bytes``, as a
+# multiple of it. Two writes, one after the other (spatium-upgrade-slot):
+# the compressed ``.raw.xz`` is staged whole on /var, streamed through xz
+# into the inactive partition and deleted; then, on the new slot's first
+# boot, k3s imports that slot's container images into containerd on /var
+# BESIDE the old slot's (spatiumddi-image-prune drops the oldest set only
+# after the slot commits). The import is the larger of the two: it is the
+# release's own images unpacked, ~1.6x the compressed slot image measured
+# on a 1.9 GB image, and the staged file is 1x. 2x covers the larger with
+# room; the 1 GiB margin stays on top for the etcd snapshot and logs. The
+# mirror stores the compressed file only, so its need is 1x.
+_NODE_NEED_IMAGE_MULTIPLE = 2
+
+
+async def _slot_image_size(slot_image_id: uuid.UUID | None) -> int | None:
+    """The run's uploaded image's ``size_bytes`` (the compressed artifact),
+    or None when the Plan names none, the row is gone or zero, or the DB
+    could not be read. None keeps each check's 4 GiB default, which fails
+    closed (#1919)."""
+    if slot_image_id is None:
+        return None
+    try:
+        async with AsyncSessionLocal() as db:
+            size = (
+                await db.execute(
+                    select(ApplianceUpgradeImage.size_bytes).where(
+                        ApplianceUpgradeImage.id == slot_image_id
+                    )
+                )
+            ).scalar_one_or_none()
+    except Exception as e:  # pragma: no cover - DB unavailable keeps the default
+        logger.warning("preflight_image_size_query_failed", error=str(e))
+        return None
+    if size is None or size <= 0:
+        return None
+    return int(size)
+
+
 async def run_all(
     *,
     target_version: str,
     namespace: str | None = None,
+    own_holder: str | None = None,
+    slot_image_id: uuid.UUID | None = None,
+    disk_nodes: list[str] | None = None,
 ) -> PreflightReport:
     """Run every check + return the aggregate report.
+
+    ``own_holder`` is passed by a run that already holds the upgrade
+    lease (see :func:`check_inflight_conflict`); Plan passes nothing.
+    ``slot_image_id`` is the run's target when it is an uploaded image
+    (#1709, :func:`check_mirror_disk_headroom`). ``disk_nodes`` is a
+    rolling run's nodes still to upgrade (:func:`check_node_disk_headroom`,
+    which also leaves out every node already on ``target_version``).
 
     Order doesn't matter (independent checks); we run them
     sequentially for now since none of them are slow. If any block
     of checks starts to dominate latency we can parallelise via
     ``asyncio.gather``.
     """
+    with kubeapi_retry.request_deadline():
+        return await _run_all(
+            target_version=target_version,
+            namespace=namespace,
+            own_holder=own_holder,
+            slot_image_id=slot_image_id,
+            disk_nodes=disk_nodes,
+        )
+
+
+async def _run_all(
+    *,
+    target_version: str,
+    namespace: str | None,
+    own_holder: str | None,
+    slot_image_id: uuid.UUID | None,
+    disk_nodes: list[str] | None,
+) -> PreflightReport:
+    image_bytes = await _slot_image_size(slot_image_id)
+    node_image_bytes = (
+        image_bytes * _NODE_NEED_IMAGE_MULTIPLE if image_bytes else _DEFAULT_SLOT_IMAGE_BYTES
+    )
     results: list[PreflightResult] = [
-        check_inflight_conflict(namespace=namespace),
+        # #2767 — both kubeapi reads here ride out a refused connection while
+        # one API server restarts; off the event loop, since they sleep.
+        await asyncio.to_thread(
+            check_inflight_conflict,
+            namespace=namespace,
+            own_holder=own_holder,
+            retry_budget_s=kubeapi_retry.READ_RETRY_BUDGET_S,
+        ),
         await check_replication_lag(),
-        check_disk_headroom(),
-        await check_mirror_disk_headroom(),
+        await check_node_disk_headroom(
+            nodes=disk_nodes,
+            target_version=target_version,
+            slot_image_size_bytes=node_image_bytes,
+        ),
+        await check_mirror_disk_headroom(
+            slot_image_id=slot_image_id,
+            slot_image_size_bytes=image_bytes or _DEFAULT_SLOT_IMAGE_BYTES,
+        ),
         check_version_path(target_version=target_version),
-        check_quorum(),
+        await asyncio.to_thread(check_quorum, retry_budget_s=kubeapi_retry.READ_RETRY_BUDGET_S),
         await check_kea_ha_version_skew(),
         await check_powerdns_lmdb_migration(),
         await check_etcd_snapshot_freshness(),
@@ -636,7 +1058,7 @@ async def run_all(
         overall = "ok"
     return PreflightReport(
         target_version=target_version,
-        current_version=settings.version or "dev",
+        current_version=canonical_version(settings.version, settings.app_version) or "dev",
         overall=overall,
         can_start=overall != "fail",
         results=results,
@@ -673,23 +1095,47 @@ async def check_kea_ha_version_skew() -> PreflightResult:
     guidance is to upgrade every HA member together. So the honest thing is to
     tell the operator before they press Start.
 
-    Two pieces of scoping matter, and getting either wrong turns this check into
-    a liar that blocks unrelated work:
+    The versions compared are the ones each agent reads live off its Kea
+    control socket (``dhcp_server.kea_version``) — what the daemons actually
+    speak to each other now. An appliance's slot version says nothing about the
+    Kea it runs, and a member that has never reported is UNKNOWN, never old.
 
-    * **Only appliance nodes.** The orchestrator only ever touches appliance
-      nodes; docker / k8s DHCP agents upgrade through the manual copy-paste path
-      and are never cordoned, drained or slot-swapped by this run. Counting them
-      would let two unrelated docker containers veto an appliance-cluster
-      upgrade. ``deployment_kind`` is matched strictly against ``appliance`` (an
-      ``appliance`` OR ``NULL`` fallback would lie about a row that has not
-      checked in yet — same convention as the Upgrade / Reboot affordances).
+    Two pieces of scoping matter, and getting either wrong turns this check into
+    a liar:
+
+    * **Only HA groups with a member on an appliance node.** The orchestrator
+      only ever touches appliance nodes; docker / k8s DHCP agents upgrade
+      through the manual copy-paste path and are never cordoned, drained or
+      slot-swapped by this run. A group made only of those is never counted —
+      two unrelated docker containers must not turn an appliance-cluster
+      upgrade amber.
+
+      Recognising an appliance node is the subtle part (#2179). The obvious
+      predicate, ``dhcp_server.deployment_kind = 'appliance'``, is a trap: #170
+      Wave C1 moved deployment telemetry onto the supervisor's heartbeat, so the
+      DHCP agent never sends it and the column is NULL on every post-#170
+      appliance — filtering on it made this check report "no Kea HA pairs" on
+      every appliance cluster it was written for. Membership comes from
+      ``orchestrated_server_condition`` instead, the rule
+      ``check_powerdns_lmdb_migration`` shares: an approved appliance owning the
+      row by FK or by the agent's host. The strictness the original column
+      match was after survives in that rule — the appliance has to be approved
+      and report ``deployment_kind = 'appliance'`` itself; an unclaimed row is
+      never assumed to be one.
     * **Only *real* HA pairs.** HA is not "≥ 2 Kea members" — that is half the
       condition. ``_resolve_failover`` in ``services/dhcp/config_bundle.py``
-      renders the HA hook only when there are ≥ 2 Kea members AND every one of
-      them carries a non-empty ``ha_peer_url``; without a URL a peer cannot be
-      reached for heartbeats or lease updates, so no HA relationship exists and
-      there is nothing for an upgrade to disrupt. This check must use the same
-      predicate or it invents HA pairs that the renderer never built.
+      renders the HA hook only for Kea members that carry a non-empty
+      ``ha_peer_url``, and only when at least two do; without a URL a peer
+      cannot be reached for heartbeats or lease updates, so it is not in the
+      relationship (a URL-less member beside a pair is sidelined, #3151) and
+      there is nothing for an upgrade to disrupt on it. The predicate is
+      evaluated over EVERY Kea member of the group, as the renderer does — not
+      over the appliance members alone, which would miss a pair whose partner
+      is a docker agent.
+
+    A pair with a member off the appliance fleet is still reported, and that
+    member is named: this run upgrades only the appliance side, so converging
+    the pair needs the other one upgraded separately.
 
     **This check never returns ``fail``.** A ``fail`` sets ``can_start=False``,
     and blocking the upgrade would be exactly backwards: if a pair is *already*
@@ -700,17 +1146,25 @@ async def check_kea_ha_version_skew() -> PreflightResult:
     """
     try:
         async with AsyncSessionLocal() as db:
-            rows = (await db.execute(text("""
-                            SELECT g.name         AS group_name,
-                                   s.name         AS server_name,
-                                   s.kea_version  AS kea_version,
-                                   s.ha_peer_url  AS ha_peer_url
-                            FROM dhcp_server_group g
-                            JOIN dhcp_server s ON s.server_group_id = g.id
-                            WHERE s.driver = 'kea'
-                              AND s.deployment_kind = 'appliance'
-                            ORDER BY g.name, s.name
-                            """))).mappings().all()
+            rows = (
+                (
+                    await db.execute(
+                        select(
+                            DHCPServerGroup.name.label("group_name"),
+                            DHCPServerGroup.mode.label("group_mode"),
+                            DHCPServer.name.label("server_name"),
+                            DHCPServer.kea_version.label("kea_version"),
+                            DHCPServer.ha_peer_url.label("ha_peer_url"),
+                            orchestrated_server_condition(DHCPServer).label("on_appliance"),
+                        )
+                        .join(DHCPServer, DHCPServer.server_group_id == DHCPServerGroup.id)
+                        .where(DHCPServer.driver == "kea")
+                        .order_by(DHCPServerGroup.name, DHCPServer.name)
+                    )
+                )
+                .mappings()
+                .all()
+            )
     except Exception as e:  # pragma: no cover - DB unavailable is its own signal
         logger.warning("preflight_kea_ha_skew_query_failed", error=str(e))
         return PreflightResult(
@@ -724,13 +1178,20 @@ async def check_kea_ha_version_skew() -> PreflightResult:
     for r in rows:
         by_group.setdefault(r["group_name"], []).append(dict(r))
 
-    # Mirror _resolve_failover exactly: ≥ 2 Kea members AND every member has a
-    # peer URL. Anything else renders no HA hook, so there is no HA to disrupt.
-    ha_groups = {
-        name: members
-        for name, members in by_group.items()
-        if len(members) >= 2 and all(m["ha_peer_url"] for m in members)
-    }
+    # Mirror _resolve_failover exactly (``services/dhcp/ha_members``): the HA
+    # participants are the Kea members with a peer URL, and HA renders only
+    # when there are ≥ 2 of them. A URL-less member beside them is sidelined
+    # (#3151) — not in the relationship, so its version does not matter here.
+    # Then keep only the pairs this run touches: at least one appliance member.
+    ha_groups: dict[str, list[dict[str, Any]]] = {}
+    for name, members in by_group.items():
+        participants = [m for m in members if m["ha_peer_url"]]
+        if (
+            members[0]["group_mode"] in HA_MODES
+            and len(participants) >= 2
+            and any(m["on_appliance"] for m in participants)
+        ):
+            ha_groups[name] = participants
     if not ha_groups:
         return PreflightResult(
             name="kea_ha_version_skew",
@@ -745,9 +1206,12 @@ async def check_kea_ha_version_skew() -> PreflightResult:
     pre_3: list[str] = []
     unknown: list[str] = []
     groups: list[dict[str, Any]] = []
+    off_appliance: list[str] = []
+    off_by_group: dict[str, list[str]] = {}
     for name, members in ha_groups.items():
         majors = {_kea_major(m["kea_version"]) for m in members}
         known = {m for m in majors if m is not None}
+        affected = True
         if len(known) > 1:
             mixed.append(name)
         elif None in majors:
@@ -757,11 +1221,22 @@ async def check_kea_ha_version_skew() -> PreflightResult:
             unknown.append(name)
         elif known and next(iter(known)) < _KEA_HA_MIN_COMPATIBLE_MAJOR:
             pre_3.append(name)
+        else:
+            affected = False
+        if affected:
+            outsiders = [m["server_name"] for m in members if not m["on_appliance"]]
+            off_by_group[name] = outsiders
+            off_appliance.extend(outsiders)
         groups.append(
             {
                 "group": name,
                 "members": [
-                    {"server": m["server_name"], "kea_version": m["kea_version"]} for m in members
+                    {
+                        "server": m["server_name"],
+                        "kea_version": m["kea_version"],
+                        "on_appliance": bool(m["on_appliance"]),
+                    }
+                    for m in members
                 ],
             }
         )
@@ -771,8 +1246,25 @@ async def check_kea_ha_version_skew() -> PreflightResult:
         "mixed_major": mixed,
         "pre_3_0": pre_3,
         "unknown_version": unknown,
+        "off_appliance_members": off_appliance,
         "groups": groups,
     }
+
+    # A member this run does not upgrade cannot be converged by it — say so,
+    # or "completing this upgrade fixes it" is false for that pair. Only the
+    # outsiders of the groups the returned message names: a note naming a
+    # member of a group the message never mentions reads as belonging to it.
+    def off_note(named: list[str]) -> str:
+        names = [s for g in named for s in off_by_group.get(g, [])]
+        if not names:
+            return ""
+        many = len(names) > 1
+        return (
+            f" {'Members' if many else 'Member'} {', '.join(names)} "
+            f"{'are' if many else 'is'} not on an appliance node, so this upgrade "
+            f"does not touch {'them' if many else 'it'} — upgrade "
+            f"{'them' if many else 'it'} separately to the same Kea major."
+        )
 
     if mixed:
         return PreflightResult(
@@ -783,6 +1275,7 @@ async def check_kea_ha_version_skew() -> PreflightResult:
                 "already span different Kea major versions, so HA lease sync is "
                 "broken right now. Completing this upgrade is what converges every "
                 "member onto one version — expect HA to stay degraded until it finishes."
+                + off_note(mixed)
             ),
             detail=detail,
         )
@@ -796,6 +1289,7 @@ async def check_kea_ha_version_skew() -> PreflightResult:
                 "HA hook cannot exchange lease updates with a pre-2.7 peer — so the "
                 "pair will fall out of sync until every member has crossed. DHCP keeps "
                 "serving throughout; only HA replication between the peers is affected."
+                + off_note(pre_3)
             ),
             detail=detail,
         )
@@ -806,7 +1300,7 @@ async def check_kea_ha_version_skew() -> PreflightResult:
             message=(
                 f"Kea version unknown for {'groups' if len(unknown) > 1 else 'group'} "
                 f"{', '.join(unknown)} (agent has not reported it yet). If those members "
-                "are on Kea < 3.0, HA will be degraded mid-upgrade."
+                "are on Kea < 3.0, HA will be degraded mid-upgrade." + off_note(unknown)
             ),
             detail=detail,
         )
@@ -866,21 +1360,24 @@ async def check_powerdns_lmdb_migration() -> PreflightResult:
       are never touched by this run.
 
       Identifying them is the subtle part. The obvious predicate —
-      ``deployment_kind = 'appliance'``, which is what ``check_kea_ha_version_skew``
-      uses — is a **trap on ``dns_server``**: #170 Wave C1 moved slot /
+      ``deployment_kind = 'appliance'`` — is a **trap on ``dns_server``** (and on
+      ``dhcp_server``, where it made ``check_kea_ha_version_skew`` inert until
+      #2179): #170 Wave C1 moved slot /
       deployment telemetry off the service containers onto the supervisor's
       heartbeat, so the DNS agent no longer sends ``deployment_kind`` at all
       and the column is NULL on every post-#170 appliance. Filtering on it
       would match nothing and report a cheerful "no PowerDNS nodes" on exactly
       the fleet this check exists for.
 
-      So match the way ``_cascade_delete_appliance_children`` already does
-      (#305): the FK when it is set, else the agent-reported ``host``, which
-      ``register`` fills with the appliance's hostname. ``deployment_kind``
-      stays in the OR for any agent that does still report it. The host match
-      can in principle over-match an off-fleet server an operator labelled
-      with an appliance's hostname — acceptable for a warn-only check, and the
-      same trade #305 accepted for a *destructive* one.
+      So membership comes from ``orchestrated_server_condition``, the rule the
+      Kea HA check shares so the two cannot drift apart again (#2179): an
+      approved ``deployment_kind = 'appliance'`` appliance owning the row by
+      FK, else by the agent-reported ``host``, which ``register`` fills with
+      the appliance's hostname. ``deployment_kind`` on the server row stays in
+      the OR for any agent that does still report it. The host match can in
+      principle over-match an off-fleet agent an operator labelled with an
+      appliance's hostname — acceptable for a warn-only check, and the same
+      trade #305 accepted for a *destructive* one.
 
     **This check never returns ``fail``.** A ``fail`` sets ``can_start=False``,
     and blocking would be wrong twice over: the migration is a supported,
@@ -889,21 +1386,23 @@ async def check_powerdns_lmdb_migration() -> PreflightResult:
     """
     try:
         async with AsyncSessionLocal() as db:
-            rows = (await db.execute(text("""
-                            SELECT s.name           AS server_name,
-                                   s.daemon_version AS daemon_version
-                            FROM dns_server s
-                            WHERE s.driver = 'powerdns'
-                              AND (
-                                    s.appliance_id IS NOT NULL
-                                 OR s.deployment_kind = 'appliance'
-                                 OR EXISTS (
-                                        SELECT 1 FROM appliance a
-                                        WHERE a.hostname = s.host
-                                    )
-                              )
-                            ORDER BY s.name
-                            """))).mappings().all()
+            rows = (
+                (
+                    await db.execute(
+                        select(
+                            DNSServer.name.label("server_name"),
+                            DNSServer.daemon_version.label("daemon_version"),
+                        )
+                        .where(
+                            DNSServer.driver == "powerdns",
+                            orchestrated_server_condition(DNSServer),
+                        )
+                        .order_by(DNSServer.name)
+                    )
+                )
+                .mappings()
+                .all()
+            )
     except Exception as e:  # pragma: no cover - DB unavailable is its own signal
         logger.warning("preflight_powerdns_lmdb_query_failed", error=str(e))
         return PreflightResult(
@@ -1264,7 +1763,7 @@ async def check_pre_upgrade_backup() -> PreflightResult:
     advice = (
         "This upgrade migrates the database forward, and the release you are "
         "leaving cannot run on it afterwards: a slot rollback alone does not bring "
-        "it back. Run a backup (Settings → Backup) before starting, so a copy from "
+        "it back. Run a backup (Administration → Backup) before starting, so a copy from "
         "before the upgrade exists."
     )
     if newest is None:

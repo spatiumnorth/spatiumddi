@@ -89,6 +89,7 @@ class FindFirewallPoliciesArgs(BaseModel):
 
 @register_tool(
     name="find_firewall_policies",
+    permission="superadmin",
     description=(
         "List fleet-firewall policies (superadmin only, #285). Each row carries "
         "name / scope (fleet|role|appliance) / role / enabled / is_builtin / "
@@ -147,6 +148,7 @@ class CountFirewallPoliciesArgs(BaseModel):
 
 @register_tool(
     name="count_firewall_policies",
+    permission="superadmin",
     description=(
         "Roll up fleet-firewall policy counts (superadmin only, #285): total, "
         "per scope_kind, and enabled vs disabled. Use for 'how many firewall "
@@ -189,6 +191,7 @@ class FindFirewallAliasesArgs(BaseModel):
 
 @register_tool(
     name="find_firewall_aliases",
+    permission="superadmin",
     description=(
         "List firewall aliases (superadmin only, #285) — named, reusable CIDR "
         "or port sets referenced by rules. Each row carries name / kind / "
@@ -237,6 +240,7 @@ class FindFirewallEffectiveArgs(BaseModel):
 
 @register_tool(
     name="find_firewall_effective",
+    permission="superadmin",
     description=(
         "Server-render a node's EFFECTIVE merged firewall drop-in (superadmin "
         "only, #285) — the exact body the supervisor heartbeat would ship, "
@@ -291,15 +295,18 @@ async def find_firewall_effective(
         ssh_scope_cidrs=inputs.get("ssh_scope_cidrs") or [],
     )
     state = await db.get(FirewallApplyState, row.id)
+    enforced = bool(inputs["firewall_enabled"])
+    # #2794 — no drift while enforcement is off (see the /effective route).
+    rendered_hash = getattr(state, "rendered_hash", None) if enforced else None
     return {
         "appliance_id": str(row.id),
         "hostname": row.hostname,
         "firewall_enabled": bool(inputs["firewall_enabled"]),
         "firewall_conf": body,
-        "rendered_hash": getattr(state, "rendered_hash", None),
+        "rendered_hash": rendered_hash,
         "applied_hash": getattr(state, "applied_hash", None),
         "applied_status": getattr(state, "applied_status", None),
-        "drift": bool(state and state.rendered_hash and state.rendered_hash != state.applied_hash),
+        "drift": bool(state and rendered_hash and rendered_hash != state.applied_hash),
     }
 
 
@@ -312,6 +319,7 @@ class FindWebUIAccessArgs(BaseModel):
 
 @register_tool(
     name="find_web_ui_access",
+    permission="superadmin",
     description=(
         "Report the appliance Web UI source restriction (superadmin "
         "only). Returns the allow-list of source CIDRs (empty = open to all) that "
@@ -357,6 +365,7 @@ class ProposeToggleFirewallPolicyArgs(BaseModel):
 
 @register_tool(
     name="propose_toggle_firewall_policy",
+    permission="superadmin",
     description=(
         "Propose enabling or disabling a fleet-firewall policy (superadmin only, "
         "#285). Disabled by default — a firewall change can sever a node's "

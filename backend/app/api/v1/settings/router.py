@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
+import json
 import re
 import uuid
 from datetime import UTC, datetime
 from ipaddress import ip_network
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 import structlog
 from fastapi import (
@@ -20,18 +22,27 @@ from fastapi import (
     UploadFile,
     status,
 )
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from app.api.deps import DB, CurrentUser
+from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.pre_body_auth import PreBodyAuthUploadRoute
 from app.core.agent_wake import HOSTCONFIG_ALL, publish_wake
+from app.core.celery_dispatch import dispatch
+from app.core.config_text import has_control_chars, reject_control_chars
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.http_etag import etag_matches, format_etag
-from app.core.permissions import is_effective_superadmin, user_has_permission
+from app.core.permissions import (
+    is_effective_superadmin,
+    refuse_and_audit,
+    user_has_permission,
+)
 from app.core.request_meta import get_trusted_client_ip
+from app.core.stored_secret_guard import require_secret_with_destination_change
 from app.models.audit import AuditLog
 from app.models.audit_forward import AuditForwardTarget
+from app.models.dns import DNS_TTL_MAX
 from app.models.influxdb import (
     DEFAULT_MEASUREMENT_PREFIX,
     DEFAULT_PUSH_INTERVAL_SECONDS,
@@ -50,10 +61,22 @@ from app.models.settings import (
 )
 from app.services import apprise_delivery
 from app.services import audit_forward as audit_forward_svc
+from app.services import feature_modules as fm_svc
+from app.services.api_token_scopes import token_write
 from app.services.appliance.access import console_only_detail, covers, effective_doors
-from app.services.appliance.apt import render_sources_list
+from app.services.appliance.apt import (
+    mask_proxy_url,
+    mask_source_uris,
+    render_sources_list,
+    restore_proxy_credentials,
+    restore_source_uri,
+    validate_apt_authority,
+)
 from app.services.appliance.ssh import is_valid_public_key, validate_lockout_safe
 from app.services.appliance.syslog import validate_syslog_filter, validate_syslog_host
+from app.services.audit_forward import targets_cache
+from app.services.dns.new_object_defaults import DNSSEC_VALIDATION_MODES
+from app.services.dns.new_object_defaults import ZONE_TYPES as DNS_ZONE_TYPES
 from app.services.forward_secrets import apply_write_only, redact, reveal, url_display
 
 # SNMP v3 protocol allow-lists. Sticking to the protocols net-snmp's
@@ -91,7 +114,9 @@ _RESOLVER_DNSSEC: set[str] = {"yes", "no", "allow-downgrade"}
 _RESOLVER_DOT: set[str] = {"yes", "opportunistic", "no"}
 
 logger = structlog.get_logger(__name__)
-router = APIRouter()
+# The upload routes here check the login from the request headers before
+# the multipart body is read (app.api.pre_body_auth, #2780).
+router = APIRouter(route_class=PreBodyAuthUploadRoute)
 
 _SINGLETON_ID = 1
 
@@ -160,6 +185,10 @@ class SettingsResponse(BaseModel):
     oui_lookup_enabled: bool
     oui_update_interval_hours: int
     oui_last_updated_at: datetime | None
+    # #2196 / #2197 — all eleven integration switches. Each is the state of
+    # the integration's feature module (``integrations.*``), filled in by
+    # ``_settings_response``; the ``PlatformSettings`` column of the same
+    # name is only a derived copy and is never what this reports.
     integration_kubernetes_enabled: bool
     integration_docker_enabled: bool
     integration_proxmox_enabled: bool
@@ -167,6 +196,10 @@ class SettingsResponse(BaseModel):
     integration_unifi_enabled: bool
     integration_cloud_enabled: bool
     integration_opnsense_enabled: bool
+    integration_netbird_enabled: bool
+    integration_panos_enabled: bool
+    integration_fortinet_enabled: bool
+    integration_meraki_enabled: bool
     domain_whois_interval_hours: int
     # Device profiling — fingerbank API key. Boolean reflects whether
     # an encrypted key is stored; the plaintext is never returned.
@@ -271,6 +304,18 @@ class SettingsResponse(BaseModel):
     ssh_port: int = 22
     ssh_allowed_source_networks: list[str] = []
     ssh_lockdown: bool = False
+    # ── Data retention (#2273) ────────────────────────────────────
+    # Read by the nightly prune tasks; every one is superadmin-only to
+    # change (not in ``SETTINGS_DELEGATE_WRITABLE``).
+    soft_delete_purge_days: int = 30
+    dhcp_lease_history_retention_days: int = 90
+    pcap_retention_days: int = 7
+    appliance_revoked_retention_days: int = 30
+    metric_retention_days: int = 7
+    log_retention_hours: int = 24
+    # E911 lookup trail bounds (#3514), superadmin-only.
+    e911_resolution_log_retention_days: int = 90
+    e911_lookup_log_budget_per_minute: int = 120
     # ── Appliance DNS resolver (issue #158) ───────────────────────
     # No secrets — resolver IPs / search domains are not sensitive, so
     # the read shape mirrors the stored shape directly (like NTP / SSH
@@ -298,6 +343,11 @@ class SettingsResponse(BaseModel):
     apt_unattended_blocklist: list[str] = []
     apt_unattended_automatic_reboot: bool = False
     apt_unattended_reboot_time: str = "02:00"
+    # #3429 — not a column: the fields a non-superadmin holding ``write`` on
+    # ``settings`` may change (``SETTINGS_DELEGATE_WRITABLE``, sorted), filled
+    # in by ``_settings_response``. Served so the Settings page enables exactly
+    # these for a delegate instead of keeping its own copy of the list.
+    delegate_writable_fields: list[str] = []
 
     model_config = {"from_attributes": True}
 
@@ -335,6 +385,14 @@ class SettingsResponse(BaseModel):
                 _redact_apt_gpg_key(k) for k in (cols.get("apt_gpg_keys") or [])
             ]
             cols["apt_auth"] = [_redact_apt_auth(a) for a in (cols.get("apt_auth") or [])]
+            # GHSA-j77h-pqg7-h2g4 — a proxy URL may embed ``user:pass@``.
+            # Mask the userinfo, keep the host; ``update_settings`` puts the
+            # stored credential back when the form re-sends the mask.
+            cols["apt_proxy_http"] = mask_proxy_url(cols.get("apt_proxy_http"))
+            # A source URI may embed ``user:pass@`` for a private mirror; mask
+            # it the same way. ``update_settings`` restores it from the mask.
+            cols["apt_sources"] = mask_source_uris(cols.get("apt_sources"))
+            cols["apt_proxy_https"] = mask_proxy_url(cols.get("apt_proxy_https"))
             return cols
         return data
 
@@ -395,6 +453,127 @@ def _redact_syslog_target(t: Any) -> dict[str, Any]:
         "protocol": t.get("protocol") or "udp",
         "format": t.get("format") or "rfc5424",
         "ca_cert_set": bool(t.get("ca_cert_pem")),
+    }
+
+
+# ── Section audit rows: changed fields only (#3995, follow-up to #3847) ───────
+#
+# SSH / resolver / syslog / APT write a row naming only the fields that
+# changed, with old and new values, and no row when nothing changed. The
+# snapshots below carry NO secret: SSH keys and APT GPG keys / mirror auth
+# appear as digests of the stored value, a syslog CA as a digest, never the
+# material. Reusable for any section: snapshot before, snapshot after, then
+# ``_section_audit_diff``.
+
+
+def _digest(value: Any) -> str:
+    """Short, non-reversible digest of a stored secret-bearing value."""
+    if not value:
+        return ""
+    raw = value if isinstance(value, bytes) else str(value).encode()
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def _ssh_key_fingerprint(public_key: str) -> str:
+    """OpenSSH-style ``SHA256:`` fingerprint of a public key line."""
+    import base64
+
+    parts = (public_key or "").split()
+    if len(parts) < 2:
+        return _digest(public_key)
+    try:
+        blob = base64.b64decode(parts[1] + "=" * (-len(parts[1]) % 4))
+    except ValueError:
+        return _digest(public_key)
+    return "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
+
+
+def _section_audit_diff(
+    old: dict[str, Any], new: dict[str, Any]
+) -> tuple[list[str], dict[str, Any], dict[str, Any]] | None:
+    """``(changed_fields, old_value, new_value)`` for the keys that differ,
+    or None when nothing changed (so the caller writes no row)."""
+    changed = sorted(k for k in new if old.get(k) != new[k])
+    if not changed:
+        return None
+    return changed, {k: old.get(k) for k in changed}, {k: new[k] for k in changed}
+
+
+def _ssh_audit_snapshot(st: Any) -> dict[str, Any]:
+    return {
+        "password_auth_enabled": bool(st.ssh_password_auth_enabled),
+        "allow_root_login": bool(st.ssh_allow_root_login),
+        "port": int(st.ssh_port or 22),
+        "allowed_source_networks": list(st.ssh_allowed_source_networks or []),
+        "lockdown": bool(st.ssh_lockdown),
+        "authorized_keys": [
+            {
+                "name": (k.get("name") or "") if isinstance(k, dict) else "",
+                "comment": (k.get("comment") or "") if isinstance(k, dict) else "",
+                "fingerprint": (
+                    _ssh_key_fingerprint(k.get("public_key") or "") if isinstance(k, dict) else ""
+                ),
+            }
+            for k in (st.ssh_authorized_keys or [])
+        ],
+    }
+
+
+def _resolver_audit_snapshot(st: Any) -> dict[str, Any]:
+    return {
+        "mode": st.resolver_mode,
+        "servers": list(st.resolver_servers or []),
+        "fallback_servers": list(st.resolver_fallback_servers or []),
+        "search_domains": list(st.resolver_search_domains or []),
+        "dnssec": st.resolver_dnssec,
+        "dns_over_tls": st.resolver_dns_over_tls,
+    }
+
+
+def _syslog_audit_snapshot(st: Any) -> dict[str, Any]:
+    targets = []
+    for t in st.syslog_targets or []:
+        red = _redact_syslog_target(t)
+        red["ca_fingerprint"] = _digest(t.get("ca_cert_pem")) if isinstance(t, dict) else ""
+        targets.append(red)
+    return {
+        "enabled": bool(st.syslog_enabled),
+        "targets": targets,
+        "filter": st.syslog_filter or "",
+        "buffer_disk": bool(st.syslog_buffer_disk),
+    }
+
+
+def _apt_audit_snapshot(st: Any) -> dict[str, Any]:
+    return {
+        "managed": bool(st.apt_managed),
+        "source_count": len(st.apt_sources or []),
+        # Source URIs can embed credentials: digest only.
+        "sources_digest": _digest(json.dumps(st.apt_sources or [], sort_keys=True, default=str)),
+        "gpg_keys": [
+            (
+                {**_redact_apt_gpg_key(k), "digest": _digest(k.get("armoured_text_enc"))}
+                if isinstance(k, dict)
+                else _redact_apt_gpg_key(k)
+            )
+            for k in (st.apt_gpg_keys or [])
+        ],
+        "auth_entries": [
+            (
+                {**_redact_apt_auth(a), "digest": _digest(a.get("password_enc"))}
+                if isinstance(a, dict)
+                else _redact_apt_auth(a)
+            )
+            for a in (st.apt_auth or [])
+        ],
+        "proxy_http_set": bool(st.apt_proxy_http),
+        "proxy_https_set": bool(st.apt_proxy_https),
+        "unattended_upgrades_enabled": bool(st.apt_unattended_upgrades_enabled),
+        "no_proxy": st.apt_proxy_no_proxy or "",
+        "unattended_origins": list(st.apt_unattended_origins or []),
+        "unattended_blocklist": list(st.apt_unattended_blocklist or []),
+        "unattended_automatic_reboot": bool(st.apt_unattended_automatic_reboot),
+        "unattended_reboot_time": st.apt_unattended_reboot_time or "",
     }
 
 
@@ -535,6 +714,16 @@ class SNMPV3UserUpdate(BaseModel):
             )
         return s
 
+    @field_validator("auth_pass", "priv_pass")
+    @classmethod
+    def _passphrase_single_line(cls, v: str | None, info: ValidationInfo) -> str | None:
+        # The passphrase is written into a ``createUser`` line of
+        # snmpd.conf, which ends at the first newline. ``None`` (keep) and
+        # ``""`` (clear) pass through.
+        if v:
+            reject_control_chars(v, info.field_name or "value")
+        return v
+
     @field_validator("auth_protocol")
     @classmethod
     def _valid_auth_proto(cls, v: str) -> str:
@@ -575,7 +764,7 @@ class NTPCustomServerUpdate(BaseModel):
         # server directive, so reject whitespace in the hostname here.
         if any(c.isspace() for c in s):
             raise ValueError("host may not contain whitespace")
-        return s
+        return reject_control_chars(s, "host")
 
 
 class SyslogTargetUpdate(BaseModel):
@@ -705,6 +894,7 @@ class AptSourceUpdate(BaseModel):
             )
         if any(c.isspace() for c in s):
             raise ValueError("uri may not contain whitespace")
+        validate_apt_authority(s)
         return s
 
     @field_validator("suites")
@@ -712,7 +902,9 @@ class AptSourceUpdate(BaseModel):
     def _suites_nonempty(cls, v: str) -> str:
         if not v.strip():
             raise ValueError("suites may not be empty")
-        return v.strip()
+        # Rendered into the one-line ``deb`` entry; a newline would end it
+        # and start another entry. Spaces stay legal (several suites).
+        return reject_control_chars(v.strip(), "suites")
 
     @field_validator("signed_by_key_id")
     @classmethod
@@ -837,6 +1029,63 @@ def _merge_apt_auth(
     return out
 
 
+# Fields a delegated ``write:settings`` holder may change through
+# ``PUT /settings``. Every other field is SUPERADMIN-ONLY, which is the
+# default: a field added to ``SettingsUpdate`` is superadmin-only until it is
+# listed here on purpose. These are IPAM / DNS / DHCP working preferences:
+# none changes authentication, what the login page shows, a URL the
+# platform hands to an identity provider, host configuration pushed to
+# appliances, or a connection the platform makes to anything off-prem. The
+# rest is either one of those or points clients and appliances at servers
+# (DHCP default DNS / NTP servers, resolvers), so it stays with superadmins.
+# ``GET /settings`` serves this list as ``delegate_writable_fields`` and the
+# Settings page enables exactly these fields for a delegate (#3429).
+# Integration switches are handled separately (only a real flip is gated),
+# and the two acknowledgement flags are not fields.
+SETTINGS_DELEGATE_WRITABLE: frozenset[str] = frozenset(
+    {
+        "ip_allocation_strategy",
+        "utilization_warn_threshold",
+        "utilization_critical_threshold",
+        "utilization_max_prefix_ipv4",
+        "utilization_max_prefix_ipv6",
+        "subnet_tree_default_expanded_depth",
+        "dns_default_ttl",
+        "dns_default_zone_type",
+        "dns_default_dnssec_validation",
+        "dns_recursive_by_default",
+        "dns_auto_sync_enabled",
+        "dns_auto_sync_interval_minutes",
+        "dns_auto_sync_delete_stale",
+        "dns_pull_from_server_enabled",
+        "dns_pull_from_server_interval_minutes",
+        "dhcp_pull_leases_enabled",
+        "dhcp_pull_leases_interval_seconds",
+        "dhcp_default_lease_time",
+        "dhcp_default_domain_name",
+        "dhcp_default_domain_search",
+        "vrf_strict_rd_validation",
+    }
+)
+
+
+# Data-retention windows (#2273), each read by a nightly prune task. All are
+# superadmin-only (none is in ``SETTINGS_DELEGATE_WRITABLE``): shortening one
+# deletes data on the next sweep.
+RETENTION_FIELDS: tuple[str, ...] = (
+    "soft_delete_purge_days",
+    "dhcp_lease_history_retention_days",
+    "pcap_retention_days",
+    "appliance_revoked_retention_days",
+    "metric_retention_days",
+    "log_retention_hours",
+    "e911_resolution_log_retention_days",
+    # Not a retention window, but a limit on what the E911 trail records and
+    # answers (#3633); it rides this audited group so a change is never silent.
+    "e911_lookup_log_budget_per_minute",
+)
+
+
 class SettingsUpdate(BaseModel):
     app_title: str | None = None
     app_base_url: str | None = None
@@ -888,6 +1137,10 @@ class SettingsUpdate(BaseModel):
     dhcp_default_lease_time: int | None = None
     oui_lookup_enabled: bool | None = None
     oui_update_interval_hours: int | None = None
+    # #2196 / #2197 — writing one of these switches the integration's
+    # feature module, exactly as Settings → Features does (superadmin-only,
+    # audited as a ``feature_module`` change). Sending the current value is a
+    # no-op, so a form that echoes the whole object back changes nothing.
     integration_kubernetes_enabled: bool | None = None
     integration_docker_enabled: bool | None = None
     integration_proxmox_enabled: bool | None = None
@@ -895,6 +1148,10 @@ class SettingsUpdate(BaseModel):
     integration_unifi_enabled: bool | None = None
     integration_cloud_enabled: bool | None = None
     integration_opnsense_enabled: bool | None = None
+    integration_netbird_enabled: bool | None = None
+    integration_panos_enabled: bool | None = None
+    integration_fortinet_enabled: bool | None = None
+    integration_meraki_enabled: bool | None = None
     domain_whois_interval_hours: int | None = None
     # Device profiling — fingerbank API key. Plaintext on the wire
     # (TLS-protected); empty string clears the stored value. Omit the
@@ -993,6 +1250,24 @@ class SettingsUpdate(BaseModel):
     # smaller tick — an operator may have sent that one for another reason.
     ssh_lockdown_force: bool | None = None
     acknowledge_console_only: bool | None = None
+    # ── Data retention (#2273) ────────────────────────────────────
+    # Superadmin-only. 0 turns the trash purge, lease-history prune and
+    # revoked-appliance hard-delete off (keep forever), as each task
+    # already reads it. pcap / metric / log windows have no "off": a
+    # capture holds plaintext credentials, and the other two are
+    # high-volume tables. ``log_retention_hours`` is capped at 168 until
+    # #2185 replaces the single unbatched DELETE with partition drops.
+    soft_delete_purge_days: int | None = Field(default=None, ge=0, le=365)
+    dhcp_lease_history_retention_days: int | None = Field(default=None, ge=0, le=3650)
+    pcap_retention_days: int | None = Field(default=None, ge=1, le=90)
+    appliance_revoked_retention_days: int | None = Field(default=None, ge=0, le=365)
+    metric_retention_days: int | None = Field(default=None, ge=1, le=365)
+    log_retention_hours: int | None = Field(default=None, ge=1, le=168)
+    # E911 lookup trail (#3514). No "keep forever" and no "unlimited": the
+    # point of both is that a read-scoped token cannot grow the table without
+    # bound. The retention floor keeps a week for an after-action review.
+    e911_resolution_log_retention_days: int | None = Field(default=None, ge=7, le=3650)
+    e911_lookup_log_budget_per_minute: int | None = Field(default=None, ge=1, le=6000)
     # ── Appliance DNS resolver (issue #158) ───────────────────────
     resolver_mode: str | None = None
     resolver_servers: list[str] | None = None
@@ -1088,6 +1363,8 @@ class SettingsUpdate(BaseModel):
         # or inject an extra directive.
         if any(c == '"' or ord(c) < 0x20 for c in s):
             raise ValueError("proxy URL must not contain quotes or control characters")
+        if s:
+            validate_apt_authority(s)
         return s
 
     @field_validator("apt_proxy_no_proxy")
@@ -1097,6 +1374,37 @@ class SettingsUpdate(BaseModel):
         # "DIRECT";`` — reject quotes / control chars for the same reason.
         if v and any(c == '"' or ord(c) < 0x20 for c in v):
             raise ValueError("no_proxy must not contain quotes or control characters")
+        return v
+
+    # #3087 — these seed new zones and server groups, and the DNSSEC mode is
+    # rendered into named.conf, so only a value the seeded object accepts.
+    @field_validator("dns_default_ttl")
+    @classmethod
+    def _valid_dns_default_ttl(cls, v: int | None) -> int | None:
+        if v is not None and not 0 <= v <= DNS_TTL_MAX:
+            raise ValueError(f"dns_default_ttl must be between 0 and {DNS_TTL_MAX}")
+        return v
+
+    @field_validator("dns_default_zone_type")
+    @classmethod
+    def _valid_dns_default_zone_type(cls, v: str | None) -> str | None:
+        if v is not None and v not in DNS_ZONE_TYPES:
+            raise ValueError(f"dns_default_zone_type must be one of {sorted(DNS_ZONE_TYPES)}")
+        return v
+
+    @field_validator("dns_default_dnssec_validation")
+    @classmethod
+    def _valid_dns_default_dnssec(cls, v: str | None) -> str | None:
+        if v is not None and v not in DNSSEC_VALIDATION_MODES:
+            raise ValueError(
+                "dns_default_dnssec_validation must be one of " f"{sorted(DNSSEC_VALIDATION_MODES)}"
+            )
+        if v == "yes":
+            raise ValueError(
+                "dns_default_dnssec_validation 'yes' is refused: a new group has no trust "
+                "anchor and BIND9 will not load 'dnssec-validation yes' without one. Use "
+                "'auto' (the built-in root key); set 'yes' per group once it has an anchor."
+            )
         return v
 
     @field_validator("resolver_mode")
@@ -1337,6 +1645,24 @@ class SettingsUpdate(BaseModel):
             raise ValueError("colour must be a 6-digit hex value such as #b91c1c")
         return s
 
+    @field_validator("app_title")
+    @classmethod
+    def _valid_app_title(cls, v: str | None) -> str | None:
+        # Mirrors the column width (VARCHAR(255)). Without it an overlong
+        # title reached the database and came back as the catch-all 422
+        # that names no field (#2205).
+        if v is not None and len(v) > 255:
+            raise ValueError("app_title must be 255 characters or fewer")
+        return v
+
+    @field_validator("app_base_url")
+    @classmethod
+    def _valid_app_base_url(cls, v: str | None) -> str | None:
+        # Mirrors the column width (VARCHAR(500)) (#2205).
+        if v is not None and len(v) > 500:
+            raise ValueError("app_base_url must be 500 characters or fewer")
+        return v
+
     @field_validator("env_banner_text")
     @classmethod
     def _valid_env_banner_text(cls, v: str | None) -> str | None:
@@ -1391,11 +1717,13 @@ class SettingsUpdate(BaseModel):
     @classmethod
     def validate_password_min_length(cls, v: int | None) -> int | None:
         # Floor at 6 even when operators relax the policy — anything
-        # shorter is a configuration mistake. Cap at 128 because bcrypt
-        # truncates inputs above 72 bytes; values past that are dead
-        # length the operator might assume is being checked.
-        if v is not None and not (6 <= v <= 128):
-            raise ValueError("Min password length must be between 6 and 128")
+        # shorter is a configuration mistake. Cap at 72: every path that
+        # sets a password refuses one over 72 bytes (bcrypt's limit, see
+        # password_policy.MAX_PASSWORD_BYTES), so a minimum above 72 would
+        # be a policy nobody can meet and would lock every password change
+        # out (#2619).
+        if v is not None and not (6 <= v <= 72):
+            raise ValueError("Min password length must be between 6 and 72")
         return v
 
     @field_validator("password_history_count")
@@ -1424,6 +1752,13 @@ class SettingsUpdate(BaseModel):
     def validate_session_timeout(cls, v: int | None) -> int | None:
         if v is not None and v < 0:
             raise ValueError("Must be >= 0 (0 = no timeout)")
+        return v
+
+    @field_validator("auto_logout_minutes")
+    @classmethod
+    def validate_auto_logout(cls, v: int | None) -> int | None:
+        if v is not None and v < 0:
+            raise ValueError("Must be >= 0 (0 = no warning)")
         return v
 
     @field_validator(
@@ -1550,6 +1885,32 @@ class SettingsUpdate(BaseModel):
             raise ValueError(f"snmp_version must be one of {sorted(_SNMP_VERSIONS)}")
         return v
 
+    @field_validator("snmp_sys_contact", "snmp_sys_location")
+    @classmethod
+    def _valid_snmp_sys_text(cls, v: str | None, info: ValidationInfo) -> str | None:
+        # Written into a ``sysContact`` / ``sysLocation`` line of
+        # snmpd.conf. That file is line-oriented, so a newline would end the
+        # line and the rest would be read as a directive of its own.
+        if v is None:
+            return None
+        return reject_control_chars(v, info.field_name or "value")
+
+    @field_validator("snmp_community")
+    @classmethod
+    def _valid_snmp_community(cls, v: str | None) -> str | None:
+        # Written unquoted as the community token of ``rocommunity
+        # <community> <source>``: a newline would start a new directive, and
+        # a space would move the next word into the source position. ``""``
+        # clears the stored community.
+        if not v:
+            return v
+        if has_control_chars(v) or any(c.isspace() for c in v):
+            raise ValueError(
+                "snmp_community must not contain whitespace or control characters "
+                "(newline, carriage return, NUL, tab or other non-printing characters)"
+            )
+        return v
+
     @field_validator("snmp_allowed_sources")
     @classmethod
     def _valid_snmp_sources(cls, v: list[str] | None) -> list[str] | None:
@@ -1594,6 +1955,7 @@ class SettingsUpdate(BaseModel):
                 continue
             if any(c.isspace() for c in s):
                 raise ValueError(f"pool hostname may not contain whitespace: {raw!r}")
+            reject_control_chars(s, "ntp_pool_servers")
             out.append(s)
         return out
 
@@ -1739,6 +2101,44 @@ class ResolverSettingsUpdate(BaseModel):
         return self
 
 
+# ── Settings-save audit (non-negotiable #4) ────────────────────────────────────
+#
+# Some sections of the settings PUT write their own audit row (SSH, resolver,
+# syslog, APT, maintenance, supervisor registration, branding, retention and
+# the integration switches, which are feature-module rows). Every OTHER field
+# used to be saved with only a ``logger.info`` line. One extra row per save
+# covers exactly those, so a single save writes the section rows it always did
+# plus at most one "general" row; nothing is recorded twice, and the sections
+# keep their purpose-built shapes (and the redaction each needs).
+
+# Fields whose changes a dedicated section row already records.
+_SECTION_AUDITED_PREFIXES: tuple[str, ...] = (
+    "ssh_",
+    "resolver_",
+    "syslog_",
+    "apt_",
+    "maintenance_",
+    "login_banner_",
+    "env_banner_",
+)
+_SECTION_AUDITED_FIELDS: frozenset[str] = frozenset(
+    {*RETENTION_FIELDS, "app_title", "supervisor_registration_enabled"}
+)
+
+# Write-only secrets: request field -> encrypted column. The audit row shows
+# that they changed, never what they were or became.
+_SECRET_FIELD_COLUMNS: dict[str, str] = {
+    "fingerbank_api_key": "fingerbank_api_key_encrypted",
+    "snmp_community": "snmp_community_encrypted",
+    "audit_forward_webhook_url": "audit_forward_webhook_url_encrypted",
+    "audit_forward_webhook_auth_header": "audit_forward_webhook_auth_header_encrypted",
+}
+
+
+def _is_section_audited(field: str) -> bool:
+    return field in _SECTION_AUDITED_FIELDS or field.startswith(_SECTION_AUDITED_PREFIXES)
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 
@@ -1782,9 +2182,23 @@ def _column_defaults() -> dict[str, Any]:
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
 
+async def _settings_response(db: DB, settings: PlatformSettings) -> SettingsResponse:
+    """Serialise the settings row, with the integration switches read from
+    their feature modules (#2196) — the module is authoritative, and a
+    column that a module turned on before this row existed never received
+    would otherwise be reported here as off."""
+    resp = SettingsResponse.model_validate(settings)
+    return resp.model_copy(
+        update={
+            **await fm_svc.integration_flags(db),
+            "delegate_writable_fields": sorted(SETTINGS_DELEGATE_WRITABLE),
+        }
+    )
+
+
 @router.get("", response_model=SettingsResponse)
-async def get_settings(current_user: CurrentUser, db: DB) -> PlatformSettings:
-    return await _get_or_create(db)
+async def get_settings(current_user: CurrentUser, db: DB) -> SettingsResponse:
+    return await _settings_response(db, await _get_or_create(db))
 
 
 @router.get("/defaults")
@@ -1795,7 +2209,7 @@ async def get_settings_defaults(current_user: CurrentUser) -> dict[str, Any]:
 @router.put("", response_model=SettingsResponse)
 async def update_settings(
     body: SettingsUpdate, request: Request, current_user: CurrentUser, db: DB
-) -> PlatformSettings:
+) -> SettingsResponse:
     forbid_in_demo_mode("Platform settings updates are disabled")
     # Superadmin passes via user_has_permission shortcut; users with an
     # explicit `write`/`admin` grant on `settings` also pass.
@@ -1811,26 +2225,6 @@ async def update_settings(
     # reads ``changes`` as the set of fields to write or to audit.
     changes.pop("ssh_lockdown_force", None)
     changes.pop("acknowledge_console_only", None)
-
-    # CROSS-FIELD merged-state guard for the DNS resolver (#158). The
-    # model_validator already rejects override + explicitly-empty servers in
-    # the same request; this also catches the case it can't see — override
-    # selected (or already on) while the RESULTING server list is empty (e.g.
-    # servers omitted and the stored list is empty too). Override routes all
-    # host DNS to the global ``DNS=`` list, so an empty list means zero working
-    # upstream DNS. Mirrors the SSH lockout-safety merged-state check below.
-    if "resolver_mode" in changes or "resolver_servers" in changes:
-        _resolver_resulting_mode = changes.get("resolver_mode", settings.resolver_mode)
-        _resolver_resulting_servers = (
-            changes["resolver_servers"]
-            if "resolver_servers" in changes
-            else list(settings.resolver_servers or [])
-        )
-        if _resolver_resulting_mode == "override" and not _resolver_resulting_servers:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="resolver override mode requires at least one DNS server",
-            )
 
     # Branding is SUPERADMIN-ONLY (issues #885 / #887). These fields render
     # on the unauthenticated login page, so a delegated ``write:settings``
@@ -1873,6 +2267,92 @@ async def update_settings(
             detail="Appliance registration can only be changed by a superadmin",
         )
 
+    # #2196 / #2197 — an integration switch is its feature module. Popped out
+    # of ``changes`` so the generic setattr loop never writes the derived
+    # column on its own; a real change goes through the module below. Only a
+    # value that DIFFERS from the module counts, so echoing the current state
+    # back is a no-op. Superadmin-only, like the Settings → Features toggle it
+    # is equivalent to: a delegated ``write:settings`` editor must not be able
+    # to arm an integration that pulls from (and, for some, writes to) other
+    # infrastructure. Demo mode is already refused for the whole PUT above.
+    _integration_requested = {
+        f: changes.pop(f) for f in list(changes) if f in fm_svc.INTEGRATION_FIELD_TO_MODULE
+    }
+    _integration_flips: dict[str, bool] = {}
+    if _integration_requested:
+        _integration_current = await fm_svc.integration_flags(db)
+        _integration_flips = {
+            f: v for f, v in _integration_requested.items() if _integration_current[f] != v
+        }
+        if _integration_flips and not is_effective_superadmin(current_user):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Integrations can only be switched on or off by a superadmin",
+            )
+
+    # Everything else outside SETTINGS_DELEGATE_WRITABLE is superadmin-only
+    # too. The checks above keep their own wording; this one covers the rest
+    # (app_base_url, authentication and password policy, appliance host
+    # configuration, outbound connections, ...). Runs before anything is
+    # written, so a refused request changes nothing.
+    _superadmin_only = sorted(f for f in changes if f not in SETTINGS_DELEGATE_WRITABLE)
+    if _superadmin_only and not is_effective_superadmin(current_user):
+        await refuse_and_audit(
+            db,
+            current_user,
+            request,
+            action="update",
+            resource_type="platform_settings",
+            resource_id="1",
+            resource_display="Platform Settings",
+            reason="superadmin_only_settings: " + ", ".join(_superadmin_only),
+            detail=(
+                "These settings can only be changed by a superadmin: " + ", ".join(_superadmin_only)
+            ),
+        )
+
+    # CROSS-FIELD merged-state guard for the DNS resolver (#158). The
+    # model_validator already rejects override + explicitly-empty servers in
+    # the same request; this also catches the case it can't see — override
+    # selected (or already on) while the RESULTING server list is empty (e.g.
+    # servers omitted and the stored list is empty too). Override routes all
+    # host DNS to the global ``DNS=`` list, so an empty list means zero working
+    # upstream DNS. Mirrors the SSH lockout-safety merged-state check below.
+    if "resolver_mode" in changes or "resolver_servers" in changes:
+        _resolver_resulting_mode = changes.get("resolver_mode", settings.resolver_mode)
+        _resolver_resulting_servers = (
+            changes["resolver_servers"]
+            if "resolver_servers" in changes
+            else list(settings.resolver_servers or [])
+        )
+        if _resolver_resulting_mode == "override" and not _resolver_resulting_servers:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="resolver override mode requires at least one DNS server",
+            )
+
+    # #3995 — section snapshots, taken before ANY write (the SSH key list is
+    # assigned directly further down, ahead of the generic setattr loop).
+    _ssh_old = _ssh_audit_snapshot(settings)
+    _resolver_old = _resolver_audit_snapshot(settings)
+    _syslog_old = _syslog_audit_snapshot(settings)
+    _apt_old = _apt_audit_snapshot(settings)
+
+    # Old values of the fields the generic audit row below covers, taken before
+    # anything is popped or written. Secrets are reduced to set / unset and
+    # ``snmp_v3_users`` to its redacted shape.
+    _general_fields = [f for f in changes if not _is_section_audited(f)]
+    _general_old: dict[str, Any] = {}
+    for _f in _general_fields:
+        if _f in _SECRET_FIELD_COLUMNS:
+            _general_old[_f] = (
+                "<set>" if getattr(settings, _SECRET_FIELD_COLUMNS[_f]) else "<unset>"
+            )
+        elif _f == "snmp_v3_users":
+            _general_old[_f] = [_redact_v3_user(u) for u in (settings.snmp_v3_users or [])]
+        else:
+            _general_old[_f] = copy.deepcopy(getattr(settings, _f, None))
+
     # Maintenance mode (issue #57). Capture the prior enabled state before
     # the setattr loop mutates it so we can detect an actual flip (and
     # server-stamp / clear ``maintenance_started_at`` accordingly + write
@@ -1887,12 +2367,6 @@ async def update_settings(
     # loop so we can detect an actual flip and write a dedicated audit row.
     _supervisor_reg_prev = bool(settings.supervisor_registration_enabled)
     _supervisor_reg_requested = changes.get("supervisor_registration_enabled")
-
-    # Issue #155 — whether this request touched any APT field. Computed here
-    # (before the secret-bearing apt_sources / apt_gpg_keys / apt_auth get
-    # popped out of ``changes`` during processing) so an apt_sources-only
-    # change still triggers the dedicated audit row below (NN #4).
-    _apt_touched = any(f.startswith("apt_") for f in changes)
 
     # Whether this update touches any host-config field a HOSTCONFIG_ALL
     # subscriber acts on. The DHCP-agent /config long-poll folds SNMP /
@@ -1917,6 +2391,18 @@ async def update_settings(
         field.startswith(("snmp_", "ntp_", "lldp_", "syslog_", "ssh_", "resolver_", "apt_"))
         or field in _supervisor_host_config_fields
         for field in changes
+    )
+
+    # The stored Authorization header goes with the legacy webhook's URL: a new
+    # URL needs the header sent again (or cleared).
+    require_secret_with_destination_change(
+        settings,
+        changes,
+        destination=(),
+        replaced=("audit_forward_webhook_url",),
+        secrets={
+            "audit_forward_webhook_auth_header": settings.audit_forward_webhook_auth_header_encrypted
+        },
     )
 
     # fingerbank_api_key needs Fernet encryption + maps to a different
@@ -2005,16 +2491,25 @@ async def update_settings(
     # lives in apt_gpg_keys). Normalise the pydantic models to JSON dicts.
     if "apt_sources" in changes:
         changes.pop("apt_sources")
+        stored_sources = list(settings.apt_sources or [])
+        try:
+            restored_uris = [
+                restore_source_uri(s.uri, s.name, stored_sources) for s in (body.apt_sources or [])
+            ]
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"apt_sources: {exc}"
+            ) from exc
         settings.apt_sources = [
             {
                 "name": s.name,
-                "uri": s.uri,
+                "uri": uri,
                 "suites": s.suites,
                 "components": s.components,
                 "signed_by_key_id": s.signed_by_key_id,
                 "enabled": s.enabled,
             }
-            for s in (body.apt_sources or [])
+            for s, uri in zip(body.apt_sources or [], restored_uris, strict=True)
         ]
 
     # apt_gpg_keys / apt_auth: atomic replace + per-entry secret merge,
@@ -2205,6 +2700,30 @@ async def update_settings(
             ),
         )
 
+    # GHSA-j77h-pqg7-h2g4 — ``GET /settings`` masks a proxy URL's
+    # credential as ``***``; the form sends that back. Keep the stored one.
+    for field in ("apt_proxy_http", "apt_proxy_https"):
+        if field in changes:
+            try:
+                changes[field] = restore_proxy_credentials(changes[field], getattr(settings, field))
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"{field}: {exc}"
+                ) from exc
+
+    # #2273 — remember the retention windows this request changes, for the
+    # dedicated audit row below (shortening one deletes data on the next
+    # nightly prune, so old and new values are both recorded).
+    _retention_old = {
+        f: getattr(settings, f)
+        for f in RETENTION_FIELDS
+        if f in changes and getattr(settings, f) != changes[f]
+    }
+
+    # #3847 — branding values before the save, so its audit row records
+    # only what changed (and nothing when the form is echoed back).
+    _branding_old = {f: getattr(settings, f) for f in _branding_fields}
+
     for field, value in changes.items():
         # Skip the synthetic audit-only flags we just inserted.
         if field in (
@@ -2220,6 +2739,26 @@ async def update_settings(
             continue
         setattr(settings, field, value)
 
+    for field, value in _integration_flips.items():
+        module_id = fm_svc.INTEGRATION_FIELD_TO_MODULE[field]
+        await fm_svc.set_module_enabled(db, module_id, value, user_id=current_user.id)
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="update",
+                resource_type="feature_module",
+                resource_id=module_id,
+                resource_display=fm_svc.MODULES_BY_ID[module_id].label,
+                result="success",
+                new_value={"enabled": value},
+            )
+        )
+    if _integration_flips:
+        await fm_svc.sync_integration_settings_mirror(db)
+        changes.update(_integration_flips)
+
     if snmp_users_audit is not None:
         changes["snmp_v3_users"] = snmp_users_audit
     if syslog_targets_audit is not None:
@@ -2230,14 +2769,18 @@ async def update_settings(
         changes["apt_gpg_keys"] = apt_gpg_keys_audit
     if apt_auth_audit is not None:
         changes["apt_auth"] = apt_auth_audit
+    # ``changes`` is logged below; never the proxy credential.
+    for field in ("apt_proxy_http", "apt_proxy_https"):
+        if field in changes:
+            changes[field] = mask_proxy_url(changes[field])
 
     # Issue #157 — dedicated audit row for any SSH config change
     # (non-negotiable #4). SSH access is high-blast-radius (it gates who
     # can log into every appliance host), so a durable audit entry is
-    # required. Public keys are NOT secrets, so the full key list is
-    # recorded (no redaction). Fires whenever this request touched any
+    # required. Keys are recorded by fingerprint only (#3995). Fires whenever this request touched any
     # ``ssh_*`` field.
-    if _ssh_field_in_request:
+    _diff = _section_audit_diff(_ssh_old, _ssh_audit_snapshot(settings))
+    if _diff:
         db.add(
             AuditLog(
                 user_id=current_user.id,
@@ -2248,23 +2791,9 @@ async def update_settings(
                 resource_id="ssh",
                 resource_display="SSH access",
                 result="success",
-                new_value={
-                    "password_auth_enabled": bool(settings.ssh_password_auth_enabled),
-                    "allow_root_login": bool(settings.ssh_allow_root_login),
-                    "port": int(settings.ssh_port or 22),
-                    "allowed_source_networks": list(settings.ssh_allowed_source_networks or []),
-                    "lockdown": bool(settings.ssh_lockdown),
-                    "authorized_keys": [
-                        {
-                            "name": (k.get("name") or "") if isinstance(k, dict) else "",
-                            "comment": (k.get("comment") or "") if isinstance(k, dict) else "",
-                            "public_key": (
-                                (k.get("public_key") or "") if isinstance(k, dict) else ""
-                            ),
-                        }
-                        for k in (settings.ssh_authorized_keys or [])
-                    ],
-                },
+                changed_fields=_diff[0],
+                old_value=_diff[1],
+                new_value=_diff[2],
             )
         )
 
@@ -2276,8 +2805,8 @@ async def update_settings(
     # whenever this request touched any ``resolver_*`` field. Computed off
     # ``changes`` which still carries the resolver keys (they go through
     # the generic setattr loop, no special pop like ssh/syslog).
-    _resolver_touched = any(f.startswith("resolver_") for f in changes)
-    if _resolver_touched:
+    _diff = _section_audit_diff(_resolver_old, _resolver_audit_snapshot(settings))
+    if _diff:
         db.add(
             AuditLog(
                 user_id=current_user.id,
@@ -2288,14 +2817,29 @@ async def update_settings(
                 resource_id="resolver",
                 resource_display="DNS resolver",
                 result="success",
-                new_value={
-                    "mode": settings.resolver_mode,
-                    "servers": list(settings.resolver_servers or []),
-                    "fallback_servers": list(settings.resolver_fallback_servers or []),
-                    "search_domains": list(settings.resolver_search_domains or []),
-                    "dnssec": settings.resolver_dnssec,
-                    "dns_over_tls": settings.resolver_dns_over_tls,
-                },
+                changed_fields=_diff[0],
+                old_value=_diff[1],
+                new_value=_diff[2],
+            )
+        )
+
+    # #2273 — dedicated audit row for a data-retention change (non-negotiable
+    # #4; the ``logger.info`` below is not an ``audit_log`` row). Only real
+    # changes are recorded, so echoing the form back writes nothing.
+    if _retention_old:
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="update",
+                resource_type="platform_settings",
+                resource_id="retention",
+                resource_display="Data retention",
+                result="success",
+                changed_fields=sorted(_retention_old),
+                old_value=_retention_old,
+                new_value={f: getattr(settings, f) for f in _retention_old},
             )
         )
 
@@ -2305,8 +2849,8 @@ async def update_settings(
     # secret CA PEM, so a durable, redacted audit entry is required. Fires
     # whenever this request touched any ``syslog_*`` field (the targets
     # list shows only the redacted shape — no CA PEM bytes).
-    _syslog_touched = any(f.startswith("syslog_") for f in changes)
-    if _syslog_touched:
+    _diff = _section_audit_diff(_syslog_old, _syslog_audit_snapshot(settings))
+    if _diff:
         db.add(
             AuditLog(
                 user_id=current_user.id,
@@ -2317,12 +2861,9 @@ async def update_settings(
                 resource_id="syslog",
                 resource_display="Syslog forwarding",
                 result="success",
-                new_value={
-                    "enabled": bool(settings.syslog_enabled),
-                    "targets": [_redact_syslog_target(t) for t in (settings.syslog_targets or [])],
-                    "filter": settings.syslog_filter or "",
-                    "buffer_disk": bool(settings.syslog_buffer_disk),
-                },
+                changed_fields=_diff[0],
+                old_value=_diff[1],
+                new_value=_diff[2],
             )
         )
 
@@ -2333,7 +2874,8 @@ async def update_settings(
     # generic ``logger.info`` below is not an ``audit_log`` row. The shape
     # records counts + presence only (never the armoured key / password,
     # and not the raw proxy URL which may embed credentials).
-    if _apt_touched:
+    _diff = _section_audit_diff(_apt_old, _apt_audit_snapshot(settings))
+    if _diff:
         db.add(
             AuditLog(
                 user_id=current_user.id,
@@ -2344,20 +2886,9 @@ async def update_settings(
                 resource_id="apt",
                 resource_display="APT sources",
                 result="success",
-                new_value={
-                    "managed": bool(settings.apt_managed),
-                    "source_count": len(settings.apt_sources or []),
-                    "gpg_key_count": len(settings.apt_gpg_keys or []),
-                    "auth_entry_count": len(settings.apt_auth or []),
-                    "proxy_http_set": bool(settings.apt_proxy_http),
-                    "proxy_https_set": bool(settings.apt_proxy_https),
-                    "unattended_upgrades_enabled": bool(settings.apt_unattended_upgrades_enabled),
-                    # Issue #164 — unattended-upgrades policy summary.
-                    "unattended_origin_count": len(settings.apt_unattended_origins or []),
-                    "unattended_blocklist_count": len(settings.apt_unattended_blocklist or []),
-                    "unattended_automatic_reboot": bool(settings.apt_unattended_automatic_reboot),
-                    "unattended_reboot_time": settings.apt_unattended_reboot_time or "",
-                },
+                changed_fields=_diff[0],
+                old_value=_diff[1],
+                new_value=_diff[2],
             )
         )
 
@@ -2440,7 +2971,10 @@ async def update_settings(
 
     # Branding (#885 / #887 / #888) — what an anonymous visitor sees before
     # they authenticate, so every change is on the record.
-    if _branding_fields:
+    _branding_changed = sorted(
+        f for f in _branding_fields if getattr(settings, f) != _branding_old[f]
+    )
+    if _branding_changed:
         db.add(
             AuditLog(
                 user_id=current_user.id,
@@ -2451,22 +2985,47 @@ async def update_settings(
                 resource_id="branding",
                 resource_display="Branding",
                 result="success",
-                new_value={
-                    "app_title": str(settings.app_title or ""),
-                    "login_banner_enabled": bool(settings.login_banner_enabled),
-                    "login_banner_title": str(settings.login_banner_title or ""),
-                    "login_banner_text": str(settings.login_banner_text or ""),
-                    "login_banner_require_ack": bool(settings.login_banner_require_ack),
-                    "env_banner_enabled": bool(settings.env_banner_enabled),
-                    "env_banner_text": str(settings.env_banner_text or ""),
-                    "env_banner_bg": str(settings.env_banner_bg or ""),
-                    "env_banner_fg": str(settings.env_banner_fg or ""),
-                    "env_banner_position": str(settings.env_banner_position or "top"),
-                },
+                changed_fields=_branding_changed,
+                old_value={f: _branding_old[f] for f in _branding_changed},
+                new_value={f: getattr(settings, f) for f in _branding_changed},
+            )
+        )
+
+    # Every field the section rows above do not cover: one row, old and new
+    # values, secrets shown as set / cleared only. Echoing the form back (no
+    # real change) writes nothing.
+    _general_new: dict[str, Any] = {}
+    for _f in _general_fields:
+        if _f in _SECRET_FIELD_COLUMNS:
+            _general_new[_f] = "<cleared>" if changes.get(f"{_f}_cleared") else "<set>"
+        elif _f == "snmp_v3_users":
+            _general_new[_f] = snmp_users_audit
+        else:
+            _general_new[_f] = getattr(settings, _f, None)
+    _general_changed = sorted(
+        f
+        for f in _general_fields
+        if f in _SECRET_FIELD_COLUMNS or _general_new[f] != _general_old[f]
+    )
+    if _general_changed:
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="update",
+                resource_type="platform_settings",
+                resource_id="general",
+                resource_display="Platform settings",
+                result="success",
+                changed_fields=_general_changed,
+                old_value={f: _general_old[f] for f in _general_changed},
+                new_value={f: _general_new[f] for f in _general_changed},
             )
         )
 
     await db.commit()
+    targets_cache.invalidate()
     await db.refresh(settings)
 
     # Drop the middleware's process-local cache so the flipping worker
@@ -2478,6 +3037,12 @@ async def update_settings(
 
         _maintenance_mode.invalidate_cache()
 
+    # Same for the idle-session timeout the auth layer enforces.
+    if "session_timeout_minutes" in changes:
+        from app.core import session_idle as _session_idle
+
+        _session_idle.invalidate_cache()
+
     # The settings router has no request-scoped wake collector, so
     # publish directly after the commit. Only fire when a host-config
     # field actually changed so unrelated settings writes don't wake
@@ -2485,8 +3050,11 @@ async def update_settings(
     if _host_config_touched:
         await publish_wake(HOSTCONFIG_ALL)
 
+    if _integration_flips:
+        fm_svc.invalidate_cache()
+
     logger.info("platform_settings_updated", user=current_user.username, changes=changes)
-    return settings
+    return await _settings_response(db, settings)
 
 
 # ── Dedicated resolver endpoints (issue #158) ───────────────────────────────────
@@ -2511,8 +3079,9 @@ async def update_resolver_settings(
 ) -> ResolverSettingsResponse:
     """Scoped write of just the appliance DNS-resolver config (issue #158).
 
-    Same guardrails as the combined PUT: demo-mode block, ``write`` on
-    ``settings`` permission gate, a dedicated audit row (``resource_id=
+    Same guardrails as the combined PUT: demo-mode block, superadmin only
+    (the resolver_* fields are superadmin-only there too — they set the
+    appliance hosts' own DNS), a dedicated audit row (``resource_id=
     'resolver'``), and a HOSTCONFIG_ALL wake so parked supervisor / DHCP-agent
     long-polls pick the change up. Only the resolver_* columns are touched.
     """
@@ -2521,6 +3090,11 @@ async def update_resolver_settings(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Permission denied: need 'write' on 'settings'",
+        )
+    if not is_effective_superadmin(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="The appliance DNS resolver can only be changed by a superadmin",
         )
 
     settings = await _get_or_create(db)
@@ -2548,32 +3122,30 @@ async def update_resolver_settings(
             detail="resolver override mode requires at least one DNS server",
         )
 
+    _resolver_old = _resolver_audit_snapshot(settings)
     for field, value in changes.items():
         setattr(settings, field, value)
 
     # Dedicated audit row (non-negotiable #4) — resolver config steers every
-    # appliance host's DNS lookups. Resolver IPs / domains are not secrets,
-    # so the full shape is recorded.
-    db.add(
-        AuditLog(
-            user_id=current_user.id,
-            user_display_name=current_user.display_name,
-            auth_source=current_user.auth_source,
-            action="update",
-            resource_type="platform_settings",
-            resource_id="resolver",
-            resource_display="DNS resolver",
-            result="success",
-            new_value={
-                "mode": settings.resolver_mode,
-                "servers": list(settings.resolver_servers or []),
-                "fallback_servers": list(settings.resolver_fallback_servers or []),
-                "search_domains": list(settings.resolver_search_domains or []),
-                "dnssec": settings.resolver_dnssec,
-                "dns_over_tls": settings.resolver_dns_over_tls,
-            },
+    # appliance host's DNS lookups. Resolver IPs / domains are not secrets.
+    # Names only the changed fields (#3995); no row when nothing changed.
+    _diff = _section_audit_diff(_resolver_old, _resolver_audit_snapshot(settings))
+    if _diff:
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="update",
+                resource_type="platform_settings",
+                resource_id="resolver",
+                resource_display="DNS resolver",
+                result="success",
+                changed_fields=_diff[0],
+                old_value=_diff[1],
+                new_value=_diff[2],
+            )
         )
-    )
 
     await db.commit()
     await db.refresh(settings)
@@ -2611,7 +3183,7 @@ async def trigger_reverse_dns_run(current_user: CurrentUser, db: DB) -> ReverseD
     try:
         from app.tasks.reverse_dns import sweep_reverse_dns
 
-        result = sweep_reverse_dns.delay(force=True)
+        result = await dispatch(sweep_reverse_dns, force=True)
         task_id = result.id
     except Exception as exc:  # noqa: BLE001 — broker unreachable; report, don't 500
         logger.warning("reverse_dns_trigger_enqueue_failed", error=str(exc))
@@ -2723,9 +3295,9 @@ async def reveal_snmp_community(
     at least visible. Local-auth users only; external-auth users have
     no local password to re-confirm.
     """
+    from app.api.stepup import require_operator_stepup
     from app.core.crypto import decrypt_str
     from app.models.audit import AuditLog
-    from app.services.reauth import ReauthOutcome, reverify_operator
 
     def _audit_denied(reason: str) -> None:
         db.add(
@@ -2752,19 +3324,18 @@ async def reveal_snmp_community(
 
     # #408 — local users re-confirm with password or TOTP; external-auth
     # users with TOTP (enrol under Settings → Security if not yet enrolled).
-    outcome = reverify_operator(current_user, password=body.password, totp_code=body.totp_code)
-    if outcome is not ReauthOutcome.OK:
-        if outcome is ReauthOutcome.MFA_REQUIRED:
-            _audit_denied("mfa_required")
-            await db.commit()
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN,
-                "Re-confirmation requires MFA. Your account has no local "
-                "password — enrol TOTP under Settings → Security, then retry.",
-            )
-        _audit_denied("bad_credential")
-        await db.commit()
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Password or TOTP code is incorrect")
+    # #1413 — through the shared step-up, so a wrong answer spends the
+    # per-account budget like every other step-up.
+    await require_operator_stepup(
+        db,
+        current_user,
+        password=body.password,
+        totp_code=body.totp_code,
+        action="snmp_community_reveal_denied",
+        resource_type="platform_settings",
+        resource_id="snmp",
+        resource_display="SNMP community",
+    )
 
     settings = await _get_or_create(db)
     if not settings.snmp_community_encrypted:
@@ -2781,7 +3352,7 @@ async def reveal_snmp_community(
         raise HTTPException(
             status.HTTP_500_INTERNAL_SERVER_ERROR,
             "Stored community could not be decrypted (key mismatch?). "
-            "Re-set the community in Settings → Appliance → SNMP.",
+            "Re-set the community under Appliance → Fleet → Services → SNMP.",
         ) from None
 
     db.add(
@@ -2826,6 +3397,9 @@ class AptValidateResponse(BaseModel):
 
 
 @router.post("/apt/validate", response_model=AptValidateResponse)
+@token_write(
+    "Structural check of a candidate APT config, no save; kept write-scoped because it needs write on settings and may create the settings singleton row on first read"
+)
 async def validate_apt_config(
     body: AptValidateRequest,
     current_user: CurrentUser,
@@ -2924,7 +3498,7 @@ async def trigger_oui_refresh(current_user: CurrentUser, db: DB) -> OUIRefreshRe
     # into its startup path.
     from app.tasks.oui_update import update_oui_database_now  # noqa: PLC0415
 
-    result = update_oui_database_now.delay()
+    result = await dispatch(update_oui_database_now)
     logger.info("oui_refresh_triggered", user=current_user.username, task_id=result.id)
     return OUIRefreshResponse(status="queued", task_id=result.id)
 
@@ -2977,8 +3551,11 @@ _VALID_SEVERITIES = {"info", "warn", "error", "denied"}
 
 
 class AuditTargetBody(BaseModel):
-    """Create / update body. kind-specific fields are ignored for
+    """Create body. kind-specific fields are ignored for
     other kinds, so a single shape fits all three (syslog/webhook/smtp)."""
+
+    # True on the update subclass, which is checked on the merged row instead.
+    partial: ClassVar[bool] = False
 
     name: str
     enabled: bool = True
@@ -3061,6 +3638,84 @@ class AuditTargetBody(BaseModel):
             raise ValueError(f"min_severity must be one of {sorted(_VALID_SEVERITIES)}")
         return v
 
+    @model_validator(mode="after")
+    def _valid_kind_config(self) -> AuditTargetBody:
+        # Per-kind completeness (#1581), mirroring the legacy
+        # flat-settings validators below. Without this a host-less
+        # syslog / URL-less webhook target was saved enabled, then
+        # silently skipped by ``audit_forward._load_targets``, and an
+        # SMTP target with no recipients warned on every audit row.
+        if self.partial:
+            return self
+        _check_kind_config(
+            self.kind,
+            host=self.host,
+            port=self.port,
+            facility=self.facility,
+            smtp_host=self.smtp_host,
+            smtp_port=self.smtp_port,
+            smtp_from_address=self.smtp_from_address,
+            smtp_to_addresses=self.smtp_to_addresses,
+        )
+        if self.kind == "webhook":
+            # ``url`` is write-only (#1502): ``None`` keeps the stored URL,
+            # so only an explicit blank is refused here. A webhook with no
+            # URL at all is caught by ``_require_webhook_url``.
+            if self.url is not None and not self.url.strip():
+                raise ValueError("url is required for a webhook target")
+        return self
+
+
+def _check_kind_config(
+    kind: str,
+    *,
+    host: str,
+    port: int,
+    facility: int,
+    smtp_host: str,
+    smtp_port: int,
+    smtp_from_address: str,
+    smtp_to_addresses: list[str] | None,
+) -> None:
+    """Per-kind completeness of a target's final field values (#1581).
+
+    Shared by the create body validator and the update handler, which runs
+    it on the merged row (#3926): a PUT carrying one field validates the
+    result, not the partial body.
+    """
+    if kind == "syslog":
+        if not (host or "").strip():
+            raise ValueError("host is required for a syslog target")
+        if not (1 <= port <= 65535):
+            raise ValueError("port must be 1–65535")
+        if not (0 <= facility <= 23):
+            raise ValueError("facility must be 0–23 (RFC 5424)")
+    elif kind == "smtp":
+        if not (smtp_host or "").strip():
+            raise ValueError("smtp_host is required for an smtp target")
+        if not (1 <= smtp_port <= 65535):
+            raise ValueError("smtp_port must be 1–65535")
+        if not (smtp_from_address or "").strip():
+            raise ValueError("smtp_from_address is required for an smtp target")
+        recipients = [a for a in (smtp_to_addresses or []) if a and a.strip()]
+        if not recipients:
+            raise ValueError("smtp_to_addresses must contain at least one recipient")
+
+
+class AuditTargetUpdate(AuditTargetBody):
+    """PUT body: only the keys the caller sent are applied (#3926).
+
+    The Edit dialog sends just the fields the operator changed, so a field
+    another client stored since the dialog read the target is not put back.
+    Kind-dependent completeness is checked on the merged result in the
+    handler, not on this partial body.
+    """
+
+    name: str | None = None  # type: ignore[assignment]
+    kind: str | None = None  # type: ignore[assignment]
+
+    partial: ClassVar[bool] = True
+
 
 class AuditTargetResponse(BaseModel):
     id: str
@@ -3127,6 +3782,31 @@ def _target_to_response(t: AuditForwardTarget) -> AuditTargetResponse:
     )
 
 
+_AUDIT_PLAIN_FIELDS = (
+    "name",
+    "enabled",
+    "kind",
+    "format",
+    "host",
+    "port",
+    "protocol",
+    "facility",
+    "ca_cert_pem",
+    "webhook_flavor",
+    "smtp_host",
+    "smtp_port",
+    "smtp_security",
+    "smtp_username",
+    "smtp_from_address",
+    "smtp_to_addresses",
+    "smtp_reply_to",
+    "min_severity",
+    "resource_types",
+)
+# Columns that are NULL-able; an explicit null on an update clears them.
+_AUDIT_NULLABLE_FIELDS = {"ca_cert_pem", "smtp_to_addresses", "min_severity", "resource_types"}
+
+
 def _target_url_display(t: AuditForwardTarget) -> str:
     url = reveal(t.url_encrypted, field="url", target=t.name)
     if t.kind == "webhook" and t.webhook_flavor == "apprise":
@@ -3137,19 +3817,29 @@ def _target_url_display(t: AuditForwardTarget) -> str:
 async def _check_apprise_target(body: AuditTargetBody, existing: AuditForwardTarget | None) -> None:
     """422 unless an Apprise target ends up with a URL Apprise can load.
 
-    The detail never contains the URL. A target switched to or from the
-    Apprise flavor needs its URL re-entered: the stored value is the other
-    kind of URL, and a blank field means "keep it".
+    Judged on the target as it will be stored (#3926): an update body that
+    omits ``kind`` or ``webhook_flavor`` keeps the row's. The detail never
+    contains the URL. A target switched to or from the Apprise flavor needs
+    its URL re-entered: the stored value is the other kind of URL, and a
+    blank field means "keep it".
     """
-    if body.kind != "webhook":
+    sent = body.model_fields_set if body.partial else None
+
+    def merged(field: str) -> Any:
+        if existing is None or sent is None or field in sent:
+            return getattr(body, field)
+        return getattr(existing, field)
+
+    if merged("kind") != "webhook":
         return
+    flavor = merged("webhook_flavor") or "generic"
     was_apprise = (
         existing is not None
         and existing.kind == "webhook"
         and existing.webhook_flavor == "apprise"
         and bool(existing.url_encrypted)
     )
-    if body.webhook_flavor != "apprise":
+    if flavor != "apprise":
         if was_apprise and body.url is None:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -3179,35 +3869,100 @@ async def _check_apprise_target(body: AuditTargetBody, existing: AuditForwardTar
 
 
 def _apply_body(t: AuditForwardTarget, body: AuditTargetBody) -> None:
+    """Apply ``body`` to ``t``.
+
+    An :class:`AuditTargetUpdate` applies only the keys it carries (#3926);
+    a create body applies every field.
+    """
     from app.core.crypto import encrypt_str
 
-    t.name = body.name
-    t.enabled = body.enabled
-    t.kind = body.kind
-    t.format = body.format
-    t.host = body.host
-    t.port = body.port
-    t.protocol = body.protocol
-    t.facility = body.facility
-    t.ca_cert_pem = body.ca_cert_pem
-    url = body.url.strip() if body.url and body.webhook_flavor == "apprise" else body.url
+    sent = body.model_fields_set if isinstance(body, AuditTargetUpdate) else None
+    for field in _AUDIT_PLAIN_FIELDS:
+        if sent is not None and field not in sent:
+            continue
+        value = getattr(body, field)
+        if value is None and field not in _AUDIT_NULLABLE_FIELDS:
+            raise HTTPException(status_code=422, detail=f"{field} may not be null")
+        setattr(t, field, value)
+    # ``url`` / ``auth_header`` / ``smtp_password``: ``None`` or omitted
+    # keeps the stored value, ``""`` clears it, anything else is encrypted.
+    url = body.url.strip() if body.url and t.kind == "webhook" and t.webhook_flavor == "apprise" else body.url
     t.url_encrypted = apply_write_only(t.url_encrypted, url)
     t.auth_header_encrypted = apply_write_only(t.auth_header_encrypted, body.auth_header)
-    t.webhook_flavor = body.webhook_flavor
-    t.smtp_host = body.smtp_host
-    t.smtp_port = body.smtp_port
-    t.smtp_security = body.smtp_security
-    t.smtp_username = body.smtp_username
-    t.smtp_from_address = body.smtp_from_address
-    t.smtp_to_addresses = body.smtp_to_addresses
-    t.smtp_reply_to = body.smtp_reply_to
-    # ``smtp_password`` semantics: ``None`` = leave existing encrypted
-    # value alone (operator editing other fields), ``""`` = clear,
-    # anything else = encrypt + replace.
     if body.smtp_password is not None:
         t.smtp_password_encrypted = encrypt_str(body.smtp_password) if body.smtp_password else None
-    t.min_severity = body.min_severity
-    t.resource_types = body.resource_types
+
+
+def _check_merged_target(t: AuditForwardTarget, body: AuditTargetUpdate) -> None:
+    """422 when the target as it would be stored is incomplete (#3926).
+
+    Runs BEFORE :func:`_apply_body`, on the row's values overlaid with the
+    keys the body carries, so one field sent for a syslog target is judged
+    against the host it already has, not against the webhook fields it does
+    not carry, and a refusal leaves the row untouched.
+    """
+    sent = body.model_fields_set
+
+    def merged(field: str) -> Any:
+        return getattr(body, field) if field in sent else getattr(t, field)
+
+    for field in _AUDIT_PLAIN_FIELDS:
+        if field in sent and getattr(body, field) is None and field not in _AUDIT_NULLABLE_FIELDS:
+            raise HTTPException(status_code=422, detail=f"{field} may not be null")
+    to_addrs = merged("smtp_to_addresses")
+    kind = merged("kind")
+    try:
+        _check_kind_config(
+            kind,
+            host=merged("host") or "",
+            port=merged("port"),
+            facility=merged("facility"),
+            smtp_host=merged("smtp_host") or "",
+            smtp_port=int(merged("smtp_port") or 0),
+            smtp_from_address=merged("smtp_from_address") or "",
+            smtp_to_addresses=list(to_addrs) if to_addrs else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if kind == "webhook":
+        if body.url is not None and not body.url.strip():
+            raise HTTPException(status_code=422, detail="url is required for a webhook target")
+        if body.url is None and not t.url_encrypted:
+            raise HTTPException(status_code=422, detail="url is required for a webhook target")
+    # The stored Authorization header and SMTP password go with the target's
+    # destination: a new webhook URL or SMTP server needs them sent again.
+    carried = {f: getattr(body, f) for f in sent}
+    if kind == "webhook":
+        require_secret_with_destination_change(
+            t,
+            carried,
+            destination=(),
+            replaced=("url",),
+            secrets={"auth_header": t.auth_header_encrypted},
+        )
+    elif kind == "smtp":
+        require_secret_with_destination_change(
+            t,
+            carried,
+            destination=("smtp_host", "smtp_port"),
+            secrets={"smtp_password": t.smtp_password_encrypted},
+        )
+
+
+def _require_webhook_url(body: AuditTargetBody, stored: bytes | None) -> None:
+    """Refuse a webhook target that would end up with no URL (#1581).
+
+    The body validator can't see the stored value, and an omitted ``url``
+    means "keep it", so this runs in the handler: on create there is
+    nothing to keep, on update there is only if the row already has one.
+    An empty bytea is *not* a stored URL: an exclude-secrets restore
+    writes ``b""`` into the encrypted column, and treating that as set
+    let a blank URL through while the target silently stopped
+    delivering. Empty bytes are unset everywhere (here, ``url_set``
+    and the audit snapshot).
+    """
+    if body.kind == "webhook" and body.url is None and not stored:
+        raise HTTPException(status_code=422, detail="url is required for a webhook target")
 
 
 def _save_error(exc: Exception, body: AuditTargetBody) -> str:
@@ -3222,10 +3977,67 @@ def _save_error(exc: Exception, body: AuditTargetBody) -> str:
     return redact(reason, body.url or "", body.auth_header or "", body.smtp_password or "")
 
 
+def _forward_snapshot(t: AuditForwardTarget) -> dict:
+    """Audit snapshot of an audit-forward target.
+
+    Never carries the webhook URL, ``auth_header`` or SMTP password
+    (nor the CA cert) — only ``*_set`` booleans for those, per #1502 /
+    PR #1506: the audit log must not become a copy of the secrets it
+    describes.
+    """
+    return {
+        "name": t.name,
+        "enabled": t.enabled,
+        "kind": t.kind,
+        "format": t.format,
+        "host": t.host,
+        "port": t.port,
+        "protocol": t.protocol,
+        "facility": t.facility,
+        "ca_cert_pem_set": bool(t.ca_cert_pem),
+        # bool(), not "is not None": an exclude-secrets restore leaves an
+        # empty bytea, which is unset, not a configured secret.
+        "url_set": bool(t.url_encrypted),
+        "auth_header_set": bool(t.auth_header_encrypted),
+        "webhook_flavor": t.webhook_flavor,
+        "smtp_host": t.smtp_host,
+        "smtp_port": t.smtp_port,
+        "smtp_security": t.smtp_security,
+        "smtp_username": t.smtp_username,
+        "smtp_password_set": bool(t.smtp_password_encrypted),
+        "smtp_from_address": t.smtp_from_address,
+        "smtp_to_addresses": list(t.smtp_to_addresses) if t.smtp_to_addresses else None,
+        "smtp_reply_to": t.smtp_reply_to,
+        "min_severity": t.min_severity,
+        "resource_types": t.resource_types,
+    }
+
+
+def _audit_forward_target(
+    db: DB,
+    current_user: CurrentUser,
+    action: str,
+    row: AuditForwardTarget,
+    old_value: dict | None = None,
+) -> None:
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action=action,
+            resource_type="audit_forward_target",
+            resource_id=str(row.id),
+            resource_display=row.name,
+            result="success",
+            old_value=old_value,
+            new_value=None if action == "delete" else _forward_snapshot(row),
+        )
+    )
+
+
 @router.get("/audit-forward-targets", response_model=list[AuditTargetResponse])
-async def list_audit_targets(current_user: CurrentUser, db: DB) -> list[AuditTargetResponse]:
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+async def list_audit_targets(current_user: SuperAdmin, db: DB) -> list[AuditTargetResponse]:
     res = await db.execute(select(AuditForwardTarget).order_by(AuditForwardTarget.name))
     return [_target_to_response(t) for t in res.scalars().all()]
 
@@ -3236,17 +4048,19 @@ async def list_audit_targets(current_user: CurrentUser, db: DB) -> list[AuditTar
     status_code=status.HTTP_201_CREATED,
 )
 async def create_audit_target(
-    body: AuditTargetBody, current_user: CurrentUser, db: DB
+    body: AuditTargetBody, current_user: SuperAdmin, db: DB
 ) -> AuditTargetResponse:
     forbid_in_demo_mode("Audit-forward target creation is disabled")
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    _require_webhook_url(body, None)
     await _check_apprise_target(body, None)
     row = AuditForwardTarget()
     _apply_body(row, body)
     db.add(row)
+    await db.flush()
+    _audit_forward_target(db, current_user, "create", row)
     try:
         await db.commit()
+        targets_cache.invalidate()
     except Exception as exc:  # noqa: BLE001 — name collisions land here
         await db.rollback()
         raise HTTPException(
@@ -3261,20 +4075,22 @@ async def update_audit_target(
     # uuid.UUID, not str: a non-UUID path value used to reach the driver and
     # surface as a bind-time 500 (live: target_id='0'); typed, it is a 422.
     target_id: uuid.UUID,
-    body: AuditTargetBody,
-    current_user: CurrentUser,
+    body: AuditTargetUpdate,
+    current_user: SuperAdmin,
     db: DB,
 ) -> AuditTargetResponse:
     forbid_in_demo_mode("Audit-forward target updates are disabled")
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     row = await db.get(AuditForwardTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Target not found")
+    old_value = _forward_snapshot(row)
+    _check_merged_target(row, body)
     await _check_apprise_target(body, row)
     _apply_body(row, body)
+    _audit_forward_target(db, current_user, "update", row, old_value=old_value)
     try:
         await db.commit()
+        targets_cache.invalidate()
     except Exception as exc:  # noqa: BLE001
         await db.rollback()
         raise HTTPException(
@@ -3285,28 +4101,29 @@ async def update_audit_target(
 
 
 @router.delete("/audit-forward-targets/{target_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_audit_target(target_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+async def delete_audit_target(target_id: uuid.UUID, current_user: SuperAdmin, db: DB) -> None:
     row = await db.get(AuditForwardTarget, target_id)
     if row is None:
         return
+    _audit_forward_target(db, current_user, "delete", row, old_value=_forward_snapshot(row))
     await db.delete(row)
     await db.commit()
+    targets_cache.invalidate()
 
 
 @router.post("/audit-forward-targets/{target_id}/test")
 async def test_audit_target(
-    target_id: uuid.UUID, current_user: CurrentUser, db: DB
+    target_id: uuid.UUID, current_user: SuperAdmin, db: DB
 ) -> dict[str, Any]:
     """Send a synthetic event to one target and report success / error.
+
+    A UDP syslog target answers ``status: "sent"`` (``confirmed: false``), not
+    ``ok``: UDP cannot confirm delivery (#4237).
 
     The event is flagged ``action="test_forward"`` so the operator can
     filter it out in the collector if they want. Doesn't land in
     ``audit_log`` — this is explicit probe traffic, not an audit.
     """
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     row = await db.get(AuditForwardTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Target not found")
@@ -3366,17 +4183,34 @@ async def test_audit_target(
         "min_severity": None,  # ignore filter on a probe
         "resource_types": None,
     }
-    # An Apprise failure is raised, not just logged, so the operator sees
-    # the service's own reason ("chat not found"), already redacted. The
-    # other kinds keep their log-and-continue behaviour here.
-    is_apprise = row.kind == "webhook" and row.webhook_flavor == "apprise"
+    reasons: list[str] = []
     try:
-        await audit_forward_svc._deliver_to_target(  # noqa: SLF001
-            target_dict, payload, raise_errors=is_apprise
+        outcome = await audit_forward_svc._deliver_to_target(  # noqa: SLF001
+            target_dict, payload, reasons
         )
     except Exception as exc:  # noqa: BLE001
-        reason = redact(str(exc), url, auth_header, smtp_password)
+        reason = audit_forward_svc._failure_reason(  # noqa: SLF001
+            exc, url, auth_header, smtp_password
+        )
         raise HTTPException(status_code=502, detail=f"delivery failed: {reason}") from exc
+    if outcome != audit_forward_svc.DELIVERED:
+        # #1577: a filtered target, a misconfigured one, or a rejected
+        # webhook used to report "ok" here because delivery was merely
+        # attempted.
+        # #3931: say why, not just the outcome word (already redacted).
+        raise HTTPException(
+            status_code=502, detail=f"delivery failed: {reasons[0] if reasons else outcome}"
+        )
+    if row.kind == "syslog" and row.protocol == "udp":
+        # #4237: UDP only hands a datagram to the network. Nothing connects
+        # first, so a wrong host, port or firewall looks exactly like success;
+        # never claim a delivery here. The real forwarder is unchanged.
+        return {
+            "status": "sent",
+            "target": row.name,
+            "confirmed": False,
+            "detail": "sent over UDP: delivery cannot be confirmed",
+        }
     return {"status": "ok", "target": row.name}
 
 
@@ -3404,14 +4238,17 @@ class InfluxDBTargetBody(BaseModel):
     # v1
     database: str = ""
     username: str = ""
-    # ``None`` = leave the stored value alone (the operator is editing
-    # another field), ``""`` = clear, anything else = encrypt + replace.
-    # Same three-way contract as ``AuditTargetBody.smtp_password``.
+    # Secrets are write-only. ``None`` or ``""`` = keep the stored value
+    # (a form whose field was typed in and cleared sends ``""``, and that
+    # must not wipe the credential, #1989); anything else = encrypt +
+    # replace. Removing one takes the explicit ``clear_*`` flag.
     password: str | None = None
+    clear_password: bool = False
     # v2 / v3
     org: str = ""
     bucket: str = ""
     token: str | None = None
+    clear_token: bool = False
     measurement_prefix: str = Field(default=DEFAULT_MEASUREMENT_PREFIX, max_length=64)
     push_interval_seconds: int = Field(
         default=DEFAULT_PUSH_INTERVAL_SECONDS, ge=MIN_PUSH_INTERVAL_SECONDS, le=86400
@@ -3448,6 +4285,17 @@ class InfluxDBTargetBody(BaseModel):
         return v
 
 
+class InfluxDBTargetUpdate(InfluxDBTargetBody):
+    """PUT body: only the keys the caller sent are applied (#3926).
+
+    A client that sends the whole form back puts the copy it loaded over
+    anything another client stored since; an omitted key is left as stored,
+    so the Edit dialog sends just what the operator changed.
+    """
+
+    name: str | None = Field(default=None, min_length=1, max_length=128)  # type: ignore[assignment]
+
+
 class InfluxDBTargetResponse(BaseModel):
     id: str
     name: str
@@ -3469,7 +4317,11 @@ class InfluxDBTargetResponse(BaseModel):
     push_dhcp_metrics: bool
     push_subnet_utilization: bool
     push_dhcp_scope_leases: bool
+    # The last ATTEMPT (moves on failure so the interval gate holds).
     last_push_at: datetime | None
+    # The last push the destination accepted; NULL = never (#1990).
+    last_success_at: datetime | None
+    # Point count of that successful push.
     last_push_points: int
     last_push_error: str | None
     last_dns_bucket_at: datetime | None
@@ -3500,6 +4352,7 @@ def _influx_to_response(t: InfluxDBTarget) -> InfluxDBTargetResponse:
         push_subnet_utilization=bool(t.push_subnet_utilization),
         push_dhcp_scope_leases=bool(t.push_dhcp_scope_leases),
         last_push_at=t.last_push_at,
+        last_success_at=t.last_success_at,
         last_push_points=int(t.last_push_points or 0),
         last_push_error=t.last_push_error,
         last_dns_bucket_at=t.last_dns_bucket_at,
@@ -3509,29 +4362,62 @@ def _influx_to_response(t: InfluxDBTarget) -> InfluxDBTargetResponse:
     )
 
 
-def _apply_influx_body(t: InfluxDBTarget, body: InfluxDBTargetBody) -> None:
+_INFLUX_PLAIN_FIELDS = (
+    "name",
+    "enabled",
+    "version",
+    "url",
+    "verify_tls",
+    "timeout_seconds",
+    "database",
+    "username",
+    "org",
+    "bucket",
+    "measurement_prefix",
+    "push_interval_seconds",
+    "push_dns_metrics",
+    "push_dhcp_metrics",
+    "push_subnet_utilization",
+    "push_dhcp_scope_leases",
+)
+
+
+def _apply_influx_body(t: InfluxDBTarget, body: InfluxDBTargetBody) -> list[str]:
+    """Apply ``body`` to ``t``; return which secrets were set or cleared.
+
+    The return value is for the audit row, which never carries a secret but
+    must say that one was replaced or removed (``password_set`` /
+    ``token_cleared`` …), or a cleared credential leaves no trace.
+
+    A :class:`InfluxDBTargetUpdate` applies only the keys it carries (#3926);
+    a create body applies every field.
+    """
     from app.core.crypto import encrypt_str
 
-    t.name = body.name
-    t.enabled = body.enabled
-    t.version = body.version
-    t.url = body.url
-    t.verify_tls = body.verify_tls
-    t.timeout_seconds = body.timeout_seconds
-    t.database = body.database
-    t.username = body.username
-    t.org = body.org
-    t.bucket = body.bucket
-    t.measurement_prefix = body.measurement_prefix
-    t.push_interval_seconds = body.push_interval_seconds
-    t.push_dns_metrics = body.push_dns_metrics
-    t.push_dhcp_metrics = body.push_dhcp_metrics
-    t.push_subnet_utilization = body.push_subnet_utilization
-    t.push_dhcp_scope_leases = body.push_dhcp_scope_leases
-    if body.password is not None:
-        t.password_encrypted = encrypt_str(body.password) if body.password else None
-    if body.token is not None:
-        t.token_encrypted = encrypt_str(body.token) if body.token else None
+    sent = body.model_fields_set if isinstance(body, InfluxDBTargetUpdate) else None
+    for field in _INFLUX_PLAIN_FIELDS:
+        if sent is not None and field not in sent:
+            continue
+        value = getattr(body, field)
+        if value is None:  # an explicit null name on an update
+            raise HTTPException(status_code=422, detail=f"{field} may not be null")
+        setattr(t, field, value)
+    # Blank never clears; only the explicit flag does. A non-blank value
+    # sent alongside the flag wins over it: the operator typed a new secret.
+    secret_changes: list[str] = []
+    if body.password:
+        t.password_encrypted = encrypt_str(body.password)
+        secret_changes.append("password_set")
+    elif body.clear_password and t.password_encrypted:
+        t.password_encrypted = None
+        secret_changes.append("password_cleared")
+    if body.token:
+        t.token_encrypted = encrypt_str(body.token)
+        secret_changes.append("token_set")
+    elif body.clear_token and t.token_encrypted:
+        t.token_encrypted = None
+        secret_changes.append("token_cleared")
+    return secret_changes
 
 
 def _assert_influx_writable(t: InfluxDBTarget) -> None:
@@ -3563,7 +4449,13 @@ def _assert_influx_writable(t: InfluxDBTarget) -> None:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-def _audit_influx(db: DB, current_user: CurrentUser, action: str, row: InfluxDBTarget) -> None:
+def _audit_influx(
+    db: DB,
+    current_user: CurrentUser,
+    action: str,
+    row: InfluxDBTarget,
+    secret_changes: list[str] | None = None,
+) -> None:
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -3593,6 +4485,11 @@ def _audit_influx(db: DB, current_user: CurrentUser, action: str, row: InfluxDBT
                     "push_dhcp_metrics": row.push_dhcp_metrics,
                     "push_subnet_utilization": row.push_subnet_utilization,
                     "push_dhcp_scope_leases": row.push_dhcp_scope_leases,
+                    # Presence only, and what this request did to it (#1989):
+                    # a cleared credential is a change the audit must show.
+                    "password_set": bool(row.password_encrypted),
+                    "token_set": bool(row.token_encrypted),
+                    "secret_changes": secret_changes or [],
                 }
             ),
         )
@@ -3600,9 +4497,7 @@ def _audit_influx(db: DB, current_user: CurrentUser, action: str, row: InfluxDBT
 
 
 @router.get("/influxdb-targets", response_model=list[InfluxDBTargetResponse])
-async def list_influxdb_targets(current_user: CurrentUser, db: DB) -> list[InfluxDBTargetResponse]:
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+async def list_influxdb_targets(current_user: SuperAdmin, db: DB) -> list[InfluxDBTargetResponse]:
     res = await db.execute(select(InfluxDBTarget).order_by(InfluxDBTarget.name))
     return [_influx_to_response(t) for t in res.scalars().all()]
 
@@ -3613,22 +4508,21 @@ async def list_influxdb_targets(current_user: CurrentUser, db: DB) -> list[Influ
     status_code=status.HTTP_201_CREATED,
 )
 async def create_influxdb_target(
-    body: InfluxDBTargetBody, current_user: CurrentUser, db: DB
+    body: InfluxDBTargetBody, current_user: SuperAdmin, db: DB
 ) -> InfluxDBTargetResponse:
     forbid_in_demo_mode("InfluxDB target creation is disabled")
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     row = InfluxDBTarget()
-    _apply_influx_body(row, body)
+    secret_changes = _apply_influx_body(row, body)
     _assert_influx_writable(row)
     db.add(row)
     await db.flush()
-    _audit_influx(db, current_user, "create", row)
+    _audit_influx(db, current_user, "create", row, secret_changes)
     try:
         await db.commit()
     except Exception as exc:  # noqa: BLE001 — name collisions land here
         await db.rollback()
-        raise HTTPException(status_code=400, detail=f"create failed: {exc}") from exc
+        logger.warning("influxdb_target_create_failed", error=str(exc))
+        raise HTTPException(status_code=400, detail="create failed") from exc
     await db.refresh(row)
     return _influx_to_response(row)
 
@@ -3636,32 +4530,46 @@ async def create_influxdb_target(
 @router.put("/influxdb-targets/{target_id}", response_model=InfluxDBTargetResponse)
 async def update_influxdb_target(
     target_id: uuid.UUID,
-    body: InfluxDBTargetBody,
-    current_user: CurrentUser,
+    body: InfluxDBTargetUpdate,
+    current_user: SuperAdmin,
     db: DB,
 ) -> InfluxDBTargetResponse:
     forbid_in_demo_mode("InfluxDB target updates are disabled")
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     row = await db.get(InfluxDBTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Target not found")
-    _apply_influx_body(row, body)
+    sent_fields = {f: getattr(body, f) for f in body.model_fields_set}
+    # A clear flag is the other way to say what happens to the stored secret.
+    if body.clear_password:
+        sent_fields["password"] = ""
+    if body.clear_token:
+        sent_fields["token"] = ""
+    require_secret_with_destination_change(
+        row,
+        sent_fields,
+        destination=("url",),
+        secrets={"password": row.password_encrypted, "token": row.token_encrypted},
+    )
+    secret_changes = _apply_influx_body(row, body)
     _assert_influx_writable(row)
-    _audit_influx(db, current_user, "update", row)
+    # Flush before the try, as create does: a taken name raises its unique
+    # violation here, where the application's IntegrityError handler turns it
+    # into the same 409 Create gives (#2750), instead of the driver's text
+    # (statement and parameters included) becoming the response detail.
+    await db.flush()
+    _audit_influx(db, current_user, "update", row, secret_changes)
     try:
         await db.commit()
     except Exception as exc:  # noqa: BLE001
         await db.rollback()
-        raise HTTPException(status_code=400, detail=f"update failed: {exc}") from exc
+        logger.warning("influxdb_target_update_failed", error=str(exc))
+        raise HTTPException(status_code=400, detail="update failed") from exc
     await db.refresh(row)
     return _influx_to_response(row)
 
 
 @router.delete("/influxdb-targets/{target_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_influxdb_target(target_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+async def delete_influxdb_target(target_id: uuid.UUID, current_user: SuperAdmin, db: DB) -> None:
     row = await db.get(InfluxDBTarget, target_id)
     if row is None:
         return
@@ -3678,7 +4586,7 @@ class InfluxDBTestResponse(BaseModel):
 
 @router.post("/influxdb-targets/{target_id}/test", response_model=InfluxDBTestResponse)
 async def test_influxdb_target(
-    target_id: uuid.UUID, current_user: CurrentUser, db: DB
+    target_id: uuid.UUID, current_user: SuperAdmin, db: DB
 ) -> InfluxDBTestResponse:
     """Write one synthetic point and report the server's verdict.
 
@@ -3689,8 +4597,6 @@ async def test_influxdb_target(
     contaminates a real series, and the watermarks are untouched — this
     is a probe, not a push.
     """
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     row = await db.get(InfluxDBTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Target not found")
@@ -3841,7 +4747,7 @@ class BrandingLogoInfo(BaseModel):
 
 @router.put("/branding/logo", response_model=BrandingLogoInfo)
 async def upload_branding_logo(
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
     file: UploadFile = File(..., description="PNG image, 512 KB maximum."),
 ) -> BrandingLogoInfo:
@@ -3852,11 +4758,6 @@ async def upload_branding_logo(
     into stored XSS against every visitor, including unauthenticated ones.
     """
     forbid_in_demo_mode("Branding changes are disabled")
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Branding can only be changed by a superadmin",
-        )
 
     # Read with one byte of headroom so an oversized upload is detected
     # rather than silently truncated to the limit.
@@ -3930,14 +4831,9 @@ async def upload_branding_logo(
 
 
 @router.delete("/branding/logo", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_branding_logo(current_user: CurrentUser, db: DB) -> Response:
+async def delete_branding_logo(current_user: SuperAdmin, db: DB) -> Response:
     """Drop the custom logo; the UI falls back to the bundled asset."""
     forbid_in_demo_mode("Branding changes are disabled")
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Branding can only be changed by a superadmin",
-        )
 
     row = (
         await db.execute(

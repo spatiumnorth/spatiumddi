@@ -15,25 +15,34 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from email.utils import format_datetime
+from types import SimpleNamespace
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, HTTPException, Request, Response, status
+from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import attributes
 
-from app.api.deps import DB, CurrentUser
+from app.api.deps import DB, SuperAdmin
+from app.api.pre_body_auth import PreBodyAuthRoute
 from app.core.content_disposition import content_disposition
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.http_etag import etag_matches, format_etag
-from app.core.permissions import is_effective_superadmin
 from app.core.responses import ZipResponse
+from app.core.stored_secret_guard import require_secret_with_destination_change
 from app.models.audit import AuditLog
 from app.models.backup import BackupTarget
+from app.services.api_token_scopes import token_outbound
+from app.services.backup import node_local
+from app.services.backup.archive import MAX_ARCHIVE_BYTES
 from app.services.backup.crypto import HINT_REVEALS_PASSPHRASE, hint_reveals_passphrase
-from app.services.backup.runner import run_backup_for_target
+from app.services.backup.runner import (
+    BackupRunBusyError,
+    reap_stale_backup_run,
+    run_backup_for_target,
+)
 from app.services.backup.schedule import (
     InvalidCronExpression,
     compute_next_run,
@@ -41,22 +50,77 @@ from app.services.backup.schedule import (
 )
 from app.services.backup.targets import (
     ARCHIVE_NAME_RE,
+    ArchiveNotFoundError,
+    ArchiveTooLargeError,
     BackupDestinationError,
     DestinationConfigError,
     InvalidArchiveNameError,
     SecretFieldError,
     UnsupportedOperationError,
+    check_config_value_types,
     decrypt_config_secrets,
     encrypt_config_secrets,
     get_destination,
+    is_pre_restore_archive,
     list_destination_kinds,
     merge_config_for_update,
+    normalize_config_for_create,
     redact_config_secrets,
     safe_filename,
+    secret_field_names,
 )
+from app.services.backup.targets.base import BackupDestination
+from app.services.backup.targets.secrets_config import ENC_PREFIX, REDACTED_SENTINEL
 
-router = APIRouter()
+# nginx admits up to 2 GiB on /api/v1/backup/ with request buffering off,
+# so every body here is authorised from its headers before it is read
+# (app.api.pre_body_auth).
+router = APIRouter(route_class=PreBodyAuthRoute)
 logger = structlog.get_logger(__name__)
+
+
+def _enforce_download_size(size_bytes: int, *, filename: str) -> None:
+    """Refuse a destination download past the archive size cap (#1568).
+
+    The 2 GB ceiling used to apply only to archives uploaded TO the
+    api; an archive fetched FROM a destination had no cap, so a
+    shared or compromised destination could serve an unbounded
+    payload into api memory (and into restore). Callers with a
+    listing check the declared size before downloading and the
+    actual length after.
+    """
+    if size_bytes > MAX_ARCHIVE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"archive {filename!r} is {size_bytes} bytes, which exceeds the "
+                f"{MAX_ARCHIVE_BYTES}-byte cap for destination downloads"
+            ),
+        )
+
+
+async def _enforce_declared_size(driver: Any, plain_config: dict[str, Any], filename: str) -> None:
+    """Refuse a named archive the destination's listing declares past the cap.
+
+    Runs before the download so an oversized archive is refused without a
+    byte of it being read. A listing that fails, or that does not carry the
+    name, refuses nothing here: the download then reports the destination
+    failure or the miss itself, and every driver's ``download`` stops at
+    ``max_bytes`` on its own.
+    """
+    try:
+        archives = await driver.list_archives(config=plain_config)
+    except BackupDestinationError:
+        return
+    for archive in archives:
+        if archive.filename == filename:
+            _enforce_download_size(archive.size_bytes, filename=filename)
+            return
+
+
+def _too_large(exc: ArchiveTooLargeError) -> HTTPException:
+    """413 for an archive a driver stopped reading at the cap."""
+    return HTTPException(status_code=413, detail=str(exc))
 
 
 # Pulled from the driver registry rather than hardcoded so new
@@ -117,14 +181,6 @@ def _assert_hint_keeps_passphrase_secret(passphrase: str | None, hint: str | Non
         raise HTTPException(status_code=422, detail=HINT_REVEALS_PASSPHRASE)
 
 
-def _require_superadmin(current_user: CurrentUser) -> None:
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Backup targets are restricted to superadmin",
-        )
-
-
 def _archive_name(filename: str) -> str:
     """Refuse a caller-supplied archive name that is not one of ours (#1243).
 
@@ -168,8 +224,8 @@ class BackupTargetCreate(BaseModel):
     passphrase: str = Field(..., min_length=8, max_length=512)
     passphrase_hint: str = Field("", max_length=200)
     schedule_cron: str | None = Field(default=None, max_length=120)
-    retention_keep_last_n: int | None = Field(default=None, ge=0, le=10_000)
-    retention_keep_days: int | None = Field(default=None, ge=0, le=10_000)
+    retention_keep_last_n: int | None = Field(default=None, ge=1, le=10_000)
+    retention_keep_days: int | None = Field(default=None, ge=1, le=10_000)
     write_only: bool = False
 
     @field_validator("kind")
@@ -181,6 +237,9 @@ class BackupTargetCreate(BaseModel):
         return v
 
 
+_NULLABLE_UPDATE_KEYS = frozenset({"retention_keep_last_n", "retention_keep_days"})
+
+
 class BackupTargetUpdate(BaseModel):
     """Partial update — only the explicitly-supplied fields are
     overwritten. Passphrase has its own dedicated rotation
@@ -189,18 +248,18 @@ class BackupTargetUpdate(BaseModel):
     validator below.
     """
 
-    name: str | None = None
-    description: str | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=500)
     enabled: bool | None = None
     config: dict[str, Any] | None = None
     passphrase: str | None = Field(default=None, min_length=8, max_length=512)
-    passphrase_hint: str | None = None
-    schedule_cron: str | None = None
-    retention_keep_last_n: int | None = Field(default=None, ge=0, le=10_000)
-    retention_keep_days: int | None = Field(default=None, ge=0, le=10_000)
+    passphrase_hint: str | None = Field(default=None, max_length=200)
+    schedule_cron: str | None = Field(default=None, max_length=120)
+    retention_keep_last_n: int | None = Field(default=None, ge=1, le=10_000)
+    retention_keep_days: int | None = Field(default=None, ge=1, le=10_000)
     write_only: bool | None = None
     drill_enabled: bool | None = None
-    drill_cron: str | None = None
+    drill_cron: str | None = Field(default=None, max_length=120)
 
 
 class BackupTargetResponse(BaseModel):
@@ -219,6 +278,10 @@ class BackupTargetResponse(BaseModel):
     last_run_status: str
     last_run_at: datetime | None
     last_run_filename: str | None
+    # The node whose pod wrote ``last_run_filename`` (#1838). For a
+    # node-local ``local_volume`` target on a multi-node appliance this is
+    # where that archive is. Null when unknown (pre-#1838 run, Compose).
+    last_run_node: str | None = None
     last_run_bytes: int | None
     last_run_duration_ms: int | None
     last_run_error: str | None
@@ -260,6 +323,7 @@ def _to_response(t: BackupTarget) -> BackupTargetResponse:
         last_run_status=t.last_run_status,
         last_run_at=t.last_run_at,
         last_run_filename=t.last_run_filename,
+        last_run_node=t.last_run_node,
         last_run_bytes=t.last_run_bytes,
         last_run_duration_ms=t.last_run_duration_ms,
         last_run_error=t.last_run_error,
@@ -290,27 +354,24 @@ class BackupTargetKinds(BaseModel):
 
 
 @router.get("/kinds", response_model=BackupTargetKinds)
-async def list_kinds(current_user: CurrentUser) -> BackupTargetKinds:
+async def list_kinds(current_user: SuperAdmin) -> BackupTargetKinds:
     """Catalog of available destination kinds + their config-field
     descriptors. The frontend reflects on these to render the
     per-kind config form.
     """
-    _require_superadmin(current_user)
     return BackupTargetKinds(kinds=list_destination_kinds())
 
 
 @router.get("", response_model=list[BackupTargetResponse])
-async def list_targets(db: DB, current_user: CurrentUser) -> list[BackupTargetResponse]:
-    _require_superadmin(current_user)
+async def list_targets(db: DB, current_user: SuperAdmin) -> list[BackupTargetResponse]:
     rows = (await db.execute(select(BackupTarget).order_by(BackupTarget.name))).scalars().all()
     return [_to_response(r) for r in rows]
 
 
 @router.get("/{target_id}", response_model=BackupTargetResponse)
 async def get_target(
-    target_id: uuid.UUID, db: DB, current_user: CurrentUser
+    target_id: uuid.UUID, db: DB, current_user: SuperAdmin
 ) -> BackupTargetResponse:
-    _require_superadmin(current_user)
     row = await db.get(BackupTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="backup target not found")
@@ -319,10 +380,9 @@ async def get_target(
 
 @router.post("", response_model=BackupTargetResponse, status_code=201)
 async def create_target(
-    body: BackupTargetCreate, db: DB, current_user: CurrentUser
+    body: BackupTargetCreate, db: DB, current_user: SuperAdmin
 ) -> BackupTargetResponse:
     forbid_in_demo_mode("Backup target creation is disabled")
-    _require_superadmin(current_user)
     if body.retention_keep_last_n is not None and body.retention_keep_days is not None:
         raise HTTPException(
             status_code=422,
@@ -334,7 +394,28 @@ async def create_target(
     _assert_hint_keeps_passphrase_secret(body.passphrase, body.passphrase_hint)
 
     driver = get_destination(body.kind)
+    # ``__enc__:`` marks stored ciphertext. A value arriving on create is
+    # never that: accepting it would skip the driver's checks (a driver may
+    # treat it as an already-validated stored secret) and be stored unwrapped.
+    for name in sorted(secret_field_names(driver)):
+        value = body.config.get(name)
+        # ``<set>`` is what a read shows for a stored secret. On Edit it means
+        # "keep the stored one"; on Add nothing is stored, so it would be saved
+        # as the secret itself (#3846).
+        if value == REDACTED_SENTINEL:
+            raise HTTPException(
+                status_code=422,
+                detail=f"'{name}' must be the secret itself, not the '<set>' placeholder",
+            )
+        if isinstance(value, str) and value.startswith(ENC_PREFIX):
+            raise HTTPException(
+                status_code=422,
+                detail=f"'{name}' must be the secret itself, not a stored '{ENC_PREFIX}' value",
+            )
     try:
+        check_config_value_types(driver, body.config)
+        # Same auth-mode rules as Edit (#3696): one mode, no unused credential.
+        body.config = normalize_config_for_create(driver, body.config)
         driver.validate_config(body.config)
         # Second pass, allowed to resolve DNS (the https_put SSRF guard).
         # Only at create / update / test — never on the scheduled-run
@@ -387,6 +468,7 @@ async def create_target(
         next_run_at=next_run,
     )
     db.add(row)
+    await db.flush()  # column-default id must exist before the audit row reads it (#2006)
     db.add(
         AuditLog(
             action="create",
@@ -409,19 +491,59 @@ async def create_target(
     return _to_response(row)
 
 
+# Config keys that decide where the stored credentials are sent.
+_DESTINATION_KEYS = ("host", "port", "server", "url", "endpoint_url")
+
+
+def _require_secrets_with_new_destination(
+    driver: BackupDestination, stored: dict[str, Any], incoming: dict[str, Any]
+) -> None:
+    """422 when an edit moves the destination but keeps a stored credential.
+
+    The console leaves a stored secret blank on Edit, so an edit of only the
+    host would otherwise carry the credential to the new host unasked.
+    """
+    secrets = secret_field_names(driver)
+    supplied: dict[str, Any] = {k: incoming[k] for k in _DESTINATION_KEYS if k in incoming}
+    for name in secrets:
+        if name not in incoming:
+            continue
+        value = incoming[name]
+        if value is None:
+            supplied[name] = ""  # an explicit null takes the stored secret away
+        elif (
+            isinstance(value, str)
+            and value
+            and value != REDACTED_SENTINEL
+            and not value.startswith(ENC_PREFIX)
+        ):
+            supplied[name] = value
+    require_secret_with_destination_change(
+        SimpleNamespace(**{k: stored.get(k) for k in _DESTINATION_KEYS}),
+        supplied,
+        destination=_DESTINATION_KEYS,
+        secrets={name: stored.get(name) for name in secrets},
+    )
+
+
 @router.patch("/{target_id}", response_model=BackupTargetResponse)
 async def update_target(
     target_id: uuid.UUID,
     body: BackupTargetUpdate,
     db: DB,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
 ) -> BackupTargetResponse:
-    _require_superadmin(current_user)
     row = await db.get(BackupTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="backup target not found")
 
     payload = body.model_dump(exclude_unset=True)
+    # What the row held before this edit, for the audit diff (#3697).
+    before = {k: getattr(row, k, None) for k in payload if k not in ("passphrase", "config")}
+    # A driver can force ``write_only`` whatever the form sent.
+    before.setdefault("write_only", row.write_only)
+    before_config = dict(row.config or {})
+    before_passphrase = row.passphrase_encrypted
 
     new_keep_n = payload.get("retention_keep_last_n", row.retention_keep_last_n)
     new_keep_days = payload.get("retention_keep_days", row.retention_keep_days)
@@ -468,14 +590,28 @@ async def update_target(
     )
     row.write_only = new_write_only
 
-    if "config" in payload:
+    # The secret fields this edit takes away (#3289), by name, for the
+    # audit row: which credential went is worth recording, its value is not.
+    secrets_cleared: list[str] = []
+    # ``config`` is NOT NULL: an explicit null leaves it as stored (#3288)
+    # rather than reaching the merge, which needs a dict.
+    if payload.get("config") is not None:
         # PATCH semantics for secret fields: an operator who only
         # changes the bucket name shouldn't have to retype the
         # secret access key. ``merge_config_for_update`` keeps the
         # existing encrypted value when the incoming payload omits
-        # the secret (or sends the redaction sentinel). Validation
-        # runs on the merged dict so shape checks see all fields.
-        merged = merge_config_for_update(driver, incoming=payload["config"], existing=row.config)
+        # the secret (or sends "" or the redaction sentinel); an explicit
+        # null, or a move to the driver's other auth mode, takes it away
+        # (#3289). Validation runs on the merged dict so shape checks see
+        # all fields.
+        try:
+            check_config_value_types(driver, payload["config"])
+            merged = merge_config_for_update(
+                driver, incoming=payload["config"], existing=row.config
+            )
+        except DestinationConfigError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        _require_secrets_with_new_destination(driver, row.config or {}, payload["config"])
         # #989 item 3 — same derivation as create. No-op unless the path
         # moved under the removable root and no node was set by hand.
         from app.services.appliance.removable import stamp_node_name  # noqa: PLC0415
@@ -489,6 +625,11 @@ async def update_target(
         # Re-encrypt — fields carried over are already wrapped
         # (the helper detects the prefix and skips them); newly
         # supplied secrets get wrapped fresh.
+        secrets_cleared = sorted(
+            name
+            for name in secret_field_names(driver)
+            if row.config.get(name) and not merged.get(name)
+        )
         row.config = encrypt_config_secrets(driver, merged)
         attributes.flag_modified(row, "config")
 
@@ -535,28 +676,97 @@ async def update_target(
         "drill_enabled",
     ):
         if key in payload:
+            # An explicit null on a NOT NULL column means "leave it"
+            # (#3288), as ``write_only`` above; it must never reach the
+            # database. The retention columns are nullable and a null
+            # there clears the limit.
+            if payload[key] is None and key not in _NULLABLE_UPDATE_KEYS:
+                continue
             setattr(row, key, payload[key])
 
-    db.add(
-        AuditLog(
-            action="update",
-            resource_type="backup_target",
-            resource_id=str(row.id),
-            resource_display=row.name,
-            user_id=current_user.id,
-            user_display_name=current_user.username,
-            result="success",
-            new_value={k: v for k, v in payload.items() if k != "passphrase"},
-        )
+    # Audit only what this edit changed (#3697): the console's Save sends
+    # the whole form, so a payload key is not evidence of a change. Config
+    # secrets are compared by their stored (wrapped) form, and only the key
+    # name is recorded, never a value.
+    old_value: dict[str, Any] = {}
+    new_value: dict[str, Any] = {}
+    for k, old in before.items():
+        cur = getattr(row, k, None)
+        if cur != old:
+            old_value[k] = old
+            new_value[k] = cur
+    config_keys_changed: list[str] = []
+    if "config" in payload and row.config is not None:
+        after_config = row.config
+        secret_names = set(secret_field_names(driver))
+        for key in sorted(set(before_config) | set(after_config)):
+            a, b = before_config.get(key), after_config.get(key)
+            if _reads_as(a) == _reads_as(b):
+                continue
+            if key in secret_names and a and b and a != b:
+                # Re-wrapping an unchanged secret yields fresh ciphertext;
+                # compare plaintext so only a real rotation counts.
+                try:
+                    if (
+                        decrypt_config_secrets(driver, {key: a})[key]
+                        == decrypt_config_secrets(driver, {key: b})[key]
+                    ):
+                        continue
+                except SecretFieldError:
+                    pass
+            config_keys_changed.append(key)
+    passphrase_changed = row.passphrase_encrypted != before_passphrase
+    if passphrase_changed:
+        try:
+            passphrase_changed = decrypt_str(before_passphrase) != decrypt_str(
+                row.passphrase_encrypted
+            )
+        except ValueError:
+            pass
+    changed_fields = sorted(
+        [
+            *new_value,
+            *(["config"] if config_keys_changed else []),
+            *(["passphrase"] if passphrase_changed else []),
+        ]
     )
+    if changed_fields:
+        if config_keys_changed:
+            new_value["config_keys_changed"] = config_keys_changed
+        if secrets_cleared:
+            new_value["config_fields_cleared"] = secrets_cleared
+        db.add(
+            AuditLog(
+                action="update",
+                resource_type="backup_target",
+                resource_id=str(row.id),
+                resource_display=row.name,
+                user_id=current_user.id,
+                user_display_name=current_user.username,
+                result="success",
+                changed_fields=changed_fields,
+                old_value=old_value or None,
+                new_value=new_value,
+            )
+        )
     await db.commit()
     await db.refresh(row)
     return _to_response(row)
 
 
+def _reads_as(value: Any) -> str | None:
+    """A config value as it reads, for the audit diff (#3947): unset is
+    None, and a number reads as its text, so ``21`` and ``"21"`` are one
+    setting."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
 @router.delete("/{target_id}", status_code=204)
-async def delete_target(target_id: uuid.UUID, db: DB, current_user: CurrentUser) -> None:
-    _require_superadmin(current_user)
+async def delete_target(target_id: uuid.UUID, db: DB, current_user: SuperAdmin) -> None:
     row = await db.get(BackupTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="backup target not found")
@@ -585,15 +795,18 @@ class RunNowResponse(BaseModel):
     duration_ms: int | None
     deleted: int
     error: str | None
+    # The node whose pod wrote the archive (#1838); null off the appliance.
+    node_name: str | None = None
+    # Set when the archive was written but the retention sweep failed.
+    retention_failure_category: str | None = None
 
 
 @router.post("/{target_id}/run-now", response_model=RunNowResponse)
-async def run_target_now(target_id: uuid.UUID, db: DB, current_user: CurrentUser) -> RunNowResponse:
+async def run_target_now(target_id: uuid.UUID, db: DB, current_user: SuperAdmin) -> RunNowResponse:
     """Kick a one-off backup against this target. Synchronous —
     blocks until ``pg_dump`` + driver write + retention prune
     finish. The schedule sweep uses the same code path.
     """
-    _require_superadmin(current_user)
     # #296 Phase H — refuse if a rolling upgrade is in flight (same
     # rationale as create-and-download: mid-upgrade snapshots are
     # internally inconsistent + surprise the operator on restore).
@@ -607,18 +820,28 @@ async def run_target_now(target_id: uuid.UUID, db: DB, current_user: CurrentUser
         raise HTTPException(status_code=404, detail="backup target not found")
     if not row.enabled:
         raise HTTPException(status_code=409, detail="target is disabled — enable it first")
-    result = await run_backup_for_target(
-        db,
-        target=row,
-        triggered_by="manual",
-        actor_id=current_user.id,
-        actor_display=current_user.username,
-    )
+    # A run stranded by a dead process (#1515) is reaped to ``failed``
+    # first — otherwise a manual-only target (which the schedule
+    # sweep never visits) would 409 here forever.
+    await reap_stale_backup_run(db, target=row, actor_display=current_user.username)
+    try:
+        result = await run_backup_for_target(
+            db,
+            target=row,
+            triggered_by="manual",
+            actor_id=current_user.id,
+            actor_display=current_user.username,
+        )
+    except BackupRunBusyError as exc:
+        # The runner's atomic claim lost to a run already in flight
+        # (a double-click, or the schedule sweep) (#1571). 409, not a
+        # second concurrent run.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return RunNowResponse(**result)
 
 
 @router.post("/{target_id}/test")
-async def test_target(target_id: uuid.UUID, db: DB, current_user: CurrentUser) -> dict[str, Any]:
+async def test_target(target_id: uuid.UUID, db: DB, current_user: SuperAdmin) -> dict[str, Any]:
     """Connectivity probe — write a tiny file at the destination, verify
     it, and remove it. Doesn't touch the DB or build a real archive.
 
@@ -631,7 +854,6 @@ async def test_target(target_id: uuid.UUID, db: DB, current_user: CurrentUser) -
     probe is refused outright rather than run, because writing it would
     overwrite the stored archive.
     """
-    _require_superadmin(current_user)
     row = await db.get(BackupTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="backup target not found")
@@ -643,6 +865,12 @@ async def test_target(target_id: uuid.UUID, db: DB, current_user: CurrentUser) -
         outcome = {"ok": False, "error": str(exc)}
     except BackupDestinationError as exc:
         outcome = {"ok": False, "error": str(exc)}
+    # #1838 — on a multi-node appliance a local volume is per node. Only
+    # the api can say so: the driver has no database to count nodes with.
+    if outcome.get("ok"):
+        cluster = node_local.multi_node_warning(row, await node_local.control_plane_size(db))
+        if cluster:
+            outcome["warning"] = " ".join(w for w in (outcome.get("warning"), cluster) if w)
     return outcome
 
 
@@ -650,14 +878,41 @@ class ArchiveListingResponse(BaseModel):
     filename: str
     size_bytes: int
     created_at: datetime
+    # The node whose disk holds the archive (node-local ``local_volume``
+    # on the appliance, #1838); null for network destinations.
+    node_name: str | None = None
+
+
+async def _archive_miss(db: DB, row: BackupTarget, filename: str, exc: Exception) -> HTTPException:
+    """502 for an archive the destination does not have (#1838).
+
+    On a multi-node appliance a ``local_volume`` archive is on the disk of
+    the node that wrote it, so the detail names the node that answered and,
+    when the run row recorded it, the node that holds the file.
+    """
+    hint = ""
+    if isinstance(exc, ArchiveNotFoundError):
+        hint = node_local.miss_hint(row, filename, await node_local.control_plane_size(db))
+    return HTTPException(status_code=502, detail=str(exc) + hint)
+
+
+async def _set_listing_note(
+    db: DB, response: Response, row: BackupTarget, filenames: list[str]
+) -> None:
+    """``X-Archive-Listing-Note``: whose disk a node-local listing is (#1838)."""
+    if not node_local.applies(row):
+        return
+    note = node_local.listing_note(row, filenames, await node_local.control_plane_size(db))
+    if note:
+        response.headers["X-Archive-Listing-Note"] = note
 
 
 @router.get("/{target_id}/archives", response_model=list[ArchiveListingResponse])
+@token_outbound
 async def list_target_archives(
-    target_id: uuid.UUID, db: DB, current_user: CurrentUser
+    target_id: uuid.UUID, db: DB, current_user: SuperAdmin, response: Response
 ) -> list[ArchiveListingResponse]:
     """List archives stored at this target, newest-first."""
-    _require_superadmin(current_user)
     row = await db.get(BackupTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="backup target not found")
@@ -671,11 +926,16 @@ async def list_target_archives(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except BackupDestinationError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    # #1838 — a node-local listing is one node's view, and says so rather
+    # than reading as the complete list. When the last successful run's
+    # archive is not in it, it is on another node, not missing.
+    await _set_listing_note(db, response, row, [a.filename for a in archives])
     return [
         ArchiveListingResponse(
             filename=a.filename,
             size_bytes=a.size_bytes,
             created_at=a.created_at,
+            node_name=a.node_name,
         )
         for a in archives
     ]
@@ -689,10 +949,11 @@ async def list_target_archives(
     response_class=ZipResponse,
     responses={200: {"description": "Backup archive"}},
 )
+@token_outbound
 async def download_latest_target_archive(
     target_id: uuid.UUID,
     db: DB,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     request: Request,
 ):
     """One-shot 'give me the newest archive at this target'
@@ -703,7 +964,10 @@ async def download_latest_target_archive(
 
     This is the pull-mode entry point (#989 item 4): an external backup
     tool (Veeam, Bacula, a cron ``curl``) fetches from here with an API
-    token restricted via ``allowed_paths`` to this one route.
+    token owned by a superadmin. The token must be unrestricted (no
+    scopes): reading the destination is outbound, which ``@token_outbound``
+    refuses to ``read``, and no write scope covers ``/backup`` (#3302).
+    ``allowed_paths`` cannot narrow it; that column is reserved.
 
     It is conditional. Archive filenames are timestamped and the bytes
     under a given name never change, so the filename *is* a strong
@@ -714,7 +978,6 @@ async def download_latest_target_archive(
     """
     from fastapi.responses import StreamingResponse  # noqa: PLC0415
 
-    _require_superadmin(current_user)
     row = await db.get(BackupTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="backup target not found")
@@ -739,7 +1002,16 @@ async def download_latest_target_archive(
     if not archives:
         raise HTTPException(status_code=404, detail=f"no archives at target {row.name!r}")
     # ``list_archives`` already returns newest-first by contract.
-    newest = archives[0]
+    # "Latest" means the newest real BACKUP (#1574): a pre-restore
+    # safety dump shares this listing on the recommended local-volume
+    # path, is newest by mtime right after a restore, and is encrypted
+    # with the public constant passphrase rather than this target's —
+    # serving it here hands the puller an archive their passphrase
+    # cannot open. Safety dumps stay listed and downloadable by name.
+    real_archives = [a for a in archives if not is_pre_restore_archive(a.filename)]
+    if not real_archives:
+        raise HTTPException(status_code=404, detail=f"no archives at target {row.name!r}")
+    newest = real_archives[0]
     # ``format_etag`` / ``etag_matches`` from app.core.http_etag rather
     # than a local pair: that module already handles ``*``, comma lists,
     # the ``W/`` prefix and the legacy unquoted spelling, and it mints a
@@ -757,10 +1029,16 @@ async def download_latest_target_archive(
                 "Cache-Control": "private, no-cache",
             },
         )
+    _enforce_download_size(newest.size_bytes, filename=newest.filename)
     try:
-        archive_bytes = await driver.download(config=plain_config, filename=newest.filename)
+        archive_bytes = await driver.download(
+            config=plain_config, filename=newest.filename, max_bytes=MAX_ARCHIVE_BYTES
+        )
+    except ArchiveTooLargeError as exc:
+        raise _too_large(exc) from exc
     except BackupDestinationError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise await _archive_miss(db, row, newest.filename, exc) from exc
+    _enforce_download_size(len(archive_bytes), filename=newest.filename)
 
     def _iter():
         yield archive_bytes
@@ -788,11 +1066,12 @@ async def download_latest_target_archive(
     response_class=ZipResponse,
     responses={200: {"description": "Backup archive"}},
 )
+@token_outbound
 async def download_target_archive(
     target_id: uuid.UUID,
     filename: str,
     db: DB,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     request: Request,
 ):
     """Stream a stored archive back to the operator's browser as a
@@ -800,12 +1079,11 @@ async def download_target_archive(
     the driver's ``download(filename)`` method does the heavy
     lifting; we wrap the bytes in a ``StreamingResponse`` with
     ``Content-Disposition: attachment``. For large archives this
-    fetches into memory before streaming; the existing 2 GB hard
-    cap on the api process catches anything pathological.
+    fetches into memory before streaming; downloads past the
+    archive size cap are refused (#1568).
     """
     from fastapi.responses import StreamingResponse  # noqa: PLC0415
 
-    _require_superadmin(current_user)
     row = await db.get(BackupTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="backup target not found")
@@ -826,16 +1104,22 @@ async def download_target_archive(
     # out of a real listing.
     try:
         plain_config = decrypt_config_secrets(driver, row.config)
-        archive_bytes = await driver.download(config=plain_config, filename=safe_name)
+        await _enforce_declared_size(driver, plain_config, safe_name)
+        archive_bytes = await driver.download(
+            config=plain_config, filename=safe_name, max_bytes=MAX_ARCHIVE_BYTES
+        )
     except SecretFieldError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ArchiveTooLargeError as exc:
+        raise _too_large(exc) from exc
     except UnsupportedOperationError as exc:
         # A write-only kind cannot read an archive back. 409 rather than
         # the generic 502 below, so the reason is legible instead of
         # looking like the destination is down.
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except BackupDestinationError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise await _archive_miss(db, row, safe_name, exc) from exc
+    _enforce_download_size(len(archive_bytes), filename=safe_name)
 
     # The archive exists and is readable — only now is a precondition
     # meaningful.
@@ -860,6 +1144,75 @@ async def download_target_archive(
     )
 
 
+class ArchiveManifestPreviewResponse(BaseModel):
+    """What ``manifest_preview_payload`` returns, as a published schema.
+
+    Typed so the route does not join the untyped-routes baseline (#917).
+    Field for field the body of ``POST /backup/manifest-preview``.
+    """
+
+    manifest: dict[str, Any]
+    archive_bytes: int
+    format_recognised: bool
+    dump_format: str | None = None
+    selective_restore_supported: bool
+    restorable: bool
+    restore_refusal: str | None = None
+
+
+@router.get(
+    "/{target_id}/archives/{filename}/manifest-preview",
+    response_model=ArchiveManifestPreviewResponse,
+)
+@token_outbound
+async def preview_target_archive_manifest(
+    target_id: uuid.UUID,
+    filename: str,
+    db: DB,
+    current_user: SuperAdmin,
+) -> dict[str, Any]:
+    """The manifest preview (``POST /backup/manifest-preview``) for an
+    archive already stored at this destination (#2222).
+
+    The destination's Restore-from-archive modal lists archives without
+    their manifest, so it could not tell a plain-SQL archive (which a
+    selective restore refuses) from a custom-format one until the restore
+    was refused. The modal calls this once, for the archive the operator
+    picked, so the whole listing never has to be downloaded. A zip's
+    central directory is at the end, so the archive is fetched under the
+    same size cap as a download; nothing is inflated and nothing applied.
+    """
+    from app.services.backup.archive import (  # noqa: PLC0415
+        BackupArchiveError,
+        manifest_preview_payload,
+    )
+
+    row = await db.get(BackupTarget, target_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="backup target not found")
+    driver = get_destination(row.kind)
+    safe_name = _archive_name(filename)
+    try:
+        plain_config = decrypt_config_secrets(driver, row.config)
+        await _enforce_declared_size(driver, plain_config, safe_name)
+        archive_bytes = await driver.download(
+            config=plain_config, filename=safe_name, max_bytes=MAX_ARCHIVE_BYTES
+        )
+    except SecretFieldError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ArchiveTooLargeError as exc:
+        raise _too_large(exc) from exc
+    except UnsupportedOperationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except BackupDestinationError as exc:
+        raise await _archive_miss(db, row, safe_name, exc) from exc
+    _enforce_download_size(len(archive_bytes), filename=safe_name)
+    try:
+        return manifest_preview_payload(archive_bytes)
+    except BackupArchiveError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 class RestoreFromArchiveBody(BaseModel):
     filename: str = Field(..., min_length=1, max_length=255)
     passphrase: str = Field(..., min_length=8, max_length=512)
@@ -881,7 +1234,7 @@ async def restore_from_archive(
     target_id: uuid.UUID,
     body: RestoreFromArchiveBody,
     db: DB,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
 ) -> dict[str, Any]:
     """Pull ``filename`` from the destination, decrypt + replay
     via the same code path as ``POST /backup/restore`` (Phase 1a).
@@ -890,7 +1243,6 @@ async def restore_from_archive(
     operator knows the key, so a stolen session token can't roll
     back the install on a hunch.
     """
-    _require_superadmin(current_user)
     _archive_name(body.filename)
     row = await db.get(BackupTarget, target_id)
     if row is None:
@@ -898,16 +1250,22 @@ async def restore_from_archive(
     driver = get_destination(row.kind)
     try:
         plain_config = decrypt_config_secrets(driver, row.config)
-        archive_bytes = await driver.download(config=plain_config, filename=body.filename)
+        await _enforce_declared_size(driver, plain_config, body.filename)
+        archive_bytes = await driver.download(
+            config=plain_config, filename=body.filename, max_bytes=MAX_ARCHIVE_BYTES
+        )
     except SecretFieldError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ArchiveTooLargeError as exc:
+        raise _too_large(exc) from exc
     except BackupDestinationError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise await _archive_miss(db, row, body.filename, exc) from exc
     if not archive_bytes:
         raise HTTPException(
             status_code=502,
             detail=f"archive {body.filename!r} fetched empty from destination",
         )
+    _enforce_download_size(len(archive_bytes), filename=body.filename)
 
     # Reuse the Phase 1a restore path so the safety dump +
     # passphrase verify + psql replay + post-replay audit row all
@@ -991,6 +1349,7 @@ async def restore_from_archive(
                     "cascade_widened_tables": outcome.cascade_widened_tables,
                     "allow_newer_schema": body.allow_newer_schema,
                     "warnings": outcome.warnings,
+                    "reconciled_backup_targets": outcome.reconciled_backup_targets,
                 },
             )
         )
@@ -1044,10 +1403,9 @@ async def delete_target_archive(
     target_id: uuid.UUID,
     filename: str,
     db: DB,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
 ) -> None:
     """Manually drop one archive at this target."""
-    _require_superadmin(current_user)
     _archive_name(filename)
     row = await db.get(BackupTarget, target_id)
     if row is None:

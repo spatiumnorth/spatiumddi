@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Keyboard } from "lucide-react";
 import { Modal } from "@/components/ui/modal";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { usePermissions } from "@/hooks/usePermissions";
 import {
   formatCombo,
   isMacPlatform,
@@ -49,6 +50,7 @@ export function KeyboardShortcutsHelp() {
   const [open, setOpen] = useState(false);
   const close = useCallback(() => setOpen(false), []);
   const { enabled } = useFeatureModules();
+  const { can } = usePermissions();
 
   // The keydown listener is bound once, so it can't close over `open`.
   // A ref keeps the current value available without re-binding on every
@@ -64,11 +66,10 @@ export function KeyboardShortcutsHelp() {
       // "?" is a legitimate thing to put in a description.
       if (isTypingTarget(e.target)) return;
       if (!matchesShortcut(e, SHOW_SHORTCUTS)) return;
-      // Don't stack on top of another dialog. Every modal binds Escape
-      // on `window` (`use-draggable-modal`), so an overlay opened over
-      // an edit form would let a single Escape dismiss BOTH — taking
-      // the operator's unsaved input with it. Closing our own overlay
-      // is still fine, hence the `openRef` check first.
+      // Don't stack on top of another dialog: a reference sheet has no
+      // business covering an edit form (Esc would still close only the
+      // topmost, #1947). Closing our own overlay is still fine, hence the
+      // `openRef` check first.
       if (
         !openRef.current &&
         document.querySelector('[role="dialog"][aria-modal="true"]')
@@ -84,7 +85,18 @@ export function KeyboardShortcutsHelp() {
 
   // Hide groups whose surface is switched off — no point advertising
   // Copilot bindings when the drawer can't be opened.
-  const groups = SHORTCUT_GROUPS.filter((g) => !g.module || enabled(g.module));
+  // Hide a binding whose handler stands down for this user (a Viewer's
+  // `n` adds no record, #3103), and a group left with none.
+  const groups = SHORTCUT_GROUPS.filter((g) => !g.module || enabled(g.module))
+    .map((g) => ({
+      ...g,
+      shortcuts: g.shortcuts.filter(
+        (s) =>
+          !s.requires ||
+          s.requires.resourceTypes.some((t) => can(s.requires!.action, t)),
+      ),
+    }))
+    .filter((g) => g.shortcuts.length > 0);
 
   return (
     <>

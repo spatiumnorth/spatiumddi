@@ -15,6 +15,12 @@ import {
   errMsg,
   DeleteConfirmModal,
 } from "./_shared";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FreshRowError } from "@/components/FreshRowError";
+import { changedFields, useFreshRow } from "@/hooks/useFreshRow";
+import { deletePolicyDescription } from "./devicePolicyCopy";
+import { ListReadError } from "@/components/ui/list-read-error";
+import { FormError } from "@/components/ui/form-error";
 
 const KEY_BASE = "dhcp-device-policies";
 const OBS_KEY = "dhcp-device-observations";
@@ -34,13 +40,27 @@ const OBS_KEY = "dhcp-device-observations";
  * from a device's next renewal, not the moment it is saved.
  */
 export function DevicePoliciesTab({ groupId }: { groupId: string }) {
+  // #1339, #1861 — writes take write, deletes delete, on ``dhcp_client_class``.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "dhcp_client_class"),
+    "Requires write permission on DHCP client classes",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "dhcp_client_class"),
+    "Requires delete permission on DHCP client classes",
+  );
   const qc = useQueryClient();
   const [showCreate, setShowCreate] = useState(false);
   const [edit, setEdit] = useState<DHCPDevicePolicy | null>(null);
   const [del, setDel] = useState<DHCPDevicePolicy | null>(null);
   const [preview, setPreview] = useState<DHCPDevicePolicy | null>(null);
 
-  const { data: policies = [], isFetching } = useQuery({
+  const {
+    data: policies = [],
+    isFetching,
+    error: policiesError,
+  } = useQuery({
     queryKey: [KEY_BASE, groupId],
     queryFn: () => dhcpApi.listDevicePolicies(groupId),
     enabled: !!groupId,
@@ -72,7 +92,8 @@ export function DevicePoliciesTab({ groupId }: { groupId: string }) {
         <button
           type="button"
           onClick={() => setShowCreate(true)}
-          className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground"
+          className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground disabled:cursor-not-allowed disabled:opacity-50"
+          {...writeGate}
         >
           <Plus className="h-4 w-4" /> New Policy
         </button>
@@ -80,6 +101,10 @@ export function DevicePoliciesTab({ groupId }: { groupId: string }) {
 
       {isFetching && policies.length === 0 ? (
         <div className="text-sm text-muted-foreground">Loading&hellip;</div>
+      ) : policiesError && policies.length === 0 ? (
+        <div className="rounded-md border border-dashed p-6 text-center text-sm">
+          <ListReadError error={policiesError} what="device policies" />
+        </div>
       ) : policies.length === 0 ? (
         <div className="rounded-md border border-dashed p-6 text-center text-sm text-muted-foreground">
           No device policies yet. A policy turns &ldquo;printers get a short
@@ -172,16 +197,20 @@ export function DevicePoliciesTab({ groupId }: { groupId: string }) {
                       <button
                         type="button"
                         title="Edit"
+                        aria-label="Edit"
                         onClick={() => setEdit(p)}
-                        className="rounded p-1 hover:bg-muted"
+                        className="rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                        {...writeGate}
                       >
                         <Pencil className="h-4 w-4" />
                       </button>
                       <button
                         type="button"
                         title="Delete"
+                        aria-label="Delete"
                         onClick={() => setDel(p)}
-                        className="rounded p-1 hover:bg-muted"
+                        className="rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                        {...deleteGate}
                       >
                         <Trash2 className="h-4 w-4" />
                       </button>
@@ -213,7 +242,7 @@ export function DevicePoliciesTab({ groupId }: { groupId: string }) {
       {del && (
         <DeleteConfirmModal
           title="Delete device policy"
-          description={`Delete "${del.name}"? Pools restricted to ${del.class_name} will no longer match any class.`}
+          description={deletePolicyDescription(del.name, del.class_name)}
           onConfirm={() => delMut.mutate(del.id)}
           onClose={() => setDel(null)}
           isPending={delMut.isPending}
@@ -228,15 +257,38 @@ export function DevicePoliciesTab({ groupId }: { groupId: string }) {
  *  returned on this install — a free-text box would let an operator build a
  *  policy against a class string that never appears, which compiles to an
  *  empty expression and renders nothing at all. */
-function DevicePolicyModal({
-  groupId,
-  policy,
-  onClose,
-}: {
+type DevicePolicyModalProps = {
   groupId: string;
   policy?: DHCPDevicePolicy;
   onClose: () => void;
-}) {
+};
+
+// Edit reads the policy fresh on open and Save sends only what changed
+// (#3379): the clicked row comes from a list loaded earlier.
+export function DevicePolicyModal(props: DevicePolicyModalProps) {
+  const fresh = useFreshRow(props.policy, () =>
+    dhcpApi
+      .listDevicePolicies(props.groupId)
+      .then((rows) => rows.find((p) => p.id === props.policy!.id)),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Device Policy"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <DevicePolicyForm {...props} policy={fresh.row} />;
+}
+
+function DevicePolicyForm({
+  groupId,
+  policy,
+  onClose,
+}: DevicePolicyModalProps) {
   const qc = useQueryClient();
   const isEdit = !!policy;
   const [name, setName] = useState(policy?.name ?? "");
@@ -256,8 +308,9 @@ function DevicePolicyModal({
     policy?.include_ambiguous ?? false,
   );
   const [optionsError, setOptionsError] = useState<string | null>(null);
+  const [leaseError, setLeaseError] = useState<string | null>(null);
 
-  const { data: obs } = useQuery({
+  const { data: obs, error: obsError } = useQuery({
     queryKey: [OBS_KEY, groupId],
     queryFn: () => dhcpApi.listDeviceObservations(groupId),
     enabled: !!groupId,
@@ -304,16 +357,54 @@ function DevicePolicyModal({
       }
     }
     setOptionsError(null);
-    mut.mutate({
+    // Blank means inherit; anything else must be a whole number of seconds.
+    // Number("10m") is NaN and JSON sends NaN as null, which would store the
+    // typo as "inherit" with no error (#1991).
+    const leaseText = leaseTime.trim();
+    let lease: number | null = null;
+    if (leaseText) {
+      if (!/^\d+$/.test(leaseText)) {
+        setLeaseError(
+          "Lease time must be a whole number of seconds, e.g. 600 (not 10m). Leave blank to inherit.",
+        );
+        return;
+      }
+      lease = Number(leaseText);
+    }
+    setLeaseError(null);
+    const body = {
       name,
       description,
       enabled,
       device_classes: selected,
-      lease_time: leaseTime.trim() ? Number(leaseTime) : null,
+      lease_time: lease,
       options: parsedOptions,
       match_override: override.trim() ? override : null,
       include_ambiguous: includeAmbiguous,
-    });
+    };
+    if (!policy) {
+      mut.mutate(body);
+      return;
+    }
+    // Edit sends only what the operator changed (#3379).
+    const diff = changedFields(
+      {
+        name: policy.name,
+        description: policy.description ?? "",
+        enabled: policy.enabled,
+        device_classes: policy.device_classes ?? [],
+        lease_time: policy.lease_time ?? null,
+        options: policy.options ?? {},
+        match_override: policy.match_override ?? null,
+        include_ambiguous: policy.include_ambiguous,
+      },
+      body,
+    );
+    if (Object.keys(diff).length === 0) {
+      onClose();
+      return;
+    }
+    mut.mutate(diff);
   };
 
   return (
@@ -344,13 +435,23 @@ function DevicePolicyModal({
         <Field
           label="Device classes"
           hint={
-            obs && obs.total_devices === 0
-              ? "No fingerprints collected yet — enable passive fingerprinting first, or this policy will match nothing."
-              : "Classes fingerbank has returned on this network, with device counts."
+            obsError
+              ? "Couldn't read the observed device classes, so the list below is not the network's."
+              : obs && obs.total_devices === 0
+                ? override.trim()
+                  ? "No fingerprints collected yet — device classes have nothing to match until passive fingerprinting is enabled. The manual match expression below applies regardless."
+                  : "No fingerprints collected yet — enable passive fingerprinting first, or this policy will match nothing."
+                : "Classes fingerbank has returned on this network, with device counts."
           }
         >
           <div className="max-h-44 space-y-1 overflow-y-auto rounded-md border p-2">
-            {options.length === 0 ? (
+            {obsError && options.length === 0 ? (
+              <ListReadError
+                error={obsError}
+                what="observed device classes"
+                className="text-xs"
+              />
+            ) : options.length === 0 ? (
               <div className="text-xs text-muted-foreground">
                 Nothing observed yet.
               </div>
@@ -404,11 +505,20 @@ function DevicePolicyModal({
           <input
             className={inputCls}
             value={leaseTime}
-            onChange={(e) => setLeaseTime(e.target.value)}
+            onChange={(e) => {
+              setLeaseTime(e.target.value);
+              setLeaseError(null);
+            }}
             placeholder="600"
             inputMode="numeric"
           />
         </Field>
+
+        {leaseError && (
+          <div role="alert" className="text-xs text-destructive">
+            {leaseError}
+          </div>
+        )}
 
         <Field
           label="Options (JSON)"
@@ -462,7 +572,9 @@ function DevicePolicyModal({
         </label>
 
         {mut.isError && (
-          <div className="text-xs text-destructive">{errMsg(mut.error)}</div>
+          <FormError className="text-xs text-destructive">
+            {errMsg(mut.error)}
+          </FormError>
         )}
         <Btns
           onClose={onClose}

@@ -60,6 +60,7 @@ class FindTimeBoundGrantsArgs(BaseModel):
 
 @register_tool(
     name="find_time_bound_grants",
+    permission="superadmin",
     description=(
         "List time-bound (temporary, auto-expiring) RBAC grants (superadmin "
         "only — issue #65). Each row carries the group, the granted "
@@ -129,6 +130,7 @@ async def find_time_bound_grants(
 
 @register_tool(
     name="propose_grant_temporary_access",
+    permission=("admin", "group"),
     description=(
         "Prepare a proposal to grant a group temporary, auto-expiring RBAC "
         "access (issue #65). Superadmin only. Returns a kind='proposal' "

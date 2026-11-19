@@ -30,13 +30,16 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB
+from app.api.stream_auth import StreamAuthGuard
 from app.core.permissions import require_permission
 from app.core.responses import EventStreamResponse
 from app.db import AsyncSessionLocal
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
-from app.services.appliance import k8s
+from app.services.appliance import k8s, postgres_instances
 from app.services.appliance.cluster_health import cluster_unavailable, get_cluster_health
+from app.services.appliance.ownership import k8s_node_name
 from app.services.appliance.storage_health import evaluate_storage, worst_severity
+from app.services.appliance.var_disk import evaluate_var_disk, reading_is_fresh, var_disk_reading
 
 logger = structlog.get_logger(__name__)
 
@@ -53,6 +56,19 @@ class HostPartition(BaseModel):
     label: str
     total_bytes: int
     used_bytes: int
+    # #2400 — statvfs f_bavail, what the kubelet's eviction signal measures
+    # (``total - used`` also counts ext4's 5 % root reserve). None from a
+    # supervisor too old to send it.
+    available_bytes: int | None = None
+
+
+class VarDiskFinding(BaseModel):
+    """#2400 — /var against kubelet eviction, from ``services/appliance/
+    var_disk`` (the ``appliance_disk_usage`` alert's own evaluator)."""
+
+    severity: str
+    free_pct: float | None = None
+    detail: str
 
 
 # ── #999 Part A — storage redundancy, as reported by the supervisor ──
@@ -254,6 +270,8 @@ class NodeVitals(BaseModel):
     # old to collect it), which is UNKNOWN and must never render as a
     # green tick. An empty snapshot is a real "nothing here" reading.
     host_storage: NodeStorage | None = None
+    # #2400 — set when /var is low or the node reports DiskPressure.
+    var_disk_finding: VarDiskFinding | None = None
 
 
 class PodSummary(BaseModel):
@@ -270,17 +288,64 @@ class PodSummary(BaseModel):
     memory_working_set_bytes: int | None = None
 
 
+class PostgresInstance(BaseModel):
+    """One CNPG instance on the database row (#2856)."""
+
+    name: str
+    node: str | None = None
+    #: ``primary`` or ``standby``.
+    role: str
+    ready: bool
+    #: When the pod's Ready condition last changed.
+    ready_since: str | None = None
+    #: Standbys only. True = the primary has a streaming WAL sender for it;
+    #: False = it has none, or one in another state; None = not checked (the
+    #: primary could not be queried, a switchover is under way, or the
+    #: sender's state is hidden from the app's role). None is never healthy.
+    streaming: bool | None = None
+
+
+class PostgresInstanceFinding(BaseModel):
+    """Why the database row is degraded although CNPG may count it healthy."""
+
+    instance: str
+    node: str | None = None
+    #: ``not_ready`` | ``not_streaming`` | ``supervisor_reported``.
+    kind: str
+    detail: str
+    since: str | None = None
+
+
 class WorkloadHealth(BaseModel):
     component: str
     kind: str | None = None
     ready: int
     total: int
     restarts: int
+    # #2945 — containers whose previous instance ended in the last 15 min,
+    # and the latest such end time. ``restarts`` is the lifetime total and
+    # only informational; the UI goes amber on ``recent_restarts`` alone.
+    recent_restarts: int = 0
+    last_restart_at: str | None = None
     # Job pods still running for this component (#1213) — e.g. a CNPG
     # replica join. Not counted in ready / total; while non-zero the
     # component reads "degraded" even at ready == total.
     jobs_running: int = 0
     status: str
+    # #1387 — for the database row: "cnpg" when ready / total are the CNPG
+    # Cluster's readyInstances / spec.instances, "pods" when it could not be
+    # read and they are a pod count. None for every other component.
+    source: str | None = None
+    # #2856 — database row only. Per-instance view, and what made the row
+    # degraded: CNPG counts a standby that is Ready but not streaming as a
+    # healthy instance, so ready / total alone read 3/3 healthy through a
+    # ten-minute replication loop.
+    instances: list[PostgresInstance] | None = None
+    current_primary: str | None = None
+    target_primary: str | None = None
+    findings: list[PostgresInstanceFinding] | None = None
+    #: Whether the streaming half was checked against pg_stat_replication.
+    replication_checked: bool | None = None
 
 
 class ClusterDnsProbe(BaseModel):
@@ -369,27 +434,44 @@ async def _merge_supervisor_host_state(db: AsyncSession, snap: dict[str, Any]) -
         return
     rows = (
         await db.execute(
-            select(Appliance.hostname, Appliance.cluster_health).where(
+            select(Appliance.hostname, Appliance.cluster_health, Appliance.last_seen_at).where(
                 Appliance.state == APPLIANCE_STATE_APPROVED
             )
         )
     ).all()
     pmap: dict[str, list[dict[str, Any]]] = {}
     smap: dict[str, dict[str, Any]] = {}
-    for hostname, ch in rows:
+    # #2400 — whose partition reading is fresh enough to JUDGE. The bars still
+    # show the last report; the /var finding follows the same freshness rule
+    # as the Fleet row and the appliance_disk_usage alert.
+    fresh: set[str] = set()
+    for hostname, ch, last_seen_at in rows:
         if not hostname or not isinstance(ch, dict):
             continue
         parts = ch.get("host_disk_partitions")
         if isinstance(parts, list) and parts:
-            pmap[hostname] = parts
+            pmap[k8s_node_name(hostname)] = parts
+            if reading_is_fresh(last_seen_at):
+                fresh.add(k8s_node_name(hostname))
         storage = ch.get("storage")
         if isinstance(storage, dict):
-            smap[hostname] = storage
+            smap[k8s_node_name(hostname)] = storage
     for node in snap["nodes"]:
-        if node["name"] in pmap:
-            node["host_disk_partitions"] = pmap[node["name"]]
-        if node["name"] in smap:
-            storage = dict(smap[node["name"]])
+        key = k8s_node_name(node["name"])
+        if key in pmap:
+            node["host_disk_partitions"] = pmap[key]
+        finding = evaluate_var_disk(
+            var_disk_reading({"host_disk_partitions": pmap.get(key)}) if key in fresh else None,
+            disk_pressure=node.get("disk_pressure"),
+        )
+        if finding is not None:
+            node["var_disk_finding"] = {
+                "severity": finding.severity,
+                "free_pct": finding.free_pct,
+                "detail": finding.detail,
+            }
+        if key in smap:
+            storage = dict(smap[key])
             findings = evaluate_storage(storage)
             storage["findings"] = [
                 {
@@ -448,6 +530,8 @@ async def cluster_health(db: DB) -> ClusterHealth:
             "kubeapi unreachable from api; retry shortly.",
         ) from exc
     await _merge_host_state_best_effort(db, snap)
+    # #2856 — the database row's streaming half (pg_stat_replication).
+    await postgres_instances.enrich_snapshot_best_effort(db, snap)
     return ClusterHealth(**snap)
 
 
@@ -468,11 +552,18 @@ async def cluster_health_stream(request: Request) -> StreamingResponse:
     animates each frame. A momentarily-unreachable kubeapi emits an
     ``available: false`` frame (with a reason) rather than dropping the
     stream, so the dashboard self-heals when the control plane settles.
+
+    The caller is re-validated on a bounded cadence (``StreamAuthGuard``);
+    the stream ends once they are signed out, disabled or lose
+    ``read:appliance``, and the client reconnects with a current token.
     """
+    guard = StreamAuthGuard(request, permission=("read", "appliance"))
 
     async def event_source():
         while True:
             if await request.is_disconnected():
+                break
+            if not await guard.still_authorized():
                 break
             try:
                 snap = await anyio.to_thread.run_sync(get_cluster_health)
@@ -483,6 +574,7 @@ async def cluster_health_stream(request: Request) -> StreamingResponse:
                 # kube frame into an "unavailable" one (#1083).
                 async with AsyncSessionLocal() as db:
                     await _merge_host_state_best_effort(db, snap)
+                    await postgres_instances.enrich_snapshot_best_effort(db, snap)
             except k8s.KubeapiUnavailableError as exc:
                 # Log detail server-side; keep the client-facing reason generic
                 # so an exception message can't leak internals to the browser

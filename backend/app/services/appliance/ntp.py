@@ -30,9 +30,31 @@ Design notes:
 from __future__ import annotations
 
 import hashlib
+from ipaddress import ip_network
 from typing import Any
 
+import structlog
+
+from app.core.config_text import has_control_chars
 from app.models.settings import PlatformSettings
+
+logger = structlog.get_logger(__name__)
+
+
+def _is_single_token(value: Any) -> bool:
+    """True for a non-empty string with no whitespace and no control
+    characters — the only shape that fits a chrony ``pool`` / ``server``
+    argument without ending the line or adding arguments.
+
+    The settings API enforces this on write; the renderer checks again for
+    rows written before that, or by another path, because chrony.conf ends a
+    directive at the newline."""
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and not has_control_chars(value)
+        and not any(c.isspace() for c in value)
+    )
 
 
 def render_chrony_conf(settings: PlatformSettings) -> str:
@@ -50,7 +72,9 @@ def render_chrony_conf(settings: PlatformSettings) -> str:
     ]
 
     mode = (settings.ntp_source_mode or "pool").strip()
-    pool_servers = list(settings.ntp_pool_servers or [])
+    pool_servers = [h for h in (settings.ntp_pool_servers or []) if _is_single_token(h)]
+    if len(pool_servers) != len(settings.ntp_pool_servers or []):
+        logger.error("ntp_pool_server_dropped_illegal_chars")
     custom_servers = list(settings.ntp_custom_servers or [])
 
     has_pool = mode in ("pool", "mixed") and pool_servers
@@ -77,6 +101,9 @@ def render_chrony_conf(settings: PlatformSettings) -> str:
         for srv in custom_servers:
             host = (srv.get("host") or "").strip()
             if not host:
+                continue
+            if not _is_single_token(host):
+                logger.error("ntp_custom_server_dropped_illegal_chars")
                 continue
             parts: list[str] = ["server", host]
             if srv.get("iburst"):
@@ -127,7 +154,14 @@ def render_chrony_conf(settings: PlatformSettings) -> str:
         if client_nets:
             lines.append("# Serve NTP to clients (issue #154)")
             for cidr in client_nets:
-                lines.append(f"allow {cidr}")
+                # Written bare into an ``allow`` line; only a value that
+                # parses as a network is emitted.
+                try:
+                    net = ip_network(str(cidr).strip(), strict=False)
+                except ValueError:
+                    logger.error("ntp_allow_network_dropped", network=repr(cidr))
+                    continue
+                lines.append(f"allow {net}")
         else:
             lines.append(
                 "# ntp_allow_clients=true but no CIDRs configured — chrony "

@@ -21,17 +21,39 @@ copy-up on a write to /etc/passwd from a process, but we want a
 purely additive merge with no in-line semantics — so write directly.
 
 Idempotent: re-runs are no-ops once the entries already exist.
+
+It also removes the live ISO session's sudoers rule from installs whose
+installer copied it across, in two steps:
+
+- ``--before-mount`` (spatium-etc-premount.service, ordered after /var is
+  mounted and before etc.mount) puts an overlay whiteout for
+  ``sudoers.d/live`` in the shared upper, so neither slot's lower can
+  show the rule (see hide_live_sudoers_in_upper);
+- the normal run removes it from the merged /etc and drops live-config's
+  /var markers (see remove_live_session_sudoers).
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import shutil
+import stat
 import sys
 from pathlib import Path
 
 LOWER = Path("/usr/lib/etc.image")
 UPPER = Path("/var/persist/etc")
+
+# The merged /etc view (etc.mount) and live-config's run markers.
+ETC = Path("/etc")
+LIVE_CONFIG_STATE = Path("/var/lib/live/config")
+
+# What live-config's 0040-sudo component writes on every live-ISO boot.
+# Installers before this change copied the live root, this file included,
+# onto the target, and then into /usr/lib/etc.image — the overlay lower of
+# both slots.
+LIVE_SUDOERS_LINE = "user ALL=(ALL) NOPASSWD: ALL"
 
 # System uid/gid range. Debian convention: 0-999 reserved for system
 # users; >= 1000 for regular accounts that the operator manages.
@@ -119,12 +141,154 @@ def ensure_shadow_rows(passwd_path: Path, shadow_path: Path) -> int:
     return len(appended)
 
 
-def main() -> int:
+def _is_whiteout(path: Path) -> bool:
+    """An overlayfs whiteout: a character device with device number 0/0."""
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        return False
+    return stat.S_ISCHR(st.st_mode) and st.st_rdev == 0
+
+
+def _make_whiteout(path: Path) -> None:
+    os.mknod(path, stat.S_IFCHR | 0o000, os.makedev(0, 0))
+
+
+def _holds_live_line(path: Path) -> bool:
+    if not path.is_file() or path.is_symlink():
+        return False
+    try:
+        return path.read_text().rstrip("\n") == LIVE_SUDOERS_LINE
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def hide_live_sudoers_in_upper(upper: Path, lower: Path) -> str | None:
+    """Whiteout ``sudoers.d/live`` in the overlay upper. Run BEFORE etc.mount.
+
+    Both slots mount /etc with this same upper over their own lower
+    (/usr/lib/etc.image). Installers before this change put the live
+    session's rule into the lower of BOTH slots. A slot upgrade replaces
+    one slot's lower and leaves the other's, so after an upgrade the
+    running slot's merged /etc no longer shows the file, and removing it
+    there (remove_live_session_sudoers) cannot reach the other slot: a
+    rollback brings the rule back. A whiteout in the shared upper hides
+    the name from whichever lower is mounted under it.
+
+    The upper is the only layer anything on a running appliance writes:
+    the lowers are install-time snapshots and slot images, and neither
+    ships a sudoers.d/live of its own. So:
+
+    - nothing in the upper at that path: write the whiteout;
+    - a regular file holding exactly the live-config line (a copy-up of
+      the rule): replace it with the whiteout;
+    - anything else (an operator's own file, an earlier whiteout, a
+      symlink): leave it.
+
+    Writes to the upper only while it is not mounted; overlayfs does not
+    define the effect of changing an upper under a live mount. Returns a
+    description of the change, or None when there was nothing to do.
+    """
+    sudoers_d = upper / "sudoers.d"
+    target = sudoers_d / "live"
+
+    if os.path.lexists(target):
+        if _is_whiteout(target):
+            return None
+        if not _holds_live_line(target):
+            logging.info("%s is not the live-session rule, leaving it", target)
+            return None
+        target.unlink()
+        _make_whiteout(target)
+        return f"replaced {target} (the live-session rule) with an overlay whiteout"
+
+    if os.path.lexists(sudoers_d) and (
+        sudoers_d.is_symlink() or not sudoers_d.is_dir()
+    ):
+        logging.warning("%s is not a directory, leaving it", sudoers_d)
+        return None
+    if not sudoers_d.exists():
+        # A new upper directory merges with the lower's, and the merged
+        # directory takes the upper's owner and mode, so copy the lower's.
+        ref = lower / "sudoers.d"
+        if ref.is_dir():
+            ref_st = ref.stat()
+            mode, uid, gid = stat.S_IMODE(ref_st.st_mode), ref_st.st_uid, ref_st.st_gid
+        else:
+            mode, uid, gid = 0o750, 0, 0
+        sudoers_d.mkdir(mode=mode)
+        os.chmod(sudoers_d, mode)
+        cur = sudoers_d.stat()
+        if (cur.st_uid, cur.st_gid) != (uid, gid):
+            os.chown(sudoers_d, uid, gid)
+    _make_whiteout(target)
+    return f"created an overlay whiteout at {target}"
+
+
+def before_mount(upper: Path, lower: Path, etc: Path) -> int:
+    if os.path.ismount(etc):
+        logging.warning("%s is already mounted; not changing its upper layer", etc)
+        return 0
+    if not upper.is_dir() or not lower.is_dir():
+        logging.info("no /etc overlay layers, skipping")
+        return 0
+    try:
+        done = hide_live_sudoers_in_upper(upper, lower)
+    except OSError as exc:
+        logging.warning("could not hide the live-session sudoers rule: %s", exc)
+        return 0
+    if done:
+        logging.info("%s", done)
+    return 0
+
+
+def remove_live_session_sudoers(etc: Path, live_config_state: Path) -> list[str]:
+    """Remove the live session's sudoers rule and live-config markers.
+
+    ``etc`` is the MERGED /etc. Unlinking there removes a copy in the
+    upper layer (/var/persist/etc) and, for a copy in the running slot's
+    lower layer (/usr/lib/etc.image), leaves an overlay whiteout in the
+    upper. It cannot see a copy in the OTHER slot's lower; the whiteout
+    hide_live_sudoers_in_upper writes before etc.mount covers that.
+
+    The file is removed only when its whole content is the single line
+    live-config writes. Anything else at that path is treated as the
+    operator's own and kept. Returns the paths it removed.
+    """
+    removed: list[str] = []
+    sudoers = etc / "sudoers.d" / "live"
+    if sudoers.is_file() and not sudoers.is_symlink():
+        try:
+            content = sudoers.read_text()
+        except (OSError, UnicodeDecodeError) as exc:
+            logging.warning("could not read %s, leaving it: %s", sudoers, exc)
+        else:
+            if content.rstrip("\n") == LIVE_SUDOERS_LINE:
+                sudoers.unlink()
+                removed.append(str(sudoers))
+            else:
+                logging.info(
+                    "%s does not hold the live-session rule, leaving it", sudoers
+                )
+
+    if live_config_state.is_dir() and not live_config_state.is_symlink():
+        shutil.rmtree(live_config_state)
+        removed.append(str(live_config_state))
+    return removed
+
+
+def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(
         format="spatium-etc-reconcile: %(message)s",
         level=logging.INFO,
         stream=sys.stderr,
     )
+    args = sys.argv[1:] if argv is None else argv
+    if args == ["--before-mount"]:
+        return before_mount(UPPER, LOWER, ETC)
+    if args:
+        logging.error("usage: spatium-etc-reconcile [--before-mount]")
+        return 2
 
     if not LOWER.is_dir():
         logging.info("no /usr/lib/etc.image — overlay not in use yet, skipping")
@@ -158,6 +322,14 @@ def main() -> int:
         logging.info("merged system accounts: %s", " ".join(parts))
     else:
         logging.info("no changes (overlay already matches image baseline)")
+
+    try:
+        for path in remove_live_session_sudoers(ETC, LIVE_CONFIG_STATE):
+            logging.info("removed live-session leftover: %s", path)
+    except OSError as exc:
+        # Never fail the boot over this; the account merge above is what
+        # the rest of sysinit depends on. The next boot tries again.
+        logging.warning("could not remove live-session leftovers: %s", exc)
     return 0
 
 

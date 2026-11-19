@@ -20,6 +20,7 @@ htmlcov/
 # Node / Frontend
 node_modules/
 frontend/dist/
+frontend/dist-legal/
 frontend/.vite/
 
 # Alembic — migrations MUST be tracked (CI needs them for the test DB).

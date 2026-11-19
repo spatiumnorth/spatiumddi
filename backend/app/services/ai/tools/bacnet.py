@@ -49,6 +49,7 @@ class FindBACnetDevicesArgs(BaseModel):
 
 @register_tool(
     name="find_bacnet_devices",
+    permission=("read", "bacnet_device"),
     description=(
         "List BACnet/IP devices with their device instance number, vendor, "
         "model, IP address and BBMD flag. Use this to answer 'which device "
@@ -116,6 +117,7 @@ class CountBACnetDevicesArgs(BaseModel):
 
 @register_tool(
     name="count_bacnet_devices",
+    permission=("read", "bacnet_device"),
     description=(
         "Count BACnet devices with a breakdown of BBMDs, foreign devices, and "
         "how many report no usable vendor id. Quick health rollup for a "
@@ -155,6 +157,7 @@ class FindBBMDsArgs(BaseModel):
 
 @register_tool(
     name="find_bbmds",
+    permission=("read", "bacnet_device"),
     description=(
         "List BACnet Broadcast Management Devices with their subnet and the "
         "size of their Broadcast Distribution and Foreign Device tables. Each "

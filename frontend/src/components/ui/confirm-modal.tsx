@@ -33,7 +33,9 @@ export function ConfirmModal({
   loading = false,
   requireCheckboxLabel,
   requirePassword = false,
+  autoFocusCancel = false,
   passwordError,
+  error,
   onConfirm,
   onClose,
 }: {
@@ -46,10 +48,16 @@ export function ConfirmModal({
   loading?: boolean;
   requireCheckboxLabel?: string;
   requirePassword?: boolean;
+  // Focus Cancel on open, so Enter backs out instead of confirming. For
+  // destructive confirmations where the safe answer must be the default.
+  autoFocusCancel?: boolean;
   // Surfaced to the password input as inline error text — used by
   // callers to render the server's 403 "Current password incorrect."
   // body without bouncing the operator out of the modal.
   passwordError?: string | null;
+  // A refused confirm's reason, drawn inside the open dialog as an alert so
+  // it is announced: the page behind an aria-modal dialog is inert (#4218).
+  error?: string | null;
   onConfirm: (password?: string) => void;
   onClose: () => void;
 }) {
@@ -112,15 +120,23 @@ export function ConfirmModal({
               disabled={loading}
             />
             {passwordError && (
-              <p className="text-xs text-destructive">{passwordError}</p>
+              <p role="alert" className="text-xs text-destructive">
+                {passwordError}
+              </p>
             )}
           </div>
+        )}
+        {error && (
+          <p role="alert" className="text-sm text-destructive">
+            {error}
+          </p>
         )}
         <div className="flex justify-end gap-2">
           <button
             type="button"
             onClick={onClose}
             disabled={loading}
+            autoFocus={autoFocusCancel}
             className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
           >
             {cancelLabel}

@@ -93,3 +93,70 @@ async def test_same_code_under_different_parents_allowed(
         headers=h,
     )
     assert fb.status_code == 201, fb.text
+
+
+async def _site_with_default_binding(db: AsyncSession, name: str):
+    from app.models.e911 import EmergencyResponseLocation, ERLBinding
+    from app.models.ownership import Site
+
+    site = Site(name=name, kind="datacenter")
+    erl = EmergencyResponseLocation(name=f"erl-{name}", country="US", a1="NY", rd="Broadway")
+    db.add_all([site, erl])
+    await db.flush()
+    db.add(ERLBinding(erl_id=erl.id, rule_kind="site_default", site_id=site.id))
+    await db.flush()
+    return site
+
+
+@pytest.mark.asyncio
+async def test_site_with_e911_default_binding_cannot_be_deleted(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#2298: the binding is ON DELETE CASCADE; the delete must be refused, not cascade."""
+    from sqlalchemy import func, select
+
+    from app.models.e911 import ERLBinding
+
+    h = await _admin(db_session)
+    site = await _site_with_default_binding(db_session, "HQ-e911")
+    r = await client.delete(f"/api/v1/sites/{site.id}", headers=h)
+    assert r.status_code == 409, r.text
+    assert "HQ-e911" in r.json()["detail"] and "erl-HQ-e911" in r.json()["detail"]
+    assert (await client.get(f"/api/v1/sites/{site.id}", headers=h)).status_code == 200
+    n = (
+        await db_session.execute(
+            select(func.count()).select_from(ERLBinding).where(ERLBinding.site_id == site.id)
+        )
+    ).scalar_one()
+    assert n == 1
+
+
+@pytest.mark.asyncio
+async def test_bulk_delete_refused_whole_when_any_site_is_e911_bound(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h = await _admin(db_session)
+    bound = await _site_with_default_binding(db_session, "bound-site")
+    plain = (await client.post("/api/v1/sites", json={"name": "plain-site"}, headers=h)).json()
+    r = await client.post(
+        "/api/v1/sites/bulk-delete", json={"ids": [str(bound.id), plain["id"]]}, headers=h
+    )
+    assert r.status_code == 409, r.text
+    assert "bound-site" in r.json()["detail"]
+    assert (await client.get(f"/api/v1/sites/{plain['id']}", headers=h)).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_site_deletes_after_binding_removed(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    from sqlalchemy import delete
+
+    from app.models.e911 import ERLBinding
+
+    h = await _admin(db_session)
+    site = await _site_with_default_binding(db_session, "later")
+    await db_session.execute(delete(ERLBinding).where(ERLBinding.site_id == site.id))
+    await db_session.flush()
+    r = await client.delete(f"/api/v1/sites/{site.id}", headers=h)
+    assert r.status_code == 204, r.text

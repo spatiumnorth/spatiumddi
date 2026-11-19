@@ -729,6 +729,20 @@ def get_lease(
     return status, None
 
 
+def _micro_time(at: float | None = None) -> str:
+    """A Lease's ``acquireTime`` / ``renewTime``: a Kubernetes MicroTime.
+
+    The apiserver parses MicroTime strictly, as RFC 3339 with exactly six
+    fractional digits (``2006-01-02T15:04:05.000000Z07:00``), and answers
+    400 "cannot be handled as a Lease" to whole seconds. Every lease write
+    used whole seconds, so the rolling-upgrade orchestrator could never
+    take its lease on a real cluster (#1445).
+    """
+    stamp = time.time() if at is None else at
+    micros = int((stamp % 1) * 1_000_000)
+    return f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(stamp))}.{micros:06d}Z"
+
+
 def create_lease(
     name: str,
     holder: str,
@@ -748,7 +762,7 @@ def create_lease(
     if cfg is None:
         return False, "ServiceAccount not mounted"
     ns = namespace or cfg.namespace
-    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    now = _micro_time()
     payload = json.dumps(
         {
             "apiVersion": "coordination.k8s.io/v1",
@@ -781,6 +795,7 @@ def update_lease(
     lease_duration_seconds: int = 60,
     bump_transitions: bool = False,
     expected_transitions: int | None = None,
+    resource_version: str | None = None,
 ) -> tuple[bool, str | None]:
     """Update a Lease's renewTime + holderIdentity.
 
@@ -790,12 +805,14 @@ def update_lease(
     Acquisition (after a previous holder's lease expired): caller
     passes their own identity as ``holder`` + sets ``bump_transitions=
     True`` so ``leaseTransitions`` increments (this is how k8s
-    leader-election detects a takeover).
+    leader-election detects a takeover). ``expected_transitions`` is the
+    value the caller read; the patch writes it plus one.
 
-    ``expected_transitions`` lets callers do an optimistic-concurrency
-    update — if set, we read first and refuse the patch when the
-    server's value drifted (another holder beat us to the takeover).
-    Returns (ok, error). 409 reports an explicit conflict.
+    ``resource_version`` makes the update a compare-and-swap (#1512): the
+    patch carries the ``metadata.resourceVersion`` the caller read, and the
+    apiserver answers 409 when the lease changed since. Without it two
+    takeovers of one expired lease both succeeded. Returns (ok, error);
+    409 reports the conflict.
     """
     cfg = get_config()
     if cfg is None:
@@ -803,7 +820,7 @@ def update_lease(
     ns = namespace or cfg.namespace
     # We do a server-side merge patch on ``spec`` only — the
     # metadata is owned by k8s + the controller-manager.
-    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    now = _micro_time()
     spec: dict[str, Any] = {
         "holderIdentity": holder,
         "leaseDurationSeconds": lease_duration_seconds,
@@ -813,7 +830,10 @@ def update_lease(
         if expected_transitions is not None:
             spec["leaseTransitions"] = expected_transitions + 1
         spec["acquireTime"] = now
-    payload = json.dumps({"spec": spec}).encode("utf-8")
+    patch: dict[str, Any] = {"spec": spec}
+    if resource_version:
+        patch["metadata"] = {"resourceVersion": resource_version}
+    payload = json.dumps(patch).encode("utf-8")
     path = f"/apis/coordination.k8s.io/v1/namespaces/{quote(ns)}/leases/{quote(name)}"
     try:
         status, body = _request(
@@ -835,6 +855,7 @@ def clear_lease_holder(
     name: str,
     *,
     namespace: str | None = None,
+    resource_version: str | None = None,
 ) -> tuple[bool, str | None]:
     """Mark a lease as released without deleting it.
 
@@ -850,8 +871,12 @@ def clear_lease_holder(
     ns = namespace or cfg.namespace
     # Two-hour-ago renewTime is well beyond any sane
     # leaseDurationSeconds → next read treats this as expired.
-    old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 7200))
-    payload = json.dumps({"spec": {"holderIdentity": "", "renewTime": old}}).encode("utf-8")
+    old = _micro_time(time.time() - 7200)
+    patch: dict[str, Any] = {"spec": {"holderIdentity": "", "renewTime": old}}
+    if resource_version:
+        # #1512 — only clear the lease the caller read (see update_lease).
+        patch["metadata"] = {"resourceVersion": resource_version}
+    payload = json.dumps(patch).encode("utf-8")
     path = f"/apis/coordination.k8s.io/v1/namespaces/{quote(ns)}/leases/{quote(name)}"
     try:
         status, body = _request(
@@ -913,6 +938,16 @@ def list_nodes(
     return status, items
 
 
+# #2449: the helpers behind the per-node writes a rolling upgrade retries (the
+# CNPG maintenance window patch, cordon, uncordon) keep the API server's whole
+# answer in their error, so a run that still fails says why. The answer used to
+# be cut at 200 bytes, just before the admission webhook's own reason. A Status
+# for a failed admission call is well under 1 KiB even with its message
+# repeated under details.causes; this bound only keeps a pathological body (an
+# intermediary's HTML error page, say) out of the run's row, its logs and the UI.
+KUBEAPI_ERROR_BODY_MAX = 4096
+
+
 def cordon_node(name: str) -> tuple[bool, str | None]:
     """Mark a Node unschedulable (idempotent — k8s no-ops if already true)."""
     cfg = get_config()
@@ -931,7 +966,7 @@ def cordon_node(name: str) -> tuple[bool, str | None]:
         return False, str(exc)
     if status in (200, 201):
         return True, None
-    return False, f"kubeapi status {status}: {body[:200]!r}"
+    return False, f"kubeapi status {status}: {body[:KUBEAPI_ERROR_BODY_MAX]!r}"
 
 
 def uncordon_node(name: str) -> tuple[bool, str | None]:
@@ -955,7 +990,31 @@ def uncordon_node(name: str) -> tuple[bool, str | None]:
         return False, str(exc)
     if status in (200, 201):
         return True, None
-    return False, f"kubeapi status {status}: {body[:200]!r}"
+    return False, f"kubeapi status {status}: {body[:KUBEAPI_ERROR_BODY_MAX]!r}"
+
+
+def patch_node(name: str, patch: dict[str, Any]) -> tuple[int, str | None]:
+    """Strategic-merge PATCH a Node. Returns ``(status, error)``; ``error``
+    is None on 200/201, and status is 0 when kubeapi was not reached. A
+    ``null`` annotation value removes that key.
+
+    Unlike :func:`cordon_node` the status comes back, so a caller can tell
+    a Node that is gone (404) from a PATCH that failed."""
+    if get_config() is None:
+        return 0, "ServiceAccount not mounted"
+    path = f"/api/v1/nodes/{quote(name)}"
+    try:
+        status, body = _request(
+            "PATCH",
+            path,
+            body=json.dumps(patch).encode("utf-8"),
+            content_type="application/strategic-merge-patch+json",
+        )
+    except KubeapiUnavailableError as exc:
+        return 0, str(exc)
+    if status in (200, 201):
+        return status, None
+    return status, f"kubeapi status {status}: {body[:200]!r}"
 
 
 def is_node_ready(node: dict[str, Any]) -> bool:
@@ -1001,6 +1060,23 @@ def pod_is_owned_by_daemonset(pod: dict[str, Any]) -> bool:
     """
     owners = (pod.get("metadata") or {}).get("ownerReferences") or []
     return any(o.get("kind") == "DaemonSet" for o in owners)
+
+
+def pod_has_controller(pod: dict[str, Any]) -> bool:
+    """True if the pod has a controller ownerReference.
+
+    A pod is controller-owned when one of its ``ownerReferences``
+    either carries ``controller: true`` (what the apiserver sets for
+    the managing controller) or names a workload controller kind
+    (ReplicaSet / StatefulSet / DaemonSet / Job /
+    ReplicationController). A bare pod — created directly, with no
+    controller — has neither, and nothing re-creates it if it is
+    deleted. Drain uses this to refuse evicting such pods (#1546),
+    matching ``kubectl drain`` without ``--force``.
+    """
+    owners = (pod.get("metadata") or {}).get("ownerReferences") or []
+    controller_kinds = {"ReplicaSet", "StatefulSet", "DaemonSet", "Job", "ReplicationController"}
+    return any(o.get("controller") or o.get("kind") in controller_kinds for o in owners)
 
 
 def pod_is_terminal(pod: dict[str, Any]) -> bool:
@@ -1073,6 +1149,22 @@ def evict_pod(
 # CR path math.
 
 
+def get_pod(name: str, namespace: str | None = None) -> tuple[int, dict[str, Any] | None]:
+    """Read one pod. Returns (status, parsed_body_or_None), like
+    ``get_cnpg_cluster``: a non-200 comes back as status + None."""
+    cfg = get_config()
+    if cfg is None:
+        raise KubeapiUnavailableError("ServiceAccount not mounted; kubeapi unreachable")
+    ns = namespace or cfg.namespace
+    status, body = _request("GET", f"/api/v1/namespaces/{quote(ns)}/pods/{quote(name)}")
+    if status == 200:
+        try:
+            return status, json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return status, None
+    return status, None
+
+
 def get_cnpg_cluster(name: str, namespace: str | None = None) -> tuple[int, dict[str, Any] | None]:
     """Read a CNPG ``postgresql.cnpg.io/v1`` Cluster CR.
 
@@ -1132,16 +1224,18 @@ def patch_cnpg_maintenance_window(
         return False, str(exc)
     if status in (200, 201):
         return True, None
-    return False, f"kubeapi status {status}: {body[:200]!r}"
+    return False, f"kubeapi status {status}: {body[:KUBEAPI_ERROR_BODY_MAX]!r}"
 
 
 # ── HelmChartConfig + rollout primitives (#296 Phase E) ────────────────
 # The orchestrator's post-loop chart bump patches the same
 # ``helm.cattle.io/v1`` HelmChartConfig CR the supervisor writes to
-# for cp-size / VIP overrides. Helpers mirror the supervisor's
-# ``_helmchartconfig_upsert`` shape so both sides converge on identical
-# kubeapi semantics — see agent/supervisor/spatium_supervisor/k8s_api.py
-# for the durability rationale.
+# for cp-size / VIP overrides. The supervisor merges only its own keys
+# into the live document (``_merge_owned_overrides``, #2024); callers here
+# must do the same — read, change their one key, write the whole document
+# back — so neither side deletes the other's keys. See
+# agent/supervisor/spatium_supervisor/k8s_api.py for the durability
+# rationale.
 
 
 def get_helmchartconfig(
@@ -1173,8 +1267,8 @@ def upsert_helmchartconfig(
 ) -> tuple[bool, str | None]:
     """Create-or-update the HelmChartConfig so its ``spec.valuesContent``
     equals ``values_yaml``. Idempotent — returns ``(True, None)`` when
-    already current. Same shape as the supervisor's
-    ``_helmchartconfig_upsert``."""
+    already current. The caller owns the merge: ``values_yaml`` must be
+    the live document with its own key changed, never just its own key."""
     cfg = get_config()
     if cfg is None:
         return False, "ServiceAccount not mounted"
@@ -1238,6 +1332,32 @@ def get_deployment(name: str, namespace: str | None = None) -> tuple[int, dict[s
     return status, None
 
 
+def list_deployments(
+    label_selector: str, namespace: str | None = None
+) -> tuple[int, list[dict[str, Any]]]:
+    """List Deployments matching ``label_selector`` (#1544).
+
+    Returns ``(status, items)``; ``items`` is empty on any non-200. Lets a
+    caller find a release's Deployments by label instead of carrying a
+    name list that goes stale when the chart adds one.
+    """
+    cfg = get_config()
+    if cfg is None:
+        raise KubeapiUnavailableError("ServiceAccount not mounted; kubeapi unreachable")
+    ns = namespace or cfg.namespace
+    path = (
+        f"/apis/apps/v1/namespaces/{quote(ns)}/deployments"
+        f"?labelSelector={quote(label_selector, safe='')}"
+    )
+    status, body = _request("GET", path)
+    if status == 200:
+        try:
+            return status, list(json.loads(body.decode("utf-8")).get("items") or [])
+        except (ValueError, UnicodeDecodeError, AttributeError):
+            return status, []
+    return status, []
+
+
 def deployment_is_rolled_out(deployment: dict[str, Any]) -> bool:
     """True when a Deployment's rolling update has finished.
 
@@ -1264,6 +1384,51 @@ def deployment_is_rolled_out(deployment: dict[str, Any]) -> bool:
     )
 
 
+def list_daemonsets(
+    label_selector: str = "", namespace: str | None = None
+) -> tuple[int, list[dict[str, Any]]]:
+    """List DaemonSets matching ``label_selector`` (every one when it is
+    empty). Returns ``(status, items)``; ``items`` is empty on any non-200.
+
+    The rolling upgrade's end-of-roll flip waits on the DaemonSets it moves
+    (the supervisor and the DNS / DHCP agents), not only the Deployments
+    (#1710).
+    """
+    cfg = get_config()
+    if cfg is None:
+        raise KubeapiUnavailableError("ServiceAccount not mounted; kubeapi unreachable")
+    ns = namespace or cfg.namespace
+    path = (
+        f"/apis/apps/v1/namespaces/{quote(ns)}/daemonsets"
+        f"?labelSelector={quote(label_selector, safe='')}"
+    )
+    status, body = _request("GET", path)
+    if status == 200:
+        try:
+            return status, list(json.loads(body.decode("utf-8")).get("items") or [])
+        except (ValueError, UnicodeDecodeError, AttributeError):
+            return status, []
+    return status, []
+
+
+def daemonset_is_rolled_out(daemonset: dict[str, Any]) -> bool:
+    """True when a DaemonSet's rolling update has finished, as
+    ``kubectl rollout status`` reads it: the controller has seen the latest
+    spec, and every scheduled pod is updated and available. A DaemonSet that
+    schedules no pod (its role is on no node) is trivially rolled out."""
+    meta = daemonset.get("metadata") or {}
+    status = daemonset.get("status") or {}
+    desired = int(status.get("desiredNumberScheduled") or 0)
+    if int(status.get("observedGeneration") or 0) < int(meta.get("generation") or 0):
+        return False
+    if desired == 0:
+        return True
+    return (
+        int(status.get("updatedNumberScheduled") or 0) >= desired
+        and int(status.get("numberAvailable") or 0) >= desired
+    )
+
+
 def get_job(name: str, namespace: str | None = None) -> tuple[int, dict[str, Any] | None]:
     """Read a batch/v1 Job. The migrate Job's ``status.succeeded`` /
     ``status.failed`` counters tell us whether the chart-bump's
@@ -1280,6 +1445,32 @@ def get_job(name: str, namespace: str | None = None) -> tuple[int, dict[str, Any
         except (ValueError, UnicodeDecodeError):
             return status, None
     return status, None
+
+
+def list_jobs(
+    label_selector: str, namespace: str | None = None
+) -> tuple[int, list[dict[str, Any]]]:
+    """List batch/v1 Jobs matching ``label_selector`` (#1829).
+
+    Returns ``(status, items)``; ``items`` is empty on any non-200. The chart
+    names its migrate Job ``<release>-migrate-r<revision>``, a new name on
+    every helm upgrade, so the chart bump finds it by its labels.
+    """
+    cfg = get_config()
+    if cfg is None:
+        raise KubeapiUnavailableError("ServiceAccount not mounted; kubeapi unreachable")
+    ns = namespace or cfg.namespace
+    path = (
+        f"/apis/batch/v1/namespaces/{quote(ns)}/jobs"
+        f"?labelSelector={quote(label_selector, safe='')}"
+    )
+    status, body = _request("GET", path)
+    if status == 200:
+        try:
+            return status, list(json.loads(body.decode("utf-8")).get("items") or [])
+        except (ValueError, UnicodeDecodeError, AttributeError):
+            return status, []
+    return status, []
 
 
 def job_terminal_state(job: dict[str, Any]) -> str | None:
@@ -1301,6 +1492,7 @@ __all__ = [
     "clear_lease_holder",
     "cordon_node",
     "create_lease",
+    "daemonset_is_rolled_out",
     "delete_pod",
     "deployment_is_rolled_out",
     "evict_pod",
@@ -1313,6 +1505,8 @@ __all__ = [
     "get_pod_logs",
     "is_node_ready",
     "job_terminal_state",
+    "list_daemonsets",
+    "list_jobs",
     "list_nodes",
     "list_pods",
     "list_pods_on_node",

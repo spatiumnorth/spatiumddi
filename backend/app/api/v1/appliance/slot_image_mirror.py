@@ -15,10 +15,16 @@ auth — no JWT / RBAC / session):
 * ``PUT  /internal/slot-images/{image_id}``  — stream body bytes to
   ``<slot_image_dir>/{image_id}.raw.xz`` via a ``.partial`` rename so
   a crashed mid-upload doesn't expose half-written bytes. No size
-  cap here — the main api already enforced one before forwarding.
+  cap of its own: the main api enforces one while it forwards, and the
+  app-wide body cap (``app.core.body_limit``) carries an allowance of
+  that size for this route. The X-Mirror-Auth header is checked (a
+  dependency) before any of the body is read.
 
 * ``GET  /internal/slot-images/{image_id}``  — stream bytes back.
   StreamingResponse so a 4 GiB download doesn't load into memory.
+
+* ``HEAD /internal/slot-images/{image_id}``  — presence probe: 200 when
+  stored, 404 when not, no body (#1919). Same ``get`` auth as the GET.
 
 * ``DELETE /internal/slot-images/{image_id}`` — remove the file.
   Best-effort; 404 on the file is fine (operator may have rm-rf'd
@@ -44,10 +50,11 @@ from hashlib import sha256
 from pathlib import Path
 
 import structlog
-from fastapi import APIRouter, HTTPException, Request, status
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
+from app.api.pre_body_auth import header_only
 from app.config import settings
 
 logger = structlog.get_logger(__name__)
@@ -166,6 +173,30 @@ def _verify_auth(operation: str, image_id: uuid.UUID, header: str | None) -> Non
         )
 
 
+@header_only
+async def require_put_auth(request: Request) -> None:
+    """The PUT's ``X-Mirror-Auth`` check, as a dependency.
+
+    The PUT takes an image of up to 4 GiB as a raw body (its body-cap
+    allowance in ``app.core.body_limit``), so the mirror checks the caller
+    before reading any of it. The handler reads ``request.stream()`` itself
+    and declares no body parameter, so FastAPI reads nothing before its
+    dependencies have run; a dependency, rather than a call at the top of the
+    handler, is what ``tests/test_pre_body_auth.py`` can see."""
+    header = request.headers.get(_AUTH_HEADER)
+    if not header:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, f"Missing {_AUTH_HEADER} header.")
+    try:
+        image_id = uuid.UUID(str(request.path_params.get("image_id", "")))
+    except ValueError:
+        # No token can be valid for an id that is not a UUID.
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            f"Invalid {_AUTH_HEADER} header.",
+        ) from None
+    _verify_auth("put", image_id, header)
+
+
 def _ensure_dir() -> None:
     d = _image_dir()
     d.mkdir(parents=True, exist_ok=True)
@@ -186,9 +217,9 @@ def _ensure_dir() -> None:
     "/{image_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="(mirror) write slot image bytes from the api",
+    dependencies=[Depends(require_put_auth)],
 )
 async def put_image(image_id: uuid.UUID, request: Request) -> None:
-    _verify_auth("put", image_id, request.headers.get(_AUTH_HEADER))
     _ensure_dir()
     target = _image_path(image_id)
     # Append ".partial" to the full ``<id>.raw.xz`` name — NOT
@@ -264,14 +295,36 @@ async def get_image(image_id: uuid.UUID, request: Request) -> FileResponse:
     )
 
 
+@router.head(
+    "/{image_id}",
+    summary="(mirror) does the mirror hold this slot image? 200 / 404, no body",
+    response_class=Response,
+)
+async def head_image(image_id: uuid.UUID, request: Request) -> Response:
+    """Presence probe (#1919). FastAPI's ``APIRoute`` does not add HEAD to a
+    GET route (Starlette's plain ``Route`` does), so without this the
+    preflight's and the re-upload check's HEAD answered 405. Same
+    ``get`` auth as the GET it stands in for; never a body."""
+    _verify_auth("get", image_id, request.headers.get(_AUTH_HEADER))
+    path = _image_path(image_id)
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return Response(status_code=status.HTTP_404_NOT_FOUND)
+    return Response(
+        status_code=status.HTTP_200_OK,
+        headers={"Content-Length": str(size), "Content-Type": "application/octet-stream"},
+    )
+
+
 class MirrorDiskUsage(BaseModel):
     """Disk-usage snapshot of the mirror's PVC volume.
 
-    Phase A's ``check_disk_headroom`` checks the api pod's local /var
-    — useful on docker-compose, useless on multi-node because the
-    api's /var isn't where the slot image actually lands. The Phase B
-    preflight ``check_mirror_disk_headroom`` calls this endpoint to
-    get the real numbers from the mirror's PVC.
+    The preflight's ``disk_headroom`` judges each appliance node's own
+    ``/var`` from its heartbeat (#1234) — where ``spatium-upgrade-slot``
+    stages the image. The mirror's PVC is a separate volume nothing
+    there sees, so the Phase B preflight ``check_mirror_disk_headroom``
+    calls this endpoint to get the real numbers from it.
     """
 
     path: str

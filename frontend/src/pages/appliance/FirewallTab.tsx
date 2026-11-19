@@ -51,6 +51,10 @@ import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { WebUIAccessCard } from "@/components/WebUIAccessCard";
 import { useSessionState } from "@/lib/useSessionState";
 import { cn } from "@/lib/utils";
+import { useApplianceAdminGate } from "@/hooks/useApplianceAdmin";
+import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
+import { isRefused, pollUnlessRefused } from "@/lib/refusal";
+import { FormError } from "@/components/ui/form-error";
 
 const ROLE_OPTIONS = [
   "dns-bind9",
@@ -231,8 +235,9 @@ function recentlySeen(iso: string | null | undefined): boolean {
   return Number.isFinite(t) && Date.now() - t < 120_000;
 }
 
-function FirewallLogsSection() {
+export function FirewallLogsSection() {
   const qc = useQueryClient();
+  const applianceGate = useApplianceAdminGate();
   const { data: enf } = useQuery({
     queryKey: ["firewall", "enforcement"],
     queryFn: firewallApi.getEnforcement,
@@ -242,10 +247,11 @@ function FirewallLogsSection() {
     onSuccess: (d) => qc.setQueryData(["firewall", "enforcement"], d),
   });
 
-  const { data: appliances } = useQuery({
+  const { data: appliances, error: appliancesError } = useQuery({
     queryKey: ["appliance", "fleet", "fw-logs"],
     queryFn: applianceApprovalApi.list,
-    refetchInterval: 30_000,
+    // #3106 — a refused list is not asked again every 30 s.
+    refetchInterval: pollUnlessRefused(30_000),
   });
   const online = useMemo(
     () =>
@@ -337,8 +343,9 @@ function FirewallLogsSection() {
           type="button"
           onClick={() => setLogging.mutate(!loggingOn)}
           disabled={setLogging.isPending}
+          {...applianceGate}
           className={cn(
-            "inline-flex shrink-0 items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm",
+            "inline-flex shrink-0 items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm disabled:cursor-not-allowed disabled:opacity-50",
             loggingOn
               ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
               : "bg-background hover:bg-accent",
@@ -368,7 +375,14 @@ function FirewallLogsSection() {
           className="rounded-md border bg-background px-2 py-1 text-sm"
         >
           {online.length === 0 && (
-            <option value="">No online appliances</option>
+            <option value="">
+              {/* #3107 — a refused list is not "no appliances". */}
+              {appliancesError
+                ? isRefused(appliancesError)
+                  ? "Appliance list not permitted"
+                  : "Couldn't load appliances"
+                : "No online appliances"}
+            </option>
           )}
           {online.map((a) => (
             <option key={a.id} value={a.id}>
@@ -376,6 +390,13 @@ function FirewallLogsSection() {
             </option>
           ))}
         </select>
+        {appliancesError && (
+          <ListReadError
+            error={appliancesError}
+            what="the appliance list"
+            className="text-xs"
+          />
+        )}
         <button
           type="button"
           onClick={() => setPaused((p) => !p)}
@@ -397,9 +418,9 @@ function FirewallLogsSection() {
       </div>
 
       {err && (
-        <div className="rounded-md border border-destructive/50 bg-destructive/10 p-2 text-xs text-destructive">
+        <FormError className="rounded-md border border-destructive/50 bg-destructive/10 p-2 text-xs text-destructive">
           {err}
-        </div>
+        </FormError>
       )}
 
       <div
@@ -429,6 +450,8 @@ function FirewallLogsSection() {
 // ── Enforcement master switch + all-CP-hardened gate (Phase 4a) ──────
 
 function EnforcementCard() {
+  // #1342 — every appliance action takes `admin` on `appliance`.
+  const applianceGate = useApplianceAdminGate();
   const qc = useQueryClient();
   const { data: e } = useQuery({
     queryKey: ["firewall", "enforcement"],
@@ -485,7 +508,8 @@ function EnforcementCard() {
             <button
               type="button"
               onClick={() => setConfirm("disable")}
-              className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
+              className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+              {...applianceGate}
             >
               Disable
             </button>
@@ -495,7 +519,8 @@ function EnforcementCard() {
               onClick={() =>
                 setConfirm(e.safe_to_enable ? "enable" : "enable-override")
               }
-              className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+              className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+              {...applianceGate}
             >
               Enable…
             </button>
@@ -527,9 +552,9 @@ function EnforcementCard() {
       )}
 
       {set.isError && (
-        <p className="mt-2 text-xs text-destructive">
+        <FormError className="mt-2 text-xs text-destructive">
           {formatApiError(set.error)}
-        </p>
+        </FormError>
       )}
 
       <ConfirmModal
@@ -586,8 +611,14 @@ function EnforcementCard() {
 // ── Policies ─────────────────────────────────────────────────────────
 
 function PoliciesSection() {
+  // #1342 — every appliance action takes `admin` on `appliance`.
+  const applianceGate = useApplianceAdminGate();
   const qc = useQueryClient();
-  const { data: policies, isLoading } = useQuery({
+  const {
+    data: policies,
+    isLoading,
+    error: policiesError,
+  } = useQuery({
     queryKey: ["firewall", "policies"],
     queryFn: () => firewallApi.listPolicies(),
   });
@@ -630,7 +661,7 @@ function PoliciesSection() {
           bars above the whole tab. Two columns so they stay compact. */}
       <div className="grid gap-3 xl:grid-cols-2">
         <EnforcementCard />
-        <WebUIAccessCard />
+        <WebUIAccessCard editDisabledReason={applianceGate.title} />
       </div>
       <div className="grid gap-2 sm:grid-cols-3">
         {POSTURE_PRESETS.map((p) => (
@@ -642,7 +673,8 @@ function PoliciesSection() {
             <button
               type="button"
               onClick={() => setConfirmPreset(p.key)}
-              className="mt-2 rounded-md border px-2.5 py-1 text-xs hover:bg-accent"
+              className="mt-2 rounded-md border px-2.5 py-1 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+              {...applianceGate}
             >
               Apply preset
             </button>
@@ -651,9 +683,9 @@ function PoliciesSection() {
       </div>
 
       {posture.isError && (
-        <p className="text-xs text-destructive">
+        <FormError className="text-xs text-destructive">
           {formatApiError(posture.error)}
-        </p>
+        </FormError>
       )}
 
       <div className="flex items-center justify-between">
@@ -671,7 +703,8 @@ function PoliciesSection() {
           <button
             type="button"
             onClick={() => setShowNew(true)}
-            className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+            className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+            {...applianceGate}
           >
             <Plus className="h-3.5 w-3.5" /> New policy
           </button>
@@ -722,6 +755,7 @@ function PoliciesSection() {
                           ? "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400"
                           : "bg-muted text-muted-foreground",
                       )}
+                      {...applianceGate}
                     >
                       {p.enabled ? "enabled" : "disabled"}
                     </button>
@@ -731,7 +765,8 @@ function PoliciesSection() {
                       <button
                         type="button"
                         onClick={() => setEditPolicy(p)}
-                        className="rounded-md border px-2 py-1 text-xs hover:bg-accent"
+                        className="rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                        {...applianceGate}
                       >
                         Edit rules
                       </button>
@@ -744,7 +779,9 @@ function PoliciesSection() {
                             ? "Built-in policies can't be deleted (disable instead)"
                             : "Delete"
                         }
+                        aria-label="Delete"
                         className="rounded-md border px-2 py-1 text-xs text-destructive hover:bg-destructive/10 disabled:opacity-40"
+                        {...applianceGate}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>
@@ -758,8 +795,11 @@ function PoliciesSection() {
                     colSpan={5}
                     className="px-3 py-6 text-center text-muted-foreground"
                   >
-                    No policies yet. The builtin role policies seed on first
-                    migrate; create a fleet baseline or appliance override here.
+                    <ListEmpty error={policiesError} what="firewall policies">
+                      No policies yet. The builtin role policies seed on first
+                      migrate; create a fleet baseline or appliance override
+                      here.
+                    </ListEmpty>
                   </td>
                 </tr>
               )}
@@ -769,9 +809,9 @@ function PoliciesSection() {
       )}
 
       {toggle.isError && (
-        <p className="text-xs text-destructive">
+        <FormError className="text-xs text-destructive">
           {formatApiError(toggle.error)}
-        </p>
+        </FormError>
       )}
 
       {showNew && (
@@ -917,9 +957,9 @@ function NewPolicyModal({
           </label>
         )}
         {save.isError && (
-          <p className="text-xs text-destructive">
+          <FormError className="text-xs text-destructive">
             {formatApiError(save.error)}
-          </p>
+          </FormError>
         )}
         <div className="flex justify-end gap-2 pt-1">
           <button
@@ -1146,6 +1186,8 @@ function RuleRowsEditor({
                 </td>
                 <td className="px-1 py-1 text-right">
                   <button
+                    aria-label="Remove rule"
+                    title="Remove rule"
                     type="button"
                     onClick={() =>
                       setRows((rs) => rs.filter((_, j) => j !== i))
@@ -1196,9 +1238,9 @@ function RuleEditorModal({
         </p>
         <RuleRowsEditor rows={rows} setRows={setRows} />
         {save.isError && (
-          <p className="text-xs text-destructive">
+          <FormError className="text-xs text-destructive">
             {formatApiError(save.error)}
-          </p>
+          </FormError>
         )}
         <div className="flex justify-end gap-2 pt-1">
           <button
@@ -1227,7 +1269,12 @@ function RuleEditorModal({
 
 function AliasesSection() {
   const qc = useQueryClient();
-  const { data: aliases, isLoading } = useQuery({
+  const applianceGate = useApplianceAdminGate();
+  const {
+    data: aliases,
+    isLoading,
+    error: aliasesError,
+  } = useQuery({
     queryKey: ["firewall", "aliases"],
     queryFn: firewallApi.listAliases,
   });
@@ -1249,7 +1296,8 @@ function AliasesSection() {
         <button
           type="button"
           onClick={() => setShowNew(true)}
-          className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+          className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+          {...applianceGate}
         >
           <Plus className="h-3.5 w-3.5" /> New alias
         </button>
@@ -1282,7 +1330,10 @@ function AliasesSection() {
                       type="button"
                       disabled={a.is_builtin}
                       onClick={() => del.mutate(a.id)}
+                      aria-label={`Delete alias ${a.name}`}
+                      title="Delete alias"
                       className="rounded-md border px-2 py-1 text-xs text-destructive hover:bg-destructive/10 disabled:opacity-40"
+                      {...applianceGate}
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                     </button>
@@ -1295,7 +1346,9 @@ function AliasesSection() {
                     colSpan={4}
                     className="px-3 py-6 text-center text-muted-foreground"
                   >
-                    No aliases yet.
+                    <ListEmpty error={aliasesError} what="firewall aliases">
+                      No aliases yet.
+                    </ListEmpty>
                   </td>
                 </tr>
               )}
@@ -1382,9 +1435,9 @@ function NewAliasModal({
           />
         </label>
         {save.isError && (
-          <p className="text-xs text-destructive">
+          <FormError className="text-xs text-destructive">
             {formatApiError(save.error)}
-          </p>
+          </FormError>
         )}
         <div className="flex justify-end gap-2 pt-1">
           <button
@@ -1420,7 +1473,7 @@ const LAYER_LABELS: { key: string; label: string }[] = [
 ];
 
 function EffectiveSection() {
-  const { data: appliances } = useQuery({
+  const { data: appliances, error: appliancesError } = useQuery({
     queryKey: ["appliance", "appliances"],
     queryFn: applianceApprovalApi.list,
   });
@@ -1458,6 +1511,13 @@ function EffectiveSection() {
             </option>
           ))}
         </select>
+        {appliancesError && (
+          <ListReadError
+            error={appliancesError}
+            what="the appliance list"
+            className="text-xs"
+          />
+        )}
         {applianceId && (
           <button
             type="button"
@@ -1473,7 +1533,9 @@ function EffectiveSection() {
       </div>
 
       {error && (
-        <p className="text-xs text-destructive">{formatApiError(error)}</p>
+        <FormError className="text-xs text-destructive">
+          {formatApiError(error)}
+        </FormError>
       )}
 
       {eff && (
@@ -1548,7 +1610,7 @@ function EffectiveSection() {
 // ── Staged-preview diff viewer (Phase 4b) ───────────────────────────
 
 function PreviewSection() {
-  const { data: appliances } = useQuery({
+  const { data: appliances, error: appliancesError } = useQuery({
     queryKey: ["appliance", "appliances"],
     queryFn: applianceApprovalApi.list,
   });
@@ -1583,6 +1645,13 @@ function PreviewSection() {
             </option>
           ))}
         </select>
+        {appliancesError && (
+          <ListReadError
+            error={appliancesError}
+            what="the appliance list"
+            className="text-xs"
+          />
+        )}
         <button
           type="button"
           disabled={!applianceId || preview.isPending}
@@ -1599,9 +1668,9 @@ function PreviewSection() {
       <RuleRowsEditor rows={rows} setRows={setRows} />
 
       {preview.isError && (
-        <p className="text-xs text-destructive">
+        <FormError className="text-xs text-destructive">
           {formatApiError(preview.error)}
-        </p>
+        </FormError>
       )}
 
       {preview.data && (

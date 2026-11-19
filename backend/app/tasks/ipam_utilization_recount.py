@@ -17,8 +17,13 @@ Idempotent + cheap by design:
     it scales to 10k+ subnets on a single round-trip.
   * A single in-memory pass over the block tree for the recursive rollup
     (mirrors ``_update_block_utilization`` in the IPAM router — full-CIDR
-    denominator, BIGINT-clamped ``total_ips``, ``deleted_at IS NULL``
-    guards on both blocks and subnets).
+    denominator, each subnet's network/broadcast addresses counted as used
+    in the block (#2982), BIGINT-clamped ``total_ips``, ``deleted_at IS
+    NULL`` guards on both blocks and subnets).
+
+Upgrade note (#2982): block counters stored before the block rule
+changed are corrected by the first hourly run after the upgrade, and by
+any write under the block before that; no data migration is needed.
   * Only rows whose cached value actually drifted are written, so a
     converged install commits nothing and writes no audit row.
 
@@ -38,8 +43,15 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.celery_app import celery_app
+from app.config import settings
 from app.db import task_session
 from app.models.audit import AuditLog
+from app.services.ipam.utilization import (
+    COUNTS_TOWARD_UTILIZATION_SQL,
+    block_allocated,
+    block_subnet_contribution_sql,
+    block_utilization_percent,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -71,7 +83,7 @@ async def _recount_subnets(db: AsyncSession) -> int:
         await db.execute(
             text(
                 "SELECT subnet_id, COUNT(*) FROM ip_address "
-                "WHERE status != 'available' GROUP BY subnet_id"
+                f"WHERE {COUNTS_TOWARD_UTILIZATION_SQL} GROUP BY subnet_id"
             )
         )
     ).all():
@@ -92,6 +104,9 @@ async def _recount_subnets(db: AsyncSession) -> int:
             changes.append({"id": str(sid), "a": new_alloc, "u": new_util})
 
     if changes:
+        # Id order: the same lock order every incremental recount takes
+        # (``recount_subnets_and_blocks``), so the two never deadlock (#3345).
+        changes.sort(key=lambda c: c["id"])
         await db.execute(
             text(
                 "UPDATE subnet SET allocated_ips = :a, utilization_percent = :u "
@@ -130,15 +145,18 @@ async def _recount_blocks(db: AsyncSession) -> int:
         current[key] = (int(allocated_ips), int(total_ips), float(util))
         networks[key] = network
 
-    # Direct allocation per block = sum of its own subnets' allocated_ips
-    # (non-deleted subnets only), matching the router's recursive CTE which
-    # guards ``s.deleted_at IS NULL``.
+    # Direct allocation per block = sum of its own subnets' contributions
+    # (``allocated_ips`` plus their network/broadcast addresses, #2982;
+    # non-deleted subnets only), the same expression as the router's
+    # recursive CTE, which guards ``s.deleted_at IS NULL``.
     subtree: dict[str, int] = {key: 0 for key in current}
     for bid, direct in (
         await db.execute(
             text(
-                "SELECT block_id, COALESCE(SUM(allocated_ips), 0) FROM subnet "
-                "WHERE deleted_at IS NULL GROUP BY block_id"
+                "SELECT s.block_id, COALESCE(SUM("
+                + block_subnet_contribution_sql("s")
+                + "), 0) FROM subnet s "
+                "WHERE s.deleted_at IS NULL GROUP BY s.block_id"
             )
         )
     ).all():
@@ -167,14 +185,17 @@ async def _recount_blocks(db: AsyncSession) -> int:
 
     changes: list[dict[str, Any]] = []
     for key, (old_alloc, old_total, old_util) in current.items():
-        alloc = subtree[key]
+        alloc = block_allocated(subtree[key], networks[key])
         block_total = _num_addresses(networks[key])
         new_total = min(block_total, _BIGINT_MAX)
-        new_util = round(alloc / block_total * 100, 2) if block_total > 0 else 0.0
+        new_util = block_utilization_percent(alloc, networks[key])
         if alloc != old_alloc or new_total != old_total or abs(new_util - old_util) > 0.001:
             changes.append({"id": key, "a": alloc, "t": new_total, "u": new_util})
 
     if changes:
+        # Id order: the lock order of every incremental recount
+        # (``_update_blocks_utilization``), so the two never deadlock (#3345).
+        changes.sort(key=lambda c: c["id"])
         await db.execute(
             text(
                 "UPDATE ip_block SET allocated_ips = :a, total_ips = :t, "
@@ -213,7 +234,7 @@ async def recount_utilization(db: AsyncSession) -> dict[str, int]:
 
 
 async def _run_recount() -> dict[str, int]:
-    async with task_session() as db:
+    async with task_session(command_timeout=settings.task_db_long_command_timeout) as db:
         result = await recount_utilization(db)
         await db.commit()
         return result

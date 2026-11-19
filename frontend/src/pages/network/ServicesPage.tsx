@@ -1,3 +1,4 @@
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -21,14 +22,24 @@ import {
   type ServiceResourceRead,
   type ServiceStatus,
   type ServiceUpdate,
+  formatApiError,
 } from "@/lib/api";
+import { formatDateOnly, termDaysLeft } from "@/lib/localTime";
 import { cn, zebraBodyCls } from "@/lib/utils";
+import { ListReadError } from "@/components/ui/list-read-error";
+import { listReadErrorMessage } from "@/lib/refusal";
 import { Modal, ModalTabs } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { TagFilterChips } from "@/components/TagFilterChips";
-import { CustomerChip } from "@/components/ownership/pickers";
+import {
+  CustomerChip,
+  MissingCustomerOption,
+} from "@/components/ownership/pickers";
 import { SavedViewsMenu } from "@/components/SavedViewsMenu";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { useModuleOn } from "@/hooks/useModuleOn";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -116,9 +127,7 @@ function KindBadge({ kind }: { kind: ServiceKind }) {
 
 function TermBadge({ termEnd }: { termEnd: string | null }) {
   if (!termEnd) return <span className="text-muted-foreground/50">—</span>;
-  const days = Math.floor(
-    (new Date(termEnd).getTime() - Date.now()) / (24 * 3600 * 1000),
-  );
+  const days = termDaysLeft(termEnd);
   let cls =
     "bg-emerald-100 text-emerald-700 dark:bg-emerald-950/30 dark:text-emerald-400";
   let label = `${days}d`;
@@ -134,7 +143,7 @@ function TermBadge({ termEnd }: { termEnd: string | null }) {
   return (
     <span className="inline-flex items-center gap-2">
       <span className="text-[11px] tabular-nums text-muted-foreground">
-        {new Date(termEnd).toLocaleDateString()}
+        {formatDateOnly(termEnd)}
       </span>
       <span
         className={cn(
@@ -197,13 +206,17 @@ function useResourcePool() {
     staleTime: 60_000,
   });
 
+  // #2135 — DNS zones can only be attached while core.dns is on; the reads
+  // would 404 otherwise.
+  const dnsOn = useModuleOn("core.dns");
   const dnsGroups = useQuery({
     queryKey: ["dns-groups", "all"],
     queryFn: () => dnsApi.listGroups(),
     staleTime: 60_000,
+    enabled: dnsOn,
   });
   const dnsZones = useQuery({
-    enabled: !!dnsGroups.data,
+    enabled: dnsOn && !!dnsGroups.data,
     queryKey: ["dns-zones", "all", (dnsGroups.data ?? []).map((g) => g.id)],
     queryFn: async () => {
       const groups = dnsGroups.data ?? [];
@@ -219,13 +232,17 @@ function useResourcePool() {
     staleTime: 60_000,
   });
 
+  // #2130 — DHCP scopes can only be attached while core.dhcp is on; the
+  // reads would 404 otherwise.
+  const dhcpOn = useModuleOn("core.dhcp");
   const dhcpGroups = useQuery({
     queryKey: ["dhcp-groups", "all"],
     queryFn: () => dhcpApi.listGroups(),
     staleTime: 60_000,
+    enabled: dhcpOn,
   });
   const dhcpScopes = useQuery({
-    enabled: !!dhcpGroups.data,
+    enabled: dhcpOn && !!dhcpGroups.data,
     queryKey: ["dhcp-scopes", "all", (dhcpGroups.data ?? []).map((g) => g.id)],
     queryFn: async () => {
       const groups = dhcpGroups.data ?? [];
@@ -241,7 +258,21 @@ function useResourcePool() {
     staleTime: 60_000,
   });
 
+  // The read error per kind, so a picker over a refused read says so
+  // instead of offering an empty list (#3148).
+  const readErrors: Partial<Record<ServiceResourceKind, unknown>> = {
+    vrf: vrfs.error,
+    subnet: subnets.error,
+    ip_block: blocks.error,
+    site: sites.error,
+    circuit: circuits.error,
+    overlay_network: overlays.error,
+    dns_zone: dnsGroups.error ?? dnsZones.error,
+    dhcp_scope: dhcpGroups.error ?? dhcpScopes.error,
+  };
+
   return {
+    readErrors,
     vrf: vrfs.data ?? [],
     subnet: subnets.data ?? [],
     ip_block: blocks.data ?? [],
@@ -303,7 +334,7 @@ function resourceLabel(
 
 // ── Resources tab — attach / detach UI ─────────────────────────────
 
-function ResourcesTab({
+export function ResourcesTab({
   service,
   onChange,
 }: {
@@ -312,6 +343,8 @@ function ResourcesTab({
 }) {
   const qc = useQueryClient();
   const pool = useResourcePool();
+  const dhcpOn = useModuleOn("core.dhcp");
+  const dnsOn = useModuleOn("core.dns");
 
   const [addKind, setAddKind] = useState<ServiceResourceKind>("vrf");
   const [addId, setAddId] = useState<string>("");
@@ -339,8 +372,7 @@ function ResourcesTab({
       onChange();
     },
     onError: (e: unknown) => {
-      const err = e as { response?: { data?: { detail?: string } } };
-      setError(err?.response?.data?.detail ?? "Attach failed");
+      setError(formatApiError(e, "Attach failed"));
     },
   });
 
@@ -410,6 +442,7 @@ function ResourcesTab({
   };
 
   const options = optionsFor(addKind);
+  const kindReadError = pool.readErrors[addKind];
 
   return (
     <div className="space-y-4">
@@ -426,7 +459,10 @@ function ResourcesTab({
               setAddId("");
             }}
           >
-            {RESOURCE_KINDS.map((k) => (
+            {RESOURCE_KINDS.filter(
+              (k) =>
+                (dhcpOn || k !== "dhcp_scope") && (dnsOn || k !== "dns_zone"),
+            ).map((k) => (
               <option key={k} value={k}>
                 {RESOURCE_KIND_LABELS[k]}
               </option>
@@ -436,9 +472,20 @@ function ResourcesTab({
             className={inputCls}
             value={addId}
             onChange={(e) => setAddId(e.target.value)}
+            disabled={!!kindReadError}
+            title={
+              kindReadError
+                ? listReadErrorMessage(
+                    kindReadError,
+                    `${RESOURCE_KIND_LABELS[addKind]} resources`,
+                  )
+                : undefined
+            }
           >
             <option value="">
-              — select a {RESOURCE_KIND_LABELS[addKind]} —
+              {kindReadError
+                ? `— can't list ${RESOURCE_KIND_LABELS[addKind]} —`
+                : `— select a ${RESOURCE_KIND_LABELS[addKind]} —`}
             </option>
             {options.map((o) => (
               <option key={o.id} value={o.id}>
@@ -461,7 +508,19 @@ function ResourcesTab({
             {attach.isPending ? "Attaching…" : "Attach"}
           </button>
         </div>
-        {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
+        {kindReadError != null && (
+          <p role="alert" className="mt-2 text-xs">
+            <ListReadError
+              error={kindReadError}
+              what={`${RESOURCE_KIND_LABELS[addKind]} resources`}
+            />
+          </p>
+        )}
+        {error && (
+          <FormError className="mt-2 text-xs text-destructive">
+            {error}
+          </FormError>
+        )}
         <p className="mt-2 text-[11px] text-muted-foreground/80">
           Common L3VPN roles: <code>primary</code> / <code>backup</code> /{" "}
           <code>hub</code> / <code>spoke</code>. Free-form — use whatever your
@@ -558,7 +617,22 @@ function SummaryTab({ serviceId }: { serviceId: string }) {
   return <CustomSummaryView summary={summary} />;
 }
 
-function L3VPNSummaryView({ summary }: { summary: L3VPNSummary }) {
+/** One line naming how many attached rows a section leaves out because the
+ *  caller has no read grant on them. Renders nothing when none are. */
+function WithheldNote({ count }: { count: number | undefined }) {
+  if (!count) return null;
+  return (
+    <p className="mt-1 text-xs italic text-muted-foreground">
+      {count} not shown (no read permission)
+    </p>
+  );
+}
+
+export function L3VPNSummaryView({ summary }: { summary: L3VPNSummary }) {
+  const withheld = summary.withheld ?? {};
+  const sites = summary.edge_sites.length + (withheld.edge_sites ?? 0);
+  const circuits = summary.edge_circuits.length + (withheld.edge_circuits ?? 0);
+  const subnets = summary.edge_subnets.length + (withheld.edge_subnets ?? 0);
   return (
     <div className="space-y-3">
       <div className="rounded-md border bg-muted/20 p-3">
@@ -574,6 +648,10 @@ function L3VPNSummaryView({ summary }: { summary: L3VPNSummary }) {
               {summary.vrf.export_targets.join(", ") || "—"}
             </div>
           </div>
+        ) : withheld.vrf ? (
+          <p className="mt-1 text-sm italic text-muted-foreground">
+            Not shown (no read permission)
+          </p>
         ) : (
           <p className="mt-1 text-sm text-muted-foreground">
             No VRF attached. L3VPN services should have exactly one — attach via
@@ -585,10 +663,13 @@ function L3VPNSummaryView({ summary }: { summary: L3VPNSummary }) {
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
         <div className="rounded-md border p-3">
           <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-            Edge sites ({summary.edge_sites.length})
+            Edge sites ({sites})
           </div>
+          <WithheldNote count={withheld.edge_sites} />
           {summary.edge_sites.length === 0 ? (
-            <p className="mt-1 text-xs text-muted-foreground">None</p>
+            !withheld.edge_sites && (
+              <p className="mt-1 text-xs text-muted-foreground">None</p>
+            )
           ) : (
             <ul className="mt-1 space-y-1 text-sm">
               {summary.edge_sites.map((s) => (
@@ -609,10 +690,13 @@ function L3VPNSummaryView({ summary }: { summary: L3VPNSummary }) {
         </div>
         <div className="rounded-md border p-3">
           <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-            Edge circuits ({summary.edge_circuits.length})
+            Edge circuits ({circuits})
           </div>
+          <WithheldNote count={withheld.edge_circuits} />
           {summary.edge_circuits.length === 0 ? (
-            <p className="mt-1 text-xs text-muted-foreground">None</p>
+            !withheld.edge_circuits && (
+              <p className="mt-1 text-xs text-muted-foreground">None</p>
+            )
           ) : (
             <ul className="mt-1 space-y-1 text-sm">
               {summary.edge_circuits.map((c) => (
@@ -634,10 +718,13 @@ function L3VPNSummaryView({ summary }: { summary: L3VPNSummary }) {
         </div>
         <div className="rounded-md border p-3">
           <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-            Edge subnets ({summary.edge_subnets.length})
+            Edge subnets ({subnets})
           </div>
+          <WithheldNote count={withheld.edge_subnets} />
           {summary.edge_subnets.length === 0 ? (
-            <p className="mt-1 text-xs text-muted-foreground">None</p>
+            !withheld.edge_subnets && (
+              <p className="mt-1 text-xs text-muted-foreground">None</p>
+            )
           ) : (
             <ul className="mt-1 space-y-1 text-sm tabular-nums">
               {summary.edge_subnets.map((s) => (
@@ -704,7 +791,7 @@ function CustomSummaryView({ summary }: { summary: CustomGroupedSummary }) {
 
 type EditorTab = "general" | "resources" | "term" | "notes" | "summary";
 
-function ServiceEditorModal({
+export function ServiceEditorModal({
   existing,
   onClose,
 }: {
@@ -771,11 +858,7 @@ function ServiceEditorModal({
       onClose();
     },
     onError: (e: unknown) => {
-      const err = e as {
-        message?: string;
-        response?: { data?: { detail?: string } };
-      };
-      setError(err?.response?.data?.detail ?? err?.message ?? "Save failed");
+      setError(formatApiError(e, "Save failed"));
     },
   });
 
@@ -850,6 +933,10 @@ function ServiceEditorModal({
               onChange={(e) => setCustomerId(e.target.value)}
             >
               <option value="">— select —</option>
+              <MissingCustomerOption
+                customerId={customerId}
+                list={customersQ}
+              />
               {customers.map((c) => (
                 <option key={c.id} value={c.id}>
                   {c.name}
@@ -973,7 +1060,9 @@ function ServiceEditorModal({
         </div>
       )}
 
-      {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
+      {error && (
+        <FormError className="mt-3 text-sm text-destructive">{error}</FormError>
+      )}
 
       <div className="mt-6 flex justify-end gap-2 border-t pt-3">
         <button
@@ -999,6 +1088,17 @@ function ServiceEditorModal({
 // ── Page ───────────────────────────────────────────────────────────
 
 export function ServicesPage() {
+  // #1340 — a read-only user is offered no write it would be refused:
+  // the network_service router asks write (delete) on 'network_service'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "network_service"),
+    "Requires write permission on network services",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "network_service"),
+    "Requires delete permission on network services",
+  );
   const qc = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
   // Reverse-lookup mode (#99): when both params are present we show only the
@@ -1095,17 +1195,27 @@ export function ServicesPage() {
     [items, selectedIds],
   );
 
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
   const bulkDelete = useMutation({
+    onMutate: () => setDeleteError(null),
     mutationFn: (ids: string[]) => servicesApi.bulkDelete(ids),
     onSuccess: () => {
       setSelectedIds(new Set());
       qc.invalidateQueries({ queryKey: ["services"] });
     },
+    onError: (e: unknown) =>
+      setDeleteError(formatApiError(e, "Failed to delete services")),
   });
 
   const removeOne = useMutation({
+    onMutate: () => setDeleteError(null),
     mutationFn: (id: string) => servicesApi.remove(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["services"] }),
+    onError: (e: unknown) => {
+      setDeleteError(formatApiError(e, "Failed to delete service"));
+      qc.invalidateQueries({ queryKey: ["services"] });
+    },
   });
 
   function toggle(id: string) {
@@ -1132,6 +1242,11 @@ export function ServicesPage() {
   return (
     <div className="h-full overflow-auto p-6">
       <div className="space-y-4">
+        {deleteError && (
+          <p role="alert" className="text-sm text-destructive">
+            {deleteError}
+          </p>
+        )}
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
             <h1 className="text-xl font-semibold">Services</h1>
@@ -1164,6 +1279,7 @@ export function ServicesPage() {
               variant="primary"
               icon={Plus}
               onClick={() => setShowNew(true)}
+              {...writeGate}
             >
               New service
             </HeaderButton>
@@ -1270,6 +1386,7 @@ export function ServicesPage() {
                   onConfirm: () => bulkDelete.mutate(ids),
                 });
               }}
+              {...deleteGate}
             >
               Delete selected
             </HeaderButton>
@@ -1316,9 +1433,32 @@ export function ServicesPage() {
                     className="px-3 py-6 text-center text-muted-foreground"
                     colSpan={10}
                   >
-                    {byResourceActive
-                      ? `No services reference this ${resourceKindParam ? RESOURCE_KIND_LABELS[resourceKindParam] : "resource"}.`
-                      : 'No services yet — click "New service" to add one.'}
+                    {byResourceActive ? (
+                      `No services reference this ${resourceKindParam ? RESOURCE_KIND_LABELS[resourceKindParam] : "resource"}.`
+                    ) : (
+                      <ListEmpty
+                        error={query.error}
+                        what="services"
+                        filtered={
+                          search !== "" ||
+                          statusFilter !== "" ||
+                          kindFilter !== "" ||
+                          customerFilter !== "" ||
+                          tagFilters.length > 0
+                        }
+                        onClearFilters={() => {
+                          setSearch("");
+                          setStatusFilter("");
+                          setKindFilter("");
+                          setCustomerFilter("");
+                          setTagFilters([]);
+                        }}
+                        gate={writeGate}
+                        hint={`Click "New service" to add one.`}
+                      >
+                        No services yet.
+                      </ListEmpty>
+                    )}
                   </td>
                 </tr>
               )}
@@ -1359,14 +1499,17 @@ export function ServicesPage() {
                     <button
                       type="button"
                       title="Edit"
+                      aria-label="Edit"
                       onClick={() => setEditing(s)}
-                      className="rounded p-1 hover:bg-muted"
+                      className="rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                      {...writeGate}
                     >
                       <Pencil className="h-3.5 w-3.5" />
                     </button>
                     <button
                       type="button"
                       title="Delete"
+                      aria-label="Delete"
                       onClick={() => {
                         setConfirm({
                           title: "Delete service",
@@ -1375,7 +1518,8 @@ export function ServicesPage() {
                           onConfirm: () => removeOne.mutate(s.id),
                         });
                       }}
-                      className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10"
+                      className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
+                      {...deleteGate}
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                     </button>

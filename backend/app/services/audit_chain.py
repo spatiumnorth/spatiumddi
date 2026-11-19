@@ -11,7 +11,9 @@ hooked into the ``before_flush`` event in
    ordering.
 3. Takes a Postgres transaction-scoped advisory lock so concurrent
    transactions can't interleave their "fetch previous hash, hash my
-   row, write it" sequence.
+   row, write it" sequence. First it row-locks any ``dns_zone`` row the
+   flush is about to write: those are taken before this lock everywhere
+   else, so taking them after it deadlocks (#3389, #3503).
 4. Fetches the latest existing ``row_hash`` (where ``seq = MAX(seq)``)
    to seed ``prev_hash`` for the first new row.
 5. Walks the new rows in order, computing
@@ -33,8 +35,10 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 import structlog
@@ -49,6 +53,18 @@ logger = structlog.get_logger(__name__)
 # Constant advisory-lock key; doesn't conflict with anything else
 # because we own this namespace. Must fit in BIGINT.
 _AUDIT_CHAIN_LOCK_KEY = 0x4144495441554449  # ASCII "ADITAUDI" — close enough
+
+
+async def lock_audit_chain(db: AsyncSession) -> None:
+    """Take the audit-chain lock now rather than at the next audit flush.
+
+    For a transaction about to take row locks that auditing transactions
+    take after this lock (#3345): taking it first keeps one order, audit
+    lock then rows, so the transaction can never hold such a row while it
+    waits for this lock. Transaction-scoped and re-entrant: the later audit
+    flush simply takes it again.
+    """
+    await db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _AUDIT_CHAIN_LOCK_KEY})
 
 
 def canonical_json(row: AuditLog) -> str:
@@ -79,6 +95,48 @@ def canonical_json(row: AuditLog) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
 
 
+#: The JSONB columns that participate in the hash.
+_JSONB_HASHED_COLUMNS = ("old_value", "new_value", "changed_fields")
+
+
+def _pg_number(token: str) -> int | float:
+    """The number PostgreSQL hands back for a JSON number ``token``.
+
+    JSONB stores numbers as ``numeric`` and prints them in plain decimal
+    notation with no exponent and no negative zero, so ``1e+16`` comes back
+    as the integer ``10000000000000000`` and ``-0.0`` as ``0.0``. A token
+    whose decimal exponent is non-negative has no fractional digits and
+    therefore reads back as an int; any other token reads back as the same
+    float (``repr`` is round-trip exact), bar the sign of zero.
+    """
+    exponent = Decimal(token).as_tuple().exponent
+    if isinstance(exponent, int) and exponent >= 0:
+        return int(Decimal(token))
+    value = float(token)
+    return 0.0 if value == 0 else value
+
+
+def normalise_jsonb_value(value: Any) -> Any:
+    """``value`` exactly as a JSONB column will return it (GHSA-8288-8vg9-82gr).
+
+    ``compute_audit_hashes`` hashes before the INSERT and ``verify_chain``
+    re-hashes what PostgreSQL returns, so anything the JSONB round trip
+    rewrites made an honest row report ``row_hash_mismatch``. Serialises the
+    way the engine's ``json_serializer`` does (``default=str``, so UUIDs,
+    datetimes and Decimals become the strings that are stored), then maps
+    every number to what ``numeric`` prints. ``NaN`` / ``Infinity``, which
+    JSONB rejects outright (failing the INSERT and the audited change with
+    it), are kept as the strings ``"NaN"`` / ``"Infinity"`` / ``"-Infinity"``.
+    """
+    if value is None:
+        return None
+    return json.loads(
+        json.dumps(value, default=str),
+        parse_float=_pg_number,
+        parse_constant=str,
+    )
+
+
 #: ``AuditLog.request_id`` is ``String(64)``.
 _REQUEST_ID_MAX = 64
 
@@ -104,6 +162,53 @@ def hash_row(prev_hash: str | None, canonical: str) -> str:
     h.update(b"|")
     h.update(canonical.encode())
     return h.hexdigest()
+
+
+#: Tables whose rows a writer locks BEFORE its audit row, so they must never
+#: be locked after the audit-chain lock (#3389, #3503). A record create bumps
+#: its zone's serial and flushes at once, holding the ``dns_zone`` row from
+#: then on, and takes the chain lock only at its commit. A transaction that
+#: took the chain lock first and then wrote that row would wait for the
+#: record create while the record create waited for it: 40P01, a bare 500.
+LOCKED_BEFORE_AUDIT_TABLES: frozenset[str] = frozenset({"dns_zone"})
+
+
+def _lock_rows_written_before_audit(session: Session) -> None:
+    """Row-lock what this flush is about to write in
+    :data:`LOCKED_BEFORE_AUDIT_TABLES`, before the chain lock is taken.
+
+    The flush itself would lock them only after ``before_flush`` returns,
+    i.e. after the chain lock, which is the order that deadlocks. Locking
+    them here, in id order, keeps zone row first and chain lock second for
+    every flush that carries both, whichever path staged them. A plain
+    ``SELECT ... FOR UPDATE`` rather than a nested flush: ``before_flush``
+    must not flush. ``FOR NO KEY UPDATE`` is the lock the UPDATE takes
+    anyway, so a concurrent FK insert (a new record's ``KEY SHARE`` on its
+    zone) is not blocked by it; a DELETE needs ``FOR UPDATE``.
+    """
+    updates: dict[Any, set[Any]] = {}
+    deletes: dict[Any, set[Any]] = {}
+    for obj in session.dirty:
+        table = getattr(type(obj), "__table__", None)
+        if table is None or table.name not in LOCKED_BEFORE_AUDIT_TABLES:
+            continue
+        if session.is_modified(obj, include_collections=False):
+            updates.setdefault(table, set()).add(obj.id)
+    for obj in session.deleted:
+        table = getattr(type(obj), "__table__", None)
+        if table is not None and table.name in LOCKED_BEFORE_AUDIT_TABLES:
+            deletes.setdefault(table, set()).add(obj.id)
+    for rows, key_share in ((updates, True), (deletes, False)):
+        for table, ids in rows.items():
+            session.execute(
+                select(table.c.id)
+                .where(table.c.id.in_(sorted(ids)))
+                .order_by(table.c.id)
+                .with_for_update(key_share=key_share)
+                # The row is locked whether or not it is soft-deleted (a
+                # restore un-stamps one).
+                .execution_options(include_deleted=True)
+            )
 
 
 def compute_audit_hashes(session: Session) -> None:
@@ -163,6 +268,14 @@ def compute_audit_hashes(session: Session) -> None:
                 and getattr(row, col.key, None) is None
             ):
                 setattr(row, col.key, default.arg)
+        # Store what is hashed: hand the row the JSONB-round-tripped form of
+        # its JSON payloads, so the verifier's re-hash of the read-back row
+        # sees the same values. ``canonical_json`` itself is untouched —
+        # every existing hash and the migration backfill depend on it.
+        for key in _JSONB_HASHED_COLUMNS:
+            current = getattr(row, key)
+            if current is not None:
+                setattr(row, key, normalise_jsonb_value(current))
 
     # DO NOT re-sort. ``verify_chain`` walks rows by ``seq`` (the DB
     # sequence assigned at INSERT) and checks each row's ``prev_hash``
@@ -175,7 +288,16 @@ def compute_audit_hashes(session: Session) -> None:
     # the uuid tie-break reordered the chain away from seq order and
     # verify_chain reported a false ``prev_hash_mismatch``.
 
+    # Rows other writers lock BEFORE their audit row, taken before the chain
+    # lock below even when this same flush writes them (#3503).
+    _lock_rows_written_before_audit(session)
+
     # Transaction-scoped advisory lock; auto-released at COMMIT/ROLLBACK.
+    # Taken before this flush's own statements, so a row written by this
+    # flush that other writers lock BEFORE their audit row is locked by
+    # ``_lock_rows_written_before_audit`` above. One already written by an
+    # earlier flush is fine; one written by a LATER flush, after this lock
+    # is held, deadlocks (#3389, #3503).
     session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _AUDIT_CHAIN_LOCK_KEY})
 
     # Fetch the most-recent persisted row's hash. Empty table → None.
@@ -205,6 +327,11 @@ class ChainBreak:
     expected_hash: str
     actual_hash: str
     reason: str  # "row_hash_mismatch" | "prev_hash_mismatch"
+    # Which row broke, so an operator (and the restore drill) can name the
+    # audited change without a second lookup (#1615).
+    action: str = ""
+    resource_type: str = ""
+    resource_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -212,9 +339,63 @@ class ChainVerifyResult:
     ok: bool
     rows_checked: int
     breaks: list[ChainBreak]
+    # How far the walk got (#2286, #2297): the range actually walked
+    # (``first_seq`` None when no row was read), the highest ``seq`` examined
+    # and its ``row_hash``, and whether rows outside that range exist.
+    # ``ok`` with ``partial=True`` means "clean within the walked range"
+    # and nothing more, so a caller never reads a window as the whole log.
+    first_seq: int | None = None
+    last_seq: int | None = None
+    last_hash: str | None = None
+    partial: bool = False
+
+    @property
+    def complete(self) -> bool:
+        return not self.partial
 
 
-async def verify_chain(db: AsyncSession, *, max_rows: int | None = None) -> ChainVerifyResult:
+#: Rows fetched per keyset page. Memory is O(chunk), not O(table).
+VERIFY_CHUNK_SIZE = 5000
+
+#: The columns the hash covers, plus the chain fields. Selecting them (not
+#: the entity) keeps a page to plain tuples, so nothing accrues in the
+#: session's identity map across the walk.
+_VERIFY_COLUMNS = (
+    AuditLog.seq,
+    AuditLog.id,
+    AuditLog.timestamp,
+    AuditLog.user_id,
+    AuditLog.user_display_name,
+    AuditLog.auth_source,
+    AuditLog.source_ip,
+    AuditLog.user_agent,
+    AuditLog.action,
+    AuditLog.resource_type,
+    AuditLog.resource_id,
+    AuditLog.resource_display,
+    AuditLog.old_value,
+    AuditLog.new_value,
+    AuditLog.changed_fields,
+    AuditLog.request_id,
+    AuditLog.result,
+    AuditLog.error_detail,
+    AuditLog.row_hash,
+    AuditLog.prev_hash,
+)
+
+#: ``on_chunk(last_seq, last_hash, rows_checked, breaks_so_far)``.
+ChunkCallback = Callable[[int, str, int, int], Awaitable[None]]
+
+
+async def verify_chain(
+    db: AsyncSession,
+    *,
+    max_rows: int | None = None,
+    start_after: tuple[int, str] | None = None,
+    chunk_size: int = VERIFY_CHUNK_SIZE,
+    on_chunk: ChunkCallback | None = None,
+    newest: bool = False,
+) -> ChainVerifyResult:
     """Walk the audit_log in seq order and check each row's hash.
 
     A break can be one of two flavours:
@@ -228,38 +409,144 @@ async def verify_chain(db: AsyncSession, *, max_rows: int | None = None) -> Chai
 
     Distinct codes so the alert message can tell operators *what*
     kind of tampering they're looking at.
-    """
-    stmt = select(AuditLog).order_by(AuditLog.seq.asc())
-    if max_rows is not None:
-        stmt = stmt.limit(max_rows)
-    rows = (await db.execute(stmt)).scalars().all()
 
+    The walk is a keyset scan (``seq > last ORDER BY seq LIMIT chunk``)
+    carrying the previous hash across pages, so memory is bounded by
+    ``chunk_size`` however large the table is (#2286). ``start_after`` is
+    ``(seq, row_hash)`` of an already-verified row: the walk then covers
+    only later rows, the first of which must chain from that hash.
+    ``on_chunk`` runs after each page so a caller can checkpoint progress.
+    Any database error propagates; a walk that did not finish is never
+    returned as a result.
+
+    ``max_rows`` caps the walk. By default it covers the OLDEST rows; with
+    ``newest=True`` it covers the NEWEST ``max_rows`` rows, anchored on the
+    ``row_hash`` of the row just before the window (#2297) so the window's
+    first ``prev_hash`` is still checked. Recent rows are where tampering
+    matters, so the Audit page badge uses the newest window.
+    """
+    chunk_size = max(1, chunk_size)
+    window_anchored = False
+    if newest and max_rows is not None and start_after is None:
+        # First row of the newest ``max_rows`` window, then the row before
+        # it as the anchor; the rest is an ordinary keyset walk from there.
+        first_in_window = (
+            await db.execute(
+                select(AuditLog.seq).order_by(AuditLog.seq.desc()).offset(max_rows - 1).limit(1)
+            )
+        ).scalar()
+        if first_in_window is not None:
+            pred = (
+                await db.execute(
+                    select(AuditLog.seq, AuditLog.row_hash)
+                    .where(AuditLog.seq < first_in_window)
+                    .order_by(AuditLog.seq.desc())
+                    .limit(1)
+                )
+            ).first()
+            if pred is not None:
+                start_after = (pred.seq, pred.row_hash)
+                window_anchored = True
+        max_rows = None
     breaks: list[ChainBreak] = []
     expected_prev: str | None = None
+    last_seq = 0
+    if start_after is not None:
+        last_seq, expected_prev = start_after
     rows_checked = 0
-    for row in rows:
-        rows_checked += 1
-        if row.prev_hash != expected_prev:
-            breaks.append(
-                ChainBreak(
-                    seq=row.seq,
-                    audit_id=str(row.id),
-                    expected_hash=expected_prev or "",
-                    actual_hash=row.prev_hash or "",
-                    reason="prev_hash_mismatch",
-                )
+    last_hash: str | None = expected_prev if start_after is not None else None
+    seen_seq: int | None = start_after[0] if start_after is not None else None
+    first_seq: int | None = None
+    complete = False
+
+    while True:
+        limit = chunk_size
+        if max_rows is not None:
+            remaining = max_rows - rows_checked
+            if remaining <= 0:
+                break
+            limit = min(limit, remaining)
+        page = (
+            await db.execute(
+                select(*_VERIFY_COLUMNS)
+                .where(AuditLog.seq > last_seq)
+                .order_by(AuditLog.seq.asc())
+                .limit(limit)
             )
-        canonical = canonical_json(row)
-        recomputed = hash_row(row.prev_hash, canonical)
-        if recomputed != row.row_hash:
-            breaks.append(
-                ChainBreak(
-                    seq=row.seq,
-                    audit_id=str(row.id),
-                    expected_hash=recomputed,
-                    actual_hash=row.row_hash,
-                    reason="row_hash_mismatch",
+        ).all()
+        for row in page:
+            rows_checked += 1
+            if first_seq is None:
+                first_seq = row.seq
+            if row.prev_hash != expected_prev:
+                breaks.append(
+                    ChainBreak(
+                        seq=row.seq,
+                        audit_id=str(row.id),
+                        expected_hash=expected_prev or "",
+                        actual_hash=row.prev_hash or "",
+                        reason="prev_hash_mismatch",
+                        action=row.action,
+                        resource_type=row.resource_type,
+                        resource_id=row.resource_id,
+                    )
                 )
-            )
-        expected_prev = row.row_hash
-    return ChainVerifyResult(ok=not breaks, rows_checked=rows_checked, breaks=breaks)
+            recomputed = hash_row(row.prev_hash, canonical_json(row))  # type: ignore[arg-type]
+            if recomputed != row.row_hash:
+                breaks.append(
+                    ChainBreak(
+                        seq=row.seq,
+                        audit_id=str(row.id),
+                        expected_hash=recomputed,
+                        actual_hash=row.row_hash,
+                        reason="row_hash_mismatch",
+                        action=row.action,
+                        resource_type=row.resource_type,
+                        resource_id=row.resource_id,
+                    )
+                )
+            expected_prev = row.row_hash
+        if page:
+            last_seq = seen_seq = page[-1].seq
+            last_hash = page[-1].row_hash
+            if on_chunk is not None:
+                await on_chunk(last_seq, last_hash, rows_checked, len(breaks))
+        if len(page) < limit:
+            complete = True
+            break
+
+    if not complete:
+        # Stopped on ``max_rows``: complete only if nothing follows.
+        more = (
+            await db.execute(select(AuditLog.seq).where(AuditLog.seq > last_seq).limit(1))
+        ).first()
+        complete = more is None
+    return ChainVerifyResult(
+        ok=not breaks,
+        rows_checked=rows_checked,
+        breaks=breaks,
+        first_seq=first_seq,
+        last_seq=seen_seq,
+        last_hash=last_hash,
+        partial=window_anchored or not complete,
+    )
+
+
+# ── Verified-up-to checkpoint (#2286) ───────────────────────────────
+
+#: A clean-from-zero checkpoint older than this is discarded and the next
+#: run walks the whole chain again. The incremental pass trusts everything
+#: at or below the checkpoint, so this bounds how long an edit to an
+#: already-verified row can go unseen.
+FULL_PASS_INTERVAL = timedelta(days=7)
+
+
+async def checkpoint_still_valid(db: AsyncSession, seq: int, row_hash: str) -> bool:
+    """Is the row the checkpoint vouches for still there, unchanged?
+
+    A missing row or a different hash means the checkpoint describes a
+    chain this table no longer holds (restore, deletion, rewrite), so the
+    caller walks from the start instead of trusting it.
+    """
+    found = (await db.execute(select(AuditLog.row_hash).where(AuditLog.seq == seq))).scalar()
+    return found == row_hash

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import os
 import stat
+import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -40,6 +42,10 @@ def appliance_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
         "_CLUSTER_JOIN_STATE_CONSUMED",
         tmp_path / "cluster-join.state.consumed",
     )
+    # #1903 — the join's fire record, likewise kept off the real host.
+    monkeypatch.setattr(
+        appliance_state, "_CLUSTER_JOIN_TRANSITION", tmp_path / "cluster-join.transition"
+    )
     return tmp_path
 
 
@@ -55,7 +61,7 @@ def test_join_writes_trigger_with_payload(appliance_paths: Path) -> None:
 
 def test_join_trigger_is_owner_only(appliance_paths: Path) -> None:
     # The payload carries the k3s join token (a control-plane-admin-
-    # equivalent secret) into the 1777-sticky release-state dir — the
+    # equivalent secret) into the shared release-state dir — the
     # trigger file must be 0o600 so no other unprivileged host user can
     # read it before the root runner consumes it (sec scanning #82).
     assert appliance_state.maybe_fire_cluster_join("member", "https://s:6443", "tok") is True
@@ -126,12 +132,49 @@ def _consume(path: Path) -> None:
     path.rename(path.with_suffix(".failed"))
 
 
-def test_join_refires_after_the_runner_consumes_the_trigger(appliance_paths: Path) -> None:
+class _Clock:
+    """The supervisor's wall clock, which also stamps the attempt ledger."""
+
+    def __init__(self) -> None:
+        self.now = datetime(2026, 9, 27, 7, 9, 4, tzinfo=UTC)
+
+    def advance(self, seconds: float) -> None:
+        self.now += timedelta(seconds=seconds)
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> _Clock:
+    c = _Clock()
+
+    class _Datetime(datetime):
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[no-untyped-def,override]
+            return c.now if tz is not None else c.now.replace(tzinfo=None)
+
+    monkeypatch.setattr(appliance_state, "datetime", _Datetime)
+    return c
+
+
+def _spend_join_budget(trigger: Path, clock: _Clock, url: str = "https://s:6443") -> None:
+    """Fire and fail every join attempt the ceiling allows against ``url``,
+    each one as soon as the spacing lets it (#1212)."""
+    for attempt in range(1, appliance_state._CLUSTER_JOIN_MAX_ATTEMPTS + 1):
+        assert appliance_state.maybe_fire_cluster_join("member", url, "t") is True
+        _consume(trigger)
+        clock.advance(appliance_state._cluster_join_retry_delay_s(attempt))
+
+
+def test_join_refires_after_the_runner_consumes_the_trigger(
+    appliance_paths: Path, clock: _Clock
+) -> None:
     """The re-fire itself is legitimate — retrying a transient failure is
-    the point. It's the UNBOUNDED re-fire that was the bug."""
+    the point. It's the UNBOUNDED re-fire that was the bug. (#1212: and the
+    BACK-TO-BACK one: the next attempt waits a minute.)"""
     trigger = appliance_paths / "cluster-join-pending"
     assert appliance_state.maybe_fire_cluster_join("member", "https://s:6443", "t") is True
     _consume(trigger)
+    assert appliance_state.maybe_fire_cluster_join("member", "https://s:6443", "t") is False
+    clock.advance(60)
     assert appliance_state.maybe_fire_cluster_join("member", "https://s:6443", "t") is True
 
 
@@ -187,7 +230,7 @@ def test_join_refires_when_promoted_to_a_DIFFERENT_seed(appliance_paths: Path) -
     assert appliance_state.maybe_fire_cluster_join("member", "https://b:6443", "t") is True
 
 
-def test_join_still_retries_after_a_reported_failure(appliance_paths: Path) -> None:
+def test_join_still_retries_after_a_reported_failure(appliance_paths: Path, clock: _Clock) -> None:
     """A ``failed`` verdict must NOT block a retry — only ready/joining do."""
     trigger = appliance_paths / "cluster-join-pending"
     state = appliance_paths / "cluster-join.state"
@@ -196,6 +239,7 @@ def test_join_still_retries_after_a_reported_failure(appliance_paths: Path) -> N
     assert appliance_state.maybe_fire_cluster_join("member", url, "t") is True
     state.write_text("failed\tboom")
     _consume(trigger)
+    clock.advance(60)
     assert appliance_state.maybe_fire_cluster_join("member", url, "t") is True
 
 
@@ -223,12 +267,12 @@ def test_leave_does_not_refire_while_the_runner_is_mid_flight(appliance_paths: P
     assert appliance_state.maybe_fire_cluster_leave("none") is False
 
 
-def test_join_stops_firing_at_the_attempt_ceiling(appliance_paths: Path) -> None:
+def test_join_stops_firing_at_the_attempt_ceiling(appliance_paths: Path, clock: _Clock) -> None:
     trigger = appliance_paths / "cluster-join-pending"
-    for _ in range(appliance_state._CLUSTER_JOIN_MAX_ATTEMPTS):
-        assert appliance_state.maybe_fire_cluster_join("member", "https://s:6443", "t") is True
-        _consume(trigger)
-    # Budget exhausted — no more destructive wipes against this target.
+    _spend_join_budget(trigger, clock)
+    # Budget exhausted — no more destructive wipes against this target, however
+    # long the control plane keeps asking.
+    clock.advance(3600)
     assert appliance_state.maybe_fire_cluster_join("member", "https://s:6443", "t") is False
     assert not trigger.exists()
 
@@ -256,7 +300,7 @@ def test_leave_stops_firing_at_the_attempt_ceiling(appliance_paths: Path) -> Non
     renames a failed trigger away, so an unbounded leave loop would re-wipe
     k3s on every heartbeat."""
     trigger = appliance_paths / "cluster-leave-pending"
-    for _ in range(appliance_state._CLUSTER_JOIN_MAX_ATTEMPTS):
+    for _ in range(appliance_state._CLUSTER_LEAVE_MAX_ATTEMPTS):
         assert appliance_state.maybe_fire_cluster_leave("none") is True
         _consume(trigger)
     assert appliance_state.maybe_fire_cluster_leave("none") is False
@@ -265,7 +309,7 @@ def test_leave_stops_firing_at_the_attempt_ceiling(appliance_paths: Path) -> Non
 
 def test_reset_restores_the_leave_budget_too(appliance_paths: Path) -> None:
     trigger = appliance_paths / "cluster-leave-pending"
-    for _ in range(appliance_state._CLUSTER_JOIN_MAX_ATTEMPTS):
+    for _ in range(appliance_state._CLUSTER_LEAVE_MAX_ATTEMPTS):
         appliance_state.maybe_fire_cluster_leave("none")
         _consume(trigger)
     assert appliance_state.maybe_fire_cluster_leave("none") is False
@@ -273,34 +317,30 @@ def test_reset_restores_the_leave_budget_too(appliance_paths: Path) -> None:
     assert appliance_state.maybe_fire_cluster_leave("none") is True
 
 
-def test_join_and_leave_budgets_are_independent(appliance_paths: Path) -> None:
+def test_join_and_leave_budgets_are_independent(appliance_paths: Path, clock: _Clock) -> None:
     """Exhausting one transition must not lock out the other."""
     join_trigger = appliance_paths / "cluster-join-pending"
-    for _ in range(appliance_state._CLUSTER_JOIN_MAX_ATTEMPTS):
-        appliance_state.maybe_fire_cluster_join("member", "https://s:6443", "t")
-        _consume(join_trigger)
+    _spend_join_budget(join_trigger, clock)
     assert appliance_state.maybe_fire_cluster_join("member", "https://s:6443", "t") is False
     assert appliance_state.maybe_fire_cluster_leave("none") is True
 
 
-def test_a_different_join_target_gets_a_fresh_budget(appliance_paths: Path) -> None:
+def test_a_different_join_target_gets_a_fresh_budget(appliance_paths: Path, clock: _Clock) -> None:
     trigger = appliance_paths / "cluster-join-pending"
-    for _ in range(appliance_state._CLUSTER_JOIN_MAX_ATTEMPTS):
-        assert appliance_state.maybe_fire_cluster_join("member", "https://a:6443", "t") is True
-        _consume(trigger)
+    _spend_join_budget(trigger, clock, "https://a:6443")
     assert appliance_state.maybe_fire_cluster_join("member", "https://a:6443", "t") is False
     # Promoted against a different seed → new fingerprint → fires again.
     assert appliance_state.maybe_fire_cluster_join("member", "https://b:6443", "t") is True
 
 
-def test_reset_restores_the_budget_for_the_same_target(appliance_paths: Path) -> None:
+def test_reset_restores_the_budget_for_the_same_target(
+    appliance_paths: Path, clock: _Clock
+) -> None:
     """The heartbeat resets the ledger whenever the control plane stops
     asking for a join — so an operator re-promoting against the SAME seed
     doesn't inherit an exhausted budget."""
     trigger = appliance_paths / "cluster-join-pending"
-    for _ in range(appliance_state._CLUSTER_JOIN_MAX_ATTEMPTS):
-        appliance_state.maybe_fire_cluster_join("member", "https://s:6443", "t")
-        _consume(trigger)
+    _spend_join_budget(trigger, clock)
     assert appliance_state.maybe_fire_cluster_join("member", "https://s:6443", "t") is False
 
     appliance_state.reset_cluster_join_attempts()
@@ -512,3 +552,95 @@ def test_read_cluster_restore_state(restore_paths: Path) -> None:
     assert appliance_state.read_cluster_restore_state() == ("restoring", "snap-A")
     (restore_paths / "cluster-restore.state").write_text("done\t")
     assert appliance_state.read_cluster_restore_state() == ("done", None)
+
+
+# ── #1903 — a stale ``ready`` from a previous membership ─────────────────────
+
+SEED = "https://s:6443"
+
+
+def _age(path: Path, seconds: float) -> None:
+    """Backdate ``path`` so it was last written ``seconds`` ago."""
+    when = time.time_ns() - int(seconds * 1e9)
+    os.utime(path, ns=(when, when))
+
+
+def test_stale_ready_for_same_seed_does_not_block_a_repromote(appliance_paths: Path) -> None:
+    """A Replace-evicted box that is still up keeps ``ready\\t<seed>`` from its
+    old membership — written long before the promote now asking. The join must
+    fire over it, and that stale verdict must not be reported as the promote's."""
+    sidecar = appliance_paths / "cluster-join.state"
+    sidecar.write_text(f"ready\t{SEED}\n")
+    _age(sidecar, 3600)
+
+    # What the heartbeat reports before anything has fired: not this promote's.
+    assert appliance_state.reported_cluster_transition_id(None) == ""
+    assert appliance_state.maybe_fire_cluster_join("member", SEED, "t", "T2", 60.0) is True
+    assert (appliance_paths / "cluster-join.transition").read_text().startswith("T2\t")
+
+    # The runner, once it has run, writes its verdict: now it proves T2 ...
+    (appliance_paths / "cluster-join-pending").unlink()
+    sidecar.write_text(f"ready\t{SEED}\n")
+    later = os.stat(sidecar).st_mtime_ns + 10**9
+    os.utime(sidecar, ns=(later, later))
+    assert appliance_state.reported_cluster_transition_id(None) == "T2"
+    # ... and the idempotence guard (#590) holds again: no wipe of a fresh join.
+    assert appliance_state.maybe_fire_cluster_join("member", SEED, "t", "T2", 120.0) is False
+
+
+def test_supervisor_upgraded_mid_join_does_not_refire_over_its_fresh_ready(
+    appliance_paths: Path,
+) -> None:
+    """A join fired by a supervisor that predates the fire record, then upgraded
+    before the control plane applied its ``ready``: no record names the id, but
+    the ``ready`` is younger than the promote, so it is this promote's. Firing
+    again would re-run the join over a working membership."""
+    sidecar = appliance_paths / "cluster-join.state"
+    sidecar.write_text(f"ready\t{SEED}\n")
+    _age(sidecar, 5)
+    assert not (appliance_paths / "cluster-join.transition").exists()
+
+    assert appliance_state.maybe_fire_cluster_join("member", SEED, "t", "T2", 300.0) is False
+    assert not (appliance_paths / "cluster-join-pending").exists()
+    # The report carries the age the control plane needs to settle it.
+    age = appliance_state.cluster_join_state_age_s()
+    assert age is not None and 0 <= age < 300
+
+
+@pytest.mark.parametrize(
+    ("sidecar_age", "promote_age", "why"),
+    [
+        (3600, None, "a control plane that sent the id without the promote's age"),
+        (305, 300.0, "older than the promote, but within the latency margin"),
+        (-60, 300.0, "a sidecar stamped in the future: the clock stepped back"),
+    ],
+)
+def test_ambiguous_ready_is_reported_not_refired(
+    appliance_paths: Path, sidecar_age: float, promote_age: float | None, why: str
+) -> None:
+    sidecar = appliance_paths / "cluster-join.state"
+    sidecar.write_text(f"ready\t{SEED}\n")
+    _age(sidecar, sidecar_age)
+    assert (
+        appliance_state.maybe_fire_cluster_join("member", SEED, "t", "T2", promote_age) is False
+    ), why
+
+
+def test_ready_from_an_earlier_promotes_join_is_stale(appliance_paths: Path) -> None:
+    """A fire record for a previous promote (T1) proves nothing about T2."""
+    (appliance_paths / "cluster-join.transition").write_text(
+        f"T1\t{time.time_ns() - 7200 * 10**9}\n"
+    )
+    sidecar = appliance_paths / "cluster-join.state"
+    sidecar.write_text(f"ready\t{SEED}\n")
+    _age(sidecar, 3600)
+    assert appliance_state.reported_cluster_transition_id(None) == "T1"
+    assert appliance_state.maybe_fire_cluster_join("member", SEED, "t", "T2", 60.0) is True
+
+
+def test_ready_without_a_transition_id_still_blocks_a_refire(appliance_paths: Path) -> None:
+    """An older control plane names no promote: the #590 guard is unchanged."""
+    sidecar = appliance_paths / "cluster-join.state"
+    sidecar.write_text(f"ready\t{SEED}\n")
+    _age(sidecar, 3600)
+    assert appliance_state.maybe_fire_cluster_join("member", SEED, "t") is False

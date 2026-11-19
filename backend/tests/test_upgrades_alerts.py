@@ -155,6 +155,8 @@ def test_classify_none_failed_at() -> None:
         upgrade_alerts.CATEGORY_CONVERGENCE_TIMEOUT,
         upgrade_alerts.CATEGORY_CHART_BUMP,
         upgrade_alerts.CATEGORY_UNCORDON_FAIL,
+        upgrade_alerts.CATEGORY_MIRROR_NOT_READY,
+        upgrade_alerts.CATEGORY_RELEASE_FAILED,
         upgrade_alerts.CATEGORY_OTHER,
     ],
 )
@@ -210,6 +212,7 @@ async def test_emit_alert_happy_path() -> None:
     run = _FakeRun()
     db = MagicMock()
     db.scalar = AsyncMock(return_value=rule)
+    db.execute = AsyncMock()  # #2261: resolves a prior open event first
     db.add = MagicMock()
 
     evt = await upgrade_alerts.emit_upgrade_failed_alert(
@@ -262,6 +265,7 @@ async def test_emit_alert_disabled_rule_returns_none() -> None:
     rule = _FakeRule(enabled=False)
     db = MagicMock()
     db.scalar = AsyncMock(return_value=rule)
+    db.execute = AsyncMock()  # #2261: resolves a prior open event first
     db.add = MagicMock()
 
     out = await upgrade_alerts.emit_upgrade_failed_alert(
@@ -282,6 +286,7 @@ async def test_emit_alert_chart_bump_no_node() -> None:
     rule = _FakeRule()
     db = MagicMock()
     db.scalar = AsyncMock(return_value=rule)
+    db.execute = AsyncMock()  # #2261: resolves a prior open event first
     db.add = MagicMock()
 
     evt = await upgrade_alerts.emit_upgrade_failed_alert(
@@ -329,6 +334,8 @@ async def test_orchestrator_fires_alert_on_node_failure(
     run = _Run()
     db = MagicMock()
     db.get = AsyncMock(return_value=run)
+    # The drive re-reads the run under a row lock before each write (#1702).
+    db.execute = AsyncMock(return_value=MagicMock(scalar_one_or_none=MagicMock(return_value=run)))
     db.add = MagicMock()
     db.commit = AsyncMock()
     db.refresh = AsyncMock()
@@ -397,6 +404,8 @@ async def test_orchestrator_fires_alert_on_chart_bump_failure(
     run = _Run()
     db = MagicMock()
     db.get = AsyncMock(return_value=run)
+    # The drive re-reads the run under a row lock before each write (#1702).
+    db.execute = AsyncMock(return_value=MagicMock(scalar_one_or_none=MagicMock(return_value=run)))
     db.add = MagicMock()
     db.commit = AsyncMock()
     db.refresh = AsyncMock()
@@ -477,3 +486,152 @@ async def test_seed_alert_rule_idempotent(monkeypatch: pytest.MonkeyPatch) -> No
     await upgrade_alerts.seed_cluster_upgrade_failed_alert_rule()
     assert session2.added == []
     assert session2.committed is False
+
+
+@pytest.mark.asyncio
+async def test_emit_alert_delivers_to_forward_targets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1576 — the upgrade-failed event must reach forward targets,
+    not just the in-app alerts page."""
+    from app.services import alerts as alert_service
+    from app.services import audit_forward
+
+    rule = _FakeRule()
+    rule.notify_syslog = True  # type: ignore[attr-defined]
+    rule.notify_webhook = True  # type: ignore[attr-defined]
+    rule.notify_smtp = True  # type: ignore[attr-defined]
+    run = _FakeRun()
+    db = MagicMock()
+    db.scalar = AsyncMock(return_value=rule)
+    db.execute = AsyncMock()  # #2261: resolves a prior open event first
+    db.add = MagicMock()
+    db.flush = AsyncMock()
+
+    async def _fake_load() -> list[dict]:
+        return [{"name": "stub", "kind": "syslog"}]
+
+    seen: dict[str, Any] = {}
+
+    async def _fake_deliver(r: object, event: object, targets: list) -> tuple[bool, bool, bool]:
+        seen["targets"] = targets
+        return True, False, False
+
+    monkeypatch.setattr(audit_forward, "_load_targets", _fake_load)
+    monkeypatch.setattr(alert_service, "_deliver", _fake_deliver)
+
+    evt = await upgrade_alerts.emit_upgrade_failed_alert(
+        db,
+        run,  # type: ignore[arg-type]
+        failed_node="node-a",
+        failed_at_step="drain",
+        category=upgrade_alerts.CATEGORY_DRAIN_STUCK,
+    )
+    assert evt is not None
+    assert seen["targets"] == [{"name": "stub", "kind": "syslog"}]
+    assert evt.delivered_syslog is True
+    assert evt.delivered_webhook is False
+
+
+# ── #1542 — the compensating release itself failed ───────────────────
+
+
+def test_release_failure_reads_stuck_from_step_dicts_and_objects() -> None:
+    from app.services.upgrades import per_node  # noqa: PLC0415
+
+    step = per_node.StepResult(name="release_node", started_at="t").finish(
+        False, error="compensating uncordon failed: x", stuck=["cordon", "maintenance_window"]
+    )
+    assert upgrade_alerts.release_failure([step]) == (
+        "compensating uncordon failed: x",
+        ["cordon", "maintenance_window"],
+    )
+    as_dict = {"name": "release_node", "ok": False, "error": "e", "detail": {"stuck": ["cordon"]}}
+    assert upgrade_alerts.release_failure([as_dict]) == ("e", ["cordon"])
+    ok = per_node.StepResult(name="release_node", started_at="t").finish(True)
+    assert upgrade_alerts.release_failure([ok]) is None
+    assert upgrade_alerts.release_failure([]) is None
+
+
+@pytest.mark.asyncio
+async def test_emit_alert_names_what_is_stuck() -> None:
+    db = MagicMock()
+    db.scalar = AsyncMock(return_value=_FakeRule())
+    db.execute = AsyncMock()  # #2261: resolves a prior open event first
+    db.add = MagicMock()
+    await upgrade_alerts.emit_upgrade_failed_alert(
+        db,
+        _FakeRun(),  # type: ignore[arg-type]
+        failed_node="node-a",
+        failed_at_step="drain",
+        category=upgrade_alerts.CATEGORY_RELEASE_FAILED,
+        stuck=["cordon", "maintenance_window"],
+    )
+    evt = db.add.call_args.args[0]
+    assert "Still held after the failed release: cordon, maintenance_window" in evt.message
+    assert evt.last_observed_value["stuck"] == ["cordon", "maintenance_window"]
+    assert evt.last_observed_value["category"] == "release_failed"
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_distinct_alert_when_release_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio  # noqa: PLC0415
+
+    from app.services.upgrades import orchestrator, per_node  # noqa: PLC0415
+
+    class _Run:
+        def __init__(self) -> None:
+            self.id = uuid.uuid4()
+            self.state = "running"
+            self.target_version = "2026.06.01-1"
+            self.last_error: str | None = None
+            self.lease_holder = "api-test"
+            self.lease_acquired_at = datetime.now(UTC)
+            self.started_at = datetime.now(UTC)
+            self.finished_at: Any = None
+            self.plan: dict[str, Any] = {"node_order": ["node-a"], "slot_image_url": "x"}
+            self.progress: dict[str, Any] = {"events": [], "per_node": {}}
+
+    run = _Run()
+    db = MagicMock()
+    db.get = AsyncMock(return_value=run)
+    # The drive re-reads the run under a row lock before each write (#1702).
+    db.execute = AsyncMock(return_value=MagicMock(scalar_one_or_none=MagicMock(return_value=run)))
+    db.add = MagicMock()
+    db.commit = AsyncMock()
+    db.refresh = AsyncMock()
+
+    async def _fail(*args: Any, **kwargs: Any) -> per_node.SingleNodeResult:
+        rel = per_node.StepResult(name="release_node", started_at="t").finish(
+            False,
+            error="uncordon ok, compensating maintenance-window clear failed: 403",
+            stuck=["maintenance_window"],
+        )
+        return per_node.SingleNodeResult(
+            node_name=kwargs["node_name"],
+            target_version="2026.06.01-1",
+            ok=False,
+            failed_at="drain",
+            steps=[rel],
+            error="drain timed out",
+        )
+
+    emit_spy = AsyncMock(return_value=None)
+    monkeypatch.setattr(per_node, "single_node_upgrade", _fail)
+    monkeypatch.setattr(orchestrator.upgrade_alerts, "emit_upgrade_failed_alert", emit_spy)
+    monkeypatch.setattr(orchestrator.mutex, "release", lambda **_kw: (True, None))
+
+    await orchestrator._drive_loop(db, run, asyncio.Event())  # type: ignore[arg-type]
+
+    assert run.state == "failed"  # the run still stops
+    kw = emit_spy.call_args.kwargs
+    assert kw["category"] == upgrade_alerts.CATEGORY_RELEASE_FAILED
+    assert kw["stuck"] == ["maintenance_window"]
+    assert kw["failed_at_step"] == "drain"
+    entry = run.progress["per_node"]["node-a"]
+    assert entry["failure_category"] == "release_failed"
+    assert entry["release_failed"]["stuck"] == ["maintenance_window"]
+    assert entry["release_failed"]["underlying_category"] == upgrade_alerts.CATEGORY_DRAIN_STUCK
+    assert "maintenance_window" in (run.last_error or "")

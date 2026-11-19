@@ -160,7 +160,7 @@ def test_the_reload_runner_snapshots_the_ssh_state_for_revert() -> None:
     body = _text(RELOAD)
     assert "LAST_GOOD_SSH_SENTINEL" in body
     for state in ("present", "retired", "absent"):
-        assert f'echo {state} > "$LAST_GOOD_SSH_SENTINEL"' in body, state
+        assert f'echo {state} | state_write "$LAST_GOOD_SSH_SENTINEL"' in body, state
 
 
 def test_the_revert_runner_restores_the_ssh_sentinel() -> None:

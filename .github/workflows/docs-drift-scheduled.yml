@@ -1,0 +1,90 @@
+name: Docs drift
+
+# Weekly: do the docs diagrams and pages still match the code (#3414)? The check
+# is scripts/lint_docs_drift.py -- version labels vs versions.json, shipped
+# workloads vs docs/assets/architecture.svg, identifiers vs backend/app/models,
+# file paths named in diagrams. If it finds anything, open ONE "Docs drift"
+# issue (or refresh the open one); when a run comes back clean, close it.
+#
+# It never gates anything and never runs on a PR: a stale diagram is a chore,
+# not a reason to block an unrelated change. `make docs-drift` reproduces it.
+#
+# The script exits 0 clean, 1 findings, 2 "could not evaluate". Only 0 and 1
+# are a verdict: on 2 the job goes red and the issue is left exactly as it is,
+# since "we could not tell" must not close an issue that is still true.
+
+on:
+  schedule:
+    # Mondays 07:23 UTC. Off the top of the hour to avoid the cron stampede.
+    - cron: "23 7 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: docs-drift-scheduled
+  cancel-in-progress: false
+
+jobs:
+  drift:
+    name: Docs vs code
+    # Forks inherit scheduled workflows; only the canonical repo files issues.
+    if: github.repository_owner == 'spatiumnorth'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run the drift check
+        id: check
+        run: |
+          if python3 scripts/lint_docs_drift.py --markdown > "$RUNNER_TEMP/docs-drift.md"; then
+            echo "status=clean" >> "$GITHUB_OUTPUT"
+          else
+            status=$?
+            if [ "$status" -ne 1 ]; then
+              echo "lint_docs_drift.py could not run (exit ${status})" >&2
+              exit "$status"
+            fi
+            echo "status=drift" >> "$GITHUB_OUTPUT"
+          fi
+          cat "$RUNNER_TEMP/docs-drift.md"
+
+      - name: Open, refresh or close the tracking issue
+        run: |
+          TITLE="Docs drift"
+          MARKER="<!-- docs-drift -->"
+          # Search by title, not a page of open issues: the repo has far more
+          # than one page open, so a --limit scan would miss it and duplicate.
+          # The search is a substring match, so confirm the exact title AND the
+          # marker the script writes as the body's first line: a human-filed
+          # issue that happens to be called "Docs drift" is not ours to close.
+          existing="$(gh issue list --repo "$REPO" --state open --limit 20 \
+            --search "\"${TITLE}\" in:title" \
+            --json number,title,body \
+            --jq "[.[] | select(.title == \"${TITLE}\" and (.body | startswith(\"${MARKER}\")))] | .[0].number // empty")"
+
+          if [ "${{ steps.check.outputs.status }}" = "drift" ]; then
+            {
+              cat "$RUNNER_TEMP/docs-drift.md"
+              echo
+              echo "_Last checked: ${GITHUB_SERVER_URL}/${REPO}/actions/runs/${GITHUB_RUN_ID}_"
+            } > "$RUNNER_TEMP/body.md"
+            # GitHub caps an issue body at 65536 characters.
+            head -c 60000 "$RUNNER_TEMP/body.md" > "$RUNNER_TEMP/body-capped.md"
+            if [ -n "$existing" ]; then
+              gh issue edit "$existing" --repo "$REPO" --body-file "$RUNNER_TEMP/body-capped.md"
+            else
+              gh issue create --repo "$REPO" --title "$TITLE" \
+                --body-file "$RUNNER_TEMP/body-capped.md" \
+                --label "documentation" --label "area:ops" --label "theme:ops-tooling"
+            fi
+          elif [ -n "$existing" ]; then
+            gh issue close "$existing" --repo "$REPO" \
+              --comment "The weekly docs drift check came back clean; closing."
+          fi

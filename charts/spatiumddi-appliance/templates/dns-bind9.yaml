@@ -46,6 +46,9 @@ spec:
         {{- include "spatiumddi-appliance.podLabels" . | nindent 8 }}
         app.kubernetes.io/name: dns-bind9
         app.kubernetes.io/component: dns-bind9
+        # #1510 — every DNS engine's pods carry this, and the one ``dns-vip``
+        # Service selects on it, so the DNS VIP follows whichever engine runs.
+        spatium.io/dns-vip: "true"
     spec:
       {{- with .Values.dnsBind9.priorityClassName }}
       priorityClassName: {{ . | quote }}
@@ -58,8 +61,8 @@ spec:
       {{- if not .Values.dns.useMetalLBVIP }}
       # #272 Phase 5 — default path: bind on the node IP so non-cluster
       # clients resolve against the appliance directly. When a DNS VIP
-      # is enabled the Pod drops hostNetwork and sits behind the
-      # LoadBalancer Service below instead.
+      # is enabled the Pod drops hostNetwork and sits behind the shared
+      # ``dns-vip`` LoadBalancer Service (dns-vip.yaml) instead.
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       {{- end }}
@@ -83,7 +86,27 @@ spec:
           # A CPU request keeps the serving pod out of BestEffort QoS (the
           # lowest CFS weight on the node) so a busy control plane cannot
           # starve it — see dhcp-kea.yaml for the measurement. Requests only.
-          {{- with .Values.dnsBind9.resources }}
+          # #2223 — memory comes from ``dnsBind9.memory`` (the supervisor
+          # sizes it from the smallest DNS node's RAM: a quarter, 2Gi to
+          # 8Gi) unless ``dnsBind9.resources`` sets the limit or the request
+          # itself, so an operator's explicit override always wins.
+          {{- $res := deepCopy (.Values.dnsBind9.resources | default dict) }}
+          {{- $mem := .Values.dnsBind9.memory | default dict }}
+          {{- if $mem.limit }}
+          {{- $limits := get $res "limits" | default dict }}
+          {{- if not (get $limits "memory") }}
+          {{- $_ := set $limits "memory" $mem.limit }}
+          {{- end }}
+          {{- $_ := set $res "limits" $limits }}
+          {{- end }}
+          {{- if $mem.request }}
+          {{- $requests := get $res "requests" | default dict }}
+          {{- if not (get $requests "memory") }}
+          {{- $_ := set $requests "memory" $mem.request }}
+          {{- end }}
+          {{- $_ := set $res "requests" $requests }}
+          {{- end }}
+          {{- with $res }}
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
@@ -115,6 +138,16 @@ spec:
               value: {{ .Values.dnsBind9.agentKey | quote }}
             - name: AGENT_GROUP
               value: {{ .Values.dnsBind9.serverGroupName | quote }}
+            {{- if .Values.dns.useMetalLBVIP }}
+            # #1715 — without hostNetwork the pod's own nodename is the POD
+            # name, so the agent would register under ``dns-…-x7k2q`` and a
+            # Fleet group change (which finds the appliance's servers by its
+            # hostname) could never find it. The node name is the hostname.
+            - name: AGENT_HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            {{- end }}
             {{- with .Values.global.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -168,17 +201,17 @@ spec:
             periodSeconds: 10
             failureThreshold: 3
             timeoutSeconds: 3
+          {{- include "spatiumddi-appliance.dnsStartupProbe" . | nindent 10 }}
           livenessProbe:
             tcpSocket:
               port: 53
             initialDelaySeconds: 30
             periodSeconds: 30
           volumeMounts:
-            # #292 — the agent's state dir (AGENT_STATE_DIR) is the ONLY
-            # thing that needs persisting. named runs with
-            # ``-c /var/lib/spatium-dns-agent/rendered/named.conf`` and
-            # every path it references (rendered zones, tsig + rndc keys,
-            # the cached ConfigBundle under config/) lives here. The old
+            # #292 — the agent's state dir (AGENT_STATE_DIR). named runs with
+            # ``-c /var/lib/spatium-dns-agent/rendered/named.conf`` and the
+            # config it serves (rendered zones, tsig + rndc keys, the cached
+            # ConfigBundle under config/) lives here. The old
             # /var/named/{data,keys} PVC mounts were never written to —
             # confirmed empty on a live install — so they're dropped.
             # MUST be persistent: on a pod restart during a control-plane
@@ -186,6 +219,22 @@ spec:
             # serving from last-known-good config (non-negotiable #5).
             - name: agent-state
               mountPath: /var/lib/spatium-dns-agent
+            # #1855 — named's own working ``directory``, which holds its
+            # DNSSEC ``key-directory`` (/var/cache/bind/keys, rendered by the
+            # agent's bind9 driver): ``dnssec-policy`` keeps every signed
+            # zone's keys and their timing state there. MUST be persistent
+            # too. Unmounted, it was the anonymous volume the image's VOLUME
+            # gives each container, and it went with the container: every
+            # new pod (an upgrade, a reboot, an engine switch, an eviction)
+            # signed each zone with new keys, and a DS published at the
+            # parent stopped matching, so validating resolvers answered
+            # SERVFAIL. The umbrella chart and the Compose files persist this
+            # path already. The entrypoint creates keys/ and chowns the tree
+            # to ``spatium`` (the user named runs as) before it drops
+            # privileges, so the root-owned dir kubelet creates is writable
+            # by named.
+            - name: data
+              mountPath: /var/cache/bind
             {{- if .Values.dnsBind9.controlPlaneUrl }}
             {{- include "spatiumddi-appliance.cpPin.mount" . | nindent 12 }}
             {{- end }}
@@ -204,6 +253,13 @@ spec:
           hostPath:
             path: /var/lib/spatiumddi/agents/dns-bind9/state
             type: DirectoryOrCreate
+        # #1855 — named's working dir and DNSSEC keys (see the mount above),
+        # beside the state dir on the same persistent /var and per node like
+        # it, as dns-powerdns and dns-technitium keep their engine's data.
+        - name: data
+          hostPath:
+            path: /var/lib/spatiumddi/agents/dns-bind9/data
+            type: DirectoryOrCreate
 ---
 apiVersion: v1
 kind: Service
@@ -212,18 +268,11 @@ metadata:
   labels:
     {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
     app.kubernetes.io/component: dns-bind9
-  {{- if .Values.dns.useMetalLBVIP }}
-  annotations:
-    # #272 Phase 5 — pin the DNS resolver VIP from the MetalLB pool.
-    metallb.universe.tf/address-pool: {{ .Values.dns.vipPool | quote }}
-    metallb.universe.tf/loadBalancerIPs: {{ .Values.dns.vip | quote }}
-  {{- end }}
 spec:
-  {{- if .Values.dns.useMetalLBVIP }}
-  type: LoadBalancer
-  {{- else }}
+  # #1510 — always ClusterIP. The DNS VIP lives on the single ``dns-vip``
+  # Service (dns-vip.yaml): three LoadBalancers asking MetalLB for the same
+  # address let the oldest one keep it, even after its engine was switched off.
   type: ClusterIP
-  {{- end }}
   selector:
     app.kubernetes.io/name: dns-bind9
   ports:

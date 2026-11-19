@@ -120,7 +120,7 @@ def _dport_ports(toks: list[str]) -> set[int]:
                 continue
             piece = tok
             for part in piece.split("-"):  # range PORT-PORT
-                if part.isdigit():
+                if part.isascii() and part.isdigit():
                     ports.add(int(part))
             if not piece.replace("-", "").isdigit() and piece not in ("{", "}", ","):
                 break  # left the port-spec

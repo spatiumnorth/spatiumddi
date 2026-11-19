@@ -12,23 +12,25 @@ edit them; bump them.
 
 | Package | Files | License |
 |---|---|---|
-| `swagger-ui-dist@5.33.0` | `swagger-ui/swagger-ui-bundle.js`, `swagger-ui/swagger-ui.css` | Apache-2.0 (`swagger-ui/LICENSE`, `swagger-ui/NOTICE`) |
+| `swagger-ui-dist@5.34.0` | `swagger-ui/swagger-ui-bundle.js`, `swagger-ui/swagger-ui.css` | Apache-2.0 (`swagger-ui/LICENSE`, `swagger-ui/NOTICE`) |
 | `redoc@2.5.4` | `redoc/redoc.standalone.js` (from `bundles/`) | MIT (`redoc/LICENSE`) |
 
 Each bundle's `*.LICENSE.txt` is the license text of the packages bundled
-into it, which the bundle's first line points at. `swagger-ui-init.js` is
-ours: it replaces FastAPI's inline initializer.
+into it, which the bundle's first line points at. `swagger-ui-init.js`,
+`redoc-init.js` and `api-docs-auth.js` are ours: the first two replace
+FastAPI's inline initializers, and the third fetches the OpenAPI document
+with the session cookie, since the document is signed-in only (#2935).
 
 npm tarball integrity (`npm view <pkg>@<version> dist.integrity`):
 
-- `swagger-ui-dist@5.33.0`: `sha512-wpdK+m6BU5yj6pmUdMskZVTSWYG4DLglAx3sIhylloY37i8O37IrH+YEpqdXNfpaTGxILRBFzUqLF2jKqbfI7A==`
+- `swagger-ui-dist@5.34.0`: `sha512-H6tAIjr3XqE31PbkZl0OFya1ziRLDfTwh3J6OHdumPtPCLfjTnyLeagl/55kFNZcTOz9a9QI9WP0FXldwiGJag==`
 - `redoc@2.5.4`: `sha512-M6jWhG1qoBnH6TFmzJnstyCZ87HmOY/UzDm78mHiYihEdlV/YcS9ogOo1NlElnJMeLsyxHFe2yFc4sNjHTrABQ==`
 
 SHA-256 of the files as shipped:
 
 ```
-62df541529080464a7660adc793eab7128c6193ce3be24ddc1e0e0a4a63edc2f  swagger-ui/swagger-ui-bundle.js
-1ac324f7dcd27e4b9386b4bd6421271ec147e922a22c05ba24b11515e9aa6321  swagger-ui/swagger-ui.css
+3f6abf70480db7e07914df4c98a77385f22ea585eaf457a3e6415ba0eae2d167  swagger-ui/swagger-ui-bundle.js
+c3cfe8248c4b0b89673600fb829924eafbac6de4bc4b2b06f5f5243483074d0a  swagger-ui/swagger-ui.css
 dcaf76612bc4a3fbcc923a8966dee2f6146a5f32e5ce1b6f02dd60cbbf89500b  redoc/redoc.standalone.js
 ```
 

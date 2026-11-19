@@ -14,9 +14,10 @@ Permissions: every endpoint is gated on ``e911_location`` at the router
 level (GET→read, POST/PATCH→write, DELETE→delete; superadmin always
 passes). The intended shape for a third-party caller — a PBX, Cisco
 Emergency Responder, RedSky, an ops script — is an existing API token
-(#74) scoped to ``allowed_paths=["/api/v1/e911"]`` with that one read
-permission: read-only, revocable, audited, and no new credential
-mechanism.
+(#74) with the ``read`` scope, owned by an account holding only
+``e911_location: read``: read-only, revocable, audited, and no new
+credential mechanism. (Token ``allowed_paths`` is a reserved column that
+nothing enforces, so the account's permission is what limits it.)
 
 **Every ``/location`` answer writes an ``e911_resolution_log`` row.** It
 is a lookup of which desk a named person sits at; the trail is not
@@ -51,6 +52,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ownership._audit import write_audit
+from app.core.agent_wake import collect_wake
 from app.core.content_disposition import content_disposition
 from app.core.mac import canonicalize_mac
 from app.core.permissions import require_resource_permission
@@ -65,6 +67,8 @@ from app.models.e911 import (
     ERLBinding,
 )
 from app.models.network import NetworkDevice, NetworkInterface
+from app.services.dhcp.agent_wake_targets import dhcp_group_channels_with_scopes
+from app.services.e911.binding_labels import resolve_binding_labels
 from app.services.e911.exports import render_csv, render_ios_snippets
 from app.services.e911.resolver import Resolution, resolve_location
 from app.services.search.ranking import escape_like
@@ -337,6 +341,12 @@ class BindingRead(BaseModel):
     mac_address: str | None
     ip_address_id: uuid.UUID | None
     site_id: uuid.UUID | None
+    #: The target spelled the way an operator knows it — ``192.0.2.50
+    #: (subnet 192.0.2.0/24)`` rather than the address row's id (#4060).
+    #: Null for a MAC / BSSID (the raw value already reads well) and when
+    #: the referenced row is gone; ``target_missing`` says which.
+    target_label: str | None = None
+    target_missing: bool = False
     is_active: bool
     notes: str
     created_at: datetime
@@ -415,7 +425,9 @@ def _erl_read(row: EmergencyResponseLocation, binding_count: int = 0) -> ERLRead
     )
 
 
-def _binding_read(row: ERLBinding, erl_name: str) -> BindingRead:
+def _binding_read(
+    row: ERLBinding, erl_name: str, target: tuple[str | None, bool] = (None, False)
+) -> BindingRead:
     return BindingRead(
         id=row.id,
         erl_id=row.erl_id,
@@ -429,6 +441,8 @@ def _binding_read(row: ERLBinding, erl_name: str) -> BindingRead:
         mac_address=str(row.mac_address) if row.mac_address else None,
         ip_address_id=row.ip_address_id,
         site_id=row.site_id,
+        target_label=target[0],
+        target_missing=target[1],
         is_active=row.is_active,
         notes=row.notes,
         created_at=row.created_at,
@@ -573,7 +587,7 @@ async def list_erls(
         (
             await db.execute(
                 _apply_erl_filters(select(EmergencyResponseLocation), **filters)
-                .order_by(EmergencyResponseLocation.name.asc())
+                .order_by(EmergencyResponseLocation.name.asc(), EmergencyResponseLocation.id)
                 .limit(limit)
                 .offset(offset)
             )
@@ -680,9 +694,12 @@ async def update_erl(erl_id: uuid.UUID, body: ERLUpdate, db: DB, user: CurrentUs
         old_value={k: str(v) for k, v in old.items()},
         new_value={k: str(v) for k, v in changes.items()},
     )
+    # #2040 — the DHCP bundle renders options 99 / 123 from these rows.
+    collect_wake(*await dhcp_group_channels_with_scopes(db))
     await db.commit()
     await db.refresh(row)
-    return _erl_read(row)
+    counts = await _binding_counts(db, [row.id])
+    return _erl_read(row, counts.get(row.id, 0))
 
 
 @router.post("/erls/{erl_id}/validation", response_model=ERLRead)
@@ -710,7 +727,8 @@ async def record_validation(
     )
     await db.commit()
     await db.refresh(row)
-    return _erl_read(row)
+    counts = await _binding_counts(db, [row.id])
+    return _erl_read(row, counts.get(row.id, 0))
 
 
 @router.delete("/erls/{erl_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -729,6 +747,8 @@ async def delete_erl(erl_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
     # Bindings CASCADE. That fails safe: the resolver then degrades to the
     # next-coarser rule rather than pointing at a location that is gone.
     await db.delete(row)
+    # #2040 — the DHCP bundle renders options 99 / 123 from these rows.
+    collect_wake(*await dhcp_group_channels_with_scopes(db))
     await db.commit()
 
 
@@ -779,13 +799,16 @@ async def list_bindings(
     )
     rows = (
         await db.execute(
-            stmt.order_by(ordering.asc(), EmergencyResponseLocation.name.asc())
+            stmt.order_by(
+                ordering.asc(), EmergencyResponseLocation.name.asc(), EmergencyResponseLocation.id
+            )
             .limit(limit)
             .offset(offset)
         )
     ).all()
+    labels = await resolve_binding_labels(db, [b for b, _ in rows])
     return BindingListResponse(
-        items=[_binding_read(b, name) for b, name in rows],
+        items=[_binding_read(b, name, labels[b.id]) for b, name in rows],
         total=int(total),
         limit=limit,
         offset=offset,
@@ -823,9 +846,11 @@ async def create_binding(body: BindingCreate, db: DB, user: CurrentUser) -> Bind
         resource_display=f"{body.rule_kind} → {erl.name}",
         new_value={"rule_kind": body.rule_kind, "erl": erl.name},
     )
+    # #2040 — the DHCP bundle renders options 99 / 123 from these rows.
+    collect_wake(*await dhcp_group_channels_with_scopes(db))
     await db.commit()
     await db.refresh(row)
-    return _binding_read(row, erl.name)
+    return _binding_read(row, erl.name, (await resolve_binding_labels(db, [row]))[row.id])
 
 
 @router.patch("/bindings/{binding_id}", response_model=BindingRead)
@@ -856,9 +881,11 @@ async def update_binding(
         old_value={k: str(v) for k, v in old.items()},
         new_value={k: str(v) for k, v in changes.items()},
     )
+    # #2040 — the DHCP bundle renders options 99 / 123 from these rows.
+    collect_wake(*await dhcp_group_channels_with_scopes(db))
     await db.commit()
     await db.refresh(row)
-    return _binding_read(row, erl.name)
+    return _binding_read(row, erl.name, (await resolve_binding_labels(db, [row]))[row.id])
 
 
 @router.delete("/bindings/{binding_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -878,6 +905,8 @@ async def delete_binding(binding_id: uuid.UUID, db: DB, user: CurrentUser) -> No
         old_value={"rule_kind": row.rule_kind, "erl_id": str(row.erl_id)},
     )
     await db.delete(row)
+    # #2040 — the DHCP bundle renders options 99 / 123 from these rows.
+    collect_wake(*await dhcp_group_channels_with_scopes(db))
     await db.commit()
 
 
@@ -971,6 +1000,7 @@ async def get_location(
         source_ip=request.client.host if request.client else None,
     )
     await db.commit()
+    erl_counts = await _binding_counts(db, [resolution.erl.id]) if resolution.erl else {}
 
     return LocationResponse(
         identity_kind=resolution.identity_kind,
@@ -981,7 +1011,11 @@ async def get_location(
         degraded_reason=resolution.degraded_reason,
         observed_at=resolution.observed_at,
         evidence_age_seconds=resolution.evidence_age_seconds,
-        erl=_erl_read(resolution.erl) if resolution.erl else None,
+        erl=(
+            _erl_read(resolution.erl, erl_counts.get(resolution.erl.id, 0))
+            if resolution.erl
+            else None
+        ),
         evidence=[
             EvidenceRead(
                 kind=e.kind,

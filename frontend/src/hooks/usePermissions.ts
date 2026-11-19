@@ -1,6 +1,9 @@
 import { useQuery } from "@tanstack/react-query";
 
 import { authApi, type PermissionGrant } from "@/lib/api";
+import { queryClient } from "@/lib/queryClient";
+
+const PERMISSIONS_KEY = ["my-permissions"];
 
 // Actions a granted `admin` implies. Mirrors the backend
 // `_ADMIN_IMPLIES` frozenset in `app/core/permissions.py`.
@@ -61,11 +64,23 @@ export function usePermissions(): {
     resourceType: string,
     resourceId?: string | null,
   ) => boolean;
+  hasAnyGrantFor: (action: string, resourceType: string) => boolean;
   isSuperadmin: boolean;
   isLoading: boolean;
+  /** The permissions read failed and there are no grants to answer from:
+   *  ``can`` answers false for everyone then, the superadmin included,
+   *  which is not the same as a role lacking the grant (#3541). A failed
+   *  background refetch over grants already read is not this: ``can``
+   *  still answers from those. */
+  isError: boolean;
+  /** Why ``can`` has no answer yet, worded for the user: the permissions
+   *  are still being read (``PERMISSIONS_CHECKING``) or the read failed
+   *  (``PERMISSIONS_UNREADABLE``). Null once grants are read, which is the
+   *  only time a false ``can`` means the role lacks the grant (#3546). */
+  unanswered: string | null;
 } {
   const query = useQuery({
-    queryKey: ["my-permissions"],
+    queryKey: PERMISSIONS_KEY,
     queryFn: authApi.myPermissions,
     staleTime: 5 * 60 * 1000,
   });
@@ -84,17 +99,87 @@ export function usePermissions(): {
     );
   }
 
-  return { can, isSuperadmin, isLoading: query.isLoading };
+  /** Whether the caller holds ANY grant of ``action`` on ``resourceType``,
+   *  scoped to an instance or not: the backend's ``has_any_grant_for``,
+   *  which ignores the grant's ``resource_id``. A coarse router gate admits
+   *  an instance-scoped delegate (an address set, #103) this way and leaves
+   *  the real boundary to its handler's per-row check, so gate a control on
+   *  this only where its route's gate does. Fail-closed like ``can()``. */
+  function hasAnyGrantFor(action: string, resourceType: string): boolean {
+    if (isSuperadmin) return true;
+    if (!query.data) return false;
+    return query.data.grants.some((g) =>
+      permissionMatch({ ...g, resource_id: null }, action, resourceType),
+    );
+  }
+
+  return {
+    can,
+    hasAnyGrantFor,
+    isSuperadmin,
+    isLoading: query.isLoading,
+    isError: query.isError && !query.data,
+    unanswered: unansweredReason(query.data, query.isError),
+  };
+}
+
+/** What to say where a gate read ``can`` while the permissions read had
+ *  failed (``isError``): it is false for everyone then, so role wording
+ *  would be wrong (#3546). */
+export const PERMISSIONS_UNREADABLE =
+  "Your permissions could not be read. Reload to try again.";
+
+/** What to say where a gate read ``can`` before the permissions arrived:
+ *  false then too, and no more a missing grant than a failed read is. */
+export const PERMISSIONS_CHECKING = "Checking your permissions…";
+
+function unansweredReason(data: unknown, isError: boolean): string | null {
+  if (data) return null;
+  return isError ? PERMISSIONS_UNREADABLE : PERMISSIONS_CHECKING;
+}
+
+/** ``unanswered`` read straight from the app's query cache, for code that
+ *  is not a hook. Null when nothing has asked for the permissions yet. */
+function cachedUnanswered(): string | null {
+  const state = queryClient.getQueryState(PERMISSIONS_KEY);
+  if (!state) return null;
+  return unansweredReason(state.data, state.status === "error");
 }
 
 /** Props for a write control whose permission check failed (#1155): it
  *  stays where it is, disabled, with the reason as its tooltip, instead of
  *  opening a form that ends in "Permission denied". Spread it after the
  *  control's own ``title`` so the reason replaces that only while denied.
- *  Pass the same check the server makes for the action behind it. */
+ *  Pass the same check the server makes for the action behind it.
+ *
+ *  While the permissions are still being read, or the read failed, ``can``
+ *  is false for everyone, so the tooltip says that instead of ``reason``
+ *  (#3546). The caller re-renders when that changes: it read ``can`` from
+ *  ``usePermissions``, which subscribes to the same query. */
 export function permissionGate(
   allowed: boolean,
   reason: string,
 ): { disabled?: boolean; title?: string } {
-  return allowed ? {} : { disabled: true, title: reason };
+  if (allowed) return {};
+  return { disabled: true, title: cachedUnanswered() ?? reason };
 }
+
+/** Props for a control that is disabled for a reason other than a missing
+ *  permission (#4212): nothing to act on yet, a precondition unmet. The
+ *  reason becomes its tooltip, as ``permissionGate`` does for a denial.
+ *  Spread it BEFORE ``permissionGate`` so a denial's reason wins, and after
+ *  the control's own ``title`` so the reason replaces that only while
+ *  disabled. Leaves ``disabled`` alone when ``when`` is false, so the caller
+ *  keeps its own ``disabled={...}`` for other states (e.g. a pending call). */
+export function disabledBecause(
+  when: boolean,
+  reason: string,
+): { disabled?: boolean; title?: string } {
+  if (!when) return {};
+  return { disabled: true, title: reason };
+}
+
+/** The reason on a control whose route takes a superadmin whatever the
+ *  caller's grants (the handler's `SuperAdmin` dependency, refused as
+ *  "Superadmin required"). Gate it on `isSuperadmin`, not on `can()`. */
+export const NEEDS_SUPERADMIN = "Requires superadmin";

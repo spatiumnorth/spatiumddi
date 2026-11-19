@@ -3,7 +3,7 @@
      preserveAspectRatio="xMidYMid meet"
      font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
   <title>PowerDNS-primary with BIND-secondary hybrid</title>
-  <desc>Operators drive the SpatiumDDI control plane, which owns two single-driver server groups: internal-pdns on PowerDNS, whose primary signs DNSSEC, and edge-bind on BIND9, whose members consume the catalog zone by AXFR.</desc>
+  <desc>Operators drive the SpatiumDDI control plane, which owns two single-driver server groups: internal-pdns on PowerDNS, whose single agent server signs DNSSEC, and edge-bind on BIND9, whose members are per-zone secondaries that AXFR from it.</desc>
   <defs>
     <linearGradient id="tpd-surface" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="#f1f5f9"/>
@@ -47,11 +47,11 @@
 
     <rect x="84" y="296" width="330" height="64" rx="8" fill="url(#tpd-agent)"/>
     <text x="249" y="322" text-anchor="middle" font-size="13" font-weight="600" fill="#ffffff">pdns1.corp</text>
-    <text x="249" y="342" text-anchor="middle" font-size="11" fill="#fed7aa">primary · signs DNSSEC</text>
+    <text x="249" y="342" text-anchor="middle" font-size="11" fill="#fed7aa">authoritative · signs DNSSEC (single signer)</text>
 
-    <rect x="84" y="376" width="330" height="64" rx="8" fill="url(#tpd-agent)"/>
-    <text x="249" y="402" text-anchor="middle" font-size="13" font-weight="600" fill="#ffffff">pdns2.corp</text>
-    <text x="249" y="422" text-anchor="middle" font-size="11" fill="#fed7aa">secondary</text>
+    <rect x="84" y="376" width="330" height="64" rx="8" fill="none" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="4 4"/>
+    <text x="249" y="404" text-anchor="middle" font-size="11" fill="#475569">a group holding signed zones takes one agent</text>
+    <text x="249" y="422" text-anchor="middle" font-size="11" fill="#475569">server — single-signer rule (#1762)</text>
   </g>
 
   <!-- edge-bind group -->
@@ -62,14 +62,14 @@
 
     <rect x="504" y="296" width="330" height="64" rx="8" fill="url(#tpd-agent)"/>
     <text x="669" y="322" text-anchor="middle" font-size="13" font-weight="600" fill="#ffffff">bind1.edge</text>
-    <text x="669" y="342" text-anchor="middle" font-size="11" fill="#fed7aa">catalog consumer of internal-pdns</text>
+    <text x="669" y="342" text-anchor="middle" font-size="11" fill="#fed7aa">secondary of internal-pdns (per-zone masters)</text>
 
     <rect x="504" y="376" width="330" height="64" rx="8" fill="url(#tpd-agent)"/>
     <text x="669" y="402" text-anchor="middle" font-size="13" font-weight="600" fill="#ffffff">bind2.edge</text>
-    <text x="669" y="422" text-anchor="middle" font-size="11" fill="#fed7aa">catalog consumer of internal-pdns</text>
+    <text x="669" y="422" text-anchor="middle" font-size="11" fill="#fed7aa">secondary of internal-pdns (per-zone masters)</text>
   </g>
 
   <!-- Catalog-zone AXFR between the groups -->
   <path d="M 250 462 V 500 H 670 V 464" stroke="#475569" stroke-width="2" stroke-dasharray="6 4" fill="none" marker-end="url(#tpd-arrow)"/>
-  <text x="460" y="522" text-anchor="middle" font-size="11" fill="#475569">catalog-zone-driven AXFR keeps both drivers in sync (NOTIFY → IXFR)</text>
+  <text x="460" y="522" text-anchor="middle" font-size="11" fill="#475569">AXFR from the per-zone masters keeps both drivers in sync (NOTIFY → IXFR)</text>
 </svg>

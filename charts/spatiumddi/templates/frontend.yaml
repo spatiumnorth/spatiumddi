@@ -1,4 +1,10 @@
 {{- $cmp := "frontend" -}}
+{{- if and (include "spatiumddi.isOpenShift" .) .Values.frontend.tls.enabled -}}
+{{- fail "frontend.tls.enabled is the appliance's :80/:443 nginx and needs to bind privileged ports, which OpenShift's restricted SCC refuses. On OpenShift leave it off and let the Route terminate TLS (openshift.route)." -}}
+{{- end -}}
+{{- if and (include "spatiumddi.isOpenShift" .) .Values.frontend.hostNetwork -}}
+{{- fail "frontend.hostNetwork is the appliance's node-port :80 nginx: OpenShift's restricted SCC refuses host networking, and on OpenShift nginx listens on :8080, which the :80 hostPort would not match. On OpenShift leave it off and use the Route (openshift.route)." -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -77,7 +83,7 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
             - name: http
-              containerPort: 80
+              containerPort: {{ include "spatiumddi.frontendHttpPort" . }}
               {{- if .Values.frontend.hostNetwork }}
               hostPort: 80
               {{- end }}
@@ -98,6 +104,10 @@ spec:
               mountPath: /etc/nginx/templates/default.conf.template
               subPath: default.conf.template
               readOnly: true
+            # A directory mount, never subPath: the kubelet updates these
+            # files in the running pod when the Secret changes, and the
+            # image's 40-tls-reload-watch.sh reloads nginx on that change
+            # (#1173). A subPath mount would freeze them at pod start.
             - name: tls-cert
               mountPath: /etc/nginx/tls
               readOnly: true
@@ -118,12 +128,27 @@ spec:
               value: {{ .Values.frontend.apiUpstream.host | default (printf "%s-api.%s.svc.cluster.local" (include "spatiumddi.fullname" .) .Release.Namespace) | quote }}
             - name: API_UPSTREAM_PORT
               value: {{ .Values.frontend.apiUpstream.port | default .Values.api.service.port | quote }}
+            {{- if include "spatiumddi.isOpenShift" . }}
+            # #3852 — a random unprivileged uid cannot bind :80. The Service
+            # keeps its port and reaches this one through the port name.
+            - name: FRONTEND_HTTP_PORT
+              value: {{ include "spatiumddi.frontendHttpPort" . | quote }}
+            {{- end }}
             {{- with .Values.frontend.nginxLocalResolvers }}
             # Explicit DNS resolver override. Leave unset to let the
             # image's 15-local-resolvers.envsh auto-detect from
             # /etc/resolv.conf — which already points at cluster DNS
             # (kube-dns / CoreDNS) inside a Pod.
             - name: NGINX_LOCAL_RESOLVERS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.frontend.trustedProxyCidrs }}
+            # #1868 — the reverse proxy / ingress in front of this pod.
+            # The image's 16-trusted-proxies.envsh renders it into nginx's
+            # set_real_ip_from + the X-Forwarded-Proto trust map. Unset
+            # (the default) = trust no proxy: a client-supplied
+            # X-Forwarded-* is never believed.
+            - name: FRONTEND_TRUSTED_PROXY_CIDRS
               value: {{ . | quote }}
             {{- end }}
             # nginx >=1.30's upstream 15-local-resolvers.envsh script
@@ -184,7 +209,10 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- include "spatiumddi.podAntiAffinity" (merge (dict "component" $cmp "mode" .Values.frontend.podAntiAffinity "replicas" .Values.frontend.replicas "override" .Values.frontend.affinity) .) | nindent 6 }}
+      {{- /* #2450 — on the host network the spread renders at one replica too, so
+             the first promotion (1 -> node count) scales the frontend instead
+             of rolling the seed's one pod off ports 80 and 443. */}}
+      {{- include "spatiumddi.podAntiAffinity" (merge (dict "component" $cmp "mode" .Values.frontend.podAntiAffinity "replicas" .Values.frontend.replicas "hostNetwork" .Values.frontend.hostNetwork "override" .Values.frontend.affinity) .) | nindent 6 }}
 ---
 apiVersion: v1
 kind: Service
@@ -221,6 +249,12 @@ spec:
   {{- end }}
   {{- else }}
   type: {{ .Values.frontend.service.type }}
+  {{- end }}
+  {{- if or .Values.frontend.controlPlaneVIP (eq .Values.frontend.service.type "LoadBalancer") }}
+  # #1550 — a MetalLB-fronted LoadBalancer (L2/BGP) never routes via
+  # NodePorts; without this every VIP port is also opened as a random
+  # NodePort on every node.
+  allocateLoadBalancerNodePorts: false
   {{- end }}
   selector:
     {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 4 }}

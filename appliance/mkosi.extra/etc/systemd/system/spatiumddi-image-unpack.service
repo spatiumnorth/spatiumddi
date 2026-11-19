@@ -1,0 +1,24 @@
+[Unit]
+Description=Unpack the slot's new container images before the kubelet needs them (issue #2788)
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/2788
+ConditionKernelCommandLine=!boot=live
+# Ordering only: a unit never pulls k3s in (#1723). The helper waits for
+# k3s's start-up import itself, as firstboot's image check does (#2109).
+After=k3s.service
+
+[Service]
+# k3s's import leaves the slot's images packed, and the kubelet unpacks
+# each one when it starts its first container from it. A rolling upgrade
+# moves the shared image tags on every node at once when its last node is
+# done (#1710), so every node used to unpack 1-2 GB together, on the /var
+# that etcd's WAL is on. This unpacks the images this node runs right
+# after its reboot, in its own turn, paced at the rate of the upgrade's
+# other writes (#2090). On a boot with nothing new it finds nothing to do.
+#
+# exec, not oneshot: the unpack takes a minute or more and boot does not
+# wait for it. Whatever it has not unpacked, the kubelet unpacks.
+Type=exec
+ExecStart=/usr/local/bin/spatium-k3s-images unpack
+
+[Install]
+WantedBy=multi-user.target

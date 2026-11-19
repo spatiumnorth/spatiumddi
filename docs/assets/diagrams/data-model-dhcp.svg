@@ -56,7 +56,7 @@
   <text x="225" y="191" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">DHCPServer</text>
   <text x="352" y="182" font-size="12" font-weight="600" fill="#334155"
         font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">dhcp_server</text>
-  <text x="352" y="200" font-size="12" fill="#475569">a Kea instance or a Windows DHCP server</text>
+  <text x="352" y="200" font-size="12" fill="#475569">a Kea instance, a Windows DHCP server or a FortiGate</text>
 
   <path d="M 118 208 V 242" stroke="#cbd5e1" stroke-width="2" fill="none"/>
   <path d="M 118 242 H 136" stroke="#cbd5e1" stroke-width="2" fill="none"/>
@@ -87,7 +87,7 @@
   <text x="261" y="379" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">DHCPPool</text>
   <text x="388" y="370" font-size="12" font-weight="600" fill="#334155"
         font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">dhcp_pool</text>
-  <text x="388" y="388" font-size="12" fill="#475569">a dynamic / excluded / reserved range</text>
+  <text x="388" y="388" font-size="12" fill="#475569">a dynamic / excluded / reserved / PD range</text>
 
   <rect x="136" y="408" width="700" height="52" rx="10"
         fill="#ffffff" stroke="#e2e8f0" stroke-width="1.5"/>

@@ -1,17 +1,27 @@
 """Ingest-back worker — reads externally-injected DDNS records off the live
-zone and ships them to the control plane (issue #641, Alt.1, BIND9).
+zone and ships them to the control plane (issue #641, Alt.1).
 
 When an operator enables dynamic updates on a zone, a third-party writer
 (an AD domain controller, a DHCP server) can inject records straight into
-the running daemon over RFC 2136. Those records live only in the journal;
+the running daemon over RFC 2136. Those records live only in the daemon;
 the control plane, which treats the DB as truth, would drop them on a full
 re-render. This worker closes the loop:
 
 * Every ``INGEST_INTERVAL`` seconds it reads the cached config bundle to
   find zones with ``dynamic_update_enabled``.
-* For each one it AXFRs the live zone from loopback, signed with the group
-  loopback TSIG key (the zone stanza grants ``allow-transfer { key … }``
-  for exactly this — nothing is opened to the network).
+* For each one it reads the live zone back from the daemon — BIND9 via a
+  loopback AXFR signed with the group loopback TSIG key (the zone stanza
+  grants ``allow-transfer { key … }`` for exactly this — nothing is opened
+  to the network), PowerDNS via ``GET /zones/{zone}`` on its loopback REST
+  API, authenticated with the same API key the driver manages.
+* Under split-horizon BIND9 answers a transfer from the first view whose
+  ``match-clients`` take it, so a loopback transfer signed with the group key
+  reads whichever view happens to admit the loopback address. Each view's
+  copy is therefore read with that view's own transfer key (#920), which
+  selects exactly that view, and the report names the view so the control
+  plane files it under that view's zone. A view with no transfer key is read
+  as before and reported without a view; the control plane files such a
+  report only when the zone name is in a single zone row.
 * It ships the full live record set (minus SOA / apex-NS / DNSSEC RRs the
   daemon owns) to ``/api/v1/dns/agents/ingested-records``. The control
   plane filters out anything it manages and mirrors the rest as
@@ -19,21 +29,27 @@ re-render. This worker closes the loop:
   UI/IPAM-visible and survive a re-render.
 
 Sending the whole zone (rather than an agent-side diff) keeps this robust:
-rdata-formatting differences between the daemon's AXFR output and the DB's
+rdata-formatting differences between the daemon's output and the DB's
 stored value can't cause churn, because the control plane dedupes by
 managed ``(name, type)`` — a formatting mismatch on a managed record is
 skipped there, not double-created here.
 
-BIND9 only. PowerDNS single-store ingest (Alt.4) is a separate path.
+PowerDNS support is issue #1524: before it, the worker ran only for
+BIND9, so RFC 2136 records written to a PowerDNS zone never appeared in
+SpatiumDDI at all — and where an external value shared a (name, type)
+with a managed rrset, the next reconcile REPLACEd it away silently.
 """
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import shutil
 import subprocess
 import threading
-from typing import Any
+from pathlib import Path
+from typing import Any, NamedTuple
 
 import httpx
 import structlog
@@ -62,6 +78,14 @@ _IGNORED_TYPES = frozenset(
         "TYPE65534",
     }
 )
+
+
+class IngestTarget(NamedTuple):
+    """One live read in a sweep: a zone, the view it selects, the TSIG key."""
+
+    zone: str
+    view: str | None
+    key: dict[str, Any] | None
 
 
 def _relative_name(owner: str, zone: str) -> str:
@@ -134,6 +158,94 @@ def _int_or_none(v: str) -> int | None:
         return None
 
 
+_TXT_CHUNK_RE = re.compile(r'"((?:\\.|[^"\\])*)"')
+
+
+def _unquote_txt(content: str) -> str:
+    """A PowerDNS TXT content back to the plain value the control plane stores.
+
+    pdns returns TXT rdata in presentation form — one or more quoted
+    chunks (``"v=spf1 " "-all"``); the control plane stores the plain
+    string and the agent re-quotes on render. Unescape and concatenate.
+    A content that is not quoted at all is returned unchanged.
+    """
+    chunks = _TXT_CHUNK_RE.findall(content)
+    if not chunks:
+        return content
+    return "".join(c.replace('\\"', '"').replace("\\\\", "\\") for c in chunks)
+
+
+def parse_pdns_zone(zone_doc: dict[str, Any], zone: str) -> list[dict[str, Any]] | None:
+    """Parse a PowerDNS ``GET /zones/{zone}`` document into record dicts.
+
+    The mirror image of :func:`parse_axfr` for the PowerDNS read-back
+    (#1524): same output shape, same drops (SOA / apex-NS / DNSSEC RRs),
+    MX / SRV rdata split into their columns. Returns None when the
+    document carries no apex SOA — pdns answers a zone it does not hold
+    (or only partially loaded) without one, and shipping an empty set
+    for that would delete every external mirror on the control plane,
+    exactly the failure ``_saw_soa`` guards on the AXFR path.
+    """
+    zname = zone.rstrip(".")
+    saw_soa = False
+    records: list[dict[str, Any]] = []
+    for rrset in zone_doc.get("rrsets") or []:
+        rtype = str(rrset.get("type") or "").upper()
+        if not rtype:
+            continue
+        owner = str(rrset.get("name") or "")
+        name = _relative_name(owner, zname)
+        if rtype == "SOA" and name == "@":
+            saw_soa = True
+            continue
+        if rtype in _IGNORED_TYPES:
+            continue
+        if rtype == "NS" and name == "@":
+            continue  # apex NS is zone-management data
+        try:
+            ttl = int(rrset.get("ttl"))
+        except (TypeError, ValueError):
+            ttl = None
+        for entry in rrset.get("records") or []:
+            if entry.get("disabled"):
+                continue  # not served — not external data either
+            content = str(entry.get("content") or "")
+            rec: dict[str, Any] = {
+                "name": name,
+                "record_type": rtype,
+                "ttl": ttl,
+                "priority": None,
+                "weight": None,
+                "port": None,
+            }
+            if rtype == "MX":
+                first, _, rest = content.partition(" ")
+                if _int_or_none(first) is not None and rest:
+                    rec["priority"] = _int_or_none(first)
+                    rec["value"] = rest
+                else:
+                    rec["value"] = content
+            elif rtype == "SRV":
+                parts = content.split(" ", 3)
+                if len(parts) == 4 and all(
+                    _int_or_none(p) is not None for p in parts[:3]
+                ):
+                    rec["priority"] = _int_or_none(parts[0])
+                    rec["weight"] = _int_or_none(parts[1])
+                    rec["port"] = _int_or_none(parts[2])
+                    rec["value"] = parts[3]
+                else:
+                    rec["value"] = content
+            elif rtype == "TXT":
+                rec["value"] = _unquote_txt(content)
+            else:
+                rec["value"] = content
+            records.append(rec)
+    if not saw_soa:
+        return None
+    return records
+
+
 def _saw_soa(text: str) -> bool:
     """True if the AXFR output carries an apex SOA record.
 
@@ -152,10 +264,47 @@ def _saw_soa(text: str) -> bool:
     return False
 
 
+# What the last sweep read off each zone (#2850): ``"<owner> <TYPE>"`` per
+# RRset, one per line, owner absolute and lowercase as ``named-compilezone``
+# spells it. It is the evidence the BIND9 driver needs that named HELD a
+# record the control plane learned from it: such a record named no longer
+# holds was deleted by the third party since, and a start inside the window
+# before the next sweep must not render it back from the mirror row.
+_SEEN_DIR = "ingest-seen"
+
+
+def seen_keys_path(state_dir: Path, zone: str) -> Path:
+    return state_dir / _SEEN_DIR / f"{zone.rstrip('.').lower()}.keys"
+
+
+def write_seen_keys(state_dir: Path, zone: str, records: list[dict[str, Any]]) -> None:
+    """Record the RRsets one sweep read off ``zone``, replacing the last."""
+    origin = zone.rstrip(".").lower() + "."
+    keys: set[str] = set()
+    for rec in records:
+        name = str(rec.get("name") or "@").lower()
+        owner = origin if name in ("@", "") else f"{name}.{origin}"
+        keys.add(f"{owner} {str(rec.get('record_type') or '').upper()}")
+    path = seen_keys_path(state_dir, zone)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text("".join(f"{k}\n" for k in sorted(keys)))
+    os.replace(tmp, path)
+
+
+def read_seen_keys(state_dir: Path, zone: str) -> set[str] | None:
+    """What the last sweep read off ``zone``, or None when nothing is known."""
+    try:
+        text = seen_keys_path(state_dir, zone).read_text()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return {line for line in text.splitlines() if line}
+
+
 class IngestWorker:
     """AXFR-and-ship loop for externally-injected DDNS records.
 
-    Daemon thread spun up by the supervisor (BIND9 only). ``stop()`` sets
+    Daemon thread spun up by the supervisor. ``stop()`` sets
     a thread-safe event checked between sweeps.
     """
 
@@ -164,6 +313,82 @@ class IngestWorker:
         self.token_ref = token_ref
         self._stop = threading.Event()
         self.dns_port = int(os.environ.get("DNS_LOOPBACK_PORT") or "53")
+        # (#1705) What the sweep needs from the cached bundle, keyed by the
+        # cache file's identity, so an unchanged config is not re-read and
+        # re-parsed (hundreds of MiB with a big blocklist) every sweep.
+        self._cache_key: tuple[Any, ...] | None = None
+        self._cache_val: list[IngestTarget] = []
+
+    #: Whether a view's copy can be addressed by its transfer key. BIND9 only;
+    #: PowerDNS renders no views and reads one copy over its REST API.
+    _views_addressable = True
+
+    def _sweep_inputs(self) -> list[IngestTarget] | None:
+        """The ``(zone name, view name, key)`` reads one sweep makes, in bundle
+        order; ``None`` = no cache. ``view name`` is None for a read that does
+        not select a view (no views, or a view without a transfer key)."""
+        cfg_dir = self.cfg.state_dir / "config"
+        try:
+            st = (cfg_dir / "current.json").stat()
+            etag = (cfg_dir / "current.etag").read_text().strip()
+        except OSError:
+            etag, st = None, None
+        key = (st.st_mtime_ns, st.st_size, etag) if st is not None else None
+        if key is not None and key == self._cache_key:
+            return self._cache_val
+        # #2223 — the zone list only. This runs in its own thread, so a full
+        # parse here (the cache changes on every record edit) could coincide
+        # with the sync loop's parse of the next bundle: two bundles in memory
+        # at once, ~1 GB at a million records.
+        bundle, _etag = load_config(self.cfg.state_dir, records=False)
+        if not bundle:
+            return None
+        # Loopback key = the group key the control plane appends first.
+        tsig_keys = bundle.get("tsig_keys") or []
+        loop_key = tsig_keys[0] if tsig_keys else None
+        view_keys = self._view_keys(bundle.get("views") or [])
+        # A split-horizon zone appears once per view in the payload, and each
+        # view holds its own copy with its own records. A view with a transfer
+        # key is read on its own; the rest of a name's copies share one
+        # unaddressed read, which the control plane files only when the name
+        # is unambiguous.
+        targets: list[IngestTarget] = []
+        seen: set[tuple[str, str | None]] = set()
+        for zone in bundle.get("zones", []):
+            if not zone.get("dynamic_update_enabled"):
+                continue
+            if zone.get("type", "primary") not in ("primary", "master"):
+                continue
+            zname = (zone.get("name") or "").rstrip(".")
+            if not zname:
+                continue
+            vname = zone.get("view_name") or None
+            vkey = view_keys.get(vname) if vname else None
+            target = (
+                IngestTarget(zname, vname, vkey)
+                if vkey is not None
+                else IngestTarget(zname, None, loop_key)
+            )
+            if (zname, target.view) in seen:
+                continue
+            seen.add((zname, target.view))
+            targets.append(target)
+        self._cache_key, self._cache_val = key, targets
+        return self._cache_val
+
+    def _view_keys(self, views: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        """``{view name: transfer key}`` for the keys the BIND9 render writes
+        into each view's ``match-clients`` (the same filter, so a key is only
+        used where named will recognise it)."""
+        if not views or not self._views_addressable:
+            return {}
+        from .drivers.bind9 import _renderable_tsig_keys, _view_transfer_keys
+
+        return {
+            vname: k
+            for vname, k in _view_transfer_keys(views).items()
+            if _renderable_tsig_keys([k])
+        }
 
     def stop(self) -> None:
         self._stop.set()
@@ -242,45 +467,90 @@ class IngestWorker:
             return None
         return parse_axfr(res.stdout, zname)
 
-    def _ship(self, zone: str, records: list[dict[str, Any]]) -> None:
+    def _read_live_zone(
+        self, zone: str, key: dict[str, Any] | None
+    ) -> list[dict[str, Any]] | None:
+        """Read one dynamic zone back from the live daemon.
+
+        Returns the parsed records, or None (skip, no ship) on any
+        failure signal so a transient error can't be mistaken for "the
+        zone has no records". The BIND9 implementation AXFRs from
+        loopback; PowerDNS overrides this to read its REST API (#1524).
+        """
+        records = self._axfr(zone, key)
+        if records is None:
+            return None
+        return self._drop_placeholder_glue(zone, records)
+
+    def _drop_placeholder_glue(
+        self, zone: str, records: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Leave out the glue the renderer wrote beside its placeholder NS.
+
+        Only when the live render says it wrote it for this zone (#2841): a
+        zone with a real NS naming ``ns1`` keeps its own ``ns1 A 127.0.0.1``.
+        """
+        from .drivers.bind9 import PLACEHOLDER_GLUE_FILE
+
+        try:
+            raw = (self.cfg.state_dir / "rendered" / PLACEHOLDER_GLUE_FILE).read_text()
+            zones = {str(z).rstrip(".").lower() for z in json.loads(raw)}
+        except (OSError, ValueError, TypeError):
+            return records  # no sidecar: the control plane's guard covers it
+        if zone.rstrip(".").lower() not in zones:
+            return records
+        return [
+            r
+            for r in records
+            if not (
+                r.get("name", "").lower() == "ns1"
+                and r.get("record_type") == "A"
+                and r.get("value") == "127.0.0.1"
+            )
+        ]
+
+    def _ship(
+        self, zone: str, records: list[dict[str, Any]], view: str | None = None
+    ) -> None:
+        payload: dict[str, Any] = {"zone_name": zone.rstrip("."), "records": records}
+        if view is not None:
+            payload["view_name"] = view
         try:
             with self._cp_client() as c:
                 resp = c.post(
                     "/api/v1/dns/agents/ingested-records",
-                    json={"zone_name": zone.rstrip("."), "records": records},
+                    json=payload,
                     headers={"Authorization": f"Bearer {self.token_ref[0]}"},
                 )
             if resp.status_code not in (200, 204):
                 log.warning(
-                    "dns_ingest_ship_failed", zone=zone, status=resp.status_code
+                    "dns_ingest_ship_failed",
+                    zone=zone,
+                    view=view,
+                    status=resp.status_code,
                 )
         except httpx.HTTPError as exc:
             log.warning("dns_ingest_ship_http_error", zone=zone, error=str(exc))
 
     def _sweep(self) -> None:
-        bundle, _etag = load_config(self.cfg.state_dir)
-        if not bundle:
+        targets = self._sweep_inputs()
+        if targets is None:
             return
-        # Loopback key = the group key the control plane appends first.
-        tsig_keys = bundle.get("tsig_keys") or []
-        loop_key = tsig_keys[0] if tsig_keys else None
-        # Dedupe zone names — a split-horizon zone appears once per view in
-        # the payload, but the live daemon serves one authoritative copy per
-        # name for AXFR purposes.
-        seen: set[str] = set()
-        for zone in bundle.get("zones", []):
-            if not zone.get("dynamic_update_enabled"):
-                continue
-            if zone.get("type", "primary") not in ("primary", "master"):
-                continue
-            zname = (zone.get("name") or "").rstrip(".")
-            if not zname or zname in seen:
-                continue
-            seen.add(zname)
-            records = self._axfr(zname, loop_key)
+        for target in targets:
+            records = self._read_live_zone(target.zone, target.key)
             if records is None:
                 continue
-            self._ship(zname, records)
+            if target.view is None:
+                # The seen file is keyed by zone name and read only for a zone
+                # rendered without views (#2850); a read of one view's copy
+                # would overwrite it with that view's records.
+                try:
+                    write_seen_keys(self.cfg.state_dir, target.zone, records)
+                except OSError as exc:
+                    log.warning(
+                        "dns_ingest_seen_write_failed", zone=target.zone, error=str(exc)
+                    )
+            self._ship(target.zone, records, target.view)
 
     def run(self) -> None:
         if not shutil.which("dig"):
@@ -298,4 +568,76 @@ class IngestWorker:
         log.info("dns_ingest_worker_stopped")
 
 
-__all__ = ["IngestWorker", "parse_axfr", "INGEST_INTERVAL"]
+class PowerDNSIngestWorker(IngestWorker):
+    """PowerDNS read-back for the ingest loop (issue #1524).
+
+    Same sweep / ship contract as the BIND9 worker; only the live read
+    differs — ``GET /zones/{zone}`` on the loopback REST API with the
+    API key the driver manages, instead of an AXFR. Until this existed
+    the worker ran for BIND9 only, so records an RFC 2136 client wrote
+    to a PowerDNS zone never reached the control plane.
+    """
+
+    _views_addressable = False
+
+    def _read_live_zone(
+        self, zone: str, key: dict[str, Any] | None
+    ) -> list[dict[str, Any]] | None:
+        from .drivers.powerdns import _PDNS_API_BASE, PowerDNSDriver
+
+        zname = zone.rstrip(".") + "."
+        api_key = PowerDNSDriver(
+            state_dir=self.cfg.state_dir
+        )._load_or_generate_api_key()
+        try:
+            with httpx.Client(timeout=20.0) as client:
+                resp = client.get(
+                    f"{_PDNS_API_BASE}/zones/{zname}",
+                    headers={"X-API-Key": api_key},
+                )
+        except httpx.HTTPError as exc:
+            log.warning("pdns_ingest_read_failed", zone=zname, error=str(exc))
+            return None
+        if resp.status_code != 200:
+            log.warning(
+                "pdns_ingest_read_non200", zone=zname, status=resp.status_code
+            )
+            return None
+        try:
+            zone_doc = resp.json()
+        except ValueError:
+            log.warning("pdns_ingest_read_bad_json", zone=zname)
+            return None
+        records = parse_pdns_zone(zone_doc, zname)
+        if records is None:
+            # No apex SOA in the document — not a zone pdns holds (yet).
+            # Never ship: an empty set would delete every external mirror.
+            log.warning("pdns_ingest_read_no_soa", zone=zname)
+            return None
+        return records
+
+    def run(self) -> None:
+        # No dig binary involved — the read-back is the REST API.
+        log.info("pdns_ingest_worker_starting", interval=INGEST_INTERVAL)
+        # Small initial delay so the daemon is up + first bundle applied.
+        self._stop.wait(timeout=30.0)
+        while not self._stop.is_set():
+            try:
+                self._sweep()
+            except Exception:  # never let ingest kill the thread
+                log.exception("pdns_ingest_sweep_failed")
+            self._stop.wait(timeout=INGEST_INTERVAL)
+        log.info("pdns_ingest_worker_stopped")
+
+
+__all__ = [
+    "INGEST_INTERVAL",
+    "IngestTarget",
+    "IngestWorker",
+    "PowerDNSIngestWorker",
+    "parse_axfr",
+    "parse_pdns_zone",
+    "read_seen_keys",
+    "seen_keys_path",
+    "write_seen_keys",
+]

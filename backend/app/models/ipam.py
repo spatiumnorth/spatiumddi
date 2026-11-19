@@ -76,6 +76,12 @@ IP_STATUSES_INTEGRATION_OWNED: frozenset[str] = frozenset(
     }
 )
 IP_STATUSES: frozenset[str] = IP_STATUSES_OPERATOR_SETTABLE | IP_STATUSES_INTEGRATION_OWNED
+# The statuses a NEW address may be created with by hand — over REST and over
+# the operation layer (requests portal, Copilot) alike: the operator-settable
+# set plus ``dhcp`` for the static-reservation conversion path. Integration
+# statuses (proxmox-vm, kubernetes-node, …) belong to their reconcilers; a
+# brand-new row carrying one would be "owned" by no integration.
+IP_STATUSES_CREATE_SETTABLE: frozenset[str] = IP_STATUSES_OPERATOR_SETTABLE | {"dhcp"}
 
 # Valid IPAddress.role values. Orthogonal to ``status`` — the role
 # describes what the IP *is* (a host vs. a VRRP virtual address),
@@ -283,7 +289,9 @@ class IPBlock(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
     # Computed / cached. ``allocated_ips`` is the recursive sum of descendant
-    # subnets' allocated_ips; ``total_ips`` is the block's CIDR size clamped to
+    # subnets' allocated_ips plus each subnet's network/broadcast addresses
+    # (a block's utilization is the share of its CIDR in use, #2982), clamped
+    # to the CIDR size; ``total_ips`` is the block's CIDR size clamped to
     # BIGINT (a huge IPv6 block reads as "uncountable" in the UI, like a /64
     # subnet). Both are populated by ``_update_block_utilization`` alongside
     # ``utilization_percent`` so block rows can show Used IPs, not just a bar.
@@ -733,6 +741,20 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     do_not_probe_reason: Mapped[str] = mapped_column(
         Text, nullable=False, default="", server_default=sa_text("''")
     )
+
+    # The create-time opt-out from the auto reverse zone (#2735). Stored, because
+    # the zone is also created by the catch-up every address sync runs and by a
+    # resize, and neither can see the request that said "no".
+    skip_reverse_zone: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+
+    # Presentational (#2137): show the green "N free · click to allocate"
+    # gap rows between allocated addresses. NULL = use the default (off
+    # for integration-owned subnets and anything larger than a /16);
+    # an explicit True / False overrides it. No effect on allocation or
+    # utilization.
+    show_free_ranges: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
 
     # IPv6 auto-allocation policy (ignored for IPv4 subnets — those use
     # PlatformSettings.ip_allocation_strategy which is sequential /

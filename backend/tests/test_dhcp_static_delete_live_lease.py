@@ -362,3 +362,32 @@ async def test_in_a_ddns_subnet_the_mirror_gets_its_dns_back(
         .all()
     )
     assert names == ["laptop-9"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "expect"),
+    [("on_lease", "laptop-9"), ("on_static_only", "printer-7"), ("disabled", "printer-7")],
+)
+async def test_handback_honours_hostname_to_ipam_sync(
+    db_session: AsyncSession, mode: str, expect: str
+) -> None:
+    """#2269 — the hand-back path writes the lease hostname only on ``on_lease``.
+
+    The row is still handed to the live lease in every mode; otherwise it keeps
+    the name it already carried.
+    """
+    grp, (srv,) = await _group(db_session)
+    subnet, scope = await _scope(db_session, grp)
+    scope.hostname_to_ipam_sync = mode
+    st = await _reservation(db_session, scope)
+    db_session.add(_lease(srv, scope, hostname="laptop-9"))
+    await db_session.flush()
+
+    await detach_ipam_for_static(db_session, st)
+    await db_session.flush()
+
+    row = await _row(db_session, subnet)
+    assert row.status == "dhcp"
+    assert row.auto_from_lease is True
+    assert row.hostname == expect

@@ -1,6 +1,13 @@
+import { useOwnershipModules } from "@/hooks/useOwnershipModules";
 import { useEffect, useMemo, useState } from "react";
+import { MissingCustomerOption } from "@/components/ownership/pickers";
+import {
+  missingCustomerLabel,
+  useReadsEveryCustomer,
+} from "@/components/ownership/missingCustomer";
 import { useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { ListPlus, Pencil, Plus, RefreshCw, Trash2, X } from "lucide-react";
 
 import { MulticastDomainsTab } from "./MulticastDomainsPage";
@@ -22,12 +29,16 @@ import {
   type MulticastMembershipRead,
   type MulticastMembershipRole,
   type MulticastPortTransport,
+  formatApiError,
 } from "@/lib/api";
+import { cascadeList } from "@/lib/delete-cascade";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal, ModalTabs } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { IPAddressPicker } from "@/components/IPAddressPicker";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -63,7 +74,7 @@ function RoleBadge({ role }: { role: string }) {
 
 type EditorTab = "general" | "ports" | "memberships";
 
-function MulticastGroupModal({
+export function MulticastGroupModal({
   existing,
   spaces,
   onClose,
@@ -72,6 +83,7 @@ function MulticastGroupModal({
   spaces: IPSpace[];
   onClose: () => void;
 }) {
+  const own = useOwnershipModules();
   const qc = useQueryClient();
   const [tab, setTab] = useState<EditorTab>("general");
 
@@ -100,6 +112,7 @@ function MulticastGroupModal({
     queryKey: ["customers", "all"],
     queryFn: () => customersApi.list({ limit: 500 }),
     staleTime: 60_000,
+    enabled: own.customer,
   });
   const customers = customersQ.data?.items ?? [];
 
@@ -141,16 +154,7 @@ function MulticastGroupModal({
       onClose();
     },
     onError: (e: unknown) => {
-      const err = e as {
-        message?: string;
-        response?: { data?: { detail?: string | { msg?: string }[] } };
-      };
-      const detail = err?.response?.data?.detail;
-      if (Array.isArray(detail)) {
-        setError(detail.map((d) => d.msg ?? "validation error").join("; "));
-      } else {
-        setError(detail ?? err?.message ?? "Save failed");
-      }
+      setError(formatApiError(e, "Save failed"));
     },
   });
 
@@ -227,23 +231,29 @@ function MulticastGroupModal({
               </p>
             )}
           </div>
-          <div>
-            <label className="text-xs font-medium text-muted-foreground">
-              Customer (optional)
-            </label>
-            <select
-              className={inputCls}
-              value={customerId ?? ""}
-              onChange={(e) => setCustomerId(e.target.value || null)}
-            >
-              <option value="">— None —</option>
-              {customers.map((c) => (
-                <option key={c.id} value={c.id}>
-                  {c.name}
-                </option>
-              ))}
-            </select>
-          </div>
+          {own.customer && (
+            <div>
+              <label className="text-xs font-medium text-muted-foreground">
+                Customer (optional)
+              </label>
+              <select
+                className={inputCls}
+                value={customerId ?? ""}
+                onChange={(e) => setCustomerId(e.target.value || null)}
+              >
+                <option value="">— None —</option>
+                <MissingCustomerOption
+                  customerId={customerId}
+                  list={customersQ}
+                />
+                {customers.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
           <div className="sm:col-span-2">
             <label className="text-xs font-medium text-muted-foreground">
               PIM domain (optional)
@@ -318,7 +328,9 @@ function MulticastGroupModal({
         <MembershipsTab groupId={existing.id} />
       )}
 
-      {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
+      {error && (
+        <FormError className="mt-3 text-sm text-destructive">{error}</FormError>
+      )}
 
       <div className="mt-6 flex justify-end gap-2 border-t pt-3">
         <button
@@ -345,7 +357,7 @@ function MulticastGroupModal({
 
 // ── Ports tab ───────────────────────────────────────────────────────
 
-function PortsTab({ groupId }: { groupId: string }) {
+export function PortsTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
   const [portStart, setPortStart] = useState("");
   const [portEnd, setPortEnd] = useState("");
@@ -369,14 +381,18 @@ function PortsTab({ groupId }: { groupId: string }) {
       setError(null);
     },
     onError: (e: unknown) => {
-      const err = e as { response?: { data?: { detail?: string } } };
-      setError(err?.response?.data?.detail ?? "Add failed");
+      setError(formatApiError(e, "Add failed"));
     },
   });
 
   const remove = useMutation({
     mutationFn: (id: string) => multicastApi.deletePort(id),
+    onMutate: () => setError(null),
     onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["multicast-ports", groupId] });
+    },
+    onError: (e: unknown) => {
+      setError(formatApiError(e, "Delete failed"));
       qc.invalidateQueries({ queryKey: ["multicast-ports", groupId] });
     },
   });
@@ -439,7 +455,11 @@ function PortsTab({ groupId }: { groupId: string }) {
             Add
           </button>
         </div>
-        {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="mt-2 text-xs text-destructive">
+            {error}
+          </FormError>
+        )}
       </div>
 
       {ports.length === 0 ? (
@@ -529,14 +549,20 @@ function MembershipsTab({ groupId }: { groupId: string }) {
       setError(null);
     },
     onError: (e: unknown) => {
-      const err = e as { response?: { data?: { detail?: string } } };
-      setError(err?.response?.data?.detail ?? "Add failed");
+      setError(formatApiError(e, "Add failed"));
     },
   });
 
   const remove = useMutation({
     mutationFn: (id: string) => multicastApi.deleteMembership(id),
+    onMutate: () => setError(null),
     onSuccess: () => {
+      qc.invalidateQueries({
+        queryKey: ["multicast-memberships", groupId],
+      });
+    },
+    onError: (e: unknown) => {
+      setError(formatApiError(e, "Delete failed"));
       qc.invalidateQueries({
         queryKey: ["multicast-memberships", groupId],
       });
@@ -592,7 +618,11 @@ function MembershipsTab({ groupId }: { groupId: string }) {
             Add
           </button>
         </div>
-        {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="mt-2 text-xs text-destructive">
+            {error}
+          </FormError>
+        )}
       </div>
 
       {memberships.length === 0 ? (
@@ -708,15 +738,7 @@ function BulkAllocateModal({
       setError(null);
     },
     onError: (e: unknown) => {
-      const err = e as {
-        response?: { data?: { detail?: string | { msg?: string }[] } };
-      };
-      const detail = err?.response?.data?.detail;
-      if (Array.isArray(detail)) {
-        setError(detail.map((d) => d.msg ?? "validation error").join("; "));
-      } else {
-        setError(detail ?? "Preview failed");
-      }
+      setError(formatApiError(e, "Preview failed"));
     },
   });
 
@@ -740,10 +762,8 @@ function BulkAllocateModal({
         setError(
           `${detail.message ?? "Commit failed"}${conflicts ? ` — ${conflicts}…` : ""}`,
         );
-      } else if (typeof detail === "string") {
-        setError(detail);
       } else {
-        setError("Commit failed");
+        setError(formatApiError(e, "Commit failed"));
       }
     },
   });
@@ -919,7 +939,9 @@ function BulkAllocateModal({
           </div>
         )}
 
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-sm text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 border-t pt-3">
           <button
@@ -1019,6 +1041,7 @@ export function MulticastGroupsPage() {
     queryFn: () => customersApi.list({ limit: 500 }),
     staleTime: 60_000,
   });
+  const readsEveryCustomer = useReadsEveryCustomer();
 
   const query = useQuery({
     queryKey: ["multicast-groups", search, spaceFilter, customerFilter],
@@ -1033,15 +1056,29 @@ export function MulticastGroupsPage() {
 
   const items = query.data?.items ?? [];
 
+  // A refused delete says why in an announced line and re-reads the list, so
+  // a group that is already gone leaves it (#4220).
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
   const removeOne = useMutation({
     mutationFn: (id: string) => multicastApi.remove(id),
+    onMutate: () => setDeleteError(null),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["multicast-groups"] }),
+    onError: (e: unknown) => {
+      setDeleteError(formatApiError(e, "Failed to delete multicast group"));
+      qc.invalidateQueries({ queryKey: ["multicast-groups"] });
+    },
   });
 
   const bulkDelete = useMutation({
     mutationFn: (ids: string[]) => multicastApi.bulkDelete(ids),
+    onMutate: () => setDeleteError(null),
     onSuccess: () => {
       setSelectedIds(new Set());
+      qc.invalidateQueries({ queryKey: ["multicast-groups"] });
+    },
+    onError: (e: unknown) => {
+      setDeleteError(formatApiError(e, "Failed to delete multicast groups"));
       qc.invalidateQueries({ queryKey: ["multicast-groups"] });
     },
   });
@@ -1143,12 +1180,24 @@ export function MulticastGroupsPage() {
             customers={customersQ.data?.items ?? []}
             spaceNames={spaceNames}
             customerNames={customerNames}
+            missingCustomer={(id) =>
+              missingCustomerLabel(id, customersQ, readsEveryCustomer) ===
+              "(customer in Trash)"
+                ? "(customer in Trash)"
+                : // Any other customer the list does not name (refused, narrowed
+                  // to other customers, or past its first page) is said, never
+                  // shown as a piece of its id (#3527). Nothing while loading.
+                  customersQ.isPending
+                  ? null
+                  : "linked, not shown"
+            }
             selectedIds={selectedIds}
             allChecked={allChecked}
             toggleAll={toggleAll}
             toggleOne={toggleOne}
             removeOne={removeOne}
             bulkDelete={bulkDelete}
+            deleteError={deleteError}
             setEditing={setEditing}
             setShowNew={setShowNew}
             setShowBulk={setShowBulk}
@@ -1211,7 +1260,7 @@ function TabPill({
 // preserves the operator's filter / selection in the same session.
 
 type GroupsTabBodyProps = {
-  query: { refetch: () => void; isFetching: boolean };
+  query: { refetch: () => void; isFetching: boolean; error?: unknown };
   items: MulticastGroupRead[];
   spaceFilter: string;
   setSpaceFilter: (v: string) => void;
@@ -1223,12 +1272,14 @@ type GroupsTabBodyProps = {
   customers: { id: string; name: string }[];
   spaceNames: Map<string, string>;
   customerNames: Map<string, string>;
+  missingCustomer: (id: string) => string | null;
   selectedIds: Set<string>;
   allChecked: boolean;
   toggleAll: () => void;
   toggleOne: (id: string) => void;
   removeOne: { mutate: (id: string) => void };
   bulkDelete: { mutate: (ids: string[]) => void; isPending: boolean };
+  deleteError: string | null;
   setEditing: (g: MulticastGroupRead | null) => void;
   setShowNew: (v: boolean) => void;
   setShowBulk: (v: boolean) => void;
@@ -1247,16 +1298,29 @@ function GroupsTabBody({
   customers,
   spaceNames,
   customerNames,
+  missingCustomer,
   selectedIds,
   allChecked,
   toggleAll,
   toggleOne,
   removeOne,
   bulkDelete,
+  deleteError,
   setEditing,
   setShowNew,
   setShowBulk,
 }: GroupsTabBodyProps) {
+  // #1340 — a read-only user is offered no write it would be refused:
+  // the router asks write (delete) on 'multicast'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "multicast"),
+    "Requires write permission on multicast groups",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "multicast"),
+    "Requires delete permission on multicast groups",
+  );
   const [confirm, setConfirm] = useState<{
     title: string;
     message: string;
@@ -1265,6 +1329,7 @@ function GroupsTabBody({
   } | null>(null);
   return (
     <>
+      <FormError className="text-sm text-destructive">{deleteError}</FormError>
       <div className="flex justify-end gap-2">
         <HeaderButton
           icon={RefreshCw}
@@ -1273,13 +1338,18 @@ function GroupsTabBody({
         >
           Refresh
         </HeaderButton>
-        <HeaderButton icon={ListPlus} onClick={() => setShowBulk(true)}>
+        <HeaderButton
+          icon={ListPlus}
+          onClick={() => setShowBulk(true)}
+          {...writeGate}
+        >
           Bulk allocate…
         </HeaderButton>
         <HeaderButton
           variant="primary"
           icon={Plus}
           onClick={() => setShowNew(true)}
+          {...writeGate}
         >
           New group
         </HeaderButton>
@@ -1329,11 +1399,12 @@ function GroupsTabBody({
               const ids = Array.from(selectedIds);
               setConfirm({
                 title: "Delete multicast groups",
-                message: `Delete ${ids.length} multicast group${ids.length === 1 ? "" : "s"}? Ports + memberships cascade.`,
+                message: `Delete ${ids.length} multicast group${ids.length === 1 ? "" : "s"}? ${ids.length === 1 ? "Its" : "Their"} ${cascadeList("multicast_group")} are deleted with ${ids.length === 1 ? "it" : "them"}.`,
                 confirmLabel: "Delete",
                 onConfirm: () => bulkDelete.mutate(ids),
               });
             }}
+            {...deleteGate}
           >
             Delete selected
           </HeaderButton>
@@ -1368,8 +1439,28 @@ function GroupsTabBody({
                   colSpan={8}
                   className="px-3 py-10 text-center text-sm text-muted-foreground"
                 >
-                  No multicast groups yet. Click <strong>New group</strong> to
-                  add the first.
+                  <ListEmpty
+                    error={query.error}
+                    what="multicast groups"
+                    gate={writeGate}
+                    hint={
+                      <>
+                        Click <strong>New group</strong> to add the first.
+                      </>
+                    }
+                    filtered={
+                      search !== "" ||
+                      spaceFilter !== "" ||
+                      customerFilter !== ""
+                    }
+                    onClearFilters={() => {
+                      setSearch("");
+                      setSpaceFilter("");
+                      setCustomerFilter("");
+                    }}
+                  >
+                    No multicast groups yet.
+                  </ListEmpty>
                 </td>
               </tr>
             )}
@@ -1394,7 +1485,7 @@ function GroupsTabBody({
                 <td className="px-3 py-1.5 text-muted-foreground">
                   {g.customer_id
                     ? (customerNames.get(g.customer_id) ??
-                      g.customer_id.slice(0, 8))
+                      missingCustomer(g.customer_id))
                     : "—"}
                 </td>
                 <td className="px-3 py-1.5 tabular-nums text-muted-foreground">
@@ -1407,7 +1498,9 @@ function GroupsTabBody({
                     type="button"
                     onClick={() => setEditing(g)}
                     title="Edit"
-                    className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                    aria-label="Edit"
+                    className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                    {...writeGate}
                   >
                     <Pencil className="h-3.5 w-3.5" />
                   </button>
@@ -1422,7 +1515,9 @@ function GroupsTabBody({
                       });
                     }}
                     title="Delete"
-                    className="ml-1 rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                    aria-label="Delete"
+                    className="ml-1 rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
+                    {...deleteGate}
                   >
                     <Trash2 className="h-3.5 w-3.5" />
                   </button>

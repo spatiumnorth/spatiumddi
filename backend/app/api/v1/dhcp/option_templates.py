@@ -17,16 +17,18 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
-from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
-from app.api.v1.dhcp.scopes import validate_dhcp_options
+from app.api.v1.dhcp.scopes import normalize_dhcp_options, validate_dhcp_options
 from app.core.agent_wake import collect_wake, dhcp_group_channel
-from app.core.permissions import require_resource_permission
+from app.core.permissions import require_permission, require_resource_permission
+from app.core.update_nulls import changed_keys, snapshot
 from app.models.dhcp import (
     DHCPOptionTemplate,
     DHCPScope,
     DHCPServerGroup,
 )
+from app.services.dhcp.option_spelling import group_raw_codes
 from app.services.dhcp.option_validation import normalize_options
 
 router = APIRouter(
@@ -115,7 +117,7 @@ async def create_template(
     group_id: uuid.UUID,
     body: OptionTemplateCreate,
     db: DB,
-    user: SuperAdmin,
+    user: CurrentUser,
 ) -> OptionTemplateResponse:
     grp = await db.get(DHCPServerGroup, group_id)
     if grp is None:
@@ -128,7 +130,7 @@ async def create_template(
     )
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="A template with that name exists")
-    options = normalize_options(body.options)
+    options = normalize_dhcp_options(body.options, raw_codes=await group_raw_codes(db, group_id))
     await validate_dhcp_options(db, options, group_id=group_id, address_family=body.address_family)
     tpl = DHCPOptionTemplate(
         group_id=group_id,
@@ -167,7 +169,7 @@ async def update_template(
     template_id: uuid.UUID,
     body: OptionTemplateUpdate,
     db: DB,
-    user: SuperAdmin,
+    user: CurrentUser,
 ) -> OptionTemplateResponse:
     tpl = await db.get(DHCPOptionTemplate, template_id)
     if tpl is None:
@@ -187,7 +189,10 @@ async def update_template(
     if "options" in payload or family != tpl.address_family:
         # The stored map is normalised too: a template saved before #1228
         # may carry an alias (``domain-name-servers``) the check rejects.
-        options = normalize_options(payload["options"] if "options" in payload else tpl.options)
+        options = normalize_dhcp_options(
+            payload["options"] if "options" in payload else tpl.options,
+            raw_codes=await group_raw_codes(db, tpl.group_id),
+        )
         # Validate only changed options (#597, #1228) so a round-tripped
         # grandfathered value doesn't block an unrelated edit — unless the
         # family changed, which makes every option new to the template.
@@ -200,6 +205,7 @@ async def update_template(
         )
         if "options" in payload:
             payload["options"] = options
+    before = snapshot(tpl, payload)
     for k, v in payload.items():
         setattr(tpl, k, v)
     write_audit(
@@ -209,7 +215,7 @@ async def update_template(
         resource_type="dhcp_option_template",
         resource_id=str(tpl.id),
         resource_display=tpl.name,
-        changed_fields=list(payload.keys()),
+        changed_fields=changed_keys(before, payload),
         new_value=payload,
     )
     await db.commit()
@@ -218,7 +224,7 @@ async def update_template(
 
 
 @router.delete("/option-templates/{template_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_template(template_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
+async def delete_template(template_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
     tpl = await db.get(DHCPOptionTemplate, template_id)
     if tpl is None:
         raise HTTPException(status_code=404, detail="Template not found")
@@ -258,12 +264,15 @@ class ApplyTemplateResponse(BaseModel):
 @router.post(
     "/scopes/{scope_id}/apply-option-template",
     response_model=ApplyTemplateResponse,
+    # Applying a template rewrites the scope's options, so the scope's own
+    # write permission is required on top of the router's template gate.
+    dependencies=[Depends(require_permission("write", "dhcp_scope"))],
 )
 async def apply_template_to_scope(
     scope_id: uuid.UUID,
     body: ApplyTemplateRequest,
     db: DB,
-    user: SuperAdmin,
+    user: CurrentUser,
 ) -> ApplyTemplateResponse:
     scope = await db.get(DHCPScope, scope_id)
     if scope is None:

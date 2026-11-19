@@ -87,9 +87,9 @@ MAX_ERROR_LEN = 2000
 #
 # The boundary that matters is between VALIDATE and RELOAD. Everything up to
 # and including validation happens against a staging copy — BIND renders into
-# ``rendered.new`` and runs ``named-checkconf`` there; Kea is asked
-# ``config-test`` before ``config-reload`` — so the running daemon has not
-# been touched and there is nothing to undo. Only a failure at RELOAD means
+# ``rendered.new`` and runs ``named-checkconf`` there; Kea's file is checked
+# with ``kea-dhcp4 -t`` before ``config-reload`` — so the running daemon has
+# not been touched and there is nothing to undo. Only a failure at RELOAD means
 # the live config has already been replaced, and only then does recovering
 # require re-rendering the previous bundle.
 
@@ -110,6 +110,13 @@ class ConfigApplyError(RuntimeError):
 
     @property
     def daemon_disturbed(self) -> bool:
+        # A cause may vouch that the daemon never took a change, whatever the
+        # phase: Technitium's reload phase is a series of API calls, and an
+        # auth refusal on the first one means nothing reached the daemon
+        # (#1772). Reverting then would only repeat the same refused calls
+        # and report ``revert_failed`` for a daemon that is still serving.
+        if getattr(self.cause, "daemon_untouched", False):
+            return False
         return self.phase in DAEMON_DISTURBING_PHASES
 
 
@@ -119,6 +126,12 @@ def truncate_error(text: str) -> str:
     if len(text) <= MAX_ERROR_LEN:
         return text
     return text[: MAX_ERROR_LEN - 1] + "…"
+
+
+#: :attr:`ApplyStatus.reason` values (#3552), mirrored by the control plane's
+#: ``app.services.agents.config_apply``.
+REASON_OOM = "oom"
+REASON_DAEMON_DIED = "daemon_died"
 
 
 @dataclass
@@ -137,15 +150,35 @@ class ApplyStatus:
     #: operator whether the daemon was ever disturbed.
     phase: str | None = None
     error: str | None = None
+    #: Why, for a verdict about a death during an apply (#3552):
+    #: :data:`REASON_OOM` when the agent has evidence the container's OOM killer
+    #: did it, :data:`REASON_DAEMON_DIED` when it does not know what did (the
+    #: control plane names it OOM when the kubelet saw one). ``None``: not a
+    #: death verdict. Neither value ever means "not out of memory".
+    reason: str | None = None
+    #: ``memory.max`` in bytes at that time; only meaningful with ``reason``.
+    memory_limit_bytes: int | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        # Nothing applied yet (#2258): the default ``ok`` with no etag is a
+        # placeholder, not a verdict. Report an empty block, which the control
+        # plane reads as "no report" and leaves the stored status (NULL =
+        # unknown, #882) untouched, instead of a fabricated ``ok``.
+        if self.status == STATUS_OK and self.etag is None:
+            return {}
+        out: dict[str, Any] = {
             "status": self.status,
             "etag": self.etag,
             "failed_etag": self.failed_etag,
             "phase": self.phase,
             "error": self.error,
         }
+        # Only when set, so the wire is unchanged for every other verdict.
+        if self.reason:
+            out["reason"] = self.reason
+            if self.memory_limit_bytes:
+                out["memory_limit_bytes"] = self.memory_limit_bytes
+        return out
 
     @property
     def healthy(self) -> bool:
@@ -163,6 +196,13 @@ class Quarantine:
     def __init__(self, state_dir: Path):
         self._path = state_dir / "config" / "quarantine.json"
         self.etag: str | None = None
+        #: ``structural_etag`` of the failed bundle (#2647). The quarantine
+        #: names a STRUCTURE, not one full etag: record CRUD moves the full
+        #: etag but not this, and a record-only change must neither clear the
+        #: quarantine nor restart its backoff ladder. ``None`` for a file
+        #: written by an older agent (full-etag keyed) or a bundle that
+        #: carried none; matching then falls back to the full etag.
+        self.structural: str | None = None
         self.reason: str | None = None
         self.failures: int = 0
         self.retry_at: float = 0.0
@@ -182,6 +222,8 @@ class Quarantine:
         if not isinstance(data, dict):
             return
         self.etag = data.get("etag")
+        structural = data.get("structural")
+        self.structural = structural if isinstance(structural, str) else None
         self.reason = data.get("reason")
         self.failures = int(data.get("failures") or 0)
         # ``retry_at`` is stored as a monotonic-independent wall clock so it
@@ -198,6 +240,7 @@ class Quarantine:
                 json.dumps(
                     {
                         "etag": self.etag,
+                        "structural": self.structural,
                         "reason": self.reason,
                         "failures": self.failures,
                         "retry_at": self.retry_at,
@@ -211,13 +254,27 @@ class Quarantine:
             # problem; failing the apply path over it would be worse.
             log.warning("quarantine_write_failed", path=str(self._path))
 
-    def record(self, etag: str, reason: str) -> None:
+    def same_structure(self, etag: str | None, structural: str | None = None) -> bool:
+        """Is this bundle the quarantined one, as far as applying it goes?
+
+        Compared on ``structural_etag`` when both sides have one (#2647), so a
+        record-only change to a quarantined structure is still that structure.
+        Otherwise (an older agent's file, a bundle without one) on the full etag.
+        """
+        if etag is None or self.etag is None:
+            return False
+        if self.structural is not None and structural is not None:
+            return structural == self.structural
+        return etag == self.etag
+
+    def record(self, etag: str, reason: str, structural: str | None = None) -> None:
         """Mark ``etag`` as failed and schedule its retry."""
-        if etag != self.etag:
-            # A different bundle — restart the backoff ladder rather than
+        if not self.same_structure(etag, structural):
+            # A different structure — restart the backoff ladder rather than
             # inheriting the previous one's.
             self.failures = 0
         self.etag = etag
+        self.structural = structural
         self.reason = reason
         self.failures += 1
         idx = min(self.failures - 1, len(RETRY_BACKOFF_SECONDS) - 1)
@@ -236,6 +293,7 @@ class Quarantine:
             return
         log.info("config_quarantine_cleared", etag=self.etag)
         self.etag = None
+        self.structural = None
         self.reason = None
         self.failures = 0
         self.retry_at = 0.0
@@ -246,9 +304,9 @@ class Quarantine:
             # restart, and the next successful apply rewrites it away.
             log.warning("quarantine_unlink_failed", path=str(self._path))
 
-    def blocks(self, etag: str | None) -> bool:
-        """Should this etag be skipped rather than applied right now?"""
-        if etag is None or self.etag is None or etag != self.etag:
+    def blocks(self, etag: str | None, structural: str | None = None) -> bool:
+        """Should this bundle be skipped rather than applied right now?"""
+        if not self.same_structure(etag, structural):
             return False
         return time.time() < self.retry_at
 

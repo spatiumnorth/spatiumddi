@@ -37,6 +37,23 @@
 
 set -uo pipefail
 
+# Writes stdin to $1, a file in the release-state directory. The api and the
+# supervisor can create names in that directory and this runs as root, so a
+# redirect onto the name would follow a symlink planted there. Instead a temp
+# file is created exclusively (mktemp) next to it and renamed over the name:
+# whatever was at the name, a symlink included, is replaced, never written
+# through. -T: a directory at the name fails the rename instead of receiving
+# the file. $2 = mode, default 0644.
+state_write() {
+    local _dst="$1" _tmp
+    _tmp=$(mktemp "$(dirname -- "$_dst")/.$(basename -- "$_dst").XXXXXX") || return 1
+    if cat > "$_tmp" && chmod "${2:-0644}" "$_tmp" && mv -fT -- "$_tmp" "$_dst"; then
+        return 0
+    fi
+    rm -f -- "$_tmp"
+    return 1
+}
+
 RELEASE_STATE=/var/lib/spatiumddi/release-state
 TRIGGER="$RELEASE_STATE/cluster-restore-pending"
 STATE="$RELEASE_STATE/cluster-restore.state"
@@ -64,7 +81,7 @@ log() { printf '[%s] %s\n' "$(date -Iseconds)" "$*" | tee -a "$LOG"; }
 # State sidecar the supervisor reads (state<TAB>reason). Keep the
 # vocabulary in lock-step with the supervisor's appliance_state.py +
 # the backend's restore_state handling: restoring | done | failed.
-write_state() { printf '%s\t%s\n' "$1" "${2:-}" > "$STATE"; }
+write_state() { printf '%s\t%s\n' "$1" "${2:-}" | state_write "$STATE"; }
 
 # Reap orphaned containerd-shims + reset the systemd start counter before
 # a (re)start — identical rationale to spatium-cluster-join's helper
@@ -115,7 +132,7 @@ do_restore() {
     # Guardrail — refuse anything not stamped by the supervisor.
     if [ "$confirm" != "$RESTORE_CONFIRM" ]; then
         log "restore trigger missing confirmation marker (got: '${confirm:-<empty>}') — refusing, not touching k3s"
-        mv -f "$TRIGGER" "${TRIGGER}.rejected.$(date +%s)" || true
+        mv -fT "$TRIGGER" "${TRIGGER}.rejected.$(date +%s)" || true
         exit 0
     fi
 
@@ -125,7 +142,7 @@ do_restore() {
     if [ -z "$snapshot" ] || printf '%s' "$snapshot" | grep -q '[/]'; then
         log "invalid snapshot name ('${snapshot:-<empty>}') — refusing"
         write_state failed "invalid snapshot name"
-        mv -f "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" || true
+        mv -fT "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" || true
         exit 1
     fi
 
@@ -133,7 +150,7 @@ do_restore() {
     if [ ! -f "$snap_path" ]; then
         log "snapshot file not found locally: $snap_path (S3 restore unsupported in v1)"
         write_state failed "snapshot not found on this node: $snapshot"
-        mv -f "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" || true
+        mv -fT "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" || true
         exit 1
     fi
 
@@ -156,7 +173,7 @@ do_restore() {
         clean_k3s_runtime
         systemctl start k3s || true
         write_state failed "k3s --cluster-reset-restore failed; cluster left as-is"
-        mv -f "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" || true
+        mv -fT "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" || true
         exit 1
     fi
 
@@ -165,13 +182,13 @@ do_restore() {
         log "RESTORE ok — single-node cluster is Ready on the restored snapshot."
         log "NOTE: other control-plane members are now orphaned — re-pair them via Fleet → Replace."
         write_state done "$snapshot"
-        mv -f "$TRIGGER" "${TRIGGER}.done.$(date +%s)" || true
+        mv -fT "$TRIGGER" "${TRIGGER}.done.$(date +%s)" || true
         exit 0
     fi
 
     log "RESTORE: k3s did not come Ready after restore — manual recovery needed"
     write_state failed "k3s not Ready after restore"
-    mv -f "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" || true
+    mv -fT "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" || true
     exit 1
 }
 

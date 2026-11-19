@@ -54,7 +54,24 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.kubernetes import KubernetesCluster
-from app.services.integration_ownership import owned_by_other_integration
+from app.services._mirror_hostname import normalize_desired_hostname
+from app.services.dns.cname_conflict import find_record_insert_conflict
+from app.services.dns.record_ops import retract_address_dns
+from app.services.integration_ownership import (
+    SpaceRelease,
+    address_taken,
+    addresses_in_space,
+    drop_wrapper_block,
+    move_stays_in_space,
+    owned_addresses_in_space,
+    owned_by_other_integration,
+    owned_subnets_in_space,
+    refuse_sync_into_trashed_space,
+    retire_vanished_subnet,
+    subnet_for_address,
+    unowned_subnets_at,
+)
+from app.services.ipam.utilization import counts_toward_utilization
 from app.services.kubernetes.client import (
     KubernetesClient,
     KubernetesClientError,
@@ -105,7 +122,7 @@ async def _recompute_subnet_utilization(db: AsyncSession, subnet_id: Any) -> Non
             select(func.count())
             .select_from(IPAddress)
             .where(IPAddress.subnet_id == subnet_id)
-            .where(IPAddress.status != "available")
+            .where(counts_toward_utilization())
         )
         or 0
     )
@@ -141,6 +158,9 @@ class _DesiredAddress:
     hostname: str
     description: str
 
+    def __post_init__(self) -> None:
+        normalize_desired_hostname(self)
+
 
 @dataclass(frozen=True)
 class _DesiredRecord:
@@ -170,6 +190,8 @@ class ReconcileSummary:
     subnets_created: int = 0
     subnets_updated: int = 0
     subnets_deleted: int = 0
+    # #2790: un-owned subnets reused at a desired CIDR instead of twinned.
+    subnets_matched: int = 0
     addresses_created: int = 0
     addresses_updated: int = 0
     addresses_deleted: int = 0
@@ -186,6 +208,9 @@ class ReconcileSummary:
     # e.g. an invalid IP, a headless service. Logged only.
     skipped_invalid: int = 0
     warnings: list[str] = field(default_factory=list)
+    # #2577 — what this sync released outside the target's IP space
+    # (``integration_ownership.release_outside_space``).
+    released: SpaceRelease = field(default_factory=SpaceRelease)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
@@ -235,28 +260,6 @@ def _find_enclosing_operator_block(
         if net.subnet_of(bnet) and bnet.prefixlen > best_prefix:  # type: ignore[arg-type]
             best = b
             best_prefix = bnet.prefixlen
-    return best
-
-
-def _find_subnet_for_ip(subnets: list[Subnet], ip: str) -> Subnet | None:
-    """Return the most-specific ``Subnet`` in ``subnets`` that contains
-    ``ip``, or None. We iterate in-memory after loading all space
-    subnets once per reconcile — it's a tiny list and a Python filter
-    beats an IN query with per-IP CIDR containment checks.
-    """
-    try:
-        addr = ipaddress.ip_address(ip)
-    except ValueError:
-        return None
-    best: Subnet | None = None
-    best_prefix: int = -1
-    for s in subnets:
-        net = _parse_net(str(s.network))
-        if net is None:
-            continue
-        if addr in net and net.prefixlen > best_prefix:
-            best = s
-            best_prefix = net.prefixlen
     return best
 
 
@@ -457,8 +460,18 @@ async def _apply_blocks_and_subnets(
         summary.blocks_created += 1
 
     # Current cluster-owned subnets.
-    res = await db.execute(select(Subnet).where(Subnet.kubernetes_cluster_id == cluster.id))
-    current_subnets = {str(s.network): s for s in res.scalars().all()}
+    # #2577 — only subnets in the cluster's own space; anything it owns in
+    # another (its old space, after a space change) is released first.
+    current_subnets = {
+        str(s.network): s
+        for s in await owned_subnets_in_space(
+            db,
+            "kubernetes_cluster_id",
+            cluster.id,
+            cluster.ipam_space_id,
+            summary=summary,
+        )
+    }
 
     desired_map = {d.network: d for d in desired_subnets}
 
@@ -466,14 +479,35 @@ async def _apply_blocks_and_subnets(
     # owned NOT in here becomes a deletion candidate.
     used_wrapper_cidrs: set[str] = set()
 
-    # Deletes first: current subnets we no longer want.
+    # Deletes first: current subnets we no longer want. #1558: a blind
+    # delete cascades to every address in the subnet — un-claim instead
+    # when operator / foreign / operator-edited addresses survive in it,
+    # like the OPNsense reconciler does.
     for net_str, row in current_subnets.items():
         if net_str not in desired_map:
-            await db.delete(row)
-            summary.subnets_deleted += 1
+            if await retire_vanished_subnet(
+                db, row, "kubernetes_cluster_id", warnings=summary.warnings
+            ):
+                summary.subnets_updated += 1
+            else:
+                summary.subnets_deleted += 1
+
+    # #2790: an un-owned subnet at exactly a desired CIDR is reused as it
+    # stands, never twinned, as the Docker reconciler does (#2601). It is one
+    # the loop above un-claimed when its CIDR left the cluster's config
+    # (#1558), one a cluster delete kept for its operator content (#2287), or
+    # one an operator made. It is neither claimed nor rewritten, and the
+    # address pass still mirrors into it.
+    kept = await unowned_subnets_at(
+        db, cluster.ipam_space_id, [n for n in desired_map if n not in current_subnets]
+    )
 
     # Creates / updates.
     for net_str, d in desired_map.items():
+        if net_str in kept:
+            summary.subnets_matched += 1
+            continue
+
         parent_block = _find_enclosing_operator_block(blocks, d.network, cluster.id)
 
         if parent_block is None:
@@ -550,9 +584,9 @@ async def _apply_blocks_and_subnets(
         # Defensive — before deleting, check no subnet still points at
         # this wrapper (pathological state; only cluster-owned subnets
         # should, and we already reparented those).
-        refs = await db.execute(select(Subnet).where(Subnet.block_id == wrapper.id))
-        if refs.scalar_one_or_none() is None:
-            await db.delete(wrapper)
+        if await drop_wrapper_block(
+            db, wrapper, "kubernetes_cluster_id", warnings=summary.warnings
+        ):
             summary.blocks_deleted += 1
 
 
@@ -571,6 +605,7 @@ async def _apply_addresses(
         .all()
     )
     subnets = list(subnet_rows)
+    space_subnet_ids = {s.id for s in subnets}
 
     desired_map: dict[str, _DesiredAddress] = {}
     for d in desired:
@@ -583,11 +618,9 @@ async def _apply_addresses(
     # for the full rationale.
     desired_addrs = list(desired_map.keys())
     if desired_addrs:
-        existing = (
-            (await db.execute(select(IPAddress).where(IPAddress.address.in_(desired_addrs))))
-            .scalars()
-            .all()
-        )
+        # #2577 — adoption candidates come from this target's own space
+        # only. The same address in another space is a different host.
+        existing = await addresses_in_space(db, cluster.ipam_space_id, desired_addrs)
         for row in existing:
             if row.kubernetes_cluster_id == cluster.id:
                 continue
@@ -606,8 +639,18 @@ async def _apply_addresses(
                 row.user_modified_at = datetime.now(UTC)
         await db.flush()
 
-    res = await db.execute(select(IPAddress).where(IPAddress.kubernetes_cluster_id == cluster.id))
-    current = {str(a.address): a for a in res.scalars().all()}
+    # #2577 — the rows we may update, move and absence-delete: ours AND in
+    # our space. One carrying our FK in another space is released first (#2577).
+    current = {
+        str(a.address): a
+        for a in await owned_addresses_in_space(
+            db,
+            "kubernetes_cluster_id",
+            cluster.id,
+            cluster.ipam_space_id,
+            summary=summary,
+        )
+    }
 
     # Subnets whose utilization we'll recompute at the end. We
     # unconditionally include every cluster-owned subnet so the
@@ -617,6 +660,7 @@ async def _apply_addresses(
     # only when something actually changed.
     dirty_subnets: set[Any] = {s.id for s in subnets if s.kubernetes_cluster_id == cluster.id}
 
+    gone: list[IPAddress] = []
     for addr, row in current.items():
         if addr not in desired_map:
             dirty_subnets.add(row.subnet_id)
@@ -626,11 +670,20 @@ async def _apply_addresses(
                 row.kubernetes_cluster_id = None
                 summary.addresses_updated += 1
             else:
-                await db.delete(row)
+                gone.append(row)
                 summary.addresses_deleted += 1
+    # #3200 — one retraction for the whole sweep, before the deletes flush.
+    await retract_address_dns(db, [r.id for r in gone])
+    for row in gone:
+        await db.delete(row)
 
     for addr, d in desired_map.items():
-        subnet = _find_subnet_for_ip(subnets, d.address)
+        # #2790: the cluster's own subnet first, then the longest prefix,
+        # with a fixed tie-break (never the order the rows came back in);
+        # an operator-edited row stays in its subnet.
+        subnet = subnet_for_address(
+            subnets, d.address, "kubernetes_cluster_id", cluster.id, held=current.get(addr)
+        )
         if subnet is None:
             summary.skipped_no_subnet += 1
             continue
@@ -638,6 +691,23 @@ async def _apply_addresses(
             row = current[addr]
             changed = False
             if row.subnet_id != subnet.id:
+                # #2577 — never re-parent a row across IP spaces.
+                if not move_stays_in_space(row.subnet_id, space_subnet_ids):
+                    summary.warnings.append(
+                        f"address {addr}: current subnet is outside this target's "
+                        f"IP space; not moving"
+                    )
+                    continue
+                # Another integration's row (or another Kubernetes cluster's) may
+                # already sit at the target (subnet, address); moving onto
+                # it would hit ``uq_ip_address_subnet_address`` and roll
+                # back the whole sync. Leave our row where it is.
+                if await address_taken(db, subnet.id, d.address, exclude_id=row.id):
+                    summary.warnings.append(
+                        f"address {addr}: subnet {subnet.network} already has a row "
+                        f"for it; not moving"
+                    )
+                    continue
                 dirty_subnets.add(row.subnet_id)  # old parent loses one
                 row.subnet_id = subnet.id
                 changed = True
@@ -655,6 +725,12 @@ async def _apply_addresses(
                 dirty_subnets.add(subnet.id)
                 summary.addresses_updated += 1
         else:
+            # The claim pass above took every row we may claim; one
+            # still at this (subnet, address) has another owner
+            # (warned there). Inserting next to it would hit
+            # ``uq_ip_address_subnet_address``.
+            if await address_taken(db, subnet.id, d.address):
+                continue
             db.add(
                 IPAddress(
                     subnet_id=subnet.id,
@@ -737,6 +813,24 @@ async def _apply_records(
             if changed:
                 summary.records_updated += 1
         else:
+            # #1561: never insert beside a non-owned record at this
+            # name (operator A, another cluster's record, a CNAME) —
+            # the API would 409 it and BIND refuses a CNAME conflict.
+            conflict = await find_record_insert_conflict(
+                db,
+                zone.id,
+                name=label,
+                record_type=d.record_type,
+                own_fk="kubernetes_cluster_id",
+                own_id=cluster.id,
+            )
+            if conflict is not None:
+                summary.warnings.append(
+                    f"record {full_fqdn} ({d.record_type}) conflicts with existing "
+                    f"{conflict.record_type} record at the same name, not owned by "
+                    f"this cluster; skipping insert"
+                )
+                continue
             db.add(
                 DNSRecord(
                     zone_id=zone.id,
@@ -765,6 +859,10 @@ async def reconcile_cluster(db: AsyncSession, cluster: KubernetesCluster) -> Rec
     never persists.
     """
     summary = ReconcileSummary(ok=False)
+    # #2577 — a target whose IP space is in Trash syncs nothing: it would
+    # rebuild its rows as live rows inside the trashed space.
+    if await refuse_sync_into_trashed_space(db, cluster, summary):
+        return summary
     try:
         token = decrypt_str(cluster.token_encrypted)
     except ValueError as exc:
@@ -820,6 +918,8 @@ async def reconcile_cluster(db: AsyncSession, cluster: KubernetesCluster) -> Rec
             resource_id=str(cluster.id),
             resource_display=cluster.name,
             new_value={
+                # #2577 — what the sync released outside the target's IP space.
+                "released": summary.released.as_dict(),
                 "blocks": {
                     "created": summary.blocks_created,
                     "deleted": summary.blocks_deleted,
@@ -828,6 +928,7 @@ async def reconcile_cluster(db: AsyncSession, cluster: KubernetesCluster) -> Rec
                     "created": summary.subnets_created,
                     "updated": summary.subnets_updated,
                     "deleted": summary.subnets_deleted,
+                    "matched": summary.subnets_matched,
                 },
                 "addresses": {
                     "created": summary.addresses_created,
@@ -849,6 +950,7 @@ async def reconcile_cluster(db: AsyncSession, cluster: KubernetesCluster) -> Rec
     summary.ok = True
     logger.info(
         "k8s_reconcile_ok",
+        **summary.released.log_fields(),
         cluster=str(cluster.id),
         nodes=summary.node_count,
         blocks_created=summary.blocks_created,
@@ -856,6 +958,7 @@ async def reconcile_cluster(db: AsyncSession, cluster: KubernetesCluster) -> Rec
         subnets_created=summary.subnets_created,
         subnets_updated=summary.subnets_updated,
         subnets_deleted=summary.subnets_deleted,
+        subnets_matched=summary.subnets_matched,
         addresses_created=summary.addresses_created,
         addresses_updated=summary.addresses_updated,
         addresses_deleted=summary.addresses_deleted,

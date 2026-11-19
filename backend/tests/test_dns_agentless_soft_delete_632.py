@@ -227,7 +227,7 @@ async def test_zone_soft_delete_and_restore_do_not_touch_agentless_records(
     # the record recorder — spy it directly so this test actually guards it.
     zone_pushes: list[tuple[str, str]] = []
 
-    async def _spy_zone_push(_db: Any, z: Any, op: str) -> None:
+    async def _spy_zone_push(_db: Any, z: Any, op: str, **_: Any) -> None:
         zone_pushes.append((z.name, op))
 
     monkeypatch.setattr(
@@ -263,7 +263,7 @@ async def test_purge_tears_down_agentless_zone_before_removing_row(
 
     pushed: list[tuple[uuid.UUID, str]] = []
 
-    async def _fake_push(_db: Any, z: DNSZone, op: str) -> None:
+    async def _fake_push(_db: Any, z: DNSZone, op: str, **_: Any) -> None:
         pushed.append((z.id, op))
 
     monkeypatch.setattr(
@@ -295,7 +295,7 @@ async def test_purge_leaves_zone_when_provider_push_fails(
     zone.deletion_batch_id = uuid.uuid4()
     await db_session.flush()
 
-    async def _boom(_db: Any, _z: DNSZone, _op: str) -> None:
+    async def _boom(_db: Any, _z: DNSZone, _op: str, **_: Any) -> None:
         raise RuntimeError("provider unreachable")
 
     monkeypatch.setattr(
@@ -332,6 +332,7 @@ async def test_purge_retracts_pre_632_agentless_record(
     recorder = _patch_record_driver(monkeypatch)
     cutoff = datetime.now(UTC) - timedelta(days=30)
     retracted = await _retract_records_from_providers(db_session, cutoff, set())
+    await db_session.commit()  # #1539 — the provider is written by the commit
 
     assert retracted == 1
     assert recorder.changes == [("delete", "stale", "A")]
@@ -377,7 +378,7 @@ async def test_purge_zone_deletes_cleanly_after_records_core_deleted(
         .execution_options(include_deleted=True)
     )
 
-    async def _noop(_db: Any, _z: DNSZone, _op: str) -> None:
+    async def _noop(_db: Any, _z: DNSZone, _op: str, **_: Any) -> None:
         return None
 
     monkeypatch.setattr(

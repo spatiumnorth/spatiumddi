@@ -1,3 +1,5 @@
+import { useOwnershipModules } from "@/hooks/useOwnershipModules";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -8,12 +10,15 @@ import {
   type DomainCreate,
   type DomainUpdate,
   type DomainWhoisState,
+  formatApiError,
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { CustomerPicker, ProviderPicker } from "@/components/ownership/pickers";
 import { ZoneScopePill } from "@/components/ZoneScopePill";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -121,6 +126,7 @@ function DomainEditorModal({
   existing: Domain | null;
   onClose: () => void;
 }) {
+  const own = useOwnershipModules();
   const qc = useQueryClient();
   const [name, setName] = useState(existing?.name ?? "");
   const [expectedNs, setExpectedNs] = useState(
@@ -181,11 +187,7 @@ function DomainEditorModal({
       onClose();
     },
     onError: (e: unknown) => {
-      const err = e as {
-        message?: string;
-        response?: { data?: { detail?: string } };
-      };
-      setError(err?.response?.data?.detail ?? err?.message ?? "Save failed");
+      setError(formatApiError(e, "Save failed"));
     },
   });
 
@@ -227,31 +229,35 @@ function DomainEditorModal({
           </p>
         </div>
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-          <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
-              Customer
-            </label>
-            <CustomerPicker
-              className={inputCls}
-              value={customerId}
-              onChange={setCustomerId}
-            />
-          </div>
-          <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
-              Registrar (Provider)
-            </label>
-            <ProviderPicker
-              className={inputCls}
-              value={registrarProviderId}
-              onChange={setRegistrarProviderId}
-              kind="registrar"
-            />
-            <p className="text-[11px] text-muted-foreground/80">
-              FK successor to the freeform registrar text. Pick a Provider of
-              kind "registrar".
-            </p>
-          </div>
+          {own.customer && (
+            <div className="space-y-1">
+              <label className="text-xs font-medium text-muted-foreground">
+                Customer
+              </label>
+              <CustomerPicker
+                className={inputCls}
+                value={customerId}
+                onChange={setCustomerId}
+              />
+            </div>
+          )}
+          {own.provider && (
+            <div className="space-y-1">
+              <label className="text-xs font-medium text-muted-foreground">
+                Registrar (Provider)
+              </label>
+              <ProviderPicker
+                className={inputCls}
+                value={registrarProviderId}
+                onChange={setRegistrarProviderId}
+                kind="registrar"
+              />
+              <p className="text-[11px] text-muted-foreground/80">
+                FK successor to the freeform registrar text. Pick a Provider of
+                kind "registrar".
+              </p>
+            </div>
+          )}
         </div>
         <div className="space-y-1">
           <label className="text-xs font-medium text-muted-foreground">
@@ -273,7 +279,9 @@ function DomainEditorModal({
             onChange={(e) => setCfRaw(e.target.value)}
           />
         </div>
-        {error && <p className="text-xs text-red-600">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-red-600">{error}</FormError>
+        )}
         <div className="flex justify-end gap-2 pt-2">
           <button
             type="button"
@@ -305,6 +313,17 @@ function DomainEditorModal({
 // ── Page ────────────────────────────────────────────────────────────────────
 
 export function DomainsPage() {
+  // #1341 — a read-only user is offered no write it would be refused:
+  // the router asks write on 'manage_domains'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "manage_domains"),
+    "Requires write permission on domains",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "manage_domains"),
+    "Requires delete permission on domains",
+  );
   const qc = useQueryClient();
   const [editing, setEditing] = useState<Domain | null>(null);
   const [showCreate, setShowCreate] = useState(false);
@@ -321,7 +340,13 @@ export function DomainsPage() {
     page_size: 200,
   };
 
-  const { data, isLoading, refetch, isFetching } = useQuery({
+  const {
+    data,
+    isLoading,
+    refetch,
+    isFetching,
+    error: listError,
+  } = useQuery({
     queryKey: ["domains", listParams],
     queryFn: () => domainsApi.list(listParams),
     // #278 — a freshly-created domain's RDAP data lands a few seconds
@@ -426,6 +451,7 @@ export function DomainsPage() {
                 "inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground",
                 "hover:bg-primary/90",
               )}
+              {...writeGate}
             >
               <Plus className="h-3.5 w-3.5" />
               New domain
@@ -478,7 +504,8 @@ export function DomainsPage() {
               <button
                 onClick={() => bulkRefresh.mutate(Array.from(selected))}
                 disabled={bulkRefresh.isPending}
-                className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-accent"
+                className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                {...writeGate}
               >
                 <RefreshCw
                   className={cn(
@@ -499,7 +526,8 @@ export function DomainsPage() {
                   }
                 }}
                 disabled={bulkDel.isPending}
-                className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30"
+                className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm text-red-600 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50 dark:hover:bg-red-950/30"
+                {...deleteGate}
               >
                 <Trash2 className="h-3.5 w-3.5" />
                 Bulk delete
@@ -548,7 +576,24 @@ export function DomainsPage() {
                     colSpan={9}
                     className="px-4 py-8 text-center text-xs text-muted-foreground"
                   >
-                    No domains yet — click "New domain" to add the first one.
+                    <ListEmpty
+                      error={listError}
+                      what="domains"
+                      filtered={
+                        stateFilter !== "" ||
+                        search.trim() !== "" ||
+                        tagFilters.length > 0
+                      }
+                      onClearFilters={() => {
+                        setStateFilter("");
+                        setSearch("");
+                        setTagFilters([]);
+                      }}
+                      gate={writeGate}
+                      hint={`Click "New domain" to add the first one.`}
+                    >
+                      No domains yet.
+                    </ListEmpty>
                   </td>
                 </tr>
               )}
@@ -610,6 +655,17 @@ function DomainRow({
   onRefresh: () => void;
   refreshing: boolean;
 }) {
+  // #1341 — a read-only user is offered no write it would be refused:
+  // the router asks write (delete) on 'manage_domains'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "manage_domains"),
+    "Requires write permission on domains",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "manage_domains"),
+    "Requires delete permission on domains",
+  );
   return (
     <tr className={cn("border-b", selected && "bg-primary/5")}>
       <td className="px-3 py-2">
@@ -665,7 +721,9 @@ function DomainRow({
             onClick={onRefresh}
             disabled={refreshing}
             title="Refresh WHOIS"
+            aria-label="Refresh WHOIS"
             className="rounded p-1.5 hover:bg-accent disabled:opacity-50"
+            {...writeGate}
           >
             <RefreshCw
               className={cn("h-3.5 w-3.5", refreshing && "animate-spin")}
@@ -674,14 +732,18 @@ function DomainRow({
           <button
             onClick={onEdit}
             title="Edit"
-            className="rounded p-1.5 hover:bg-accent"
+            aria-label="Edit"
+            className="rounded p-1.5 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+            {...writeGate}
           >
             <Pencil className="h-3.5 w-3.5" />
           </button>
           <button
             onClick={onDelete}
             title="Delete"
-            className="rounded p-1.5 text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30"
+            aria-label="Delete"
+            className="rounded p-1.5 text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30 disabled:cursor-not-allowed disabled:opacity-50"
+            {...deleteGate}
           >
             <Trash2 className="h-3.5 w-3.5" />
           </button>

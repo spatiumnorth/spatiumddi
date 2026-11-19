@@ -35,8 +35,12 @@ import {
   type MulticastMembershipReadWithGroup,
   type NmapScanRead,
   type Subnet,
+  formatApiError,
+  formatDialogError,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { isDefaultGatewayHostname } from "@/lib/gatewayDns";
+import { GatewayHostnameNote } from "@/components/GatewayHostnameNote";
 import { OT_PROTOCOL_LABELS, OT_ROLE_LABELS } from "@/lib/otLabels";
 import { CertsCompactTable } from "@/pages/network/CertificatesPage";
 import {
@@ -47,7 +51,11 @@ import { AskAIButton } from "@/components/copilot/AskAIButton";
 import { IPNetworkTab } from "./IPNetworkTab";
 import { SeenDot } from "./SeenDot";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { useModuleOn } from "@/hooks/useModuleOn";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { ListReadError } from "@/components/ui/list-read-error";
 import { RpkiPill } from "@/components/network/bgp-route-table";
+import { FormError } from "@/components/ui/form-error";
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -123,6 +131,9 @@ export interface IPDetailModalProps {
   address: IPAddress;
   subnet?: Subnet | null;
   zoneNameById?: Record<string, string>;
+  /** Whether the subnet resolves to a forward zone, i.e. whether a
+   *  "gateway" host has a forward record to skip (#2101). */
+  hasForwardZone?: boolean;
   canEdit: boolean;
   onClose: () => void;
   onEdit: () => void;
@@ -147,6 +158,7 @@ export function IPDetailModal({
   address: addr,
   subnet,
   zoneNameById,
+  hasForwardZone,
   canEdit,
   onClose,
   onEdit,
@@ -156,7 +168,29 @@ export function IPDetailModal({
 }: IPDetailModalProps) {
   const { dialogProps, titleProps, dialogStyle, dragHandleProps } =
     useModalDialog(onClose);
+  const dhcpOn = useModuleOn("core.dhcp");
+  // #2100 — the NAT badge goes with the ``ipam.nat`` module.
+  const natOn = useModuleOn("ipam.nat");
+  // #2135 — zones, the DNS linkage and the alias count are DNS state: hidden
+  // while core.dns is off (the stored values are untouched).
+  const dnsOn = useModuleOn("core.dns");
   const zoneNames = zoneNameById ?? {};
+  // A scan is started with write on 'manage_nmap_scans' and watched with
+  // read; a role holding only write would start one it cannot see (#3279).
+  const nmapPerms = usePermissions();
+  const nmapOn = useModuleOn("tools.nmap");
+  const canNmap =
+    nmapPerms.can("write", "manage_nmap_scans") &&
+    nmapPerms.can("read", "manage_nmap_scans");
+
+  // Wake sends a packet from the control plane: the route needs read on
+  // 'use_network_tools' and write on subnets (#3452). The IPAM gate checks
+  // that write type-wide: a grant scoped to this one subnet does not reach
+  // the route (it names the address, not the subnet), so ``can`` is asked
+  // without an id, exactly as the server asks it.
+  const canWake =
+    nmapPerms.can("read", "use_network_tools") &&
+    nmapPerms.can("write", "subnet");
 
   // Wake-on-LAN (#533) — self-contained like the "Re-profile now" action.
   // Fire-and-forget: no data changes, so no query invalidation; we just
@@ -184,16 +218,9 @@ export function IPDetailModal({
       });
     },
     onError: (err: unknown) => {
-      // detail is a string for our HTTPExceptions but a list of objects for a
-      // Pydantic 422 — only render it when it's actually a string.
-      const detail = (err as { response?: { data?: { detail?: unknown } } })
-        ?.response?.data?.detail;
       setWakeMsg({
         ok: false,
-        text:
-          typeof detail === "string"
-            ? detail
-            : "Failed to send the magic packet.",
+        text: formatApiError(err, "Failed to send the magic packet."),
       });
     },
   });
@@ -292,14 +319,20 @@ export function IPDetailModal({
               tooltip="Ask AI about this IP"
               prompt="Summarise this IP — owner, last-seen, services, vendor, and anything flagged."
             />
-            <button
-              type="button"
-              onClick={onScan}
-              className="inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs hover:bg-accent"
-              title="Run an nmap scan against this IP"
-            >
-              <Radar className="h-3.5 w-3.5" /> Scan with Nmap
-            </button>
+            {nmapOn && (
+              <button
+                type="button"
+                onClick={onScan}
+                className="inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                title="Run an nmap scan against this IP"
+                {...permissionGate(
+                  canNmap,
+                  "Requires write and read permission on nmap scans (read shows the result)",
+                )}
+              >
+                <Radar className="h-3.5 w-3.5" /> Scan with Nmap
+              </button>
+            )}
             {addr.mac_address && (
               <div className="inline-flex items-center gap-2">
                 <button
@@ -311,6 +344,10 @@ export function IPDetailModal({
                   disabled={wake.isPending}
                   className="inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
                   title="Send a Wake-on-LAN magic packet to this MAC"
+                  {...permissionGate(
+                    canWake,
+                    "Requires read on network tools and write on subnets",
+                  )}
                 >
                   {wake.isPending ? (
                     <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -327,7 +364,7 @@ export function IPDetailModal({
                     type="checkbox"
                     checked={verifyAfterWake}
                     onChange={(e) => setVerifyAfterWake(e.target.checked)}
-                    disabled={wake.isPending}
+                    disabled={wake.isPending || !canWake}
                   />
                   verify
                 </label>
@@ -440,51 +477,74 @@ export function IPDetailModal({
                 )}
               </span>
             </Field>
-            <Field label="Forward DNS zone">
-              {addr.forward_zone_id ? (
-                <span className="font-mono text-xs">
-                  {/* #516 — zoneNameById is now supplied by the caller (it was
+            {dnsOn && (
+              <Field label="Forward DNS zone">
+                {addr.forward_zone_id ? (
+                  <span className="font-mono text-xs">
+                    {/* #516 — zoneNameById is now supplied by the caller (it was
                       previously never passed, so this always rendered "—").
                       Fall back to the raw id if the map lacks the zone. */}
-                  {zoneNames[addr.forward_zone_id] ?? addr.forward_zone_id}
+                    {zoneNames[addr.forward_zone_id] ?? addr.forward_zone_id}
+                  </span>
+                ) : (
+                  dash(null)
+                )}
+              </Field>
+            )}
+            {dnsOn && (
+              <Field label="Reverse DNS zone">
+                {addr.reverse_zone_id ? (
+                  <span className="font-mono text-xs">
+                    {zoneNames[addr.reverse_zone_id] ?? addr.reverse_zone_id}
+                  </span>
+                ) : (
+                  dash(null)
+                )}
+              </Field>
+            )}
+            {(dnsOn || dhcpOn) && (
+              <Field
+                label={
+                  dnsOn
+                    ? dhcpOn
+                      ? "DNS / DHCP linkage"
+                      : "DNS linkage"
+                    : "DHCP linkage"
+                }
+              >
+                <span className="space-x-2 text-[11px] text-muted-foreground">
+                  {dnsOn && addr.dns_record_id && <span>A-record</span>}
+                  {dhcpOn && addr.dhcp_lease_id && <span>· DHCP lease</span>}
+                  {dhcpOn && addr.static_assignment_id && (
+                    <span>· DHCP static</span>
+                  )}
+                  {!(dnsOn && addr.dns_record_id) &&
+                    !(dhcpOn && addr.dhcp_lease_id) &&
+                    !(dhcpOn && addr.static_assignment_id) &&
+                    dash(null)}
                 </span>
-              ) : (
-                dash(null)
+              </Field>
+            )}
+            {dnsOn &&
+              isDefaultGatewayHostname(addr.hostname) &&
+              (hasForwardZone ?? !!addr.forward_zone_id) && (
+                <div className="sm:col-span-2">
+                  <GatewayHostnameNote />
+                </div>
               )}
-            </Field>
-            <Field label="Reverse DNS zone">
-              {addr.reverse_zone_id ? (
-                <span className="font-mono text-xs">
-                  {zoneNames[addr.reverse_zone_id] ?? addr.reverse_zone_id}
-                </span>
-              ) : (
-                dash(null)
-              )}
-            </Field>
-            <Field label="DNS / DHCP linkage">
-              <span className="space-x-2 text-[11px] text-muted-foreground">
-                {addr.dns_record_id && <span>A-record</span>}
-                {addr.dhcp_lease_id && <span>· DHCP lease</span>}
-                {addr.static_assignment_id && <span>· DHCP static</span>}
-                {!addr.dns_record_id &&
-                  !addr.dhcp_lease_id &&
-                  !addr.static_assignment_id &&
-                  dash(null)}
-              </span>
-            </Field>
           </div>
 
           {/* Counters row */}
-          {((addr.alias_count ?? 0) > 0 ||
-            (addr.nat_mapping_count ?? 0) > 0) && (
+          {((dnsOn && (addr.alias_count ?? 0) > 0) ||
+            (natOn && (addr.nat_mapping_count ?? 0) > 0)) && (
             <div className="flex flex-wrap items-center gap-2 text-[11px]">
-              {(addr.alias_count ?? 0) > 0 && (
+              {dnsOn && (addr.alias_count ?? 0) > 0 && (
                 <span className="inline-flex items-center rounded bg-indigo-100 px-1.5 py-0.5 font-medium text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400">
                   +{addr.alias_count} alias
                   {addr.alias_count === 1 ? "" : "es"}
                 </span>
               )}
-              {(addr.nat_mapping_count ?? 0) > 0 && (
+              {natOn && (addr.nat_mapping_count ?? 0) > 0 && (
                 <span className="inline-flex items-center rounded bg-amber-100 px-1.5 py-0.5 font-medium text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">
                   NAT {addr.nat_mapping_count}
                 </span>
@@ -601,7 +661,7 @@ export function IPDetailModal({
 
           {/* Reputation — DNSBL / RBL listing status (issue #528). Hidden
               when the security.dnsbl module is off or the IP isn't IPv4. */}
-          <ReputationSection address={addr.address} canEdit={canEdit} />
+          <ReputationSection address={addr.address} />
         </div>
       </div>
     </div>
@@ -614,23 +674,29 @@ export function IPDetailModal({
 // "Check now" action. IPv4-only (v1). Hidden when the security.dnsbl
 // feature module is disabled.
 
-function ReputationSection({
-  address,
-  canEdit,
-}: {
-  address: string;
-  canEdit: boolean;
-}) {
+export function ReputationSection({ address }: { address: string }) {
   const qc = useQueryClient();
+  // POST /dnsbl/check takes write on 'dnsbl' (the router's method gate),
+  // not write on the address: an IPAM Editor holds the second and not the
+  // first, so gating on the address's canEdit offered a check the server
+  // refused (#1879's sweep).
+  const checkGate = permissionGate(
+    usePermissions().can("write", "dnsbl"),
+    "Requires write permission on DNSBL",
+  );
   const { enabled } = useFeatureModules();
   const dnsblEnabled = enabled("security.dnsbl");
   const bareIp = (address || "").split("/")[0];
   const isIPv4 = bareIp.includes(".") && !bareIp.includes(":");
 
+  // GET /dnsbl/listings/by-ip takes read on 'dnsbl'; a user without it is
+  // not asked, and told so rather than "No blocklists are enabled" (#2704).
+  const dnsblPerms = usePermissions();
+  const canReadDnsbl = dnsblPerms.can("read", "dnsbl");
   const q = useQuery({
     queryKey: ["dnsbl", "by-ip", bareIp],
     queryFn: () => dnsblApi.byIp(bareIp),
-    enabled: dnsblEnabled && isIPv4,
+    enabled: dnsblEnabled && isIPv4 && canReadDnsbl,
     staleTime: 30_000,
   });
 
@@ -658,24 +724,38 @@ function ReputationSection({
           )}{" "}
           Reputation
         </div>
-        {canEdit && (
-          <button
-            type="button"
-            onClick={() => check.mutate()}
-            disabled={check.isPending}
-            className="inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] hover:bg-accent disabled:opacity-60"
-          >
-            {check.isPending ? (
-              <Loader2 className="h-3 w-3 animate-spin" />
-            ) : (
-              <RefreshCw className="h-3 w-3" />
-            )}
-            Check now
-          </button>
-        )}
+        <button
+          type="button"
+          onClick={() => check.mutate()}
+          disabled={check.isPending || !!checkGate.disabled}
+          title={checkGate.title}
+          className="inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] hover:bg-accent disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          {check.isPending ? (
+            <Loader2 className="h-3 w-3 animate-spin" />
+          ) : (
+            <RefreshCw className="h-3 w-3" />
+          )}
+          Check now
+        </button>
       </div>
 
-      {entries.length === 0 ? (
+      {check.isError && (
+        <p role="alert" className="mb-1 text-[11px] text-destructive">
+          {formatDialogError(check.error, "Blocklist check failed")}
+        </p>
+      )}
+
+      {q.error || !canReadDnsbl ? (
+        <div className="rounded border border-dashed px-2 py-1.5 text-[11px] text-muted-foreground">
+          {q.error ? (
+            <ListReadError error={q.error} what="this IP's blocklist status" />
+          ) : (
+            (dnsblPerms.unanswered ??
+            "You don't have permission to see this IP's blocklist status.")
+          )}
+        </div>
+      ) : entries.length === 0 ? (
         <div className="rounded border border-dashed px-2 py-1.5 text-[11px] text-muted-foreground">
           No blocklists are enabled. Enable lists in Administration → DNS
           Blocklists to check this IP.
@@ -742,7 +822,9 @@ function ReputationSection({
 
 function CertsSection({ addressId }: { addressId: string }) {
   const { enabled } = useFeatureModules();
-  const certsEnabled = enabled("security.tls_certs");
+  // Read on 'tls_cert' (#2704): a user without it is not asked.
+  const canRead = usePermissions().can("read", "tls_cert");
+  const certsEnabled = enabled("security.tls_certs") && canRead;
 
   const q = useQuery({
     queryKey: ["tls-certs", "by-ip", addressId],
@@ -768,7 +850,8 @@ function CertsSection({ addressId }: { addressId: string }) {
 
 function MulticastMembershipsSection({ addressId }: { addressId: string }) {
   const { enabled } = useFeatureModules();
-  const multicastEnabled = enabled("network.multicast");
+  const canRead = usePermissions().can("read", "multicast");
+  const multicastEnabled = enabled("network.multicast") && canRead;
 
   const q = useQuery({
     queryKey: ["multicast-memberships-by-ip", addressId],
@@ -824,7 +907,8 @@ function BACnetDeviceSection({ addressId }: { addressId: string }) {
   // module list is still loading, so without it a hard page load fires
   // one request that 404s when the module is off.
   const { enabled, ready } = useFeatureModules();
-  const bacnetEnabled = ready && enabled("network.bacnet");
+  const canRead = usePermissions().can("read", "bacnet_device");
+  const bacnetEnabled = ready && enabled("network.bacnet") && canRead;
 
   const q = useQuery({
     queryKey: ["bacnet-device-by-ip", addressId],
@@ -896,7 +980,8 @@ function BACnetDeviceSection({ addressId }: { addressId: string }) {
 
 function DICOMAESection({ addressId }: { addressId: string }) {
   const { enabled, ready } = useFeatureModules();
-  const dicomEnabled = ready && enabled("network.dicom");
+  const canRead = usePermissions().can("read", "dicom_ae");
+  const dicomEnabled = ready && enabled("network.dicom") && canRead;
 
   const q = useQuery({
     queryKey: ["dicom-ae-by-ip", addressId],
@@ -960,7 +1045,8 @@ function DICOMAESection({ addressId }: { addressId: string }) {
 
 function OTDeviceSection({ addressId }: { addressId: string }) {
   const { enabled, ready } = useFeatureModules();
-  const otEnabled = ready && enabled("network.ot");
+  const canRead = usePermissions().can("read", "ot_device");
+  const otEnabled = ready && enabled("network.ot") && canRead;
 
   const q = useQuery({
     queryKey: ["ot-device-by-ip", addressId],
@@ -1028,7 +1114,8 @@ function OTDeviceSection({ addressId }: { addressId: string }) {
  *  module is off or nothing in the active RIB covers the address. */
 function BgpRouteLookupSection({ address }: { address: string }) {
   const { enabled } = useFeatureModules();
-  const lgEnabled = enabled("network.looking_glass");
+  const canRead = usePermissions().can("read", "bgp_lg_peer");
+  const lgEnabled = enabled("network.looking_glass") && canRead;
 
   const q = useQuery({
     queryKey: ["bgp-lg-route-for-ip", address],
@@ -1129,6 +1216,19 @@ function DeviceProfileSection({
   canEdit: boolean;
 }) {
   const qc = useQueryClient();
+  // The profile route starts a scan, but reading it back takes read on
+  // 'manage_nmap_scans', which the IPAM/DNS/DHCP Editor roles lack. A user
+  // who cannot read the scan is not offered the press (it would sit on
+  // "Scanning…" for a scan it can never see end) and is not asked for it (#3271).
+  // The tools.nmap module being off refuses every scan route with "Feature
+  // 'tools.nmap' is disabled.", so it closes the same door (#3271).
+  const nmapOn = useModuleOn("tools.nmap");
+  const scanPerms = usePermissions();
+  const canReadScans = scanPerms.can("read", "manage_nmap_scans") && nmapOn;
+  const scansUnavailable = nmapOn
+    ? (scanPerms.unanswered ??
+      "You don't have permission to see this IP's profile scan.")
+    : "Nmap scanning is turned off, so this IP's profile scan is not shown.";
   const [error, setError] = useState<string | null>(null);
   const [showRawSig, setShowRawSig] = useState(false);
   // Track the scan dispatched by clicking "Re-profile now" so we can
@@ -1145,7 +1245,7 @@ function DeviceProfileSection({
   const [sessionScan, setSessionScan] = useState<NmapScanRead | null>(null);
 
   const scanQuery = useQuery({
-    enabled: !!addr.last_profile_scan_id,
+    enabled: !!addr.last_profile_scan_id && canReadScans,
     queryKey: ["nmap-scan", addr.last_profile_scan_id],
     queryFn: () => nmapApi.getScan(addr.last_profile_scan_id as string),
     staleTime: 30_000,
@@ -1198,11 +1298,29 @@ function DeviceProfileSection({
     qc,
   ]);
 
+  // A scan whose progress cannot be read (refused, gone, or the read
+  // failing) never reaches a terminal status above, so without this the
+  // button would stay on "Scanning…" for as long as the modal is open
+  // (#3271). Stop tracking it and say why.
+  useEffect(() => {
+    if (!activeScanId || !activeScanQuery.isError) return;
+    setError(
+      formatApiError(
+        activeScanQuery.error,
+        "The scan started, but its progress could not be read",
+      ),
+    );
+    setActiveScanId(null);
+  }, [activeScanId, activeScanQuery.isError, activeScanQuery.error]);
+
   // Passive fingerprint — Phase 2. The endpoint 404s when no MAC or
   // no fingerprint has been observed; treat 404 as "no data" rather
   // than a hard error.
+  // #2130 — fingerprints are read off DHCP traffic; with DHCP off there is
+  // nothing to read, so neither the query nor the panel is shown.
+  const dhcpOn = useModuleOn("core.dhcp");
   const fingerprintQuery = useQuery({
-    enabled: !!addr.mac_address,
+    enabled: !!addr.mac_address && dhcpOn,
     queryKey: ["dhcp-fingerprint", addr.id],
     queryFn: async () => {
       try {
@@ -1227,9 +1345,7 @@ function DeviceProfileSection({
       qc.invalidateQueries({ queryKey: ["nmap-scans"] });
     },
     onError: (err: unknown) => {
-      const detail = (err as { response?: { data?: { detail?: string } } })
-        ?.response?.data?.detail;
-      setError(typeof detail === "string" ? detail : "Failed to dispatch scan");
+      setError(formatApiError(err, "Failed to dispatch scan"));
     },
   });
 
@@ -1263,10 +1379,11 @@ function DeviceProfileSection({
     fingerprintQuery.data?.fingerbank_manufacturer ??
     null;
   const hasPassive =
-    !!passiveType ||
-    !!passiveClass ||
-    !!passiveManufacturer ||
-    !!fingerprintQuery.data;
+    dhcpOn &&
+    (!!passiveType ||
+      !!passiveClass ||
+      !!passiveManufacturer ||
+      !!fingerprintQuery.data);
 
   return (
     <div>
@@ -1274,7 +1391,7 @@ function DeviceProfileSection({
         <div className="flex items-center gap-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
           <Radar className="h-3 w-3" /> Device profile
         </div>
-        {canEdit && (
+        {canEdit && canReadScans && (
           <button
             type="button"
             onClick={() => reprofile.mutate()}
@@ -1297,9 +1414,9 @@ function DeviceProfileSection({
       </div>
 
       {error && (
-        <div className="mb-2 rounded-md border border-destructive/40 bg-destructive/5 px-2 py-1 text-[11px] text-destructive">
+        <FormError className="mb-2 rounded-md border border-destructive/40 bg-destructive/5 px-2 py-1 text-[11px] text-destructive">
           {error}
-        </div>
+        </FormError>
       )}
 
       {/* Passive layer — DHCP fingerprint via fingerbank. */}
@@ -1386,9 +1503,15 @@ function DeviceProfileSection({
         if (!havePrior && !isScanning) {
           return (
             <p className="text-xs text-muted-foreground italic">
-              No active profile yet. Auto-profiling triggers on a fresh DHCP
-              lease when the subnet's "Device profiling" toggle is enabled, or
-              run one ad-hoc via the button above.
+              No active profile yet.{" "}
+              {!canReadScans
+                ? nmapOn
+                  ? (scanPerms.unanswered ??
+                    "You don't have permission to run or see profile scans.")
+                  : "Nmap scanning is turned off."
+                : dhcpOn
+                  ? `Auto-profiling triggers on a fresh DHCP lease when the subnet's "Device profiling" toggle is enabled, or run one ad-hoc via the button above.`
+                  : "Run one ad-hoc via the button above."}
             </p>
           );
         }
@@ -1398,6 +1521,8 @@ function DeviceProfileSection({
             lastProfiledAt={displayProfiledAt}
             scan={displayScan}
             loading={scanQuery.isLoading && !sessionScan}
+            scanHidden={!canReadScans}
+            hiddenReason={scansUnavailable}
           />
         );
       })()}
@@ -1440,11 +1565,25 @@ function DeviceProfileScanPanel({
   lastProfiledAt,
   scan,
   loading,
+  scanHidden = false,
+  hiddenReason = "You don't have permission to see this IP's profile scan.",
 }: {
   lastProfiledAt: string | null;
   scan: NmapScanRead | null;
   loading: boolean;
+  scanHidden?: boolean;
+  hiddenReason?: string;
 }) {
+  if (scanHidden && !scan) {
+    return (
+      <p className="text-xs text-muted-foreground italic">
+        {lastProfiledAt
+          ? `Last scanned ${new Date(lastProfiledAt).toLocaleString()}. `
+          : ""}
+        {hiddenReason}
+      </p>
+    );
+  }
   if (loading) {
     return (
       <p className="text-xs text-muted-foreground">

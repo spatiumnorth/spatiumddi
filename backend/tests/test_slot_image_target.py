@@ -62,6 +62,10 @@ class _FakeDB:
     async def get(self, _model, _pk):
         return self._image
 
+    async def execute(self, _stmt, _params=None):
+        # #2400 — the catalogue advisory lock; nothing to lock here.
+        return None
+
 
 # ── resolve_slot_image_target ────────────────────────────────────────
 

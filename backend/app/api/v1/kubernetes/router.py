@@ -28,15 +28,21 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
-from app.api.v1._common import StatusResponse
+from app.api.v1._common import StatusResponse, add_trigger_audit
+from app.core.celery_dispatch import dispatch
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
+from app.core.exc_text import describe_exc
+from app.core.header_credentials import header_credential_problem, header_secret
 from app.core.permissions import require_resource_permission
 from app.core.ssrf import assert_safe_target
+from app.core.stored_secret_guard import require_secret_with_destination_change
 from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace
 from app.models.kubernetes import KubernetesCluster
+from app.services.dns.bundle_dirty import mark_integration_dns_released
+from app.services.integration_ownership import release_integration_rows
 
 router = APIRouter(
     tags=["kubernetes"],
@@ -92,6 +98,8 @@ class ClusterBase(BaseModel):
 class ClusterCreate(ClusterBase):
     token: str  # plaintext; encrypted before persist
 
+    _check_token = field_validator("token")(header_secret)
+
 
 class ClusterUpdate(BaseModel):
     """Partial update — any unset field is left unchanged.
@@ -112,6 +120,8 @@ class ClusterUpdate(BaseModel):
     service_cidr: str | None = None
     sync_interval_seconds: int | None = None
     mirror_pods: bool | None = None
+
+    _check_token = field_validator("token")(header_secret)
 
 
 class ClusterResponse(BaseModel):
@@ -150,6 +160,8 @@ class TestConnectionRequest(BaseModel):
     ca_bundle_pem: str | None = None
     token: str | None = None
 
+    _check_token = field_validator("token")(header_secret)
+
 
 class TestConnectionResponse(BaseModel):
     ok: bool
@@ -168,6 +180,8 @@ class DetectCIDRsRequest(BaseModel):
     api_server_url: str | None = None
     ca_bundle_pem: str | None = None
     token: str | None = None
+
+    _check_token = field_validator("token")(header_secret)
 
 
 class DetectCIDRsResponse(BaseModel):
@@ -204,6 +218,28 @@ def _to_response(c: KubernetesCluster) -> ClusterResponse:
         created_at=c.created_at,
         modified_at=c.modified_at,
     )
+
+
+def _require_usable_credentials(api_server_url: str, token: str) -> str:
+    """422 for a token that cannot be a bearer token, or a URL httpx cannot
+    parse, before a client is built from them (#1913). The token may come
+    from the request body or from the stored cluster, so surrounding
+    whitespace (a stored token saved with its trailing newline before the
+    schema stripped it) is dropped here too. Returns the token to send."""
+    token = token.strip()
+    problem = header_credential_problem(token, "token")
+    if problem:
+        raise HTTPException(status_code=422, detail=problem)
+    try:
+        url = httpx.URL(api_server_url)
+    except (httpx.InvalidURL, UnicodeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"api_server_url is not a valid URL: {exc}")
+    if url.scheme not in ("http", "https") or not url.host:
+        raise HTTPException(
+            status_code=422,
+            detail="api_server_url must be an http(s) URL such as https://k8s.example:6443",
+        )
+    return token
 
 
 async def _probe_cluster(
@@ -282,12 +318,14 @@ async def _probe_cluster(
         return TestConnectionResponse(
             ok=False, message=f"HTTP {exc.response.status_code} from apiserver"
         )
-    except httpx.ConnectError as exc:
-        return TestConnectionResponse(ok=False, message=f"Could not reach apiserver: {exc}")
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        return TestConnectionResponse(
+            ok=False, message=f"Could not reach apiserver: {describe_exc(exc)}"
+        )
     except ssl.SSLError as exc:
         return TestConnectionResponse(ok=False, message=f"TLS error: {exc}")
     except Exception as exc:  # noqa: BLE001 — surface anything else verbatim
-        return TestConnectionResponse(ok=False, message=str(exc))
+        return TestConnectionResponse(ok=False, message=describe_exc(exc))
     finally:
         if ca_file is not None:
             tempfile.TemporaryFile().close()
@@ -396,7 +434,7 @@ async def _detect_cidrs(
                             "manage pod IPs out-of-band. Enter the pod CIDR manually."
                         )
             except httpx.HTTPError as exc:
-                messages.append(f"Pod CIDR probe failed: {exc}")
+                messages.append(f"Pod CIDR probe failed: {describe_exc(exc)}")
 
             # ── Service CIDR from ServiceCIDR resource ────────────────
             sc_paths = [
@@ -409,7 +447,7 @@ async def _detect_cidrs(
                 try:
                     resp = await client.get(path, params={"limit": "50"})
                 except httpx.HTTPError as exc:
-                    messages.append(f"Service CIDR probe ({version}) failed: {exc}")
+                    messages.append(f"Service CIDR probe ({version}) failed: {describe_exc(exc)}")
                     continue
                 if resp.status_code == 404:
                     continue
@@ -443,11 +481,11 @@ async def _detect_cidrs(
                     "enter the service CIDR manually."
                 )
 
-    except httpx.ConnectError as exc:
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
         return DetectCIDRsResponse(
             pod_cidr=None,
             service_cidr=None,
-            messages=[f"Could not reach apiserver: {exc}"],
+            messages=[f"Could not reach apiserver: {describe_exc(exc)}"],
         )
     except ssl.SSLError as exc:
         return DetectCIDRsResponse(
@@ -455,6 +493,10 @@ async def _detect_cidrs(
             service_cidr=None,
             messages=[f"TLS error: {exc}"],
         )
+    except Exception as exc:  # noqa: BLE001 — honour "never raises" (#1913)
+        # e.g. httpx refusing to build the client from a header value it
+        # cannot encode; keep whatever was detected before the failure.
+        messages.append(f"Detection failed: {describe_exc(exc)}")
 
     return DetectCIDRsResponse(
         pod_cidr=pod_cidr,
@@ -565,6 +607,12 @@ async def update_cluster(
         raise HTTPException(status_code=404, detail="Cluster not found")
 
     changes = body.model_dump(exclude_unset=True)
+    require_secret_with_destination_change(
+        c,
+        changes,
+        destination=["api_server_url"],
+        secrets={"token": c.token_encrypted},
+    )
     new_ipam = changes.get("ipam_space_id", c.ipam_space_id)
     new_dns = changes.get("dns_group_id", c.dns_group_id)
     if "ipam_space_id" in changes or "dns_group_id" in changes:
@@ -605,6 +653,13 @@ async def delete_cluster(cluster_id: uuid.UUID, db: DB, user: SuperAdmin) -> Non
         cluster_id=c.id,
         cluster_name=c.name,
     )
+    # #2287 — hand back operator-made rows in mirrored subnets / blocks before
+    # the FK cascade can destroy them.
+    await release_integration_rows(
+        db, own_fk="kubernetes_cluster_id", target_id=c.id, user=user, target_name=c.name
+    )
+    # #2288 — the DNS rows cascade in the database; mark their groups' bundles dirty.
+    await mark_integration_dns_released(db, own_fk="kubernetes_cluster_id", target_id=c.id)
     await db.delete(c)
     await db.commit()
 
@@ -613,7 +668,7 @@ async def delete_cluster(cluster_id: uuid.UUID, db: DB, user: SuperAdmin) -> Non
     "/clusters/{cluster_id}/sync",
     status_code=status.HTTP_202_ACCEPTED,
 )
-async def sync_cluster(cluster_id: uuid.UUID, db: DB, _: SuperAdmin) -> StatusResponse:
+async def sync_cluster(cluster_id: uuid.UUID, db: DB, user: SuperAdmin) -> StatusResponse:
     """Queue an on-demand reconcile for this cluster.
 
     Fire-and-forget — the reconciler runs on the worker and updates
@@ -625,10 +680,20 @@ async def sync_cluster(cluster_id: uuid.UUID, db: DB, _: SuperAdmin) -> StatusRe
         raise HTTPException(status_code=404, detail="Cluster not found")
 
     # Deferred import — keeps the router module cheap to import.
+    add_trigger_audit(
+        db,
+        user,
+        resource_type="kubernetes_cluster",
+        resource_id=c.id,
+        resource_display=str(getattr(c, "name", None) or c.id),
+        action="sync",
+    )
+    await db.commit()
+
     from app.tasks.kubernetes_sync import sync_cluster_now  # noqa: PLC0415
 
     try:
-        result = sync_cluster_now.delay(str(c.id))
+        result = await dispatch(sync_cluster_now, str(c.id))
         return StatusResponse(status="queued", task_id=result.id)
     except Exception:  # noqa: BLE001
         # Broker down — the periodic sweep will catch up.
@@ -672,6 +737,8 @@ async def test_connection(
             status_code=422,
             detail="api_server_url and token are required (either in body or via stored cluster_id)",
         )
+
+    token = _require_usable_credentials(api_server_url, token)
 
     # SECURITY (#400, L5): advisory SSRF guard — log the resolved API
     # server IP so operators can audit what the control plane dialed.
@@ -730,6 +797,8 @@ async def detect_cidrs(body: DetectCIDRsRequest, db: DB, _: SuperAdmin) -> Detec
             status_code=422,
             detail="api_server_url and token are required (either in body or via stored cluster_id)",
         )
+
+    token = _require_usable_credentials(api_server_url, token)
 
     return await _detect_cidrs(
         api_server_url=api_server_url,

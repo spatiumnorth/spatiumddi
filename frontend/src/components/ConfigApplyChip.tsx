@@ -1,4 +1,10 @@
 import type { ConfigApplyFields, ConfigApplyStatus } from "@/lib/api";
+import {
+  isPartialApply,
+  PARTIAL_APPLY_EXPLAIN,
+  PARTIAL_APPLY_LABEL,
+  partialApplyDetail,
+} from "@/lib/configApply";
 
 /**
  * Chip surfacing an agent's last config-apply verdict (#882).
@@ -51,16 +57,18 @@ export function ConfigApplyChip({
 }) {
   const status = server.config_apply_status;
   if (!status || status === "ok") return null;
+  // A partial apply reports `reverted`, but nothing rolled back (#1280).
+  const partial = isPartialApply(status, server.config_apply_error);
 
   const when = server.config_apply_at
     ? new Date(server.config_apply_at).toLocaleString()
     : null;
   const title = [
-    EXPLAIN[status],
+    partial ? PARTIAL_APPLY_EXPLAIN : EXPLAIN[status],
     server.config_apply_error
-      ? `\n\nAgent reported: ${server.config_apply_error}`
+      ? `\n\nAgent reported: ${partial ? partialApplyDetail(server.config_apply_error) : server.config_apply_error}`
       : "",
-    server.config_failed_etag
+    server.config_failed_etag && !partial
       ? `\n\nRejected config: ${server.config_failed_etag}`
       : "",
     when ? `\n\nReported: ${when}` : "",
@@ -71,7 +79,7 @@ export function ConfigApplyChip({
       className={`inline-flex items-center rounded px-1.5 py-0.5 text-[11px] font-medium ${TONE[status]} ${className}`}
       title={title}
     >
-      {LABEL[status]}
+      {partial ? PARTIAL_APPLY_LABEL : LABEL[status]}
     </span>
   );
 }
@@ -91,6 +99,7 @@ export function ConfigApplyBanner({
 }) {
   const status = server.config_apply_status;
   if (!status || status === "ok") return null;
+  const partial = isPartialApply(status, server.config_apply_error);
 
   const tone =
     status === "reverted"
@@ -99,15 +108,21 @@ export function ConfigApplyBanner({
 
   return (
     <div className={`rounded border px-3 py-2 text-xs ${tone}`}>
-      <div className="font-medium">{LABEL[status]}</div>
-      <p className="mt-0.5 opacity-90">{EXPLAIN[status]}</p>
+      <div className="font-medium">
+        {partial ? PARTIAL_APPLY_LABEL : LABEL[status]}
+      </div>
+      <p className="mt-0.5 opacity-90">
+        {partial ? PARTIAL_APPLY_EXPLAIN : EXPLAIN[status]}
+      </p>
       {server.config_apply_error && (
         <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded bg-black/5 p-2 font-mono text-[11px] dark:bg-white/5">
-          {server.config_apply_error}
+          {partial
+            ? partialApplyDetail(server.config_apply_error)
+            : server.config_apply_error}
         </pre>
       )}
       <div className="mt-1.5 flex flex-wrap gap-x-3 opacity-75">
-        {server.config_failed_etag && (
+        {server.config_failed_etag && !partial && (
           <span className="font-mono break-all">
             rejected: {server.config_failed_etag}
           </span>

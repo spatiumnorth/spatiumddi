@@ -154,12 +154,18 @@ def driver_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
     async def _delete(*, config: dict[str, Any], filename: str) -> None:
         calls.append(("delete", filename))
 
-    async def _download(*, config: dict[str, Any], filename: str) -> bytes:
+    async def _download(
+        *, config: dict[str, Any], filename: str, max_bytes: int | None = None
+    ) -> bytes:
         calls.append(("download", filename))
         return b"PK\x05\x06" + b"\x00" * 18
 
+    async def _list_archives(*, config: dict[str, Any]) -> list[Any]:
+        return []
+
     monkeypatch.setattr(driver, "delete", _delete)
     monkeypatch.setattr(driver, "download", _download)
+    monkeypatch.setattr(driver, "list_archives", _list_archives)
     monkeypatch.setattr(
         "app.api.v1.backup.targets.decrypt_config_secrets", lambda _driver, cfg: cfg
     )

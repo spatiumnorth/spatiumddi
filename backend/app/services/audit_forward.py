@@ -44,12 +44,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import socket
 import ssl
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 import structlog
@@ -58,12 +61,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from app.config import settings as _app_settings
+from app.db import task_connect_args
 from app.models.audit import AuditLog
 from app.models.audit_forward import AuditForwardTarget
 from app.models.settings import PlatformSettings
-from app.services import apprise_delivery
+from app.services import apprise_delivery, dispatch_db
 from app.services.after_commit_dispatch import dispatch
-from app.services.forward_secrets import redact, reveal, secret_url_in_flight
+from app.services.audit_redact import redact_audit_payload
+from app.services.forward_secrets import redact, reveal, secret_url_in_flight, url_display
 
 logger = structlog.get_logger(__name__)
 
@@ -130,11 +135,36 @@ def _serialize(row: AuditLog) -> dict[str, Any]:
     }
 
 
-def _severity_bucket(result: str | None) -> str:
+def _severity_bucket(result: str | None, action: str | None = None) -> str:
+    """Bucket an audit row's ``result`` for the PRI / CEF / LEEF severity
+    and the ``min_severity`` gate.
+
+    #1874: three result spellings used to fall through to ``info``, so a
+    target filtered above info dropped them:
+
+    * ``failure`` on a ``login`` row is a rejected sign-in (bad password,
+      bad MFA code, locked or disabled account). It buckets with
+      ``denied``, not ``error``: the system worked and refused an
+      unauthenticated request, which is what ``denied`` means for an
+      authenticated one, and RFC 5424 severity 4 (warning) is where
+      authentication failures conventionally sit. ``err`` (3) means the
+      system itself failed — a provider timeout on the same ``login``
+      action is audited ``error`` and keeps that bucket. It also puts a
+      failed sign-in through the strictest selectable threshold, which
+      is the one an operator picks to see security refusals only.
+    * ``failure`` on anything else (a backup run, a backup drill, a
+      Wake-on-LAN send, an auth-provider test) is an operation that did
+      not work, so it ranks with ``failed``.
+    * ``forbidden`` is a refused request (non-superadmin break-glass or
+      secret reveal, throttled supervisor registration), the same thing
+      ``denied`` records under another name.
+    """
     r = (result or "").lower()
-    if r == "denied":
+    if r in ("denied", "forbidden"):
         return "denied"
-    if r in ("failed", "error"):
+    if r == "failure" and (action or "").lower() == "login":
+        return "denied"
+    if r in ("failed", "failure", "error"):
         return "error"
     return "info"
 
@@ -176,7 +206,8 @@ def _payload_severity(payload: dict[str, Any]) -> str:
     sev = payload.get("severity")
     if isinstance(sev, str) and sev:
         return sev.lower()
-    return _severity_bucket(payload.get("result"))
+    action = payload.get("action")
+    return _severity_bucket(payload.get("result"), action if isinstance(action, str) else None)
 
 
 def _payload_timestamp(payload: dict[str, Any]) -> str:
@@ -481,8 +512,19 @@ async def _send_syslog(
     ca_cert_pem: str | None = None,
 ) -> None:
     if protocol == "udp":
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.sendto((message + "\n").encode("utf-8"), (host, port))
+        # Resolve via the event loop (#1583): an ``AF_INET`` socket
+        # hardcoded here meant an IPv6-literal host — or a hostname
+        # with only AAAA records — failed on every event, and a plain
+        # ``sendto`` with a hostname does a blocking DNS lookup on the
+        # loop. ``getaddrinfo`` runs off-loop and hands back the
+        # address family to open the socket with.
+        loop = asyncio.get_running_loop()
+        infos = await loop.getaddrinfo(host, port, type=socket.SOCK_DGRAM)
+        if not infos:
+            raise OSError(f"could not resolve syslog host {host!r}")
+        family, _socktype, _proto, _canonname, sockaddr = infos[0]
+        with socket.socket(family, socket.SOCK_DGRAM) as sock:
+            sock.sendto((message + "\n").encode("utf-8"), sockaddr)
         return
 
     ssl_ctx: ssl.SSLContext | None = None
@@ -518,10 +560,21 @@ async def _send_webhook(url: str, auth_header: str, payload: dict[str, Any]) -> 
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.post(url, json=payload, headers=headers)
     if resp.status_code >= 300:
+        # Raise rather than log-and-swallow (#1577): the caller
+        # turns this into a ``failed`` delivery outcome, so a
+        # rejected webhook is not recorded as delivered.
         logger.warning(
             "audit_forward_webhook_non2xx",
             status=resp.status_code,
-            body_preview=redact(resp.text[:200], url, auth_header),
+            # Redact BEFORE truncating (GHSA-5qf8-pqm4-58mj): a secret
+            # straddling the 200-char cut is no longer an exact match.
+            body_preview=redact(resp.text, url, auth_header)[:200],
+        )
+        preview = " ".join(_scrub_urls(redact(resp.text, url, auth_header))[:200].split())
+        raise httpx.HTTPStatusError(
+            f"webhook answered HTTP {resp.status_code}" + (f": {preview}" if preview else ""),
+            request=resp.request,
+            response=resp,
         )
 
 
@@ -544,13 +597,14 @@ _SEVERITY_COLOURS = {
     "critical": 0xDC2626,  # darker red
 }
 
-_TEAMS_COLOURS = {
-    "info": "4FACFE",
-    "warn": "F59E0B",
-    "error": "EF4444",
-    "denied": "EF4444",
-    "warning": "F59E0B",
-    "critical": "DC2626",
+#: Adaptive Cards have no free-form colour, only named text colours.
+_TEAMS_TITLE_COLOURS = {
+    "info": "Accent",
+    "warn": "Warning",
+    "warning": "Warning",
+    "error": "Attention",
+    "denied": "Attention",
+    "critical": "Attention",
 }
 
 
@@ -584,6 +638,19 @@ def _payload_summary_lines(payload: dict[str, Any]) -> tuple[str, str]:
     return title, body
 
 
+#: Slack rejects a Block Kit ``section`` whose text exceeds 3,000
+#: characters with ``invalid_blocks`` (#1582). The top-level ``text``
+#: fallback gets the same cap.
+_SLACK_TEXT_LIMIT = 3000
+
+
+def _truncate_with_ellipsis(text: str, limit: int) -> str:
+    """Cap ``text`` at ``limit`` chars, marking the cut with ``…``."""
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
 def _slack_payload(payload: dict[str, Any]) -> dict[str, Any]:
     title, body = _payload_summary_lines(payload)
     sev = _payload_severity(payload)
@@ -595,29 +662,87 @@ def _slack_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "denied": ":no_entry:",
         "critical": ":rotating_light:",
     }.get(sev, ":information_source:")
+    # Long bodies (the AI daily digest is the realistic case) used to
+    # go out whole, so Slack rejected the whole message (#1582).
+    # Truncate like the Discord flavor caps its fields.
+    header = _truncate_with_ellipsis(f"{icon} *{title}*", _SLACK_TEXT_LIMIT)
+    section_body = _truncate_with_ellipsis(body or "—", _SLACK_TEXT_LIMIT)
     return {
-        "text": f"{icon} *{title}*\n{body}",
+        "text": _truncate_with_ellipsis(f"{icon} *{title}*\n{body}", _SLACK_TEXT_LIMIT),
         "blocks": [
             {
                 "type": "section",
-                "text": {"type": "mrkdwn", "text": f"{icon} *{title}*"},
+                "text": {"type": "mrkdwn", "text": header},
             },
-            {"type": "section", "text": {"type": "mrkdwn", "text": body or "—"}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": section_body}},
         ],
     }
 
 
+#: Teams refuses a message over ~28 KB. The caps are on the JSON-escaped
+#: text (``\uXXXX`` for non-ASCII, the worst case), leaving room for
+#: the card around it.
+_TEAMS_TITLE_LIMIT = 2_000
+_TEAMS_BODY_LIMIT = 20_000
+
+
+def _cap_json_escaped(text: str, limit: int) -> str:
+    """Cut ``text`` so ``json.dumps(text)`` fits ``limit`` bytes, marking the cut."""
+    if len(json.dumps(text)) <= limit:
+        return text
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if len(json.dumps(text[:mid] + "…")) <= limit:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo] + "…"
+
+
 def _teams_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """An Adaptive Card in the envelope a Teams Workflows webhook takes (#1504).
+
+    The Office 365 "Incoming Webhook" connector, which took the old
+    ``MessageCard`` body, has been retired. Its replacement, a Workflows
+    webhook ("When a Teams webhook request is received" / "Send webhook
+    alerts to a channel"), posts the cards in ``attachments``. A
+    MessageCard has none: depending on the flow it is accepted with 202
+    and never posted.
+    """
     title, body = _payload_summary_lines(payload)
     sev = _payload_severity(payload)
-    colour = _TEAMS_COLOURS.get(sev, "4FACFE")
+    # Card text is Markdown, where a single newline is only a soft break.
+    paragraphs = "\n\n".join(line for line in (body or "").splitlines() if line.strip())
     return {
-        "@type": "MessageCard",
-        "@context": "https://schema.org/extensions",
-        "summary": title,
-        "themeColor": colour,
-        "title": title,
-        "text": body or "—",
+        "type": "message",
+        "attachments": [
+            {
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "contentUrl": None,
+                "content": {
+                    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                    "type": "AdaptiveCard",
+                    "version": "1.4",
+                    "msteams": {"width": "Full"},
+                    "body": [
+                        {
+                            "type": "TextBlock",
+                            "text": _cap_json_escaped(title, _TEAMS_TITLE_LIMIT),
+                            "weight": "Bolder",
+                            "size": "Medium",
+                            "color": _TEAMS_TITLE_COLOURS.get(sev, "Accent"),
+                            "wrap": True,
+                        },
+                        {
+                            "type": "TextBlock",
+                            "text": _cap_json_escaped(paragraphs or "—", _TEAMS_BODY_LIMIT),
+                            "wrap": True,
+                        },
+                    ],
+                },
+            }
+        ],
     }
 
 
@@ -789,20 +914,63 @@ def _target_accepts(target: dict[str, Any], payload: dict[str, Any]) -> bool:
     return True
 
 
-async def _deliver_to_target(
-    target: dict[str, Any],
-    payload: dict[str, Any],
-    *,
-    raise_errors: bool = False,
-) -> None:
-    """Deliver one event to one target.
+# ── Delivery outcomes (#1577) ──────────────────────────────────────
+#
+# ``_deliver_to_target`` used to return ``None`` in every case, so
+# callers stamped "delivered" whenever delivery was *attempted*:
+# filter-rejected events, misconfigured SMTP targets, transport
+# errors, and webhooks answering 4xx/5xx all recorded as delivered.
+# It now reports what actually happened.
 
-    Failures are logged and swallowed so one dead target never affects the
-    others. ``raise_errors`` re-raises after logging, for the Test button,
-    which wants to show the operator why a probe failed.
+DELIVERED = "delivered"
+FILTERED = "filtered"
+FAILED = "failed"
+
+
+_URL_IN_TEXT = re.compile(r"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s'\"<>]+")
+
+
+def _scrub_urls(text: str) -> str:
+    """Collapse every URL in ``text`` to scheme + host. httpx quotes the full
+    request URL ("for url '…'"), which for a chat webhook IS the credential;
+    exact-match redaction misses a re-normalised or partly-echoed one (#3931)."""
+    return _URL_IN_TEXT.sub(lambda m: url_display(m.group(0)), text)
+
+
+def _failure_reason(exc: Exception, *secrets: str) -> str:
+    """A failure's own words for the operator (#3931), secrets redacted. An
+    exception with no message (a timeout) is named by its type."""
+    extra: list[str] = []
+    for secret in secrets:
+        try:
+            parts = urlsplit(secret)
+            extra += [x for x in (parts.username, parts.password) if x]
+        except ValueError:
+            continue
+    text = _scrub_urls(redact(str(exc), *secrets, *extra)).strip()
+    name = type(exc).__name__
+    return f"{name}: {text}" if text else name
+
+
+async def _deliver_to_target(
+    target: dict[str, Any], payload: dict[str, Any], reasons: list[str] | None = None
+) -> str:
+    """Deliver ``payload`` to one target; return DELIVERED / FILTERED /
+    FAILED. Never raises — a transport failure is a FAILED outcome,
+    logged here exactly as it was when the exception was swallowed. When
+    ``reasons`` is given, the failure's redacted reason is appended to it
+    (the "Test target" probe shows it, #3931).
+
+    This is the ONE function every forwarded event reaches a transport
+    through — audit rows, alert events, the AI digest and the "Test
+    target" probe alike — so the read-side redaction the audit API applies
+    (#2009) is applied here, on a copy, before any renderer sees the
+    payload (#2015). Doing it in ``_serialize`` instead would cover audit
+    rows only, and a new caller of this function would bypass it.
     """
+    payload = redact_audit_payload(payload)
     if not _target_accepts(target, payload):
-        return
+        return FILTERED
     kind = target.get("kind")
     try:
         if kind == "syslog":
@@ -830,7 +998,7 @@ async def _deliver_to_target(
                     body=text_body,
                     severity=_payload_severity(payload),
                 )
-                return
+                return DELIVERED
             body = _shape_webhook_body(flavor, payload)
             # Slack / Teams / Discord incoming-webhook URLs accept
             # unauthenticated POSTs by design; forwarding the
@@ -846,7 +1014,9 @@ async def _deliver_to_target(
                     "audit_forward_smtp_missing_config",
                     target=target.get("name"),
                 )
-                return
+                if reasons is not None:
+                    reasons.append("SMTP host, sender address and recipients must all be set")
+                return FAILED
             subject, email_body = _smtp_subject_body(payload)
             await _send_smtp(
                 target["smtp_host"],
@@ -860,7 +1030,25 @@ async def _deliver_to_target(
                 email_body,
                 reply_to=target.get("smtp_reply_to") or None,
             )
+        else:
+            logger.warning(
+                "audit_forward_unknown_kind",
+                target=target.get("name"),
+                kind=kind,
+            )
+            if reasons is not None:
+                reasons.append(f"unknown target kind {kind!r}")
+            return FAILED
     except Exception as exc:  # noqa: BLE001
+        if reasons is not None:
+            reasons.append(
+                _failure_reason(
+                    exc,
+                    target.get("url") or "",
+                    target.get("auth_header") or "",
+                    target.get("smtp_password") or "",
+                )
+            )
         logger.warning(
             "audit_forward_target_failed",
             target=target.get("name"),
@@ -869,8 +1057,8 @@ async def _deliver_to_target(
             # the credential (#1502).
             error=redact(str(exc), target.get("url") or "", target.get("auth_header") or ""),
         )
-        if raise_errors:
-            raise
+        return FAILED
+    return DELIVERED
 
 
 # ── Legacy deliver helper (alerts.py still calls _deliver_one indirectly) ──
@@ -909,22 +1097,52 @@ async def _deliver_one(
 # ── Config loading ─────────────────────────────────────────────────────────
 
 
+# The session the current task already holds, so the loaders below share ONE
+# connection instead of taking up to three in a row (#2782).
+_held_session: ContextVar[AsyncSession | None] = ContextVar("audit_forward_session", default=None)
+# True on the after-commit dispatch path, which uses the shared capped engine;
+# other callers (Celery tasks, alerts) run on a throwaway loop of their own and
+# keep a NullPool engine, which has no loop-bound state to leak.
+_on_dispatch_path: ContextVar[bool] = ContextVar("audit_forward_on_dispatch", default=False)
+
+# Nothing to forward to: no enabled target and no legacy flat config.
+# Invalidated by the settings routes that write targets / the legacy columns;
+# another process sees a new target within the TTL.
+targets_cache = dispatch_db.NegativeCache()
+
+
 @asynccontextmanager
 async def _ephemeral_session() -> AsyncIterator[AsyncSession]:
-    """Short-lived engine + session for audit-forward config reads.
+    """Session for audit-forward config reads; re-entrant (the held session
+    is reused).
 
-    Why: the ``after_commit`` listener runs on whatever event loop
-    committed the parent session. In FastAPI that's the long-lived
-    request loop; in Celery workers each task spins its own loop via
-    ``asyncio.run``. Using the global engine from ``app.db`` would
-    reuse asyncpg connections created on a prior loop and race them
-    ("another operation is in progress"). An ephemeral engine with
-    ``NullPool`` has no loop-bound pool state to leak.
-    """
-    engine = create_async_engine(_app_settings.database_url, poolclass=NullPool)
+    On the dispatch path it comes from the shared, capped engine
+    (``app.services.dispatch_db``, #2782). Otherwise: short-lived engine +
+    ``NullPool``, because those callers' loop is per-task (``asyncio.run``)
+    and an asyncpg connection from a previous loop would race
+    ("another operation is in progress")."""
+    held = _held_session.get()
+    if held is not None:
+        yield held
+        return
+    if _on_dispatch_path.get():
+        async with dispatch_db.session() as session:
+            token = _held_session.set(session)
+            try:
+                yield session
+            finally:
+                _held_session.reset(token)
+        return
+    engine = create_async_engine(
+        _app_settings.database_url, poolclass=NullPool, connect_args=task_connect_args()
+    )
     try:
         async with AsyncSession(engine, expire_on_commit=False) as session:
-            yield session
+            token = _held_session.set(session)
+            try:
+                yield session
+            finally:
+                _held_session.reset(token)
     finally:
         await engine.dispose()
 
@@ -936,11 +1154,17 @@ async def _load_forward_config() -> tuple[dict[str, Any] | None, dict[str, Any] 
     ``audit_forward_target``; falls back to the flat settings columns
     when the table is empty.
     """
-    async with _ephemeral_session() as session:
+    async with _ephemeral_session() as session:  # held: the fallback reuses it
         res = await session.execute(
             select(AuditForwardTarget).where(AuditForwardTarget.enabled.is_(True))
         )
         rows = list(res.scalars().all())
+        return await _forward_config_from(session, rows)
+
+
+async def _forward_config_from(
+    session: AsyncSession, rows: list[AuditForwardTarget]
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
 
     syslog_cfg: dict[str, Any] | None = None
     webhook_cfg: dict[str, Any] | None = None
@@ -977,8 +1201,7 @@ async def _load_forward_config() -> tuple[dict[str, Any] | None, dict[str, Any] 
     # No targets configured — fall back to legacy flat columns so a
     # pre-multi-target deployment keeps forwarding after upgrade without
     # the operator having to re-create the row.
-    async with _ephemeral_session() as session:
-        ps = await session.get(PlatformSettings, _SINGLETON_ID)
+    ps = await session.get(PlatformSettings, _SINGLETON_ID)
     if ps is None:
         return None, None
     if (
@@ -1007,8 +1230,16 @@ async def _load_forward_config() -> tuple[dict[str, Any] | None, dict[str, Any] 
 async def _load_targets() -> list[dict[str, Any]]:
     """Return every enabled target as a dict. Includes a fallback from
     the legacy flat settings when the targets table is empty, so existing
-    deployments keep forwarding across the upgrade boundary."""
-    async with _ephemeral_session() as session:
+    deployments keep forwarding across the upgrade boundary.
+
+    One connection for the whole call (#2782): the legacy fallback used to
+    open a second and third in sequence."""
+    async with _ephemeral_session():
+        return await _load_targets_held()
+
+
+async def _load_targets_held() -> list[dict[str, Any]]:
+    async with _ephemeral_session() as session:  # re-entrant: the held one
         res = await session.execute(
             select(AuditForwardTarget).where(AuditForwardTarget.enabled.is_(True))
         )
@@ -1087,7 +1318,7 @@ async def _load_targets() -> list[dict[str, Any]]:
         return out
 
     # Legacy flat-config fallback.
-    syslog_cfg, webhook_cfg = await _load_forward_config()
+    syslog_cfg, webhook_cfg = await _load_forward_config()  # reuses the held session
     if syslog_cfg is not None:
         out.append(
             {
@@ -1117,8 +1348,15 @@ async def _load_targets() -> list[dict[str, Any]]:
 
 
 async def _dispatch(rows: list[dict[str, Any]]) -> None:
-    targets = await _load_targets()
+    if targets_cache.known_empty():
+        return
+    token = _on_dispatch_path.set(True)
+    try:
+        targets = await _load_targets()
+    finally:
+        _on_dispatch_path.reset(token)
     if not targets:
+        targets_cache.mark_empty()
         return
 
     tasks: list[Any] = []
@@ -1177,6 +1415,9 @@ _register_session_listener()
 
 __all__: list[str] = [
     "render_for_target",
+    "DELIVERED",
+    "FILTERED",
+    "FAILED",
     "_send_syslog",
     "_send_webhook",
     "_deliver_to_target",

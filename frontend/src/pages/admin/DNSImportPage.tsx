@@ -21,8 +21,10 @@ import {
   dnsApi,
   dnsImportApi,
   type CloudDNSServerOption,
+  type DNSImportApexNsPolicy,
   type DNSImportCommitResult,
   type DNSImportConflictDecision,
+  type DNSImportedZone,
   type DNSImportPreview,
   type DNSImportSource,
   type DNSImportZoneConflict,
@@ -33,7 +35,13 @@ import {
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { HeaderButton } from "@/components/ui/header-button";
+import { ListReadError } from "@/components/ui/list-read-error";
 import { ZoneScopePill } from "@/components/ZoneScopePill";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
 
 // Tab metadata. Every source is live; ``available: false`` remains the
 // hook for rendering a not-yet-shipped source (so the operator sees the
@@ -108,6 +116,14 @@ interface BindUploadState {
   result: DNSImportCommitResult | null;
   phase: Phase;
   error: string | null;
+}
+
+/** Every DNS import route — preview, test and commit — takes a superadmin
+ *  (`dns_import/router.py`), so the controls that start one say so rather
+ *  than letting a DNS Editor upload an archive and be refused (#1879's
+ *  sweep). Commit is reachable only from a successful preview. */
+function useImportGate(): { disabled?: boolean; title?: string } {
+  return permissionGate(usePermissions().isSuperadmin, NEEDS_SUPERADMIN);
 }
 
 function emptyState(): BindUploadState {
@@ -241,30 +257,27 @@ function BindTab() {
       }));
     },
     onError: (err: unknown) => {
-      const detail =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? formatApiError(err);
+      const detail = formatApiError(err);
       setState((s) => ({ ...s, phase: "select", error: detail }));
     },
   });
 
   const commitMut = useMutation({
-    mutationFn: () => {
+    mutationFn: (apexNsPolicy: DNSImportApexNsPolicy) => {
       if (!state.preview) throw new Error("Preview the archive first");
       return dnsImportApi.bind9Commit({
         target_group_id: state.groupId,
         target_view_id: state.viewId || null,
         plan: state.preview,
         conflict_actions: state.decisions,
+        apex_ns_policy: apexNsPolicy,
       });
     },
     onSuccess: (result) => {
       setState((s) => ({ ...s, result, phase: "result", error: null }));
     },
     onError: (err: unknown) => {
-      const detail =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? formatApiError(err);
+      const detail = formatApiError(err);
       setState((s) => ({ ...s, phase: "ready", error: detail }));
     },
   });
@@ -322,9 +335,9 @@ function BindTab() {
                 setState((s) => ({ ...s, decisions: updater(s.decisions) }))
               }
               conflictByZone={conflictByZone}
-              onCommit={() => {
+              onCommit={(apexNsPolicy) => {
                 setState((s) => ({ ...s, phase: "committing", error: null }));
-                commitMut.mutate();
+                commitMut.mutate(apexNsPolicy);
               }}
               committing={commitMut.isPending}
               onReset={reset}
@@ -407,30 +420,27 @@ function WindowsDNSTab() {
       }));
     },
     onError: (err: unknown) => {
-      const detail =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? formatApiError(err);
+      const detail = formatApiError(err);
       setState((s) => ({ ...s, phase: "select", error: detail }));
     },
   });
 
   const commitMut = useMutation({
-    mutationFn: () => {
+    mutationFn: (apexNsPolicy: DNSImportApexNsPolicy) => {
       if (!state.preview) throw new Error("Preview the server first");
       return dnsImportApi.windowsDNSCommit({
         target_group_id: state.groupId,
         target_view_id: state.viewId || null,
         plan: state.preview,
         conflict_actions: state.decisions,
+        apex_ns_policy: apexNsPolicy,
       });
     },
     onSuccess: (result) => {
       setState((s) => ({ ...s, result, phase: "result", error: null }));
     },
     onError: (err: unknown) => {
-      const detail =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? formatApiError(err);
+      const detail = formatApiError(err);
       setState((s) => ({ ...s, phase: "ready", error: detail }));
     },
   });
@@ -461,6 +471,7 @@ function WindowsDNSTab() {
             setState={setState}
             servers={serversQ.data ?? []}
             serversLoading={serversQ.isLoading}
+            serversError={serversQ.error}
             groups={groupsQ.data ?? []}
             views={viewsQ.data ?? []}
             onPreview={() => {
@@ -478,9 +489,9 @@ function WindowsDNSTab() {
                 setState((s) => ({ ...s, decisions: updater(s.decisions) }))
               }
               conflictByZone={conflictByZone}
-              onCommit={() => {
+              onCommit={(apexNsPolicy) => {
                 setState((s) => ({ ...s, phase: "committing", error: null }));
-                commitMut.mutate();
+                commitMut.mutate(apexNsPolicy);
               }}
               committing={commitMut.isPending}
               onReset={reset}
@@ -497,6 +508,7 @@ function WindowsDNSPullForm({
   setState,
   servers,
   serversLoading,
+  serversError,
   groups,
   views,
   onPreview,
@@ -506,11 +518,13 @@ function WindowsDNSPullForm({
   setState: React.Dispatch<React.SetStateAction<WindowsDNSState>>;
   servers: WindowsDNSServerOption[];
   serversLoading: boolean;
+  serversError: unknown;
   groups: { id: string; name: string }[];
   views: { id: string; name: string }[];
   onPreview: () => void;
   previewing: boolean;
 }) {
+  const gate = useImportGate();
   const canPreview = Boolean(state.serverId && state.groupId) && !previewing;
   const eligible = servers.filter((s) => s.has_credentials);
   const hasIneligible = servers.length > eligible.length;
@@ -547,9 +561,11 @@ function WindowsDNSPullForm({
             <option value="">
               {serversLoading
                 ? "Loading…"
-                : eligible.length === 0
-                  ? "— no eligible servers —"
-                  : "— select —"}
+                : serversError
+                  ? "— servers unavailable —"
+                  : eligible.length === 0
+                    ? "— no eligible servers —"
+                    : "— select —"}
             </option>
             {servers.map((srv) => (
               <option
@@ -562,6 +578,14 @@ function WindowsDNSPullForm({
               </option>
             ))}
           </select>
+          {serversError ? (
+            <p className="mt-1 text-xs">
+              <ListReadError
+                error={serversError}
+                what="the servers to import from"
+              />
+            </p>
+          ) : null}
           {hasIneligible && (
             <p className="mt-1 text-[11px] text-amber-700 dark:text-amber-400">
               Some servers are listed but disabled — they don't have WinRM
@@ -623,7 +647,8 @@ function WindowsDNSPullForm({
           icon={previewing ? Loader2 : ServerIcon}
           iconClassName={previewing ? "animate-spin" : undefined}
           onClick={onPreview}
-          disabled={!canPreview}
+          disabled={!canPreview || !!gate.disabled}
+          title={gate.title}
         >
           {previewing ? "Pulling zones…" : "Preview import"}
         </HeaderButton>
@@ -738,30 +763,27 @@ function CloudDNSTab({ initialServerId }: { initialServerId?: string }) {
       }));
     },
     onError: (err: unknown) => {
-      const detail =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? formatApiError(err);
+      const detail = formatApiError(err);
       setState((s) => ({ ...s, phase: "select", error: detail }));
     },
   });
 
   const commitMut = useMutation({
-    mutationFn: () => {
+    mutationFn: (apexNsPolicy: DNSImportApexNsPolicy) => {
       if (!state.preview) throw new Error("Preview the server first");
       return dnsImportApi.cloudDNSCommit({
         target_group_id: state.groupId,
         target_view_id: state.viewId || null,
         plan: state.preview,
         conflict_actions: state.decisions,
+        apex_ns_policy: apexNsPolicy,
       });
     },
     onSuccess: (result) => {
       setState((s) => ({ ...s, result, phase: "result", error: null }));
     },
     onError: (err: unknown) => {
-      const detail =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? formatApiError(err);
+      const detail = formatApiError(err);
       setState((s) => ({ ...s, phase: "ready", error: detail }));
     },
   });
@@ -792,6 +814,7 @@ function CloudDNSTab({ initialServerId }: { initialServerId?: string }) {
             setState={setState}
             servers={serversQ.data ?? []}
             serversLoading={serversQ.isLoading}
+            serversError={serversQ.error}
             selectedServer={selectedServer}
             groups={groupsQ.data ?? []}
             views={viewsQ.data ?? []}
@@ -810,9 +833,9 @@ function CloudDNSTab({ initialServerId }: { initialServerId?: string }) {
                 setState((s) => ({ ...s, decisions: updater(s.decisions) }))
               }
               conflictByZone={conflictByZone}
-              onCommit={() => {
+              onCommit={(apexNsPolicy) => {
                 setState((s) => ({ ...s, phase: "committing", error: null }));
-                commitMut.mutate();
+                commitMut.mutate(apexNsPolicy);
               }}
               committing={commitMut.isPending}
               onReset={reset}
@@ -829,6 +852,7 @@ function CloudDNSPullForm({
   setState,
   servers,
   serversLoading,
+  serversError,
   selectedServer,
   groups,
   views,
@@ -839,12 +863,14 @@ function CloudDNSPullForm({
   setState: React.Dispatch<React.SetStateAction<CloudDNSState>>;
   servers: CloudDNSServerOption[];
   serversLoading: boolean;
+  serversError: unknown;
   selectedServer: CloudDNSServerOption | null;
   groups: { id: string; name: string }[];
   views: { id: string; name: string }[];
   onPreview: () => void;
   previewing: boolean;
 }) {
+  const gate = useImportGate();
   const canPreview = Boolean(state.serverId && state.groupId) && !previewing;
   const eligible = servers.filter((s) => s.has_credentials);
   const hasIneligible = servers.length > eligible.length;
@@ -880,9 +906,11 @@ function CloudDNSPullForm({
             <option value="">
               {serversLoading
                 ? "Loading…"
-                : eligible.length === 0
-                  ? "— no eligible servers —"
-                  : "— select —"}
+                : serversError
+                  ? "— servers unavailable —"
+                  : eligible.length === 0
+                    ? "— no eligible servers —"
+                    : "— select —"}
             </option>
             {servers.map((srv) => (
               <option
@@ -895,6 +923,14 @@ function CloudDNSPullForm({
               </option>
             ))}
           </select>
+          {serversError ? (
+            <p className="mt-1 text-xs">
+              <ListReadError
+                error={serversError}
+                what="the servers to import from"
+              />
+            </p>
+          ) : null}
           {selectedServer && (
             <p className="mt-1 text-[11px] text-muted-foreground">
               Source provider:{" "}
@@ -964,7 +1000,8 @@ function CloudDNSPullForm({
           icon={previewing ? Loader2 : Cloud}
           iconClassName={previewing ? "animate-spin" : undefined}
           onClick={onPreview}
-          disabled={!canPreview}
+          disabled={!canPreview || !!gate.disabled}
+          title={gate.title}
         >
           {previewing ? "Pulling zones…" : "Preview import"}
         </HeaderButton>
@@ -1034,9 +1071,7 @@ function PowerDNSTab() {
       setState((s) => ({ ...s, testInfo: info, error: null }));
     },
     onError: (err: unknown) => {
-      const detail =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? formatApiError(err);
+      const detail = formatApiError(err);
       setState((s) => ({ ...s, testInfo: null, error: detail }));
     },
   });
@@ -1070,30 +1105,27 @@ function PowerDNSTab() {
       }));
     },
     onError: (err: unknown) => {
-      const detail =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? formatApiError(err);
+      const detail = formatApiError(err);
       setState((s) => ({ ...s, phase: "select", error: detail }));
     },
   });
 
   const commitMut = useMutation({
-    mutationFn: () => {
+    mutationFn: (apexNsPolicy: DNSImportApexNsPolicy) => {
       if (!state.preview) throw new Error("Preview the server first");
       return dnsImportApi.powerDNSCommit({
         target_group_id: state.groupId,
         target_view_id: state.viewId || null,
         plan: state.preview,
         conflict_actions: state.decisions,
+        apex_ns_policy: apexNsPolicy,
       });
     },
     onSuccess: (result) => {
       setState((s) => ({ ...s, result, phase: "result", error: null }));
     },
     onError: (err: unknown) => {
-      const detail =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? formatApiError(err);
+      const detail = formatApiError(err);
       setState((s) => ({ ...s, phase: "ready", error: detail }));
     },
   });
@@ -1141,9 +1173,9 @@ function PowerDNSTab() {
                 setState((s) => ({ ...s, decisions: updater(s.decisions) }))
               }
               conflictByZone={conflictByZone}
-              onCommit={() => {
+              onCommit={(apexNsPolicy) => {
                 setState((s) => ({ ...s, phase: "committing", error: null }));
-                commitMut.mutate();
+                commitMut.mutate(apexNsPolicy);
               }}
               committing={commitMut.isPending}
               onReset={reset}
@@ -1174,6 +1206,7 @@ function PowerDNSPullForm({
   onPreview: () => void;
   previewing: boolean;
 }) {
+  const gate = useImportGate();
   const canTest =
     Boolean(state.apiUrl && state.apiKey) && !testing && !previewing;
   const canPreview =
@@ -1252,7 +1285,8 @@ function PowerDNSPullForm({
               icon={testing ? Loader2 : Plug}
               iconClassName={testing ? "animate-spin" : undefined}
               onClick={onTest}
-              disabled={!canTest}
+              disabled={!canTest || !!gate.disabled}
+              title={gate.title}
             >
               {testing ? "Testing…" : "Test connection"}
             </HeaderButton>
@@ -1318,7 +1352,8 @@ function PowerDNSPullForm({
           icon={previewing ? Loader2 : Globe}
           iconClassName={previewing ? "animate-spin" : undefined}
           onClick={onPreview}
-          disabled={!canPreview}
+          disabled={!canPreview || !!gate.disabled}
+          title={gate.title}
         >
           {previewing ? "Pulling zones…" : "Preview import"}
         </HeaderButton>
@@ -1385,9 +1420,7 @@ function TechnitiumTab() {
       setState((s) => ({ ...s, testInfo: info, error: null }));
     },
     onError: (err: unknown) => {
-      const detail =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? formatApiError(err);
+      const detail = formatApiError(err);
       setState((s) => ({ ...s, testInfo: null, error: detail }));
     },
   });
@@ -1420,30 +1453,27 @@ function TechnitiumTab() {
       }));
     },
     onError: (err: unknown) => {
-      const detail =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? formatApiError(err);
+      const detail = formatApiError(err);
       setState((s) => ({ ...s, phase: "select", error: detail }));
     },
   });
 
   const commitMut = useMutation({
-    mutationFn: () => {
+    mutationFn: (apexNsPolicy: DNSImportApexNsPolicy) => {
       if (!state.preview) throw new Error("Preview the server first");
       return dnsImportApi.technitiumCommit({
         target_group_id: state.groupId,
         target_view_id: state.viewId || null,
         plan: state.preview,
         conflict_actions: state.decisions,
+        apex_ns_policy: apexNsPolicy,
       });
     },
     onSuccess: (result) => {
       setState((s) => ({ ...s, result, phase: "result", error: null }));
     },
     onError: (err: unknown) => {
-      const detail =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? formatApiError(err);
+      const detail = formatApiError(err);
       setState((s) => ({ ...s, phase: "ready", error: detail }));
     },
   });
@@ -1491,9 +1521,9 @@ function TechnitiumTab() {
                 setState((s) => ({ ...s, decisions: updater(s.decisions) }))
               }
               conflictByZone={conflictByZone}
-              onCommit={() => {
+              onCommit={(apexNsPolicy) => {
                 setState((s) => ({ ...s, phase: "committing", error: null }));
-                commitMut.mutate();
+                commitMut.mutate(apexNsPolicy);
               }}
               committing={commitMut.isPending}
               onReset={reset}
@@ -1524,6 +1554,7 @@ function TechnitiumPullForm({
   onPreview: () => void;
   previewing: boolean;
 }) {
+  const gate = useImportGate();
   const canTest =
     Boolean(state.apiUrl && state.apiToken) && !testing && !previewing;
   const canPreview =
@@ -1584,7 +1615,8 @@ function TechnitiumPullForm({
               icon={testing ? Loader2 : Plug}
               iconClassName={testing ? "animate-spin" : undefined}
               onClick={onTest}
-              disabled={!canTest}
+              disabled={!canTest || !!gate.disabled}
+              title={gate.title}
             >
               {testing ? "Testing…" : "Test connection"}
             </HeaderButton>
@@ -1652,7 +1684,8 @@ function TechnitiumPullForm({
           icon={previewing ? Loader2 : Globe}
           iconClassName={previewing ? "animate-spin" : undefined}
           onClick={onPreview}
-          disabled={!canPreview}
+          disabled={!canPreview || !!gate.disabled}
+          title={gate.title}
         >
           {previewing ? "Pulling zones…" : "Preview import"}
         </HeaderButton>
@@ -1678,6 +1711,7 @@ function UploadForm({
   onPreview: () => void;
   previewing: boolean;
 }) {
+  const gate = useImportGate();
   const canPreview = Boolean(state.file && state.groupId) && !previewing;
   return (
     <div className="rounded-md border bg-muted/20 p-4">
@@ -1764,7 +1798,8 @@ function UploadForm({
           icon={previewing ? Loader2 : Download}
           iconClassName={previewing ? "animate-spin" : undefined}
           onClick={onPreview}
-          disabled={!canPreview}
+          disabled={!canPreview || !!gate.disabled}
+          title={gate.title}
         >
           {previewing ? "Parsing…" : "Preview import"}
         </HeaderButton>
@@ -1773,7 +1808,59 @@ function UploadForm({
   );
 }
 
-function PreviewPanel({
+/**
+ * #1892 — an imported zone carries the source server's apex NS, and the
+ * group's agents serve those rows as the zone's whole NS set, so without this
+ * the managed zone stays delegated to the host it was migrated off. Off by
+ * default: an apex NS outside the group can be deliberate (a hidden primary
+ * whose public NS are a provider's), so replacing it is the operator's call.
+ */
+function ApexNsPolicyChoice({
+  zones,
+  replace,
+  onChange,
+}: {
+  zones: DNSImportedZone[];
+  replace: boolean;
+  onChange: (replace: boolean) => void;
+}) {
+  const affected = zones.filter((z) => (z.foreign_apex_ns ?? []).length > 0);
+  if (affected.length === 0) return null;
+  return (
+    <div className="mb-3 space-y-2 rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-xs">
+      <div className="font-medium text-amber-700 dark:text-amber-400">
+        Apex NS outside the target group
+      </div>
+      <div className="text-amber-700/90 dark:text-amber-300/90">
+        These zones name a server that is not in the target group as their NS.
+        Kept, the imported zone stays delegated to that host and goes lame once
+        it is retired.
+      </div>
+      <ul className="space-y-0.5">
+        {affected.map((z) => (
+          <li key={z.name} className="break-all font-mono">
+            {z.name} → {(z.foreign_apex_ns ?? []).join(", ")}
+          </li>
+        ))}
+      </ul>
+      <label className="flex items-start gap-2">
+        <input
+          type="checkbox"
+          checked={replace}
+          onChange={(e) => onChange(e.target.checked)}
+          className="mt-0.5"
+        />
+        <span>
+          Replace them with the target group&apos;s servers (only servers whose
+          host is a DNS name; NS records below the apex are kept). Leave
+          unticked if the zone is deliberately served from these hosts.
+        </span>
+      </label>
+    </div>
+  );
+}
+
+export function PreviewPanel({
   preview,
   decisions,
   setDecisions,
@@ -1790,10 +1877,11 @@ function PreviewPanel({
     ) => Record<string, DNSImportConflictDecision>,
   ) => void;
   conflictByZone: Map<string, DNSImportZoneConflict>;
-  onCommit: () => void;
+  onCommit: (apexNsPolicy: DNSImportApexNsPolicy) => void;
   committing: boolean;
   onReset: () => void;
 }) {
+  const [replaceApexNs, setReplaceApexNs] = useState(false);
   return (
     <div className="space-y-4">
       <div className="rounded-md border bg-muted/20 p-4">
@@ -1831,6 +1919,12 @@ function PreviewPanel({
             ))}
           </div>
         )}
+
+        <ApexNsPolicyChoice
+          zones={preview.zones}
+          replace={replaceApexNs}
+          onChange={setReplaceApexNs}
+        />
 
         {Object.keys(preview.record_type_histogram).length > 0 && (
           <div className="mb-3 flex flex-wrap gap-2">
@@ -1882,6 +1976,18 @@ function PreviewPanel({
                         <div className="mt-0.5 text-[10px] text-muted-foreground">
                           view <span className="font-mono">{z.view_name}</span>
                         </div>
+                      )}
+                      {/* #3097: the "warnings" pill said a zone had notes
+                          and never what they were. */}
+                      {z.parse_warnings.length > 0 && (
+                        <ul
+                          aria-label={`Notes for ${z.name}`}
+                          className="mt-1 max-w-md list-disc space-y-0.5 pl-4 font-sans text-[11px] text-amber-700 [overflow-wrap:anywhere] dark:text-amber-400"
+                        >
+                          {z.parse_warnings.map((w, i) => (
+                            <li key={i}>{w}</li>
+                          ))}
+                        </ul>
                       )}
                     </td>
                     <td className="px-3 py-2 align-top">
@@ -1973,7 +2079,7 @@ function PreviewPanel({
           variant="primary"
           icon={committing ? Loader2 : Database}
           iconClassName={committing ? "animate-spin" : undefined}
-          onClick={onCommit}
+          onClick={() => onCommit(replaceApexNs ? "replace" : "keep")}
           disabled={committing}
         >
           {committing ? "Committing…" : "Commit import"}

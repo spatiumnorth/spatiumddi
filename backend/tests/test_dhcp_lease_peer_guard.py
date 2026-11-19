@@ -574,3 +574,112 @@ async def test_purging_the_old_clients_lease_keeps_the_new_clients_mirror(
     await db_session.flush()
     assert not await _mirror_exists(db_session, mirror.id)
     assert ddns.revoked == [IP]
+
+
+# ── A replayed GRANT must not re-point the row to the old client (#2391) ──
+
+T0 = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
+
+
+def _ev_at(mac: str, state: str, start: datetime, hours: int = 24) -> dict[str, Any]:
+    end = start + timedelta(hours=hours)
+    return {
+        "ip_address": IP,
+        "mac_address": mac,
+        "hostname": f"h-{mac[-2:]}",
+        "state": state,
+        "starts_at": start.isoformat(),
+        "ends_at": end.isoformat(),
+        "expires_at": end.isoformat(),
+    }
+
+
+async def _handed_over(client: AsyncClient, db: AsyncSession, server: DHCPServer) -> None:
+    now = datetime.now(UTC)
+    await _post_events(client, db, server, [_ev_at(OLD_MAC, "active", now - timedelta(hours=3))])
+    await _post_events(client, db, server, [_ev_at(OLD_MAC, "released", now - timedelta(hours=3))])
+    await _post_events(client, db, server, [_ev_at(NEW_MAC, "active", now - timedelta(hours=1))])
+
+
+@pytest.mark.asyncio
+async def test_a_replayed_grant_does_not_repoint_the_row_to_the_old_client(
+    client: AsyncClient, db_session: AsyncSession, ddns: _DDNSSpy
+) -> None:
+    a, _b, _scope, subnet, _mirror = await _pair(db_session, driver="kea", grouped=False)
+    await db_session.commit()
+    a_id, subnet_id = a.id, subnet.id
+    await _handed_over(client, db_session, a)
+    before = await _mirror_of(db_session, subnet_id)
+    assert before is not None and str(before.mac_address) == NEW_MAC
+    before_id, before_lease, before_host = before.id, before.dhcp_lease_id, before.hostname
+
+    now = datetime.now(UTC)
+    await _post_events(
+        client,
+        db_session,
+        a,
+        [
+            _ev_at(OLD_MAC, "active", now - timedelta(hours=3)),
+            _ev_at(OLD_MAC, "released", now - timedelta(hours=3)),
+        ],
+    )
+
+    after = await _mirror_of(db_session, subnet_id)
+    assert after is not None and after.id == before_id and after.status == "dhcp"
+    assert str(after.mac_address) == NEW_MAC
+    assert after.hostname == before_host
+    assert after.dhcp_lease_id == before_lease
+    assert await _states(db_session, a_id) == {OLD_MAC: "released", NEW_MAC: "active"}
+
+
+@pytest.mark.asyncio
+async def test_a_replayed_grant_alone_does_not_resurrect_the_old_lease(
+    client: AsyncClient, db_session: AsyncSession, ddns: _DDNSSpy
+) -> None:
+    a, _b, _scope, subnet, _mirror = await _pair(db_session, driver="kea", grouped=False)
+    await db_session.commit()
+    a_id, subnet_id = a.id, subnet.id
+    await _handed_over(client, db_session, a)
+
+    await _post_events(
+        client,
+        db_session,
+        a,
+        [_ev_at(OLD_MAC, "active", datetime.now(UTC) - timedelta(hours=3))],
+    )
+
+    assert await _states(db_session, a_id) == {OLD_MAC: "released", NEW_MAC: "active"}
+    row = await _mirror_of(db_session, subnet_id)
+    assert row is not None and str(row.mac_address) == NEW_MAC
+
+
+@pytest.mark.asyncio
+async def test_a_genuine_later_grant_to_the_old_client_moves_the_row_back(
+    client: AsyncClient, db_session: AsyncSession, ddns: _DDNSSpy
+) -> None:
+    a, _b, _scope, subnet, _mirror = await _pair(db_session, driver="kea", grouped=False)
+    await db_session.commit()
+    subnet_id = subnet.id
+    await _handed_over(client, db_session, a)
+
+    await _post_events(client, db_session, a, [_ev_at(OLD_MAC, "active", datetime.now(UTC))])
+
+    row = await _mirror_of(db_session, subnet_id)
+    assert row is not None and str(row.mac_address) == OLD_MAC
+
+
+@pytest.mark.asyncio
+async def test_a_renewal_by_the_current_client_still_updates_the_row(
+    client: AsyncClient, db_session: AsyncSession, ddns: _DDNSSpy
+) -> None:
+    a, _b, _scope, subnet, _mirror = await _pair(db_session, driver="kea", grouped=False)
+    await db_session.commit()
+    subnet_id = subnet.id
+    await _handed_over(client, db_session, a)
+
+    renewal = _ev_at(NEW_MAC, "active", datetime.now(UTC))
+    renewal["hostname"] = "renamed"
+    await _post_events(client, db_session, a, [renewal])
+
+    row = await _mirror_of(db_session, subnet_id)
+    assert row is not None and str(row.mac_address) == NEW_MAC and row.hostname == "renamed"

@@ -3,11 +3,31 @@ Description=Reboot SpatiumDDI appliance after web-UI request (Phase 4f)
 
 [Service]
 Type=oneshot
+# GHSA-h2j9-qrg7-grfw — act only on a trigger written by root, the
+# supervisor or the api; anything else is renamed aside and the unit
+# skips cleanly. See spatiumddi-trigger-guard.
+ExecCondition=/usr/local/bin/spatiumddi-trigger-guard /var/lib/spatiumddi/release-state/reboot-pending
 # 10-second grace so the api's 202-Accepted response actually reaches
 # the browser before the host kills the network stack.
 ExecStartPre=/bin/sleep 10
 # Rename the trigger to .done so it doesn't re-fire on next boot.
 # ``-`` prefix (#553): tolerate an already-moved/absent trigger so this
 # oneshot never ends ``failed`` — the reboot still needs to fire.
-ExecStartPre=-/bin/mv /var/lib/spatiumddi/release-state/reboot-pending /var/lib/spatiumddi/release-state/reboot-pending.done
-ExecStart=/usr/bin/systemctl reboot
+# ``-T``: the api and the supervisor can create names in release-state, and
+# without it a directory (or a link to one) at ``reboot-pending.done`` would
+# receive the trigger, i.e. root would move it wherever that link points.
+ExecStartPre=-/bin/mv -T /var/lib/spatiumddi/release-state/reboot-pending /var/lib/spatiumddi/release-state/reboot-pending.done
+# #2974 — hands the PostgreSQL primary off first, then systemctl reboot.
+# No start timeout (a oneshot's default, stated here so nobody adds one):
+# a timeout stops the wrapper, which it takes as a cancel, undoing the
+# cordon and NOT rebooting. The wrapper caps the handoff itself and then
+# reboots whatever the handoff did.
+TimeoutStartSec=infinity
+ExecStart=/usr/local/bin/spatium-power-action reboot
+# #3162 — F9 (systemctl stop) is a cancel, not a failure: the wrapper ends by
+# the stop's own signal. For Type=oneshot systemd counts death by SIGTERM /
+# SIGINT / SIGHUP as a FAILURE (result 'signal') unless listed here, so
+# without this line the unit is left 'failed' exactly as with the old exit 1
+# (verified on systemd 257). It also covers a stop that lands in an
+# ExecStartPre sleep. Exit 1 (a failed systemctl reboot) stays a failure.
+SuccessExitStatus=TERM INT HUP

@@ -21,6 +21,7 @@ ORM doesn't surface here).
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -41,6 +42,9 @@ from app.models.proxmox import ProxmoxNode
 from app.models.tailscale import TailscaleTenant
 from app.models.unifi import UnifiController
 from app.services.ai.tools.base import register_tool
+from app.services.integration_credentials import credential_status
+from app.services.ipam.integration_space_audit import find_cross_space_adoptions, suspect_to_dict
+from app.services.tailscale.client import is_auth_rejected
 
 
 def _common_target_args() -> dict[str, Any]:
@@ -70,6 +74,7 @@ class ListKubernetesTargetsArgs(BaseModel):
 
 @register_tool(
     name="list_kubernetes_targets",
+    permission=("read", "kubernetes_cluster"),
     module="integrations.kubernetes",
     description=(
         "List configured Kubernetes clusters that SpatiumDDI mirrors "
@@ -133,6 +138,7 @@ class ListDockerTargetsArgs(BaseModel):
 
 @register_tool(
     name="list_docker_targets",
+    permission=("read", "docker_host"),
     module="integrations.docker",
     description=(
         "List configured Docker hosts that SpatiumDDI mirrors into "
@@ -195,6 +201,7 @@ class ListProxmoxTargetsArgs(BaseModel):
 
 @register_tool(
     name="list_proxmox_targets",
+    permission=("read", "proxmox_node"),
     module="integrations.proxmox",
     description=(
         "List configured Proxmox VE endpoints that SpatiumDDI mirrors "
@@ -260,13 +267,22 @@ class ListTailscaleTargetsArgs(BaseModel):
 
 @register_tool(
     name="list_tailscale_targets",
+    permission=("read", "tailscale_tenant"),
     module="integrations.tailscale",
     description=(
         "List configured Tailscale tenants (tailnets) that SpatiumDDI "
         "mirrors into IPAM. Each row carries id, name, description, "
-        "enabled flag, ipam_space_id, sync_interval_seconds, and "
-        "last_synced_at. Use for 'which tailnets are connected?' or "
-        "'is Tailscale syncing?'. PAT tokens never appear."
+        "enabled flag, ipam_space_id, sync_interval_seconds, "
+        "last_synced_at, last_sync_error, and the API access token's "
+        "expiry: api_key_expires_at (null = unknown), "
+        "api_key_expiry_source ('api' = read from Tailscale, 'operator' = "
+        "typed in), credential_state (ok / expiring / expired / rejected / "
+        "unknown / disabled — 'rejected' means the last sync got HTTP 401; "
+        "'disabled' means the tenant is off, so its last_sync_error is history "
+        "from before it was switched off, not a live problem) and "
+        "credential_days_left. Tailscale caps these tokens at 90 days. Use "
+        "for 'which tailnets are connected?', 'is Tailscale syncing?' or "
+        "'when does the Tailscale token expire?'. Tokens never appear."
     ),
     args_model=ListTailscaleTargetsArgs,
     category="integrations",
@@ -287,9 +303,16 @@ async def list_tailscale_targets(
         stmt = stmt.where(TailscaleTenant.enabled.is_(args.enabled))
     stmt = stmt.order_by(TailscaleTenant.name.asc()).limit(args.limit)
     rows = (await db.execute(stmt)).scalars().all()
+    now = datetime.now(UTC)
     out: list[dict[str, Any]] = []
     for r in rows:
         last_synced = getattr(r, "last_synced_at", None)
+        cred = credential_status(
+            expires_at=r.api_key_expires_at,
+            rejected=is_auth_rejected(r.last_sync_error),
+            now=now,
+            enabled=r.enabled,
+        )
         out.append(
             {
                 "id": str(r.id),
@@ -301,6 +324,13 @@ async def list_tailscale_targets(
                 ),
                 "sync_interval_seconds": getattr(r, "sync_interval_seconds", None),
                 "last_synced_at": last_synced.isoformat() if last_synced else None,
+                "last_sync_error": r.last_sync_error,
+                "api_key_expires_at": (
+                    r.api_key_expires_at.isoformat() if r.api_key_expires_at else None
+                ),
+                "api_key_expiry_source": r.api_key_expiry_source,
+                "credential_state": cred.state,
+                "credential_days_left": cred.days_left,
             }
         )
     return out
@@ -317,6 +347,7 @@ class ListNetbirdTargetsArgs(BaseModel):
 
 @register_tool(
     name="list_netbird_targets",
+    permission=("read", "netbird_instance"),
     module="integrations.netbird",
     description=(
         "List configured NetBird instances (mesh deployments) that "
@@ -374,6 +405,7 @@ class ListUnifiTargetsArgs(BaseModel):
 
 @register_tool(
     name="list_unifi_targets",
+    permission=("read", "unifi_controller"),
     module="integrations.unifi",
     description=(
         "List configured UniFi controllers that SpatiumDDI mirrors "
@@ -455,6 +487,7 @@ class ListCloudTargetsArgs(BaseModel):
 
 @register_tool(
     name="list_cloud_targets",
+    permission=("read", "cloud_endpoint"),
     module="integrations.cloud",
     description=(
         "List configured public-cloud accounts (AWS / Azure / GCP) that "
@@ -523,6 +556,7 @@ class ListOPNsenseTargetsArgs(BaseModel):
 
 @register_tool(
     name="list_opnsense_targets",
+    permission=("read", "opnsense_router"),
     module="integrations.opnsense",
     description=(
         "List configured OPNsense firewalls that SpatiumDDI mirrors "
@@ -584,6 +618,7 @@ class ListPanosTargetsArgs(BaseModel):
 
 @register_tool(
     name="list_panos_targets",
+    permission=("read", "panos_firewall"),
     module="integrations.paloalto",
     description=(
         "List configured Palo Alto PAN-OS / Panorama firewalls that "
@@ -685,6 +720,7 @@ _SOURCE_KIND_COL = {
 
 @register_tool(
     name="find_firewall_objects",
+    permission=("read", ("panos_firewall", "fortinet_firewall", "meraki_org")),
     description=(
         "List mirrored firewall address objects / groups from every configured "
         "firewall vendor (Palo Alto #605, Fortinet + Meraki #606) — the 'shadow "
@@ -760,6 +796,7 @@ class CountFirewallObjectsArgs(BaseModel):
 
 @register_tool(
     name="count_firewall_objects",
+    permission=("read", ("panos_firewall", "fortinet_firewall", "meraki_org")),
     description=(
         "Count mirrored firewall address objects across every vendor (Palo Alto "
         "#605, Fortinet + Meraki #606) grouped by kind, plus the number that "
@@ -813,6 +850,7 @@ class ListFortinetTargetsArgs(BaseModel):
 
 @register_tool(
     name="list_fortinet_targets",
+    permission=("read", "fortinet_firewall"),
     module="integrations.fortinet",
     description=(
         "List configured Fortinet FortiGate firewalls that SpatiumDDI mirrors "
@@ -871,6 +909,7 @@ class ListMerakiTargetsArgs(BaseModel):
 
 @register_tool(
     name="list_meraki_targets",
+    permission=("read", "meraki_org"),
     module="integrations.meraki",
     description=(
         "List configured Cisco Meraki organizations that SpatiumDDI mirrors into "
@@ -926,6 +965,7 @@ class ListFirewallFeedsArgs(BaseModel):
 
 @register_tool(
     name="list_firewall_feeds",
+    permission=("read", "firewall_feed"),
     module="security.firewall_feeds",
     description=(
         "List SpatiumDDI-hosted firewall block-list feeds (#606). A feed-polling "
@@ -958,3 +998,46 @@ async def list_firewall_feeds(
         }
         for f in rows
     ]
+
+
+# ── find_cross_space_integration_adoptions (#2577) ────────────────────
+
+
+class FindCrossSpaceAdoptionsArgs(BaseModel):
+    include_same_space: bool = Field(
+        default=False,
+        description=(
+            "Also list operator-origin rows an integration adopted inside its own "
+            "space (normal, documented adoption — not #2577 damage)."
+        ),
+    )
+    limit: int = Field(default=200, ge=1, le=1000)
+
+
+@register_tool(
+    name="find_cross_space_integration_adoptions",
+    permission="superadmin",
+    description=(
+        "Find IP address rows an integration mirror (UniFi, Docker, Kubernetes, "
+        "Proxmox, Tailscale, NetBird, Cloud, OPNsense, firewalls) took from "
+        "ANOTHER IP space on a build before the #2577 fix. Each row carries the "
+        "integration + target, the subnet/space it sits in now, the evidence "
+        "(operator_create_audit / created_before_target / outside_target_space / "
+        "dhcp_reservation_in_other_space / predates_its_space_subnets), "
+        "likely_cross_space (set only with evidence the row lived in another "
+        "space), needs_review (operator row whose address also exists in another "
+        "space but with no such evidence — may be a normal same-space adoption; "
+        "confirm before moving), and home_candidates: subnets in other spaces that "
+        "contain the address and whether the address is free there. Read-only; "
+        "the repair is manual (docs/TROUBLESHOOTING.md). Superadmin only."
+    ),
+    args_model=FindCrossSpaceAdoptionsArgs,
+    category="integrations",
+)
+async def find_cross_space_integration_adoptions(
+    db: AsyncSession, user: User, args: FindCrossSpaceAdoptionsArgs
+) -> list[dict[str, Any]]:
+    rows = await find_cross_space_adoptions(
+        db, include_same_space=args.include_same_space, limit=args.limit
+    )
+    return [suspect_to_dict(r) for r in rows]

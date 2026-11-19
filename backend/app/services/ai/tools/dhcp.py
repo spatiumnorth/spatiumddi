@@ -30,6 +30,7 @@ from app.models.dhcp_device_policy import DHCPDevicePolicy
 from app.models.dhcp_fingerprint import DHCPFingerprint
 from app.models.ipam import Subnet
 from app.models.metrics import DHCPMetricSample
+from app.services.agents.instance_ownership import duplicate_active as duplicate_agent_active
 from app.services.ai.tools.base import register_tool
 from app.services.dhcp.device_policy import compile_device_policy
 from app.services.dhcp.normalize import canonical_duid
@@ -43,9 +44,12 @@ class ListDHCPServersArgs(BaseModel):
 
 @register_tool(
     name="list_dhcp_servers",
+    permission=("read", "dhcp_server"),
     description=(
         "List DHCP servers (Kea / Windows DHCP). Each summary "
-        "includes name, group, driver, operational status, and HA state. "
+        "includes name, group, driver, operational status, HA state, and "
+        "whether two agent processes are polling as it at once "
+        "(``duplicate_agent``, a cloned VM or copied agent state dir). "
         "Kea HA covers DHCPv4 only: ha_state is the DHCPv4 daemon's state, "
         "and DHCPv6 scopes on an HA group are served by each member "
         "independently, with no lease coordination."
@@ -79,6 +83,10 @@ async def list_dhcp_servers(
             "driver": s.driver,
             "status": s.status,
             "ha_state": s.ha_state,
+            # #3143 — a second live agent process polls as this server and is
+            # being refused (the one the row's alert and chip read).
+            "duplicate_agent": duplicate_agent_active(s),
+            "duplicate_agent_ip": s.duplicate_agent_ip if duplicate_agent_active(s) else None,
         }
         for s in rows
     ]
@@ -95,6 +103,7 @@ class ListDHCPScopesArgs(BaseModel):
 
 @register_tool(
     name="list_dhcp_scopes",
+    permission=("read", "dhcp_scope"),
     description=(
         "List DHCP scopes (subnets where DHCP serves leases). Filter "
         "by server group or name / CIDR substring."
@@ -190,6 +199,7 @@ class FindDHCPLeasesArgs(BaseModel):
 
 @register_tool(
     name="find_dhcp_leases",
+    permission=("read", "dhcp_server"),
     description=(
         "Find DHCP leases. Filterable by server, scope, MAC, IP, DHCPv6 "
         "DUID, hostname substring, state, or fingerbank device class. "
@@ -281,6 +291,7 @@ class ListServerGroupsArgs(BaseModel):
 
 @register_tool(
     name="list_dhcp_server_groups",
+    permission=("read", "dhcp_server"),
     description=(
         "List DHCP server groups (logical bundles of Kea servers, "
         "with HA implicit when the group has ≥ 2 members). Each "
@@ -330,6 +341,9 @@ async def list_dhcp_server_groups(
                 "lease_cache_threshold": g.lease_cache_threshold,
                 "lease_cache_max_age": g.lease_cache_max_age,
                 "member_count": int(member_count or 0),
+                # Whether the group holds a Kea HA peer credential. The
+                # credential itself is never returned.
+                "ha_peer_credential_set": bool(g.ha_peer_credential_encrypted),
             }
         )
     return out
@@ -352,12 +366,16 @@ class ListDHCPPoolsArgs(BaseModel):
 
 @register_tool(
     name="list_dhcp_pools",
+    permission=("read", "dhcp_pool"),
     description=(
         "List DHCP pools — IP ranges within a scope, classified as "
         "dynamic (lease pool), excluded (skip during allocation), or "
         "reserved (operator-managed). Each row carries id, scope_id, "
         "name, start_ip + end_ip, pool_type, optional class_restriction, "
-        "lease_time_override, and any options_override. Use for "
+        "and any options_override. lease_time_override is a legacy field: "
+        "Kea has no per-pool lease time, so a pool always gets its scope's "
+        "lease_time and new values are refused; a non-null value is a stale "
+        "row that has no effect. Use for "
         "'what's the dynamic range in the corp scope?', 'show "
         "excluded ranges', or 'is the IoT pool restricted to a "
         "client class?'."
@@ -412,6 +430,7 @@ class ListDHCPStaticsArgs(BaseModel):
 
 @register_tool(
     name="list_dhcp_statics",
+    permission=("read", "dhcp_static"),
     description=(
         "List DHCP static reservations (MAC → IP). Filterable by "
         "scope, MAC, IP, or hostname substring. Each row carries id, "
@@ -469,6 +488,7 @@ class ListDHCPClientClassesArgs(BaseModel):
 
 @register_tool(
     name="list_dhcp_client_classes",
+    permission=("read", "dhcp_client_class"),
     description=(
         "List DHCP client classes — group-scoped expressions used "
         "for conditional option delivery. Each row carries id, "
@@ -498,6 +518,7 @@ async def list_dhcp_client_classes(
             "name": c.name,
             "match_expression": c.match_expression,
             "description": c.description,
+            "address_family": c.address_family,
             "options": c.options,
         }
         for c in rows
@@ -519,6 +540,7 @@ class ListDHCPOptionTemplatesArgs(BaseModel):
 
 @register_tool(
     name="list_dhcp_option_templates",
+    permission=("read", "dhcp_option_template"),
     description=(
         "List DHCP option templates — reusable named bundles of "
         "option-code → value pairs scoped per server group. Apply "
@@ -569,6 +591,7 @@ class ListPXEProfilesArgs(BaseModel):
 
 @register_tool(
     name="list_pxe_profiles",
+    permission=("read", "dhcp_scope"),
     description=(
         "List PXE / iPXE provisioning profiles — group-scoped, "
         "operator-pickable per scope via DHCPScope.pxe_profile_id. "
@@ -593,7 +616,9 @@ async def list_pxe_profiles(
     if args.search:
         stmt = stmt.where(func.lower(DHCPPXEProfile.name).like(f"%{args.search.lower()}%"))
     stmt = stmt.order_by(DHCPPXEProfile.name.asc()).limit(args.limit)
-    rows = (await db.execute(stmt)).scalars().all()
+    # ``matches`` is a joined-eager collection, so the rows need ``unique()``
+    # (#1911); without it any profile with a match raised InvalidRequestError.
+    rows = (await db.execute(stmt)).unique().scalars().all()
     return [
         {
             "id": str(p.id),
@@ -630,6 +655,7 @@ class ListPhoneProfilesArgs(BaseModel):
 
 @register_tool(
     name="list_phone_profiles",
+    permission=("read", "dhcp_scope"),
     description=(
         "List VoIP phone provisioning profiles — group-scoped, attached "
         "to scopes via the dhcp_phone_profile_scope join. Each row "
@@ -664,11 +690,14 @@ async def list_phone_profiles(
         return []
 
     # Roll up scope-attachment counts in one query rather than per-row.
+    # Counted through ``DHCPScope`` so the soft-delete filter leaves a scope
+    # in the Trash out, as the profile's own read does (#3448).
     counts_stmt = (
         select(
             DHCPPhoneProfileScope.profile_id,
-            func.count(DHCPPhoneProfileScope.scope_id),
+            func.count(DHCPScope.id),
         )
+        .join(DHCPScope, DHCPScope.id == DHCPPhoneProfileScope.scope_id)
         .where(DHCPPhoneProfileScope.profile_id.in_([p.id for p in rows]))
         .group_by(DHCPPhoneProfileScope.profile_id)
     )
@@ -716,6 +745,7 @@ class ListDHCPMACBlocksArgs(BaseModel):
 
 @register_tool(
     name="list_dhcp_mac_blocks",
+    permission=("read", "dhcp_mac_block"),
     description=(
         "List blocked MAC addresses — group-global, applies to "
         "every scope in the group. Each row carries id, group_id, "
@@ -768,6 +798,7 @@ class FindDHCPPoolOccupancyArgs(BaseModel):
 
 @register_tool(
     name="find_dhcp_pool_occupancy",
+    permission=("read", "dhcp_pool"),
     description=(
         "Live occupancy of dynamic DHCP pools — assigned vs total addresses, "
         "free count, and occupancy percent, computed from active leases inside "
@@ -851,6 +882,7 @@ class FindDHCPFailoverRelationshipsArgs(BaseModel):
 
 @register_tool(
     name="find_dhcp_failover_relationships",
+    permission=("read", "dhcp_server"),
     description=(
         "Windows DHCP failover relationships as each Windows server reports "
         "them (Get-DhcpServerv4Failover): name, mode (LoadBalance / "
@@ -920,6 +952,7 @@ class FindDHCPRespondersArgs(BaseModel):
 
 @register_tool(
     name="find_dhcp_responders",
+    permission=("read", "dhcp_server"),
     description=(
         "List DHCP servers the active rogue-detection probe has observed "
         "answering on managed segments (issue #370). Each row carries the "
@@ -968,6 +1001,7 @@ class FindDHCPServerStatsArgs(BaseModel):
 
 @register_tool(
     name="find_dhcp_server_stats",
+    permission=("read", "dhcp_server"),
     description=(
         "Summarize a DHCP server's recent traffic: active lease count and "
         "per-message-type totals (discover/offer/request/ack/nak/decline/"
@@ -975,10 +1009,13 @@ class FindDHCPServerStatsArgs(BaseModel):
         "window. Use for 'how busy is server X?' and 'is server X dropping "
         "packets?'. socket_drop counts packets the kernel dropped before the "
         "server could read them (its receive buffer filled — the node is "
-        "short of CPU); receive_drop counts packets the server read and then "
-        "discarded. Either may be null, meaning the agent did not measure it "
-        "(too old, or cannot read /proc/net/udp) — null is NOT zero, and must "
-        "not be reported as 'no packets were dropped'."
+        "short of CPU); queue_evicted counts DHCPv4 requests the server read "
+        "and then discarded from its full packet queue during a burst, which "
+        "no server-side counter records; receive_drop counts packets the "
+        "server read and then discarded. Any may be null, meaning the agent "
+        "did not measure it (too old, no raw-socket capability, a v6-only "
+        "server) — null is NOT zero, and must not be reported as 'no packets "
+        "were dropped'."
     ),
     args_model=FindDHCPServerStatsArgs,
     category="dhcp",
@@ -1025,6 +1062,7 @@ async def find_dhcp_server_stats(
                 # null rather than as a zero it would summarise as healthy.
                 func.sum(DHCPMetricSample.receive_drop).label("receive_drop"),
                 func.sum(DHCPMetricSample.socket_drop).label("socket_drop"),
+                func.sum(DHCPMetricSample.queue_evicted).label("queue_evicted"),
             )
             .where(DHCPMetricSample.server_id == sid)
             .where(DHCPMetricSample.bucket_at >= since)
@@ -1057,13 +1095,22 @@ async def find_dhcp_server_stats(
             "socket_drop": (
                 None if totals_row.socket_drop is None else int(totals_row.socket_drop)
             ),
+            # #2889 — its own null: measured independently of socket_drop
+            # (it needs a raw socket and a kea-dhcp4), so ``measured`` above
+            # does not vouch for it.
+            "queue_evicted": (
+                None if totals_row.queue_evicted is None else int(totals_row.queue_evicted)
+            ),
             "receive_drop": (
                 None if totals_row.receive_drop is None else int(totals_row.receive_drop)
             ),
             "measured": totals_row.socket_drop is not None,
             "note": (
-                "socket_drop is lost traffic; receive_drop also counts deliberate "
-                "drops (blocklisted MAC, HA out-of-scope) and is not by itself a fault"
+                "socket_drop and queue_evicted are lost traffic (the kernel "
+                "dropped it before the server read it; the server read it and "
+                "its full queue evicted it). receive_drop also counts deliberate "
+                "drops (blocklisted MAC, HA out-of-scope) and is not by itself a "
+                "fault"
             ),
         },
     }
@@ -1088,6 +1135,7 @@ class FindDHCPLeaseHistoryArgs(BaseModel):
 
 @register_tool(
     name="find_dhcp_lease_history",
+    permission=("read", "dhcp_server"),
     description=(
         "Expired / released DHCP leases across every server — 'has this MAC "
         "EVER had a lease here?', which find_dhcp_leases cannot answer "
@@ -1165,6 +1213,7 @@ class ListDevicePoliciesArgs(BaseModel):
 
 @register_tool(
     name="find_dhcp_device_policies",
+    permission=("read", "dhcp_client_class"),
     description=(
         "List fingerprint-driven DHCP device policies (issue #700) — the rules "
         "that give devices of a given fingerbank class (Printer, IoT, game "
@@ -1211,6 +1260,7 @@ class PreviewDevicePolicyArgs(BaseModel):
 
 @register_tool(
     name="preview_dhcp_device_policy",
+    permission=("read", "dhcp_client_class"),
     description=(
         "Compile one fingerprint-driven DHCP device policy and report exactly "
         "what it matches: the Kea expression, how many observed signatures went "

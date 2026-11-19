@@ -1,7 +1,10 @@
 import { useMemo, useState } from "react";
+import { FormError } from "@/components/ui/form-error";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Pencil, Plus, Trash2 } from "lucide-react";
 import {
+  formatApiError,
+  formatDialogError,
   groupsApi,
   rolesApi,
   usersApi,
@@ -11,9 +14,14 @@ import {
   type InternalGroupCreate,
   type InternalGroupUpdate,
 } from "@/lib/api";
+import { apiErrorStatus } from "@/lib/refusal";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { ListReadError } from "@/components/ui/list-read-error";
+import { StepUpSection } from "@/components/StepUpSection";
+import { isStepUpRequired, stepUpBody } from "@/lib/stepup";
 import { TimeBoundGrantsPanel } from "./TimeBoundGrantsPanel";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -42,6 +50,8 @@ function MultiPicker<T extends { id: string }>({
   labelFor,
   secondaryFor,
   placeholder = "No items",
+  readError,
+  what = "items",
 }: {
   items: T[] | undefined;
   selected: string[];
@@ -49,6 +59,9 @@ function MultiPicker<T extends { id: string }>({
   labelFor: (item: T) => string;
   secondaryFor?: (item: T) => string | null;
   placeholder?: string;
+  /** The list's read failed (a 403, say): say so, never "No users" (#2437). */
+  readError?: unknown;
+  what?: string;
 }) {
   const [filter, setFilter] = useState("");
   const filtered = useMemo(() => {
@@ -75,7 +88,11 @@ function MultiPicker<T extends { id: string }>({
         onChange={(e) => setFilter(e.target.value)}
       />
       <div className="max-h-52 overflow-y-auto rounded-md border">
-        {filtered.length === 0 ? (
+        {readError != null && !items ? (
+          <p className="p-3 text-xs">
+            <ListReadError error={readError} what={what} />
+          </p>
+        ) : filtered.length === 0 ? (
           <p className="p-3 text-xs text-muted-foreground">{placeholder}</p>
         ) : (
           filtered.map((item) => {
@@ -115,11 +132,15 @@ function GroupModal({
   group,
   roles,
   users,
+  rolesError,
+  usersError,
   onClose,
 }: {
   group: InternalGroup | null;
-  roles: AppRole[];
-  users: AppUser[];
+  roles: AppRole[] | undefined;
+  users: AppUser[] | undefined;
+  rolesError?: unknown;
+  usersError?: unknown;
   onClose: () => void;
 }) {
   const qc = useQueryClient();
@@ -128,6 +149,11 @@ function GroupModal({
   const [roleIds, setRoleIds] = useState<string[]>(group?.role_ids ?? []);
   const [userIds, setUserIds] = useState<string[]>(group?.user_ids ?? []);
   const [error, setError] = useState<string | null>(null);
+  // #1412 — shown once the server says this change makes someone a
+  // superadmin; the dialog cannot work that out itself.
+  const [needsStepUp, setNeedsStepUp] = useState(false);
+  const [stepPassword, setStepPassword] = useState("");
+  const [stepTotp, setStepTotp] = useState("");
 
   const mutation = useMutation({
     mutationFn: () => {
@@ -136,6 +162,7 @@ function GroupModal({
         description,
         role_ids: roleIds,
         user_ids: userIds,
+        ...(needsStepUp ? stepUpBody(stepPassword, stepTotp) : {}),
       };
       return group
         ? groupsApi.update(group.id, payload as InternalGroupUpdate)
@@ -146,10 +173,12 @@ function GroupModal({
       onClose();
     },
     onError: (err: unknown) => {
-      const msg =
-        (err as { response?: { data?: { detail?: unknown } } })?.response?.data
-          ?.detail ?? "Failed to save group";
-      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      if (isStepUpRequired(err)) {
+        setNeedsStepUp(true);
+        setError(null);
+        return;
+      }
+      setError(formatDialogError(err, "Failed to save group"));
     },
   });
 
@@ -190,6 +219,8 @@ function GroupModal({
               labelFor={(r) => r.name}
               secondaryFor={(r) => (r.is_builtin ? "built-in" : null)}
               placeholder="No roles defined"
+              readError={rolesError}
+              what="roles"
             />
           </div>
           <div>
@@ -203,11 +234,22 @@ function GroupModal({
               labelFor={(u) => u.username}
               secondaryFor={(u) => u.display_name}
               placeholder="No users"
+              readError={usersError}
+              what="users"
             />
           </div>
         </div>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {needsStepUp && (
+          <StepUpSection
+            reason="This change makes one or more members superadmins. Confirm it's you to save it."
+            password={stepPassword}
+            onPassword={setStepPassword}
+            totp={stepTotp}
+            onTotp={setStepTotp}
+          />
+        )}
+        <FormError>{error}</FormError>
         <div className="flex justify-end gap-2 pt-2">
           <button
             onClick={onClose}
@@ -220,7 +262,11 @@ function GroupModal({
               setError(null);
               mutation.mutate();
             }}
-            disabled={!name || mutation.isPending}
+            disabled={
+              !name ||
+              mutation.isPending ||
+              (needsStepUp && !stepPassword && !stepTotp)
+            }
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {mutation.isPending ? "Saving…" : "Save"}
@@ -253,6 +299,14 @@ function DeleteModal({
       qc.invalidateQueries({ queryKey: ["groups"] });
       onClose();
     },
+    // 404: already gone (another tab or admin), which is what was asked for,
+    // so refresh the list and close. Any other refusal is shown (#2436).
+    onError: (err: unknown) => {
+      if (apiErrorStatus(err) === 404) {
+        qc.invalidateQueries({ queryKey: ["groups"] });
+        onClose();
+      }
+    },
   });
   return (
     <Modal title="Delete Group" onClose={onClose}>
@@ -262,6 +316,11 @@ function DeleteModal({
           ? Users will lose any permissions carried by this group's roles. This
           cannot be undone.
         </p>
+        {mutation.isError && apiErrorStatus(mutation.error) !== 404 && (
+          <FormError className="text-xs text-destructive">
+            {formatApiError(mutation.error)}
+          </FormError>
+        )}
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}
@@ -283,6 +342,13 @@ function DeleteModal({
 }
 
 export function GroupsPage() {
+  // #1341 — a read-only user is offered no write it would be refused:
+  // the router asks admin on 'group'.
+  const perms = usePermissions();
+  const adminGate = permissionGate(
+    perms.can("admin", "group"),
+    "Requires admin permission on groups",
+  );
   const [showCreate, setShowCreate] = useState(false);
   const [editGroup, setEditGroup] = useState<InternalGroup | null>(null);
   const [deleteGroup, setDeleteGroup] = useState<InternalGroup | null>(null);
@@ -291,11 +357,11 @@ export function GroupsPage() {
     queryKey: ["groups"],
     queryFn: groupsApi.list,
   });
-  const { data: roles } = useQuery({
+  const { data: roles, error: rolesError } = useQuery({
     queryKey: ["roles"],
     queryFn: rolesApi.list,
   });
-  const { data: users } = useQuery({
+  const { data: users, error: usersError } = useQuery({
     queryKey: ["users"],
     queryFn: usersApi.list,
   });
@@ -322,7 +388,8 @@ export function GroupsPage() {
           </div>
           <button
             onClick={() => setShowCreate(true)}
-            className="flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+            className="flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+            {...adminGate}
           >
             <Plus className="h-3.5 w-3.5" />
             New Group
@@ -389,15 +456,19 @@ export function GroupsPage() {
                     <div className="flex items-center justify-end gap-1">
                       <button
                         onClick={() => setEditGroup(group)}
-                        className="rounded p-1 text-muted-foreground hover:text-foreground"
+                        className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                         title="Edit"
+                        aria-label="Edit"
+                        {...adminGate}
                       >
                         <Pencil className="h-3.5 w-3.5" />
                       </button>
                       <button
                         onClick={() => setDeleteGroup(group)}
-                        className="rounded p-1 text-muted-foreground hover:text-destructive"
+                        className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                         title="Delete"
+                        aria-label="Delete"
+                        {...adminGate}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>
@@ -413,16 +484,20 @@ export function GroupsPage() {
       {showCreate && (
         <GroupModal
           group={null}
-          roles={roles ?? []}
-          users={users ?? []}
+          roles={roles}
+          users={users}
+          rolesError={rolesError}
+          usersError={usersError}
           onClose={() => setShowCreate(false)}
         />
       )}
       {editGroup && (
         <GroupModal
           group={editGroup}
-          roles={roles ?? []}
-          users={users ?? []}
+          roles={roles}
+          users={users}
+          rolesError={rolesError}
+          usersError={usersError}
           onClose={() => setEditGroup(null)}
         />
       )}

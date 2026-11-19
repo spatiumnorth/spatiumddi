@@ -17,15 +17,19 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
-from app.api.v1._common import StatusResponse
+from app.api.v1._common import StatusResponse, add_trigger_audit
+from app.core.celery_dispatch import dispatch
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
+from app.core.exc_text import describe_exc
 from app.core.permissions import require_resource_permission
 from app.core.ssrf import assert_safe_target
+from app.core.stored_secret_guard import require_secret_with_destination_change
 from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace
 from app.models.opnsense import OPNsenseRouter
+from app.services.integration_ownership import release_integration_rows
 
 router = APIRouter(
     tags=["opnsense"],
@@ -256,8 +260,10 @@ async def _probe(
         return TestConnectionResponse(
             ok=False, message=f"HTTP {exc.response.status_code} from OPNsense"
         )
-    except httpx.ConnectError as exc:
-        return TestConnectionResponse(ok=False, message=f"Could not reach OPNsense: {exc}")
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        return TestConnectionResponse(
+            ok=False, message=f"Could not reach OPNsense: {describe_exc(exc)}"
+        )
     except ssl.SSLError as exc:
         return TestConnectionResponse(
             ok=False,
@@ -267,7 +273,7 @@ async def _probe(
             ),
         )
     except Exception as exc:  # noqa: BLE001
-        return TestConnectionResponse(ok=False, message=str(exc))
+        return TestConnectionResponse(ok=False, message=describe_exc(exc))
 
 
 async def _validate_bindings(
@@ -370,6 +376,12 @@ async def update_router(
         raise HTTPException(status_code=404, detail="OPNsense firewall not found")
 
     changes = body.model_dump(exclude_unset=True)
+    require_secret_with_destination_change(
+        r,
+        changes,
+        destination=["host", "port"],
+        secrets={"api_secret": r.api_secret_encrypted},
+    )
     new_ipam = changes.get("ipam_space_id", r.ipam_space_id)
     new_dns = changes.get("dns_group_id", r.dns_group_id)
     if "ipam_space_id" in changes or "dns_group_id" in changes:
@@ -397,10 +409,23 @@ async def update_router(
 
 
 @router.delete("/routers/{router_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_router(router_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
+async def delete_router(
+    router_id: uuid.UUID, db: DB, user: SuperAdmin, force: bool = False
+) -> None:
     r = await db.get(OPNsenseRouter, router_id)
     if r is None:
         raise HTTPException(status_code=404, detail="OPNsense firewall not found")
+    from app.services.block_sync.delete_guard import (  # noqa: PLC0415
+        assert_block_sync_deletable,
+    )
+
+    await assert_block_sync_deletable(
+        db,
+        target_kind="opnsense",
+        target_id=r.id,
+        armed=r.block_sync_enabled,
+        force=force,
+    )
     # #601 — sweep any active block-sync push rows for this target. They have no
     # FK to opnsense_router (target_id is polymorphic), so nothing cascades.
     # NOTE: this does NOT lift the blocks off the firewall — disarm the target
@@ -416,6 +441,11 @@ async def delete_router(router_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
         )
     )
     _audit(db, user=user, action="delete", router_id=r.id, router_name=r.name)
+    # #2287 — hand back operator-made rows in mirrored subnets / blocks before
+    # the FK cascade can destroy them.
+    await release_integration_rows(
+        db, own_fk="opnsense_router_id", target_id=r.id, user=user, target_name=r.name
+    )
     await db.delete(r)
     await db.commit()
 
@@ -424,15 +454,25 @@ async def delete_router(router_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     "/routers/{router_id}/sync",
     status_code=status.HTTP_202_ACCEPTED,
 )
-async def sync_router(router_id: uuid.UUID, db: DB, _: SuperAdmin) -> StatusResponse:
+async def sync_router(router_id: uuid.UUID, db: DB, user: SuperAdmin) -> StatusResponse:
     r = await db.get(OPNsenseRouter, router_id)
     if r is None:
         raise HTTPException(status_code=404, detail="OPNsense firewall not found")
 
+    add_trigger_audit(
+        db,
+        user,
+        resource_type="opnsense_router",
+        resource_id=r.id,
+        resource_display=str(getattr(r, "name", None) or r.id),
+        action="sync",
+    )
+    await db.commit()
+
     from app.tasks.opnsense_sync import sync_router_now  # noqa: PLC0415
 
     try:
-        result = sync_router_now.delay(str(r.id))
+        result = await dispatch(sync_router_now, str(r.id))
         return StatusResponse(status="queued", task_id=result.id)
     except Exception:  # noqa: BLE001
         return StatusResponse(status="broker_unavailable", task_id="")

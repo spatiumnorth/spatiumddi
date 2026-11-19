@@ -13,10 +13,12 @@ two-person approval workflow (covered by ``test_approval_workflows.py``):
   router's coarse gate via a scoped ``{delete, address_set, <id>}`` grant
   (#103) must be able to soft-delete inline WITHOUT the factored ``apply()``
   403/500-ing on a permission re-check it shouldn't run.
-* **#8 — approve-path superadmin parity.** ``delete_zone`` / ``delete_scope``
-  / ``delete_group`` were fully ``SuperAdmin``-gated at the route, so their
-  ``apply()`` must require superadmin ALWAYS — the approve path (which
-  bypasses the route's dependency) relies on this.
+* **#8 — approve-path superadmin parity.** ``apply()`` must require
+  superadmin exactly where the route does — the approve path (which
+  bypasses the route's dependency) relies on this. ``delete_group`` is still
+  fully ``SuperAdmin``-gated, so its ``apply()`` requires superadmin ALWAYS;
+  ``delete_zone`` / ``delete_scope`` take the resource's ``delete`` since
+  #1861, so theirs require superadmin on the ``permanent`` branch only.
 * **#5 — fail-closed on a deleted requester.** When ``requested_by_user_id``
   is NULL (requester deleted), approval is REFUSED (409), not fail-open.
 * **#4 — non-gateable policy rejected.** Creating an approval policy with an
@@ -151,9 +153,14 @@ async def test_scoped_delegate_inline_delete_no_500(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     """A delegate the IPAM router gate admits via a scoped {delete,
-    address_set, <id>} grant (#103) can soft-delete inline — the factored
-    apply() must NOT run enforce_operation_permission (which would 403/500 a
-    delegate lacking the type-level {delete, subnet})."""
+    address_set, <id>} grant (#103) must get a clean 403 on a subnet delete,
+    never a 500 from the factored apply()'s permission re-check.
+
+    This used to assert 204: the inline soft-delete ran for a delegate with
+    no {delete, subnet} grant at all, which is the cross-type escalation
+    GHSA-6g57-4vj6-87mv closes. The per-type gate now refuses it before
+    apply() runs, so the 500 this test was written against can't occur
+    either."""
     await _enable_module(db_session, enabled=False)
     subnet = await _subnet(db_session)
     # ONLY an instance-scoped address_set delete grant — no {delete, subnet}.
@@ -170,55 +177,58 @@ async def test_scoped_delegate_inline_delete_no_500(
     )
 
     r = await client.delete(f"/api/v1/ipam/subnets/{subnet.id}", headers=_auth(token))
-    # Must not 500 (perm re-check) and must not 403 — the coarse gate admitted
-    # the delegate and the inline soft-delete runs.
-    assert r.status_code == 204, r.text
+    assert r.status_code == 403, r.text
+    assert "delete" in r.json()["detail"] and "subnet" in r.json()["detail"]
     await db_session.refresh(subnet)
-    assert subnet.deleted_at is not None
+    assert subnet.deleted_at is None
 
 
-# ── #8: apply() requires superadmin ALWAYS for zone / scope / group ────────────
+# ── #8: apply() requires superadmin where the route does ───────────────────────
 
 
 @pytest.mark.asyncio
-async def test_delete_zone_apply_requires_superadmin(db_session: AsyncSession) -> None:
-    """delete_zone.apply() raises 403 for a non-superadmin — the route was
-    fully SuperAdmin-gated, so the approve path (which bypasses the route's
-    SuperAdmin dependency) must enforce it inside apply() (#8). The superadmin
-    check runs before the zone lookup, so random ids suffice."""
+@pytest.mark.parametrize("permanent,status", [(True, 403), (False, 404)])
+async def test_delete_zone_apply_requires_superadmin_only_when_permanent(
+    db_session: AsyncSession, permanent: bool, status: int
+) -> None:
+    """delete_zone.apply() refuses a non-superadmin the permanent branch (#8),
+    checked before the zone lookup; the default soft-delete takes ``delete``
+    on ``dns_zone`` since #1861, so it reaches the lookup and 404s on a
+    random id instead."""
     from fastapi import HTTPException
 
     from app.services.ai.operations_risky import DeleteZoneArgs, _apply_delete_zone
 
     nonadmin, _ = await _user(
         db_session,
-        name="zone-editor",
+        name=f"zone-editor-{permanent}",
         permissions=[{"action": "delete", "resource_type": "dns_zone"}],
     )
-    args = DeleteZoneArgs(group_id=uuid.uuid4(), zone_id=uuid.uuid4(), permanent=False)
+    args = DeleteZoneArgs(group_id=uuid.uuid4(), zone_id=uuid.uuid4(), permanent=permanent)
     with pytest.raises(HTTPException) as ei:
         await _apply_delete_zone(db_session, nonadmin, args)
-    assert ei.value.status_code == 403
+    assert ei.value.status_code == status
 
 
 @pytest.mark.asyncio
-async def test_delete_scope_apply_requires_superadmin(db_session: AsyncSession) -> None:
-    """delete_scope.apply() requires superadmin always (#8)."""
+@pytest.mark.parametrize("permanent,status", [(True, 403), (False, 404)])
+async def test_delete_scope_apply_requires_superadmin_only_when_permanent(
+    db_session: AsyncSession, permanent: bool, status: int
+) -> None:
+    """delete_scope.apply(): superadmin on the permanent branch only (#8, #1861)."""
     from fastapi import HTTPException
 
     from app.services.ai.operations_risky import DeleteScopeArgs, _apply_delete_scope
 
     nonadmin, _ = await _user(
         db_session,
-        name="scope-editor",
+        name=f"scope-editor-{permanent}",
         permissions=[{"action": "delete", "resource_type": "dhcp_scope"}],
     )
-    # Missing scope would 404 — but superadmin is checked first, so a
-    # non-superadmin gets 403 before the lookup.
-    args = DeleteScopeArgs(scope_id=uuid.uuid4(), permanent=False)
+    args = DeleteScopeArgs(scope_id=uuid.uuid4(), permanent=permanent)
     with pytest.raises(HTTPException) as ei:
         await _apply_delete_scope(db_session, nonadmin, args)
-    assert ei.value.status_code == 403
+    assert ei.value.status_code == status
 
 
 @pytest.mark.asyncio
@@ -451,6 +461,52 @@ async def test_read_only_user_404_on_another_users_request(
 
     r = await client.get(f"/api/v1/change-requests/{theirs.id}", headers=_auth(rtok))
     assert r.status_code == 404, r.text
+
+
+@pytest.mark.asyncio
+async def test_requester_without_read_grant_sees_own_requests_only(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#1863: an editor whose write a policy queued holds no
+    ``read,change_request`` (only Change Approver does) and must still see the
+    request it made — list, ``?mine=true`` and get/{id} — and nobody else's."""
+    await _enable_module(db_session)
+    subnet_a = await _subnet(db_session, "10.23.1.0/24")
+    subnet_b = await _subnet(db_session, "10.23.2.0/24")
+    editor, etok = await _user(
+        db_session,
+        name="editor",
+        permissions=[{"action": "delete", "resource_type": "subnet"}],
+    )
+    other, _ = await _user(db_session, name="other3")
+    mine = await _pending_cr(db_session, subnet_a, editor, display="mine")
+    theirs = await _pending_cr(db_session, subnet_b, other, display="theirs")
+    # The editor's own self-service portal row (#696) shares the table; the
+    # gate queue must not serve it, grant or no grant.
+    portal = await _pending_cr(db_session, subnet_a, editor, display="portal")
+    portal.origin = "portal"
+    await db_session.commit()
+
+    # No query parameter widens the own-rows scope: not ``mine=false``, not a
+    # filter that matches the other user's row too.
+    for url in (
+        "/api/v1/change-requests",
+        "/api/v1/change-requests?mine=true",
+        "/api/v1/change-requests?mine=false",
+        "/api/v1/change-requests?state=pending&resource_type=subnet",
+        "/api/v1/change-requests?limit=500&offset=0",
+    ):
+        r = await client.get(url, headers=_auth(etok))
+        assert r.status_code == 200, (url, r.text)
+        ids = {row["id"] for row in r.json()}
+        assert ids == {str(mine.id)}, url
+
+    r = await client.get(f"/api/v1/change-requests/{mine.id}", headers=_auth(etok))
+    assert r.status_code == 200, r.text
+    assert r.json()["preview_text"] == "Soft-delete subnet (mine)"
+    for cr_id in (theirs.id, portal.id):
+        r = await client.get(f"/api/v1/change-requests/{cr_id}", headers=_auth(etok))
+        assert r.status_code == 404, (cr_id, r.text)
 
 
 @pytest.mark.asyncio

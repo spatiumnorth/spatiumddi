@@ -17,6 +17,10 @@ import {
   type ApplianceSelfTestReport,
   formatApiError,
 } from "@/lib/api";
+import {
+  NEEDS_APPLIANCE_ADMIN_FOR_LOGS,
+  useCanReadApplianceLogs,
+} from "@/hooks/useApplianceAdmin";
 
 /**
  * Logs & Diagnostics (Phase 4e, rewritten as Phase 11 wave 4).
@@ -33,6 +37,9 @@ import {
  *    redacted env.
  */
 export function LogsTab() {
+  // Host log text and the diagnostic bundle both take `admin` on
+  // `appliance`; a read-only role keeps the self-test only.
+  const canReadLogs = useCanReadApplianceLogs();
   return (
     <div className="mx-auto max-w-4xl space-y-4">
       <div>
@@ -47,8 +54,16 @@ export function LogsTab() {
       </div>
 
       <SelfTestCard />
-      <LogViewerCard />
-      <DiagnosticBundleCard />
+      {canReadLogs ? (
+        <>
+          <LogViewerCard />
+          <DiagnosticBundleCard />
+        </>
+      ) : (
+        <p className="rounded-lg border border-dashed bg-muted/30 px-4 py-3 text-xs text-muted-foreground">
+          {NEEDS_APPLIANCE_ADMIN_FOR_LOGS}.
+        </p>
+      )}
     </div>
   );
 }
@@ -224,6 +239,19 @@ function LogViewerCard() {
 // ── Diagnostic bundle card ──────────────────────────────────────────
 
 function DiagnosticBundleCard() {
+  const download = useMutation({
+    mutationFn: applianceDiagnosticsApi.downloadBundle,
+    onSuccess: ({ blob, filename }) => {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    },
+  });
   return (
     <section className="rounded-lg border bg-card p-4 shadow-sm">
       <div className="flex items-start justify-between gap-3">
@@ -235,18 +263,27 @@ function DiagnosticBundleCard() {
           <p className="mt-0.5 text-[11px] text-muted-foreground">
             One-click zip of host logs, per-pod log tails (last 500 lines each
             via kubeapi), system info, and a redacted env dump. Useful for
-            support tickets. Secrets (passwords, tokens, keys) are stripped
-            before bundling.
+            support tickets. Environment values are kept only for known
+            non-secret settings, and logs are swept for credential-shaped values
+            (keys, tokens, passwords in URLs). The log sweep is best effort, so
+            review the bundle before sharing it.
           </p>
         </div>
-        <a
-          href={applianceDiagnosticsApi.bundleUrl()}
-          className="inline-flex shrink-0 items-center gap-1 rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-accent"
+        <button
+          type="button"
+          onClick={() => download.mutate()}
+          disabled={download.isPending}
+          className="inline-flex shrink-0 items-center gap-1 rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-accent disabled:opacity-60"
         >
           <Download className="h-3.5 w-3.5" />
-          Download bundle
-        </a>
+          {download.isPending ? "Building bundle…" : "Download bundle"}
+        </button>
       </div>
+      {download.isError && (
+        <p role="alert" className="mt-2 text-xs text-destructive">
+          {formatApiError(download.error, "Download failed")}
+        </p>
+      )}
     </section>
   );
 }

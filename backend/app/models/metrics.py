@@ -81,6 +81,16 @@ class DHCPMetricSample(Base):
     # rather than folding it to zero.
     receive_drop: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     socket_drop: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # #2889 — DHCPv4 requests Kea read and then evicted from its
+    # multi-threading packet queue when a burst outran its worker. Kea keeps
+    # no statistic for it, and neither counter above moves: ``socket_drop``
+    # is before Kea reads, ``receive_drop`` is the worker, after the queue.
+    # The agent derives it — kernel-counted arrivals at Kea's intake, less
+    # the DHCPv4 share of ``socket_drop``, less ``pkt4-received``. Loss
+    # exactly like ``socket_drop``, and NULL means unmeasured exactly like
+    # it: an agent without ``CAP_NET_RAW``, a v6-only server, the bucket in
+    # which its counting socket reopened, or an agent older than this change.
+    queue_evicted: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
 
 __all__ = ["DNSMetricSample", "DHCPMetricSample"]

@@ -1,8 +1,9 @@
 import { useState, type FormEvent } from "react";
-import { useNavigate } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { isAxiosError } from "axios";
 import { authApi } from "@/lib/api";
+import { setMustChangePassword } from "@/lib/authToken";
 import { evaluatePolicy, parsePasswordError } from "@/lib/password-policy";
 import { cn } from "@/lib/utils";
 import { PasswordInput } from "@/components/ui/password-input";
@@ -11,6 +12,10 @@ const GENERIC_FAILURE = "Failed to change password — try again.";
 
 export function ChangePasswordPage() {
   const navigate = useNavigate();
+  // Account's "Change password…" link says the change is the user's own
+  // choice; a forced change arrives by redirect with no such state (#2441).
+  const voluntary =
+    (useLocation().state as { voluntary?: boolean } | null)?.voluntary === true;
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -60,6 +65,7 @@ export function ChangePasswordPage() {
     setLoading(true);
     try {
       await authApi.changePassword(currentPassword, newPassword);
+      setMustChangePassword(false);
       navigate("/dashboard");
     } catch (err) {
       // Three shapes reach here: the policy / history 400's
@@ -88,7 +94,9 @@ export function ChangePasswordPage() {
         <div className="space-y-1 text-center">
           <h1 className="text-2xl font-bold tracking-tight">Change Password</h1>
           <p className="text-sm text-muted-foreground">
-            You must set a new password before continuing.
+            {voluntary
+              ? "Choose a new password for this account."
+              : "You must set a new password before continuing."}
           </p>
         </div>
         <form onSubmit={handleSubmit} className="space-y-4">
@@ -148,6 +156,14 @@ export function ChangePasswordPage() {
           >
             {loading ? "Updating…" : "Set New Password"}
           </button>
+          {voluntary && (
+            <Link
+              to="/account"
+              className="block w-full rounded-md border px-4 py-2 text-center text-sm hover:bg-muted"
+            >
+              Cancel
+            </Link>
+          )}
         </form>
       </div>
     </div>

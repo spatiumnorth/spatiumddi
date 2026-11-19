@@ -1,5 +1,5 @@
 SpatiumDDI
-Copyright 2024 SpatiumDDI Contributors
+Copyright 2026 Spatium North Inc.
 
 This product bundles, ships, or integrates with the following open source
 components. Grouped by role; license + project URL for each.
@@ -52,6 +52,10 @@ Where the two disagree about a license, THIS file is authoritative.
 - Helm — Apache 2.0 — https://helm.sh
 - MetalLB (L2 load balancer / control-plane VIP) — Apache 2.0 — https://metallb.io
 - FRRouting (BGP daemon, via MetalLB's frr-k8s backend) — GPL v2 — https://frrouting.org
+- frr-k8s (MetalLB's BGP backend; only with BGP mode enabled) — Apache 2.0 —
+  https://github.com/metallb/frr-k8s
+- kube-rbac-proxy (frr-k8s metrics sidecar; only with BGP mode enabled) —
+  Apache 2.0 — https://github.com/brancz/kube-rbac-proxy
 - CloudNativePG (PostgreSQL operator) — Apache 2.0 — https://cloudnative-pg.io
 - Patroni (bare-metal HA Postgres overlay) — MIT — https://github.com/patroni/patroni
 - HAProxy (Patroni HA overlay) — GPL v2 (+ LGPL exception for libs) —
@@ -79,6 +83,7 @@ Where the two disagree about a license, THIS file is authoritative.
 - node (frontend build stage) — MIT — https://nodejs.org
 - ASP.NET Core runtime (Technitium agent image) — MIT — https://dotnet.microsoft.com
 - tini — MIT — https://github.com/krallin/tini
+- jemalloc — BSD-2-Clause — https://jemalloc.net
 - su-exec — MIT — https://github.com/ncopa/su-exec
 - gosu — Apache 2.0 — https://github.com/tianon/gosu
 
@@ -115,8 +120,7 @@ Where the two disagree about a license, THIS file is authoritative.
 - structlog — MIT / Apache 2.0 — https://www.structlog.org
 - cryptography — Apache 2.0 / BSD 3-Clause — https://cryptography.io
 - pyOpenSSL (TLS cert chain capture) — Apache 2.0 — https://www.pyopenssl.org
-- python-jose (JWT) — MIT — https://github.com/mpdavis/python-jose
-- joserfc (OIDC ID-token validation, JWKS) — BSD 3-Clause — https://jose.authlib.org
+- joserfc (JWT issue + verify, OIDC ID-token validation, JWKS) — BSD 3-Clause — https://jose.authlib.org
 - bcrypt — Apache 2.0 — https://github.com/pyca/bcrypt
 - pyotp (TOTP) — MIT — https://github.com/pyauth/pyotp
 - python-multipart — Apache 2.0 — https://github.com/Kludex/python-multipart

@@ -35,6 +35,7 @@ surface of its own (non-negotiable #14).
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
@@ -47,7 +48,23 @@ from app.models.auth import User
 from app.models.influxdb import InfluxDBTarget
 from app.models.logs import DHCPLogEntry, DNSQueryLogEntry
 from app.models.metrics import DHCPMetricSample, DNSMetricSample
-from app.services.ai.tools.base import register_tool
+from app.services.ai.tools.base import register_tool, tool_permission_allows
+from app.services.logs.agent_logs import (
+    InvalidLogFilter,
+    LogScopeError,
+    resolve_dhcp_log_servers,
+    resolve_dns_log_servers,
+    search_dhcp_activity,
+    search_dns_queries,
+)
+
+# The agent fleet-health tools span three resource families; each kind is
+# shown only to a caller who can read that family on its own REST surface.
+_AGENT_KIND_PERMISSION: dict[str, tuple[str, tuple[str, ...]]] = {
+    "dns_server": ("read", ("dns_group",)),
+    "dhcp_server": ("read", ("dhcp_server",)),
+    "looking_glass_collector": ("read", ("bgp_lg_peer",)),
+}
 
 
 def _since_default(hours: float | None) -> datetime | None:
@@ -67,8 +84,15 @@ class QueryDNSQueryLogArgs(BaseModel):
     qtype: str | None = Field(
         default=None, description="Filter by record type (A, AAAA, MX, TXT, …)."
     )
-    client_ip: str | None = Field(default=None, description="Filter by client IP (exact match).")
+    client_ip: str | None = Field(
+        default=None, description="Client IP: whole address, CIDR, or leading part (e.g. 10.1.)."
+    )
     view: str | None = Field(default=None, description="Filter by DNS view (split-horizon name).")
+    server_id: uuid.UUID | None = Field(default=None, description="Only this DNS server.")
+    group_id: uuid.UUID | None = Field(
+        default=None,
+        description="Only the servers in this DNS server group. Omit both for every server.",
+    )
     since_hours: float | None = Field(
         default=24,
         description="Only include rows newer than N hours ago. None = no lower bound.",
@@ -79,6 +103,7 @@ class QueryDNSQueryLogArgs(BaseModel):
 
 @register_tool(
     name="query_dns_query_log",
+    permission=("read", "server"),
     description=(
         "Query the BIND9 query log (rows shipped by the DNS agent's "
         "QueryLogShipper). Filterable by qname substring, qtype, "
@@ -96,26 +121,33 @@ class QueryDNSQueryLogArgs(BaseModel):
 async def query_dns_query_log(
     db: AsyncSession, user: User, args: QueryDNSQueryLogArgs
 ) -> list[dict[str, Any]]:
-    stmt = select(DNSQueryLogEntry)
-    if args.qname_contains:
-        stmt = stmt.where(
-            func.lower(DNSQueryLogEntry.qname).like(f"%{args.qname_contains.lower()}%")
+    # One server resolution + row query for this tool, find_dns_queries and
+    # POST /logs/dns-queries (#2120), narrowed to what the caller may read.
+    try:
+        servers = await resolve_dns_log_servers(
+            db, user, server_id=args.server_id, group_id=args.group_id
         )
-    if args.qtype:
-        stmt = stmt.where(DNSQueryLogEntry.qtype == args.qtype.upper())
-    if args.client_ip:
-        stmt = stmt.where(DNSQueryLogEntry.client_ip == args.client_ip)
-    if args.view:
-        stmt = stmt.where(DNSQueryLogEntry.view == args.view)
-    cutoff = _since_default(args.since_hours)
-    if cutoff is not None:
-        stmt = stmt.where(DNSQueryLogEntry.ts >= cutoff)
-    stmt = stmt.order_by(desc(DNSQueryLogEntry.ts)).limit(args.limit)
-    rows = (await db.execute(stmt)).scalars().all()
+    except LogScopeError as exc:
+        return [{"result": exc.detail}]
+    names = {s.id: s.name for s in servers}
+    try:
+        rows = await search_dns_queries(
+            db,
+            list(names),
+            since=_since_default(args.since_hours),
+            qname_contains=args.qname_contains,
+            qtype=args.qtype,
+            client_ip=args.client_ip,
+            view=args.view,
+            limit=args.limit,
+        )
+    except InvalidLogFilter as exc:
+        return [{"result": exc.detail}]
     return [
         {
             "ts": r.ts.isoformat() if r.ts else None,
             "server_id": str(r.server_id) if r.server_id else None,
+            "server_name": names.get(r.server_id),
             "client_ip": str(r.client_ip) if r.client_ip else None,
             "client_port": r.client_port,
             "qname": r.qname,
@@ -140,9 +172,17 @@ class QueryDHCPActivityLogArgs(BaseModel):
         default=None, description="Filter by Kea log code (e.g. DHCP4_LEASE_ALLOC)."
     )
     mac_address: str | None = Field(
-        default=None, description="Filter by MAC address (exact match)."
+        default=None,
+        description="MAC: whole address or leading part, any separator (e.g. aa:bb or aabb).",
     )
-    ip_address: str | None = Field(default=None, description="Filter by IP address (exact match).")
+    ip_address: str | None = Field(
+        default=None, description="IP: whole address, CIDR, or leading part (e.g. 10.1.)."
+    )
+    server_id: uuid.UUID | None = Field(default=None, description="Only this DHCP server.")
+    group_id: uuid.UUID | None = Field(
+        default=None,
+        description="Only the servers in this DHCP server group. Omit both for every server.",
+    )
     since_hours: float | None = Field(
         default=24,
         description="Only include rows newer than N hours ago. None = no lower bound.",
@@ -153,6 +193,7 @@ class QueryDHCPActivityLogArgs(BaseModel):
 
 @register_tool(
     name="query_dhcp_activity_log",
+    permission=("read", "server"),
     description=(
         "Query the Kea DHCPv4 activity log (rows shipped by the DHCP "
         "agent's LogShipper). Filterable by severity, Kea log code, "
@@ -167,24 +208,31 @@ class QueryDHCPActivityLogArgs(BaseModel):
 async def query_dhcp_activity_log(
     db: AsyncSession, user: User, args: QueryDHCPActivityLogArgs
 ) -> list[dict[str, Any]]:
-    stmt = select(DHCPLogEntry)
-    if args.severity:
-        stmt = stmt.where(DHCPLogEntry.severity == args.severity.upper())
-    if args.code:
-        stmt = stmt.where(DHCPLogEntry.code == args.code)
-    if args.mac_address:
-        stmt = stmt.where(DHCPLogEntry.mac_address == args.mac_address)
-    if args.ip_address:
-        stmt = stmt.where(DHCPLogEntry.ip_address == args.ip_address)
-    cutoff = _since_default(args.since_hours)
-    if cutoff is not None:
-        stmt = stmt.where(DHCPLogEntry.ts >= cutoff)
-    stmt = stmt.order_by(desc(DHCPLogEntry.ts)).limit(args.limit)
-    rows = (await db.execute(stmt)).scalars().all()
+    try:
+        servers = await resolve_dhcp_log_servers(
+            db, user, server_id=args.server_id, group_id=args.group_id
+        )
+    except LogScopeError as exc:
+        return [{"result": exc.detail}]
+    names = {s.id: s.name for s in servers}
+    try:
+        rows = await search_dhcp_activity(
+            db,
+            list(names),
+            since=_since_default(args.since_hours),
+            severity=args.severity,
+            code=args.code,
+            mac_address=args.mac_address,
+            ip_address=args.ip_address,
+            limit=args.limit,
+        )
+    except InvalidLogFilter as exc:
+        return [{"result": exc.detail}]
     return [
         {
             "ts": r.ts.isoformat() if r.ts else None,
             "server_id": str(r.server_id) if r.server_id else None,
+            "server_name": names.get(r.server_id),
             "severity": r.severity,
             "code": r.code,
             "mac_address": str(r.mac_address) if r.mac_address else None,
@@ -205,6 +253,7 @@ class QueryLogsArgs(BaseModel):
 
 @register_tool(
     name="query_logs",
+    permission=("read", "server"),
     description=(
         "Inventory of agent-driven log sources available — DNS query "
         "log + DHCP activity log + audit log — with the row count "
@@ -275,6 +324,7 @@ class GetDNSQueryRateArgs(BaseModel):
 
 @register_tool(
     name="get_dns_query_rate",
+    permission=("read", "dns_group"),
     description=(
         "DNS query-rate timeseries from the ``dns_metric_sample`` "
         "table. Returns recent buckets with queries_total / noerror "
@@ -333,6 +383,7 @@ class GetDHCPLeaseRateArgs(BaseModel):
 
 @register_tool(
     name="get_dhcp_lease_rate",
+    permission=("read", "dhcp_server"),
     description=(
         "DHCP packet-rate timeseries from the ``dhcp_metric_sample`` "
         "table. Returns recent buckets with discover / offer / "
@@ -417,6 +468,8 @@ class GlobalSearchArgs(BaseModel):
 
 @register_tool(
     name="global_search",
+    honours_token_binding=True,
+    permission="authenticated",
     description=(
         "Cross-resource search across IPAM (IPs / subnets / blocks / "
         "spaces) and DNS (groups / zones / records). Same lookup the "
@@ -468,6 +521,7 @@ class FindAgentConfigFailuresArgs(BaseModel):
 
 @register_tool(
     name="find_agents_with_config_failures",
+    permission=("read", ("dns_group", "dhcp_server")),
     description=(
         "List DNS servers, DHCP servers and Looking Glass collectors whose "
         "agent could NOT apply the configuration the control plane sent, and "
@@ -486,7 +540,7 @@ class FindAgentConfigFailuresArgs(BaseModel):
 )
 async def find_agents_with_config_failures(
     db: AsyncSession,
-    user: User,  # noqa: ARG001 — read-only fleet health, same gate as the other ops tools
+    user: User,
     args: FindAgentConfigFailuresArgs,
 ) -> list[dict[str, Any]]:
     from app.models.bgp_looking_glass import LookingGlassCollector  # noqa: PLC0415
@@ -500,6 +554,8 @@ async def find_agents_with_config_failures(
         (DHCPServer, "dhcp_server"),
         (LookingGlassCollector, "looking_glass_collector"),
     ):
+        if not tool_permission_allows(user, _AGENT_KIND_PERMISSION[kind]):
+            continue
         stmt = select(model)
         if args.include_unreported:
             stmt = stmt.where(
@@ -545,6 +601,7 @@ class FindAgentSpoolBacklogArgs(BaseModel):
 
 @register_tool(
     name="find_agents_with_spool_backlog",
+    permission=("read", ("dns_group", "dhcp_server")),
     description=(
         "List DNS and DHCP servers whose agent is holding a backlog of pushes "
         "(query logs, DHCP activity, metrics, Kea lease events) that the "
@@ -562,7 +619,7 @@ class FindAgentSpoolBacklogArgs(BaseModel):
 )
 async def find_agents_with_spool_backlog(
     db: AsyncSession,
-    user: User,  # noqa: ARG001 — read-only fleet health, same gate as the other ops tools
+    user: User,
     args: FindAgentSpoolBacklogArgs,
 ) -> list[dict[str, Any]]:
     from app.models.dhcp import DHCPServer  # noqa: PLC0415
@@ -571,6 +628,8 @@ async def find_agents_with_spool_backlog(
 
     out: list[dict[str, Any]] = []
     for model, kind in ((DNSServer, "dns_server"), (DHCPServer, "dhcp_server")):
+        if not tool_permission_allows(user, _AGENT_KIND_PERMISSION[kind]):
+            continue
         rows = (
             (await db.execute(select(model).where(model.spool_status.is_not(None)))).scalars().all()
         )
@@ -625,12 +684,15 @@ class FindInfluxDBTargetsArgs(BaseModel):
 
 @register_tool(
     name="find_influxdb_targets",
+    permission="superadmin",
     description=(
         "List configured InfluxDB push-export targets and their delivery "
         "health. Each row carries name, version (v1 / v2 / v3), URL, the "
         "database or bucket written to, measurement prefix, push interval, "
-        "which metric families it carries, and the last push's timestamp, "
-        "point count and error. Use to answer 'is the Grafana export "
+        "which metric families it carries, last_push_at (the last ATTEMPT, "
+        "which moves on failure too), last_success_at (the last push the "
+        "destination accepted; null = never), the point count of that "
+        "success, and the last error. Use to answer 'is the Grafana export "
         "working?' or 'why did metrics stop arriving in InfluxDB?'. "
         "Read-only, superadmin-only, and never returns tokens or passwords "
         "— only whether one is on file."
@@ -690,6 +752,7 @@ async def find_influxdb_targets(
                 ],
                 "credential_on_file": bool(t.password_encrypted or t.token_encrypted),
                 "last_push_at": t.last_push_at.isoformat() if t.last_push_at else None,
+                "last_success_at": t.last_success_at.isoformat() if t.last_success_at else None,
                 "last_push_points": t.last_push_points,
                 "last_push_error": t.last_push_error,
             }

@@ -36,17 +36,20 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.celery_app import celery_app
 from app.config import settings
 from app.core.agent_wake import dns_group_channel, publish_wake
+from app.db import task_connect_args
 from app.drivers.dhcp import is_agentless
 from app.models.audit import AuditLog
 from app.models.dhcp import DHCPServer
 from app.models.settings import PlatformSettings
 from app.services.feature_modules import is_module_enabled
+from app.tasks._interval_gate import FAST_BEAT_JITTER_TOLERANCE, interval_skip
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -59,8 +62,13 @@ async def _run_pull() -> dict[str, Any]:
     from app.services.dhcp.pull_leases import (  # noqa: PLC0415
         pull_leases_from_server,
     )
+    from app.services.ipam.utilization import (  # noqa: PLC0415
+        recount_subnets_and_blocks,
+    )
 
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
     try:
@@ -77,18 +85,40 @@ async def _run_pull() -> dict[str, Any]:
             # Minimum 10 s — beat only ticks that often, and we don't want to
             # hammer the WinRM endpoint harder than that by accident.
             interval = timedelta(seconds=max(10, ps.dhcp_pull_leases_interval_seconds))
-            if ps.dhcp_pull_leases_last_run_at is not None:
-                elapsed = now - ps.dhcp_pull_leases_last_run_at
-                if elapsed < interval:
-                    return {
-                        "status": "skipped",
-                        "reason": "interval_not_elapsed",
-                        "wait_seconds": int((interval - elapsed).total_seconds()),
-                    }
+            skip = interval_skip(
+                now, ps.dhcp_pull_leases_last_run_at, interval, FAST_BEAT_JITTER_TOLERANCE
+            )
+            if skip is not None:
+                return skip
+
+            # #2262 — claim the interval BEFORE pulling, atomically. The stamp
+            # used to be written only at the end of the pass, so a pull slower
+            # than the 10 s beat tick was started again on every tick while it
+            # was still running. The conditional UPDATE makes exactly one of
+            # several concurrent ticks win; the per-server lock inside
+            # ``pull_leases_from_server`` covers the rest (a pass slower than
+            # the whole interval, and the manual Sync).
+            claimed = await db.execute(
+                update(PlatformSettings)
+                .where(
+                    PlatformSettings.id == _SINGLETON_ID,
+                    or_(
+                        PlatformSettings.dhcp_pull_leases_last_run_at.is_(None),
+                        PlatformSettings.dhcp_pull_leases_last_run_at <= now - interval,
+                    ),
+                )
+                .values(dhcp_pull_leases_last_run_at=now)
+                .execution_options(synchronize_session=False)
+            )
+            if claimed.rowcount == 0:
+                await db.rollback()
+                return {"status": "skipped", "reason": "already_claimed"}
+            await db.commit()
 
             servers = list((await db.execute(select(DHCPServer))).scalars().all())
 
             servers_scanned = 0
+            servers_busy = 0
             total_server_leases = 0
             total_imported = 0
             total_refreshed = 0
@@ -113,6 +143,7 @@ async def _run_pull() -> dict[str, Any]:
             # every tick of that week.
             warnings: list[str] = []
             wake_group_ids: set[str] = set()  # #428 — DNS groups to wake post-commit
+            touched_subnet_ids: set[Any] = set()  # #3345 — recounted before commit
 
             for server in servers:
                 if not is_agentless(server.driver):
@@ -120,7 +151,8 @@ async def _run_pull() -> dict[str, Any]:
 
                 servers_scanned += 1
                 try:
-                    result = await pull_leases_from_server(db, server, apply=True)
+                    # #3345 — recounted once, after the last server's pull.
+                    result = await pull_leases_from_server(db, server, apply=True, recount=False)
                 except Exception as exc:  # noqa: BLE001 — don't let one server poison the run
                     errors.append(f"{server.name}: {exc}")
                     logger.warning(
@@ -129,6 +161,16 @@ async def _run_pull() -> dict[str, Any]:
                         driver=server.driver,
                         error=str(exc),
                     )
+                    # #2306 — persist on the row so the server list can show
+                    # it; a later successful pull clears it.
+                    server.last_sync_error = (str(exc) or type(exc).__name__)[:2000]
+                    server.last_sync_error_at = now
+                    continue
+
+                if result.busy:
+                    # #2262 — a manual Sync (or a still-running pass) holds
+                    # this server; it is doing the work, so skip it quietly.
+                    servers_busy += 1
                     continue
 
                 total_server_leases += result.server_leases
@@ -148,10 +190,11 @@ async def _run_pull() -> dict[str, Any]:
                 total_statics_removed += result.statics_removed
                 total_scopes_deferred += result.scopes_deferred
                 wake_group_ids.update(result.dns_wake_group_ids)
+                touched_subnet_ids.update(result.touched_subnet_ids)
                 errors.extend(f"{server.name}: {e}" for e in result.errors)
                 warnings.extend(f"{server.name}: {w}" for w in result.warnings)
 
-            ps.dhcp_pull_leases_last_run_at = now
+            # (``dhcp_pull_leases_last_run_at`` was claimed at the start, #2262.)
 
             if (
                 total_imported
@@ -200,6 +243,10 @@ async def _run_pull() -> dict[str, Any]:
                         },
                     )
                 )
+            # #3345 — the mirrors every pull above created or removed. Last,
+            # after the audit row is staged and every driver call is done, so
+            # the audit-chain and subnet / block locks are held only to commit.
+            await recount_subnets_and_blocks(db, touched_subnet_ids)
             await db.commit()
 
             # #428 — wake the agent long-polls for any DNS group whose zone
@@ -212,6 +259,7 @@ async def _run_pull() -> dict[str, Any]:
             logger.info(
                 "dhcp_pull_leases_completed",
                 servers_scanned=servers_scanned,
+                servers_busy=servers_busy,
                 server_leases=total_server_leases,
                 imported=total_imported,
                 refreshed=total_refreshed,
@@ -232,6 +280,7 @@ async def _run_pull() -> dict[str, Any]:
             return {
                 "status": "ran",
                 "servers_scanned": servers_scanned,
+                "servers_busy": servers_busy,
                 "server_leases": total_server_leases,
                 "imported": total_imported,
                 "refreshed": total_refreshed,
@@ -252,6 +301,7 @@ async def _run_pull() -> dict[str, Any]:
 
 
 @celery_app.task(name="app.tasks.dhcp_pull_leases.auto_pull_dhcp_leases", bind=True)
+@module_gated("core.dhcp")
 def auto_pull_dhcp_leases(self: object) -> dict[str, Any]:  # type: ignore[type-arg]
     """Celery beat entrypoint — fires every 10s; the task itself checks the
     platform-settings gate and the per-run interval (in seconds)."""

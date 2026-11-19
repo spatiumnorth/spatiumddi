@@ -246,4 +246,5 @@ async def parse_windows_dns_server(server: Any) -> ImportPreview:
         warnings=overall_warnings,
         total_records=total_records,
         record_type_histogram=histogram,
+        source_server_id=getattr(server, "id", None),
     )

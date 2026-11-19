@@ -1,4 +1,6 @@
+import { poolDeleteSummary } from "@/lib/pool-delete-copy";
 import { useState } from "react";
+import { humanTime } from "../network/_shared";
 import { useNavigate } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -17,6 +19,12 @@ import {
   type DNSZone,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { ListReadError } from "@/components/ui/list-read-error";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
 import { useStickyLocation } from "@/lib/stickyLocation";
 import { PoolModal } from "./PoolsView";
 
@@ -37,6 +45,12 @@ export function DNSPoolsPage() {
   useStickyLocation("spatium.lastUrl.dnsPools");
   const qc = useQueryClient();
   const nav = useNavigate();
+  // Every pool write takes a superadmin (dns/pool_router.py): create, edit,
+  // delete and check-now all carry the SuperAdmin dependency (#1879).
+  const poolGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
 
   const [showPicker, setShowPicker] = useState(false);
   const [createCtx, setCreateCtx] = useState<{
@@ -47,11 +61,16 @@ export function DNSPoolsPage() {
     null,
   );
 
-  const { data: pools = [], isFetching } = useQuery({
+  const {
+    data: poolsData,
+    isFetching,
+    error: poolsError,
+  } = useQuery({
     queryKey: ["dns-pools-all"],
     queryFn: () => dnsApi.listAllPools(),
     refetchInterval: 30_000,
   });
+  const pools = poolsData ?? [];
 
   const checkNow = useMutation({
     mutationFn: (poolId: string) => dnsApi.checkPoolNow(poolId),
@@ -83,7 +102,8 @@ export function DNSPoolsPage() {
         <button
           type="button"
           onClick={() => setShowPicker(true)}
-          className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90"
+          className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+          {...poolGate}
         >
           <Plus className="h-3 w-3" /> New Pool
         </button>
@@ -93,14 +113,27 @@ export function DNSPoolsPage() {
         {isFetching && pools.length === 0 && (
           <p className="text-sm text-muted-foreground">Loading…</p>
         )}
-        {!isFetching && pools.length === 0 && (
+        {/* A refused read (pools take `manage_dns_pools`, and the sidebar
+            offers this page to every DNS reader) or a failed one says so,
+            not "No DNS pools yet" (#3426). */}
+        {!isFetching && pools.length === 0 && poolsError != null && (
+          <p className="text-sm">
+            <ListReadError error={poolsError} what="DNS pools" />
+          </p>
+        )}
+        {!isFetching && pools.length === 0 && poolsError == null && (
           <div className="flex flex-col items-center justify-center rounded-md border border-dashed bg-card py-16 text-center">
             <p className="text-sm text-muted-foreground">No DNS pools yet.</p>
             <p className="mt-1 max-w-md text-xs text-muted-foreground">
               A pool maps one DNS name (e.g.{" "}
               <code className="font-mono">www.example.com</code>) to a set of
-              target IPs with health checks. Click <em>New Pool</em> to create
-              one.
+              target IPs with health checks.
+              {!poolGate.disabled && (
+                <>
+                  {" "}
+                  Click <em>New Pool</em> to create one.
+                </>
+              )}
             </p>
           </div>
         )}
@@ -127,6 +160,7 @@ export function DNSPoolsPage() {
                   <PoolRow
                     key={p.id}
                     pool={p}
+                    gate={poolGate}
                     onCheckNow={() => checkNow.mutate(p.id)}
                     onOpen={() =>
                       nav(
@@ -175,11 +209,13 @@ export function DNSPoolsPage() {
 
 function PoolRow({
   pool,
+  gate,
   onCheckNow,
   onOpen,
   onDelete,
 }: {
   pool: DNSPoolListEntry;
+  gate: { disabled?: boolean; title?: string };
   onCheckNow: () => void;
   onOpen: () => void;
   onDelete: () => void;
@@ -246,17 +282,17 @@ function PoolRow({
       </td>
       <td className="px-3 py-2 text-right text-xs tabular-nums">{pool.ttl}s</td>
       <td className="px-3 py-2 text-right text-xs text-muted-foreground">
-        {pool.last_checked_at
-          ? new Date(pool.last_checked_at).toLocaleTimeString()
-          : "—"}
+        {pool.last_checked_at ? humanTime(pool.last_checked_at) : "—"}
       </td>
       <td className="px-3 py-2 text-right">
         <div className="flex items-center justify-end gap-1">
           <button
             type="button"
             onClick={onCheckNow}
-            className="rounded p-1 text-muted-foreground hover:text-foreground"
+            className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
             title="Check now"
+            aria-label="Check now"
+            {...gate}
           >
             <RefreshCw className="h-3.5 w-3.5" />
           </button>
@@ -271,8 +307,10 @@ function PoolRow({
           <button
             type="button"
             onClick={onDelete}
-            className="rounded p-1 text-muted-foreground hover:text-destructive"
+            className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
             title="Delete pool"
+            aria-label="Delete pool"
+            {...gate}
           >
             <Trash2 className="h-3.5 w-3.5" />
           </button>
@@ -395,7 +433,7 @@ function PickGroupZoneModal({
   );
 }
 
-function ConfirmDeleteModal({
+export function ConfirmDeleteModal({
   pool,
   onConfirm,
   onClose,
@@ -413,13 +451,14 @@ function ConfirmDeleteModal({
   return (
     <Modal title={`Delete pool: ${pool.name}`} onClose={onClose}>
       <p className="text-sm text-muted-foreground">
-        Delete pool <span className="font-medium">{pool.name}</span> and remove
-        the {pool.member_count} member
-        {pool.member_count === 1 ? "" : "s"} currently published as{" "}
-        <span className="font-mono">
-          {fqdn} {pool.record_type}
-        </span>
-        ?
+        {poolDeleteSummary({
+          name: pool.name,
+          fqdn,
+          recordType: pool.record_type,
+          poolEnabled: pool.enabled,
+          memberCount: pool.member_count,
+          publishedCount: pool.enabled ? pool.live_count : 0,
+        })}
       </p>
       <div className="mt-4 flex justify-end gap-2">
         <button

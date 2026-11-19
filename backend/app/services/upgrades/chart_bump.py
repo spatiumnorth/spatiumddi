@@ -52,6 +52,7 @@ import structlog
 import yaml
 
 from app.services.appliance import k8s
+from app.services.upgrades.shared_tags import carries_tag
 
 logger = structlog.get_logger(__name__)
 
@@ -156,10 +157,18 @@ async def _wait_for_deployments_rolled(
     names: list[str],
     namespace: str,
     *,
+    new_tag: str,
     stop_after_monotonic: float,
 ) -> tuple[bool, list[str], str | None]:
-    """Poll each Deployment until ``deployment_is_rolled_out`` returns
-    True. Returns ``(ok, rolled_names, error)``.
+    """Poll each Deployment until it has rolled onto ``new_tag``. Returns
+    ``(ok, rolled_names, error)``.
+
+    #1829 — a Deployment counts only once its pod template runs ``new_tag``
+    AND ``deployment_is_rolled_out`` holds for that template. The status
+    alone is not enough: read before helm-controller re-rendered the
+    Deployment, it is the old template's, long complete, and the bump
+    reported the control plane rolled 32 s before its new ReplicaSets
+    existed. A kubeapi error is retried until the deadline.
 
     A 404 on a name is treated as success — the operator may have
     customised the chart to drop one of the standard Deployments
@@ -168,45 +177,87 @@ async def _wait_for_deployments_rolled(
     """
     rolled: list[str] = []
     remaining = set(names)
+    last_error: str | None = None
     while remaining and time.monotonic() < stop_after_monotonic:
-        for name in list(remaining):
+        for name in sorted(remaining):
             try:
                 status, body = k8s.get_deployment(name, namespace=namespace)
             except k8s.KubeapiUnavailableError as exc:
-                return False, rolled, f"kubeapi unreachable: {exc}"
+                last_error = f"kubeapi unreachable: {exc}"
+                break
             if status == 404:
                 remaining.discard(name)
                 continue
             if status != 200 or body is None:
                 continue
-            if k8s.deployment_is_rolled_out(body):
+            if carries_tag(body, new_tag) and k8s.deployment_is_rolled_out(body):
                 rolled.append(name)
                 remaining.discard(name)
         if remaining:
             await asyncio.sleep(_POLL_INTERVAL_S)
     if remaining:
-        return False, rolled, f"timed out waiting for: {', '.join(sorted(remaining))}"
+        error = f"timed out waiting for {new_tag} on: {', '.join(sorted(remaining))}"
+        if last_error:
+            error = f"{error} (last kubeapi error: {last_error})"
+        return False, rolled, error
     return True, rolled, None
 
 
+def _newest_migrate_job(
+    release: str, namespace: str, new_tag: str
+) -> tuple[str | None, dict[str, Any] | None]:
+    """The newest migrate Job of ``release`` whose pod template runs
+    ``new_tag``, as ``(name, job)``, or ``(None, None)``.
+
+    The chart names the Job ``<release>-migrate-r<revision>`` (a new name on
+    every helm upgrade, migrate-job.yaml), so it is found by its labels; an
+    older revision's Job, not yet collected by its TTL, runs an older tag."""
+    selector = f"app.kubernetes.io/component=migrate,app.kubernetes.io/instance={release}"
+    status, items = k8s.list_jobs(selector, namespace=namespace)
+    if status != 200:
+        raise k8s.KubeapiUnavailableError(f"Job list status {status}")
+    jobs = [j for j in items if carries_tag(j, new_tag)]
+    if not jobs:
+        return None, None
+    job = max(jobs, key=lambda j: str((j.get("metadata") or {}).get("creationTimestamp") or ""))
+    return str((job.get("metadata") or {}).get("name") or ""), job
+
+
 async def _wait_for_migrate_job(
-    job_name: str,
+    job_name: str | None,
     namespace: str,
     *,
     stop_after_monotonic: float,
+    new_tag: str | None = None,
+    release: str = DEFAULT_CHART_NAME,
 ) -> tuple[bool, str | None, str | None]:
     """Poll the migrate Job until terminal. Returns
     ``(ok, terminal_state, error)``. ``terminal_state`` is
     ``'succeeded'`` / ``'failed'`` / ``None``.
 
-    A 404 is treated as ``terminal_state='absent'`` — some chart
-    shapes use a Helm pre-upgrade hook Job that gets garbage-
-    collected after success, so by the time we poll there's nothing
-    to find. We don't fail-loud on that.
+    ``job_name`` names the Job outright (a renamed release's override).
+    Without it (#1829) the Job is the newest of ``release``'s migrate Jobs
+    on ``new_tag``, found by its labels: the default name this read before,
+    ``<chart>-spatiumddi-migrate``, is one the chart never uses, so the
+    wait always read "absent".
+
+    A Job not found is treated as ``terminal_state='absent'``: the chart's
+    Job is collected by its ``ttlSecondsAfterFinished`` after it finishes,
+    and the control Deployments, which this runs after, wait for the schema
+    before they start (their wait-for-migrate init container). We don't
+    fail-loud on that.
     """
     while time.monotonic() < stop_after_monotonic:
         try:
-            status, body = k8s.get_job(job_name, namespace=namespace)
+            if job_name is not None:
+                name = job_name
+                status, body = k8s.get_job(job_name, namespace=namespace)
+            elif new_tag is None:
+                return True, "absent", None
+            else:
+                found, body = _newest_migrate_job(release, namespace, new_tag)
+                name = found or ""
+                status = 200 if found else 404
         except k8s.KubeapiUnavailableError as exc:
             return False, None, f"kubeapi unreachable: {exc}"
         if status == 404:
@@ -218,9 +269,9 @@ async def _wait_for_migrate_job(
             if terminal == "failed":
                 # Cluster-side migrate failure — operator needs to
                 # debug + helm-rollback / re-run. We report cleanly.
-                return False, "failed", "migrate Job failed"
+                return False, "failed", f"migrate Job {name} failed"
         await asyncio.sleep(_POLL_INTERVAL_S)
-    return False, None, f"timed out polling migrate Job {job_name!r}"
+    return False, None, f"timed out polling migrate Job {job_name or release!r}"
 
 
 # ── Top-level entry ──────────────────────────────────────────────────
@@ -254,7 +305,9 @@ async def bump_chart_image_tag(
         f"{chart_name}-spatiumddi-worker",
         f"{chart_name}-spatiumddi-beat",
     ]
-    migrate_job = migrate_job_name or f"{chart_name}-spatiumddi-migrate"
+    # #1829 — the chart's migrate Job is ``<release>-migrate-r<revision>``,
+    # found by its labels unless a name is passed.
+    migrate_job = migrate_job_name
 
     if k8s.get_config() is None:
         return ChartBumpResult(
@@ -327,7 +380,7 @@ async def bump_chart_image_tag(
     deadline = started_monotonic + timeout_s
 
     deploy_ok, rolled, deploy_err = await _wait_for_deployments_rolled(
-        deployments, release_namespace, stop_after_monotonic=deadline
+        deployments, release_namespace, new_tag=new_tag, stop_after_monotonic=deadline
     )
     if not deploy_ok:
         return ChartBumpResult(
@@ -342,7 +395,11 @@ async def bump_chart_image_tag(
         )
 
     migrate_ok, migrate_state, migrate_err = await _wait_for_migrate_job(
-        migrate_job, release_namespace, stop_after_monotonic=deadline
+        migrate_job,
+        release_namespace,
+        stop_after_monotonic=deadline,
+        new_tag=new_tag,
+        release=chart_name,
     )
     if not migrate_ok:
         return ChartBumpResult(

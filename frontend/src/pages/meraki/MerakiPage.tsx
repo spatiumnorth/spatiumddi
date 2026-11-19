@@ -1,5 +1,8 @@
+import { useCredentialReask } from "@/hooks/useCredentialReask";
+import { useModuleOn } from "@/hooks/useModuleOn";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import {
   Boxes,
   Network,
@@ -26,12 +29,30 @@ import {
 import { HeaderButton } from "@/components/ui/header-button";
 import { Modal } from "@/components/ui/modal";
 import { IPSpacePicker } from "@/components/ipam/space-picker";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
+import { secondsFieldError, SYNC_INTERVAL_BOUNDS } from "@/lib/seconds";
+import { FormError } from "@/components/ui/form-error";
 
 // ── Page ─────────────────────────────────────────────────────────────
 
 export function MerakiPage() {
+  // #1340 — every write on this integration takes a superadmin (its
+  // router's create / update / delete / sync / test handlers take
+  // SuperAdmin), so a read-only user is offered none of them.
+  const superadminGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const qc = useQueryClient();
-  const { data: orgs = [], isFetching } = useQuery({
+  const {
+    data: orgs = [],
+    isFetching,
+    error: listError,
+  } = useQuery({
     queryKey: ["meraki-orgs"],
     queryFn: merakiApi.list,
   });
@@ -108,6 +129,7 @@ export function MerakiPage() {
               variant="primary"
               icon={Plus}
               onClick={() => setShowCreate(true)}
+              {...superadminGate}
             >
               Add Organization
             </HeaderButton>
@@ -129,11 +151,14 @@ export function MerakiPage() {
           {orgs.length === 0 ? (
             <div className="p-8 text-center">
               <p className="text-sm text-muted-foreground">
-                No Meraki organizations configured yet.
+                <ListEmpty error={listError} what="Meraki organizations">
+                  No Meraki organizations configured yet.
+                </ListEmpty>
               </p>
               <button
                 onClick={() => setShowCreate(true)}
-                className="mt-3 inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
+                className="mt-3 inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                {...superadminGate}
               >
                 <Plus className="h-3 w-3" /> Add Organization
               </button>
@@ -253,6 +278,7 @@ export function MerakiPage() {
                             onClick={() => testMut.mutate(o.id)}
                             disabled={testMut.isPending}
                             className="inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] hover:bg-accent disabled:opacity-50"
+                            {...superadminGate}
                           >
                             <TestTube2 className="h-3 w-3" />
                             Test
@@ -285,6 +311,8 @@ export function MerakiPage() {
                             }
                             className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-50"
                             title="Sync Now"
+                            aria-label="Sync Now"
+                            {...superadminGate}
                           >
                             <RotateCw
                               className={`h-3.5 w-3.5 ${
@@ -296,15 +324,19 @@ export function MerakiPage() {
                           </button>
                           <button
                             onClick={() => setEdit(o)}
-                            className="rounded p-1 text-muted-foreground hover:text-foreground"
+                            className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                             title="Edit"
+                            aria-label="Edit"
+                            {...superadminGate}
                           >
                             <Pencil className="h-3.5 w-3.5" />
                           </button>
                           <button
                             onClick={() => setDel(o)}
-                            className="rounded p-1 text-muted-foreground hover:text-destructive"
+                            className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                             title="Delete"
+                            aria-label="Delete"
+                            {...superadminGate}
                           >
                             <Trash2 className="h-3.5 w-3.5" />
                           </button>
@@ -327,9 +359,13 @@ export function MerakiPage() {
       {del && (
         <DeleteOrgModal
           org={del}
-          onClose={() => setDel(null)}
+          onClose={() => {
+            delMut.reset();
+            setDel(null);
+          }}
           onConfirm={() => delMut.mutate(del.id)}
           isPending={delMut.isPending}
+          error={delMut.isError ? errMsg(delMut.error, "Delete failed") : null}
         />
       )}
     </div>
@@ -492,9 +528,13 @@ function OrgModal({ org, onClose }: { org?: MerakiOrg; onClose: () => void }) {
   const qc = useQueryClient();
   const editing = !!org;
 
+  // DNS off (#2135): no /dns/groups read and no picker. The stored
+  // dns_group_id is sent back untouched, so saving here cannot clear it.
+  const dnsOn = useModuleOn("core.dns");
   const { data: dnsGroups = [] } = useQuery<DNSServerGroup[]>({
     queryKey: ["dns-groups"],
     queryFn: () => dnsApi.listGroups(),
+    enabled: dnsOn,
   });
 
   const [name, setName] = useState(org?.name ?? "");
@@ -508,6 +548,13 @@ function OrgModal({ org, onClose }: { org?: MerakiOrg; onClose: () => void }) {
     (org?.network_ids ?? []).join(", "),
   );
   const [apiKey, setApiKey] = useState("");
+  // #4135 — a moved address needs the stored key entered again.
+  const reask = useCredentialReask(
+    { baseUrl },
+    org && { baseUrl: org.base_url },
+    () => setApiKey(""),
+  );
+  const mustEnter = reask.asks(org?.api_key_present);
   const [spaceId, setSpaceId] = useState(org?.ipam_space_id ?? "");
   const [dnsGroupId, setDnsGroupId] = useState(org?.dns_group_id ?? "");
   const [mirrorPolicyObjects, setMirrorPolicyObjects] = useState(
@@ -524,7 +571,7 @@ function OrgModal({ org, onClose }: { org?: MerakiOrg; onClose: () => void }) {
     org?.mirror_clients ?? false,
   );
   const [syncInterval, setSyncInterval] = useState(
-    org?.sync_interval_seconds ?? 300,
+    String(org?.sync_interval_seconds ?? 300),
   );
   const [error, setError] = useState("");
 
@@ -571,7 +618,7 @@ function OrgModal({ org, onClose }: { org?: MerakiOrg; onClose: () => void }) {
           mirror_dhcp_reservations: mirrorDhcpReservations,
           mirror_nat_rules: mirrorNatRules,
           mirror_clients: mirrorClients,
-          sync_interval_seconds: syncInterval,
+          sync_interval_seconds: Number(syncInterval.trim()),
         };
         if (apiKey) update.api_key = apiKey;
         return merakiApi.update(org!.id, update);
@@ -591,7 +638,7 @@ function OrgModal({ org, onClose }: { org?: MerakiOrg; onClose: () => void }) {
         mirror_dhcp_reservations: mirrorDhcpReservations,
         mirror_nat_rules: mirrorNatRules,
         mirror_clients: mirrorClients,
-        sync_interval_seconds: syncInterval,
+        sync_interval_seconds: Number(syncInterval.trim()),
       };
       return merakiApi.create(create);
     },
@@ -611,6 +658,17 @@ function OrgModal({ org, onClose }: { org?: MerakiOrg; onClose: () => void }) {
       <form
         onSubmit={(e) => {
           e.preventDefault();
+          // #2110 — "1h" and an empty field are refused, not read as 1 / the default.
+          const intervalError = secondsFieldError(
+            "Sync interval",
+            syncInterval,
+            SYNC_INTERVAL_BOUNDS,
+          );
+          if (intervalError) {
+            setError(intervalError);
+            return;
+          }
+          setError("");
           saveMut.mutate();
         }}
         className="space-y-3"
@@ -689,7 +747,11 @@ function OrgModal({ org, onClose }: { org?: MerakiOrg; onClose: () => void }) {
         <div className="space-y-2 border-t pt-3">
           <Field
             label="API key"
-            hint="The read-only Dashboard API key. On edit, leave blank to keep the stored key."
+            hint={
+              mustEnter
+                ? reask.hint
+                : "The read-only Dashboard API key. On edit, leave blank to keep the stored key."
+            }
           >
             <input
               className={`${inputCls} font-mono text-[11px]`}
@@ -698,11 +760,13 @@ function OrgModal({ org, onClose }: { org?: MerakiOrg; onClose: () => void }) {
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
               placeholder={
-                editing && org?.api_key_present
-                  ? "••• stored — enter to replace"
-                  : "API key"
+                mustEnter
+                  ? reask.placeholder
+                  : editing && org?.api_key_present
+                    ? "••• stored — enter to replace"
+                    : "API key"
               }
-              required={!editing}
+              required={!editing || mustEnter}
             />
           </Field>
         </div>
@@ -741,20 +805,22 @@ function OrgModal({ org, onClose }: { org?: MerakiOrg; onClose: () => void }) {
           <Field label="IPAM space">
             <IPSpacePicker value={spaceId} onChange={setSpaceId} required />
           </Field>
-          <Field label="DNS server group (optional)">
-            <select
-              className={inputCls}
-              value={dnsGroupId ?? ""}
-              onChange={(e) => setDnsGroupId(e.target.value)}
-            >
-              <option value="">— none —</option>
-              {dnsGroups.map((g) => (
-                <option key={g.id} value={g.id}>
-                  {g.name}
-                </option>
-              ))}
-            </select>
-          </Field>
+          {dnsOn && (
+            <Field label="DNS server group (optional)">
+              <select
+                className={inputCls}
+                value={dnsGroupId ?? ""}
+                onChange={(e) => setDnsGroupId(e.target.value)}
+              >
+                <option value="">— none —</option>
+                {dnsGroups.map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.name}
+                  </option>
+                ))}
+              </select>
+            </Field>
+          )}
         </div>
 
         <Field label="Sync interval (seconds)" hint="Minimum 30 s.">
@@ -763,7 +829,7 @@ function OrgModal({ org, onClose }: { org?: MerakiOrg; onClose: () => void }) {
             className={inputCls}
             value={syncInterval}
             min={30}
-            onChange={(e) => setSyncInterval(parseInt(e.target.value) || 300)}
+            onChange={(e) => setSyncInterval(e.target.value)}
           />
         </Field>
 
@@ -845,7 +911,9 @@ function OrgModal({ org, onClose }: { org?: MerakiOrg; onClose: () => void }) {
           </label>
         </div>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -857,7 +925,7 @@ function OrgModal({ org, onClose }: { org?: MerakiOrg; onClose: () => void }) {
           </button>
           <button
             type="submit"
-            disabled={saveMut.isPending || (!editing && !apiKey)}
+            disabled={saveMut.isPending || ((!editing || mustEnter) && !apiKey)}
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {saveMut.isPending ? "Saving…" : editing ? "Save" : "Create"}
@@ -873,11 +941,13 @@ function DeleteOrgModal({
   onConfirm,
   onClose,
   isPending,
+  error,
 }: {
   org: MerakiOrg;
   onConfirm: () => void;
   onClose: () => void;
   isPending: boolean;
+  error?: string | null;
 }) {
   const [checked, setChecked] = useState(false);
   return (
@@ -886,9 +956,12 @@ function DeleteOrgModal({
         <p className="text-sm text-muted-foreground">
           Remove the Meraki organization{" "}
           <span className="font-semibold">{org.name}</span>? This only affects
-          SpatiumDDI — nothing on the Meraki side changes. All IPAM rows
-          mirrored from this organization (subnets + addresses) will be removed
-          via the FK cascade.
+          SpatiumDDI — nothing on the Meraki side changes. If active block sync
+          is armed, disarm it first (that lifts the pushed blocks from the
+          device); delete is refused while it is armed. Only rows that were
+          purely mirrored are removed. Anything you added yourself (addresses,
+          DHCP scopes, reservations, edited rows, custom fields) is kept and
+          detached from this integration.
         </p>
         <label className="flex cursor-pointer items-start gap-2 text-sm">
           <input
@@ -899,6 +972,11 @@ function DeleteOrgModal({
           />
           <span>I understand.</span>
         </label>
+        {error && (
+          <FormError className="break-words rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            {error}
+          </FormError>
+        )}
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}

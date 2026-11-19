@@ -1,5 +1,8 @@
+import { useCredentialReask } from "@/hooks/useCredentialReask";
+import { useModuleOn } from "@/hooks/useModuleOn";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import {
   Boxes,
   Check,
@@ -27,6 +30,13 @@ import { copyToClipboard } from "@/lib/clipboard";
 import { HeaderButton } from "@/components/ui/header-button";
 import { Modal } from "@/components/ui/modal";
 import { IPSpacePicker } from "@/components/ipam/space-picker";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
+import { secondsFieldError, SYNC_INTERVAL_BOUNDS } from "@/lib/seconds";
+import { FormError } from "@/components/ui/form-error";
 
 // ── Setup guide ─────────────────────────────────────────────────────
 // Shown in the create modal so operators know what to run on their
@@ -90,8 +100,19 @@ kubectl cluster-info | head -1`;
 // ── Page ─────────────────────────────────────────────────────────────
 
 export function KubernetesPage() {
+  // #1340 — every write on this integration takes a superadmin (its
+  // router's create / update / delete / sync / test handlers take
+  // SuperAdmin), so a read-only user is offered none of them.
+  const superadminGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const qc = useQueryClient();
-  const { data: clusters = [], isFetching } = useQuery({
+  const {
+    data: clusters = [],
+    isFetching,
+    error: listError,
+  } = useQuery({
     queryKey: ["kubernetes-clusters"],
     queryFn: kubernetesApi.listClusters,
   });
@@ -174,6 +195,7 @@ export function KubernetesPage() {
               variant="primary"
               icon={Plus}
               onClick={() => setShowCreate(true)}
+              {...superadminGate}
             >
               Add Cluster
             </HeaderButton>
@@ -186,11 +208,14 @@ export function KubernetesPage() {
           {clusters.length === 0 ? (
             <div className="p-8 text-center">
               <p className="text-sm text-muted-foreground">
-                No clusters configured yet.
+                <ListEmpty error={listError} what="Kubernetes clusters">
+                  No clusters configured yet.
+                </ListEmpty>
               </p>
               <button
                 onClick={() => setShowCreate(true)}
-                className="mt-3 inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
+                className="mt-3 inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                {...superadminGate}
               >
                 <Plus className="h-3 w-3" /> Add Cluster
               </button>
@@ -297,6 +322,7 @@ export function KubernetesPage() {
                             onClick={() => testMut.mutate(c.id)}
                             disabled={testMut.isPending}
                             className="inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] hover:bg-accent disabled:opacity-50"
+                            {...superadminGate}
                           >
                             <TestTube2 className="h-3 w-3" />
                             Test
@@ -322,6 +348,8 @@ export function KubernetesPage() {
                             }
                             className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-50"
                             title="Sync Now"
+                            aria-label="Sync Now"
+                            {...superadminGate}
                           >
                             <RotateCw
                               className={`h-3.5 w-3.5 ${
@@ -333,15 +361,19 @@ export function KubernetesPage() {
                           </button>
                           <button
                             onClick={() => setEdit(c)}
-                            className="rounded p-1 text-muted-foreground hover:text-foreground"
+                            className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                             title="Edit"
+                            aria-label="Edit"
+                            {...superadminGate}
                           >
                             <Pencil className="h-3.5 w-3.5" />
                           </button>
                           <button
                             onClick={() => setDel(c)}
-                            className="rounded p-1 text-muted-foreground hover:text-destructive"
+                            className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                             title="Delete"
+                            aria-label="Delete"
+                            {...superadminGate}
                           >
                             <Trash2 className="h-3.5 w-3.5" />
                           </button>
@@ -382,9 +414,13 @@ function ClusterModal({
   const qc = useQueryClient();
   const editing = !!cluster;
 
+  // DNS off (#2135): no /dns/groups read and no picker. The stored
+  // dns_group_id is sent back untouched, so saving here cannot clear it.
+  const dnsOn = useModuleOn("core.dns");
   const { data: dnsGroups = [] } = useQuery<DNSServerGroup[]>({
     queryKey: ["dns-groups"],
     queryFn: () => dnsApi.listGroups(),
+    enabled: dnsOn,
   });
 
   const [name, setName] = useState(cluster?.name ?? "");
@@ -395,12 +431,19 @@ function ClusterModal({
   );
   const [caBundlePem, setCaBundlePem] = useState("");
   const [token, setToken] = useState("");
+  // #4135 — a moved address needs the stored token entered again.
+  const reask = useCredentialReask(
+    { apiServerUrl },
+    cluster && { apiServerUrl: cluster.api_server_url },
+    () => setToken(""),
+  );
+  const mustEnter = reask.asks(cluster?.token_present);
   const [spaceId, setSpaceId] = useState(cluster?.ipam_space_id ?? "");
   const [dnsGroupId, setDnsGroupId] = useState(cluster?.dns_group_id ?? "");
   const [podCidr, setPodCidr] = useState(cluster?.pod_cidr ?? "");
   const [serviceCidr, setServiceCidr] = useState(cluster?.service_cidr ?? "");
   const [syncInterval, setSyncInterval] = useState(
-    cluster?.sync_interval_seconds ?? 60,
+    String(cluster?.sync_interval_seconds ?? 60),
   );
   const [mirrorPods, setMirrorPods] = useState(cluster?.mirror_pods ?? false);
   const [showGuide, setShowGuide] = useState(!editing);
@@ -466,7 +509,7 @@ function ClusterModal({
           dns_group_id: dnsGroupId || null,
           pod_cidr: podCidr,
           service_cidr: serviceCidr,
-          sync_interval_seconds: syncInterval,
+          sync_interval_seconds: Number(syncInterval.trim()),
           mirror_pods: mirrorPods,
         };
         if (caBundlePem) update.ca_bundle_pem = caBundlePem;
@@ -487,7 +530,7 @@ function ClusterModal({
         dns_group_id: dnsGroupId || null,
         pod_cidr: podCidr,
         service_cidr: serviceCidr,
-        sync_interval_seconds: syncInterval,
+        sync_interval_seconds: Number(syncInterval.trim()),
         mirror_pods: mirrorPods,
       };
       return kubernetesApi.createCluster(create);
@@ -508,6 +551,17 @@ function ClusterModal({
       <form
         onSubmit={(e) => {
           e.preventDefault();
+          // #2110 — "1h" and an empty field are refused, not read as 1 / the default.
+          const intervalError = secondsFieldError(
+            "Sync interval",
+            syncInterval,
+            SYNC_INTERVAL_BOUNDS,
+          );
+          if (intervalError) {
+            setError(intervalError);
+            return;
+          }
+          setError("");
           saveMut.mutate();
         }}
         className="space-y-3"
@@ -596,9 +650,11 @@ function ClusterModal({
         <Field
           label="Bearer token"
           hint={
-            editing && cluster?.token_present
-              ? "Stored. Leave blank to keep the existing token."
-              : "Service account token (single line)."
+            mustEnter
+              ? reask.hint
+              : editing && cluster?.token_present
+                ? "Stored. Leave blank to keep the existing token."
+                : "Service account token (single line)."
           }
         >
           <textarea
@@ -607,8 +663,13 @@ function ClusterModal({
             value={token}
             onChange={(e) => setToken(e.target.value)}
             placeholder={
-              editing && cluster?.token_present ? "••• stored" : "eyJhbGciOi..."
+              mustEnter
+                ? reask.placeholder
+                : editing && cluster?.token_present
+                  ? "••• stored"
+                  : "eyJhbGciOi..."
             }
+            required={mustEnter}
           />
         </Field>
 
@@ -642,20 +703,22 @@ function ClusterModal({
           <Field label="IPAM space">
             <IPSpacePicker value={spaceId} onChange={setSpaceId} required />
           </Field>
-          <Field label="DNS server group (optional)">
-            <select
-              className={inputCls}
-              value={dnsGroupId ?? ""}
-              onChange={(e) => setDnsGroupId(e.target.value)}
-            >
-              <option value="">— none —</option>
-              {dnsGroups.map((g) => (
-                <option key={g.id} value={g.id}>
-                  {g.name}
-                </option>
-              ))}
-            </select>
-          </Field>
+          {dnsOn && (
+            <Field label="DNS server group (optional)">
+              <select
+                className={inputCls}
+                value={dnsGroupId ?? ""}
+                onChange={(e) => setDnsGroupId(e.target.value)}
+              >
+                <option value="">— none —</option>
+                {dnsGroups.map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.name}
+                  </option>
+                ))}
+              </select>
+            </Field>
+          )}
         </div>
 
         <div className="space-y-2">
@@ -710,7 +773,7 @@ function ClusterModal({
             className={inputCls}
             value={syncInterval}
             min={30}
-            onChange={(e) => setSyncInterval(parseInt(e.target.value) || 60)}
+            onChange={(e) => setSyncInterval(e.target.value)}
           />
         </Field>
 
@@ -732,7 +795,9 @@ function ClusterModal({
           </div>
         </label>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -744,7 +809,7 @@ function ClusterModal({
           </button>
           <button
             type="submit"
-            disabled={saveMut.isPending}
+            disabled={saveMut.isPending || (mustEnter && !token.trim())}
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {saveMut.isPending ? "Saving…" : editing ? "Save" : "Create"}
@@ -773,9 +838,10 @@ function DeleteClusterModal({
         <p className="text-sm text-muted-foreground">
           Remove the cluster connection for{" "}
           <span className="font-semibold">{cluster.name}</span>? This only
-          affects SpatiumDDI — nothing on the cluster changes. Any IPAM / DNS
-          rows previously mirrored from this cluster will be cleaned up on the
-          next reconcile pass.
+          affects SpatiumDDI — nothing on the cluster changes. Only rows that
+          were purely mirrored are removed. Anything you added yourself
+          (addresses, DHCP scopes, reservations, edited rows, custom fields) is
+          kept and detached from this integration.
         </p>
         <label className="flex cursor-pointer items-start gap-2 text-sm">
           <input

@@ -1,8 +1,8 @@
 """SCP / SFTP backup destination (issue #117 Phase 1d).
 
 Writes archives to a remote host via SSH. Authentication is
-either password or private-key (ED25519 / ECDSA / RSA / DSS —
-whatever paramiko supports). Both creds are Fernet-wrapped at
+either password or private-key (ED25519 / ECDSA / RSA; not DSA,
+which paramiko 4.0 removed — #1692). Both creds are Fernet-wrapped at
 rest via :mod:`secrets_config` because they're declared
 ``secret=True`` in the config-fields spec.
 
@@ -16,11 +16,16 @@ Config shape:
 * ``private_key`` — optional, PEM-encoded. **Secret.**
 * ``private_key_passphrase`` — optional, **secret.** Only set
   when the key itself is passphrase-protected.
-* ``host_key_check`` — ``"strict"`` (default — refuse
-  unknown hosts), ``"known_hosts"`` (use the operator-supplied
-  ``known_hosts_pem``), or ``"insecure_skip"`` (homelab/lab
-  shortcut, *not* recommended for production).
-* ``known_hosts`` — optional, the OpenSSH known_hosts content.
+* ``host_key_check`` — ``"known_hosts"`` (default — refuse
+  hosts not in the operator-supplied ``known_hosts``),
+  ``"strict"`` (the same check under its historical name;
+  also uses the supplied ``known_hosts``), or
+  ``"insecure_skip"`` (homelab/lab shortcut, *not*
+  recommended for production).
+* ``known_hosts`` — the OpenSSH known_hosts content. Required
+  for the checked modes: the driver loads no system host keys,
+  so a checked mode with no supplied keys has an empty store
+  and would refuse every server (#1569).
 
 Implementation notes:
 
@@ -51,13 +56,17 @@ from typing import Any
 
 import structlog
 
+from app.core.exc_text import describe_exc
 from app.services.backup.targets.base import (
     ARCHIVE_NAME_RE,
     ArchiveListing,
+    ArchiveTooLargeError,
     BackupDestination,
     BackupDestinationError,
     ConfigFieldSpec,
     DestinationConfigError,
+    check_size,
+    read_capped,
     safe_filename,
 )
 
@@ -73,10 +82,25 @@ _HOST_KEY_MODES = {"strict", "known_hosts", "insecure_skip"}
 # build_backup_archive timeout).
 _SSH_CONNECT_TIMEOUT = 30
 _SSH_BANNER_TIMEOUT = 30
+# Per-operation ceiling on the SFTP channel (#1515). connect / banner /
+# auth timeouts were set, but the channel itself had none, so a server
+# that stalls mid-transfer hung the backup run indefinitely — the
+# runner's row sat ``in_progress`` with no process-level bound at all.
+_SFTP_CHANNEL_TIMEOUT = 300
+
+
+def _open_sftp(client):  # type: ignore[no-untyped-def]
+    """Open the SFTP subsystem with a channel timeout set (#1515)."""
+    sftp = client.open_sftp()
+    channel = sftp.get_channel()
+    if channel is not None:
+        channel.settimeout(_SFTP_CHANNEL_TIMEOUT)
+    return sftp
 
 
 class ScpDestination(BackupDestination):
     kind = "scp"
+    secret_alternatives = (("password",), ("private_key", "private_key_passphrase"))
     label = "SCP / SFTP"
     config_fields = (
         ConfigFieldSpec(
@@ -117,10 +141,11 @@ class ScpDestination(BackupDestination):
             name="private_key",
             label="Private key (PEM)",
             type="password",
+            multiline=True,
             required=False,
             secret=True,
             description=(
-                "ED25519 / ECDSA / RSA / DSS. Paste the entire "
+                "ED25519 / ECDSA / RSA. Paste the entire "
                 "PEM-encoded key including BEGIN / END lines."
             ),
         ),
@@ -138,8 +163,8 @@ class ScpDestination(BackupDestination):
             type="text",
             required=False,
             description=(
-                "'strict' (default; refuse unknown hosts), "
-                "'known_hosts' (use the supplied list), or "
+                "'known_hosts' (default; refuse hosts not in the supplied "
+                "known_hosts), 'strict' (same check, historical name), or "
                 "'insecure_skip' (homelab shortcut, not recommended)."
             ),
         ),
@@ -147,10 +172,11 @@ class ScpDestination(BackupDestination):
             name="known_hosts",
             label="known_hosts content",
             type="text",
+            multiline=True,
             required=False,
             description=(
-                "OpenSSH known_hosts file content. Only used when "
-                "host_key_check = 'known_hosts'."
+                "OpenSSH known_hosts file content. Required when "
+                "host_key_check = 'known_hosts' (the default) or 'strict'."
             ),
         ),
     )
@@ -172,18 +198,40 @@ class ScpDestination(BackupDestination):
                 raise DestinationConfigError("'port' must be 1..65535")
         if not config.get("password") and not config.get("private_key"):
             raise DestinationConfigError("set ONE of 'password' or 'private_key'")
+        private_key = config.get("private_key")
+        if isinstance(private_key, str) and _pem_lost_its_line_breaks(private_key):
+            # paramiko answers a one-line key with "not a valid OPENSSH
+            # private key file", which reads as a wrong key rather than a
+            # mangled one. A one-line input folds every line break into a
+            # space, so say that, here (#2199).
+            raise DestinationConfigError(
+                "'private_key' has lost its line breaks: a PEM key's BEGIN line, "
+                "base64 body and END line must each be on their own line. Paste "
+                "the key into a multi-line field, or send it with real '\\n' "
+                "characters"
+            )
         remote_path = config["remote_path"]
         if not remote_path.startswith("/"):
             raise DestinationConfigError("'remote_path' must be absolute")
-        host_key_check = config.get("host_key_check") or "strict"
+        host_key_check = config.get("host_key_check") or "known_hosts"
         if host_key_check not in _HOST_KEY_MODES:
             raise DestinationConfigError(
                 f"'host_key_check' must be one of {sorted(_HOST_KEY_MODES)} "
                 f"(got {host_key_check!r})"
             )
-        if host_key_check == "known_hosts" and not config.get("known_hosts"):
+        if host_key_check in {"known_hosts", "strict"} and not config.get("known_hosts"):
+            # The driver loads no system host keys, so a checked mode
+            # without supplied keys checks against an EMPTY store and
+            # refuses every server (#1569). The old default was
+            # exactly that ("strict" with nothing loaded), which
+            # pushed operators to insecure_skip. Refuse the config
+            # here, where the fix is obvious, instead of at connect
+            # time, where it looks like a server problem.
             raise DestinationConfigError(
-                "host_key_check='known_hosts' requires 'known_hosts' to be set"
+                f"host_key_check={host_key_check!r} requires 'known_hosts' to be "
+                "set — paste the server's known_hosts line(s) (e.g. the output of "
+                "`ssh-keyscan <host>`), or set host_key_check='insecure_skip' "
+                "(not recommended: it accepts any host key)"
             )
 
     def _connect(self, config: dict[str, Any]):
@@ -191,41 +239,17 @@ class ScpDestination(BackupDestination):
         import paramiko  # noqa: PLC0415
 
         client = paramiko.SSHClient()
-        host_key_check = config.get("host_key_check") or "strict"
+        host_key_check = config.get("host_key_check") or "known_hosts"
         if host_key_check == "insecure_skip":
             # Equivalent to ``StrictHostKeyChecking no`` — only
             # appropriate for trusted lab networks.
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        elif host_key_check == "known_hosts":
-            known = config.get("known_hosts") or ""
-            for line in known.splitlines():
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                try:
-                    parts = line.split()
-                    # paramiko's add_host_keys consumes a file path,
-                    # so we feed lines manually via load_host_keys's
-                    # internals.
-                    if len(parts) < 3:
-                        continue
-                    hostnames, keytype, key_b64 = parts[0], parts[1], parts[2]
-                    key_obj = paramiko.RSAKey if keytype == "ssh-rsa" else None
-                    if not key_obj:
-                        # Try the generic loader for non-RSA types.
-                        # paramiko's HostKeys handles parsing better
-                        # than a hand-rolled mapping.
-                        host_keys = paramiko.HostKeys()
-                        host_keys.add(hostnames, keytype, _decode_pubkey(keytype, key_b64))
-                        client._host_keys.update(host_keys)  # noqa: SLF001
-                    else:
-                        decoded = _decode_pubkey(keytype, key_b64)
-                        if decoded is not None:
-                            client._host_keys.add(hostnames, keytype, decoded)  # noqa: SLF001
-                except Exception:  # noqa: BLE001
-                    continue
-            client.set_missing_host_key_policy(paramiko.RejectPolicy())
-        else:  # strict
+        else:
+            # "known_hosts" and "strict" are the same check (#1569):
+            # load the operator-supplied keys, then refuse anything
+            # not among them. ``strict`` used to skip the load, which
+            # left the store empty and made the mode unusable.
+            _load_supplied_host_keys(client, config.get("known_hosts") or "")
             client.set_missing_host_key_policy(paramiko.RejectPolicy())
 
         port = int(config.get("port") or 22)
@@ -250,7 +274,7 @@ class ScpDestination(BackupDestination):
             client.connect(**connect_kwargs)
         except Exception as exc:  # noqa: BLE001
             client.close()
-            raise BackupDestinationError(f"SSH connect failed: {exc}") from exc
+            raise BackupDestinationError(f"SSH connect failed: {describe_exc(exc)}") from exc
         return client
 
     async def write(
@@ -267,7 +291,10 @@ class ScpDestination(BackupDestination):
         def _do() -> None:
             client = self._connect(config)
             try:
-                sftp = client.open_sftp()
+                try:
+                    sftp = _open_sftp(client)
+                except Exception as exc:  # noqa: BLE001
+                    raise BackupDestinationError(f"SFTP write failed: {describe_exc(exc)}") from exc
                 try:
                     # Atomic rename: write to .tmp then rename so a
                     # crashed transfer doesn't leave a half-archive
@@ -279,10 +306,24 @@ class ScpDestination(BackupDestination):
                     except OSError:
                         pass  # didn't exist
                     sftp.rename(tmp, remote)
+                except Exception as exc:  # noqa: BLE001
+                    # Best-effort cleanup of the staged file (#1570),
+                    # mirroring the NFS driver: listing and retention
+                    # only match ``*.zip``, so a leftover ``.tmp`` is
+                    # invisible and is never pruned.
+                    try:
+                        sftp.remove(tmp)
+                    except FileNotFoundError:
+                        pass  # the failure predates the staged file
+                    except Exception as cleanup_exc:  # noqa: BLE001
+                        logger.warning(
+                            "scp_partial_cleanup_failed",
+                            path=tmp,
+                            error=str(cleanup_exc),
+                        )
+                    raise BackupDestinationError(f"SFTP write failed: {describe_exc(exc)}") from exc
                 finally:
                     sftp.close()
-            except Exception as exc:  # noqa: BLE001
-                raise BackupDestinationError(f"SFTP write failed: {exc}") from exc
             finally:
                 client.close()
 
@@ -294,7 +335,7 @@ class ScpDestination(BackupDestination):
         def _do() -> list[ArchiveListing]:
             client = self._connect(config)
             try:
-                sftp = client.open_sftp()
+                sftp = _open_sftp(client)
                 try:
                     entries = sftp.listdir_attr(remote_path)
                 except FileNotFoundError as exc:
@@ -302,7 +343,9 @@ class ScpDestination(BackupDestination):
                         f"remote_path {remote_path!r} not found on host"
                     ) from exc
                 except Exception as exc:  # noqa: BLE001
-                    raise BackupDestinationError(f"SFTP listdir failed: {exc}") from exc
+                    raise BackupDestinationError(
+                        f"SFTP listdir failed: {describe_exc(exc)}"
+                    ) from exc
                 finally:
                     sftp.close()
             finally:
@@ -327,21 +370,26 @@ class ScpDestination(BackupDestination):
 
         return await asyncio.to_thread(_do)
 
-    async def download(self, *, config: dict[str, Any], filename: str) -> bytes:
+    async def download(
+        self, *, config: dict[str, Any], filename: str, max_bytes: int | None = None
+    ) -> bytes:
         safe = safe_filename(filename)
         remote = config["remote_path"].rstrip("/") + "/" + safe
 
         def _do() -> bytes:
             client = self._connect(config)
             try:
-                sftp = client.open_sftp()
+                sftp = _open_sftp(client)
                 try:
                     with sftp.file(remote, "rb") as fh:
-                        return fh.read()
+                        check_size(safe, fh.stat().st_size or 0, max_bytes)
+                        return read_capped(fh.read, filename=safe, max_bytes=max_bytes)
+                except ArchiveTooLargeError:
+                    raise
                 except FileNotFoundError as exc:
                     raise BackupDestinationError(f"archive {safe!r} not found at {remote}") from exc
                 except Exception as exc:  # noqa: BLE001
-                    raise BackupDestinationError(f"SFTP read failed: {exc}") from exc
+                    raise BackupDestinationError(f"SFTP read failed: {describe_exc(exc)}") from exc
                 finally:
                     sftp.close()
             finally:
@@ -356,13 +404,15 @@ class ScpDestination(BackupDestination):
         def _do() -> None:
             client = self._connect(config)
             try:
-                sftp = client.open_sftp()
+                sftp = _open_sftp(client)
                 try:
                     sftp.remove(remote)
                 except FileNotFoundError:
                     return  # idempotent
                 except Exception as exc:  # noqa: BLE001
-                    raise BackupDestinationError(f"SFTP delete failed: {exc}") from exc
+                    raise BackupDestinationError(
+                        f"SFTP delete failed: {describe_exc(exc)}"
+                    ) from exc
                 finally:
                     sftp.close()
             finally:
@@ -385,7 +435,7 @@ class ScpDestination(BackupDestination):
             except BackupDestinationError as exc:
                 return {"ok": False, "error": str(exc)}
             try:
-                sftp = client.open_sftp()
+                sftp = _open_sftp(client)
                 try:
                     # Sanity-check the path exists + is a directory.
                     stat = sftp.stat(remote_path)
@@ -417,35 +467,184 @@ class ScpDestination(BackupDestination):
         return await asyncio.to_thread(_do)
 
 
+def _load_supplied_host_keys(client, known: str) -> None:
+    """Load operator-supplied known_hosts lines into the client's
+    host-key store. Malformed lines are skipped, as before.
+
+    A line whose key this driver cannot decode (``ssh-dss`` since
+    paramiko 4.0, a FIDO ``sk-*`` key, bad base64) is skipped BEFORE it
+    reaches the store. It used to be added with a ``None`` key, and
+    paramiko's ``HostKeys.add`` / ``lookup`` call ``e.key.get_name()``
+    on every entry for that host — so a valid pin on a later line for
+    the same host raised, was skipped too, and the server was refused
+    as "not found in known_hosts" with the right key pinned (#1692).
+    """
+    revoked: set[bytes] = set()
+    pins: list[tuple[list[str], str, str]] = []
+    for line in known.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        marker = None
+        if parts and parts[0].startswith("@"):
+            marker, parts = parts[0], parts[1:]
+        if len(parts) < 3:
+            continue
+        hostfield, keytype, key_b64 = parts[0], parts[1], parts[2]
+        if marker == "@revoked":
+            # Keyed on the key BLOB, not on the line's spelling of it, so
+            # a revoked key cannot slip through because the pin wrote its
+            # base64 or its type field differently.
+            revoked.update(_key_identities(keytype, key_b64))
+            continue
+        if marker is not None:
+            # ``@cert-authority`` pins a CA that signs host certificates,
+            # not a host key, and paramiko verifies no host certificates.
+            # Loading its key as a plain pin would trust a key OpenSSH
+            # treats as a CA, so the line is dropped: the host is refused
+            # unless it has a plain line of its own (fail closed). An
+            # unknown marker is an error line to OpenSSH, so it is too.
+            continue
+        # The host field is a comma-separated pattern list (sshd(8),
+        # SSH_KNOWN_HOSTS FILE FORMAT): ``host,ip``, ``[host]:port``, or
+        # one hashed ``|1|salt|hash`` entry. paramiko's HostKeys.add takes
+        # ONE name, so each is added under its own (#1728). This store
+        # compares names literally, so a wildcard can never match and is
+        # dropped. A ``!`` negation cannot be stored either, but it still
+        # binds the line: OpenSSH never matches a host that a negated
+        # pattern on the line matches, so a literal name it covers is
+        # dropped rather than pinned.
+        fields = [n for n in hostfield.split(",") if n]
+        negated = [n[1:] for n in fields if n.startswith("!") and len(n) > 1]
+        names = [
+            n
+            for n in fields
+            if not n.startswith("!")
+            and "*" not in n
+            and "?" not in n
+            and not any(_ssh_pattern_matches(n, neg) for neg in negated)
+        ]
+        if names:
+            pins.append((names, keytype, key_b64))
+    for names, keytype, key_b64 in pins:
+        # A key revoked anywhere in the file is refused everywhere. That is
+        # stricter than OpenSSH, which scopes ``@revoked`` to its host
+        # patterns, and is the fail-closed reading.
+        if revoked & _key_identities(keytype, key_b64):
+            continue
+        try:
+            decoded = _decode_pubkey(keytype, key_b64)
+            if decoded is None:
+                continue
+            for name in names:
+                client._host_keys.add(name, keytype, decoded)  # noqa: SLF001
+        except Exception:  # noqa: BLE001 — a bad line pins nothing
+            continue
+
+
+def _ssh_pattern_matches(name: str, pattern: str) -> bool:
+    """OpenSSH ``match_pattern``: ``*`` and ``?`` are the only
+    metacharacters (``[`` is literal, as in ``[host]:port``), and host
+    names compare case-insensitively."""
+    import re  # noqa: PLC0415
+
+    rx = "".join(".*" if c == "*" else "." if c == "?" else re.escape(c) for c in pattern.lower())
+    return re.fullmatch(rx, name.lower(), flags=re.DOTALL) is not None
+
+
+def _key_identities(keytype: str, key_b64: str) -> set[bytes]:
+    """The forms a known_hosts key is compared by: the decoded wire blob
+    and, when paramiko can parse it, its canonical re-encoding."""
+    import base64  # noqa: PLC0415
+
+    out: set[bytes] = set()
+    try:
+        out.add(base64.b64decode(key_b64))
+    except Exception:  # noqa: BLE001 — undecodable: nothing to compare by
+        return out
+    decoded = _decode_pubkey(keytype, key_b64)
+    if decoded is not None:
+        try:
+            out.add(decoded.asbytes())
+        except Exception:  # noqa: BLE001 — the raw blob above still counts
+            pass
+    return out
+
+
+def _pem_lost_its_line_breaks(pem: str) -> bool:
+    """True for a PEM block whose BEGIN and END markers sit on ONE line.
+
+    A Fernet-wrapped value (``__enc__:…``, the PATCH carry-over) and a
+    non-PEM value never match, so only a key that was actually pasted
+    flattened is refused.
+    """
+    text = pem.strip()
+    if not text.startswith("-----BEGIN ") or "-----END " not in text:
+        return False
+    return "\n" not in text and "\r" not in text
+
+
 def _load_private_key(pem: str, passphrase: str | None):
     """Load a PEM-encoded SSH private key. paramiko's
     ``RSAKey.from_private_key`` / ``Ed25519Key.from_private_key`` /
     etc. each only handle one algo, so we try them in turn.
+
+    No DSA (#1692): paramiko 4.0 removed ``DSSKey``, and the backend's
+    unbounded ``paramiko>=3.4.0`` installs 4.0 or later, so naming it
+    raised ``AttributeError`` before any key was tried. OpenSSH dropped
+    DSA as well.
+
+    Every failure is a :class:`BackupDestinationError`, never a bare
+    exception: ``RSAKey`` does not check the type inside an OpenSSH
+    container, so an OpenSSH-format DSA key reaches ``cryptography`` as
+    RSA numbers and raises ``ValueError`` — which escaped Test
+    connection as a 500. The loop therefore treats ANY exception from a
+    class as "not this class".
     """
     import paramiko  # noqa: PLC0415
 
+    # A key pasted into a text field often carries a leading blank line
+    # or indentation; paramiko then fails to find the BEGIN line.
+    pem = pem.strip() + "\n"
+    if "-----BEGIN PRIVATE KEY-----" in pem or "-----BEGIN ENCRYPTED PRIVATE KEY-----" in pem:
+        raise BackupDestinationError(
+            "could not parse private key: PKCS#8 ('BEGIN PRIVATE KEY') is not "
+            "supported — convert it to OpenSSH format with "
+            "`ssh-keygen -p -f <keyfile>` and paste the result"
+        )
     text_io = io.StringIO(pem)
     last_exc: Exception | None = None
+    needs_passphrase = False
     for cls in (
         paramiko.Ed25519Key,
         paramiko.ECDSAKey,
         paramiko.RSAKey,
-        paramiko.DSSKey,
     ):
         text_io.seek(0)
         try:
             return cls.from_private_key(text_io, password=passphrase)
-        except paramiko.SSHException as exc:
+        except paramiko.PasswordRequiredException as exc:
+            needs_passphrase = True
             last_exc = exc
-            continue
+        except Exception as exc:  # noqa: BLE001 — any parse failure means "not this class"
+            last_exc = exc
+    if needs_passphrase and not passphrase:
+        raise BackupDestinationError(
+            "could not parse private key: it is passphrase-protected — set "
+            "'private_key_passphrase'"
+        )
     raise BackupDestinationError(
-        f"could not parse private key (tried Ed25519 / ECDSA / RSA / DSS): {last_exc}"
+        f"could not parse private key (tried Ed25519 / ECDSA / RSA; DSA is not "
+        f"supported): {last_exc}"
     )
 
 
 def _decode_pubkey(keytype: str, b64: str):
     """Best-effort decoder for known_hosts pubkey lines.
-    Returns a paramiko PKey subclass or None on parse failure.
+    Returns a paramiko PKey subclass or None on parse failure, or for a
+    key type this driver does not take (``ssh-dss``: no ``DSSKey`` in
+    paramiko 4.0 and later, #1692).
     """
     import base64  # noqa: PLC0415
 
@@ -457,7 +656,6 @@ def _decode_pubkey(keytype: str, b64: str):
         return None
     cls_map = {
         "ssh-rsa": paramiko.RSAKey,
-        "ssh-dss": paramiko.DSSKey,
         "ssh-ed25519": paramiko.Ed25519Key,
         "ecdsa-sha2-nistp256": paramiko.ECDSAKey,
         "ecdsa-sha2-nistp384": paramiko.ECDSAKey,

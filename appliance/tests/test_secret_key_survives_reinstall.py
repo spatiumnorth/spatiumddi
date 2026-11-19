@@ -117,6 +117,8 @@ def _render_control_helmchart() -> dict:
         set -euo pipefail
         {fn.group(0)}
         SPATIUMDDI_VERSION=0.0.0-test
+        APP_KEY_SECRET=spatium-control-app-keys
+        CHART_APP_SECRET=spatium-control-spatiumddi-app
         DNS_AGENT_KEY_VAL=x
         DHCP_AGENT_KEY_VAL=x
         LG_AGENT_KEY_VAL=x
@@ -154,7 +156,7 @@ def test_the_control_helmchart_retries_instead_of_reinstalling() -> None:
     uninstall half. `helm uninstall` decides what to keep from the LAST stored
     revision's manifest, never from the live object, so after a slot rollback to a
     release older than #1044 (2026.09.04-1) the next reinstall deleted the Secret
-    and minted a new SECRET_KEY. `retry` (helm-controller v0.17.7, k3s v1.36.4+k3s1)
+    and minted a new SECRET_KEY. `retry` (helm-controller v0.17.9, k3s v1.36.5+k3s1)
     upgrades a failed release again and never deletes any of it, and unlike `abort`
     it does not wait for an operator. A HelmChartConfig's policy overrides this
     one; test_firstboot_failure_policy.py pins that half.

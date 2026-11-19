@@ -8,7 +8,12 @@ import {
   Server,
   Trash2,
 } from "lucide-react";
-import { dhcpApi, type DHCPPool, type DHCPScope } from "@/lib/api";
+import {
+  dhcpApi,
+  formatApiError,
+  type DHCPPool,
+  type DHCPScope,
+} from "@/lib/api";
 import { zebraBodyCls } from "@/lib/utils";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import {
@@ -19,6 +24,7 @@ import {
 import { CreateScopeModal } from "./CreateScopeModal";
 import { CreatePoolModal } from "./CreatePoolModal";
 import { DeleteConfirmModal, V6NoHaTag } from "./_shared";
+import { scopeDeleteCopy } from "@/lib/dhcp-scope-delete";
 import { v6ScopeLacksHa } from "@/lib/dhcpHa";
 import { ScopeServingStrip } from "./WindowsFailoverPanel";
 
@@ -58,6 +64,7 @@ function PoolRow({ pool, scope }: { pool: DHCPPool; scope: DHCPScope }) {
           onClick={() => setEdit(true)}
           className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-40"
           title="Edit pool"
+          aria-label="Edit pool"
           {...permissionGate(perms.can("write", "dhcp_pool"), NEEDS_POOL_WRITE)}
         >
           <Pencil className="h-3.5 w-3.5" />
@@ -66,6 +73,7 @@ function PoolRow({ pool, scope }: { pool: DHCPPool; scope: DHCPScope }) {
           onClick={() => setDel(true)}
           className="rounded p-1 text-muted-foreground hover:text-destructive disabled:opacity-40"
           title="Delete pool"
+          aria-label="Delete pool"
           {...permissionGate(
             perms.can("delete", "dhcp_pool"),
             NEEDS_POOL_DELETE,
@@ -86,8 +94,14 @@ function PoolRow({ pool, scope }: { pool: DHCPPool; scope: DHCPScope }) {
           title="Delete Pool"
           description={`Delete pool ${pool.start_ip} – ${pool.end_ip}?`}
           onConfirm={() => mut.mutate()}
-          onClose={() => setDel(false)}
+          onClose={() => {
+            mut.reset();
+            setDel(false);
+          }}
           isPending={mut.isPending}
+          error={
+            mut.isError ? formatApiError(mut.error, "Delete failed") : null
+          }
         />
       )}
     </tr>
@@ -107,6 +121,11 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
   const { data: pools = [] } = useQuery({
     queryKey: ["dhcp-pools", scope.id],
     queryFn: () => dhcpApi.listPools(scope.id),
+  });
+  // #2446 — the delete takes the scope's reservations too; count them.
+  const { data: statics = [] } = useQuery({
+    queryKey: ["dhcp-statics", scope.id],
+    queryFn: () => dhcpApi.listStatics(scope.id),
   });
   // #1238 — HA is DHCPv4 only; flag a v6 scope on a multi-Kea group.
   const { data: groups = [] } = useQuery({
@@ -160,7 +179,6 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
             <p className="text-xs text-muted-foreground">
               Lease {scope.lease_time}s · {pools.length} pool
               {pools.length !== 1 ? "s" : ""}
-              {scope.ddns_enabled && " · DDNS"}
             </p>
           </div>
         </div>
@@ -178,6 +196,7 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
             onClick={() => setEditScope(true)}
             className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-40"
             title="Edit scope"
+            aria-label="Edit scope"
             {...permissionGate(canWriteScope, NEEDS_SCOPE_WRITE)}
           >
             <Pencil className="h-3.5 w-3.5" />
@@ -186,6 +205,7 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
             onClick={() => setDeleteScope(true)}
             className="rounded p-1 text-muted-foreground hover:text-destructive disabled:opacity-40"
             title="Delete scope"
+            aria-label="Delete scope"
             {...permissionGate(
               perms.can("delete", "dhcp_scope"),
               NEEDS_SCOPE_DELETE,
@@ -254,8 +274,11 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
       {deleteScope && (
         <DeleteConfirmModal
           title="Delete DHCP Scope"
-          description={`Delete scope "${scope.name}" and all its pools?`}
-          references={[`${pools.length} pool${pools.length !== 1 ? "s" : ""}`]}
+          {...scopeDeleteCopy(
+            scope.name || scope.id.slice(0, 8),
+            pools.length,
+            statics.length,
+          )}
           onConfirm={() => delMut.mutate()}
           onClose={() => {
             setDeleteScope(false);
@@ -263,6 +286,11 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
             delMut.reset();
           }}
           isPending={delMut.isPending}
+          error={
+            delMut.isError
+              ? formatApiError(delMut.error, "Delete failed")
+              : null
+          }
           notice={deleteNotice}
         />
       )}
@@ -316,7 +344,9 @@ export function DHCPSubnetPanel({ subnetId }: { subnetId: string }) {
           <Server className="mx-auto mb-3 h-10 w-10 text-muted-foreground/30" />
           <p className="text-sm font-medium">No DHCP scopes on this subnet</p>
           <p className="mt-1 text-xs text-muted-foreground">
-            Create a scope to start serving leases from a DHCP server.
+            {perms.can("write", "dhcp_scope")
+              ? "Create a scope to start serving leases from a DHCP server."
+              : "Scopes serve leases from a DHCP server."}
           </p>
         </div>
       )}

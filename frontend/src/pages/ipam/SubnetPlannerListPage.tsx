@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { CheckCircle2, Loader2, Plus, Trash2, Workflow } from "lucide-react";
@@ -8,22 +9,40 @@ import {
   type IPSpace,
   type SubnetPlanRead,
   formatApiError,
+  formatDialogError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { newNodeId } from "@/lib/uuid";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Index of saved subnet plans. New plans bootstrap with a root node and a
  * choice between "anchored to existing block" or "new top-level CIDR".
  */
 export function SubnetPlannerListPage() {
+  // #1341 — a read-only user is offered no write it would be refused:
+  // the router asks write (delete) on 'ip_block'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "ip_block"),
+    "Requires write permission on IP blocks",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "ip_block"),
+    "Requires delete permission on IP blocks",
+  );
   const [showNew, setShowNew] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<SubnetPlanRead | null>(
     null,
   );
   const qc = useQueryClient();
 
-  const { data = [], isLoading } = useQuery({
+  const {
+    data = [],
+    isLoading,
+    error,
+  } = useQuery({
     queryKey: ["subnet-plans"],
     queryFn: () => ipamApi.listSubnetPlans(),
   });
@@ -61,7 +80,8 @@ export function SubnetPlannerListPage() {
           <button
             type="button"
             onClick={() => setShowNew(true)}
-            className="inline-flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90"
+            className="inline-flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+            {...writeGate}
           >
             <Plus className="h-4 w-4" /> New plan
           </button>
@@ -77,7 +97,14 @@ export function SubnetPlannerListPage() {
           <div className="rounded-lg border border-dashed p-12 text-center">
             <Workflow className="mx-auto h-8 w-8 text-muted-foreground/40" />
             <p className="mt-3 text-sm text-muted-foreground">
-              No plans yet. Create one to design a CIDR hierarchy.
+              <ListEmpty
+                error={error}
+                what="plans"
+                gate={writeGate}
+                hint="Create one to design a CIDR hierarchy."
+              >
+                No plans yet.
+              </ListEmpty>
             </p>
           </div>
         ) : (
@@ -133,8 +160,9 @@ export function SubnetPlannerListPage() {
                       <button
                         type="button"
                         onClick={() => setPendingDelete(p)}
-                        className="rounded p-1 text-muted-foreground hover:text-destructive"
+                        className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                         aria-label="Delete plan"
+                        {...deleteGate}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>
@@ -157,6 +185,11 @@ export function SubnetPlannerListPage() {
             This deletes only the plan record — any IPAM blocks / subnets that
             were already applied stay in place.
           </p>
+          {deleteMut.isError && (
+            <p role="alert" className="mb-3 text-xs text-destructive">
+              {formatDialogError(deleteMut.error, "Failed to delete plan")}
+            </p>
+          )}
           <div className="flex justify-end gap-2">
             <button
               type="button"
@@ -331,9 +364,7 @@ function NewPlanModal({ onClose }: { onClose: () => void }) {
           )}
         </div>
         {createMut.isError && (
-          <p className="text-xs text-destructive">
-            {formatApiError(createMut.error)}
-          </p>
+          <FormError>{formatApiError(createMut.error)}</FormError>
         )}
         <div className="flex justify-end gap-2 pt-2">
           <button

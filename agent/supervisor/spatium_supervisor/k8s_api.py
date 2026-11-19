@@ -24,9 +24,10 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import re
 import socket
 import ssl
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -91,6 +92,12 @@ class PodStatus:
     status: str  # Pending / Running / Succeeded / Failed / Unknown
     container_statuses: list[dict[str, Any]] = field(default_factory=list)
     labels: dict[str, str] = field(default_factory=dict)
+    # #2018 — ``spec.nodeName``, so the watchdog can tell this node's pod of
+    # a DaemonSet from another node's, and each container's
+    # ``resources.limits.memory`` (``"2Gi"``), so an ``OOMKilled`` report can
+    # name the limit that was hit.
+    node_name: str = ""
+    memory_limits: dict[str, str] = field(default_factory=dict)
 
 
 def _resolve_config() -> KubeConfig | None:
@@ -339,7 +346,13 @@ def list_pods(
     out: list[PodStatus] = []
     for item in data.get("items") or []:
         meta = item.get("metadata") or {}
+        spec = item.get("spec") or {}
         status_block = item.get("status") or {}
+        limits: dict[str, str] = {}
+        for c in spec.get("containers") or []:
+            mem = ((c.get("resources") or {}).get("limits") or {}).get("memory")
+            if c.get("name") and mem:
+                limits[str(c["name"])] = str(mem)
         out.append(
             PodStatus(
                 name=meta.get("name") or "",
@@ -347,6 +360,8 @@ def list_pods(
                 status=status_block.get("phase") or "Unknown",
                 container_statuses=status_block.get("containerStatuses") or [],
                 labels=meta.get("labels") or {},
+                node_name=spec.get("nodeName") or "",
+                memory_limits=limits,
             )
         )
     return out
@@ -494,7 +509,9 @@ def delete_node(name: str) -> tuple[bool, str | None]:
     never was a Node", and a node can be an etcd member without one (it
     became a voter before its Node registered), so the eviction is
     confirmed against etcd by etcd_evict, never by this answer."""
-    path = f"/api/v1/nodes/{quote(name)}"
+    # #1757 — k3s lowercases the host's name for its Node (RFC 1123); an old
+    # backend may still send the hostname as stored.
+    path = f"/api/v1/nodes/{quote(name.strip().rstrip('.').lower())}"
     try:
         status, resp = _request("DELETE", path)
     except RuntimeError as exc:
@@ -504,11 +521,66 @@ def delete_node(name: str) -> tuple[bool, str | None]:
     return False, f"kubeapi status {status}: {resp[:200]!r}"
 
 
+@dataclass
+class RedisReclaim:
+    """What one Redis sweep did (#2404). ``reclaimed``: the claims whose
+    DELETE landed this sweep; ``terminating``: claims an earlier sweep
+    deleted that pvc-protection still holds (their pod DELETE is retried,
+    they are not counted again); ``nodes``: the hostnames the reclaimed
+    claims were pinned to; ``sources``: per reclaimed claim, whether the
+    bound PV's node affinity (``pv``) or the scheduler's selected-node
+    annotation (``annotation``) decided it was stranded; ``error``: why the
+    sweep stopped, quoting the start of the answer's body when it was
+    refused; ``error_kind``: the same without the body (the request, and
+    its status when the sweep has it), set wherever ``error`` can quote
+    one. The heartbeat logs a failure once per kind, and an apiserver can
+    answer every tick with another body (review of #2433)."""
+
+    reclaimed: list[str] = field(default_factory=list)
+    error: str | None = None
+    terminating: list[str] = field(default_factory=list)
+    nodes: list[str] = field(default_factory=list)
+    sources: dict[str, str] = field(default_factory=dict)
+    error_kind: str = ""
+
+    def __iter__(self):
+        # ``reclaimed, err = ...``, the shape #590's callers unpack.
+        yield self.reclaimed
+        yield self.error
+
+
+_REDIS_CLAIM_MARK = "-redis-"
+_PENDING_PODS_QUERY = f"?fieldSelector={quote('status.phase=Pending')}"
+
+
+def _waits_on_redis_claim(pod: dict) -> bool:
+    """A Pending pod that mounts a ``-redis-`` claim. A stranded claim's
+    replica always is one: the scheduler cannot place it."""
+    if ((pod or {}).get("status") or {}).get("phase") != "Pending":
+        return False
+    for volume in ((pod or {}).get("spec") or {}).get("volumes") or []:
+        claim = ((volume or {}).get("persistentVolumeClaim") or {}).get("claimName")
+        if _REDIS_CLAIM_MARK in str(claim or ""):
+            return True
+    return False
+
+
+def _k3s_node_names(names: str | Iterable[str]) -> set[str]:
+    """PURE: the names as k3s registers its Nodes, lowercased with no trailing
+    dot (#1757), as delete_node sends them. A bare string is one name."""
+    given = [names] if isinstance(names, str) else names
+    return {str(n).strip().rstrip(".").lower() for n in given if n} - {""}
+
+
 def reclaim_stranded_redis_storage(
-    node: str, namespace: str = "spatium"
-) -> tuple[list[str], str | None]:
+    evicted_nodes: str | Iterable[str] = (),
+    namespace: str = "spatium",
+    *,
+    owed_nodes: str | Iterable[str] = (),
+) -> RedisReclaim:
     """Delete Redis PVCs (and their Pending consumer pods) stranded on a
-    just-deleted node — returns (reclaimed_pvc_names, error).
+    node that no longer exists. Returns a :class:`RedisReclaim`, which
+    unpacks as ``(reclaimed_pvc_names, error)``.
 
     #590 — local-path PVs are node-affine, so evicting a dead node
     permanently strands every ReadWriteOnce PVC provisioned on it: the
@@ -531,46 +603,322 @@ def reclaim_stranded_redis_storage(
     :func:`reclaim_stranded_postgres_storage` (#1058). The PVC goes first
     (pvc-protection holds it until its pod is gone), then the pod — the
     StatefulSet then recreates both and the provisioner lands the new PV
-    on a live node."""
+    on a live node.
+
+    #2404: level-triggered, like the Postgres reclaim (#1058). #590 ran
+    this once, on the tick whose Node DELETE succeeded, keyed on the name
+    it was given, and nothing looked again: the eviction loop skips a name
+    it has handled for as long as the backend lists it, and the backend
+    stops listing it once etcd drops the member. An error answer on that
+    tick, a Node removed any other way, or a name sent in another form than
+    the claim's annotation left the claim stranded for good (on a fresh
+    three-node cluster, Redis still ran two of three 37 minutes after a
+    replace). The seed calls it on every tick now:
+
+    * ``evicted_nodes``: the names the caller deleted this tick (a bare
+      name is one node). They are authoritative, as for Postgres: their
+      claims go at once, with no Node read (the DELETE is milliseconds old
+      and the Node can still be listed).
+    * ``owed_nodes``: the names a failed sweep left owed. They were evicted
+      on an earlier tick, and a run of failed sweeps can keep them owed
+      while the node rejoins under the same hostname, its replica running
+      on the claim again (review of #2433). So one Node read decides: a
+      name the list no longer has goes as if evicted now, and one it lists
+      again keeps its claim and pod. A Node list that cannot be read is an
+      error, and nothing is freed.
+    * otherwise one read, the namespace's Pending pods. Only while a pod
+      that mounts a ``-redis-`` claim is Pending does the sweep read the
+      Node list, and it reclaims each claim whose every pinned hostname
+      the list no longer carries. NotReady is not gone: a claim whose node
+      is still a Node is left alone, because that node can come back with
+      its data.
+
+    Where a claim lives is read as for Postgres and the mirror
+    (:func:`_pvc_pinned_hostnames`): the bound PV's node affinity, the
+    selected-node annotation only when there is no PV, and a PV read that
+    fails is an error, never a guess. A claim an earlier sweep deleted is
+    reported ``terminating``, not reclaimed again, and its pod DELETE is
+    retried."""
+    forced = _k3s_node_names(evicted_nodes)
+    owed = _k3s_node_names(owed_nodes) - forced
+    base = f"/api/v1/namespaces/{quote(namespace)}"
+    if owed:
+        # Owed, not evicted this tick: only while the Node list lacks the name.
+        listed, nodes_err = cluster_node_names()
+        if listed is None:
+            return RedisReclaim(error=nodes_err, error_kind="list nodes")
+        forced |= owed - set(listed)
+    live: set[str] | None = None
+    if not forced:
+        try:
+            status, resp = _request("GET", f"{base}/pods{_PENDING_PODS_QUERY}")
+        except (RuntimeError, OSError) as exc:
+            return RedisReclaim(error=str(exc))
+        if status != 200:
+            return RedisReclaim(
+                error=f"kubeapi status {status}: {resp[:200]!r}",
+                error_kind=f"list Pending pods: status {status}",
+            )
+        try:
+            pending = json.loads(resp).get("items") or []
+        except (ValueError, AttributeError):
+            return RedisReclaim(error="unparseable pod list")
+        if not any(_waits_on_redis_claim(pod) for pod in pending):
+            return RedisReclaim()
+        listed, nodes_err = cluster_node_names()
+        if listed is None:
+            return RedisReclaim(error=nodes_err, error_kind="list nodes")
+        live = set(listed)
+
+    try:
+        status, resp = _request("GET", f"{base}/persistentvolumeclaims")
+    except (RuntimeError, OSError) as exc:
+        return RedisReclaim(error=str(exc))
+    if status != 200:
+        return RedisReclaim(
+            error=f"kubeapi status {status}: {resp[:200]!r}",
+            error_kind=f"list claims: status {status}",
+        )
+    try:
+        items = json.loads(resp).get("items", [])
+    except (ValueError, AttributeError):
+        return RedisReclaim(error="unparseable PVC list")
+    out = RedisReclaim()
+    gone: set[str] = set()
+    for pvc in items:
+        meta = pvc.get("metadata") or {}
+        name = str(meta.get("name") or "")
+        if _REDIS_CLAIM_MARK not in name:
+            continue
+        pinned, source, pin_err = _pvc_pinned_hostnames(pvc)
+        if pin_err:
+            out.error, out.error_kind = f"{name}: {pin_err}", f"read the volume of {name}"
+            break
+        # Stranded: every hostname the volume is pinned to is gone, i.e. one
+        # the caller evicted, or (on a sweep) one the Node list no longer has.
+        if not pinned or not all(
+            host in forced or (live is not None and host not in live) for host in pinned
+        ):
+            continue
+        if meta.get("deletionTimestamp"):
+            out.terminating.append(name)
+        else:
+            try:
+                status, resp = _request(
+                    "DELETE", f"{base}/persistentvolumeclaims/{quote(name)}"
+                )
+            except (RuntimeError, OSError) as exc:
+                out.error = str(exc)
+                break
+            if status not in (200, 202, 404):
+                out.error = f"kubeapi status {status}: {resp[:200]!r}"
+                out.error_kind = f"delete claim {name}: status {status}"
+                break
+            if status != 404:  # 404: gone between the list and the delete
+                out.reclaimed.append(name)
+                out.sources[name] = source
+                gone |= pinned
+        # volumeClaimTemplate name is the prefix: data-<pod-name>. Delete
+        # the Pending pod so the StatefulSet recreates it against a fresh
+        # claim (an existing pod keeps referencing the deleted PVC). A
+        # refusal is reported, so the heartbeat keeps the node owed and the
+        # next tick retries it; a pod that is already gone (404) is the goal.
+        pod = name.partition("-")[2]
+        if pod:
+            try:
+                status, resp = _request("DELETE", f"{base}/pods/{quote(pod)}")
+            except (RuntimeError, OSError) as exc:
+                out.error = f"pod {pod}: {exc}"
+                break
+            if status not in (200, 202, 404):
+                out.error = f"pod {pod}: kubeapi status {status}: {resp[:200]!r}"
+                out.error_kind = f"delete pod {pod}: status {status}"
+                break
+    out.nodes = sorted(gone)
+    return out
+
+
+# #1541 — the slot-image mirror's claim, stranded on an evicted node.
+_MIRROR_COMPONENT = "slot-image-mirror"
+_MIRROR_CLAIM_SUFFIX = "-slot-image-mirror-data"
+# Metadata the apiserver / provisioner / scheduler stamp on a bound claim.
+# A re-created claim must carry none of them: ``selected-node`` names the
+# node that is gone, and the bind annotations describe a PV the new claim
+# does not have.
+_CLAIM_RUNTIME_ANNOTATIONS = (
+    "volume.kubernetes.io/selected-node",
+    "pv.kubernetes.io/bind-completed",
+    "pv.kubernetes.io/bound-by-controller",
+    "volume.beta.kubernetes.io/storage-provisioner",
+    "volume.kubernetes.io/storage-provisioner",
+    "kubectl.kubernetes.io/last-applied-configuration",
+)
+
+
+def _recreatable_claim(pvc: dict) -> dict:
+    """A copy of ``pvc`` the apiserver will accept as a NEW claim: its name,
+    namespace, labels and Helm ownership annotations (so the release still
+    owns it and its next upgrade patches it rather than refusing it), and its
+    requested shape — never its binding (``volumeName``), its status, or the
+    node the old volume was provisioned on."""
+    meta = pvc.get("metadata") or {}
+    spec = pvc.get("spec") or {}
+    anns = {
+        k: v
+        for k, v in (meta.get("annotations") or {}).items()
+        if k not in _CLAIM_RUNTIME_ANNOTATIONS
+    }
+    out_meta: dict[str, Any] = {"name": meta.get("name")}
+    if meta.get("namespace"):
+        out_meta["namespace"] = meta["namespace"]
+    if meta.get("labels"):
+        out_meta["labels"] = dict(meta["labels"])
+    if anns:
+        out_meta["annotations"] = anns
+    out_spec: dict[str, Any] = {}
+    for key in ("accessModes", "resources", "storageClassName", "volumeMode"):
+        if spec.get(key) is not None:
+            out_spec[key] = spec[key]
+    return {
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": out_meta,
+        "spec": out_spec,
+    }
+
+
+def reclaim_stranded_mirror_storage(
+    node: str, namespace: str = "spatium"
+) -> tuple[dict[str, dict], str | None]:
+    """Delete the slot-image mirror's claim (and its Pending pod) when its
+    volume is pinned to ``node``, a node that was just deleted — returns
+    ``({claim_name: manifest_to_recreate}, error)``.
+
+    #1541 — the mirror is a single-replica Deployment on a local-path RWO
+    claim, so it has the Redis and Postgres hazard: once the node holding
+    its volume is evicted (a dead-node Replace, or a demote's cleanup), the
+    re-created pod sits Pending on the volume's node affinity for good. The
+    shrink reclaimed Redis's and Postgres's claims and not the mirror's (the
+    #1659 walk). Unlike those, nothing re-creates this claim: it is a plain
+    Helm-owned PVC (``helm.sh/resource-policy: keep``), not a StatefulSet
+    volumeClaimTemplate or a CNPG instance claim, and a Helm upgrade only
+    restores it if one happens to run. So the caller keeps the returned
+    manifest and hands it to :func:`recreate_reclaimed_claims` until the old
+    claim has finished terminating.
+
+    The bytes on the old volume are gone with the node either way; the
+    mirror starts empty on a live node and the api's download handler falls
+    back to its local copy, as it does after a promote.
+
+    The bound PV's node affinity decides it, with the scheduler's
+    ``selected-node`` annotation standing in only when there is no PV to
+    read (:func:`_pvc_pinned_hostnames`); a PV read that fails is an error,
+    never a guess."""
     base = f"/api/v1/namespaces/{quote(namespace)}"
     try:
         status, resp = _request("GET", f"{base}/persistentvolumeclaims")
     except RuntimeError as exc:
-        return [], str(exc)
+        return {}, str(exc)
     if status != 200:
-        return [], f"kubeapi status {status}: {resp[:200]!r}"
+        return {}, f"kubeapi status {status}: {resp[:200]!r}"
     try:
         items = json.loads(resp).get("items", [])
     except ValueError:
-        return [], "unparseable PVC list"
-    reclaimed: list[str] = []
+        return {}, "unparseable PVC list"
+    owed: dict[str, dict] = {}
     for pvc in items:
         meta = pvc.get("metadata") or {}
         name = str(meta.get("name") or "")
-        anns = meta.get("annotations") or {}
-        if "-redis-" not in name:
+        if not name.endswith(_MIRROR_CLAIM_SUFFIX) or meta.get("deletionTimestamp"):
             continue
-        if anns.get("volume.kubernetes.io/selected-node") != node:
+        hostnames, _source, err = _pvc_pinned_hostnames(pvc)
+        if err:
+            return owed, err
+        if node not in hostnames:
             continue
+        manifest = _recreatable_claim(pvc)
         try:
             status, resp = _request(
                 "DELETE", f"{base}/persistentvolumeclaims/{quote(name)}"
             )
         except RuntimeError as exc:
-            return reclaimed, str(exc)
+            return owed, str(exc)
         if status not in (200, 202, 404):
-            return reclaimed, f"kubeapi status {status}: {resp[:200]!r}"
-        # volumeClaimTemplate name is the prefix: data-<pod-name>. Delete
-        # the Pending pod so the StatefulSet recreates it against a fresh
-        # claim (an existing pod keeps referencing the deleted PVC).
-        pod = name.partition("-")[2]
-        if pod:
+            return owed, f"kubeapi status {status}: {resp[:200]!r}"
+        owed[name] = manifest
+        _delete_component_pods(_MIRROR_COMPONENT, namespace)
+    return owed, None
+
+
+def _delete_component_pods(component: str, namespace: str) -> None:
+    """Delete every pod carrying ``app.kubernetes.io/component=<component>``
+    so pvc-protection releases the claim it references and the Deployment
+    re-creates the pod against the new one. Best effort: the claim reclaim
+    is what matters, and a pod that is already gone is the goal."""
+    for pod in list_pods(
+        namespace, label_selector=f"app.kubernetes.io/component={component}"
+    ):
+        try:
+            _request(
+                "DELETE", f"/api/v1/namespaces/{quote(namespace)}/pods/{quote(pod.name)}"
+            )
+        except RuntimeError:
+            pass  # gone already, or the next tick retries via the 409 path
+
+
+def recreate_reclaimed_claims(
+    owed: dict[str, dict], namespace: str = "spatium"
+) -> tuple[list[str], dict[str, dict], str | None]:
+    """Create each claim :func:`reclaim_stranded_mirror_storage` deleted —
+    returns ``(created, still_owed, error)``.
+
+    A claim still terminating answers 409 (pvc-protection holds it until no
+    pod references it): it stays owed, and its consumer pods are deleted
+    again in case the Deployment re-created one against the old claim in
+    between. A 409 for a claim that is NOT terminating means somebody else
+    (a Helm upgrade) has already re-created it, which is the outcome wanted,
+    so it is settled without a second write."""
+    base = f"/api/v1/namespaces/{quote(namespace)}/persistentvolumeclaims"
+    created: list[str] = []
+    still: dict[str, dict] = {}
+    error: str | None = None
+    for name, manifest in owed.items():
+        try:
+            status, resp = _request(
+                "POST",
+                base,
+                body=json.dumps(manifest).encode(),
+                content_type="application/json",
+            )
+        except RuntimeError as exc:
+            still[name], error = manifest, str(exc)
+            continue
+        if status in (200, 201, 202):
+            created.append(name)
+            continue
+        if status != 409:
+            still[name] = manifest
+            error = f"kubeapi status {status}: {resp[:200]!r}"
+            continue
+        try:
+            status, resp = _request("GET", f"{base}/{quote(name)}")
+        except RuntimeError as exc:
+            still[name], error = manifest, str(exc)
+            continue
+        terminating = True
+        if status == 200:
             try:
-                _request("DELETE", f"{base}/pods/{quote(pod)}")
-            except RuntimeError:
-                pass  # pod may not exist; the PVC reclaim is what matters
-        reclaimed.append(name)
-    return reclaimed, None
+                terminating = bool(
+                    (json.loads(resp).get("metadata") or {}).get("deletionTimestamp")
+                )
+            except ValueError:
+                terminating = True
+        elif status == 404:
+            terminating = True  # gone between the two calls: create next tick
+        if terminating:
+            still[name] = manifest
+            _delete_component_pods(_MIRROR_COMPONENT, namespace)
+    return created, still, error
 
 
 # #1058 — CloudNativePG instance storage stranded on an evicted node.
@@ -876,6 +1224,622 @@ def reclaim_stranded_postgres_storage(
                            terminating)
 
 
+# #2132 — re-clone a CloudNativePG instance stuck on WAL it can never get.
+#
+# A former primary that cannot ``pg_rewind`` (the WAL it needs was recycled,
+# or cut short by the kill that made it a former primary, and the appliance
+# has no WAL archive to restore it from), or a standby whose replication slot
+# #2317's ``max_slot_wal_keep_size`` invalidated, loops for ever: CNPG retries,
+# never re-clones, and the cluster runs one copy short until someone deletes
+# the PVC by hand. CNPG documents one way to ask it for that re-clone, the
+# ``alpha.cnpg.io/unrecoverable`` pod annotation: the operator deletes the pod
+# and its PVCs and joins a fresh instance from the primary, and ignores the
+# annotation on the current or target primary.
+_CNPG_UNRECOVERABLE_ANNOTATION = "alpha.cnpg.io/unrecoverable"
+_CNPG_JOB_ROLE_LABEL = "cnpg.io/jobRole"
+
+# The loops that never end on their own while no WAL archive is configured,
+# MOST SPECIFIC FIRST: when several repeat in one window, the earliest here
+# names the loop. Each is a substring of a line CNPG's instance manager or
+# PostgreSQL writes to the instance pod's log; a hit only counts once it has
+# held for STUCK_INSTANCE_AFTER_S, so one transient line (a pg_rewind
+# attempted while the new primary was still promoting) is never enough.
+_STUCK_SIGNATURES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # #2132's first signature: pg_rewind asks the (absent) archive for a
+    # segment the former primary no longer has.
+    ("pg_rewind_archive", ("could not restore file", "from archive")),
+    # #2132's fourth occurrence: the segment is the instance's own, cut short
+    # ("could not read file ... read 0 of 8192"); every pg_rewind failure
+    # ends in this line.
+    ("pg_rewind_failed", ("Failed to execute pg_rewind",)),
+    # A standby whose slot the #2317 cap invalidated, or asking for WAL the
+    # primary has recycled.
+    ("slot_invalidated", ("can no longer get changes from replication slot",)),
+    ("wal_removed", ("has already been removed",)),
+    # #2132's second and third occurrences. LAST, because it is the least
+    # specific: CNPG's restore_command logs it on every walreceiver retry once
+    # the cluster is past timeline 1, so it rides along with each of the loops
+    # above (case 4 of the #2765 walk logged it once per wal_removed line, and
+    # a count-based pick named every such run future_timeline) and with a
+    # standby that merely cannot connect to the primary, which heals.
+    ("future_timeline", ("Refusing to restore future timeline history file",)),
+)
+
+# Signatures that prove on their own that the WAL the instance needs is gone:
+# a failed pg_rewind (the former primary's own WAL from the divergence point,
+# which no slot on the new primary covers), or the primary saying it has
+# removed the segment / invalidated the slot the standby asks for.
+# ``future_timeline`` is not one: a standby cut off from the primary logs it
+# just the same, and catches up once it reconnects (#2765's walk re-cloned
+# exactly such a standby, its slot ``reserved`` 32 MB behind).
+_REWIND_SIGNATURES = frozenset({"pg_rewind_archive", "pg_rewind_failed"})
+_WAL_GONE_SIGNATURES = frozenset({"slot_invalidated", "wal_removed"})
+
+# How long a signature must keep appearing before the instance is re-cloned.
+# The QA desk's drill gate is 15 minutes; a rewind that is going to work does
+# so within a minute or two of the instance coming back.
+STUCK_INSTANCE_AFTER_S = 600
+# The log window read per instance per tick: three heartbeats (30 s each), and
+# room for the slowest loop above (pg_rewind every 10-20 s) to repeat.
+_STUCK_LOG_WINDOW_S = 90
+_STUCK_LOG_LIMIT_BYTES = 256 * 1024
+# A signature counts only when it REPEATS in the window, i.e. the instance is
+# looping now. A replica joining a forming cluster logs "Refusing to restore
+# future timeline history file" once or twice in its first seconds (the
+# Cluster's recorded timeline lags the history file it was cloned with) and
+# then streams; the walk on #2765 saw exactly one such line per joiner, 11 s
+# and 24 s after start. Every real loop repeats far faster than this needs:
+# pg_rewind fails every 10-20 s (4-9 lines in the window), the future-timeline
+# refusal and the WAL-removed / slot-invalidated walreceiver errors every 1-5 s.
+STUCK_MIN_REPEATS = 3
+# A loop that has held this long across ticks is reported as stuck (a
+# warning). Before that it is only "looping" (info): one tick is not evidence.
+STUCK_REPORT_AFTER_S = 120
+
+# CNPG's instance manager serves its own status, including the primary's
+# ``pg_replication_slots`` (``replicationSlotsInfo``: slot name, walStatus),
+# on this port of every instance pod. ``kubectl cnpg status`` reads the same
+# document. Reading it straight off the pod IP needs no grant on the pods
+# themselves, where the alternatives each need one much wider than the
+# question: pods/exec (a shell in any pod of the namespace) or pods/proxy.
+#
+# The endpoint presents the cluster's server certificate, signed by the
+# cluster CA (``<cluster>-ca``) with the cluster's service names as SANs
+# (``<cluster>-rw``, ``-r``, ``-ro`` and their namespace / svc forms; never
+# the pod IP or the pod name). So the read connects to the pod IP and checks
+# the certificate against the CA under the name ``<cluster>-rw``, which every
+# instance's certificate carries. The CA reaches the supervisor as its public
+# certificate only, in the ConfigMap ``<cluster>-ca-crt`` the control chart's
+# publisher CronJob keeps in step with the CA secret
+# (charts/spatiumddi/templates/cnpg-ca-publisher.yaml): the secret also holds
+# the CA private key, so the supervisor is never granted it.
+_CNPG_STATUS_PORT = 8000
+_CNPG_STATUS_PATH = "/pg/status"
+_CNPG_STATUS_TIMEOUT_S = 4.0
+# The ConfigMap (and its key) the control chart publishes the cluster CA's
+# public certificate into.
+_CNPG_CA_CONFIGMAP_SUFFIX = "-ca-crt"
+_CNPG_CA_CONFIGMAP_KEY = "ca.crt"
+# The SAN the status endpoint's certificate is checked against.
+_CNPG_STATUS_NAME_SUFFIX = "-rw"
+# The slot name CNPG gives each instance's HA slot on the primary is
+# ``<prefix><instance name with - as _>``, prefix ``_cnpg_`` by default.
+_CNPG_SLOT_PREFIX = "_cnpg_"
+# walStatus values under which the WAL from the slot's restart_lsn is still
+# on the primary (``unreserved``: past max_wal_size, kept until the next
+# checkpoint): the standby can stream it once it reconnects.
+_SLOT_WAL_PRESENT = frozenset({"reserved", "extended", "unreserved"})
+
+
+def repeating_signatures(log_text: str) -> list[str]:
+    """Every never-heals signature that repeats at least
+    :data:`STUCK_MIN_REPEATS` times in ``log_text`` (one match per line),
+    most specific first (the order of :data:`_STUCK_SIGNATURES`)."""
+    counts: dict[str, int] = {}
+    for line in log_text.splitlines():
+        for name, parts in _STUCK_SIGNATURES:
+            if all(part in line for part in parts):
+                counts[name] = counts.get(name, 0) + 1
+                break
+    return [name for name, _ in _STUCK_SIGNATURES if counts.get(name, 0) >= STUCK_MIN_REPEATS]
+
+
+def stuck_signature(log_text: str) -> str | None:
+    """The most specific never-heals signature that repeats in ``log_text``,
+    or None. Specificity, not line count, picks it: ``future_timeline`` is
+    logged alongside every other loop, so it only names a loop that shows
+    nothing else."""
+    repeating = repeating_signatures(log_text)
+    return repeating[0] if repeating else None
+
+
+def _newest_match_stamp(log_text: str) -> str:
+    """The kubelet timestamp (``timestamps=true``) of the newest line in
+    ``log_text`` that matches any signature, or "" when the lines carry
+    none. Two ticks reporting the same newest line mean the loop logged
+    nothing new between them."""
+    newest = ""
+    for line in log_text.splitlines():
+        if any(all(part in line for part in parts) for _, parts in _STUCK_SIGNATURES):
+            stamp, _, _ = line.partition(" ")
+            if stamp[:1].isdigit() and "T" in stamp:
+                newest = stamp
+    return newest
+
+
+@dataclass
+class StuckSighting:
+    """An instance first seen looping at ``since`` (the caller's clock),
+    under ``primary``. A change of primary starts the clock again: the
+    instance may be able to follow the new one.
+
+    ``confirmed`` is set once a later tick finds the loop still logging new
+    lines (a newer matching line than the first tick saw): a healthy follower
+    that logs a burst of future-timeline refusals across a switchover leaves
+    those lines in the next two windows, but logs no new ones.
+    ``evidence`` collects every repeating signature seen in this sighting."""
+
+    primary: str
+    since: float
+    signature: str
+    first_stamp: str = ""
+    confirmed: bool = False
+    evidence: set[str] = field(default_factory=set)
+
+
+@dataclass
+class PostgresReclone:
+    """What one :func:`reclone_stuck_postgres_instances` call did.
+
+    ``stuck`` maps each looping instance to ``{"signature", "seconds",
+    "confirmed", "slot"}``; ``marked`` names the instance annotated for a
+    re-clone this call (at most one); ``deferred_reason`` says why a due
+    instance was not; ``held`` maps a due instance to why it is NOT being
+    re-cloned at all (its WAL still exists, or that cannot be told);
+    ``clock_reset`` maps an instance whose stuck clock restarted this call
+    to why."""
+
+    stuck: dict[str, dict[str, Any]] = field(default_factory=dict)
+    marked: list[str] = field(default_factory=list)
+    deferred_reason: str = ""
+    held: dict[str, str] = field(default_factory=dict)
+    clock_reset: dict[str, str] = field(default_factory=dict)
+    # Set on a call that read the primary's slots: ``slot_state_error`` says
+    # why they could not be read (so every stuck instance reads ``unknown``
+    # and none is re-cloned), "" when they were, with the endpoint's TLS
+    # verified against the cluster CA (``slot_state_read``).
+    slot_state_read: bool = False
+    slot_state_error: str = ""
+    error: str | None = None
+
+
+def _pod_ready(pod: dict) -> bool:
+    for cond in (pod.get("status") or {}).get("conditions") or []:
+        if cond.get("type") == "Ready":
+            return str(cond.get("status")) == "True"
+    return False
+
+
+def cnpg_ca_configmap_name(cluster_name: str = _CNPG_DEFAULT_CLUSTER) -> str:
+    """The ConfigMap the control chart publishes ``cluster_name``'s CA
+    certificate (public part only) into."""
+    return cluster_name + _CNPG_CA_CONFIGMAP_SUFFIX
+
+
+def _cnpg_status_ca(namespace: str, cluster_name: str) -> tuple[str | None, str]:
+    """The cluster CA certificate (PEM) the status endpoint is verified
+    against, read from :func:`cnpg_ca_configmap_name`, or ``(None, why)``.
+    Never the CA secret: that holds the private key too."""
+    name = cnpg_ca_configmap_name(cluster_name)
+    try:
+        status, resp = _request(
+            "GET", f"/api/v1/namespaces/{quote(namespace)}/configmaps/{quote(name)}"
+        )
+    except RuntimeError as exc:
+        return None, f"the CA ConfigMap {name} could not be read: {exc}"
+    if status == 404:
+        return None, (
+            f"the CA ConfigMap {name} does not exist (the control chart's "
+            "CA publisher has not run yet, or is not enabled)"
+        )
+    if status != 200:
+        return None, f"the CA ConfigMap {name} could not be read: kubeapi status {status}"
+    try:
+        data = json.loads(resp).get("data") or {}
+    except (ValueError, AttributeError):
+        return None, f"the CA ConfigMap {name} is unparseable"
+    pem = data.get(_CNPG_CA_CONFIGMAP_KEY) if isinstance(data, dict) else None
+    if not isinstance(pem, str) or "-----BEGIN CERTIFICATE-----" not in pem:
+        return None, f"the CA ConfigMap {name} carries no {_CNPG_CA_CONFIGMAP_KEY} certificate"
+    return pem, ""
+
+
+class _NamedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS to an address, with the certificate checked against
+    ``server_hostname`` (also sent as SNI) rather than the address: the
+    status endpoint's certificate names the cluster's services, not pods."""
+
+    def __init__(
+        self, host: str, port: int, *, server_hostname: str, context: ssl.SSLContext, timeout: float
+    ) -> None:
+        super().__init__(host, port, timeout=timeout, context=context)
+        self._server_hostname = server_hostname
+        self._verify_context = context
+
+    def connect(self) -> None:
+        http.client.HTTPConnection.connect(self)
+        self.sock = self._verify_context.wrap_socket(
+            self.sock, server_hostname=self._server_hostname
+        )
+
+
+def _cnpg_instance_status(
+    pod_ip: str, *, ca_pem: str, server_hostname: str
+) -> tuple[dict | None, str]:
+    """GET CNPG's instance-manager status document off ``pod_ip``, with its
+    TLS certificate verified against ``ca_pem`` (the cluster CA) under the
+    name ``server_hostname``. ``(doc, "")``, or ``(None, why)`` when it
+    cannot be read or the certificate does not verify. Nothing is read from
+    an endpoint whose certificate fails: a forged slot state is then no
+    better than none, and none holds every re-clone."""
+    try:
+        ctx = ssl.create_default_context(cadata=ca_pem)
+    except (ssl.SSLError, ValueError) as exc:
+        return None, f"the cluster CA certificate could not be loaded: {exc}"
+    ctx.check_hostname = True
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    # Pinned rather than left to the interpreter's defaults, so the check is
+    # the same on every Python the supervisor runs (the image ships 3.14;
+    # 3.13 made both the default): RFC 5280 strict chain checks, and TLS 1.2
+    # or later. CNPG's certificates pass the strict checks: Go's x509 gives
+    # its CA a Subject Key Identifier and the server leaf an Authority Key
+    # Identifier (verified live on a CNPG 1.30.1 cluster).
+    ctx.verify_flags |= ssl.VERIFY_X509_STRICT
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    conn = _NamedHTTPSConnection(
+        pod_ip,
+        _CNPG_STATUS_PORT,
+        server_hostname=server_hostname,
+        context=ctx,
+        timeout=_CNPG_STATUS_TIMEOUT_S,
+    )
+    try:
+        conn.request("GET", _CNPG_STATUS_PATH, headers={"Accept": "application/json"})
+        resp = conn.getresponse()
+        body = resp.read()
+        if resp.status != 200:
+            return None, f"the primary's status endpoint answered {resp.status}"
+        doc = json.loads(body)
+        if not isinstance(doc, dict):
+            return None, "the primary's status document is not an object"
+        return doc, ""
+    except ssl.SSLCertVerificationError as exc:
+        return None, (
+            "the primary's status endpoint certificate did not verify against the "
+            f"cluster CA as {server_hostname}: {exc.verify_message or exc}"
+        )
+    except ssl.SSLError as exc:
+        return None, f"TLS to the primary's status endpoint failed: {exc}"
+    except (OSError, http.client.HTTPException) as exc:
+        return None, f"the primary's status endpoint could not be read: {exc}"
+    except ValueError:
+        return None, "the primary's status document is unparseable"
+    finally:
+        conn.close()
+
+
+def _slot_states(
+    primary_pod: dict | None,
+    *,
+    namespace: str = "spatium",
+    cluster_name: str = _CNPG_DEFAULT_CLUSTER,
+) -> tuple[dict[str, str] | None, str]:
+    """``{slot_name: walStatus}`` for the primary's replication slots (a
+    NULL walStatus, a slot that never reserved WAL, reads ``"unset"``), and
+    ``""``; or ``(None, why)`` when the primary's status cannot be read, or
+    its certificate cannot be verified against the cluster CA."""
+    if primary_pod is None:
+        return None, "the primary's pod is not listed"
+    pod_ip = str((primary_pod.get("status") or {}).get("podIP") or "")
+    if not pod_ip:
+        return None, "the primary's pod has no IP yet"
+    ca_pem, why = _cnpg_status_ca(namespace, cluster_name)
+    if ca_pem is None:
+        return None, why
+    doc, why = _cnpg_instance_status(
+        pod_ip, ca_pem=ca_pem, server_hostname=cluster_name + _CNPG_STATUS_NAME_SUFFIX
+    )
+    if doc is None:
+        return None, why
+    if not doc.get("isPrimary"):
+        # Not (or no longer) the primary: its slots say nothing about the
+        # standby's WAL on the primary that counts.
+        return None, "the instance read is no longer the primary"
+    slots = doc.get("replicationSlotsInfo") or []
+    if not isinstance(slots, list):
+        return None, "the primary's status document carries no slot list"
+    out: dict[str, str] = {}
+    for slot in slots:
+        if isinstance(slot, dict) and slot.get("slotName"):
+            out[str(slot["slotName"])] = str(slot.get("walStatus") or "unset")
+    return out, ""
+
+
+def _instance_slot(instance: str, slots: dict[str, str] | None) -> str:
+    """The walStatus of ``instance``'s HA slot on the primary: a walStatus
+    value, ``"unset"``, ``"absent"`` (the primary has slots, none of them
+    this instance's), ``"none"`` (the primary has no slots at all, so HA
+    slots are off and nothing can be told from them), or ``"unknown"``."""
+    if slots is None:
+        return "unknown"
+    if not slots:
+        return "none"
+    suffix = instance.replace("-", "_")
+    exact = slots.get(_CNPG_SLOT_PREFIX + suffix)
+    if exact is not None:
+        return exact
+    for name, wal_status in slots.items():
+        if name.endswith(suffix):
+            return wal_status
+    return "absent"
+
+
+def reclone_blocker(signature: str, evidence: set[str], slot: str) -> str | None:
+    """Why an instance that has looped for STUCK_INSTANCE_AFTER_S must NOT be
+    re-cloned, or None when there is positive evidence it can never recover.
+
+    A re-clone destroys the instance's volume and copies the whole database,
+    so it needs proof the WAL the instance needs is gone, not just a loop:
+
+    * the slot state could not be read: hold (fail towards keeping data);
+    * a pg_rewind failure loop: re-clone. The former primary needs its own
+      WAL from the divergence point, which no slot on the new primary covers;
+    * the slot on the primary is ``lost`` or gone: re-clone;
+    * the slot still holds the WAL (``reserved`` / ``extended`` /
+      ``unreserved``): hold, it streams once it reconnects;
+    * no slot speaks for it (never reserved WAL, or HA slots off): re-clone
+      only when its log shows the primary removed the WAL it asks for;
+      ``future_timeline`` alone is what a standby that merely cannot
+      connect logs too.
+    """
+    if slot == "unknown":
+        return (
+            "the primary's replication-slot state could not be read, and a "
+            "re-clone needs proof the WAL this instance needs is gone"
+        )
+    if evidence & _REWIND_SIGNATURES:
+        return None
+    if slot in ("lost", "absent"):
+        return None
+    if slot in _SLOT_WAL_PRESENT:
+        return (
+            f"its replication slot on the primary is {slot}: the WAL it needs "
+            "still exists, so it catches up once it reconnects"
+        )
+    if evidence & _WAL_GONE_SIGNATURES:
+        return None
+    return (
+        f"its log shows only {signature} and no slot on the primary says its "
+        f"WAL is gone (slot {slot}); a standby that cannot reach the primary "
+        "logs the same and heals once it reconnects"
+    )
+
+
+def reclone_stuck_postgres_instances(
+    tracker: dict[str, StuckSighting],
+    *,
+    now: float,
+    namespace: str = "spatium",
+    cluster_name: str = _CNPG_DEFAULT_CLUSTER,
+    stuck_after_s: float = STUCK_INSTANCE_AFTER_S,
+) -> PostgresReclone:
+    """Find CNPG instances looping on WAL they can never get, and have CNPG
+    re-clone one of them. ``tracker`` is the caller's state across ticks
+    (mutated in place); ``now`` is a monotonic clock.
+
+    An instance counts as stuck when one of :data:`_STUCK_SIGNATURES`
+    repeats (:data:`STUCK_MIN_REPEATS` lines) in its pod's last
+    ``_STUCK_LOG_WINDOW_S`` of log on every call for ``stuck_after_s``, under
+    the same primary, and a later call has seen it log new lines
+    (``confirmed``). A call where it does not repeat resets the clock, so a
+    replica that logs a line or two while it joins and then streams is never
+    counted (#2765's walk). Readiness is deliberately not a condition: a
+    former primary looping on ``pg_rewind`` is not ready, but a standby that
+    lost its slot (#2317) runs as a hot standby and reads Ready while it
+    streams nothing.
+
+    A due instance is annotated ``alpha.cnpg.io/unrecoverable`` only when:
+
+    * the Cluster names one primary (``currentPrimary == targetPrimary``), so
+      no failover or switchover is under way, and the instance is not it;
+    * the primary's pod is Ready, since the re-clone copies from it;
+    * no other re-clone is in flight: no instance pod already carries the
+      annotation or is terminating, and no CNPG ``join`` Job pod is running.
+      One copy is rebuilt at a time, as a person doing it by hand would, so
+      a primary left alone (#2132's fourth occurrence: six stuck at once)
+      is never asked for six base backups together;
+    * there is positive evidence its WAL is gone (:func:`reclone_blocker`,
+      read against the primary's ``pg_replication_slots``). An instance that
+      fails it is reported in ``held`` and keeps its clock.
+
+    Kubeapi errors are returned, never guessed around; a 403 on the log read
+    means the supervisor Role predates #2132 and nothing is marked.
+    """
+    cr_path = (
+        f"/apis/postgresql.cnpg.io/v1/namespaces/{quote(namespace)}"
+        f"/clusters/{quote(cluster_name)}"
+    )
+    try:
+        status, resp = _request("GET", cr_path)
+    except RuntimeError as exc:
+        return PostgresReclone(error=str(exc))
+    if status == 404:
+        tracker.clear()
+        return PostgresReclone()  # not a cnpg deployment / Cluster not up yet
+    if status != 200:
+        return PostgresReclone(error=f"kubeapi status {status}: {resp[:200]!r}")
+    try:
+        cr_status = json.loads(resp).get("status") or {}
+    except (ValueError, AttributeError):
+        return PostgresReclone(error="unparseable Cluster CR")
+    current = str(cr_status.get("currentPrimary") or "")
+    target = str(cr_status.get("targetPrimary") or "")
+    if not current or current != target:
+        # A failover or switchover is under way, or the primary is unknown:
+        # nothing seen now says anything about the next primary.
+        reason = "the Cluster names no single primary (failover or switchover under way)"
+        out = PostgresReclone(
+            deferred_reason=reason,
+            clock_reset={instance: reason for instance in tracker},
+        )
+        tracker.clear()
+        return out
+
+    base = f"/api/v1/namespaces/{quote(namespace)}"
+    selector = quote(f"{_CNPG_CLUSTER_LABEL}={cluster_name}", safe="")
+    try:
+        status, resp = _request("GET", f"{base}/pods?labelSelector={selector}")
+    except RuntimeError as exc:
+        return PostgresReclone(error=str(exc))
+    if status != 200:
+        return PostgresReclone(error=f"kubeapi status {status}: {resp[:200]!r}")
+    try:
+        pods = json.loads(resp).get("items", [])
+    except (ValueError, AttributeError):
+        return PostgresReclone(error="unparseable pod list")
+
+    instances: dict[str, dict] = {}
+    rebuilding: list[str] = []
+    for pod in pods:
+        meta = pod.get("metadata") or {}
+        labels = meta.get("labels") or {}
+        name = str(meta.get("name") or "")
+        if labels.get(_CNPG_JOB_ROLE_LABEL):
+            phase = (pod.get("status") or {}).get("phase")
+            if labels.get(_CNPG_JOB_ROLE_LABEL) == "join" and phase in ("Pending", "Running"):
+                rebuilding.append(name)
+            continue
+        instance = str(labels.get(_CNPG_INSTANCE_LABEL) or "")
+        if not instance:
+            continue
+        instances[instance] = pod
+        if (meta.get("annotations") or {}).get(_CNPG_UNRECOVERABLE_ANNOTATION) or meta.get(
+            "deletionTimestamp"
+        ):
+            rebuilding.append(instance)
+
+    out = PostgresReclone()
+    for gone in set(tracker) - (set(instances) - {current}):
+        tracker.pop(gone, None)
+    for instance, pod in sorted(instances.items()):
+        if instance == current:
+            continue
+        name = str((pod.get("metadata") or {}).get("name") or instance)
+        path = (
+            f"{base}/pods/{quote(name)}/log?container=postgres"
+            f"&sinceSeconds={_STUCK_LOG_WINDOW_S}&limitBytes={_STUCK_LOG_LIMIT_BYTES}"
+            "&timestamps=true"
+        )
+        try:
+            status, resp = _request("GET", path)
+        except RuntimeError as exc:
+            out.error = f"pod {name} log: {exc}"
+            continue
+        if status == 403:
+            out.error = f"pod {name} log: kubeapi status 403 (pods/log not granted): {resp[:200]!r}"
+            return out
+        if status != 200:
+            # A container not started yet (400) or a pod gone between the
+            # list and the read: no evidence either way, so the clock is
+            # neither advanced nor reset.
+            continue
+        text = resp.decode("utf-8", "replace")
+        repeating = repeating_signatures(text)
+        seen = tracker.get(instance)
+        if not repeating:
+            tracker.pop(instance, None)
+            continue
+        signature = repeating[0]
+        stamp = _newest_match_stamp(text)
+        if seen is not None and seen.primary != current:
+            out.clock_reset[instance] = f"the primary changed from {seen.primary} to {current}"
+            seen = None
+        if seen is None:
+            seen = tracker[instance] = StuckSighting(current, now, signature, first_stamp=stamp)
+        elif not seen.confirmed and now > seen.since and (not stamp or stamp != seen.first_stamp):
+            # Still repeating on a later tick, with lines newer than the
+            # first tick's (or no timestamps to tell): a live loop.
+            seen.confirmed = True
+        seen.signature = signature
+        seen.evidence.update(repeating)
+        out.stuck[instance] = {
+            "signature": signature,
+            "seconds": int(now - seen.since),
+            "confirmed": seen.confirmed,
+        }
+
+    if any(s["confirmed"] for s in out.stuck.values()):
+        # One read of the primary's slots per tick, and only while something
+        # loops; it rides on every stuck report so the journal can say why a
+        # loop will not be re-cloned before it is due.
+        slots, why = _slot_states(
+            instances.get(current), namespace=namespace, cluster_name=cluster_name
+        )
+        out.slot_state_read = slots is not None
+        out.slot_state_error = why
+        for instance, seen_out in out.stuck.items():
+            seen_out["slot"] = _instance_slot(instance, slots)
+
+    due = sorted(
+        (i for i, s in out.stuck.items() if s["confirmed"] and s["seconds"] >= stuck_after_s),
+        key=lambda i: -out.stuck[i]["seconds"],
+    )
+    if not due:
+        return out
+    if out.error:
+        out.deferred_reason = "a log read failed this tick; retrying next tick"
+        return out
+    primary_pod = instances.get(current)
+    if primary_pod is None or not _pod_ready(primary_pod):
+        out.deferred_reason = f"the primary {current} is not Ready; a re-clone copies from it"
+        return out
+    if rebuilding:
+        out.deferred_reason = f"a re-clone is already in flight ({', '.join(sorted(rebuilding))})"
+        return out
+    eligible = []
+    for instance in due:
+        blocker = reclone_blocker(
+            out.stuck[instance]["signature"],
+            tracker[instance].evidence,
+            out.stuck[instance].get("slot", "unknown"),
+        )
+        if blocker:
+            out.held[instance] = blocker
+        else:
+            eligible.append(instance)
+    if not eligible:
+        return out
+    instance = eligible[0]
+    name = str((instances[instance].get("metadata") or {}).get("name") or instance)
+    patch = {"metadata": {"annotations": {_CNPG_UNRECOVERABLE_ANNOTATION: "true"}}}
+    try:
+        status, resp = _request(
+            "PATCH",
+            f"{base}/pods/{quote(name)}",
+            body=json.dumps(patch).encode(),
+            content_type="application/merge-patch+json",
+        )
+    except RuntimeError as exc:
+        out.error = f"pod {name} annotate: {exc}"
+        return out
+    if status not in (200, 201):
+        out.error = f"pod {name} annotate: kubeapi status {status}: {resp[:200]!r}"
+        return out
+    out.marked.append(instance)
+    tracker.pop(instance, None)
+    return out
+
+
 # #272 — durable control-plane state via k3s HelmChartConfig.
 #
 # The seed supervisor reflects cluster state (control-plane member count,
@@ -894,62 +1858,170 @@ def reclaim_stranded_postgres_storage(
 # defaults as the floor.
 
 
-def _helmchartconfig_upsert(
-    name: str, values_yaml: str, *, namespace: str = "kube-system"
+def _merge_owned_overrides(
+    name: str,
+    owned: dict[str, Any] | Callable[[dict], dict[str, Any]],
+    *,
+    namespace: str = "kube-system",
+    failure_policy_on_create: str | None = None,
 ) -> tuple[bool, str | None]:
-    """Create-or-update the HelmChartConfig ``name`` so its
-    ``spec.valuesContent`` equals ``values_yaml``. Idempotent — returns
-    ``(False, None)`` when already current. helm-controller merges this
-    on top of the same-named HelmChart's values, and it survives k3s
-    manifest re-apply on restart (unlike a HelmChart CR patch)."""
-    base = f"/apis/helm.cattle.io/v1/namespaces/{quote(namespace)}/helmchartconfigs"
-    path = f"{base}/{quote(name)}"
-    try:
-        status, resp = _request("GET", path)
-    except RuntimeError as exc:
-        return False, str(exc)
-    if status == 200:
-        try:
-            cur = (json.loads(resp).get("spec") or {}).get("valuesContent") or ""
-        except (json.JSONDecodeError, ValueError):
-            cur = None
-        if cur == values_yaml:
-            return False, None
-        patch = json.dumps({"spec": {"valuesContent": values_yaml}}).encode("utf-8")
+    """Merge the supervisor's ``owned`` keys into the HelmChartConfig
+    ``name`` and write it back only if that changes anything.
+
+    The ONE write path for every supervisor-owned HelmChartConfig
+    (``spatium-control``, ``spatium-metallb``, ``spatiumddi-appliance``).
+    Returns ``(True, None)`` on a write, ``(False, None)`` when there was
+    nothing to do, ``(False, error)`` otherwise.
+
+    #2024 — the supervisor OWNS ITS KEYS, not the document. These CRs are
+    also where an operator puts their own overrides (APPLIANCE.md sends
+    them to ``spatiumddi-appliance`` to raise ``dnsBind9.resources``), and
+    the backend's chart bump stamps ``image.tag`` onto ``spatium-control``
+    (#792). This used to replace ``spec.valuesContent`` with the
+    supervisor's keys alone whenever the string differed, so every such
+    key was reverted on the next heartbeat. Now:
+
+    * the live document is read and parsed; an unknown current state
+      (unreachable, unparseable, not a mapping) ABORTS rather than merging
+      onto ``{}`` — see ``_helmchartconfig_doc``;
+    * ``owned`` is deep-merged on top (``owned`` wins on a collision —
+      those keys are the supervisor's by definition), so every other key
+      survives exactly as the operator wrote it;
+    * nothing is written when the merge leaves the document as it is
+      (compared PARSED, so an operator's formatting is not "a change"), nor
+      when it leaves the EFFECTIVE values ``deep_merge(chart, config)``
+      unchanged — #1005's guard against a helm revision for nothing;
+    * the PATCH carries the ``resourceVersion`` of the document it merged
+      into, so an operator edit landing between our read and our write is
+      a 409 (retried next heartbeat against the new document) instead of
+      being overwritten.
+
+    Two consequences worth knowing:
+
+    * **Removal is expressed by value, never by omission.** A merge cannot
+      delete a key, so every owned key must be written explicitly in every
+      state (``useMetalLBVIP: false`` + ``vip: ""`` when the VIP is off,
+      ``enabled: false`` for MetalLB). A key the supervisor stops owning in
+      a later release stays in the CR until someone removes it.
+    * **Comments do not survive a write.** The document is re-dumped with
+      ``yaml.safe_dump(sort_keys=True)`` — the same normalisation the
+      backend's chart bump uses, so two writers converge on identical bytes
+      — which keeps every operator KEY and VALUE but drops YAML comments and
+      reorders keys. A beat that changes nothing does not write, so a
+      comment lasts until the supervisor's own keys next change.
+
+    ``owned`` may be a callable taking the current document, for overrides
+    that depend on it (the slot-image mirror latch, #787).
+
+    ``failure_policy_on_create`` is written as ``spec.failurePolicy`` when
+    this call CREATES the CR, and never on a PATCH (#2826, see
+    ``_CONTROL_FAILURE_POLICY``)."""
+    path = (
+        f"/apis/helm.cattle.io/v1/namespaces/{quote(namespace)}"
+        f"/helmchartconfigs/{quote(name)}"
+    )
+    current_doc, exists, resource_version = _values_content_read(
+        path, kind="helmchartconfig", name=name
+    )
+    if current_doc is None:
+        # Unknown current state — writing would merge onto {} and delete
+        # every key we do not own.
+        # The read logged why. A CR an operator left unparseable stays
+        # frozen — the supervisor's own keys included — until it is fixed or
+        # deleted, so say so on every beat rather than once.
+        return False, (
+            f"could not read the current {name} values; nothing written "
+            f"(if this persists, fix or delete the HelmChartConfig {name})"
+        )
+    owned_keys = owned(current_doc) if callable(owned) else owned
+    merged = _deep_merge(current_doc, owned_keys)
+    if exists and merged == current_doc:
+        return False, None
+
+    # #1005 — do not write a HelmChartConfig that changes nothing.
+    #
+    # helm-controller merges the Config on top of the HelmChart, so a
+    # Config whose every key the Chart already carries changes no rendered
+    # object but still records a helm revision and runs a helm-install Job.
+    # The comparison is therefore on the EFFECTIVE values — what helm
+    # actually renders — not on the CR alone.
+    #
+    # Deliberately not restricted to the create case. A create-only guard
+    # would hand the write to the worst possible moment instead of removing
+    # it: ``chart_bump._patch_image_tag`` creates ``spatium-control``
+    # carrying only ``image.tag`` to roll the control plane to a new
+    # version, and from the next heartbeat — at most 30 s later, i.e.
+    # mid-upgrade — a create-only guard is bypassed and every owned key is
+    # PATCHed in while the tag-bump apply is still in flight.
+    #
+    # Skipping is safe with a Config present precisely because it is a
+    # skip: nothing is replaced, so no key we do not own can be dropped.
+    # And it self-heals — a slot upgrade that ships a chart with different
+    # defaults makes the comparison differ, and the next heartbeat writes.
+    # An unreadable Chart falls through to the write: a redundant CR is the
+    # status quo, suppressing a needed one is not.
+    chart_values = _helmchart_values(name, namespace=namespace)
+    if chart_values is not None and _deep_merge(chart_values, merged) == _deep_merge(
+        chart_values, current_doc
+    ):
+        log.info(
+            "supervisor.helmchartconfig.write_skipped",
+            chart=name,
+            reason="the HelmChart already carries every overridden value",
+        )
+        return False, None
+
+    values_yaml = yaml.safe_dump(merged, sort_keys=True, default_flow_style=False)
+    if exists:
+        patch: dict[str, Any] = {"spec": {"valuesContent": values_yaml}}
+        if resource_version:
+            # Optimistic concurrency: kubeapi answers 409 Conflict when the
+            # object has moved on since the read we merged into.
+            patch["metadata"] = {"resourceVersion": resource_version}
         try:
             st, rb = _request(
-                "PATCH", path, body=patch, content_type="application/merge-patch+json"
+                "PATCH",
+                path,
+                body=json.dumps(patch).encode("utf-8"),
+                content_type="application/merge-patch+json",
             )
         except RuntimeError as exc:
             return False, str(exc)
-        return (st in (200, 201)), (
-            None if st in (200, 201) else f"PATCH status {st}: {rb[:200]!r}"
-        )
-    if status != 404:
-        return False, f"kubeapi GET status {status}"
+        if st in (200, 201):
+            return True, None
+        if st == 409:
+            return False, "HelmChartConfig changed under us; retrying next heartbeat"
+        return False, f"PATCH status {st}: {rb[:200]!r}"
+    base = f"/apis/helm.cattle.io/v1/namespaces/{quote(namespace)}/helmchartconfigs"
+    spec: dict[str, Any] = {"valuesContent": values_yaml}
+    if failure_policy_on_create:
+        spec["failurePolicy"] = failure_policy_on_create
     body = json.dumps(
         {
             "apiVersion": "helm.cattle.io/v1",
             "kind": "HelmChartConfig",
             "metadata": {"name": name, "namespace": namespace},
-            "spec": {"valuesContent": values_yaml},
+            "spec": spec,
         }
     ).encode("utf-8")
     try:
         st, rb = _request("POST", base, body=body, content_type="application/json")
     except RuntimeError as exc:
         return False, str(exc)
-    return (st in (200, 201)), (
-        None if st in (200, 201) else f"POST status {st}: {rb[:200]!r}"
-    )
+    if st in (200, 201):
+        return True, None
+    # 409 here is AlreadyExists — another node's supervisor (or an
+    # operator) created it between our read and our write. Next heartbeat
+    # merges into theirs.
+    return False, f"POST status {st}: {rb[:200]!r}"
 
 
 # Fast-evict tolerations for the CONTROL-PLANE workloads (api / frontend /
-# worker). Deliberately a separate constant from ``_FAST_EVICT_TOLERATIONS``,
-# which coredns uses: the two are the same 20 s today but answer different
-# questions (how fast must a control-plane replica leave a dead node, vs how
-# fast must cluster DNS), and collapsing them would make a future retune of
-# one silently retune the other.
+# worker). CoreDNS carried its own copy until #1753: with one CoreDNS replica
+# per node an evicted DNS pod has nowhere to go, and the copy was the one
+# template field k3s's manifest re-apply fought over. This one answers a
+# different question (how fast must a control-plane replica leave a dead
+# node) and is unchanged.
 _CONTROL_PLANE_FAST_EVICT = [
     {
         "key": "node.kubernetes.io/unreachable",
@@ -964,6 +2036,28 @@ _CONTROL_PLANE_FAST_EVICT = [
         "tolerationSeconds": 20,
     },
 ]
+
+
+#: #1805 — the api Service's ``trafficDistribution`` on the appliance. The
+#: supervisor's heartbeat, the DNS and DHCP agents and the frontend's ``/api``
+#: proxy reach the api through that Service, and kube-proxy spread their
+#: connections over every api pod, so after a node's hard loss its api pod,
+#: still listed until the node reads NotReady, held a share of every other
+#: node's requests until their own timeout. ``PreferSameNode`` keeps a node's
+#: callers on its own api pod while that pod is ready.
+#:
+#: The appliance's and not the umbrella chart's (whose default is ``""``):
+#: here every control-plane node runs one api pod (``replicas`` = the
+#: control-plane size, hard anti-affinity), while on a BYO-Kubernetes cluster
+#: the field would pin each node's callers to whichever api pod shares their
+#: node. Written at every size, because a merge cannot remove a key and one
+#: api pod makes it inert. firstboot renders the same value, or the first
+#: heartbeat of every install would add a helm revision (#1005).
+_NODE_LOCAL_API = "PreferSameNode"
+#: #3645 — ``api.service.nodeLocal``: the second, ``internalTrafficPolicy:
+#: Local`` api Service the frontend's /api proxy and the members' supervisors
+#: use, so their plain-http hop never crosses the node LAN. Written with
+#: ``trafficDistribution`` (and rendered by firstboot, #1005).
 
 
 def _deep_merge(base: dict, overlay: dict) -> dict:
@@ -982,8 +2076,17 @@ def _deep_merge(base: dict, overlay: dict) -> dict:
     return out
 
 
-def _values_content_doc(path: str, *, kind: str, name: str) -> dict | None:
+def _values_content_read(
+    path: str, *, kind: str, name: str
+) -> tuple[dict | None, bool, str | None]:
     """Shared reader for a helm.cattle.io CR's ``spec.valuesContent``.
+
+    Returns ``(doc, exists, resource_version)``. ``doc`` is ``{}`` when the
+    CR is absent (``exists`` False) or its ``valuesContent`` is empty, and
+    ``None`` when the answer is unknown — see ``_helmchartconfig_doc``.
+    ``resource_version`` is the CR's ``metadata.resourceVersion`` when the
+    body carried one, so a writer can make its PATCH conditional on the
+    document it merged into (#2024).
 
     ``kind`` only names the log event (``helmchart`` / ``helmchartconfig``);
     the semantics below are identical for both and must stay that way — the
@@ -994,31 +2097,44 @@ def _values_content_doc(path: str, *, kind: str, name: str) -> dict | None:
         st, resp = _request("GET", path)
     except (RuntimeError, OSError) as exc:
         log.warning(f"supervisor.{kind}.read_failed", chart=name, error=str(exc))
-        return None
+        return None, False, None
     if st == 404:
-        return {}
+        return {}, False, None
     if st != 200:
         log.warning(f"supervisor.{kind}.read_failed", chart=name, status=st)
-        return None
+        return None, True, None
     try:
-        raw = (json.loads(resp).get("spec") or {}).get("valuesContent") or ""
-    except (json.JSONDecodeError, ValueError):
+        body = json.loads(resp)
+        raw = (body.get("spec") or {}).get("valuesContent") or ""
+        rv = (body.get("metadata") or {}).get("resourceVersion") or None
+    except (json.JSONDecodeError, ValueError, AttributeError):
         log.warning(f"supervisor.{kind}.unparseable_body", chart=name)
-        return None
+        return None, True, None
     if not str(raw).strip():
-        return {}
+        return {}, True, rv
     try:
         doc = yaml.safe_load(raw)
     except yaml.YAMLError as exc:
         log.warning(f"supervisor.{kind}.unparseable_values", chart=name, error=str(exc))
-        return None
+        return None, True, rv
+    if doc is None:
+        # A document of only comments (or ``---`` / ``null``) is a YAML
+        # empty document: helm reads it as no values, so there is nothing to
+        # preserve. Refusing it would freeze every supervisor key in this CR
+        # for good on an operator who commented their override out.
+        return {}, True, rv
     if not isinstance(doc, dict):
         # A list or scalar at the top level is not something we can merge
         # into. Refusing beats replacing it with our own keys and calling
         # the operator's document a typo.
         log.warning(f"supervisor.{kind}.values_not_a_mapping", chart=name)
-        return None
-    return doc
+        return None, True, rv
+    return doc, True, rv
+
+
+def _values_content_doc(path: str, *, kind: str, name: str) -> dict | None:
+    """``_values_content_read`` without the existence / version detail."""
+    return _values_content_read(path, kind=kind, name=name)[0]
 
 
 def _helmchart_values(name: str, *, namespace: str = "kube-system") -> dict | None:
@@ -1047,7 +2163,8 @@ def _helmchartconfig_doc(name: str, *, namespace: str = "kube-system") -> dict |
     """Current ``spec.valuesContent`` of the HelmChartConfig, parsed.
 
     Returns ``{}`` only when there is genuinely nothing to preserve: the CR
-    does not exist (404), or it exists with an empty ``valuesContent``.
+    does not exist (404), or it exists with an empty ``valuesContent`` (an
+    all-comments document is empty too — YAML parses it to null).
 
     Returns ``None`` for every other non-answer — kubeapi unreachable, an
     unexpected status, a body we cannot parse, or a document that is not a
@@ -1179,13 +2296,22 @@ def _slot_image_mirror_enabled(cp_size: int, current_doc: dict) -> bool:
 # a maintainer retunes them here and in firstboot's mirror
 # (``_render_control_helmchart``), and ``tests/test_control_plane_sizing.py``
 # holds the two copies together.
+#
+# #2240 — the worker's share is 0.40 of the budget, capped at 16 GiB, but
+# never more than what the api and Postgres leave of it: one
+# ``render_dns_bundle`` for a server at ~2M records peaked at 5.1-5.5 GiB and
+# was OOM-killed at the old 4 GiB cap on every worker of a 7-node, 24 GiB
+# lab. "What the others leave" keeps #1115's whole-node fit: below ~22 GiB the
+# api's half and Postgres' quarter leave the worker its old quarter (an 8 GiB
+# node is unchanged, 1536Mi), and from there the 0.40 share applies (a 24 GiB
+# node gets ~8.8 GiB, a 32 GiB node 12 GiB, a 48 GiB node and up the 16 GiB cap).
 _PLATFORM_RESERVE_MIB = 2048
 _API_MEM_SHARE = 0.5
 _API_MEM_MIN_MIB = 1024
 _API_MEM_MAX_MIB = 8192
-_WORKER_MEM_SHARE = 0.25
+_WORKER_MEM_SHARE = 0.40
 _WORKER_MEM_MIN_MIB = 1024
-_WORKER_MEM_MAX_MIB = 4096
+_WORKER_MEM_MAX_MIB = 16384
 _POSTGRES_MEM_SHARE = 0.25
 _POSTGRES_MEM_MIN_MIB = 1024
 _POSTGRES_MEM_MAX_MIB = 4096
@@ -1199,31 +2325,182 @@ _POSTGRES_MEM_REQUEST_MIN_MIB = 256
 # throughput-bound on an appliance.
 _WORKER_SMALL_NODE_MIB = 12288
 
+# #2240 — CPU limits sized from the node's CPU count. The chart ships
+# Postgres at ``1000m`` and the api at ``1000m`` whatever the node has; at 1M
+# devices on 8-vCPU nodes the CloudNativePG primary used 0.98 cores and was
+# throttled in 89% of CFS periods, and the whole cluster wrote ~20 records/s.
+# At 4 cores it used 2.8 (9% throttled) and wrote ~80/s. Postgres gets half
+# the node's CPUs (floor 1, cap 8), the api a quarter (floor 1, cap 4), as
+# whole cores written in the chart's millicore form ("4000m"), so a node whose
+# sizing lands on the chart's own 1000m renders exactly the chart's string
+# and the #1005 guard writes nothing for it. The worker keeps the chart's
+# 2000m: its renders are memory-bound, not CPU-bound. Limits only: requests
+# stay the chart's, so scheduling is unchanged. firstboot mirrors these with
+# ``nproc`` (the same affinity count ``node_cpu_count`` reads).
+_POSTGRES_CPU_DIVISOR = 2
+_POSTGRES_CPU_MIN = 1
+_POSTGRES_CPU_MAX = 8
+_API_CPU_DIVISOR = 4
+_API_CPU_MIN = 1
+_API_CPU_MAX = 4
+
+# #2156 — the Postgres memory limit has to hold the connections the cluster
+# can open, and that number grows with the control-plane node count: every
+# node runs an api pod with its own SQLAlchemy pool (``pool_size`` 10 +
+# ``max_overflow`` 20, held open at idle because the agents' long-polls keep
+# a session each) and a worker, and the primary runs one WAL sender per
+# replica. The share above is sized from the seed's RAM alone, so at nine
+# nodes it did not move while the backends did: the primary was killed at
+# its 2479Mi limit on a node with 14 GiB free, with ~120 processes holding
+# 1.6 GiB of private memory (~14 MiB each, most of it transparent huge
+# pages), 660 MiB of shared buffers and 150 MiB of page tables.
+#
+# Two halves, so the envelope is closed from both sides:
+#
+# * the api's pool per pod shrinks as pods are added, so the cluster's api
+#   connections stop at ~120 instead of growing 30 per node (``api_db_pool``):
+#   unchanged up to four nodes, 13 per pod at nine;
+# * the limit is never below shared_buffers + a fixed allowance + the
+#   connections that can then be open x what one backend costs
+#   (``postgres_connection_budget``). One backend is the issue's measured
+#   ~14 MiB of private memory (with THP) plus its page tables for mapping
+#   shared_buffers in 4 KiB pages (8 bytes per page, so shared_buffers / 512).
+#
+# #2782 — the after-commit event publisher and audit forwarder share one
+# small engine per PROCESS (``pool_size=2, max_overflow=0``), outside the
+# api's own pool: two more connections per api pod, per worker process and
+# for the one celery-beat.
+#
+# #2944 — ``/health/ready`` checks the database over its own one-connection
+# engine (``app.db.probe_engine``), outside the request pool and the hooks',
+# so a pool saturated by load cannot fail the probe: one more connection per
+# api pod, held open at idle.
+#
+# ``max_connections`` is the appliance's floor of 200 until the budget passes
+# it (from five nodes with four worker processes, seven with two), then the
+# budget, so a pool is never refused a connection it was sized for
+# (``tests/test_postgres_connection_budget_2156.py`` holds that). It moves
+# with the memory limit, so it costs no restart of its own.
+_API_DB_POOL_SIZE = 10
+_API_DB_CONN_PER_POD_MAX = 30
+_API_DB_CONN_PER_POD_MIN = 12
+_API_DB_CONN_CLUSTER = 120
+_WORKER_DB_CONN_SLACK = 1
+# #2782 — the after-commit hooks' engine, per api / worker / beat process.
+_HOOK_DB_CONN_PER_PROCESS = 2
+# #2944 — the readiness probe's own engine, per api pod.
+_PROBE_DB_CONN_PER_API_POD = 1
+_PG_CONN_RESERVE = 10
+_PG_BACKEND_BASE_MIB = 14
+_PG_FIXED_MIB = 256
+# The appliance's floor: charts/spatiumddi/values.yaml's pre-#2955 200. The
+# chart now derives max_connections (and the memory limit) from its own pools
+# when the value is empty, so the appliance always writes one; keeping 200
+# below the crossing means an existing appliance does not roll.
+_PG_CHART_MAX_CONNECTIONS = 200
+
+
+def api_db_pool(cp_size: int) -> dict[str, int]:
+    """PURE (#2156): the api's SQLAlchemy pool for ``cp_size`` api pods, as
+    the chart's ``api.databasePool`` values. Each pod may open
+    ``clamp(120 // cp_size, 12, 30)`` connections: the application's own
+    10 + 20 up to four pods, then fewer per pod so the cluster's total stays
+    near 120. ``size`` (the connections kept open) stays 10 while the total
+    allows it, the rest is overflow."""
+    per_pod = min(
+        max(_API_DB_CONN_CLUSTER // max(cp_size, 1), _API_DB_CONN_PER_POD_MIN),
+        _API_DB_CONN_PER_POD_MAX,
+    )
+    size = min(_API_DB_POOL_SIZE, per_pod)
+    return {"size": size, "maxOverflow": per_pod - size}
+
+
+def postgres_connection_budget(cp_size: int, worker_concurrency: int) -> int:
+    """PURE (#2156): the backends the cluster can hold open on the primary —
+    every api pod's whole pool, every worker's processes plus one, the
+    #2782 after-commit hooks' two per api pod, per worker process and for
+    celery-beat, the #2944 readiness probe's one per api pod, the WAL
+    senders (one per replica) and a fixed reserve (CloudNativePG's own and superuser connections, celery-beat's own, a
+    migrate Job, an operator's psql)."""
+    cp = max(cp_size, 1)
+    pool = api_db_pool(cp)
+    hooks = _HOOK_DB_CONN_PER_PROCESS
+    per_node = (
+        pool["size"]
+        + pool["maxOverflow"]
+        + hooks  # the api pod's hooks (#2782)
+        + _PROBE_DB_CONN_PER_API_POD  # the api pod's readiness probe (#2944)
+        + worker_concurrency * (1 + hooks)  # each worker process, and its hooks
+        + _WORKER_DB_CONN_SLACK
+    )
+    beat_hooks = hooks  # the one celery-beat's hooks (#2782)
+    return cp * per_node + (cp - 1) + _PG_CONN_RESERVE + beat_hooks
+
+
+def postgres_backend_mib(shared_buffers_mb: int) -> int:
+    """PURE (#2156): what one Postgres backend costs the instance's cgroup, in
+    MiB: the measured private memory plus the page tables mapping
+    shared_buffers (rounded up)."""
+    return _PG_BACKEND_BASE_MIB + (shared_buffers_mb + 511) // 512
+
 
 def _clamp_mib(total_mib: int, fraction: float, lo: int, hi: int) -> int:
     return int(min(max(total_mib * fraction, lo), hi))
 
 
-def control_plane_sizing(mem_total_mib: int) -> dict[str, int]:
+def _clamp_cores(cpu_count: int, divisor: int, lo: int, hi: int) -> int:
+    return min(max(cpu_count // divisor, lo), hi)
+
+
+def _millicores(cores: int) -> str:
+    """Whole cores in the chart's own notation (``1000m``, ``2000m``)."""
+    return f"{cores * 1000}m"
+
+
+def control_plane_sizing(mem_total_mib: int, cp_size: int = 1) -> dict[str, int]:
     """PURE: the whole-node budget for a node with ``mem_total_mib`` of RAM —
     the ``api``, ``worker`` and ``postgres`` memory limits in MiB, Postgres'
     ``shared_buffers`` in MB (which Postgres reads as MiB) and the Postgres
     memory request in MiB (``postgres_request``, at or above
-    ``shared_buffers``). The one place the arithmetic lives; firstboot mirrors
-    it in bash so a fresh install's first render already carries these
-    numbers."""
+    ``shared_buffers``), the worker ``concurrency`` and (#2156) the
+    connection budget the Postgres limit holds for a control plane of
+    ``cp_size`` nodes. The one place the arithmetic lives;
+    firstboot mirrors it in bash (at one node, the only size a fresh install
+    has) so a fresh install's first render already carries these numbers."""
     budget = max(mem_total_mib - _PLATFORM_RESERVE_MIB, 0)
+    api_mib = _clamp_mib(budget, _API_MEM_SHARE, _API_MEM_MIN_MIB, _API_MEM_MAX_MIB)
     postgres_mib = _clamp_mib(
         budget, _POSTGRES_MEM_SHARE, _POSTGRES_MEM_MIN_MIB, _POSTGRES_MEM_MAX_MIB
     )
-    shared_buffers_mb = int(postgres_mib * _POSTGRES_SHARED_BUFFERS_SHARE)
-    return {
-        "api": _clamp_mib(budget, _API_MEM_SHARE, _API_MEM_MIN_MIB, _API_MEM_MAX_MIB),
-        "worker": _clamp_mib(
-            budget, _WORKER_MEM_SHARE, _WORKER_MEM_MIN_MIB, _WORKER_MEM_MAX_MIB
+    # #2240 — the worker's share, but never more than the api and Postgres
+    # leave of the budget (and never below its floor).
+    worker_mib = max(
+        min(
+            _clamp_mib(budget, _WORKER_MEM_SHARE, _WORKER_MEM_MIN_MIB, _WORKER_MEM_MAX_MIB),
+            budget - api_mib - postgres_mib,
         ),
+        _WORKER_MEM_MIN_MIB,
+    )
+    shared_buffers_mb = int(postgres_mib * _POSTGRES_SHARED_BUFFERS_SHARE)
+    concurrency = 2 if mem_total_mib <= _WORKER_SMALL_NODE_MIB else 4
+    # #2156 — the limit holds the connections the cluster can open. The share
+    # still sets shared_buffers, the request and what the worker is left, so
+    # this only ever RAISES the limit, and only where the share was too small
+    # for the connections (a node under ~6 GiB, or a multi-node cluster).
+    connections = postgres_connection_budget(cp_size, concurrency)
+    postgres_mib = max(
+        postgres_mib,
+        shared_buffers_mb + _PG_FIXED_MIB + connections * postgres_backend_mib(shared_buffers_mb),
+    )
+    return {
+        "api": api_mib,
+        "worker": worker_mib,
         "postgres": postgres_mib,
         "shared_buffers": shared_buffers_mb,
+        "concurrency": concurrency,
+        "postgres_connections": connections,
+        # The appliance floor of 200 until the budget passes it (#2156, #2782).
+        "max_connections": max(_PG_CHART_MAX_CONNECTIONS, connections),
         # CloudNativePG refuses a Cluster whose memory request is below
         # shared_buffers (Postgres reads MB as MiB, so the two compare one
         # to one); the chart's own 256Mi is the floor.
@@ -1231,40 +2508,75 @@ def control_plane_sizing(mem_total_mib: int) -> dict[str, int]:
     }
 
 
-def control_plane_resources(mem_total_mib: int | None) -> dict[str, Any]:
-    """PURE: the ``api`` / ``worker`` / ``postgresql`` resource overrides for
-    a node with ``mem_total_mib`` of RAM — ``{}`` when the size is unknown
-    (the chart's defaults then stand, exactly as before).
+def control_plane_cpu_sizing(cpu_count: int) -> dict[str, int]:
+    """PURE: the ``postgres`` and ``api`` CPU limits, in whole cores, for a
+    node with ``cpu_count`` CPUs (#2240): half the node for Postgres (1-8),
+    a quarter for the api (1-4). An 8-vCPU node gets 4 and 2; a 4-vCPU node
+    2 and 1. firstboot mirrors it in bash from ``nproc``."""
+    return {
+        "postgres": _clamp_cores(
+            cpu_count, _POSTGRES_CPU_DIVISOR, _POSTGRES_CPU_MIN, _POSTGRES_CPU_MAX
+        ),
+        "api": _clamp_cores(cpu_count, _API_CPU_DIVISOR, _API_CPU_MIN, _API_CPU_MAX),
+    }
 
-    The ``postgresql`` block carries the CloudNativePG instance limit, the
-    matching ``shared_buffers`` and the memory request CloudNativePG's
-    admission webhook demands at or above ``shared_buffers`` (with the
-    chart's 256Mi request alone the Cluster is refused as soon as the sizing
-    moves off 256MB); the chart renders them straight into the Cluster CR
-    (``templates/cnpg-cluster.yaml``), and a change to any of them on a
-    formed cluster is a CNPG rolling restart — replicas first, then a
+
+def control_plane_resources(
+    mem_total_mib: int | None, cpu_count: int | None = None, cp_size: int = 1
+) -> dict[str, Any]:
+    """PURE: the ``api`` / ``worker`` / ``postgresql`` resource overrides for
+    a node with ``mem_total_mib`` of RAM and ``cpu_count`` CPUs. Each input
+    sizes its own keys and an unknown one sizes nothing: ``{}`` when both are
+    unknown (the chart's defaults then stand, exactly as before), only the
+    memory keys when the CPU count is unknown, only the CPU limits
+    (``api`` / ``postgresql`` ``resources.limits.cpu``, #2240) when the RAM is.
+
+    The ``postgresql`` block carries the CloudNativePG instance limits (memory
+    and, #2240, CPU), the matching ``shared_buffers`` and the memory request
+    CloudNativePG's admission webhook demands at or above ``shared_buffers``
+    (with the chart's 256Mi request alone the Cluster is refused as soon as
+    the sizing moves off 256MB); the chart renders them straight into the
+    Cluster CR (``templates/cnpg-cluster.yaml``), and a change to any of them
+    on a formed cluster is a CNPG rolling restart — replicas first, then a
     switchover of the primary. On a fresh install firstboot renders the same
     numbers into the HelmChart, so the Cluster is created with them and
-    nothing rolls; an appliance that upgrades into this sizing takes that one
-    rolling restart on its first heartbeat, and the #1005 guard keeps every
-    later heartbeat quiet."""
-    if not mem_total_mib or mem_total_mib <= 0:
-        return {}
-    sized = control_plane_sizing(mem_total_mib)
-    return {
-        "api": {"resources": {"limits": {"memory": f"{sized['api']}Mi"}}},
-        "worker": {
-            "concurrency": 2 if mem_total_mib <= _WORKER_SMALL_NODE_MIB else 4,
-            "resources": {"limits": {"memory": f"{sized['worker']}Mi"}},
-        },
-        "postgresql": {
-            "resources": {
-                "requests": {"memory": f"{sized['postgres_request']}Mi"},
-                "limits": {"memory": f"{sized['postgres']}Mi"},
+    nothing rolls; an appliance that upgrades into this sizing (#2240's CPU
+    limits and worker memory included) takes that one rolling restart on its
+    first heartbeat, and the #1005 guard keeps every later heartbeat quiet."""
+    out: dict[str, Any] = {}
+    if mem_total_mib and mem_total_mib > 0:
+        sized = control_plane_sizing(mem_total_mib, cp_size)
+        out = {
+            "api": {"resources": {"limits": {"memory": f"{sized['api']}Mi"}}},
+            "worker": {
+                "concurrency": sized["concurrency"],
+                "resources": {"limits": {"memory": f"{sized['worker']}Mi"}},
             },
-            "cnpg": {"parameters": {"shared_buffers": f"{sized['shared_buffers']}MB"}},
-        },
-    }
+            "postgresql": {
+                "resources": {
+                    "requests": {"memory": f"{sized['postgres_request']}Mi"},
+                    "limits": {"memory": f"{sized['postgres']}Mi"},
+                },
+                "cnpg": {
+                    "parameters": {
+                        "shared_buffers": f"{sized['shared_buffers']}MB",
+                        "max_connections": str(sized["max_connections"]),
+                    }
+                },
+            },
+        }
+    if cpu_count and cpu_count > 0:
+        cores = control_plane_cpu_sizing(cpu_count)
+        out = _deep_merge(
+            out,
+            {
+                "api": {"resources": {"limits": {"cpu": _millicores(cores["api"])}}},
+                "postgresql": {
+                    "resources": {"limits": {"cpu": _millicores(cores["postgres"])}}
+                },
+            },
+        )
+    return out
 
 
 def node_memory_mib() -> int | None:
@@ -1279,20 +2591,225 @@ def node_memory_mib() -> int | None:
     return None
 
 
+def node_cpu_count() -> int | None:
+    """The CPUs this node schedules on (#2240), the count ``nproc`` prints:
+    the process's CPU affinity, else ``os.cpu_count()``; ``None`` when
+    unknown. In the supervisor's pod this is the node's vCPU count (a
+    container's CPU limit is a CFS quota, not an affinity mask)."""
+    # getattr: sched_getaffinity is Linux-only (and so absent to a type check
+    # on a developer mac).
+    affinity = getattr(os, "sched_getaffinity", None)
+    try:
+        count = len(affinity(0)) if affinity is not None else 0
+    except OSError:
+        count = 0
+    if count <= 0:
+        count = os.cpu_count() or 0
+    return count if count > 0 else None
+
+
+# #1585 — the size the control plane is budgeted from. A virtio balloon
+# changes the guest's MemTotal while it runs (Proxmox inflates it by itself
+# once the host passes 80 % RAM), and the sizing is linear at MiB
+# resolution, so every balloon step re-rendered spatium-control: a new api
+# rollout and migrate Job, and on a bigger seed a CNPG rolling restart, per
+# step (about 110 helm revisions in five hours on one install). A balloon
+# only ever takes memory away from what the guest booted with, so the
+# largest MemTotal seen since this boot is the RAM the node really has. It is
+# kept per boot_id in the supervisor's state dir, so a supervisor restart
+# while ballooned does not size down either. A real RAM change needs a reboot
+# (or a hot-plug, which raises MemTotal and so is taken at once).
+_SIZING_MEMORY_FILE = "sizing-memory.json"
+_BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
+
+
+def sizing_memory_mib(state_dir: Path | None = None) -> int | None:
+    """The MemTotal (MiB) to size the control plane from: the largest
+    ``node_memory_mib()`` seen since this boot (#1585); ``None`` when
+    MemTotal is unreadable. Never raises."""
+    current = node_memory_mib()
+    if current is None:
+        return None
+    try:
+        boot_id = _BOOT_ID_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        boot_id = ""
+    if state_dir is None or not boot_id:
+        return current
+    path = Path(state_dir) / _SIZING_MEMORY_FILE
+    try:
+        seen = json.loads(path.read_text(encoding="utf-8"))
+        if seen.get("boot_id") == boot_id and int(seen.get("mem_mib", 0)) >= current:
+            return int(seen["mem_mib"])
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    try:
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"boot_id": boot_id, "mem_mib": current}), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        log.warning("supervisor.sizing_memory_unpersisted", error=str(exc))
+    return current
+
+
+# #2223 — the dns-bind9 memory limit, sized from node RAM. named holds every
+# zone and RPZ in memory, so a fixed limit that fits a lab is OOM-killed at
+# scale: ddi-pg's lab hit the old fixed 2Gi at about 2M records. A quarter of
+# the node, floor 2Gi (the old fixed value, so no node gets less than it did),
+# cap 8Gi (the rest of the node is the control plane's and the kernel's). The
+# request keeps the chart's old ratio, an eighth of the limit (256Mi at 2Gi).
+# Rounded to whole GiB so the value moves only when the node really changes
+# size: a MiB-resolution limit would change with every few MiB of MemTotal,
+# and every change is a rollout of named on every DNS node.
+_DNS_BIND9_MEM_SHARE = 0.25
+_DNS_BIND9_MEM_MIN_GIB = 2
+_DNS_BIND9_MEM_MAX_GIB = 8
+_DNS_BIND9_REQUEST_DIVISOR = 8
+
+
+def dns_bind9_memory(mem_total_mib: int | None) -> dict[str, str]:
+    """PURE: the ``dnsBind9.memory`` values (``limit`` / ``request``) for a
+    node with ``mem_total_mib`` of RAM; ``{}`` when the size is unknown, so
+    the chart's own default (2Gi / 256Mi) stands.
+
+    The chart applies these only where ``dnsBind9.resources`` does not set
+    the memory limit or request itself, so an operator's explicit override
+    always wins (``templates/dns-bind9.yaml``)."""
+    if not mem_total_mib or mem_total_mib <= 0:
+        return {}
+    quarter_gib = int(mem_total_mib * _DNS_BIND9_MEM_SHARE / 1024 + 0.5)
+    limit_gib = min(max(quarter_gib, _DNS_BIND9_MEM_MIN_GIB), _DNS_BIND9_MEM_MAX_GIB)
+    return {
+        "limit": f"{limit_gib}Gi",
+        "request": f"{limit_gib * 1024 // _DNS_BIND9_REQUEST_DIVISOR}Mi",
+    }
+
+
+_QUANTITY_UNITS = {
+    "": 1, "k": 10**3, "M": 10**6, "G": 10**9, "T": 10**12,
+    "Ki": 1 << 10, "Mi": 1 << 20, "Gi": 1 << 30, "Ti": 1 << 40,
+}  # fmt: skip
+
+
+def quantity_mib(value: Any) -> int | None:
+    """PURE: a Kubernetes memory quantity (``"16374512Ki"``) in MiB; ``None``
+    when it does not parse."""
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([A-Za-z]*)", str(value or "").strip())
+    if not m or m.group(2) not in _QUANTITY_UNITS:
+        return None
+    return int(float(m.group(1)) * _QUANTITY_UNITS[m.group(2)]) >> 20
+
+
+_DNS_BIND9_ROLE_LABEL = "spatium.io/role-dns-bind9"
+
+
+def dns_sizing_memory_of(nodes_doc: Any) -> int | None:
+    """PURE — #2223: the RAM (MiB) to size dns-bind9 from, out of a
+    ``/api/v1/nodes`` list: the SMALLEST ``status.capacity.memory`` among the
+    nodes labelled for dns-bind9, or among every node when none is yet.
+
+    One value for the cluster, not this node's own: the role chart is ONE
+    HelmChart every member applies whole, and a value two nodes render
+    differently restarts named on every DNS node each time the other applies
+    (#1137). The DaemonSet also takes one limit for all its pods, so the
+    smallest node it runs on decides — a limit sized for a bigger node would
+    let named take a small one down. The kubelet reads the capacity once at
+    start, so a virtio balloon does not move it (#1585). ``None`` when no node
+    reports a capacity."""
+    items = nodes_doc.get("items") if isinstance(nodes_doc, dict) else None
+    labelled: list[int] = []
+    every: list[int] = []
+    for node in items or []:
+        node = node or {}
+        mib = quantity_mib(((node.get("status") or {}).get("capacity") or {}).get("memory"))
+        if mib is None or mib <= 0:
+            continue
+        every.append(mib)
+        labels = (node.get("metadata") or {}).get("labels") or {}
+        if labels.get(_DNS_BIND9_ROLE_LABEL) == "true":
+            labelled.append(mib)
+    pool = labelled or every
+    return min(pool) if pool else None
+
+
+def dns_sizing_memory_mib(timeout: float = 5.0) -> tuple[int | None, str | None]:
+    """``(mib, error)``: :func:`dns_sizing_memory_of` over ``GET /api/v1/nodes``.
+
+    ``None`` with an error means unknown, never "unsized": the role apply then
+    writes nothing rather than dropping the sizing, which would put every DNS
+    node back on the chart's 2Gi default and restart named cluster-wide."""
+    try:
+        status, body = _request("GET", "/api/v1/nodes", timeout=timeout)
+    except (RuntimeError, OSError) as exc:
+        return None, str(exc)
+    if status != 200:
+        return None, f"kubeapi status {status}: {body[:200]!r}"
+    try:
+        doc = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        return None, "unparseable node list"
+    mib = dns_sizing_memory_of(doc)
+    if mib is None:
+        return None, "no node reports a memory capacity"
+    return mib, None
+
+
+# #2826: the failure policy the control release's HelmChartConfig is created
+# with.
+#
+# helm-controller hands klipper-helm the HelmChartConfig's failurePolicy in
+# place of the HelmChart's whenever the Config carries one, and the
+# HelmChartConfig CRD defaults an omitted failurePolicy to 'reinstall' (k3s
+# v1.36.5+k3s1 embeds helm-controller v0.17.9). A Config created with
+# valuesContent alone therefore runs the release under 'reinstall', whatever
+# firstboot's _render_control_helmchart asks for ('retry', #1299), and under
+# 'reinstall' klipper-helm uninstalls a release it finds failed and installs it
+# again. firstboot's pin_control_failure_policy sets 'retry' on every boot, but
+# on a fresh appliance its first-boot read of the Config can fail ("failurePolicy
+# not pinned this boot"). The first promote then CREATED the Config, and until
+# the seed's next boot the formation's helm upgrades ran under 'reinstall': two
+# override writes 44 s apart left the release failed and it was uninstalled and
+# installed again, the seed's web ports refused for 34 s.
+#
+# Only the create carries it. An existing Config's policy is the pin's to set,
+# and every later write stays a merge-patch of valuesContent (#2024).
+_CONTROL_FAILURE_POLICY = "retry"
+
+
 def apply_control_plane_overrides(
     cp_size: int,
     control_plane_vip: str,
     web_ui_allowed_cidrs: list[str] | None = None,
     *,
     mem_total_mib: int | None = None,
+    cpu_count: int | None = None,
     cnpg_instances: int | None = None,
 ) -> tuple[bool, str | None]:
     """Durably set the spatium-control overrides: api / frontend / worker
     replicas + CNPG instances + redis sentinel replicas = ``cp_size``,
     plus the frontend control-plane VIP, plus the api / worker / Postgres
     memory limits, Postgres' shared_buffers and the worker concurrency,
-    sized from ``mem_total_mib`` (see ``control_plane_resources``). Written to the spatium-control
-    HelmChartConfig so it survives a k3s restart (#272).
+    sized from ``mem_total_mib``, and the api / Postgres CPU limits, sized
+    from ``cpu_count`` (#2240; see ``control_plane_resources``), plus the api
+    Service's ``trafficDistribution`` (#1805, see ``_NODE_LOCAL_API``),
+    plus (#2156) the api's database pool per pod, with the Postgres limit
+    held to the connections ``cp_size`` nodes can open.
+    Written to the spatium-control HelmChartConfig so it survives a k3s
+    restart (#272).
+
+    #2240 — a sizing change on a formed cluster (an appliance upgrading into
+    the CPU limits or the larger worker cap) is one CloudNativePG rolling
+    restart and one api / worker rollout, on the first heartbeat that writes
+    it; the #1005 guard in ``_merge_owned_overrides`` keeps every later
+    heartbeat quiet.
+
+    #2156 — the Postgres limit follows ``cp_size``, so a promote or demote
+    that moves it is also one CloudNativePG rolling restart (replicas first,
+    then, with two or more instances, a switchover to an updated replica, so
+    the primary moves to another node: the chart sets
+    ``primaryUpdateMethod: switchover``, #2831; a single instance is still
+    restarted in place), and a promote past four nodes is one api rollout
+    for the smaller pool.
 
     #1313 — CNPG instances are ``cnpg_instances`` when given: the count
     ``patch_cnpg_instances`` left on the Cluster this tick
@@ -1323,7 +2840,11 @@ def apply_control_plane_overrides(
     # and evict them from a dead node in seconds rather than the k8s default
     # 300 s. ``replicas`` here IS the node count, so hard
     # (requiredDuringScheduling) anti-affinity is exactly right, and the
-    # chart no-ops it below 2 replicas.
+    # chart no-ops it below 2 replicas, except the frontend's on the host
+    # network, which it renders at one replica too (#2450). The first promote
+    # then changes the frontend's replicas and nothing in its pod template, so
+    # the seed's frontend pod is scaled beside, never rolled off ports 80 and
+    # 443 (test_frontend_promotion_overrides.py pins this side of it).
     #
     # Written on every promote/demote rather than relying on the
     # firstboot-rendered HelmChart values, because firstboot only runs on a
@@ -1342,39 +2863,53 @@ def apply_control_plane_overrides(
         "podAntiAffinity": "hard",
         "tolerations": _CONTROL_PLANE_FAST_EVICT,
     }
-    current_doc = _helmchartconfig_doc("spatium-control")
-    if current_doc is None:
-        # Unknown current state — see _helmchartconfig_doc. Writing here
-        # would merge onto {} and delete every key we do not own.
-        return False, "could not read the current spatium-control values"
-    sized = control_plane_resources(mem_total_mib)
-    owned: dict[str, Any] = {
-        "api": dict(scaled) | sized.get("api", {}),
-        "frontend": dict(scaled)
-        | {
-            "controlPlaneVIP": vip,
-            "loadBalancerSourceRanges": cidrs,
-        },
-        "worker": dict(scaled) | sized.get("worker", {}),
-        "slotImageMirror": {
-            "enabled": _slot_image_mirror_enabled(cp_size, current_doc)
-        },
-        # #1115 — the CNPG instance memory limit and shared_buffers ride along
-        # with the instance count (both live under ``postgresql``; the merge
-        # keeps ``cnpg.instances`` beside ``cnpg.parameters``). #1313 — the
-        # count is the Cluster's own, as the supervisor's patch left it.
-        "postgresql": _deep_merge(
-            {"cnpg": {"instances": cnpg_instances if cnpg_instances else cp_size}},
-            sized.get("postgresql", {}),
-        ),
-        # ``kind`` is stated, not assumed: ``sentinel.replicas`` is only
-        # read by the chart under ``kind: sentinel``, and firstboot is the
-        # only place that ever set it. An appliance whose HelmChart values
-        # came from an older firstboot (or an operator's own override)
-        # would scale a key the chart ignores and keep a standalone redis
-        # on a three-node control plane.
-        "redis": {"kind": "sentinel", "sentinel": {"replicas": cp_size}},
-    }
+    sized = control_plane_resources(mem_total_mib, cpu_count, cp_size)
+
+    def owned(current_doc: dict) -> dict[str, Any]:
+        # The slot-image mirror latch (#787) reads the live document, so
+        # the owned keys are computed from the same read the merge uses.
+        return {
+            "api": dict(scaled)
+            | sized.get("api", {})
+            # #2156 — the pool per api pod shrinks as pods are added, so the
+            # connections Postgres' limit is sized for are all it can be sent.
+            | {"databasePool": api_db_pool(cp_size)}
+            | {"service": {"trafficDistribution": _NODE_LOCAL_API, "nodeLocal": True}},
+            "frontend": dict(scaled)
+            | {
+                "controlPlaneVIP": vip,
+                "loadBalancerSourceRanges": cidrs,
+            },
+            "worker": dict(scaled) | sized.get("worker", {}),
+            "slotImageMirror": {
+                "enabled": _slot_image_mirror_enabled(cp_size, current_doc)
+            },
+            # #1115 — the CNPG instance memory limit and shared_buffers ride along
+            # with the instance count (both live under ``postgresql``; the merge
+            # keeps ``cnpg.instances`` beside ``cnpg.parameters``). #1313 — the
+            # count is the Cluster's own, as the supervisor's patch left it.
+            # #3021 — and the instance pods reach the API server on their own
+            # node (every control-plane node is a k3s server): through the
+            # kubernetes Service, the loss of the node whose API server held
+            # the primary's connection restarted the primary.
+            "postgresql": _deep_merge(
+                {
+                    "cnpg": {
+                        "instances": cnpg_instances if cnpg_instances else cp_size,
+                        "nodeLocalApiServer": {"enabled": True},
+                    }
+                },
+                sized.get("postgresql", {}),
+            ),
+            # ``kind`` is stated, not assumed: ``sentinel.replicas`` is only
+            # read by the chart under ``kind: sentinel``, and firstboot is the
+            # only place that ever set it. An appliance whose HelmChart values
+            # came from an older firstboot (or an operator's own override)
+            # would scale a key the chart ignores and keep a standalone redis
+            # on a three-node control plane.
+            "redis": {"kind": "sentinel", "sentinel": {"replicas": cp_size}},
+        }
+
     # MERGE onto what is already there rather than replacing the document.
     #
     # This used to be a hand-concatenated string assigned wholesale to
@@ -1390,56 +2925,19 @@ def apply_control_plane_overrides(
     #
     # Merging fixes the deletion; dumping through the SAME normalisation
     # chart_bump uses fixes the churn, because two agents writing the same
-    # logical document now produce byte-identical strings and the upsert's
-    # idempotent compare finally holds.
-    merged = _deep_merge(current_doc, owned)
-
-    # #1005 — do not write a HelmChartConfig that changes nothing.
+    # logical document now produce byte-identical strings.
     #
-    # helm-controller merges the Config on top of the HelmChart, and since
-    # #1003 item 4 firstboot renders the same sizing the supervisor would.
-    # So the first heartbeat of every control-plane install used to create a
-    # CR whose every key the Chart already carried — no Deployment changed,
-    # but helm still recorded revision 2 and ran a second helm-install Job.
-    # ``_helmchartconfig_upsert`` could not catch it: its idempotence is
-    # against the CR's own previous body, and on a fresh boot there is none.
+    # #1005 — and the write is skipped when it would not change the
+    # EFFECTIVE values ``deep_merge(chart, config)``; the full rationale
+    # (including why that guard is not create-only) lives in
+    # ``_merge_owned_overrides``, now the one write path for every
+    # supervisor-owned HelmChartConfig (#2024).
     #
-    # So the comparison is on the EFFECTIVE values — what helm actually
-    # renders — rather than on the CR alone: skip when merging ``owned`` in
-    # leaves ``deep_merge(chart, config)`` exactly as it already is.
-    #
-    # Deliberately not restricted to the create case. A create-only guard
-    # would hand the write to the worst possible moment instead of removing
-    # it: ``chart_bump._patch_image_tag`` creates this CR carrying only
-    # ``image.tag`` to roll the control plane to a new version, and from the
-    # next heartbeat — at most 30 s later, i.e. mid-upgrade — ``current_doc``
-    # is truthy, so a create-only guard is bypassed and every owned key is
-    # PATCHed in while the tag-bump apply is still in flight. Before #1005
-    # that write did not happen at all, because the CR already carried those
-    # keys and the rendered document was byte-identical.
-    #
-    # Skipping is safe with a Config present precisely because it is a skip:
-    # nothing is replaced, so the keys we do not own (``image.tag``) cannot
-    # be dropped. And it self-heals — a slot upgrade that ships a chart with
-    # different defaults makes the comparison differ, and the next heartbeat
-    # writes. In practice the skip only ever fires on a single-node control
-    # plane, since ``cp_size`` is the one value firstboot cannot know and any
-    # promote puts the Config ahead of the Chart for good.
-    #
-    # An unreadable Chart falls through to the write: writing a redundant CR
-    # is the status quo, suppressing a needed one is not.
-    chart_values = _helmchart_values("spatium-control")
-    if chart_values is not None and _deep_merge(chart_values, merged) == _deep_merge(
-        chart_values, current_doc
-    ):
-        log.info(
-            "supervisor.helmchartconfig.write_skipped",
-            chart="spatium-control",
-            reason="the HelmChart already carries every overridden value",
-        )
-        return False, None
-    values = yaml.safe_dump(merged, sort_keys=True, default_flow_style=False)
-    return _helmchartconfig_upsert("spatium-control", values)
+    # #2826: a Config this write CREATES runs the release under 'retry', not
+    # the CRD's 'reinstall' (``_CONTROL_FAILURE_POLICY``).
+    return _merge_owned_overrides(
+        "spatium-control", owned, failure_policy_on_create=_CONTROL_FAILURE_POLICY
+    )
 
 
 def apply_metallb_overrides(
@@ -1474,12 +2972,11 @@ def apply_metallb_overrides(
     frrk8s.enabled; the chart's own template hard-``fail``s if both are
     true).
 
-    MUST render every MetalLB-related key in ONE combined body —
-    ``_helmchartconfig_upsert`` replaces the whole valuesContent string,
-    so calling this (or a sibling function targeting the same
-    HelmChartConfig) twice per tick would have the second call blank
-    out the first's keys."""
-    pool_json = json.dumps([a.strip() for a in pool_addresses if a and a.strip()])
+    Every key is written explicitly in both states (``enabled: false``,
+    empty lists) because the write MERGES into the live document (#2024)
+    and a merge cannot express removal by omission. Keys the supervisor
+    does not own — an operator's own MetalLB tuning — survive."""
+    pool = [a.strip() for a in pool_addresses if a and a.strip()]
 
     def _peer(p: dict) -> dict:
         out: dict = {
@@ -1503,17 +3000,19 @@ def apply_metallb_overrides(
             out["aggregationLength"] = a["aggregation_length"]
         return out
 
-    peers_json = json.dumps([_peer(p) for p in (bgp_peers or [])])
-    adv_json = json.dumps([_adv(a) for a in (bgp_advertisements or [])])
-    values = (
-        f"metallb:\n  enabled: {'true' if metallb_enabled else 'false'}\n"
-        f"  ipPool:\n    addresses: {pool_json}\n"
-        f"  frrk8s:\n    enabled: {'true' if bgp_enabled else 'false'}\n"
-        f"  bgp:\n    enabled: {'true' if bgp_enabled else 'false'}\n"
-        f"    peers: {peers_json}\n"
-        f"    advertisements: {adv_json}\n"
-    )
-    return _helmchartconfig_upsert("spatium-metallb", values)
+    owned = {
+        "metallb": {
+            "enabled": bool(metallb_enabled),
+            "ipPool": {"addresses": pool},
+            "frrk8s": {"enabled": bool(bgp_enabled)},
+            "bgp": {
+                "enabled": bool(bgp_enabled),
+                "peers": [_peer(p) for p in (bgp_peers or [])],
+                "advertisements": [_adv(a) for a in (bgp_advertisements or [])],
+            },
+        }
+    }
+    return _merge_owned_overrides("spatium-metallb", owned)
 
 
 def apply_dataplane_vip_overrides(
@@ -1532,17 +3031,23 @@ def apply_dataplane_vip_overrides(
     Written to the HelmChartConfig (not the HelmChart CR) so it survives
     a k3s restart's manifest re-apply, exactly like the cp-size + VIP
     overrides. helm-controller merges it on top of the role-assignment
-    values the supervisor PATCHes onto the same-named HelmChart, so this
-    overlay only carries the VIP keys and never fights for ownership of
-    the per-role ``enabled`` flags. Idempotent — only writes on change."""
+    values the supervisor PATCHes onto the same-named HelmChart, so it
+    does not touch the per-role ``enabled`` flags.
+
+    #2024 — this Config is ALSO where APPLIANCE.md sends an operator to
+    raise ``dnsBind9.resources``, so the supervisor owns its three keys
+    and nothing else: they are merged into the live document and every
+    other key survives the heartbeat. The VIP keys are written explicitly
+    when off (``useMetalLBVIP: false``, ``vip: ""``, ``relayVIP: ""``)
+    because a merge cannot remove a key by leaving it out. Writes only
+    when the merge changes something."""
     dns_vip = (dns_vip or "").strip()
     relay_vip = (dhcp_relay_vip or "").strip()
-    values = (
-        f"dns:\n  useMetalLBVIP: {'true' if dns_vip else 'false'}\n"
-        f'  vip: "{dns_vip}"\n'
-        f'dhcpKea:\n  relayVIP: "{relay_vip}"\n'
-    )
-    return _helmchartconfig_upsert("spatiumddi-appliance", values)
+    owned = {
+        "dns": {"useMetalLBVIP": bool(dns_vip), "vip": dns_vip},
+        "dhcpKea": {"relayVIP": relay_vip},
+    }
+    return _merge_owned_overrides("spatiumddi-appliance", owned)
 
 
 def patch_node_labels(
@@ -1585,6 +3090,44 @@ def patch_node_labels(
     if status in (200, 201):
         return True, None
     return False, f"kubeapi status {status}: {resp[:200]!r}"
+
+
+def daemonset_template_env(
+    name: str,
+    *,
+    env_name: str,
+    namespace: str = "spatium",
+    timeout: float = 5.0,
+) -> tuple[bool | None, str | None, str | None]:
+    """``(exists, value, error)``: the literal ``env_name`` of a DaemonSet's pod
+    TEMPLATE, i.e. what a pod scheduled onto a node right now would start with.
+
+    #2190 — the role apply reads this before it labels a node for a role, so a
+    label flip cannot start a pod from the previous chart revision's values.
+    ``exists`` is ``False`` on a 404 (nothing to schedule from) and ``None``
+    when the read failed (``error`` says why). ``value`` is the first literal
+    ``value`` any container sets for ``env_name``, ``None`` when none does."""
+    path = f"/apis/apps/v1/namespaces/{quote(namespace)}/daemonsets/{quote(name)}"
+    try:
+        status, body = _request("GET", path, timeout=timeout)
+    except (RuntimeError, OSError) as exc:
+        return None, None, str(exc)
+    if status == 404:
+        return False, None, None
+    if status != 200:
+        return None, None, f"kubeapi status {status}: {body[:200]!r}"
+    try:
+        doc = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        return None, None, "unparseable daemonset"
+    if not isinstance(doc, dict):
+        return None, None, "unparseable daemonset"
+    pod_spec = ((doc.get("spec") or {}).get("template") or {}).get("spec") or {}
+    for container in pod_spec.get("containers") or []:
+        for env in (container or {}).get("env") or []:
+            if (env or {}).get("name") == env_name and "value" in env:
+                return True, str(env.get("value") or ""), None
+    return True, None, None
 
 
 def count_nodes(timeout: float = 5.0) -> tuple[int, int, str | None]:
@@ -1633,22 +3176,91 @@ def count_nodes(timeout: float = 5.0) -> tuple[int, int, str | None]:
     return len(items), schedulable, None
 
 
+_ROLE_LABEL_PREFIX = "spatium.io/role-"
+
+
+def role_labels_of(nodes_doc: Any, exclude: str = "") -> set[str]:
+    """PURE — #1439: the roles (``spatium.io/role-<role>=true``) that every node
+    of a ``/api/v1/nodes`` list carries, except the node named ``exclude``.
+
+    The labels are what schedules the agents (each agent DaemonSet selects on
+    its role's label), so they are the cluster's own answer to "which roles does
+    another node serve right now". ``exclude`` empty counts every node."""
+    roles: set[str] = set()
+    items = nodes_doc.get("items") if isinstance(nodes_doc, dict) else None
+    for node in items or []:
+        meta = (node or {}).get("metadata") or {}
+        if exclude and meta.get("name") == exclude:
+            continue
+        for key, value in (meta.get("labels") or {}).items():
+            if key.startswith(_ROLE_LABEL_PREFIX) and value == "true":
+                roles.add(key[len(_ROLE_LABEL_PREFIX) :])
+    return roles
+
+
+def node_role_labels(exclude: str = "", timeout: float = 5.0) -> tuple[set[str] | None, str | None]:
+    """``(roles, error)``: :func:`role_labels_of` over ``GET /api/v1/nodes``.
+
+    ``None`` means unknown (a transport error, a status other than 200, an
+    unparseable list), never "no other node serves anything": the role apply
+    acts on the answer, and an unknown read taken as an empty one would turn off
+    the agents other nodes serve, which is the very thing it guards."""
+    try:
+        status, body = _request("GET", "/api/v1/nodes", timeout=timeout)
+    except (RuntimeError, OSError) as exc:
+        return None, str(exc)
+    if status != 200:
+        return None, f"kubeapi status {status}: {body[:200]!r}"
+    try:
+        doc = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        return None, "unparseable node list"
+    if not isinstance(doc, dict) or not isinstance(doc.get("items"), list):
+        return None, "unparseable node list"
+    return role_labels_of(doc, exclude), None
+
+
+def node_names_of(nodes_doc: Any) -> list[str]:
+    """PURE — #1750: the name of every node in a ``/api/v1/nodes`` list."""
+    items = nodes_doc.get("items") if isinstance(nodes_doc, dict) else None
+    names: list[str] = []
+    for node in items or []:
+        name = ((node or {}).get("metadata") or {}).get("name")
+        if isinstance(name, str) and name:
+            names.append(name)
+    return names
+
+
+def cluster_node_names(timeout: float = 5.0) -> tuple[list[str] | None, str | None]:
+    """``(names, error)``: :func:`node_names_of` over ``GET /api/v1/nodes``.
+
+    ``None`` means unknown, never "this node is alone": the role apply decides
+    from it whether the chart it would write is another node's too (#1750), and
+    an unknown read taken as "alone" would let a leaving member write its
+    non-member values over the cluster's shared chart."""
+    try:
+        status, body = _request("GET", "/api/v1/nodes", timeout=timeout)
+    except (RuntimeError, OSError) as exc:
+        return None, str(exc)
+    if status != 200:
+        return None, f"kubeapi status {status}: {body[:200]!r}"
+    try:
+        doc = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        return None, "unparseable node list"
+    if not isinstance(doc, dict) or not isinstance(doc.get("items"), list):
+        return None, "unparseable node list"
+    return node_names_of(doc), None
+
+
 _COREDNS_PATH = "/apis/apps/v1/namespaces/kube-system/deployments/coredns"
+_KUBE_DNS_PATH = "/api/v1/namespaces/kube-system/services/kube-dns"
+#: #1718 — the kube-dns Service's ``trafficDistribution`` on a real cluster:
+#: a node's lookups go to the CoreDNS pod on that node while it is ready.
+_NODE_LOCAL_DNS = "PreferSameNode"
+#: The fast-evict tolerations earlier builds added (20 s on both keys). The
+#: reconciler now removes them wherever it finds them (#1753, below).
 _FAST_EVICT_KEYS = ("node.kubernetes.io/unreachable", "node.kubernetes.io/not-ready")
-_FAST_EVICT_TOLERATIONS = [
-    {
-        "key": "node.kubernetes.io/unreachable",
-        "operator": "Exists",
-        "effect": "NoExecute",
-        "tolerationSeconds": 20,
-    },
-    {
-        "key": "node.kubernetes.io/not-ready",
-        "operator": "Exists",
-        "effect": "NoExecute",
-        "tolerationSeconds": 20,
-    },
-]
 _COREDNS_SPREAD = {
     "podAntiAffinity": {
         "requiredDuringSchedulingIgnoredDuringExecution": [
@@ -1681,7 +3293,7 @@ def _merge_patch(target: Any, patch: Any) -> Any:
     return merged
 
 
-def ensure_coredns_ha(max_replicas: int = 2) -> tuple[bool, str | None]:
+def ensure_coredns_ha() -> tuple[bool, str | None]:
     """Match the k3s-bundled CoreDNS to the cluster's NODE COUNT — returns
     (changed, error); ``(False, None)`` means converged or deferred.
 
@@ -1714,11 +3326,33 @@ def ensure_coredns_ha(max_replicas: int = 2) -> tuple[bool, str | None]:
       REMOVED, pod anti-affinity REMOVED. Both buy exactly nothing with one
       hostname domain — worse, a 20 s unreachable toleration means a kubelet
       blip evicts the only DNS pod with nowhere to put it.
-    * **≥2 registered nodes → HA.** ``min(registered, max_replicas)``
-      replicas + fast-evict + required spread. The cap is 2 by default
-      because required anti-affinity places at most one pod per node, and
-      two is what surviving a node loss needs — a third on a 3-node cluster
-      costs memory for no extra failure tolerance.
+    * **≥2 registered nodes → HA.** One replica per registered node +
+      required spread, so every node runs its own CoreDNS.
+      This used to be capped at 2, on the reasoning that two survive a node
+      loss and a third buys no failure tolerance. #1718 showed what the
+      third buys. Until a lost node reads NotReady (about 40 s), its CoreDNS
+      pod stays a ready kube-dns endpoint, and kube-proxy keeps sending it
+      about half of every other node's lookups. Each one stalls for the
+      resolver's whole timeout. Redis Sentinel resolves its peers inside
+      its event loop, so the stalls put every surviving sentinel in TILT,
+      and the Redis failover took 77 s instead of seconds. With a replica
+      on every node and the kube-dns Service set to ``PreferSameNode``
+      (``ensure_kube_dns_node_local``), a pod's lookups stay on its own
+      node. A lost node then takes only its own pods' DNS with it.
+
+    #1753 — the HA shape no longer carries the fast-evict tolerations (20 s
+    on ``unreachable``/``not-ready``) that #590 added. ``tolerations`` is the
+    one pod-template field both this reconciler and k3s's bundled manifest
+    set. k3s force re-applies that manifest at every server start, which put
+    the list back to its own two entries: rollout one. The next seed
+    heartbeat patched the fast-evict pair back in: rollout two. So every
+    node's return replaced every CoreDNS pod twice, and lookups in flight to
+    the replaced pods stalled and put Redis Sentinel into TILT again. With one
+    replica per node, the eviction those tolerations hasten has nowhere to
+    go: the required spread leaves no node free for the evicted pod's
+    replacement. So the template now keeps k3s's own tolerations, and its
+    re-apply is a no-op. Any fast-evict entry found is removed, in both
+    shapes.
 
     The count is *registered* Node objects, deliberately, and deliberately
     NOT the ``control_plane_size`` that sizes every other appliance workload
@@ -1764,7 +3398,7 @@ def ensure_coredns_ha(max_replicas: int = 2) -> tuple[bool, str | None]:
         return False, "kubeapi reported no nodes"
 
     want_ha = registered >= 2
-    desired = min(registered, max_replicas) if want_ha else 1
+    desired = registered if want_ha else 1
 
     try:
         status, resp = _request("GET", _COREDNS_PATH)
@@ -1807,7 +3441,7 @@ def ensure_coredns_ha(max_replicas: int = 2) -> tuple[bool, str | None]:
         # above. Nulling the whole ``affinity`` here would take the operator's
         # other scheduling constraints with it.
         affinity_patch = {"podAntiAffinity": None}
-    want_tolerations = (keep + _FAST_EVICT_TOLERATIONS) if want_ha else keep
+    want_tolerations = keep
 
     # Whether the PATCH would actually rewrite the pod template, computed from
     # the body we are about to send rather than from ``template_ok``. The two
@@ -1875,6 +3509,205 @@ def ensure_coredns_ha(max_replicas: int = 2) -> tuple[bool, str | None]:
     return False, f"kubeapi status {status}: {resp[:200]!r}"
 
 
+def ensure_kube_dns_node_local() -> tuple[bool, str | None]:
+    """Keep each pod's cluster-DNS lookups on its own node once the cluster has
+    a second node (#1718). Returns (changed, error), like ``ensure_coredns_ha``;
+    ``(False, None)`` means converged.
+
+    The kube-dns Service gets ``trafficDistribution: PreferSameNode``. With it,
+    kube-proxy sends a node's lookups to the CoreDNS pod on that node while that
+    pod is ready, and to every pod only while it is not. ``ensure_coredns_ha``
+    runs one replica per node, so a lost node's CoreDNS pod answers nobody
+    else's lookups. Without this, it stays a ready endpoint until the node reads
+    NotReady, and about half of every other node's lookups stall on it for the
+    resolver's whole timeout: Redis Sentinel's blocking peer lookups went into
+    TILT for over a minute, and the supervisor's own lookups failed with
+    EAI_AGAIN. On a single node the field is removed again: there every endpoint
+    is local, and stock is the target there (#750).
+
+    k3s's bundled ``coredns.yaml`` does not set the field, so k3s's re-apply at
+    every server start leaves it in place. It is still reconciled on every seed
+    heartbeat, like the Deployment.
+    """
+    registered, _schedulable, node_err = count_nodes()
+    if node_err is not None:
+        return False, f"node count unavailable: {node_err}"
+    if registered <= 0:
+        return False, "kubeapi reported no nodes"
+    want = _NODE_LOCAL_DNS if registered >= 2 else None
+    try:
+        status, resp = _request("GET", _KUBE_DNS_PATH)
+    except (RuntimeError, OSError) as exc:
+        return False, str(exc)
+    if status != 200:
+        return False, f"kubeapi status {status}: {resp[:200]!r}"
+    try:
+        svc = json.loads(resp)
+    except ValueError:
+        return False, "unparseable kube-dns service"
+    if not isinstance(svc, dict):
+        return False, "unparseable kube-dns service"
+    if (svc.get("spec") or {}).get("trafficDistribution") == want:
+        return False, None
+    # ``null`` deletes the key under a JSON merge-patch: stock again.
+    payload = json.dumps({"spec": {"trafficDistribution": want}}).encode("utf-8")
+    try:
+        status, resp = _request(
+            "PATCH",
+            _KUBE_DNS_PATH,
+            body=payload,
+            content_type="application/merge-patch+json",
+        )
+    except (RuntimeError, OSError) as exc:
+        return False, str(exc)
+    if status in (200, 201):
+        log.info(
+            "supervisor.k8s_api.kube_dns_traffic_reconciled",
+            registered_nodes=registered,
+            traffic_distribution=want,
+        )
+        return True, None
+    return False, f"kubeapi status {status}: {resp[:200]!r}"
+
+
+#: #2240: the CNPG operator's Deployment as the spatium-bootstrap release
+#: renders it (the cloudnative-pg subchart under its ``cloudnative-pg``
+#: nameOverride, #277).
+_CNPG_OPERATOR_PATH = (
+    "/apis/apps/v1/namespaces/spatium/deployments/spatium-bootstrap-cloudnative-pg"
+)
+#: The term the chart's own PREFERRED rule carries (values.yaml ``cnpg.affinity``),
+#: made REQUIRED once the cluster can honour it.
+_CNPG_OPERATOR_SPREAD_TERM = {
+    "topologyKey": "kubernetes.io/hostname",
+    "labelSelector": {"matchLabels": {"app.kubernetes.io/name": "cloudnative-pg"}},
+}
+#: Two replicas plus the surge pod a pod-template rollout adds while the old
+#: pods still hold their nodes.
+_CNPG_OPERATOR_REQUIRED_MIN_NODES = 3
+
+
+def ensure_cnpg_operator_spread() -> tuple[bool, str | None]:
+    """Keep the CloudNativePG operator's two replicas on different nodes once
+    the cluster has three. Returns (changed, error), like ``ensure_coredns_ha``;
+    ``(False, None)`` means converged, deferred or no operator.
+
+    #2240: the operator IS Postgres failover. While it is gone, nothing
+    promotes a new primary. #590 gave it two replicas, 20 s fast-evict
+    tolerations and a PREFERRED hostname anti-affinity (charts/
+    spatiumddi-appliance values.yaml ``cnpg``). But firstboot installs it on
+    the seed while the seed is the only node, so both replicas start there,
+    and preferred anti-affinity is IgnoredDuringExecution: Kubernetes never
+    rebalances running pods, so they stay on the seed as members join. A
+    seven-node cluster lost both at once when its seed was killed, and the
+    failover waited for their rescheduling. ``ensure_coredns_ha`` (#633)
+    records the same lesson for CoreDNS.
+
+    A REQUIRED rule cannot be the chart's default, for the reason the chart
+    gives: on one node the second replica could never schedule. It also
+    needs more than two nodes to be APPLIED. Changing the pod template starts
+    a rollout, and with two replicas the rollout surges one new pod and keeps
+    both old ones until it is Ready. The new pod must land on a node with no
+    operator pod, while the old pods still hold up to two: on two nodes that
+    is the #750 deadlock. So:
+
+    * **3 or more registered nodes**: the required term is added. The
+      rollout it starts moves the replicas apart, and the scheduler keeps
+      them apart from then on: a lost node's replica is replaced on a node
+      without one. While fewer than three nodes are Ready and uncordoned the
+      change is deferred to a later heartbeat, as ``ensure_coredns_ha``
+      defers its own.
+    * **fewer**: the term is removed, which is the chart's own template.
+      Never deferred: a preferred-only rollout can always place its surge
+      pod.
+
+    Registered Node objects, not ``control_plane_size``, for the reasons
+    ``ensure_coredns_ha`` gives: they are the hostname domains that exist, and
+    a node OUTAGE does not drop the count and undo the spread at the moment
+    it matters.
+
+    The patch is a JSON merge-patch that carries only
+    ``requiredDuringSchedulingIgnoredDuringExecution``. The chart's preferred
+    term and every other field stay exactly as Helm rendered them, so a later
+    helm upgrade of spatium-bootstrap (a slot upgrade) has nothing of its own
+    to revert: a three-way merge leaves a field the chart has never set. If a
+    reinstall drops the term anyway, the next heartbeat adds it again. A 404
+    means this appliance's bootstrap chart runs no operator: nothing to do.
+    """
+    registered, schedulable, node_err = count_nodes()
+    if node_err is not None:
+        return False, f"node count unavailable: {node_err}"
+    if registered <= 0:
+        # Same guard as ensure_coredns_ha: zero is a bad read, never a
+        # nodeless cluster, and acting on it would turn it into a rollout.
+        return False, "kubeapi reported no nodes"
+    want_required = registered >= _CNPG_OPERATOR_REQUIRED_MIN_NODES
+
+    try:
+        status, resp = _request("GET", _CNPG_OPERATOR_PATH)
+    except (RuntimeError, OSError) as exc:
+        return False, str(exc)
+    if status == 404:
+        return False, None
+    if status != 200:
+        return False, f"kubeapi status {status}: {resp[:200]!r}"
+    try:
+        dep = json.loads(resp)
+    except ValueError:
+        return False, "unparseable cnpg operator deployment"
+    if not isinstance(dep, dict):
+        return False, "unparseable cnpg operator deployment"
+    tmpl_spec = ((dep.get("spec") or {}).get("template") or {}).get("spec") or {}
+    anti = (tmpl_spec.get("affinity") or {}).get("podAntiAffinity") or {}
+    current = anti.get("requiredDuringSchedulingIgnoredDuringExecution")
+
+    desired = [_CNPG_OPERATOR_SPREAD_TERM] if want_required else None
+    if (current or None) == desired:
+        return False, None
+    if want_required and schedulable < _CNPG_OPERATOR_REQUIRED_MIN_NODES:
+        log.info(
+            "supervisor.k8s_api.cnpg_operator_spread_deferred",
+            registered_nodes=registered,
+            schedulable_nodes=schedulable,
+        )
+        return False, None
+
+    # ``null`` deletes the key under a JSON merge-patch, restoring the chart's
+    # template; a list replaces the key whole.
+    payload = json.dumps(
+        {
+            "spec": {
+                "template": {
+                    "spec": {
+                        "affinity": {
+                            "podAntiAffinity": {
+                                "requiredDuringSchedulingIgnoredDuringExecution": desired
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    ).encode("utf-8")
+    try:
+        status, resp = _request(
+            "PATCH",
+            _CNPG_OPERATOR_PATH,
+            body=payload,
+            content_type="application/merge-patch+json",
+        )
+    except (RuntimeError, OSError) as exc:
+        return False, str(exc)
+    if status in (200, 201):
+        log.info(
+            "supervisor.k8s_api.cnpg_operator_spread_reconciled",
+            registered_nodes=registered,
+            shape="required" if want_required else "chart",
+        )
+        return True, None
+    return False, f"kubeapi status {status}: {resp[:200]!r}"
+
+
 @dataclass
 class CnpgScale:
     """What one ``patch_cnpg_instances`` call did. ``changed`` is any PATCH
@@ -1922,6 +3755,7 @@ def patch_cnpg_instances(
     namespace: str = "spatium",
     scale_down: bool = True,
     hold_reason: str = "",
+    shrink_past_unready: bool = False,
 ) -> CnpgScale:
     """Directly reconcile the CNPG ``Cluster`` CR's ``spec.instances`` and
     its instance-spreading policy.
@@ -1970,8 +3804,21 @@ def patch_cnpg_instances(
     ``Status.Instances`` counts PVC groups, a pending join included), so it
     would refuse the write anyway and act on it later, when the cluster is
     whole and nobody means it any more. The
-    caller retries every tick, so a real demote still lands once the cluster
-    is whole. Scale-UP and the affinity patch are never deferred.
+    caller retries every tick; a demote, whose departed instances never make
+    the cluster whole again, lifts this deferral (#1541, below). Scale-UP and
+    the affinity patch are never deferred.
+
+    #1541 — ``shrink_past_unready`` lifts the readiness deferral for a
+    demote whose nodes are gone (``heartbeat._DemoteShrink``). There the
+    unready instances are the departed nodes' and never come back, so the
+    Cluster is never whole again and the deferral above would hold the old
+    size for good. It is lifted only when the new size is at least the
+    number of ready instances: a spec no smaller than what is healthy can
+    never make CloudNativePG remove a healthy instance. CNPG's own gate
+    still keeps it from acting until the stranded instances' claims are
+    reclaimed (#1058; it does not remove instances while one is not
+    reporting), and then the smaller spec is what stops it re-creating them
+    on the nodes that are left.
 
     Note the affinity patch can strand an instance whose PVC is already
     bound to a node that now hosts another instance — it goes Pending until
@@ -2025,7 +3872,7 @@ def patch_cnpg_instances(
             deferred = hold_reason or "scale-down held by the caller"
         elif ready is None or reported is None:
             deferred = "the Cluster reports no readiness yet"
-        elif ready < reported:
+        elif ready < reported and not (shrink_past_unready and instances >= ready):
             deferred = f"readyInstances {ready} < instances {reported}"
     result = CnpgScale(current=current if isinstance(current, int) else None,
                        ready=ready, reported=reported, deferred=deferred)
@@ -2068,6 +3915,7 @@ __all__ = [
     "apply_metallb_overrides",
     "apply_control_plane_overrides",
     "apply_helmchart",
+    "cluster_node_names",
     "check_kubeapi_ready",
     "delete_helmchart",
     "delete_node",

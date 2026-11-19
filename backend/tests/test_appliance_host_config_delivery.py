@@ -26,7 +26,7 @@ async def _settings(db: AsyncSession) -> PlatformSettings:
     if s is None:
         s = PlatformSettings(id=1)
         db.add(s)
-    # The supervisor endpoints 404 unless the feature flag is on.
+    # Only /supervisor/register needs the flag since #2798; kept on for parity.
     s.supervisor_registration_enabled = True
     s.lldp_enabled = True
     s.lldp_tx_interval = 30

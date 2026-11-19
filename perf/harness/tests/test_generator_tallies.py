@@ -42,6 +42,31 @@ def test_handshake_three_strictnesses_from_todays_numbers() -> None:
     assert handshake_summary({})["strict_pct"] is None
 
 
+def test_handshake_keeps_resent_leases_and_open_rounds_visible() -> None:
+    """With the RFC 2131 backoff a round times out only ≈60 s in, so a lease
+    that took a resend is a success: `acked_after_resend` says how many, and
+    `in_flight` the rounds a stopped shard left without a verdict. 44 resent
+    of 10,000 is the size of a 2026-10 narrow miss (8-44 timeouts)."""
+    h = handshake_summary({"dora_ack": 10000, "timeout": 0, "nak": 0,
+                           "dora_ack_resent": 44, "dora_ack_over_budget": 3,
+                           "dora_in_flight": 2})
+    assert h["strict_pct"] == 100.0 and h["acked_after_resend"] == 44
+    assert h["acked_without_resend"] == 9956 and h["without_resend_pct"] == 99.56
+    assert h["acked_within_budget"] == 9997 and h["in_flight"] == 2
+    # a summary written before the counters existed reads as unknown, not 0
+    old = handshake_summary({"dora_ack": 9997, "timeout": 637, "nak": 0})
+    assert old["acked_after_resend"] is None and old["acked_without_resend"] is None
+    assert old["without_resend_pct"] is None and old["in_flight"] is None
+    # and a shard that wrote zero is a measured zero
+    zero = handshake_summary({"dora_ack": 5, "dora_ack_resent": 0, "dora_in_flight": 0})
+    assert zero["acked_without_resend"] == 5 and zero["in_flight"] == 0
+    # folded across shards like every other counter
+    blk = orchestrator_accounting([{"counters": {"dora_ack": 3, "dora_ack_resent": 1}},
+                                   {"counters": {"dora_ack": 2, "dora_ack_resent": 2}}])
+    assert blk["handshake"]["acked_after_resend"] == 3
+    assert blk["handshake"]["acked_without_resend"] == 2
+
+
 def test_dns_summary_shows_the_pre_fix_hole_and_the_fixed_ledger() -> None:
     """nightly-20260909 PostQA: dns_sent 606,185 / ok 0 / timeouts 46 beside a
     606,139-sample histogram — the answers counted as nothing show up as

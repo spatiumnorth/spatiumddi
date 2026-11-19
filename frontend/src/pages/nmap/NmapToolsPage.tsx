@@ -1,9 +1,12 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListReadError } from "@/components/ui/list-read-error";
+import { pollUnlessRefused } from "@/lib/refusal";
 import { Loader2, Radar, Trash2 } from "lucide-react";
 import { type NmapScanRead, nmapApi } from "@/lib/api";
 import { useModalDialog } from "@/components/ui/use-draggable-modal";
 import { cn } from "@/lib/utils";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { NmapScanForm } from "./NmapScanForm";
 import { NmapScanLiveViewer } from "./NmapScanLiveViewer";
 import { NmapResultPanel } from "./NmapResultPanel";
@@ -11,6 +14,19 @@ import { ConfirmDeleteScanModal } from "./ConfirmDeleteScanModal";
 import { humanTime } from "@/pages/network/_shared";
 
 type RightTab = "live" | "history" | "result";
+
+/**
+ * Whether Start scan is offered (#4116): the same pair NmapScanForm's
+ * writeGate asks. Words that tell the reader to start a scan are drawn only
+ * when it is.
+ */
+function useCanStartScan(): boolean {
+  const perms = usePermissions();
+  return (
+    perms.can("write", "manage_nmap_scans") &&
+    perms.can("read", "manage_nmap_scans")
+  );
+}
 
 export function NmapToolsPage() {
   const [activeScan, setActiveScan] = useState<NmapScanRead | null>(null);
@@ -145,11 +161,14 @@ function LiveTab({
   onComplete: (s: NmapScanRead) => void;
   onCancelClose: () => void;
 }) {
+  const canStart = useCanStartScan();
   if (!activeScan) {
     return (
       <p className="text-xs text-muted-foreground">
-        No scan running — kick one off on the left. Live output will stream
-        here.
+        No scan running
+        {canStart
+          ? " — kick one off on the left. Live output will stream here."
+          : "."}
       </p>
     );
   }
@@ -167,7 +186,7 @@ function LiveTab({
   );
 }
 
-function ResultTab({
+export function ResultTab({
   scan,
   onClear,
 }: {
@@ -182,11 +201,17 @@ function ResultTab({
     queryKey: ["nmap-scan", scan?.id],
     queryFn: () => nmapApi.getScan(scan!.id),
     initialData: scan ?? undefined,
+    // #2577 — the list's copy is incomplete (no raw output, and on an older
+    // server no IP space), so treat it as stale and fetch the scan at once
+    // rather than trusting it for the default `staleTime`.
+    initialDataUpdatedAt: 0,
   });
+  const canStart = useCanStartScan();
   if (!data) {
     return (
       <p className="text-xs text-muted-foreground">
-        Nothing to show yet. Click a row in History or run a fresh scan.
+        Nothing to show yet. Click a row in History
+        {canStart ? " or run a fresh scan." : "."}
       </p>
     );
   }
@@ -225,14 +250,21 @@ function ResultTab({
 
 function HistoryTab({ onSelect }: { onSelect: (s: NmapScanRead) => void }) {
   const qc = useQueryClient();
+  // Cancel and delete (single and bulk) take delete on 'manage_nmap_scans'
+  // (nmap/router.py).
+  const canStart = useCanStartScan();
+  const deleteGate = permissionGate(
+    usePermissions().can("delete", "manage_nmap_scans"),
+    "Requires delete permission on nmap scans",
+  );
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [pendingSingle, setPendingSingle] = useState<NmapScanRead | null>(null);
   const [pendingBulk, setPendingBulk] = useState<NmapScanRead[] | null>(null);
 
-  const { data, isLoading, isError } = useQuery({
+  const { data, isLoading, isError, error } = useQuery({
     queryKey: ["nmap-scans", "recent"],
     queryFn: () => nmapApi.listScans({ page_size: 50 }),
-    refetchInterval: 5000,
+    refetchInterval: pollUnlessRefused(5000),
   });
   const items = data?.items ?? [];
 
@@ -294,13 +326,15 @@ function HistoryTab({ onSelect }: { onSelect: (s: NmapScanRead) => void }) {
   }
   if (isError) {
     return (
-      <p className="text-xs text-destructive">Failed to load recent scans.</p>
+      <p className="text-xs">
+        <ListReadError error={error} what="recent scans" />
+      </p>
     );
   }
   if (items.length === 0) {
     return (
       <p className="text-xs text-muted-foreground">
-        No scans yet — kick one off on the left.
+        No scans yet{canStart ? " — kick one off on the left." : "."}
       </p>
     );
   }
@@ -327,6 +361,7 @@ function HistoryTab({ onSelect }: { onSelect: (s: NmapScanRead) => void }) {
               onClick={() => setPendingBulk(selectedItems)}
               disabled={bulkDelete.isPending}
               className="inline-flex items-center gap-1 rounded border border-destructive/40 px-2 py-0.5 text-[11px] text-destructive hover:bg-destructive/10 disabled:opacity-60"
+              {...deleteGate}
             >
               <Trash2 className="h-3 w-3" />
               Delete {selected.size}
@@ -401,9 +436,15 @@ function HistoryTab({ onSelect }: { onSelect: (s: NmapScanRead) => void }) {
                           ? "Cancel scan"
                           : "Delete scan"
                       }
+                      aria-label={
+                        s.status === "queued" || s.status === "running"
+                          ? "Cancel scan"
+                          : "Delete scan"
+                      }
                       disabled={singleDelete.isPending}
                       onClick={() => setPendingSingle(s)}
                       className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:opacity-50"
+                      {...deleteGate}
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                     </button>

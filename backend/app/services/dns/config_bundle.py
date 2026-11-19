@@ -31,6 +31,7 @@ from app.drivers.dns.base import (
     ZoneData,
 )
 from app.models.dns import (
+    DEFAULT_ALLOW_RECURSION,
     DNSAcl,
     DNSRecord,
     DNSSECPolicy,
@@ -40,10 +41,20 @@ from app.models.dns import (
     DNSZone,
     DNSZoneUpdateAcl,
 )
+from app.services.dns.dnssec_trust import (
+    effective_dnssec_validation,
+    render_as_initial_key,
+)
+from app.services.dns.named_conf_validation import (
+    effective_key_lifetime_days,
+    effective_nsec3_iterations,
+)
 from app.services.dns.pool_geo import (
     build_geo_steering,
     build_view_descriptors,
+    places_zone,
     records_for_view,
+    views_rendering_zone,
 )
 from app.services.dns_blocklist import (
     EffectiveBlocklist,
@@ -97,8 +108,14 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             forwarders=tuple(opts_row.forwarders or ()),
             forward_policy=opts_row.forward_policy,
             recursion_enabled=opts_row.recursion_enabled,
-            allow_recursion=tuple(opts_row.allow_recursion or ("any",)),
-            dnssec_validation=opts_row.dnssec_validation,
+            allow_recursion=tuple(
+                DEFAULT_ALLOW_RECURSION
+                if opts_row.allow_recursion is None
+                else opts_row.allow_recursion
+            ),
+            dnssec_validation=effective_dnssec_validation(
+                opts_row.dnssec_validation, server.driver, len(opts_row.trust_anchors or ())
+            ),
             notify_enabled=opts_row.notify_enabled,
             also_notify=tuple(opts_row.also_notify or ()),
             allow_notify=tuple(opts_row.allow_notify or ()),
@@ -144,7 +161,8 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
                     algorithm=ta.algorithm,
                     key_tag=ta.key_tag,
                     public_key=ta.public_key,
-                    is_initial_key=ta.is_initial_key,
+                    # A static root anchor is rendered as initial-key (#3609).
+                    is_initial_key=render_as_initial_key(ta.zone_name, ta.is_initial_key),
                 )
                 for ta in (opts_row.trust_anchors or ())
             ),
@@ -280,6 +298,8 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             view_name=view_name,
             forwarders=tuple(z.forwarders or ()),
             forward_only=bool(z.forward_only),
+            forward_transport=z.forward_transport or "do53",
+            forward_tls_hostname=z.forward_tls_hostname,
             masters=tuple(z.masters or ()),
             dnssec_enabled=bool(z.dnssec_enabled),
             dnssec_policy_name=_zone_policy_name(z),
@@ -294,28 +314,24 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         if not has_views:
             # No views in the group — flat render with every record
             # (the historical behaviour, byte-for-byte).
-            zones.append(_zone_data(z, tuple(_record_data(r) for r in all_records), None))
+            # A member scoped to a site with no subnets serves nobody (#2292).
+            flat = (r for r in all_records if str(r.pool_member_id) not in geo.unreachable_members)
+            zones.append(_zone_data(z, tuple(_record_data(r) for r in flat), None))
             continue
 
         # Split-horizon (issue #24) composed with geo steering (#530).
-        # Operator views: the zone materialises in each view referenced by
-        # a scoped record PLUS its own pinned ``view_id``; with no explicit
+        # Operator views: a pinned zone materialises in its pin alone; an
+        # unpinned one in each view referenced by a scoped record (a learned
+        # record follows the zone, ``places_zone``); with no explicit
         # scoping it's a "global" zone rendered into every operator view.
         # Geo + catch-all views always render the zone (like a global one)
-        # so the catch-all serves the default member set. Per-view record
+        # so the catch-all serves the default member set. The placement is
+        # the agent bundle's own call (``views_rendering_zone``), so this
+        # preview cannot disagree with what the agents serve. Per-view record
         # filtering (operator scope ∪ shared/default, geo-member isolation)
         # is delegated to ``records_for_view``.
-        record_view_ids = {r.view_id for r in all_records if r.view_id is not None}
-        zone_view_ids = {z.view_id} if z.view_id is not None else set()
-        operator_target_ids = record_view_ids | zone_view_ids
-
-        for vd in view_descs:
-            if (
-                vd["kind"] == "operator"
-                and operator_target_ids
-                and vd["id"] not in operator_target_ids
-            ):
-                continue
+        placing = (r.view_id for r in all_records if places_zone(r))
+        for vd in views_rendering_zone(view_descs, z.view_id, placing):
             recs = tuple(_record_data(r) for r in records_for_view(all_records, vd, geo))
             zones.append(_zone_data(z, recs, vd["name"]))
 
@@ -348,10 +364,10 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         DNSSECPolicyData(
             name=p.name,
             algorithm=p.algorithm,
-            ksk_lifetime_days=p.ksk_lifetime_days,
-            zsk_lifetime_days=p.zsk_lifetime_days,
+            ksk_lifetime_days=effective_key_lifetime_days(p.name, "ksk", p.ksk_lifetime_days),
+            zsk_lifetime_days=effective_key_lifetime_days(p.name, "zsk", p.zsk_lifetime_days),
             nsec3=p.nsec3,
-            nsec3_iterations=p.nsec3_iterations,
+            nsec3_iterations=effective_nsec3_iterations(p.name, p.nsec3_iterations),
             nsec3_salt_length=p.nsec3_salt_length,
             nsec3_optout=p.nsec3_optout,
         )

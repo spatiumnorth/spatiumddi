@@ -11,7 +11,10 @@ Aggregates four security-relevant signals into one rollup:
   means never-expires (intentional for service tokens) and is
   excluded from the count.
 * **Failed-login bursts** — audit rows with ``action="login"`` and
-  ``result="denied"`` in the trailing 24 h, grouped by source IP +
+  ``result="failure"`` (what every sign-in path writes for a rejected
+  attempt: bad password, unknown user, locked or disabled account, bad
+  MFA code, external-provider rejection; ``"error"`` rows are provider
+  outages, not guesses) in the trailing 24 h, grouped by source IP +
   username so brute-force runs surface as a single row.
 * **Recent permission changes** — audit rows touching ``role`` /
   ``group`` / ``user`` resources within the trailing 7 d. The
@@ -77,6 +80,10 @@ class PermissionChangeRow(BaseModel):
 
 class SecurityDashboardSummary(BaseModel):
     generated_at: datetime
+
+    # True when the four per-row lists below were stripped for this caller
+    # (#400 M2): an empty list then means "not shown to you", never "none".
+    detail_withheld: bool = False
 
     # MFA
     mfa_total_local_users: int
@@ -185,7 +192,9 @@ async def security_summary(db: DB, current_user: CurrentUser) -> SecurityDashboa
         (
             await db.execute(
                 select(APIToken)
+                .where(APIToken.is_active.is_(True))
                 .where(APIToken.expires_at.is_not(None))
+                .where(APIToken.expires_at > now)
                 .where(APIToken.expires_at <= expiry_cutoff)
                 .order_by(APIToken.expires_at.asc())
             )
@@ -223,7 +232,7 @@ async def security_summary(db: DB, current_user: CurrentUser) -> SecurityDashboa
             await db.execute(
                 select(AuditLog)
                 .where(AuditLog.action == "login")
-                .where(AuditLog.result == "denied")
+                .where(AuditLog.result == "failure")
                 .where(AuditLog.timestamp >= failed_window_start)
             )
         )
@@ -282,6 +291,7 @@ async def security_summary(db: DB, current_user: CurrentUser) -> SecurityDashboa
     # callers — the tile still renders from the headline counts.
     return SecurityDashboardSummary(
         generated_at=now,
+        detail_withheld=not privileged,
         mfa_total_local_users=mfa_total,
         mfa_enrolled_count=mfa_enrolled,
         mfa_coverage_pct=round(mfa_pct, 1),

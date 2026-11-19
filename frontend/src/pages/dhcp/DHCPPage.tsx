@@ -1,4 +1,6 @@
+import { ListReadError } from "@/components/ui/list-read-error";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { humanTime } from "../network/_shared";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useStickyLocation } from "@/lib/stickyLocation";
 import {
@@ -35,6 +37,7 @@ import {
   type DHCPLease,
   formatApiError,
 } from "@/lib/api";
+import { ResizablePane } from "@/components/ui/resizable-pane";
 import { useSessionState } from "@/lib/useSessionState";
 import { copyToClipboard } from "@/lib/clipboard";
 import { cn, zebraBodyCls } from "@/lib/utils";
@@ -48,6 +51,7 @@ import {
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
 import { HeaderButton } from "@/components/ui/header-button";
+import { Modal } from "@/components/ui/modal";
 import { Pager } from "@/components/ui/pager";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { AskAIButton } from "@/components/copilot/AskAIButton";
@@ -58,13 +62,18 @@ import { ServerDetailModal } from "./ServerDetailModal";
 import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import { ConfigApplyChip } from "@/components/ConfigApplyChip";
 import { DaemonStateChip } from "@/components/DaemonStateChip";
+import { DuplicateAgentChip } from "@/components/DuplicateAgentChip";
 import { SpoolChip } from "@/components/SpoolChip";
 import { CreateScopeModal } from "./CreateScopeModal";
 import { CreateClientClassModal } from "./CreateClientClassModal";
 import { CreateOptionTemplateModal } from "./CreateOptionTemplateModal";
 import { CreateStaticAssignmentModal } from "./CreateStaticAssignmentModal";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
-import { usePermissions } from "@/hooks/usePermissions";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
 import { MacBlocksTab } from "./MacBlocksTab";
 import { DevicePoliciesTab } from "./DevicePoliciesTab";
 import { PhoneProfilesTab } from "./PhoneProfilesTab";
@@ -77,13 +86,38 @@ import {
   servingByScopeId,
   useGroupFailover,
 } from "./windowsFailover";
+import { deleteServerDescription } from "./serverDeleteCopy";
 import { DeleteConfirmModal, StatusDot, V6NoHaTag } from "./_shared";
+import { fromLocalInputValue, toLocalInputValue } from "@/lib/localTime";
+import { scopeDeleteCopy } from "@/lib/dhcp-scope-delete";
+import { syncLabel } from "@/lib/dhcp-sync-label";
+import { scopePickerLabel } from "@/lib/dhcp-scope-label";
+import { poolOccupancyTone } from "@/lib/pool-occupancy-tone";
 import { haPillTitle, v6ScopeLacksHa } from "@/lib/dhcpHa";
 import {
   APPROVAL_QUEUED_MESSAGE,
   CHANGE_REQUEST_QUERY_KEY,
   handleApprovalQueued,
 } from "@/lib/approvalQueue";
+
+// #1861 — the DHCP data surfaces (scopes, statics, client classes, option
+// templates) gate each control on the route's own resource permission; the
+// server, server-group and failover controls stay superadmin-only.
+const DHCP_LABELS: Record<string, string> = {
+  dhcp_scope: "DHCP scopes",
+  dhcp_static: "DHCP static assignments",
+  dhcp_client_class: "DHCP client classes",
+  dhcp_option_template: "DHCP option templates",
+};
+
+function useDhcpGate() {
+  const perms = usePermissions();
+  return (action: "write" | "delete", resourceType: string) =>
+    permissionGate(
+      perms.can(action, resourceType),
+      `Requires ${action} permission on ${DHCP_LABELS[resourceType] ?? resourceType}`,
+    );
+}
 
 type Selection =
   | { type: "group"; group: DHCPServerGroup }
@@ -114,19 +148,30 @@ function GroupSidebar({
   onSelect: (s: Selection) => void;
   onCreateGroup: () => void;
 }) {
+  // #1339 — every DHCP server group, server and Kea-tab write takes a
+  // superadmin (the DHCP routers' handlers take SuperAdmin).
+  const superadminGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const qc = useQueryClient();
   const [expanded, setExpanded] = useSessionState<Set<string>>(
     "spatium.dhcp.expandedGroups",
     new Set(),
   );
-  const { data: groups = [], isLoading } = useQuery({
+  const {
+    data: groups = [],
+    isLoading,
+    error: groupsError,
+  } = useQuery({
     queryKey: ["dhcp-groups"],
     queryFn: dhcpApi.listGroups,
   });
-  const { data: ungrouped = [] } = useQuery({
+  const { data: serversData, error: serversError } = useQuery({
     queryKey: ["dhcp-servers", "all"],
     queryFn: () => dhcpApi.listServers(),
   });
+  const ungrouped = serversData ?? [];
 
   function toggle(id: string) {
     setExpanded((prev) => {
@@ -138,7 +183,12 @@ function GroupSidebar({
   }
 
   return (
-    <div className="w-72 flex-shrink-0 flex flex-col border-r bg-card">
+    <ResizablePane
+      storageKey="dhcp"
+      defaultWidth={288}
+      label="Resize DHCP server groups tree"
+      className="flex flex-col border-r bg-card"
+    >
       <div className="flex items-center justify-between px-4 py-3 border-b">
         <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
           DHCP Server Groups
@@ -159,9 +209,11 @@ function GroupSidebar({
             <RefreshCw className="h-3.5 w-3.5" />
           </button>
           <button
-            className="flex h-6 w-6 items-center justify-center rounded hover:bg-accent"
+            className="flex h-6 w-6 items-center justify-center rounded hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
             onClick={onCreateGroup}
             title="New group"
+            aria-label="New group"
+            {...superadminGate}
           >
             <Plus className="h-3.5 w-3.5" />
           </button>
@@ -172,15 +224,22 @@ function GroupSidebar({
         {isLoading && (
           <p className="px-4 py-2 text-xs text-muted-foreground">Loading…</p>
         )}
-        {groups.length === 0 && !isLoading && (
+        {/* A refused or failed read says so, not an empty estate (#3337). */}
+        {groups.length === 0 && !isLoading && groupsError != null && (
+          <p className="px-4 pt-6 text-center text-xs">
+            <ListReadError error={groupsError} what="DHCP server groups" />
+          </p>
+        )}
+        {groups.length === 0 && !isLoading && groupsError == null && (
           <div className="px-4 pt-6 text-center">
             <Wifi className="h-8 w-8 text-muted-foreground/30 mx-auto mb-2" />
             <p className="text-xs text-muted-foreground mb-3">
               No server groups yet.
             </p>
             <button
-              className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs mx-auto hover:bg-accent"
+              className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs mx-auto hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
               onClick={onCreateGroup}
+              {...superadminGate}
             >
               <Plus className="h-3 w-3" /> Create Group
             </button>
@@ -228,18 +287,29 @@ function GroupSidebar({
                   <Wifi className="h-3.5 w-3.5 flex-shrink-0" />
                   <span className="text-sm font-medium truncate">{g.name}</span>
                   <span className="ml-auto text-xs text-muted-foreground">
-                    {serversInGroup.length}
+                    {/* A refused, failed or unanswered read has no count (#3426). */}
+                    {serversData !== undefined ? serversInGroup.length : null}
                   </span>
                 </button>
               </div>
 
               {isExpanded && (
                 <div className="ml-6 mb-1">
-                  {serversInGroup.length === 0 && (
-                    <p className="py-1 text-xs text-muted-foreground/70">
-                      No servers in this group.
+                  {/* A refused or failed read says so, and one not answered
+                      yet says nothing: neither is "No servers in this
+                      group." (#3426). */}
+                  {serversInGroup.length === 0 && serversError != null && (
+                    <p className="py-1 text-xs">
+                      <ListReadError error={serversError} what="DHCP servers" />
                     </p>
                   )}
+                  {serversInGroup.length === 0 &&
+                    serversData !== undefined &&
+                    serversError == null && (
+                      <p className="py-1 text-xs text-muted-foreground/70">
+                        No servers in this group.
+                      </p>
+                    )}
                   {serversInGroup.map((s) => {
                     const active =
                       selection?.type === "server" &&
@@ -300,7 +370,7 @@ function GroupSidebar({
           </div>
         )}
       </div>
-    </div>
+    </ResizablePane>
   );
 }
 
@@ -407,6 +477,12 @@ function GroupDetailView({
   onEditServer: (s: DHCPServer) => void;
   onDeleteServer: (s: DHCPServer) => void;
 }) {
+  // #1339 — every DHCP server group, server and Kea-tab write takes a
+  // superadmin (the DHCP routers' handlers take SuperAdmin).
+  const superadminGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const qc = useQueryClient();
   const navigate = useNavigate();
   // Per-group tab persistence keyed on group id so navigating between
@@ -453,6 +529,43 @@ function GroupDetailView({
                 {group.description}
               </p>
             )}
+            {(group.ha_sidelined_members?.length ?? 0) > 0 && (
+              <p
+                className="mt-1 text-xs text-amber-700 dark:text-amber-400"
+                data-testid="ha-sidelined-members"
+              >
+                More than two Kea members: HA runs between the members that have
+                an HA Peer URL, and {group.ha_sidelined_members!.join(", ")}{" "}
+                {group.ha_sidelined_members!.length > 1
+                  ? "serve no scopes until each has one"
+                  : "serves no scopes until it has one"}{" "}
+                (Edit server → HA Peer URL), so nothing hands out the same pool
+                uncoordinated.
+                {group.ha_autofill_skipped_reason ===
+                  "more_than_two_kea_members" &&
+                  " Not filled automatically: a third Kea member joins as an HA backup, and roles follow server order, so it could take the primary role from the existing pair."}
+                {group.ha_autofill_skipped_reason === "bridged_network_mode" &&
+                  " Not filled automatically: in bridged mode the node address is not where Kea listens."}
+              </p>
+            )}
+            {(group.ha_peer_urls_missing?.length ?? 0) > 0 &&
+              (group.ha_sidelined_members?.length ?? 0) === 0 && (
+                <p
+                  className="mt-1 text-xs text-amber-700 dark:text-amber-400"
+                  data-testid="ha-peer-urls-missing"
+                >
+                  HA is not running: no HA Peer URL on{" "}
+                  {group.ha_peer_urls_missing!.join(", ")}. Set it on each
+                  server (Edit server → HA Peer URL), e.g.{" "}
+                  <span className="font-mono">http://&lt;host&gt;:8000/</span>.
+                  {group.ha_autofill_skipped_reason ===
+                    "more_than_two_kea_members" &&
+                    " Not filled automatically: a third Kea member joins as an HA backup, and roles follow server order, so it could take the primary role from the existing pair."}
+                  {group.ha_autofill_skipped_reason ===
+                    "bridged_network_mode" &&
+                    " Not filled automatically: in bridged mode the node address is not where Kea listens."}
+                </p>
+              )}
           </div>
           <div className="flex items-center gap-2">
             <AskAIButton
@@ -485,13 +598,14 @@ function GroupDetailView({
             >
               PXE Profiles
             </HeaderButton>
-            <HeaderButton icon={Pencil} onClick={onEdit}>
+            <HeaderButton icon={Pencil} onClick={onEdit} {...superadminGate}>
               Edit Group
             </HeaderButton>
             <HeaderButton
               variant="destructive"
               icon={Trash2}
               onClick={onDelete}
+              {...superadminGate}
             >
               Delete Group
             </HeaderButton>
@@ -615,8 +729,14 @@ function GroupDetailView({
 // Rogue-DHCP observed responders (#370). Lists DHCP servers the active probe
 // saw answering on this group's segments + lets the operator acknowledge a
 // known-but-external one (allowlists it so the rogue alert auto-resolves).
-function RespondersTab({ groupId }: { groupId: string }) {
+export function RespondersTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
+  // Acknowledging allowlists the source: a POST the router gates as
+  // write on dhcp_server (no SuperAdmin on the handler).
+  const ackGate = permissionGate(
+    usePermissions().can("write", "dhcp_server"),
+    "Requires write permission on DHCP servers",
+  );
   const { data: responders = [], isFetching } = useQuery({
     queryKey: ["dhcp-responders", groupId],
     queryFn: () => dhcpApi.listResponders(groupId),
@@ -637,9 +757,9 @@ function RespondersTab({ groupId }: { groupId: string }) {
       <p className="text-xs text-muted-foreground">
         DHCP servers seen answering on this group's segments by the active probe
         (enable <code>DHCP_ROGUE_PROBE_ENABLED=1</code> on the agent). Unknown
-        responders classify <span className="text-rose-600">rogue</span> and
-        fire the Rogue DHCP alert — acknowledge a known-but-external one to
-        allowlist it.
+        responders classify <span className="text-rose-600">rogue</span>, and
+        fire the Rogue DHCP alert once that rule is enabled (Alerts → Rules; it
+        ships disabled) — acknowledge a known-but-external one to allowlist it.
       </p>
       <div className="rounded-lg border overflow-auto">
         <table className="w-full text-sm">
@@ -695,7 +815,8 @@ function RespondersTab({ groupId }: { groupId: string }) {
                     <button
                       onClick={() => ack.mutate(r.id)}
                       disabled={ack.isPending}
-                      className="rounded-md border px-2 py-1 text-xs hover:bg-accent"
+                      className="rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                      {...ackGate}
                     >
                       Acknowledge
                     </button>
@@ -716,6 +837,12 @@ function RespondersTab({ groupId }: { groupId: string }) {
 // that allowlists an expected router so the rogue_ra alert auto-resolves.
 function RouterAdvertisementsTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
+  // Acknowledging allowlists the source: a POST the router gates as
+  // write on dhcp_server (no SuperAdmin on the handler).
+  const ackGate = permissionGate(
+    usePermissions().can("write", "dhcp_server"),
+    "Requires write permission on DHCP servers",
+  );
   const { data: preview } = useQuery({
     queryKey: ["ra-config", groupId],
     queryFn: () => dhcpApi.raConfigPreview(groupId),
@@ -867,7 +994,8 @@ function RouterAdvertisementsTab({ groupId }: { groupId: string }) {
                       <button
                         onClick={() => ack.mutate(r.id)}
                         disabled={ack.isPending}
-                        className="rounded-md border px-2 py-1 text-xs hover:bg-accent"
+                        className="rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                        {...ackGate}
                       >
                         Acknowledge
                       </button>
@@ -925,6 +1053,12 @@ function GroupServersList({
   onEditServer: (s: DHCPServer) => void;
   onDeleteServer: (s: DHCPServer) => void;
 }) {
+  // #1339 — every DHCP server group, server and Kea-tab write takes a
+  // superadmin (the DHCP routers' handlers take SuperAdmin).
+  const superadminGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const qc = useQueryClient();
   const pauseMutId = useRef<string | null>(null);
   // Pause / resume mutations — shared instance for every row so the
@@ -979,6 +1113,20 @@ function GroupServersList({
         </div>
       )}
 
+      {resumeMut.isError && (
+        <div className="mb-3 flex items-center justify-between rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          <span>
+            Resume failed: {formatApiError(resumeMut.error, "request failed")}
+          </span>
+          <button
+            type="button"
+            onClick={() => resumeMut.reset()}
+            className="rounded border px-2 py-0.5 hover:bg-muted"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
       <div className="flex items-center justify-between mb-4">
         <div>
           <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
@@ -990,8 +1138,9 @@ function GroupServersList({
           </p>
         </div>
         <button
-          className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
+          className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
           onClick={onAddServer}
+          {...superadminGate}
         >
           <Plus className="h-3 w-3" /> Add Server
         </button>
@@ -999,7 +1148,9 @@ function GroupServersList({
 
       {servers.length === 0 ? (
         <p className="text-sm text-muted-foreground italic">
-          No servers. Add one manually or start a Kea agent container.
+          No servers.
+          {!superadminGate.disabled &&
+            " Add one manually or start a Kea agent container."}
         </p>
       ) : (
         <div className="space-y-2">
@@ -1015,10 +1166,10 @@ function GroupServersList({
             const seenLabel =
               s.driver === "kea"
                 ? seenAt
-                  ? `seen ${new Date(seenAt).toLocaleTimeString()}`
+                  ? `seen ${humanTime(seenAt)}`
                   : "never heard from"
                 : seenAt
-                  ? `synced ${new Date(seenAt).toLocaleTimeString()}`
+                  ? `synced ${humanTime(seenAt)}`
                   : "never synced";
             const pauseInFlight =
               (pauseMut.isPending || resumeMut.isPending) &&
@@ -1038,7 +1189,14 @@ function GroupServersList({
                         className={`inline-block h-2 w-2 rounded-full ${SERVER_STATUS_DOT_CLS[s.status] ?? "bg-muted"}`}
                         title={`status: ${s.status}`}
                       />
-                      <span className="text-sm font-medium">{s.name}</span>
+                      <button
+                        type="button"
+                        onClick={() => onSelectServer(s)}
+                        aria-label={`View details of ${s.name}`}
+                        className="text-sm font-medium hover:underline focus-visible:underline focus:outline-none"
+                      >
+                        {s.name}
+                      </button>
                       <span
                         className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium ${SERVER_STATUS_PILL_CLS[s.status] ?? "bg-muted text-muted-foreground"}`}
                       >
@@ -1067,9 +1225,18 @@ function GroupServersList({
                           Maintenance
                         </span>
                       )}
+                      {s.last_sync_error && (
+                        <span
+                          className="inline-flex items-center rounded bg-amber-500/15 px-1.5 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-400"
+                          title={`Lease pull failing since ${s.last_sync_error_at ? new Date(s.last_sync_error_at).toLocaleString() : "unknown"}: ${s.last_sync_error}`}
+                        >
+                          Sync failing
+                        </span>
+                      )}
                       <ConfigApplyChip server={s} />
                       <SpoolChip server={s} />
                       <DaemonStateChip server={s} />
+                      <DuplicateAgentChip server={s} kind="DHCP" />
                     </div>
                     <p className="text-xs text-muted-foreground truncate">
                       <span className="font-mono">
@@ -1099,6 +1266,7 @@ function GroupServersList({
                       disabled={pauseInFlight}
                       className="inline-flex items-center gap-1 rounded border border-emerald-600/40 bg-emerald-500/10 px-1.5 py-1 text-[11px] font-medium text-emerald-700 hover:bg-emerald-500/20 disabled:opacity-50 dark:text-emerald-400"
                       title="Resume — exit maintenance mode"
+                      {...superadminGate}
                     >
                       <Play className="h-3 w-3" />
                       {pauseInFlight ? "…" : "Resume"}
@@ -1110,30 +1278,35 @@ function GroupServersList({
                         e.stopPropagation();
                         setPausePrompt(s);
                       }}
-                      className="inline-flex items-center gap-1 rounded border border-amber-600/40 bg-amber-500/10 px-1.5 py-1 text-[11px] font-medium text-amber-700 hover:bg-amber-500/20 dark:text-amber-400"
+                      className="inline-flex items-center gap-1 rounded border border-amber-600/40 bg-amber-500/10 px-1.5 py-1 text-[11px] font-medium text-amber-700 hover:bg-amber-500/20 dark:text-amber-400 disabled:cursor-not-allowed disabled:opacity-50"
                       title="Pause — enter maintenance mode"
+                      {...superadminGate}
                     >
                       <Pause className="h-3 w-3" />
                       Pause
                     </button>
                   )}
                   <button
-                    className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
+                    className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                     onClick={(e) => {
                       e.stopPropagation();
                       onEditServer(s);
                     }}
                     title="Edit server"
+                    aria-label="Edit server"
+                    {...superadminGate}
                   >
                     <Pencil className="h-3.5 w-3.5" />
                   </button>
                   <button
-                    className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-destructive"
+                    className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                     onClick={(e) => {
                       e.stopPropagation();
                       onDeleteServer(s);
                     }}
                     title="Delete server"
+                    aria-label="Delete server"
+                    {...superadminGate}
                   >
                     <Trash2 className="h-3.5 w-3.5" />
                   </button>
@@ -1183,6 +1356,7 @@ function ScopeDeleteModal({
   onConfirm,
   onClose,
   isPending,
+  error,
   notice,
 }: {
   scope: DHCPScope;
@@ -1190,6 +1364,9 @@ function ScopeDeleteModal({
   onConfirm: () => void;
   onClose: () => void;
   isPending: boolean;
+  // #3113 — the server's reason when it refuses the delete (a Windows
+  // failover scope answers 409 with the step to take first).
+  error?: string | null;
   // #62 two-person approval queue "Submitted for approval" message.
   notice?: string | null;
 }) {
@@ -1209,46 +1386,35 @@ function ScopeDeleteModal({
     queryFn: () => (groupId ? dhcpApi.listServers(groupId) : []),
     enabled: !!groupId,
   });
-  const references: string[] = [];
-  if (pools.length)
-    references.push(`${pools.length} pool${pools.length === 1 ? "" : "s"}`);
-  if (statics.length)
-    references.push(
-      `${statics.length} reservation${statics.length === 1 ? "" : "s"}`,
-    );
+  const copy = scopeDeleteCopy(
+    scope.name || scope.id.slice(0, 8),
+    pools.length,
+    statics.length,
+  );
   const windowsNote = groupServers.some((s) => s.driver === "windows_dhcp")
     ? " The scope is also removed from the Windows DHCP server via WinRM."
     : "";
   return (
     <DeleteConfirmModal
       title="Delete DHCP Scope"
-      description={
-        // The old copy — "All its pools and reservations will be removed as
-        // well" — described the permanent path, which the UI never takes. The
-        // default is a soft-delete: the scope and its children stop being served
-        // immediately (agents converge within seconds) but move to Trash
-        // together and restore together (#617).
-        `Delete scope "${scope.name || scope.id.slice(0, 8)}"? ` +
-        "Its pools and reservations go with it — they stop being served straight " +
-        "away, and are restorable as a set from Administration → Trash. Any " +
-        "dynamic clients (leases) it learned are released too, and their IPAM " +
-        "and DNS entries removed." +
-        windowsNote
-      }
-      referencesTitle={
-        references.length ? "This scope currently has:" : undefined
-      }
-      references={references.length ? references : undefined}
+      description={copy.description + windowsNote}
+      referencesTitle={copy.referencesTitle}
+      references={copy.references}
+      acknowledgement={copy.acknowledgement}
       onConfirm={onConfirm}
       onClose={onClose}
       isPending={isPending}
+      error={error}
       notice={notice}
     />
   );
 }
 
-function ServerScopesTab({ groupId }: { groupId: string }) {
+export function ServerScopesTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
+  // #1339, #1861 — scope create / edit take write and delete takes delete on
+  // ``dhcp_scope`` (scopes.py).
+  const dhcpGate = useDhcpGate();
   const [tagFilters, setTagFilters] = useState<string[]>([]);
   const { data: subnets = [] } = useQuery({
     queryKey: ["subnets"],
@@ -1258,7 +1424,7 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
   // Scopes live on the DHCP server group, not on individual servers — every
   // peer in the group renders the same set. Both the group detail view and
   // the (legacy) Windows-server detail view feed in the same group id.
-  const { data: groupScopes = [] } = useQuery({
+  const { data: groupScopes = [], error: groupScopesError } = useQuery({
     queryKey: ["dhcp-scopes-group", groupId, tagFilters],
     queryFn: () =>
       groupId
@@ -1269,6 +1435,20 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
         : Promise.resolve([]),
     enabled: !!groupId,
   });
+  // #3118 — the tag filter narrows the list, never what the group serves:
+  // the count line, the empty line and the subnet picker read the unfiltered
+  // set. Same key as the filtered query when no chip is set, so one fetch.
+  const unfilteredQ = useQuery({
+    queryKey: ["dhcp-scopes-group", groupId, []],
+    queryFn: () =>
+      groupId ? dhcpApi.listScopesByGroup(groupId) : Promise.resolve([]),
+    enabled: !!groupId,
+  });
+  // Until the unfiltered list has loaded, which subnets the group serves is
+  // unknown: the picker then offers none rather than every subnet. A server
+  // with no group serves nothing, and its query never runs.
+  const unfilteredScopes = groupId ? unfilteredQ.data : [];
+  const unfilteredCount = unfilteredScopes?.length;
   const subnetById = new Map(subnets.map((s) => [s.id, s]));
   // #1110 — how the group's Windows members serve each scope. The column
   // only appears on a group that has Windows members.
@@ -1320,8 +1500,24 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
       />
       <div className="flex items-center justify-between">
         <p className="text-xs text-muted-foreground">
-          {allScopes.length} scope{allScopes.length !== 1 ? "s" : ""} on this
-          group.
+          {groupScopesError != null ? (
+            <ListReadError
+              error={groupScopesError}
+              what="this group's scopes"
+            />
+          ) : tagFilters.length === 0 ? (
+            `${allScopes.length} scope${allScopes.length !== 1 ? "s" : ""} on this group.`
+          ) : unfilteredCount === undefined ? (
+            allScopes.length === 1 ? (
+              "1 scope matches the tag filter."
+            ) : (
+              `${allScopes.length} scopes match the tag filter.`
+            )
+          ) : unfilteredCount === 1 ? (
+            `${allScopes.length} of 1 scope matches the tag filter.`
+          ) : (
+            `${allScopes.length} of ${unfilteredCount} scopes match the tag filter.`
+          )}
         </p>
         <div className="flex items-center gap-2">
           <select
@@ -1331,11 +1527,22 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
               if (e.target.value) setCreateForSubnet(e.target.value);
               e.target.value = "";
             }}
+            aria-label="Serve leases on subnet"
             title="Pick the IPAM subnet you want this DHCP server to serve leases from."
+            {...dhcpGate("write", "dhcp_scope")}
           >
             <option value="">+ Serve leases on subnet…</option>
-            {subnets
-              .filter((s) => !allScopes.some((sc) => sc.subnet_id === s.id))
+            {unfilteredScopes === undefined && (
+              <option value="" disabled>
+                {unfilteredQ.isError
+                  ? "Could not load the group's scopes"
+                  : "Loading the group's scopes…"}
+              </option>
+            )}
+            {(unfilteredScopes === undefined ? [] : subnets)
+              .filter(
+                (s) => !unfilteredScopes?.some((sc) => sc.subnet_id === s.id),
+              )
               .map((s) => (
                 <option key={s.id} value={s.id}>
                   {s.network}
@@ -1348,7 +1555,16 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
       <div className="rounded-lg border">
         {allScopes.length === 0 ? (
           <p className="p-6 text-center text-sm text-muted-foreground">
-            No scopes on this server.
+            {groupScopesError != null ? (
+              <ListReadError
+                error={groupScopesError}
+                what="this group's scopes"
+              />
+            ) : tagFilters.length > 0 && unfilteredCount !== 0 ? (
+              "No scopes match the current tag filter."
+            ) : (
+              "No scopes on this server."
+            )}
           </p>
         ) : (
           <div className="overflow-x-auto">
@@ -1359,7 +1575,6 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
                   <th className="px-3 py-2 text-left font-medium">Name</th>
                   <th className="px-3 py-2 text-left font-medium">Enabled</th>
                   <th className="px-3 py-2 text-left font-medium">Lease (s)</th>
-                  <th className="px-3 py-2 text-left font-medium">DDNS</th>
                   {showServing && (
                     <th
                       className="px-3 py-2 text-left font-medium"
@@ -1395,9 +1610,6 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
                         <td className="px-3 py-2 tabular-nums">
                           {sc.lease_time}
                         </td>
-                        <td className="px-3 py-2">
-                          {sc.ddns_enabled ? "on" : "off"}
-                        </td>
                         {showServing && (
                           <td className="px-3 py-2">
                             {servingById.get(sc.id) ? (
@@ -1421,7 +1633,6 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
                                   : null,
                                 `enabled: ${sc.enabled ? "yes" : "no"}`,
                                 `lease time: ${sc.lease_time}s`,
-                                `DDNS: ${sc.ddns_enabled ? "on" : "off"}`,
                                 `scope_id: ${sc.id}`,
                                 sc.subnet_id
                                   ? `subnet_id: ${sc.subnet_id}`
@@ -1442,13 +1653,19 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
                             />
                             <button
                               onClick={() => setEditScope(sc)}
-                              className="rounded p-1 text-muted-foreground hover:text-foreground"
+                              className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+                              aria-label={`Edit scope ${sc.name}`}
+                              title="Edit scope"
+                              {...dhcpGate("write", "dhcp_scope")}
                             >
                               <Pencil className="h-3.5 w-3.5" />
                             </button>
                             <button
                               onClick={() => setDelScope(sc)}
-                              className="rounded p-1 text-muted-foreground hover:text-destructive"
+                              className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40"
+                              aria-label={`Delete scope ${sc.name}`}
+                              title="Delete scope"
+                              {...dhcpGate("delete", "dhcp_scope")}
                             >
                               <Trash2 className="h-3.5 w-3.5" />
                             </button>
@@ -1459,12 +1676,16 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
                     <ContextMenuContent>
                       <ContextMenuLabel>{sc.name}</ContextMenuLabel>
                       <ContextMenuSeparator />
-                      <ContextMenuItem onSelect={() => setEditScope(sc)}>
+                      <ContextMenuItem
+                        onSelect={() => setEditScope(sc)}
+                        {...dhcpGate("write", "dhcp_scope")}
+                      >
                         Edit Scope…
                       </ContextMenuItem>
                       <ContextMenuItem
                         destructive
                         onSelect={() => setDelScope(sc)}
+                        {...dhcpGate("delete", "dhcp_scope")}
                       >
                         Delete Scope…
                       </ContextMenuItem>
@@ -1514,6 +1735,11 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
             delMut.reset();
           }}
           isPending={delMut.isPending}
+          error={
+            delMut.isError
+              ? formatApiError(delMut.error, "Delete failed")
+              : null
+          }
           notice={delScopeNotice}
         />
       )}
@@ -1549,12 +1775,7 @@ function PoolOccupancyCell({
   if (!occ) {
     return <span className="text-xs text-muted-foreground/40">—</span>;
   }
-  const tone =
-    occ.percent >= 90
-      ? "bg-rose-500"
-      : occ.percent >= 75
-        ? "bg-amber-500"
-        : "bg-emerald-500";
+  const tone = poolOccupancyTone(occ.percent);
   return (
     <div
       className="flex min-w-[9rem] items-center gap-2"
@@ -1576,7 +1797,7 @@ function PoolOccupancyCell({
   );
 }
 
-function ServerPoolsOrStaticsTab({
+export function ServerPoolsOrStaticsTab({
   groupId,
   kind,
 }: {
@@ -1585,13 +1806,20 @@ function ServerPoolsOrStaticsTab({
 }) {
   // Scopes belong to the group — pull them once and walk into each scope
   // for its pool / static rows. Empty when the group has no scopes yet.
-  const { data: groupScopes = [] } = useQuery({
+  const { data: groupScopes = [], error: groupScopesError } = useQuery({
     queryKey: ["dhcp-scopes-group", groupId],
     queryFn: () =>
       groupId ? dhcpApi.listScopesByGroup(groupId) : Promise.resolve([]),
     enabled: !!groupId,
   });
   const allScopes = groupScopes;
+  // #2447 — scopes are commonly left with the same name; the picker also
+  // names each one's subnet so the options can be told apart.
+  const { data: subnets = [] } = useQuery({
+    queryKey: ["subnets"],
+    queryFn: () => ipamApi.listSubnets(),
+  });
+  const subnetNetworkById = new Map(subnets.map((s) => [s.id, s.network]));
 
   const nestedQueries = useQueries({
     queries: allScopes.map((sc) => ({
@@ -1625,6 +1853,17 @@ function ServerPoolsOrStaticsTab({
   }> = nestedQueries.flatMap((q, i) =>
     (q.data ?? []).map((item) => ({ scope: allScopes[i]!, item })),
   );
+  // A refused or failed read of the scopes, or of any scope's pools /
+  // statics, is not an empty list (#3337): a role that reads ``dhcp_scope``
+  // but not ``dhcp_pool`` / ``dhcp_static`` is refused the next read.
+  const rowsError =
+    groupScopesError ?? nestedQueries.find((q) => q.error != null)?.error;
+  const rowsWhat =
+    groupScopesError != null
+      ? "this group's scopes"
+      : kind === "pools"
+        ? "this group's pools"
+        : "this group's static assignments";
 
   type PoolRow = { scope: DHCPScope; item: DHCPPool };
   type StaticRow = { scope: DHCPScope; item: DHCPStaticAssignment };
@@ -1677,9 +1916,11 @@ function ServerPoolsOrStaticsTab({
 
   // Static reservations are created/edited here (issue #472). Creation is
   // group-centric — the operator picks which scope the reservation lands in.
-  // Backend create/update/delete are superadmin-gated, so gate the UI too.
+  // Backend create / update take write and delete takes delete on
+  // ``dhcp_static`` (#1861), so gate the UI the same way.
   const qc = useQueryClient();
-  const { isSuperadmin } = usePermissions();
+  const perms = usePermissions();
+  const dhcpGate = useDhcpGate();
   const [showCreate, setShowCreate] = useState(false);
   const [createScopeId, setCreateScopeId] = useState("");
   const [editStatic, setEditStatic] = useState<StaticRow | null>(null);
@@ -1694,13 +1935,18 @@ function ServerPoolsOrStaticsTab({
       // Delete detaches the linked IPAM row + triggers DNS sync server-side,
       // so refresh the same IPAM/DNS keys the create/edit modal invalidates.
       qc.invalidateQueries({ queryKey: ["addresses", row.scope.subnet_id] });
+      qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
       qc.invalidateQueries({
         queryKey: ["subnet-dns-sync", row.scope.subnet_id],
       });
       setDelStatic(null);
     },
   });
-  const canManageStatics = kind === "statics" && isSuperadmin;
+  const canManageStatics =
+    kind === "statics" && perms.can("write", "dhcp_static");
+  const canDeleteStatics =
+    kind === "statics" && perms.can("delete", "dhcp_static");
 
   return (
     <div className="space-y-3">
@@ -1716,7 +1962,7 @@ function ServerPoolsOrStaticsTab({
               >
                 {allScopes.map((sc) => (
                   <option key={sc.id} value={sc.id}>
-                    {sc.name || `Scope ${sc.id.slice(0, 8)}`}
+                    {scopePickerLabel(sc, subnetNetworkById.get(sc.subnet_id))}
                   </option>
                 ))}
               </select>
@@ -1733,11 +1979,15 @@ function ServerPoolsOrStaticsTab({
       <div className="rounded-lg border">
         {rows.length === 0 ? (
           <p className="p-6 text-center text-sm text-muted-foreground">
-            {kind === "pools"
-              ? "No pools yet."
-              : allScopes.length === 0
-                ? "No DHCP scopes in this group yet — create a scope first, then add reservations here."
-                : "No static assignments yet."}
+            {rowsError != null ? (
+              <ListReadError error={rowsError} what={rowsWhat} />
+            ) : kind === "pools" ? (
+              "No pools yet."
+            ) : allScopes.length === 0 ? (
+              "No DHCP scopes in this group yet — create a scope first, then add reservations here."
+            ) : (
+              "No static assignments yet."
+            )}
           </p>
         ) : kind === "pools" ? (
           <div className="overflow-x-auto">
@@ -1854,6 +2104,9 @@ function ServerPoolsOrStaticsTab({
                   >
                     Hostname
                   </SortableTh>
+                  <th className="px-3 py-2">
+                    <span className="sr-only">Actions</span>
+                  </th>
                 </tr>
               </thead>
               <tbody className={zebraBodyCls}>
@@ -1871,6 +2124,26 @@ function ServerPoolsOrStaticsTab({
                             {s.ip_address}
                           </td>
                           <td className="px-3 py-2">{s.hostname || "—"}</td>
+                          <td className="px-3 py-2 text-right whitespace-nowrap">
+                            <button
+                              onClick={() => setEditStatic({ scope, item: s })}
+                              className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+                              aria-label={`Edit static assignment ${s.ip_address}`}
+                              title="Edit static assignment"
+                              {...dhcpGate("write", "dhcp_static")}
+                            >
+                              <Pencil className="h-3.5 w-3.5" />
+                            </button>
+                            <button
+                              onClick={() => setDelStatic({ scope, item: s })}
+                              className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40"
+                              aria-label={`Delete static assignment ${s.ip_address}`}
+                              title="Delete static assignment"
+                              {...dhcpGate("delete", "dhcp_static")}
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          </td>
                         </tr>
                       </ContextMenuTrigger>
                       <ContextMenuContent>
@@ -1893,20 +2166,22 @@ function ServerPoolsOrStaticsTab({
                             Copy Hostname
                           </ContextMenuItem>
                         )}
+                        {(canManageStatics || canDeleteStatics) && (
+                          <ContextMenuSeparator />
+                        )}
                         {canManageStatics && (
-                          <>
-                            <ContextMenuSeparator />
-                            <ContextMenuItem
-                              onSelect={() => setEditStatic({ scope, item: s })}
-                            >
-                              Edit…
-                            </ContextMenuItem>
-                            <ContextMenuItem
-                              onSelect={() => setDelStatic({ scope, item: s })}
-                            >
-                              Delete…
-                            </ContextMenuItem>
-                          </>
+                          <ContextMenuItem
+                            onSelect={() => setEditStatic({ scope, item: s })}
+                          >
+                            Edit…
+                          </ContextMenuItem>
+                        )}
+                        {canDeleteStatics && (
+                          <ContextMenuItem
+                            onSelect={() => setDelStatic({ scope, item: s })}
+                          >
+                            Delete…
+                          </ContextMenuItem>
                         )}
                       </ContextMenuContent>
                     </ContextMenu>
@@ -1935,7 +2210,11 @@ function ServerPoolsOrStaticsTab({
           title="Delete Static Assignment"
           description={`Delete reservation ${delStatic.item.ip_address} (${delStatic.item.mac_address})?`}
           onConfirm={() => delMut.mutate(delStatic)}
-          onClose={() => setDelStatic(null)}
+          onClose={() => {
+            setDelStatic(null);
+            // A refusal must not carry over to the next row's confirm.
+            delMut.reset();
+          }}
           isPending={delMut.isPending}
           error={
             delMut.isError
@@ -1948,7 +2227,10 @@ function ServerPoolsOrStaticsTab({
   );
 }
 
-function ClientClassesTab({ groupId }: { groupId: string }) {
+export function ClientClassesTab({ groupId }: { groupId: string }) {
+  // #1339, #1861 — each write takes the tab's own resource permission, with
+  // the HTTP method's action (``delete`` for a delete).
+  const dhcpGate = useDhcpGate();
   const qc = useQueryClient();
   const { data: classes = [] } = useQuery({
     queryKey: ["dhcp-client-classes", groupId],
@@ -1983,7 +2265,8 @@ function ClientClassesTab({ groupId }: { groupId: string }) {
       <div className="flex justify-end">
         <button
           onClick={() => setShowCreate(true)}
-          className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90"
+          className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+          {...dhcpGate("write", "dhcp_client_class")}
         >
           <Plus className="h-3 w-3" /> New Client Class
         </button>
@@ -2002,6 +2285,7 @@ function ClientClassesTab({ groupId }: { groupId: string }) {
                   <th className="px-3 py-2 text-left font-medium">
                     Description
                   </th>
+                  <th className="px-3 py-2 text-left font-medium">Family</th>
                   <th className="px-3 py-2 text-left font-medium">Match</th>
                   <th className="px-3 py-2"></th>
                 </tr>
@@ -2013,19 +2297,32 @@ function ClientClassesTab({ groupId }: { groupId: string }) {
                     <td className="px-3 py-2 text-muted-foreground">
                       {c.description}
                     </td>
+                    <td className="px-3 py-2 text-xs whitespace-nowrap">
+                      {c.address_family === "dual"
+                        ? "IPv4 + IPv6"
+                        : c.address_family === "ipv6"
+                          ? "IPv6"
+                          : "IPv4"}
+                    </td>
                     <td className="px-3 py-2 font-mono text-xs truncate max-w-md">
                       {c.match_expression}
                     </td>
                     <td className="px-3 py-2 text-right">
                       <button
                         onClick={() => setEdit(c)}
-                        className="rounded p-1 text-muted-foreground hover:text-foreground"
+                        className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                        aria-label={`Edit client class ${c.name}`}
+                        title="Edit client class"
+                        {...dhcpGate("write", "dhcp_client_class")}
                       >
                         <Pencil className="h-3.5 w-3.5" />
                       </button>
                       <button
                         onClick={() => setDel(c)}
-                        className="rounded p-1 text-muted-foreground hover:text-destructive"
+                        className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
+                        aria-label={`Delete client class ${c.name}`}
+                        title="Delete client class"
+                        {...dhcpGate("delete", "dhcp_client_class")}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>
@@ -2056,15 +2353,26 @@ function ClientClassesTab({ groupId }: { groupId: string }) {
           title="Delete Client Class"
           description={`Delete class "${del.name}"?`}
           onConfirm={() => delMut.mutate(del.id)}
-          onClose={() => setDel(null)}
+          onClose={() => {
+            delMut.reset();
+            setDel(null);
+          }}
           isPending={delMut.isPending}
+          error={
+            delMut.isError
+              ? formatApiError(delMut.error, "Delete failed")
+              : null
+          }
         />
       )}
     </div>
   );
 }
 
-function OptionTemplatesTab({ groupId }: { groupId: string }) {
+export function OptionTemplatesTab({ groupId }: { groupId: string }) {
+  // #1339, #1861 — each write takes the tab's own resource permission, with
+  // the HTTP method's action (``delete`` for a delete).
+  const dhcpGate = useDhcpGate();
   const qc = useQueryClient();
   const { data: templates = [] } = useQuery({
     queryKey: ["dhcp-option-templates", groupId],
@@ -2104,7 +2412,8 @@ function OptionTemplatesTab({ groupId }: { groupId: string }) {
         </p>
         <button
           onClick={() => setShowCreate(true)}
-          className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90"
+          className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+          {...dhcpGate("write", "dhcp_option_template")}
         >
           <Plus className="h-3 w-3" /> New Template
         </button>
@@ -2148,13 +2457,19 @@ function OptionTemplatesTab({ groupId }: { groupId: string }) {
                     <td className="px-3 py-2 text-right">
                       <button
                         onClick={() => setEdit(t)}
-                        className="rounded p-1 text-muted-foreground hover:text-foreground"
+                        className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                        aria-label={`Edit option template ${t.name}`}
+                        title="Edit option template"
+                        {...dhcpGate("write", "dhcp_option_template")}
                       >
                         <Pencil className="h-3.5 w-3.5" />
                       </button>
                       <button
                         onClick={() => setDel(t)}
-                        className="rounded p-1 text-muted-foreground hover:text-destructive"
+                        className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
+                        aria-label={`Delete option template ${t.name}`}
+                        title="Delete option template"
+                        {...dhcpGate("delete", "dhcp_option_template")}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>
@@ -2185,15 +2500,23 @@ function OptionTemplatesTab({ groupId }: { groupId: string }) {
           title="Delete Option Template"
           description={`Delete template "${del.name}"? Scopes that already had it applied keep their options.`}
           onConfirm={() => delMut.mutate(del.id)}
-          onClose={() => setDel(null)}
+          onClose={() => {
+            delMut.reset();
+            setDel(null);
+          }}
           isPending={delMut.isPending}
+          error={
+            delMut.isError
+              ? formatApiError(delMut.error, "Delete failed")
+              : null
+          }
         />
       )}
     </div>
   );
 }
 
-function LeasesTab({ server }: { server: DHCPServer }) {
+export function LeasesTab({ server }: { server: DHCPServer }) {
   const [state, setState] = useState<string>("");
   const [subnetId, setSubnetId] = useState<string>("");
   const [deviceClass, setDeviceClass] = useState<string>("");
@@ -2339,13 +2662,18 @@ function LeasesTab({ server }: { server: DHCPServer }) {
               <th className="px-3 py-2 text-left font-medium">State</th>
               <th className="px-3 py-2 text-left font-medium">Expires</th>
               <th className="px-3 py-2 text-left font-medium">Last Seen</th>
+              {isSuperadmin && (
+                <th className="px-3 py-2 text-right font-medium">
+                  <span className="sr-only">Actions</span>
+                </th>
+              )}
             </tr>
           </thead>
           <tbody className={zebraBodyCls}>
             {leases.length === 0 && (
               <tr>
                 <td
-                  colSpan={7}
+                  colSpan={isSuperadmin ? 8 : 7}
                   className="p-6 text-center text-sm text-muted-foreground"
                 >
                   {isFetching ? "Loading…" : "No leases."}
@@ -2433,6 +2761,22 @@ function LeasesTab({ server }: { server: DHCPServer }) {
                         ? new Date(l.last_seen_at).toLocaleString()
                         : "—"}
                     </td>
+                    {isSuperadmin && (
+                      <td className="px-3 py-1.5 text-right whitespace-nowrap">
+                        {/* The keyboard path to Delete lease (#3912): the
+                            right-click menu has no Tab stop to open it
+                            from. */}
+                        <button
+                          type="button"
+                          onClick={() => setDel(l)}
+                          className="rounded p-1 text-muted-foreground hover:text-destructive"
+                          aria-label={`Delete lease ${l.ip_address}`}
+                          title="Delete lease"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      </td>
+                    )}
                   </tr>
                 </ContextMenuTrigger>
                 <ContextMenuContent>
@@ -2605,13 +2949,10 @@ function LeaseHistoryTab({ server }: { server: DHCPServer }) {
         <input
           type="datetime-local"
           className="rounded-md border bg-background px-2 py-1 text-xs"
-          // Slice off seconds + Z to satisfy the input control's local
-          // datetime format. Round-trip back to ISO Z on change.
-          value={since ? since.slice(0, 16) : ""}
+          // ``since`` is a UTC instant; the input is local wall-clock (#2260).
+          value={toLocalInputValue(since)}
           onChange={(e) => {
-            setSince(
-              e.target.value ? new Date(e.target.value).toISOString() : "",
-            );
+            setSince(fromLocalInputValue(e.target.value) ?? "");
             setPage(1);
           }}
           title="Show entries with expired_at on or after this time"
@@ -2730,6 +3071,12 @@ function ServerDetailView({
   onDelete: () => void;
   onSelectGroup?: (group: DHCPServerGroup) => void;
 }) {
+  // #1339 — every DHCP server group, server and Kea-tab write takes a
+  // superadmin (the DHCP routers' handlers take SuperAdmin).
+  const superadminGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const qc = useQueryClient();
   // For Kea servers attached to a Kea-managed group, scopes / pools /
   // statics / classes / option templates / MAC blocks all live on the
@@ -2753,16 +3100,18 @@ function ServerDetailView({
       qc.invalidateQueries({ queryKey: ["dhcp-servers"] });
     },
     onError: (e) => {
-      const err = e as {
-        response?: { status?: number; data?: { detail?: string } };
-      };
-      const detail = err?.response?.data?.detail;
-      if (err?.response?.status === 409) {
+      const response = (e as { response?: { status?: number } })?.response;
+      if (response?.status === 409) {
+        // The response alone, so a 409 without a detail still names the
+        // conflict instead of axios's "Request failed with status code 409".
         setAdoptConflict(
-          detail ?? "A DHCP server already exists on the interface.",
+          formatApiError(
+            { response },
+            "A DHCP server already exists on the interface.",
+          ),
         );
       } else {
-        setSyncBanner(detail ?? "Force sync failed");
+        setSyncBanner(formatApiError(e, "Force sync failed"));
       }
     },
   });
@@ -2837,11 +3186,7 @@ function ServerDetailView({
         );
       setSyncBanner(parts.join(" · "));
     },
-    onError: (e) =>
-      setSyncBanner(
-        (e as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Sync leases failed",
-      ),
+    onError: (e) => setSyncBanner(formatApiError(e, "Sync leases failed")),
   });
   const approveMut = useMutation({
     mutationFn: () => dhcpApi.approveServer(server.id),
@@ -2889,11 +3234,7 @@ function ServerDetailView({
                 {server.host}:{server.port}
               </span>
               {group && <span>Group: {group.name}</span>}
-              <span>
-                {server.last_sync_at
-                  ? `Last sync ${new Date(server.last_sync_at).toLocaleString()}`
-                  : "Never synced"}
-              </span>
+              <span>{syncLabel(server)}</span>
             </div>
           </div>
           <div className="flex items-center gap-2">
@@ -2902,6 +3243,7 @@ function ServerDetailView({
                 onClick={() => approveMut.mutate()}
                 disabled={approveMut.isPending}
                 className="bg-emerald-600 text-white hover:bg-emerald-700"
+                {...superadminGate}
               >
                 Approve
               </HeaderButton>
@@ -2916,6 +3258,7 @@ function ServerDetailView({
                 }}
                 disabled={leaseSyncMut.isPending}
                 title="Poll this server for active leases and mirror them into DHCP + IPAM"
+                {...superadminGate}
               >
                 Sync Leases
               </HeaderButton>
@@ -2925,17 +3268,19 @@ function ServerDetailView({
                 iconClassName={syncMut.isPending ? "animate-spin" : ""}
                 onClick={() => syncMut.mutate(false)}
                 disabled={syncMut.isPending}
+                {...superadminGate}
               >
                 Force Sync
               </HeaderButton>
             )}
-            <HeaderButton icon={Pencil} onClick={onEdit}>
+            <HeaderButton icon={Pencil} onClick={onEdit} {...superadminGate}>
               Edit
             </HeaderButton>
             <HeaderButton
               variant="destructive"
               icon={Trash2}
               onClick={onDelete}
+              {...superadminGate}
             >
               Delete
             </HeaderButton>
@@ -3100,6 +3445,188 @@ function ServerDetailView({
   );
 }
 
+/** The confirm sentence of Delete Server Group (#2607). `count: null` is a list
+ *  that did not load: the kind is named without a number. */
+function deleteGroupDescription(
+  name: string,
+  kinds: { one: string; many: string; count: number | null }[],
+): string {
+  const held = kinds
+    .filter((k) => k.count === null || k.count > 0)
+    .map((k) =>
+      k.count === null
+        ? `its ${k.many}`
+        : `${k.count} ${k.count === 1 ? k.one : k.many}`,
+    );
+  const config =
+    held.length > 0
+      ? ` The group's own configuration is deleted with it, none of it into Trash: ${held.join(", ")}.`
+      : "";
+  return `Permanently delete group "${name}"? Scopes of this group already in Trash are deleted with it, with their pools and reservations, and can no longer be restored.${config} Its rogue-DHCP responder and router-advertisement records and allowlists go too. None of this can be restored.`;
+}
+
+/** Delete Server Group (#1399). The server refuses a group that still holds
+ *  servers or live scopes (409), so the dialog reads both first and, when the
+ *  group holds either, says what it holds and offers no Delete: the console
+ *  never sends a delete it knows will be refused. The server's refusal stays
+ *  the backstop (a list read before another tab added a scope, the API, the
+ *  approval queue) and its reason shows in the dialog. What a delete still
+ *  takes is the group's scopes already in Trash, for good. */
+export function DeleteServerGroupModal({
+  group,
+  onConfirm,
+  onClose,
+  isPending,
+  error,
+  notice,
+}: {
+  group: DHCPServerGroup;
+  onConfirm: () => void;
+  onClose: () => void;
+  isPending?: boolean;
+  error?: string | null;
+  notice?: string | null;
+}) {
+  const serversQ = useQuery({
+    queryKey: ["dhcp-servers", group.id],
+    queryFn: () => dhcpApi.listServers(group.id),
+  });
+  const scopesQ = useQuery({
+    queryKey: ["dhcp-scopes-group", group.id],
+    queryFn: () => dhcpApi.listScopesByGroup(group.id),
+  });
+  // What else a delete destroys (#2607): the group's own configuration goes with
+  // it by FK cascade and none of it goes to Trash. Counted from the lists the
+  // group's tabs already read; one that fails to load is named without a number.
+  const configQs = [
+    {
+      one: "MAC block",
+      many: "MAC blocks",
+      q: useQuery({
+        queryKey: ["dhcp-group-delete-count", "mac-blocks", group.id],
+        queryFn: () => dhcpApi.listMacBlocks(group.id),
+      }),
+    },
+    {
+      one: "client class",
+      many: "client classes",
+      q: useQuery({
+        queryKey: ["dhcp-group-delete-count", "client-classes", group.id],
+        queryFn: () => dhcpApi.listClientClasses(group.id),
+      }),
+    },
+    {
+      one: "option template",
+      many: "option templates",
+      q: useQuery({
+        queryKey: ["dhcp-group-delete-count", "option-templates", group.id],
+        queryFn: () => dhcpApi.listOptionTemplates(group.id),
+      }),
+    },
+    {
+      one: "PXE profile",
+      many: "PXE profiles",
+      q: useQuery({
+        queryKey: ["dhcp-group-delete-count", "pxe-profiles", group.id],
+        queryFn: () => dhcpApi.listPxeProfiles(group.id),
+      }),
+    },
+    {
+      one: "device policy",
+      many: "device policies",
+      q: useQuery({
+        queryKey: ["dhcp-group-delete-count", "device-policies", group.id],
+        queryFn: () => dhcpApi.listDevicePolicies(group.id),
+      }),
+    },
+    {
+      one: "phone profile",
+      many: "phone profiles",
+      q: useQuery({
+        queryKey: ["dhcp-group-delete-count", "phone-profiles", group.id],
+        queryFn: () => dhcpApi.listPhoneProfiles(group.id),
+      }),
+    },
+  ];
+  const title = "Delete Server Group";
+
+  if (serversQ.isPending || scopesQ.isPending) {
+    return (
+      <Modal title={title} onClose={onClose}>
+        <p className="text-sm text-muted-foreground">
+          Checking what group "{group.name}" still holds…
+        </p>
+      </Modal>
+    );
+  }
+  // A list that failed to load is read as empty: the server still refuses.
+  const servers = serversQ.data?.length ?? 0;
+  const scopes = scopesQ.data?.length ?? 0;
+  if (servers || scopes) {
+    const held = [
+      servers ? `${servers} server${servers === 1 ? "" : "s"}` : "",
+      scopes ? `${scopes} scope${scopes === 1 ? "" : "s"}` : "",
+    ]
+      .filter(Boolean)
+      .join(" and ");
+    const first = [
+      servers ? "move or delete its servers" : "",
+      scopes ? "delete its scopes" : "",
+    ]
+      .filter(Boolean)
+      .join(", and ");
+    return (
+      <Modal title={title} onClose={onClose}>
+        <div className="space-y-4">
+          <p className="text-sm text-muted-foreground">
+            Group "{group.name}" still holds {held}, so it cannot be deleted.
+            First {first}.
+            {scopes > 0 &&
+              " A deleted scope goes to Trash; deleting the group then deletes its scopes in Trash for good, with their pools and reservations."}
+          </p>
+          <div className="flex justify-end">
+            <button
+              onClick={onClose}
+              className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      </Modal>
+    );
+  }
+  // Only the delete path needs the configuration counts; a refused group
+  // (above) never waits for them.
+  if (configQs.some(({ q }) => q.isPending)) {
+    return (
+      <Modal title={title} onClose={onClose}>
+        <p className="text-sm text-muted-foreground">
+          Checking what group "{group.name}" holds…
+        </p>
+      </Modal>
+    );
+  }
+  return (
+    <DeleteConfirmModal
+      title={title}
+      description={deleteGroupDescription(
+        group.name,
+        configQs.map(({ one, many, q }) => ({
+          one,
+          many,
+          count: q.data ? q.data.length : null,
+        })),
+      )}
+      onConfirm={onConfirm}
+      onClose={onClose}
+      isPending={isPending}
+      error={error}
+      notice={notice}
+    />
+  );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Page shell
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3209,10 +3736,7 @@ export function DHCPPage() {
     },
   });
   const deleteGroupError =
-    deleteGroupMut.error &&
-    (((deleteGroupMut.error as { response?: { data?: { detail?: string } } })
-      ?.response?.data?.detail as string | undefined) ??
-      formatApiError(deleteGroupMut.error));
+    deleteGroupMut.error && formatApiError(deleteGroupMut.error);
   const deleteServerMut = useMutation({
     mutationFn: (id: string) => dhcpApi.deleteServer(id),
     onSuccess: (_, id) => {
@@ -3237,6 +3761,32 @@ export function DHCPPage() {
     if (selection?.type !== "server") return null;
     return freshServer ?? selection.server;
   }, [selection, freshServer]);
+  // #3369 — the selection holds the group as it was when clicked; draw the
+  // panel from the refreshed list so a saved edit shows at once. On a
+  // server's page the group is the one the server is in NOW, so moving it
+  // with Edit DHCP Server moves the page's "Group:" line with it.
+  const liveGroup = useMemo(() => {
+    if (!selection) return null;
+    if (selection.type === "server" && effectiveServer) {
+      const gid = effectiveServer.server_group_id;
+      if (!gid) return null;
+      return (
+        allGroups?.find((g) => g.id === gid) ??
+        (selection.group?.id === gid ? selection.group : null)
+      );
+    }
+    if (!selection.group) return null;
+    return (
+      allGroups?.find((g) => g.id === selection.group!.id) ?? selection.group
+    );
+  }, [selection, allGroups, effectiveServer]);
+  // The read-only server inspector opened from a group's server list is a
+  // click-time snapshot too: its Pause / Resume refreshes the server lists,
+  // so draw it from the refreshed list or the button never flips.
+  const liveModalServer = useMemo(() => {
+    if (!modalServer) return null;
+    return allServers?.find((s) => s.id === modalServer.id) ?? modalServer;
+  }, [modalServer, allServers]);
 
   return (
     <div className="flex h-full overflow-hidden">
@@ -3259,9 +3809,9 @@ export function DHCPPage() {
         )}
         {selection?.type === "group" && (
           <GroupDetailView
-            group={selection.group}
-            onEdit={() => setEditGroup(selection.group)}
-            onDelete={() => setDelGroup(selection.group)}
+            group={liveGroup ?? selection.group}
+            onEdit={() => setEditGroup(liveGroup ?? selection.group)}
+            onDelete={() => setDelGroup(liveGroup ?? selection.group)}
             onAddServer={() => setAddServerFor(selection.group.id)}
             // Issue #181: open the read-only modal instead of
             // navigating to the full standalone server view. Mirrors
@@ -3274,7 +3824,7 @@ export function DHCPPage() {
         {selection?.type === "server" && effectiveServer && (
           <ServerDetailView
             server={effectiveServer}
-            group={selection.group}
+            group={liveGroup}
             onEdit={() => setEditServer(effectiveServer)}
             onDelete={() => setDelServer(effectiveServer)}
             onSelectGroup={(g) => setSelection({ type: "group", group: g })}
@@ -3292,9 +3842,8 @@ export function DHCPPage() {
         />
       )}
       {delGroup && (
-        <DeleteConfirmModal
-          title="Delete Server Group"
-          description={`Permanently delete group "${delGroup.name}"? The group must be empty — move or delete its servers first.`}
+        <DeleteServerGroupModal
+          group={delGroup}
           onConfirm={() => deleteGroupMut.mutate(delGroup.id)}
           onClose={() => {
             setDelGroup(null);
@@ -3321,7 +3870,7 @@ export function DHCPPage() {
       {delServer && (
         <DeleteConfirmModal
           title="Delete DHCP Server"
-          description={`Remove server "${delServer.name}"? Its scopes remain but will be unassigned.`}
+          description={deleteServerDescription(delServer.name)}
           onConfirm={() => deleteServerMut.mutate(delServer.id)}
           onClose={() => {
             setDelServer(null);
@@ -3335,9 +3884,9 @@ export function DHCPPage() {
           }
         />
       )}
-      {modalServer && (
+      {liveModalServer && (
         <ServerDetailModal
-          server={modalServer}
+          server={liveModalServer}
           onClose={() => setModalServer(null)}
         />
       )}

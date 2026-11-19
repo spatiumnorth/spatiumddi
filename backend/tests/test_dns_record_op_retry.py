@@ -385,14 +385,17 @@ async def test_an_apex_op_keys_the_same_with_or_without_a_name(
     assert (older.state, older.superseded_by) == ("superseded", newer.id)
 
 
-async def test_an_agentless_failure_does_not_raise_the_retry_alert(
+async def test_an_agentless_failure_raises_the_retry_alert(
     db_session: AsyncSession,
 ) -> None:
-    """An agentless driver applies once, inline, and hands the failure to the
-    caller; the rule's "after every retry" would be false for it."""
+    """Since #1538 an agentless op goes through the same retry budget as an
+    agent op, so a terminally ``failed`` one means "after every retry" for
+    it too and the rule fires. (This test used to assert the opposite,
+    back when an agentless failure was a single inline attempt.)"""
     server, zone = await _server(db_session)
     server.driver = "route53"
     op = _op(server, zone, state="failed")
     db_session.add(op)
     await db_session.flush()
-    assert await alerts._matching_dns_record_op_failed_subjects(db_session, None) == []  # type: ignore[arg-type]
+    matches = await alerts._matching_dns_record_op_failed_subjects(db_session, None)  # type: ignore[arg-type]
+    assert len(matches) == 1

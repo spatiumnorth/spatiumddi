@@ -80,12 +80,12 @@
   </g>
   <g>
     <rect x="416" y="244" width="160" height="64" rx="8" fill="url(#t1-agent)"/>
-    <text x="496" y="276" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">bind9</text>
+    <text x="496" y="276" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">dns-bind9</text>
     <text x="496" y="296" text-anchor="middle" font-size="11" fill="#fed7aa">DNS — :53 udp/tcp</text>
   </g>
   <g>
     <rect x="592" y="244" width="160" height="64" rx="8" fill="url(#t1-agent)"/>
-    <text x="672" y="276" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">kea-dhcp</text>
+    <text x="672" y="276" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">dhcp-kea</text>
     <text x="672" y="296" text-anchor="middle" font-size="11" fill="#fed7aa">DHCP — :67 udp</text>
   </g>
 
@@ -93,7 +93,7 @@
   <g>
     <rect x="40" y="354" width="840" height="34" rx="6" fill="url(#t1-volume)" opacity="0.85"/>
     <text x="60" y="376" font-size="12" font-weight="500" fill="#ffffff">
-      Backup: local_volume → /var/lib/spatiumddi/backups (named volume)  ·  or remote — S3 / SCP / Azure / SMB / FTP / GCS / WebDAV
+      Backup: local_volume (named volume)  ·  or remote — S3 / SCP / Azure / SMB / FTP / GCS / WebDAV / NFS / HTTPS PUT
     </text>
   </g>
 </svg>

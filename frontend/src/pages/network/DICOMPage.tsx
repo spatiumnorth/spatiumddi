@@ -1,3 +1,4 @@
+import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -33,7 +34,8 @@ import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { Pager } from "@/components/ui/pager";
 import { IPAddressPicker } from "@/components/IPAddressPicker";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
-import { usePermissions } from "@/hooks/usePermissions";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 // DICOM AE Title registry (issue #723, part of #543). Registry only —
 // nothing on this page opens a DICOM association, and nothing here holds
@@ -167,8 +169,20 @@ export function DICOMPage() {
                 DICOM application entities
               </h1>
               <span className="text-xs text-muted-foreground">
-                {total} AE{total === 1 ? "" : "s"} · {peers.length} association
-                {peers.length === 1 ? "" : "s"}
+                {aesQ.error ? (
+                  <ListReadError
+                    error={aesQ.error}
+                    what="DICOM application entities"
+                  />
+                ) : (
+                  `${total} AE${total === 1 ? "" : "s"}`
+                )}{" "}
+                ·{" "}
+                {peersQ.error ? (
+                  <ListReadError error={peersQ.error} what="associations" />
+                ) : (
+                  `${peers.length} association${peers.length === 1 ? "" : "s"}`
+                )}
               </span>
             </div>
             <p className="mt-1 max-w-3xl text-xs text-muted-foreground">
@@ -197,7 +211,10 @@ export function DICOMPage() {
               icon={Upload}
               disabled={!canWrite}
               title={
-                canWrite ? undefined : "Requires write permission on DICOM AEs"
+                permissionGate(
+                  canWrite,
+                  "Requires write permission on DICOM AEs",
+                ).title
               }
               onClick={() => setImportOpen(true)}
             >
@@ -208,7 +225,10 @@ export function DICOMPage() {
               icon={Plus}
               disabled={!canWrite}
               title={
-                canWrite ? undefined : "Requires write permission on DICOM AEs"
+                permissionGate(
+                  canWrite,
+                  "Requires write permission on DICOM AEs",
+                ).title
               }
               onClick={() => setModal({ mode: "create" })}
             >
@@ -288,9 +308,29 @@ export function DICOMPage() {
           <div className="rounded-lg border">
             {aes.length === 0 ? (
               <div className="p-8 text-center text-sm text-muted-foreground">
-                {aesQ.isLoading
-                  ? "Loading application entities…"
-                  : "No DICOM application entities recorded."}
+                {aesQ.isLoading ? (
+                  "Loading application entities…"
+                ) : (
+                  <ListEmpty
+                    error={aesQ.error}
+                    what="DICOM application entities"
+                    filtered={
+                      search.trim() !== "" ||
+                      subnetFilter !== "" ||
+                      classFilter !== "" ||
+                      reservationsOnly
+                    }
+                    onClearFilters={() => {
+                      setSearch("");
+                      setSubnetFilter("");
+                      setClassFilter("");
+                      setReservationsOnly(false);
+                      setPage(1);
+                    }}
+                  >
+                    No DICOM application entities recorded.
+                  </ListEmpty>
+                )}
               </div>
             ) : (
               <div className="overflow-x-auto">
@@ -417,7 +457,10 @@ export function DICOMPage() {
               disabled={!canWrite || aes.length < 2}
               title={
                 !canWrite
-                  ? "Requires write permission on DICOM AEs"
+                  ? permissionGate(
+                      canWrite,
+                      "Requires write permission on DICOM AEs",
+                    ).title
                   : aes.length < 2
                     ? "Register at least two application entities first"
                     : undefined
@@ -430,9 +473,14 @@ export function DICOMPage() {
           <div className="rounded-lg border">
             {peers.length === 0 ? (
               <div className="p-8 text-center text-sm text-muted-foreground">
-                {peersQ.isLoading
-                  ? "Loading associations…"
-                  : "No associations documented. Without them, the blast radius of renumbering a host cannot be reported."}
+                {peersQ.isLoading ? (
+                  "Loading associations…"
+                ) : (
+                  <ListEmpty error={peersQ.error} what="associations">
+                    No associations documented. Without them, the blast radius
+                    of renumbering a host cannot be reported.
+                  </ListEmpty>
+                )}
               </div>
             ) : (
               <div className="overflow-x-auto">
@@ -770,7 +818,7 @@ function PeerModal({
             placeholder="Network configuration notes"
           />
         </Field>
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
         <div className="flex justify-end gap-2 pt-2">
           <button
             type="button"
@@ -991,7 +1039,7 @@ function ImportModal({ onClose }: { onClose: () => void }) {
           </div>
         )}
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
 
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -1280,7 +1328,7 @@ function AEModal({
           </p>
         </Field>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
 
         <div className="flex justify-end gap-2 pt-2">
           <button

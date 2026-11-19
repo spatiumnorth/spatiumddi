@@ -303,6 +303,23 @@ def test_render_server_config_rrl_default_noop(zone: ZoneData) -> None:
     assert "tcp-clients" not in out
 
 
+def test_render_server_config_query_log_switch(zone: ZoneData) -> None:
+    """#2249 — an explicit ``querylog yes;`` with query logging on, mirroring
+    the agent renderer, and nothing with it off so an existing group's
+    preview is unchanged."""
+    on = ServerOptions(query_log_enabled=True, response_log_enabled=True)
+    out = BIND9Driver().render_server_config(
+        SimpleNamespace(id="x", name="ns1"), on, bundle=_bundle_with_opts(zone, on)
+    )
+    assert "querylog yes;" in out
+    assert "responselog yes;" in out
+    off = ServerOptions()
+    out = BIND9Driver().render_server_config(
+        SimpleNamespace(id="x", name="ns1"), off, bundle=_bundle_with_opts(zone, off)
+    )
+    assert "querylog" not in out
+
+
 def test_render_server_config_split_horizon_views() -> None:
     """Issue #24: the same zone name materialises once per view (with
     each view's filtered records pre-expanded by the bundle builder),
@@ -371,7 +388,7 @@ def test_render_server_config_views_put_rpz_inside_view() -> None:
     response-policy directive must render INSIDE the owning view block,
     never at the top level — BIND9 rejects top-level ``zone {}``
     alongside ``view {}``. A ``view_name=None`` blocklist is group-level
-    and replicates into every view."""
+    and lands only in a view with no zone of its own (#1706)."""
     b = ConfigBundle(
         server_id=str(uuid.uuid4()),
         server_name="ns1",
@@ -422,6 +439,64 @@ def test_render_server_config_views_put_rpz_inside_view() -> None:
     assert 'zone "spatium-blocklist-internal.rpz." {' not in preamble
 
 
+def test_render_server_config_group_rpz_only_in_a_view_without_its_own_1706() -> None:
+    """#1706: a view's own RPZ zone already folds in the group's lists, so the
+    group zone is not loaded beside it; a view with no zone of its own still
+    falls back to it. Mirrors the agent's BIND9 renderer."""
+
+    def _bl(zone: str, view: str | None) -> EffectiveBlocklistData:
+        return EffectiveBlocklistData(
+            rpz_zone_name=zone,
+            entries=(
+                BlocklistEntry(
+                    domain="ads.example.com",
+                    action="block",
+                    block_mode="nxdomain",
+                    sinkhole_ip=None,
+                    target=None,
+                    is_wildcard=False,
+                ),
+            ),
+            exceptions=frozenset(),
+            view_name=view,
+        )
+
+    def _view(name: str, clients: str, order: int) -> ViewData:
+        return ViewData(
+            name=name,
+            match_clients=(clients,),
+            match_destinations=(),
+            recursion=True,
+            order=order,
+        )
+
+    b = ConfigBundle(
+        server_id=str(uuid.uuid4()),
+        server_name="ns1",
+        driver="bind9",
+        roles=("authoritative",),
+        options=ServerOptions(),
+        acls=(),
+        views=(_view("internal", "10.0.0.0/8", 0), _view("external", "any", 1)),
+        zones=(),
+        tsig_keys=(),
+        blocklists=(
+            _bl("spatium-blocklist-internal.rpz.", "internal"),
+            _bl("spatium-blocklist.rpz.", None),
+        ),
+        generated_at=datetime(2026, 4, 14, 12, 0, tzinfo=UTC),
+    )
+    out = BIND9Driver().render_server_config(
+        SimpleNamespace(id=b.server_id, name=b.server_name), b.options, bundle=b
+    )
+    internal = out.split('view "internal" {', 1)[1].split('view "external" {', 1)[0]
+    external = out.split('view "external" {', 1)[1]
+    assert 'zone "spatium-blocklist-internal.rpz.";' in internal
+    assert 'zone "spatium-blocklist.rpz."' not in internal
+    assert 'zone "spatium-blocklist.rpz.";' in external
+    assert "spatium-blocklist-internal" not in external
+
+
 # ── RPZ rendering ─────────────────────────────────────────────────────────
 
 
@@ -468,6 +543,7 @@ def test_render_rpz_zone_nxdomain_and_sinkhole_and_exception() -> None:
     assert "spatium-blocklist.rpz. IN SOA" in out
     assert "ads.example.com IN CNAME ." in out
     assert "*.tracker.example.net IN A 10.0.0.250" in out
+    assert "*.tracker.example.net IN AAAA ::" in out  # #2124
     assert "redirect.example.org IN A 1.2.3.4" in out
     assert "allowed.example.com" not in out  # exception excluded
 
@@ -668,3 +744,68 @@ def test_config_bundle_etag_is_deterministic(bundle: ConfigBundle) -> None:
 
 def test_driver_is_dnsdriver_subclass() -> None:
     assert issubclass(BIND9Driver, DNSDriver)
+
+
+# ── Query-log channel settings (#2265) ───────────────────────────────────
+
+
+def _logging_stanza(zone: ZoneData, **opts: object) -> str:
+    base = {"forwarders": ("1.1.1.1",), "query_log_enabled": True}
+    b = ConfigBundle(
+        server_id=str(uuid.uuid4()),
+        server_name="ns1",
+        driver="bind9",
+        roles=("authoritative",),
+        options=ServerOptions(**{**base, **opts}),  # type: ignore[arg-type]
+        acls=(),
+        views=(),
+        zones=(zone,),
+        tsig_keys=(),
+        blocklists=(),
+        generated_at=datetime(2026, 4, 14, 12, 0, tzinfo=UTC),
+    )
+    out = BIND9Driver().render_server_config(
+        SimpleNamespace(id=b.server_id, name=b.server_name), b.options, bundle=b
+    )
+    start = out.index("channel queries_channel")
+    return out[start : out.index("};", start) + 2]
+
+
+def test_query_log_defaults_render_the_historical_channel(zone: ZoneData) -> None:
+    assert _logging_stanza(zone) == (
+        "channel queries_channel {\n"
+        '        file "/var/log/named/queries.log" versions 5 size 50m;\n'
+        "        severity info;\n"
+        "        print-category yes;\n"
+        "        print-severity yes;\n"
+        "        print-time yes;\n"
+        "    };"
+    )
+
+
+def test_query_log_severity_and_print_flags_reach_named_conf(zone: ZoneData) -> None:
+    out = _logging_stanza(
+        zone,
+        query_log_severity="debug 3",
+        query_log_print_category=False,
+        query_log_print_severity=False,
+    )
+    assert "severity debug 3;" in out
+    assert "print-category no;" in out
+    assert "print-severity no;" in out
+
+
+def test_query_log_channel_and_file_stay_on_the_shipper_file(zone: ZoneData) -> None:
+    # A stored syslog / odd-path / too-quiet row must not starve the
+    # DNS Queries tab: the render ignores channel + file and floors severity.
+    out = _logging_stanza(
+        zone,
+        query_log_channel="syslog",
+        query_log_file="/var/log/named/x.log",
+        query_log_severity="error",
+        query_log_print_time=False,
+    )
+    assert 'file "/var/log/named/queries.log" versions 5 size 50m;' in out
+    assert "syslog" not in out
+    assert "severity info;" in out
+    assert "print-time yes;" in out

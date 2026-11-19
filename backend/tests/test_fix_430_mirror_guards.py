@@ -26,6 +26,7 @@ from app.services.kubernetes.client import KubernetesClient, KubernetesClientErr
 from app.services.opnsense.client import OPNsenseClient, OPNsenseClientError
 from app.services.proxmox.client import ProxmoxClient, ProxmoxClientError
 from app.services.tailscale.client import TailscaleClient, TailscaleClientError
+from app.services.unifi.client import UnifiClient, UnifiClientConfig, UnifiClientError
 
 
 def _stub_get(client: Any, value: Any) -> None:
@@ -62,6 +63,59 @@ async def test_k8s_empty_cluster_is_legitimate() -> None:
 @pytest.mark.parametrize("body", [{}, {"items": None}, {"kind": "Status"}, []])
 async def test_k8s_wrong_shape_200_raises(body: Any) -> None:
     client = _k8s_with_body(body)
+    with pytest.raises(KubernetesClientError):
+        await client.list_nodes()
+
+
+# ── Kubernetes pagination (#1560) ─────────────────────────────────────
+
+
+def _k8s_paged(pages: list[tuple[int, Any]]) -> KubernetesClient:
+    """Mock transport serving ``pages`` in request order."""
+    client = KubernetesClient(api_server_url="https://k8s.test", token="t")
+    calls: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls.append(req)
+        status, body = pages[len(calls) - 1]
+        return httpx.Response(status, json=body)
+
+    client._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://k8s.test"
+    )
+    client._calls = calls  # type: ignore[attr-defined]
+    return client
+
+
+@pytest.mark.asyncio
+async def test_k8s_list_follows_continue_token_until_empty() -> None:
+    node = {"metadata": {"name": "n1"}, "status": {"addresses": [], "conditions": []}}
+    node2 = {"metadata": {"name": "n2"}, "status": {"addresses": [], "conditions": []}}
+    client = _k8s_paged(
+        [
+            (200, {"items": [node], "metadata": {"continue": "tok-1"}}),
+            (200, {"items": [node2], "metadata": {"continue": ""}}),
+        ]
+    )
+    out = await client.list_nodes()
+    assert [n.name for n in out] == ["n1", "n2"]
+    calls = client._calls  # type: ignore[attr-defined]
+    assert len(calls) == 2
+    assert calls[0].url.params.get("continue") is None
+    assert calls[1].url.params.get("continue") == "tok-1"
+
+
+@pytest.mark.asyncio
+async def test_k8s_paging_failure_midway_raises_instead_of_partial_list() -> None:
+    # 410 Gone = expired continue token. The reconcile must abort, not
+    # prune everything past page one against a partial list.
+    node = {"metadata": {"name": "n1"}, "status": {"addresses": [], "conditions": []}}
+    client = _k8s_paged(
+        [
+            (200, {"items": [node], "metadata": {"continue": "tok-1"}}),
+            (410, {"kind": "Status", "reason": "Expired"}),
+        ]
+    )
     with pytest.raises(KubernetesClientError):
         await client.list_nodes()
 
@@ -136,6 +190,26 @@ async def test_proxmox_data_null_raises(body: Any) -> None:
         await client.list_nodes()
     with pytest.raises(ProxmoxClientError):
         await client.list_qemu("pve", include_stopped=False)
+
+
+@pytest.mark.asyncio
+async def test_proxmox_guest_config_failure_is_recorded_unreadable() -> None:
+    # #1559 — the guest list itself read fine, but this guest's config
+    # fetch failed: the guest is omitted AND recorded in
+    # ``unreadable_guests`` so the reconciler can tell "unreadable" from
+    # "gone" and skip its address absence-delete for the pass.
+    client = _proxmox()
+
+    async def _fake(path: str) -> Any:
+        if path.endswith("/qemu") or path.endswith("/lxc"):
+            return [{"vmid": 101, "name": "vm101", "status": "running"}]
+        raise ProxmoxClientError(f"{path}: HTTP 500 boom")
+
+    client._get = _fake  # type: ignore[assignment]
+    assert await client.list_qemu("pve", include_stopped=False) == []
+    assert client.unreadable_guests == ["pve/qemu/101"]
+    assert await client.list_lxc("pve", include_stopped=False) == []
+    assert client.unreadable_guests == ["pve/qemu/101", "pve/lxc/101"]
 
 
 # ── OPNsense (bespoke envelope guards) ────────────────────────────────
@@ -216,3 +290,101 @@ async def test_opnsense_vlans_missing_envelope_raises(body: Any) -> None:
     _stub_get(client, body)
     with pytest.raises(OPNsenseClientError):
         await client.list_vlans()
+
+
+# ── UniFi (require_list / require_keyed_list after _get_legacy) ───────
+# #1555 — UniFi was the one mirror still collapsing a wrong-shape 200 to
+# [] in its list methods, bypassing the reconciler's #430 abort guard.
+
+
+def _unifi() -> UnifiClient:
+    return UnifiClient(
+        UnifiClientConfig(
+            mode="local",
+            host="unifi.test",
+            port=443,
+            cloud_host_id=None,
+            verify_tls=False,
+            ca_bundle_pem="",
+            auth_kind="api_key",
+            api_key="k",
+            username="",
+            password="",
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_unifi_empty_legacy_lists_are_legitimate() -> None:
+    client = _unifi()
+    _stub_get(client, {"meta": {"rc": "ok"}, "data": []})
+    assert await client.list_networks("default") == []
+    assert await client.list_active_clients("default") == []
+    assert await client.list_known_clients("default") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"meta": {"rc": "ok"}, "data": None},
+        {"meta": {"rc": "ok"}, "data": {"message": "bad gateway"}},
+        {"meta": {"rc": "ok"}},  # envelope without data
+        None,
+        "oops",
+    ],
+)
+async def test_unifi_wrong_shape_200_raises(body: Any) -> None:
+    client = _unifi()
+    _stub_get(client, body)
+    with pytest.raises(UnifiClientError):
+        await client.list_networks("default")
+    with pytest.raises(UnifiClientError):
+        await client.list_active_clients("default")
+    with pytest.raises(UnifiClientError):
+        await client.list_known_clients("default")
+
+
+@pytest.mark.asyncio
+async def test_unifi_legacy_meta_rc_error_raises() -> None:
+    # Legacy in-band failure: HTTP 200 with meta.rc == "error" must be a
+    # failed read even when a data key rides along.
+    client = _unifi()
+    _stub_get(client, {"meta": {"rc": "error", "msg": "api.err.NoSiteContext"}, "data": []})
+    with pytest.raises(UnifiClientError):
+        await client.list_networks("default")
+
+
+def _stub_unifi_sites(client: UnifiClient, integration_body: Any) -> None:
+    """Legacy sites unavailable (the documented fallback trigger);
+    the Integration API answers with ``integration_body``."""
+
+    async def _legacy_fail(*_a: Any, **_k: Any) -> Any:
+        raise UnifiClientError("legacy 404")
+
+    async def _integration(*_a: Any, **_k: Any) -> Any:
+        return integration_body
+
+    client._get_legacy = _legacy_fail  # type: ignore[assignment]
+    client._get_integration = _integration  # type: ignore[assignment]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [{}, {"data": None}, {"foo": 1}, [], None])
+async def test_unifi_list_sites_wrong_shape_fallback_raises(body: Any) -> None:
+    client = _unifi()
+    _stub_unifi_sites(client, body)
+    with pytest.raises(UnifiClientError):
+        await client.list_sites()
+
+
+@pytest.mark.asyncio
+async def test_unifi_list_sites_fallback_empty_and_rows() -> None:
+    client = _unifi()
+    _stub_unifi_sites(client, {"data": []})
+    assert await client.list_sites() == []
+
+    client = _unifi()
+    _stub_unifi_sites(client, {"data": [{"id": "abc", "name": "Branch"}]})
+    sites = await client.list_sites()
+    assert len(sites) == 1 and sites[0].site_id == "abc"

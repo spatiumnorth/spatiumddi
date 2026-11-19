@@ -1,4 +1,4 @@
-"""BIND9 agent query / response / RPZ logging block (issues #699, #914).
+"""BIND9 agent query / response / RPZ logging block (issues #699, #914, #2249).
 
 This renderer — not the control-plane Jinja template — is what every
 agent-managed BIND9 server actually runs, and the two have drifted:
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from spatium_dns_agent.drivers.bind9 import (
     _render_logging_block,
+    _render_query_log_option,
     _render_response_log_option,
 )
 
@@ -24,6 +25,15 @@ def test_logging_off_renders_nothing() -> None:
     assert _render_logging_block({"query_log_enabled": False}) == ""
     # An existing group must render a byte-identical named.conf.
     assert _render_response_log_option({"response_log_enabled": True}) == ""
+    assert _render_query_log_option({}) == ""
+    assert _render_query_log_option({"query_log_enabled": False}) == ""
+
+
+def test_query_logging_renders_an_explicit_querylog() -> None:
+    """The marker the runtime sync reads back (#2249), and what makes a
+    fresh named start with query logging on without leaning on BIND's
+    category-based defaulting."""
+    assert _render_query_log_option({"query_log_enabled": True}) == "    querylog yes;\n"
 
 
 def test_query_logging_routes_the_rpz_categories() -> None:
@@ -79,6 +89,71 @@ def _driver(tmp_path, conf_text: str):
     return driver
 
 
+def _fake_rndc(monkeypatch, rc: int = 0, stderr: str = "") -> list[list[str]]:
+    import subprocess
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, rc, "", stderr)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    return calls
+
+
+def test_reconfig_asserts_query_logging_on(tmp_path, monkeypatch) -> None:
+    """``rndc reconfig`` does not apply query logging either (#2249).
+
+    Verified against BIND 9.20.29: a named started with query logging off
+    stays off after a reconfig that adds the ``queries`` category, with or
+    without ``querylog yes;``. #914 believed query logging followed its
+    category on reload; it only does at startup. Without this call the
+    DNS Queries tab stays empty until named restarts, and with response
+    logging on every response line is dropped as an orphan.
+    """
+    calls = _fake_rndc(monkeypatch)
+    driver = _driver(tmp_path, "options {\n    querylog yes;\n};\n")
+    driver._sync_logging_runtime(["rndc"])
+    assert calls == [["rndc", "querylog", "on"], ["rndc", "responselog", "off"]]
+
+
+def test_reconfig_asserts_query_logging_off(tmp_path, monkeypatch) -> None:
+    """And the other direction: a named started with query logging on keeps
+    logging after a reconfig that removes it, until told otherwise."""
+    calls = _fake_rndc(monkeypatch)
+    driver = _driver(tmp_path, "options {\n    recursion yes;\n};\n")
+    driver._sync_logging_runtime(["rndc"])
+    assert calls == [["rndc", "querylog", "off"], ["rndc", "responselog", "off"]]
+
+
+def test_responselog_is_not_mistaken_for_querylog(tmp_path, monkeypatch) -> None:
+    """The two markers are read independently and anchored to a statement,
+    so neither one's presence turns the other on."""
+    calls = _fake_rndc(monkeypatch)
+    driver = _driver(tmp_path, "options {\n    responselog yes;\n};\n")
+    driver._sync_logging_runtime(["rndc"])
+    assert ["rndc", "querylog", "off"] in calls
+    assert ["rndc", "responselog", "on"] in calls
+
+
+def test_markers_only_match_a_statement(tmp_path, monkeypatch) -> None:
+    """A commented-out statement, or a zone whose name happens to be
+    ``querylog``, is not the switch: only a real statement turns it on."""
+    calls = _fake_rndc(monkeypatch)
+    conf = (
+        "options {\n"
+        "    // querylog yes;\n"
+        "    # responselog yes;\n"
+        "};\n"
+        'zone "querylog" { type primary; file "querylog yes;"; };\n'
+        'zone "responselog.example" { type primary; file "x.db"; };\n'
+    )
+    driver = _driver(tmp_path, conf)
+    driver._sync_logging_runtime(["rndc"])
+    assert calls == [["rndc", "querylog", "off"], ["rndc", "responselog", "off"]]
+
+
 def test_reconfig_asserts_response_logging_on(tmp_path, monkeypatch) -> None:
     """``rndc reconfig`` does not apply ``responselog``.
 
@@ -88,46 +163,17 @@ def test_reconfig_asserts_response_logging_on(tmp_path, monkeypatch) -> None:
     that rewrites named.conf, validates, reloads — and logs nothing
     until the daemon next restarts.
     """
-    import subprocess
-
-    calls: list[list[str]] = []
-
-    def fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
-        calls.append(list(cmd))
-        return subprocess.CompletedProcess(cmd, 0, "", "")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    driver = _driver(tmp_path, "options {\n    responselog yes;\n};\n")
-    driver._sync_response_log_runtime(["rndc"])
-    assert calls == [["rndc", "responselog", "on"]]
+    calls = _fake_rndc(monkeypatch)
+    driver = _driver(tmp_path, "options {\n    querylog yes;\n    responselog yes;\n};\n")
+    driver._sync_logging_runtime(["rndc"])
+    assert calls == [["rndc", "querylog", "on"], ["rndc", "responselog", "on"]]
 
 
-def test_reconfig_asserts_response_logging_off(tmp_path, monkeypatch) -> None:
-    """And the other direction — turning it back off must actually stop
-    the second line per query, not wait for a restart."""
-    import subprocess
-
-    calls: list[list[str]] = []
-
-    def fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
-        calls.append(list(cmd))
-        return subprocess.CompletedProcess(cmd, 0, "", "")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    driver = _driver(tmp_path, "options {\n    recursion yes;\n};\n")
-    driver._sync_response_log_runtime(["rndc"])
-    assert calls == [["rndc", "responselog", "off"]]
-
-
-def test_response_log_sync_survives_an_old_named(tmp_path, monkeypatch) -> None:
+def test_logging_sync_survives_an_old_named(tmp_path, monkeypatch) -> None:
     """A named with no ``responselog`` command is a legitimate reason to
     fail here, and the config-file value still applies at the next
     restart — so it warns rather than raising and aborting the apply."""
-    import subprocess
-
-    def fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
-        return subprocess.CompletedProcess(cmd, 1, "", "unknown command")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    calls = _fake_rndc(monkeypatch, rc=1, stderr="unknown command")
     driver = _driver(tmp_path, "options {\n    responselog yes;\n};\n")
-    driver._sync_response_log_runtime(["rndc"])  # must not raise
+    driver._sync_logging_runtime(["rndc"])  # must not raise
+    assert len(calls) == 2, "a failed querylog must not stop the responselog call"

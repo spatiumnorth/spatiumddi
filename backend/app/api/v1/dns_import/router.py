@@ -22,9 +22,11 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from app.api.deps import DB, SuperAdmin
+from app.api.pre_body_auth import PreBodyAuthRoute
 from app.core.agent_wake import collect_wake, dns_group_channel
 from app.core.ssrf import assert_safe_target
 from app.models.dns import DNSServer, DNSServerGroup
+from app.services.api_token_scopes import read_only_post, token_write
 from app.services.dns.name_scope import classify_zone_name
 from app.services.dns.tld_registry import effective_registry
 from app.services.dns_import import (
@@ -43,6 +45,7 @@ from app.services.dns_import import (
     test_powerdns_connection,
     test_technitium_connection,
 )
+from app.services.dns_import.apex_ns import annotate_apex_ns
 from app.services.dns_import.canonical import (
     ConflictAction,
     ImportedRecord,
@@ -51,10 +54,15 @@ from app.services.dns_import.canonical import (
     ImportPreview,
     ZoneConflict,
 )
+from app.services.dns_import.cname_check import annotate_cname_conflicts
 from app.services.dns_import.commit import commit_import, detect_conflicts
+from app.services.dns_import.soa_mailbox import annotate_admin_email
 
 logger = structlog.get_logger(__name__)
-router = APIRouter()
+# Every body route here checks the login from the request headers before
+# the body is read, JSON routes included (app.api.pre_body_auth): these
+# routes carry body allowances above the app-wide cap (app.core.body_limit).
+router = APIRouter(route_class=PreBodyAuthRoute)
 
 # Match the BIND9 parser's archive cap so the multipart upload guard
 # fails fast before unpack.
@@ -108,6 +116,10 @@ class ImportedZoneOut(BaseModel):
     # payload (see the ``soa`` note above). None rather than "public" so an
     # unclassified row shows no pill instead of a reassuring wrong one.
     name_scope: str | None = None
+    # #1892 — apex NS targets that name no server of the target group (the
+    # source server's own name, typically). Derived by the preview, never
+    # round-tripped; the UI offers ``apex_ns_policy="replace"`` from it.
+    foreign_apex_ns: list[str] = Field(default_factory=list)
 
 
 class ZoneConflictOut(BaseModel):
@@ -137,6 +149,9 @@ class PreviewOut(BaseModel):
     warnings: list[str]
     total_records: int
     record_type_histogram: dict[str, int]
+    # Set by the live-pull previews (cloud, Windows DNS) to the server the
+    # records came from; the commit doesn't push them back to it (#1456).
+    source_server_id: uuid.UUID | None = None
 
 
 class ConflictDecision(BaseModel):
@@ -154,6 +169,10 @@ class CommitIn(BaseModel):
     # left untouched can be omitted; the commit defaults them to
     # skip-on-conflict / create-otherwise.
     conflict_actions: dict[str, ConflictDecision] = Field(default_factory=dict)
+    # #1892 — "replace" swaps an imported apex NS that names a host outside the
+    # target group for the group's own servers. Default keeps the rows as
+    # imported; preview lists the zones this would change.
+    apex_ns_policy: Literal["keep", "replace"] = "keep"
 
 
 class WindowsDNSPreviewIn(BaseModel):
@@ -325,6 +344,7 @@ def _zone_to_pydantic(z: ImportedZone, tlds: frozenset[str] | None = None) -> Im
         forwarders=list(z.forwarders),
         skipped_record_types=dict(z.skipped_record_types),
         parse_warnings=list(z.parse_warnings),
+        foreign_apex_ns=list(z.foreign_apex_ns),
     )
 
 
@@ -345,6 +365,7 @@ def _preview_to_pydantic(p: ImportPreview, tlds: frozenset[str] | None = None) -
         warnings=list(p.warnings),
         total_records=p.total_records,
         record_type_histogram=dict(p.record_type_histogram),
+        source_server_id=p.source_server_id,
     )
 
 
@@ -379,7 +400,27 @@ def _preview_from_pydantic(o: PreviewOut) -> ImportPreview:
         warnings=list(o.warnings),
         total_records=o.total_records,
         record_type_histogram=dict(o.record_type_histogram),
+        source_server_id=o.source_server_id,
     )
+
+
+async def _check_source_server(db: DB, plan: PreviewOut) -> None:
+    """Reject a plan whose ``source_server_id`` doesn't match its source.
+
+    The id comes back from the client with the plan, and it turns off the
+    record ops to that server (#1456), so it has to name a server of the
+    plan's own driver: a live-pull source only, never a file import.
+    """
+    if plan.source_server_id is None:
+        return
+    server = await db.get(DNSServer, plan.source_server_id)
+    if server is None or server.driver != plan.source:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Plan source_server_id {plan.source_server_id} is not a " f"{plan.source} server"
+            ),
+        )
 
 
 def _commit_result_to_pydantic(r: CommitResult) -> CommitOut:
@@ -425,6 +466,7 @@ async def _read_archive(file: UploadFile) -> bytes:
 
 
 @router.post("/bind9/preview", response_model=PreviewOut)
+@read_only_post
 async def bind9_preview(
     current_user: SuperAdmin,
     db: DB,
@@ -470,6 +512,9 @@ async def bind9_preview(
         target_view_id=str(target_view_id) if target_view_id else None,
         user=current_user.display_name,
     )
+    await annotate_apex_ns(db, preview, target_group_id)
+    annotate_admin_email(preview)
+    annotate_cname_conflicts(preview)
     return _preview_to_pydantic(preview, (await effective_registry(db)).tlds)
 
 
@@ -492,6 +537,7 @@ async def bind9_commit(
             detail=f"Plan source mismatch: endpoint=bind9 plan={body.plan.source}",
         )
 
+    await _check_source_server(db, body.plan)
     preview = _preview_from_pydantic(body.plan)
     actions: dict[str, tuple[ConflictAction, str | None]] = {
         zone_name: (decision.action, decision.rename_to)
@@ -506,6 +552,7 @@ async def bind9_commit(
             target_view_id=body.target_view_id,
             conflict_actions=actions,
             current_user=current_user,
+            apex_ns_policy=body.apex_ns_policy,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
@@ -572,6 +619,7 @@ async def windows_dns_servers(
     response_model=PreviewOut,
     responses={502: {"description": "The remote import source is unreachable or refused the pull"}},
 )
+@token_write("Live WinRM pull from a Windows DNS server with stored credentials (outbound)")
 async def windows_dns_preview(
     current_user: SuperAdmin,
     db: DB,
@@ -629,6 +677,9 @@ async def windows_dns_preview(
         target_view_id=str(body.target_view_id) if body.target_view_id else None,
         user=current_user.display_name,
     )
+    await annotate_apex_ns(db, preview, body.target_group_id)
+    annotate_admin_email(preview)
+    annotate_cname_conflicts(preview)
     return _preview_to_pydantic(preview, (await effective_registry(db)).tlds)
 
 
@@ -651,6 +702,7 @@ async def windows_dns_commit(
             detail=f"Plan source mismatch: endpoint=windows_dns plan={body.plan.source}",
         )
 
+    await _check_source_server(db, body.plan)
     preview = _preview_from_pydantic(body.plan)
     actions: dict[str, tuple[ConflictAction, str | None]] = {
         zone_name: (decision.action, decision.rename_to)
@@ -665,6 +717,7 @@ async def windows_dns_commit(
             target_view_id=body.target_view_id,
             conflict_actions=actions,
             current_user=current_user,
+            apex_ns_policy=body.apex_ns_policy,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
@@ -725,6 +778,7 @@ async def powerdns_test_connection(
     response_model=PreviewOut,
     responses={502: {"description": "The remote import source is unreachable or refused the pull"}},
 )
+@token_write("Live pull from a PowerDNS API (outbound)")
 async def powerdns_preview(
     current_user: SuperAdmin,
     db: DB,
@@ -767,6 +821,9 @@ async def powerdns_preview(
         target_view_id=str(body.target_view_id) if body.target_view_id else None,
         user=current_user.display_name,
     )
+    await annotate_apex_ns(db, preview, body.target_group_id)
+    annotate_admin_email(preview)
+    annotate_cname_conflicts(preview)
     return _preview_to_pydantic(preview, (await effective_registry(db)).tlds)
 
 
@@ -789,6 +846,7 @@ async def powerdns_commit(
             detail=f"Plan source mismatch: endpoint=powerdns plan={body.plan.source}",
         )
 
+    await _check_source_server(db, body.plan)
     preview = _preview_from_pydantic(body.plan)
     actions: dict[str, tuple[ConflictAction, str | None]] = {
         zone_name: (decision.action, decision.rename_to)
@@ -803,6 +861,7 @@ async def powerdns_commit(
             target_view_id=body.target_view_id,
             conflict_actions=actions,
             current_user=current_user,
+            apex_ns_policy=body.apex_ns_policy,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
@@ -855,6 +914,7 @@ async def technitium_test_connection(
     response_model=PreviewOut,
     responses={502: {"description": "The remote import source is unreachable or refused the pull"}},
 )
+@token_write("Live pull from a Technitium API (outbound)")
 async def technitium_preview(
     current_user: SuperAdmin,
     db: DB,
@@ -893,6 +953,9 @@ async def technitium_preview(
         target_view_id=str(body.target_view_id) if body.target_view_id else None,
         user=current_user.display_name,
     )
+    await annotate_apex_ns(db, preview, body.target_group_id)
+    annotate_admin_email(preview)
+    annotate_cname_conflicts(preview)
     return _preview_to_pydantic(preview, (await effective_registry(db)).tlds)
 
 
@@ -914,6 +977,7 @@ async def technitium_commit(
             detail=f"Plan source mismatch: endpoint=technitium plan={body.plan.source}",
         )
 
+    await _check_source_server(db, body.plan)
     preview = _preview_from_pydantic(body.plan)
     actions: dict[str, tuple[ConflictAction, str | None]] = {
         zone_name: (decision.action, decision.rename_to)
@@ -928,6 +992,7 @@ async def technitium_commit(
             target_view_id=body.target_view_id,
             conflict_actions=actions,
             current_user=current_user,
+            apex_ns_policy=body.apex_ns_policy,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
@@ -986,6 +1051,7 @@ async def cloud_dns_servers(
 
 
 @router.post("/cloud/preview", response_model=PreviewOut)
+@token_write("Live pull from a cloud DNS provider API with stored credentials (outbound)")
 async def cloud_dns_preview(
     current_user: SuperAdmin,
     db: DB,
@@ -1023,6 +1089,9 @@ async def cloud_dns_preview(
         target_group_id=str(body.target_group_id),
         user=current_user.display_name,
     )
+    await annotate_apex_ns(db, preview, body.target_group_id)
+    annotate_admin_email(preview)
+    annotate_cname_conflicts(preview)
     return _preview_to_pydantic(preview, (await effective_registry(db)).tlds)
 
 
@@ -1048,6 +1117,7 @@ async def cloud_dns_commit(
             ),
         )
 
+    await _check_source_server(db, body.plan)
     preview = _preview_from_pydantic(body.plan)
     actions: dict[str, tuple[ConflictAction, str | None]] = {
         zone_name: (decision.action, decision.rename_to)
@@ -1062,6 +1132,7 @@ async def cloud_dns_commit(
             target_view_id=body.target_view_id,
             conflict_actions=actions,
             current_user=current_user,
+            apex_ns_policy=body.apex_ns_policy,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))

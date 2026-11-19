@@ -19,8 +19,10 @@
 # binary doesn't serve (it exposes /metrics on the monitoring port), so
 # the speaker crashloops. The dependency in Chart.yaml is therefore
 # pinned to the 0.15.3 chart end-to-end. Revert to the chart default
-# once #3063 is fixed upstream. KEEP the image tags below in lock-step
-# with the chart version + appliance/scripts/bake-images.sh
+# once #3063 is fixed upstream. KEEP the controller / speaker / frr-k8s
+# image tags below in lock-step with the chart version; FRR and
+# kube-rbac-proxy are pinned past the chart's defaults as a security
+# override (#2239). Every tag must match appliance/scripts/bake-images.sh
 # ``METALLB_IMAGES``.
 # POD POSTURE (#983) — the ``priorityClassName`` values below name classes
 # rendered by a DIFFERENT release (spatium-bootstrap, the spatiumddi-appliance
@@ -211,15 +213,21 @@ metallb:
     # #575 — the frr-k8s controller wires a kube-rbac-proxy sidecar (twice
     # per pod) whose image defaults to `gcr.io/kubebuilder/kube-rbac-proxy`,
     # which Google sunset (now 404 — broke the bake + any non-airgap pull).
-    # Repoint to kube-rbac-proxy's maintained upstream home, quay.io/brancz
-    # (same image, same v0.12.0 tag). NOTE `rbacProxy` lives at the frr-k8s
-    # chart's TOP level under `prometheus:` (controller.yaml:397/423 read
+    # Repoint to kube-rbac-proxy's maintained upstream home, quay.io/brancz.
+    # #2239 — and pinned PAST the subchart's v0.12.0 default as a security
+    # override (v0.12.0 is a 2022 build carrying go-restful CVE-2022-1996, an
+    # auth bypass, on the only BGP-mode container with an authenticated
+    # listener). The subchart's args still parse on v0.23: ``--logtostderr``
+    # is accepted and ignored with a warning; ``--secure-listen-address``,
+    # ``--upstream`` and ``--tls-cipher-suites`` are unchanged.
+    # NOTE `rbacProxy` lives at the frr-k8s chart's TOP level under
+    # `prometheus:` (controller.yaml:397/423 read
     # `.Values.prometheus.rbacProxy.*`), NOT under the `frrk8s:` block below.
     # KEEP in lock-step with appliance/scripts/bake-images.sh METALLB_IMAGES.
     prometheus:
       rbacProxy:
         repository: quay.io/brancz/kube-rbac-proxy
-        tag: v0.12.0
+        tag: v0.23.0
     # frr-k8s chart's OWN internal `frrk8s:` key (see the long comment
     # above) — nodeSelector / image / frr-image config all live here,
     # NOT at this block's top level.
@@ -265,20 +273,29 @@ metallb:
       # can supply one. The render check therefore exempts these two
       # workloads by name rather than skipping the chart, which is how they
       # went unnoticed until #983. Revisit on a chart bump.
-      # Explicit image tags, locked to what the vendored 0.15.3 metallb
-      # package's frr-k8s@0.0.21 subchart defaults to (verified by
-      # inspecting charts/frr-k8s/values.yaml + Chart.yaml inside the
-      # tarball) — pin explicitly so a `helm dependency update` re-fetch
-      # that silently changes upstream defaults can't drift the pin
+      # Explicit image tags — pin explicitly so a `helm dependency update`
+      # re-fetch that silently changes upstream defaults can't drift the pin
       # unnoticed. KEEP in lock-step with
       # appliance/scripts/bake-images.sh ``METALLB_IMAGES``.
+      #
+      # frr-k8s itself stays at the vendored frr-k8s@0.0.21 subchart's own
+      # version. It is NOT image-bumpable within this chart (#2239): from
+      # v0.0.23 the binary serves its metrics over HTTPS and watches an
+      # FRRK8sConfiguration CRD, while these 0.0.21 templates probe it over
+      # plain HTTP, pass a --metrics-bind-address that collides with the new
+      # health-probe default, and grant no RBAC for that CRD — so the pod
+      # never goes Ready. versions.json ``frr-k8s.hold`` has the details.
+      #
+      # FRR is pinned past the subchart's 10.4.1 default to the newest patch
+      # on the same 10.4 line (#2239, OpenSSL CRITICAL) — security fixes
+      # only, no config-syntax changes, and the line frr-k8s 0.0.21 targets.
       image:
         repository: quay.io/metallb/frr-k8s
         tag: v0.0.21
       frr:
         image:
           repository: quay.io/frrouting/frr
-          tag: 10.4.1
+          tag: 10.4.5
         # #965 — the FRR daemon itself; see the resources note above.
         resources:
           requests:

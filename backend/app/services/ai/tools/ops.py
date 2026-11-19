@@ -5,8 +5,9 @@ buckets — they're "what an operator wants to ask the platform when
 they're staring at an incident":
 
 * ``current_state`` — single-shot rollup of "what's broken right now"
-  across every signal we already collect (open alerts, stale
-  integrations, audit-chain status, top-utilisation subnets).
+  across the signals we already collect (open alerts, top-utilisation
+  subnets, recent failed logins), each shown only to a caller who may
+  read it.
 * ``audit_walk`` — natural-language audit interrogation — "who did
   what to X in the last D hours" with optional resource_type / actor
   filters.
@@ -35,6 +36,8 @@ from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.ipam import Subnet
 from app.services.ai.tools.base import register_tool
+from app.services.ipam.probe_policy import check_probe_target
+from app.services.nettools.schemas import is_blocked_target
 
 # ── current_state ───────────────────────────────────────────────────
 
@@ -50,84 +53,67 @@ class CurrentStateArgs(BaseModel):
 
 @register_tool(
     name="current_state",
+    # The loosest of the sections' own grants: a caller who may see one
+    # section can call the tool, and each section below re-checks its own.
+    permission=("read", ("subnet", "alert", "audit_log")),
     description=(
-        "Single-shot 'what's broken right now?' rollup. Returns open "
-        "alert counts by severity, top-N highest-utilisation subnets, "
-        "audit-log chain integrity status, recent failed login bursts, "
-        "and stale audit-chain breaks. Use this when an operator says "
-        "'something is wrong, where do I look?' — it surfaces every "
-        "signal in one tool call so you can summarise without "
-        "fanning out to a half-dozen other tools."
+        "Single-shot 'what's broken right now?' rollup. Returns, for each "
+        "part the caller may read: open alert counts by severity plus the "
+        "newest critical / warning alerts (needs alert read), the top-N "
+        "highest-utilisation subnets (needs subnet read), and the number of "
+        "failed logins in the last hour (needs audit-log read). A part the "
+        "caller has no grant for is left out and named in "
+        "``sections_omitted``. Use this when an operator says 'something is "
+        "wrong, where do I look?' so you can summarise without fanning out "
+        "to a half-dozen other tools."
     ),
     args_model=CurrentStateArgs,
     category="ops",
 )
 async def current_state(
     db: AsyncSession,
-    user: User,  # noqa: ARG001 — surfaces user-scope visibility downstream
+    user: User,
     args: CurrentStateArgs,
 ) -> dict[str, Any]:
+    # Imported here: app.core.permissions loads the auth deps, which must
+    # not load on the tool-registry import path.
+    from app.core.permissions import user_has_permission  # noqa: PLC0415
+
     now = datetime.now(UTC)
+    out: dict[str, Any] = {"generated_at": now.isoformat()}
+    omitted: list[str] = []
 
-    # Open alerts grouped by severity.
-    open_alerts_q = (
-        await db.execute(
-            select(AlertEvent.severity, func.count(AlertEvent.id))
-            .where(AlertEvent.resolved_at.is_(None))
-            .group_by(AlertEvent.severity)
-        )
-    ).all()
-    alert_summary = {sev: int(n) for sev, n in open_alerts_q}
-    alert_total = sum(alert_summary.values())
-
-    # Top-severity recent alerts (the ones the operator should look
-    # at first). Critical + warning, newest 5.
-    recent_alerts = (
-        (
+    # Each section is gated on what the matching REST surface requires:
+    # alerts -> read alert, subnets -> read subnet, logins -> read audit_log.
+    if user_has_permission(user, "read", "alert"):
+        # Open alerts grouped by severity.
+        open_alerts_q = (
             await db.execute(
-                select(AlertEvent)
+                select(AlertEvent.severity, func.count(AlertEvent.id))
                 .where(AlertEvent.resolved_at.is_(None))
-                .where(AlertEvent.severity.in_(["critical", "warning"]))
-                .order_by(AlertEvent.fired_at.desc())
-                .limit(args.top_n)
+                .group_by(AlertEvent.severity)
             )
-        )
-        .scalars()
-        .all()
-    )
+        ).all()
+        alert_summary = {sev: int(n) for sev, n in open_alerts_q}
 
-    # High-utilisation subnets — pure DB query against the cached
-    # ``utilization_percent`` column. Skip soft-deleted rows; the
-    # global filter handles that automatically.
-    util_rows = (
-        (
-            await db.execute(
-                select(Subnet)
-                .where(Subnet.utilization_percent >= 80)
-                .order_by(Subnet.utilization_percent.desc())
-                .limit(args.top_n)
+        # Top-severity recent alerts (the ones the operator should look
+        # at first). Critical + warning, newest 5.
+        recent_alerts = (
+            (
+                await db.execute(
+                    select(AlertEvent)
+                    .where(AlertEvent.resolved_at.is_(None))
+                    .where(AlertEvent.severity.in_(["critical", "warning"]))
+                    .order_by(AlertEvent.fired_at.desc())
+                    .limit(args.top_n)
+                )
             )
+            .scalars()
+            .all()
         )
-        .scalars()
-        .all()
-    )
-
-    # Failed-login bursts in the last hour — spot brute-force runs
-    # without the operator having to filter audit log by hand.
-    failed_login_count = (
-        await db.execute(
-            select(func.count(AuditLog.id))
-            .where(AuditLog.action == "login")
-            .where(AuditLog.result == "failure")
-            .where(AuditLog.timestamp >= now - timedelta(hours=1))
-        )
-    ).scalar_one()
-
-    return {
-        "generated_at": now.isoformat(),
-        "open_alerts_total": alert_total,
-        "open_alerts_by_severity": alert_summary,
-        "recent_critical_or_warning": [
+        out["open_alerts_total"] = sum(alert_summary.values())
+        out["open_alerts_by_severity"] = alert_summary
+        out["recent_critical_or_warning"] = [
             {
                 "severity": e.severity,
                 "subject_type": e.subject_type,
@@ -136,8 +122,27 @@ async def current_state(
                 "fired_at": e.fired_at.isoformat() if e.fired_at else None,
             }
             for e in recent_alerts
-        ],
-        "high_utilisation_subnets": [
+        ]
+    else:
+        omitted.append("alerts")
+
+    if user_has_permission(user, "read", "subnet"):
+        # High-utilisation subnets — pure DB query against the cached
+        # ``utilization_percent`` column. Skip soft-deleted rows; the
+        # global filter handles that automatically.
+        util_rows = (
+            (
+                await db.execute(
+                    select(Subnet)
+                    .where(Subnet.utilization_percent >= 80)
+                    .order_by(Subnet.utilization_percent.desc())
+                    .limit(args.top_n)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        out["high_utilisation_subnets"] = [
             {
                 "id": str(s.id),
                 # #923: the column is ``network``; ``Subnet.cidr`` does not
@@ -150,15 +155,35 @@ async def current_state(
                 "utilization_percent": float(s.utilization_percent or 0),
             }
             for s in util_rows
-        ],
-        "failed_logins_last_hour": int(failed_login_count),
-        "hint": (
-            "If ``open_alerts_total`` is 0, ``failed_logins_last_hour`` is "
-            "small, and no subnet is past 80% utilisation, tell the user the "
-            "platform is healthy. Otherwise summarise the top concerns and "
-            "suggest the relevant admin page (Alerts / IPAM / Audit)."
-        ),
-    }
+        ]
+    else:
+        omitted.append("subnets")
+
+    if user_has_permission(user, "read", "audit_log"):
+        # Failed-login bursts in the last hour — spot brute-force runs
+        # without the operator having to filter audit log by hand.
+        failed_login_count = (
+            await db.execute(
+                select(func.count(AuditLog.id))
+                .where(AuditLog.action == "login")
+                .where(AuditLog.result == "failure")
+                .where(AuditLog.timestamp >= now - timedelta(hours=1))
+            )
+        ).scalar_one()
+        out["failed_logins_last_hour"] = int(failed_login_count)
+    else:
+        omitted.append("failed_logins")
+
+    out["sections_omitted"] = omitted
+    out["hint"] = (
+        "If ``open_alerts_total`` is 0, ``failed_logins_last_hour`` is "
+        "small, and no subnet is past 80% utilisation, tell the user the "
+        "platform is healthy. A section listed in ``sections_omitted`` was "
+        "not checked (the caller lacks its permission): say so rather than "
+        "calling the platform healthy. Otherwise summarise the top concerns "
+        "and suggest the relevant admin page (Alerts / IPAM / Audit)."
+    )
+    return out
 
 
 # ── audit_walk ──────────────────────────────────────────────────────
@@ -202,6 +227,7 @@ class AuditWalkArgs(BaseModel):
 
 @register_tool(
     name="audit_walk",
+    permission=("read", "audit_log"),
     description=(
         "Walk the audit log with operator-friendly filters — answers "
         "'who changed X last week?' / 'what did user Y do?' / 'show me "
@@ -278,10 +304,42 @@ class TlsCertCheckArgs(BaseModel):
         return v
 
 
-def _fetch_cert_sync(host: str, port: int, timeout: float) -> dict[str, Any]:
+def _resolve_allowed(host: str, port: int) -> tuple[str | None, str | None]:
+    """Resolve ``host`` and apply the network tools' SSRF denylist
+    (loopback / link-local / cloud-metadata) to EVERY address it maps to.
+
+    Returns ``(connect_ip, None)`` on success or ``(None, reason)`` when the
+    target is refused. The caller connects to the returned address rather
+    than re-resolving, so a name cannot be rebound into a blocked range
+    between this check and the connect. An unresolvable name is not refused
+    here — ``(None, None)`` lets the connect report the resolver error.
+    """
+    if is_blocked_target(host):
+        return (
+            None,
+            f"target {host!r} is in a blocked range (loopback / link-local / cloud-metadata)",
+        )
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except (socket.gaierror, UnicodeError):
+        return None, None
+    addrs = [str(info[4][0]) for info in infos]
+    for addr in addrs:
+        if is_blocked_target(addr):
+            return None, (
+                f"target {host!r} resolves to {addr}, which is in a blocked range "
+                "(loopback / link-local / cloud-metadata)"
+            )
+    return (addrs[0] if addrs else None), None
+
+
+def _fetch_cert_sync(
+    host: str, port: int, timeout: float, connect_ip: str | None = None
+) -> dict[str, Any]:
     """Blocking SSL fetch — runs in a thread to keep the event loop
     free. Returns the parsed cert dict (binary form decoded by
-    ``ssl.SSLSocket.getpeercert``)."""
+    ``ssl.SSLSocket.getpeercert``). Connects to ``connect_ip`` when given
+    (the address the SSRF check approved), sending ``host`` as SNI."""
     ctx = ssl.create_default_context()
     # We want the cert even when it's expired or self-signed — the
     # tool's whole job is to surface those problems. Accept any chain.
@@ -298,7 +356,7 @@ def _fetch_cert_sync(host: str, port: int, timeout: float) -> dict[str, Any]:
     # broken.
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
 
-    with socket.create_connection((host, port), timeout=timeout) as sock:
+    with socket.create_connection((connect_ip or host, port), timeout=timeout) as sock:
         with ctx.wrap_socket(sock, server_hostname=host) as tls_sock:
             der = tls_sock.getpeercert(binary_form=True)
             tls_version = tls_sock.version()
@@ -403,6 +461,9 @@ def _parse_x509_date(value: str | None) -> datetime | None:
 
 @register_tool(
     name="tls_cert_check",
+    outbound=True,
+    rate_limit="default",
+    permission=("read", "use_network_tools"),
     description=(
         "Fetch the TLS certificate served by host:port and report the "
         "subject, issuer, SANs, validity window, and days-until-expiry. "
@@ -414,15 +475,29 @@ def _parse_x509_date(value: str | None) -> datetime | None:
     args_model=TlsCertCheckArgs,
     category="ops",
     default_enabled=False,
+    module="tools.network",
 )
 async def tls_cert_check(
-    db: AsyncSession,  # noqa: ARG001
+    db: AsyncSession,
     user: User,  # noqa: ARG001
     args: TlsCertCheckArgs,
 ) -> dict[str, Any]:
     timeout = 10.0
+    # Same guards the network tools apply (GHSA-4wrc-78rq-vgcg): the SSRF
+    # denylist, checked against every resolved address, and the
+    # fragile-device do-not-probe scopes (#722).
+    connect_ip, blocked = await asyncio.to_thread(_resolve_allowed, args.host, args.port)
+    if blocked is not None:
+        return {"host": args.host, "port": args.port, "error": f"{blocked}; refused"}
+    verdict = await check_probe_target(db, args.host)
+    if verdict.blocked:
+        return {
+            "host": args.host,
+            "port": args.port,
+            "error": verdict.message(action="TLS probing"),
+        }
     try:
-        info = await asyncio.to_thread(_fetch_cert_sync, args.host, args.port, timeout)
+        info = await asyncio.to_thread(_fetch_cert_sync, args.host, args.port, timeout, connect_ip)
     except (TimeoutError, OSError, ssl.SSLError) as exc:
         return {
             "host": args.host,
@@ -512,6 +587,8 @@ class HelpWritePermissionArgs(BaseModel):
 
 @register_tool(
     name="help_write_permission",
+    honours_token_binding=True,
+    permission="authenticated",
     description=(
         "Build the RBAC permission JSON to paste into a Role's "
         "``permissions`` list. Validates the action and resource_type "

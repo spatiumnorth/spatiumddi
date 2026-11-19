@@ -66,12 +66,27 @@ RUN echo "apk snapshot ${APK_SNAPSHOT}" >/dev/null \
       nftables libcap \
       ca-certificates tzdata \
       iputils traceroute bind-tools \
- && addgroup -S spatium \
- && adduser -S -G spatium spatium \
+ && addgroup -S -g 101 spatium \
+ && adduser -S -u 100 -G spatium spatium \
+ && addgroup -S -g 2770 spatium-host \
+ && addgroup spatium spatium-host \
  && mkdir -p /var/lib/spatium-supervisor \
  && chown -R spatium:spatium /var/lib/spatium-supervisor \
  && setcap cap_net_admin+eip /usr/sbin/nft \
  && setcap cap_net_raw+ep /usr/bin/traceroute
+# GHSA-h2j9-qrg7-grfw — the ``spatium`` ids are PINNED (100/101: what
+# ``-S`` happened to allocate on this base, so nothing already on disk
+# changes owner) and the user is a member of ``spatium-host`` (2770). The
+# host's trigger directory /var/lib/spatiumddi/release-state is 1770
+# root:2770, no longer 1777, so that membership is what lets the
+# supervisor write triggers; the host kubeconfig is 0640 root:2770 for the
+# same reason. ``spatiumddi-trigger-guard`` on the host accepts triggers
+# owned by uid 100, so a dynamically allocated uid would break every
+# trigger plane. The entrypoint's ``su-exec spatium`` runs initgroups(),
+# which is how the 2770 membership reaches the process — a pod-level
+# supplementalGroups would not survive it. All three numbers must match
+# appliance/ (spatiumddi-firstboot, spatiumddi-trigger-guard,
+# config.yaml.d/spatium-kubeconfig.yaml); appliance/tests pins that.
 # dashboard-and-remote-nettools — traceroute needs a raw socket but
 # Alpine ships it NON-setuid, so the unprivileged ``spatium`` user the
 # entrypoint drops to can't open one without a file cap. ``ping`` is
@@ -123,3 +138,23 @@ ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/spatium-supervisor-entrypoint"]
 # Last, so a new version only rebuilds this layer.
 ARG APP_VERSION=dev
 ENV SPATIUM_SUPERVISOR_VERSION=${APP_VERSION}
+
+# #3913 — image metadata the OCI spec and Red Hat's preflight expect, plus the
+# project licence texts at /licenses. ``release`` is the image build number,
+# not the product version; ``version`` follows APP_VERSION from release.yml.
+ARG IMAGE_RELEASE=1
+COPY LICENSE NOTICE /licenses/
+LABEL name="spatium-supervisor" \
+      vendor="Spatium North Inc." \
+      version="${APP_VERSION:-dev}" \
+      release="${IMAGE_RELEASE}" \
+      summary="SpatiumDDI appliance supervisor" \
+      description="Host-side supervisor for SpatiumDDI appliances: pairing, role assignment and health reporting." \
+      maintainer="Spatium North Inc. <https://www.spatiumddi.com/>" \
+      url="https://www.spatiumddi.com/" \
+      org.opencontainers.image.title="spatium-supervisor" \
+      org.opencontainers.image.vendor="Spatium North Inc." \
+      org.opencontainers.image.url="https://www.spatiumddi.com/" \
+      org.opencontainers.image.source="https://github.com/spatiumnorth/spatiumddi" \
+      org.opencontainers.image.documentation="https://www.spatiumddi.com/" \
+      org.opencontainers.image.licenses="Apache-2.0"

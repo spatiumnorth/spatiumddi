@@ -27,6 +27,15 @@ image:
 # Chart-wide settings the appliance + multi-node HA work consume.
 # Plain K8s / docker-compose installs leave these at defaults.
 global:
+  # #3852 — ``auto`` (the default) detects OpenShift from the cluster serving
+  # ``security.openshift.io/v1``; ``openshift`` / ``kubernetes`` force it.
+  # ``helm template`` has no cluster to ask, so pass ``--api-versions
+  # security.openshift.io/v1`` or set this. On OpenShift the chart omits the
+  # pinned uid / gid / fsGroup values its restricted SCC refuses, runs the
+  # frontend on :8080, and renders the ``openshift`` objects below. Everywhere
+  # else it renders exactly as before.
+  platform: auto
+
   # #272 Phase 1 — every control-plane workload (api / frontend /
   # worker / beat / postgres / redis) merges this map into its
   # nodeSelector block on top of any per-component override. The
@@ -63,6 +72,40 @@ global:
   # runs out of memory.
   servicePriorityClassName: ""
 
+# ── OpenShift (#3852) ────────────────────────────────────────────────────────
+# Read ONLY when the platform is OpenShift (``global.platform``). See
+# docs/deployment/KUBERNETES.md, "OpenShift".
+openshift:
+  # A ``route.openshift.io/v1`` Route in front of the frontend Service.
+  route:
+    enabled: true
+    # Empty lets the router pick ``<name>-<namespace>.<apps domain>``.
+    host: ""
+    # ``edge`` (the router terminates TLS with its default certificate unless
+    # you add one) or ``none`` (plain HTTP). passthrough / reencrypt need TLS
+    # inside the frontend pod and are refused.
+    termination: edge
+    # What the router does with plain HTTP when ``termination: edge``:
+    # Redirect | Allow | None.
+    insecureEdgeTerminationPolicy: Redirect
+    # The Web UI streams (AI chat, logs, cluster health); the router's 30 s
+    # default drops an idle stream.
+    annotations:
+      haproxy.router.openshift.io/timeout: 1h
+  scc:
+    # Create the SecurityContextConstraints, ServiceAccounts and RBAC the DNS /
+    # DHCP agents need to bind :53 / :67. Set false where SCCs are managed by
+    # the cluster admins: then grant an SCC allowing NET_BIND_SERVICE (and
+    # NET_RAW for Kea) with allowPrivilegeEscalation true to the
+    # ``<fullname>-dns-agent`` / ``-dhcp-agent`` ServiceAccounts yourself.
+    create: true
+  # Give the worker NET_RAW + NET_BIND_SERVICE (and its own SCC) so nmap raw
+  # scans work. OFF by default: the control plane then runs under plain
+  # restricted-v2 with no grant at all, and nmap / tcpdump fall back to what an
+  # unprivileged process can do. Needs ``worker.serviceAccount.enabled``.
+  # Independent of ``worker.netRawCapability``, which is ignored on OpenShift.
+  workerNetRaw: false
+
 # Cluster-wide app name override. Leave empty to use `.Release.Name`.
 fullnameOverride: ""
 nameOverride: ""
@@ -73,12 +116,39 @@ nameOverride: ""
 # upgrades. Override only if you're consolidating secret management.
 auth:
   secretKey: ""
-  existingSecret: ""             # must carry key `secret-key`; `metrics-token` optional
+  existingSecret: ""             # must carry key `secret-key`; `metrics-token` and `credential-key` optional
+  # #1358 — CREDENTIAL_ENCRYPTION_KEY: the Fernet key stored credentials are
+  # encrypted under. Empty = generated and kept across upgrades, like secretKey.
+  # Set it explicitly when rendering without a cluster (helm template, GitOps).
+  credentialEncryptionKey: ""
+  # #1358 — CREDENTIAL_KEY_SINCE. Empty = the chart decides: it stamps the
+  # release that adds a key to an already-running install, and the api of
+  # that release keeps writing under the old key until the next upgrade (so a
+  # pod from before the key can still read everything). A render without
+  # cluster access (helm template, GitOps) cannot see the stored value, so it
+  # stamps the version being rendered every time and writes never move onto
+  # the key: there, set this to the version that first carried the key.
+  credentialKeySince: ""
   # #1159 — bearer token /metrics accepts (any API token works too). Empty =
   # generated on first install and kept across upgrades, like secretKey.
   metricsToken: ""
 
 # ── API ──────────────────────────────────────────────────────────────────────
+# #1826 — env appended to the api, worker AND beat containers (not the migrate
+# Job or the slot-image mirror). Anything the Celery side reads from
+# ``settings`` belongs here rather than in ``api.env``; the appliance's
+# APPLIANCE_MODE / hostname / host IPs live here. Same shape as ``api.env``.
+sharedEnv: []
+
+# #2004 / #2176 — the appliance's version, appended to the api, worker and beat
+# env as APPLIANCE_VERSION (``settings.appliance_version``: what system/info and
+# /version report). A value of its own rather than a ``sharedEnv`` entry, so a
+# cluster Rolling Upgrade can hold it with ``image.tag`` in the HelmChartConfig
+# until every node runs the target: a HelmChartConfig pins a scalar, but
+# replaces a list whole. Empty (the default, and every install that is not an
+# appliance) renders no APPLIANCE_VERSION, which the api reads as unknown.
+applianceVersion: ""
+
 api:
   replicas: 2
   priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class
@@ -97,15 +167,61 @@ api:
   service:
     type: ClusterIP
     port: 8000
+    # #1805 — "" (the default) renders no field: kube-proxy spreads every
+    # caller's connections over every api pod, as before #1805.
+    # PreferSameNode sends a node's connections to the api pod on that node
+    # while it is ready, and to all api pods only while it is not; a node
+    # with no api pod of its own keeps the spread. The appliance sets it in
+    # its own values (firstboot's spatium-control HelmChart and the seed
+    # supervisor's HelmChartConfig): it runs one api pod per control-plane
+    # node, and a node lost hard keeps its api pod listed until the node
+    # reads NotReady (about 40 s), so without it a share of every other
+    # node's requests (the supervisor's heartbeat, the DNS and DHCP agents,
+    # the frontend's /api proxy) hung there until the caller's own timeout.
+    # On other clusters it pins every caller on a node that runs an api pod
+    # to that one pod, which can leave the other api pods idle and the HPA
+    # reacting late. Rendered on Kubernetes 1.34+, where the PreferSameNode
+    # feature is on by default; older API servers refuse the value.
+    trafficDistribution: ""
+    # #3645 — false (the default) renders only the one api Service. true adds
+    # a second, ``<release>-api-local`` with ``internalTrafficPolicy: Local``,
+    # which only ever answers from an api pod on the caller's own node, for
+    # the member supervisors' heartbeat, so that plain-http hop never crosses
+    # the node LAN (with no local pod they fall back to their pinned https
+    # URL). The frontend keeps the cluster Service: a node whose api pod is
+    # down or being rolled must still serve the UI. The appliance sets it in firstboot's HelmChart and the supervisor's
+    # HelmChartConfig; leave it off elsewhere.
+    nodeLocal: false
   autoscaling:
     enabled: true
     minReplicas: 2
     maxReplicas: 10
+    # #3110 — the autoscaler scales on CPU, which falls as replicas share the
+    # load: 70 % of the 200m request below is 140m per pod, and each of two api
+    # pods used about 100m under light load (amd64), so light use stays at
+    # minReplicas and a heavier load scales out.
     targetCPUUtilizationPercentage: 70
-    targetMemoryUtilizationPercentage: 80
+    # #3110 — memory is opt-in: empty (the default) renders no memory metric.
+    # One api process's memory is its own baseline, about 305 MiB from the
+    # moment it starts, so adding replicas does not lower the average: once a
+    # memory target is passed the autoscaler goes to maxReplicas and stays
+    # there. At 80 % of the old 256Mi request that happened at rest, and every
+    # default install with a metrics-server ran 10 idle replicas. If you set
+    # one, aim it above what a busy api pod holds (80 % of the 512Mi request
+    # is about 410 MiB) and expect it to scale up only.
+    targetMemoryUtilizationPercentage:
+  # #3110 — sized from the measured footprint (docs/deployment/SIZING.md,
+  # Kubernetes). One api pod held about 305 MiB at rest and at most 373 MiB
+  # under light load, so the memory request holds it: a pod above its memory
+  # request is the kubelet's first eviction candidate (#1828). One process
+  # taking all of the light load peaked at 469 MiB, and on the appliance 0.4
+  # to 0.85 GiB under the API suite: hence the 1Gi limit, the appliance's own
+  # floor. The appliance sizes these limits from the node's RAM and CPUs
+  # (firstboot, k8s_api.control_plane_resources) and keeps these requests;
+  # the slot-image mirror takes all four (#1174).
   resources:
-    requests: { cpu: 100m, memory: 256Mi }
-    limits:   { cpu: 1000m, memory: 512Mi }
+    requests: { cpu: 200m, memory: 512Mi }
+    limits:   { cpu: 1000m, memory: 1Gi }
   # #1051 — probe budgets sized for a BUSY event loop, not an idle one.
   #
   # The api is one uvicorn worker, so the kubelet's probes are answered by
@@ -140,6 +256,22 @@ api:
       timeoutSeconds: 15
       failureThreshold: 3
   env: []                        # extra env entries appended to container
+  # #2156 — the api's SQLAlchemy pool per pod, rendered as DATABASE_POOL_SIZE /
+  # DATABASE_MAX_OVERFLOW. Unset (the default) leaves the application's own
+  # 10 + 20. Every api pod holds its pool against the same Postgres, so
+  # replicas x (size + maxOverflow) is what Postgres' max_connections and its
+  # memory limit have to hold, plus three per pod outside the pool: the
+  # after-commit hooks' two (#2782) and the readiness probe's one (#2944).
+  # At the defaults (2..10 replicas, 33 each) that is 66..330 api
+  # connections. Postgres' max_connections is derived from this pool and the
+  # HPA maximum when it is left empty (#2955, ``postgresql.maxConnections`` /
+  # ``postgresql.cnpg.parameters.max_connections``), so changing the pool or
+  # the HPA moves it; a pinned max_connections has to be sized by hand. The
+  # appliance's supervisor sets the pool from the control-plane node count
+  # (fewer per pod past four nodes).
+  databasePool:
+    size:
+    maxOverflow:
   nodeSelector: {}
   # Fast-eviction tolerations are NOT a chart default: setting both taint
   # keys explicitly suppresses Kubernetes' DefaultTolerationSeconds
@@ -170,6 +302,9 @@ api:
   # Off-appliance docker-compose installs leave this off; the
   # /appliance/* endpoints no-op there anyway via the
   # ``settings.appliance_mode`` gate.
+  # #3761 — also what makes Platform Insights > Containers show this release's
+  # pods + their (redacted) logs on a plain Helm install; without it that tab
+  # reports "Kubernetes not available: enable api.serviceAccount.enabled".
   serviceAccount:
     enabled: false
   # #296 Phase C/D/E — opt-in cluster-scoped + kube-system RBAC for
@@ -179,6 +314,10 @@ api:
   # (nodeMaintenanceWindow); manage the orchestrator's Lease in the
   # api's own namespace; GET+PATCH HelmChartConfigs in kube-system
   # (chart image-tag bump after every node is on the new slot).
+  # The orchestrator itself runs in the Celery worker, so when
+  # ``worker.serviceAccount.enabled`` is also on, the worker's SA gets
+  # the same grants (its own Role carries only the orchestrator's
+  # namespaced rules, not the api's Secret / Deployment patch) (#1445).
   # Plain docker/k8s deploys that don't run the rolling upgrade flow
   # leave this off — the api stays scoped to namespace-only Pod /
   # Secret / Deployment grants and can't touch cluster-scoped
@@ -260,6 +399,11 @@ api:
     # which actually lives at ``/var/lib/spatiumddi/release-state/...``
     # on the appliance's filesystem.
     releaseStateDir: /var/lib/spatiumddi/release-state
+    # GHSA-h2j9-qrg7-grfw — the gid that owns releaseStateDir (mode 1770,
+    # set by spatiumddi-firstboot + a tmpfiles.d entry). Added to the api
+    # pod's supplementalGroups so it can write triggers there. Must match
+    # SPATIUM_HOST_GID in appliance/…/spatiumddi-firstboot.
+    hostGroupGid: 2770
     hostLogDir: /var/log/spatiumddi
     hostEtcDir: /etc/spatiumddi
     # #386 — host dir backing the api's upgrade-image store
@@ -319,7 +463,8 @@ api:
 # upgrades. Without this, the upload endpoint writes to the api pod's
 # ephemeral local FS and every other api replica 404s on the serve
 # side. The api Deployment proxies byte ops to the mirror Service when
-# ``SLOT_IMAGE_MIRROR_URL`` is set on the api (via env wiring below).
+# ``SLOT_IMAGE_MIRROR_URL`` is set on the api; the worker gets it too, for
+# the upgrade preflight's mirror disk-headroom check (#1826).
 #
 # Disabled by default — only useful for multi-replica api deployments
 # that also use the slot-image upload feature (= multi-node appliance
@@ -357,12 +502,21 @@ slotImageMirror:
     # appliance uses ``local-path`` (k3s default), which is RWO +
     # node-pinned — exactly the property we want here.
     storageClass: ""
-  resources:
-    # Mostly idle process serving multipart streams. Resources match
-    # the api defaults so we can reuse the image without surprise
-    # OOM behaviour during a large upload.
-    requests: { cpu: 50m, memory: 128Mi }
-    limits:   { cpu: 500m, memory: 256Mi }
+  # #1174 — empty: the mirror takes ``api.resources``. It runs the api's
+  # image and imports the whole application before it serves a byte
+  # (about 280 MiB resident once started, on the 2026-10-02 image), so it
+  # is sized as the api: the chart's api defaults here, and on an
+  # appliance the limit the supervisor sizes from the node's RAM. The
+  # 256Mi / 500m it used to carry OOMKilled it during that import on every
+  # multi-node control plane. Keys set here are laid over the api's
+  # (e.g. ``limits: { memory: 2Gi }``); keep its limits at or above the
+  # api's, which the Charts job's ``chart-slot-image-mirror.py`` enforces.
+  resources: {}
+  # #1174 — empty: the mirror's liveness and readiness probes take
+  # ``api.probes`` (#1051), because they probe the same process. Keys set
+  # here are laid over the api's, e.g. ``liveness: { periodSeconds: 60 }``;
+  # the Charts job refuses a timeout or a failure budget below the api's.
+  probes: {}
   nodeSelector: {}
   tolerations: []
   auth:
@@ -419,6 +573,22 @@ frontend:
   # Off-appliance K8s deployments leave this false + run an Ingress
   # in front instead.
   hostNetwork: false
+  # ── Reverse proxy / ingress in front of the frontend (#1868) ─────────────
+  # Comma-separated CIDRs (or addresses) of the proxy / ingress controller
+  # whose X-Forwarded-For and X-Forwarded-Proto the frontend nginx believes
+  # (FRONTEND_TRUSTED_PROXY_CIDRS). It then takes the real client address and
+  # scheme from them, so the login throttle, audit rows, the Secure refresh
+  # cookie and SSO callback URLs describe the user and not the ingress.
+  # Empty (default) trusts no proxy: today's behaviour. List ONLY the proxy
+  # (for ingress-nginx, its pod network): every listed peer can choose the
+  # client address it reports, so a private-range catch-all lets anything in
+  # those ranges that can reach the frontend Service spoof it. Keep the
+  # frontend Service ClusterIP when you list a pod network, since NodePort /
+  # LoadBalancer traffic can be SNAT'd to a node address in that range.
+  # ``*`` trusts every peer. The api needs nothing here: its own TRUSTED_PROXY_CIDRS
+  # default (private ranges) already covers the frontend pods.
+  # See docs/deployment/REVERSE_PROXY.md.
+  trustedProxyCidrs: ""
   # Phase 11 wave 3 (#183) — TLS termination at the frontend nginx.
   # When enabled, the frontend pod mounts a ConfigMap with a
   # TLS-aware nginx template (templates/frontend-tls-config.yaml)
@@ -431,6 +601,12 @@ frontend:
   tls:
     enabled: false
     secretName: spatium-appliance-tls
+    # With tls.enabled the :80 listener 301s to https UNLESS a proxy listed in
+    # ``frontend.trustedProxyCidrs`` sends ``X-Forwarded-Proto: https``
+    # (#1868): a TLS-terminating proxy that talks plain http to :80 is served
+    # directly instead of looping. With trustedProxyCidrs empty the redirect
+    # is unconditional, as before. The simplest proxy setup is still
+    # tls.enabled=false (see docs/deployment/REVERSE_PROXY.md).
   # Issue #176: the frontend nginx proxies ``/api/`` to the api Service
   # using a runtime-substituted upstream. The Docker image defaults to
   # ``api:8000`` (the Compose service name) which doesn't resolve on
@@ -464,6 +640,9 @@ frontend:
 # ── Worker (Celery queues: ipam, dns, dhcp, default, bundles) ─────────────────────────
 worker:
   replicas: 2
+  # #1754 — must exceed the worst-case warm shutdown (WORKER_TERMINATION_GRACE_S
+  # in backend/app/celery_app.py); a lower value reopens the SIGKILL window.
+  terminationGracePeriodSeconds: 90
   priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class
   # #983 Phase 2 — mount a ServiceAccount on the worker so it can read the
   # kubelet Summary API. Alert evaluation runs in the WORKER, so without this
@@ -492,16 +671,34 @@ worker:
   # #1111 — ``bundles`` carries the DNS agent bundle renders; give it its
   # own worker (concurrency 1, its own memory cap) on large-record estates.
   queues: "ipam,dns,dhcp,default,bundles"
+  # Memory (#2227, measured): each of the ``concurrency`` processes is about
+  # 130 MB at rest. A bundle render adds about 4 kB per zone in the group,
+  # ~15 MB for one batch of records and twice the compressed body, whatever
+  # the record count: ~100 MB for 20k zones at 1M or 2M records (it was
+  # ~850 MB per million records before #2227). Under split-horizon views add
+  # ~1 - 1.5 kB per record of the group's largest zone. At most
+  # ``DNS_AGENT_BUNDLE_RENDER_SLOTS`` (2) renders run at once fleet-wide. See
+  # docs/features/DNS.md, "Control-plane memory for large groups".
+  # #3110 — measured (docs/deployment/SIZING.md, Kubernetes): the four
+  # processes grow for about the first hour, then level off near 1 GiB. Under
+  # the old 1Gi limit that left about 0.1 GiB for a burst of work (amd64: 0.87
+  # and 0.91 GiB two hours in; arm64 reached the limit after about 40 minutes,
+  # the kernel reclaiming page cache to stay under it), and with no limit one
+  # worker peaked at 1084 MiB. Hence 2Gi. The appliance sizes this limit from
+  # the node's RAM (firstboot, k8s_api.control_plane_resources).
   resources:
     requests: { cpu: 200m, memory: 256Mi }
-    limits:   { cpu: 2000m, memory: 1Gi }
-  # Add CAP_NET_RAW to the worker pod so nmap can do SYN scans + ``-O``
-  # OS detection from the device-profiling auto-nmap path. NET_RAW is
-  # in containerd's default cap set so this is a no-op on permissive
-  # clusters; on restricted PSA / OpenShift-SCC it's required.
-  # Set to false if you've turned off device profiling cluster-wide
-  # and want a tighter security posture.
-  netRawCapability: true
+    limits:   { cpu: 2000m, memory: 2Gi }
+  # Explicitly ADD CAP_NET_RAW to the worker container (#3952). Off by
+  # default, and leaving it off costs nothing on containerd (k3s, Talos,
+  # EKS, AKS, GKE): containerd's default capability set already carries
+  # NET_RAW, so nmap's SYN scans and ``-O`` OS detection work without it.
+  # Turning it on matters only on a runtime whose default set lacks NET_RAW
+  # (CRI-O outside OpenShift). It also makes the pod fail Pod Security
+  # ``baseline``: PSA refuses the whole pod at admission, it does not drop
+  # the capability. So with ``true`` the namespace must be ``privileged``,
+  # or exempted. OpenShift is handled by ``openshift.workerNetRaw`` instead.
+  netRawCapability: false
   nodeSelector: {}
   # See api.tolerations — fast eviction is an appliance-only override.
   tolerations: []
@@ -532,6 +729,20 @@ beat:
   # tolerationSeconds so the gap is ~30s instead of the ~300s default.
   fastRescheduleSeconds: 30
 
+# ── Init containers ──────────────────────────────────────────────────────────
+# #3208 — resources of the ``wait-for-postgres`` / ``wait-for-migrate`` init
+# containers of the migrate Job and the api / worker / beat / slot-image-mirror
+# pods, and of the Redis sentinel pods' ``render-config`` init container. They
+# are a ``sleep 3`` loop (the migrate wait runs ``alembic`` once per
+# loop, so it needs the memory), sized as such. Without them a namespace
+# LimitRange or a policy that requires resources on every container, init
+# containers included, either rejects the pod or fills them in with its own
+# defaults.
+initContainers:
+  resources:
+    requests: { cpu: 10m, memory: 32Mi }
+    limits:   { memory: 256Mi }
+
 # ── Migrate (Alembic upgrade head) ───────────────────────────────────────────
 # Regular Job (named per Helm revision so each install/upgrade creates
 # a fresh one). The Job's pod has a wait-for-postgres init container; the
@@ -546,16 +757,42 @@ migrate:
   # Without a TTL the cluster would slowly accumulate one completed Job
   # per Helm revision.
   ttlSecondsAfterFinished: 600
+  # Annotations on the Job object (not its pod). For GitOps controllers that
+  # render the chart with ``helm template``, where ``.Release.Revision`` is
+  # always 1: the Job is then ``<release>-migrate-r1`` on every sync, and a
+  # Job's pod template is immutable, so the first image bump fails with
+  # "field is immutable" until the old Job is deleted by hand. Under Argo CD,
+  # make it a sync hook so it is recreated (and re-run) on every sync:
+  #   argocd.argoproj.io/hook: Sync
+  #   argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+  # Plain ``helm install`` / ``helm upgrade`` ignore these.
+  annotations: {}
   resources:
     requests: { cpu: 50m, memory: 128Mi }
     limits:   { cpu: 200m, memory: 256Mi }
+  # #3207 — placement of the Job's pod. UNSET (null) follows the api, so the
+  # Job runs where the api runs and is kept off the nodes the rest of the
+  # release is kept off: ``api.nodeSelector`` / ``api.tolerations`` /
+  # ``api.affinity.nodeAffinity`` (not the api's pod (anti-)affinity, which
+  # is about api pods and would keep the Job off the api's nodes), with
+  # ``global.controlPlaneNodeSelector`` merged into the
+  # selector as for every control-plane workload. Set to ``{}`` / ``[]`` to
+  # place the Job with no selector / toleration / affinity of its own (the
+  # global selector still applies to the selector).
+  nodeSelector:
+  tolerations:
+  affinity:
 
 # ── Ingress (for the frontend; API is routed through the frontend nginx) ─────
 ingress:
   enabled: false
   className: nginx
   annotations: {}
+    # nginx.ingress.kubernetes.io/proxy-buffering: "off"      # SSE: AI chat, cluster health, logs (#1868)
+    # nginx.ingress.kubernetes.io/proxy-body-size: "4g"       # ingress-nginx's 1m default 413s imports + backup / slot-image uploads (#3036)
+    # nginx.ingress.kubernetes.io/proxy-request-buffering: "off"  # stream bodies to the frontend nginx, which applies the per-route limits
     # nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    # nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
     # cert-manager.io/cluster-issuer: letsencrypt-prod
   hosts:
     - host: spatiumddi.example.com
@@ -594,6 +831,16 @@ postgresql:
   enabled: true
   priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class
   kind: standalone
+  # #2955 — standalone only: max_connections. "" derives it from the pools
+  # (see ``postgresql.cnpg.parameters.max_connections``) and raises the memory
+  # limit below to hold it (see ``resources``). Changing it, or the pools /
+  # HPA it derives from, restarts the Postgres pod once.
+  maxConnections: ""
+  # #3932 — standalone only: ``idle_in_transaction_session_timeout`` ("0"
+  # turns it off). The CNPG kind sets it in ``cnpg.parameters``. The pod's
+  # args also carry the TCP keepalives, so the first upgrade to this chart
+  # restarts a standalone Postgres once.
+  idleInTransactionSessionTimeout: "1h"
   image:
     repository: postgres
     tag: "16-alpine"
@@ -611,6 +858,12 @@ postgresql:
     enabled: true
     size: 8Gi
     storageClass: ""             # empty → cluster default StorageClass
+  # #2955 — while max_connections is derived (the default, either kind) the
+  # chart RAISES the memory limit to shared_buffers + 256 MiB +
+  # max_connections x (14 MiB + shared_buffers / 512), the appliance's rule
+  # (#2156): ~14 MiB is one busy backend. At the defaults that is 5919Mi
+  # standalone and 6077Mi on CNPG. The request is not touched, so scheduling
+  # is unchanged; set max_connections (and smaller pools) to keep a lower limit.
   resources:
     requests: { cpu: 100m, memory: 256Mi }
     limits:   { cpu: 1000m, memory: 1Gi }
@@ -633,6 +886,18 @@ postgresql:
       operator: Exists
       effect: NoExecute
       tolerationSeconds: 20
+  # Standalone: rendered as the pod's whole ``affinity``. ``kind: cnpg``
+  # (#3205): only ``nodeAffinity`` is read, and lands in the Cluster's
+  # ``spec.affinity.nodeAffinity`` beside the ``nodeSelector`` / tolerations /
+  # pod anti-affinity settings (CNPG owns the pod anti-affinity), so Postgres
+  # can PREFER a node without being hard-pinned to it by ``nodeSelector``:
+  #   affinity:
+  #     nodeAffinity:
+  #       preferredDuringSchedulingIgnoredDuringExecution:
+  #         - weight: 100
+  #           preference:
+  #             matchExpressions:
+  #               - { key: kubernetes.io/hostname, operator: In, values: [node-a] }
   affinity: {}
   # CNPG-specific topology (only used when ``kind: cnpg``).
   cnpg:
@@ -649,6 +914,61 @@ postgresql:
     # clusters. CNPG enforces odd counts implicitly via its leader-
     # election layer.
     instances: 3
+    # #2831: how CNPG updates the PRIMARY once a spec change has rolled the
+    # replicas (a resources or parameter change, on an upgrade, a resize or
+    # a promote). ``switchover`` promotes an already-updated replica first
+    # and fast-shuts the old primary, so a new connection waits seconds.
+    # CNPG's own default, ``restart``, deletes the primary's pod while it
+    # still serves: its smart shutdown turns every new connection away for
+    # the whole ``smartShutdownTimeout`` (180 s), because the services'
+    # pooled sessions never end on their own. Rendered only with two or more
+    # instances: one instance has no replica to switch to and keeps CNPG's
+    # default. Not part of the instance pods' spec, so changing it rolls
+    # nothing.
+    #
+    # Under ``switchover`` CNPG's admission webhook refuses an update that
+    # changes ``imageName`` and any ``parameters`` key together, and a
+    # refused apply fails the helm upgrade (#1313): move the Postgres image
+    # in a release that changes no parameter (versions.json says so too).
+    primaryUpdateMethod: switchover   # switchover | restart
+    # #2878: the seconds an instance's smart shutdown may refuse new
+    # connections before the instance manager fast-shuts it (CNPG's
+    # ``spec.smartShutdownTimeout``; its default is 180). A smart shutdown
+    # lets the sessions already open keep committing, but the services'
+    # pooled sessions never end on their own, so it always runs to this
+    # timeout. With one instance (a single node, or a cluster demoted to
+    # one) nothing switches over: a spec change that rolls it, such as the
+    # Postgres limit a demote moves (#2156), restarts it in place, and the
+    # api and worker reach no database until the new pod is up. 15 s lets
+    # a transaction already running commit, then the instance stops fast.
+    # A switchover is not affected (it fast-shuts the old primary under
+    # its own ``switchoverDelay``). Not part of the instance pods' spec,
+    # so changing it rolls nothing.
+    smartShutdownTimeout: 15
+    # #3021 — where the instance pods reach the Kubernetes API server. Off
+    # (the default): through the ``kubernetes`` Service, like every pod.
+    # On: through the API server on their own node, ``status.hostIP`` at
+    # ``port``, set as KUBERNETES_SERVICE_HOST / KUBERNETES_SERVICE_PORT.
+    #
+    # The primary's instance manager keeps one long-lived connection to the
+    # API server. Through the Service that connection goes to any node's
+    # API server, and when that node is lost the primary cannot reach the
+    # API: its liveness probe's isolation check then fails on the replica
+    # it can no longer reach either, and kubelet restarts the primary,
+    # taking the database away for 25 to 35 s although only a replica's
+    # node was lost. On its own node's API server the primary loses the API
+    # only when its own node does, and CloudNativePG's self-fencing of an
+    # isolated primary is unchanged.
+    #
+    # Only for a cluster where every node that can host an instance runs an
+    # API server at its own address: the appliance, where each
+    # control-plane node is a k3s server (port 6443), sets it on. A
+    # BYO-Kubernetes cluster usually does not run one on its nodes. A change
+    # is one rolling update of the instances (the primary last, by
+    # switchover).
+    nodeLocalApiServer:
+      enabled: false
+      port: 6443
     # #590 — instance spreading. CNPG defaults to anti-affinity ON but
     # ``preferred`` (best effort), which on a 1→3 promote let two of three
     # instances land on the seed: losing that node would have taken the
@@ -678,9 +998,96 @@ postgresql:
     # Server-side parameters. Tune for your workload; defaults match
     # the prototype at ``k8s/ha/postgres-cluster.yaml``.
     parameters:
-      max_connections: "200"
+      # #2156 — every api pod's pool (api.databasePool) and every worker
+      # process connects here, plus two per api / worker / beat process for
+      # the after-commit hooks (#2782) and one per api pod for its readiness
+      # probe (#2944); replicas x pool has to stay under this. The appliance's
+      # supervisor always writes a value: 200 as a floor, raised past it when
+      # its connection budget does (from five control-plane nodes).
+      # #2955 — "" (the default) derives it from the pools: api pods (HPA max)
+      # x (pool + 3) + workers x (concurrency x 3 + 1) + beat + WAL senders +
+      # 10 reserve (helper ``spatiumddi.postgresMaxConnections``, the rule the
+      # appliance's supervisor applies), and the memory limit is raised to
+      # hold it (``postgresql.resources``). A set value wins, and then the
+      # memory limit is yours too; keep both above what the pools need.
+      max_connections: ""
       shared_buffers: "256MB"
       work_mem: "16MB"
+      # #2132 / #2240 — WAL kept for a former primary to come back. After a
+      # partition of the primary's node, CNPG promotes a replica and later
+      # rewinds the old primary onto the new timeline: ``pg_rewind`` needs
+      # the old primary's own WAL back to the last checkpoint before the
+      # point where the two diverged, and the rewound instance then streams
+      # the new primary's WAL from there. The new primary may or may not hold
+      # a replication slot for it (CNPG synchronises its HA slots to the
+      # standbys, #2317), so plain retention, on both, is what reliably keeps
+      # that WAL. With CNPG's 512MB default a loaded cluster recycled it
+      # within minutes and the old primary looped for ever ("requested WAL
+      # segment ... has already been removed", then ``pg_rewind`` "could not
+      # restore file ... from archive"). 2GB covers that much write traffic
+      # during the partition. A longer or heavier one still outruns it, and
+      # so can a former primary whose own WAL was cut short by a kill; on the
+      # appliance the seed supervisor then re-clones that instance from the
+      # primary once it has looped for 10 minutes (#2132,
+      # ``k8s_api.reclone_stuck_postgres_instances``).
+      #
+      # A reload, not a restart: CNPG applies a change to a formed cluster
+      # without a rolling restart. The supervisor's HelmChartConfig sets only
+      # ``shared_buffers`` in this map (#1115) and Helm merges maps key by
+      # key, so this default stays beside it.
+      wal_keep_size: "2GB"
+      # #2317 — the most WAL a replication slot may hold back. CNPG keeps an
+      # HA slot per standby on the primary and synchronises them to every
+      # standby, so after a failover the new primary holds slots for standbys
+      # that may never follow it. PostgreSQL's default (-1) lets such a slot
+      # keep WAL without limit: a lab primary's pg_wal reached 26 GB on its
+      # node's /var while CNPG read healthy 7/7. Past this cap PostgreSQL
+      # invalidates the slot at the next checkpoint (``wal_status = lost``),
+      # the WAL goes, and that standby needs a re-clone, which the supervisor
+      # does (#2132) when the standby keeps failing on the missing WAL.
+      #
+      # Sizing. PostgreSQL keeps the LARGER of this cap and ``wal_keep_size``
+      # (the two do not add), plus up to ``max_wal_size`` (PostgreSQL's 1GB
+      # default, unset here) since the last checkpoint. So pg_wal is bounded
+      # near max(2GB, 3GB) + 1GB = 4GB, half of ``persistence.size`` (8Gi),
+      # leaving the other half for the data. ``charts-render-check.sh``
+      # (chart-cnpg-recovery.py) fails a render where that bound is over half
+      # the instance volume or the cap is unset. 3GB is also above
+      # ``wal_keep_size`` on purpose: a cap at or below it would let a slot
+      # protect nothing that plain retention does not.
+      #
+      # Raise ``persistence.size`` before raising this. On the appliance the
+      # volume is local-path, which does not enforce its size, so an
+      # unbounded pg_wal fills the node's /var and everything else on it.
+      # A reload, like ``wal_keep_size``.
+      max_slot_wal_keep_size: "3GB"
+      # #3932 — a session whose client has gone must not outlive it. The
+      # 1.0.0 upgrade drill left an api pod's session idle in transaction on
+      # a primary that had since moved; PostgreSQL never noticed the peer
+      # was dead (default keepalive: 2 h + 9 x 75 s) and the migration's
+      # ALTER TABLE queued behind its lock for 2 h+, with the API
+      # "initialising" throughout. Two independent backstops:
+      # * the TCP keepalives make the server probe a silent peer after 60 s,
+      #   every 10 s, and drop it after 6 misses: a dead client's session is
+      #   gone within ~2 min of the peer dying. This is the half that fixes
+      #   the drill's case.
+      # * ``idle_in_transaction_session_timeout`` is the backstop for a
+      #   client that is alive but stuck in an open transaction. It has to
+      #   sit above the longest LEGITIMATE idle window, because Postgres
+      #   ending such a session turns slow work into an error: a scheduled
+      #   backup holds its session idle in transaction for the whole pg_dump
+      #   (up to 30 min) and upload, an agent bundle render for a very large
+      #   group can compute for many minutes between statements (#2240),
+      #   and a batched WinRM push idles between its chunks. Hence 1 h, not
+      #   minutes. The migrate command ends a stale holder that blocks it
+      #   after 5 min on its own (MIGRATION_STALE_IDLE_TXN_SECONDS).
+      #   "0" turns it off.
+      # All four are reloads (sighup / user context), not restarts: CNPG
+      # applies them to a formed cluster without a rolling restart.
+      idle_in_transaction_session_timeout: "1h"
+      tcp_keepalives_idle: "60"
+      tcp_keepalives_interval: "10"
+      tcp_keepalives_count: "6"
     # PodMonitor for Prometheus Operator. Default false because most
     # installs don't have Prometheus Operator + ServiceMonitor CRDs.
     monitoring:
@@ -693,7 +1100,11 @@ postgresql:
     # CNPG-blessed pattern. Outside the upgrade window the PDB
     # prevents accidental simultaneous evictions taking the primary
     # offline (e.g. an operator running ``kubectl drain`` by hand).
-    enablePDB: true
+    # #3204: unset (null) = "auto": on when ``instances > 1``, off with a
+    # single instance, whose PDB allows 0 disruptions and makes the node
+    # undrainable while protecting nothing (no replica to fail over to). An
+    # explicit true / false always wins.
+    enablePDB:
     # Continuous WAL archiving to an object store. Defer beyond #272
     # Phase 2 — the existing pg_dump-based backup workflow already
     # covers the disaster-recovery story for v1. See CNPG docs for
@@ -701,6 +1112,26 @@ postgresql:
     backup:
       enabled: false
       retentionPolicy: "30d"
+    # #2132 — publish the cluster CA's PUBLIC certificate into the ConfigMap
+    # ``<cluster>-ca-crt``, so a reader can verify the TLS of CNPG's
+    # instance-manager status endpoint without a grant on the CA secret
+    # (which also holds the CA private key). The appliance's supervisor reads
+    # the primary's replication slots from that endpoint before it re-clones
+    # a stuck instance. A CronJob, so a renewed CA reaches the ConfigMap
+    # within one ``schedule`` interval; until then (and before its first run)
+    # the reader treats the slot state as unknown and re-clones nothing.
+    # Off by default: only the appliance has a reader. The appliance overlay
+    # (spatiumddi-firstboot) turns it on.
+    caPublisher:
+      enabled: false
+      schedule: "*/10 * * * *"
+      # Per-workload PriorityClass override; unset inherits
+      # ``global.priorityClassName``, "" means none (see the helper).
+      priorityClassName: null
+      nodeSelector: {}
+      resources:
+        requests: { cpu: 10m, memory: 32Mi }
+        limits:   { cpu: 200m, memory: 96Mi }
 
 # Used when postgresql.enabled=false.
 externalDatabase:
@@ -836,6 +1267,26 @@ dnsAgents:
     repository: ghcr.io/spatiumnorth/dns-bind9
     tag: ""                      # empty → use Chart.appVersion
     pullPolicy: IfNotPresent
+  # #3209 — name the StatefulSet / Service / headless Service
+  # ``<release fullname>-dns-<flavor>-<name>`` like every other object in the
+  # chart (and honour ``fullnameOverride``), so two releases in one namespace
+  # do not collide (a name over 52 characters is cut to 43 plus a hash of the
+  # whole, so it stays unique). FALSE keeps today's ``dns-<flavor>-<name>``. Changing it on
+  # a live install is NOT an in-place rename: the old StatefulSet is deleted
+  # and a new one created, with NEW PVCs (``<claim>-<new name>-0``) and a new
+  # pod name, which is the server's registered identity — the agent registers
+  # as a fresh server. Set it on a new install (see
+  # docs/deployment/KUBERNETES.md, "Naming of agent objects"). The default is
+  # expected to flip in a later release.
+  prefixWithFullname: false
+  # #3206 — StorageClass of both volume claims (agent-state, dns-state).
+  # Unset uses the cluster's default class. Per server: ``servers[].storageClass``.
+  # Changing it on a live StatefulSet is refused by Kubernetes (claim templates
+  # are immutable): run ``kubectl delete sts <name> --cascade=orphan`` first
+  # (pod and PVCs survive); ``helm upgrade`` says so. Existing PVCs keep the
+  # class they were created with; it applies to claims created after it is set.
+  # See README "Adopting storageClass on an existing install".
+  storageClass: ""
   # Per-driver image overrides (issue #127). Each key matches a
   # ``servers[].flavor`` value; missing keys fall back to
   # ``dnsAgents.image``. Add a ``powerdns`` server entry to enable
@@ -852,13 +1303,61 @@ dnsAgents:
   agentKey:
     existingSecret: ""           # external secret with key DNS_AGENT_KEY
     value: ""
+  # #2223 — how long a server may take to start listening on :53 before it
+  # is restarted; the liveness probe (:53, 3 x 30 s) only starts after it.
+  # A cold start renders and checks every zone before the daemon starts:
+  # measured with BIND 9.20, named-checkzone costs ~70 ms a zone, so 20,000
+  # zones take ~23 minutes on a release without #2180's batched checks.
+  # 10 s x 360 = 60 minutes. Per server: servers[].startupProbe.
+  startupProbe:
+    periodSeconds: 10
+    failureThreshold: 360
+  # Agent Services default to ClusterIP (#3229): set servers[].service.type
+  # to LoadBalancer (MetalLB / cloud LB) or NodePort to reach DNS from
+  # clients. k3s's bundled servicelb breaks the node's own resolver on :53;
+  # see the chart README, "Exposing DNS and DHCP to clients".
   servers: []
     # - name: ns1
     #   flavor: bind9            # bind9 (default) | powerdns | technitium
     #   role: primary            # primary | secondary
     #   group: internal-resolvers
     #   storage: { agentState: 1Gi, dnsState: 2Gi }
+    #   # Optional placement. Agents only PREFER separate nodes; pin with
+    #   # nodeSelector to keep one per node across drains.
+    #   nodeSelector: { kubernetes.io/hostname: node-a }
+    #   tolerations: []
+    #   # #3206 — a node affinity (say, PREFER node-a without pinning), MERGED
+    #   # with the chart's preferred one-per-node anti-affinity; only a
+    #   # podAntiAffinity of your own replaces that one.
+    #   affinity:
+    #     nodeAffinity:
+    #       preferredDuringSchedulingIgnoredDuringExecution:
+    #         - weight: 100
+    #           preference:
+    #             matchExpressions:
+    #               - { key: kubernetes.io/hostname, operator: In, values: [node-a] }
+    #   storageClass: fast-ssd   # overrides dnsAgents.storageClass
     #   service: { type: LoadBalancer }
+    #   # LoadBalancer Services keep the client address by default
+    #   # (externalTrafficPolicy: Local — each server is a single-replica
+    #   # StatefulSet, so the announcing node is the pod's node anyway);
+    #   # set externalTrafficPolicy: Cluster to opt out. The remaining
+    #   # fields are rendered when set (#1548):
+    #   # service:
+    #   #   annotations:
+    #   #     metallb.universe.tf/address-pool: default
+    #   #     metallb.universe.tf/loadBalancerIPs: 10.0.0.53
+    #   #   loadBalancerIP: 10.0.0.53
+    #   #   loadBalancerSourceRanges: [192.0.2.0/24]
+    #   #   ipFamilyPolicy: PreferDualStack  # + ipFamilies: [IPv4, IPv6]
+    #   # 512Mi is for a group with NO blocklists. One catalog feed (AdGuard DNS
+    #   # filter, ~186k entries) needs roughly 1 GB while an apply is in flight
+    #   # (estimate): size the limit from docs/features/DNS.md section 8.0
+    #   # before subscribing. Zone data needs it too (#2223, measured): about
+    #   # 1.5 kB per record for named and the agent while it takes a bundle,
+    #   # so 512Mi is a few hundred thousand records at most, and a million
+    #   # records in 20,000 zones peaked at ~1.35 GB. With no `resources` set
+    #   # the server gets the 2Gi default limit.
     #   resources:
     #     requests: { cpu: 100m, memory: 128Mi }
     #     limits:   { cpu: 500m, memory: 512Mi }
@@ -891,6 +1390,22 @@ dhcpAgents:
     repository: ghcr.io/spatiumnorth/dhcp-kea
     tag: ""
     pullPolicy: IfNotPresent
+  # #3209 — same as ``dnsAgents.prefixWithFullname``: name the StatefulSet and
+  # Services ``<release fullname>-dhcp-<flavor>-<name>``. FALSE keeps
+  # ``dhcp-<flavor>-<name>``; flipping it on a live install recreates the
+  # StatefulSet with new PVCs and a new pod name (the server's identity).
+  prefixWithFullname: false
+  # #3907 — a ``helm upgrade`` runs a pre-upgrade hook that deletes a DHCP agent
+  # StatefulSet (PVCs kept) holding a pod that is Running but not Ready for 2+
+  # minutes, so Helm recreates it from the new template (OrderedReady blocks a roll). Needed coming
+  # from 2026.10.02-1 or older, whose readiness probe could never pass (#1589).
+  # Ready pods are never touched; fresh installs never run it. false = delete
+  # such a pod by hand (docs/deployment/KUBERNETES.md, "Upgrading from CalVer on Helm with DHCP agents").
+  upgradeUnstickPods: true
+  # #3206 — StorageClass of both volume claims; unset = the cluster default.
+  # Per server: ``servers[].storageClass``. On an existing install see README
+  # "Adopting storageClass on an existing install" (orphan-delete the sts first).
+  storageClass: ""
   agentKey:
     existingSecret: ""           # external secret with key SPATIUM_AGENT_KEY
     value: ""
@@ -899,8 +1414,29 @@ dhcpAgents:
     #   role: primary
     #   group: default
     #   storage: { agentState: 1Gi, keaState: 2Gi }
-    #   service: { type: NodePort }
-    #   hostNetwork: false       # true required for L2 DHCP broadcast (no relay)
+    #   storageClass: fast-ssd   # overrides dhcpAgents.storageClass (#3206)
+    #   # Placement (#3206). ``affinity`` is merged with the chart's preferred
+    #   # one-per-node anti-affinity; only your own podAntiAffinity replaces it.
+    #   nodeSelector: { kubernetes.io/hostname: node-a }
+    #   tolerations: []
+    #   affinity: {}
+    #   hostNetwork: false       # true binds the node's UDP/67 directly:
+    #                            # broadcast clients work with no relay,
+    #                            # and a relay reaches the node on 67
+    #   service: { type: LoadBalancer }
+    #                            # opt-in (the default is ClusterIP, #3229;
+    #                            # not with k3s servicelb). A DHCP relay (ip
+    #                            # helper-address) can only forward to
+    #                            # UDP/67, so without hostNetwork point it
+    #                            # at the LoadBalancer address. A pinned
+    #                            # NodePort (service: { type: NodePort,
+    #                            # nodePort: 30067 }) only helps a relay
+    #                            # that can forward to a non-standard
+    #                            # port. On a NodePort Service the
+    #                            # `port: 67` is in-cluster only; the
+    #                            # node-facing port is the nodePort, which
+    #                            # Kubernetes picks at random (30000–32767)
+    #                            # when it is not pinned.
     #   resources:
     #     requests: { cpu: 100m, memory: 128Mi }
     #     limits:   { cpu: 500m, memory: 512Mi }

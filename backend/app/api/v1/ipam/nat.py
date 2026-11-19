@@ -36,8 +36,9 @@ from sqlalchemy.dialects.postgresql import INET
 from app.api.deps import DB, CurrentUser
 from app.api.pagination import MAX_PAGE
 from app.api.v1.dhcp._audit import write_audit
-from app.core.permissions import require_resource_permission
+from app.core.permissions import require_resource_permission, user_has_permission
 from app.models.ipam import IPAddress, NATMapping, Subnet
+from app.services.ipam.live_address import get_live_address
 
 router = APIRouter(
     prefix="/nat-mappings",
@@ -211,6 +212,9 @@ class NATMappingResponse(BaseModel):
     # Populated by ``_serialize_nat_*`` helpers; never read from a column.
     internal_subnet_cidr: str | None = None
     internal_subnet_name: str | None = None
+    # True when the subnet exists but the caller cannot read it, so the
+    # name / CIDR above are withheld (#3641).
+    internal_subnet_redacted: bool = False
     internal_port_start: int | None
     internal_port_end: int | None
     external_ip: str | None
@@ -233,18 +237,28 @@ class NATMappingResponse(BaseModel):
         return str(v) if v is not None else v
 
 
-async def _serialize_one(db: Any, row: NATMapping) -> NATMappingResponse:
+def _fill_subnet(resp: NATMappingResponse, sn: Subnet, user: Any) -> None:
+    """Fill the internal-subnet display labels, unless the caller cannot read
+    that subnet: the mapping itself is gated on ``nat_mapping``, and a subnet
+    name / CIDR is subnet data (#3641)."""
+    if user_has_permission(user, "read", "subnet", sn.id):
+        resp.internal_subnet_cidr = str(sn.network)
+        resp.internal_subnet_name = sn.name or None
+    else:
+        resp.internal_subnet_redacted = True
+
+
+async def _serialize_one(db: Any, row: NATMapping, user: Any) -> NATMappingResponse:
     """Serialize one mapping with the internal subnet display fields filled."""
     resp = NATMappingResponse.model_validate(row)
     if row.internal_subnet_id is not None:
         sn = await db.get(Subnet, row.internal_subnet_id)
         if sn is not None:
-            resp.internal_subnet_cidr = str(sn.network)
-            resp.internal_subnet_name = sn.name or None
+            _fill_subnet(resp, sn, user)
     return resp
 
 
-async def _serialize_many(db: Any, rows: list[NATMapping]) -> list[NATMappingResponse]:
+async def _serialize_many(db: Any, rows: list[NATMapping], user: Any) -> list[NATMappingResponse]:
     """Batch-load subnets so listing N mappings is one extra SELECT, not N."""
     sn_ids = {r.internal_subnet_id for r in rows if r.internal_subnet_id is not None}
     subnets: dict[uuid.UUID, Subnet] = {}
@@ -257,8 +271,7 @@ async def _serialize_many(db: Any, rows: list[NATMapping]) -> list[NATMappingRes
         if row.internal_subnet_id is not None:
             sn = subnets.get(row.internal_subnet_id)
             if sn is not None:
-                resp.internal_subnet_cidr = str(sn.network)
-                resp.internal_subnet_name = sn.name or None
+                _fill_subnet(resp, sn, user)
         out.append(resp)
     return out
 
@@ -266,28 +279,41 @@ async def _serialize_many(db: Any, rows: list[NATMapping]) -> list[NATMappingRes
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 
-async def _resolve_ip_to_address_id(db: Any, ip_str: str | None) -> uuid.UUID | None:
-    """Look up an IPAddress row whose ``address`` matches the literal IP.
+async def _resolve_ip_to_address_id(
+    db: Any, ip_str: str | None, *, subnet_id: uuid.UUID | None = None
+) -> uuid.UUID | None:
+    """Look up the IPAddress row whose ``address`` matches the literal IP.
 
-    Returns the UUID if found, ``None`` if the IP isn't tracked in IPAM.
-    The INET ``host()`` cast on both sides handles netmask-suffixed
-    forms (``10.0.0.5/32``) so an exact-match lookup works regardless
-    of how the operator typed it.
+    Returns the UUID if exactly one row matches, ``None`` if the IP isn't
+    tracked in IPAM. The INET ``host()`` cast on both sides handles
+    netmask-suffixed forms (``10.0.0.5/32``) so an exact-match lookup
+    works regardless of how the operator typed it.
+
+    The same address can exist in several IP spaces (#2577). When
+    ``subnet_id`` is given the lookup is confined to that subnet's space;
+    otherwise an address found in more than one space is ambiguous and
+    left unlinked (``None``) — the string stays authoritative — rather
+    than attaching the mapping to whichever space's row came back first.
     """
 
     if not ip_str:
         return None
     try:
-        res = await db.execute(
-            select(IPAddress.id).where(
-                func.host(IPAddress.address) == func.host(cast(ip_str, INET))
-            )
+        stmt = (
+            select(IPAddress.id, Subnet.space_id)
+            .join(Subnet, Subnet.id == IPAddress.subnet_id)
+            .where(func.host(IPAddress.address) == func.host(cast(ip_str, INET)))
         )
-        row = res.first()
-        return row[0] if row else None
+        if subnet_id is not None:
+            space_subq = select(Subnet.space_id).where(Subnet.id == subnet_id).scalar_subquery()
+            stmt = stmt.where(Subnet.space_id == space_subq)
+        rows = (await db.execute(stmt.limit(2))).all()
     except Exception:
         # Bad IP literal — let pydantic validation surface it elsewhere.
         return None
+    if len(rows) != 1:
+        return None
+    return rows[0][0]
 
 
 async def _check_external_conflict(
@@ -347,7 +373,7 @@ class NATMappingPage(BaseModel):
 @router.get("", response_model=NATMappingPage)
 async def list_nat_mappings(
     db: DB,
-    _: CurrentUser,
+    user: CurrentUser,
     kind: str | None = Query(None),
     internal_ip: str | None = Query(None),
     external_ip: str | None = Query(None),
@@ -387,7 +413,9 @@ async def list_nat_mappings(
     rows = (
         (
             await db.execute(
-                base.order_by(NATMapping.name).offset((page - 1) * per_page).limit(per_page)
+                base.order_by(NATMapping.name, NATMapping.id)
+                .offset((page - 1) * per_page)
+                .limit(per_page)
             )
         )
         .scalars()
@@ -397,7 +425,7 @@ async def list_nat_mappings(
         total=int(total or 0),
         page=page,
         per_page=per_page,
-        items=await _serialize_many(db, list(rows)),
+        items=await _serialize_many(db, list(rows), user),
     )
 
 
@@ -425,7 +453,9 @@ async def create_nat_mapping(
     row = NATMapping(**body.model_dump())
     # Auto-resolve string IPs to IPAM rows when known. Strings stay
     # authoritative; the FK is just for fast joins + cascade-on-delete.
-    row.internal_ip_address_id = await _resolve_ip_to_address_id(db, body.internal_ip)
+    row.internal_ip_address_id = await _resolve_ip_to_address_id(
+        db, body.internal_ip, subnet_id=body.internal_subnet_id
+    )
     row.external_ip_address_id = await _resolve_ip_to_address_id(db, body.external_ip)
     db.add(row)
     await db.flush()
@@ -440,15 +470,15 @@ async def create_nat_mapping(
     )
     await db.commit()
     await db.refresh(row)
-    return await _serialize_one(db, row)
+    return await _serialize_one(db, row, user)
 
 
 @router.get("/{mapping_id}", response_model=NATMappingResponse)
-async def get_nat_mapping(mapping_id: uuid.UUID, db: DB, _: CurrentUser) -> NATMappingResponse:
+async def get_nat_mapping(mapping_id: uuid.UUID, db: DB, user: CurrentUser) -> NATMappingResponse:
     row = await db.get(NATMapping, mapping_id)
     if row is None:
         raise HTTPException(status_code=404, detail="NAT mapping not found")
-    return await _serialize_one(db, row)
+    return await _serialize_one(db, row, user)
 
 
 @router.patch("/{mapping_id}", response_model=NATMappingResponse)
@@ -461,7 +491,7 @@ async def update_nat_mapping(
 
     patch = body.model_dump(exclude_unset=True)
     if not patch:
-        return await _serialize_one(db, row)
+        return await _serialize_one(db, row, user)
 
     # Build the merged-state shape and re-run kind-aware validation so a
     # partial update that toggles ``kind`` still gets the full check.
@@ -513,7 +543,9 @@ async def update_nat_mapping(
 
     # Re-resolve FK if either IP changed (or was cleared).
     if "internal_ip" in patch:
-        row.internal_ip_address_id = await _resolve_ip_to_address_id(db, patch["internal_ip"])
+        row.internal_ip_address_id = await _resolve_ip_to_address_id(
+            db, patch["internal_ip"], subnet_id=row.internal_subnet_id
+        )
     if "external_ip" in patch:
         row.external_ip_address_id = await _resolve_ip_to_address_id(db, patch["external_ip"])
 
@@ -529,12 +561,12 @@ async def update_nat_mapping(
     )
     await db.commit()
     await db.refresh(row)
-    return await _serialize_one(db, row)
+    return await _serialize_one(db, row, user)
 
 
 @router.get("/by-ip/{ip_address_id}", response_model=list[NATMappingResponse])
 async def list_nat_mappings_for_ip(
-    ip_address_id: uuid.UUID, db: DB, _: CurrentUser
+    ip_address_id: uuid.UUID, db: DB, user: CurrentUser
 ) -> list[NATMappingResponse]:
     """Every NAT mapping that touches a given IPAM address.
 
@@ -544,7 +576,7 @@ async def list_nat_mappings_for_ip(
     counted; the IP can play either role in a NAT pair.
     """
 
-    ip = await db.get(IPAddress, ip_address_id)
+    ip = await get_live_address(db, ip_address_id)
     if ip is None:
         raise HTTPException(status_code=404, detail="IP address not found")
 
@@ -568,23 +600,30 @@ async def list_nat_mappings_for_ip(
         .scalars()
         .all()
     )
-    return await _serialize_many(db, list(rows))
+    return await _serialize_many(db, list(rows), user)
 
 
 @router.get("/by-subnet/{subnet_id}", response_model=list[NATMappingResponse])
 async def list_nat_mappings_for_subnet(
-    subnet_id: uuid.UUID, db: DB, _: CurrentUser
+    subnet_id: uuid.UUID, db: DB, user: CurrentUser
 ) -> list[NATMappingResponse]:
-    """Every NAT mapping whose internal IP falls inside this subnet's CIDR.
+    """Every NAT mapping that references an IP inside this subnet's CIDR.
 
     Combines:
       * mappings with ``internal_subnet_id == subnet_id`` (hide-NAT pinned to subnet)
       * mappings whose ``internal_ip`` is contained by the subnet's network
+      * mappings whose ``external_ip`` is contained by the subnet's network
+        (#2617) — the address rows' "NAT n" badge counts both sides, so the
+        tab has to list both or it contradicts the badge.
     """
 
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=404, detail="Subnet not found")
+    # Keyed on a subnet: a caller who cannot read it is refused, as the
+    # subnet routes do, rather than handed its address-side mappings (#3641).
+    if not user_has_permission(user, "read", "subnet", subnet_id):
+        raise HTTPException(status_code=403, detail="Permission denied: read on subnet")
 
     cidr_lit = cast(str(subnet.network), INET)
     rows = (
@@ -598,6 +637,10 @@ async def list_nat_mappings_for_subnet(
                             NATMapping.internal_ip.is_not(None),
                             NATMapping.internal_ip.op("<<=")(cidr_lit),
                         ),
+                        and_(
+                            NATMapping.external_ip.is_not(None),
+                            NATMapping.external_ip.op("<<=")(cidr_lit),
+                        ),
                     )
                 )
                 .order_by(NATMapping.name)
@@ -606,7 +649,7 @@ async def list_nat_mappings_for_subnet(
         .scalars()
         .all()
     )
-    return await _serialize_many(db, list(rows))
+    return await _serialize_many(db, list(rows), user)
 
 
 @router.delete("/{mapping_id}", status_code=status.HTTP_204_NO_CONTENT)

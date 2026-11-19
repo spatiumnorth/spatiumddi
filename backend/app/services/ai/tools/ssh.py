@@ -43,6 +43,7 @@ class FindSshSettingsArgs(BaseModel):
 
 @register_tool(
     name="find_ssh_settings",
+    permission="authenticated",
     description=(
         "Return the appliance SSH configuration: whether password "
         "authentication is enabled, whether root login is permitted, the sshd "
@@ -141,6 +142,7 @@ class FindRemoteAccessDoorsArgs(BaseModel):
 
 @register_tool(
     name="find_remote_access_doors",
+    permission="superadmin",
     description=(
         "Return BOTH appliance source restrictions together: the Web UI "
         "allow-list (web_ui_allowed_cidrs) and the SSH allow-list, with "

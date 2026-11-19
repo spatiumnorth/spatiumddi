@@ -49,8 +49,8 @@ def test_renders_core_directives() -> None:
     assert "configure lldp tx-hold 4" in out
     # Interface allowlist always emitted (excludes container vNICs).
     assert f"configure system interface pattern {_DEFAULT_IFACE}" in out
-    assert "configure lldp management-addresses-advertisements enable" in out
-    assert "configure lldp capabilities-advertisements enable" in out
+    assert "configure lldp management-addresses-advertisements" in out.splitlines()
+    assert "configure lldp capabilities-advertisements" in out.splitlines()
     # No mgmt pattern / hostname / description lines when those are empty.
     assert "ip management pattern" not in out
     assert "configure system hostname" not in out
@@ -93,9 +93,32 @@ def test_agentx_appends_x_flag() -> None:
     s.lldp_protocols = ["cdp"]
     assert render_lldpd_daemon_args(s) == "-c"
     s.lldp_snmp_agentx = True
-    assert render_lldpd_daemon_args(s) == "-c -x"  # issue #348
+    # issue #348 (-x) + #2154 (-X pinned to the socket snmpd is master on)
+    assert render_lldpd_daemon_args(s) == "-c -x -X /run/agentx/master"
     s.lldp_protocols = []
-    assert render_lldpd_daemon_args(s) == "-x"
+    assert render_lldpd_daemon_args(s) == "-x -X /run/agentx/master"
+
+
+def test_agentx_socket_matches_the_snmpd_master() -> None:
+    """Issue #2154 — lldpd's ``-X`` and snmpd's ``agentXSocket`` must name
+    the same path, or the subagent dials a socket nobody listens on."""
+    from app.core.crypto import encrypt_str
+    from app.services.appliance.snmp import AGENTX_SOCKET, render_snmpd_conf
+
+    s = _bare_settings()
+    s.lldp_snmp_agentx = True
+    args = render_lldpd_daemon_args(s).split()
+    sock = args[args.index("-X") + 1]
+    assert sock == AGENTX_SOCKET
+
+    s.snmp_enabled = True
+    s.snmp_version = "v2c"
+    s.snmp_community_encrypted = encrypt_str("c")
+    s.snmp_allowed_sources = ["10.0.0.0/8"]
+    s.snmp_v3_users = []
+    s.snmp_sys_contact = ""
+    s.snmp_sys_location = ""
+    assert f"agentXSocket {sock}" in render_snmpd_conf(s).splitlines()
 
 
 def test_med_elin_renders() -> None:
@@ -225,3 +248,16 @@ async def test_settings_lldp_agentx_and_elin_round_trip(
     body = r.json()
     assert body["lldp_snmp_agentx"] is True
     assert body["lldp_med_location"] == {"elin": "911"}
+
+
+def test_no_rendered_line_ends_in_a_bare_enable_or_disable() -> None:
+    """lldpcli takes these toggles with no argument (``unconfigure`` turns
+    them off); a trailing ``enable`` is refused at every lldpd start (#2576)."""
+    s = _bare_settings()
+    s.lldp_sys_name = "core-rtr1"
+    s.lldp_management_pattern = "10.0.0.0/24"
+    s.lldp_med_location = {"elin": "5551234567"}
+    for line in render_lldpd_conf(s).splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        assert line.split()[-1] not in {"enable", "disable"}, line

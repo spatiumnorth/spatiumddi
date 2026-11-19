@@ -239,6 +239,14 @@ async def _async_check_and_alert() -> dict:
             logger.error("schema_behind_head_no_rule", detail=result.detail)
             return {"ok": False, "detail": result.detail, "no_rule": True}
 
+        if not rule.enabled:
+            # #1988 — a disabled rule opens nothing and delivers nothing,
+            # as the acme / upgrade / conformity rules already behave.
+            # Disabling resolves the open events, so without this gate the
+            # next tick would re-open one and deliver it for a rule the
+            # operator switched off. The drift is logged above regardless.
+            return {"ok": False, "detail": result.detail, "rule_disabled": True}
+
         # Dedupe: one open event covers the drift. Subject id is the
         # observed (behind) version so a fresh drift to a *different*
         # actual version opens a distinct event.
@@ -275,6 +283,24 @@ async def _async_check_and_alert() -> dict:
             },
         )
         db.add(evt)
+        # #2261 — commit the event BEFORE delivering it. Delivering first
+        # meant a failed commit (and this task's autoretry) re-paged for an
+        # event that was never stored; now a retry finds it open and dedupes.
+        await db.commit()
+        # #1576 — deliver to forward targets; the generic evaluator
+        # skips externally-driven rule types, so without this the
+        # event only ever showed in-app.
+        try:
+            from app.services import alerts as alert_service  # noqa: PLC0415
+            from app.services import audit_forward  # noqa: PLC0415
+
+            targets = await audit_forward._load_targets()  # noqa: SLF001
+            ds, dw, dm = await alert_service._deliver(rule, evt, targets)  # noqa: SLF001
+            evt.delivered_syslog = ds
+            evt.delivered_webhook = dw
+            evt.delivered_smtp = dm
+        except Exception as exc:  # noqa: BLE001 — delivery must not lose the alert
+            logger.warning("schema_behind_head_delivery_failed", error=str(exc))
         await db.commit()
         return {"ok": False, "detail": result.detail}
 

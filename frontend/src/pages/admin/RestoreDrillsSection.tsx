@@ -15,11 +15,14 @@ import {
 
 import {
   backupTargetsApi,
+  formatApiError,
   type BackupTarget,
   type RestoreDrill,
   type RestoreDrillAssertion,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
+import { isRefused } from "@/lib/refusal";
 
 /**
  * Restore Drills section on the Backup admin page (issue #702).
@@ -176,7 +179,11 @@ export function RestoreDrillsSection() {
     // A drill is synchronous but slow; poll while one is in flight so
     // the row flips without the operator hitting Refresh.
     refetchInterval: (q) =>
-      (q.state.data ?? []).some((d) => d.state === "running") ? 5000 : false,
+      !isRefused(q.state.error) &&
+      (q.state.data ?? []).some((d) => d.state === "running")
+        ? 5000
+        : false,
+    retry: (n, err) => !isRefused(err) && n < 3,
   });
 
   const runDrill = useMutation({
@@ -228,9 +235,11 @@ export function RestoreDrillsSection() {
           </div>
         ) : targets.length === 0 ? (
           <div className="px-4 py-6 text-sm text-muted-foreground">
-            No backup targets configured yet. Add one on the{" "}
-            <strong>Destinations</strong> tab — drills verify the archives a
-            target has already written.
+            <ListEmpty error={targetsQ.error} what="backup targets">
+              No backup targets configured yet. Add one on the{" "}
+              <strong>Destinations</strong> tab — drills verify the archives a
+              target has already written.
+            </ListEmpty>
           </div>
         ) : (
           <div className="overflow-x-auto">
@@ -341,7 +350,7 @@ export function RestoreDrillsSection() {
 
         {runDrill.isError && (
           <div className="border-t px-4 py-2 text-xs text-rose-600 dark:text-rose-400">
-            {(runDrill.error as Error).message}
+            {formatApiError(runDrill.error, "drill failed")}
           </div>
         )}
         <p className="border-t px-4 py-2 text-xs text-muted-foreground">
@@ -364,6 +373,10 @@ export function RestoreDrillsSection() {
         {drillsQ.isLoading ? (
           <div className="px-4 py-6 text-sm text-muted-foreground">
             Loading&hellip;
+          </div>
+        ) : drillsQ.isError ? (
+          <div className="px-4 py-6 text-sm">
+            <ListReadError error={drillsQ.error} what="the drill history" />
           </div>
         ) : drills.length === 0 ? (
           <div className="px-4 py-6 text-sm text-muted-foreground">
@@ -533,7 +546,7 @@ function ScheduleDrillModal({
 
         {save.isError && (
           <p className="text-xs text-rose-600 dark:text-rose-400">
-            {(save.error as Error).message}
+            {formatApiError(save.error)}
           </p>
         )}
 

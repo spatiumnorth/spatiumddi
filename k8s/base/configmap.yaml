@@ -4,9 +4,22 @@ metadata:
   name: spatiumddi-config
   namespace: spatiumddi
 data:
-  DATABASE_URL: "postgresql+asyncpg://spatiumddi:$(POSTGRES_PASSWORD)@postgres-primary:5432/spatiumddi"
-  REDIS_URL: "redis://redis-headless:6379/0"
-  CELERY_BROKER_URL: "redis://redis-headless:6379/1"
-  CELERY_RESULT_BACKEND: "redis://redis-headless:6379/2"
+  # #1547 — the CNPG Cluster in k8s/ha/ is named `postgres`, so the
+  # read/write Service CNPG creates is `postgres-rw` (there is no
+  # `postgres-primary` Service). The quick start exposes its
+  # standalone Postgres under the same name (see k8s/README.md).
+  DATABASE_URL: "postgresql+asyncpg://spatiumddi:$(POSTGRES_PASSWORD)@postgres-rw:5432/spatiumddi"
+  # #1547 — Redis runs behind Sentinel (k8s/ha/redis-sentinel.yaml):
+  # a plain redis:// URL against the headless Service lands on a
+  # replica ~2 times in 3 (READONLY) and carries no password (NOAUTH —
+  # the manifest sets requirepass). The sentinel:// URLs themselves
+  # are NOT here: they embed the Redis password, credentials belong in
+  # the spatiumddi-secrets Secret only, and $(REDIS_PASSWORD)
+  # interpolation only expands in a Deployment env `value` — so the
+  # api / worker / beat Deployments build REDIS_URL /
+  # CELERY_BROKER_URL / CELERY_RESULT_BACKEND inline from the
+  # `redis-password` Secret key, the same wiring as the umbrella
+  # chart's commonEnv. Only the (non-secret) master name stays here.
+  REDIS_SENTINEL_MASTER: "mymaster"
   DEBUG: "false"
   LOG_LEVEL: "info"

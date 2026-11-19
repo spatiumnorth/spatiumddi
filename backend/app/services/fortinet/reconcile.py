@@ -38,6 +38,7 @@ from app.services.fortinet.client import (
     _FortiLease,
     _FortiNatRule,
 )
+from app.services.integration_ownership import refuse_sync_into_trashed_space
 
 logger = structlog.get_logger(__name__)
 
@@ -82,6 +83,10 @@ def _to_address(ls: _FortiLease) -> MirrorAddress:
 
 async def reconcile_firewall(db: AsyncSession, fw: FortinetFirewall) -> MirrorSummary:
     summary = MirrorSummary(ok=False)
+    # #2577 — a target whose IP space is in Trash syncs nothing: it would
+    # rebuild its rows as live rows inside the trashed space.
+    if await refuse_sync_into_trashed_space(db, fw, summary):
+        return summary
 
     token = ""
     if fw.api_token_encrypted:
@@ -163,6 +168,8 @@ async def reconcile_firewall(db: AsyncSession, fw: FortinetFirewall) -> MirrorSu
             resource_id=str(fw.id),
             resource_display=fw.name,
             new_value={
+                # #2577 — what the sync released outside the target's IP space.
+                "released": summary.released.as_dict(),
                 "objects": {
                     "created": summary.objects_created,
                     "updated": summary.objects_updated,
@@ -191,6 +198,7 @@ async def reconcile_firewall(db: AsyncSession, fw: FortinetFirewall) -> MirrorSu
     summary.ok = True
     logger.info(
         "fortinet_reconcile_ok",
+        **summary.released.log_fields(),
         firewall=str(fw.id),
         version=summary.sw_version,
         objects=summary.object_count,

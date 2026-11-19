@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from app.celery_app import celery_app
 from app.config import settings
+from app.db import task_connect_args
 from app.models.network import (
     NetworkArpEntry,
     NetworkDevice,
@@ -57,6 +58,7 @@ from app.services.snmp.poller import (
     NeighbourData,
     walk_lldp_neighbours,
 )
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -274,7 +276,9 @@ async def _upsert_neighbours(
 
 
 async def _poll_device_async(device_id: str) -> dict[str, Any]:
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     factory = async_sessionmaker(engine, expire_on_commit=False)
     summary: dict[str, Any] = {
         "status": "skipped",
@@ -463,6 +467,7 @@ async def _poll_device_async(device_id: str) -> dict[str, Any]:
 
 
 @celery_app.task(name="app.tasks.snmp_poll.poll_device", bind=True)
+@module_gated("network.device")
 def poll_device(self: Any, device_id_str: str) -> dict[str, Any]:  # noqa: ARG001
     """Poll one device. Idempotent — safe to retry."""
     return asyncio.run(_poll_device_async(device_id_str))
@@ -472,7 +477,9 @@ def poll_device(self: Any, device_id_str: str) -> dict[str, Any]:  # noqa: ARG00
 
 
 async def _dispatch_due_async() -> int:
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     factory = async_sessionmaker(engine, expire_on_commit=False)
     queued = 0
     try:
@@ -504,6 +511,7 @@ async def _dispatch_due_async() -> int:
 
 
 @celery_app.task(name="app.tasks.snmp_poll.dispatch_due_devices", bind=True)
+@module_gated("network.device")
 def dispatch_due_devices(self: Any) -> int:  # noqa: ARG001
     """Beat-fired sweep — queues a ``poll_device`` task per due row."""
     return asyncio.run(_dispatch_due_async())
@@ -513,7 +521,14 @@ def dispatch_due_devices(self: Any) -> int:  # noqa: ARG001
 
 
 async def _purge_stale_arp_async(days: int) -> int:
-    engine = create_async_engine(settings.database_url, future=True)
+    # Long bound (#1719): one unbatched DELETE over every device's ARP rows
+    # older than the cutoff; on a large switch estate that single statement
+    # can run past the 120 s default, like the other prunes.
+    engine = create_async_engine(
+        settings.database_url,
+        future=True,
+        connect_args=task_connect_args(command_timeout=settings.task_db_long_command_timeout),
+    )
     factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with factory() as db:

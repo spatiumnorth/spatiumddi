@@ -9,6 +9,7 @@ import {
 } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
 import { cn } from "@/lib/utils";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { NmapResultPanel } from "./NmapResultPanel";
 
 const TERMINAL: NmapScanStatus[] = ["completed", "failed", "cancelled"];
@@ -63,6 +64,11 @@ export function NmapScanLiveViewer({
   onComplete,
 }: NmapScanLiveViewerProps) {
   const qc = useQueryClient();
+  // Cancel and delete take delete on 'manage_nmap_scans' (nmap/router.py).
+  const deleteGate = permissionGate(
+    usePermissions().can("delete", "manage_nmap_scans"),
+    "Requires delete permission on nmap scans",
+  );
   const [lines, setLines] = useState<string[]>([]);
   const [streamStatus, setStreamStatus] = useState<
     "connecting" | "open" | "done" | "error"
@@ -176,7 +182,11 @@ export function NmapScanLiveViewer({
         )}
         <div className="ml-auto flex gap-1.5">
           {!isTerminal && (
-            <HeaderButton variant="destructive" onClick={cancel}>
+            <HeaderButton
+              variant="destructive"
+              onClick={cancel}
+              {...deleteGate}
+            >
               <StopCircle className="h-3.5 w-3.5" />
               Cancel
             </HeaderButton>

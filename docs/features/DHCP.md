@@ -27,7 +27,7 @@ DHCPServer
 
 ### DHCP Server Groups
 
-**DHCPServerGroup is the primary configuration container.** Scopes, pools, statics, and client classes all belong to a group — every member server renders the same Kea config. A group with one member is a standalone DHCP service; a group with two Kea members is implicitly an HA pair, driving the `libdhcp_ha.so` hook.
+**DHCPServerGroup is the primary configuration container.** Scopes, pools, statics, and client classes all belong to a group — every member server renders the same Kea config. A group with one member is a standalone DHCP service; a `hot-standby` or `load-balancing` group with two Kea members is an HA pair, driving the `libdhcp_ha.so` hook. A `standalone` group never renders HA (#2969).
 
 ```
 DHCPServerGroup
@@ -57,6 +57,47 @@ change re-renders the running Kea within a heartbeat. It is distinct from
 `network_mode` (host vs bridged), which controls the *container's* network
 namespace on supervisor-managed appliances — a directly-attached server
 typically wants `network_mode: host` **and** `dhcp_socket_mode: direct`.
+
+**Behind the MetalLB DHCP relay VIP, a group must be `relay` (#2899).**
+The relay VIP (`dhcp_relay_vip`, Fleet → Network → MetalLB → Advanced) is a
+LoadBalancer Service over every Kea pod in the appliance cluster, with
+`externalTrafficPolicy: Cluster`. kube-proxy on the node announcing the VIP
+keeps about one relay flow in N on that node's own Kea. In `direct` mode
+Kea's raw socket sees that frame before netfilter, still addressed to the
+VIP, and its filter (broadcast or the socket's own address only) drops it;
+the DNATed copy reaches Kea's UDP socket, which raw mode drains and
+discards. So those relays' clients get no address, and no counter shows it —
+the #2889 arrival counter leaves VIP-addressed frames out on purpose. In
+`relay` mode Kea reads that UDP socket, so every relay is answered. Kea
+replies to the relay's `giaddr`, from the node's own address — the same way
+the other nodes already answer the flows forwarded to them — so the reply
+comes back from the VIP only when the relay sends from its `giaddr`.
+
+"Behind the VIP" means a node of the control plane's own k3s cluster: the
+seed, and every promoted member. An approved Additional node that was never
+promoted runs its own single-node k3s with no MetalLB, so a branch appliance
+serving its directly attached VLAN in `direct` mode is not affected and is
+never refused or alerted on.
+
+There is no way to serve both through the VIP: Kea cannot mix raw and UDP
+sockets in one daemon, and SpatiumDDI does not switch a group's mode on its
+own, because `relay` stops directly attached clients being served. Instead:
+
+- `PUT …/control-plane/metallb` refuses (422) to **turn on** a relay VIP
+  while any group it would front is `direct`, naming the groups;
+- `PUT /dhcp/server-groups/{id}` refuses to change a group behind the VIP
+  **to** `direct`; while a VIP is set, the Fleet / Copilot role assignment
+  refuses to point a cluster node's DHCP role at a `direct` group (or to add
+  the role to a node already pointed at one), `PUT /dhcp/servers/{id}`
+  refuses to move a cluster node's Kea into a `direct` group, and a
+  control-plane promote refuses a joiner that serves one;
+- the default-on `dhcp_relay_vip_direct_socket` alert (critical, one event
+  per group) and the MetalLB card report the state whenever it exists — an
+  install that had it before these checks, or a path they do not cover.
+
+A group that must also serve directly attached clients keeps `direct`, and its
+relays forward to every DHCP node's own address (several `ip helper-address`
+lines) rather than to the VIP.
 See [TROUBLESHOOTING.md](../TROUBLESHOOTING.md#dhcp-server-kea-doesnt-respond-to-discover)
 for the "no DHCPOFFER" diagnosis flow.
 
@@ -67,7 +108,7 @@ for the "no DHCPOFFER" diagnosis flow.
 This is the most granular part of the DHCP model. Within a **subnet**, you can define:
 - Multiple **pools** with different behaviors (dynamic, reserved, excluded)
 - **Static assignments** (fixed IPs by MAC address)
-- **Pool-level DHCP options** that override subnet defaults
+- **Pool-level DHCP options** that override subnet defaults (set through the API as `options_override`; the console's New Pool dialog has no options field)
 
 ### Hierarchy
 
@@ -92,8 +133,8 @@ DHCPScope
     "bootfile-name": "pxelinux.0",
     "code:176": "MCIPADD=10.0.0.20"   -- raw vendor option by code (see below)
   }
-  ddns_enabled: bool
-  ddns_hostname_policy: enum(client, server_name, derived, none)  -- default client (#1308)
+  ddns_enabled: bool                 -- INERT (#2270): DDNS is subnet-level; only false is accepted
+  ddns_hostname_policy: str          -- INERT (#2270): only the default "client" is accepted
   dns_track_dynamic_leases: bool (default true)  -- see "Dynamic-lease DNS drift" below
   address_family: enum(ipv4, ipv6)   -- inferred from the bound subnet's CIDR
   v6_address_mode: enum(stateful, stateless, slaac)  -- v6 only (issue #52)
@@ -141,6 +182,25 @@ rendered by Kea and FortiGate only, never by Windows, so they always take
 An option stored before this check (an imported `opt-NN` on a Kea group,
 say) stays editable as long as it is left unchanged.
 
+The spelling is checked on the other ways in as well (#1347):
+
+- **A server joining a group.** Creating a server in a group, or moving
+  one into it, is refused (422) when the group's servers would then drop
+  a raw option already stored on one of its scopes: a Windows server
+  joining a group whose scopes hold `code:43`, say. The refusal names the
+  scopes and keys, so they can be re-keyed or removed first.
+- **The importer.** Options arrive in the source server's spelling (the
+  Windows importer keeps an unmapped option as `opt-NN`). They are re-keyed
+  to the target group's spelling on commit, and any no server in the group
+  can serve (a code Kea has no definition for, or any raw code in a mixed
+  group) are dropped, each named in the import's warnings.
+- **The option editor.** A pick from the option-code catalogue is keyed in
+  the group's spelling: `opt-43` on a Windows group, `code:43` elsewhere.
+
+Each DHCP driver declares the spelling it reads
+(`DHCPDriver.raw_option_spelling`), so a new driver states its own rather
+than inheriting Kea's.
+
 **A DHCPv6 scope cannot share a group with a Windows DHCP server (#1480).**
 SpatiumDDI manages Windows DHCP over DHCPv4 only, so creating a v6 scope in
 a group with a Windows member is refused, and so is creating or moving a
@@ -148,10 +208,10 @@ Windows server into a group that has v6 scopes. Keep DHCPv6 in a Kea group.
 
 DHCPv6 scopes accept `dns-servers`, `ntp-servers` (IPv6 addresses),
 `domain-search` and `bootfile-name`. They refuse options with no DHCPv6
-equivalent and all raw codes. A client class renders into the DHCPv4
-config always, and into the DHCPv6 config when the group has v6 scopes, so
-its options are checked as DHCPv4: an IPv6 `dns-servers` in a class is
-refused, because Dhcp4 would reject it.
+equivalent and all raw codes, `opt-NN` on a Windows group included: the
+Windows driver writes options with `Set-DhcpServerv4OptionValue` only. A
+client class is checked against its own address family (§4); a `dual`
+class accepts an option either family accepts.
 Raw `option_data` is refused: it is for internal producers such as the
 E911 location options (#972).
 
@@ -306,7 +366,8 @@ DHCPPool
     -- excluded:  range exists in subnet but DHCP will NOT offer these IPs
     -- reserved:  range held for static assignments only (not auto-assigned)
   class_restriction: str (nullable)   -- Kea client class
-  lease_time_override: int (nullable) -- overrides scope lease_time for this pool
+  lease_time_override: int (nullable) -- NOT SUPPORTED (#1689): Kea has no per-pool lease time, so
+                                         a value is refused with a 422; null only (kept so an old row can be cleared)
   options_override: JSONB (nullable)  -- additional options for this pool only
 ```
 
@@ -315,6 +376,8 @@ DHCPPool
 > row — occupancy is derived at request time from mirrored lease and
 > reservation state, and is served by the endpoints below (#913, corrected
 > in #917).
+
+**Range validation (#2500).** `start_ip` / `end_ip` must be valid IPs of the subnet's address family, `start_ip <= end_ip`, and both must lie inside the scope's subnet, for every range type (`dynamic`, `reserved`, `excluded`); otherwise the API answers 422 naming the subnet. Kea rejects a pool outside its subnet's prefix and the whole group stops converging. On update the merged range (stored row under the patch) is checked, but only when `start_ip` / `end_ip` is edited, so pools stored by the importers or the Windows topology pull (which write rows directly, not through this endpoint) stay editable for other fields.
 
 ### Pool occupancy over REST (issue #913)
 
@@ -410,9 +473,9 @@ errors.
 |---|---|---|---|
 | Infrastructure | 10.1.2.1–10.1.2.20 | excluded | Gateways, servers — never DHCP |
 | Static Only | 10.1.2.21–10.1.2.50 | reserved | Printers with static assignments |
-| VoIP Phones | 10.1.2.51–10.1.2.100 | dynamic | Class: VoIP, short lease, option 150 |
+| VoIP Phones | 10.1.2.51–10.1.2.100 | dynamic | Class: VoIP, option 150 (by API) |
 | Workstations | 10.1.2.101–10.1.2.200 | dynamic | Standard lease, all defaults |
-| Guest WiFi | 10.1.2.201–10.1.2.240 | dynamic | Class: Guest, 2h lease, no internal DNS |
+| Guest WiFi | 10.1.2.201–10.1.2.240 | dynamic | Class: Guest, options by API (no internal DNS) |
 | Management | 10.1.2.241–10.1.2.254 | excluded | Network equipment |
 
 ---
@@ -452,8 +515,8 @@ empty.
 **Prerequisite — create a scope for the subnet.** A scope lives on a DHCP
 **server group** that has at least one Kea member (DHCP is group-centric —
 scopes / pools / statics / classes all belong to the group). Create it from
-**IPAM → the subnet → "DHCP Pools" tab → Create Scope**, or from
-**DHCP → the server group → Scopes tab → New Scope**. A dynamic pool is optional;
+**IPAM → the subnet → DHCP tab → Create Scope**, or from
+**DHCP → the server group → Scopes tab → "+ Serve leases on subnet…"** (pick the subnet). A dynamic pool is optional;
 the scope alone is enough to emit the `subnet4` block that reservations hang off.
 
 **Create the reservation — two equivalent paths:**
@@ -462,20 +525,28 @@ the scope alone is enough to emit the `subnet4` block that reservations hang off
 New static assignment**. Pick the scope (a picker appears when the group has
 more than one), then enter the MAC + IP + hostname and save. Edit and Delete
 live on the per-row right-click menu. Creating / editing / deleting a
-reservation requires a **superadmin**.
+reservation requires `write` / `delete` on `dhcp_static` (the built-in DHCP Editor role holds `admin` on it).
 
 *From IPAM (at allocation time):*
 
 1. **IPAM → select the subnet → "Allocate IP"** (the primary header button; also
    reachable from a free-range gap row or the subnet context menu).
 2. In the **Allocate IP Address** modal set **Type / Status = `static_dhcp`**.
-   This reveals the **DHCP Scope** picker.
-3. Pick the **DHCP Scope**, enter the **MAC address** (required — see caveat
-   below), and set the hostname. If no scope exists for the subnet yet, the
-   picker offers a **Create a scope** button that opens the scope modal inline.
+3. Enter the **MAC address** (required — see caveat below) and set the
+   hostname. There is no scope picker: the server puts the reservation on
+   the subnet's sole matching-family scope itself. If no scope exists for
+   the subnet yet, the modal says so and offers a **Create a scope** button
+   that opens the scope modal inline.
 4. Click **Allocate**. IPAM creates the address row with
-   `IPAddress.status = static_dhcp` and mirrors it into the scope as a
-   `DHCPStaticAssignment` (via `POST /api/v1/dhcp/scopes/{scope_id}/statics`).
+   `IPAddress.status = static_dhcp` and the server syncs a
+   `DHCPStaticAssignment` behind it in the same request
+   (`sync_static_for_ipam_row`, #1628) — no second call from the browser.
+
+The same sync runs on **Edit**, on **bulk-edit**, and in the **address
+importer**: flipping a row into `static_dhcp` creates its reservation,
+changing its MAC / hostname updates the reservation in place, and flipping
+it away (or clearing the reservation state) removes the reservation. A save
+never overwrites a reservation's description with the IPAM row's empty one.
 
 Either way, the Kea agent picks up the new `ConfigBundle` (a group wake fires +
 the ETag shifts) and renders the host reservation within seconds. The **Static
@@ -487,18 +558,31 @@ Assignments** tab lists every reservation across the group's scopes.
   `static_dhcp` address without a `mac_address` returns **422**
   (`mac_address is required when status is 'static_dhcp'`) from both the
   `create` and `next-address` endpoints, so **nothing is created** — neither the
-  IPAM row nor the reservation.
-- **`static_dhcp` with a MAC but no scope creates the IPAM row and silently skips
-  the reservation.** If no DHCP scope is selected (e.g. none exists for the
-  subnet yet), the IPAM address is created but the mirror to Kea is **not
-  attempted** — this is the real "I set it static but nothing happened" trap.
-  Create a scope first (see the prerequisite above).
-- **Editing an existing IPAM row to `static_dhcp` does not create a reservation.**
-  Flipping an *existing* IP to `static_dhcp` via **Edit** (or bulk-edit) updates
-  the IPAM row but does **not** mirror it to Kea. Add the reservation from the
-  DHCP **Static Assignments** tab, or delete and re-allocate via the IPAM flow.
-- **Creating a static currently requires a superadmin.** A non-superadmin who
-  allocates a `static_dhcp` IP gets the IPAM row but the mirror call returns 403.
+  IPAM row nor the reservation. The same 422 answers an edit that sends
+  `mac_address: null` for a row that is (or is becoming) `static_dhcp`.
+- **`static_dhcp` with a MAC but no unambiguous scope creates the IPAM row and
+  warns.** If no DHCP scope serves the subnet, or several scopes match, the
+  IPAM address is created but no reservation is — the server does not guess —
+  and the response (or import result) carries a `dhcp_static_warning` saying
+  so instead of silently skipping it. Create exactly one scope for the
+  subnet, then re-save the row.
+- **The sync needs the `dhcp_static` permission.** Creating or updating a
+  reservation through IPAM requires the acting user's `write` grant on
+  `dhcp_static`; removing one requires `delete` — the same grants the DHCP
+  statics endpoints enforce. Without the grant the IPAM write still succeeds
+  but the reservation is left untouched and the response carries the
+  permission warning (GHSA-44ph). Direct reservation CRUD on the DHCP side
+  takes the same `dhcp_static` grants, as above.
+- **Deleting the address follows the same rule.** Deleting an IPAM row (or
+  purging orphans) removes the reservations linked to it, on the DHCP server
+  too, so it needs `delete` on `dhcp_static`. Without it the delete is
+  refused with 403 rather than leaving a reservation behind a row that no
+  longer exists (GHSA-hxpx). Each reservation a delete removes writes its own
+  `dhcp_static_assignment` audit row.
+- **No backfill for rows from before the server-side sync.** A `static_dhcp`
+  row created before #1628 that never got its reservation is not repaired
+  in the background: it gets one the next time it is saved, or when it is
+  re-imported with `overwrite`.
 
 ### Troubleshooting — reservations render empty in Kea
 
@@ -511,8 +595,9 @@ up, walk this checklist — each item is a real, mostly-silent drop point:
   `GET /api/v1/dhcp/scopes/{scope_id}/statics` or the group's Static Assignments
   tab. If it's absent, distinguish two cases: the allocation was
   **rejected** (a blank MAC 422s the whole allocation — nothing was created), or
-  it **succeeded without mirroring** (a MAC was given but no scope was selected,
-  or a non-superadmin hit 403 on the mirror call). See the caveats above.
+  it **succeeded without mirroring** (a MAC was given but there was no scope —
+  or several — or the acting user lacked the `dhcp_static` grant; the response
+  carried a `dhcp_static_warning` naming which). See the caveats above.
 - **The scope is inactive.** Only `is_active = true` scopes (and the statics
   under them) are assembled into the config bundle — a disabled scope silently
   drops every reservation it holds.
@@ -618,6 +703,15 @@ best-effort by design (failures are logged, not raised): a `502` from an
 unreachable Windows box would roll the DB restore back and make the row
 *unrestorable*, which is the opposite of what a recovery action should do.
 
+### Deleting a server releases its lease mirrors (#2290)
+
+Deleting a DHCP server purges its leases through the same teardown the expiry
+sweep uses: each lease's `auto_from_lease` IPAM mirror is freed and its DDNS
+A/PTR retracted, unless an HA / failover partner (or another client on the
+server) still holds an active lease on the address, in which case the shared
+mirror and DNS stay. The hourly mirror sweep also frees any `status="dhcp"`
+mirror that no lease row backs, healing servers deleted before this fix.
+
 ### The IPAM mirror is released on wholesale deletes (#618)
 
 A reservation owns an `ip_address` row at `status="static_dhcp"`, back-linked via
@@ -644,6 +738,27 @@ The row is released to `available` (not `allocated`): a leftover `allocated` row
 is skipped by the agent's lease-mirror refresh, so it would shadow a future
 dynamic lease at that IP *and* never be reaped (#478). Migration `b3e7d21c9f04`
 repairs the rows already stranded by pre-existing hard-deletes.
+
+### Deleting a server group (#1399)
+
+A group that still holds a live scope cannot be deleted: `DELETE
+/api/v1/dhcp/server-groups/{id}` answers `409`, as it does while the group
+holds servers, and so do the two-person approval queue and the Copilot,
+which read the same preview. Delete the group's scopes first. The console's
+Delete Server Group reads the group's servers and scopes before it offers
+the delete: while the group holds either, the dialog says what it holds and
+offers no delete, so the `409` is only the backstop. A scope already in
+Trash does not block the group, but it goes with it: deleting the group
+deletes its scopes in Trash for good, with their pools and reservations, and
+the console's dialog and the approval preview say so. A DNS server group
+behaves the same way for its zones.
+
+The leases of those scopes in Trash are torn down first, in committed
+batches, before the group goes (#3744). When more of them are left than the
+request can tear down in 10 s (a scope trashed moments before, with its own
+background teardown still running), the delete answers `409` with
+`Retry-After: 60` and hands the rest to that teardown; retry once it has
+finished.
 
 ### Known gap — Windows scope sync (issue #620)
 
@@ -672,9 +787,71 @@ DHCPClientClass
   match_expression: str -- Kea expression
                         -- e.g., "option[60].hex == 'Cisco7960'"
   description: str
+  address_family: ipv4 | ipv6 | dual   -- which Kea daemons get it (#1229)
 ```
 
 Classes are referenced by pool `class_restriction` field. The DHCP driver translates these to server-native syntax.
+
+The reference is by name, and Kea accepts a name it does not define (the pool then matches nobody), so the API guards it (#2285): renaming or deleting a class, or deleting a device policy, is refused with a 409 while a pool in the group (or another class's `member()` test) still names it; a pool naming a class that does not exist is a 422. A dangling restriction that still reaches a bundle is rendered as stored (fail closed, never opened to every client) and logged as `dhcp_pool_restricted_to_undefined_class` when the set of dangling references changes.
+
+### Address family (#1229, #1295)
+
+Kea runs one daemon per family, and a class goes only into the daemons its
+`address_family` names. Every class used to go into both, and that broke
+things two ways. First, some test tokens exist in only one daemon: `pkt4` and
+`relay4` (option 82 matching) are DHCPv4-only, and `pkt6` and `relay6` are
+DHCPv6-only. kea-dhcp6 rejects the whole config over a `pkt4` test, and
+kea-dhcp4 does the same over `pkt6`. The agent then reverts the bundle for
+**both** daemons. Second, one options map cannot serve both:
+`dns-servers` is an IPv4 list in Dhcp4 and an IPv6 list in Dhcp6.
+
+- `ipv4` / `ipv6` — the class and all its options go to that daemon only.
+  The test may not use the other family's tokens; the API returns a 422
+  saying which token and which family would take it.
+- `dual` — the class goes to both daemons. The test may use neither
+  family's tokens. Each option goes to the daemon it is valid in: an IPv4
+  `dns-servers` to Dhcp4, `domain-search` to both, and `routers` to Dhcp4
+  only, as before. The control plane works out the split, because only it
+  holds the option tables, and ships it to the agent.
+
+Named option lookups in a test (`option[host-name]`) are family-specific
+as well, but by option name, which no short list covers. For those, Kea's
+own check and the agent's revert (#882) are the backstop.
+
+A pool that names a class its daemon does not define is fine to Kea, which
+is exactly the danger: the pool loads and silently matches no client. So
+the API refuses both ways of getting there. Changing a class's family is a
+`409` while a pool in the family it would leave still restricts to it, and
+the pools are named. Setting a pool's `class_restriction` to an operator
+class not rendered for the pool's family is a `422`. Device-policy classes
+and Kea's built-ins such as `KNOWN` are not checked.
+
+Generated PXE (`pxe-…`) and phone (`voip-…`) classes are checked against
+what the bundle renders (#3388). A pool may name one only while it exists
+for that pool: a phone class while its profile is enabled and attached to
+an active scope, a PXE class while its profile is enabled and bound to the
+pool's OWN scope, since a PXE class is evaluated only in the scopes bound
+to its profile (#2731). Anything else is a `422`. Taking the class away
+while a pool names it is a `409` naming the pools: disabling a PXE
+profile, unbinding it from the pool's scope, deleting a rule (#3374);
+disabling, deleting or detaching a phone profile, or deleting or
+deactivating the last active scope it is attached to.
+
+The Kea importer keeps the daemon block each class came from. A class
+defined in both the `Dhcp4` and `Dhcp6` blocks, with the same test and no
+conflicting options, becomes one `dual` class. Otherwise the second copy
+is flagged for manual review instead of being dropped.
+
+Upgrading backfills the column (migration `c2f7a94e1d58`):
+
+- A test using `pkt6` / `relay6` becomes `ipv6`.
+- A test using `pkt4` / `relay4` becomes `ipv4`, including one that also
+  uses a v6 token, which could never load in either daemon.
+- Any other class becomes `dual` if its group has a live DHCPv6 scope,
+  which is how it rendered before. Otherwise it becomes `ipv4`.
+
+A bundle from a control plane older than this carries no family, so the
+agent renders the class into both daemons as it always did.
 
 Hand-authoring a match expression is not the only way to get a class:
 [§17a](#17a-fingerprint-driven-device-policies-issue-700) compiles one
@@ -704,8 +881,10 @@ DHCPMACBlock
 
 | Driver | Enforcement | Update mechanism |
 |---|---|---|
-| Kea | Packets matching the reserved `DROP` client class are silently dropped before allocation. The agent renders active blocks as `hexstring(pkt4.mac, ':') == '…'` OR-clauses inside `DROP.test`. | ConfigBundle — blocklist changes shift the bundle ETag; agent long-poll picks them up and re-renders. |
+| Kea | Packets matching the reserved `DROP` client class are silently dropped before allocation. The agent renders active blocks as `hexstring(pkt4.mac, ':') == '…'` OR-clauses inside `DROP.test`. On DHCPv6 scopes the same class is rendered best-effort (#2268), see below. | ConfigBundle — blocklist changes shift the bundle ETag; agent long-poll picks them up and re-renders. |
 | Windows DHCP | Server-level deny filter list (`Add-DhcpServerv4Filter -List Deny`). Deny filter is server-global — every scope on the server enforces it. | 60 s Celery beat task diffs desired-set against `Get-DhcpServerv4Filter -List Deny` and ships one batched PS script per WinRM round trip. |
+
+**What a MAC block can and cannot catch on DHCPv6.** A DHCPv6 packet has no hardware address field (Kea has no `pkt6.mac`), so the Dhcp6 `DROP` class derives the MAC from what the client sends: the link-layer address inside an Ethernet DUID-LL (type 3) or DUID-LLT (type 1) client-id, and the client link-layer address option (79, RFC 6939) that a first-hop relay may add (checked on both the innermost relay, which is the first hop, and the outermost, so a chain of relays is covered). It does **not** catch a client using DUID-EN or DUID-UUID, a DUID it randomised (many OSes generate a stable but non-MAC-derived DUID), a client that changes DUID, or a relayed packet whose relay adds no option 79. Treat the v6 block as a partial control: for a hard guarantee also block the device at the switch or router. Windows DHCP's deny filter is IPv4-only and does not apply to DHCPv6 scopes.
 
 Group-global is deliberate. Kea supports per-subnet via class/pool pinning; Windows doesn't support per-scope deny at all. A single "this device is bad, nowhere gets to serve it" rule is the usage pattern — per-scope precision is deferred until a concrete need surfaces.
 
@@ -721,7 +900,7 @@ Group-global is deliberate. Kea supports per-subnet via class/pool pinning; Wind
 
 ## 4b. Kea Lease Cache (#637)
 
-Kea 3.0 (shipped from Alpine 3.23) enables **lease caching** by default —
+Kea 3.0 (shipped from Alpine since 3.23) enables **lease caching** by default —
 `cache-threshold: 0.25`. When a client re-requests a lease that still has more
 than 75% of its lifetime remaining, Kea hands back the *same* lease with an
 **unchanged expiry** and skips the lease-database write entirely.
@@ -785,14 +964,16 @@ Three counters, and only one of them moves:
 
 | Counter | What it means | Moves here? |
 |---|---|---|
-| per-socket `sk_drops` (`/proc/net/udp`) | the kernel found the receive buffer full and discarded the datagram | **yes** |
+| per-socket `sk_drops` of the sockets Kea serves from (`/proc/net/udp`; with `dhcp-socket-type: raw`, kea-dhcp4's AF_PACKET sockets, #1283) | the kernel found the receive buffer full and discarded the datagram | **yes** |
 | `pkt4-receive-drop` / `pkt6-receive-drop` | Kea read the packet and discarded it (unparseable, `DROP` class, no subnet) | no |
 | `pkt4-discover-received` vs `pkt4-offer-sent` | Kea answering what it read | always equal |
+| DHCPv4 arrivals − `socket_drop` − `pkt4-received` (#2889) | Kea read the request and then evicted it from its full packet queue | under bursts deeper than the queue — see [the queue below](#keas-packet-queue) |
 
 Verified against kea-dhcp4 3.0.3: a run that lost **9,700** datagrams to
 buffer overflow reported `pkt4-receive-drop = 0` for its entire duration.
-Both are reported per 60 s bucket on `dhcp_metric_sample` as `socket_drop`
-and `receive_drop`, but only the first is treated as loss.
+All three are reported per 60 s bucket on `dhcp_metric_sample` as
+`socket_drop`, `queue_evicted` and `receive_drop`. The first two are
+treated as loss; `receive_drop` is not.
 
 > **`receive_drop` is context, not a fault.** Kea counts a packet there when
 > it reads one and throws it away — *including on purpose*. Verified against
@@ -800,20 +981,22 @@ and `receive_drop`, but only the first is treated as loss.
 > per packet, and a `DROP` class is exactly what the shipped
 > [DHCP MAC blocklist](#4a-dhcp-mac-blocklist) renders; Kea's HA hook drops
 > out-of-scope queries in `hot-standby` the same way. So the *DROPPED* line,
-> the `N dropped` chip and the alert rule all read `socket_drop` **alone** —
-> a rule that counted `receive_drop` would fire permanently, and never
-> auto-resolve, on any install with a blocklisted MAC or an HA pair.
+> the `N dropped` chip and the alert rule read `socket_drop` +
+> `queue_evicted` and **never** `receive_drop` — a rule that counted it
+> would fire permanently, and never auto-resolve, on any install with a
+> blocklisted MAC or an HA pair.
 > `receive_drop` is still surfaced beside it, labelled as what it is.
 
 The server detail modal's **Stats** tab draws a dashed *DROPPED* line and a
-red `N dropped` chip from `socket_drop`, and the default-on
-**`dhcp_packets_dropped`** alert rule fires on any confirmed kernel-side loss
-over a 15-minute window (raise the rule's minimum-count threshold to alert
+red `N dropped` chip from `socket_drop` + `queue_evicted`, and the default-on
+**`dhcp_packets_dropped`** alert rule fires on any confirmed loss of either
+kind over a 15-minute window (raise the rule's minimum-count threshold to alert
 only past a number of packets).
 
 > **`NULL` is not zero, anywhere in this chain.** An agent older than #980,
 > or one whose runtime cannot read `/proc/net/udp`, reports no `socket_drop`
-> and the column stays NULL. That renders as *loss not measured*, the alert
+> and the column stays NULL. So does one that, in raw mode, cannot read
+> Kea's AF_PACKET sockets. That renders as *loss not measured*, the alert
 > skips the server rather than vouching for it, and nothing folds it to 0 —
 > a wall of green zeros from an un-upgraded fleet is precisely the false
 > reassurance this section exists to remove. Every "was this measured?" test
@@ -830,24 +1013,51 @@ only past a number of packets).
 > whose floor is one packet. (A file that is *absent* is different, and is
 > a valid partial answer: no IPv6 stack means no v6 sockets to miss.)
 >
-> One real blind spot: the AF_PACKET socket Kea opens for
-> `dhcp-socket-type: raw` is not covered. `/proc/net/packet` carries no drop
-> column and its statistics can only be read by the process that owns the
-> socket. Relayed traffic is unicast and therefore arrives on the UDP
-> fallback socket, which is fully covered; directly-attached broadcast
-> traffic is not.
+> **In raw mode the DHCPv4 count comes from the AF_PACKET socket (#1283).**
+> With `dhcp-socket-type: raw` (`dhcp_socket_mode: direct`, the default),
+> Kea reads every DHCPv4 packet from an AF_PACKET socket, relayed unicast
+> included. The copy that lands on its UDP :67 socket is LPF's fallback,
+> which Kea drains and discards. So in raw mode the drops that cost a client
+> a retransmit are on the AF_PACKET socket, and the fallback's drops are
+> copies.
+>
+> In that mode the agent counts the AF_PACKET socket in place of UDP :67. In
+> `udp` mode (`dhcp_socket_mode: relay`) it counts the UDP sockets, as
+> before. DHCPv6 has no raw mode, so its :547 sockets always count. The
+> agent takes the mode from the config it rendered for Kea. An unreadable
+> config counts both kinds rather than guess.
+>
+> Measured under relayed bursts on kea-dhcp4 3.0.3 (AF_PACKET socket against
+> UDP :67):
+> - 261 against 126;
+> - 41 against 0;
+> - 505 against 300. Here the 505 were exactly the requests Kea never
+>   received.
+>
+> How the agent reads it:
+> - `/proc/net/packet` has no drop column, so the count comes through
+>   sock_diag, which needs no privilege.
+> - Kea's fd table is closed to the agent. So the agent counts the raw
+>   `ETH_P_ALL` sockets owned by the pod's user that it does not hold itself.
+> - Another program's raw socket under the same numeric uid is counted too.
+>   On the appliance that is the host's lldpd, whose BPF filter keeps DHCP
+>   traffic out of its queues, so it adds 0.
 
 ### What actually helps
 
-Two things do not, and it is worth knowing why before reaching for them:
+Two things do not help with *sustained* overload, and it is worth knowing why
+before reaching for them:
 
 * **A bigger socket receive buffer** removes the drops and replaces them with
   latency. Measured under #952: with 8 MiB of buffer the drops vanish and a
   DORA takes **34 s instead of 1.5 s**, because Kea then works through a
   backlog answering requests whole retransmit rounds late.
-* **A bigger `packet-queue-size`** does nothing at all. 64 → 2048 (32x)
-  changed neither throughput nor drops; that queue sits *behind* the receive
-  thread, and the bottleneck is the receive thread not being scheduled.
+* **A bigger `packet-queue-size`** does not raise throughput. At 12,000
+  relayed pkt/s offered, 64 → 2048 (32x) changed neither throughput nor
+  socket drops. That queue sits *behind* the receive thread, and no queue
+  holds a rate the workers cannot serve. A short burst is a different case,
+  and there the queue does matter: see
+  [the queue below](#keas-packet-queue).
 
 What helps is giving the receive thread the CPU. The chart already ships a
 500m CPU request on the Kea pod (#953 / #967 — see
@@ -907,7 +1117,228 @@ you whether you are at the knee where it is worth it.
 > `DHCP4_MULTI_THREADING_INFO`, the last being the line that reports whether
 > the pool size above took effect.
 
+#### Kea's packet queue
+
+**`packet-queue-size` is rendered as 1024, not left at Kea's 64 (#1283).**
+
+*What the queue does.* Under multi-threading, Kea's receive thread puts
+each packet on a queue that the workers take from. When a burst fills the
+queue, Kea evicts the oldest packet to make room. The only trace is a
+debug-level log line. `pkt4-received` is counted by the worker, so an
+evicted request appears in no statistic and no drop counter, and its client
+simply retransmits 4 s later.
+
+*What we measured.* A three-node cluster's relayed load ramp: kea-dhcp4
+3.0.3, a pool of 1, arrival bursts of 2-4 s. Only the queue size changed
+between runs:
+
+| `packet-queue-size` | requests evicted, counted nowhere | handshakes re-sent | answer latency p99 / max |
+|---|---|---|---|
+| 64 (Kea's default) | 2,286 | 35.1 % | 0.14 s / 0.33 s |
+| **1024** | **0** | 15.1 % | 1.17 s / 1.21 s |
+| 4096 | 0 | 7.8 % | 1.37 s / 1.39 s |
+
+*Why 1024.* The cost of a bigger queue is the wait in it: at most its size
+divided by the rate the workers serve at.
+- At 1024 the queue's deepest point was about 570, so those bursts fit with
+  room to spare.
+- At the roughly 470 packets/s one worker served there, a full queue drains
+  in about 2 s, inside the client's first retransmit.
+- At 4096 it would take over 8 s. Kea would then answer requests their
+  clients have already re-sent, the shape #952 measured as a 34 s DORA.
+
+The size is not scaled by `kea_thread_pool_size`, because more workers only
+drain the queue faster.
+
+*What is left.* The re-sends at 1024 and 4096 match the kernel's drops on
+Kea's raw socket in those runs: 1,042 and 505. Those drops are counted:
+they are `socket_drop` (above).
+
+#### Counting what the queue evicts (#2889)
+
+A burst deeper than the queue still evicts. On the gate load (12 relays,
+~4,000 devices, each minute's new devices released in a 2-4 s burst) a
+burst of 2,521 devices lost 690 requests that way, with `socket_drop`,
+`receive_drop` and `pkt4-received` all silent about them. The size of the
+queue, the worker count and Kea's per-packet logging were left as they
+are (#980 made those calls); the loss is **counted** instead, as
+`queue_evicted`:
+
+```
+queue_evicted = DHCPv4 arrivals − DHCPv4 socket_drop − pkt4-received
+```
+
+Kea 3.0 keeps no statistic for the eviction, so it is the remainder once
+everything that accounts for an arrival is taken out. That identity held
+to the packet over five measured runs.
+
+*Counting the arrivals.* The agent holds an `AF_PACKET` socket of its own
+with a classic-BPF filter and reads `PACKET_STATISTICS` from it every
+minute. The kernel counts every packet the filter accepts, and the socket
+is never read, so a counted packet costs an increment, not a copy. The
+socket is bound to no interface, so the filter itself (about 20
+instructions) runs on **every** inbound IPv4 packet on the host, not only
+on DHCP; on a node that also carries heavy unrelated traffic that is a
+measurable, if small, per-packet cost. It taps the receive path ahead of
+netfilter, as Kea's own raw socket does, though after VLAN untagging and
+bridge handling (one consequence is the 802.1p case below). It needs `CAP_NET_RAW`, which the agent already holds for the
+fingerprint sniffer, so nothing new is granted. The filter counts:
+
+- IPv4, UDP, destination port 67, first fragment only;
+- received, not sent, on an interface in Kea's `interfaces` (`*` = every
+  interface except loopback) that has an IPv4 address;
+- addressed to the address Kea serves from on those interfaces (the
+  interface's primary address, or the one pinned as `iface/address`) —
+  in `raw` mode also to 255.255.255.255. Those are the only destinations
+  Kea's own raw-socket filter admits. Without this check, a node that
+  announces a MetalLB relay VIP (#272) and forwards most of the relayed
+  requests to another node's Kea would count every one of them as
+  evicted;
+- in `udp` mode (`dhcp_socket_mode: relay`) unicast only, because Kea's
+  UDP sockets are bound to interface addresses and never see a broadcast.
+
+> **Why not an nftables counter.** The issue proposed one on the
+> appliance. Reading it needs `CAP_NET_ADMIN`, which neither the DHCP pod
+> nor the supervisor pod holds, so a root host runner would have had to
+> copy the value into a file on a timer, seconds out of step with Kea's
+> own counters. A counter on the existing `udp dport 67 accept` rule would
+> also miss most relayed traffic: `ct state established,related accept`
+> sits ahead of it in the chain, so every relay packet after the first in
+> a flow never reaches it. And `/etc/nftables.conf` re-creates its table
+> whole on every firewall apply, which resets the counter. Counting in the
+> agent avoids all of that, works on Compose and Kubernetes as well as on
+> the appliance, and reads on both sides of Kea's own counter snapshot.
+
+*The arithmetic.* Kea's counters are one snapshot, taken inside Kea at
+some instant, and the arrivals cannot be read at that same instant. A
+single read on one side of it is not good enough: on a server with steady
+traffic the packets that arrive in between make the remainder wobble by a
+few packets at every read, and an estimator fed that wobble reports some
+of it as eviction. Simulated, a mean of 0.2 packets of skew per read was
+enough to raise the default-on alert in a third of the day's 15-minute
+windows. So the agent reads the arrivals **twice**, once before it sends
+`statistic-get-all` and once after the reply and the socket drops are in.
+That brackets the remainder at Kea's snapshot between a lower and an
+upper bound.
+
+The first read is also **aged**. The agent waits `packet-queue-size` ÷
+100 seconds between it and the snapshot (10 s for the rendered 1,024,
+clamped to 2-15 s). Kea's queue never holds more than its depth, so in a
+queue that is not full every packet is taken by the worker within depth ÷
+service rate seconds, and 100 packets a second is far below any measured
+Kea rate. A packet counted by the first read and still not received at
+the snapshot is therefore one Kea evicted, not one waiting behind a backlog.
+Without the wait, a few packets still queued at two consecutive reads
+(after a 253 ms Kea stall, in the QA walk) were confirmed as an eviction.
+The wait is taken off the minute, so the poll period is unchanged.
+
+From those two bounds:
+
+- an eviction is confirmed only from the **lower** bound, and only once it
+  has held at two reads in a row, so a backlog in flight at one read is
+  never loss and read skew can only make the count lower;
+- the zero point is moved down only from the **upper** bound, so a
+  baseline taken while a backlog was in flight is corrected as it drains,
+  without any skew turning into loss;
+- what is reported is a high-water mark: never negative, never reported
+  twice, and an eviction lands in the bucket **after** the one it happened
+  in.
+
+The only way left to over-report is a packet that waited longer than the
+aging wait at two reads a minute apart, without being evicted: Kea serving
+under 100 packets a second, or stalled for most of the wait, with a backlog
+at both reads. A backlog below the queue's depth, however long it lasts,
+is not enough.
+
+The wait has a price, and it is paid in the safe direction. A request that
+arrives during the wait and is served before the snapshot is counted as
+received but not yet as arrived, so it pulls the remainder down. Under
+continuous background traffic the count can therefore read LOW, by up to
+the requests served during the wait (about 10 s of traffic), until a read
+whose wait was quieter. It never reads high. On bursty load (bursts with
+quiet between them, like the gate load) an eviction is counted exactly,
+one bucket after it happened. A delivery path on which Kea
+receives packets the filter does not count can only lower the estimate.
+
+*NULL is unmeasured, as everywhere above.* `queue_evicted` is NULL when
+the agent cannot open the raw socket (no `CAP_NET_RAW`), on a DHCPv6-only
+server (it counts DHCPv4 only), when `socket_drop` was not measured, and for
+the bucket in which the counting socket was (re)opened because Kea's interfaces, their addresses or the socket mode
+changed. It is also NULL when Kea's interfaces resolve to more than 200
+interfaces or addresses, which one filter cannot express. It is never 0 in
+those cases. The minute in which the agent starts, or Kea restarts, has **no
+bucket at all**, for every counter, as since #980: it is the baseline the
+next minute is diffed against. Counting resumes in the next bucket, against
+a fresh baseline, so on the Stats tab that minute is a gap, not a NULL.
+
+*Where the identity can be wrong.* Each of these counts as an eviction:
+
+- a DHCPv4 packet that Kea's sockets do not accept but the filter does.
+  In `raw` mode: unicast to the address of one Kea interface arriving on
+  another (asymmetric routing), or a frame carrying an 802.1p priority tag
+  (VLAN ID 0) — the kernel strips that tag before the filter sees the
+  packet, while Kea's raw socket drops any tagged frame;
+- in `udp` mode, a packet the host firewall drops before Kea's socket.
+  The appliance accepts UDP/67 unconditionally.
+
+Each of these goes the safe way, and is under-counted instead: traffic Kea
+serves on an address other than the interface's primary one, and traffic
+it receives on an interface outside its `interfaces` list.
+
+## 4d. An OOM-killed Kea is reported (#2023)
+
+Kea runs under the dhcp-kea container's memory limit. When it reaches
+that limit the container is killed and restarted into the same config,
+and without a record that is a crash loop in which every surface reads
+healthy between kills. The kill is now reported as the daemon state
+`degraded` with an `oom_killed:` reason, which the control plane reads
+as **not serving**: the red chip on the server row and the default-on
+**Agent daemon not serving** alert (five-minute grace, the same rule
+the DNS side uses; no new rule or column). An unreported state stays
+NULL (unknown), never "no OOM".
+
+How the kill is seen depends on the deployment:
+
+- **Appliance (Kubernetes / k3s).** The kubelet sets
+  `memory.oom.group` on every container, so Kea and the DHCP agent die
+  together and the agent can write nothing. The supervisor reports the
+  container's last termination (`OOMKilled`) in `role_health`, and the
+  control plane stamps it onto the live Kea row (the most recently seen
+  of the rows the appliance owns), over the restarted agent's `ok`,
+  timed from the kill. It counts for 10 minutes after the container is
+  back up, and only while the supervisor is heartbeating (15 minutes).
+- **Docker Compose.** Docker kills the one largest process, so the agent
+  survives. It samples the container cgroup's `oom_kill` counter
+  (`memory.events`, or `memory.oom_control` on cgroup v1) once a
+  second, persists a record in its state dir (`daemon_oom.json`) and
+  reports it on every heartbeat, over the sync loop's own `ok`. The
+  record clears when the counter has been still for 10 minutes. The
+  counter says a process in the container was OOM-killed, not which one,
+  and Kea is not the only candidate: the agent's own `kea-dhcpX -t`
+  config preflight loads the whole config, and radvd runs there too. So
+  a move is recorded only when Kea did not survive it, read from Kea's
+  pid files (`/run/kea/kea-dhcp{4,6}.kea-dhcp{4,6}.pid`): a pid gone, or
+  changed since the previous second, is a killed Kea. Both daemons alive
+  under the same pids means something else was killed; the agent logs
+  `dhcp_oom_kill_not_kea` and reports nothing, because Kea is serving.
+  Unreadable pid files prove nothing either way, so the kill is reported,
+  worded as unconfirmed. If the agent itself is the victim nothing is
+  recorded: the entrypoint takes the container down with it.
+- **Plain Helm install (umbrella chart)** group-kills like the
+  appliance but has no supervisor, so only the pod's last state
+  (`kubectl get pod ... -o jsonpath='{.status.containerStatuses[0].lastState}'`)
+  records it. The kubelet's `singleProcessOOMKill: true` (Kubernetes
+  1.32+) restores the single-process kill and the agent's own record.
+
 ---
+
+> **Logs → DHCP Activity across a group (#2120).** The Kea activity log
+> reads one server, one DHCP server group, or every server:
+> `POST /logs/dhcp-activity` takes an optional `server_id` and an optional
+> `group_id`, each row carries the `server_name` that logged it, and the
+> selection is narrowed to the servers the caller may read — so an HA pair's
+> two halves read as one time-ordered stream. See
+> [`OBSERVABILITY.md` §4½](../OBSERVABILITY.md).
 
 ## 5. DHCP Lease Tracking
 
@@ -926,9 +1357,17 @@ DHCPLease (not persisted long-term — cached in Redis, written to DB for histor
 
 ### Lease Sync Strategy
 
-- **Real-time (preferred)**: Kea `lease_cmds` hook + webhook to SpatiumDDI on lease events
-- **Polling fallback**: Celery task pulls lease dump every N minutes via DHCP driver API
+- **Kea (agent)**: the agent tails Kea's lease CSV and posts each lease change
+  to `POST /api/v1/dhcp/agents/lease-events` in batches, spooling them on disk
+  while the control plane is unreachable
+- **Agentless (Windows DHCP, FortiGate)**: the `auto_pull_dhcp_leases` Celery
+  task pulls leases through the driver API on the interval set in
+  `dhcp_pull_leases_interval_seconds` (see §15)
 - Leases are used to update `IPAddress.status`, `IPAddress.last_seen`, and trigger DDNS
+
+### DDNS on renewal (#3776)
+
+A renewal with an unchanged hostname writes nothing when the published records are already right. Otherwise it repairs them: a deleted A/AAAA or PTR is republished, and a changed effective `ddns_ttl` (subnet, block or space) is applied to the existing records. The TTL of a DDNS-generated record follows `ddns_ttl`, so a TTL hand-edited on such a record is reset to the effective `ddns_ttl` at the next renewal. To pin a TTL, change `ddns_ttl` on the subnet, block or space, or replace the record with a manual one; an operator's own record keeps its TTL. See [DNS.md §7](DNS.md) for the rest of the DDNS pipeline.
 
 ### Lease History (forensic trail)
 
@@ -965,7 +1404,11 @@ Each DHCP server is managed by an **SpatiumDDI Agent** — a lightweight sidecar
 ### Agent Behavior
 
 **When control plane is reachable:**
-1. Agent polls SpatiumDDI API for config changes every N seconds (configurable, default 30s)
+1. Agent long-polls `GET /api/v1/dhcp/agents/config` with its last ETag; the
+   control plane holds the request (up to `LONGPOLL_TIMEOUT`, default 30 s)
+   and answers as soon as the bundle changes, woken by a Redis pub/sub
+   message published after the change commits. A heartbeat goes out
+   separately every `HEARTBEAT_INTERVAL` (default 30 s)
 2. On config change: agent validates new config, writes to local cache, applies to DHCP daemon
 3. Agent reports lease events back to SpatiumDDI API in real time
 4. Agent writes a "last successful sync" timestamp to local disk
@@ -978,6 +1421,38 @@ Each DHCP server is managed by an **SpatiumDDI Agent** — a lightweight sidecar
 5. On reconnect: agent replays every push it spooled during the gap — lease
    events, activity log, metrics — in order, then reconciles leases from a
    full Kea snapshot (see *Push spool* below, #1077)
+
+**When a second agent process claims the same server
+([#3143](https://github.com/spatiumnorth/spatiumddi/issues/3143)):**
+A cloned Kea VM, or two agent containers given one state directory, keeps
+the same `agent_id`, so both authenticate as one server. Before #3143 they
+shared the server's one token: each registration or token rotation made
+the other's token stale, and the pair traded `401 Stale token` and
+re-registrations forever while the server row flapped between them. The
+DHCP agent now names its process (`X-Spatium-Agent-Instance`, a random id
+per process, not persisted) on every config poll, heartbeat and
+registration, and the control plane applies the DNS agent's rules
+(see [DNS_AGENT.md §2, *Duplicate agent processes*](../deployment/DNS_AGENT.md#duplicate-agent-processes)):
+1. Only the newest process is served. A process the server has never seen
+   takes over at once, so replacing or restarting an agent is unchanged.
+2. The one it displaced, if it polls or registers again while the owner is
+   still polling, is answered `409` with
+   `X-Spatium-Duplicate-Agent-Instance: 1`. No token is minted, and its
+   heartbeats never rotate the token, so the owner keeps a working one.
+3. The refused agent logs `sync_duplicate_agent_instance` (or
+   `register_duplicate_agent_instance`), **keeps Kea serving the config it
+   already has**, and asks again every 30 s. If the owner stops polling for
+   5 minutes, it takes the server back by itself.
+4. Refusals that last over 2 minutes show a **Duplicate agent** chip on the
+   server row and detail, with the address the refused agent polled from,
+   set `duplicate_agent` on the `list_dhcp_servers` MCP tool, and raise the
+   default-on `dhcp_agent_duplicate_instance` alert ("Two DHCP agents on one
+   server"). All clear 10 minutes after the extra agent stops.
+
+Kea HA pairs are not affected: each peer has its own `agent_id`. An agent
+older than #3143 sends no process id and registers and polls exactly as
+before. To fix a duplicate, stop the extra agent, or clear its state
+directory so it registers as a server of its own.
 
 ### Cache Format
 
@@ -1014,14 +1489,20 @@ whichever bundle came before this one — that rotation destroyed the fallback
 after two poll cycles), and `quarantine.json` records an etag whose apply
 failed so it is not re-rendered on every poll.
 
-Kea's `config-test` is what makes the distinction usable: a rejection is a
+The preflight (`kea-dhcp4 -t` / `kea-dhcp6 -t` on the written file, in a
+separate process) is what makes the distinction usable: a rejection is a
 verdict about the config, whereas an unreachable control socket says nothing
-about it — Kea may simply be restarting. Only a rejection reverts; reverting
-on an unreachable socket would discard a good bundle because of a timing
-accident.
+about it — Kea may simply be restarting. A rejection reverts; reverting on an
+unreachable socket would discard a good bundle because of a timing accident.
+A check that could not run at all (missing binary, 30 s timeout, crash) is
+not a verdict either, but it is not an acceptance: the reload is skipped and
+the apply fails in the `validate` phase, so it is reverted on disk,
+quarantined and retried on the backoff. The agent does not use Kea's
+`config-test` command: on Kea 3.0.3 it leaves the running daemon unable to
+start the HA listener (#1447).
 
 The revert rewrites the on-disk `kea-dhcp4.conf` / `kea-dhcp6.conf`, not just
-the agent's bookkeeping. `config-test` rejects *without* disturbing the
+the agent's bookkeeping. The `-t` check rejects *without* disturbing the
 running daemon, so Kea itself is fine either way — but the refused document
 has already been written to those paths, and that file is what Kea reads on
 its next start. Leaving it turns a rejected apply into a crash loop the next
@@ -1041,7 +1522,7 @@ unreachable or a config was rejected — lands on `dhcp_server.daemon_status`
 read by nothing before), is exposed on the server row, drives a chip and a
 detail banner, and feeds the `agent_daemon_degraded` alert rule once a
 daemon that is not serving has stayed that way past a five-minute grace. A
-rejected config is not that: `config-test` refuses without disturbing the
+rejected config is not that: the `-t` check refuses without disturbing the
 running Kea, so a `degraded` whose reason is `config_apply_reverted: …` or
 Kea's own `dhcp4_config_rejected: …` / `dhcp6_…` is the verdict above,
 reported by `agent_config_rejected`. The server response's
@@ -1103,22 +1584,17 @@ the batches dropped; `find_agents_with_spool_backlog` is the Copilot tool.
 ### Push (IPAM → DHCP Server)
 Triggered by:
 - Scope/pool/static assignment create/update/delete
-- Manual "Force Sync" from UI
-- Scheduled full sync (default: every 5 minutes)
+- Manual "Force Sync" from UI (every server except Windows DHCP)
 
-The push is **diff-based** — only changed objects are sent, not a full config replacement. This prevents unnecessary DHCP server disruption.
+There is no scheduled full push. Kea agents long-poll the control plane for the whole config bundle by ETag, so any change that alters the rendered config reaches them within seconds; the agent applies the bundle it gets rather than a diff.
 
 ### Pull (DHCP Server → IPAM)
 Triggered by:
 - Lease events (real-time via webhook or Kea hook)
-- Scheduled lease dump pull (fallback)
-- Manual "Import Leases" from UI
+- Scheduled lease pull for agentless servers (Windows DHCP, FortiGate), gated by **Settings → DHCP Lease Sync**
+- Manual **Sync Leases** on a Windows DHCP server's detail page (other servers show Force Sync instead)
 
-### Reconciliation Report
-Available from the admin UI: compares IPAM DB state vs. live DHCP server state and flags:
-- IPs in DHCP scope but not in IPAM
-- Static assignments in DHCP not in IPAM
-- Scopes in DHCP not known to IPAM
+There is no DHCP reconciliation report in the console or the API; drift between IPAM and a live DHCP server is not reported as a diff.
 
 ---
 
@@ -1179,18 +1655,20 @@ Full reference: [Migration](MIGRATION.md). Parser internals:
 ## 10. Environment Variables for DHCP
 
 ```bash
-DHCP_SYNC_INTERVAL_SECONDS=30       # How often agents poll for config
-DHCP_LEASE_SYNC_INTERVAL_MINUTES=5  # Fallback polling for leases
-DHCP_CONFIG_CACHE_PATH=/var/cache/spatiumddi/dhcp-config.json
-DHCP_AGENT_RECONNECT_INTERVAL=60    # Seconds between reconnect attempts
-DHCP_AGENT_MAX_CACHE_AGE_HOURS=72   # Alert if cache older than this
+# DHCP agent (read by agent/dhcp/spatium_dhcp_agent/config.py)
+SPATIUM_API_URL=https://spatium.example.com  # control plane URL
+SPATIUM_AGENT_KEY=...                # bootstrap PSK, exchanged for a JWT
+CACHE_DIR=/var/lib/spatium-dhcp-agent # token, config cache, spool
+LONGPOLL_TIMEOUT=30                 # seconds the control plane holds /config
+HEARTBEAT_INTERVAL=30               # seconds between heartbeats
+AGENT_SPOOL_MAX_BYTES=268435456     # on-disk spool cap during an outage (#1077)
 ```
 
 ---
 
 ## 11. DHCP Options Reference
 
-The following standard DHCP options can be configured at the scope, pool, or host level. All options are configurable in the UI and via API. Parent scope options are inherited by child pools unless overridden.
+The following standard DHCP options can be configured at the scope, pool, or host level. Most options are configurable in the UI and via API; options 58 and 59 are not (see below). Parent scope options are inherited by child pools unless overridden.
 
 | Option Code | Name | Description |
 |---|---|---|
@@ -1202,14 +1680,16 @@ The following standard DHCP options can be configured at the scope, pool, or hos
 | 28 | Broadcast Address | Auto-computed |
 | 43 | Vendor Specific | Raw hex or vendor-specific encapsulated options |
 | 51 | IP Address Lease Time | Seconds; default lease time |
-| 58 | Renewal Time | T1 (default: 50% of lease time) |
-| 59 | Rebinding Time | T2 (default: 87.5% of lease time) |
+| 58 | Renewal Time | T1 — derived from each lease (50% of its lifetime); **not settable** |
+| 59 | Rebinding Time | T2 — derived from each lease (87.5% of its lifetime); **not settable** |
 | 66 | TFTP Server Name | Boot server hostname (PXE) |
 | 67 | Bootfile Name | PXE bootfile path |
 | 119 | Domain Search | Multiple search domains |
 | 150 | TFTP Server Address | Cisco VoIP boot server IP |
 
-**Min/Max lease times**: Configured as `min_lease_time` / `max_lease_time` on the DHCPScope. Clients requesting shorter/longer leases are clamped to this range.
+**Renewal / rebind timers (58 / 59)** cannot be set (#1690): the API refuses `dhcp-renewal-time`, `dhcp-rebinding-time` and `code:58` / `code:59` with a 422. Kea is rendered with `calculate-tee-times` so every lease gets T1 / T2 at 50% / 87.5% of its own lifetime (v6: 50% / 80% of the preferred lifetime). A Kea import drops `renew-timer` / `rebind-timer` and says so: a subnet's in that scope's `parse_warnings`, a global one in the preview's `warnings`.
+
+**Min/Max lease times**: Configured as `min_lease_time` / `max_lease_time` on the DHCPScope. Clients requesting shorter/longer leases are clamped to this range. The API refuses (422, naming the field) any set that is not ordered `min_lease_time <= lease_time <= max_lease_time`, on create and on update (judged on the stored row merged with the patch), because Kea rejects the whole config for an out-of-order set (#2499).
 
 ---
 
@@ -1252,8 +1732,10 @@ DHCPScope.hostname_to_ipam_sync: enum(disabled, on_lease, on_static_only)
 | Mode | Behavior |
 |---|---|
 | `disabled` | No hostname sync — IPAM hostname is managed manually |
-| `on_lease` | Hostname from every new DHCP lease is written to IPAM |
-| `on_static_only` | Only static DHCP assignments sync hostname to IPAM |
+| `on_lease` | Hostname from every DHCP lease is written to IPAM (the default) |
+| `on_static_only` | Lease hostnames are not written to IPAM; only static DHCP assignments set an IPAM hostname |
+
+The setting governs the **hostname only**. Every lease is still mirrored into IPAM as an `auto_from_lease` row (status, MAC, last-seen) in every mode, and the same rule applies to the Kea lease-event path, the Windows poll path and a reservation handing its address back to a live lease. Turning the setting off changes nothing already stored: existing mirror rows are not deleted and their hostnames are not blanked or overwritten by later lease events. A subnet with DDNS enabled still gets the hostname DDNS publishes; that is governed by the DDNS settings, not this one. Upgrade note (#2269): the setting used to be ignored, so scopes stored as `on_static_only` (the old default) were rewritten to `on_lease` to keep their behaviour; `disabled` is honoured as set.
 
 **Recommendation**: Set to `disabled` or `on_static_only` for large dynamic subnets (e.g., WiFi /16) where lease hostname data is noisy. Set to `on_lease` for server subnets where every IP should have a known hostname.
 
@@ -1268,8 +1750,9 @@ When two DHCP server containers serve the same pool, they must not hand the same
 ### Data model
 
 - HA config fields live on `DHCPServerGroup`: `mode`, `heartbeat_delay_ms`, `max_response_delay_ms`, `max_ack_delay_ms`, `max_unacked_clients`, `auto_failover`.
+- **`heartbeat_delay_ms` defaults to 2000** (it was 10000, #3779). Every Kea `config-reload` restarts the HA hook's state machine, and each transition is paced by the heartbeat: measured on a live Kea 3.0.3 pair, a joint reload takes about 4 s out of hot-standby at 2 s and about 21 s at 10 s. The cost is a little more traffic between the members (one small HTTPS request every 2 s, answered by the HA hook's dedicated listener threads rather than the packet workers). Failover does not get more eager: Kea declares communication interrupted only after `max_response_delay_ms` (60000) without any successful exchange with the partner, so a busy member missing a heartbeat or two does not leave hot-standby. Keep `max_response_delay_ms` several times larger than the heartbeat if you tune either. On upgrade, migration `ede3bcd2aff4` moves groups still at exactly 10000 to 2000 (a deliberate 10000 cannot be told apart from the old default); any other value is kept. The agent also reloads only the daemon (dhcp4 / dhcp6) whose document changed, so a v6-only scope change no longer resets v4 HA.
 - Each `DHCPServer` has its own `ha_peer_url` — the listener endpoint the partner calls for heartbeats + lease updates. Empty string for standalone servers.
-- A group with **one Kea member** is standalone; HA fields are ignored. A group with **two Kea members + non-empty `ha_peer_url` on both** renders HA into their configs. A third or later Kea member renders as a `backup` peer (#332): it takes no part in the heartbeat but receives lease updates.
+- A group with **one Kea member** is standalone; HA fields are ignored. A group whose `mode` is `hot-standby` or `load-balancing` with **two Kea members + non-empty `ha_peer_url` on both** renders HA into their configs. A `standalone` group never does, whatever URLs its members carry (#2969): Kea refuses `"mode": "standalone"` and would reject the whole config. The HA listener firewall rule and the `kea_ha_version_skew` pre-flight follow the same rule. A standalone group with two or more Kea members and an active scope has every member serving that scope uncoordinated, and raises the `dhcp_scope_uncoordinated` alert naming the group. A third or later Kea member renders as a `backup` peer (#332): it takes no part in the heartbeat but receives lease updates. **Only members with a URL take part (#3151):** HA renders between the Kea members that have a non-empty `ha_peer_url`, once there are at least two of them. A Kea member without one, in a group where two or more others have one, is **sidelined**: it gets no HA hook and serves none of the group's scopes (no pools, reservations or router advertisements), because serving the group's pools beside a running pair with no lease sync would hand one address to two clients. So assigning a third node to a working pair's group leaves the pair as it was, and the third node serves nothing until you give it a URL (it then joins as a `backup`, or by server order as a partner — see the autofill note below) or move it out. The group API lists it in `ha_sidelined_members` and the group page says "More than two Kea members", naming it. With fewer than two URLs, HA does not render and every member serves the scopes, as before; so if a pair member later leaves a group whose third member has no URL, the remaining two serve uncoordinated until the URL is set (the page then shows "HA is not running").
 - Mixed groups (Kea + Windows DHCP) are **refused** (#1110): creating or moving a server into a group that already has the other kind is a `422`. Kea serves every active scope of its group and cannot coordinate with Windows failover, so a scope both serve would be two uncoordinated DHCP servers. A mixed group that predates the refusal is flagged on the group's Windows failover panel, and each shared scope is reported uncoordinated. Two or more *Windows* members are handled by §15.8.
 
 ### Modes
@@ -1288,7 +1771,7 @@ On each `ConfigBundle` long-poll, the control plane emits a `failover` block alo
     "high-availability": [{
       "this-server-name": "<local server name>",
       "mode": "hot-standby|load-balancing",
-      "heartbeat-delay": 10000,
+      "heartbeat-delay": 2000,
       "max-response-delay": 60000,
       "max-ack-delay": 10000,
       "max-unacked-clients": 5,
@@ -1324,13 +1807,15 @@ Kea's HA hook parses peer URLs with Boost asio, which only accepts IP literals �
 
 ### Managing HA
 
-HA is configured on the server group, not a separate page. Edit the group under the DHCP tab, pick mode (`hot-standby` / `load-balancing`), tune the heartbeat / max-response / max-ack / max-unacked fields if the defaults don't fit your network, and make sure each Kea member has its **HA Peer URL** filled in (the server-level field) — typically `http://<host>:8000/` on the SpatiumDDI-shipped image. The HA hook renders automatically once the group has two Kea peers with non-empty URLs. Removing a server from the group or clearing its URL drops the hook on the next config push.
+HA is configured on the server group, not a separate page. Edit the group under the DHCP tab, pick mode (`hot-standby` / `load-balancing`), tune the heartbeat / max-response / max-ack / max-unacked fields if the defaults don't fit your network, and make sure each Kea member has its **HA Peer URL** filled in (the server-level field) — typically `http://<host>:8000/` on the SpatiumDDI-shipped image. **On appliances this is filled for you (#2963):** when an appliance-hosted Kea server joins a host-networked group in `hot-standby` or `load-balancing` mode and the group then has exactly two Kea members, each empty URL is set to `http://<node IP>:8000/`, using the node's k3s InternalIP as the supervisor reports it (the first IPv4, else IPv6) — the same address the cluster join URL and the HA firewall rule use. It happens when a member joins: an agent registering a new server row, a Fleet or Copilot role assignment that moves the server in, or a server PUT that changes its group. An agent restart is not a join, so a URL you clear to keep the pair from forming stays cleared. Never derived: a URL you set (never overwritten), a `standalone` group (the operator's "no HA"), `bridged` groups (the node IP is not where Kea listens), a member that is not an approved appliance, and a third or later member — it would join as an HA `backup`, and because roles follow server order it could take the primary role from the live pair, so that stays your decision. The group API reports `ha_peer_urls_missing` (members still without a URL in an HA-mode group) and `ha_autofill_skipped_reason` (`bridged_network_mode` / `more_than_two_kea_members`), and the group page shows the same warning. A derived URL is not refreshed if the node is later re-addressed; re-enter it, or clear it and re-assign the role. The HA hook renders automatically once the group has two Kea peers with non-empty URLs. Removing a server from the group or clearing its URL drops it from the relationship on the next config push (and drops the hook for the whole group once fewer than two members have a URL).
 
-**On appliances, the firewall opens the HA listener to the pair (#1167).** The host `input` chain is `policy drop`, and nothing used to open the HA port, so two appliances in one HA group could not reach each other. The control plane now works out, for each appliance in a rendered HA group, the port in its own member's `ha_peer_url` (80 / 443 when the URL names none) and the addresses of the group's other Kea members. A partner's address is the IP literal in its URL, else the node IPs of the appliance running it, else the address its agent last connected from. The rule is scoped to those addresses and never opened to `any`: Kea's HA API is unauthenticated unless you configure TLS or basic auth, and it accepts lease updates. It follows the same readiness rule as the HA hook, so the port is open exactly while Kea listens on it. A change reaches the firewall on the appliance's next heartbeat, within about 30 s. The Fleet → Firewall effective view shows the rule as `role:dhcp-ha`.
+**On appliances, the firewall opens the HA listener to the pair (#1167).** The host `input` chain is `policy drop`, and nothing used to open the HA port, so two appliances in one HA group could not reach each other. The control plane now works out, for each appliance in a rendered HA group, the port in its own member's `ha_peer_url` (80 / 443 when the URL names none) and the addresses of the group's other Kea members. A partner's address is the IP literal in its URL, else the node IPs of the appliance running it, else the address its agent last connected from. The rule is scoped to those addresses and never opened to `any`: the HA API accepts lease updates, and a group whose peer credential is not yet active (below) runs it without authentication. It follows the same readiness rule as the HA hook, so the port is open exactly while Kea listens on it. A change reaches the firewall on the appliance's next heartbeat, within about 30 s. The Fleet → Firewall effective view shows the rule as `role:dhcp-ha`.
+
+**HA peers authenticate to each other with a generated per-group credential.** Every server group holds its own CA and peer certificate, generated by the control plane and never shown or returned. Once every Kea member of the group runs an agent that supports it, both members render it into the HA hook (`trust-anchor` / `cert-file` / `key-file`, `require-client-certs`) and the peer URLs switch to `https` on the same port, so each HA listener accepts only its own group's partner. Until then — a pair part-way through an upgrade — the group keeps its current HA configuration, and both members switch together when the last one upgrades. The group shows `ha_peer_auth_active` when it is in use. A superadmin can replace the credential with `POST /api/v1/dhcp/server-groups/{id}/ha-peer-credential/rotate`; the members re-render within seconds and HA reconnects. Details, including why Kea's `basic-auth-user` is not used, are in [DHCP drivers → HA peer authentication](../drivers/DHCP_DRIVERS.md#ha-peer-authentication).
 
 ---
 
-## 15. Windows DHCP — Path A (read-only)
+## 15. Windows DHCP (agentless, WinRM)
 
 SpatiumDDI supports Windows Server DHCP as an **agentless** backend, driven over WinRM. It polls each Windows server for its leases and scopes and reflects them into IPAM, and writes scope / pool / reservation edits through to the server per object (it does not push config bundles — Windows has no whole-config entry point). A group with more than one Windows member is covered in §15.8.
 
@@ -1380,7 +1865,7 @@ Scheduled Celery beat task: [`app.tasks.dhcp_pull_leases.auto_pull_dhcp_leases`]
 |---|---|---|
 | `dhcp_pull_leases_enabled` | off | Master toggle. |
 | `dhcp_pull_leases_interval_seconds` | 15 | How often to poll each agentless server, in seconds. Floor is 10 (matching the beat tick). Operators who don't need sub-minute freshness can raise it to 60 / 300 / etc to reduce WinRM load. |
-| `dhcp_pull_leases_last_run_at` | — | Populated after each pass; visible in Settings. |
+| `dhcp_pull_leases_last_run_at` | — | Claimed when a pass **starts** (#2262), so a pass slower than the beat tick is not started again while it runs; visible in Settings. |
 
 > **Windows DHCP has no streaming primitive.** The lease audit log (`DhcpSrvLog-<Day>.log`) and `Get-DhcpServerv4Lease` are the only real windows into the running service, and both are pull-based. WinRM itself is request/response — `Get-Content -Wait` does exist in PowerShell but it holds the HTTPS connection open indefinitely and can't flush partial output back through `pywinrm.run_ps`, so true push-style streaming would require an agent process on the DC that POSTs events back to SpatiumDDI. Short-interval polling is the practical upper bound without adding that complexity.
 
@@ -1388,9 +1873,11 @@ Per poll:
 
 1. Enumerate agentless DHCP servers (`DHCPServer.driver in AGENTLESS_DRIVERS`).
 2. For each, call `driver.get_leases(server)` over WinRM.
-3. Upsert the lease into `DHCPLease` by `(server_id, ip_address)`.
+3. Upsert the lease into `DHCPLease` by `(server_id, ip_address)`. One pull per server runs at a time: the scheduled pass and the manual Sync share a per-server Postgres advisory lock, so a server another pull is already reconciling is skipped for that pass (#2262). If an address already carries more than one row (left by overlapping pulls before that lock existed), the pull keeps the most recently seen row and deletes the rest instead of failing.
 4. If the lease's IP falls inside a known subnet, mirror it into `IPAddress` with `status="dhcp"` and `auto_from_lease=True`.
 5. **Absence-delete** — any active `DHCPLease` row for this server whose IP didn't appear in the wire response is deleted, along with its mirrored `auto_from_lease=True` IPAM row. The Windows DHCP driver only returns *currently-active* leases, so absence from the response is the server's way of saying "that lease is gone" (admin purged it, client released it, etc.). Before this fix, deleted-on-server leases persisted in our DB indefinitely because `pull_leases` was upsert-only and the time-based cleanup sweep only looked at `expires_at`. The response adds two counters — `removed` (lease rows dropped) and `ipam_revoked` (IPAM mirrors cleaned up alongside) — both surface in the scheduled-task audit row and the manual sync modal.
+**Failures are visible on the server row (#2306).** When a server's scheduled pull raises, the reason is stored on `dhcp_server.last_sync_error` (with `last_sync_error_at`) and the server list shows an amber **Sync failing** chip; the next successful pull clears it. `status` is not used for this because the health probe rewrites it every cycle.
+
 6. The existing time-based `dhcp_lease_cleanup` sweep still handles leases that drift past `expires_at` between polls (e.g. when lease pull is disabled). The two mechanisms overlap harmlessly.
 
 **Scope absence** — not yet deleted. If an operator removes a scope on the Windows server, the `DHCPScope` row stays in SpatiumDDI's DB until deleted via the UI. Scope-absence cleanup is tracked separately.
@@ -1398,6 +1885,8 @@ Per poll:
 ### 15.4 Manual "Sync Leases" button
 
 Agentless DHCP servers have a **Sync Leases** button on the server detail header that runs the same lease pull immediately without waiting for the scheduled task. Useful after adding a new server, or when debugging a new lease. From the **subnet detail**, a `[Sync ▾]` dropdown with a **DHCP** entry fans out `POST /dhcp/servers/{id}/sync-leases` across every unique server backing a scope in that subnet and opens a result modal with per-server counters (active / refreshed / new / removed / IPAM revoked + any errors).
+
+While the scheduled pull (or another Sync) is reconciling the same server, `sync-leases` answers **409** rather than running a second pull alongside it; try again once that pass finishes (#2262).
 
 `sync-leases` is an agentless-only operation — agent-based Kea streams lease events continuously and converges scope/config via the ConfigBundle long-poll, so there is nothing to pull. As of `2026.06.25-1` (#453) calling it against an agent-based server is **no longer a 400**: the endpoint returns a no-op `SyncLeasesResponse` with an explanatory `note` (and nudges the agent to re-poll its config so the scope definition converges immediately), rendered as an info line in both the subnet sync modal and the server-detail banner.
 
@@ -1431,7 +1920,7 @@ Two Windows DHCP servers only share a scope safely inside a **failover relations
 - **Relationships are managed from the group's panel** — create, edit, delete, add or remove scopes, replicate one partner's configuration over the other's — over the CredSSP WinRM transport, which is the only one that can reach the partner from the server a cmdlet runs on.
 - The lease-sync poll records each server's relationships and the scopes it holds; one member imports each shared scope and the others are compared against it for drift.
 - A lease's shared IPAM mirror and DDNS records are not torn down while another server in the group still holds the lease.
-- The default-on **DHCP scope served uncoordinated** alert rule (`dhcp_scope_uncoordinated`, critical) fires per scope two servers serve without coordinating.
+- The default-on **DHCP scope served uncoordinated** alert rule (`dhcp_scope_uncoordinated`, critical) fires per scope two servers serve without coordinating, and per `standalone` group with two or more Kea members (#2969).
 
 The group page shows it all under **Windows DHCP failover**; the scopes table and the IPAM subnet's scope card carry a **Windows** badge. REST: `GET /dhcp/server-groups/{id}/failover`, `GET /dhcp/scopes/{id}/failover`, and the management routes under `/dhcp/server-groups/{id}/failover/relationships` (superadmin, audited — never the shared secret); MCP: `find_dhcp_failover_relationships` (read-only — deliberately no `propose_*` for relationship changes). Setup and every refusal: [WINDOWS.md](../deployment/WINDOWS.md#more-than-one-windows-dhcp-server-in-a-group). Internals: [DHCP_DRIVERS.md](../drivers/DHCP_DRIVERS.md#failover-relationships-and-multi-member-groups-1110).
 
@@ -1565,10 +2054,13 @@ rule here has been surfaced to an operator, not just silently logged.
   lease updates but takes no part in the heartbeat.
 - **Group mode enum.** `mode` must be `standalone`, `hot-standby`, or
   `load-balancing`. Enforced at `backend/app/api/v1/dhcp/server_groups.py`.
-- **HA rendering requires both peers' URLs.** If either Kea member in
+- **HA rendering requires two peer URLs.** If either Kea member in
   a 2-member group has an empty `ha_peer_url`, the config bundle
   drops the `failover` block and neither peer loads the HA hook —
-  silent fall-through to "not-yet-configured" state.
+  both serve the group's scopes uncoordinated until the URL is set
+  (the group page says "HA is not running"). In a larger group a
+  URL-less member beside two or more with URLs is sidelined instead:
+  no hook and no scopes, while the others keep running HA (#3151).
 - **Mixed driver groups are refused (#1110).** Creating or moving a
   server into a group that already has the other driver is a `422`:
   Kea HA cannot coordinate with Windows failover. See §14.
@@ -1789,7 +2281,7 @@ but Kea rejects a malformed config **whole**, so an unbalanced paren
 would stop every other class, scope and reservation in the group
 converging, not just this policy. Same blast radius `named.conf`
 validation exists for in #876 / #899. The agent still runs Kea's own
-`config-test` before applying, and #882's quarantine means a rejected
+`kea-dhcp4 -t` check before applying, and #882's quarantine means a rejected
 bundle is reverted rather than re-applied in a loop.
 
 ### Rendering
@@ -1962,3 +2454,25 @@ REST (gated by the module): `GET /dhcp/ra/groups/{id}/ra-config`
 /dhcp/ra/groups/{id}/ra-allowlist`. Operator-Copilot tools:
 `find_ra_subnets`, `find_observed_ra_routers`, `count_rogue_ra_routers`
 (reads, default on) + `propose_allowlist_ra_router` (write proposal).
+
+---
+
+## 20. DHCP server management — reference summary
+
+_Moved here from the README feature tour (#3410), so the detail stays in the documentation._
+
+### Kea servers, scope authoring and PXE profiles
+
+Kea container + agent with lease tracking.
+
+- Group-centric HA (hot-standby + load-balancing) with live state reporting
+- Self-healing peer-IP drift
+- Supervised daemons for crash-loop-safe restarts
+- **Scope authoring**:
+  - 95-entry RFC 2132 + IANA option-code library with autocomplete on the custom-options row (search by code or name, description shown inline)
+  - Named option templates (group-scoped, e.g. "VoIP phones", "PXE BIOS clients") — apply to a scope in one click; apply is a stamp not a binding, so later template edits don't propagate
+- **PXE / iPXE provisioning profiles** — netboot a mixed-architecture estate without hand-writing Kea client classes
+  - A profile is group-scoped and reusable; a scope selects one via `pxe_profile_id`. It carries the `next_server` (TFTP / HTTP boot host) and N **architecture matches**
+  - Each match pairs a vendor-class + DHCP arch-code filter with the boot file that architecture should pull — `undionly.kpxe` for BIOS, `ipxe.efi` for UEFI x64, the arm64 or ia32 equivalents, or a chained iPXE config URL
+  - **iPXE chainloading** is the case that makes this worth modelling: the classic two-stage boot needs a class guarded on `dhcp.user-class` matching the iPXE signature, so the second request (from iPXE itself) is answered with a script URL instead of the binary it already loaded — otherwise the client loops
+  - Profiles can be **disabled** rather than deleted; a disabled profile renders no classes at all, so an operator can A/B-test boot files and roll back by flipping one switch

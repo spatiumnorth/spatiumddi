@@ -42,7 +42,7 @@ from app.core.security import create_access_token, hash_password
 from app.models.auth import Group, Role, User
 from app.models.change_request import ChangeRequest
 from app.models.feature_module import FeatureModule
-from app.models.ipam import IPBlock, IPSpace, Subnet
+from app.models.ipam import IPAMTemplate, IPBlock, IPSpace, Subnet
 from app.services import feature_modules
 
 MODULE = "governance.requests"
@@ -101,9 +101,20 @@ def _auth(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
-REQUESTER_PERMS = [
+# The built-in Requester role's grants, as handed out to a department.
+BARE_REQUESTER_PERMS = [
     {"action": "write", "resource_type": "provisioning_request"},
     {"action": "read", "resource_type": "provisioning_request"},
+]
+# A requester who can also read the resources a request names: submit refuses
+# a payload naming a resource the requester cannot read, answering it like an
+# unknown id, so the read grant is what makes a target requestable.
+REQUESTER_PERMS = [
+    *BARE_REQUESTER_PERMS,
+    {"action": "read", "resource_type": "subnet"},
+    {"action": "read", "resource_type": "ip_block"},
+    {"action": "read", "resource_type": "dns_zone"},
+    {"action": "read", "resource_type": "dhcp_scope"},
 ]
 # An approver who can decide AND holds the underlying op permission.
 APPROVER_PERMS = [
@@ -112,6 +123,8 @@ APPROVER_PERMS = [
     {"action": "write", "resource_type": "subnet"},
     {"action": "read", "resource_type": "subnet"},
     {"action": "read", "resource_type": "ip_block"},
+    # Provisioning a subnet writes into its parent block (#3425).
+    {"action": "write", "resource_type": "ip_block"},
 ]
 
 
@@ -220,8 +233,16 @@ async def test_submit_validates_args_against_the_operation_schema(
         headers=_auth(token),
         json={"kind": "subnet", "args": {"prefix_len": "not-a-number"}},
     )
-    assert resp.status_code == 400
-    assert "Invalid request payload" in resp.json()["detail"]
+    # FastAPI's own 422 shape (#3253): each entry names its field under
+    # ``body.args`` and carries the error type, so the form can label it.
+    # Nothing echoes the input back.
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    by_field = {e["loc"][-1]: e for e in detail}
+    assert all(e["loc"][:2] == ["body", "args"] for e in detail)
+    assert by_field["prefix_len"]["type"] == "int_parsing"
+    assert by_field["block_id"]["type"] == "missing"
+    assert "input" not in resp.text and "not-a-number" not in resp.text
 
 
 @pytest.mark.asyncio
@@ -516,7 +537,10 @@ async def test_admin_grant_confers_submit(client: AsyncClient, db_session: Async
     _, token = await _user(
         db_session,
         name="adm",
-        permissions=[{"action": "admin", "resource_type": "provisioning_request"}],
+        permissions=[
+            {"action": "admin", "resource_type": "provisioning_request"},
+            {"action": "read", "resource_type": "ip_block"},
+        ],
     )
     out = await _submit_subnet_request(client, token, block)
     assert out["status"] == 201, out
@@ -575,3 +599,243 @@ async def test_unrelated_carve_does_not_block_approval(
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["state"] == "executed"
+
+
+# ── Approving a request whose apply() refuses it (#2911) ─────────────────────
+#
+# The spine rolls the session back when apply() raises, which expires the
+# approver's User; the failure stamp then read ``approver.id`` on it and
+# raised MissingGreenlet — a bare 500, request still pending. Every case goes
+# through the real approve route.
+
+
+async def _pending_ip_request(
+    client: AsyncClient, db: AsyncSession, *, address: str = "10.77.0.10"
+) -> tuple[str, str, Subnet, User]:
+    await _enable_module(db)
+    block = await _block(db, "10.77.0.0/16")
+    subnet = Subnet(space_id=block.space_id, block_id=block.id, network="10.77.0.0/24", name="s")
+    db.add(subnet)
+    await db.flush()
+    _, req_token = await _user(
+        db,
+        name="req",
+        permissions=REQUESTER_PERMS + [{"action": "read", "resource_type": "subnet"}],
+    )
+    appr, appr_token = await _user(
+        db,
+        name="appr",
+        permissions=APPROVER_PERMS + [{"action": "write", "resource_type": "ip_address"}],
+    )
+    resp = await client.post(
+        "/api/v1/requests",
+        headers=_auth(req_token),
+        json={
+            "kind": "ip_address",
+            "args": {"subnet_id": str(subnet.id), "address": address},
+            "justification": "Printer for the imaging lab.",
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()["id"], appr_token, subnet, appr
+
+
+async def _assert_failed_with(
+    client: AsyncClient, db: AsyncSession, req_id: str, token: str, appr: User, reason: str
+) -> None:
+    resp = await client.post(
+        f"/api/v1/requests/{req_id}/approve",
+        headers=_auth(token),
+        json={"decision_note": "go"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["state"] == "failed"
+    assert reason in body["error"]
+    assert body["decided_by_user_id"] == str(appr.id)
+    assert body["decided_at"] is not None
+    assert body["decision_note"] == "go"
+    # The requester sees the same terminal row.
+    from app.models.audit import AuditLog
+
+    actions = (
+        (
+            await db.execute(
+                select(AuditLog.action).where(
+                    AuditLog.resource_type == "change_request",
+                    AuditLog.resource_id == req_id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert any("approve" in a for a in actions), actions
+    assert any("fail" in a for a in actions), actions
+
+
+@pytest.mark.asyncio
+async def test_ip_request_approver_needs_write_subnet(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#3074: an address is written through the subnet that owns it (#3058),
+    so ``create_ip_address`` names ``write subnet``. An approver holding only
+    ``write ip_address`` is refused up front (403, still pending, so another
+    approver can take it) instead of approving a request whose apply then
+    fails on the subnet check."""
+    from app.models.ipam import IPAddress
+
+    req_id, _, _, _ = await _pending_ip_request(client, db_session)
+    _, addr_token = await _user(
+        db_session,
+        name="addr-only",
+        permissions=[
+            {"action": "approve", "resource_type": "change_request"},
+            {"action": "read", "resource_type": "change_request"},
+            {"action": "read", "resource_type": "subnet"},
+            {"action": "write", "resource_type": "ip_address"},
+        ],
+    )
+    resp = await client.post(
+        f"/api/v1/requests/{req_id}/approve", headers=_auth(addr_token), json={}
+    )
+    assert resp.status_code == 403, resp.text
+    row = (await client.get(f"/api/v1/requests/{req_id}", headers=_auth(addr_token))).json()
+    assert row["state"] == "pending"
+    assert not (await db_session.execute(select(IPAddress))).scalars().all()
+
+
+@pytest.mark.asyncio
+async def test_approve_when_the_address_was_taken_meanwhile_records_failed(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    from app.models.ipam import IPAddress
+
+    req_id, token, subnet, appr = await _pending_ip_request(client, db_session)
+    db_session.add(IPAddress(subnet_id=subnet.id, address="10.77.0.10", status="allocated"))
+    await db_session.flush()
+    await _assert_failed_with(client, db_session, req_id, token, appr, "already allocated")
+
+
+@pytest.mark.asyncio
+async def test_approve_of_a_pre_2910_multicast_request_records_failed(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    req_id, token, subnet, appr = await _pending_ip_request(client, db_session)
+    # A request queued before the multicast refusal existed.
+    subnet.kind = "multicast"
+    await db_session.flush()
+    await _assert_failed_with(client, db_session, req_id, token, appr, "multicast")
+
+
+def _patched_apply(monkeypatch: pytest.MonkeyPatch, exc: Exception) -> None:
+    import dataclasses
+
+    from app.services.ai import operations
+
+    async def boom(db, user, args):  # noqa: ANN001
+        raise exc
+
+    op = operations._OPERATIONS["create_ip_address"]
+    monkeypatch.setitem(
+        operations._OPERATIONS, "create_ip_address", dataclasses.replace(op, apply=boom)
+    )
+
+
+@pytest.mark.asyncio
+async def test_approve_when_apply_raises_value_error_records_failed(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    req_id, token, _, appr = await _pending_ip_request(client, db_session)
+    _patched_apply(monkeypatch, ValueError("address went away"))
+    await _assert_failed_with(client, db_session, req_id, token, appr, "address went away")
+
+
+@pytest.mark.asyncio
+async def test_approve_when_apply_raises_generic_exception_records_failed(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    req_id, token, _, appr = await _pending_ip_request(client, db_session)
+    _patched_apply(monkeypatch, RuntimeError("driver exploded"))
+    # Not stored as ``str(exc)`` (#3642): the cause is in the server log.
+    await _assert_failed_with(client, db_session, req_id, token, appr, "internal error")
+
+
+@pytest.mark.asyncio
+async def test_approve_when_apply_raises_a_5xx_records_failed(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fastapi import HTTPException
+
+    req_id, token, _, appr = await _pending_ip_request(client, db_session)
+    _patched_apply(monkeypatch, HTTPException(status_code=502, detail="upstream down"))
+    await _assert_failed_with(client, db_session, req_id, token, appr, "upstream down")
+
+
+@pytest.mark.asyncio
+async def test_approve_when_apply_raises_a_4xx_records_failed(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 4xx refusal from apply() is recorded like any other (#2911): the
+    request ends ``failed`` with the detail the requester can read. It used to
+    stay pending (#11), telling nobody why."""
+    from fastapi import HTTPException
+
+    req_id, token, _, appr = await _pending_ip_request(client, db_session)
+    _patched_apply(monkeypatch, HTTPException(status_code=409, detail="raced"))
+    await _assert_failed_with(client, db_session, req_id, token, appr, "raced")
+
+
+@pytest.mark.asyncio
+async def test_approve_when_apply_raises_permission_error_is_403_and_pending(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.services.ai.operations import OperationPermissionError
+
+    req_id, token, _, _ = await _pending_ip_request(client, db_session)
+    _patched_apply(monkeypatch, OperationPermissionError("write", "ip_address"))
+    resp = await client.post(f"/api/v1/requests/{req_id}/approve", headers=_auth(token), json={})
+    assert resp.status_code == 403, resp.text
+    row = (await client.get(f"/api/v1/requests/{req_id}", headers=_auth(token))).json()
+    assert row["state"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_request_carries_the_template_name_without_template_read(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#3649: the template line must not need read on IPAM templates."""
+    await _enable_module(db_session)
+    block = await _block(db_session)
+    tpl = IPAMTemplate(name="Branch office", applies_to="subnet")
+    db_session.add(tpl)
+    await db_session.flush()
+    _, req_tok = await _user(db_session, name="req", permissions=REQUESTER_PERMS)
+    _, appr_tok = await _user(db_session, name="appr", permissions=APPROVER_PERMS)
+    resp = await client.post(
+        "/api/v1/requests",
+        headers=_auth(req_tok),
+        json={
+            "kind": "subnet",
+            "args": {
+                "block_id": str(block.id),
+                "prefix_len": 26,
+                "name": "tpl-net",
+                "template_id": str(tpl.id),
+            },
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["template_name"] == "Branch office"
+    # The requester and approver hold no read on templates themselves.
+    for tok in (req_tok, appr_tok):
+        assert (
+            await client.get(f"/api/v1/ipam/templates/{tpl.id}", headers=_auth(tok))
+        ).status_code == 403
+        listing = await client.get("/api/v1/requests", headers=_auth(tok))
+        assert [r["template_name"] for r in listing.json()] == ["Branch office"]
+        one = await client.get(f"/api/v1/requests/{body['id']}", headers=_auth(tok))
+        assert one.json()["template_name"] == "Branch office"
+        # Name only: nothing of the template body rides along.
+        assert not {"template", "tags", "custom_fields"} & set(one.json())

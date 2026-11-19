@@ -29,6 +29,13 @@ from typing import Any
 
 import httpx
 
+from app.drivers.dns._caa import (
+    caa_key,
+    caa_text,
+    caa_unquoted_value,
+    caa_value_octets,
+    parse_caa,
+)
 from app.drivers.dns._cloud_base import (
     CloudDNSDriverBase,
     CloudDNSError,
@@ -51,6 +58,21 @@ _PER_PAGE = 50
 # round-trips as "let the provider decide" rather than a literal value, and
 # omit ``ttl`` from writes when None so the API applies its default.
 _TTL_DEFAULT = 1800
+
+
+def _is_not_found(response: Any) -> bool:
+    """DigitalOcean's documented not-found answer (#1889): HTTP 404 carrying
+    ``{"id": "not_found", ...}`` (``shared/responses/not_found.yml`` in
+    DigitalOcean's OpenAPI spec). Keyed on the body as well as the status, so
+    a 404 that is not DigitalOcean's own verdict on the resource is never
+    read as "the zone is gone"."""
+    if getattr(response, "status_code", 0) != 404:
+        return False
+    try:
+        body = response.json()
+    except (ValueError, TypeError):
+        return False
+    return isinstance(body, dict) and body.get("id") == "not_found"
 
 
 class DigitalOceanDNSDriver(CloudDNSDriverBase):
@@ -203,7 +225,7 @@ class DigitalOceanDNSDriver(CloudDNSDriverBase):
                         RecordData(
                             name=self._relativize(rec.get("name", "@"), zone_fqdn),
                             record_type=rec["type"],
-                            value=rec.get("data", ""),
+                            value=self._read_value(rec),
                             ttl=ttl,
                             priority=rec.get("priority"),
                             weight=rec.get("weight"),
@@ -215,6 +237,32 @@ class DigitalOceanDNSDriver(CloudDNSDriverBase):
                 page += 1
         return records
 
+    @staticmethod
+    def _read_value(rec: dict[str, Any]) -> str:
+        """The canonical value of a pulled record. DigitalOcean keeps a CAA
+        record's flags, tag and value in three fields (``flags`` / ``tag`` /
+        ``data``); the canonical ``<flags> <tag> "<value>"`` is rebuilt (#2959).
+        Field names from the ``domain_record`` model in
+        github.com/digitalocean/openapi (``flags`` 0-255, ``tag``, ``data`` =
+        "the domain name of the CA"). A ``data`` that arrives as one quoted
+        string is unquoted rather than escaped, so either spelling keys the
+        same. A CAA row with no ``tag`` (the whole value in ``data``, as a
+        release before #2959 sent it) reads as that text."""
+        if str(rec.get("type")).upper() == "CAA" and rec.get("tag"):
+            return caa_text(
+                rec.get("flags") or 0, rec["tag"], caa_value_octets(str(rec.get("data") or ""))
+            )
+        return str(rec.get("data", ""))
+
+    @staticmethod
+    def record_value_refusal(record_type: str, value: str) -> str | None:
+        """Why DigitalOcean cannot hold this record value, or None (#2959).
+        A CAA record is sent as separate ``flags`` / ``tag`` / ``data``, so a
+        value that does not parse as ``<flags> <tag> <value>`` cannot be sent."""
+        if record_type.upper() == "CAA" and parse_caa(value) is None:
+            return f"DigitalOcean: CAA value {value!r} is not '<flags> <tag> <value>'."
+        return None
+
     # ── Record writes ───────────────────────────────────────────────────
     def _record_payload(self, change: RecordChange) -> dict[str, Any]:
         rec = change.record
@@ -223,6 +271,15 @@ class DigitalOceanDNSDriver(CloudDNSDriverBase):
             "name": self._write_name(rec.name),
             "data": rec.value,
         }
+        if rec.record_type.upper() == "CAA":
+            parsed = parse_caa(rec.value)
+            if parsed is None:
+                raise CloudDNSError(
+                    self.record_value_refusal(rec.record_type, rec.value) or "bad CAA value"
+                )
+            payload["flags"] = parsed[0]
+            payload["tag"] = parsed[1]
+            payload["data"] = caa_unquoted_value(rec.value)
         # Omit ttl when None so DigitalOcean applies its account default
         # (1800s), mirroring the auto-TTL round-trip on the read path.
         if rec.ttl is not None:
@@ -278,7 +335,10 @@ class DigitalOceanDNSDriver(CloudDNSDriverBase):
                     if first_match is None:
                         first_match = int(rec["id"])
                     continue
-                if rec.get("data") != value:
+                if record_type == "CAA":
+                    if caa_key(self._read_value(rec)) != caa_key(value):
+                        continue
+                elif rec.get("data") != value:
                     continue
                 if priority is not None and rec.get("priority") != priority:
                     continue
@@ -340,7 +400,15 @@ class DigitalOceanDNSDriver(CloudDNSDriverBase):
             raise CloudDNSError(f"DigitalOcean: unsupported record op {change.op!r}")
 
     # ── Zone writes ─────────────────────────────────────────────────────
-    async def _apply_zone(self, server: Any, creds: dict[str, Any], zone: Any, op: str) -> None:
+    async def _apply_zone(
+        self,
+        server: Any,
+        creds: dict[str, Any],
+        zone: Any,
+        op: str,
+        *,
+        managed_records: list[RecordData] | None = None,
+    ) -> None:
         token = self._token(creds)
         zone_fqdn = normalize_fqdn(getattr(zone, "name", ""))
         bare = zone_fqdn.rstrip(".")
@@ -352,6 +420,10 @@ class DigitalOceanDNSDriver(CloudDNSDriverBase):
 
             if op == "delete":
                 resp = await client.delete(f"/domains/{bare}")
+                if _is_not_found(resp):
+                    # Already gone at the provider; deleting it is done
+                    # (#1889, as #1537).
+                    return
                 self._unwrap(resp)
                 return
 

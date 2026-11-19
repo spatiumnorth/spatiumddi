@@ -31,6 +31,7 @@ from app.api.v1.ownership._audit import write_audit
 from app.core.permissions import require_resource_permission
 from app.models.dnsbl import DNSBLList, DNSBLListing, DNSBLPinnedIP
 from app.models.settings import PlatformSettings
+from app.services.api_token_scopes import token_write
 
 router = APIRouter(
     tags=["dnsbl"],
@@ -367,7 +368,9 @@ async def list_listings(
     count_stmt = select(func.count()).select_from(stmt.subquery())
     total = await db.scalar(count_stmt) or 0
     stmt = (
-        stmt.order_by(DNSBLListing.first_listed_at.desc().nullslast()).limit(limit).offset(offset)
+        stmt.order_by(DNSBLListing.first_listed_at.desc().nullslast(), DNSBLListing.id)
+        .limit(limit)
+        .offset(offset)
     )
     rows = (await db.execute(stmt)).all()
     return DNSBLListingListResponse(
@@ -460,6 +463,9 @@ async def listings_by_ip(ip: str, db: DB, _: CurrentUser) -> DNSBLListingsByIP:
 
 
 @router.post("/check", response_model=DNSBLCheckResult)
+@token_write(
+    "Queries DNSBL zones through the configured resolvers (outbound) and writes an audit row"
+)
 async def check_now(body: DNSBLCheckRequest, db: DB, user: CurrentUser) -> DNSBLCheckResult:
     """On-demand reputation check of one IP across every enabled list."""
     from app.services.dnsbl.sweep import check_ip_now  # noqa: PLC0415

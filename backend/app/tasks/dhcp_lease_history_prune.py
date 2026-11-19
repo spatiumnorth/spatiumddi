@@ -22,16 +22,18 @@ import structlog
 from sqlalchemy import delete, select
 
 from app.celery_app import celery_app
+from app.config import settings as app_config
 from app.db import task_session
 from app.models.dhcp import DHCPLeaseHistory
 from app.models.settings import PlatformSettings
 from app.services.feature_modules import is_module_enabled
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
 
 async def _prune() -> int:
-    async with task_session() as db:
+    async with task_session(command_timeout=app_config.task_db_long_command_timeout) as db:
         # #1068 — the DHCP/DNS subsystem can be switched off wholesale;
         # do no work (and open no driver connections) when it is.
         if not await is_module_enabled(db, "core.dhcp"):
@@ -53,6 +55,7 @@ async def _prune() -> int:
 
 
 @celery_app.task(name="app.tasks.dhcp_lease_history_prune.prune_lease_history")
+@module_gated("core.dhcp")
 def prune_lease_history() -> dict[str, int]:
     removed = asyncio.run(_prune())
     logger.info("dhcp_lease_history_prune_complete", rows_removed=removed)

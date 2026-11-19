@@ -10,6 +10,7 @@ keyfile classifier.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from spatium_dns_agent.drivers.bind9 import (
@@ -119,3 +120,32 @@ def test_keyfile_is_ksk(tmp_path: Path) -> None:
     zsk.write_text("ex.com. IN DNSKEY 256 3 13 BBBB...\n")
     assert _keyfile_is_ksk(str(ksk)) is True
     assert _keyfile_is_ksk(str(zsk)) is False
+
+
+def test_nonzero_nsec3_iterations_render_as_zero() -> None:
+    """BIND 9.20 rejects the whole named.conf over iterations > 0 (#3153)."""
+    out = _render_dnssec_policies(
+        [{"name": "old", "nsec3": True, "nsec3_iterations": 151, "nsec3_salt_length": 8}]
+    )
+    assert "nsec3param iterations 0 optout no salt-length 8;" in out
+    assert "151" not in out
+
+
+def test_key_lifetimes_bind_refuses_render_in_range() -> None:
+    """named-checkconf 9.20 rejects the whole named.conf over a key lifetime
+    that is negative, past 49710 days, or shorter than a rollover takes (#3411).
+    The control plane holds a stored one to BIND's range; an older one may
+    still ship it as stored."""
+    out = _render_dnssec_policies(
+        [
+            {"name": "neg", "ksk_lifetime_days": -1, "zsk_lifetime_days": 7},
+            {"name": "big", "ksk_lifetime_days": 1, "zsk_lifetime_days": 1000000},
+        ]
+    )
+    neg, big = out.split('dnssec-policy "big"')
+    assert "ksk lifetime unlimited algorithm ecdsap256sha256;" in neg
+    assert "zsk lifetime 11d algorithm ecdsap256sha256;" in neg
+    assert "ksk lifetime 2d algorithm ecdsap256sha256;" in big
+    assert "zsk lifetime 49710d algorithm ecdsap256sha256;" in big
+    assert not re.search(r"lifetime\s+-1d", out)
+    assert not re.search(r"lifetime\s+1000000d", out)

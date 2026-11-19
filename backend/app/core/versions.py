@@ -86,6 +86,31 @@ def nightly_build_date(version: str | None) -> date | None:
         return None
 
 
+_BARE_NIGHTLY_RE = re.compile(r"^nightly-(\d{8})$")
+
+
+def canonical_version(version: str | None, build_stamp: str | None = None) -> str:
+    """The one spelling of a running build's version (#2111).
+
+    A nightly's images are tagged ``nightly-YYYYMMDD`` (the Helm ``image.tag``,
+    so ``VERSION`` in the api), while its agents, supervisor and appliance
+    slot report ``0.0.0-nightly-YYYYMMDD+<sha>``. This maps the bare tag onto
+    the second form, taking the ``+<sha>`` from ``build_stamp`` (the build's
+    own stamp, baked as ``APP_VERSION``) when that names the same night.
+    Anything that is not a bare nightly tag is returned unchanged.
+    """
+    value = (version or "").strip()
+    match = _BARE_NIGHTLY_RE.match(value)
+    if not match:
+        return value
+    stamp = (build_stamp or "").strip()
+    night = nightly_build_date(stamp)
+    if night is not None and f"{night:%Y%m%d}" == match.group(1):
+        return stamp
+    candidate = f"0.0.0-nightly-{match.group(1)}"
+    return candidate if nightly_build_date(candidate) is not None else value
+
+
 def includes_release(version: str | None, release: str) -> bool | None:
     """Whether a build reporting ``version`` has everything in ``release``.
 
@@ -131,3 +156,53 @@ def upgrade_direction(installed: str | None, target: str | None) -> str:
     if includes is None:
         return "unknown"
     return "backward" if includes else "forward"
+
+
+# A nightly's identity without its build: the release tag
+# (``nightly-YYYY.MM.DD``), the image tag (``nightly-YYYYMMDD``) or the slot
+# version with no ``+<sha>``. Each names a night, not a build.
+_NIGHTLY_DAY_RE = re.compile(
+    r"^(?:nightly-(\d{4})\.?(\d{2})\.?(\d{2})|0\.0\.0-nightly-(\d{4})(\d{2})(\d{2}))$"
+)
+
+
+def _nightly_day_target(target: str) -> date | None:
+    match = _NIGHTLY_DAY_RE.match(target)
+    if not match:
+        return None
+    groups = [g for g in match.groups() if g is not None]
+    try:
+        return date(*(int(g) for g in groups))
+    except ValueError:
+        return None
+
+
+def is_installed_target(installed: str | None, target: str | None) -> bool:
+    """Whether a node reporting ``installed`` is already running ``target`` (#3026).
+
+    A release is installed under its own tag, so the two strings are equal,
+    and so is a target that spells out a nightly's full version including its
+    ``+<sha>``: that names one build, and only that build matches it.
+
+    A nightly's release tag does not: it is ``nightly-YYYY.MM.DD`` (the image
+    tag ``nightly-YYYYMMDD`` and a sha-less ``0.0.0-nightly-YYYYMMDD`` are
+    accepted too) while the slot reports ``0.0.0-nightly-YYYYMMDD+<sha>``. A
+    plain string compare never matched them, so a completed nightly upgrade
+    stayed "pending" and the supervisor could fire it again over the rollback
+    slot. Such a target names a NIGHT, so any build of that night matches:
+    the tag carries nothing finer, and nightly.yml publishes one build per
+    night (a forced same-night rebuild reuses the tag, and is the one case
+    this cannot tell apart).
+
+    ``spatium_supervisor.appliance_state.installed_is_target`` is a copy (a
+    separate package); ``tests/test_nightly_upgrade_cleared_3026.py`` runs
+    both over the same cases.
+    """
+    installed = (installed or "").strip()
+    target = (target or "").strip()
+    if not installed or not target:
+        return False
+    if installed == target:
+        return True
+    night = nightly_build_date(installed)
+    return night is not None and night == _nightly_day_target(target)

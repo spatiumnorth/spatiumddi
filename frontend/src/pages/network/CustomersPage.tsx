@@ -1,3 +1,4 @@
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
@@ -7,11 +8,14 @@ import {
   type CustomerRead,
   type CustomerStatus,
   type CustomerUpdate,
+  formatApiError,
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -90,11 +94,7 @@ function CustomerEditorModal({
       onClose();
     },
     onError: (e: unknown) => {
-      const err = e as {
-        message?: string;
-        response?: { data?: { detail?: string } };
-      };
-      setError(err?.response?.data?.detail ?? err?.message ?? "Save failed");
+      setError(formatApiError(e, "Save failed"));
     },
   });
 
@@ -189,7 +189,9 @@ function CustomerEditorModal({
             />
           </div>
         </div>
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-sm text-destructive">{error}</FormError>
+        )}
         <div className="flex justify-end gap-2">
           <button
             type="button"
@@ -213,6 +215,25 @@ function CustomerEditorModal({
 }
 
 export function CustomersPage() {
+  // #1340 — a read-only user is offered no write it would be refused:
+  // the customer router asks write (delete) on 'customer'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "customer"),
+    "Requires write permission on customers",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "customer"),
+    "Requires delete permission on customers",
+  );
+  // A row's Edit asks what PUT /customers/{id} asks, which takes a grant
+  // scoped to that one customer (#3039, #3134); New and Delete stay
+  // type-level, as their routes do.
+  const editGate = (id: string) =>
+    permissionGate(
+      perms.can("write", "customer", id),
+      "Requires write permission on customers",
+    );
   const qc = useQueryClient();
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<CustomerStatus | "">("");
@@ -243,17 +264,27 @@ export function CustomersPage() {
     [items, selectedIds],
   );
 
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
   const bulkDelete = useMutation({
+    onMutate: () => setDeleteError(null),
     mutationFn: (ids: string[]) => customersApi.bulkDelete(ids),
     onSuccess: () => {
       setSelectedIds(new Set());
       qc.invalidateQueries({ queryKey: ["customers"] });
     },
+    onError: (e: unknown) =>
+      setDeleteError(formatApiError(e, "Failed to delete customers")),
   });
 
   const removeOne = useMutation({
+    onMutate: () => setDeleteError(null),
     mutationFn: (id: string) => customersApi.remove(id),
     onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["customers"] });
+    },
+    onError: (e: unknown) => {
+      setDeleteError(formatApiError(e, "Failed to delete customer"));
       qc.invalidateQueries({ queryKey: ["customers"] });
     },
   });
@@ -278,6 +309,11 @@ export function CustomersPage() {
   return (
     <div className="h-full overflow-auto p-6">
       <div className="space-y-4">
+        {deleteError && (
+          <p role="alert" className="text-sm text-destructive">
+            {deleteError}
+          </p>
+        )}
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
             <h1 className="text-xl font-semibold">Customers</h1>
@@ -298,6 +334,7 @@ export function CustomersPage() {
               variant="primary"
               icon={Plus}
               onClick={() => setShowNew(true)}
+              {...writeGate}
             >
               New customer
             </HeaderButton>
@@ -338,11 +375,12 @@ export function CustomersPage() {
                 const ids = Array.from(selectedIds);
                 setConfirm({
                   title: "Delete customers",
-                  message: `Soft-delete ${ids.length} customer${ids.length === 1 ? "" : "s"}? Cross-references on subnets / zones / ASNs will be cleared.`,
+                  message: `Soft-delete ${ids.length} customer${ids.length === 1 ? "" : "s"}? Subnets, zones and ASNs that name them are not changed and keep pointing at the hidden customer. A superadmin can restore them from Administration → Trash.`,
                   confirmLabel: "Delete",
                   onConfirm: () => bulkDelete.mutate(ids),
                 });
               }}
+              {...deleteGate}
             >
               Delete selected
             </HeaderButton>
@@ -385,7 +423,19 @@ export function CustomersPage() {
                     className="px-3 py-6 text-center text-muted-foreground"
                     colSpan={6}
                   >
-                    No customers yet — click "New customer" to add one.
+                    <ListEmpty
+                      error={query.error}
+                      what="customers"
+                      filtered={search !== "" || statusFilter !== ""}
+                      onClearFilters={() => {
+                        setSearch("");
+                        setStatusFilter("");
+                      }}
+                      gate={writeGate}
+                      hint={`Click "New customer" to add one.`}
+                    >
+                      No customers yet.
+                    </ListEmpty>
                   </td>
                 </tr>
               )}
@@ -414,23 +464,27 @@ export function CustomersPage() {
                     <button
                       type="button"
                       title="Edit"
+                      aria-label="Edit"
                       onClick={() => setEditing(c)}
-                      className="rounded p-1 hover:bg-muted"
+                      className="rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                      {...editGate(c.id)}
                     >
                       <Pencil className="h-3.5 w-3.5" />
                     </button>
                     <button
                       type="button"
                       title="Delete"
+                      aria-label="Delete"
                       onClick={() => {
                         setConfirm({
                           title: "Delete customer",
-                          message: `Soft-delete customer "${c.name}"? Cross-references will be cleared.`,
+                          message: `Soft-delete customer "${c.name}"? Anything that names it is not changed and keeps pointing at the hidden customer. A superadmin can restore it from Administration → Trash.`,
                           confirmLabel: "Delete",
                           onConfirm: () => removeOne.mutate(c.id),
                         });
                       }}
-                      className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10"
+                      className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
+                      {...deleteGate}
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                     </button>

@@ -44,6 +44,7 @@ from typing import Any
 
 import httpx
 
+from app.core.exc_text import describe_exc
 from app.services.technitium.rdata import (
     DNSSEC_RECORD_TYPES as _DNSSEC_RECORDS,
 )
@@ -232,7 +233,7 @@ async def parse_technitium_server(
             )
         except httpx.HTTPError as exc:
             raise TechnitiumImportError(
-                f"Could not reach the Technitium API at {api_url!r}: {exc}"
+                f"Could not reach the Technitium API at {api_url!r}: {describe_exc(exc)}"
             ) from exc
         if resp.status_code >= 400:
             raise TechnitiumImportError(
@@ -305,7 +306,7 @@ async def parse_technitium_server(
                         kind=_classify_zone(name),
                         soa=None,
                         records=[],
-                        parse_warnings=[f"Could not pull records: {exc}"],
+                        parse_warnings=[f"Could not pull records: {describe_exc(exc)}"],
                     )
                 )
                 continue
@@ -337,7 +338,7 @@ async def test_technitium_connection(
             resp = await client.get(_api_url(api_url, "zones/list"), params={"token": api_token})
         except httpx.HTTPError as exc:
             raise TechnitiumImportError(
-                f"Could not reach the Technitium API at {api_url!r}: {exc}"
+                f"Could not reach the Technitium API at {api_url!r}: {describe_exc(exc)}"
             ) from exc
         if resp.status_code >= 400:
             raise TechnitiumImportError(

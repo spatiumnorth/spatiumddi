@@ -22,7 +22,9 @@ import structlog
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.celery_app import celery_app
+from app.config import settings
 from app.db import task_session
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -31,7 +33,12 @@ async def _run() -> dict[str, object]:
     from app.services.dns_threat.aggregate import run_aggregation  # noqa: PLC0415
     from app.services.feature_modules import is_module_enabled  # noqa: PLC0415
 
-    async with task_session() as db:
+    # Long bound (#1719): ``aggregate_window`` streams an hour of raw query
+    # log ORDER BY client_ip, and the sort completes before the first row
+    # arrives, so on a busy install that first fetch is one statement that
+    # can run past the 120 s default. The once-per-process backfill repeats
+    # it for up to 24 buckets in this same session.
+    async with task_session(command_timeout=settings.task_db_long_command_timeout) as db:
         if not await is_module_enabled(db, "security.dns_threat"):
             return {"status": "module_disabled"}
         result = await run_aggregation(db)
@@ -50,6 +57,7 @@ async def _run() -> dict[str, object]:
     retry_backoff_max=600,
     max_retries=3,
 )
+@module_gated("security.dns_threat")
 def aggregate_dns_client_windows(self) -> dict[str, object]:  # type: ignore[no-untyped-def]
     result = asyncio.run(_run())
     if result.get("status") == "ok" and (

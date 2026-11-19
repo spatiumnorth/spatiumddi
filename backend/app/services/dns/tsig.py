@@ -47,7 +47,8 @@ from app.services.dns.pool_geo import (
     GEO_DEFAULT_VIEW,
     build_geo_steering,
     build_view_descriptors,
-    view_renders_zone,
+    places_zone_clause,
+    views_rendering_zone,
 )
 
 logger = structlog.get_logger(__name__)
@@ -118,7 +119,56 @@ async def resolve_group_transfer_key(db: AsyncSession, group_id: uuid.UUID) -> T
                 key=k.name,
             )
             continue
+        if tsig_secret_shape_problem(secret) is not None:
+            # Left out of the bundle for the same reason, so never granted.
+            continue
         return TsigKey(name=k.name, algorithm=k.algorithm, secret=secret)
+    return None
+
+
+#: Decoded length bounds for an operator-supplied secret. 16 bytes is the
+#: floor RFC 8945 §6 sets for a usable HMAC key; 512 is far beyond any
+#: algorithm's block size and only stops a pasted blob, not a real key.
+TSIG_SECRET_MIN_BYTES = 16
+TSIG_SECRET_MAX_BYTES = 512
+
+_TSIG_SECRET_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
+
+
+def tsig_secret_shape_problem(secret: str | None) -> str | None:
+    """Why ``secret`` is not one base64 string, or None.
+
+    The structural half only — what decides whether the value can sit inside
+    ``secret "…";`` in a key file at all. The bundle builder applies it to
+    stored rows, where refusing a short-but-working key would break a group
+    that converges today.
+    """
+    value = secret or ""
+    if not value or len(value) % 4 or not _TSIG_SECRET_RE.match(value):
+        return "must be base64 (A-Z, a-z, 0-9, '+', '/', with '=' padding only at the end)"
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError):
+        return "is not valid base64"
+    if not decoded:
+        return "decodes to an empty key"
+    return None
+
+
+def tsig_secret_problem(secret: str | None) -> str | None:
+    """Why ``secret`` cannot be stored as a TSIG key secret, or None.
+
+    The API's check on create: the shape check above plus a decoded length
+    between :data:`TSIG_SECRET_MIN_BYTES` and :data:`TSIG_SECRET_MAX_BYTES`.
+    """
+    if problem := tsig_secret_shape_problem(secret):
+        return problem
+    n = len(base64.b64decode(secret or "", validate=True))
+    if not TSIG_SECRET_MIN_BYTES <= n <= TSIG_SECRET_MAX_BYTES:
+        return (
+            f"decodes to {n} bytes; a key must be between {TSIG_SECRET_MIN_BYTES} "
+            f"and {TSIG_SECRET_MAX_BYTES} bytes"
+        )
     return None
 
 
@@ -141,6 +191,39 @@ def group_tsig_secret(group: DNSServerGroup | None) -> str | None:
 
 def set_group_tsig_secret(group: DNSServerGroup, secret: str) -> None:
     group.tsig_key_secret_encrypted = encrypt_str(secret)
+
+
+RESERVED_TSIG_PREFIX = "spatium-"
+
+
+def normalize_tsig_name(name: str | None) -> str:
+    """The identity BIND gives a key name: case-folded, trailing dot dropped.
+
+    ``Foo.``, ``foo.`` and ``foo`` are ONE key to named, so a second ``key``
+    statement for any of them is a redefinition that fails ``named-checkconf``
+    and makes the agent decline the whole bundle (#2295).
+    """
+    return (name or "").strip().lower().rstrip(".")
+
+
+def dedupe_tsig_keys(keys: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop every key whose normalised name an earlier entry already holds.
+
+    First writer wins, so the order the caller built decides: the legacy
+    group key first (it is ``tsig_keys[0]``, the agent's loopback identity),
+    then operator keys by name. Rows stored before the API refused the clash
+    are therefore rendered once, deterministically, and logged.
+    """
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for k in keys:
+        norm = normalize_tsig_name(k.get("name"))
+        if norm in seen:
+            logger.warning("dns_tsig_key_duplicate_skipped", key=k.get("name"))
+            continue
+        seen.add(norm)
+        out.append(k)
+    return out
 
 
 def legacy_group_key(group: DNSServerGroup | None) -> TsigKey | None:
@@ -224,37 +307,50 @@ def is_view_transfer_key(key: TsigKey | None) -> bool:
     return key is not None and key.name.startswith(VIEW_TRANSFER_KEY_PREFIX)
 
 
-async def transfer_view_name(db: AsyncSession, zone: DNSZone) -> str | None:
-    """The view whose copy of ``zone`` the control plane reads, or None when
-    the zone's group renders no views.
+async def zone_holding_views(db: AsyncSession, zone: DNSZone) -> list[dict[str, Any]]:
+    """The view descriptors (in render order) that carry a copy of ``zone``,
+    or an empty list when the zone's group renders no views.
 
-    Only views that hold a copy are candidates — the same rule the bundle
-    expands zones by (:func:`~app.services.dns.pool_geo.view_renders_zone`).
-    Among them: the zone's own pinned view; else the first operator view in
-    precedence order (it serves every shared record, plus its own scoped
-    ones); else the geo catch-all, which serves the default pool members;
-    else the first view left, which can only be a geo view.
+    The same rule the bundle expands zones by
+    (:func:`~app.services.dns.pool_geo.views_rendering_zone`), so a view this
+    names is one the agents serve the zone in.
     """
     views = list(
         (await db.execute(select(DNSView).where(DNSView.group_id == zone.group_id))).scalars().all()
     )
     geo = await build_geo_steering(db, zone.group_id)
     if not views and not geo.active:
-        return None
+        return []
     descs = build_view_descriptors(sorted(views, key=lambda v: (v.order, v.name)), geo)
     scoped = set(
         (
             await db.execute(
                 select(DNSRecord.view_id)
-                .where(DNSRecord.zone_id == zone.id, DNSRecord.view_id.is_not(None))
+                .where(
+                    DNSRecord.zone_id == zone.id,
+                    DNSRecord.view_id.is_not(None),
+                    places_zone_clause(),
+                )
                 .distinct()
             )
         )
         .scalars()
         .all()
     )
-    targets = scoped | ({zone.view_id} if zone.view_id is not None else set())
-    holding = [vd for vd in descs if view_renders_zone(vd, targets)]
+    return views_rendering_zone(descs, zone.view_id, scoped)
+
+
+async def transfer_view_name(db: AsyncSession, zone: DNSZone) -> str | None:
+    """The view whose copy of ``zone`` the control plane reads, or None when
+    the zone's group renders no views.
+
+    Only views that hold a copy are candidates (:func:`zone_holding_views`).
+    Among them: the zone's own pinned view; else the first operator view in
+    precedence order (it serves every shared record, plus its own scoped
+    ones); else the geo catch-all, which serves the default pool members;
+    else the first view left, which can only be a geo view.
+    """
+    holding = await zone_holding_views(db, zone)
     for pick in (
         lambda vd: vd["kind"] == "operator" and vd["id"] == zone.view_id,
         lambda vd: vd["kind"] == "operator",
@@ -298,6 +394,78 @@ def _answered_badkey(exc: BaseException) -> bool:
     return False
 
 
+async def resolve_transfer_vip(db: AsyncSession) -> str:
+    """The appliance's DNS resolver VIP, or ``""`` when none is configured.
+
+    #1470 — with ``dns_vip`` set the appliance's DNS pods drop hostNetwork and
+    sit behind a MetalLB LoadBalancer, so the node address a ``DNSServer`` row
+    carries answers nothing on :53. The VIP itself is only the SIGNAL that
+    this is happening; it is never dialled (see ``transfer_fallback_hosts``).
+    Resolved once per drift / sync call, because the drift fan-out touches no
+    DB.
+    """
+    from app.models.settings import PlatformSettings  # noqa: PLC0415
+
+    ps = await db.get(PlatformSettings, 1)
+    return ((ps.dns_vip if ps else "") or "").strip()
+
+
+def transfer_fallback_hosts(server: DNSServer, vip: str) -> list[str]:
+    """Extra addresses to AXFR ``server`` from when its own refuses (#1470).
+
+    The member's OWN address, never the VIP. Behind the VIP the pod keeps an
+    address of its own on the cluster network, and its agent heartbeats the
+    in-cluster API Service from it, so ``last_seen_ip`` is exactly where this
+    member's daemon listens. The VIP is the wrong target for a per-server
+    read: kube-proxy balances in-cluster traffic to it across every pod
+    labelled ``spatium.io/dns-vip`` — every member of every DNS group in the
+    cluster — so a drift row read through it describes an arbitrary member,
+    and a member whose daemon is down would read as in sync because another
+    one answered.
+
+    Only offered when ``dns_vip`` is set (outside VIP mode the node address
+    is where the daemon listens, so a refusal there is a real answer) and
+    only to an agent-managed server: Windows, cloud and an operator's own
+    BIND9 are reached at their own address and must not be redirected.
+    A ``host`` that does not resolve is a separate case with its own,
+    VIP-independent fallback: :func:`transfer_unresolved_fallback_hosts`.
+    """
+    if not vip or not transfer_needs_tsig(server):
+        return []
+    own = (getattr(server, "last_seen_ip", None) or "").strip()
+    if not own or own in {server.host, vip}:
+        return []
+    return [own]
+
+
+def transfer_unresolved_fallback_hosts(server: DNSServer) -> list[str]:
+    """Where to AXFR ``server`` from when its ``host`` does not RESOLVE (#3757).
+
+    A chart-deployed agent registered its bare pod name, which only resolves
+    inside that pod. Its heartbeat source address (``last_seen_ip``) is where
+    its daemon listens, and unlike :func:`transfer_fallback_hosts` this needs
+    no VIP: it is only dialled after ``host`` failed to resolve, so a server
+    whose name works is never redirected. Same eligibility: agent-managed
+    only, so Windows, cloud and an operator's own BIND9 are never redirected.
+    """
+    if not transfer_needs_tsig(server):
+        return []
+    own = (getattr(server, "last_seen_ip", None) or "").strip()
+    if not own or own == server.host:
+        return []
+    return [own]
+
+
+def transfer_fallback_kwargs(server: DNSServer, vip: str) -> dict[str, list[str]]:
+    """``pull_zone_records`` kwargs for both fallbacks; empty when neither applies."""
+    out: dict[str, list[str]] = {}
+    if hosts := transfer_fallback_hosts(server, vip):
+        out["fallback_hosts"] = hosts
+    if unresolved := transfer_unresolved_fallback_hosts(server):
+        out["unresolved_fallback_hosts"] = unresolved
+    return out
+
+
 async def pull_zone_records_signed(
     driver: Any,
     server: Any,
@@ -305,8 +473,12 @@ async def pull_zone_records_signed(
     keys: Sequence[TsigKey | None],
     *,
     view_name: str | None = None,
+    **pull_kwargs: Any,
 ) -> tuple[list[RecordData], TsigKey | None]:
     """``driver.pull_zone_records`` with each of ``keys`` in turn.
+
+    ``pull_kwargs`` go to every ``pull_zone_records`` call unchanged (the
+    drift report's ``include_apex_ns``, #1857).
 
     Moves to the next key only when the server answered BADKEY. That is how an
     agent that predates the per-view keys (#920) answers one — it never
@@ -324,7 +496,7 @@ async def pull_zone_records_signed(
     first: Exception | None = None
     for i, key in enumerate(keys):
         try:
-            return await driver.pull_zone_records(server, zone_name, tsig=key), key
+            return await driver.pull_zone_records(server, zone_name, tsig=key, **pull_kwargs), key
         except Exception as exc:  # noqa: BLE001 — classified below, re-raised
             first = first or exc
             if i == len(keys) - 1 or not _answered_badkey(exc):
@@ -347,6 +519,10 @@ __all__ = [
     "is_view_transfer_key",
     "legacy_group_key",
     "pull_zone_records_signed",
+    "resolve_transfer_vip",
+    "transfer_fallback_hosts",
+    "transfer_fallback_kwargs",
+    "transfer_unresolved_fallback_hosts",
     "resolve_group_transfer_key",
     "resolve_view_transfer_key",
     "rotate_group_tsig_key",

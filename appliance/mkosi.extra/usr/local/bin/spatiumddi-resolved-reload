@@ -48,6 +48,23 @@
 
 set -euo pipefail
 
+# Writes stdin to $1, a file in the release-state directory. The api and the
+# supervisor can create names in that directory and this runs as root, so a
+# redirect onto the name would follow a symlink planted there. Instead a temp
+# file is created exclusively (mktemp) next to it and renamed over the name:
+# whatever was at the name, a symlink included, is replaced, never written
+# through. -T: a directory at the name fails the rename instead of receiving
+# the file. $2 = mode, default 0644.
+state_write() {
+    local _dst="$1" _tmp
+    _tmp=$(mktemp "$(dirname -- "$_dst")/.$(basename -- "$_dst").XXXXXX") || return 1
+    if cat > "$_tmp" && chmod "${2:-0644}" "$_tmp" && mv -fT -- "$_tmp" "$_dst"; then
+        return 0
+    fi
+    rm -f -- "$_tmp"
+    return 1
+}
+
 TRIGGER=/var/lib/spatiumddi/release-state/resolver-config-pending
 HASH_SIDECAR=/var/lib/spatiumddi/release-state/resolver-config-hash
 STATUS_SIDECAR=/var/lib/spatiumddi/release-state/resolver-status
@@ -108,9 +125,9 @@ case "$MARKER" in
         # bundle could). Refuse rather than fight no-stub-listener.conf.
         if grep -qi 'DNSStubListener' "$TMP_BODY"; then
             echo "  ✗ staged drop-in contains DNSStubListener — refusing"
-            echo "failed" > "$STATUS_SIDECAR"
-            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
-            mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+            echo "failed" | state_write "$STATUS_SIDECAR"
+            echo "failed $(date -Iseconds)" | state_write "${TRIGGER}.state"
+            mv -T "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
             exit 1
         fi
         # Owner root, mode 0644 — no secrets (resolver IPs / domains are
@@ -118,11 +135,11 @@ case "$MARKER" in
         install -o root -g root -m 0644 "$TMP_BODY" "$ETC_DROPIN"
         echo "  ✓ wrote $ETC_DROPIN"
         if resolved_reload; then
-            echo "override" > "$STATUS_SIDECAR"
+            echo "override" | state_write "$STATUS_SIDECAR"
         else
-            echo "failed" > "$STATUS_SIDECAR"
-            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
-            mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+            echo "failed" | state_write "$STATUS_SIDECAR"
+            echo "failed $(date -Iseconds)" | state_write "${TRIGGER}.state"
+            mv -T "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
             exit 1
         fi
         ;;
@@ -136,24 +153,24 @@ case "$MARKER" in
             echo "  (no managed drop-in present — already automatic)"
         fi
         if resolved_reload; then
-            echo "automatic" > "$STATUS_SIDECAR"
+            echo "automatic" | state_write "$STATUS_SIDECAR"
         else
-            echo "failed" > "$STATUS_SIDECAR"
-            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
-            mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+            echo "failed" | state_write "$STATUS_SIDECAR"
+            echo "failed $(date -Iseconds)" | state_write "${TRIGGER}.state"
+            mv -T "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
             exit 1
         fi
         ;;
     *)
         echo "  ✗ unknown marker line: ${MARKER:-<empty>}"
-        echo "failed" > "$STATUS_SIDECAR"
-        echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
-        mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+        echo "failed" | state_write "$STATUS_SIDECAR"
+        echo "failed $(date -Iseconds)" | state_write "${TRIGGER}.state"
+        mv -T "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
         exit 1
         ;;
 esac
 
-echo "$HASH" > "$HASH_SIDECAR"
-echo "done $(date -Iseconds)" > "${TRIGGER}.state"
-mv "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
+echo "$HASH" | state_write "$HASH_SIDECAR"
+echo "done $(date -Iseconds)" | state_write "${TRIGGER}.state"
+mv -T "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
 echo "  ✓ done — resolver state: $(cat "$STATUS_SIDECAR")"

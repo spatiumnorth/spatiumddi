@@ -62,7 +62,8 @@ from datetime import UTC, datetime
 from typing import Any
 
 import structlog
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dns_names import sanitize_hostname
@@ -75,7 +76,10 @@ from app.models.dhcp import (
     DHCPStaticAssignment,
 )
 from app.models.ipam import IPAddress, Subnet
-from app.services.dhcp.ipam_mirror import insert_ipam_mirror_row
+from app.services.dhcp.ipam_mirror import (
+    insert_ipam_mirror_row,
+    lease_hostname_suppressed_subnets,
+)
 from app.services.dhcp.lease_cleanup import purge_lease
 from app.services.dhcp.lease_history import record_lease_history
 from app.services.dhcp.normalize import norm_ip, norm_mac
@@ -90,14 +94,25 @@ from app.services.dhcp.windows_failover import (
     record_failover_observation,
     record_scope_observation,
 )
+from app.services.ipam.utilization import recount_subnets_and_blocks
+from app.services.lock_order import lock_lease_rows, lock_mirror_rows, lock_zones_for_addresses
 
 
 def _refresh_lease_owned_row(
-    row: IPAddress, lease: dict[str, Any], mac: str, now: datetime
+    row: IPAddress,
+    lease: dict[str, Any],
+    mac: str,
+    now: datetime,
+    *,
+    write_hostname: bool = True,
 ) -> None:
-    """Refresh an auto-from-lease mirror row from the wire lease."""
+    """Refresh an auto-from-lease mirror row from the wire lease.
+
+    ``write_hostname=False`` (scope not set to ``on_lease``, #2269) leaves the
+    row's hostname alone.
+    """
     row.mac_address = mac
-    if lease.get("hostname"):
+    if write_hostname and lease.get("hostname"):
         row.hostname = lease.get("hostname")
     row.last_seen_at = now
     row.last_seen_method = "dhcp"
@@ -139,9 +154,95 @@ class PullLeasesResult:
     # the caller publishes an agent wake for them AFTER its commit so the
     # records converge instantly instead of on the agent's safety tick.
     dns_wake_group_ids: set[str] = field(default_factory=set)
+    # #2262 — another pull of this server (the scheduled task or a manual
+    # Sync) holds its lock, so this one did nothing. Not an error: the other
+    # pull is doing the work.
+    busy: bool = False
+    # #2262 — surplus ``dhcp_lease`` rows for one address deleted by this pull
+    # (left behind by overlapping pulls before they were serialised).
+    duplicates_removed: int = 0
+    # #3345 — subnets whose mirror rows this pull created or removed, for the
+    # one recount at the end (``pull_leases_from_server``, or its caller). The
+    # topology merge's reservation mirrors land here too (#3354).
+    touched_subnet_ids: set[Any] = field(default_factory=set)
+
+
+# #2262 — namespace for the per-server lease-pull advisory lock. The second key
+# is hashtext(server_id); this int keeps the keyspace apart from the other
+# two-int advisory locks in the app.
+_PULL_LOCK_NS = 0x2262_D4C9
+
+
+async def _try_lock_server(db: AsyncSession, server: DHCPServer) -> bool:
+    """Take the per-server pull lock for the rest of the caller's transaction.
+
+    Transaction-scoped, so it is released by the caller's COMMIT (or
+    ROLLBACK): exactly when this pull's writes become visible to the next
+    one. The scheduled task and ``POST /dhcp/servers/{id}/sync-leases`` both
+    come through here, so they serialise against each other as well as
+    against themselves.
+    """
+    return bool(
+        await db.scalar(
+            text("SELECT pg_try_advisory_xact_lock(:ns, hashtext(:sid))"),
+            {"ns": _PULL_LOCK_NS, "sid": str(server.id)},
+        )
+    )
+
+
+_SYNC_ERROR_MAX = 2000
+_SYNC_ERROR_SHOWN = 3
+
+
+def _summarise_errors(errors: list[str]) -> str:
+    """Concise, bounded one-liner naming the failing parts (first few errors)."""
+    shown = "; ".join(errors[:_SYNC_ERROR_SHOWN])
+    if len(errors) > _SYNC_ERROR_SHOWN:
+        shown += f" (+{len(errors) - _SYNC_ERROR_SHOWN} more)"
+    return shown[:_SYNC_ERROR_MAX]
 
 
 async def pull_leases_from_server(
+    db: AsyncSession,
+    server: DHCPServer,
+    *,
+    apply: bool = True,
+    recount: bool = True,
+) -> PullLeasesResult:
+    """Pull leases, then record the outcome on the server row (#2306).
+
+    Single place for both callers (scheduled task + manual Sync leases). A
+    pull that returns any ``result.errors`` is FAILING — including a partial
+    one (scopes read but the lease read failed, or one scope's enumeration
+    failed); the summary names the failing parts. Only a clean pull clears
+    ``last_sync_error``. Agent-based drivers are not applicable and untouched.
+
+    A ``busy`` result (#2262) records nothing: this call did no pull, so it
+    has no outcome to report, and the pass that holds the server records its
+    own. Writing the row here would also wait on that pass's row lock, so a
+    manual Sync that should answer 409 at once would hang until it finished.
+
+    Ends by recounting the subnets whose mirrors changed (#3345). A caller
+    pulling several servers in one transaction passes ``recount=False`` and
+    recounts ``result.touched_subnet_ids`` itself after the last pull: the
+    recount takes the audit-chain lock and subnet / block row locks until
+    commit, and must not hold them through the next server's driver call.
+    """
+    result = await _pull_leases_core(db, server, apply=apply)
+    if apply and not result.busy and is_agentless(server.driver):
+        if result.errors:
+            server.last_sync_error = _summarise_errors(result.errors)
+            server.last_sync_error_at = datetime.now(UTC)
+        else:
+            server.last_sync_error = None
+            server.last_sync_error_at = None
+        await db.flush()
+    if apply and recount:
+        await recount_subnets_and_blocks(db, result.touched_subnet_ids)
+    return result
+
+
+async def _pull_leases_core(
     db: AsyncSession,
     server: DHCPServer,
     *,
@@ -157,6 +258,9 @@ async def pull_leases_from_server(
     and would double-count.
     """
     result = PullLeasesResult()
+    # Subnets whose mirror rows this pull created or removed; recounted once
+    # at the end, never per lease (#3345).
+    touched_subnets = result.touched_subnet_ids
 
     if not is_agentless(server.driver):
         result.errors.append(
@@ -168,6 +272,14 @@ async def pull_leases_from_server(
         driver = get_driver(server.driver)
     except ValueError as exc:
         result.errors.append(str(exc))
+        return result
+
+    # #2262 — one pull per server at a time. Two overlapping pulls both saw a
+    # new lease as absent and both inserted it; every later pull then failed
+    # on that address. A dry run writes nothing and needs no lock.
+    if apply and not await _try_lock_server(db, server):
+        result.busy = True
+        logger.info("dhcp_pull_leases_server_busy", server=str(server.id))
         return result
 
     subnets = await _load_subnet_cache(db)
@@ -219,6 +331,10 @@ async def pull_leases_from_server(
             await _upsert_scope(
                 db, server, wscope, subnets, result, apply=apply, snapshot_at=snapshot_at
             )
+        # The reservation mirrors' subnets are in ``touched_subnet_ids`` and
+        # recounted with the lease mirrors' after the pull, never here: the
+        # recount holds the audit-chain lock and subnet / block row locks to
+        # commit, and the lease phase below is another driver call (#3354).
 
     # Phase 2 — leases.
     try:
@@ -253,8 +369,61 @@ async def pull_leases_from_server(
     # #844 — subnet ids this server's group actually serves; hoisted out of
     # the per-lease loops (rebuilding the set per lease is O(scopes) each).
     preferred_subnet_ids = set(scope_cache)
+    # #2269 — scopes not set to ``on_lease`` keep the lease hostname out of IPAM.
+    no_hostname_subnets = await lease_hostname_suppressed_subnets(
+        db, group_id=server.server_group_id
+    )
 
     now = datetime.now(UTC)
+
+    # #3617: one lock order with every other lease-path writer
+    # (``app.services.lock_order``): this server's lease rows by id, then the
+    # lease mirrors this pull may write by id, then (after the per-lease pass,
+    # below) the zones its DDNS may write, by id. The pull used to take all
+    # three per lease, in wire order, so the expiry sweep (leases → mirrors →
+    # zones, #3605) or a lease batch could hold a row this pull wanted next
+    # while waiting for one it held. Locking every lease row up front also
+    # makes a renewal wait for an expiry sweep that holds the row, so the
+    # per-address read below (``populate_existing``) sees what the sweep
+    # committed rather than a stale ``state='active'`` (#3624).
+    wire_subnet = {
+        lease.get("ip_address"): _find_containing_subnet(
+            lease["ip_address"], subnets, preferred_subnet_ids=preferred_subnet_ids
+        )
+        for lease in wire
+        if lease.get("ip_address")
+    }
+    wire = sorted(
+        wire,
+        key=lambda lease: _write_order(
+            wire_subnet.get(lease.get("ip_address")), lease.get("ip_address")
+        ),
+    )
+    if apply:
+        await lock_lease_rows(db, DHCPLease.server_id == server.id)
+        mirror_keys = {
+            (sn.id, norm_ip(ip)) for ip, sn in wire_subnet.items() if sn is not None and ip
+        }
+        for held in (
+            await db.execute(
+                select(DHCPLease)
+                .where(DHCPLease.server_id == server.id, DHCPLease.state == "active")
+                .execution_options(populate_existing=True)
+            )
+        ).scalars():
+            sid = scope_subnet_ids.get(held.scope_id) if held.scope_id else None
+            if sid is None:
+                held_subnet = _find_containing_subnet(
+                    str(held.ip_address), subnets, preferred_subnet_ids=preferred_subnet_ids
+                )
+                sid = held_subnet.id if held_subnet is not None else None
+            if sid is not None:
+                mirror_keys.add((sid, norm_ip(str(held.ip_address))))
+        locked_mirrors = await lock_mirror_rows(db, mirror_keys)
+    else:
+        locked_mirrors = []
+    # (subnet, mirror row, client hostname) to publish DDNS for, after the pass.
+    ddns_todo: list[tuple[Subnet, IPAddress, str | None]] = []
 
     for lease in wire:
         ip = lease.get("ip_address")
@@ -262,31 +431,63 @@ async def pull_leases_from_server(
         if not ip or not mac:
             continue
 
-        containing = _find_containing_subnet(ip, subnets, preferred_subnet_ids=preferred_subnet_ids)
+        containing = wire_subnet.get(ip)
         scope_id = scope_cache.get(containing.id) if containing else None
 
-        existing = (
-            await db.execute(
-                select(DHCPLease).where(
-                    DHCPLease.server_id == server.id,
-                    DHCPLease.ip_address == ip,
-                )
+        # #2262 — every row for the address, newest first. This path keeps one
+        # row per address, but overlapping pulls from before it was serialised
+        # left installs with two; ``scalar_one_or_none`` raised on those and
+        # aborted the server's pull on every tick. Keep the newest, drop the
+        # rest (the kept row still holds the address, so no mirror or DDNS
+        # teardown).
+        lease_q = (
+            select(DHCPLease)
+            .where(
+                DHCPLease.server_id == server.id,
+                DHCPLease.ip_address == ip,
             )
-        ).scalar_one_or_none()
+            .order_by(DHCPLease.last_seen_at.desc(), DHCPLease.id.desc())
+        )
+        if apply:
+            # #3624 — re-read: the rows were locked above, possibly after a
+            # wait on the sweep, and must not keep a value read before it.
+            lease_q = lease_q.execution_options(populate_existing=True)
+        rows = list((await db.execute(lease_q)).scalars().all())
+        existing = rows[0] if rows else None
+        if apply and len(rows) > 1:
+            for extra in rows[1:]:
+                await db.delete(extra)
+            # Flushed now: the unit of work orders UPDATEs before DELETEs, so
+            # the MAC refresh below could otherwise collide with a surplus row
+            # carrying the new MAC on the identity index.
+            await db.flush()
+            result.duplicates_removed += len(rows) - 1
+            logger.info(
+                "dhcp_pull_leases_duplicates_removed",
+                server=str(server.id),
+                ip=ip,
+                removed=len(rows) - 1,
+            )
 
         if existing is None:
             if apply:
-                db.add(
-                    DHCPLease(
-                        server_id=server.id,
-                        scope_id=scope_id,
-                        ip_address=ip,
-                        mac_address=mac,
-                        hostname=lease.get("hostname"),
-                        client_id=lease.get("client_id"),
-                        state="active",
-                        expires_at=lease.get("expires_at"),
-                        last_seen_at=now,
+                # #2262 — an upsert on the lease identity, so a pull racing a
+                # writer the lock does not cover still lands one row.
+                fields = {
+                    "scope_id": scope_id,
+                    "hostname": lease.get("hostname"),
+                    "client_id": lease.get("client_id"),
+                    "state": "active",
+                    "expires_at": lease.get("expires_at"),
+                    "last_seen_at": now,
+                }
+                await db.execute(
+                    pg_insert(DHCPLease)
+                    .values(server_id=server.id, ip_address=ip, mac_address=mac, **fields)
+                    .on_conflict_do_update(
+                        index_elements=["server_id", "ip_address", "mac_address"],
+                        index_where=DHCPLease.duid.is_(None),
+                        set_=fields,
                     )
                 )
             result.imported += 1
@@ -320,6 +521,7 @@ async def pull_leases_from_server(
             result.out_of_scope += 1
             continue
 
+        hostname_suppressed = containing.id in no_hostname_subnets
         ipam_row = (
             await db.execute(
                 select(IPAddress).where(
@@ -335,7 +537,7 @@ async def pull_leases_from_server(
                     subnet_id=containing.id,
                     address=ip,
                     status="dhcp",
-                    hostname=lease.get("hostname"),
+                    hostname=None if hostname_suppressed else lease.get("hostname"),
                     mac_address=mac,
                     last_seen_at=now,
                     last_seen_method="dhcp",
@@ -350,10 +552,13 @@ async def pull_leases_from_server(
                 ipam_row, created = await insert_ipam_mirror_row(db, candidate)
                 if created:
                     result.ipam_created += 1
+                    touched_subnets.add(containing.id)
                 elif ipam_row.auto_from_lease:
                     # Lost the race to a lease-owned row — refresh it
                     # like the elif path below.
-                    _refresh_lease_owned_row(ipam_row, lease, mac, now)
+                    _refresh_lease_owned_row(
+                        ipam_row, lease, mac, now, write_hostname=not hostname_suppressed
+                    )
                     result.ipam_refreshed += 1
                 else:
                     # Lost the race to a manual/static row — leave it
@@ -365,44 +570,19 @@ async def pull_leases_from_server(
             # Only refresh rows we own. Manually-allocated rows are left
             # alone — the lease + IPAM coexist.
             if apply:
-                _refresh_lease_owned_row(ipam_row, lease, mac, now)
+                _refresh_lease_owned_row(
+                    ipam_row, lease, mac, now, write_hostname=not hostname_suppressed
+                )
             result.ipam_refreshed += 1
         else:
             # Manual allocation — skip DDNS entirely. Whatever hostname
             # the operator set stays put.
             continue
 
-        # Fire DDNS off the freshly-mirrored row. Gate-keeping lives
-        # inside the service (subnet.ddns_enabled, policy, static
-        # override, idempotency); we just pass through and let it
-        # decide. Any exception is logged but doesn't break the
-        # lease-pull pass — DNS will reconcile next tick either way.
+        # DDNS fires off the freshly-mirrored row once every row is written
+        # (#3617, the order above).
         if apply and ipam_row is not None:
-            try:
-                from app.services.dns.ddns import apply_ddns_for_lease  # noqa: PLC0415
-
-                fired = await apply_ddns_for_lease(
-                    db,
-                    subnet=containing,
-                    ipam_row=ipam_row,
-                    client_hostname=lease.get("hostname"),
-                )
-                # #428 — record the affected DNS group(s) so the task wakes
-                # the agent after commit (instead of waiting the safety tick).
-                if fired:
-                    from app.api.v1.ipam.router import (  # noqa: PLC0415
-                        _resolve_effective_dns,
-                    )
-
-                    group_ids, _, _ = await _resolve_effective_dns(db, containing)
-                    result.dns_wake_group_ids.update(str(g) for g in group_ids)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "dhcp_pull_leases_ddns_failed",
-                    server=str(server.id),
-                    ip=ip,
-                    error=str(exc),
-                )
+            ddns_todo.append((containing, ipam_row, lease.get("hostname")))
 
     # Absence-delete: any active lease we have for this server that did
     # NOT appear in the wire response was removed on the DHCP server
@@ -487,6 +667,8 @@ async def pull_leases_from_server(
         .scalars()
         .all()
     )
+    if apply:
+        await _publish_pull_ddns(db, server, ddns_todo, stale_leases, locked_mirrors, result)
     for stale in stale_leases:
         # Scope the mirror lookup to the lease's owning subnet — the same
         # discipline as the upsert/create branch above. The unscoped
@@ -506,7 +688,9 @@ async def pull_leases_from_server(
             # lease. Pass the subnet we already resolved so the helper keeps the
             # per-poll O(1) resolution. Same helper the delete_lease endpoint
             # and scope deletion use (DRY).
-            if await purge_lease(db, stale, subnet_id=stale_subnet_id, now=now):
+            if await purge_lease(
+                db, stale, subnet_id=stale_subnet_id, now=now, touched_subnets=touched_subnets
+            ):
                 result.ipam_revoked += 1
         elif stale_subnet_id is not None:
             # Dry-run (apply=False): count the mirror the purge WOULD remove,
@@ -532,6 +716,64 @@ async def pull_leases_from_server(
 
 
 # ── helpers ───────────────────────────────────────────────────────────
+
+
+def _write_order(subnet: Any, address: Any) -> tuple[str, int, int, str]:
+    """(subnet id, address version, int address): the lease batches' write
+    order (#3480, #3601), which the pull follows too (#3617)."""
+    key = str(subnet.id) if subnet is not None else ""
+    ip = norm_ip(str(address or ""))
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return (key, 0, 0, ip)
+    return (key, addr.version, int(addr), ip)
+
+
+async def _publish_pull_ddns(
+    db: AsyncSession,
+    server: DHCPServer,
+    todo: list[tuple[Subnet, IPAddress, str | None]],
+    stale_leases: list[DHCPLease],
+    locked_mirrors: list[IPAddress],
+    result: PullLeasesResult,
+) -> None:
+    """The pull's DDNS, after every lease and mirror row is written (#3617).
+
+    Every zone the publishes below and the absence-delete revokes after them
+    may write is locked first, in id order: one address's zones after
+    another's are not in id order, and a revoke took the reverse zone before
+    the forward one. Gate-keeping lives inside the service (subnet DDNS,
+    policy, static override, idempotency). Any exception is logged but doesn't
+    break the pull — DNS will reconcile next tick either way.
+    """
+    from app.api.v1.ipam.router import _resolve_effective_dns  # noqa: PLC0415
+    from app.services.dns.ddns import apply_ddns_for_lease  # noqa: PLC0415
+
+    stale_ips = {norm_ip(str(lease.ip_address)) for lease in stale_leases}
+    await lock_zones_for_addresses(
+        db,
+        publishing=[(subnet, row) for subnet, row, _host in todo],
+        retracting=[m for m in locked_mirrors if norm_ip(str(m.address)) in stale_ips],
+        ddns=True,
+    )
+    for subnet, row, hostname in todo:
+        try:
+            fired = await apply_ddns_for_lease(
+                db, subnet=subnet, ipam_row=row, client_hostname=hostname
+            )
+            # #428 — record the affected DNS group(s) so the task wakes the
+            # agent after commit (instead of waiting the safety tick).
+            if fired:
+                group_ids, _, _ = await _resolve_effective_dns(db, subnet)
+                result.dns_wake_group_ids.update(str(g) for g in group_ids)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "dhcp_pull_leases_ddns_failed",
+                server=str(server.id),
+                ip=str(row.address),
+                error=str(exc),
+            )
 
 
 @dataclass
@@ -662,6 +904,36 @@ async def _load_scope_cache(db: AsyncSession, group_id: Any) -> dict[Any, Any]:
         )
     )
     return {subnet_id: scope_id for subnet_id, scope_id in res.all()}
+
+
+async def _load_trashed_scope_nets(
+    db: AsyncSession, group_id: Any
+) -> list[tuple[Any, ipaddress._BaseNetwork]]:
+    """``[(scope_id, network)]`` for this group's scopes in the Trash (#3733),
+    each with its subnet's network, read even when the subnet is in the Trash
+    with it (a subnet delete trashes its scopes).
+
+    ``_load_scope_cache`` leaves these out, so an address of a trashed scope
+    no longer ranks its subnet first and falls back to the global
+    longest-prefix match. The lease-events handler matches such an address
+    against these networks and takes no event for it: a scope in the Trash
+    gets no lease, mirror or DDNS record back.
+    """
+    if group_id is None:
+        return []
+    res = await db.execute(
+        select(DHCPScope.id, Subnet.network)
+        .join(Subnet, Subnet.id == DHCPScope.subnet_id)
+        .where(DHCPScope.group_id == group_id, DHCPScope.deleted_at.is_not(None))
+        .execution_options(include_deleted=True)
+    )
+    out: list[tuple[Any, ipaddress._BaseNetwork]] = []
+    for scope_id, network in res.all():
+        try:
+            out.append((scope_id, ipaddress.ip_network(str(network), strict=False)))
+        except (ValueError, TypeError):
+            continue
+    return out
 
 
 def _find_containing_subnet(
@@ -934,6 +1206,7 @@ async def _merge_statics(
     re-syncs DNS, and this runs on the beat.
     """
     wire = _dedupe_wire_statics(wscope.get("statics") or [])
+    changes_before = result.statics_removed + result.statics_synced
     existing = list(
         (
             await db.execute(
@@ -968,7 +1241,7 @@ async def _merge_statics(
             # a machine reconcile, and a persisted freed row still renders as a
             # line in the subnet table and still counts toward utilization
             # (#618). Tears the reservation's DNS records down first.
-            await remove_ipam_for_static(db, st)
+            await remove_ipam_for_static(db, st, touched_subnets=result.touched_subnet_ids)
             await db.delete(st)
             by_mac.pop(norm_mac(str(st.mac_address)), None)
             result.statics_removed += 1
@@ -1041,6 +1314,11 @@ async def _merge_statics(
         await upsert_ipam_for_static(db, scope, st, action="create")
         occupied[ip_key] = st
         result.statics_synced += 1
+
+    # Mirrors were created, moved or deleted above; the caller recounts the
+    # subnet and its blocks once, with every other scope's (#3354).
+    if result.statics_removed + result.statics_synced != changes_before:
+        result.touched_subnet_ids.add(scope.subnet_id)
 
 
 def _dedupe_wire_statics(raw: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:

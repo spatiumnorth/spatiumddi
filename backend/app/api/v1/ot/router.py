@@ -54,7 +54,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ownership._audit import write_audit
-from app.core.permissions import require_resource_permission
+from app.core.permissions import require_permission, require_resource_permission
 from app.models.ipam import IPAddress, IPSpace, Subnet
 from app.models.ot import (
     OT_DEVICE_SOURCES,
@@ -64,6 +64,8 @@ from app.models.ot import (
     OTDevice,
     OTZone,
 )
+from app.services.api_token_scopes import read_only_post
+from app.services.ipam.live_address import get_live_address
 from app.services.ot.importer import (
     MAX_IMPORT_ROWS,
     OTImportError,
@@ -511,7 +513,7 @@ async def _load_address_for_write(
     resource-scoped API token (#374) can't attach a descriptor to an
     address outside its subnet.
     """
-    ip = await db.get(IPAddress, ip_address_id)
+    ip = await get_live_address(db, ip_address_id)
     if ip is None:
         raise HTTPException(status_code=422, detail="ip_address_id not found")
     _enforce_subnet_scope(user, ip.subnet_id)
@@ -634,7 +636,7 @@ async def list_devices(
     stmt = apply_tag_filter(stmt, OTDevice.tags, tag)
 
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
-    stmt = stmt.order_by(IPAddress.address.asc()).limit(limit).offset(offset)
+    stmt = stmt.order_by(IPAddress.address.asc(), IPAddress.id).limit(limit).offset(offset)
     rows = (await db.execute(stmt)).all()
     return OTDeviceListResponse(
         items=[_device_read(device, ip) for device, ip in rows],
@@ -758,7 +760,7 @@ async def get_device_by_address(
     "nothing to show here", and the distinction would leak the existence
     of addresses outside a scoped token's reach.
     """
-    ip = await db.get(IPAddress, ip_address_id)
+    ip = await get_live_address(db, ip_address_id)
     if ip is None:
         raise HTTPException(status_code=404, detail="No OT descriptor for this address")
     _enforce_subnet_scope(user, ip.subnet_id)
@@ -1011,7 +1013,14 @@ def _rows_out(plan: list[PlannedRow]) -> list[OTDeviceImportRow]:
     ]
 
 
-@router.post("/devices/import/preview", response_model=OTDeviceImportPreviewResponse)
+@router.post(
+    "/devices/import/preview",
+    response_model=OTDeviceImportPreviewResponse,
+    # ``@read_only_post`` relaxes the router gate to ``read``; an import
+    # preview still needs what the commit needs (#3302).
+    dependencies=[Depends(require_permission("write", "ot_device"))],
+)
+@read_only_post
 async def import_preview(
     body: OTDeviceImportRequest, db: DB, user: CurrentUser
 ) -> OTDeviceImportPreviewResponse:

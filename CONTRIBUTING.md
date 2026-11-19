@@ -11,6 +11,8 @@ The PR template asks you to confirm you have read it.
 - **Sign off your commits.** We use the [Developer Certificate of Origin](#developer-certificate-of-origin-dco):
   add `-s` to `git commit` to certify you have the right to contribute the
   change. No CLA, no account. A required check verifies it on every PR.
+- Read our [Code of Conduct](CODE_OF_CONDUCT.md). It applies to issues, pull
+  requests, discussions and every other project space.
 - Read the [CLAUDE.md](CLAUDE.md) file — it is the canonical spec for the project and defines all architectural decisions
 - Check [open issues](https://github.com/spatiumnorth/spatiumddi/issues) to avoid duplicate work
 - For significant changes, open a discussion or issue first so we can align before you invest time coding

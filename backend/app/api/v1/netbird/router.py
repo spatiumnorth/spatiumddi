@@ -18,15 +18,20 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
-from app.api.v1._common import StatusResponse
+from app.api.v1._common import StatusResponse, add_trigger_audit
+from app.core.celery_dispatch import dispatch
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
+from app.core.header_credentials import header_secret
 from app.core.permissions import require_resource_permission
 from app.core.ssrf import assert_safe_target
+from app.core.stored_secret_guard import require_secret_with_destination_change
 from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace
 from app.models.netbird import NetbirdInstance
+from app.services.dns.bundle_dirty import mark_integration_dns_released
+from app.services.integration_ownership import release_integration_rows
 from app.services.netbird.client import (
     NetbirdClient,
     NetbirdClientError,
@@ -107,6 +112,8 @@ class InstanceCreate(InstanceBase):
             raise ValueError("api_key is required")
         return v
 
+    _check_api_key = field_validator("api_key")(header_secret)
+
 
 class InstanceUpdate(BaseModel):
     name: str | None = None
@@ -140,6 +147,8 @@ class InstanceUpdate(BaseModel):
     def _floor_interval(cls, v: int | None) -> int | None:
         return None if v is None else _floor_sync_interval(v)
 
+    _check_api_key = field_validator("api_key")(header_secret)
+
 
 class InstanceResponse(BaseModel):
     id: uuid.UUID
@@ -167,6 +176,8 @@ class TestConnectionRequest(BaseModel):
     api_url: str | None = None
     verify_tls: bool = True
     api_key: str | None = None
+
+    _check_api_key = field_validator("api_key")(header_secret)
 
 
 class TestConnectionResponse(BaseModel):
@@ -324,6 +335,12 @@ async def update_instance(
         raise HTTPException(status_code=404, detail="NetBird instance not found")
 
     changes = body.model_dump(exclude_unset=True)
+    require_secret_with_destination_change(
+        t,
+        changes,
+        destination=["api_url"],
+        secrets={"api_key": t.api_key_encrypted},
+    )
     new_ipam = changes.get("ipam_space_id", t.ipam_space_id)
     new_dns = changes.get("dns_group_id", t.dns_group_id)
     if "ipam_space_id" in changes or "dns_group_id" in changes:
@@ -356,6 +373,13 @@ async def delete_instance(instance_id: uuid.UUID, db: DB, user: SuperAdmin) -> N
     if t is None:
         raise HTTPException(status_code=404, detail="NetBird instance not found")
     _audit(db, user=user, action="delete", instance_id=t.id, instance_name=t.name)
+    # #2287 — hand back operator-made rows in mirrored subnets / blocks before
+    # the FK cascade can destroy them.
+    await release_integration_rows(
+        db, own_fk="netbird_instance_id", target_id=t.id, user=user, target_name=t.name
+    )
+    # #2288 — the DNS rows cascade in the database; mark their groups' bundles dirty.
+    await mark_integration_dns_released(db, own_fk="netbird_instance_id", target_id=t.id)
     await db.delete(t)
     await db.commit()
 
@@ -364,15 +388,25 @@ async def delete_instance(instance_id: uuid.UUID, db: DB, user: SuperAdmin) -> N
     "/instances/{instance_id}/sync",
     status_code=status.HTTP_202_ACCEPTED,
 )
-async def sync_instance(instance_id: uuid.UUID, db: DB, _: SuperAdmin) -> StatusResponse:
+async def sync_instance(instance_id: uuid.UUID, db: DB, user: SuperAdmin) -> StatusResponse:
     t = await db.get(NetbirdInstance, instance_id)
     if t is None:
         raise HTTPException(status_code=404, detail="NetBird instance not found")
 
+    add_trigger_audit(
+        db,
+        user,
+        resource_type="netbird_instance",
+        resource_id=t.id,
+        resource_display=str(getattr(t, "name", None) or t.id),
+        action="sync",
+    )
+    await db.commit()
+
     from app.tasks.netbird_sync import sync_instance_now  # noqa: PLC0415
 
     try:
-        result = sync_instance_now.delay(str(t.id))
+        result = await dispatch(sync_instance_now, str(t.id))
         return StatusResponse(status="queued", task_id=result.id)
     except Exception:  # noqa: BLE001
         return StatusResponse(status="broker_unavailable", task_id="")

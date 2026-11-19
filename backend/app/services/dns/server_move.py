@@ -19,11 +19,12 @@ state that becomes a lie the moment its group changes:
   * ``config_apply_status`` (#882) says whether the LIVE config is the
     SAVED one. A move changes the saved one, so a carried-over ``ok`` is
     false at the instant of commit — and NULL means UNKNOWN, never ok.
-  * ``is_primary`` is per-group and load-bearing: ``resolve_primary_server``
-    drops every record write for a group with no primary, and
-    ``build_config_bundle`` fetches the primary with ``scalar_one_or_none``,
-    so a group with TWO would 500 the agent long-poll rather than merely
-    pick wrong.
+  * ``is_primary`` is per-group and load-bearing: it picks the server an
+    agentless group writes through (a group with none used to drop every
+    record write; since #2276 ``resolve_primary_server`` stands in the
+    election's pick and a beat sweep re-stamps the flag), and a group with
+    TWO used to 500 the agent long-poll, which is why every primary lookup
+    now caps at one.
 
 So the move is a small transaction rather than an assignment, and it lives
 here rather than in the router so it can be tested without HTTP.
@@ -33,6 +34,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from typing import Any
 
 import structlog
 from sqlalchemy import delete as sa_delete
@@ -45,15 +47,28 @@ from app.core.agent_wake import (
     dns_group_channel,
     dns_server_channel,
 )
-from app.models.appliance import Appliance
 from app.models.dns import (
+    DNSIngestSnapshot,
     DNSRecordOp,
     DNSServer,
     DNSServerGroup,
+    DNSServerOptions,
     DNSServerZoneState,
+    DNSTrustAnchor,
 )
-from app.services.dns.record_ops import QUEUED_OP_STATES
+from app.services.appliance.cluster_dns_group import cluster_dns_group_refusal
+from app.services.appliance.ownership import owning_appliance_for_dns_server
+from app.services.dns import technitium_api_scope
+from app.services.dns.dnssec_signers import second_signer_refusal
+from app.services.dns.dnssec_trust import (
+    NEEDS_ANCHOR_MESSAGE,
+    count_anchors,
+    stored_validation,
+)
+from app.services.dns.record_ops import QUEUED_OP_STATES, primary_candidate
+from app.services.dns.row_locks import lock_op_ids, lock_zone_state_rows
 from app.services.dns.tsig import ensure_group_tsig_key
+from app.services.dns.tsig_algorithms import group_key_refusal
 
 logger = structlog.get_logger(__name__)
 
@@ -105,10 +120,112 @@ class ServerMoveResult:
         }
 
 
-async def _elect_primary(
-    db: AsyncSession, group_id: uuid.UUID, *, exclude_id: uuid.UUID
+# #1782 — Technitium catalog zones are broken in both roles (the producer's
+# member zones inherit the catalog's transfer Deny / notify None, undoing the
+# #734 grant; the consumer's SecondaryCatalog has no TSIG and stays empty).
+# The real fix is #1766 (1.1.0); until then SpatiumDDI stops claiming it.
+CATALOG_UNSUPPORTED_DRIVERS = frozenset({"technitium", "technitium_api"})
+
+
+def catalog_unsupported_message(drivers: list[str] | set[str]) -> str:
+    bad = ", ".join(sorted(set(drivers) & CATALOG_UNSUPPORTED_DRIVERS))
+    return (
+        f"Catalog zones are not supported on Technitium (driver {bad}): its member "
+        "zones inherit the catalog zone's zone-transfer Deny and notify None, which "
+        "stops zone transfers, drift checks and NOTIFY, and its consumer catalog is "
+        "created without TSIG, so it stays empty. Support is tracked in #1766 (1.1.0)."
+    )
+
+
+async def ensure_group_catalog_compatible(
+    db: AsyncSession, group: DNSServerGroup, driver: str
+) -> None:
+    """Refuse (422) putting a ``driver`` server into a catalog-enabled group
+    when that driver cannot do catalog zones (#1782)."""
+    if group.catalog_zones_enabled and driver in CATALOG_UNSUPPORTED_DRIVERS:
+        raise ServerMoveError(
+            f"Group {group.name!r} has catalog zones enabled. "
+            + catalog_unsupported_message({driver}),
+            status_code=422,
+        )
+
+
+async def ensure_group_single_driver(
+    db: AsyncSession,
+    group_id: uuid.UUID,
+    driver: str,
+    *,
+    group_name: str,
+    hint: str,
+    exclude_server_id: uuid.UUID | None = None,
+) -> None:
+    """Refuse (422) putting a ``driver`` server into a group that already
+    runs a different driver (#1540).
+
+    A group is single-driver (docs/drivers/DNS_DRIVERS.md §5.1): its
+    rendered config, catalog-zone semantics and AXFR shape all assume
+    one driver, record fan-out follows the primary's driver, and the
+    driver-gated operations 422 on a mixed group. Shared by the move
+    path (which has always checked), server create, and a driver change
+    on update — the two paths that used to manufacture mixed groups
+    silently. ``exclude_server_id`` is the server being changed, whose
+    own current driver must not count against its new one.
+    """
+    conditions = [
+        DNSServer.group_id == group_id,
+        DNSServer.driver != driver,
+    ]
+    if exclude_server_id is not None:
+        conditions.append(DNSServer.id != exclude_server_id)
+    res = await db.execute(select(DNSServer.driver).where(*conditions).distinct())
+    foreign_drivers = sorted({d for d in res.scalars().all() if d})
+    if foreign_drivers:
+        raise ServerMoveError(
+            f"Group {group_name!r} runs {foreign_drivers}; this server runs "
+            f"{driver!r}. A server group is single-driver — {hint}",
+            status_code=422,
+        )
+    # #1858 — a Technitium server cannot use an hmac-sha224 key the group
+    # already holds; joining would install it and fail every signed transfer.
+    if refusal := await group_key_refusal(db, group_id, {driver}):
+        raise ServerMoveError(f"Group {group_name!r}: {refusal}", status_code=422)
+    # #2266 — only BIND9 renders DNSSEC trust anchors; a group holding some
+    # would have them silently ignored (and validation weakened) by a server
+    # of any other driver. Mirrors the 422 on adding an anchor.
+    if driver != "bind9":
+        n_anchors = (
+            await db.execute(
+                select(func.count(DNSTrustAnchor.id))
+                .join(DNSServerOptions, DNSTrustAnchor.server_options_id == DNSServerOptions.id)
+                .where(DNSServerOptions.group_id == group_id)
+            )
+        ).scalar_one()
+        if n_anchors:
+            raise ServerMoveError(
+                f"Group {group_name!r} has DNSSEC trust anchors, which only BIND9 applies; "
+                f"a {driver!r} server would ignore them. Remove the anchors first.",
+                status_code=422,
+            )
+    # #3560 — a BIND9 server in a group set to ``dnssec-validation yes`` with
+    # no trust anchor would make named refuse the whole config.
+    if driver == "bind9" and await stored_validation(db, group_id) == "yes":
+        if not await count_anchors(db, group_id):
+            raise ServerMoveError(f"Group {group_name!r}: {NEEDS_ANCHOR_MESSAGE}", status_code=422)
+    # #1784 — the experimental agentless Technitium driver supports ONE
+    # server per group. Enforced on every path that puts a server in a group
+    # (create, driver change, move) because they all come through here.
+    if driver == technitium_api_scope.DRIVER:
+        if await technitium_api_scope.count_other_servers(db, group_id, exclude_server_id):
+            raise ServerMoveError(
+                technitium_api_scope.single_server_message(group_name), status_code=422
+            )
+
+
+async def elect_primary(
+    db: AsyncSession, group_id: uuid.UUID, *, exclude_id: uuid.UUID | None
 ) -> DNSServer | None:
-    """Pick a replacement primary for a group that has just lost one.
+    """Pick a replacement primary for a group that has just lost one — by a
+    move out of it, or by its primary being deleted (#2276).
 
     Prefers a server that can actually accept writes: enabled, not paused
     for maintenance (``record_ops`` excludes paused servers from
@@ -122,32 +239,48 @@ async def _elect_primary(
     query re-elects the very server being demoted. The move then silently
     does nothing: the old group's flag sits on a member that has left, and
     the target group ends up with two primaries, which is the shape that
-    500s the agent long-poll rather than merely picking wrong.
+    500s the agent long-poll rather than merely picking wrong. ``None`` is
+    for a caller that has already flushed the departing rows away (the
+    appliance revoke, which can delete several of one group's servers).
     """
-    base = (
-        select(DNSServer)
-        .where(DNSServer.group_id == group_id, DNSServer.id != exclude_id)
-        .order_by(DNSServer.created_at, DNSServer.id)
-        .limit(1)
-    )
-    candidate = (
-        await db.execute(
-            base.where(
-                DNSServer.is_enabled.is_(True),
-                DNSServer.maintenance_mode.is_(False),
-            )
-        )
-    ).scalar_one_or_none()
-    if candidate is None:
-        # Every remaining server is disabled or paused. Fall back to any
-        # member rather than leaving the group primary-less: a paused
-        # primary still beats none, because ``resolve_primary_server``
-        # returning None drops record writes SILENTLY (a log line, no
-        # error to the caller), whereas a paused one is visible in the UI.
-        candidate = (await db.execute(base)).scalar_one_or_none()
+    # The ordering (enabled + unpaused, oldest first, else any member) lives
+    # in ``primary_candidate`` so the write path's stand-in and the beat
+    # self-heal pick the same server this does (#2276).
+    candidate = await primary_candidate(db, group_id, exclude_id=exclude_id)
     if candidate is not None:
         candidate.is_primary = True
     return candidate
+
+
+async def lock_server_row(db: AsyncSession, server_id: Any) -> None:
+    """Lock everything a group move writes, in the order ``row_locks`` sets
+    (#1703, #1929), before the move's first write to any of it.
+
+    Its zone-state rows and queued ops first, then the server row ``FOR
+    UPDATE``. ``FOR UPDATE`` because the move changes ``group_id``, a column
+    of the unique index ``uq_dns_server_group_name``; taken any later, after a
+    weaker write to the row (the primary demotion, a plain field on the same
+    PUT, the Fleet engine switch's driver), it waited for the ``FOR KEY
+    SHARE`` a worker's bundle insert holds while the worker waited for that
+    weaker write: 40P01 (#1703). The zone-state rows and ops come first
+    because that is the order the agent's poll, heartbeat and zone-state
+    report take them in; taking the server row first instead deadlocked the
+    poll, which marks its ops before it writes ``last_config_etag`` (#1929's
+    walk of #1923).
+
+    Runs without autoflush, so a write the caller has already made to the
+    instance is not flushed ahead of the locks. A write the caller has already
+    FLUSHED holds the weaker lock already, so callers take this before their
+    first flush of the row.
+    """
+    with db.no_autoflush:
+        await lock_zone_state_rows(db, DNSServerZoneState.server_id == server_id)
+        await lock_op_ids(
+            db,
+            DNSRecordOp.server_id == server_id,
+            DNSRecordOp.state.in_(QUEUED_OP_STATES),
+        )
+        await db.execute(select(DNSServer.id).where(DNSServer.id == server_id).with_for_update())
 
 
 async def move_server_to_group(
@@ -165,6 +298,7 @@ async def move_server_to_group(
     old_group_id = server.group_id
     if old_group_id == target_group.id:
         return None
+    await lock_server_row(db, server.id)
 
     # ── Refusals ──────────────────────────────────────────────────────
     #
@@ -187,24 +321,45 @@ async def move_server_to_group(
     # Driver homogeneity. A group is single-driver (docs/drivers/
     # DNS_DRIVERS.md §5.1): its rendered config, catalog-zone semantics and
     # AXFR shape all assume one driver, and the driver-gated operations
-    # (DNSSEC signing, ALIAS records) 422 on a mixed group. Today that is
-    # enforced lazily, at operation time, so a mixed group is reachable and
-    # only fails later on an unrelated action. A move is a NEW operation
-    # with no existing installs to break, so it fails closed here instead
-    # of manufacturing a state that breaks something else afterwards.
-    res = await db.execute(
-        select(DNSServer.driver)
-        .where(DNSServer.group_id == target_group.id, DNSServer.driver != server.driver)
-        .distinct()
+    # (DNSSEC signing, ALIAS records) 422 on a mixed group. A move is a
+    # NEW operation with no existing installs to break, so it fails
+    # closed here instead of manufacturing a state that breaks something
+    # else afterwards. The check itself is shared with server create and
+    # driver-change updates (#1540).
+    await ensure_group_single_driver(
+        db,
+        target_group.id,
+        server.driver,
+        group_name=target_group.name,
+        hint=f"move it to a {server.driver}-only group, or an empty one.",
     )
-    foreign_drivers = sorted({d for d in res.scalars().all() if d})
-    if foreign_drivers:
-        raise ServerMoveError(
-            f"Group {target_group.name!r} runs {foreign_drivers}; this server runs "
-            f"{server.driver!r}. A server group is single-driver — move it to a "
-            f"{server.driver}-only group, or an empty one.",
-            status_code=422,
+    await ensure_group_catalog_compatible(db, target_group, server.driver)
+
+    # #1762 — a server joining a group that already has one and holds signed
+    # zones would sign them with its own keys. Enabled or not: a disabled
+    # agent still receives and serves the bundle.
+    refusal = await second_signer_refusal(db, target_group, driver=server.driver)
+    if refusal is not None:
+        raise ServerMoveError(refusal, status_code=422)
+
+    # #1427 — the move repoints the owning appliance's DNS group (below), and
+    # a control-plane cluster serves one: refuse a cluster member's server a
+    # group the cluster's other DNS members are not in. The roles PUT, which
+    # moves the appliance's own servers through here, has already refused or
+    # passed the same group, so it never trips this.
+    appliance = await owning_appliance_for_dns_server(db, server)
+    if appliance is not None and appliance.assigned_dns_group_id == old_group_id:
+        roles = list(appliance.assigned_roles or [])
+        refusal = await cluster_dns_group_refusal(
+            db,
+            appliance,
+            roles=roles,
+            group_id=target_group.id,
+            prev_roles=set(roles),
+            prev_group_id=appliance.assigned_dns_group_id,
         )
+        if refusal is not None:
+            raise ServerMoveError(refusal, status_code=422)
 
     # ── Purge state that belongs to the old group ─────────────────────
     zone_state_purged = (
@@ -212,6 +367,10 @@ async def move_server_to_group(
             sa_delete(DNSServerZoneState).where(DNSServerZoneState.server_id == server.id)
         )
     ).rowcount or 0
+    # #2654 — the server's last DDNS ingest report per zone describes the OLD
+    # group's zones; compared against later, it would read as records the
+    # writer withdrew.
+    await db.execute(sa_delete(DNSIngestSnapshot).where(DNSIngestSnapshot.server_id == server.id))
     # ``in_flight`` as well as ``pending``: an op already shipped in a bundle
     # is not finished with. ``ack_op`` resets a NACKed one back to ``pending``
     # (fewer than 5 attempts), and that ack can arrive AFTER the move — which
@@ -228,6 +387,12 @@ async def move_server_to_group(
         )
     ).rowcount or 0
 
+    # #2281 — the purge above dropped ops the daemon never applied. The target
+    # group's zones nearly always move the structural etag anyway, but two
+    # groups can render the same structural payload (same zone names and
+    # settings, different records), and then nothing would re-render them.
+    server.zone_resync_seq = (server.zone_resync_seq or 0) + 1
+
     # #882 verdict refers to a bundle from the old group. NULL = UNKNOWN.
     server.config_apply_status = None
     server.config_apply_error = None
@@ -239,7 +404,7 @@ async def move_server_to_group(
     old_group_new_primary_id: uuid.UUID | None = None
     if demoted:
         server.is_primary = False
-        replacement = await _elect_primary(db, old_group_id, exclude_id=server.id)
+        replacement = await elect_primary(db, old_group_id, exclude_id=server.id)
         old_group_new_primary_id = replacement.id if replacement else None
 
     server.group_id = target_group.id
@@ -285,15 +450,16 @@ async def move_server_to_group(
     # Only repointed when it currently names the group being left: an
     # appliance deliberately assigned elsewhere is not ours to redirect.
     appliance_repointed_id: uuid.UUID | None = None
-    if server.appliance_id is not None:
-        appliance = await db.get(Appliance, server.appliance_id)
-        if appliance is not None and appliance.assigned_dns_group_id == old_group_id:
-            appliance.assigned_dns_group_id = target_group.id
-            appliance_repointed_id = appliance.id
-            # Per-appliance desired state changed, so wake the supervisor's
-            # heartbeat long-poll rather than making it wait out its interval
-            # for a firewall rule its agent already needs.
-            collect_wake(appliance_channel(appliance.id))
+    # Found by FK, else by the same hostname rule Fleet uses (#1749): agents
+    # register by hostname and never set ``appliance_id``. Looked up with the
+    # refusals above.
+    if appliance is not None and appliance.assigned_dns_group_id == old_group_id:
+        appliance.assigned_dns_group_id = target_group.id
+        appliance_repointed_id = appliance.id
+        # Per-appliance desired state changed, so wake the supervisor's
+        # heartbeat long-poll rather than making it wait out its interval
+        # for a firewall rule its agent already needs.
+        collect_wake(appliance_channel(appliance.id))
 
     # Both groups' bundles change shape (a member left one and joined the
     # other), and the server's own channel is what reaches an agent already

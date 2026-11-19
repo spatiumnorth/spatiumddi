@@ -206,3 +206,78 @@ async def test_export_all_zones_returns_zip(client: AsyncClient, db_session: Asy
         names = zf.namelist()
     assert "example.com.zone" in names
     assert "other.test.zone" in names
+
+
+@pytest.mark.asyncio
+async def test_reimporting_own_export_keeps_inherited_ttl_inherited(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#1727: a record with ttl NULL (inherits the zone) is not an update."""
+    from sqlalchemy import select
+
+    from app.models.dns import DNSRecord
+
+    headers = await _admin_auth(db_session)
+    group, zone = await _make_zone(db_session)
+    zone.ttl = 3600
+    db_session.add_all(
+        [
+            DNSRecord(
+                zone_id=zone.id,
+                name="ctl1",
+                fqdn="ctl1.example.com.",
+                record_type="A",
+                value="192.0.2.79",
+                ttl=None,
+            ),
+            DNSRecord(
+                zone_id=zone.id,
+                name="pinned",
+                fqdn="pinned.example.com.",
+                record_type="A",
+                value="192.0.2.80",
+                ttl=300,
+            ),
+        ]
+    )
+    await db_session.flush()
+    base = f"/api/v1/dns/groups/{group.id}/zones/{zone.id}"
+
+    export = await client.get(f"{base}/export", headers=headers)
+    assert export.status_code == 200
+    preview = await client.post(
+        f"{base}/import/preview",
+        json={
+            "zone_file": export.text,
+            "zone_name": "example.com.",
+            "conflict_strategy": "replace",
+        },
+        headers=headers,
+    )
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["to_update"] == []
+
+    commit = await client.post(
+        f"{base}/import/commit",
+        json={
+            "zone_file": export.text,
+            "zone_name": "example.com.",
+            "conflict_strategy": "replace",
+        },
+        headers=headers,
+    )
+    assert commit.status_code == 200, commit.text
+    assert commit.json()["updated"] == 0
+    row = (await db_session.execute(select(DNSRecord).where(DNSRecord.name == "ctl1"))).scalar_one()
+    await db_session.refresh(row)
+    assert row.ttl is None
+
+    # A foreign file whose explicit TTL differs from the zone default still updates.
+    foreign = export.text.replace("ctl1\tIN\tA", "ctl1\t120\tIN\tA")
+    assert "ctl1\t120" in foreign
+    preview = await client.post(
+        f"{base}/import/preview",
+        json={"zone_file": foreign, "zone_name": "example.com."},
+        headers=headers,
+    )
+    assert [c["name"] for c in preview.json()["to_update"]] == ["ctl1"]

@@ -3,7 +3,8 @@
 Three layers are exercised:
 
 * the BIND9 zone-file writer renders the new types (SVCB/HTTPS passthrough,
-  DNAME FQDN-normalised like CNAME),
+  DNAME written as stored like CNAME: absolute with a dot, relative without,
+  #2187),
 * the PowerDNS driver's supported-type set accepts them (it rejects unknown
   types at render otherwise),
 * the record-create API accepts them on a bind9/powerdns group but gates them
@@ -58,15 +59,18 @@ def test_writer_renders_svcb_https_dname() -> None:
     records = [
         _Rec(id="1", name="@", record_type="HTTPS", value='1 . alpn="h2,h3"'),
         _Rec(id="2", name="_dns", record_type="SVCB", value="1 dns.example.com."),
-        # DNAME target without a trailing dot must be FQDN-normalised.
-        _Rec(id="3", name="legacy", record_type="DNAME", value="new.example.net"),
+        # An absolute DNAME target keeps its trailing dot.
+        _Rec(id="3", name="legacy", record_type="DNAME", value="new.example.net."),
+        # A bare target is relative to the zone, which is how BIND serves the
+        # stored value (#2187); the export writes it as stored, not as root.
+        _Rec(id="4", name="old", record_type="DNAME", value="moved"),
     ]
     text = write_zone_file(_Zone(), records)  # type: ignore[arg-type]
 
     assert '@\t3600\tIN\tHTTPS\t1 . alpn="h2,h3"' in text
     assert "_dns\t3600\tIN\tSVCB\t1 dns.example.com." in text
-    # DNAME gained a trailing dot.
     assert "legacy\t3600\tIN\tDNAME\tnew.example.net." in text
+    assert "old\t3600\tIN\tDNAME\tmoved\n" in text
 
     # The output round-trips through the parser without losing the types.
     kinds = {r.record_type for r in parse_zone_file(text, "example.com").records}

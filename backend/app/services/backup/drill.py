@@ -55,7 +55,9 @@ from app.config import settings
 from app.core.crypto import decrypt_str
 from app.models.audit import AuditLog
 from app.models.backup import BackupTarget, RestoreDrill
+from app.services.backup import node_local
 from app.services.backup.archive import (
+    MAX_ARCHIVE_BYTES,
     BackupArchiveError,
     _pg_env_from_url,
     _pg_subprocess_env,
@@ -64,10 +66,12 @@ from app.services.backup.archive import (
 from app.services.backup.crypto import BackupCryptoError, decrypt_secrets
 from app.services.backup.restore import SUPPORTED_FORMAT_VERSIONS
 from app.services.backup.targets import (
+    ArchiveTooLargeError,
     BackupDestinationError,
     SecretFieldError,
     decrypt_config_secrets,
     get_destination,
+    is_pre_restore_archive,
 )
 
 logger = structlog.get_logger(__name__)
@@ -406,8 +410,9 @@ async def reap_orphaned_scratch_dbs(*, live_db_url: str) -> list[str]:
     killed drill would permanently add another copy until the volume
     filled. The fixed prefix exists precisely so this sweep is possible.
 
-    Liveness, not age, is the safety signal: a drill holds a connection
-    to its scratch database for the whole replay-and-assert window, so
+    Liveness, not age, is the safety signal: a drill holds a keeper
+    connection to its scratch database from right after CREATE DATABASE
+    (before the dump is even written to disk) until just before the drop, so
     "carries the prefix AND has no backend attached" cannot match a
     drill that is still working. That avoids having to guess a safe age
     threshold, and it stays correct however long a legitimate drill
@@ -435,6 +440,29 @@ async def reap_orphaned_scratch_dbs(*, live_db_url: str) -> list[str]:
             note="left behind by drills that were killed before cleanup",
         )
     return reaped
+
+
+async def _open_keeper(scratch_db: str, *, live_db_url: str) -> tuple[Any, Any]:
+    """Open the connection that keeps the reaper off a live drill's
+    scratch database (see the call site)."""
+    engine = create_async_engine(_scratch_url(live_db_url, scratch_db), poolclass=NullPool)
+    try:
+        return engine, await engine.connect()
+    except Exception:
+        await engine.dispose()
+        raise
+
+
+async def _close_keeper(engine: Any, conn: Any) -> None:
+    """Release the connection that marks a scratch database as live."""
+    try:
+        if conn is not None:
+            await conn.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("restore_drill_keeper_close_failed", error=str(exc))
+    finally:
+        if engine is not None:
+            await engine.dispose()
 
 
 def _scratch_url(live_db_url: str, scratch_db: str) -> str:
@@ -708,7 +736,10 @@ async def _assert_audit_chain(
         return
     first = result.breaks[0] if result.breaks else None
     detail = f"{len(result.breaks)} break(s) across {result.rows_checked} rows" + (
-        f"; first at seq {first.seq} ({first.reason})" if first is not None else ""
+        f"; first at seq {first.seq} ({first.reason}: {first.action} "
+        f"{first.resource_type} {first.resource_id})"
+        if first is not None
+        else ""
     )
     out.append(Assertion("audit_chain_intact", FAIL, detail))
 
@@ -932,11 +963,18 @@ async def _execute(target: BackupTarget, *, live_db_url: str) -> DrillOutcome:
     except DrillError as exc:
         return DrillOutcome(state="error", error=str(exc))
 
-    # 1. Fetch the newest archive from the destination.
+    # 1. Fetch the newest archive from the destination. Pre-restore
+    #    safety dumps are not this target's backups (#1574): they are
+    #    encrypted with the public constant passphrase, so drilling one
+    #    would report a healthy target's archive as unrestorable.
     try:
         driver = get_destination(target.kind)
         plain_config = decrypt_config_secrets(driver, target.config)
-        listings = await driver.list_archives(config=plain_config)
+        listings = [
+            listing
+            for listing in await driver.list_archives(config=plain_config)
+            if not is_pre_restore_archive(listing.filename)
+        ]
     except (BackupDestinationError, SecretFieldError, ValueError) as exc:
         if target.write_only:
             # A write-only target whose credential cannot list is the
@@ -969,6 +1007,13 @@ async def _execute(target: BackupTarget, *, live_db_url: str) -> DrillOutcome:
                     "is empty. Recovery readiness reports it as UNVERIFIED."
                 ),
             )
+        elsewhere = node_local.drill_note(target, [])
+        if elsewhere:
+            # #1838 — a node-local destination on a multi-node appliance:
+            # this node's directory is empty because the archive is on
+            # the node that wrote it. That is no verdict about the backup,
+            # so ``error`` (could not drill), never ``failed`` (no archive).
+            return DrillOutcome(state="error", error=f"could not drill here: {elsewhere}")
         assertions.append(
             Assertion(
                 "archive_available",
@@ -979,17 +1024,42 @@ async def _execute(target: BackupTarget, *, live_db_url: str) -> DrillOutcome:
         return DrillOutcome(state="failed", assertions=assertions)
 
     newest = max(listings, key=lambda a: a.created_at)
-    assertions.append(
-        Assertion("archive_available", PASS, f"{newest.filename} ({newest.size_bytes} bytes)")
-    )
+    available = f"{newest.filename} ({newest.size_bytes} bytes)"
+    # #1838 — the newest archive VISIBLE here is older than the target's
+    # last run when that run's archive sits on another node's disk. Drill
+    # what is here, but say it is not the newest backup.
+    elsewhere = node_local.drill_note(target, [a.filename for a in listings])
+    if elsewhere:
+        available += f"; this is the newest on this node, not the newest backup: {elsewhere}"
+    assertions.append(Assertion("archive_available", PASS, available))
+
+    if newest.size_bytes > MAX_ARCHIVE_BYTES:
+        # Same destination-download cap as the API (#1568): the
+        # listing already declares the size, so refuse before the
+        # bytes are fetched into memory at all.
+        return DrillOutcome(
+            state="error",
+            filename=newest.filename,
+            assertions=assertions,
+            error=(
+                f"archive {newest.filename} declares {newest.size_bytes} bytes, "
+                f"which exceeds the {MAX_ARCHIVE_BYTES}-byte cap for "
+                "destination downloads"
+            ),
+        )
 
     try:
         # Bounded explicitly: the destination drivers impose no ceiling
         # of their own, and an unbounded fetch would make the sweep's
         # stale-mutex threshold meaningless (see
         # STALE_IN_PROGRESS_SECONDS).
+        # ``max_bytes`` backs up the declared-size check above: the
+        # listing's size is the destination's word, and the driver stops
+        # reading at the cap whatever the archive turns out to be.
         archive_bytes = await asyncio.wait_for(
-            driver.download(config=plain_config, filename=newest.filename),
+            driver.download(
+                config=plain_config, filename=newest.filename, max_bytes=MAX_ARCHIVE_BYTES
+            ),
             timeout=_DOWNLOAD_TIMEOUT_SECONDS,
         )
     except TimeoutError:
@@ -1001,6 +1071,13 @@ async def _execute(target: BackupTarget, *, live_db_url: str) -> DrillOutcome:
                 f"downloading {newest.filename} from the destination exceeded "
                 f"{_DOWNLOAD_TIMEOUT_SECONDS}s"
             ),
+        )
+    except ArchiveTooLargeError as exc:
+        return DrillOutcome(
+            state="error",
+            filename=newest.filename,
+            assertions=assertions,
+            error=str(exc),
         )
     except BackupDestinationError as exc:
         return DrillOutcome(
@@ -1069,7 +1146,9 @@ async def _execute(target: BackupTarget, *, live_db_url: str) -> DrillOutcome:
         )
 
     try:
-        payload = decrypt_secrets(secrets_enc, passphrase=passphrase)
+        # Same off-loop derivation as the restore path (#1568): the
+        # PBKDF2 cost is deliberate CPU work, not event-loop work.
+        payload = await asyncio.to_thread(decrypt_secrets, secrets_enc, passphrase=passphrase)
     except BackupCryptoError as exc:
         assertions.append(
             Assertion(
@@ -1116,6 +1195,25 @@ async def _execute(target: BackupTarget, *, live_db_url: str) -> DrillOutcome:
             error=f"could not create the scratch database: {exc}",
         )
 
+    # Hold a backend on the scratch database from the moment it exists
+    # (#2272). ``reap_orphaned_scratch_dbs`` treats "no backend" as
+    # "orphaned", and until pg_restore connects there is none: writing the
+    # dump to a temp file takes minutes at the size cap. Closed in the
+    # ``finally`` below, before the DROP, which would otherwise be refused.
+    try:
+        keeper_engine, keeper_conn = await _open_keeper(scratch_db, live_db_url=live_db_url)
+    except Exception as exc:  # noqa: BLE001
+        await _drop_scratch_db(scratch_db, live_db_url=live_db_url)
+        return DrillOutcome(
+            state="error",
+            filename=newest.filename,
+            archive_bytes=len(archive_bytes),
+            manifest=manifest,
+            scratch_db=scratch_db,
+            assertions=assertions,
+            error=f"could not hold a connection on the scratch database: {exc}",
+        )
+
     try:
         try:
             await _replay_into_scratch(
@@ -1157,6 +1255,7 @@ async def _execute(target: BackupTarget, *, live_db_url: str) -> DrillOutcome:
                 error=f"post-replay assertions could not run: {exc}",
             )
     finally:
+        await _close_keeper(keeper_engine, keeper_conn)
         await _drop_scratch_db(scratch_db, live_db_url=live_db_url)
 
     base.state = "failed" if any(a.status == FAIL for a in assertions) else "passed"

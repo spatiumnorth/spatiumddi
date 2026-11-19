@@ -1,3 +1,4 @@
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { LayoutTemplate, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
@@ -8,9 +9,21 @@ import {
   type IPAMTemplate,
   type IPAMTemplateAppliesTo,
   type IPAMTemplateCreate,
+  type TemplateReapplyAllResponse,
   type IPAMTemplateUpdate,
+  formatApiError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { parseTtlInput } from "@/lib/dnsNames";
+import {
+  disabledBecause,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
+import { useModuleOn } from "@/hooks/useModuleOn";
+import { useFreshRow, changedFields } from "@/hooks/useFreshRow";
+import { FreshRowError } from "@/components/FreshRowError";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -43,7 +56,8 @@ interface TemplateForm {
   children: ChildEntryForm[];
 }
 
-const EMPTY: TemplateForm = {
+// eslint-disable-next-line react-refresh/only-export-components -- exported for its test
+export const EMPTY: TemplateForm = {
   name: "",
   description: "",
   applies_to: "subnet",
@@ -83,7 +97,8 @@ function formFromTemplate(t: IPAMTemplate): TemplateForm {
   };
 }
 
-function toCreatePayload(form: TemplateForm): IPAMTemplateCreate {
+// eslint-disable-next-line react-refresh/only-export-components -- exported for its test
+export function toCreatePayload(form: TemplateForm): IPAMTemplateCreate {
   let tags: Record<string, unknown> = {};
   let cfs: Record<string, unknown> = {};
   try {
@@ -115,7 +130,11 @@ function toCreatePayload(form: TemplateForm): IPAMTemplateCreate {
       }),
     };
   }
-  const ttl = form.ddns_ttl ? parseInt(form.ddns_ttl, 10) : null;
+  // #2086 — "1h" is refused, never saved as 1; blank means no override.
+  const ttl = parseTtlInput(form.ddns_ttl);
+  if (typeof ttl === "string") {
+    throw new Error(`TTL override ${ttl}. Leave blank for the zone default.`);
+  }
   return {
     name: form.name.trim(),
     description: form.description,
@@ -132,6 +151,48 @@ function toCreatePayload(form: TemplateForm): IPAMTemplateCreate {
     ddns_ttl: ttl,
     child_layout,
   };
+}
+
+// Edit reads the template when it opens (#3863): the row the page holds is
+// from a list that may predate another client's change, and the form is
+// seeded once.
+function EditTemplate({
+  tpl,
+  error,
+  saving,
+  onClose,
+  onSave,
+}: {
+  tpl: IPAMTemplate;
+  error?: string;
+  saving: boolean;
+  onClose: () => void;
+  onSave: (form: TemplateForm, base: IPAMTemplate) => void;
+}) {
+  const fresh = useFreshRow<IPAMTemplate>(tpl, () =>
+    ipamApi.getTemplate(tpl.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit IPAM Template"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={onClose}
+      />
+    );
+  if (!fresh.ready || !fresh.row) return null;
+  const base = fresh.row;
+  return (
+    <TemplateEditor
+      mode="edit"
+      initial={formFromTemplate(base)}
+      error={error}
+      saving={saving}
+      onClose={onClose}
+      onSave={(f) => onSave(f, base)}
+    />
+  );
 }
 
 type TabKey = "general" | "stamp" | "ddns" | "children";
@@ -154,13 +215,21 @@ function TemplateEditor({
   const [form, setForm] = useState<TemplateForm>(initial);
   const [tab, setTab] = useState<TabKey>("general");
 
+  // #2135 — no DNS server groups to pick, no DNS zone or DDNS settings to
+  // edit, while core.dns is off. The stored values stay in the form state
+  // and are sent back unchanged on save.
+  const dnsOn = useModuleOn("core.dns");
   const dnsGroupsQ = useQuery({
     queryKey: ["dns-groups"],
     queryFn: dnsApi.listGroups,
+    enabled: dnsOn,
   });
+  // #2130 — no DHCP server groups to pick while core.dhcp is off.
+  const dhcpOn = useModuleOn("core.dhcp");
   const dhcpGroupsQ = useQuery({
     queryKey: ["dhcp-groups"],
     queryFn: dhcpApi.listGroups,
+    enabled: dhcpOn,
   });
 
   function set<K extends keyof TemplateForm>(key: K, v: TemplateForm[K]) {
@@ -200,9 +269,9 @@ function TemplateEditor({
     >
       <div className="space-y-4">
         {error && (
-          <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          <FormError className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
             {error}
-          </div>
+          </FormError>
         )}
 
         <div className="flex flex-wrap gap-1 border-b">
@@ -213,24 +282,28 @@ function TemplateEditor({
               ["ddns", "DDNS"],
               ["children", "Child layout"],
             ] as [TabKey, string][]
-          ).map(([k, label]) => {
-            const disabled = k === "children" && form.applies_to !== "block";
-            return (
-              <button
-                key={k}
-                type="button"
-                onClick={() => !disabled && setTab(k)}
-                disabled={disabled}
-                className={`-mb-px border-b-2 px-3 py-1.5 text-sm transition-colors ${
-                  tab === k
-                    ? "border-primary text-foreground"
-                    : "border-transparent text-muted-foreground hover:text-foreground"
-                } ${disabled ? "opacity-40 cursor-not-allowed" : ""}`}
-              >
-                {label}
-              </button>
-            );
-          })}
+          )
+            // DDNS is DHCP updating DNS: it needs both modules, as the
+            // IPAM dialogs' DDNS tab does (#2135).
+            .filter(([k]) => (dnsOn && dhcpOn) || k !== "ddns")
+            .map(([k, label]) => {
+              const disabled = k === "children" && form.applies_to !== "block";
+              return (
+                <button
+                  key={k}
+                  type="button"
+                  onClick={() => !disabled && setTab(k)}
+                  disabled={disabled}
+                  className={`-mb-px border-b-2 px-3 py-1.5 text-sm transition-colors ${
+                    tab === k
+                      ? "border-primary text-foreground"
+                      : "border-transparent text-muted-foreground hover:text-foreground"
+                  } ${disabled ? "opacity-40 cursor-not-allowed" : ""}`}
+                >
+                  {label}
+                </button>
+              );
+            })}
         </div>
 
         {tab === "general" && (
@@ -306,52 +379,58 @@ function TemplateEditor({
               />
             </div>
             <div className="grid grid-cols-2 gap-4">
+              {dnsOn && (
+                <div>
+                  <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                    DNS server group
+                  </label>
+                  <select
+                    value={form.dns_group_id}
+                    onChange={(e) => set("dns_group_id", e.target.value)}
+                    className={inputCls}
+                  >
+                    <option value="">— none —</option>
+                    {(dnsGroupsQ.data ?? []).map((g) => (
+                      <option key={g.id} value={g.id}>
+                        {g.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+              {dhcpOn && (
+                <div>
+                  <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                    DHCP server group
+                  </label>
+                  <select
+                    value={form.dhcp_group_id}
+                    onChange={(e) => set("dhcp_group_id", e.target.value)}
+                    className={inputCls}
+                  >
+                    <option value="">— none —</option>
+                    {(dhcpGroupsQ.data ?? []).map((g) => (
+                      <option key={g.id} value={g.id}>
+                        {g.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+            </div>
+            {dnsOn && (
               <div>
                 <label className="mb-1 block text-xs font-medium text-muted-foreground">
-                  DNS server group
+                  Default DNS zone (optional)
                 </label>
-                <select
-                  value={form.dns_group_id}
-                  onChange={(e) => set("dns_group_id", e.target.value)}
-                  className={inputCls}
-                >
-                  <option value="">— none —</option>
-                  {(dnsGroupsQ.data ?? []).map((g) => (
-                    <option key={g.id} value={g.id}>
-                      {g.name}
-                    </option>
-                  ))}
-                </select>
+                <input
+                  value={form.dns_zone_id}
+                  onChange={(e) => set("dns_zone_id", e.target.value)}
+                  placeholder="zone UUID — operator can leave blank"
+                  className={`${inputCls} font-mono text-xs`}
+                />
               </div>
-              <div>
-                <label className="mb-1 block text-xs font-medium text-muted-foreground">
-                  DHCP server group
-                </label>
-                <select
-                  value={form.dhcp_group_id}
-                  onChange={(e) => set("dhcp_group_id", e.target.value)}
-                  className={inputCls}
-                >
-                  <option value="">— none —</option>
-                  {(dhcpGroupsQ.data ?? []).map((g) => (
-                    <option key={g.id} value={g.id}>
-                      {g.name}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
-                Default DNS zone (optional)
-              </label>
-              <input
-                value={form.dns_zone_id}
-                onChange={(e) => set("dns_zone_id", e.target.value)}
-                placeholder="zone UUID — operator can leave blank"
-                className={`${inputCls} font-mono text-xs`}
-              />
-            </div>
+            )}
           </div>
         )}
 
@@ -464,6 +543,8 @@ function TemplateEditor({
                         className={inputCls}
                       />
                       <button
+                        aria-label="Remove child"
+                        title="Remove child"
                         type="button"
                         onClick={() => removeChild(idx)}
                         className="rounded-md border px-2 py-1 text-xs text-muted-foreground hover:text-destructive"
@@ -505,25 +586,70 @@ function TemplateEditor({
   );
 }
 
-function ReapplyConfirmModal({
+export function ReapplyConfirmModal({
   template,
   onClose,
   onConfirm,
   busy,
+  result,
+  error,
 }: {
   template: IPAMTemplate;
   onClose: () => void;
   onConfirm: () => void;
   busy: boolean;
+  result: TemplateReapplyAllResponse | null;
+  error: string;
 }) {
   const [typed, setTyped] = useState("");
+  if (result) {
+    return (
+      <Modal title={`Reapply — ${template.name}`} onClose={onClose}>
+        <div className="space-y-3 text-sm" role="status">
+          <p>
+            Reapplied {result.instances_processed} of {result.instances_total}{" "}
+            instance{result.instances_total === 1 ? "" : "s"}
+            {result.instances_skipped > 0
+              ? `; skipped ${result.instances_skipped}, each left as it was`
+              : ""}
+            .
+          </p>
+          {result.cap_reached && (
+            <p className="text-amber-600">
+              More instances exist than the 200 handled per call; run Reapply
+              again for the rest.
+            </p>
+          )}
+          {result.skipped.length > 0 && (
+            <ul className="list-disc space-y-1 pl-5">
+              {result.skipped.map((sk) => (
+                <li key={sk.target_id}>
+                  <span className="font-mono text-xs">{sk.network}</span>:{" "}
+                  {sk.reason}
+                </li>
+              ))}
+            </ul>
+          )}
+          <div className="flex justify-end border-t pt-3">
+            <button
+              onClick={onClose}
+              className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      </Modal>
+    );
+  }
   return (
     <Modal title={`Reapply — ${template.name}`} onClose={onClose}>
       <div className="space-y-3 text-sm">
         <p>
           This will stamp the template across every recorded instance with
           <code className="mx-1">force=True</code>, overwriting any operator
-          overrides. Capped at 200 instances per call.
+          overrides. Capped at 200 instances per call. An instance whose child
+          layout cannot be carved is skipped and left as it was.
         </p>
         <p>
           Type the template name to confirm:{" "}
@@ -534,6 +660,11 @@ function ReapplyConfirmModal({
           onChange={(e) => setTyped(e.target.value)}
           className={inputCls}
         />
+        {error && (
+          <p role="alert" className="text-sm text-destructive">
+            {error}
+          </p>
+        )}
         <div className="flex justify-end gap-2 border-t pt-3">
           <button
             onClick={onClose}
@@ -555,6 +686,19 @@ function ReapplyConfirmModal({
 }
 
 export function IPAMTemplatesPage() {
+  const dhcpOn = useModuleOn("core.dhcp");
+  const dnsOn = useModuleOn("core.dns");
+  // #1341 — a read-only user is offered no write it would be refused:
+  // the router asks write (delete) on 'manage_ipam_templates'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "manage_ipam_templates"),
+    "Requires write permission on IPAM templates",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "manage_ipam_templates"),
+    "Requires delete permission on IPAM templates",
+  );
   const qc = useQueryClient();
   const tplsQ = useQuery({
     queryKey: ["ipam-templates"],
@@ -568,7 +712,7 @@ export function IPAMTemplatesPage() {
   const [editor, setEditor] = useState<
     | null
     | { mode: "create"; initial: TemplateForm }
-    | { mode: "edit"; tpl: IPAMTemplate; initial: TemplateForm }
+    | { mode: "edit"; tpl: IPAMTemplate }
   >(null);
   const [editorErr, setEditorErr] = useState<string>("");
   const [reapplyTarget, setReapplyTarget] = useState<IPAMTemplate | null>(null);
@@ -596,10 +740,7 @@ export function IPAMTemplatesPage() {
       setEditorErr("");
     },
     onError: (err: unknown) => {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? String(err);
-      setEditorErr(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setEditorErr(formatApiError(err, String(err)));
     },
   });
 
@@ -612,10 +753,7 @@ export function IPAMTemplatesPage() {
       setEditorErr("");
     },
     onError: (err: unknown) => {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? String(err);
-      setEditorErr(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setEditorErr(formatApiError(err, String(err)));
     },
   });
 
@@ -627,12 +765,14 @@ export function IPAMTemplatesPage() {
   const reapplyMut = useMutation({
     mutationFn: (id: string) => ipamApi.reapplyAllTemplate(id),
     onSuccess: () => {
-      setReapplyTarget(null);
       qc.invalidateQueries({ queryKey: ["ipam-templates"] });
     },
   });
 
-  function handleSave(form: TemplateForm) {
+  // `base` is the template as read when the editor opened (#3863): the Save
+  // sends only what the operator changed against it, so a field another
+  // client set since the list loaded is not put back.
+  function handleSave(form: TemplateForm, base?: IPAMTemplate) {
     setEditorErr("");
     let payload: IPAMTemplateCreate;
     try {
@@ -641,29 +781,43 @@ export function IPAMTemplatesPage() {
       setEditorErr(e instanceof Error ? e.message : String(e));
       return;
     }
-    if (editor?.mode === "edit") {
-      const { id } = editor.tpl;
-      const update: IPAMTemplateUpdate = {
-        name: payload.name,
-        description: payload.description,
-        tags: payload.tags,
-        custom_fields: payload.custom_fields,
-        dns_group_id: payload.dns_group_id ?? null,
-        dns_zone_id: payload.dns_zone_id ?? null,
-        dhcp_group_id: payload.dhcp_group_id ?? null,
-        ddns_enabled: payload.ddns_enabled,
-        ddns_hostname_policy: payload.ddns_hostname_policy,
-        ddns_domain_override: payload.ddns_domain_override ?? null,
-        ddns_ttl: payload.ddns_ttl ?? null,
-        child_layout: payload.child_layout ?? null,
-        clear_dns_group_id: payload.dns_group_id == null,
-        clear_dhcp_group_id: payload.dhcp_group_id == null,
-        clear_dns_zone_id: payload.dns_zone_id == null,
-        clear_child_layout: payload.child_layout == null,
-        clear_ddns_domain_override: payload.ddns_domain_override == null,
-        clear_ddns_ttl: payload.ddns_ttl == null,
-      };
-      updateMut.mutate({ id, body: update });
+    if (editor?.mode === "edit" && base) {
+      const before = toCreatePayload(formFromTemplate(base));
+      const diff: IPAMTemplateUpdate = changedFields(
+        before as unknown as Record<string, unknown>,
+        {
+          name: payload.name,
+          description: payload.description,
+          tags: payload.tags,
+          custom_fields: payload.custom_fields,
+          dns_group_id: payload.dns_group_id ?? null,
+          dns_zone_id: payload.dns_zone_id ?? null,
+          dhcp_group_id: payload.dhcp_group_id ?? null,
+          ddns_enabled: payload.ddns_enabled,
+          ddns_hostname_policy: payload.ddns_hostname_policy,
+          ddns_domain_override: payload.ddns_domain_override ?? null,
+          ddns_ttl: payload.ddns_ttl ?? null,
+          child_layout: payload.child_layout ?? null,
+        },
+      );
+      // A changed field that is now empty is a clear, not a no-op.
+      if ("dns_group_id" in diff && diff.dns_group_id == null)
+        diff.clear_dns_group_id = true;
+      if ("dhcp_group_id" in diff && diff.dhcp_group_id == null)
+        diff.clear_dhcp_group_id = true;
+      if ("dns_zone_id" in diff && diff.dns_zone_id == null)
+        diff.clear_dns_zone_id = true;
+      if ("child_layout" in diff && diff.child_layout == null)
+        diff.clear_child_layout = true;
+      if ("ddns_domain_override" in diff && diff.ddns_domain_override == null)
+        diff.clear_ddns_domain_override = true;
+      if ("ddns_ttl" in diff && diff.ddns_ttl == null)
+        diff.clear_ddns_ttl = true;
+      if (Object.keys(diff).length === 0) {
+        setEditor(null);
+        return;
+      }
+      updateMut.mutate({ id: base.id, body: diff });
       return;
     }
     createMut.mutate(payload);
@@ -688,7 +842,8 @@ export function IPAMTemplatesPage() {
               setEditorErr("");
               setEditor({ mode: "create", initial: { ...EMPTY } });
             }}
-            className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+            {...writeGate}
           >
             <Plus className="h-4 w-4" /> New template
           </button>
@@ -720,8 +875,8 @@ export function IPAMTemplatesPage() {
               <tr>
                 <th className="px-3 py-2">Name</th>
                 <th className="px-3 py-2">Applies to</th>
-                <th className="px-3 py-2">DNS group</th>
-                <th className="px-3 py-2">DHCP group</th>
+                {dnsOn && <th className="px-3 py-2">DNS group</th>}
+                {dhcpOn && <th className="px-3 py-2">DHCP group</th>}
                 <th className="px-3 py-2">Children</th>
                 <th className="px-3 py-2">Applied</th>
                 <th className="px-3 py-2 text-right">Actions</th>
@@ -744,7 +899,17 @@ export function IPAMTemplatesPage() {
                     colSpan={7}
                     className="px-3 py-8 text-center text-muted-foreground"
                   >
-                    No templates yet.
+                    <ListEmpty
+                      error={tplsQ.error}
+                      what="templates"
+                      filtered={filterApplies !== "" || search !== ""}
+                      onClearFilters={() => {
+                        setFilterApplies("");
+                        setSearch("");
+                      }}
+                    >
+                      No templates yet.
+                    </ListEmpty>
                   </td>
                 </tr>
               )}
@@ -761,12 +926,16 @@ export function IPAMTemplatesPage() {
                   <td className="px-3 py-2 text-xs">
                     {APPLIES_TO_LABEL[t.applies_to]}
                   </td>
-                  <td className="px-3 py-2 text-xs font-mono">
-                    {t.dns_group_id ? t.dns_group_id.slice(0, 8) : "—"}
-                  </td>
-                  <td className="px-3 py-2 text-xs font-mono">
-                    {t.dhcp_group_id ? t.dhcp_group_id.slice(0, 8) : "—"}
-                  </td>
+                  {dnsOn && (
+                    <td className="px-3 py-2 text-xs font-mono">
+                      {t.dns_group_id ? t.dns_group_id.slice(0, 8) : "—"}
+                    </td>
+                  )}
+                  {dhcpOn && (
+                    <td className="px-3 py-2 text-xs font-mono">
+                      {t.dhcp_group_id ? t.dhcp_group_id.slice(0, 8) : "—"}
+                    </td>
+                  )}
                   <td className="px-3 py-2 text-xs">
                     {t.child_layout?.children?.length ?? 0}
                   </td>
@@ -774,22 +943,26 @@ export function IPAMTemplatesPage() {
                   <td className="px-3 py-2 text-right">
                     <button
                       onClick={() => setReapplyTarget(t)}
-                      disabled={t.applied_count === 0}
                       className="mr-1 inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent disabled:opacity-40"
                       title="Reapply across all instances"
+                      aria-label="Reapply across all instances"
+                      {...disabledBecause(
+                        t.applied_count === 0,
+                        "Not applied anywhere yet: nothing to reapply.",
+                      )}
+                      {...writeGate}
                     >
                       <RefreshCw className="h-3 w-3" />
                     </button>
                     <button
                       onClick={() => {
                         setEditorErr("");
-                        setEditor({
-                          mode: "edit",
-                          tpl: t,
-                          initial: formFromTemplate(t),
-                        });
+                        setEditor({ mode: "edit", tpl: t });
                       }}
-                      className="mr-1 rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent"
+                      className="mr-1 rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                      aria-label={`Edit template ${t.name}`}
+                      title="Edit template"
+                      {...writeGate}
                     >
                       <Pencil className="h-3 w-3" />
                     </button>
@@ -802,7 +975,10 @@ export function IPAMTemplatesPage() {
                         )
                           deleteMut.mutate(t.id);
                       }}
-                      className="rounded-md border px-2 py-1 text-xs text-muted-foreground hover:text-destructive hover:bg-accent"
+                      className="rounded-md border px-2 py-1 text-xs text-muted-foreground hover:text-destructive hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                      aria-label={`Delete template ${t.name}`}
+                      title="Delete template"
+                      {...deleteGate}
                     >
                       <Trash2 className="h-3 w-3" />
                     </button>
@@ -813,9 +989,21 @@ export function IPAMTemplatesPage() {
           </table>
         </div>
 
-        {editor && (
+        {editor?.mode === "edit" && (
+          <EditTemplate
+            tpl={editor.tpl}
+            error={editorErr}
+            saving={updateMut.isPending}
+            onClose={() => {
+              setEditor(null);
+              setEditorErr("");
+            }}
+            onSave={handleSave}
+          />
+        )}
+        {editor?.mode === "create" && (
           <TemplateEditor
-            mode={editor.mode}
+            mode="create"
             initial={editor.initial}
             error={editorErr}
             saving={createMut.isPending || updateMut.isPending}
@@ -830,9 +1018,18 @@ export function IPAMTemplatesPage() {
         {reapplyTarget && (
           <ReapplyConfirmModal
             template={reapplyTarget}
-            onClose={() => setReapplyTarget(null)}
+            onClose={() => {
+              setReapplyTarget(null);
+              reapplyMut.reset();
+            }}
             onConfirm={() => reapplyMut.mutate(reapplyTarget.id)}
             busy={reapplyMut.isPending}
+            result={reapplyMut.data ?? null}
+            error={
+              reapplyMut.isError
+                ? formatApiError(reapplyMut.error, "Reapply failed")
+                : ""
+            }
           />
         )}
       </div>

@@ -39,8 +39,13 @@ import hashlib
 import json
 from typing import Any
 
+import structlog
+
+from app.core.config_text import has_control_chars
 from app.core.crypto import decrypt_str
 from app.models.settings import PlatformSettings
+
+logger = structlog.get_logger(__name__)
 
 # Where the per-key armoured files land on the host. The ``signed-by``
 # option on each sources.list entry points here.
@@ -68,7 +73,7 @@ def render_sources_list(settings: PlatformSettings) -> str:
     """
     lines = [
         "# Managed by SpatiumDDI — edits will be overwritten on next config push.",
-        "# Source of truth: Settings → Appliance → APT in the SpatiumDDI UI.",
+        "# Source of truth: Appliance → Fleet → Services → APT in the SpatiumDDI UI.",
         "",
     ]
     for src in settings.apt_sources or []:
@@ -84,10 +89,177 @@ def render_sources_list(settings: PlatformSettings) -> str:
         if key_id:
             opts = f"[signed-by={_keyring_path(key_id)}] "
         name = str(src.get("name") or "").strip()
+        # Each source is one ``deb`` line, and apt ends an entry at the
+        # newline. The settings API rejects control characters in every
+        # field of a source; a stored source that still has one (written
+        # before that check, or restored from elsewhere) is left out rather
+        # than allowed to add an entry of its own.
+        if any(has_control_chars(v) for v in (uri, suites, components, key_id, name)) or any(
+            c.isspace() for c in uri + key_id
+        ):
+            logger.error("apt_source_omitted_illegal_chars")
+            lines.append(
+                "# A source was OMITTED — a stored field contains a newline or other "
+                "control character. Re-enter it in the UI."
+            )
+            continue
         if name:
             lines.append(f"# {name}")
         lines.append(f"deb {opts}{uri} {suites} {components}".rstrip())
     return "\n".join(lines) + "\n"
+
+
+#: What a proxy URL's userinfo reads as on every read surface.
+PROXY_USERINFO_MASK = "***"
+
+
+def _split_proxy_userinfo(url: str) -> tuple[str, str | None, str]:
+    """``(scheme://, userinfo or None, host-and-rest)`` for a source or proxy URL.
+
+    Read the way apt reads it: the host part ends at the first ``/`` only,
+    and userinfo is everything before the LAST ``@`` ahead of it. Every
+    caller (mask, restore, destination check) shares this one reading, so
+    they cannot disagree with apt about where the host is. A value with no
+    ``://`` is returned whole as host-and-rest.
+    """
+    scheme, sep, rest = url.partition("://")
+    if not sep:
+        return "", None, url
+    end = rest.find("/")
+    if end == -1:
+        end = len(rest)
+    authority = rest[:end]
+    if "@" not in authority:
+        return f"{scheme}://", None, rest
+    userinfo, _, host = authority.rpartition("@")
+    return f"{scheme}://", userinfo, host + rest[end:]
+
+
+def validate_apt_authority(url: str) -> None:
+    """Refuse a URL whose authority is ambiguous between parsers.
+
+    The authority is the text up to the first ``/`` (the whole remainder
+    for a proxy URL, which has no path). It may not hold ``?``, ``#``,
+    ``\\``, whitespace or control characters, more than one ``@``, or a
+    non-numeric port: a mirror or proxy needs none of them there, and each
+    is read differently by some URL parser. A value with no ``://`` (such
+    as ``file:/x``) has no authority and passes.
+    """
+    _, sep, rest = url.partition("://")
+    if not sep:
+        return
+    authority = rest.split("/", 1)[0]
+    if any(c in "?#\\" or c.isspace() or ord(c) < 0x20 for c in authority):
+        raise ValueError(
+            "the host part of the URL may not contain '?', '#', '\\', whitespace "
+            "or control characters"
+        )
+    if authority.count("@") > 1:
+        raise ValueError("the host part of the URL may contain only one '@'")
+    hostport = authority.rpartition("@")[2]
+    if hostport.startswith("["):
+        _, _, tail = hostport.partition("]")
+        port = tail[1:] if tail.startswith(":") else ""
+        bad = bool(tail) and not tail.startswith(":")
+    else:
+        _, colon, port = hostport.rpartition(":")
+        bad = False
+        if not colon:
+            port = ""
+    if bad or (port and not (port.isascii() and port.isdigit())):
+        raise ValueError("the port in the URL must be numeric")
+
+
+def mask_proxy_url(url: str | None) -> str:
+    """A proxy URL with any embedded credential replaced by ``***``
+    (GHSA-j77h-pqg7-h2g4).
+
+    ``http://bob:pw@proxy:3128/`` reads as ``http://***@proxy:3128/``: the
+    host stays visible (which proxy is a fair question for any reader),
+    the credential does not leave the server. A URL with no userinfo is
+    returned unchanged.
+    """
+    if not url:
+        return url or ""
+    prefix, userinfo, rest = _split_proxy_userinfo(url)
+    if userinfo is None:
+        return url
+    return f"{prefix}{PROXY_USERINFO_MASK}@{rest}"
+
+
+def _destination(url: str) -> tuple[str, str]:
+    """Scheme and ``host[:port]`` of a URL, as apt reads it."""
+    prefix, _, rest = _split_proxy_userinfo(url)
+    return prefix.lower(), rest.split("/", 1)[0].lower()
+
+
+def restore_proxy_credentials(incoming: str, stored: str | None) -> str:
+    """Put the stored credential back into a proxy URL that carries the mask.
+
+    The Settings form re-sends the value ``GET /settings`` showed it, i.e.
+    the masked one; writing that literally would replace the real
+    credential with ``***``. So a userinfo of exactly ``***`` means "keep
+    the stored one", spliced onto whatever host / port / path the caller
+    sent, as long as the scheme, host and port are the stored ones (a path
+    may change). Raises ``ValueError`` when there is no stored credential to
+    keep, or when the destination moved: the credential is then asked for
+    again rather than sent to the new host.
+    """
+    prefix, userinfo, rest = _split_proxy_userinfo(incoming)
+    if userinfo != PROXY_USERINFO_MASK:
+        return incoming
+    validate_apt_authority(incoming)
+    _, stored_userinfo, _ = _split_proxy_userinfo(stored or "")
+    if not stored_userinfo:
+        raise ValueError(
+            "proxy URL carries the '***' credential placeholder, but no "
+            "credential is stored to keep; enter the user:password or remove "
+            "the '***@'"
+        )
+    if _destination(incoming) != _destination(stored or ""):
+        raise ValueError(
+            "the host, port or scheme changed: re-enter the user:password in the "
+            "same request (stored credentials are not re-sent to a different destination)"
+        )
+    restored = f"{prefix}{stored_userinfo}@{rest}"
+    # Last line of defence: the result must point where the stored value did.
+    if _destination(restored) != _destination(stored or ""):
+        raise ValueError(
+            "the host, port or scheme changed: re-enter the user:password in the "
+            "same request (stored credentials are not re-sent to a different destination)"
+        )
+    return restored
+
+
+def mask_source_uris(sources: Any) -> list[Any]:
+    """``apt_sources`` rows with any ``user:pass@`` in a ``uri`` masked.
+
+    A private mirror's URI may embed the credential apt reads from it; every
+    read surface shows it the way a proxy URL is shown (``***@host``).
+    """
+    out: list[Any] = []
+    for src in sources or []:
+        if isinstance(src, dict) and isinstance(src.get("uri"), str):
+            src = {**src, "uri": mask_proxy_url(src["uri"])}
+        out.append(src)
+    return out
+
+
+def restore_source_uri(incoming: str, name: str, stored_sources: Any) -> str:
+    """Put a stored source's credential back into a URI that carries the mask.
+
+    The stored row is the one with the same ``name``, else the one whose
+    masked URI equals ``incoming``. Raises ``ValueError`` when there is no
+    credential to keep.
+    """
+    _, userinfo, _ = _split_proxy_userinfo(incoming)
+    if userinfo != PROXY_USERINFO_MASK:
+        return incoming
+    rows = [s for s in (stored_sources or []) if isinstance(s, dict)]
+    match = next((s for s in rows if name and s.get("name") == name), None)
+    if match is None:
+        match = next((s for s in rows if mask_proxy_url(str(s.get("uri", ""))) == incoming), None)
+    return restore_proxy_credentials(incoming, str(match.get("uri", "")) if match else None)
 
 
 def render_proxy_conf(settings: PlatformSettings) -> str:
@@ -96,10 +268,22 @@ def render_proxy_conf(settings: PlatformSettings) -> str:
     http = (settings.apt_proxy_http or "").strip()
     https = (settings.apt_proxy_https or "").strip()
     no_proxy = (settings.apt_proxy_no_proxy or "").strip()
+    # Each value sits inside a quoted apt.conf string; a quote or a control
+    # character would end it. The settings API rejects both; a stored value
+    # that has one is not rendered.
+    if _breaks_apt_string(http):
+        logger.error("apt_proxy_omitted_illegal_chars", scheme="http")
+        http = ""
+    if _breaks_apt_string(https):
+        logger.error("apt_proxy_omitted_illegal_chars", scheme="https")
+        https = ""
+    if _breaks_apt_string(no_proxy):
+        logger.error("apt_no_proxy_omitted_illegal_chars")
+        no_proxy = ""
     if not http and not https:
         return ""
     lines = [
-        "// Managed by SpatiumDDI — Settings → Appliance → APT.",
+        "// Managed by SpatiumDDI — Appliance → Fleet → Services → APT.",
     ]
     if http:
         lines.append(f'Acquire::http::Proxy "{http}";')
@@ -116,11 +300,15 @@ def render_proxy_conf(settings: PlatformSettings) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _breaks_apt_string(value: str) -> bool:
+    return '"' in value or has_control_chars(value)
+
+
 def render_auth_conf(settings: PlatformSettings) -> str:
     """Render ``/etc/apt/auth.conf.d/spatiumddi.conf`` (netrc-style) from
     the decrypted private-mirror credentials. Empty when none set; the
     runner writes it 0600."""
-    out: list[str] = ["# Managed by SpatiumDDI — Settings → Appliance → APT."]
+    out: list[str] = ["# Managed by SpatiumDDI — Appliance → Fleet → Services → APT."]
     any_entry = False
     for entry in settings.apt_auth or []:
         if not isinstance(entry, dict):
@@ -129,6 +317,13 @@ def render_auth_conf(settings: PlatformSettings) -> str:
         login = str(entry.get("login") or "").strip()
         password = _decrypt(entry.get("password_enc"))
         if not machine or not login or password is None:
+            continue
+        # One netrc-style line per entry; a newline in any part would add a
+        # line of its own. The settings API rejects these on write.
+        if has_control_chars(machine + login + password) or any(
+            c.isspace() for c in machine + login
+        ):
+            logger.error("apt_auth_entry_omitted_illegal_chars")
             continue
         out.append(f"machine {machine} login {login} password {password}")
         any_entry = True

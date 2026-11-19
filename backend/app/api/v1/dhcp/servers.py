@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -13,9 +13,11 @@ from sqlalchemy import func, or_, select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE, MAX_PAGE_SIZE, Page, paginate
+from app.api.v1._common import WinRMSettings, winrm_settings_from_blob
 from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp._leases import LeaseResponse, apply_lease_filters, enrich_leases
 from app.core.agent_wake import (
+    appliance_channel,
     collect_wake,
     dhcp_group_channel,
     dhcp_server_channel,
@@ -25,7 +27,12 @@ from app.core.agent_wake import (
 from app.core.crypto import encrypt_dict
 from app.core.permissions import require_resource_permission
 from app.core.ssrf import assert_safe_target
-from app.drivers._winrm import validate_transport
+from app.core.stored_secret_guard import (
+    require_secret_with_destination_change,
+    sent_server_credential,
+)
+from app.core.update_nulls import changed_keys, snapshot
+from app.drivers._winrm import validate_transport, winrm_settings_diff
 from app.drivers.dhcp import is_agentless, is_cloud, is_read_only
 from app.drivers.dhcp.base import MACBlockDef
 from app.drivers.dhcp.fortigate import test_fortigate_credentials
@@ -36,16 +43,22 @@ from app.models.audit import AuditLog
 from app.models.dhcp import DHCPConfigOp, DHCPLease, DHCPMACBlock, DHCPScope, DHCPServer
 from app.models.ipam import Subnet
 from app.models.metrics import DHCPMetricSample
+from app.services.agents.container_oom import daemon_reported_by
 from app.services.agents.daemon_state import is_not_serving
+from app.services.agents.instance_ownership import duplicate_active as duplicate_agent_active
 from app.services.agents.spool_status import SpoolStatus
+from app.services.api_token_scopes import token_outbound
+from app.services.appliance.ownership import owning_appliance_for_dhcp_server
 from app.services.dhcp.cloud_writethrough import push_cloud_scope_upsert
 from app.services.dhcp.config_bundle import build_config_bundle
+from app.services.dhcp.option_spelling import group_drivers, scopes_losing_raw_options
 from app.services.dhcp.pull_leases import pull_leases_from_server
 from app.services.dhcp.stats import (
     STATS_BUCKET_SECONDS,
     STATS_WINDOW_SECONDS,
     active_lease_count,
 )
+from app.services.ipam.utilization import recount_subnets_and_blocks
 
 router = APIRouter(
     prefix="/servers",
@@ -64,8 +77,9 @@ class WindowsCredentialsInput(BaseModel):
     """Windows DHCP admin credentials (for driver='windows_dhcp').
 
     Stored Fernet-encrypted on ``DHCPServer.credentials_encrypted``.
-    Server never returns the password back — responses only expose
-    ``has_credentials``.
+    The username and password are never returned — responses expose
+    ``has_credentials`` and the non-secret ``winrm_settings`` (port,
+    transport, TLS, certificate validation) only.
 
     All fields are optional to support **partial updates** on edit: if the
     server already has stored credentials, sending just ``{"transport":
@@ -174,9 +188,25 @@ class ServerUpdate(BaseModel):
 # #1238 — shared by ``ServerResponse`` and the group roll-up's
 # ``ServerSummary`` so the two descriptions of one column cannot drift.
 HA_STATE_DESCRIPTION = (
-    "Kea HA state reported by the DHCPv4 daemon. HA covers DHCPv4 only: "
-    "DHCPv6 scopes on the group are served by each member independently (#1238)."
+    "Kea HA state reported by the DHCPv4 daemon. Null when the server takes part "
+    "in no HA relationship (a standalone group, no partner or peer URL, or "
+    "sidelined): it is cleared once the server's config carries no HA hook "
+    "(#3241). HA covers DHCPv4 only: DHCPv6 scopes on the group are served by "
+    "each member independently (#1238)."
 )
+
+
+def _duplicate_agent_fields(s: DHCPServer) -> dict[str, Any]:
+    """#3143 — the server row's duplicate-agent fields, all empty unless an
+    episode is current (one reading, shared with the alert)."""
+    if not duplicate_agent_active(s):
+        return {}
+    return {
+        "duplicate_agent": True,
+        "duplicate_agent_since": s.duplicate_agent_first_at,
+        "duplicate_agent_last_at": s.duplicate_agent_last_at,
+        "duplicate_agent_ip": s.duplicate_agent_ip,
+    }
 
 
 class ServerResponse(BaseModel):
@@ -190,6 +220,8 @@ class ServerResponse(BaseModel):
     server_group_id: uuid.UUID | None
     status: str
     last_sync_at: datetime | None
+    last_sync_error: str | None = None
+    last_sync_error_at: datetime | None = None
     last_health_check_at: datetime | None
     agent_registered: bool
     agent_approved: bool
@@ -210,6 +242,10 @@ class ServerResponse(BaseModel):
     # hard-coded default (which would silently re-disable verification on any
     # unrelated edit). Null for non-cloud drivers.
     verify_tls: bool | None = None
+    # The stored non-secret WinRM settings (windows_dhcp with credentials;
+    # null otherwise). Lets the edit dialog show what is stored, so an
+    # untouched save sends nothing and keeps it. Never carries the secrets.
+    winrm_settings: WinRMSettings | None = None
     # Kea HA listener URL this server exposes to its partner.
     ha_peer_url: str = ""
     # Kea HA state — latest value reported by the agent's periodic
@@ -246,6 +282,23 @@ class ServerResponse(BaseModel):
     # ``config_apply_status`` reports at #882's severity. ``null`` — never
     # reported.
     daemon_not_serving: bool | None = None
+    # #2962 — who the current not-``ok`` daemon state came from: ``agent``
+    # (its own heartbeat) or ``supervisor`` (the appliance's supervisor, from
+    # the kubelet's container state, when the agent died with its container
+    # or has gone silent). ``null`` on ``ok`` or never reported. Derived
+    # (``container_oom.daemon_reported_by``), the same reading the alert's
+    # wording uses.
+    daemon_reported_by: Literal["agent", "supervisor"] | None = None
+    # #3143 — a second live agent process is polling as this server (a cloned
+    # VM or a copied state dir keeps the agent_id) and is being refused: only
+    # the most recent process is served. Derived
+    # (``instance_ownership.duplicate_active``), as the
+    # ``dhcp_agent_duplicate_instance`` alert reads it. ``duplicate_agent_ip``
+    # is where the refused process last polled from.
+    duplicate_agent: bool = False
+    duplicate_agent_since: datetime | None = None
+    duplicate_agent_last_at: datetime | None = None
+    duplicate_agent_ip: str | None = None
     maintenance_reason: str | None = None
     created_at: datetime
     modified_at: datetime
@@ -282,6 +335,8 @@ class ServerResponse(BaseModel):
             server_group_id=s.server_group_id,
             status=s.status,
             last_sync_at=s.last_sync_at,
+            last_sync_error=s.last_sync_error,
+            last_sync_error_at=s.last_sync_error_at,
             last_health_check_at=s.last_health_check_at,
             agent_registered=s.agent_registered,
             # Agentless drivers have no agent to approve, so "approval" is
@@ -300,6 +355,11 @@ class ServerResponse(BaseModel):
             is_read_only=is_read_only(s.driver),
             vdom=vdom,
             verify_tls=verify_tls,
+            winrm_settings=(
+                winrm_settings_from_blob(s.credentials_encrypted)
+                if s.driver == "windows_dhcp"
+                else None
+            ),
             ha_peer_url=s.ha_peer_url or "",
             ha_state=s.ha_state,
             ha_last_heartbeat_at=s.ha_last_heartbeat_at,
@@ -315,6 +375,8 @@ class ServerResponse(BaseModel):
             daemon_reason=s.daemon_reason,
             daemon_status_since=s.daemon_status_since,
             daemon_not_serving=is_not_serving(s.daemon_status, s.daemon_reason),
+            daemon_reported_by=daemon_reported_by(s.daemon_status, s.daemon_reason),
+            **_duplicate_agent_fields(s),
             created_at=s.created_at,
             modified_at=s.modified_at,
         )
@@ -451,6 +513,36 @@ class SyncLeasesResponse(BaseModel):
 _UNCOORDINATABLE_DRIVERS = frozenset({"kea", "windows_dhcp"})
 
 
+async def _assert_group_options_servable(
+    db: DB, group_id: uuid.UUID | None, driver: str, *, exclude_server_id: uuid.UUID | None = None
+) -> None:
+    """422 when this server joining ``group_id`` would make its servers drop
+    raw-code options already stored on the group's scopes (#1347).
+
+    Windows reads ``opt-NN`` and drops ``code:NN``; Kea and FortiGate the
+    reverse. The scope write refuses a key the group cannot serve, but a
+    scope saved on a Kea, FortiGate or empty group kept its ``code:NN`` when
+    a Windows server joined, and was then served without it, silently.
+    """
+    if group_id is None:
+        return
+    drivers = await group_drivers(db, group_id, exclude_server_id=exclude_server_id)
+    affected = await scopes_losing_raw_options(db, group_id, drivers | {driver})
+    if not affected:
+        return
+    listed = "; ".join(f"{label}: {', '.join(keys)}" for label, keys in affected[:5])
+    more = f" (and {len(affected) - 5} more)" if len(affected) > 5 else ""
+    raise HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail=(
+            f"A {driver} server in this group would not serve raw options already set "
+            f"on {len(affected)} scope(s): {listed}{more}. Windows reads opt-NN and drops "
+            "code:NN, Kea and FortiGate the reverse. Re-key or remove those options "
+            "first, or use a named option."
+        ),
+    )
+
+
 async def _assert_no_v6_scopes_for_windows(db: DB, group_id: uuid.UUID | None, driver: str) -> None:
     """422 when a Windows server would join a group with DHCPv6 scopes (#1480).
 
@@ -524,6 +616,7 @@ async def create_server(body: ServerCreate, db: DB, user: SuperAdmin) -> ServerR
         raise HTTPException(status_code=409, detail="A DHCP server with that name exists")
 
     await _assert_driver_mix_allowed(db, body.server_group_id, body.driver)
+    await _assert_group_options_servable(db, body.server_group_id, body.driver)
     await _assert_no_v6_scopes_for_windows(db, body.server_group_id, body.driver)
     payload = body.model_dump(exclude={"windows_credentials", "cloud_credentials"})
     # Resolve the per-driver default port when the caller omitted it: cloud/REST
@@ -624,7 +717,28 @@ async def update_server(
     target_driver = changes.get("driver", s.driver)
     if target_group != s.server_group_id or target_driver != s.driver:
         await _assert_driver_mix_allowed(db, target_group, target_driver, exclude_server_id=s.id)
+        await _assert_group_options_servable(
+            db, target_group, target_driver, exclude_server_id=s.id
+        )
         await _assert_no_v6_scopes_for_windows(db, target_group, target_driver)
+    if target_group != s.server_group_id:
+        # #2899 — a cluster node's Kea is behind the MetalLB relay VIP
+        # Service; it cannot move into a ``direct`` group while a VIP is set.
+        from app.services.dhcp.relay_vip import server_join_refusal  # noqa: PLC0415
+
+        refusal = await server_join_refusal(db, s, target_group)
+        if refusal is not None:
+            raise HTTPException(status_code=422, detail=refusal)
+    require_secret_with_destination_change(
+        s,
+        {
+            **changes,
+            "credentials": sent_server_credential(body.windows_credentials, body.cloud_credentials),
+        },
+        destination=("host", "port"),
+        secrets={"credentials": s.credentials_encrypted},
+    )
+    before = snapshot(s, changes)
     for k, v in changes.items():
         setattr(s, k, v)
 
@@ -638,12 +752,38 @@ async def update_server(
             if gid is not None:
                 collect_wake(dhcp_group_channel(gid))
 
+    # #1749 — an appliance's own DHCP server moved: repoint the appliance so
+    # the supervisor renders AGENT_GROUP, the network mode and the #1167 HA
+    # listener for the group the agent now serves. Found by FK, else by the
+    # Fleet hostname rule (agents register by hostname and never set
+    # ``appliance_id``). Only when the pointer names the group being left —
+    # an appliance deliberately assigned elsewhere is not ours to redirect —
+    # and never on a clear: a NULL group idles the supervisor's DHCP role.
+    appliance_repointed_id: uuid.UUID | None = None
+    if s.server_group_id is not None and s.server_group_id != old_group_id:
+        owner = await owning_appliance_for_dhcp_server(db, s)
+        if owner is not None and owner.assigned_dhcp_group_id == old_group_id:
+            owner.assigned_dhcp_group_id = s.server_group_id
+            appliance_repointed_id = owner.id
+            collect_wake(appliance_channel(owner.id))
+
+    # #2963 - a server moved into a group is a membership change: the group's
+    # appliance-hosted Kea members get an empty HA peer URL derived from the
+    # node address (host-networked HA-mode groups only; never overwrites).
+    if s.server_group_id is not None and s.server_group_id != old_group_id:
+        from app.services.dhcp.ha_peer_autofill import (  # noqa: PLC0415
+            autofill_group_ha_peer_urls,
+        )
+
+        await autofill_group_ha_peer_urls(db, s.server_group_id, via="server_update")
+
     # Credentials handling:
     #   * None → leave alone
     #   * {}   → clear
     #   * dict with any subset of fields → decrypt-merge-reencrypt (so the
     #     UI can change just the transport/port/tls without re-typing the
     #     password).
+    winrm_diff: dict[str, dict[str, Any]] = {}
     if body.windows_credentials is not None:
         if isinstance(body.windows_credentials, WindowsCredentialsInput):
             patch = body.windows_credentials.model_dump(exclude_none=True)
@@ -653,10 +793,15 @@ async def update_server(
             elif s.credentials_encrypted:
                 from app.core.crypto import decrypt_dict  # noqa: PLC0415
 
+                # Merge: a key the request does not carry keeps its stored
+                # value, so an edit that omits the TLS settings never resets
+                # them to the create defaults.
                 existing = decrypt_dict(s.credentials_encrypted)
+                before_creds = dict(existing)
                 existing.update(patch)
                 s.credentials_encrypted = encrypt_dict(existing)
                 changes["windows_credentials_updated"] = sorted(patch.keys())
+                winrm_diff = winrm_settings_diff(before_creds, existing)
             else:
                 # No stored creds — require a full username/password on first set.
                 if not patch.get("username") or not patch.get("password"):
@@ -674,6 +819,7 @@ async def update_server(
                 patch.setdefault("winrm_port", 5986 if patch.get("use_tls") else 5985)
                 s.credentials_encrypted = encrypt_dict(patch)
                 changes["windows_credentials_set"] = True
+                winrm_diff = winrm_settings_diff(None, patch)
         elif body.windows_credentials == {}:
             s.credentials_encrypted = None
             changes["windows_credentials_cleared"] = True
@@ -708,10 +854,16 @@ async def update_server(
     )
     if clear_group:
         audit_payload["server_group_id"] = None
+    if appliance_repointed_id is not None:
+        audit_payload["appliance_repointed_id"] = str(appliance_repointed_id)
     if "windows_credentials_set" in changes:
         audit_payload["windows_credentials_set"] = True
     if "windows_credentials_cleared" in changes:
         audit_payload["windows_credentials_cleared"] = True
+    if "windows_credentials_updated" in changes:
+        audit_payload["windows_credentials_updated"] = changes["windows_credentials_updated"]
+    if winrm_diff:
+        audit_payload["winrm_settings_changed"] = winrm_diff
     if "cloud_credentials_set" in changes:
         audit_payload["cloud_credentials_set"] = True
     if "cloud_credentials_updated" in changes:
@@ -726,7 +878,7 @@ async def update_server(
         resource_type="dhcp_server",
         resource_id=str(s.id),
         resource_display=s.name,
-        changed_fields=list(changes.keys()),
+        changed_fields=changed_keys(before, changes),
         new_value=audit_payload,
     )
     await db.commit()
@@ -739,6 +891,19 @@ async def delete_server(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     s = await db.get(DHCPServer, server_id)
     if s is None:
         raise HTTPException(status_code=404, detail="Server not found")
+    # #430 — capture the group before delete; removing a member can drop a
+    # group out of HA, re-rendering the survivors' failover block. Wake it.
+    gid = s.server_group_id
+    # #2290 — leases cascade with the server, so tear their IPAM mirrors and
+    # DDNS down first (sparing any an HA peer still holds).
+    from app.services.dhcp.lease_cleanup import delete_leases_for_server  # noqa: PLC0415
+
+    await delete_leases_for_server(db, s.id)
+    # #3687: the audit row goes after the lease teardown. Its flush takes the
+    # audit-chain lock, and the teardown's first query autoflushes pending
+    # rows: an audit row staged earlier took the chain lock before the zone
+    # rows ``delete_leases_for_server`` locks, the reverse of the order a
+    # permanent zone delete takes them (``app.services.lock_order``).
     write_audit(
         db,
         user=user,
@@ -747,9 +912,6 @@ async def delete_server(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
         resource_id=str(s.id),
         resource_display=s.name,
     )
-    # #430 — capture the group before delete; removing a member can drop a
-    # group out of HA, re-rendering the survivors' failover block. Wake it.
-    gid = s.server_group_id
     await db.delete(s)
     if gid is not None:
         collect_wake(dhcp_group_channel(gid))
@@ -976,6 +1138,7 @@ async def test_fortigate_credentials_endpoint(
 
 
 @router.get("/{server_id}/fortigate-interfaces", response_model=list[FortiGateInterface])
+@token_outbound
 async def fortigate_interfaces(
     server_id: uuid.UUID, db: DB, _user: SuperAdmin
 ) -> list[FortiGateInterface]:
@@ -1113,7 +1276,17 @@ async def sync_leases_now(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> Syn
                 "poll. Nudged the agent to re-poll now."
             ),
         )
-    result = await pull_leases_from_server(db, s, apply=True)
+    # Recounted below, just before commit: the recount holds the audit-chain
+    # lock and subnet / block row locks until commit, and the MAC-block
+    # reconcile that follows is another WinRM call (#3345, #3354).
+    result = await pull_leases_from_server(db, s, apply=True, recount=False)
+    if result.busy:
+        # #2262 — the scheduled pull (or another Sync) is reconciling this
+        # server right now; two at once used to insert the same lease twice.
+        raise HTTPException(
+            status_code=409,
+            detail="A lease pull for this server is already running; try again shortly.",
+        )
 
     # Reconcile the server's MAC deny-filter list against the group's
     # active blocks while we're already holding the WinRM session up.
@@ -1184,6 +1357,7 @@ async def sync_leases_now(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> Syn
             "warnings": result.warnings[:20],
         },
     )
+    await recount_subnets_and_blocks(db, result.touched_subnet_ids)
     await db.commit()
     return SyncLeasesResponse(
         server_leases=result.server_leases,
@@ -1645,6 +1819,9 @@ class DHCPRateBucket(BaseModel):
     # receive buffer was full. The one that moves when a node is short of
     # CPU; ``receive_drop`` stays at 0 through exactly that failure.
     socket_drop: int | None = None
+    # #2889 — DHCPv4 requests Kea read and then evicted from its packet
+    # queue under a burst. Loss like ``socket_drop``; no Kea counter sees it.
+    queue_evicted: int | None = None
 
 
 class DHCPServerStatsResponse(BaseModel):
@@ -1714,6 +1891,7 @@ async def get_server_stats(
             # loss. A partially-measured bucket sums the samples that did.
             func.sum(DHCPMetricSample.receive_drop).label("receive_drop"),
             func.sum(DHCPMetricSample.socket_drop).label("socket_drop"),
+            func.sum(DHCPMetricSample.queue_evicted).label("queue_evicted"),
         )
         .where(DHCPMetricSample.server_id == server_id)
         .where(DHCPMetricSample.bucket_at >= since)
@@ -1734,6 +1912,7 @@ async def get_server_stats(
             # ``is None`` rather than ``or``: 0 is a real, measured value.
             receive_drop=None if r.receive_drop is None else int(r.receive_drop),
             socket_drop=None if r.socket_drop is None else int(r.socket_drop),
+            queue_evicted=None if r.queue_evicted is None else int(r.queue_evicted),
         )
         for r in rows
     ]

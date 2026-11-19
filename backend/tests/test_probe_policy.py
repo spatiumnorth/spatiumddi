@@ -588,3 +588,39 @@ async def test_bmc_is_an_accepted_ip_role(client: AsyncClient, db_session: Async
     )
     assert resp.status_code == 201, resp.text
     assert resp.json()["role"] == "bmc"
+
+
+# ── Copilot ping_host (#3302) ────────────────────────────────────────
+
+
+async def test_copilot_ping_host_refuses_do_not_probe_target(db_session: AsyncSession) -> None:
+    from unittest.mock import AsyncMock
+
+    from app.services.ai.tools import REGISTRY
+
+    user, _ = await _make_superadmin(db_session)
+    _, _, subnet = await _make_chain(db_session)
+    subnet.do_not_probe = True
+    subnet.do_not_probe_reason = "infusion pumps"
+    await db_session.flush()
+
+    with patch("asyncio.create_subprocess_exec", AsyncMock()) as spawn:
+        out = await REGISTRY.call("ping_host", {"target": "10.20.30.5"}, db=db_session, user=user)
+    spawn.assert_not_called()
+    assert "infusion pumps" in out["error"]
+
+
+def test_copilot_probing_tools_are_gated_by_the_network_module() -> None:
+    from app.services.ai.tools import REGISTRY
+    from app.services.ai.tools.base import effective_tool_names
+    from app.services.feature_modules import all_module_ids
+
+    for name in ("ping_host", "tls_cert_check"):
+        tool = REGISTRY.get(name)
+        assert tool is not None and tool.module == "tools.network", name
+    eff = effective_tool_names(
+        platform_enabled=None,
+        provider_enabled=None,
+        enabled_modules=all_module_ids() - {"tools.network"},
+    )
+    assert "ping_host" not in eff and "tls_cert_check" not in eff

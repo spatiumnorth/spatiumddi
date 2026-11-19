@@ -1,8 +1,95 @@
 import { useEffect, useId, useRef, useState } from "react";
+import {
+  captureSuccessors,
+  returnFocus,
+  type FocusSuccessor,
+} from "./focus-return";
 
 /** CSS for the outer flex-center backdrop. Same across every modal. */
 export const MODAL_BACKDROP_CLS =
   "fixed inset-0 z-50 flex items-center justify-center bg-black/20 p-2 sm:p-4";
+
+/**
+ * Layer stack. Every open dialog is a layer; only the topmost one owns Esc
+ * and the Tab trap (#1947, #1948). Separate stacks for the two concerns keep
+ * a shell that only drags (no trap) correct for Esc, and both are pushed in
+ * mount order so they always agree.
+ */
+function createLayerStack() {
+  const layers: { token: symbol; seq: number }[] = [];
+  return {
+    /** Register a layer ranked by `seq`; returns the unregister function. */
+    push(seq: number): { token: symbol; remove: () => void } {
+      const token = Symbol("modal-layer");
+      layers.push({ token, seq });
+      return {
+        token,
+        remove: () => {
+          const i = layers.findIndex((l) => l.token === token);
+          if (i >= 0) layers.splice(i, 1);
+        },
+      };
+    },
+    isTop: (token: symbol) =>
+      layers.length > 0 &&
+      layers.reduce((a, b) => (b.seq > a.seq ? b : a)).token === token,
+    size: () => layers.length,
+  };
+}
+
+/** Rank of a dialog, taken at first render. Render order is parent before
+ *  child and earlier before later, whereas effects run child-first — so a
+ *  dialog nested in another's JSX (a ConfirmModal in a form) and mounted in
+ *  the same commit would otherwise register beneath its own parent. */
+let layerSeq = 0;
+function useLayerSeq(): number {
+  return useState(() => ++layerSeq)[0];
+}
+
+const escStack = createLayerStack();
+const trapStack = createLayerStack();
+
+/** True while any dialog (or overlay layer) is open. Non-dialog Esc handlers
+ *  (the copilot drawer, popovers) consult it so one Esc does not dismiss them
+ *  as well as the dialog over them. */
+export function hasOpenModal(): boolean {
+  return escStack.size() > 0 || trapStack.size() > 0;
+}
+
+/** Make an overlay that is not built on these hooks (the search palette) the
+ *  topmost layer while `active`, so the dialogs under it neither take its Esc
+ *  nor pull its Tab back into themselves. The overlay handles its own Esc and
+ *  must stop it propagating. */
+export function useOverlayLayer(active: boolean): void {
+  useEffect(() => {
+    if (!active) return;
+    const seq = ++layerSeq;
+    const esc = escStack.push(seq);
+    const trap = trapStack.push(seq);
+    return () => {
+      esc.remove();
+      trap.remove();
+    };
+  }, [active]);
+}
+
+/** Esc handler for a popup list (suggestions, combobox) inside a dialog:
+ *  while the list is open, Esc closes the list only; the dialog keeps what
+ *  was typed and takes the next Esc (#2720). Call from the input's keydown;
+ *  returns true when the key was consumed. An IME composition's Esc is left
+ *  alone. */
+export function closePopupOnEscape(
+  e: React.KeyboardEvent,
+  isOpen: boolean,
+  close: () => void,
+): boolean {
+  if (e.key !== "Escape" || !isOpen) return false;
+  if (e.nativeEvent.isComposing || e.keyCode === 229) return false;
+  e.preventDefault();
+  e.stopPropagation();
+  close();
+  return true;
+}
 
 /**
  * Drag hook for modal dialogs. Returns a style to apply to the dialog card
@@ -16,6 +103,7 @@ export const MODAL_BACKDROP_CLS =
  * doesn't warn about mixed component + utility exports.
  */
 export function useDraggableModal(onClose: () => void) {
+  const seq = useLayerSeq();
   const [offset, setOffset] = useState({ x: 0, y: 0 });
   const dragRef = useRef<{
     startX: number;
@@ -44,13 +132,32 @@ export function useDraggableModal(onClose: () => void) {
     };
   }, []);
 
+  // Esc closes only the topmost dialog, and the event stops there. Each
+  // dialog binds its own listener, so without the stack one keypress closed
+  // every dialog in a nested stack. `stopImmediatePropagation` matters:
+  // React flushes the close in a microtask between two listeners, which
+  // would make the dialog underneath the new top before its listener ran.
+  const onCloseRef = useRef(onClose);
   useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
+  useEffect(() => {
+    const { token, remove } = escStack.push(seq);
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key !== "Escape" || !escStack.isTop(token)) return;
+      // An Esc that ends an IME composition belongs to the input method, and
+      // one a control inside already handled (an open suggestion list closing
+      // itself, #2720) belongs to that control: the innermost layer owns it.
+      if (e.isComposing || e.keyCode === 229 || e.defaultPrevented) return;
+      e.stopImmediatePropagation();
+      onCloseRef.current();
     };
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      remove();
+    };
+  }, [seq]);
 
   const startDrag = (e: React.MouseEvent) => {
     // Don't start dragging when the press landed on an interactive control
@@ -88,33 +195,108 @@ const FOCUSABLE_SELECTOR =
  * On open it remembers the previously-focused element and — unless a control
  * inside already grabbed focus via ``autoFocus`` (e.g. ConfirmModal's password
  * field) — moves focus into the dialog. Tab / Shift+Tab cycle within the
- * dialog so keyboard focus can't escape to the page behind. On close focus
+ * topmost dialog so keyboard focus can't escape to the page behind. On close focus
  * returns to wherever it was, so the operator's place in the page is kept.
  *
  * Lives next to ``useDraggableModal`` so every modal can opt in with one line.
  */
 export function useFocusTrap<T extends HTMLElement>() {
   const ref = useRef<T>(null);
+  const seq = useLayerSeq();
+  // The opener is read during the FIRST RENDER, not in the effect: React
+  // applies a child's `autoFocus` at commit, before any effect runs, so by
+  // then `document.activeElement` is the dialog's own field and "focus
+  // return" would restore to a node that is unmounted with the dialog (#2050).
+  // Render is the last point focus is still where the operator left it.
+  // That is first render of THIS hook instance: every caller mounts the
+  // dialog on open and unmounts it on close, which is also what the trap
+  // effect below assumes (it runs once, on mount).
+  const openerRef = useRef<FocusReturnTargets | undefined>(undefined);
+  const successorsRef = useRef<FocusSuccessor[]>([]);
+  if (openerRef.current === undefined) {
+    openerRef.current = captureFocusReturnTargets();
+    // Where focus goes if the opener is gone by the close (#3909). Not for a
+    // dialog opened from a menu item: the menu's own owner places focus then
+    // (the right-click menu, #3908), and a heading fallback here would win.
+    const active = document.activeElement;
+    successorsRef.current =
+      active && !active.closest('[role="menu"]')
+        ? captureSuccessors(active)
+        : [];
+  }
   useEffect(() => {
     const node = ref.current;
     if (!node) return;
-    const previouslyFocused = document.activeElement as HTMLElement | null;
+    const returnTargets = openerRef.current;
+    const { token, remove } = trapStack.push(seq);
+    // A dialog that takes this one's place in the same commit (a loading
+    // phase handing over to its confirm) is opened while focus sits on this
+    // card; it inherits these targets, or its own close would have nowhere
+    // to return to (#2723).
+    if (returnTargets) cardReturnTargets.set(node, returnTargets);
+
+    // Focus follows a dialog's content. A step that replaces the focused
+    // control (Continue → the next step) removes the node focus was on, and
+    // the browser drops focus on <body> while the dialog stays open: nothing
+    // in it is focused and a screen reader announces nothing (#2723). Put it
+    // back on the card, as on open, when exactly that happened.
+    let lastFocused: HTMLElement | null = null;
+    const onFocusIn = (e: FocusEvent) => {
+      if (e.target instanceof HTMLElement) lastFocused = e.target;
+    };
+    node.addEventListener("focusin", onFocusIn);
+    // The same happens when the focused control is DISABLED, not removed: a
+    // submit or confirm that disables itself while its request runs stays in
+    // the DOM, the browser still drops focus on <body>, and a refusal then
+    // leaves the dialog open with focus outside it (#3155). Both cases are
+    // caught here, in the mutation callback (a microtask, before the browser's
+    // own focus fix-up), so the card takes focus right away.
+    const observer = new MutationObserver(() => {
+      if (!node.isConnected || !trapStack.isTop(token)) return;
+      const active = document.activeElement;
+      const lostToDisabled =
+        lastFocused &&
+        lastFocused.isConnected &&
+        node.contains(lastFocused) &&
+        (lastFocused as HTMLButtonElement).disabled === true &&
+        (!active || active === document.body || active === lastFocused);
+      if (!lostToDisabled) {
+        if (active && active !== document.body) return;
+        if (!lastFocused || lastFocused.isConnected) return;
+      }
+      lastFocused = null;
+      node.setAttribute("tabindex", "-1");
+      node.focus();
+    });
+    observer.observe(node, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["disabled"],
+    });
 
     const focusables = () =>
       Array.from(node.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
-        (el) => el.offsetParent !== null,
+        (el) => isVisible(el, node),
       );
 
     // Respect an existing autoFocus inside the dialog; otherwise focus the
     // dialog container itself (tabindex -1) so screen readers announce it and
-    // the operator tabs into the content — never auto-landing on the close X.
+    // the operator tabs into the content. Never a control: the first one can
+    // be a confirm's destructive button, which Enter would then fire.
     if (!node.contains(document.activeElement)) {
       node.setAttribute("tabindex", "-1");
       node.focus();
     }
 
+    // Bound on the document, not the dialog: focus can sit outside it (the
+    // page behind, after a click on the backdrop) and Tab must still come
+    // back in. Only the topmost dialog traps; a nested one is a separate
+    // portal, so the parent's trap steps aside while it is open.
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key !== "Tab") return;
+      if (e.key !== "Tab" || e.defaultPrevented || !trapStack.isTop(token)) {
+        return;
+      }
       const items = focusables();
       if (items.length === 0) {
         e.preventDefault();
@@ -124,24 +306,112 @@ export function useFocusTrap<T extends HTMLElement>() {
       const first = items[0];
       const last = items[items.length - 1];
       const active = document.activeElement;
+      // The container itself (where focus lands when nothing better exists)
+      // counts as "before the first control": Shift+Tab from it must wrap,
+      // not walk out to the page behind.
+      const outside = !active || !node.contains(active) || active === node;
       if (e.shiftKey) {
-        if (active === first || !node.contains(active)) {
+        if (active === first || outside) {
           e.preventDefault();
           last.focus();
         }
-      } else if (active === last || !node.contains(active)) {
+      } else if (active === last || outside) {
         e.preventDefault();
         first.focus();
       }
     };
-    node.addEventListener("keydown", onKeyDown);
+    document.addEventListener("keydown", onKeyDown);
     return () => {
-      node.removeEventListener("keydown", onKeyDown);
-      // Return focus to where it was before the modal opened (if still in DOM).
-      previouslyFocused?.focus?.();
+      document.removeEventListener("keydown", onKeyDown);
+      node.removeEventListener("focusin", onFocusIn);
+      observer.disconnect();
+      remove();
+      // A dialog still in the document is not closing: this is StrictMode's
+      // simulated unmount (dev), whose re-run would then find focus outside
+      // the dialog and take it off the autofocused field. A real close
+      // removes the node before passive cleanups run.
+      if (node.isConnected) return;
+      // Return focus to where it was before the modal opened. An opener
+      // that left the DOM (a menu item, unmounted with its menu) falls back
+      // to the menu's trigger; neither is focused once detached.
+      const target = returnTargets?.find(
+        (el) => el !== document.body && el.isConnected,
+      );
+      // A dialog's card is a target only as the place to land inside a dialog
+      // that is still open; it takes focus the way the trap gives it on open.
+      if (
+        target?.getAttribute("role") === "dialog" &&
+        !target.hasAttribute("tabindex")
+      ) {
+        target.setAttribute("tabindex", "-1");
+      }
+      // An opener already gone, or removed by the refetch that follows a
+      // delete, hands focus to a successor in the page, not the body (#3909).
+      returnFocus(target ? [target] : [], successorsRef.current);
     };
-  }, []);
+  }, [seq]);
   return ref;
+}
+
+/** Where focus goes back to when a dialog closes, best first. */
+type FocusReturnTargets = HTMLElement[];
+
+/** The return targets of each open dialog's card (see `useFocusTrap`). */
+const cardReturnTargets = new WeakMap<HTMLElement, FocusReturnTargets>();
+
+/** The focused element, plus — when it is an item in an ARIA menu — the
+ *  button that controls that menu. A dialog opened from a menu item outlives
+ *  the item (the menu closes as the dialog opens), so the trigger is the
+ *  operator's place in the page. Resolved now, while the menu is still open
+ *  and its trigger still carries ``aria-controls``. */
+function captureFocusReturnTargets(): FocusReturnTargets {
+  if (typeof document === "undefined") return [];
+  const active = document.activeElement as HTMLElement | null;
+  if (!active) return [];
+  const targets = [active];
+  // Focus is on a dialog's own card: this dialog replaces that one, so what
+  // that one would have returned to is where this one returns to as well.
+  const inherited = cardReturnTargets.get(active);
+  if (inherited) targets.push(...inherited);
+  const menu = active.closest<HTMLElement>('[role="menu"][id]');
+  if (menu) {
+    const trigger = Array.from(
+      document.querySelectorAll<HTMLElement>("[aria-controls]"),
+    ).find((el) =>
+      (el.getAttribute("aria-controls") ?? "").split(/\s+/).includes(menu.id),
+    );
+    if (trigger) targets.push(trigger);
+  }
+  // Focus is on a control inside a dialog (Enter in a form field submits it
+  // and the next dialog opens with focus still there, or a Tab moved it off
+  // the card). The control can leave before this dialog closes, two ways:
+  // - the enclosing dialog stays open and only the control goes (a row
+  //   removed by what this dialog did): focus belongs on that dialog's card,
+  //   never on its opener in the page behind it;
+  // - the enclosing dialog is replaced and the control goes with it: return
+  //   to what that dialog would have returned to (#3483).
+  // Both after the control itself and after a menu's trigger, so a dialog
+  // opened from a menu inside another dialog still lands on that trigger.
+  const card = active.closest<HTMLElement>('[role="dialog"]');
+  if (card && card !== active) {
+    targets.push(card);
+    const enclosing = cardReturnTargets.get(card);
+    if (enclosing) targets.push(...enclosing);
+  }
+  return targets;
+}
+
+/** Rendered and focusable: no `hidden` / `display:none` / `visibility:hidden`
+ *  between the element and the dialog. Computed style, not `offsetParent`,
+ *  so it holds for `position: fixed` content and under jsdom. */
+function isVisible(el: HTMLElement, root: HTMLElement): boolean {
+  for (let n: HTMLElement | null = el; n; n = n.parentElement) {
+    if (n.hidden) return false;
+    const cs = getComputedStyle(n);
+    if (cs.display === "none" || cs.visibility === "hidden") return false;
+    if (n === root) break;
+  }
+  return true;
 }
 
 /**

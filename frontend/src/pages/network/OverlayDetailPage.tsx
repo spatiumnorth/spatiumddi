@@ -15,6 +15,7 @@ import {
   applicationsApi,
   circuitsApi,
   customersApi,
+  formatApiError,
   ipamApi,
   networkApi,
   overlaysApi,
@@ -34,9 +35,12 @@ import {
   type SimulateResponse,
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
+import { apiErrorStatus, isRefused } from "@/lib/refusal";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -96,6 +100,22 @@ const TRANSPORT_CLASSES = [
   "express_route_azure",
   "interconnect_gcp",
 ];
+
+// #2518 — the router asks write (delete) on 'overlay_network' for every
+// site and policy route, as the overlay list does.
+function useOverlayGates() {
+  const perms = usePermissions();
+  return {
+    writeGate: permissionGate(
+      perms.can("write", "overlay_network"),
+      "Requires write permission on overlay networks",
+    ),
+    deleteGate: permissionGate(
+      perms.can("delete", "overlay_network"),
+      "Requires delete permission on overlay networks",
+    ),
+  };
+}
 
 // ── Tabs container ─────────────────────────────────────────────────
 
@@ -196,7 +216,21 @@ function OverviewTab({ overlay }: { overlay: OverlayRead }) {
     enabled: !!overlay.customer_id,
     queryKey: ["customer", overlay.customer_id],
     queryFn: () => customersApi.get(overlay.customer_id!),
+    // A 404 (customer in the Trash) or a 403 does not heal by asking again;
+    // anything else may be transient.
+    retry: (n, err) => apiErrorStatus(err) !== 404 && !isRefused(err) && n < 2,
   });
+  // A trashed customer answers 404 (#3192); only that is "in Trash". A
+  // refusal or any other failure says so instead of mislabelling it.
+  const customerLabel = customerQ.data?.name
+    ? customerQ.data.name
+    : !customerQ.isError
+      ? "Loading…"
+      : apiErrorStatus(customerQ.error) === 404
+        ? "(customer in Trash)"
+        : isRefused(customerQ.error)
+          ? "(no permission to see the customer)"
+          : "(couldn't load the customer)";
   return (
     <div className="space-y-4">
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
@@ -210,9 +244,7 @@ function OverviewTab({ overlay }: { overlay: OverlayRead }) {
           {overlay.encryption_profile ?? "—"}
         </Card>
         <Card label="Customer">
-          {overlay.customer_id
-            ? customerQ.data?.name || "Loading…"
-            : "Internal / unattributed"}
+          {overlay.customer_id ? customerLabel : "Internal / unattributed"}
         </Card>
         <Card label="Sites">{overlay.site_count}</Card>
         <Card label="Policies">{overlay.policy_count}</Card>
@@ -256,6 +288,7 @@ function Card({
 // polish pass.
 
 function TopologyTab({ overlayId }: { overlayId: string }) {
+  const { writeGate } = useOverlayGates();
   const topoQ = useQuery({
     queryKey: ["overlay-topology", overlayId],
     queryFn: () => overlaysApi.topology(overlayId),
@@ -281,8 +314,9 @@ function TopologyTab({ overlayId }: { overlayId: string }) {
   if (nodes.length === 0) {
     return (
       <div className="rounded-md border bg-muted/20 p-6 text-center text-sm text-muted-foreground">
-        No sites attached yet. Use the Sites tab to add hub / spoke / transit /
-        gateway sites with their preferred underlay circuits.
+        No sites attached yet.
+        {!writeGate.disabled &&
+          " Use the Sites tab to add hub / spoke / transit / gateway sites with their preferred underlay circuits."}
       </div>
     );
   }
@@ -422,6 +456,7 @@ function transportColor(transportClass: string): string {
 
 function SitesTab({ overlayId }: { overlayId: string }) {
   const qc = useQueryClient();
+  const { writeGate } = useOverlayGates();
   const sitesQ = useQuery({
     queryKey: ["overlay-sites", overlayId],
     queryFn: () => overlaysApi.listSites(overlayId),
@@ -446,6 +481,7 @@ function SitesTab({ overlayId }: { overlayId: string }) {
           variant="primary"
           icon={Plus}
           onClick={() => setShowAdd(true)}
+          {...writeGate}
         >
           Attach site
         </HeaderButton>
@@ -474,14 +510,31 @@ function SitesTab({ overlayId }: { overlayId: string }) {
       <ConfirmModal
         open={confirmDetachId !== null}
         title="Detach site"
-        message="Detach this site from the overlay?"
+        loading={detach.isPending}
+        message={
+          <>
+            Detach this site from the overlay?
+            {detach.isError && (
+              <span role="alert" className="mt-2 block text-destructive">
+                Could not detach the site:{" "}
+                {formatApiError(detach.error, "the request failed")}
+              </span>
+            )}
+          </>
+        }
         confirmLabel="Detach"
         tone="destructive"
         onConfirm={() => {
-          if (confirmDetachId) detach.mutate(confirmDetachId);
+          // Stays open on a refusal, so it never reads as having worked.
+          if (confirmDetachId)
+            detach.mutate(confirmDetachId, {
+              onSuccess: () => setConfirmDetachId(null),
+            });
+        }}
+        onClose={() => {
+          detach.reset();
           setConfirmDetachId(null);
         }}
-        onClose={() => setConfirmDetachId(null)}
       />
     </div>
   );
@@ -496,6 +549,7 @@ function SiteTable({
   onEdit: (r: OverlaySiteRead) => void;
   onDelete: (r: OverlaySiteRead) => void;
 }) {
+  const { writeGate, deleteGate } = useOverlayGates();
   const sitesQ = useQuery({
     queryKey: ["sites", "all"],
     queryFn: () => sitesApi.list({ limit: 500 }),
@@ -559,16 +613,20 @@ function SiteTable({
                 <button
                   type="button"
                   title="Edit"
+                  aria-label="Edit"
                   onClick={() => onEdit(r)}
-                  className="rounded p-1 hover:bg-muted"
+                  className="rounded p-1 hover:bg-muted disabled:opacity-30"
+                  {...writeGate}
                 >
                   <Pencil className="h-3.5 w-3.5" />
                 </button>
                 <button
                   type="button"
                   title="Detach"
+                  aria-label="Detach"
                   onClick={() => onDelete(r)}
-                  className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10"
+                  className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10 disabled:opacity-30"
+                  {...deleteGate}
                 >
                   <Trash2 className="h-3.5 w-3.5" />
                 </button>
@@ -685,11 +743,7 @@ function SiteEditorModal({
       onClose();
     },
     onError: (e: unknown) => {
-      const err = e as {
-        message?: string;
-        response?: { data?: { detail?: string } };
-      };
-      setError(err?.response?.data?.detail ?? err?.message ?? "Save failed");
+      setError(formatApiError(e, "Save failed"));
     },
   });
 
@@ -879,7 +933,9 @@ function SiteEditorModal({
         </div>
       </div>
 
-      {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
+      {error && (
+        <FormError className="mt-3 text-sm text-destructive">{error}</FormError>
+      )}
 
       <div className="mt-6 flex justify-end gap-2 border-t pt-3">
         <button
@@ -906,6 +962,7 @@ function SiteEditorModal({
 
 function PoliciesTab({ overlayId }: { overlayId: string }) {
   const qc = useQueryClient();
+  const { writeGate, deleteGate } = useOverlayGates();
   const policiesQ = useQuery({
     queryKey: ["overlay-policies", overlayId],
     queryFn: () => overlaysApi.listPolicies(overlayId),
@@ -923,6 +980,9 @@ function PoliciesTab({ overlayId }: { overlayId: string }) {
       qc.invalidateQueries({ queryKey: ["overlay-policies", overlayId] });
       qc.invalidateQueries({ queryKey: ["overlay", overlayId] });
     },
+    // A 404 means the policy is already gone: re-read so it leaves the list.
+    onError: () =>
+      qc.invalidateQueries({ queryKey: ["overlay-policies", overlayId] }),
   });
 
   // Reorder: compute the new priority by averaging neighbours so we
@@ -957,11 +1017,20 @@ function PoliciesTab({ overlayId }: { overlayId: string }) {
           variant="primary"
           icon={Plus}
           onClick={() => setShowAdd(true)}
+          {...writeGate}
         >
           New policy
         </HeaderButton>
       </div>
 
+      {(remove.isError || updatePriority.isError) && (
+        <p role="alert" className="text-sm text-destructive">
+          {formatApiError(
+            remove.error ?? updatePriority.error,
+            "Change failed",
+          )}
+        </p>
+      )}
       <div className="overflow-x-auto rounded-lg border">
         <table className="w-full text-sm">
           <thead className="bg-muted/40 text-xs uppercase tracking-wider text-muted-foreground">
@@ -1020,42 +1089,50 @@ function PoliciesTab({ overlayId }: { overlayId: string }) {
                   <button
                     type="button"
                     title="Move up"
+                    aria-label="Move up"
                     disabled={idx === 0 || updatePriority.isPending}
                     onClick={() => move(idx, -1)}
                     className="rounded p-1 hover:bg-muted disabled:opacity-30"
+                    {...writeGate}
                   >
                     <ArrowUp className="h-3.5 w-3.5" />
                   </button>
                   <button
                     type="button"
                     title="Move down"
+                    aria-label="Move down"
                     disabled={
                       idx === (policiesQ.data?.length ?? 0) - 1 ||
                       updatePriority.isPending
                     }
                     onClick={() => move(idx, 1)}
                     className="rounded p-1 hover:bg-muted disabled:opacity-30"
+                    {...writeGate}
                   >
                     <ArrowDown className="h-3.5 w-3.5" />
                   </button>
                   <button
                     type="button"
                     title="Edit"
+                    aria-label="Edit"
                     onClick={() => setEditing(p)}
-                    className="rounded p-1 hover:bg-muted"
+                    className="rounded p-1 hover:bg-muted disabled:opacity-30"
+                    {...writeGate}
                   >
                     <Pencil className="h-3.5 w-3.5" />
                   </button>
                   <button
                     type="button"
                     title="Delete"
+                    aria-label="Delete"
                     onClick={() => {
                       setConfirm({
                         name: p.name,
                         onConfirm: () => remove.mutate(p.id),
                       });
                     }}
-                    className="rounded p-1 text-destructive hover:bg-destructive/10"
+                    className="rounded p-1 text-destructive hover:bg-destructive/10 disabled:opacity-30"
+                    {...deleteGate}
                   >
                     <Trash2 className="h-3.5 w-3.5" />
                   </button>
@@ -1160,11 +1237,7 @@ function PolicyEditorModal({
       onClose();
     },
     onError: (e: unknown) => {
-      const err = e as {
-        message?: string;
-        response?: { data?: { detail?: string } };
-      };
-      setError(err?.response?.data?.detail ?? err?.message ?? "Save failed");
+      setError(formatApiError(e, "Save failed"));
     },
   });
 
@@ -1366,7 +1439,9 @@ function PolicyEditorModal({
         </div>
       </div>
 
-      {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
+      {error && (
+        <FormError className="mt-3 text-sm text-destructive">{error}</FormError>
+      )}
 
       <div className="mt-6 flex justify-end gap-2 border-t pt-3">
         <button
@@ -1392,6 +1467,9 @@ function PolicyEditorModal({
 // ── Simulate tab ───────────────────────────────────────────────────
 
 function SimulateTab({ overlayId }: { overlayId: string }) {
+  // #4118 — the route is write-scoped on 'overlay_network' even though it
+  // never writes, so the run button asks what the route asks.
+  const { writeGate } = useOverlayGates();
   const [downCircuits, setDownCircuits] = useState<Set<string>>(new Set());
   const [result, setResult] = useState<SimulateResponse | null>(null);
 
@@ -1458,8 +1536,10 @@ function SimulateTab({ overlayId }: { overlayId: string }) {
         </div>
         {candidates.length === 0 ? (
           <p className="px-3 py-6 text-center text-sm text-muted-foreground">
-            No circuits referenced by this overlay's sites yet — attach sites
-            with preferred circuits first.
+            No circuits referenced by this overlay's sites yet
+            {writeGate.disabled
+              ? "."
+              : " — attach sites with preferred circuits first."}
           </p>
         ) : (
           <ul className="divide-y">
@@ -1490,6 +1570,7 @@ function SimulateTab({ overlayId }: { overlayId: string }) {
           type="button"
           disabled={sim.isPending}
           onClick={() => sim.mutate()}
+          {...writeGate}
           className="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
         >
           {sim.isPending ? "Simulating…" : "Run simulation"}
@@ -1507,7 +1588,9 @@ function SimulateTab({ overlayId }: { overlayId: string }) {
           </button>
         )}
         {sim.isError && (
-          <p className="text-xs text-destructive">Simulation failed</p>
+          <FormError className="text-xs text-destructive">
+            {formatApiError(sim.error, "Simulation failed")}
+          </FormError>
         )}
       </div>
 

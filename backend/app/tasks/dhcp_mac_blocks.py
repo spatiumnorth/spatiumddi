@@ -24,17 +24,21 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.celery_app import celery_app
 from app.config import settings
+from app.db import task_connect_args
 from app.drivers.dhcp import is_agentless
 from app.drivers.dhcp.base import MACBlockDef
 from app.drivers.dhcp.registry import get_driver
 from app.models.dhcp import DHCPMACBlock, DHCPServer
 from app.services.feature_modules import is_module_enabled
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
 
 async def _run_sync() -> dict[str, Any]:
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
     try:
@@ -121,6 +125,7 @@ async def _run_sync() -> dict[str, Any]:
     retry_backoff=True,
     max_retries=2,
 )
+@module_gated("core.dhcp")
 def sync_dhcp_mac_blocks(self: Any) -> dict[str, Any]:  # noqa: ARG001
     """Beat-fired entrypoint. Runs the async reconciler under asyncio."""
     return asyncio.run(_run_sync())

@@ -13,6 +13,7 @@ command-line cap and hard-failing an entire chunk (#426).
 from __future__ import annotations
 
 import base64
+import unicodedata
 from typing import Any
 
 import structlog
@@ -41,6 +42,41 @@ class WinRMCommandTooLong(RuntimeError):
     Raised before dispatch so the caller can split the batch rather than
     let CMD.EXE truncate it into a cryptic parser error.
     """
+
+
+# Every character PowerShell's tokenizer treats as a single quote. A
+# single-quoted literal ends at any of them, and a quote is written inside
+# the literal by doubling the same character, so each must be doubled.
+_PS_SINGLE_QUOTES = "'\u2018\u2019\u201a\u201b"
+_PS_SINGLE_QUOTE_TABLE = {ord(c): c * 2 for c in _PS_SINGLE_QUOTES}
+
+
+def ps_single_quote_escape(value: str | None) -> str:
+    """Escape ``value`` for the inside of a PowerShell single-quoted literal.
+
+    The one definition of this rule: every driver, and the runbook text,
+    goes through it (a sweep test fails on a private copy).
+    """
+    return (value or "").translate(_PS_SINGLE_QUOTE_TABLE)
+
+
+def ps_single_quote(value: str | None) -> str:
+    """Return ``value`` as a complete PowerShell single-quoted literal."""
+    return "'" + ps_single_quote_escape(value) + "'"
+
+
+def ps_one_line(value: str | None) -> str:
+    """``value`` with every control or line-separator character replaced by a space.
+
+    For a value written OUTSIDE a literal, such as in a ``#`` comment, where a
+    line break would end the comment and start a statement, and for script text
+    an operator copies out of a Markdown code fence, where a line break could
+    close the fence. No host or zone name legitimately contains one of these
+    characters, so nothing correct is lost.
+    """
+    return "".join(
+        " " if unicodedata.category(c) in ("Cc", "Zl", "Zp") else c for c in (value or "")
+    )
 
 
 def encoded_command_len(script: str) -> int:
@@ -77,6 +113,46 @@ def validate_transport(value: str | None) -> str | None:
     if value not in SUPPORTED_TRANSPORTS:
         raise ValueError(f"transport must be one of {', '.join(SUPPORTED_TRANSPORTS)}")
     return value
+
+
+# The non-secret connection settings of a stored WinRM credential blob. The
+# server responses echo these (never ``username`` / ``password``) so an edit
+# dialog can show what is stored instead of a hard-coded default.
+WINRM_SETTING_KEYS: tuple[str, ...] = ("winrm_port", "transport", "use_tls", "verify_tls")
+
+
+def effective_winrm_settings(creds: dict[str, Any]) -> dict[str, Any]:
+    """The connection settings ``run_ps`` will actually use for ``creds``.
+
+    One reading for the session builder and the API echo, so what an edit
+    dialog shows is what the next WinRM call does — including for a blob
+    stored without one of the keys.
+    """
+    use_tls = bool(creds.get("use_tls", False))
+    return {
+        "winrm_port": int(creds.get("winrm_port") or (5986 if use_tls else 5985)),
+        "transport": creds.get("transport") or "ntlm",
+        "use_tls": use_tls,
+        "verify_tls": bool(creds.get("verify_tls", False)),
+    }
+
+
+def winrm_settings_diff(
+    before: dict[str, Any] | None, after: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
+    """``{key: {"old": …, "new": …}}`` for each effective setting that moved.
+
+    For the audit row: a credential update records the old and new value of
+    every non-secret setting it changed, not just the key names it carried.
+    ``before`` is None when nothing was stored.
+    """
+    new = effective_winrm_settings(after)
+    old = effective_winrm_settings(before) if before is not None else None
+    return {
+        k: {"old": old[k] if old is not None else None, "new": new[k]}
+        for k in WINRM_SETTING_KEYS
+        if old is None or old[k] != new[k]
+    }
 
 
 def _warn_insecure_transport(host: str, transport: str, use_tls: bool, verify_tls: bool) -> None:
@@ -131,14 +207,15 @@ def run_ps(
     # that only run agent-based drivers don't need the pywinrm wheel.
     import winrm  # noqa: PLC0415
 
-    transport = creds.get("transport") or "ntlm"
+    settings = effective_winrm_settings(creds)
+    transport = settings["transport"]
     if transport == "kerberos":
         # A server saved with Kerberos before #1128 — say why, instead of
         # letting pywinrm fail on the missing library.
         raise RuntimeError(KERBEROS_UNSUPPORTED + " Edit the server and pick another transport.")
-    use_tls = bool(creds.get("use_tls", False))
-    verify_tls = bool(creds.get("verify_tls", False))
-    port = int(creds.get("winrm_port") or (5986 if use_tls else 5985))
+    use_tls = settings["use_tls"]
+    verify_tls = settings["verify_tls"]
+    port = settings["winrm_port"]
     scheme = "https" if use_tls else "http"
     endpoint = f"{scheme}://{host}:{port}/wsman"
 

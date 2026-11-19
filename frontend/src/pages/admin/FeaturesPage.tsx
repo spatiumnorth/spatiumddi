@@ -16,7 +16,11 @@ import {
   CHANGE_REQUEST_QUERY_KEY,
   handleApprovalQueued,
 } from "@/lib/approvalQueue";
-import { usePermissions } from "@/hooks/usePermissions";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
 import { resolveEnabled } from "@/hooks/useFeatureModules";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { useSessionState } from "@/lib/useSessionState";
@@ -135,10 +139,10 @@ export function FeaturesPage() {
       qc.invalidateQueries({ queryKey: ["feature-modules"] });
       // The lock can flip on at enable-time (protect_controls) — re-read it.
       qc.invalidateQueries({ queryKey: ["approvals-lock"] });
-      // Settings page also reads PlatformSettings.integration_*_enabled
-      // (the toggle endpoint mirrors the value). Bust that cache too
-      // so any open Settings tab catches the change without a manual
-      // refresh.
+      // ``GET /settings`` reports each integration_*_enabled from its
+      // feature module (#2196), and the Dashboard reads it there. Bust
+      // that cache too so an open Dashboard catches the change without a
+      // manual refresh.
       qc.invalidateQueries({ queryKey: ["settings"] });
     },
     // Without this a refusal is silent. Disabling core.dns / core.dhcp 422s
@@ -473,7 +477,17 @@ export function FeaturesPage() {
                           <Toggle
                             label={`${m.enabled ? "Disable" : "Enable"} ${m.label}`}
                             checked={m.enabled && !isBlocked}
-                            disabled={toggleMutation.isPending || isBlocked}
+                            disabled={
+                              toggleMutation.isPending ||
+                              isBlocked ||
+                              // #1341 — turning a module on or off takes a
+                              // superadmin (PATCH /admin/feature-modules).
+                              !isSuperadmin
+                            }
+                            title={
+                              permissionGate(isSuperadmin, NEEDS_SUPERADMIN)
+                                .title
+                            }
                             onChange={(v) => handleToggle(m, v)}
                           />
                         </div>

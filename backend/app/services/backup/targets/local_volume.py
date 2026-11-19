@@ -51,10 +51,13 @@ from app.services.appliance.removable import REMOVABLE_ROOT
 from app.services.backup.targets.base import (
     ARCHIVE_NAME_RE,
     ArchiveListing,
+    ArchiveNotFoundError,
     BackupDestination,
     BackupDestinationError,
     ConfigFieldSpec,
     DestinationConfigError,
+    check_size,
+    read_capped,
     safe_filename,
 )
 
@@ -83,7 +86,11 @@ class LocalVolumeDestination(BackupDestination):
                 "scheduled runs and the api lists and restores them. The "
                 "Docker Compose file and the appliance mount "
                 "/var/lib/spatiumddi/backups that way; Test connection "
-                "warns when a path is not on a volume."
+                "warns when a path is not on a volume. On a multi-node "
+                "appliance the volume is per node: an archive stays on the "
+                "disk of the node that wrote it and can only be listed, "
+                "downloaded or restored through that node. Use S3, SCP, "
+                "SMB or NFS for a cluster."
             ),
         ),
         ConfigFieldSpec(
@@ -141,16 +148,28 @@ class LocalVolumeDestination(BackupDestination):
         # thread would put those lstats on the shared api event loop.
         def _do() -> None:
             root = self._path(config)
+            target = root / safe_filename(filename)
+            tmp = target.with_suffix(target.suffix + ".tmp")
             try:
                 root.mkdir(parents=True, exist_ok=True)
-                target = root / safe_filename(filename)
-                tmp = target.with_suffix(target.suffix + ".tmp")
                 tmp.write_bytes(archive_bytes)
                 # Atomic rename so partial writes are never visible to
                 # the listing pass — important for the retention sweep
                 # which keys on filename + size.
                 os.replace(tmp, target)
             except OSError as exc:
+                # Best-effort cleanup of the staged file (#1570),
+                # mirroring the NFS driver: listing and retention only
+                # match ``*.zip``, so a leftover ``.tmp`` is invisible
+                # and is never pruned.
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError as cleanup_exc:
+                    logger.warning(
+                        "backup_local_volume_partial_cleanup_failed",
+                        path=str(tmp),
+                        error=str(cleanup_exc),
+                    )
                 # Translated, not propagated. ``run_backup_for_target``
                 # commits ``last_run_status="in_progress"`` BEFORE the
                 # write and catches only the BackupDestination/Archive
@@ -194,24 +213,54 @@ class LocalVolumeDestination(BackupDestination):
                         filename=entry.name,
                         size_bytes=stat.st_size,
                         created_at=datetime.fromtimestamp(stat.st_mtime, UTC),
+                        node_name=_this_node() or None,
                     )
                 )
             rows.sort(key=lambda r: r.created_at, reverse=True)
             return rows
 
-        return await asyncio.to_thread(_do)
+        try:
+            return await asyncio.to_thread(_do)
+        except OSError as exc:
+            # Translated at the driver boundary (#1515), like write:
+            # a bare OSError escaping the runner left the target
+            # stranded ``in_progress``.
+            raise BackupDestinationError(
+                f"could not list archives at {config['path']}: {exc}"
+            ) from exc
 
-    async def download(self, *, config: dict[str, Any], filename: str) -> bytes:
+    async def download(
+        self, *, config: dict[str, Any], filename: str, max_bytes: int | None = None
+    ) -> bytes:
         safe = safe_filename(filename)
 
         def _do() -> bytes:
             root = self._path(config)
             target = root / safe
-            if not target.is_file():
-                raise BackupDestinationError(f"archive {safe!r} not found at {root}")
-            return target.read_bytes()
+            # Refuse symlinks, matching ``list_archives`` (#1573):
+            # ``is_file`` / ``read_bytes`` follow links, so a symlink
+            # named like an archive was invisible in the listing but
+            # served here — escaping the configured root the listing
+            # deliberately never leaves.
+            if target.is_symlink() or not target.is_file():
+                # The api appends where the archive probably is on a
+                # multi-node appliance (#1838, services.backup.node_local);
+                # the driver has no database to tell one node from three.
+                raise ArchiveNotFoundError(f"archive {safe!r} not found at {root}")
+            # The size is known before a byte is read, so an archive past
+            # the cap is refused without reading it.
+            check_size(safe, target.stat().st_size, max_bytes)
+            with target.open("rb") as fh:
+                # Capped read as well: the file can grow between the stat
+                # and the read.
+                return read_capped(fh.read, filename=safe, max_bytes=max_bytes)
 
-        return await asyncio.to_thread(_do)
+        try:
+            return await asyncio.to_thread(_do)
+        except OSError as exc:
+            raise BackupDestinationError(
+                f"could not read {safe!r} from {config['path']}: {exc}"
+            ) from exc
 
     async def delete(self, *, config: dict[str, Any], filename: str) -> None:
         safe = safe_filename(filename)
@@ -227,7 +276,13 @@ class LocalVolumeDestination(BackupDestination):
                     path=str(target),
                     error=str(exc),
                 )
-                raise
+                # Translated, not re-raised bare (#1515): delete runs
+                # in the retention sweep AFTER the archive was
+                # written, so a bare OSError escaped the runner
+                # before the success stamp — the run that just
+                # succeeded was recorded as neither success nor
+                # failure and the target stranded ``in_progress``.
+                raise BackupDestinationError(f"could not delete {safe!r} at {root}: {exc}") from exc
 
         await asyncio.to_thread(_do)
 
@@ -271,6 +326,11 @@ class LocalVolumeDestination(BackupDestination):
         if warning:
             outcome["warning"] = warning
         return outcome
+
+
+def _this_node() -> str:
+    """The k8s node this pod runs on; empty off the appliance."""
+    return os.environ.get("NODE_NAME", "").strip()
 
 
 def _not_on_a_volume_warning(root: Path) -> str | None:

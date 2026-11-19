@@ -50,6 +50,7 @@ from app.models.acme_client import (
     ACME_ORDER_INVALID,
     ACME_ORDER_PENDING,
     ACME_ORDER_PROCESSING,
+    ACME_ORDER_VALID,
     ACMEClientAccount,
     ACMEOrder,
 )
@@ -713,7 +714,13 @@ async def test_run_order_idempotent_on_already_valid(db_session: AsyncSession) -
 # ── (d) Phase 3 preview ─────────────────────────────────────────────
 
 
-async def _seed_managed_zone(db: AsyncSession, zone_name: str, *, driver: str = "bind9") -> None:
+async def _seed_managed_zone(
+    db: AsyncSession,
+    zone_name: str,
+    *,
+    driver: str = "bind9",
+    group_type: str = "internal",
+) -> None:
     """Seed a minimal managed primary zone (group + zone + primary server)
     that covers ``zone_name`` so ``resolve_managed`` reports ``managed=True``.
 
@@ -722,7 +729,7 @@ async def _seed_managed_zone(db: AsyncSession, zone_name: str, *, driver: str = 
     """
     from app.models.dns import DNSServer, DNSServerGroup, DNSZone
 
-    group = DNSServerGroup(name=f"grp-{uuid.uuid4().hex[:6]}")
+    group = DNSServerGroup(name=f"grp-{uuid.uuid4().hex[:6]}", group_type=group_type)
     db.add(group)
     await db.flush()
     db.add(
@@ -796,6 +803,113 @@ async def test_preview_managed_domain_reports_zone_and_driver(
     # Relative label inside the zone (challenge FQDN minus the zone suffix).
     assert row["record_name"] == "_acme-challenge.www"
     assert row["driver"] == "powerdns"
+
+
+async def _preview(client: AsyncClient, token: str, domains: list[str]) -> dict[str, dict]:
+    r = await client.post(
+        "/api/v1/appliance/acme/preview",
+        json={"domains": domains},
+        headers=_hdr(token),
+    )
+    assert r.status_code == 200, r.text
+    return {row["domain"]: row for row in r.json()}
+
+
+@pytest.mark.asyncio
+async def test_preview_public_parent_beats_internal_subzone(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Split horizon (#1454): ``example.com`` is public (external group,
+    Cloudflare), ``home.example.com`` exists only internally. The challenge
+    for a name under the internal subzone must go into the public parent,
+    because that is the only zone a public CA can query; the preview says
+    which internal zone was skipped."""
+    _, token = await _superadmin(db_session)
+    await _seed_managed_zone(db_session, "example.com.", driver="cloudflare", group_type="external")
+    await _seed_managed_zone(db_session, "home.example.com.", driver="technitium")
+    await db_session.commit()
+
+    rows = await _preview(client, token, ["*.home.example.com", "ddi.home.example.com"])
+
+    wild = rows["*.home.example.com"]
+    assert wild["managed"] is True
+    assert wild["zone_name"] == "example.com."
+    assert wild["driver"] == "cloudflare"
+    assert wild["challenge_fqdn"] == "_acme-challenge.home.example.com"
+    assert wild["record_name"] == "_acme-challenge.home"
+    assert "home.example.com." in wild["note"]
+
+    host = rows["ddi.home.example.com"]
+    assert host["zone_name"] == "example.com."
+    assert host["record_name"] == "_acme-challenge.ddi.home"
+    assert host["note"] is not None
+
+
+@pytest.mark.asyncio
+async def test_preview_internal_zone_still_used_when_no_public_zone_covers(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Nothing public covers the name → the most specific internal zone
+    still takes it (a private ACME CA resolving internally keeps working),
+    and there is nothing to note."""
+    _, token = await _superadmin(db_session)
+    await _seed_managed_zone(db_session, "example.com.", driver="bind9")
+    await _seed_managed_zone(db_session, "home.example.com.", driver="technitium")
+    await _seed_managed_zone(db_session, "example.net.", driver="cloudflare", group_type="external")
+    await db_session.commit()
+
+    row = (await _preview(client, token, ["www.home.example.com"]))["www.home.example.com"]
+    assert row["managed"] is True
+    assert row["zone_name"] == "home.example.com."
+    assert row["record_name"] == "_acme-challenge.www"
+    assert row["driver"] == "technitium"
+    assert row["note"] is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_zone_cloud_driver_counts_as_public(db_session: AsyncSession) -> None:
+    """A group left at the default ``internal`` type but served by a cloud
+    DNS driver is public too, and on a same-name tie the public zone wins.
+    Exercised on ``_resolve_zone`` directly, which is what ``solve()``
+    writes the TXT through."""
+    from app.services.acme_client import dns01
+
+    await _seed_managed_zone(db_session, "example.com.", driver="route53")
+    await _seed_managed_zone(db_session, "home.example.com.", driver="bind9")
+    await _seed_managed_zone(db_session, "example.org.", driver="bind9")
+    await _seed_managed_zone(db_session, "example.org.", driver="cloudflare", group_type="external")
+    await db_session.commit()
+
+    res = await dns01._resolve_zone(db_session, "_acme-challenge.www.home.example.com")
+    assert res is not None
+    assert res.zone.name == "example.com."
+    assert res.public is True
+    assert res.relative == "_acme-challenge.www.home"
+    assert res.skipped_internal is not None
+    assert res.skipped_internal.name == "home.example.com."
+
+    res = await dns01._resolve_zone(db_session, "_acme-challenge.example.org")
+    assert res is not None
+    assert res.public is True
+    assert res.relative == "_acme-challenge"
+    assert res.skipped_internal is not None
+    assert res.skipped_internal.group_id != res.zone.group_id
+
+
+@pytest.mark.asyncio
+async def test_preview_wildcard_uses_base_name_for_challenge(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """``*.example.com`` is validated at ``_acme-challenge.example.com``
+    (RFC 8555 §7.1.3), not ``_acme-challenge.*.example.com``."""
+    _, token = await _superadmin(db_session)
+    await _seed_managed_zone(db_session, "example.com.", driver="powerdns")
+    await db_session.commit()
+
+    row = (await _preview(client, token, ["*.example.com"]))["*.example.com"]
+    assert row["challenge_fqdn"] == "_acme-challenge.example.com"
+    assert row["zone_name"] == "example.com."
+    assert row["record_name"] == "_acme-challenge"
 
 
 # ── (e) Phase 3 manual + Phase 4 http-01 issue ──────────────────────
@@ -1062,3 +1176,536 @@ async def test_secret_expiring_covers_letsencrypt_web_cert(
     ids = {sid for sid, _disp, _msg, _sev in subjects}
     assert f"appliance_cert_tls:{near.id}" in ids
     assert f"appliance_cert_tls:{far.id}" not in ids
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("appliance_mode", [True, False])
+async def test_secret_expiring_le_message_names_where_the_cert_is_managed(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    appliance_mode: bool,
+) -> None:
+    """#3045 — the alert sends the operator to the Web UI Certificate entry
+    under Appliance → Fleet (there is no Appliance tab of that name), and only
+    on an appliance-hosted control plane, the one place Fleet shows it."""
+    from datetime import UTC, datetime
+
+    from app.config import settings
+    from app.models.alerts import AlertRule
+    from app.services.alerts import _matching_secret_expiring_subjects
+
+    monkeypatch.setattr(settings, "appliance_mode", appliance_mode)
+    now = datetime.now(UTC)
+    rule = AlertRule(
+        name="Secret expiry",
+        rule_type="secret_expiring",
+        severity="warning",
+        threshold_days=30,
+        enabled=True,
+    )
+    db_session.add(rule)
+    near = await _seed_le_cert(db_session, days_to_expiry=5, sans=["ui.example.com"])
+    await db_session.commit()
+
+    subjects = await _matching_secret_expiring_subjects(db_session, rule, now)
+    messages = [m for sid, _d, m, _s in subjects if sid == f"appliance_cert_tls:{near.id}"]
+    assert len(messages) == 1
+    if appliance_mode:
+        assert "check Appliance → Fleet → Web UI Certificate." in messages[0]
+    else:
+        assert "Web UI Certificate" not in messages[0]
+        assert "POST /api/v1/appliance/acme/issue" in messages[0]
+
+
+# ── (i) Manual DNS-01 propagation check queries authoritative NS ─────
+
+
+@pytest.mark.asyncio
+async def test_poll_public_txt_requires_every_authoritative_ns() -> None:
+    """#1532 — the manual-fallback propagation gate requires the TXT on
+    EVERY authoritative nameserver, queried directly — not on the
+    worker's own resolver, which can serve the record (split-horizon /
+    cache) while the servers the CA queries don't have it yet."""
+    from unittest.mock import AsyncMock
+
+    from app.services.acme_client import dns01
+
+    fqdn = "_acme-challenge.www.example.com"
+
+    async def _ips(host: str) -> list[str]:
+        return {"ns1.example.com": ["192.0.2.1"], "ns2.example.com": ["192.0.2.2"]}[host]
+
+    async def _txt_complete(ip: str, name: str) -> set[str]:
+        return {"expected-token"}
+
+    with (
+        patch.object(
+            dns01,
+            "_authoritative_ns_hosts",
+            new=AsyncMock(return_value=["ns1.example.com", "ns2.example.com"]),
+        ),
+        patch.object(dns01, "_ns_host_ips", new=_ips),
+        patch.object(dns01, "_txt_values_at", new=AsyncMock(side_effect=_txt_complete)) as txt_at,
+    ):
+        assert await dns01.poll_public_txt(fqdn, "expected-token", timeout=5, interval=0) is True
+    # Both authoritative servers were asked directly.
+    assert {c.args[0] for c in txt_at.call_args_list} == {"192.0.2.1", "192.0.2.2"}
+
+    async def _txt_missing_on_one(ip: str, name: str) -> set[str]:
+        return {"expected-token"} if ip == "192.0.2.1" else set()
+
+    with (
+        patch.object(
+            dns01,
+            "_authoritative_ns_hosts",
+            new=AsyncMock(return_value=["ns1.example.com", "ns2.example.com"]),
+        ),
+        patch.object(dns01, "_ns_host_ips", new=_ips),
+        patch.object(dns01, "_txt_values_at", new=_txt_missing_on_one),
+    ):
+        # One authoritative server lacks the record → keep waiting
+        # (here: until the short timeout) instead of signalling ready.
+        assert (
+            await dns01.poll_public_txt(fqdn, "expected-token", timeout=0.2, interval=0.01) is False
+        )
+
+
+@pytest.mark.asyncio
+async def test_authoritative_ns_hosts_walks_up_to_the_zone() -> None:
+    """#1532 — the NS set is found by walking up from the challenge FQDN
+    to the first level that answers NS (the zone apex)."""
+    from types import SimpleNamespace
+
+    from app.services.acme_client import dns01
+
+    class _FakeResolver:
+        lifetime: float = 0.0
+
+        async def resolve(self, name: str, rdtype: str):  # noqa: ANN202
+            assert rdtype == "NS"
+            if name == "example.com":
+                return [
+                    SimpleNamespace(target="ns1.example.com."),
+                    SimpleNamespace(target="ns2.example.com."),
+                ]
+            raise RuntimeError("no NS here")
+
+    with patch("dns.asyncresolver.Resolver", _FakeResolver):
+        hosts = await dns01._authoritative_ns_hosts("_acme-challenge.www.example.com")
+    assert hosts == ["ns1.example.com", "ns2.example.com"]
+
+
+# ── (j) #1529: renewal reuses the per-cert issuance shape ───────────
+
+
+@pytest.mark.asyncio
+async def test_issue_does_not_write_settings_shape(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#1529 — ``POST /issue`` must NOT record the issuance shape on
+    ``platform_settings`` at order creation: a later (even failed) issue
+    attempt for different domains used to retarget what the active cert
+    would be renewed for. The shape is written only on order success."""
+    _, token = await _superadmin(db_session)
+    await _seed_account(db_session)
+    await _enable_acme(db_session)
+    settings = await db_session.get(PlatformSettings, 1)
+    assert settings is not None
+    settings.acme_challenge_type = "dns-01"
+    settings.acme_domains = ["keep.example.com"]
+    await db_session.commit()
+
+    with patch("app.tasks.acme.run_acme_order.delay"):
+        r = await client.post(
+            "/api/v1/appliance/acme/issue",
+            json={"domains": ["new.example.com"], "challenge_type": "http-01"},
+            headers=_hdr(token),
+        )
+    assert r.status_code == 201, r.text
+
+    db_session.expire_all()
+    settings = await db_session.get(PlatformSettings, 1)
+    assert settings is not None
+    assert settings.acme_challenge_type == "dns-01"
+    assert settings.acme_domains == ["keep.example.com"]
+
+
+@pytest.mark.asyncio
+async def test_record_issuance_shape_copies_successful_order(
+    db_session: AsyncSession,
+) -> None:
+    """#1529 — on success the orchestrator copies the order's shape onto
+    settings, so they describe the last order that actually produced a
+    cert (the sweep's legacy fallback)."""
+    account = await _seed_account(db_session)
+    await _enable_acme(db_session)
+    order = ACMEOrder(
+        account_id=account.id,
+        domains=["app.example.com"],
+        challenge_type="http-01",
+        dns_provider=None,
+        status=ACME_ORDER_VALID,
+    )
+    db_session.add(order)
+    await db_session.commit()
+
+    await orchestrator._record_issuance_shape(db_session, order)
+    # ``_record_issuance_shape`` runs inside ``execute_order``'s unit of
+    # work; the caller commits. Commit here too, or ``expire_all``
+    # below discards the unflushed change and reloads the old row.
+    await db_session.commit()
+
+    db_session.expire_all()
+    settings = await db_session.get(PlatformSettings, 1)
+    assert settings is not None
+    assert settings.acme_challenge_type == "http-01"
+    assert settings.acme_domains == ["app.example.com"]
+
+
+async def _seed_shape(db_session: AsyncSession) -> None:
+    """Common renewal-shape seed: enabled settings + account, with the
+    global ``acme_domains`` emptied so a renewal can ONLY come from the
+    per-cert order shape (proving the sweep no longer uses the global)."""
+    settings = await db_session.get(PlatformSettings, 1)
+    if settings is None:
+        settings = PlatformSettings(id=1)
+        db_session.add(settings)
+    settings.acme_enabled = True
+    settings.acme_auto_renew = True
+    settings.acme_domains = []
+    await _seed_account(db_session)
+
+
+async def _valid_order_for(
+    db_session: AsyncSession, cert, **kwargs
+) -> ACMEOrder:  # noqa: ANN001, ANN202
+    account = (
+        await db_session.execute(
+            select(ACMEClientAccount).order_by(ACMEClientAccount.created_at.desc()).limit(1)
+        )
+    ).scalar_one()
+    order = ACMEOrder(
+        account_id=account.id,
+        status=ACME_ORDER_VALID,
+        certificate_id=cert.id,
+        **kwargs,
+    )
+    db_session.add(order)
+    await db_session.flush()
+    return order
+
+
+@pytest.mark.asyncio
+async def test_renew_reuses_http01_issuance_shape(db_session: AsyncSession) -> None:
+    """#1529 — a cert issued over http-01 renews as http-01 with the
+    successful order's domains — not as managed-zone dns-01 with the
+    global domain list (the old behaviour, under which it never
+    renewed at all)."""
+    from app.tasks import acme as acme_tasks
+
+    await _seed_shape(db_session)
+    cert = await _seed_le_cert(db_session, days_to_expiry=10, sans=["old.example.com"])
+    await _valid_order_for(
+        db_session,
+        cert,
+        domains=["app.example.com"],
+        challenge_type="http-01",
+        allow_manual=False,
+    )
+    await db_session.commit()
+
+    with patch.object(acme_tasks.run_acme_order, "delay") as delay:
+        result = await acme_tasks._renew()
+    assert result == "renewed=1", result
+    delay.assert_called_once()
+
+    db_session.expire_all()
+    orders = (
+        (await db_session.execute(select(ACMEOrder).where(ACMEOrder.status == ACME_ORDER_PENDING)))
+        .scalars()
+        .all()
+    )
+    assert len(orders) == 1
+    assert orders[0].challenge_type == "http-01"
+    assert orders[0].domains == ["app.example.com"]
+
+
+@pytest.mark.asyncio
+async def test_renew_manual_dns01_skips_and_alerts(db_session: AsyncSession) -> None:
+    """#1529 — a cert issued with manual DNS-01 for an unmanaged domain
+    cannot renew unattended: the sweep creates NO order, opens ONE
+    deduped ``acme-manual-renewal`` alert event, and reports the skip."""
+    from app.models.alerts import AlertEvent, AlertRule
+    from app.tasks import acme as acme_tasks
+
+    await _seed_shape(db_session)
+    db_session.add(
+        AlertRule(
+            name="acme-manual-renewal",
+            rule_type="acme_manual_renewal",
+            severity="warning",
+            enabled=True,
+        )
+    )
+    cert = await _seed_le_cert(db_session, days_to_expiry=10, sans=["manual.example.org"])
+    await _valid_order_for(
+        db_session,
+        cert,
+        domains=["manual.example.org"],
+        challenge_type="dns-01",
+        allow_manual=True,
+    )
+    await db_session.commit()
+    # Capture the id before expire_all() below: accessing cert.id
+    # afterwards would lazy-load an expired attribute outside a
+    # greenlet (MissingGreenlet).
+    cert_id = cert.id
+
+    with patch.object(acme_tasks.run_acme_order, "delay") as delay:
+        result = await acme_tasks._renew()
+        assert result == "renewed=0 skipped_manual=1", result
+        delay.assert_not_called()
+        # Second sweep: still skipped, still exactly one open event.
+        result2 = await acme_tasks._renew()
+        assert result2 == "renewed=0 skipped_manual=1", result2
+
+    db_session.expire_all()
+    pending = (
+        (await db_session.execute(select(ACMEOrder).where(ACMEOrder.status == ACME_ORDER_PENDING)))
+        .scalars()
+        .all()
+    )
+    assert pending == []
+    events = (
+        (await db_session.execute(select(AlertEvent).where(AlertEvent.subject_id == str(cert_id))))
+        .scalars()
+        .all()
+    )
+    assert len(events) == 1
+    assert events[0].resolved_at is None
+    assert "manual DNS-01" in events[0].message
+
+
+@pytest.mark.asyncio
+async def test_renew_manual_dns01_renews_when_now_managed(
+    db_session: AsyncSession,
+) -> None:
+    """#1529 — a manual-fallback order whose domains are ALL covered by
+    a managed zone today renews unattended as plain dns-01 (no manual
+    step is actually needed)."""
+    from app.tasks import acme as acme_tasks
+
+    await _seed_shape(db_session)
+    await _seed_managed_zone(db_session, "example.org.")
+    cert = await _seed_le_cert(db_session, days_to_expiry=10, sans=["www.example.org"])
+    await _valid_order_for(
+        db_session,
+        cert,
+        domains=["www.example.org"],
+        challenge_type="dns-01",
+        allow_manual=True,
+    )
+    await db_session.commit()
+
+    with patch.object(acme_tasks.run_acme_order, "delay") as delay:
+        result = await acme_tasks._renew()
+    assert result == "renewed=1", result
+    delay.assert_called_once()
+
+    db_session.expire_all()
+    orders = (
+        (await db_session.execute(select(ACMEOrder).where(ACMEOrder.status == ACME_ORDER_PENDING)))
+        .scalars()
+        .all()
+    )
+    assert len(orders) == 1
+    assert orders[0].challenge_type == "dns-01"
+    assert orders[0].allow_manual is False
+
+
+# ── #3061: DoT / DoH certs renew in place ───────────────────────────
+
+
+def _self_signed_chain(cn: str) -> tuple[str, str]:
+    """A real PEM cert + key, so ``_store_certificate`` can parse it."""
+    from datetime import UTC, datetime, timedelta
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+    now = datetime.now(UTC)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + timedelta(days=90))
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName(cn)]), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+    key_pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode()
+    return cert.public_bytes(serialization.Encoding.PEM).decode(), key_pem
+
+
+async def _dot_group_on(db: AsyncSession, cert) -> uuid.UUID:  # noqa: ANN001
+    from app.models.dns import DNSServerGroup, DNSServerOptions
+
+    group = DNSServerGroup(name=f"g-{uuid.uuid4().hex[:6]}")
+    db.add(group)
+    await db.flush()
+    db.add(DNSServerOptions(group_id=group.id, dot_enabled=True, tls_certificate_id=cert.id))
+    await db.flush()
+    return group.id
+
+
+@pytest.mark.asyncio
+async def test_renew_includes_an_inactive_cert_a_dot_listener_serves(
+    db_session: AsyncSession,
+) -> None:
+    """A second ACME issue deactivates the first, and off an appliance nothing
+    else ever re-activates it — so keying the sweep on ``is_active`` alone let
+    every DoT cert but the newest expire. The renewal order also names the cert
+    it renews, which is what makes the orchestrator rewrite it in place."""
+    from app.tasks import acme as acme_tasks
+
+    await _seed_shape(db_session)
+    cert = await _seed_le_cert(db_session, days_to_expiry=10, sans=["dot.example.com"])
+    cert.is_active = False
+    await _dot_group_on(db_session, cert)
+    # An inactive LE cert nothing serves stays out of the sweep.
+    idle = await _seed_le_cert(db_session, days_to_expiry=10, sans=["idle.example.com"])
+    idle.is_active = False
+    cert_id = cert.id
+    await db_session.commit()
+
+    with patch.object(acme_tasks.run_acme_order, "delay") as delay:
+        result = await acme_tasks._renew()
+    assert result == "renewed=1", result
+    delay.assert_called_once()
+
+    db_session.expire_all()
+    orders = (
+        (await db_session.execute(select(ACMEOrder).where(ACMEOrder.status == ACME_ORDER_PENDING)))
+        .scalars()
+        .all()
+    )
+    assert len(orders) == 1
+    assert orders[0].domains == ["dot.example.com"]
+    assert orders[0].certificate_id == cert_id
+
+
+@pytest.mark.asyncio
+async def test_renewal_rewrites_the_dot_cert_in_place_and_keeps_activation(
+    db_session: AsyncSession,
+) -> None:
+    """Renewal used to land in a NEW row and make it the sole active cert, so
+    the DNS group kept pointing at the old row until it expired, and on an
+    appliance a DoT-only cert took over the Web UI. Now the renewed chain
+    lands in the row the group already names, and activation is untouched."""
+    from app.models.appliance import ApplianceCertificate
+    from app.models.dns import DNSServerOptions
+
+    await _seed_shape(db_session)
+    web = await _seed_le_cert(db_session, days_to_expiry=60, sans=["ui.example.com"])
+    dot = await _seed_le_cert(db_session, days_to_expiry=10, sans=["dot.example.com"])
+    dot.is_active = False
+    web.is_active = True
+    group_id = await _dot_group_on(db_session, dot)
+    dot_id, web_id = dot.id, web.id
+    account = (await db_session.execute(select(ACMEClientAccount).limit(1))).scalar_one()
+    order = ACMEOrder(
+        account_id=account.id,
+        domains=["dot.example.com"],
+        challenge_type="dns-01",
+        status=ACME_ORDER_PENDING,
+        certificate_id=dot_id,
+    )
+    db_session.add(order)
+    await db_session.flush()
+
+    chain_pem, key_pem = _self_signed_chain("dot.example.com")
+    row = await orchestrator._store_certificate(db_session, order, chain_pem, key_pem)
+
+    assert row.id == dot_id
+    db_session.expire_all()
+    renewed = await db_session.get(ApplianceCertificate, dot_id)
+    assert renewed is not None
+    assert renewed.cert_pem == chain_pem
+    assert renewed.is_active is False
+    still_web = await db_session.get(ApplianceCertificate, web_id)
+    assert still_web is not None and still_web.is_active is True
+    opts = (
+        await db_session.execute(
+            select(DNSServerOptions).where(DNSServerOptions.group_id == group_id)
+        )
+    ).scalar_one()
+    assert opts.tls_certificate_id == dot_id
+    count = len(
+        (
+            await db_session.execute(
+                select(ApplianceCertificate).where(ApplianceCertificate.name.like("letsencrypt-%"))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert count == 0  # no new ``letsencrypt-<order>`` row was minted
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_issue_still_becomes_the_sole_active_cert(
+    db_session: AsyncSession,
+) -> None:
+    """The fresh-issue path is unchanged: no ``certificate_id`` on the order,
+    so a new row lands and becomes the active cert."""
+    from app.models.appliance import ApplianceCertificate
+
+    await _seed_shape(db_session)
+    old = await _seed_le_cert(db_session, days_to_expiry=60, sans=["ui.example.com"])
+    old_id = old.id
+    account = (await db_session.execute(select(ACMEClientAccount).limit(1))).scalar_one()
+    order = ACMEOrder(
+        account_id=account.id,
+        domains=["new.example.com"],
+        challenge_type="dns-01",
+        status=ACME_ORDER_PENDING,
+    )
+    db_session.add(order)
+    await db_session.flush()
+
+    chain_pem, key_pem = _self_signed_chain("new.example.com")
+    row = await orchestrator._store_certificate(db_session, order, chain_pem, key_pem)
+
+    assert row.id != old_id
+    assert row.is_active is True
+    db_session.expire_all()
+    previous = await db_session.get(ApplianceCertificate, old_id)
+    assert previous is not None and previous.is_active is False
+
+
+def test_nginx_proxies_acme_challenge_in_both_templates() -> None:
+    """#3061 — the certificate store's UI offers http-01 on every install
+    type, so both shipped templates must route the challenge to the api;
+    without a location it falls through to the SPA and the CA reads
+    index.html. Skipped when the repo root is absent (the api image carries
+    only ``backend/``), as ``test_nginx_proxies_held_in_both_templates``."""
+    import pathlib as _p
+
+    root = _p.Path(__file__).resolve().parents[2]
+    templates = [
+        root / "frontend" / "default.conf.template",
+        root / "charts" / "spatiumddi" / "templates" / "frontend-tls-config.yaml",
+    ]
+    if not all(t.is_file() for t in templates):
+        pytest.skip("nginx templates are outside the api image; run from a checkout")
+    for t in templates:
+        assert "location /.well-known/acme-challenge/" in t.read_text(), str(t)

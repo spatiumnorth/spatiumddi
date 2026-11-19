@@ -1,3 +1,4 @@
+import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Building2, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
@@ -18,7 +19,8 @@ import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { Pager } from "@/components/ui/pager";
 import { IPAddressPicker } from "@/components/IPAddressPicker";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
-import { usePermissions } from "@/hooks/usePermissions";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 // BACnet/IP device registry (issue #541, part of #543). Documentation
 // only — nothing on this page reads or writes a device object; rows come
@@ -126,6 +128,7 @@ export function BACnetDevicesPage() {
       qc.invalidateQueries({ queryKey: ["bacnet-bbmds"] });
       setDel(null);
     },
+    onError: () => qc.invalidateQueries({ queryKey: ["bacnet-devices"] }),
   });
 
   return (
@@ -137,8 +140,17 @@ export function BACnetDevicesPage() {
               <Building2 className="h-5 w-5 text-muted-foreground" />
               <h1 className="text-lg font-semibold">BACnet/IP devices</h1>
               <span className="text-xs text-muted-foreground">
-                {total} device{total === 1 ? "" : "s"} · {bbmds.length} BBMD
-                {bbmds.length === 1 ? "" : "s"}
+                {devicesQ.error ? (
+                  <ListReadError error={devicesQ.error} what="BACnet devices" />
+                ) : (
+                  `${total} device${total === 1 ? "" : "s"}`
+                )}{" "}
+                ·{" "}
+                {bbmdsQ.error ? (
+                  <ListReadError error={bbmdsQ.error} what="BBMDs" />
+                ) : (
+                  `${bbmds.length} BBMD${bbmds.length === 1 ? "" : "s"}`
+                )}
               </span>
             </div>
             <p className="mt-1 max-w-3xl text-xs text-muted-foreground">
@@ -168,9 +180,10 @@ export function BACnetDevicesPage() {
               icon={Plus}
               disabled={!canWrite}
               title={
-                canWrite
-                  ? undefined
-                  : "Requires write permission on BACnet devices"
+                permissionGate(
+                  canWrite,
+                  "Requires write permission on BACnet devices",
+                ).title
               }
               onClick={() => setModal({ mode: "create" })}
             >
@@ -245,9 +258,29 @@ export function BACnetDevicesPage() {
           <div className="rounded-lg border">
             {devices.length === 0 ? (
               <div className="p-8 text-center text-sm text-muted-foreground">
-                {devicesQ.isLoading
-                  ? "Loading devices…"
-                  : "No BACnet devices recorded."}
+                {devicesQ.isLoading ? (
+                  "Loading devices…"
+                ) : (
+                  <ListEmpty
+                    error={devicesQ.error}
+                    what="BACnet devices"
+                    filtered={
+                      search.trim() !== "" ||
+                      subnetFilter !== "" ||
+                      vendorFilter.trim() !== "" ||
+                      bbmdOnly
+                    }
+                    onClearFilters={() => {
+                      setSearch("");
+                      setSubnetFilter("");
+                      setVendorFilter("");
+                      setBbmdOnly(false);
+                      setPage(1);
+                    }}
+                  >
+                    No BACnet devices recorded.
+                  </ListEmpty>
+                )}
               </div>
             ) : (
               <div className="overflow-x-auto">
@@ -454,19 +487,29 @@ export function BACnetDevicesPage() {
         title="Delete BACnet device"
         message={
           <>
-            Delete device instance{" "}
-            <span className="font-mono font-semibold">
-              {del?.device_instance}
-            </span>
-            {del?.device_name ? ` (${del.device_name})` : ""}? The instance
-            number is freed for re-use; the IPAM address itself is untouched.
+            <>
+              Delete device instance{" "}
+              <span className="font-mono font-semibold">
+                {del?.device_instance}
+              </span>
+              {del?.device_name ? ` (${del.device_name})` : ""}? The instance
+              number is freed for re-use; the IPAM address itself is untouched.
+            </>
+            {delMut.isError && (
+              <p role="alert" className="mt-2 text-destructive">
+                {formatApiError(delMut.error, "Failed to delete BACnet device")}
+              </p>
+            )}
           </>
         }
         tone="destructive"
         confirmLabel="Delete"
         loading={delMut.isPending}
         onConfirm={() => del && delMut.mutate(del.id)}
-        onClose={() => setDel(null)}
+        onClose={() => {
+          setDel(null);
+          delMut.reset();
+        }}
       />
     </div>
   );
@@ -803,7 +846,9 @@ function DeviceModal({
           />
         </Field>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 pt-2">
           <button

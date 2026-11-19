@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,6 +26,15 @@ from app.models.appliance import ApplianceCertificate
 from app.models.auth import User
 
 _URL = "/api/v1/api-tokens/enrolment-context"
+
+
+@pytest.fixture(autouse=True)
+def _appliance_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only an appliance deploys the active row to the TLS secret it serves,
+    so every test here runs as one unless it says otherwise (#3061)."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "appliance_mode", True)
 
 
 async def _user(db: AsyncSession) -> tuple[User, dict[str, str]]:
@@ -79,6 +89,24 @@ async def test_reports_the_active_certificate_fingerprint(
     assert body["tls_fingerprint_sha256"] == "ab" * 32
     assert body["fingerprint_source"] == "self-signed"
     assert body["fingerprint_unavailable_reason"] is None
+
+
+async def test_reports_nothing_off_an_appliance_even_with_an_active_row(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3061 — the certificate store has a UI on Compose / Kubernetes now,
+    and an ACME issue there marks its cert active (it is for DoT / DoH).
+    Nothing deploys that row to a frontend, so its fingerprint is not what
+    clients are served — reporting it would be exactly the wrong guess."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "appliance_mode", False)
+    _, headers = await _user(db_session)
+    await _cert(db_session, fingerprint="AB" * 32)
+
+    body = (await client.get(_URL, headers=headers)).json()
+    assert body["tls_fingerprint_sha256"] is None
+    assert body["fingerprint_unavailable_reason"]
 
 
 async def test_normalises_the_stored_colon_form_to_bare_lower_hex(

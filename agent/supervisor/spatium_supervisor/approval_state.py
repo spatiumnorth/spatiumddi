@@ -4,7 +4,7 @@ Before this module the supervisor cached ``cert.pem`` at first
 approval and assumed it stayed approved forever. The console
 dashboard read that cert's existence as the "Approved ✓" green chip,
 even after the operator deleted the appliance row from the Fleet UI
-and the heartbeat had been returning 403 / 404 for hours.
+and the heartbeat had been refused for hours.
 
 This module turns the implicit two-state (no-cert vs has-cert) into
 an explicit three-state machine:
@@ -17,15 +17,17 @@ an explicit three-state machine:
                   ``REVOCATION_STRIKE_LIMIT`` returned 200. This is
                   the steady-state green-chip path.
 * ``revoked``   — ``REVOCATION_STRIKE_LIMIT`` consecutive heartbeats
-                  returned 403 / 404. The appliance row was deleted
+                  were refused as a revocation (a 403 carrying the
+                  ``X-Spatium-Revocation`` marker, #2798 — a bare 404 or
+                  an unmarked 403 is never one). The appliance row was deleted
                   (or its supervisor cert was revoked) on the control
                   plane; the supervisor stops applying role
                   assignments and surfaces a red ``Approval revoked``
                   chip on the console dashboard.
 
 The strike counter is the de-noise layer: a control-plane restart
-or migration window can produce a short 404 burst that shouldn't
-trip a revocation. We require N consecutive 403/404 responses
+or migration window can produce a short burst of refusals that shouldn't
+trip a revocation. We require N consecutive revocation refusals
 (N=3 default → ~3 min at the standard 60 s heartbeat cadence) before
 flipping state.
 
@@ -34,8 +36,8 @@ on the appliance):
 
 * ``approval-state``       — bare text ``approved`` / ``revoked``.
                              Absent = pending.
-* ``revocation-strikes``   — integer; how many consecutive 403/404
-                             responses since the last successful
+* ``revocation-strikes``   — integer; how many consecutive revocation
+                             refusals since the last successful
                              heartbeat. Reset to 0 on any 200.
 
 Both are atomically written so a supervisor crash mid-flush can't
@@ -49,7 +51,7 @@ from typing import Literal
 
 ApprovalState = Literal["pending", "approved", "revoked"]
 
-# Number of consecutive 403/404 heartbeats before we flip to
+# Number of consecutive revocation refusals (#2798) before we flip to
 # ``revoked``. Two strikes × 60s heartbeat = ~2 min from operator
 # click to services going dark — short enough to feel responsive,
 # long enough that a single missed heartbeat (transient network
@@ -76,6 +78,22 @@ def read_state(state_dir: Path) -> ApprovalState:
     if body == "revoked":
         return "revoked"
     return "pending"
+
+
+def role_services_hold(state_dir: Path) -> ApprovalState | None:
+    """The approval state that holds this node's role services down, or
+    ``None`` when the node is approved and they may run (#2808).
+
+    The one gate every path that brings role services up consults: the
+    watchdog's auto-heal and the heartbeat's role apply. Only ``approved``
+    lets them run. ``revoked`` is a node taken out of service (its teardown
+    deliberately keeps ``role-compose.env`` so a re-registration can restore
+    the roles, #2801, so the file alone says nothing about whether they should
+    be running); ``pending`` is a node not yet approved, including one that
+    re-registered after a revoke and is waiting for its new row's first
+    accepted heartbeat."""
+    state = read_state(state_dir)
+    return None if state == "approved" else state
 
 
 def read_strikes(state_dir: Path) -> int:

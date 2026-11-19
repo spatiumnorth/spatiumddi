@@ -41,12 +41,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.alerts import AlertRule
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
-from app.models.audit import AuditLog
+from app.models.audit import AUDIT_LOG_GUARD_TRIGGERS
 from app.models.av import AVFlowProfile, AVReservedRange
 from app.models.bacnet import BACnetDevice
 from app.models.dicom import DICOMApplicationEntity
@@ -289,7 +289,12 @@ async def check_no_open_ports(
     ``args["max_age_days"]`` (int, optional, default 30): if no
     completed scan exists within this window the result is ``warn``
     — operators see "we don't actually know yet" instead of a false
-    pass.
+    pass. The same ``warn`` applies when the latest scan has no parsed
+    summary, has no result for the target's address (a CIDR sweep
+    omits hosts that did not answer), reports the host as anything but
+    ``up``, shows a forbidden port only as ``open|filtered``, or never
+    probed a forbidden port (a ping-only sweep, or a ``-p`` list that
+    leaves it out).
 
     Today the check only runs against ``target_kind=ip_address``.
     Subnet-level is a useful follow-up but needs aggregation logic
@@ -328,35 +333,150 @@ async def check_no_open_ports(
             f"no completed nmap scan within {max_age_days} d for {target.address}",
             {"max_age_days": max_age_days, "ports": sorted(forbidden)},
         )
-    summary = scan.summary_json if isinstance(scan.summary_json, dict) else {}
-    open_ports_raw = summary.get("open_ports") or []
+    scan_meta = {
+        "scan_id": str(scan.id),
+        "scan_finished_at": scan.finished_at.isoformat() if scan.finished_at else None,
+        "scan_target": scan.target_ip,
+        "ports": sorted(forbidden),
+    }
+    # Every branch below that cannot positively establish the port
+    # state is ``warn``, never ``pass`` (#2257): the check used to read
+    # a key the parser never wrote and so passed every scanned host.
+    summary = scan.summary_json
+    if not isinstance(summary, dict):
+        return CheckOutcome.warn(
+            f"nmap scan {scan.id} has no parsed summary — port state unknown",
+            scan_meta,
+        )
+    entry = _nmap_entry_for_address(
+        summary, address=str(target.address), scan_target=scan.target_ip
+    )
+    if entry is None:
+        return CheckOutcome.warn(
+            f"nmap scan {scan.id} has no result for {target.address} — port state unknown",
+            scan_meta,
+        )
+    host_state = entry.get("host_state")
+    if host_state != "up":
+        return CheckOutcome.warn(
+            f"nmap scan {scan.id} reported {target.address} as "
+            f"{host_state or 'unknown'} — port state unknown",
+            {**scan_meta, "host_state": host_state},
+        )
+    raw_ports = entry.get("ports")
+    if not isinstance(raw_ports, list):
+        return CheckOutcome.warn(
+            f"nmap scan {scan.id} has an unreadable port list — port state unknown",
+            scan_meta,
+        )
     open_ports: set[int] = set()
-    for entry in open_ports_raw:
-        if isinstance(entry, int):
-            open_ports.add(entry)
-        elif isinstance(entry, dict) and isinstance(entry.get("port"), int):
-            open_ports.add(int(entry["port"]))
-        elif isinstance(entry, str) and entry.isdigit():
-            open_ports.add(int(entry))
+    ambiguous_ports: set[int] = set()
+    for port_entry in raw_ports:
+        if not isinstance(port_entry, dict) or not isinstance(port_entry.get("port"), int):
+            continue
+        state = port_entry.get("state")
+        if state == "open":
+            open_ports.add(int(port_entry["port"]))
+        elif state == "open|filtered":
+            # nmap could not tell open from filtered (typical for UDP).
+            ambiguous_ports.add(int(port_entry["port"]))
+    diagnostic = {
+        **scan_meta,
+        "host_state": host_state,
+        "open_ports": sorted(open_ports),
+        "forbidden": sorted(forbidden),
+    }
     overlap = sorted(open_ports & forbidden)
     if overlap:
         return CheckOutcome.fail(
             f"forbidden port(s) {overlap} open per scan {scan.id}",
-            {
-                "scan_id": str(scan.id),
-                "scan_finished_at": scan.finished_at.isoformat() if scan.finished_at else None,
-                "open_ports": sorted(open_ports),
-                "forbidden": sorted(forbidden),
-            },
+            diagnostic,
+        )
+    ambiguous = sorted(ambiguous_ports & forbidden)
+    if ambiguous:
+        return CheckOutcome.warn(
+            f"forbidden port(s) {ambiguous} open|filtered per scan {scan.id} — "
+            "nmap could not tell whether they are open",
+            {**diagnostic, "open_filtered_ports": sorted(ambiguous_ports)},
+        )
+    unprobed = _unprobed_ports(summary, scan, forbidden)
+    if unprobed:
+        return CheckOutcome.warn(
+            f"nmap scan {scan.id} did not probe forbidden port(s) {unprobed} — "
+            "port state unknown",
+            {**diagnostic, "unprobed_ports": unprobed},
         )
     return CheckOutcome.passed(
         f"no forbidden ports open per scan {scan.id}",
-        {
-            "scan_id": str(scan.id),
-            "scan_finished_at": scan.finished_at.isoformat() if scan.finished_at else None,
-            "open_ports": sorted(open_ports),
-        },
+        diagnostic,
     )
+
+
+def _services_cover(spec: str, port: int) -> bool:
+    """True when nmap's ``<scaninfo services>`` range list (``"1,3-4,22"``)
+    includes ``port``."""
+    for part in spec.split(","):
+        lo, _, hi = part.strip().partition("-")
+        try:
+            if int(lo) <= port <= int(hi or lo):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _unprobed_ports(summary: dict[str, Any], scan: NmapScan, forbidden: set[int]) -> list[int]:
+    """Forbidden ports the scan never probed, so their absence from the
+    port list proves nothing (nmap lists only ports in a non-default
+    state). A ping-only ``-sn`` sweep probes none; ``-p 80`` probes one.
+
+    Summaries stored before the parser recorded ``scanned_ports`` cannot
+    say what was probed; only a ping sweep is known to have probed
+    nothing, so those are still trusted otherwise.
+    """
+    scanned = summary.get("scanned_ports")
+    if isinstance(scanned, dict):
+        specs = [v for v in scanned.values() if isinstance(v, str)]
+        return sorted(p for p in forbidden if not any(_services_cover(s, p) for s in specs))
+    if scan.preset == "subnet_sweep" or "-sn" in (scan.extra_args or "").split():
+        return sorted(forbidden)
+    return []
+
+
+def _normalise_ip(value: object) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    if value is None:
+        return None
+    try:
+        return ipaddress.ip_address(str(value))
+    except ValueError:
+        return None
+
+
+def _nmap_entry_for_address(
+    summary: dict[str, Any], *, address: str, scan_target: str
+) -> dict[str, Any] | None:
+    """Return the per-host block of a ``parse_nmap_xml`` summary that
+    describes ``address``, or ``None`` when the scan says nothing about it.
+
+    A multi-host (CIDR) scan carries one entry per host in ``hosts``;
+    nmap omits hosts that did not answer, so a target missing from that
+    list is unknown, not clean. A single-host summary carries its own
+    ``address``; rows written before that field existed are trusted only
+    when the scan targeted exactly this IP — a CIDR sweep where one host
+    answered also produces a single-host summary, for whichever host it was.
+    """
+    want = _normalise_ip(address)
+    if want is None:
+        return None
+    hosts = summary.get("hosts")
+    if isinstance(hosts, list) and hosts:
+        for host in hosts:
+            if isinstance(host, dict) and _normalise_ip(host.get("address")) == want:
+                return host
+        return None
+    if "address" in summary:
+        return summary if _normalise_ip(summary.get("address")) == want else None
+    return summary if _normalise_ip(scan_target) == want else None
 
 
 # ── Check 4: alert_rule_covers ──────────────────────────────────────
@@ -517,29 +637,76 @@ async def check_audit_log_immutable(
     args: dict[str, Any],
     now: datetime,
 ) -> CheckOutcome:
-    """Pass when the audit_log table is queryable and reachable.
+    """Pass when every trigger that makes ``audit_log`` append-only is
+    present and enabled.
 
-    Platform-level. Useful for the auditor checkbox "audit log is
-    append-only and tamper-resistant" — the SpatiumDDI promise is
-    that ``audit_log`` rows never mutate (DB trigger guards
-    DELETE) so this check always passes when the table is healthy.
-    Used as a positive presence signal in the PDF artifact.
+    Platform-level. The guards are the row triggers named in
+    ``AUDIT_LOG_GUARD_TRIGGERS`` — ``BEFORE DELETE`` (#73) and
+    ``BEFORE UPDATE`` (#2315), each raising. The check reads them from
+    ``pg_trigger`` and fails, naming each one, when a trigger is missing,
+    disabled (``ALTER TABLE … DISABLE TRIGGER``, or enabled for replica
+    sessions only), or no longer a ``BEFORE … FOR EACH ROW`` trigger on
+    that event running the expected function. It used to count rows,
+    which passed with the guard dropped (#2315).
+
+    Tamper-evident, not tamper-proof: the table owner can drop a trigger.
+    This check is how that becomes visible; the hash-chain verifier
+    covers rewritten content.
     """
     if target_kind != "platform":
         return CheckOutcome.not_applicable(
             f"requires target_kind=platform (got {target_kind})",
         )
     try:
-        count = (await db.execute(select(func.count()).select_from(AuditLog))).scalar_one()
+        rows = (
+            await db.execute(
+                text(
+                    "SELECT t.tgname, t.tgtype, t.tgenabled::text, p.proname "
+                    "FROM pg_catalog.pg_trigger t "
+                    "JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid "
+                    "WHERE t.tgrelid = to_regclass('audit_log') "
+                    "AND NOT t.tgisinternal"
+                )
+            )
+        ).all()
     except Exception as exc:  # noqa: BLE001
         return CheckOutcome.fail(
-            "audit_log table is unreachable",
+            "audit_log triggers could not be read",
             {"error": str(exc)},
         )
+    present = {row[0]: (int(row[1]), str(row[2]), str(row[3])) for row in rows}
+    problems: dict[str, str] = {}
+    for name, (event_name, function) in AUDIT_LOG_GUARD_TRIGGERS.items():
+        found = present.get(name)
+        if found is None:
+            problems[name] = "missing"
+            continue
+        tgtype, enabled, proname = found
+        event_bit = _TRIGGER_EVENT_BITS[event_name]
+        if not (
+            tgtype & _TRIGGER_TYPE_ROW and tgtype & _TRIGGER_TYPE_BEFORE and tgtype & event_bit
+        ):
+            problems[name] = f"not a BEFORE {event_name} row trigger"
+        elif proname != function:
+            problems[name] = f"runs {proname}(), expected {function}()"
+        elif enabled not in ("O", "A"):
+            problems[name] = "disabled"
+    if problems:
+        detail = ", ".join(f"{n} ({why})" for n, why in sorted(problems.items()))
+        return CheckOutcome.fail(
+            f"audit_log is not append-only: {detail}",
+            {"problems": problems},
+        )
     return CheckOutcome.passed(
-        f"audit_log healthy ({int(count)} row(s))",
-        {"row_count": int(count)},
+        "audit_log refuses UPDATE and DELETE (guard triggers present and enabled)",
+        {"triggers": sorted(AUDIT_LOG_GUARD_TRIGGERS)},
     )
+
+
+# ``pg_trigger.tgtype`` bits (PostgreSQL ``catalog/pg_trigger.h``).
+_TRIGGER_TYPE_ROW = 1 << 0
+_TRIGGER_TYPE_BEFORE = 1 << 1
+_TRIGGER_EVENT_BITS = {"INSERT": 1 << 2, "DELETE": 1 << 3, "UPDATE": 1 << 4}
 
 
 # ── Check 7: voice_segment_not_internet_facing ──────────────────────
@@ -587,11 +754,6 @@ async def check_voice_segment_not_internet_facing(
         "voice subnet is not flagged internet_facing",
         {"subnet_role": target.subnet_role, "network": str(target.network)},
     )
-
-
-# Suppress unused-import warning when this module is read in
-# isolation — referenced by check_no_open_ports.
-_ = ipaddress
 
 
 # ── Check: no_multicast_collision ──────────────────────────────────
@@ -673,15 +835,18 @@ async def check_no_lanwide_control_plane_ports(
     supervisor's peer-scoped drop-in is authoritative. Each node reports
     ``base_lanwide_k3s`` (True = still on the legacy LAN-wide base).
 
-    Verdict policy honours non-negotiable #5 — **never connectivity-FAIL**:
+    Verdict policy (#2259) — an unverified node is not a compliant node:
 
     * FAIL only on a CONFIRMED LAN-wide node (``base_lanwide_k3s is True``).
-    * Otherwise PASS. Nodes that are stale (no recent heartbeat, beyond
+    * WARN when any node is stale (no heartbeat inside
       ``args["stale_minutes"]`` — default 30) or unverified
-      (``base_lanwide_k3s is None``) report **PASS-stale** with a
-      diagnostic, rather than failing the compliance claim because the
-      control plane temporarily lost contact.
-    * No reporting appliance node → vacuously PASS.
+      (``base_lanwide_k3s is None``): "we don't know yet", the same
+      outcome ``no_open_ports`` uses. Never FAIL for lost contact, but
+      never PASS either — a PASS counts in ``pass_count`` and the PDF
+      pass percentage, and nothing was verified.
+    * NOT_APPLICABLE when no appliance node reports a base-conf marker
+      (Compose / plain k8s have none; there is nothing to assess).
+    * PASS only when every reporting node is hardened and fresh.
     """
     if target_kind != "platform":
         return CheckOutcome.not_applicable(
@@ -709,8 +874,8 @@ async def check_no_lanwide_control_plane_ports(
             {"lanwide_hosts": sorted(r.hostname for r in lanwide)},
         )
     if not rows:
-        return CheckOutcome.passed(
-            "no appliance node has reported a base-conf marker (vacuously compliant)",
+        return CheckOutcome.not_applicable(
+            "no appliance node has reported a base-conf marker — nothing to assess",
             {"reported": 0},
         )
     cutoff = now - timedelta(minutes=stale_minutes)
@@ -722,9 +887,9 @@ async def check_no_lanwide_control_plane_ports(
     stale = [r for r in rows if r.base_lanwide_k3s is False and _stale(r)]
     fresh = [r for r in rows if r.base_lanwide_k3s is False and not _stale(r)]
     if unknown or stale:
-        return CheckOutcome.passed(
+        return CheckOutcome.warn(
             f"{len(fresh)} node(s) confirmed hardened; {len(stale)} stale + "
-            f"{len(unknown)} unverified reported PASS-stale (no LAN-wide port confirmed)",
+            f"{len(unknown)} unverified — LAN-wide control-plane ports not confirmed absent",
             {
                 "hardened_fresh": sorted(r.hostname for r in fresh),
                 "stale": sorted(r.hostname for r in stale),
@@ -1825,7 +1990,7 @@ CHECK_CATALOG: list[dict[str, Any]] = [
     },
     {
         "name": "audit_log_immutable",
-        "label": "Audit log is reachable and append-only",
+        "label": "Audit log refuses UPDATE and DELETE",
         "supports": ["platform"],
         "args": [],
     },
@@ -1851,7 +2016,7 @@ CHECK_CATALOG: list[dict[str, Any]] = [
                 "type": "int",
                 "required": False,
                 "default": 30,
-                "label": "Treat a node's report as stale after N minutes (PASS-stale, never FAIL)",
+                "label": "Treat a node's report as stale after N minutes (warn, never FAIL)",
             }
         ],
     },

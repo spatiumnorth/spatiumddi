@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { NavLink, useLocation } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
   Github,
+  Info,
   ChevronsLeft,
   ChevronsRight,
   ChevronDown,
@@ -17,8 +18,14 @@ import { cn } from "@/lib/utils";
 import { safeExternalHref } from "@/lib/safeUrl";
 import { changeRequestsApi, versionApi } from "@/lib/api";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { usePermissions } from "@/hooks/usePermissions";
+import { pollUnlessRefused } from "@/lib/refusal";
 import { useSessionState } from "@/lib/useSessionState";
+import { safeLocalStorage } from "@/lib/safeStorage";
 import { BrandLogo } from "@/components/BrandLogo";
+import { captureSuccessors, returnFocus } from "@/components/ui/focus-return";
+import { hasOpenModal } from "@/components/ui/use-draggable-modal";
+import { UpdateCheckError } from "@/components/UpdateCheckError";
 import {
   usePublicSettings,
   DEFAULT_APP_TITLE,
@@ -109,6 +116,11 @@ function SubNavLabel({
     </div>
   );
 }
+
+/** A footer utility (About, GitHub, Collapse): icon only, with the label as
+ *  both tooltip and accessible name (#2895). */
+const FOOTER_ICON_CLS =
+  "inline-flex shrink-0 items-center justify-center rounded-md p-2 text-sidebar-foreground/70 transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground";
 
 function NavItem({
   label,
@@ -210,7 +222,7 @@ export function Sidebar({
   onMobileClose?: () => void;
 } = {}) {
   const [collapsed, setCollapsed] = useState(
-    () => localStorage.getItem("sidebar-collapsed") === "true",
+    () => safeLocalStorage.getItem("sidebar-collapsed") === "true",
   );
   const location = useLocation();
 
@@ -228,10 +240,62 @@ export function Sidebar({
   function toggle() {
     setCollapsed((v) => {
       const next = !v;
-      localStorage.setItem("sidebar-collapsed", String(next));
+      safeLocalStorage.setItem("sidebar-collapsed", String(next));
       return next;
     });
   }
+
+  // Below md the open sidebar is a drawer over a backdrop, so it behaves as
+  // a modal dialog (#3911): focus moves in and stays in, Esc closes it, and
+  // closing gives focus back to what opened it (Open navigation). From md up
+  // `mobileOpen` has no visual effect and none of this applies.
+  const asideRef = useRef<HTMLElement | null>(null);
+  const openerRef = useRef<HTMLElement | null>(null);
+  const drawerOpen =
+    mobileOpen &&
+    (typeof window.matchMedia !== "function" ||
+      !window.matchMedia("(min-width: 768px)").matches);
+  useEffect(() => {
+    const node = asideRef.current;
+    if (!drawerOpen || !node) return;
+    const active = document.activeElement as HTMLElement | null;
+    if (!node.contains(active)) openerRef.current = active;
+    node
+      .querySelector<HTMLElement>('button[aria-label="Close navigation"]')
+      ?.focus();
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.isComposing) return;
+      if (e.key === "Escape") {
+        // A dialog over the drawer owns this Esc.
+        if (hasOpenModal()) return;
+        e.preventDefault();
+        onMobileClose?.();
+        return;
+      }
+      if (e.key !== "Tab") return;
+      const items = Array.from(
+        node.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ),
+      );
+      if (items.length === 0) return;
+      const first = items[0];
+      const last = items[items.length - 1];
+      const cur = document.activeElement;
+      const outside = !cur || !node.contains(cur);
+      if (e.shiftKey ? cur === first || outside : cur === last || outside) {
+        e.preventDefault();
+        (e.shiftKey ? last : first).focus();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      const opener = openerRef.current;
+      returnFocus([opener], captureSuccessors(opener));
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [drawerOpen]);
 
   // In the mobile drawer, ignore the "collapsed" state — always show labels.
   const effectiveCollapsed = mobileOpen ? false : collapsed;
@@ -270,20 +334,23 @@ export function Sidebar({
   // polls when the (default-off) governance.approvals module is on, so a
   // disabled module fires zero requests.
   const approvalsOn = moduleEnabled("governance.approvals");
+  // The count is the queue awaiting an approver's decision, so only an
+  // approver asks for it. Anyone else is refused (or, with no `approve`, would
+  // see only their own rows counted as "waiting"), and every refusal is an
+  // audited `denied` row each 30 s (#1864).
+  const canApproveRequests = usePermissions().can("approve", "change_request");
   const pendingChangeCount = useQuery({
     queryKey: ["change-requests", "pending-count"],
     queryFn: changeRequestsApi.countPending,
-    enabled: approvalsOn,
-    refetchInterval: 30000,
+    enabled: approvalsOn && canApproveRequests,
+    refetchInterval: pollUnlessRefused(30000),
   }).data;
 
   // Integrations live in their own sidebar section, rendered between
   // the main nav and the admin nav, but only when at least one
   // integration is enabled. Each integration's visibility is gated
-  // by its feature_module id (Settings → Features → Integrations);
-  // the matching ``PlatformSettings.integration_*_enabled`` columns
-  // are kept in lock-step by the toggle endpoint so reconciler tasks
-  // don't need to migrate.
+  // by its feature_module id (Settings → Features → Integrations),
+  // the same switch its reconciler gates on (#2196).
   // Sorted alphabetically by label so the order is stable regardless
   // of the order we added integrations here — adding a new one later
   // shouldn't re-shuffle the sidebar for operators already using it.
@@ -305,6 +372,11 @@ export function Sidebar({
         />
       )}
       <aside
+        ref={asideRef}
+        id="app-sidebar"
+        {...(drawerOpen
+          ? { role: "dialog", "aria-modal": true, "aria-label": "Navigation" }
+          : {})}
         className={cn(
           "flex flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground transition-all duration-200",
           // Desktop: inline, fixed width, always visible (md+).
@@ -583,44 +655,18 @@ export function Sidebar({
           </NavSection>
         </nav>
 
-        {/* Footer */}
+        {/* Footer (#2895 — compacted). The three destinations an operator
+            reads by name stay as text rows; the utilities (About, GitHub,
+            Collapse) share ONE row with the version, as icon buttons with a
+            tooltip and an aria-label. Collapsed, everything is an icon in a
+            column, as before. The palette still lists every page from
+            ``footerNav`` in lib/navigation.ts, About included. */}
         <div
           className={cn(
             "border-t border-sidebar-border p-2 space-y-1",
             effectiveCollapsed && "flex flex-col items-center",
           )}
         >
-          {!effectiveCollapsed && (
-            <div className="flex items-center gap-2 px-3 py-1">
-              <span className="text-xs font-mono text-sidebar-muted-foreground/80">
-                v{displayVersion}
-              </span>
-              {updateAvailable && latestReleaseUrl && (
-                <a
-                  href={latestReleaseUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  title={`Update available: ${latestVersion ?? "newer release"}`}
-                  className="inline-flex items-center gap-1 rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 hover:bg-emerald-500/25 dark:text-emerald-400"
-                >
-                  <Sparkles className="h-3 w-3" />
-                  update
-                </a>
-              )}
-            </div>
-          )}
-          {effectiveCollapsed && updateAvailable && latestReleaseUrl && (
-            <a
-              href={latestReleaseUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              title={`Update available: ${latestVersion ?? "newer release"}`}
-              className="flex items-center justify-center rounded-md p-2 text-emerald-600 hover:bg-sidebar-accent dark:text-emerald-400"
-            >
-              <Sparkles className="h-4 w-4" />
-            </a>
-          )}
-
           {/*
             Appliance management — always visible. When the API host
             itself runs the SpatiumDDI OS appliance ISO, /appliance
@@ -659,38 +705,92 @@ export function Sidebar({
             onNavigate={mobileOpen ? onMobileClose : undefined}
           />
 
-          <a
-            href="https://github.com/spatiumnorth/spatiumddi"
-            target="_blank"
-            rel="noopener noreferrer"
-            title={effectiveCollapsed ? "GitHub" : undefined}
+          <div
+            data-testid="sidebar-utility-row"
             className={cn(
-              "flex items-center rounded-md px-3 py-2 text-sm font-medium text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground transition-colors",
-              effectiveCollapsed ? "justify-center" : "gap-3",
+              "flex",
+              effectiveCollapsed
+                ? "flex-col items-center gap-1"
+                : "items-center gap-1 pl-3",
             )}
           >
-            <Github className="h-4 w-4 flex-shrink-0" />
-            {!effectiveCollapsed && "GitHub"}
-          </a>
+            {!effectiveCollapsed && (
+              <div className="flex min-w-0 flex-1 items-center gap-2">
+                <span className="truncate text-xs font-mono text-sidebar-muted-foreground/80">
+                  v{displayVersion}
+                </span>
+                {updateAvailable && latestReleaseUrl && (
+                  <a
+                    href={latestReleaseUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    title={`Update available: ${latestVersion ?? "newer release"}`}
+                    className="inline-flex shrink-0 items-center gap-1 rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 hover:bg-emerald-500/25 dark:text-emerald-400"
+                  >
+                    <Sparkles className="h-3 w-3" />
+                    update
+                  </a>
+                )}
+                {versionInfo && <UpdateCheckError compact info={versionInfo} />}
+              </div>
+            )}
+            {effectiveCollapsed && updateAvailable && latestReleaseUrl && (
+              <a
+                href={latestReleaseUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                title={`Update available: ${latestVersion ?? "newer release"}`}
+                aria-label={`Update available: ${latestVersion ?? "newer release"}`}
+                className={FOOTER_ICON_CLS}
+              >
+                <Sparkles className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+              </a>
+            )}
 
-          {/* Collapse toggle — desktop only */}
-          <button
-            onClick={toggle}
-            title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-            className={cn(
-              "hidden md:flex w-full items-center rounded-md px-3 py-2 text-sm text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground transition-colors",
-              collapsed ? "justify-center" : "gap-3",
-            )}
-          >
-            {collapsed ? (
-              <ChevronsRight className="h-4 w-4 flex-shrink-0" />
-            ) : (
-              <>
-                <ChevronsLeft className="h-4 w-4 flex-shrink-0" />
-                <span>Collapse</span>
-              </>
-            )}
-          </button>
+            {/* #2895 — About: version, licence, NOTICE, third-party lists. */}
+            <NavLink
+              to="/about"
+              title="About"
+              aria-label="About"
+              onClick={mobileOpen ? onMobileClose : undefined}
+              className={({ isActive }) =>
+                cn(
+                  FOOTER_ICON_CLS,
+                  isActive &&
+                    "bg-sidebar-primary text-sidebar-primary-foreground hover:bg-sidebar-primary hover:text-sidebar-primary-foreground",
+                )
+              }
+            >
+              <Info className="h-4 w-4" aria-hidden />
+            </NavLink>
+
+            <a
+              href="https://github.com/spatiumnorth/spatiumddi"
+              target="_blank"
+              rel="noopener noreferrer"
+              title="GitHub"
+              aria-label="GitHub (opens in a new tab)"
+              className={FOOTER_ICON_CLS}
+            >
+              <Github className="h-4 w-4" aria-hidden />
+            </a>
+
+            {/* Collapse toggle — desktop only; the mobile drawer has none. */}
+            <button
+              type="button"
+              onClick={toggle}
+              title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+              aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+              aria-expanded={!collapsed}
+              className={cn(FOOTER_ICON_CLS, "hidden md:inline-flex")}
+            >
+              {collapsed ? (
+                <ChevronsRight className="h-4 w-4" aria-hidden />
+              ) : (
+                <ChevronsLeft className="h-4 w-4" aria-hidden />
+              )}
+            </button>
+          </div>
         </div>
       </aside>
     </>

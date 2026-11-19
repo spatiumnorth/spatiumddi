@@ -34,7 +34,22 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.tailscale import TailscaleTenant
-from app.services.integration_ownership import owned_by_other_integration
+from app.services._mirror_hostname import normalize_desired_hostname
+from app.services.dns.cname_conflict import find_record_insert_conflict
+from app.services.dns.record_ops import retract_address_dns
+from app.services.integration_ownership import (
+    SpaceRelease,
+    address_taken,
+    addresses_in_space,
+    move_stays_in_space,
+    owned_addresses_in_space,
+    owned_by_other_integration,
+    owned_subnets_in_space,
+    refuse_sync_into_trashed_space,
+    subnet_for_address,
+    unowned_subnets_at,
+)
+from app.services.ipam.utilization import counts_toward_utilization
 from app.services.tailscale.client import (
     TailscaleClient,
     TailscaleClientError,
@@ -57,6 +72,9 @@ class _DesiredAddress:
     description: str
     custom_fields: dict[str, Any]
 
+    def __post_init__(self) -> None:
+        normalize_desired_hostname(self)
+
 
 @dataclass
 class ReconcileSummary:
@@ -66,6 +84,8 @@ class ReconcileSummary:
     device_count: int = 0
     blocks_created: int = 0
     subnets_created: int = 0
+    # #2790: an un-owned subnet reused at the tenant's CIDR instead of twinned.
+    subnets_matched: int = 0
     addresses_created: int = 0
     addresses_updated: int = 0
     addresses_deleted: int = 0
@@ -78,6 +98,9 @@ class ReconcileSummary:
     dns_records_deleted: int = 0
     dns_skipped: bool = False
     warnings: list[str] = field(default_factory=list)
+    # #2577 — what this sync released outside the target's IP space
+    # (``integration_ownership.release_outside_space``).
+    released: SpaceRelease = field(default_factory=SpaceRelease)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -123,30 +146,13 @@ def _expires_in_past(iso: str | None) -> bool:
     return dt < datetime.now(UTC)
 
 
-def _find_subnet_for_ip(subnets: list[Subnet], ip: str) -> Subnet | None:
-    try:
-        addr = ipaddress.ip_address(ip)
-    except ValueError:
-        return None
-    best: Subnet | None = None
-    best_prefix: int = -1
-    for s in subnets:
-        net = _parse_net(str(s.network))
-        if net is None:
-            continue
-        if addr in net and net.prefixlen > best_prefix:
-            best = s
-            best_prefix = net.prefixlen
-    return best
-
-
 async def _recompute_subnet_utilization(db: AsyncSession, subnet_id: Any) -> None:
     allocated = (
         await db.scalar(
             select(func.count())
             .select_from(IPAddress)
             .where(IPAddress.subnet_id == subnet_id)
-            .where(IPAddress.status != "available")
+            .where(counts_toward_utilization())
         )
         or 0
     )
@@ -196,6 +202,10 @@ def _compute_desired(
         cf: dict[str, Any] = {
             "tailscale_id": d.id,
             "tailscale_node_id": d.node_id,
+            # #1557: the device name is an FQDN — keep it here, NOT in
+            # ``hostname`` (IPAM publishing appends the zone to hostname,
+            # which doubled the suffix: host.tailnet.ts.net.<zone>).
+            "fqdn": d.name,
             "os": d.os,
             "client_version": d.client_version,
             "user": d.user,
@@ -216,7 +226,9 @@ def _compute_desired(
             out.append(
                 _DesiredAddress(
                     address=ip,
-                    hostname=d.name,
+                    # Host label only (#1557) — the short hostname the
+                    # client reports, else the FQDN's first label.
+                    hostname=d.hostname or d.name.split(".")[0],
                     description=description,
                     custom_fields=cf,
                 )
@@ -234,7 +246,8 @@ async def _ensure_block_and_subnet(
     label: str,
     summary: ReconcileSummary,
 ) -> Subnet | None:
-    """Ensure a tenant-owned block + subnet exist for ``cidr``.
+    """Ensure a tenant-owned block + subnet exist for ``cidr``, unless an
+    un-owned subnet already sits there (#2790), which is reused instead.
 
     Returns the subnet row, or ``None`` if the CIDR is unparseable
     (operator typo on the tenant config). Idempotent — safe to call
@@ -246,10 +259,37 @@ async def _ensure_block_and_subnet(
         return None
     cidr_norm = str(net)
 
+    # #2577 — the overlay subnet in the tenant's own space only; one it owns
+    # in another space (its old space, after a space change) is released.
+    existing_subnet = next(
+        (
+            s
+            for s in await owned_subnets_in_space(
+                db,
+                "tailscale_tenant_id",
+                tenant.id,
+                tenant.ipam_space_id,
+                summary=summary,
+            )
+            if str(s.network) == cidr_norm
+        ),
+        None,
+    )
+    if existing_subnet is None:
+        # #2790: an un-owned subnet at exactly this CIDR, one a tenant delete
+        # kept for its operator content (#2287) or one an operator made, is
+        # reused as it stands, with no block or subnet put beside it, as the
+        # Docker reconciler does (#2601). The address pass mirrors into it.
+        kept = (await unowned_subnets_at(db, tenant.ipam_space_id, [cidr_norm])).get(cidr_norm)
+        if kept is not None:
+            summary.subnets_matched += 1
+            return kept
+
     existing_block = (
         await db.execute(
             select(IPBlock).where(
                 IPBlock.tailscale_tenant_id == tenant.id,
+                IPBlock.space_id == tenant.ipam_space_id,
                 IPBlock.network == cidr_norm,
             )
         )
@@ -266,14 +306,6 @@ async def _ensure_block_and_subnet(
         await db.flush()
         summary.blocks_created += 1
 
-    existing_subnet = (
-        await db.execute(
-            select(Subnet).where(
-                Subnet.tailscale_tenant_id == tenant.id,
-                Subnet.network == cidr_norm,
-            )
-        )
-    ).scalar_one_or_none()
     if existing_subnet is None:
         existing_subnet = Subnet(
             space_id=tenant.ipam_space_id,
@@ -305,6 +337,7 @@ async def _apply_addresses(
         .all()
     )
     subnets = list(subnet_rows)
+    space_subnet_ids = {s.id for s in subnets}
 
     desired_map: dict[str, _DesiredAddress] = {}
     for d in desired:
@@ -315,11 +348,9 @@ async def _apply_addresses(
     # Claim pre-existing operator rows at desired addresses.
     desired_addrs = list(desired_map.keys())
     if desired_addrs:
-        existing = (
-            (await db.execute(select(IPAddress).where(IPAddress.address.in_(desired_addrs))))
-            .scalars()
-            .all()
-        )
+        # #2577 — adoption candidates come from this target's own space
+        # only. The same address in another space is a different host.
+        existing = await addresses_in_space(db, tenant.ipam_space_id, desired_addrs)
         for row in existing:
             if row.tailscale_tenant_id == tenant.id:
                 continue  # already ours
@@ -338,11 +369,18 @@ async def _apply_addresses(
                 row.user_modified_at = datetime.now(UTC)
         await db.flush()
 
-    res = await db.execute(select(IPAddress).where(IPAddress.tailscale_tenant_id == tenant.id))
-    current = {str(a.address): a for a in res.scalars().all()}
+    # #2577 — the rows we may update, move and absence-delete: ours AND in
+    # our space. One carrying our FK in another space is released first (#2577).
+    current = {
+        str(a.address): a
+        for a in await owned_addresses_in_space(
+            db, "tailscale_tenant_id", tenant.id, tenant.ipam_space_id, summary=summary
+        )
+    }
 
     dirty_subnets: set[Any] = {s.id for s in subnets if s.tailscale_tenant_id == tenant.id}
 
+    gone: list[IPAddress] = []
     for addr, row in current.items():
         if addr not in desired_map:
             dirty_subnets.add(row.subnet_id)
@@ -353,11 +391,20 @@ async def _apply_addresses(
                 row.tailscale_tenant_id = None
                 summary.addresses_updated += 1
             else:
-                await db.delete(row)
+                gone.append(row)
                 summary.addresses_deleted += 1
+    # #3200 — one retraction for the whole sweep, before the deletes flush.
+    await retract_address_dns(db, [r.id for r in gone])
+    for row in gone:
+        await db.delete(row)
 
     for addr, d in desired_map.items():
-        subnet = _find_subnet_for_ip(subnets, d.address)
+        # #2790: the tenant's own subnet first, then the longest prefix,
+        # with a fixed tie-break (never the order the rows came back in);
+        # an operator-edited row stays in its subnet.
+        subnet = subnet_for_address(
+            subnets, d.address, "tailscale_tenant_id", tenant.id, held=current.get(addr)
+        )
         if subnet is None:
             summary.skipped_no_subnet += 1
             continue
@@ -365,6 +412,23 @@ async def _apply_addresses(
             row = current[addr]
             changed = False
             if row.subnet_id != subnet.id:
+                # #2577 — never re-parent a row across IP spaces.
+                if not move_stays_in_space(row.subnet_id, space_subnet_ids):
+                    summary.warnings.append(
+                        f"address {addr}: current subnet is outside this target's "
+                        f"IP space; not moving"
+                    )
+                    continue
+                # Another integration's row (or another Tailscale tenant's) may
+                # already sit at the target (subnet, address); moving onto
+                # it would hit ``uq_ip_address_subnet_address`` and roll
+                # back the whole sync. Leave our row where it is.
+                if await address_taken(db, subnet.id, d.address, exclude_id=row.id):
+                    summary.warnings.append(
+                        f"address {addr}: subnet {subnet.network} already has a row "
+                        f"for it; not moving"
+                    )
+                    continue
                 dirty_subnets.add(row.subnet_id)
                 row.subnet_id = subnet.id
                 changed = True
@@ -389,6 +453,12 @@ async def _apply_addresses(
                 dirty_subnets.add(subnet.id)
                 summary.addresses_updated += 1
         else:
+            # The claim pass above took every row we may claim; one
+            # still at this (subnet, address) has another owner
+            # (warned there). Inserting next to it would hit
+            # ``uq_ip_address_subnet_address``.
+            if await address_taken(db, subnet.id, d.address):
+                continue
             db.add(
                 IPAddress(
                     subnet_id=subnet.id,
@@ -559,9 +629,25 @@ async def _apply_synthetic_dns(
         await db.delete(row)
         summary.dns_records_deleted += 1
 
-    # Insert records that are new.
+    # Insert records that are new. #1561: never insert beside a
+    # non-owned record at the same name — skip + warn instead.
     for key in desired_keys - current_by_key.keys():
         label, rtype, value = key
+        conflict = await find_record_insert_conflict(
+            db,
+            zone.id,
+            name=label,
+            record_type=rtype,
+            own_fk="tailscale_tenant_id",
+            own_id=tenant.id,
+        )
+        if conflict is not None:
+            summary.warnings.append(
+                f"DNS record {label} ({rtype}) in zone {zone_name!r} conflicts with "
+                f"existing {conflict.record_type} record at the same name, not owned "
+                f"by this tenant; skipping insert"
+            )
+            continue
         fqdn = zone_name.rstrip(".") if label == "@" else f"{label}.{zone_name.rstrip('.')}"
         db.add(
             DNSRecord(
@@ -583,6 +669,10 @@ async def _apply_synthetic_dns(
 
 async def reconcile_tenant(db: AsyncSession, tenant: TailscaleTenant) -> ReconcileSummary:
     summary = ReconcileSummary(ok=False)
+    # #2577 — a target whose IP space is in Trash syncs nothing: it would
+    # rebuild its rows as live rows inside the trashed space.
+    if await refuse_sync_into_trashed_space(db, tenant, summary):
+        return summary
 
     api_key = ""
     if tenant.api_key_encrypted:
@@ -646,8 +736,11 @@ async def reconcile_tenant(db: AsyncSession, tenant: TailscaleTenant) -> Reconci
             resource_id=str(tenant.id),
             resource_display=tenant.name,
             new_value={
+                # #2577 — what the sync released outside the target's IP space.
+                "released": summary.released.as_dict(),
                 "blocks_created": summary.blocks_created,
                 "subnets_created": summary.subnets_created,
+                "subnets_matched": summary.subnets_matched,
                 "addresses": {
                     "created": summary.addresses_created,
                     "updated": summary.addresses_updated,
@@ -669,11 +762,13 @@ async def reconcile_tenant(db: AsyncSession, tenant: TailscaleTenant) -> Reconci
     summary.ok = True
     logger.info(
         "tailscale_reconcile_ok",
+        **summary.released.log_fields(),
         tenant=str(tenant.id),
         tailnet_domain=summary.tailnet_domain,
         devices=summary.device_count,
         blocks_created=summary.blocks_created,
         subnets_created=summary.subnets_created,
+        subnets_matched=summary.subnets_matched,
         addresses_created=summary.addresses_created,
         addresses_updated=summary.addresses_updated,
         addresses_deleted=summary.addresses_deleted,

@@ -1834,14 +1834,22 @@ def _generator_lines(gen: dict[str, Any]) -> list[str]:
     def pct(v: Any) -> str:
         return "—" if v is None else f"{v:.2f}%"
 
+    def num(v: Any) -> str:
+        # None = a summary written before the counter existed: unknown, not 0.
+        return "—" if v is None else f"{v:,}"
+
     rc = ", ".join(f"{k} {v:,}" for k, v in (d.get("rcodes") or {}).items()) or "none"
     return [
         f"- **Shards:** {gen.get('shards', 0)}",
         f"- **DHCP handshake:** attempts {h.get('attempts', 0):,} · "
         f"acked {h.get('acked', 0):,} ({pct(h.get('strict_pct'))} strict) · "
+        f"without a resend {num(h.get('acked_without_resend'))} "
+        f"({pct(h.get('without_resend_pct'))}) · "
+        f"after a resend {num(h.get('acked_after_resend'))} · "
         f"within budget {h.get('acked_within_budget', 0):,} ({pct(h.get('within_budget_pct'))}) · "
         f"late {h.get('acked_late', 0):,} ({pct(h.get('with_late_pct'))} with late) · "
-        f"timeouts {h.get('timeouts', 0):,} · naks {h.get('naks', 0):,}",
+        f"timeouts {h.get('timeouts', 0):,} · naks {h.get('naks', 0):,} · "
+        f"in flight at stop {num(h.get('in_flight'))}",
         f"- **DNS stream:** sent {d.get('sent', 0):,} · answered {d.get('answered', 0):,} · "
         f"ok {d.get('ok', 0):,} ({pct(d.get('ok_pct_of_sent'))} of sent) · "
         f"timeouts {d.get('timeouts', 0):,} · errors {d.get('errors', 0):,} · "

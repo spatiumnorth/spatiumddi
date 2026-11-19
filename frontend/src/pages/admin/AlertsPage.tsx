@@ -1,5 +1,10 @@
-import { useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { cloneElement, isValidElement, useId, useState } from "react";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import {
   AlertTriangle,
   Check,
@@ -12,43 +17,30 @@ import {
 } from "lucide-react";
 import {
   alertsApi,
-  type AlertChangeScope,
-  type AlertClassification,
+  type AlertParamSpec,
   type AlertRule,
-  type AlertRuleType,
-  type AlertServerType,
+  type AlertRuleTypeSpec,
+  type AlertRuleUpdate,
   type AlertSeverity,
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { ListEmpty } from "@/components/ui/list-read-error";
+import { errMsg } from "@/pages/dhcp/_shared";
 import { AskAIButton } from "@/components/copilot/AskAIButton";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
 
-// Per-rule-type sensible starting values, seeded when the operator picks a
-// type in the New-rule modal. Without this, switching to e.g. stale_ip_count
-// would inherit subnet_utilization's 90 / 30 and create a 90-count / 30-day
-// rule that contradicts the documented 10 / 90 semantics.
-const RULE_TYPE_PARAM_DEFAULTS: Partial<
-  Record<AlertRuleType, { threshold?: number; thresholdDays?: number }>
-> = {
-  subnet_utilization: { threshold: 90 },
-  voice_lease_count_below: { threshold: 10 },
-  stale_ip_count: { threshold: 10, thresholdDays: 90 },
-  dhcp_pool_exhaustion: { threshold: 90 },
-  domain_expiring: { thresholdDays: 30 },
-  circuit_term_expiring: { thresholdDays: 30 },
-  service_term_expiring: { thresholdDays: 30 },
-  secret_expiring: { thresholdDays: 30 },
-  decom_expiring: { thresholdDays: 30 },
-  // #983 Phase 2 — PSI stall %. Conservative on purpose: nobody has watched
-  // PSI on a loaded appliance yet, so it starts where the reading is
-  // unambiguous rather than where it is sensitive. Tune DOWN with field
-  // numbers; starting low pages on day one and teaches people to ignore it.
-  node_pressure: { threshold: 50 },
-};
-
+// #1994 — the label names its control: the single child element gets an
+// `id` and the label a matching `htmlFor`, so a screen reader (or a
+// search by label) finds the control.
 function Field({
   label,
   hint,
@@ -56,22 +48,52 @@ function Field({
 }: {
   label: string;
   hint?: string;
-  children: React.ReactNode;
+  children: React.ReactElement<{ id?: string }>;
 }) {
+  const id = useId();
   return (
     <div className="space-y-1">
-      <label className="text-xs font-medium text-muted-foreground">
+      <label htmlFor={id} className="text-xs font-medium text-muted-foreground">
         {label}
       </label>
-      {children}
+      {isValidElement(children) ? cloneElement(children, { id }) : children}
       {hint && <p className="text-[11px] text-muted-foreground/80">{hint}</p>}
     </div>
   );
 }
 
+// A numeric input's value: a stored null stays empty, never a default.
+const numVal = (n: number | null): number | string => (n === null ? "" : n);
+const parseNum = (v: string): number | null => (v === "" ? null : Number(v));
+
+// A select's empty value ("") means NULL on the wire.
+const norm = (v: unknown): unknown => (v === "" || v === undefined ? null : v);
+
+// What the control shows for a stored value. A stored null stays empty for a
+// number (#1986); a select has no empty option unless the catalogue lists
+// one, so it shows the value the evaluator reads the null as (or, for a
+// required parameter with no such value, the first option).
+function shownFor(p: AlertParamSpec, stored: unknown): number | string | null {
+  if (stored !== null && stored !== undefined) return stored as number | string;
+  if (p.kind === "integer") return null;
+  return p.default ?? p.initial ?? p.options[0]?.value ?? null;
+}
+
+// A new rule's starting value when the catalogue names no ``initial``: the
+// evaluator's default, unless the API would refuse it (dns_query_rate_spike's
+// 200% is above threshold_percent's 0..100) — then empty, which the evaluator
+// reads as that same default.
+function newRuleDefault(p: AlertParamSpec): number | string | null {
+  if (p.kind === "select") return shownFor(p, null);
+  const d = p.default;
+  if (typeof d !== "number") return null;
+  if ((p.min != null && d < p.min) || (p.max != null && d > p.max)) return null;
+  return d;
+}
+
 // ── Rule editor ────────────────────────────────────────────────────────────
 
-function RuleEditorModal({
+export function RuleEditorModal({
   existing,
   onClose,
 }: {
@@ -79,31 +101,28 @@ function RuleEditorModal({
   onClose: () => void;
 }) {
   const qc = useQueryClient();
+  // #1997 — the rule types and each one's editable parameters come from the
+  // backend, so a type added there is editable here with no change.
+  const catalogue = useQuery({
+    queryKey: ["alert-rule-types"],
+    queryFn: alertsApi.ruleTypes,
+    staleTime: 5 * 60_000,
+  });
+  const types = catalogue.data;
   const [name, setName] = useState(existing?.name ?? "");
   const [description, setDescription] = useState(existing?.description ?? "");
   const [enabled, setEnabled] = useState(existing?.enabled ?? true);
-  const [ruleType, setRuleType] = useState<AlertRuleType>(
-    existing?.rule_type ?? "subnet_utilization",
-  );
-  const [threshold, setThreshold] = useState<number>(
-    existing?.threshold_percent ?? 90,
-  );
-  const [thresholdDays, setThresholdDays] = useState<number>(
-    existing?.threshold_days ?? 30,
-  );
-  // dhcp_pool_exhaustion: 0 means "no free-address floor" (occupancy % only).
-  const [minFree, setMinFree] = useState<number>(
-    existing?.min_free_addresses ?? 0,
-  );
-  const [serverType, setServerType] = useState<AlertServerType>(
-    (existing?.server_type as AlertServerType | null) ?? "any",
-  );
-  const [classification, setClassification] = useState<AlertClassification>(
-    (existing?.classification as AlertClassification | null) ?? "pci_scope",
-  );
-  const [changeScope, setChangeScope] = useState<AlertChangeScope>(
-    (existing?.change_scope as AlertChangeScope | null) ?? "any_change",
-  );
+  const [pickedType, setPickedType] = useState<string | null>(null);
+  const ruleType =
+    existing?.rule_type ??
+    pickedType ??
+    types?.find((t) => t.rule_type === "subnet_utilization")?.rule_type ??
+    types?.[0]?.rule_type ??
+    null;
+  const spec = types?.find((t) => t.rule_type === ruleType) ?? null;
+  // Only what the operator has touched; everything else shows (and keeps)
+  // the stored value, or the type's starting value on a new rule.
+  const [touched, setTouched] = useState<Record<string, unknown>>({});
   const [severity, setSeverity] = useState<AlertSeverity>(
     existing?.severity ?? "warning",
   );
@@ -115,10 +134,23 @@ function RuleEditorModal({
   );
   const [notifySmtp, setNotifySmtp] = useState(existing?.notify_smtp ?? false);
   const [error, setError] = useState<string | null>(null);
+  // #3929 — a number input holding text the browser cannot read as a number
+  // (`85-`) reports value "", which would save as "use the default". Track
+  // those fields (from the input's validity) so Save refuses them in words.
+  const [unreadable, setUnreadable] = useState<Record<string, boolean>>({});
+
+  const stored = existing as unknown as Record<string, unknown> | null;
+  const current = (p: AlertParamSpec): number | string | null => {
+    if (p.name in touched) return touched[p.name] as number | string | null;
+    if (stored) return shownFor(p, stored[p.name]);
+    return p.initial ?? newRuleDefault(p);
+  };
+  const setParam = (n: string, v: number | string | null) =>
+    setTouched((t) => ({ ...t, [n]: v }));
 
   const mut = useMutation({
     mutationFn: async () => {
-      const body = {
+      const base: AlertRuleUpdate = {
         name,
         description,
         enabled,
@@ -126,44 +158,57 @@ function RuleEditorModal({
         notify_syslog: notifySyslog,
         notify_webhook: notifyWebhook,
         notify_smtp: notifySmtp,
-        threshold_percent:
-          ruleType === "subnet_utilization" ||
-          ruleType === "voice_lease_count_below" ||
-          ruleType === "stale_ip_count" ||
-          ruleType === "dhcp_pool_exhaustion" ||
-          ruleType === "node_pressure"
-            ? threshold
-            : null,
-        min_free_addresses:
-          ruleType === "dhcp_pool_exhaustion" && minFree > 0 ? minFree : null,
-        threshold_days:
-          ruleType === "domain_expiring" ||
-          ruleType === "circuit_term_expiring" ||
-          ruleType === "service_term_expiring" ||
-          ruleType === "secret_expiring" ||
-          ruleType === "decom_expiring" ||
-          ruleType === "stale_ip_count"
-            ? thresholdDays
-            : null,
-        server_type: ruleType === "server_unreachable" ? serverType : null,
-        classification:
-          ruleType === "compliance_change" ? classification : null,
-        change_scope: ruleType === "compliance_change" ? changeScope : null,
       };
+      // Only the parameters this rule type has are ever sent.
+      const params: Record<string, unknown> = {};
+      for (const p of spec?.params ?? []) params[p.name] = norm(current(p));
       if (existing) {
-        return alertsApi.updateRule(existing.id, body);
+        // #1986 — send only what the operator changed; an unchanged Save
+        // sends nothing at all. A stored null a select can only show as a
+        // value compares as the value the evaluator reads it as, so leaving
+        // the control alone is not a change; a required parameter with no
+        // such value (a compliance rule's classification) is compared to
+        // null, so the shown choice is sent — the server refuses any edit
+        // that keeps it null (#1580).
+        const was = (k: string, p?: AlertParamSpec): unknown => {
+          const v = (stored as Record<string, unknown>)[k];
+          if (v !== null && v !== undefined) return v;
+          return p?.kind === "select" ? norm(p.default) : null;
+        };
+        const changed: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(base)) {
+          const w = k === "description" ? (was(k) ?? "") : was(k);
+          if (w !== v) changed[k] = v;
+        }
+        for (const p of spec?.params ?? [])
+          if (norm(was(p.name, p)) !== params[p.name])
+            changed[p.name] = params[p.name];
+        if (Object.keys(changed).length === 0) return existing;
+        return alertsApi.updateRule(existing.id, changed as AlertRuleUpdate);
       }
-      return alertsApi.createRule({ ...body, rule_type: ruleType });
+      return alertsApi.createRule({
+        ...base,
+        ...params,
+        name,
+        rule_type: ruleType as string,
+      });
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["alert-rules"] });
       onClose();
     },
     onError: (e: unknown) => {
-      const err = e as { response?: { data?: { detail?: string } } };
-      setError(err?.response?.data?.detail ?? "Save failed");
+      // #1993 — a 422's `detail` is a list; render it as text.
+      setError(errMsg(e, "Save failed"));
     },
   });
+
+  // The catalogue gates a NEW rule (no type to create without it); an edit
+  // can still change its non-parameter fields if the catalogue is down.
+  const catalogueBlocks = !existing && !spec;
+  const groups: Record<string, AlertRuleTypeSpec[]> = {};
+  for (const t of types ?? [])
+    if (!t.system_driven) (groups[t.group] ??= []).push(t);
 
   return (
     <Modal
@@ -193,312 +238,106 @@ function RuleEditorModal({
           >
             <select
               className={inputCls}
-              value={ruleType}
+              value={ruleType ?? ""}
+              disabled={!types}
               onChange={(e) => {
-                const next = e.target.value as AlertRuleType;
-                setRuleType(next);
-                const d = RULE_TYPE_PARAM_DEFAULTS[next];
-                if (d?.threshold !== undefined) setThreshold(d.threshold);
-                if (d?.thresholdDays !== undefined)
-                  setThresholdDays(d.thresholdDays);
+                setPickedType(e.target.value);
+                setTouched({});
               }}
             >
-              <optgroup label="Infrastructure">
-                <option value="subnet_utilization">Subnet utilization</option>
-                <option value="dhcp_pool_exhaustion">
-                  DHCP pool exhaustion (dynamic pool pressure)
-                </option>
-                <option value="server_unreachable">Server unreachable</option>
-                <option value="stale_ip_count">
-                  Stale IP count (address-space hygiene)
-                </option>
-                <option value="node_pressure">
-                  Node resource pressure (PSI stalling)
-                </option>
-              </optgroup>
-              <optgroup label="Subnet / IPAM">
-                <option value="decom_expiring">
-                  Subnet decommission approaching
-                </option>
-              </optgroup>
-              <optgroup label="Network (ASN / RPKI)">
-                <option value="asn_holder_drift">ASN holder drift</option>
-                <option value="asn_whois_unreachable">
-                  ASN WHOIS unreachable
-                </option>
-                <option value="rpki_roa_expiring">RPKI ROA expiring</option>
-                <option value="rpki_roa_expired">RPKI ROA expired</option>
-              </optgroup>
-              <optgroup label="Domains (registry)">
-                <option value="domain_expiring">Domain expiring</option>
-                <option value="domain_nameserver_drift">
-                  Domain nameserver drift
-                </option>
-                <option value="domain_registrar_changed">
-                  Domain registrar changed (transfer)
-                </option>
-                <option value="domain_dnssec_status_changed">
-                  Domain DNSSEC status changed
-                </option>
-              </optgroup>
-              <optgroup label="Circuits (WAN transport)">
-                <option value="circuit_term_expiring">
-                  Circuit term expiring
-                </option>
-                <option value="circuit_status_changed">
-                  Circuit status changed (suspended / decom)
-                </option>
-              </optgroup>
-              <optgroup label="Service catalog">
-                <option value="service_term_expiring">
-                  Service term expiring
-                </option>
-                <option value="service_resource_orphaned">
-                  Service resource orphaned (target deleted)
-                </option>
-              </optgroup>
-              <optgroup label="Compliance">
-                <option value="compliance_change">
-                  Compliance change (PCI / HIPAA / internet-facing)
-                </option>
-              </optgroup>
-              <optgroup label="VoIP">
-                <option value="voice_lease_count_below">
-                  Voice VLAN lease count below threshold
-                </option>
-              </optgroup>
-              <optgroup label="Security">
-                <option value="secret_expiring">
-                  Secret / certificate expiring
-                </option>
-              </optgroup>
+              {Object.entries(groups).map(([g, ts]) => (
+                <optgroup key={g} label={g}>
+                  {ts.map((t) => (
+                    <option key={t.rule_type} value={t.rule_type}>
+                      {t.label}
+                    </option>
+                  ))}
+                </optgroup>
+              ))}
             </select>
           </Field>
         )}
-        {ruleType === "voice_lease_count_below" && (
-          <Field
-            label="Minimum active leases"
-            hint="Fires when any subnet tagged subnet_role='voice' has fewer active DHCP leases than this. Set to roughly 50% of the expected phone fleet so brief reboots don't trigger but a real mass-disconnect does."
-          >
-            <input
-              type="number"
-              min={0}
-              className={inputCls}
-              value={threshold}
-              onChange={(e) => setThreshold(Number(e.target.value))}
-            />
-          </Field>
+        {catalogue.isLoading && (
+          <p className="text-xs text-muted-foreground">
+            Loading rule parameters…
+          </p>
         )}
-        {ruleType === "subnet_utilization" && (
-          <Field
-            label="Threshold (%)"
-            hint="Fires when subnet utilization ≥ this. PTP / loopback subnets (prefix > utilization_max_prefix_*) are excluded."
-          >
-            <input
-              type="number"
-              min={0}
-              max={100}
-              className={inputCls}
-              value={threshold}
-              onChange={(e) => setThreshold(Number(e.target.value))}
-            />
-          </Field>
+        {catalogue.isError && (
+          <FormError>
+            Could not load the rule types
+            {existing ? "; its parameters cannot be edited here." : "."}
+          </FormError>
         )}
-        {ruleType === "node_pressure" && (
+        {existing && types && !spec && (
+          // #2130 — the catalogue leaves out a type whose feature module is
+          // off. The rule is kept as stored (no parameter is sent on Save)
+          // and is not evaluated until the module is back on.
+          <p className="text-xs text-muted-foreground">
+            This rule&apos;s type belongs to a feature module that is turned
+            off, so it is not evaluated. Its parameters are kept as stored and
+            can be edited again once the module is on.
+          </p>
+        )}
+        {spec?.params.map((p) => (
           <Field
-            label="Stall threshold (%)"
+            key={p.name}
+            label={p.label}
             hint={
-              "Warns when CPU or memory 'some' stalling holds at or above this " +
-              "across a 5-minute window — the share of wall time at least one " +
-              "task was blocked waiting for the resource. Separate from the " +
-              "fixed 1% memory 'full' floor, which is always critical: 'some' " +
-              "at 20% is a busy node, 'full' at 20% is a node doing no work. " +
-              "Silent on nodes whose kubelet does not report PSI (below " +
-              "Kubernetes 1.36)."
+              p.hint
+                ? p.default != null &&
+                  p.kind === "integer" &&
+                  p.hint.indexOf("Default") < 0
+                  ? `${p.hint} Empty uses ${p.default}${p.unit === "%" ? "%" : p.unit === "days" ? " d" : ""}.`
+                  : p.hint
+                : undefined
             }
           >
-            <input
-              type="number"
-              min={0}
-              max={100}
-              className={inputCls}
-              value={threshold}
-              onChange={(e) => setThreshold(Number(e.target.value))}
-            />
-          </Field>
-        )}
-        {ruleType === "dhcp_pool_exhaustion" && (
-          <>
-            <Field
-              label="Occupancy threshold (%)"
-              hint="Fires when a dynamic DHCP pool's live occupancy (active leases ÷ pool size) reaches this. Orthogonal to subnet utilization, which counts allocated IPAM rows — a pool can be exhausted while the subnet looks empty."
-            >
-              <input
-                type="number"
-                min={0}
-                max={100}
-                className={inputCls}
-                value={threshold}
-                onChange={(e) => setThreshold(Number(e.target.value))}
-              />
-            </Field>
-            <Field
-              label="Minimum free addresses (optional)"
-              hint="Also fire when fewer than this many addresses are free in the pool, regardless of percent. Set 0 to use the percent threshold only."
-            >
-              <input
-                type="number"
-                min={0}
-                className={inputCls}
-                value={minFree}
-                onChange={(e) => setMinFree(Number(e.target.value))}
-              />
-            </Field>
-          </>
-        )}
-        {ruleType === "stale_ip_count" && (
-          <>
-            <Field
-              label="Stale IP count threshold"
-              hint="Fires when a subnet holds at least this many allocated IPs that haven't been seen on the wire in the window below. Reads the discovery last-seen signal; never-seen rows are excluded (chase those from the Stale-IP report)."
-            >
-              <input
-                type="number"
-                min={1}
-                className={inputCls}
-                value={threshold}
-                onChange={(e) => setThreshold(Number(e.target.value))}
-              />
-            </Field>
-            <Field
-              label="Stale window (days)"
-              hint="An allocated IP counts as stale once its last-seen timestamp is older than this. Default 90."
-            >
-              <input
-                type="number"
-                min={1}
-                max={3650}
-                className={inputCls}
-                value={thresholdDays}
-                onChange={(e) => setThresholdDays(Number(e.target.value))}
-              />
-            </Field>
-          </>
-        )}
-        {ruleType === "server_unreachable" && (
-          <Field label="Server type">
-            <select
-              className={inputCls}
-              value={serverType}
-              onChange={(e) => setServerType(e.target.value as AlertServerType)}
-            >
-              <option value="any">DNS + DHCP</option>
-              <option value="dns">DNS only</option>
-              <option value="dhcp">DHCP only</option>
-            </select>
-          </Field>
-        )}
-        {(ruleType === "domain_expiring" ||
-          ruleType === "circuit_term_expiring" ||
-          ruleType === "service_term_expiring" ||
-          ruleType === "secret_expiring" ||
-          ruleType === "decom_expiring") && (
-          <Field
-            label="Threshold (days)"
-            hint="Soft fire at threshold; severity escalates to warning at threshold/4 and critical at threshold/12 (e.g. 30 → 7.5 → 2.5 d)."
-          >
-            <input
-              type="number"
-              min={1}
-              max={3650}
-              className={inputCls}
-              value={thresholdDays}
-              onChange={(e) => setThresholdDays(Number(e.target.value))}
-            />
-          </Field>
-        )}
-        {ruleType === "domain_nameserver_drift" && (
-          <p className="rounded-md border bg-muted/20 p-3 text-[11px] text-muted-foreground">
-            Fires for any domain whose operator-pinned{" "}
-            <code>expected_nameservers</code> list differs from the
-            registrar-reported <code>actual_nameservers</code>. Resolves when
-            drift clears.
-          </p>
-        )}
-        {ruleType === "domain_registrar_changed" && (
-          <p className="rounded-md border bg-muted/20 p-3 text-[11px] text-muted-foreground">
-            Fires once per registrar transition (e.g. a transfer). Auto-resolves
-            after 7 days; can be marked resolved manually before then. The first
-            observation per domain is recorded as a baseline without paging.
-          </p>
-        )}
-        {ruleType === "domain_dnssec_status_changed" && (
-          <p className="rounded-md border bg-muted/20 p-3 text-[11px] text-muted-foreground">
-            Fires once when a domain's <code>dnssec_signed</code> flag flips at
-            the parent zone (DS records appearing or disappearing).
-            Auto-resolves after 7 days; can be marked resolved manually.
-          </p>
-        )}
-        {ruleType === "circuit_status_changed" && (
-          <p className="rounded-md border bg-muted/20 p-3 text-[11px] text-muted-foreground">
-            Fires once when a circuit transitions into <code>suspended</code> or{" "}
-            <code>decom</code>. Routine <code>active</code> ↔{" "}
-            <code>pending</code> flips during commissioning are excluded.
-            Auto-resolves after 7 days; can be marked resolved manually.
-          </p>
-        )}
-        {ruleType === "service_resource_orphaned" && (
-          <p className="rounded-md border bg-muted/20 p-3 text-[11px] text-muted-foreground">
-            Fires when a service has a resource link (VRF / subnet / circuit /
-            etc.) whose target row was deleted out from under it. Resolves
-            automatically when the operator detaches the orphan link or
-            re-creates the target.
-          </p>
-        )}
-        {ruleType === "compliance_change" && (
-          <>
-            <Field
-              label="Classification"
-              hint="Subnet flag this rule watches. Mutations against subnets / IPs / DHCP scopes whose subnet has the flag fire one event per audit row."
-            >
+            {p.kind === "select" ? (
               <select
                 className={inputCls}
-                value={classification}
-                onChange={(e) =>
-                  setClassification(e.target.value as AlertClassification)
-                }
+                value={String(current(p) ?? "")}
+                onChange={(e) => setParam(p.name, e.target.value)}
               >
-                <option value="pci_scope">PCI scope</option>
-                <option value="hipaa_scope">HIPAA scope</option>
-                <option value="internet_facing">Internet-facing</option>
+                {p.options.map((o) => (
+                  <option key={o.value} value={o.value}>
+                    {o.label}
+                  </option>
+                ))}
               </select>
-            </Field>
-            <Field
-              label="Change scope"
-              hint="Which audit-log actions count. Update + create + delete cover the common cases; pick a narrower scope to reduce noise."
-            >
-              <select
+            ) : (
+              <input
+                type="number"
+                min={p.min ?? undefined}
+                max={p.max ?? undefined}
                 className={inputCls}
-                value={changeScope}
-                onChange={(e) =>
-                  setChangeScope(e.target.value as AlertChangeScope)
-                }
-              >
-                <option value="any_change">
-                  Any change (create + update + delete)
-                </option>
-                <option value="create">Create only</option>
-                <option value="delete">Delete only</option>
-              </select>
-            </Field>
-            <p className="rounded-md border bg-muted/20 p-3 text-[11px] text-muted-foreground">
-              On first enable, the rule baselines its watermark to "now" — it
-              won't retro-fire on existing audit history. Each matching audit
-              row opens one event that auto-resolves after 24 h. Inheritance
-              from IP block / space is not supported today (classification flags
-              only exist on subnet rows).
-            </p>
-          </>
+                value={numVal(current(p) as number | null)}
+                onChange={(e) => {
+                  setUnreadable((u) => ({
+                    ...u,
+                    [p.name]: e.target.validity.badInput,
+                  }));
+                  setParam(p.name, parseNum(e.target.value));
+                }}
+              />
+            )}
+          </Field>
+        ))}
+        {spec && spec.params.length === 0 && (
+          <p className="rounded-md border bg-muted/20 p-3 text-[11px] text-muted-foreground">
+            No adjustable parameters.
+          </p>
+        )}
+        {spec?.description && (
+          <p className="rounded-md border bg-muted/20 p-3 text-[11px] text-muted-foreground">
+            {spec.description}
+          </p>
+        )}
+        {existing && !spec && types && (
+          <p className="rounded-md border bg-muted/20 p-3 text-[11px] text-muted-foreground">
+            This server does not describe rule type{" "}
+            <code>{existing.rule_type}</code>; stored parameters are kept as
+            they are.
+          </p>
         )}
         <Field label="Severity">
           <select
@@ -553,7 +392,7 @@ function RuleEditorModal({
           />
           Rule enabled
         </label>
-        {error && <p className="text-xs text-red-600">{error}</p>}
+        {error && <FormError>{error}</FormError>}
         <div className="flex justify-end gap-2 pt-2">
           <button
             type="button"
@@ -564,8 +403,25 @@ function RuleEditorModal({
           </button>
           <button
             type="button"
-            disabled={!name.trim() || mut.isPending}
-            onClick={() => mut.mutate()}
+            disabled={
+              !name.trim() ||
+              mut.isPending ||
+              catalogueBlocks ||
+              (!!existing && catalogue.isLoading)
+            }
+            onClick={() => {
+              const bad = (spec?.params ?? []).filter(
+                (p) => p.kind !== "select" && unreadable[p.name],
+              );
+              if (bad.length > 0) {
+                setError(
+                  `${bad.map((p) => p.label).join(", ")}: not a number. Enter digits only, or clear the field to use the default.`,
+                );
+                return;
+              }
+              setError(null);
+              mut.mutate();
+            }}
             className={cn(
               "rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground",
               "hover:bg-primary/90 disabled:opacity-50",
@@ -579,24 +435,80 @@ function RuleEditorModal({
   );
 }
 
+// The Parameters cell: each parameter the type has, a stored null shown as
+// the value the evaluator reads it as (#1997).
+function paramSummary(r: AlertRule, spec?: AlertRuleTypeSpec): string {
+  if (!spec || spec.params.length === 0) return "—";
+  const row = r as unknown as Record<string, unknown>;
+  return (
+    spec.params
+      .map((p) => {
+        const v = row[p.name] ?? p.default;
+        if (v === null || v === undefined || v === "") return null;
+        if (p.kind === "select")
+          return `${p.label}: ${p.options.find((o) => o.value === v)?.label ?? v}`;
+        const unit = p.unit === "%" ? "%" : p.unit === "days" ? " d" : "";
+        return `${p.label}: ${v}${unit}`;
+      })
+      .filter(Boolean)
+      .join(" · ") || "—"
+  );
+}
+
 // ── Page ───────────────────────────────────────────────────────────────────
 
+const EVENTS_PAGE_SIZE = 100;
+
 export function AlertsPage() {
+  // #1341 — every write on this page takes a superadmin (its handlers
+  // take SuperAdmin), so a read-only user is offered none of them.
+  const superadminGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const qc = useQueryClient();
   const [editing, setEditing] = useState<AlertRule | null>(null);
   const [showCreate, setShowCreate] = useState(false);
   const [openOnly, setOpenOnly] = useState(true);
 
-  const { data: rules = [], isLoading: rulesLoading } = useQuery({
+  const {
+    data: rules = [],
+    isLoading: rulesLoading,
+    error: rulesError,
+  } = useQuery({
     queryKey: ["alert-rules"],
     queryFn: alertsApi.listRules,
   });
 
-  const { data: events = [] } = useQuery({
+  const { data: ruleTypes } = useQuery({
+    queryKey: ["alert-rule-types"],
+    queryFn: alertsApi.ruleTypes,
+    staleTime: 5 * 60_000,
+  });
+  const specByType = new Map((ruleTypes ?? []).map((t) => [t.rule_type, t]));
+
+  // Paged (#3830): the page used to read the newest 100 and say "100 shown"
+  // over an estate holding more, while the Dashboard counted every one.
+  const eventsQuery = useInfiniteQuery({
     queryKey: ["alert-events", { openOnly }],
-    queryFn: () => alertsApi.listEvents({ open_only: openOnly, limit: 100 }),
+    queryFn: ({ pageParam }) =>
+      alertsApi.listEventsPage({
+        open_only: openOnly,
+        limit: EVENTS_PAGE_SIZE,
+        offset: pageParam,
+      }),
+    initialPageParam: 0,
+    getNextPageParam: (last, all) => {
+      const loaded = all.reduce((n, p) => n + p.items.length, 0);
+      return last.items.length > 0 && loaded < last.total ? loaded : undefined;
+    },
     refetchInterval: 15_000,
   });
+  const events = (eventsQuery.data?.pages ?? []).flatMap((p) => p.items);
+  const eventsTotal =
+    eventsQuery.data?.pages[eventsQuery.data.pages.length - 1]?.total ??
+    events.length;
+  const eventsError = eventsQuery.error;
 
   const toggle = useMutation({
     mutationFn: (r: AlertRule) =>
@@ -628,15 +540,18 @@ export function AlertsPage() {
           <div className="min-w-0 flex-1">
             <h1 className="text-2xl font-bold tracking-tight">Alerts</h1>
             <p className="mt-1 text-xs text-muted-foreground">
-              Rule-based notifications on subnet utilization + server health.
-              Fires via syslog + webhook to the audit-forward targets.
+              Rule-based notifications on IPAM, DHCP, DNS, infrastructure,
+              security and more. Each rule notifies by syslog, webhook and/or
+              email (SMTP), as set on the rule, through the Settings → Audit
+              Event Forwarding targets of that kind.
             </p>
           </div>
           <div className="flex shrink-0 gap-2">
             <button
               onClick={() => evaluate.mutate()}
-              className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
+              className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
               disabled={evaluate.isPending}
+              {...superadminGate}
             >
               <Play className="h-3.5 w-3.5" />
               {evaluate.isPending ? "Evaluating…" : "Evaluate now"}
@@ -647,6 +562,7 @@ export function AlertsPage() {
                 "inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground",
                 "hover:bg-primary/90",
               )}
+              {...superadminGate}
             >
               <Plus className="h-3.5 w-3.5" />
               New rule
@@ -669,7 +585,11 @@ export function AlertsPage() {
               <AlertTriangle className="h-4 w-4 text-amber-500" />
               <h2 className="text-sm font-semibold">Events</h2>
               <span className="text-xs text-muted-foreground">
-                {events.length} shown
+                {eventsError && events.length === 0
+                  ? "not loaded"
+                  : eventsTotal > events.length
+                    ? `${events.length} of ${eventsTotal} shown`
+                    : `${events.length} shown`}
               </span>
             </div>
             <label className="flex items-center gap-2 text-xs text-muted-foreground">
@@ -694,15 +614,27 @@ export function AlertsPage() {
                 </tr>
               </thead>
               <tbody className={zebraBodyCls}>
-                {events.length === 0 && (
+                {events.length === 0 && eventsQuery.isLoading && (
                   <tr>
                     <td
                       colSpan={6}
                       className="px-4 py-8 text-center text-xs text-muted-foreground"
                     >
-                      {openOnly
-                        ? "No open events — all clear."
-                        : "No events yet."}
+                      Loading…
+                    </td>
+                  </tr>
+                )}
+                {events.length === 0 && !eventsQuery.isLoading && (
+                  <tr>
+                    <td
+                      colSpan={6}
+                      className="px-4 py-8 text-center text-xs text-muted-foreground"
+                    >
+                      <ListEmpty error={eventsError} what="alert events">
+                        {openOnly
+                          ? "No open events — all clear."
+                          : "No events yet."}
+                      </ListEmpty>
                     </td>
                   </tr>
                 )}
@@ -755,7 +687,8 @@ export function AlertsPage() {
                         {!ev.resolved_at && (
                           <button
                             onClick={() => resolve.mutate(ev.id)}
-                            className="rounded border px-2 py-0.5 text-[11px] hover:bg-accent"
+                            className="rounded border px-2 py-0.5 text-[11px] hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                            {...superadminGate}
                           >
                             Resolve
                           </button>
@@ -767,6 +700,21 @@ export function AlertsPage() {
               </tbody>
             </table>
           </div>
+          {eventsQuery.hasNextPage && (
+            <div className="flex items-center justify-between gap-3 border-t px-4 py-2.5 text-xs text-muted-foreground">
+              <span>
+                Showing the newest {events.length} of {eventsTotal}.
+              </span>
+              <button
+                type="button"
+                onClick={() => eventsQuery.fetchNextPage()}
+                disabled={eventsQuery.isFetchingNextPage}
+                className="rounded-md border px-3 py-1 text-xs hover:bg-muted disabled:opacity-50"
+              >
+                {eventsQuery.isFetchingNextPage ? "Loading…" : "Load more"}
+              </button>
+            </div>
+          )}
         </div>
 
         {/* ── Rules ───────────────────────────────────────────────────── */}
@@ -774,7 +722,7 @@ export function AlertsPage() {
           <div className="flex items-center justify-between border-b px-4 py-2.5">
             <h2 className="text-sm font-semibold">Rules</h2>
             <span className="text-xs text-muted-foreground">
-              {rules.length} total
+              {rulesError ? "not loaded" : `${rules.length} total`}
             </span>
           </div>
           <div className="overflow-x-auto">
@@ -807,7 +755,14 @@ export function AlertsPage() {
                       colSpan={7}
                       className="px-4 py-8 text-center text-xs text-muted-foreground"
                     >
-                      No rules yet — click “New rule” to create one.
+                      <ListEmpty
+                        error={rulesError}
+                        what="alert rules"
+                        gate={superadminGate}
+                        hint={`Click “New rule” to create one.`}
+                      >
+                        No rules yet.
+                      </ListEmpty>
                     </td>
                   </tr>
                 )}
@@ -818,25 +773,7 @@ export function AlertsPage() {
                       {r.rule_type}
                     </td>
                     <td className="px-4 py-2 text-muted-foreground tabular-nums">
-                      {r.rule_type === "subnet_utilization"
-                        ? `≥ ${r.threshold_percent}%`
-                        : r.rule_type === "voice_lease_count_below"
-                          ? `< ${r.threshold_percent ?? 1} leases`
-                          : r.rule_type === "stale_ip_count"
-                            ? `≥ ${r.threshold_percent ?? 10} stale · ${r.threshold_days ?? 90}d`
-                            : r.rule_type === "node_pressure"
-                              ? `≥ ${r.threshold_percent ?? 50}% stalled · full ≥ 1%`
-                              : r.rule_type === "server_unreachable"
-                                ? `type=${r.server_type ?? "any"}`
-                                : r.rule_type === "domain_expiring" ||
-                                    r.rule_type === "circuit_term_expiring" ||
-                                    r.rule_type === "service_term_expiring" ||
-                                    r.rule_type === "secret_expiring" ||
-                                    r.rule_type === "decom_expiring"
-                                  ? `≤ ${r.threshold_days ?? 30} d`
-                                  : r.rule_type === "compliance_change"
-                                    ? `${r.classification ?? "?"} · ${r.change_scope ?? "any_change"}`
-                                    : "—"}
+                      {paramSummary(r, specByType.get(r.rule_type))}
                     </td>
                     <td className="px-4 py-2">
                       <SeverityBadge severity={r.severity} />
@@ -890,14 +827,18 @@ export function AlertsPage() {
                         <button
                           onClick={() => toggle.mutate(r)}
                           title={r.enabled ? "Disable" : "Enable"}
-                          className="rounded p-1.5 hover:bg-accent"
+                          aria-label={r.enabled ? "Disable" : "Enable"}
+                          className="rounded p-1.5 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                          {...superadminGate}
                         >
                           <Power className="h-3.5 w-3.5" />
                         </button>
                         <button
                           onClick={() => setEditing(r)}
                           title="Edit"
-                          className="rounded p-1.5 hover:bg-accent"
+                          aria-label="Edit"
+                          className="rounded p-1.5 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                          {...superadminGate}
                         >
                           <Pencil className="h-3.5 w-3.5" />
                         </button>
@@ -908,7 +849,9 @@ export function AlertsPage() {
                             }
                           }}
                           title="Delete"
-                          className="rounded p-1.5 text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30"
+                          aria-label="Delete"
+                          className="rounded p-1.5 text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30 disabled:cursor-not-allowed disabled:opacity-50"
+                          {...superadminGate}
                         >
                           <Trash2 className="h-3.5 w-3.5" />
                         </button>

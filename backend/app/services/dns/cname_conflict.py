@@ -23,6 +23,8 @@ agent renders, so it never takes a CNAME.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
+from dataclasses import dataclass
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -86,28 +88,162 @@ async def find_cname_conflict(
     return (await db.execute(stmt.order_by(DNSRecord.created_at).limit(1))).scalars().first()
 
 
-def describe_cname_conflict(record_type: str, fqdn: str, existing: DNSRecord) -> str:
-    """The refusal message, shared so REST and the Copilot say the same thing."""
+async def find_record_insert_conflict(
+    db: AsyncSession,
+    zone_id: uuid.UUID,
+    *,
+    name: str,
+    record_type: str,
+    own_fk: str,
+    own_id: uuid.UUID,
+) -> DNSRecord | None:
+    """A non-owned row that blocks an integration mirror inserting a
+    record at (zone, name) (#1561), or None.
+
+    The record passes of the Kubernetes / Tailscale / NetBird mirrors
+    only ever saw rows carrying their own FK, so they inserted beside
+    operator records (and other integrations' records) at the same
+    name: an unexplained extra round-robin A, or a CNAME beside an A —
+    the state the record API refuses with 409 and BIND refuses to load.
+    A row blocks the insert when it is NOT owned by the caller
+    (``own_fk`` != ``own_id``) and either shares the type, or either
+    side is a CNAME (``types_conflict`` — the same rule
+    ``find_cname_conflict`` applies for the API). The caller's own rows
+    never block: the pass manages those itself.
+    """
+    stmt = select(DNSRecord).where(
+        DNSRecord.zone_id == zone_id,
+        func.lower(DNSRecord.name) == name.strip().lower(),
+    )
+    rows = (await db.execute(stmt.order_by(DNSRecord.created_at))).scalars().all()
+    rtype = record_type.strip().upper()
+    for row in rows:
+        if getattr(row, own_fk, None) == own_id:
+            continue
+        if row.record_type.strip().upper() == rtype or types_conflict(rtype, row.record_type):
+            return row
+    return None
+
+
+def _describe(
+    record_type: str,
+    fqdn: str,
+    other_type: str,
+    other_value: str,
+    other_id: uuid.UUID | None,
+    *,
+    requester_safe: bool = False,
+) -> str:
     name = fqdn.rstrip(".")
     rtype = record_type.strip().upper()
-    if existing.record_type.upper() == "CNAME":
+    # A portal requester may hold no read on the zone: the words say which
+    # rule was hit, never the other record's value or id.
+    ref = f" (id {other_id})" if other_id is not None and not requester_safe else ""
+    to = "" if requester_safe else f" to {other_value}"
+    if other_type.upper() == "CNAME":
         if rtype == "CNAME":
-            what = (
-                f"{name} already has a CNAME to {existing.value} (id {existing.id}), "
-                "and a name holds at most one CNAME"
-            )
+            what = f"{name} already has a CNAME{to}{ref}, and a name holds at most one CNAME"
         else:
-            what = (
-                f"{name} is a CNAME to {existing.value} (id {existing.id}), so it "
-                f"can hold no {rtype} record"
-            )
+            what = f"{name} is a CNAME{to}{ref}, so it can hold no {rtype} record"
+    elif requester_safe:
+        what = f"{name} already holds other data, so it cannot take a CNAME"
     else:
-        what = (
-            f"{name} already holds data ({existing.record_type} {existing.value}, "
-            f"id {existing.id}), so it cannot take a CNAME"
-        )
+        what = f"{name} already holds data ({other_type} {other_value}{ref}), so it cannot take a CNAME"
     return (
         f"{what}. A CNAME must be the only record at its name (RFC 1034 section "
         "3.6.2, RFC 2181 section 10.1); PowerDNS and BIND both refuse a zone "
         "that breaks this, and the server stops applying it."
     )
+
+
+def describe_cname_conflict(
+    record_type: str, fqdn: str, existing: DNSRecord, *, requester_safe: bool = False
+) -> str:
+    """The refusal message, shared so REST and the Copilot say the same thing.
+    ``requester_safe`` leaves out the other record's value and id (#3642)."""
+    return _describe(
+        record_type,
+        fqdn,
+        existing.record_type,
+        existing.value,
+        existing.id,
+        requester_safe=requester_safe,
+    )
+
+
+@dataclass(frozen=True)
+class NameRow:
+    """One record as the in-memory check sees it: an owner name relative to
+    its zone (``@`` / empty is the apex), a type, rdata, and a view scope
+    (None renders into every view)."""
+
+    name: str
+    record_type: str
+    value: str = ""
+    view_id: uuid.UUID | None = None
+
+
+def _rel(name: str) -> str:
+    n = name.strip().lower().rstrip(".")
+    return "@" if n == "" else n
+
+
+def _meet(a: NameRow, b: NameRow) -> bool:
+    """The DB check's rule on two in-memory rows: one name (case-insensitive),
+    overlapping views, and a CNAME on at least one side."""
+    return (
+        _rel(a.name) == _rel(b.name)
+        and views_overlap(a.view_id, b.view_id)
+        and types_conflict(a.record_type, b.record_type)
+    )
+
+
+def refused_by_cname_rule(
+    new_rows: Sequence[NameRow], standing: Sequence[NameRow] = ()
+) -> dict[int, str]:
+    """The in-memory twin of :func:`find_cname_conflict`, for rows that are
+    not in the database yet (an import batch). Returns ``{index into
+    new_rows: reason}`` for every row that cannot be stored.
+
+    ``standing`` are rows that stay where they are (records already in the
+    target zone): they always win. Within ``new_rows`` the non-CNAME data
+    wins over a CNAME at the same name (what BIND needs to load the zone),
+    and of several CNAMEs at one name the first is kept. A CNAME at the apex
+    is refused outright. DNSSEC's own types are never stored as operator
+    records, so they never reach this check.
+    """
+    refused: dict[int, str] = {}
+    for i, row in enumerate(new_rows):
+        if row.record_type.strip().upper() == "CNAME":
+            continue
+        for st in standing:
+            if _meet(row, st):
+                refused[i] = _describe(row.record_type, row.name, st.record_type, st.value, None)
+                break
+    kept_cnames: list[NameRow] = []
+    for i, row in enumerate(new_rows):
+        if row.record_type.strip().upper() != "CNAME":
+            continue
+        if is_apex(row.name):
+            refused[i] = APEX_CNAME_DETAIL
+            continue
+        other = next((st for st in standing if _meet(row, st)), None)
+        if other is None:
+            other = next(
+                (
+                    r
+                    for j, r in enumerate(new_rows)
+                    if j not in refused
+                    and j != i
+                    and _meet(row, r)
+                    and r.record_type.strip().upper() != "CNAME"
+                ),
+                None,
+            )
+        if other is None:
+            other = next((k for k in kept_cnames if _meet(row, k)), None)
+        if other is not None:
+            refused[i] = _describe("CNAME", row.name, other.record_type, other.value, None)
+            continue
+        kept_cnames.append(row)
+    return refused

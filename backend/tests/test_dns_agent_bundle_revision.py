@@ -44,6 +44,116 @@ PINNED_DIGESTS: dict[int, dict[str, str]] = {
         "plain": "c69af6546ce6118fe11c4abfeb4abc230e7d4c8b33c679444fa6e06cfba33748",
         "views": "1e70781c25f21f3563a0800205adfaef09b615eb0990e0f4ab8569f9d02bb7a0",
     },
+    # #1171: every zone copy carries refresh / retry / expire / minimum, at
+    # the ZONE_DEFAULT_* values for these fixtures' zones.
+    2: {
+        "plain": "f3b09e44127b9a25c77f06180586ee1c935853403f98f72988efa8b35d19a73e",
+        "views": "f76b076ee933fc8a82a303ec95e417641820daa18e4fe75af5cf14954b560d8f",
+    },
+    # #1373: the serial left the plain group's structural etag (views keep it).
+    3: {
+        "plain": "2ff144dc196f8f186e9a3ba3dcfc6b9f988839d9bf2e2ad6f5ee0596e32138d9",
+        "views": "1f827ac5f77c9df550a3dfd5fb644e184a081bb0e908a90f07b4d5d032a8412b",
+    },
+    # #1373: the zones are listed by name, so the plain group's reverse zone
+    # now comes before its forward one (the views group has one zone).
+    4: {
+        "plain": "90082e1b1aebf1f15faecfdecaa1056b5316cdd884a9479dbad94a84aae1d6ab",
+        "views": "1f827ac5f77c9df550a3dfd5fb644e184a081bb0e908a90f07b4d5d032a8412b",
+    },
+    # #1171's later change under #1373's: a group serves each zone's own SOA
+    # timers only once its last BIND9 agent renders them, so these fixtures'
+    # zones (no agent has said so) carry the old defaults again. 2 is #1171's
+    # stamp of that change alone; 3 and 4 were stamped over its earlier head.
+    5: {
+        "plain": "4f6e1693cdc51817e42e0e4bd45060a8ffddce72ab6ac343e382235bb9581811",
+        "views": "f76b076ee933fc8a82a303ec95e417641820daa18e4fe75af5cf14954b560d8f",
+    },
+    # #1513: only a Technitium server's bundle changed (``svcb_target_rule``,
+    # and SVCB targets the a3d9e5c17b42 migration wrote); these fixtures are
+    # BIND9, so their bytes are 5's.
+    6: {
+        "plain": "4f6e1693cdc51817e42e0e4bd45060a8ffddce72ab6ac343e382235bb9581811",
+        "views": "f76b076ee933fc8a82a303ec95e417641820daa18e4fe75af5cf14954b560d8f",
+    },
+    # #1759: only a Technitium server's bundle changed (``name_target_rule``,
+    # and the targets d6b2f81a3c57 wrote); these fixtures are BIND9, so
+    # their bytes are 5's and 6's.
+    7: {
+        "plain": "4f6e1693cdc51817e42e0e4bd45060a8ffddce72ab6ac343e382235bb9581811",
+        "views": "f76b076ee933fc8a82a303ec95e417641820daa18e4fe75af5cf14954b560d8f",
+    },
+    # 8 (#1523): the bundle ships the NOTIFY fields — server options
+    # notify_enabled / also_notify / allow_notify + zone allow_query /
+    # also_notify / notify_enabled.
+    8: {
+        "plain": "f7d933cc7f7d4194cbc0afab5f56e878fa547debfeb0455702f08bb76ab5cc19",
+        "views": "3e94415136b79039793de83663d182e3a0e329d962c73e2306fc786ba0c178b1",
+    },
+    # #1786: a BIND9 server's options carry ``allow_recursion``, on top of
+    # 8's NOTIFY fields.
+    9: {
+        "plain": "b0c88e0ffd0dadc9aa87f42812916763a1d1d78a58b41e6d440dbbfed030d422",
+        "views": "352e73b9717507d9654ad019bf677f81ca8f739ef61aa3e5ee29640d352d9bde",
+    },
+    # #1817: the same field, now the local + private networks default for
+    # groups that never set it (the fixtures' options rows).
+    10: {
+        "plain": "af022478ea75fc1b23f6fac003a76d8d8d0d53165668cc5db9ec53ba23e6ade5",
+        "views": "22c8d8f537d3b0ea47263eeca1c1218ee6ad6344e8680dd1e131d6d57fbd0940",
+    },
+    # #1706: a split-horizon group no longer ships the group blocklist zone
+    # beside each view's own. These fixtures carry no blocklist, so their
+    # bytes are 10's; the blocklist shape is pinned in
+    # test_dns_agent_bundle_blocklist_stream_1662.py.
+    11: {
+        "plain": "af022478ea75fc1b23f6fac003a76d8d8d0d53165668cc5db9ec53ba23e6ade5",
+        "views": "22c8d8f537d3b0ea47263eeca1c1218ee6ad6344e8680dd1e131d6d57fbd0940",
+    },
+    # #2157: a BIND9 bundle's RPZ zones carry ``rpz_sha256``. These fixtures
+    # carry no blocklist, so their bytes are 11's: an upgrade re-renders them
+    # and no agent sees an ETag move. The blocklist shape is pinned in
+    # test_dns_agent_bundle_blocklist_stream_1662.py.
+    12: {
+        "plain": "af022478ea75fc1b23f6fac003a76d8d8d0d53165668cc5db9ec53ba23e6ade5",
+        "views": "22c8d8f537d3b0ea47263eeca1c1218ee6ad6344e8680dd1e131d6d57fbd0940",
+    },
+    # #2124: only a sinkhole list's entries change (they carry its
+    # ``sinkhole_ip``), and these fixtures have none, so their digests are
+    # 12's. The sinkhole bytes are pinned in
+    # test_dns_agent_bundle_blocklist_stream_1662.py.
+    13: {
+        "plain": "af022478ea75fc1b23f6fac003a76d8d8d0d53165668cc5db9ec53ba23e6ade5",
+        "views": "22c8d8f537d3b0ea47263eeca1c1218ee6ad6344e8680dd1e131d6d57fbd0940",
+    },
+    # #2264: a non-default group ``allow_query_cache`` is now shipped; these
+    # fixtures keep the stored default, so their bytes are 13's.
+    14: {
+        "plain": "af022478ea75fc1b23f6fac003a76d8d8d0d53165668cc5db9ec53ba23e6ade5",
+        "views": "22c8d8f537d3b0ea47263eeca1c1218ee6ad6344e8680dd1e131d6d57fbd0940",
+    },
+    # #2835: the legacy group key is marked ``loopback``. These fixtures' groups
+    # have no legacy key, so their bytes are 14's; the marker is pinned in
+    # test_dns_bind9_serial_2835.py.
+    15: {
+        "plain": "af022478ea75fc1b23f6fac003a76d8d8d0d53165668cc5db9ec53ba23e6ade5",
+        "views": "22c8d8f537d3b0ea47263eeca1c1218ee6ad6344e8680dd1e131d6d57fbd0940",
+    },
+    # #3560/#3609: only a BIND9 group stored at ``yes`` with no anchor, or one
+    # holding a static root anchor, renders differently; these fixtures are
+    # neither, so their digests are 15's. The bump re-renders the groups that
+    # are, at the upgrade.
+    16: {
+        "plain": "af022478ea75fc1b23f6fac003a76d8d8d0d53165668cc5db9ec53ba23e6ade5",
+        "views": "22c8d8f537d3b0ea47263eeca1c1218ee6ad6344e8680dd1e131d6d57fbd0940",
+    },
+    # #3638: only a pinned zone holding a record scoped to another view renders
+    # differently (it leaves that view); these fixtures have none, so their
+    # digests are 16's.
+    17: {
+        "plain": "af022478ea75fc1b23f6fac003a76d8d8d0d53165668cc5db9ec53ba23e6ade5",
+        "views": "22c8d8f537d3b0ea47263eeca1c1218ee6ad6344e8680dd1e131d6d57fbd0940",
+    },
 }
 
 

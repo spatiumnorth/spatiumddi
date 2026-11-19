@@ -481,6 +481,44 @@ async def test_apply_zone_delete_uses_bare_name(monkeypatch: pytest.MonkeyPatch)
     assert fake.calls[0]["path"] == "/domains/example.org"
 
 
+# ── #1889 — deleting a zone already absent at the provider is done ──────
+async def test_apply_zone_delete_already_absent_is_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = {"id": "not_found", "message": "The resource you requested could not be found."}
+    fake = _FakeClient({"delete": [_FakeResponse(404, body)]})
+    driver = _patch_client(monkeypatch, fake)
+    zone = type("Z", (), {"name": "gone.example."})()
+
+    await driver._apply_zone(_Server(), _CREDS, zone, "delete")
+
+    assert [c["method"] for c in fake.calls] == ["delete"]
+
+
+async def test_apply_zone_delete_other_errors_still_raise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for status in (401, 429, 500):
+        fake = _FakeClient({"delete": [_FakeResponse(status, {"message": "nope"})]})
+        driver = _patch_client(monkeypatch, fake)
+        zone = type("Z", (), {"name": "gone.example."})()
+        with pytest.raises(CloudDNSError):
+            await driver._apply_zone(_Server(), _CREDS, zone, "delete")
+
+
+async def test_apply_zone_delete_404_without_not_found_id_still_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only DigitalOcean's documented ``{"id": "not_found"}`` means gone: a
+    404 that is not its verdict on the domain must not drop the zone."""
+    for body in ({}, {"id": "something_else", "message": "?"}):
+        fake = _FakeClient({"delete": [_FakeResponse(404, body)]})
+        driver = _patch_client(monkeypatch, fake)
+        zone = type("Z", (), {"name": "gone.example."})()
+        with pytest.raises(CloudDNSError):
+            await driver._apply_zone(_Server(), _CREDS, zone, "delete")
+
+
 # ── Error surfacing ─────────────────────────────────────────────────────
 async def test_non_2xx_raises_clouddnserror(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = {"id": "unauthorized", "message": "Unable to authenticate you."}

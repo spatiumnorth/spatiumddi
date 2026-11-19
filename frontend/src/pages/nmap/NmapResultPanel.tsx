@@ -1,14 +1,19 @@
 import { useState } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight, Copy, Loader2, MapPin } from "lucide-react";
 import {
+  ipamApi,
   nmapApi,
   type NmapHostResult,
   type NmapPortResult,
   type NmapScanRead,
+  formatApiError,
 } from "@/lib/api";
 import { useModalDialog } from "@/components/ui/use-draggable-modal";
 import { cn } from "@/lib/utils";
+import { automaticSpaceLabel, pinnedScanSpaceName } from "./scanSpace";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Parsed-summary panel for a finished nmap scan.
@@ -26,7 +31,7 @@ export function NmapResultPanel({ scan }: { scan: NmapScanRead }) {
   const summary = scan.summary;
   if (!summary) return null;
 
-  if (summary.hosts && summary.hosts.length > 0) {
+  if (Array.isArray(summary.hosts)) {
     return <MultiHostResult scan={scan} hosts={summary.hosts} />;
   }
   return <SingleHostResult scan={scan} />;
@@ -51,6 +56,12 @@ function MultiHostResult({
   scan: NmapScanRead;
   hosts: NmapHostResult[];
 }) {
+  // Stamping writes IPAM rows: the route asks write on 'ip_address'
+  // (nmap/router.py), not the scan permission.
+  const stampGate = permissionGate(
+    usePermissions().can("write", "ip_address"),
+    "Requires write permission on IP addresses",
+  );
   const alive = hosts.filter((h) => h.host_state === "up");
   const aliveAddrs = alive
     .map((h) => h.address)
@@ -95,8 +106,9 @@ function MultiHostResult({
             <button
               type="button"
               onClick={() => setConfirmStamp(true)}
-              className="inline-flex items-center gap-1 rounded border border-emerald-500/40 bg-emerald-500/5 px-2 py-0.5 text-[11px] text-emerald-700 hover:bg-emerald-500/10 dark:text-emerald-400"
+              className="inline-flex items-center gap-1 rounded border border-emerald-500/40 bg-emerald-500/5 px-2 py-0.5 text-[11px] text-emerald-700 hover:bg-emerald-500/10 disabled:cursor-not-allowed disabled:opacity-50 dark:text-emerald-400"
               title="Create / refresh IPAM rows for the alive hosts"
+              {...stampGate}
             >
               <MapPin className="h-3 w-3" />
               Stamp alive hosts → IPAM
@@ -122,6 +134,7 @@ function MultiHostResult({
       {confirmStamp && (
         <StampDiscoveredModal
           scanId={scan.id}
+          scanSpaceName={pinnedScanSpaceName(scan)}
           aliveCount={alive.length}
           onClose={() => setConfirmStamp(false)}
         />
@@ -132,27 +145,38 @@ function MultiHostResult({
 
 function StampDiscoveredModal({
   scanId,
+  scanSpaceName,
   aliveCount,
   onClose,
 }: {
   scanId: string;
+  /** Name of the space of the IPAM row the scan was launched from, or null
+   *  when the scan is not pinned to a row. */
+  scanSpaceName: string | null;
   aliveCount: number;
   onClose: () => void;
 }) {
   const qc = useQueryClient();
+  // Overlapping IP spaces are independent (#2577): the operator picks
+  // which space the sweep belongs to. "" = let the server decide: the
+  // scan's own space when it was launched from an IPAM row, otherwise
+  // skip any host whose address exists in more than one space.
+  const [spaceId, setSpaceId] = useState("");
+  const { data: spaces } = useQuery({
+    queryKey: ["spaces"],
+    queryFn: ipamApi.listSpaces,
+  });
   const stamp = useMutation({
-    mutationFn: () => nmapApi.stampDiscovered(scanId),
+    mutationFn: () => nmapApi.stampDiscovered(scanId, spaceId || undefined),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["addresses"] });
       qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
     },
   });
   const result = stamp.data;
   const errMsg =
-    stamp.isError &&
-    ((stamp.error as { response?: { data?: { detail?: string } } })?.response
-      ?.data?.detail ??
-      "Failed to stamp hosts");
+    stamp.isError && formatApiError(stamp.error, "Failed to stamp hosts");
   const { dialogProps, titleProps } = useModalDialog(onClose);
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4">
@@ -175,18 +199,40 @@ function StampDiscoveredModal({
             subnet are skipped.
           </p>
         )}
+        {!result && !stamp.isPending && (spaces?.length ?? 0) > 1 && (
+          <label className="mt-3 block text-sm">
+            <span className="text-muted-foreground">IP space</span>
+            <select
+              value={spaceId}
+              onChange={(e) => setSpaceId(e.target.value)}
+              className="mt-1 w-full rounded-md border bg-background px-2 py-1.5 text-sm"
+            >
+              <option value="">{automaticSpaceLabel(scanSpaceName)}</option>
+              {spaces?.map((sp) => (
+                <option key={sp.id} value={sp.id}>
+                  {sp.name}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
         {stamp.isPending && (
           <p className="mt-2 inline-flex items-center gap-2 text-sm text-muted-foreground">
             <Loader2 className="h-3.5 w-3.5 animate-spin" /> Stamping…
           </p>
         )}
         {errMsg && (
-          <p className="mt-2 rounded-md border border-destructive/40 bg-destructive/5 p-2 text-xs text-destructive">
+          <FormError className="mt-2 rounded-md border border-destructive/40 bg-destructive/5 p-2 text-xs text-destructive">
             {String(errMsg)}
-          </p>
+          </FormError>
         )}
         {result && (
           <div className="mt-2 space-y-1 rounded-md border bg-muted/30 p-3 text-sm">
+            <div data-testid="stamp-space-used">
+              {result.space_used
+                ? `Stamped into IP space ${result.space_used.name}`
+                : "No single IP space — hosts in more than one space were skipped"}
+            </div>
             <div>
               Created:{" "}
               <strong className="text-emerald-700 dark:text-emerald-400">
@@ -204,6 +250,20 @@ function StampDiscoveredModal({
                 Skipped (not in any subnet):{" "}
                 <strong>{result.skipped_no_subnet}</strong>
               </div>
+            )}
+            {result.skipped_ambiguous?.length > 0 && (
+              <details className="text-[11px] text-amber-700 dark:text-amber-400">
+                <summary className="cursor-pointer">
+                  Skipped — address exists in more than one IP space (
+                  {result.skipped_ambiguous.length}); pick a space and stamp
+                  again
+                </summary>
+                <ul className="mt-1 list-disc pl-4 font-mono">
+                  {result.skipped_ambiguous.slice(0, 50).map((a) => (
+                    <li key={a}>{a}</li>
+                  ))}
+                </ul>
+              </details>
             )}
             {result.skipped_addresses.length > 0 && (
               <details className="text-[11px] text-muted-foreground">

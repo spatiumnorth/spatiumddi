@@ -1,5 +1,8 @@
+import { useCredentialReask } from "@/hooks/useCredentialReask";
+import { useModuleOn } from "@/hooks/useModuleOn";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import {
   Check,
   Clipboard,
@@ -25,6 +28,13 @@ import { copyToClipboard } from "@/lib/clipboard";
 import { HeaderButton } from "@/components/ui/header-button";
 import { Modal } from "@/components/ui/modal";
 import { IPSpacePicker } from "@/components/ipam/space-picker";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
+import { secondsFieldError, SYNC_INTERVAL_BOUNDS } from "@/lib/seconds";
+import { FormError } from "@/components/ui/form-error";
 
 // ── Setup guide ─────────────────────────────────────────────────────
 // Shown in the create modal so operators know how to expose their
@@ -74,8 +84,19 @@ services:
 // ── Page ─────────────────────────────────────────────────────────────
 
 export function DockerPage() {
+  // #1340 — every write on this integration takes a superadmin (its
+  // router's create / update / delete / sync / test handlers take
+  // SuperAdmin), so a read-only user is offered none of them.
+  const superadminGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const qc = useQueryClient();
-  const { data: hosts = [], isFetching } = useQuery({
+  const {
+    data: hosts = [],
+    isFetching,
+    error: listError,
+  } = useQuery({
     queryKey: ["docker-hosts"],
     queryFn: dockerApi.listHosts,
   });
@@ -150,6 +171,7 @@ export function DockerPage() {
               variant="primary"
               icon={Plus}
               onClick={() => setShowCreate(true)}
+              {...superadminGate}
             >
               Add Host
             </HeaderButton>
@@ -162,11 +184,14 @@ export function DockerPage() {
           {hosts.length === 0 ? (
             <div className="p-8 text-center">
               <p className="text-sm text-muted-foreground">
-                No hosts configured yet.
+                <ListEmpty error={listError} what="Docker hosts">
+                  No hosts configured yet.
+                </ListEmpty>
               </p>
               <button
                 onClick={() => setShowCreate(true)}
-                className="mt-3 inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
+                className="mt-3 inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                {...superadminGate}
               >
                 <Plus className="h-3 w-3" /> Add Host
               </button>
@@ -260,6 +285,7 @@ export function DockerPage() {
                             onClick={() => testMut.mutate(h.id)}
                             disabled={testMut.isPending}
                             className="inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] hover:bg-accent disabled:opacity-50"
+                            {...superadminGate}
                           >
                             <TestTube2 className="h-3 w-3" />
                             Test
@@ -285,6 +311,8 @@ export function DockerPage() {
                             }
                             className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-50"
                             title="Sync Now"
+                            aria-label="Sync Now"
+                            {...superadminGate}
                           >
                             <RotateCw
                               className={`h-3.5 w-3.5 ${
@@ -296,15 +324,19 @@ export function DockerPage() {
                           </button>
                           <button
                             onClick={() => setEdit(h)}
-                            className="rounded p-1 text-muted-foreground hover:text-foreground"
+                            className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                             title="Edit"
+                            aria-label="Edit"
+                            {...superadminGate}
                           >
                             <Pencil className="h-3.5 w-3.5" />
                           </button>
                           <button
                             onClick={() => setDel(h)}
-                            className="rounded p-1 text-muted-foreground hover:text-destructive"
+                            className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                             title="Delete"
+                            aria-label="Delete"
+                            {...superadminGate}
                           >
                             <Trash2 className="h-3.5 w-3.5" />
                           </button>
@@ -345,9 +377,13 @@ function HostModal({
   const qc = useQueryClient();
   const editing = !!host;
 
+  // DNS off (#2135): no /dns/groups read and no picker. The stored
+  // dns_group_id is sent back untouched, so saving here cannot clear it.
+  const dnsOn = useModuleOn("core.dns");
   const { data: dnsGroups = [] } = useQuery<DNSServerGroup[]>({
     queryKey: ["dns-groups"],
     queryFn: () => dnsApi.listGroups(),
+    enabled: dnsOn,
   });
 
   const [name, setName] = useState(host?.name ?? "");
@@ -360,6 +396,15 @@ function HostModal({
   const [caBundlePem, setCaBundlePem] = useState("");
   const [clientCertPem, setClientCertPem] = useState("");
   const [clientKeyPem, setClientKeyPem] = useState("");
+  // #4135 — a moved endpoint needs the stored client key pasted again (only
+  // asked while the key field is on screen, i.e. for a TCP endpoint).
+  const reask = useCredentialReask(
+    { connectionType, endpoint },
+    host && { connectionType: host.connection_type, endpoint: host.endpoint },
+    () => setClientKeyPem(""),
+  );
+  const mustEnter =
+    connectionType === "tcp" && reask.asks(host?.client_key_present);
   const [spaceId, setSpaceId] = useState(host?.ipam_space_id ?? "");
   const [dnsGroupId, setDnsGroupId] = useState(host?.dns_group_id ?? "");
   const [mirrorContainers, setMirrorContainers] = useState(
@@ -372,7 +417,7 @@ function HostModal({
     host?.include_stopped_containers ?? false,
   );
   const [syncInterval, setSyncInterval] = useState(
-    host?.sync_interval_seconds ?? 60,
+    String(host?.sync_interval_seconds ?? 60),
   );
   const [showGuide, setShowGuide] = useState(!editing);
   const [error, setError] = useState("");
@@ -413,7 +458,7 @@ function HostModal({
           mirror_containers: mirrorContainers,
           include_default_networks: includeDefaults,
           include_stopped_containers: includeStopped,
-          sync_interval_seconds: syncInterval,
+          sync_interval_seconds: Number(syncInterval.trim()),
         };
         if (caBundlePem) update.ca_bundle_pem = caBundlePem;
         if (clientCertPem) update.client_cert_pem = clientCertPem;
@@ -434,7 +479,7 @@ function HostModal({
         mirror_containers: mirrorContainers,
         include_default_networks: includeDefaults,
         include_stopped_containers: includeStopped,
-        sync_interval_seconds: syncInterval,
+        sync_interval_seconds: Number(syncInterval.trim()),
       };
       return dockerApi.createHost(create);
     },
@@ -454,6 +499,17 @@ function HostModal({
       <form
         onSubmit={(e) => {
           e.preventDefault();
+          // #2110 — "1h" and an empty field are refused, not read as 1 / the default.
+          const intervalError = secondsFieldError(
+            "Sync interval",
+            syncInterval,
+            SYNC_INTERVAL_BOUNDS,
+          );
+          if (intervalError) {
+            setError(intervalError);
+            return;
+          }
+          setError("");
           saveMut.mutate();
         }}
         className="space-y-3"
@@ -580,17 +636,23 @@ function HostModal({
                   }
                 />
               </Field>
-              <Field label="Client key (PEM)">
+              <Field
+                label="Client key (PEM)"
+                hint={mustEnter ? reask.hint : undefined}
+              >
                 <textarea
                   className={`${inputCls} font-mono text-[11px]`}
                   rows={3}
                   value={clientKeyPem}
                   onChange={(e) => setClientKeyPem(e.target.value)}
                   placeholder={
-                    editing && host?.client_key_present
-                      ? "••• stored — paste to replace"
-                      : "-----BEGIN PRIVATE KEY-----\n..."
+                    mustEnter
+                      ? reask.placeholder
+                      : editing && host?.client_key_present
+                        ? "••• stored — paste to replace"
+                        : "-----BEGIN PRIVATE KEY-----\n..."
                   }
+                  required={mustEnter}
                 />
               </Field>
             </div>
@@ -629,20 +691,22 @@ function HostModal({
           <Field label="IPAM space">
             <IPSpacePicker value={spaceId} onChange={setSpaceId} required />
           </Field>
-          <Field label="DNS server group (optional)">
-            <select
-              className={inputCls}
-              value={dnsGroupId ?? ""}
-              onChange={(e) => setDnsGroupId(e.target.value)}
-            >
-              <option value="">— none —</option>
-              {dnsGroups.map((g) => (
-                <option key={g.id} value={g.id}>
-                  {g.name}
-                </option>
-              ))}
-            </select>
-          </Field>
+          {dnsOn && (
+            <Field label="DNS server group (optional)">
+              <select
+                className={inputCls}
+                value={dnsGroupId ?? ""}
+                onChange={(e) => setDnsGroupId(e.target.value)}
+              >
+                <option value="">— none —</option>
+                {dnsGroups.map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.name}
+                  </option>
+                ))}
+              </select>
+            </Field>
+          )}
         </div>
 
         <Field label="Sync interval (seconds)" hint="Minimum 30 s.">
@@ -651,7 +715,7 @@ function HostModal({
             className={inputCls}
             value={syncInterval}
             min={30}
-            onChange={(e) => setSyncInterval(parseInt(e.target.value) || 60)}
+            onChange={(e) => setSyncInterval(e.target.value)}
           />
         </Field>
 
@@ -706,7 +770,9 @@ function HostModal({
           </label>
         </div>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -718,7 +784,7 @@ function HostModal({
           </button>
           <button
             type="submit"
-            disabled={saveMut.isPending}
+            disabled={saveMut.isPending || (mustEnter && !clientKeyPem.trim())}
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {saveMut.isPending ? "Saving…" : editing ? "Save" : "Create"}
@@ -747,8 +813,10 @@ function DeleteHostModal({
         <p className="text-sm text-muted-foreground">
           Remove the host connection for{" "}
           <span className="font-semibold">{host.name}</span>? This only affects
-          SpatiumDDI — nothing on the Docker host changes. Any IPAM rows
-          mirrored from this host will be cleaned up on the next reconcile pass.
+          SpatiumDDI — nothing on the Docker host changes. Only rows that were
+          purely mirrored are removed. Anything you added yourself (addresses,
+          DHCP scopes, reservations, edited rows, custom fields) is kept and
+          detached from this integration.
         </p>
         <label className="flex cursor-pointer items-start gap-2 text-sm">
           <input

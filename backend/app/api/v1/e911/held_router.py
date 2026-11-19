@@ -6,8 +6,10 @@ configured with a whole URL and the protocol names this path; the ACME
 ``.well-known`` route is mounted the same way for the same reason.
 
 **Authenticated like any other API surface.** A third-party caller — a
-PBX, Cisco Emergency Responder, RedSky — uses an API token scoped to
-``/held`` with the ``e911_location`` read permission. The unauthenticated
+PBX, Cisco Emergency Responder, RedSky — uses an API token with the ``read``
+scope, owned by an account holding ``e911_location`` read. ``POST /held`` is
+``@read_only_post`` (it writes only the lookup trail), so the permission
+gate asks for ``read`` (#3302). The unauthenticated
 device-self-query mode RFC 5985 §6 describes is Phase 2 and is off by
 default (see ``E911_SELF_QUERY_ENABLED``), because an unauthenticated
 endpoint that answers "where is the device at this IP" is one an attacker
@@ -23,29 +25,43 @@ is never reached by accident.
 
 Every answer writes an ``e911_resolution_log`` row, exactly as the JSON
 lookup does. The protocol is different; the fact that somebody asked where
-a person sits is not.
+a person sits is not. The trail is bounded (#3514, #3633): past a per-caller
+budget (``PlatformSettings.e911_lookup_log_budget_per_minute``) the lookup is
+refused with a 429 and ``Retry-After`` and resolves nothing, so every location
+returned has its own row, and ``prune_e911_resolution_log`` drops rows past
+``e911_resolution_log_retention_days``.
 """
 
 from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, Request, Response, status
+import structlog
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.e911.router import log_resolution
 from app.config import settings
-from app.core.auth_throttle import e911_self_query_rate_limited
+from app.core.auth_throttle import (
+    e911_lookup_log_rate_limited,
+    e911_lookup_retry_after,
+    e911_self_query_rate_limited,
+)
+from app.core.body_limit import read_body_capped
 from app.core.mac import canonicalize_mac
 from app.core.permissions import require_resource_permission
 from app.core.responses import HeldXmlResponse
 from app.models.auth import User
+from app.models.settings import PlatformSettings
+from app.services.api_token_scopes import read_only_post
 from app.services.e911.held import (
     ERROR_CANNOT_PROVIDE,
+    ERROR_GENERAL_LIS_ERROR,
     ERROR_LOCATION_UNKNOWN,
     ERROR_NOT_LOCATABLE,
     ERROR_REQUEST_ERROR,
+    MAX_REQUEST_BYTES,
     HeldError,
     HeldRequest,
     parse_location_request,
@@ -55,9 +71,30 @@ from app.services.e911.held import (
 from app.services.e911.pidf_lo import render_pidf_lo
 from app.services.e911.resolver import resolve_location
 
+logger = structlog.get_logger(__name__)
+
 router = APIRouter(tags=["e911"])
 
 HELD_MEDIA_TYPE = "application/held+xml"
+
+
+async def _read_document(request: Request) -> bytes:
+    """The request body, read no further than ``MAX_REQUEST_BYTES``.
+
+    The self-query route has no login to check first (it is unauthenticated
+    by design, and off unless ``E911_SELF_QUERY_ENABLED``), so the size is
+    the only bound on what an unauthenticated sender can make the api read.
+    ``parse_location_request`` refuses an oversized document too, but only
+    after reading it whole. A body over the limit gets the same HELD error,
+    without reading past the limit (#2780)."""
+    try:
+        return await read_body_capped(request, MAX_REQUEST_BYTES)
+    except HTTPException as exc:
+        if exc.status_code != status.HTTP_413_CONTENT_TOO_LARGE:
+            raise
+        raise HeldError(
+            ERROR_REQUEST_ERROR, f"request larger than {MAX_REQUEST_BYTES} bytes"
+        ) from exc
 
 
 def _error(code: str, message: str, http_status: int) -> Response:
@@ -85,6 +122,35 @@ async def _answer(
     sequence that could drift. The request is parsed by the caller and
     passed in, so the body is parsed once.
     """
+    source_ip = request.client.host if request.client else None
+    # Bounded (#3514, #3633): a read-scoped token must not grow the trail
+    # without limit. Past the per-caller budget the lookup is REFUSED with a
+    # 429 and resolves nothing, so every location returned has a trail row of
+    # its own. The budget is read live, so a change in Settings applies on
+    # the next call.
+    ps = await db.get(PlatformSettings, 1)
+    budget = ps.e911_lookup_log_budget_per_minute if ps is not None else 120
+    actor = str(api_token_id or (user.id if user else None) or source_ip)
+    if await e911_lookup_log_rate_limited(actor, budget):
+        retry_after = await e911_lookup_retry_after(actor)
+        logger.warning(
+            "e911_held_lookup_refused_over_budget",
+            actor_kind=actor_kind,
+            actor=actor,
+            source_ip=source_ip,
+            budget_per_minute=budget,
+        )
+        return Response(
+            content=render_error(
+                ERROR_GENERAL_LIS_ERROR,
+                f"lookup budget of {budget} per minute exceeded; retry after "
+                f"{retry_after} seconds",
+            ),
+            media_type=HELD_MEDIA_TYPE,
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            headers={"Retry-After": str(retry_after)},
+        )
+
     mac = held.mac
     if mac:
         try:
@@ -100,7 +166,6 @@ async def _answer(
         port_id=held.port_id,
     )
 
-    source_ip = request.client.host if request.client else None
     log_resolution(
         db,
         resolution,
@@ -162,10 +227,11 @@ async def _answer(
     dependencies=[Depends(require_resource_permission("e911_location"))],
     summary="HELD locationRequest (RFC 5985) — returns PIDF-LO",
 )
+@read_only_post
 async def held_third_party(request: Request, db: DB, user: CurrentUser) -> Response:
     """Third-party HELD: the caller names the device (RFC 6155 identity)."""
     try:
-        held = parse_location_request(await request.body())
+        held = parse_location_request(await _read_document(request))
     except HeldError as exc:
         return _error(exc.code, exc.message, status.HTTP_400_BAD_REQUEST)
 
@@ -243,7 +309,7 @@ async def held_self_query(request: Request, db: DB) -> Response:
         )
 
     try:
-        parsed = parse_location_request(await request.body())
+        parsed = parse_location_request(await _read_document(request))
     except HeldError as exc:
         return _error(exc.code, exc.message, status.HTTP_400_BAD_REQUEST)
 

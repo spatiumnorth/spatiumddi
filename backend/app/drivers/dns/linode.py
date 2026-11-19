@@ -44,6 +44,13 @@ from typing import Any
 
 import httpx
 
+from app.drivers.dns._caa import (
+    caa_key,
+    caa_text,
+    caa_unquoted_value,
+    caa_value_octets,
+    parse_caa,
+)
 from app.drivers.dns._cloud_base import (
     CloudDNSDriverBase,
     CloudDNSError,
@@ -56,6 +63,9 @@ from app.drivers.dns.base import RecordChange, RecordData
 # self-hosted Linode. The token in the Authorization header is the only
 # per-server input.
 _API_BASE = "https://api.linode.com/v4"
+
+# The CAA property tags Linode's ``DomainRecord.tag`` enum accepts (#2959).
+_CAA_TAGS = frozenset({"issue", "issuewild", "iodef"})
 
 # Linode's per-page maximum is 500; 100 (the API default) keeps responses
 # small while still rarely needing a second round trip for typical zones.
@@ -70,6 +80,27 @@ _TTL_DEFAULT = 0
 # disambiguates by priority within a name+type set (MX preference, SRV
 # priority). Used to decide whether priority participates in RRset matching.
 _PRIORITY_TYPES = frozenset({"MX", "SRV"})
+
+
+def _is_not_found(response: Any) -> bool:
+    """Linode's not-found answer (#1889): HTTP 404 ("Not Found. The resource
+    you're requesting doesn't exist.") carrying Linode's documented error
+    envelope, ``{"errors": [{"reason": ...}]}``. The envelope is required so
+    a 404 that is not Linode's own verdict on the domain is never read as
+    "the zone is gone"; the reason text is not, since the docs do not pin it."""
+    if getattr(response, "status_code", 0) != 404:
+        return False
+    try:
+        body = response.json()
+    except (ValueError, TypeError):
+        return False
+    errors = body.get("errors") if isinstance(body, dict) else None
+    return isinstance(errors, list) and bool(errors)
+
+
+class LinodeDomainNotFound(CloudDNSError):
+    """The zone is not on the account (a subclass, so existing callers that
+    catch :class:`CloudDNSError` still see it)."""
 
 
 class LinodeDNSDriver(CloudDNSDriverBase):
@@ -150,7 +181,7 @@ class LinodeDNSDriver(CloudDNSDriverBase):
         for d in results:
             if str(d.get("domain", "")).lower().rstrip(".") == name:
                 return int(d["id"])
-        raise CloudDNSError(f"Linode domain {name!r} not found on this account.")
+        raise LinodeDomainNotFound(f"Linode domain {name!r} not found on this account.")
 
     @staticmethod
     def _relativize(label: str, zone_fqdn: str) -> str:
@@ -238,13 +269,18 @@ class LinodeDNSDriver(CloudDNSDriverBase):
                 for rec in body.get("data") or []:
                     raw_ttl = rec.get("ttl_sec")
                     ttl = None if raw_ttl in (None, _TTL_DEFAULT) else raw_ttl
+                    is_srv = str(rec["type"]).upper() == "SRV"
                     records.append(
                         RecordData(
                             name=self._relativize(rec.get("name") or "", zone_fqdn),
                             record_type=rec["type"],
-                            value=rec["target"],
+                            value=self._read_value(rec),
                             ttl=ttl,
                             priority=rec.get("priority"),
+                            # SRV weight/port are their own Linode fields
+                            # (#1526); other types don't carry them.
+                            weight=rec.get("weight") if is_srv else None,
+                            port=rec.get("port") if is_srv else None,
                         )
                     )
                 total_pages = int(body.get("pages") or 1)
@@ -252,6 +288,47 @@ class LinodeDNSDriver(CloudDNSDriverBase):
                     break
                 page += 1
         return records
+
+    @staticmethod
+    def _read_value(rec: dict[str, Any]) -> str:
+        """The canonical value of a held record. A CAA record keeps its tag
+        and value in ``tag`` / ``target`` and has no flags field, so the
+        canonical ``0 <tag> "<value>"`` is rebuilt (#2959). A CAA row with no
+        ``tag`` (the whole value in ``target``, as a release before #2959
+        sent it) reads as that target, so it keys the same as before. A
+        ``target`` that arrives as one quoted string is unquoted, not escaped."""
+        if str(rec.get("type")).upper() == "CAA" and rec.get("tag"):
+            return caa_text(0, rec["tag"], caa_value_octets(str(rec.get("target") or "")))
+        return str(rec.get("target") or "")
+
+    @staticmethod
+    def record_value_refusal(record_type: str, value: str) -> str | None:
+        """Why Linode cannot hold this record value, or None (#2959).
+
+        Checked by the record API before a record is stored, so the operator
+        gets a 422 instead of a record that fails on every push. Linode's
+        record has ``tag`` and ``target`` for CAA but no flags field (the
+        ``DomainRecord`` schema in github.com/linode/linode-api-docs
+        ``openapi.json``), so a non-zero flags value (the issuer-critical bit)
+        cannot be carried and would silently be dropped. Its ``tag`` is an
+        enum of ``issue`` / ``issuewild`` / ``iodef`` in the same schema, so
+        any other property tag is refused too."""
+        if record_type.upper() != "CAA":
+            return None
+        parsed = parse_caa(value)
+        if parsed is None:
+            return f"Linode: CAA value {value!r} is not '<flags> <tag> <value>'."
+        if parsed[0] != 0:
+            return (
+                f"Linode: CAA flags {parsed[0]} cannot be stored; Linode's CAA "
+                "record has no flags field, so only flags 0 is supported."
+            )
+        if parsed[1].lower() not in _CAA_TAGS:
+            return (
+                f"Linode: CAA tag {parsed[1]!r} is not supported; Linode accepts "
+                f"only {', '.join(sorted(_CAA_TAGS))}."
+            )
+        return None
 
     # ── Record writes ───────────────────────────────────────────────────
     def _record_payload(self, change: RecordChange, zone_fqdn: str) -> dict[str, Any]:
@@ -263,8 +340,22 @@ class LinodeDNSDriver(CloudDNSDriverBase):
             # Linode's "use the zone default TTL" is the sentinel 0.
             "ttl_sec": _TTL_DEFAULT if rec.ttl is None else rec.ttl,
         }
+        if rec.record_type.upper() == "CAA":
+            refusal = self.record_value_refusal(rec.record_type, rec.value)
+            parsed = parse_caa(rec.value)
+            if refusal is not None or parsed is None:
+                raise CloudDNSError(refusal or f"Linode: CAA value {rec.value!r} does not parse.")
+            payload["tag"] = parsed[1].lower()
+            payload["target"] = caa_unquoted_value(rec.value)
         if rec.priority is not None:
             payload["priority"] = rec.priority
+        if rec.record_type.upper() == "SRV":
+            # Linode carries SRV weight/port as their own fields (#1526) —
+            # without them the SRV write is malformed.
+            if rec.weight is not None:
+                payload["weight"] = rec.weight
+            if rec.port is not None:
+                payload["port"] = rec.port
         return payload
 
     async def _find_record_id(
@@ -312,8 +403,14 @@ class LinodeDNSDriver(CloudDNSDriverBase):
         # Value-keyed lookup: pick the row whose target (and priority for
         # MX/SRV) actually matches.
         match_priority = priority is not None and record_type in _PRIORITY_TYPES
+        is_caa = record_type.upper() == "CAA"
         for rec in results:
-            if rec.get("target") != target:
+            if is_caa:
+                # One record however it is spelled: split tag/target, or a
+                # whole value in ``target`` from a release before #2959.
+                if caa_key(self._read_value(rec)) != caa_key(target):
+                    continue
+            elif rec.get("target") != target:
                 continue
             if match_priority and rec.get("priority") != priority:
                 continue
@@ -371,7 +468,15 @@ class LinodeDNSDriver(CloudDNSDriverBase):
             raise CloudDNSError(f"Linode: unsupported record op {change.op!r}")
 
     # ── Zone writes ─────────────────────────────────────────────────────
-    async def _apply_zone(self, server: Any, creds: dict[str, Any], zone: Any, op: str) -> None:
+    async def _apply_zone(
+        self,
+        server: Any,
+        creds: dict[str, Any],
+        zone: Any,
+        op: str,
+        *,
+        managed_records: list[RecordData] | None = None,
+    ) -> None:
         token = self._token(creds)
         zone_fqdn = normalize_fqdn(getattr(zone, "name", ""))
         bare = zone_fqdn.rstrip(".")
@@ -389,8 +494,16 @@ class LinodeDNSDriver(CloudDNSDriverBase):
                 return
 
             if op == "delete":
-                domain_id = await self._resolve_domain_id(client, zone_fqdn)
+                # Already gone at the provider is done (#1889, as #1537):
+                # absent from the list, or a 404 on the delete itself.
+                try:
+                    domain_id = await self._resolve_domain_id(client, zone_fqdn)
+                except LinodeDomainNotFound:
+                    return
                 resp = await client.delete(f"/domains/{domain_id}")
+                if _is_not_found(resp):
+                    # Gone between the lookup and the delete.
+                    return
                 self._unwrap(resp)
                 return
 

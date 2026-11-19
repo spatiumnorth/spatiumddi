@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import asdict
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -51,6 +52,7 @@ from app.services.ai.tools.proposals import _persist_proposal, _proposal_result
 from app.services.appliance.network_mtu import (
     fleet_summary as mtu_fleet_summary,
 )
+from app.services.appliance.var_disk import var_disk_fields
 
 
 def _superadmin_gate(user: User) -> dict[str, Any] | None:
@@ -62,6 +64,21 @@ def _superadmin_gate(user: User) -> dict[str, Any] | None:
             )
         }
     return None
+
+
+def _heartbeat_fields(row: Appliance) -> dict[str, Any]:
+    from app.services.appliance.agent_cmd import ONLINE_STALE_SECONDS  # noqa: PLC0415
+
+    seen = row.last_seen_at
+    if seen is None:
+        return {"seconds_since_last_seen": None, "heartbeat_stale": None}
+    if seen.tzinfo is None:
+        seen = seen.replace(tzinfo=UTC)
+    age = max(0.0, (datetime.now(UTC) - seen).total_seconds())
+    return {
+        "seconds_since_last_seen": int(age),
+        "heartbeat_stale": age > ONLINE_STALE_SECONDS,
+    }
 
 
 def _row_to_dict(row: Appliance) -> dict[str, Any]:
@@ -98,6 +115,10 @@ def _row_to_dict(row: Appliance) -> dict[str, Any]:
         "paired_at": row.paired_at.isoformat(),
         "approved_at": (row.approved_at.isoformat() if row.approved_at else None),
         "last_seen_at": (row.last_seen_at.isoformat() if row.last_seen_at else None),
+        # #2259 — every other field below (roles, role_health, firewall,
+        # storage, ...) is the LAST report. ``heartbeat_stale`` says whether
+        # that report is still current; None = never heartbeated.
+        **_heartbeat_fields(row),
         # #1017 — the interface MTU etc-render actually APPLIED, not what
         # STATE asked for. Through the same helper the REST row uses, so
         # the two surfaces cannot disagree about how to read the field,
@@ -105,6 +126,9 @@ def _row_to_dict(row: Appliance) -> dict[str, Any]:
         # set"), ``mtu_requested`` and the refusal reason rather than the
         # bare value.
         **mtu_fields(row.cluster_health),
+        # #2400 — /var headroom against kubelet eviction, judged by the
+        # evaluator behind the appliance_disk_usage alert and the Fleet row.
+        **var_disk_fields(row.cluster_health, row.last_seen_at),
         "last_seen_ip": row.last_seen_ip,
         "cert_serial": row.cert_serial,
         "cert_expires_at": (row.cert_expires_at.isoformat() if row.cert_expires_at else None),
@@ -125,6 +149,7 @@ class FindPendingAppliancesArgs(BaseModel):
 
 @register_tool(
     name="find_pending_appliances",
+    permission="superadmin",
     description=(
         "List Application appliances sitting in pending_approval state "
         "(superadmin only). Each row carries the supervisor's hostname, "
@@ -191,6 +216,7 @@ class FindApplianceFleetArgs(BaseModel):
 
 @register_tool(
     name="find_appliance_fleet",
+    permission="superadmin",
     description=(
         "Roll up the SpatiumDDI appliance fleet (superadmin only). "
         "Returns every appliance row — pending + approved + rejected — "
@@ -295,6 +321,7 @@ class FindApplianceStorageArgs(BaseModel):
 
 @register_tool(
     name="find_appliance_storage",
+    permission="superadmin",
     description=(
         "Report software-RAID (md) and multipath storage redundancy "
         "across the appliance fleet (superadmin only, #999). Each row "
@@ -404,6 +431,7 @@ class FindApplianceRemovableArgs(BaseModel):
 
 @register_tool(
     name="find_appliance_removable",
+    permission="superadmin",
     description=(
         "Report removable (USB) backup disks across the appliance fleet "
         "(superadmin only, #989). Each configured mount carries a state: "
@@ -512,6 +540,7 @@ class ProposeStorageActionArgs(BaseModel):
 
 @register_tool(
     name="propose_storage_action",
+    permission="superadmin",
     description=(
         "Propose an md / multipath management action on an appliance "
         "(superadmin only, #999 Part B) — fail or remove an array "
@@ -588,12 +617,15 @@ class FindControlPlaneVipArgs(BaseModel):
 
 @register_tool(
     name="find_control_plane_vip",
+    permission="superadmin",
     description=(
         "Read the cluster-wide MetalLB VIP config (superadmin only, "
         "#272). Returns whether MetalLB is enabled, the L2 address pool, "
         "the floating control-plane VIP that fronts the Web UI across "
         "control-plane nodes, and the data-plane resolver VIPs (DNS :53 "
-        "and DHCP relay :67). Read-only — changing a VIP "
+        "and DHCP relay :67), plus any DHCP server group the relay VIP "
+        "fronts that is still in direct (raw socket) mode — those lose "
+        "relays landing on the announcing node. Read-only — changing a VIP "
         "is a high-blast-radius operation (it can sever Web UI / agent / "
         "resolver reachability) and is done in Fleet → Control plane, "
         "not via the Copilot."
@@ -619,13 +651,19 @@ async def find_control_plane_vip(
             "control_plane_vip": "",
             "dns_vip": "",
             "dhcp_relay_vip": "",
+            "dhcp_relay_vip_direct_groups": [],
         }
+    from app.services.dhcp.relay_vip import direct_groups_behind_relay_vip
+
     return {
         "enabled": bool(row.metallb_enabled),
         "pool_addresses": list(row.metallb_pool_addresses or []),
         "control_plane_vip": row.control_plane_vip or "",
         "dns_vip": row.dns_vip or "",
         "dhcp_relay_vip": row.dhcp_relay_vip or "",
+        # #2899 — groups the relay VIP fronts that still read raw sockets;
+        # relays landing on the announcing node get no answer from them.
+        "dhcp_relay_vip_direct_groups": [g.name for g in await direct_groups_behind_relay_vip(db)],
     }
 
 
@@ -650,6 +688,7 @@ class FindK8sPodsArgs(BaseModel):
 
 @register_tool(
     name="find_k8s_pods",
+    permission="superadmin",
     description=(
         "List Kubernetes pods on the appliance control plane (superadmin "
         "only, #272). Returns per-pod namespace / name / phase / node / "
@@ -716,6 +755,7 @@ class FindClusterHealthArgs(BaseModel):
 
 @register_tool(
     name="find_cluster_health",
+    permission="superadmin",
     description=(
         "Roll up the appliance control-plane cluster health (superadmin "
         "only, #272). Returns the settled control-plane member count, an "
@@ -787,6 +827,7 @@ class FindClusterMetricsArgs(BaseModel):
 
 @register_tool(
     name="find_cluster_metrics",
+    permission="superadmin",
     description=(
         "Live resource metrics for the appliance k3s cluster (superadmin "
         "only, #402). Unlike ``find_cluster_health`` (control-plane "
@@ -805,7 +846,13 @@ class FindClusterMetricsArgs(BaseModel):
         "CoreDNS replica count, node spread, and a live resolve probe — "
         "replicas existing and DNS actually answering are different facts, "
         "and a failed probe with healthy replicas points at kube-proxy or "
-        "the pod network rather than at CoreDNS. Appliance control plane only; "
+        "the pod network rather than at CoreDNS. The ``database`` workload "
+        "carries one entry per PostgreSQL instance (node, primary / standby, "
+        "Ready, and whether a standby is streaming from the primary per "
+        "pg_stat_replication) plus ``findings`` naming any instance that is "
+        "not Ready or not streaming (#2856) — CNPG counts a Ready standby "
+        "that is not replicating as healthy, so ready/total alone can read "
+        "3/3 through a replication outage. Appliance control plane only; "
         "read-only — the same data the Cluster → Overview dashboard renders."
     ),
     args_model=FindClusterMetricsArgs,
@@ -835,6 +882,11 @@ async def find_cluster_metrics(
         return {"error": f"kubeapi unreachable: {exc}"}
     if not snap.get("available"):
         return {"available": False, "detail": snap.get("detail")}
+    # #2856 — the database row's streaming half, the same verdict the
+    # Cluster screen and the postgres_instance_unhealthy alert use.
+    from app.services.appliance import postgres_instances  # noqa: PLC0415
+
+    await postgres_instances.enrich_snapshot_best_effort(db, snap)
 
     def _pct(used: float | None, cap: float | None) -> float | None:
         return round(100.0 * used / cap, 1) if used is not None and cap else None
@@ -910,6 +962,7 @@ class FindEtcdSnapshotsArgs(BaseModel):
 
 @register_tool(
     name="find_etcd_snapshots",
+    permission="superadmin",
     description=(
         "List recoverable etcd snapshots reported by the appliance "
         "control-plane seed (superadmin only). Returns "
@@ -990,13 +1043,18 @@ class FindUpgradeImagesArgs(BaseModel):
 
 @register_tool(
     name="find_upgrade_images",
+    permission="superadmin",
     description=(
         "List appliance upgrade images stored on the control plane "
         "(superadmin only, #199). These are the ``.raw.xz`` artifacts an "
         "operator uploaded (air-gap) or imported from a GitHub release — "
         "the pool a fleet / per-box OS upgrade can point at. Each row "
         "carries filename / appliance_version / architecture / size / a "
-        "short SHA-256 / upload time / notes. ``architecture`` is null for "
+        "short SHA-256 / upload time / notes, plus channel (nightly / "
+        "prerelease / stable), the fleet-architecture verdict, which "
+        "appliances have that version installed, which are scheduled to "
+        "fetch it, and any active rolling run naming it (an image with "
+        "scheduled_for or rolling_run_id set is in use). ``architecture`` is null for "
         "an image nobody labelled — that means UNKNOWN, never amd64 "
         "(#1026). Use to answer 'which upgrade images do we "
         "have staged?' or 'is 1.0.0 already uploaded?'. Read-only "
@@ -1011,6 +1069,9 @@ async def find_upgrade_images(
 ) -> dict[str, Any]:
     if (err := _superadmin_gate(user)) is not None:
         return err
+    from app.services.appliance import releases as releases_service  # noqa: PLC0415
+    from app.services.appliance import upgrade_image_catalog as catalog  # noqa: PLC0415
+
     rows = list(
         (
             await db.execute(
@@ -1022,6 +1083,11 @@ async def find_upgrade_images(
         .scalars()
         .all()
     )
+    # #2410 — the same derivations GET /upgrade-images uses, so the copilot
+    # and the table cannot disagree about an image.
+    fleet = await catalog.fleet_architectures(db)
+    usage = await catalog.image_usage(db, rows)
+    cached = releases_service.peek_upgrade_image_releases()
     return {
         "images": [
             {
@@ -1036,6 +1102,15 @@ async def find_upgrade_images(
                 "sha256_short": (r.sha256[:12] + "…" + r.sha256[-6:]) if r.sha256 else None,
                 "uploaded_at": r.uploaded_at.isoformat(),
                 "notes": r.notes,
+                # #2410 — channel from the tag; fleet verdict is #2399's
+                # (matches / no_node / unknown); installed_on is NOT in use
+                # (bytes are on a slot), scheduled_for / rolling_run_id are
+                # (a delete is refused while either is set).
+                "channel": catalog.staged_channel(r, catalog.release_for_staged(r, cached)),
+                "fleet_architecture": catalog.fleet_verdict(fleet, r.architecture)[0],
+                "installed_on": usage[r.id].installed_on,
+                "scheduled_for": usage[r.id].scheduled_for,
+                "rolling_run_id": str(usage[r.id].run_id) if usage[r.id].run_id else None,
             }
             for r in rows
         ],
@@ -1052,10 +1127,14 @@ class FindAvailableUpgradeImagesArgs(BaseModel):
 
 @register_tool(
     name="find_available_upgrade_images",
+    outbound=True,
+    permission="superadmin",
     description=(
         "List GitHub releases that carry an importable appliance upgrade "
         "image (superadmin only, #199). Returns each release tag + name + "
-        "architecture + prerelease/installed flags + the image size, plus "
+        "architecture + channel + prerelease flag + the image size + the "
+        "fleet-architecture verdict + the staged image id when already "
+        "imported (``is_installed`` means the CONTROL PLANE runs this tag), plus "
         "whether GitHub was reachable at all. A release that publishes "
         "both architectures appears ONCE PER ARCHITECTURE, so the same tag "
         "can be listed twice (#1026). Use to answer 'what upgrade images can I "
@@ -1073,12 +1152,21 @@ async def find_available_upgrade_images(
     if (err := _superadmin_gate(user)) is not None:
         return err
     from app.services.appliance import releases as releases_service  # noqa: PLC0415
+    from app.services.appliance import upgrade_image_catalog as catalog  # noqa: PLC0415
 
     reachable, rows = await releases_service.list_available_upgrade_images()
+    fleet = await catalog.fleet_architectures(db)
+    staged = (await db.execute(select(ApplianceUpgradeImage))).scalars().all()
+    staged_ids = catalog.staged_assignment(staged, rows)
     return {
         "github_reachable": reachable,
         "available": [
             {
+                "channel": releases_service.release_channel(r.tag, r.is_prerelease),
+                "fleet_architecture": catalog.fleet_verdict(fleet, r.architecture)[0],
+                "staged_image_id": (
+                    str(sid) if (sid := staged_ids.get((r.tag, r.architecture))) else None
+                ),
                 "tag": r.tag,
                 "name": r.name,
                 "is_prerelease": r.is_prerelease,
@@ -1107,6 +1195,7 @@ class ProposeApproveApplianceArgs(BaseModel):
 
 @register_tool(
     name="propose_approve_appliance",
+    permission="superadmin",
     description=(
         "Propose approving a pending Application appliance "
         "(superadmin only). Approval is irreversible cryptographically "
@@ -1164,20 +1253,25 @@ class ProposeAssignRoleArgs(BaseModel):
         default=None,
         description=(
             "Optional DNSServerGroup UUID. Required if roles include "
-            "a DNS role and there's no existing assignment."
+            "a DNS role and there's no existing assignment. Pass null "
+            "explicitly to unassign the current group; omit to leave "
+            "it unchanged."
         ),
     )
     dhcp_group_id: str | None = Field(
         default=None,
         description=(
             "Optional DHCPServerGroup UUID. Required if roles include "
-            "dhcp and there's no existing assignment."
+            "dhcp and there's no existing assignment. Pass null "
+            "explicitly to unassign the current group; omit to leave "
+            "it unchanged."
         ),
     )
 
 
 @register_tool(
     name="propose_assign_role",
+    permission="superadmin",
     description=(
         "Propose role + group assignment for an approved appliance "
         "(superadmin only). The model proposes the assignment + the "
@@ -1211,7 +1305,10 @@ async def propose_assign_role(
         db,
         user=user,
         operation="assign_appliance_role",
-        args=args.model_dump(),
+        # exclude_unset (#1562): an explicit null group id means
+        # "unassign", an omitted one means "leave it" — a full dump
+        # would turn every omitted group into an unassign on apply.
+        args=args.model_dump(exclude_unset=True),
         preview_text=preview.preview_text,
     )
     return _proposal_result(proposal, preview_text=preview.preview_text)

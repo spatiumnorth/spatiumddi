@@ -1,8 +1,10 @@
 """Audit log read endpoints (superadmin or users with `read:audit_log`)."""
 
+import uuid
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
-from fastapi import APIRouter, Depends, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, field_validator
 from sqlalchemy import func, select
 
@@ -12,6 +14,7 @@ from app.core.permissions import require_permission
 from app.core.responses import PdfResponse
 from app.models.audit import AuditLog
 from app.services.audit_chain import verify_chain
+from app.services.audit_redact import redact_audit_value
 from app.services.audit_report import generate_change_report_pdf
 
 router = APIRouter(dependencies=[Depends(require_permission("read", "audit_log"))])
@@ -33,6 +36,15 @@ class AuditLogResponse(BaseModel):
     resource_display: str
     result: str
     source_ip: str | None = None
+    # What the entry recorded (#2009): the stored state before / after and the
+    # names of the fields that changed. ``None`` on the list unless the caller
+    # asks with ``include_details`` (payloads can be large and a page is up to
+    # 500 rows); always filled by ``GET /audit/{id}``. Credential-shaped keys
+    # and values are redacted on read (``services/audit_redact``).
+    old_value: dict[str, Any] | None = None
+    new_value: dict[str, Any] | None = None
+    changed_fields: list[str] | None = None
+    error_detail: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -58,6 +70,10 @@ async def list_audit_log(
     resource_display: str | None = Query(default=None),
     result: str | None = Query(default=None),
     source_ip: str | None = Query(default=None),
+    include_details: bool = Query(
+        default=False,
+        description="Also return old_value / new_value / changed_fields / error_detail per row.",
+    ),
 ) -> AuditLogPage:
     q = select(AuditLog)
 
@@ -77,10 +93,40 @@ async def list_audit_log(
     count_q = select(func.count()).select_from(q.subquery())
     total = (await db.execute(count_q)).scalar_one()
 
-    q = q.order_by(AuditLog.timestamp.desc()).offset(offset).limit(limit)
+    q = q.order_by(AuditLog.timestamp.desc(), AuditLog.id.desc()).offset(offset).limit(limit)
     rows = (await db.execute(q)).scalars().all()
 
-    return AuditLogPage(total=total, items=list(rows))
+    return AuditLogPage(
+        total=total,
+        items=[_to_response(r, details=include_details) for r in rows],
+    )
+
+
+_DETAIL_FIELDS = ("old_value", "new_value", "changed_fields", "error_detail")
+_SUMMARY_FIELDS = tuple(f for f in AuditLogResponse.model_fields if f not in _DETAIL_FIELDS)
+
+
+def _as_object(value: object) -> dict[str, Any] | None:
+    """The JSONB payload as an object. The columns are typed ``dict`` but
+    nothing stops a writer storing a bare list or scalar; wrapping it keeps
+    one odd row from turning the response into a 500."""
+    if value is None or isinstance(value, dict):
+        return value
+    return {"value": value}
+
+
+def _to_response(row: AuditLog, *, details: bool) -> AuditLogResponse:
+    # Built from the summary columns only, so the list without
+    # ``include_details`` never validates a stored payload: an odd one
+    # cannot break a list that never shows it.
+    out = AuditLogResponse.model_validate({f: getattr(row, f) for f in _SUMMARY_FIELDS})
+    if details:
+        out.old_value = redact_audit_value(_as_object(row.old_value))
+        out.new_value = redact_audit_value(_as_object(row.new_value))
+        cf = row.changed_fields
+        out.changed_fields = [str(f) for f in cf] if isinstance(cf, list) else None
+        out.error_detail = redact_audit_value(row.error_detail)
+    return out
 
 
 # ── Compliance / change report PDF (issue #48) ──────────────────────
@@ -142,6 +188,9 @@ class ChainBreakResponse(BaseModel):
     expected_hash: str
     actual_hash: str
     reason: str
+    action: str
+    resource_type: str
+    resource_id: str
 
 
 class IntegrityResponse(BaseModel):
@@ -158,6 +207,11 @@ class IntegrityResponse(BaseModel):
     ok: bool
     rows_checked: int
     breaks: list[ChainBreakResponse]
+    # Range walked + whether rows outside it exist (#2297): the badge
+    # states how much it verified instead of implying the whole log.
+    first_seq: int | None = None
+    last_seq: int | None = None
+    partial: bool = False
 
 
 @router.get("/integrity", response_model=IntegrityResponse)
@@ -171,15 +225,28 @@ async def get_audit_integrity(
             "the full walk is expensive — leave unset for a complete sweep."
         ),
     ),
+    newest: bool = Query(
+        default=False,
+        description=(
+            "With max_rows: verify the NEWEST rows (anchored on the row "
+            "before the window) instead of the oldest."
+        ),
+    ),
 ) -> IntegrityResponse:
     """Walk the audit_log chain and report any tamper. Slow on tables
-    past ~1M rows — the nightly Celery task pre-computes the same
-    answer and writes an alert event when it breaks, so the UI hit
-    is mostly for ad-hoc operator confirmation."""
-    result = await verify_chain(db, max_rows=max_rows)
+    past ~1M rows. The nightly Celery task checks only the rows added
+    since its last clean run. It starts again from the first row once
+    its last full pass is more than 7 days old (so roughly every eighth
+    nightly run, later if runs fail), or when its checkpoint cannot be
+    trusted. It writes an alert event when it finds a break, so the UI
+    hit is mostly for ad-hoc operator confirmation."""
+    result = await verify_chain(db, max_rows=max_rows, newest=newest)
     return IntegrityResponse(
         ok=result.ok,
         rows_checked=result.rows_checked,
+        first_seq=result.first_seq,
+        last_seq=result.last_seq,
+        partial=result.partial,
         breaks=[
             ChainBreakResponse(
                 seq=b.seq,
@@ -187,7 +254,19 @@ async def get_audit_integrity(
                 expected_hash=b.expected_hash,
                 actual_hash=b.actual_hash,
                 reason=b.reason,
+                action=b.action,
+                resource_type=b.resource_type,
+                resource_id=b.resource_id,
             )
             for b in result.breaks
         ],
     )
+
+
+@router.get("/{entry_id}", response_model=AuditLogResponse)
+async def get_audit_entry(entry_id: uuid.UUID, db: DB) -> AuditLogResponse:
+    """One entry with its details (#2009)."""
+    row = await db.get(AuditLog, entry_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Audit entry not found")
+    return _to_response(row, details=True)

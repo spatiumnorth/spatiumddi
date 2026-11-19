@@ -1,4 +1,12 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import {
+  useState,
+  useEffect,
+  useId,
+  useRef,
+  useCallback,
+  useMemo,
+} from "react";
+import { createPortal } from "react-dom";
 import { useNavigate } from "react-router-dom";
 import {
   Search,
@@ -39,6 +47,7 @@ import { askAI } from "@/components/copilot/askAI";
 import { useAiAvailable } from "@/components/copilot/useAiAvailable";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { useSessionState } from "@/lib/useSessionState";
+import { useOverlayLayer } from "@/components/ui/use-draggable-modal";
 import {
   ALL_NAV_DESTINATIONS,
   navEntryVisible,
@@ -165,14 +174,21 @@ function ResultRow({
   result,
   isActive,
   onSelect,
+  optionId,
 }: {
   result: SearchResult;
   isActive: boolean;
   onSelect: (r: SearchResult) => void;
+  optionId: string;
 }) {
   const Icon = TYPE_ICONS[result.type] ?? FileText;
   return (
     <button
+      type="button"
+      id={optionId}
+      role="option"
+      aria-selected={isActive}
+      tabIndex={-1}
       className={cn(
         "flex w-full items-start gap-3 px-4 py-2.5 text-left transition-colors",
         isActive ? "bg-accent" : "hover:bg-accent/50",
@@ -279,6 +295,9 @@ export function GlobalSearch() {
   const [activeIdx, setActiveIdx] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
+  const cardRef = useRef<HTMLDivElement>(null);
+  const openerRef = useRef<HTMLElement | null>(null);
+  const uid = useId();
   const navigate = useNavigate();
   const { enabled: moduleEnabled } = useFeatureModules();
 
@@ -367,13 +386,25 @@ export function GlobalSearch() {
     el?.scrollIntoView({ block: "nearest" });
   }, [activeIdx]);
 
+  // While open, the palette is the topmost layer: a dialog under it leaves
+  // its Esc and Tab alone (#1947).
+  useOverlayLayer(open);
+
   useEffect(() => {
     function handler(e: KeyboardEvent) {
       if (matchesShortcut(e, OPEN_GLOBAL_SEARCH)) {
         e.preventDefault();
         setOpen((v) => !v);
       }
-      if (e.key === "Escape") setOpen(false);
+      if (e.key === "Escape") {
+        // An Esc that ends an IME composition belongs to the input method:
+        // the palette stays open with its query (#3156).
+        if (e.isComposing || e.keyCode === 229) return;
+        // Esc in the open palette closes the palette only, not a dialog
+        // under it (whose Esc listener sits on window, after this one).
+        if (cardRef.current) e.stopPropagation();
+        setOpen(false);
+      }
     }
     document.addEventListener("keydown", handler);
     return () => document.removeEventListener("keydown", handler);
@@ -381,11 +412,61 @@ export function GlobalSearch() {
 
   useEffect(() => {
     if (open) {
-      setTimeout(() => inputRef.current?.focus(), 50);
-    } else {
-      setQuery("");
-      setScope("all");
+      // Remember the opener so closing hands focus back to it (the palette
+      // is a modal dialog: #1949). The trigger button, or whatever had focus
+      // when Ctrl/Cmd+K was pressed.
+      openerRef.current = document.activeElement as HTMLElement | null;
+      const t = setTimeout(() => inputRef.current?.focus(), 50);
+      return () => clearTimeout(t);
     }
+    setQuery("");
+    setScope("all");
+    const opener = openerRef.current;
+    openerRef.current = null;
+    if (opener && opener.isConnected) opener.focus();
+  }, [open]);
+
+  // Keep Tab / Shift+Tab inside the palette (#1949). Bound on the document
+  // while open, not on the card: after a click on the card's padding focus
+  // sits on <body>, outside the card, and Tab must still come back in.
+  // Exactly one trap acts: `useOverlayLayer` above makes the palette the
+  // topmost layer, so the trap of a dialog under it steps aside, and the
+  // shared `useFocusTrap` cannot be used here because its layer rank is
+  // taken when this always-mounted component first renders, i.e. beneath
+  // every dialog opened since.
+  useEffect(() => {
+    if (!open) return;
+    function onTab(e: KeyboardEvent) {
+      if (e.key !== "Tab" || e.defaultPrevented) return;
+      const card = cardRef.current;
+      if (!card) return;
+      // Options are tabIndex=-1: the combobox owns them via
+      // aria-activedescendant, so they are not Tab stops.
+      const items = Array.from(
+        card.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]):not([tabindex="-1"]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ),
+      );
+      if (items.length === 0) {
+        e.preventDefault();
+        return;
+      }
+      const first = items[0];
+      const last = items[items.length - 1];
+      const active = document.activeElement;
+      const outside = !active || !card.contains(active);
+      if (e.shiftKey) {
+        if (active === first || outside) {
+          e.preventDefault();
+          last.focus();
+        }
+      } else if (active === last || outside) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+    document.addEventListener("keydown", onTab);
+    return () => document.removeEventListener("keydown", onTab);
   }, [open]);
 
   const remember = useCallback(
@@ -476,9 +557,20 @@ export function GlobalSearch() {
       const row = rows[activeIdx];
       if (row) activate(row);
     } else if (e.key === "Escape") {
+      // A composing Esc cancels the composition only (#3156).
+      if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+      // Stops the native event at the React root, so neither the document
+      // handler above nor a dialog's window listener sees it (#1947).
+      e.stopPropagation();
       setOpen(false);
     }
   }
+
+  const optionId = (i: number) => `${uid}-opt-${i}`;
+  const activeOptionId =
+    rows.length > 0 && activeIdx < rows.length
+      ? optionId(activeIdx)
+      : undefined;
 
   const firstCommandIdx = rows.findIndex((r) => r.kind === "command");
 
@@ -486,7 +578,9 @@ export function GlobalSearch() {
     <>
       {/* Trigger button */}
       <button
+        type="button"
         onClick={() => setOpen(true)}
+        aria-haspopup="dialog"
         className="flex items-center gap-2 rounded-md border border-border/50 bg-muted/30 px-3 py-1.5 text-sm text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground w-80"
       >
         <Search className="h-3.5 w-3.5 flex-shrink-0" />
@@ -499,205 +593,255 @@ export function GlobalSearch() {
         </kbd>
       </button>
 
-      {/* Modal overlay */}
-      {open && (
-        <div
-          className="fixed inset-0 z-50 flex items-start justify-center pt-[15vh]"
-          onClick={() => setOpen(false)}
-        >
-          <div className="absolute inset-0 bg-black/50" />
-
+      {/* Modal overlay. Portalled to <body> like every dialog: rendered in
+          place it sits inside #root and paints BENEATH a dialog opened
+          before it, while holding the keyboard as the top layer (#2721). */}
+      {open &&
+        createPortal(
           <div
-            className="relative z-10 w-full max-w-xl rounded-xl border bg-card shadow-2xl"
-            onClick={(e) => e.stopPropagation()}
+            className="fixed inset-0 z-50 flex items-start justify-center pt-[15vh]"
+            onClick={() => setOpen(false)}
           >
-            {/* Input */}
-            <div className="flex items-center gap-3 border-b px-4 py-3">
-              <Search className="h-4 w-4 flex-shrink-0 text-muted-foreground" />
-              <input
-                ref={inputRef}
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                onKeyDown={handleKeyDown}
-                placeholder="Search IP, hostname, MAC, subnet, zone, record, page…"
-                className="flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
-              />
-              {query && (
-                <button
-                  onClick={() => setQuery("")}
-                  className="text-muted-foreground hover:text-foreground"
-                >
-                  <X className="h-4 w-4" />
-                </button>
-              )}
-              <kbd className="rounded border bg-muted px-1.5 py-0.5 text-[10px] font-mono text-muted-foreground">
-                ESC
-              </kbd>
-            </div>
+            <div className="absolute inset-0 bg-black/50" />
 
-            {/* Scope chips */}
-            {scopes.length > 1 && (
-              <div className="flex flex-wrap items-center gap-1 border-b px-3 py-2">
-                {[{ id: "all", label: "All" }, ...scopes].map((s) => (
+            <div
+              ref={cardRef}
+              role="dialog"
+              aria-modal="true"
+              aria-label="Search"
+              className="relative z-10 w-full max-w-xl rounded-xl border bg-card shadow-2xl"
+              onClick={(e) => e.stopPropagation()}
+            >
+              {/* Input */}
+              <div className="flex items-center gap-3 border-b px-4 py-3">
+                <Search className="h-4 w-4 flex-shrink-0 text-muted-foreground" />
+                <input
+                  ref={inputRef}
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  onKeyDown={handleKeyDown}
+                  role="combobox"
+                  aria-label="Search"
+                  aria-autocomplete="list"
+                  aria-expanded={rows.length > 0}
+                  aria-controls={`${uid}-list`}
+                  aria-activedescendant={activeOptionId}
+                  placeholder="Search IP, hostname, MAC, subnet, zone, record, page…"
+                  className="flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
+                />
+                {query && (
                   <button
-                    key={s.id}
                     type="button"
-                    onClick={() => setScope(s.id)}
-                    className={cn(
-                      "rounded-full px-2.5 py-0.5 text-[11px] font-medium transition-colors",
-                      scope === s.id
-                        ? "bg-primary text-primary-foreground"
-                        : "bg-muted/60 text-muted-foreground hover:bg-muted",
-                    )}
+                    onClick={() => {
+                      setQuery("");
+                      inputRef.current?.focus();
+                    }}
+                    aria-label="Clear search"
+                    title="Clear search"
+                    className="text-muted-foreground hover:text-foreground"
                   >
-                    {s.label}
+                    <X className="h-4 w-4" />
                   </button>
-                ))}
-              </div>
-            )}
-
-            {/* Results */}
-            <div ref={listRef} className="max-h-96 overflow-y-auto">
-              {!query && recents.length === 0 && (
-                <p className="px-4 py-6 text-center text-sm text-muted-foreground">
-                  Search IP addresses, subnets, zones, records, scopes, VLANs
-                  and more — or type a page name to jump straight to it.
-                </p>
-              )}
-              {!query && recents.length > 0 && (
-                <div className="px-4 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/70">
-                  Recent searches
-                </div>
-              )}
-              {query && isFetching && results.length === 0 && (
-                <p className="px-4 py-6 text-center text-sm text-muted-foreground">
-                  Searching…
-                </p>
-              )}
-              {query &&
-                !isFetching &&
-                rows.length === 0 &&
-                debouncedQuery.length > 0 && (
-                  <p className="px-4 py-6 text-center text-sm text-muted-foreground">
-                    No results for{" "}
-                    <span className="font-mono font-medium">
-                      "{debouncedQuery}"
-                    </span>
-                    {scope !== "all" && " in this scope"}
-                  </p>
                 )}
+                <kbd className="rounded border bg-muted px-1.5 py-0.5 text-[10px] font-mono text-muted-foreground">
+                  ESC
+                </kbd>
+              </div>
 
-              {rows.map((row, i) => {
-                const isActive = i === activeIdx;
-                if (row.kind === "result") {
-                  return (
-                    <div key={row.key} data-active={isActive}>
-                      <ResultRow
-                        result={row.result}
-                        isActive={isActive}
-                        onSelect={handleSelect}
-                      />
-                    </div>
-                  );
-                }
-                if (row.kind === "recent") {
-                  return (
+              {/* Scope chips */}
+              {scopes.length > 1 && (
+                <div className="flex flex-wrap items-center gap-1 border-b px-3 py-2">
+                  {[{ id: "all", label: "All" }, ...scopes].map((s) => (
                     <button
-                      key={row.key}
+                      key={s.id}
                       type="button"
-                      data-active={isActive}
-                      onMouseDown={(e) => {
-                        e.preventDefault();
-                        activate(row);
-                      }}
+                      onClick={() => setScope(s.id)}
                       className={cn(
-                        "flex w-full items-center gap-3 px-4 py-2 text-left text-sm transition-colors",
-                        isActive ? "bg-accent" : "hover:bg-accent/50",
+                        "rounded-full px-2.5 py-0.5 text-[11px] font-medium transition-colors",
+                        scope === s.id
+                          ? "bg-primary text-primary-foreground"
+                          : "bg-muted/60 text-muted-foreground hover:bg-muted",
                       )}
                     >
-                      <Clock className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />
-                      <span className="truncate font-mono">{row.query}</span>
+                      {s.label}
                     </button>
-                  );
-                }
-                if (row.kind === "command") {
-                  const Icon = row.dest.icon;
-                  return (
-                    <div key={row.key}>
-                      {i === firstCommandIdx && (
-                        <div className="border-t px-4 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/70">
-                          Go to
+                  ))}
+                </div>
+              )}
+
+              {/* Results. Status text (hint, "Searching…", "No results") sits
+                outside the listbox, whose children are options, in a polite
+                live region so a screen reader hears it change. */}
+              <div ref={listRef} className="max-h-96 overflow-y-auto">
+                <div aria-live="polite">
+                  {!query && recents.length === 0 && (
+                    <p className="px-4 py-6 text-center text-sm text-muted-foreground">
+                      Search IP addresses, subnets, zones, records, scopes,
+                      VLANs and more — or type a page name to jump straight to
+                      it.
+                    </p>
+                  )}
+                  {query && isFetching && results.length === 0 && (
+                    <p className="px-4 py-6 text-center text-sm text-muted-foreground">
+                      Searching…
+                    </p>
+                  )}
+                  {query &&
+                    !isFetching &&
+                    rows.length === 0 &&
+                    debouncedQuery.length > 0 && (
+                      <p className="px-4 py-6 text-center text-sm text-muted-foreground">
+                        No results for{" "}
+                        <span className="font-mono font-medium">
+                          "{debouncedQuery}"
+                        </span>
+                        {scope !== "all" && " in this scope"}
+                      </p>
+                    )}
+                </div>
+                <div
+                  id={`${uid}-list`}
+                  role="listbox"
+                  aria-label="Search results"
+                >
+                  {!query && recents.length > 0 && (
+                    <div className="px-4 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/70">
+                      Recent searches
+                    </div>
+                  )}
+                  {rows.map((row, i) => {
+                    const isActive = i === activeIdx;
+                    if (row.kind === "result") {
+                      return (
+                        <div key={row.key} data-active={isActive}>
+                          <ResultRow
+                            result={row.result}
+                            isActive={isActive}
+                            onSelect={handleSelect}
+                            optionId={optionId(i)}
+                          />
                         </div>
-                      )}
+                      );
+                    }
+                    if (row.kind === "recent") {
+                      return (
+                        <button
+                          key={row.key}
+                          type="button"
+                          id={optionId(i)}
+                          role="option"
+                          aria-selected={isActive}
+                          tabIndex={-1}
+                          data-active={isActive}
+                          onMouseDown={(e) => {
+                            e.preventDefault();
+                            activate(row);
+                          }}
+                          className={cn(
+                            "flex w-full items-center gap-3 px-4 py-2 text-left text-sm transition-colors",
+                            isActive ? "bg-accent" : "hover:bg-accent/50",
+                          )}
+                        >
+                          <Clock className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />
+                          <span className="truncate font-mono">
+                            {row.query}
+                          </span>
+                        </button>
+                      );
+                    }
+                    if (row.kind === "command") {
+                      const Icon = row.dest.icon;
+                      return (
+                        <div key={row.key}>
+                          {i === firstCommandIdx && (
+                            <div className="border-t px-4 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/70">
+                              Go to
+                            </div>
+                          )}
+                          <button
+                            type="button"
+                            id={optionId(i)}
+                            role="option"
+                            aria-selected={isActive}
+                            tabIndex={-1}
+                            data-active={isActive}
+                            onMouseDown={(e) => {
+                              e.preventDefault();
+                              activate(row);
+                            }}
+                            className={cn(
+                              "flex w-full items-center gap-3 px-4 py-2 text-left text-sm transition-colors",
+                              isActive ? "bg-accent" : "hover:bg-accent/50",
+                            )}
+                          >
+                            <Icon className="h-4 w-4 flex-shrink-0 text-muted-foreground" />
+                            <span className="flex-1 truncate">
+                              {row.dest.label}
+                            </span>
+                            <span className="text-[11px] text-muted-foreground">
+                              {row.dest.section}
+                            </span>
+                            <CornerDownLeft className="h-3 w-3 flex-shrink-0 text-muted-foreground/60" />
+                          </button>
+                        </div>
+                      );
+                    }
+                    return (
                       <button
+                        key={row.key}
                         type="button"
+                        id={optionId(i)}
+                        role="option"
+                        aria-selected={isActive}
+                        tabIndex={-1}
                         data-active={isActive}
                         onMouseDown={(e) => {
                           e.preventDefault();
                           activate(row);
                         }}
                         className={cn(
-                          "flex w-full items-center gap-3 px-4 py-2 text-left text-sm transition-colors",
-                          isActive ? "bg-accent" : "hover:bg-accent/50",
+                          "flex w-full items-center gap-3 border-t px-4 py-2.5 text-left text-sm transition-colors",
+                          isActive ? "bg-primary/5" : "hover:bg-accent/50",
                         )}
                       >
-                        <Icon className="h-4 w-4 flex-shrink-0 text-muted-foreground" />
-                        <span className="flex-1 truncate">
-                          {row.dest.label}
-                        </span>
-                        <span className="text-[11px] text-muted-foreground">
-                          {row.dest.section}
-                        </span>
-                        <CornerDownLeft className="h-3 w-3 flex-shrink-0 text-muted-foreground/60" />
+                        <Sparkles className="h-4 w-4 flex-shrink-0 text-primary" />
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate">
+                            Ask AI:{" "}
+                            <span className="font-medium">
+                              "{debouncedQuery}"
+                            </span>
+                          </div>
+                          <div className="text-[11px] text-muted-foreground">
+                            Open Copilot with this query pre-filled
+                          </div>
+                        </div>
                       </button>
-                    </div>
-                  );
-                }
-                return (
-                  <button
-                    key={row.key}
-                    type="button"
-                    data-active={isActive}
-                    onMouseDown={(e) => {
-                      e.preventDefault();
-                      activate(row);
-                    }}
-                    className={cn(
-                      "flex w-full items-center gap-3 border-t px-4 py-2.5 text-left text-sm transition-colors",
-                      isActive ? "bg-primary/5" : "hover:bg-accent/50",
-                    )}
-                  >
-                    <Sparkles className="h-4 w-4 flex-shrink-0 text-primary" />
-                    <div className="min-w-0 flex-1">
-                      <div className="truncate">
-                        Ask AI:{" "}
-                        <span className="font-medium">"{debouncedQuery}"</span>
-                      </div>
-                      <div className="text-[11px] text-muted-foreground">
-                        Open Copilot with this query pre-filled
-                      </div>
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
-
-            {results.length > 0 && (
-              <div className="flex items-center justify-between border-t px-4 py-2 text-xs text-muted-foreground">
-                <span>
-                  {data?.total ?? 0} result{(data?.total ?? 0) !== 1 ? "s" : ""}
-                  {(data?.total ?? 0) > results.length &&
-                    ` · showing top ${results.length}`}
-                </span>
-                <span className="flex items-center gap-2">
-                  <span>↑↓ navigate</span>
-                  <span>↵ select</span>
-                </span>
+                    );
+                  })}
+                </div>
               </div>
-            )}
-          </div>
-        </div>
-      )}
+
+              {results.length > 0 && (
+                <div className="flex items-center justify-between border-t px-4 py-2 text-xs text-muted-foreground">
+                  <span>
+                    {data?.total ?? 0}
+                    {data?.total_capped ? "+" : ""} result
+                    {(data?.total ?? 0) !== 1 || data?.total_capped ? "s" : ""}
+                    {((data?.total ?? 0) > results.length ||
+                      data?.total_capped) &&
+                      ` · showing top ${results.length}`}
+                  </span>
+                  <span className="flex items-center gap-2">
+                    <span>↑↓ navigate</span>
+                    <span>↵ select</span>
+                  </span>
+                </div>
+              )}
+            </div>
+          </div>,
+          document.body,
+        )}
     </>
   );
 }

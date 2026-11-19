@@ -10,9 +10,11 @@ contract, and the ``network.ot`` feature-module gate.
 
 from __future__ import annotations
 
+import csv
 import uuid
 from decimal import Decimal
 
+import pytest
 from httpx import AsyncClient
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -461,6 +463,66 @@ async def test_import_commit_only_touches_existing_addresses(
     assert again.json()["created"] == 0
     assert again.json()["skipped"] == 1
     assert (await db_session.scalar(select(func.count()).select_from(OTDevice))) == 1
+
+
+@pytest.mark.parametrize("eol", ["\n", "\r\n", "\r"], ids=["LF", "CRLF", "CR"])
+async def test_import_reads_every_line_ending(
+    eol: str, client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A device table saved with classic Mac line endings (a bare carriage
+    return between rows) imports like any other (#1711, #1637). The CR
+    reached the csv reader inside an unquoted field, and preview and commit
+    answered 500."""
+    _, token = await _make_superadmin(db_session)
+    subnet = await _make_subnet(db_session)
+    await _make_ip(db_session, subnet, "10.0.0.5")
+    await _make_ip(db_session, subnet, "10.0.0.6")
+    headers = _auth(token)
+    body = {
+        "csv_text": eol.join(
+            [
+                "IP address,Protocol,Device name",
+                "10.0.0.5,PROFINET,plc-a",
+                "10.0.0.6,PROFINET,plc-b",
+            ]
+        )
+        + eol,
+        "column_map": {
+            "address": "IP address",
+            "ot_protocol": "Protocol",
+            "profinet_device_name": "Device name",
+        },
+    }
+
+    preview = await client.post("/api/v1/ot/devices/import/preview", headers=headers, json=body)
+    assert preview.status_code == 200, preview.text
+    assert [(r["address"], r["action"]) for r in preview.json()["rows"]] == [
+        ("10.0.0.5", "create"),
+        ("10.0.0.6", "create"),
+    ]
+
+    commit = await client.post("/api/v1/ot/devices/import/commit", headers=headers, json=body)
+    assert commit.status_code == 201, commit.text
+    assert commit.json()["created"] == 2
+    assert (await db_session.scalar(select(func.count()).select_from(OTDevice))) == 2
+
+
+async def test_import_answers_422_when_the_csv_reader_refuses_the_text(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Whatever else the csv reader refuses is a 422 that says why, not a
+    500 (#1711): here a cell over the reader's field size limit."""
+    _, token = await _make_superadmin(db_session)
+    resp = await client.post(
+        "/api/v1/ot/devices/import/preview",
+        headers=_auth(token),
+        json={
+            "csv_text": "IP address,Notes\n10.0.0.5," + "x" * (csv.field_size_limit() + 1) + "\n",
+            "column_map": {"address": "IP address"},
+        },
+    )
+    assert resp.status_code == 422, resp.text[:300]
+    assert resp.json()["detail"].startswith("CSV could not be read"), resp.json()["detail"]
 
 
 async def test_import_rejects_unmapped_column(

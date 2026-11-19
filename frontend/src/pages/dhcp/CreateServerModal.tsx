@@ -7,17 +7,47 @@ import {
   type FortiGateCredentials,
   formatApiError,
 } from "@/lib/api";
+import {
+  WINRM_FORM_DEFAULTS,
+  winrmFormFrom,
+  winrmSettingsPayload,
+} from "@/lib/winrm";
+import { useCredentialReask } from "@/hooks/useCredentialReask";
+import { useFreshRow, changedFields } from "@/hooks/useFreshRow";
+import { FreshRowError } from "@/components/FreshRowError";
 import { Modal, Field, Btns, inputCls, errMsg } from "./_shared";
+import { FormError } from "@/components/ui/form-error";
 
-export function CreateServerModal({
-  server,
-  defaultGroupId,
-  onClose,
-}: {
+type CreateServerModalProps = {
   server?: DHCPServer;
   defaultGroupId?: string | null;
   onClose: () => void;
-}) {
+};
+
+// Edit reads the server fresh on open (#3739): the row the page holds comes
+// from a list polled every 30 s, and the form is seeded once.
+export function CreateServerModal(props: CreateServerModalProps) {
+  const fresh = useFreshRow(props.server, () =>
+    dhcpApi.getServer(props.server!.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit DHCP Server"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <ServerModalForm {...props} server={fresh.row} />;
+}
+
+function ServerModalForm({
+  server,
+  defaultGroupId,
+  onClose,
+}: CreateServerModalProps) {
   const qc = useQueryClient();
   const editing = !!server;
   const [name, setName] = useState(server?.name ?? "");
@@ -32,15 +62,25 @@ export function CreateServerModal({
   const [error, setError] = useState("");
 
   // Windows-only fields. When editing a server that already has creds set,
-  // we leave the fields blank and only submit them if the user types a new
-  // password — matches the "None → leave alone, {} → clear" server contract.
+  // the username/password stay blank and are only submitted if the user
+  // types one — matches the "None → leave alone, {} → clear" server
+  // contract. The connection settings are seeded from what is stored, and
+  // only the ones the operator changes are sent, so an untouched save keeps
+  // them.
+  const [winSeed] = useState(() =>
+    server?.driver === "windows_dhcp" && server.has_credentials
+      ? winrmFormFrom(server.winrm_settings)
+      : undefined,
+  );
+  const winInitial = winSeed ?? WINRM_FORM_DEFAULTS;
   const [winUsername, setWinUsername] = useState("");
   const [winPassword, setWinPassword] = useState("");
-  const [winPort, setWinPort] = useState("5985");
-  const [winTransport, setWinTransport] =
-    useState<WindowsDHCPCredentials["transport"]>("ntlm");
-  const [winUseTLS, setWinUseTLS] = useState(false);
-  const [winVerifyTLS, setWinVerifyTLS] = useState(false);
+  const [winPort, setWinPort] = useState(winInitial.port);
+  const [winTransport, setWinTransport] = useState<
+    WindowsDHCPCredentials["transport"]
+  >(winInitial.transport);
+  const [winUseTLS, setWinUseTLS] = useState(winInitial.useTls);
+  const [winVerifyTLS, setWinVerifyTLS] = useState(winInitial.verifyTls);
   const [winClearCreds, setWinClearCreds] = useState(false);
 
   // FortiGate-only fields. Same "blank = keep stored" contract on edit.
@@ -60,6 +100,27 @@ export function CreateServerModal({
   } | null>(null);
 
   const hasExistingCreds = !!server?.has_credentials;
+
+  // #4135 — a moved host / port needs the stored credential entered again
+  // (or cleared).
+  const reask = useCredentialReask(
+    { host, port },
+    server && { host: server.host, port: server.port },
+    () => {
+      setFgToken("");
+      setWinPassword("");
+    },
+  );
+  const mustEnterFgToken =
+    driver === "fortigate" &&
+    reask.asks(hasExistingCreds) &&
+    !fgClearCreds &&
+    !fgToken;
+  const mustEnterWinPassword =
+    driver === "windows_dhcp" &&
+    reask.asks(hasExistingCreds) &&
+    !winClearCreds &&
+    !winPassword;
 
   const testMut = useMutation({
     mutationFn: () => {
@@ -119,7 +180,7 @@ export function CreateServerModal({
   });
 
   const mut = useMutation({
-    mutationFn: () => {
+    mutationFn: async () => {
       const data: Partial<DHCPServer> & {
         windows_credentials?: WindowsDHCPCredentials | Record<string, never>;
         cloud_credentials?: FortiGateCredentials | Record<string, never>;
@@ -159,16 +220,21 @@ export function CreateServerModal({
         if (winClearCreds) {
           data.windows_credentials = {};
         } else {
-          // Always send the creds block on windows_dhcp so transport / port /
-          // TLS toggles reach the backend even when username+password are
-          // blank (edit case — backend merges with stored blob). The backend
-          // requires username+password only on first-time set.
-          const creds: Partial<WindowsDHCPCredentials> = {
-            winrm_port: parseInt(winPort, 10) || 5985,
-            transport: winTransport,
-            use_tls: winUseTLS,
-            verify_tls: winVerifyTLS,
-          };
+          // With stored credentials, send only what the operator changed —
+          // the backend merges a partial block over the stored one, so an
+          // untouched setting keeps its stored value and an untouched dialog
+          // sends no block at all. Otherwise (new server, or nothing stored)
+          // send every setting; the backend requires username+password on
+          // first-time set.
+          const creds: Partial<WindowsDHCPCredentials> = winrmSettingsPayload(
+            {
+              port: winPort,
+              transport: winTransport ?? "ntlm",
+              useTls: winUseTLS,
+              verifyTls: winVerifyTLS,
+            },
+            winSeed,
+          );
           if (winUsername) creds.username = winUsername;
           if (winPassword) creds.password = winPassword;
           if (!editing && (!winUsername || !winPassword)) {
@@ -176,16 +242,57 @@ export function CreateServerModal({
               "Windows DHCP requires a username + password to connect over WinRM.",
             );
           }
-          data.windows_credentials = creds as WindowsDHCPCredentials;
+          if (Object.keys(creds).length > 0) {
+            data.windows_credentials = creds as WindowsDHCPCredentials;
+          }
         }
       }
 
-      return editing
-        ? dhcpApi.updateServer(server!.id, data)
-        : dhcpApi.createServer(data);
+      if (!editing) return dhcpApi.createServer(data);
+      // Send only what changed (#3739): a field the operator did not touch
+      // stays as another client stored it. The credential blocks above are
+      // already partial, so they ride along as they are.
+      const {
+        windows_credentials: winCreds,
+        cloud_credentials: cloudCreds,
+        ...plain
+      } = data;
+      const diff: typeof data = changedFields(
+        {
+          name: server!.name,
+          driver: server!.driver,
+          host: server!.host,
+          port: server!.port,
+          server_group_id: server!.server_group_id ?? null,
+          ha_peer_url: server!.ha_peer_url ?? "",
+          description: server!.description ?? "",
+        },
+        plain,
+      );
+      if (winCreds) diff.windows_credentials = winCreds;
+      if (cloudCreds) diff.cloud_credentials = cloudCreds;
+      if (Object.keys(diff).length === 0) return server!;
+      return dhcpApi.updateServer(server!.id, diff);
     },
-    onSuccess: () => {
+    onSuccess: (saved) => {
+      // #3366 — the server page reads ["dhcp-server", id] on a 30 s poll and
+      // opens this dialog from it; write the Save's answer into that copy and
+      // the cached lists first, or a reopen before the poll shows the old row
+      // and an untouched Save writes it back.
+      if (editing && saved?.id) {
+        qc.setQueryData(["dhcp-server", saved.id], (old: unknown) =>
+          old ? { ...(old as DHCPServer), ...saved } : saved,
+        );
+        qc.setQueriesData({ queryKey: ["dhcp-servers"] }, (old: unknown) =>
+          Array.isArray(old)
+            ? old.map((r: DHCPServer) =>
+                r.id === saved.id ? { ...r, ...saved } : r,
+              )
+            : old,
+        );
+      }
       qc.invalidateQueries({ queryKey: ["dhcp-servers"] });
+      qc.invalidateQueries({ queryKey: ["dhcp-server"] });
       qc.invalidateQueries({ queryKey: ["dhcp-groups"] });
       onClose();
     },
@@ -298,7 +405,11 @@ export function CreateServerModal({
         {driver === "kea" && (
           <Field
             label="HA Peer URL (optional)"
-            hint="This server's own Kea HA hook listener endpoint. Required for Kea HA pairs — the partner calls this URL for heartbeats and lease updates. Leave blank for standalone servers. Example: http://dhcp-kea:8000/"
+            hint={
+              groups.find((g) => g.id === groupId)?.mode === "standalone"
+                ? "The selected group is standalone, so this URL is ignored: Kea HA renders only in a hot-standby or load-balancing group. Change the group's mode to pair its Kea servers."
+                : "This server's own Kea HA hook listener endpoint. Required for Kea HA pairs — the partner calls this URL for heartbeats and lease updates. Leave blank for standalone servers. Example: http://dhcp-kea:8000/"
+            }
           >
             <input
               className={inputCls}
@@ -398,13 +509,25 @@ export function CreateServerModal({
             <div
               className={`grid grid-cols-2 gap-3 ${fgClearCreds ? "opacity-40 pointer-events-none" : ""}`}
             >
-              <Field label="API Token" hint="FortiOS REST API admin token">
+              <Field
+                label="API Token"
+                hint={
+                  mustEnterFgToken ? reask.hint : "FortiOS REST API admin token"
+                }
+              >
                 <input
                   type="password"
                   className={inputCls}
                   value={fgToken}
                   onChange={(e) => setFgToken(e.target.value)}
-                  placeholder={hasExistingCreds ? "(unchanged)" : "required"}
+                  required={mustEnterFgToken}
+                  placeholder={
+                    mustEnterFgToken
+                      ? reask.placeholder
+                      : hasExistingCreds
+                        ? "(unchanged)"
+                        : "required"
+                  }
                   autoComplete="off"
                 />
               </Field>
@@ -688,13 +811,23 @@ export function CreateServerModal({
                   autoComplete="off"
                 />
               </Field>
-              <Field label="Password">
+              <Field
+                label="Password"
+                hint={mustEnterWinPassword ? reask.hint : undefined}
+              >
                 <input
                   type="password"
                   className={inputCls}
                   value={winPassword}
                   onChange={(e) => setWinPassword(e.target.value)}
-                  placeholder={hasExistingCreds ? "(unchanged)" : "required"}
+                  required={mustEnterWinPassword}
+                  placeholder={
+                    mustEnterWinPassword
+                      ? reask.placeholder
+                      : hasExistingCreds
+                        ? "(unchanged)"
+                        : "required"
+                  }
                   autoComplete="off"
                 />
               </Field>
@@ -783,8 +916,14 @@ export function CreateServerModal({
           </div>
         )}
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
-        <Btns onClose={onClose} pending={mut.isPending} />
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
+        <Btns
+          onClose={onClose}
+          pending={mut.isPending}
+          disabled={mustEnterFgToken || mustEnterWinPassword}
+        />
       </form>
     </Modal>
   );

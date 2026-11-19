@@ -8,7 +8,10 @@
 ## Prerequisites
 
 - Docker Engine 25+ and Docker Compose v2.20+
-- 2 GB RAM minimum (4 GB recommended)
+- 2 vCPU and 4 GiB RAM minimum, 4 vCPU and 8 GiB recommended. The containers
+  held 1.3 GiB at rest and at most 1.65 GiB under light load, and the host with
+  its OS used at most 2.2 GiB (measured on amd64; arm64 alike); the
+  recommendation is derived: see [`SIZING.md`](SIZING.md#docker-compose)
 - Ports 8077 (frontend, `HTTP_PORT`) and optionally 8000 (API direct access, `API_PORT`) free on the host
 
 ---
@@ -67,12 +70,15 @@ Access the UI at `http://your-host-or-ip:8077/` (or `http://localhost:8077/` if 
 |---|---|---|
 | `POSTGRES_PASSWORD` | `changeme` | PostgreSQL password — **must change** |
 | `SECRET_KEY` | (none) | JWT signing key, and the source of the credential-encryption key when `CREDENTIAL_ENCRYPTION_KEY` is empty. **Required:** the api refuses to boot on the `.env.example` placeholder, anything under 32 characters, or anything that reads like a placeholder, such as `change-me…` (#1222). Use `openssl rand -hex 32`. To replace one an install already uses, see [Rotating `SECRET_KEY`](#rotating-secret_key) |
-| `CREDENTIAL_ENCRYPTION_KEY` | (empty) | Fernet key for stored credentials. Empty derives it from `SECRET_KEY`. A value that is not a valid Fernet key stops the api from booting |
+| `CREDENTIAL_ENCRYPTION_KEY` | (empty) | Fernet key for stored credentials. **Set it** (`python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`): empty derives the key from `SECRET_KEY`, which also signs session tokens. Setting it on a running install is safe, values already stored keep decrypting; see [Moving stored credentials onto a dedicated key](#moving-stored-credentials-onto-a-dedicated-key). A value that is not a valid Fernet key stops the api from booting. Back it up: values written under it are unreadable without it |
 | `ALLOW_INSECURE_SECRET_KEY` | `false` | Boot on a placeholder or weak `SECRET_KEY` with a warning instead of refusing. **Local development only** — `docker-compose.dev.yml` sets it; nothing else should |
 | `HTTP_PORT` | `8077` | Host port for the frontend |
 | `API_PORT` | `8000` | Host port for the API |
 | `API_BIND` | `127.0.0.1` | Host address the API port is published on. Widening it (e.g. `0.0.0.0`) lets LAN clients reach the API directly; if you do, narrow `TRUSTED_PROXY_CIDRS` to the frontend's address, since the API believes `X-Real-IP` from those peers (#1221) |
 | `TRUSTED_PROXY_CIDRS` | private, loopback, CGNAT and ULA ranges | Peers whose `X-Real-IP` / `X-Forwarded-Proto` the API applies. `*` trusts every peer |
+| `FRONTEND_TRUSTED_PROXY_CIDRS` | unset (trust no proxy) | Your own reverse proxy in front of the frontend: the frontend nginx keeps its `X-Forwarded-Proto` and takes the client address from its `X-Forwarded-For`. List only the proxy. See [`REVERSE_PROXY.md`](REVERSE_PROXY.md) |
+| `LOGIN_FAIL_MAX_PER_USERNAME` | `20` | Failed passwords per submitted username per 15 minutes before `/auth/login` answers `429` for that name. `0` turns it off. See [Sign-in throttles](../features/AUTH.md#sign-in-throttles) |
+| `LOGIN_FAIL_MAX_GLOBAL` | `500` | Failed passwords across the whole install per 15 minutes before every password sign-in answers `429` until the window ends. `0` turns it off. See [Sign-in throttles](../features/AUTH.md#sign-in-throttles) |
 | `DATABASE_URL` | auto-constructed | Override only if using an external PostgreSQL |
 | `REDIS_URL` | `redis://redis:6379/0` | Override to point at an external Redis |
 | `DEBUG` | `false` | Enable FastAPI debug mode |
@@ -114,6 +120,12 @@ EOF
 
 ## 5. TLS / HTTPS
 
+Options A and B put a reverse proxy in front of the frontend. Whatever proxy
+you use, read [`REVERSE_PROXY.md`](REVERSE_PROXY.md) too: it covers the
+settings that make sign-in, SSO and the login throttle work behind one
+(External URL, `FRONTEND_TRUSTED_PROXY_CIDRS`, streaming), with examples for nginx,
+Caddy, Traefik, HAProxy and Nginx Proxy Manager.
+
 ### Option A: Terminate TLS at the host with nginx (recommended for VMs)
 
 Place a reverse proxy in front of the `spatiumddi-frontend-1` container:
@@ -132,9 +144,21 @@ server {
         proxy_set_header   X-Real-IP $remote_addr;
         proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header   X-Forwarded-Proto https;
+        proxy_http_version 1.1;
+        proxy_buffering    off;          # AI chat / log streams
+        proxy_read_timeout 3600s;
+        client_max_body_size 4g;
     }
 }
 ```
+
+Then set `FRONTEND_TRUSTED_PROXY_CIDRS` in `.env` to the address the proxy
+connects from (a proxy on the Docker host itself usually arrives from the
+compose network's gateway, e.g. `172.18.0.1`; the frontend's access log shows
+it) and set **Settings > General > External URL** to the public `https://`
+URL. Without the first the frontend nginx overwrites the proxy's
+`X-Forwarded-Proto` and client address, so every user shares one login
+throttle bucket and SSO callbacks are built as `http://`.
 
 ### Option B: Caddy (automatic Let's Encrypt — simplest for appliance installs)
 
@@ -148,7 +172,18 @@ Caddy handles ACME certificate issuance and renewal automatically.
 
 ### Option C: TLS inside the nginx container
 
-Mount your certificate files and an updated `nginx.conf` into the frontend container:
+Mount your certificate files and a replacement nginx **template** into the
+frontend container. Do not mount a file over
+`/etc/nginx/conf.d/default.conf`: the image's entrypoint renders that file at
+every start from `/etc/nginx/templates/default.conf.template`
+(substituting `API_UPSTREAM_HOST`, `API_UPSTREAM_PORT`,
+`NGINX_LOCAL_RESOLVERS` and the trusted-proxy blocks), so a mounted file is
+overwritten.
+
+Start from the repository's `frontend/default.conf.template` (or the TLS
+variant in `charts/spatiumddi/templates/frontend-tls-config.yaml`, which
+already has the `listen 443 ssl` server and the certificate paths), keep its
+`${...}` placeholders, and mount your edited copy:
 
 ```yaml
 # In docker-compose.override.yml
@@ -157,8 +192,9 @@ services:
     ports:
       - "443:443"
     volumes:
-      - /etc/letsencrypt:/etc/letsencrypt:ro
-      - ./nginx-ssl.conf:/etc/nginx/conf.d/default.conf:ro
+      - /etc/letsencrypt/live/ddi.example.com/fullchain.pem:/etc/nginx/tls/tls.crt:ro
+      - /etc/letsencrypt/live/ddi.example.com/privkey.pem:/etc/nginx/tls/tls.key:ro
+      - ./default.conf.template:/etc/nginx/templates/default.conf.template:ro
 ```
 
 ### ACME / DNS Challenge (for IPAM-integrated certificate management)
@@ -196,6 +232,8 @@ The default single Redis container uses `maxmemory-policy allkeys-lru` for Celer
 
 ## 8. Upgrading
 
+> **A dead client cannot block the migration (#3932).** The bundled Postgres starts with TCP keepalives of 60 s / 10 s / 6 (a vanished peer's session is dropped in about two minutes) and `idle_in_transaction_session_timeout=1h` as a backstop for a stuck live client. `migrate` sets a `MIGRATION_LOCK_TIMEOUT_SECONDS` (30) `lock_timeout`; after each timed-out wait it logs `migration waiting on lock held by pid N`, ends `idle in transaction` sessions of the app's role that it is waiting on (`pg_blocking_pids`) and that have been idle over `MIGRATION_STALE_IDLE_TXN_SECONDS` (default 300), and retries, without limit unless `MIGRATION_LOCK_RETRIES` is set, so a migration behind a running backup still waits it out. Changing the `command` recreates the `postgres` container once on the first `docker compose up` after upgrading; an external database needs the same settings applied by its operator.
+
 > **Take a backup before upgrading.** Sign in as a superadmin → **System Admin → Backup → Manual → Build + download**, supply a passphrase you'll remember (or pick a configured destination's **Run now** button). The archive is the single rollback artifact if the upgrade goes sideways. See §9 below for the full backup / restore surface.
 
 ```bash
@@ -224,6 +262,16 @@ To upgrade to a specific release rather than the newest, set
 `SPATIUMDDI_VERSION` in `.env` first; see the README's *Upgrading* section.
 
 If you skipped the backup and need to roll back: every restore takes a `pre-restore-{ts}.zip` safety dump under `/var/lib/spatiumddi/backups/` automatically (passphrase is the literal string `pre-restore-safety`). That gets you back to wherever the last restore landed — but it does **not** cover an upgrade you ran without a restore in between, so the build-and-download nudge above is the durable hedge.
+
+### Moving stored credentials onto a dedicated key
+
+Until `CREDENTIAL_ENCRYPTION_KEY` is set, every stored credential is encrypted under a key derived from `SECRET_KEY`. Compose does not generate one for you (the helm chart and the appliance do), so on an existing install:
+
+1. Generate a key and add it to `.env`: `CREDENTIAL_ENCRYPTION_KEY=<Fernet.generate_key()>`. Keep a copy somewhere that is not this host; the backup archive's `secrets.enc` carries it too.
+2. Restart the stack (`docker compose up -d`). Nothing is lost at this point: new writes use the new key, and the `SECRET_KEY`-derived key stays a read fallback, so every value already stored still decrypts.
+3. Move the existing values across: `docker compose exec api python -m app.core.rotate_credential_key`. It re-encrypts every stored credential (the same column walk a cross-install restore uses), records an audit row (`rotate_credential_key`, counts only, never keys), and is idempotent and resumable: a value already under the dedicated key is skipped, so re-running it after an interruption, or after an old pod wrote one more value, is safe. It can run while the stack is up.
+
+The `SECRET_KEY`-derived fallback is never removed, so a missed value still decrypts. To replace a dedicated key that is already in use, stop the stack, set the new one, and run the command with `OLD_CREDENTIAL_ENCRYPTION_KEY` set to the old one (environment only).
 
 ### Rotating `SECRET_KEY`
 
@@ -274,7 +322,7 @@ docker compose up -d api worker beat
 
 If it reports `NOT COMPLETE`, leave `.env.old-secret-key` where it is: it is the only copy of the old key. Fix what the output names and run the `docker compose run` line again.
 
-The command reports how many values it re-encrypted and records an audit row. It is safe to run again: a value already under the new key is skipped. If `CREDENTIAL_ENCRYPTION_KEY` was already set and you are changing it at the same time, pass the old one as `OLD_CREDENTIAL_ENCRYPTION_KEY` (exported, and `-e OLD_CREDENTIAL_ENCRYPTION_KEY` like above). Leave it unset if the install had no credential key before, including when you are adding one now. If it is set and unchanged, stored credentials never depended on `SECRET_KEY`: the command finds every value already under the current key and moves nothing.
+The command reports how many values it re-encrypted and records an audit row. It is safe to run again: a value already under the new key is skipped. If `CREDENTIAL_ENCRYPTION_KEY` was already set and you are changing it at the same time, pass the old one as `OLD_CREDENTIAL_ENCRYPTION_KEY` (exported, and `-e OLD_CREDENTIAL_ENCRYPTION_KEY` like above). Leave it unset if the install had no credential key before, including when you are adding one now. If it is set and unchanged, values already moved onto it (see [above](#moving-stored-credentials-onto-a-dedicated-key)) are found under the current key and skipped; only values still under the old `SECRET_KEY`-derived key are re-encrypted.
 
 If the install ran on a **placeholder** key, anyone who knew it could sign requests as any user. After rotating, review **Admin → API tokens** and the users and superadmins list, and check the audit log for changes you do not recognise: a token or account created with a forged session survives the rotation.
 
@@ -369,7 +417,7 @@ docker compose -f docker-compose.agent-dhcp.yml up -d
 docker compose -f docker-compose.agent-dhcp.yml --profile dhcp-ha up -d
 ```
 
-For a **true HA pair across two VMs**, run the same compose file on each VM with a different `DHCP_HOSTNAME` (say `dhcp-kea-east` and `dhcp-kea-west`) and the same `AGENT_GROUP`. On the control plane, edit the DHCP Server Group's HA mode (hot-standby or load-balancing) and set each server's `ha_peer_url` to **its own** HA listener URL (`http://<that VM's address>:8000/`). Each server's URL goes into every peer's `peers` list, which is how the partner reaches it. The agent resolves peer hostnames at render time and the `PeerResolveWatcher` thread keeps them fresh if IPs change.
+For a **true HA pair across two VMs**, run the same compose file on each VM with a different `DHCP_HOSTNAME` (say `dhcp-kea-east` and `dhcp-kea-west`) and the same `AGENT_GROUP`. On the control plane, edit the DHCP Server Group's HA mode (hot-standby or load-balancing) and set each server's `ha_peer_url` (only appliance-hosted members are ever filled automatically) to **its own** HA listener URL (`http://<that VM's address>:8000/`). Each server's URL goes into every peer's `peers` list, which is how the partner reaches it. The agent resolves peer hostnames at render time and the `PeerResolveWatcher` thread keeps them fresh if IPs change.
 
 #### Optional: passive DHCP fingerprinting
 

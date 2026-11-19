@@ -13,6 +13,7 @@ import {
   alertsApi,
   dnsApi,
   domainsApi,
+  formatApiError,
   tlsCertsApi,
   type AlertSeverity,
   type Domain,
@@ -21,6 +22,8 @@ import {
 import { RdapPanel } from "@/components/network/rdap-panel";
 import { CertsCompactTable } from "@/pages/network/CertificatesPage";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { useModuleOn } from "@/hooks/useModuleOn";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { cn, zebraBodyCls } from "@/lib/utils";
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -475,6 +478,9 @@ export function DomainDetailPage() {
   const { id = "" } = useParams<{ id: string }>();
   const qc = useQueryClient();
   const [tab, setTab] = useState<Tab>("whois");
+  // #2135 — a Domain does not need DNS, but its Linked DNS Zones tab reads
+  // /dns/*, so it exists only while core.dns is on.
+  const dnsOn = useModuleOn("core.dns");
 
   const {
     data: domain,
@@ -485,6 +491,13 @@ export function DomainDetailPage() {
     queryFn: () => domainsApi.get(id),
     enabled: !!id,
   });
+
+  // #2519 — the router asks write on 'manage_domains', as the list does.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "manage_domains"),
+    "Requires write permission on domains",
+  );
 
   const refreshMut = useMutation({
     mutationFn: () => domainsApi.refreshWhois(id),
@@ -546,6 +559,7 @@ export function DomainDetailPage() {
             onClick={() => refreshMut.mutate()}
             disabled={refreshMut.isPending}
             className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-accent disabled:opacity-50"
+            {...writeGate}
           >
             <RefreshCw
               className={cn(
@@ -555,6 +569,11 @@ export function DomainDetailPage() {
             />
             {refreshMut.isPending ? "Refreshing…" : "Refresh WHOIS"}
           </button>
+          {refreshMut.isError && (
+            <p role="alert" className="basis-full text-sm text-destructive">
+              {formatApiError(refreshMut.error, "WHOIS refresh failed")}
+            </p>
+          )}
         </div>
 
         {/* Info card */}
@@ -650,11 +669,13 @@ export function DomainDetailPage() {
               onClick={() => setTab("whois")}
               label="WHOIS"
             />
-            <TabButton
-              active={tab === "zones"}
-              onClick={() => setTab("zones")}
-              label="Linked DNS Zones"
-            />
+            {dnsOn && (
+              <TabButton
+                active={tab === "zones"}
+                onClick={() => setTab("zones")}
+                label="Linked DNS Zones"
+              />
+            )}
             <TabButton
               active={tab === "certs"}
               onClick={() => setTab("certs")}
@@ -668,7 +689,7 @@ export function DomainDetailPage() {
           </div>
           <div className="mt-4">
             {tab === "whois" && <WhoisTab domain={domain} />}
-            {tab === "zones" && <LinkedZonesTab domain={domain} />}
+            {tab === "zones" && dnsOn && <LinkedZonesTab domain={domain} />}
             {tab === "certs" && <CertificatesTab domainId={domain.id} />}
             {tab === "alerts" && <AlertHistoryTab domainId={domain.id} />}
           </div>

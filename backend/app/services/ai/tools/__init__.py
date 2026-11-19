@@ -58,6 +58,7 @@ from app.services.ai.tools import (  # noqa: F401, E402
     redis,
     reports,
     resolver,
+    retention,
     saved_views,
     services,
     snmp,
@@ -77,8 +78,10 @@ from app.services.ai.tools.base import (
     ToolArgumentError,
     ToolDisabled,
     ToolNotFound,
+    ToolPermissionDenied,
     ToolRegistry,
     effective_tool_names,
+    is_rate_limit_refusal,
     register_tool,
 )
 
@@ -89,6 +92,8 @@ __all__ = [
     "ToolNotFound",
     "ToolArgumentError",
     "ToolDisabled",
+    "ToolPermissionDenied",
     "register_tool",
     "effective_tool_names",
+    "is_rate_limit_refusal",
 ]

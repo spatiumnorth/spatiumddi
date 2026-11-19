@@ -58,3 +58,39 @@ export function withCustomFieldDefaults(
   }
   return out;
 }
+
+const isBlank = (v: unknown): boolean =>
+  v === undefined || v === null || (typeof v === "string" && v.trim() === "");
+
+/**
+ * Labels of the Required custom fields a save would leave empty (#2478), the
+ * same rule the API applies: a value inherited from a parent block counts;
+ * on create every Required field needs one; on an update (`stored` given) only
+ * a field the form holds a key for, or the row already had a value for. A
+ * legacy row that never had the field can still be saved untouched.
+ */
+export function missingRequiredCustomFields(
+  definitions: CustomField[],
+  values: Record<string, unknown>,
+  inherited: Record<string, unknown> = {},
+  stored?: Record<string, unknown> | null,
+): string[] {
+  const out: string[] = [];
+  for (const def of definitions) {
+    if (!def.is_required) continue;
+    if (!isBlank(values[def.name]) || !isBlank(inherited[def.name])) continue;
+    if (
+      stored !== undefined &&
+      !(def.name in values) &&
+      isBlank(stored?.[def.name])
+    )
+      continue;
+    out.push(def.label);
+  }
+  return out;
+}
+
+/** The message a save shows for the labels from `missingRequiredCustomFields`. */
+export function requiredFieldsMessage(labels: string[]): string {
+  return `Required custom field${labels.length > 1 ? "s" : ""} need a value: ${labels.join(", ")}.`;
+}

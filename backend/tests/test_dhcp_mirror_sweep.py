@@ -188,3 +188,69 @@ async def test_sweep_is_idempotent(db_session: AsyncSession) -> None:
     await db_session.commit()
     assert await sweep_orphaned_static_mirrors(db_session) == 0
     await db_session.commit()
+
+
+def _patch_sweep(monkeypatch: pytest.MonkeyPatch, db: AsyncSession, counts: list[int]) -> None:
+    from contextlib import asynccontextmanager
+
+    import app.tasks.dhcp_mirror_sweep as sw
+
+    @asynccontextmanager
+    async def _ts():  # type: ignore[no-untyped-def]
+        yield db
+
+    async def _enabled(*_a, **_k):  # type: ignore[no-untyped-def]
+        return True
+
+    async def _static(*_a, **_k):  # type: ignore[no-untyped-def]
+        return 0
+
+    it = iter(counts)
+
+    async def _lease(*_a, **_k):  # type: ignore[no-untyped-def]
+        return next(it)
+
+    monkeypatch.setattr(sw, "task_session", _ts)
+    monkeypatch.setattr(sw, "is_module_enabled", _enabled)
+    monkeypatch.setattr(sw, "sweep_orphaned_static_mirrors", _static)
+    monkeypatch.setattr(sw, "sweep_orphaned_lease_mirrors", _lease)
+    monkeypatch.setattr(sw, "_MAX_PER_RUN", 2)
+
+
+async def _last_sweep_audit(db: AsyncSession):  # type: ignore[no-untyped-def]
+    from app.models.audit import AuditLog
+
+    return (
+        await db.execute(
+            select(AuditLog)
+            .where(AuditLog.action == "dhcp-mirror-sweep")
+            .order_by(AuditLog.timestamp.desc())
+            .limit(1)
+        )
+    ).scalar_one()
+
+
+@pytest.mark.asyncio
+async def test_sweep_audit_not_capped_when_it_freed_everything(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import app.tasks.dhcp_mirror_sweep as sw
+
+    _patch_sweep(monkeypatch, db_session, [2, 2, 1])  # 5 freed, last batch short
+    assert await sw._sweep() == 5
+    row = await _last_sweep_audit(db_session)
+    assert row.new_value == {"mirrors_freed": 5, "capped": False}
+    assert row.resource_display == "orphaned DHCP mirrors (reservation + lease)"
+
+
+@pytest.mark.asyncio
+async def test_sweep_audit_capped_when_budget_runs_out(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import app.tasks.dhcp_mirror_sweep as sw
+
+    _patch_sweep(monkeypatch, db_session, [2, 2])
+    monkeypatch.setattr(sw, "_LEASE_SWEEP_BUDGET_S", -1.0)  # already expired
+    assert await sw._sweep() == 2
+    row = await _last_sweep_audit(db_session)
+    assert row.new_value["capped"] is True

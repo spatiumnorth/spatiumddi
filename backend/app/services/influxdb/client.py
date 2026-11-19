@@ -32,6 +32,8 @@ from typing import Any
 
 import httpx
 
+from app.core.exc_text import describe_http_exc
+
 # Line protocol timestamps are sent in whole seconds — see
 # ``line_protocol.Point.timestamp``.
 _PRECISION = "s"
@@ -146,7 +148,7 @@ async def write_lines(cfg: InfluxTargetConfig, body: str) -> None:
     # function entirely — aborting the whole beat sweep and rolling back
     # every *other* target's state instead of recording one failure here.
     except (httpx.HTTPError, httpx.InvalidURL) as exc:
-        raise InfluxDBWriteError(f"{type(exc).__name__}: {exc}") from exc
+        raise InfluxDBWriteError(describe_http_exc(exc, timeout=timeout)) from exc
     # 204 is the documented success for both endpoints; 200 shows up on
     # some proxies. Anything else carries a body worth surfacing.
     if resp.status_code not in (200, 204):

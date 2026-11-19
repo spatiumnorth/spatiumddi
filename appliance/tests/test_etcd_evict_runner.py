@@ -387,3 +387,34 @@ def test_ipv6_addresses_match_however_they_are_written(tmp_path: Path) -> None:
     assert mod.canonical_addr("fd00:0::0086") == "fd00::86"
     assert mod.canonical_addr("192.168.122.86") == "192.168.122.86"
     assert mod.canonical_addr("Node-3.LAN") == "node-3.lan"
+
+
+# ---- #1757: an uppercase hostname --------------------------------------------------
+# k3s lowercases the host's name for the node (RFC 1123) and names the etcd
+# member `<lowercase name>-<8 hex>`; the hostname the operator typed keeps its case.
+
+
+def test_an_uppercase_hostname_still_matches_its_lowercase_member(tmp_path: Path) -> None:
+    results, _, etcd = _run(tmp_path, [SEED, M1, GHOST],
+                            _request(("Ddipg-Member-3", "192.168.122.86")))
+    assert results["Ddipg-Member-3"] == (
+        "removed", "18446744073709551557 ddipg-member-3-7d1c4ad1")
+    assert etcd["removed"] == [18446744073709551557]
+
+
+def test_an_uppercase_own_hostname_never_removes_its_own_member(tmp_path: Path) -> None:
+    """The runner's own hostname as socket.gethostname() reports it keeps its
+    case; its member is lowercase. With no etcd config to read, only the
+    lowercase spelling of the hostname recognises the member as its own."""
+    mod = _module()
+    old = os.environ.get("SPATIUM_NODE_NAME")
+    os.environ["SPATIUM_NODE_NAME"] = "DDIPG-SEED"
+    try:
+        mine = mod.own_names()
+    finally:
+        if old is None:
+            os.environ.pop("SPATIUM_NODE_NAME")
+        else:
+            os.environ["SPATIUM_NODE_NAME"] = old
+    assert "ddipg-seed" in mine
+    assert mod.node_members([SEED], "ddipg-seed", [], mine) == []

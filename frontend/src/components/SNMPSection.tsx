@@ -10,6 +10,7 @@ import {
   type SnmpPrivProtocol,
   type SnmpVersion,
   formatApiError,
+  formatDialogError,
 } from "@/lib/api";
 import { Toggle } from "@/components/ui/toggle";
 import { cn } from "@/lib/utils";
@@ -72,7 +73,7 @@ function CommunityField({
   return (
     <Field
       label="Community string (v2c)"
-      description="Read-only community for SNMPv2c queries. Stored Fernet-encrypted server-side; the Reveal button surfaces the plaintext after a password re-confirm (every reveal is audited). ``public`` is intentionally NOT pre-seeded — leaving the field empty disables SNMP queries even when the master toggle is on."
+      description="Read-only community for SNMPv2c queries. Stored Fernet-encrypted server-side; the Reveal button surfaces the plaintext after a password re-confirm (every reveal is audited). ‘public’ is intentionally NOT pre-seeded — leaving the field empty disables SNMP queries even when the master toggle is on."
     >
       <div className="flex flex-col items-end gap-2">
         {clearPending ? (
@@ -361,9 +362,11 @@ export function SNMPSection({
       setSavedAt(Date.now());
       setTimeout(() => setSavedAt(null), 2500);
     },
+    // formatDialogError, not err.message: on an AxiosError the latter is only
+    // "Request failed with status code N", which hides the server's reason,
+    // the validator's sentence naming the refused value (#3424).
     onError: (err: unknown) => {
-      const msg = err instanceof Error ? err.message : String(err);
-      setSaveErr(msg);
+      setSaveErr(formatDialogError(err));
     },
   });
 
@@ -439,7 +442,7 @@ export function SNMPSection({
 
       <Field
         label="Enable SNMP"
-        description="When on, the rendered snmpd.conf is shipped to every appliance host through the ConfigBundle long-poll, the host runner validates it via ``snmpd -t``, and starts snmpd."
+        description="When on, the rendered snmpd.conf is shipped to every appliance host through the ConfigBundle long-poll, the host runner checks it with a probe run of snmpd, and starts snmpd."
       >
         <Toggle
           checked={enabled}
@@ -604,8 +607,8 @@ export function SNMPSection({
       )}
 
       <Field
-        label="Allowed source CIDRs (v2c only)"
-        description="Comma- or space-separated list of CIDRs allowed to query SNMP. Empty = nothing allowed (snmpd will run but refuse every query). For v3, USM authenticates by user+pass; use the host firewall (nftables) to restrict by source IP instead."
+        label="Allowed source CIDRs"
+        description="Comma- or space-separated list of CIDRs allowed to query SNMP. The host firewall opens UDP 161 only to these sources, for v2c and v3. Empty = the port is open to any source (v2c still answers nothing until a source is listed; v3 is then protected only by its user credentials). A custom firewall_extra rule accepting UDP 161 adds its sources to this list."
       >
         <input
           type="text"

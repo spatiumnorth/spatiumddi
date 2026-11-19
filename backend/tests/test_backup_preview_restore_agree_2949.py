@@ -1,0 +1,204 @@
+"""The restore card's verdict covers what the restore refuses (#2949).
+
+The manifest preview said "recognised" for an archive whose manifest was
+fine, and the console then enabled a Full restore the restore refuses
+outright: no database dump, no ``secrets.enc``, a newer ``format_version``.
+The preview now answers ``restorable`` / ``restore_refusal`` from the same
+helpers the restore uses, so these tests build each archive and check the
+preview and the real restore agree.
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import zipfile
+
+import pytest
+from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.security import create_access_token, hash_password
+from app.models.auth import User
+from app.services.backup.archive import BackupArchiveError, extract_archive_members
+from app.services.backup.restore import BackupRestoreError, _apply_backup_restore_inner
+
+_PASS = "correct horse battery"
+_PHRASE = "RESTORE-FROM-BACKUP"
+
+
+def _zip(manifest: dict, members: dict[str, bytes]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("manifest.json", json.dumps(manifest))
+        for name, data in members.items():
+            zf.writestr(name, data)
+    return buf.getvalue()
+
+
+_BASE = {"format": "spatiumddi-backup", "format_version": 2}
+_GOOD = {"database.dump": b"PGDMP", "secrets.enc": b"x"}
+
+CASES = {
+    "good": (_zip({**_BASE, "dump_format": "custom"}, _GOOD), True, None),
+    "no_dump": (
+        _zip(_BASE, {"secrets.enc": b"x"}),
+        False,
+        "neither database.dump nor database.sql",
+    ),
+    "declared_dump_missing": (
+        _zip({**_BASE, "dump_format": "custom"}, {"secrets.enc": b"x"}),
+        False,
+        "member 'database.dump' is missing",
+    ),
+    "no_secrets": (
+        _zip({**_BASE, "dump_format": "custom"}, {"database.dump": b"PGDMP"}),
+        False,
+        "secrets.enc",
+    ),
+    "newer_format": (
+        _zip({**_BASE, "format_version": 3, "dump_format": "custom"}, _GOOD),
+        False,
+        "unsupported backup format_version: 3",
+    ),
+}
+
+
+async def _superadmin(db: AsyncSession) -> dict[str, str]:
+    user = User(
+        username="p2949",
+        email="p2949@example.com",
+        display_name="p2949",
+        hashed_password=hash_password("password123"),
+        auth_source="local",
+        is_superadmin=True,
+    )
+    db.add(user)
+    await db.flush()
+    await db.commit()
+    return {"Authorization": f"Bearer {create_access_token(str(user.id))}"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", sorted(CASES))
+async def test_preview_verdict_matches_the_restore(
+    client: AsyncClient, db_session: AsyncSession, case: str
+) -> None:
+    data, restorable, reason = CASES[case]
+    headers = await _superadmin(db_session)
+    resp = await client.post(
+        "/api/v1/backup/manifest-preview",
+        headers=headers,
+        files={"archive": ("a.zip", io.BytesIO(data), "application/zip")},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["restorable"] is restorable
+    if restorable:
+        assert body["restore_refusal"] is None
+        return
+    assert reason in body["restore_refusal"]
+    # The restore's own answer is the same sentence.
+    with pytest.raises((BackupArchiveError, BackupRestoreError)) as exc:
+        await _apply_backup_restore_inner(
+            db_session,
+            archive_bytes=data,
+            passphrase=_PASS,
+            confirmation_phrase=_PHRASE,
+            db_url="postgresql://unused",
+        )
+    assert str(exc.value) == body["restore_refusal"]
+
+
+def test_extract_and_preview_share_the_member_rule() -> None:
+    data, _, _ = CASES["no_dump"]
+    with pytest.raises(BackupArchiveError, match="neither database.dump"):
+        extract_archive_members(data)
+
+
+@pytest.mark.asyncio
+async def test_preview_refuses_a_schema_head_this_install_cannot_place(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#3287: a head the restore would refuse as newer is not restorable."""
+    from app.services.backup.migrations import _local_head
+
+    headers = await _superadmin(db_session)
+
+    async def preview(schema_version: str | None) -> dict:
+        manifest = {**_BASE, "dump_format": "custom"}
+        if schema_version is not None:
+            manifest["schema_version"] = schema_version
+        resp = await client.post(
+            "/api/v1/backup/manifest-preview",
+            headers=headers,
+            files={"archive": ("a.zip", io.BytesIO(_zip(manifest, _GOOD)), "application/zip")},
+        )
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+
+    newer = await preview("ffffffffffff")
+    assert newer["restorable"] is False
+    assert "NEWER schema" in newer["restore_refusal"]
+    # Controls: no recorded head (read from secrets.enc by the restore) and
+    # this install's own head are both restorable.
+    blank = await preview(None)
+    assert blank["restorable"] is True and blank["restore_refusal"] is None
+    own = _local_head()
+    if own:
+        assert (await preview(own))["restorable"] is True
+
+
+@pytest.mark.asyncio
+async def test_schema_refusal_matches_the_restore_and_older_heads_pass(
+    db_session: AsyncSession,
+) -> None:
+    """#3287: the preview's schema verdict is the restore's own sentence.
+
+    Built through :func:`manifest_preview_payload`, the one builder both the
+    upload preview and a destination's archive preview return. An older head
+    in this install's chain is restorable (the restore upgrades it); a head
+    the chain does not contain is refused before anything destructive, by
+    the preview and by the restore alike.
+    """
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    from app.services.backup.archive import manifest_preview_payload
+    from app.services.backup.crypto import encrypt_secrets
+    from app.services.backup.migrations import _alembic_ini, _local_head
+
+    local = _local_head()
+    ini = _alembic_ini()
+    assert local and ini, "the test needs a single readable alembic head"
+    down = ScriptDirectory.from_config(Config(str(ini))).get_revision(local).down_revision
+    parent = down[0] if isinstance(down, tuple) else down
+    assert isinstance(parent, str)
+
+    def archive(head: str) -> bytes:
+        return _zip(
+            {**_BASE, "dump_format": "custom", "schema_version": head},
+            {
+                "database.dump": b"PGDMP",
+                "secrets.enc": encrypt_secrets({"schema_version": head}, passphrase=_PASS),
+            },
+        )
+
+    older = manifest_preview_payload(archive(parent))
+    assert older["restorable"] is True and older["restore_refusal"] is None
+
+    for head in ("ffffffffffff", "000000000000"):
+        data = archive(head)
+        body = manifest_preview_payload(data)
+        assert body["restorable"] is False
+        assert repr(head) in body["restore_refusal"]
+        assert "Upgrade SpatiumDDI" in body["restore_refusal"]
+        with pytest.raises(BackupRestoreError) as exc:
+            await _apply_backup_restore_inner(
+                db_session,
+                archive_bytes=data,
+                passphrase=_PASS,
+                confirmation_phrase=_PHRASE,
+                db_url="postgresql://unused",
+            )
+        assert str(exc.value) == body["restore_refusal"]

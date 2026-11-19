@@ -61,6 +61,8 @@ class PcapCaptureRead(BaseModel):
     bytes_captured: int
     pcap_size_bytes: int | None
     pcap_sha256: str | None
+    # Node whose disk holds the artifact (#2866); null when unknown.
+    artifact_node: str | None = None
     # True when the row has captured bytes available to download.
     has_artifact: bool = False
     metadata_json: dict | None = None

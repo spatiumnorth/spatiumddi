@@ -25,7 +25,7 @@ preview → commit idiom, so it sits in the same table.
 | | DNS importer (#128) | DHCP importer (#129) | NetBox / IPAM importer (#36) | Windows cutover (#756) |
 |---|---|---|---|---|
 | Feature module | `dns.import` | `dhcp.import` | `ipam.import.netbox` | `migration.cutover` |
-| Admin surface | DNS Import (sidebar) | DHCP Import (sidebar) | Import → NetBox | Import → Windows cutover |
+| Admin surface | Import → DNS | Import → DHCP | Import → NetBox | Import → Windows cutover |
 | Sources | BIND9 archive · Windows DNS live-pull · PowerDNS REST · Technitium REST · Cloud DNS live-pull (Cloudflare / Route 53 / Azure DNS / Google Cloud DNS) | Kea JSON file · Windows DHCP live-pull · ISC `dhcpd.conf` | NetBox REST live-pull (v3.x–4.6+) | live Windows DNS + Windows DHCP over WinRM |
 | Target | DNS server group (+ optional view) | DHCP server group (+ IPAM linkage) | native IPAM rows (space / block / subnet / address + VRF / VLAN / Customer / Site) | zones + scopes that already exist here — it creates none |
 | Provenance columns | `dns_zone` / `dns_record` `import_source` + `imported_at` | `dhcp_scope` / `dhcp_pool` / `dhcp_static_assignment` / `dhcp_client_class` `import_source` + `imported_at` | IPAM / network rows `import_source` + `imported_at` + `netbox_id` (in `custom_fields` / `tags`) | `dhcp_static_assignment` `import_source="windows_cutover"` + `imported_at` (lease handover only) |
@@ -78,9 +78,12 @@ Five sources, all reducing to canonical `ImportedZone` + `ImportedRecord`:
 
 - **BIND9 archive** — upload a `.zip` / `.tar(.gz|.bz2|.xz)` containing
   `named.conf` + the referenced master files. The parser walks every
-  `zone "…" { … }` declaration (including those nested in `view {}`
-  blocks), resolves the `file "…"` directive inside the archive, and
-  parses each master file. ACL / controls / logging / key declarations
+  `zone "…" [class] { … }` declaration (including those nested in
+  `view {}` blocks), resolves the `file "…"` directive inside the
+  archive, and parses each master file. Only class `IN` zones import;
+  `hint` / `mirror` / `redirect` / `static-stub` / `delegation-only`
+  zones, unquoted zone names and `include`d files are not read, and
+  each is named in the preview's warnings. ACL / controls / logging / key declarations
   stay out of scope; DNSSEC records (DNSKEY / RRSIG / NSEC* / DS) are
   stripped with a warning — re-sign post-import via the zone DNSSEC tab.
 - **Windows DNS live-pull** — pick a registered `windows_dns` server
@@ -134,6 +137,56 @@ or `google_dns` — into every created row's `import_source` column, so
 provenance stays queryable per provider. The plan's `source` field
 must match the endpoint or the commit is rejected.
 
+**Apex NS (#1892).** The BIND9, PowerDNS and Technitium sources carry the
+source server's apex NS (`@ NS tech1.example.`) into the zone's records, and
+the group's agents serve those rows as the zone's whole NS set (#1153), so the
+managed zone stays delegated to the host it was migrated off and goes lame once
+that host is retired. Preview therefore lists, per primary zone, any apex NS
+whose target is not a server of the target group (matched on the server's name
+or host), in the zone's `foreign_apex_ns` and as a warning. A group with no
+servers yet is not compared. Nothing changes unless the operator asks: an apex
+NS outside the group can be deliberate, for example a hidden primary whose
+public name servers are a provider's. The review step shows the affected zones
+with an unticked **Replace them with the target group's servers** box; the
+commit API's `apex_ns_policy: "replace"` (and the Copilot's
+`commit_dns_import`) does the same. Replacing drops the foreign apex NS rows,
+adds every enabled server in the group whose host is a DNS hostname (not an IP,
+not a single label) as an apex NS, and moves a SOA primary name that named a
+foreign host. Delegations below the apex are never touched, the change is
+recorded in the zone's audit row (`apex_ns_replaced`), and a group with no such
+server keeps the imported rows with a warning rather than falling back to the
+agent's loopback placeholder. Existing zones are not rewritten.
+
+**CNAME beside other data (#2089).** A CNAME must be the only record at its
+name and never sits at the apex (RFC 1034 §3.6.2, RFC 2181 §10.1). The record
+API refuses both (#1381), and so does every importer, with the same rule
+(`services/dns/cname_conflict.py`). A source that holds such a pair (a
+PowerDNS, Windows, Technitium or cloud zone; a zone file with one is already
+refused by the parser) imports without the offending row, rather than as a zone
+the server then refuses to load. Which side is kept:
+
+- within one imported zone, the non-CNAME data is kept and the CNAME skipped;
+  of several CNAMEs at one name the first in the source's order is kept; an
+  apex CNAME is skipped;
+- in a zone-file import into an existing zone, the records already there win,
+  in both directions. Records in the trash do not count, IPAM-generated records
+  do, and records match per view (a row with no view meets every view). A
+  `replace` frees the names of the records it deletes, so the preview takes
+  `conflict_strategy` as the commit does.
+
+**BIND check-names (#4155).** BIND refuses to load a zone whose A / AAAA / MX
+owner, or MX / NS / SRV target, is not a host name (an `_` label, say), so the
+zone answers SERVFAIL; the record API 422s such a record and the zone-file
+import skips it (#2912). The configuration importers (BIND9, Windows DNS,
+PowerDNS, Technitium, cloud) apply the same rule
+(`app.core.dns_names.bind_check_names_error`): the preview lists each such
+record as a `Name rule:` warning, and the commit skips it and names it in the
+result's warnings, while the zone and its other records import.
+
+The preview lists each such record as a warning (or under **Will not be
+imported** for a zone file), the commit's warnings repeat it, and the zone's
+audit row names it (`records_skipped_unsafe`, or `skipped` for a zone file).
+
 See `docs/drivers/DNS_DRIVERS.md` for parser + agentless-driver
 internals.
 
@@ -153,7 +206,20 @@ Three sources, all reducing to canonical `ImportedScope` +
   `reservations` → reservations, `option-data` → canonical options,
   and top-level `client-classes` → client classes (Kea `test`
   expressions are SpatiumDDI's native class shape, so they import
-  verbatim).
+  verbatim). Subnets under `shared-networks` are flattened into
+  individual scopes, as the ISC importer does: a member inherits the
+  network's `option-data` (option by option), `valid-lifetime`,
+  `min-` / `max-valid-lifetime` and `ddns-send-updates`, and its own
+  value wins. The preview says each network was flattened, and names
+  any setting a scope has no field for (`interface`, `relay`,
+  `client-class`, `match-client-id`, other `ddns-*`, …) on the
+  network or on a subnet, so a lost relay or interface binding is
+  never silent. A reservation whose
+  address is not an IP address, is the wrong family, or lies outside
+  its scope's subnet (the static form's rule) is dropped in the
+  preview and the commit with a warning naming it, and the scope is
+  still imported; a Dhcp6 reservation's further `ip-addresses` and its
+  `prefixes` are named as not imported.
 - **Windows DHCP live-pull** *(Phase 2)* — pick a registered
   `windows_dhcp` server with WinRM credentials; the importer reuses the
   Path A read driver (`Get-DhcpServerv4Scope` + option values +
@@ -712,3 +778,24 @@ conflicting object to **skip**, so a fat-fingered "Commit" twice
 doesn't duplicate or trample. To intentionally refresh an imported
 object, set its conflict action to **overwrite** (DNS also offers
 **rename**; NetBox keys re-runs off the stored `netbox_id`).
+
+---
+
+## DNS configuration importer — reference summary
+
+_Moved here from the README feature tour (#3410), so the detail stays in the documentation._
+
+### Sources, preview and commit semantics
+
+one-shot migration tool that turns existing zone data into native SpatiumDDI zones + records.
+
+- Five sources, one canonical IR + commit pipeline:
+  - **BIND9** — upload a `.zip` / `.tar.gz` of the `named.conf` tree; the parser reads `named.conf` itself (an `include`d file is not read, and the preview names each include so you can paste its zone declarations into `named.conf`), resolves zone files via four strategies (relative path, absolute path, `directory` option, search), tolerates `view {}` blocks, and feeds the same canonical-zone shape the other sources do
+  - **Windows DNS** — live pull over WinRM via the existing `WindowsDNSDriver`; honours system zones (TrustAnchors / `_msdcs.*`) by routing them through a dedicated branch instead of trying to migrate them
+  - **PowerDNS** — live pull over the authoritative REST API (`X-API-Key` auth, hard cap of 5000 zones / 60 s socket timeout); hoists SOA from rrset content, splits MX / SRV priority into the dedicated columns, drops disabled records + DNSSEC + LUA / ALIAS with distinct warnings
+  - **Technitium** — live pull over the console REST API (token auth); only `Primary` zones import, with secondary / stub / forwarder / catalog reported as warnings rather than minted as rows SpatiumDDI would then serve authoritatively. Technitium returns structured `rData` whose field names differ from its own *write* API and which renders numeric rdata as enum names, so the importer inverts that back to wire values (`DANE-EE` / `SPKI` / `SHA2-256` → `3 1 1 <hex>`), passing unknown enum members through unchanged
+- Preview-before-commit on every source — operator sees the conflict picker (skip / overwrite / rename) before any rows are written
+- Per-zone savepoint commit so a failure on zone N rolls back N but keeps zones 1..N-1 — no all-or-nothing import abort
+- Provenance stamping — `import_source` + `imported_at` columns on `dns_zone` + `dns_record` flag everything that came in from the importer (UI surfaces a chip)
+- Tabbed admin page at `/admin/dns-import` (the Import hub is at `/admin/import`) — one tab per source (plus a Cloud tab that pulls from a registered cloud-DNS server row), all rendered by a shared preview panel + commit-result panel
+- Once imported, SpatiumDDI is the source of truth — there is no continuous two-way mirror

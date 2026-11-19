@@ -138,9 +138,65 @@ def parse_sighting_packet(packet: Any) -> MacSighting | None:
         (it's the authoritative L2 address) but fall back to
         ``Ether.src``.
     """
-    # Lazy import — scapy is a runtime dep, gated on the
-    # DHCP_MAC_SIGHTING_ENABLED toggle. We don't want to pay the import
-    # cost on every agent boot.
+    layers = _scapy_layers()
+    if layers is None:
+        return None
+    ether, arp_cls, ipv6, ns, na, opt_src, opt_dst = layers
+
+    # One walk down the layer chain, instead of up to six ``haslayer``
+    # calls each re-walking it (#1109 Part 4).
+    found: dict[Any, Any] = {}
+    layer = packet
+    while layer is not None and layer.__class__.__name__ != "NoPayload":
+        found.setdefault(layer.__class__, layer)
+        layer = layer.payload if hasattr(layer, "payload") else None
+
+    eth = found.get(ether)
+    ether_mac = _normalize_mac(getattr(eth, "src", None)) if eth is not None else None
+
+    # --- ARP ---
+    arp = found.get(arp_cls)
+    if arp is not None:
+        # Prefer the ARP sender hardware address; fall back to Ether.src.
+        mac = _normalize_mac(getattr(arp, "hwsrc", None)) or ether_mac
+        ip = _normalize_ip(getattr(arp, "psrc", None))
+        if mac and ip:
+            return MacSighting(mac_address=mac, ip_address=ip)
+        return None
+
+    # --- IPv6 Neighbor Discovery (ICMPv6 NS / NA) ---
+    ip6 = found.get(ipv6)
+    if ip6 is not None and (ns in found or na in found):
+        # The link-layer-address option is the authoritative L2 address
+        # when present (NS carries src-LLA, NA carries tgt-LLA).
+        opt_mac: str | None = None
+        if opt_src in found:
+            opt_mac = _normalize_mac(getattr(found[opt_src], "lladdr", None))
+        if opt_mac is None and opt_dst in found:
+            opt_mac = _normalize_mac(getattr(found[opt_dst], "lladdr", None))
+        mac = opt_mac or ether_mac
+        ip = _normalize_ip(getattr(ip6, "src", None))
+        if mac and ip:
+            return MacSighting(mac_address=mac, ip_address=ip)
+        return None
+
+    return None
+
+
+_SCAPY_LAYERS: tuple[Any, ...] | None = None
+
+
+def _scapy_layers() -> tuple[Any, ...] | None:
+    """Import the scapy layer classes once, on first use.
+
+    scapy is a runtime dep gated on ``DHCP_MAC_SIGHTING_ENABLED``, so it is
+    not imported at module load (no cost on an agent that never sniffs), but
+    the per-packet path must not re-run seven import statements either
+    (#1109 Part 4). ``None`` = scapy missing; that is retried, not cached.
+    """
+    global _SCAPY_LAYERS
+    if _SCAPY_LAYERS is not None:
+        return _SCAPY_LAYERS
     try:
         from scapy.layers.inet6 import (  # type: ignore[import-not-found]
             ICMPv6ND_NA,
@@ -152,35 +208,16 @@ def parse_sighting_packet(packet: Any) -> MacSighting | None:
         from scapy.layers.l2 import ARP, Ether  # type: ignore[import-not-found]
     except ImportError:
         return None
-
-    ether_mac = _normalize_mac(getattr(packet[Ether], "src", None)) if packet.haslayer(Ether) else None
-
-    # --- ARP ---
-    if packet.haslayer(ARP):
-        arp = packet[ARP]
-        # Prefer the ARP sender hardware address; fall back to Ether.src.
-        mac = _normalize_mac(getattr(arp, "hwsrc", None)) or ether_mac
-        ip = _normalize_ip(getattr(arp, "psrc", None))
-        if mac and ip:
-            return MacSighting(mac_address=mac, ip_address=ip)
-        return None
-
-    # --- IPv6 Neighbor Discovery (ICMPv6 NS / NA) ---
-    if packet.haslayer(IPv6) and (packet.haslayer(ICMPv6ND_NS) or packet.haslayer(ICMPv6ND_NA)):
-        # The link-layer-address option is the authoritative L2 address
-        # when present (NS carries src-LLA, NA carries tgt-LLA).
-        opt_mac: str | None = None
-        if packet.haslayer(ICMPv6NDOptSrcLLAddr):
-            opt_mac = _normalize_mac(getattr(packet[ICMPv6NDOptSrcLLAddr], "lladdr", None))
-        if opt_mac is None and packet.haslayer(ICMPv6NDOptDstLLAddr):
-            opt_mac = _normalize_mac(getattr(packet[ICMPv6NDOptDstLLAddr], "lladdr", None))
-        mac = opt_mac or ether_mac
-        ip = _normalize_ip(getattr(packet[IPv6], "src", None))
-        if mac and ip:
-            return MacSighting(mac_address=mac, ip_address=ip)
-        return None
-
-    return None
+    _SCAPY_LAYERS = (
+        Ether,
+        ARP,
+        IPv6,
+        ICMPv6ND_NS,
+        ICMPv6ND_NA,
+        ICMPv6NDOptSrcLLAddr,
+        ICMPv6NDOptDstLLAddr,
+    )
+    return _SCAPY_LAYERS
 
 
 @dataclass

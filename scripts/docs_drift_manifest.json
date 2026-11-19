@@ -1,0 +1,167 @@
+{
+  "$comment": [
+    "Config for scripts/lint_docs_drift.py (#3414).",
+    "",
+    "inventory_allowlist is ONLY for shipped things that legitimately do not belong in the",
+    "architecture diagram, each with the reason. It is not a place to park a diagram that has",
+    "gone stale: a missing Looking Glass collector is a finding, not an allowlist entry. The",
+    "check also fails an entry that matches nothing shipped, so this list cannot rot.",
+    "",
+    "needles overrides the name a diagram is searched for (matched on whole words, case and",
+    "punctuation ignored). Use it for naming variance only: the frontend container IS nginx.",
+    "inventory_regions confines a kind to one section of the diagram, from the first text naming",
+    "'from' up to the next naming 'to'. Drivers must be drawn in the data plane and integrations in",
+    "the mirrors lane: a bare product name anywhere is not enough (the FortiGate DHCP driver is not",
+    "the Fortinet FortiGate integration card). A heading that moves makes the check exit 2.",
+    "version_labels omits Kea on purpose: the docs compare Kea 2.4 / 2.6 / 3.0 behaviour throughout, so a bare 'Kea 2.6' is history far more often than a stale claim. Redis requires a major of 4+ so 'Redis 1' (a replica count) is not read as a version. Alpine also matches the image-tag form ('FROM alpine:3.24'), which the docs quote in code blocks; versions.json pins one Alpine for every agent image (#1037 moved them all to 3.24), so there is no per-image pin to choose between.",
+    "identifier_diagrams may map a module outside backend/app/models (a service, core/auth): from those only top-level function / class names and the string members of UPPER_CASE collection constants (e.g. QUEUED_OP_STATES) count, never every string literal."
+  ],
+  "architecture_diagram": "docs/assets/architecture.svg",
+  "version_labels": {
+    "redis": "\\bRedis\\s+v?((?:[4-9]|\\d{2,})(?:\\.\\d+)*)",
+    "postgres": "\\bPostgre(?:SQL|s)\\s+v?(\\d+(?:\\.\\d+)*)",
+    "bind": "\\bBIND(?:\\s?9)?\\s+(9\\.\\d+(?:\\.\\d+)*)",
+    "pdns": "\\bPowerDNS\\s+(?:Authoritative\\s+)?v?(\\d+(?:\\.\\d+)*)",
+    "dnsdist": "\\bdnsdist\\s+v?(\\d+\\.\\d+(?:\\.\\d+)*)",
+    "nginx": "\\bnginx\\s+v?(\\d+\\.\\d+(?:\\.\\d+)*)",
+    "haproxy": "\\bHAProxy\\s+v?(\\d+\\.\\d+(?:\\.\\d+)*)",
+    "technitium": "\\bTechnitium\\s+(?:DNS\\s+)?v?(\\d+\\.\\d+(?:\\.\\d+)*)",
+    "k3s": "\\bk3s\\s+v?(\\d+\\.\\d+(?:\\.\\d+)*)",
+    "metallb": "\\bMetalLB\\s+v?(\\d+\\.\\d+(?:\\.\\d+)*)",
+    "alpine": "\\b[Aa]lpine[\\s:]+(\\d+\\.\\d+(?:\\.\\d+)*)"
+  },
+  "version_exclude": [
+    "docs/SHIPPED.md"
+  ],
+  "needles": {
+    "compose:postgres": [
+      "postgres",
+      "postgresql"
+    ],
+    "compose:frontend": [
+      "frontend",
+      "nginx"
+    ],
+    "workload:frontend": [
+      "frontend",
+      "nginx"
+    ],
+    "workload:postgresql": [
+      "postgres",
+      "postgresql"
+    ],
+    "workload:dns-agent": [
+      "spatium dns agent"
+    ],
+    "workload:dhcp-agent": [
+      "spatium dhcp agent"
+    ],
+    "agent:dns": [
+      "spatium dns agent"
+    ],
+    "agent:dhcp": [
+      "spatium dhcp agent"
+    ],
+    "agent:supervisor": [
+      "spatium supervisor"
+    ],
+    "agent:looking-glass": [
+      "looking glass"
+    ],
+    "compose:dns-dnsdist": [
+      "dnsdist"
+    ],
+    "dns-driver:windows": [
+      "windows dns"
+    ],
+    "dhcp-driver:windows": [
+      "windows dhcp"
+    ],
+    "dns-driver:azuredns": [
+      "azure dns"
+    ],
+    "dns-driver:googledns": [
+      "google cloud dns"
+    ],
+    "dns-driver:route53": [
+      "route 53"
+    ],
+    "integration:paloalto": [
+      "palo alto",
+      "pan os"
+    ]
+  },
+  "inventory_allowlist": {
+    "compose:migrate": "one-shot alembic job that exits; not a runtime component",
+    "compose:dhcp-kea-2": "second HA peer of dhcp-kea, same image; the diagram draws the one container",
+    "workload:agent-landing": "static landing page served on agent-only appliance nodes; no data path",
+    "workload:kube-state-metrics": "appliance observability exporter, not part of the DDI architecture",
+    "workload:node-exporter": "appliance observability exporter, not part of the DDI architecture",
+    "workload:slot-image-mirror": "serves A/B slot images to peers; an upgrade helper, not a service tier",
+    "workload:redis-sentinel": "the HA form of the redis workload; the diagram draws it as 'Redis Sentinel' under multi-node HA"
+  },
+  "inventory_regions": {
+    "dns-driver": {
+      "from": "Data plane",
+      "to": "Integration mirrors"
+    },
+    "dhcp-driver": {
+      "from": "Data plane",
+      "to": "Integration mirrors"
+    },
+    "integration": {
+      "from": "Integration mirrors"
+    }
+  },
+  "identifier_diagrams": {
+    "docs/assets/diagrams/data-model-dns.svg": [
+      "backend/app/models/dns.py"
+    ],
+    "docs/assets/diagrams/data-model-dhcp.svg": [
+      "backend/app/models/dhcp.py"
+    ],
+    "docs/assets/diagrams/data-model-ipam.svg": [
+      "backend/app/models/ipam.py"
+    ],
+    "docs/assets/diagrams/data-model-rbac.svg": [
+      "backend/app/models/auth.py",
+      "backend/app/models/auth_provider.py",
+      "backend/app/models/time_bound_grant.py",
+      "backend/app/core/auth/user_sync.py"
+    ],
+    "docs/assets/diagrams/dns-record-propagation.svg": [
+      "backend/app/models/dns.py",
+      "backend/app/services/dns/record_ops.py"
+    ],
+    "docs/assets/diagrams/dns-namespace-views.svg": [
+      "backend/app/models/dns.py"
+    ],
+    "docs/assets/diagrams/dhcp-scope-containment.svg": [
+      "backend/app/models/dhcp.py",
+      "backend/app/models/ipam.py"
+    ],
+    "docs/assets/diagrams/ipam-containment.svg": [
+      "backend/app/models/ipam.py",
+      "backend/app/models/dhcp.py"
+    ]
+  },
+  "identifier_ignore": {
+    "PowerDNS": "a product name, not a model identifier",
+    "resource_type": "key inside the Role.permissions JSONB, not a column",
+    "resource_id": "key inside the Role.permissions JSONB, not a column",
+    "FortiGate": "a vendor product (the FortiGate DHCP driver), not a model identifier"
+  },
+  "path_roots": [
+    "backend",
+    "frontend",
+    "agent",
+    "charts",
+    "docs",
+    "scripts",
+    "appliance",
+    "k8s",
+    "perf",
+    "supervisor",
+    ".github"
+  ]
+}

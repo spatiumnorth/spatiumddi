@@ -17,6 +17,8 @@ Pipeline:
 4. Each ``subnet4`` / ``subnet6`` becomes an :class:`ImportedScope`;
    ``pools`` → :class:`ImportedPool`, ``reservations`` →
    :class:`ImportedReservation`, ``option-data`` → canonical options.
+   A subnet under ``shared-networks`` is flattened into a scope of its
+   own, inheriting the network's options and lifetimes (#3336).
    Top-level ``client-classes`` become :class:`ImportedClientClass`.
 
 We deliberately don't carry hook libraries (HA / host-cache /
@@ -31,12 +33,15 @@ import ipaddress
 import json
 from typing import Any
 
+from app.services.dhcp.class_refs import reserved_name_reason
+
 from .canonical import (
     ImportedClientClass,
     ImportedPool,
     ImportedReservation,
     ImportedScope,
     ImportPreview,
+    pool_problem,
 )
 from .options import coerce_option_value, kea_option_to_canonical, normalise_mac
 
@@ -55,6 +60,49 @@ _UNSUPPORTED_KEYS: dict[str, str] = {
     "repopulate from the running daemon once a server is attached.",
     "loggers": "Kea logger config is not imported.",
 }
+
+
+# Subnet-level parameters a scope models; a shared network's value is what
+# its members inherit when they do not set their own (#3336).
+_INHERITED_SCALARS = (
+    "valid-lifetime",
+    "min-valid-lifetime",
+    "max-valid-lifetime",
+    "ddns-send-updates",
+)
+
+# Subnet / shared-network parameters that change how Kea serves the subnet
+# and that a scope has no field for. Named rather than dropped silently: a
+# lost relay or interface binding, or a class restriction, changes which
+# clients the imported scope answers (#3336).
+_UNMODELLED_SUBNET_KEYS = (
+    "interface",
+    "interface-id",
+    "relay",
+    "client-class",
+    "require-client-classes",
+    "evaluate-additional-classes",
+    "match-client-id",
+    "authoritative",
+    "reservations-global",
+    "reservations-in-subnet",
+    "reservations-out-of-pool",
+    "reservation-mode",
+    "next-server",
+    "server-hostname",
+    "boot-file-name",
+    "preferred-lifetime",
+    "min-preferred-lifetime",
+    "max-preferred-lifetime",
+    "rapid-commit",
+)
+
+
+def _unmodelled_keys(entry: dict[str, Any]) -> list[str]:
+    """The serving-relevant keys ``entry`` sets that no scope field carries."""
+    keys = [k for k in _UNMODELLED_SUBNET_KEYS if k in entry]
+    keys += sorted(k for k in entry if k.startswith("ddns-") and k != "ddns-send-updates")
+    return keys
 
 
 class KeaImportError(ValueError):
@@ -143,14 +191,19 @@ def _parse_option_data(raw: list[dict[str, Any]] | None, *, address_family: str)
 
 def _parse_pool(entry: dict[str, Any]) -> ImportedPool | None:
     """Kea pool: ``{"pool": "10.0.0.10 - 10.0.0.100"}`` or
-    ``{"pool": "10.0.0.0/25"}``."""
+    ``{"pool": "10.0.0.0/25"}``.
+
+    Kea removes every space from the string, then splits at the dash, so
+    ``a-b`` and ``a - b`` are the same range. Returns None when the
+    string is not a range (or CIDR, or single address) at all; the caller
+    turns that into a preview warning.
+    """
     raw = entry.get("pool")
     if not raw or not isinstance(raw, str):
         return None
-    raw = raw.strip()
-    if " - " in raw or " -" in raw or "- " in raw:
-        start, _, end = raw.partition("-")
-        start_ip, end_ip = start.strip(), end.strip()
+    raw = "".join(raw.split())
+    if "-" in raw:
+        start_ip, _, end_ip = raw.partition("-")
     elif "/" in raw:
         try:
             net = ipaddress.ip_network(raw, strict=False)
@@ -219,8 +272,20 @@ def _parse_subnet(
     for p in entry.get("pools") or []:
         if isinstance(p, dict):
             pool = _parse_pool(p)
-            if pool is not None:
+            problem = (
+                "not a valid address range"
+                if pool is None
+                else pool_problem(pool.start_ip, pool.end_ip, canonical)
+            )
+            if problem is not None:
+                parse_warnings.append(f"Pool {p.get('pool')!r} not imported: {problem}.")
+            elif pool is not None:
                 pools.append(pool)
+        else:
+            # Kea wants each pool as an object with a "pool" key; a bare
+            # string or number is not one, and dropping it silently would
+            # leave the operator no notice of the missing range (#3097).
+            parse_warnings.append(f"Pool {p!r} not imported: not a pool object.")
 
     reservations: list[ImportedReservation] = []
     skipped_duid = 0
@@ -228,8 +293,31 @@ def _parse_subnet(
         res = _parse_reservation(r, address_family=address_family)
         if res is not None:
             reservations.append(res)
+            # A reservation holds one address; name what a multi-address /
+            # prefix-delegation one leaves out rather than dropping it (#3336).
+            extra = [str(a) for a in (r.get("ip-addresses") or [])[1:]]
+            if extra:
+                parse_warnings.append(
+                    f"Reservation {res.ip_address} ({res.mac_address}): further address(es) "
+                    f"{', '.join(extra)} not imported — a reservation holds one address."
+                )
+            if r.get("prefixes"):
+                parse_warnings.append(
+                    f"Reservation {res.ip_address} ({res.mac_address}): delegated prefix(es) "
+                    f"{', '.join(str(x) for x in r['prefixes'])} not imported."
+                )
         elif isinstance(r, dict) and not r.get("hw-address"):
             skipped_duid += 1
+        elif isinstance(r, dict):
+            # A MAC-keyed reservation that still cannot be one: the hw-address
+            # is not a MAC, or there is no address (a hostname / options-only
+            # or prefix-only reservation). Named, not dropped silently (#3336).
+            why = (
+                "hw-address is not a MAC address"
+                if normalise_mac(r.get("hw-address")) is None
+                else "it reserves no address"
+            )
+            parse_warnings.append(f"Reservation for {r.get('hw-address')!r} not imported: {why}.")
     if skipped_duid:
         parse_warnings.append(
             f"{skipped_duid} DUID-only reservation(s) skipped — only MAC-keyed reservations import."
@@ -239,6 +327,28 @@ def _parse_subnet(
     # behaves identically without a separate group-options surface.
     scope_options = _parse_option_data(entry.get("option-data"), address_family=address_family)
     options = {**global_options, **scope_options}
+
+    # #1690 — SpatiumDDI has no per-scope T1/T2 setting (Kea is rendered with
+    # calculate-tee-times), so say what the import drops instead of dropping it.
+    dropped_timers = [k for k in ("renew-timer", "rebind-timer") if entry.get(k) is not None]
+    if dropped_timers:
+        parse_warnings.append(
+            f"{' and '.join(dropped_timers)} ({', '.join(str(entry[k]) for k in dropped_timers)} s) "
+            "not imported — renew/rebind times are derived from each lease "
+            + (
+                "(50% / 80% of its preferred lifetime)"
+                if address_family == "ipv6"
+                else "(options 58/59: 50% / 87.5% of its lifetime)"
+            )
+            + " and cannot be set per scope."
+        )
+
+    unmodelled = _unmodelled_keys(entry)
+    if unmodelled:
+        parse_warnings.append(
+            f"{', '.join(unmodelled)} not imported — the scope has no equivalent; "
+            "set it up by hand after the import."
+        )
 
     lease_time = int(entry.get("valid-lifetime") or global_lease_time or 86400)
     min_lt = entry.get("min-valid-lifetime")
@@ -274,14 +384,55 @@ def _parse_client_classes(
         name = str(entry["name"])
         if name == "DROP":
             continue
+        # Any other reserved name (``drop``, ``HA_*``, a name SpatiumDDI
+        # generates) is shown in the preview but not created.
+        reserved = reserved_name_reason(name)
         out.append(
             ImportedClientClass(
                 name=name,
                 match_expression=str(entry.get("test") or ""),
+                address_family=address_family,
                 options=_parse_option_data(entry.get("option-data"), address_family=address_family),
-                supported=True,
+                supported=reserved is None,
+                warning=f"Not imported: {reserved}." if reserved else None,
             )
         )
+    return out
+
+
+def _merge_family_twins(classes: list[ImportedClientClass]) -> list[ImportedClientClass]:
+    """One class per name across the Dhcp4 and Dhcp6 blocks (#1229).
+
+    A class defined in both blocks under one name is how a dual-stack Kea
+    config spells "this class in both daemons"; the commit keys on the name,
+    so the second copy would be skipped as existing and the class would
+    silently vanish from Dhcp6. Same test and no conflicting option → one
+    ``dual`` class holding both option sets (``options_for_family`` routes
+    each). Otherwise the twin cannot be expressed as one row, and it goes to
+    manual review rather than being dropped without a word.
+    """
+    by_name: dict[str, ImportedClientClass] = {}
+    out: list[ImportedClientClass] = []
+    for cc in classes:
+        twin = by_name.get(cc.name)
+        if twin is None:
+            by_name[cc.name] = cc
+            out.append(cc)
+            continue
+        shared = set(twin.options) & set(cc.options)
+        if twin.match_expression == cc.match_expression and all(
+            twin.options[k] == cc.options[k] for k in shared
+        ):
+            twin.address_family = "dual"
+            twin.options = {**twin.options, **cc.options}
+            continue
+        cc.supported = False
+        cc.warning = (
+            f"class '{cc.name}' is defined in both Dhcp4 and Dhcp6 with a different "
+            "test or option values; SpatiumDDI holds one class per name, so the "
+            f"{cc.address_family} copy needs recreating by hand"
+        )
+        out.append(cc)
     return out
 
 
@@ -291,6 +442,13 @@ def _dhcp_block(obj: dict[str, Any], wrapper: str, subnet_key: str) -> dict[str,
     if wrapper in obj and isinstance(obj[wrapper], dict):
         return obj[wrapper]
     if subnet_key in obj:
+        return obj
+    # A bare body of shared networks alone (#3336): only the family its
+    # members are written in, or a v4 body would be read as Dhcp6 too.
+    networks = obj.get("shared-networks")
+    if isinstance(networks, list) and any(
+        isinstance(sn, dict) and subnet_key in sn for sn in networks
+    ):
         return obj
     return None
 
@@ -330,13 +488,53 @@ def parse_kea_config(data: bytes) -> ImportPreview:
                 f"{wrapper}: {len(global_options)} global option(s) applied to every "
                 f"imported {af} scope (SpatiumDDI has no group-wide option surface on import)."
             )
-        for raw_subnet in block.get(subnet_key) or []:
+        # #1690 — the global timers every subnet without its own inherits; the
+        # per-subnet ones are warned about in ``_parse_subnet``.
+        global_timers = [k for k in ("renew-timer", "rebind-timer") if block.get(k) is not None]
+        if global_timers:
+            warnings.append(
+                f"{wrapper}: global {' and '.join(global_timers)} "
+                f"({', '.join(str(block[k]) for k in global_timers)} s) not imported — "
+                "renew/rebind times are derived from each lease and cannot be set."
+            )
+        # (subnet, options) — subnets under a shared network are flattened into
+        # scopes, as the ISC importer does (#3336). A member inherits the
+        # network's option-data (option by option) and the scalars a scope
+        # models; its own value wins. What a scope cannot carry is named.
+        members: list[tuple[Any, dict[str, Any]]] = [
+            (s, global_options) for s in block.get(subnet_key) or []
+        ]
+        for sn in block.get("shared-networks") or []:
+            if not isinstance(sn, dict):
+                continue
+            sn_name = str(sn.get("name") or "(unnamed)")
+            sn_subnets = [s for s in sn.get(subnet_key) or [] if isinstance(s, dict)]
+            warnings.append(
+                f"{wrapper}: shared network {sn_name!r} flattened — its "
+                f"{len(sn_subnets)} member subnet(s) imported individually; SpatiumDDI has "
+                "no shared-network grouping."
+            )
+            not_carried = _unmodelled_keys(sn) + [
+                k for k in ("renew-timer", "rebind-timer") if sn.get(k) is not None
+            ]
+            if not_carried:
+                warnings.append(
+                    f"{wrapper}: shared network {sn_name!r} sets {', '.join(not_carried)}, "
+                    "which its member scopes do not carry — set it up by hand after the import."
+                )
+            sn_options = {
+                **global_options,
+                **_parse_option_data(sn.get("option-data"), address_family=af),
+            }
+            inherited = {k: sn[k] for k in _INHERITED_SCALARS if k in sn}
+            members.extend(({**inherited, **s}, sn_options) for s in sn_subnets)
+        for raw_subnet, sub_options in members:
             if not isinstance(raw_subnet, dict):
                 continue
             scope = _parse_subnet(
                 raw_subnet,
                 address_family=af,
-                global_options=global_options,
+                global_options=sub_options,
                 global_lease_time=global_lease_time,
                 global_ddns=global_ddns,
                 warnings=warnings,
@@ -347,6 +545,8 @@ def parse_kea_config(data: bytes) -> ImportPreview:
         for key, note in _UNSUPPORTED_KEYS.items():
             if key in block:
                 unsupported.append(note)
+
+    client_classes = _merge_family_twins(client_classes)
 
     if not scopes and not client_classes:
         raise KeaImportError(

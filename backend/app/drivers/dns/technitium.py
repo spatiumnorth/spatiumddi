@@ -28,7 +28,8 @@ Scope (this driver):
   stub zones carry primaries to transfer from, no views).
 
 Landed after the v1 cut, so the sections below are no longer "deferred":
-online DNSSEC signing (#740), native DNS-over-TLS/HTTPS/QUIC listeners plus
+online DNSSEC signing (#740; new signing withdrawn again by #1783, full
+support is #1767), native DNS-over-TLS/HTTPS/QUIC listeners plus
 encrypted *upstream* forwarding over all three (#741 — a real differentiator
 over both PowerDNS, which needs a dnsdist sidecar and cannot forward at all,
 and BIND9, which forwards over DoT only), secondary / stub / catalog zones
@@ -50,6 +51,7 @@ CLAUDE.md non-negotiable #10: this driver speaks only neutral
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import structlog
@@ -116,7 +118,7 @@ def _record_payload(zone: ZoneData, rr: RecordData) -> dict[str, Any]:
     """
     rtype = rr.record_type.upper()
     value = strip_control_chars(rr.value).rstrip(".")
-    payload: dict[str, Any] = {"ttl": rr.ttl or zone.ttl}
+    payload: dict[str, Any] = {"ttl": rr.ttl if rr.ttl is not None else zone.ttl}
     if rtype in ("A", "AAAA"):
         payload["ipAddress"] = value
     elif rtype == "CNAME":
@@ -158,6 +160,10 @@ class TechnitiumDriver(DNSDriver):
     """
 
     name = "technitium"
+
+    # ``pull_zone_records`` takes ``include_apex_ns`` (#1857): the AXFR read
+    # can keep the apex NS set for the drift report, which compares it.
+    pull_can_include_apex_ns = True
 
     # ── Rendering ─────────────────────────────────────────────────────────
 
@@ -267,7 +273,14 @@ class TechnitiumDriver(DNSDriver):
         )
 
     async def pull_zone_records(
-        self, server: Any, zone_name: str, *, tsig: TsigKey | None = None
+        self,
+        server: Any,
+        zone_name: str,
+        *,
+        tsig: TsigKey | None = None,
+        include_apex_ns: bool = False,
+        fallback_hosts: Sequence[str] = (),
+        unresolved_fallback_hosts: Sequence[str] = (),
     ) -> list[RecordData]:
         """AXFR the zone off the Technitium host, for the #61 drift report.
 
@@ -304,6 +317,9 @@ class TechnitiumDriver(DNSDriver):
                 log_driver="technitium",
                 server_id=str(getattr(server, "id", "")),
                 tsig=tsig,
+                include_apex_ns=include_apex_ns,
+                fallback_hosts=fallback_hosts,
+                unresolved_fallback_hosts=unresolved_fallback_hosts,
             )
         except Exception as exc:
             # A bare "REFUSED" tells the operator nothing about what to do.
@@ -391,13 +407,16 @@ class TechnitiumDriver(DNSDriver):
             "name": "technitium",
             "views": False,
             "rpz": False,
-            "dnssec_inline_signing": True,  # issue #740 — online signing
+            "dnssec_inline_signing": False,  # #1783; full support is #1767
             "incremental_updates": "rest_api",
             "zone_types": sorted(_SUPPORTED_ZONE_TYPES),
             "record_types": sorted(_SUPPORTED_RECORD_TYPES),
             "alias_records": False,
             "lua_records": False,
-            "catalog_zones": True,
+            # #1782 — broken in both roles (producer members inherit the
+            # catalog's transfer Deny / notify None; consumer has no TSIG).
+            # Not claimed until #1766 (1.1.0).
+            "catalog_zones": False,
         }
 
     @property

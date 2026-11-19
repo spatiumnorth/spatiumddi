@@ -30,7 +30,8 @@ Reuses shipped building blocks verbatim:
 
 Permission scoping is enforced at *resolve* time against the schedule
 **owner** (non-negotiable #3) so a schedule can't wake hosts in subnets its
-owner has since lost read access to.
+owner has since lost read access to, or at all when the owner has lost the
+type-level ``write`` on ``subnet`` the manual wake route needs (#3461).
 """
 
 from __future__ import annotations
@@ -194,6 +195,11 @@ async def _rows_for_selector(
     # #3). Candidate set narrowed to unicast + not-deleted subnets.
     structural = [Subnet.kind == "unicast", Subnet.deleted_at.is_(None)]
     readable = await _readable_subnet_ids(db, user, structural)
+    # Waking a host by hand (``POST /ipam/addresses/{id}/wake``) also needs
+    # type-level write on ``subnet`` (#3461). A schedule fires as its owner,
+    # so an owner without it wakes nothing, checked on every fire.
+    if readable is not None and not user_has_permission(user, "write", "subnet"):
+        readable = []
 
     def _scoped(stmt: Any) -> Any:
         if readable is not None:

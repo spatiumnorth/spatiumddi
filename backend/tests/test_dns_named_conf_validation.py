@@ -137,9 +137,89 @@ def test_accepts_addresses_prefixes_and_builtins():
     assert validate_address_match_list(ok, field="match_clients") == ok
 
 
-def test_host_bits_set_is_accepted_like_bind_accepts_it():
-    """``10.0.0.5/24`` is legal in an address-match-list."""
-    assert validate_address_match_list(["10.0.0.5/24"], field="match_clients")
+@pytest.mark.parametrize(
+    ("element", "network", "address"),
+    [
+        ("10.0.0.5/24", "10.0.0.0/24", "10.0.0.5"),
+        ("!10.0.0.5/24", "10.0.0.0/24", "10.0.0.5"),
+        ("192.168.1.1/16", "192.168.0.0/16", "192.168.1.1"),
+        ("10.0.0.0/0", "0.0.0.0/0", "10.0.0.0"),
+        ("2001:db8::1/64", "2001:db8::/64", "2001:db8::1"),
+        ("10.0.0.5/255.255.255.0", "10.0.0.0/24", "10.0.0.5"),
+    ],
+)
+def test_a_prefix_with_host_bits_set_is_refused_naming_the_network(
+    element: str, network: str, address: str
+):
+    """BIND refuses ``10.0.0.5/24`` (#2695): ``named-checkconf`` fails with
+    "address/prefix length mismatch", and the group stops loading new config.
+    Refused rather than rewritten, because it may mean the network or the
+    one host; the message offers both."""
+    with pytest.raises(ViewValidationError) as exc:
+        validate_address_match_list(["10.0.0.0/8", element], field="match_clients")
+    assert exc.value.field == "match_clients"
+    assert exc.value.value == element
+    assert f"use {network} " in str(exc.value)
+    assert f"or {address} " in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("element", "network"),
+    [
+        ("10.0.0.0/255.255.255.0", "10.0.0.0/24"),
+        ("!10.0.0.0/255.255.255.0", "10.0.0.0/24"),
+        ("10.0.0.0/0.0.0.255", "10.0.0.0/24"),
+        ("10.0.0.0/255.255.255.255", "10.0.0.0/32"),
+    ],
+)
+def test_a_mask_where_the_length_goes_is_refused_naming_the_prefix(element: str, network: str):
+    """BIND reads only a decimal length after the slash (#2695):
+    ``named-checkconf`` refuses ``10.0.0.0/255.255.255.0`` with "expected
+    prefix length", though ``ipaddress`` reads it as ``10.0.0.0/24``."""
+    with pytest.raises(ViewValidationError) as exc:
+        validate_address_match_list(["10.0.0.0/8", element], field="match_clients")
+    assert exc.value.field == "match_clients"
+    assert exc.value.value == element
+    assert str(exc.value).endswith(f"write it as {network}.")
+
+
+@pytest.mark.parametrize(
+    "element",
+    [
+        "10.0.0.0/24",
+        "10.0.0.5/32",
+        "0.0.0.0/0",
+        "10.0.0.0/024",
+        "2001:db8::/64",
+        "2001:db8::1/128",
+        "::/0",
+    ],
+)
+def test_a_prefix_bind_reads_is_accepted(element: str):
+    """No host bits and a decimal length, the leading zero included: BIND 9's
+    ``named-checkconf`` takes each of these."""
+    assert validate_address_match_list([element], field="match_clients") == [element]
+
+
+def test_the_bundle_builder_can_ask_about_syntax_alone():
+    """How a prefix BIND 9 refuses ships depends on the driver (a BIND9
+    server gets the network it stands for, the Technitium and PowerDNS agents
+    apply that network themselves), so the bundle builder, deciding per
+    server, asks the syntax question without that one."""
+    lenient = ["10.0.0.5/24", "10.0.0.0/255.255.255.0"]
+    assert (
+        validate_address_match_list(
+            lenient, field="entries", allow_unknown_names=True, allow_bind9_refused_prefixes=True
+        )
+        == lenient
+    )
+    with pytest.raises(ViewValidationError):
+        validate_address_match_list(
+            ["10.0.0.0/33"],
+            field="entries",
+            allow_unknown_names=True,
+            allow_bind9_refused_prefixes=True,
+        )
 
 
 def test_rejects_a_malformed_prefix():

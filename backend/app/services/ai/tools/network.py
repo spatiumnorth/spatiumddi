@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import re
+import uuid
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -16,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.alerts import AlertEvent, AlertRule
 from app.models.audit import AuditLog
 from app.models.auth import User
-from app.models.ipam import IPAddress
+from app.models.ipam import IPAddress, Subnet
 from app.models.network import (
     NetworkArpEntry,
     NetworkDevice,
@@ -24,6 +25,8 @@ from app.models.network import (
     NetworkInterface,
 )
 from app.services.ai.tools.base import register_tool
+from app.services.audit_redact import redact_audit_value
+from app.services.ipam.probe_policy import check_probe_target
 from app.services.oui import is_voip_phone_vendor, lookup_vendor
 
 # ── network devices ───────────────────────────────────────────────────
@@ -47,6 +50,7 @@ class ListDevicesArgs(BaseModel):
 
 @register_tool(
     name="list_network_devices",
+    permission=("read", "manage_network_devices"),
     module="network.device",
     description=(
         "List SNMP-polled network devices (routers / switches / APs / "
@@ -118,10 +122,16 @@ class ListAlertsArgs(BaseModel):
         description="Filter by subject type — 'subnet' or 'server'.",
     )
     limit: int = Field(default=50, ge=1, le=200)
+    offset: int = Field(
+        default=0,
+        ge=0,
+        description="Rows to skip (newest first) to page past ``limit`` (#3830).",
+    )
 
 
 @register_tool(
     name="list_alerts",
+    permission=("read", "alert"),
     description=(
         "List alert events. Defaults to open (unresolved) alerts; "
         "set ``open_only=False`` for historical alerts. Each event "
@@ -139,7 +149,11 @@ async def list_alerts(db: AsyncSession, user: User, args: ListAlertsArgs) -> lis
         stmt = stmt.where(AlertEvent.severity == args.severity)
     if args.subject_type:
         stmt = stmt.where(AlertEvent.subject_type == args.subject_type)
-    stmt = stmt.order_by(AlertEvent.fired_at.desc()).limit(args.limit)
+    stmt = (
+        stmt.order_by(AlertEvent.fired_at.desc(), AlertEvent.id)
+        .offset(args.offset)
+        .limit(args.limit)
+    )
     rows = (await db.execute(stmt)).scalars().all()
     return [
         {
@@ -163,6 +177,7 @@ class ListAlertRulesArgs(BaseModel):
 
 @register_tool(
     name="list_alert_rules",
+    permission=("read", "alert"),
     description=(
         "List configured alert rules. Each summary includes name, "
         "rule type, enabled flag, and key thresholds."
@@ -208,14 +223,25 @@ class GetAuditHistoryArgs(BaseModel):
         description="Filter by action — create / update / delete / login / logout / etc.",
     )
     limit: int = Field(default=50, ge=1, le=500)
+    include_details: bool = Field(
+        default=False,
+        description=(
+            "Also return each entry's recorded before/after values "
+            "(old_value / new_value, credentials redacted). Off by default: "
+            "ask for it only when the question needs what a change set a "
+            "field to, not just who changed what."
+        ),
+    )
 
 
 @register_tool(
     name="get_audit_history",
+    permission=("read", "audit_log"),
     description=(
         "Query the append-only audit log. Filters: user, resource "
         "type, resource id, action. Returns chronological audit "
-        "entries with old / new values when set. Useful for 'who "
+        "entries with the fields each change touched; pass "
+        "include_details for the before/after values. Useful for 'who "
         "changed X?' and 'show me recent activity by user Y'."
     ),
     args_model=GetAuditHistoryArgs,
@@ -235,8 +261,9 @@ async def get_audit_history(
         stmt = stmt.where(AuditLog.action == args.action)
     stmt = stmt.order_by(AuditLog.timestamp.desc()).limit(args.limit)
     rows = (await db.execute(stmt)).scalars().all()
-    return [
-        {
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        entry: dict[str, Any] = {
             "id": str(r.id),
             "timestamp": r.timestamp.isoformat() if r.timestamp else None,
             "user_id": str(r.user_id) if r.user_id else None,
@@ -249,8 +276,15 @@ async def get_audit_history(
             "result": r.result,
             "changed_fields": r.changed_fields,
         }
-        for r in rows
-    ]
+        # #2009: the recorded state, redacted the same way the REST endpoint
+        # does it, and only on request. A copilot's provider can be
+        # off-premises, so the values leave the box only when the question
+        # needs them (non-negotiable #13), mirroring ?include_details=true.
+        if args.include_details:
+            entry["old_value"] = redact_audit_value(r.old_value)
+            entry["new_value"] = redact_audit_value(r.new_value)
+        out.append(entry)
+    return out
 
 
 # ── find_switchport ───────────────────────────────────────────────────
@@ -273,6 +307,15 @@ class FindSwitchportArgs(BaseModel):
             "operator already has the MAC."
         ),
     )
+    space_id: str | None = Field(
+        default=None,
+        description=(
+            "IP space UUID to resolve ``ip`` in. IP spaces are independent "
+            "and can reuse the same address; when the IP exists in several "
+            "spaces with different MACs and no space is given, the tool "
+            "returns the candidates instead of guessing."
+        ),
+    )
 
 
 def _normalize_mac(value: str) -> str:
@@ -284,6 +327,7 @@ def _normalize_mac(value: str) -> str:
 
 @register_tool(
     name="find_switchport",
+    permission=("read", "manage_network_devices"),
     module="network.device",
     description=(
         "Find which switch port an IP / MAC is plugged into. Joins "
@@ -310,20 +354,53 @@ async def find_switchport(db: AsyncSession, user: User, args: FindSwitchportArgs
     if target_mac is None and args.ip:
         # Prefer the IPAM row's MAC (operator-authoritative); fall back
         # to ARP if IPAM has no MAC recorded.
-        ip_row = (
-            await db.execute(select(IPAddress).where(IPAddress.address == args.ip).limit(1))
-        ).scalar_one_or_none()
-        if ip_row and ip_row.mac_address:
-            target_mac = _normalize_mac(str(ip_row.mac_address))
+        #
+        # #2577 — the same address can exist in several IP spaces. Never
+        # take an arbitrary row: scope to ``space_id`` when given, and
+        # report the candidates when the spaces disagree on the MAC.
+        space_uuid: uuid.UUID | None = None
+        if args.space_id:
+            try:
+                space_uuid = uuid.UUID(args.space_id)
+            except ValueError:
+                return {"error": f"invalid space_id: {args.space_id!r}"}
+        ip_q = (
+            select(IPAddress, Subnet.space_id)
+            .join(Subnet, Subnet.id == IPAddress.subnet_id)
+            .where(IPAddress.address == args.ip)
+        )
+        if space_uuid is not None:
+            ip_q = ip_q.where(Subnet.space_id == space_uuid)
+        ip_rows = [
+            (row, sp) for row, sp in (await db.execute(ip_q)).all() if row.mac_address is not None
+        ]
+        ipam_macs = {_normalize_mac(str(row.mac_address)) for row, _ in ip_rows}
+        if len(ipam_macs) > 1:
+            return {
+                "error": (
+                    f"IP {args.ip!r} exists in more than one IP space with "
+                    "different MACs; pass space_id or mac."
+                ),
+                "candidates": [
+                    {
+                        "space_id": str(sp),
+                        "ip_address_id": str(row.id),
+                        "mac_address": _normalize_mac(str(row.mac_address)),
+                    }
+                    for row, sp in ip_rows
+                ],
+            }
+        if ipam_macs:
+            target_mac = next(iter(ipam_macs))
             ip_source = "ipam"
         else:
+            arp_q = select(NetworkArpEntry).where(func.text(NetworkArpEntry.ip_address) == args.ip)
+            if space_uuid is not None:
+                arp_q = arp_q.join(
+                    NetworkDevice, NetworkDevice.id == NetworkArpEntry.device_id
+                ).where(NetworkDevice.ip_space_id == space_uuid)
             arp = (
-                await db.execute(
-                    select(NetworkArpEntry)
-                    .where(func.text(NetworkArpEntry.ip_address) == args.ip)
-                    .order_by(NetworkArpEntry.last_seen.desc())
-                    .limit(1)
-                )
+                await db.execute(arp_q.order_by(NetworkArpEntry.last_seen.desc()).limit(1))
             ).scalar_one_or_none()
             if arp:
                 target_mac = _normalize_mac(str(arp.mac_address))
@@ -484,6 +561,9 @@ class PingHostArgs(BaseModel):
 
 @register_tool(
     name="ping_host",
+    outbound=True,
+    rate_limit="default",
+    permission=("read", "use_network_tools"),
     description=(
         "Send ICMP echo requests to a host and return liveness + RTT "
         "statistics. Use for 'ping 192.168.0.4' / 'is host X "
@@ -495,6 +575,7 @@ class PingHostArgs(BaseModel):
     ),
     args_model=PingHostArgs,
     category="network",
+    module="tools.network",
 )
 async def ping_host(db: AsyncSession, user: User, args: PingHostArgs) -> dict[str, Any]:
     target = _validate_target(args.target)
@@ -505,6 +586,12 @@ async def ping_host(db: AsyncSession, user: User, args: PingHostArgs) -> dict[st
                 "IPv4 / IPv6 address or hostname."
             ),
         }
+
+    # #722 / #3302 — same do-not-probe gate as ``network_ping`` and the
+    # REST ``/tools/ping`` route; this tool spawns ping directly.
+    verdict = await check_probe_target(db, target)
+    if verdict.blocked:
+        return {"target": target, "error": verdict.message(action="Pinging")}
 
     # Pick the right binary for v4/v6. ``ping`` on modern Debian /
     # Alpine resolves both, but explicit ping6 is safer on some

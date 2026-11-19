@@ -12,6 +12,7 @@ import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { cn } from "@/lib/utils";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 import { errMsg, humanTime, inputCls } from "./_shared";
 
@@ -49,9 +50,25 @@ export function BgpMonitorTab({
   asnKind: string;
 }) {
   const qc = useQueryClient();
+  // #3104 — every route here sits under the router's 'manage_asns' gate
+  // (POST write, DELETE delete); a read-only user is offered none of them.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "manage_asns"),
+    "Requires write permission on ASNs",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "manage_asns"),
+    "Requires delete permission on ASNs",
+  );
   const [addOpen, setAddOpen] = useState(false);
   const [newPrefix, setNewPrefix] = useState("");
   const [err, setErr] = useState<string | null>(null);
+  // #4212 — Stop tracking deletes the watch, and no further alerts fire.
+  const [stopTarget, setStopTarget] = useState<{
+    id: string;
+    prefix: string;
+  } | null>(null);
   const [ackTarget, setAckTarget] = useState<BGPHijackDetection | null>(null);
   const [allowTarget, setAllowTarget] = useState<BGPHijackDetection | null>(
     null,
@@ -94,8 +111,14 @@ export function BgpMonitorTab({
 
   const delM = useMutation({
     mutationFn: (id: string) => asnsApi.deleteTrackedPrefix(id),
-    onSuccess: invalidate,
-    onError: (e) => setErr(errMsg(e, "Delete failed")),
+    onSuccess: () => {
+      setStopTarget(null);
+      invalidate();
+    },
+    onError: (e) => {
+      setStopTarget(null);
+      setErr(errMsg(e, "Delete failed"));
+    },
   });
 
   const ackM = useMutation({
@@ -142,6 +165,7 @@ export function BgpMonitorTab({
             variant="secondary"
             onClick={() => refreshM.mutate()}
             disabled={refreshM.isPending || asnKind === "private"}
+            {...writeGate}
           >
             {refreshM.isPending ? (
               <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -158,9 +182,10 @@ export function BgpMonitorTab({
             </div>
           ) : hijacks.length === 0 ? (
             <div className="p-8 text-center text-sm text-muted-foreground">
-              No hijack detections. If BGP monitoring is enabled in Settings,
-              the poll opens a row here when an unexpected origin announces a
-              tracked prefix.
+              No hijack detections. While BGP monitoring is on, the poll opens a
+              row here when an unexpected origin announces a tracked prefix. It
+              is switched on by the bgp_monitoring_enabled platform setting,
+              through the settings API; the console has no control for it.
             </div>
           ) : (
             <table className="w-full text-xs">
@@ -230,7 +255,9 @@ export function BgpMonitorTab({
                           <button
                             className="rounded p-1 hover:bg-muted"
                             title="Acknowledge"
+                            aria-label="Acknowledge"
                             onClick={() => setAckTarget(h)}
+                            {...writeGate}
                           >
                             <ShieldCheck className="h-3.5 w-3.5" />
                           </button>
@@ -238,6 +265,7 @@ export function BgpMonitorTab({
                             className="rounded px-1.5 py-1 text-[10px] hover:bg-muted"
                             title="Mark this origin as expected (allowlist)"
                             onClick={() => setAllowTarget(h)}
+                            {...writeGate}
                           >
                             Allowlist
                           </button>
@@ -262,6 +290,7 @@ export function BgpMonitorTab({
               setErr(null);
               setAddOpen(true);
             }}
+            {...writeGate}
           >
             <Plus className="h-3.5 w-3.5" /> Track prefix
           </HeaderButton>
@@ -315,7 +344,11 @@ export function BgpMonitorTab({
                       <button
                         className="rounded p-1 hover:bg-muted"
                         title="Stop tracking"
-                        onClick={() => delM.mutate(p.id)}
+                        aria-label="Stop tracking"
+                        onClick={() =>
+                          setStopTarget({ id: p.id, prefix: p.prefix })
+                        }
+                        {...deleteGate}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>
@@ -355,6 +388,7 @@ export function BgpMonitorTab({
                 variant="primary"
                 onClick={() => addM.mutate()}
                 disabled={addM.isPending || !newPrefix.trim()}
+                {...writeGate}
               >
                 {addM.isPending ? "Adding…" : "Add"}
               </HeaderButton>
@@ -363,6 +397,21 @@ export function BgpMonitorTab({
         </Modal>
       )}
 
+      <ConfirmModal
+        open={stopTarget !== null}
+        title="Stop tracking prefix?"
+        message={
+          stopTarget
+            ? `Stop tracking ${stopTarget.prefix}? The watch is deleted and no further hijack alerts fire for it.`
+            : null
+        }
+        confirmLabel="Stop tracking"
+        tone="destructive"
+        autoFocusCancel
+        loading={delM.isPending}
+        onClose={() => setStopTarget(null)}
+        onConfirm={() => stopTarget && delM.mutate(stopTarget.id)}
+      />
       {ackTarget && (
         <ConfirmModal
           open

@@ -37,9 +37,11 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.celery_app import celery_app
 from app.config import settings
+from app.db import task_connect_args
 from app.models.audit import AuditLog
 from app.models.oui import OUIVendor
 from app.models.settings import PlatformSettings
+from app.tasks._interval_gate import interval_skip
 
 logger = structlog.get_logger(__name__)
 
@@ -75,7 +77,9 @@ def _parse_oui_csv(text: str) -> list[dict[str, str]]:
 
 
 async def _run_update(force: bool = False) -> dict[str, Any]:
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
     try:
@@ -86,14 +90,10 @@ async def _run_update(force: bool = False) -> dict[str, Any]:
 
             now = datetime.now(UTC)
             interval = timedelta(hours=max(1, ps.oui_update_interval_hours))
-            if not force and ps.oui_last_updated_at is not None:
-                elapsed = now - ps.oui_last_updated_at
-                if elapsed < interval:
-                    return {
-                        "status": "skipped",
-                        "reason": "interval_not_elapsed",
-                        "wait_seconds": int((interval - elapsed).total_seconds()),
-                    }
+            if not force:
+                skip = interval_skip(now, ps.oui_last_updated_at, interval)
+                if skip is not None:
+                    return skip
 
             logger.info("oui_update_fetching", url=_OUI_SOURCE_URL, force=force)
             try:

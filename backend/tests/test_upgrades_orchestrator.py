@@ -215,6 +215,10 @@ class _FakeRun:
 def _db_for_state_test(run: _FakeRun) -> MagicMock:
     db = MagicMock()
     db.get = AsyncMock(return_value=run)
+    # drive_upgrade re-reads the row FOR UPDATE (#1512).
+    locked = MagicMock()
+    locked.scalar_one_or_none.return_value = run
+    db.execute = AsyncMock(return_value=locked)
     db.add = MagicMock()
     db.commit = AsyncMock()
     db.refresh = AsyncMock()
@@ -252,20 +256,22 @@ async def test_resume_upgrade_halted_to_running() -> None:
 async def test_abort_upgrade_from_planned() -> None:
     run = _FakeRun(state="planned")
     db = _db_for_state_test(run)
-    with patch.object(orchestrator.mutex, "release", return_value=(True, None)):
+    with patch.object(orchestrator.mutex, "release", return_value=(True, None)) as rel:
         out = await orchestrator.abort_upgrade(db, run.id, actor_display="admin")
     assert out.state == "aborted"
     assert out.finished_at is not None
+    rel.assert_called_once()  # a run that never started has no drive to wait for
 
 
 @pytest.mark.asyncio
-async def test_abort_upgrade_from_running_releases_lease() -> None:
+async def test_abort_upgrade_from_running_leaves_the_lease_to_the_drive() -> None:
+    """The drive releases its own Lease once it has stopped (#1707)."""
     run = _FakeRun(state="running")
     db = _db_for_state_test(run)
     with patch.object(orchestrator.mutex, "release", return_value=(True, None)) as rel:
         out = await orchestrator.abort_upgrade(db, run.id)
     assert out.state == "aborted"
-    rel.assert_called_once()
+    rel.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -323,16 +329,43 @@ async def test_drive_loop_happy_path_two_nodes(monkeypatch: pytest.MonkeyPatch) 
         calls.append(kwargs["node_name"])
         return _good_result(kwargs["node_name"])
 
-    release_mock = MagicMock(return_value=(True, None))
+    # The run releases only its own lease, retrying an unanswered API (#1449).
+    release_mock = MagicMock(return_value=True)
     monkeypatch.setattr(per_node, "single_node_upgrade", _fake_per_node)
-    monkeypatch.setattr(orchestrator.mutex, "release", release_mock)
+    monkeypatch.setattr(orchestrator.mutex, "release_if_held", release_mock)
     monkeypatch.setattr(orchestrator, "_BETWEEN_NODES_PAUSE_S", 0.01)
 
-    await orchestrator._drive_loop(db, run, stop)  # type: ignore[arg-type]
+    await orchestrator._drive_loop(db, run, stop, "api-0_drive")  # type: ignore[arg-type]
     assert calls == ["node-a", "node-b"]
     assert run.state == "succeeded"
     assert run.finished_at is not None
-    release_mock.assert_called()
+    # Released under this drive's own identity (#1512), never the pod's.
+    release_mock.assert_called_once_with(
+        holder="api-0_drive", attempts=orchestrator._LEASE_RELEASE_ATTEMPTS
+    )
+
+
+@pytest.mark.asyncio
+async def test_drive_loop_passes_its_lease_holder_to_each_node(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The node chain's preflight must know the lease is this run's (#1445)."""
+    run = _FakeRun(state="running")
+    run.lease_holder = "worker-0"
+    run.plan = {"node_order": ["node-a"], "slot_image_url": "http://mirror/x"}
+    db = _db_for_state_test(run)
+    holders: list[Any] = []
+
+    async def _fake_per_node(*args: Any, **kwargs: Any) -> per_node.SingleNodeResult:
+        holders.append(kwargs.get("lease_holder"))
+        return _good_result(kwargs["node_name"])
+
+    monkeypatch.setattr(per_node, "single_node_upgrade", _fake_per_node)
+    monkeypatch.setattr(orchestrator.mutex, "release", lambda **_kw: (True, None))
+    monkeypatch.setattr(orchestrator, "_BETWEEN_NODES_PAUSE_S", 0.01)
+
+    await orchestrator._drive_loop(db, run, asyncio.Event())  # type: ignore[arg-type]
+    assert holders == ["worker-0"]
 
 
 @pytest.mark.asyncio
@@ -466,7 +499,7 @@ async def test_lease_renewal_loop_stops_on_renew_failure(
     monkeypatch.setattr(orchestrator, "_LEASE_RENEW_INTERVAL_S", 0.01)
     monkeypatch.setattr(orchestrator.mutex, "renew", lambda **_kw: (False, "lease taken over"))
 
-    await orchestrator._lease_renewal_loop(stop)
+    await orchestrator._lease_renewal_loop(stop, "api-test_x")
     assert stop.is_set()
 
 
@@ -492,7 +525,7 @@ async def test_lease_renewal_loop_renews_until_stop(
         stop.set()
 
     await asyncio.gather(
-        orchestrator._lease_renewal_loop(stop),
+        orchestrator._lease_renewal_loop(stop, "api-test_x"),
         _stop_after_a_few_renews(),
     )
     assert renew_count >= 2
@@ -517,7 +550,9 @@ async def test_drive_upgrade_planned_acquires_lease(monkeypatch: pytest.MonkeyPa
 
     await orchestrator.drive_upgrade(db, run.id)
     acquire.assert_called_once()
-    assert run.lease_holder == "api-test"
+    # #1512 — one identity per drive: <pod>_<random>, never the bare pod name.
+    assert run.lease_holder.startswith("api-test_")
+    assert acquire.call_args.kwargs["holder"] == run.lease_holder
     # Empty node_order → loop transitions immediately to succeeded.
     assert run.state == "succeeded"
 

@@ -18,22 +18,27 @@ from typing import Any
 
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
-from fastapi.responses import StreamingResponse
-from jose import JWTError
-from pydantic import BaseModel, ConfigDict, Field
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB
+from app.api.pre_body_auth import PreBodyAuthRoute, header_auth
 from app.config import settings
 from app.core.agent_wake import (
     WAKE_TICK_SECONDS,
+    WakeResult,
+    collecting_wakes,
     dns_wake_channels,
     wake_subscription,
 )
+from app.core.dns_names import validate_hostname
 from app.core.http_etag import etag_matches, format_etag
+from app.core.jwt_compat import JWTError
 from app.core.redis_client import make_async_redis
+from app.core.versions import is_installed_target
 from app.drivers.dns import get_driver as get_dns_driver
 from app.metrics import (
     AGENT_BUNDLE_INLINE_FAILURES,
@@ -55,6 +60,11 @@ from app.models.dns_rpz_hit import DNSRPZHit
 from app.models.logs import DNSQueryLogEntry
 from app.models.metrics import DNSMetricSample
 from app.services.agents.config_apply import apply_reported_status
+from app.services.agents.container_oom import (
+    container_oom_kill,
+    effective_daemon_report,
+    fresh_role_health,
+)
 from app.services.agents.daemon_state import apply_reported_daemon_state
 from app.services.agents.ingest_receipt import (
     BatchId,
@@ -62,31 +72,85 @@ from app.services.agents.ingest_receipt import (
     claim_batch,
     duplicate_response,
 )
+from app.services.agents.server_gone import refresh_agent_server
 from app.services.agents.spool_status import apply_reported_spool
+from app.services.appliance.ownership import (
+    owning_appliance_for_dns_agent,
+    owning_appliance_for_dns_server,
+)
 from app.services.dns import agent_bundle_store as bundle_store
+from app.services.dns import dnssec_signers
 from app.services.dns.agent_bundle_render import render_and_store
 from app.services.dns.agent_bundle_store import RENDERED_BY_API, encode_body
 from app.services.dns.agent_config import page_pending_ops
+from app.services.dns.agent_instance import (
+    claim_poll,
+    is_displaced,
+    is_refused,
+    refuse_registration,
+)
 from app.services.dns.agent_token import (
     hash_token,
     mint_agent_token,
     needs_rotation,
     verify_agent_token,
 )
-from app.services.dns.bundle_dirty import enqueue_renders
-from app.services.dns.record_ops import ack_op, apply_acks, reset_unacknowledged_ops
-from app.services.dns.tsig import ensure_group_tsig_key
+from app.services.dns.blocklist_pack import renders_packed_blocklists
+from app.services.dns.bundle_dirty import enqueue_renders, mark_bundles_dirty
+from app.services.dns.new_object_defaults import add_group_with_defaults
+from app.services.dns.record_ops import (
+    ack_op,
+    apply_acks,
+    lock_heartbeat_ops,
+    reassert_after_retried_deletes,
+    reset_unacknowledged_ops,
+    return_ops_dispatched_elsewhere,
+)
+from app.services.dns.row_locks import (
+    lock_op_ids,
+    lock_server_key_share,
+    lock_zone_state_rows,
+)
+from app.services.dns.server_move import CATALOG_UNSUPPORTED_DRIVERS
+from app.services.dns.soa_timers import (
+    AGENT_FEATURES_HEADER,
+    reconcile_soa_timers,
+    renders_soa_timers,
+    reports_served_serials,
+)
+from app.services.dns.tsig import ensure_group_tsig_key, transfer_view_name, zone_holding_views
+from app.services.dns.tsig_algorithms import UNSUPPORTED_TSIG_ALGORITHMS, group_key_refusal
 from app.services.feature_modules import is_module_enabled
-from app.tasks.prune_logs import DEFAULT_RETENTION_HOURS as QUERY_LOG_RETENTION_HOURS
+from app.tasks.prune_logs import log_retention_hours
 
 logger = structlog.get_logger(__name__)
-router = APIRouter(prefix="/agents", tags=["dns-agents"])
+
+#: How far above the later of the zone's ``last_serial`` and today's
+#: ``YYYYMMDD00`` a PowerDNS-reported serial may be adopted (#1968): one year
+#: in ``YYYYMMDDNN`` terms.
+_SERIAL_ADOPT_HEADROOM = 1_000_000
+#: Never adopt into the last stretch of the signed 32-bit ``last_serial``
+#: column, so the bump that follows cannot overflow it.
+_SERIAL_ADOPT_MAX = 2**31 - 1 - _SERIAL_ADOPT_HEADROOM
+# Every body route here checks the agent's credential from the headers
+# before the body is read: ``/ingested-records`` takes up to 64 MiB
+# (``app.core.body_limit``), and the batch routes take several MiB.
+router = APIRouter(prefix="/agents", tags=["dns-agents"], route_class=PreBodyAuthRoute)
 
 LONGPOLL_TIMEOUT_SECONDS = int(os.environ.get("DNS_AGENT_LONGPOLL_TIMEOUT", "30"))
 LONGPOLL_POLL_INTERVAL = 2.0
 
 
 # ── Schemas ────────────────────────────────────────────────────────────────────
+
+
+# #1567 — drivers an agent binary can actually serve. The full driver
+# registry also names agentless drivers (windows_dns, the cloud
+# providers, technitium_api) that the operator API accepts but no agent
+# can register as; the supervisor's driver selection raises on anything
+# outside this set, so accepting it here only wrote a junk ``active``
+# server row before the agent crash-looped.
+AGENT_CAPABLE_DRIVERS = frozenset({"bind9", "powerdns", "technitium"})
 
 
 class AgentRegisterRequestV2(BaseModel):
@@ -101,6 +165,77 @@ class AgentRegisterRequestV2(BaseModel):
     group_name: str | None = Field(default=None, max_length=255)
     fingerprint: str = Field(max_length=128)
     agent_id: str | None = None  # persisted UUID from previous runs
+    # #3757 — a resolvable form of ``hostname`` the control plane reads zones
+    # back from (the chart sends the pod's headless-Service FQDN). Optional:
+    # an older agent sends none and the row keeps its host (new rows use
+    # hostname). Vetted by ``_agent_reported_host``, which ignores rather than
+    # refuses a value it will not store: a refused agent re-bootstraps in a loop.
+    host: str | None = Field(default=None, max_length=255)
+
+    @field_validator("driver")
+    @classmethod
+    def validate_driver(cls, v: str) -> str:
+        if v not in AGENT_CAPABLE_DRIVERS:
+            raise ValueError(
+                f"driver must be one of {sorted(AGENT_CAPABLE_DRIVERS)} " "for agent registration"
+            )
+        return v
+
+
+def _agent_reported_host(body: AgentRegisterRequestV2) -> str | None:
+    """The ``host`` an agent sent, if registration may store it (#3757).
+
+    Only the agent's own name, or a qualified form of it (``<hostname>.<...>``,
+    which is what a StatefulSet pod's DNS name is), and only a legal host name.
+    Anything else is ignored with a warning, never refused: the agent's PSK
+    already lets it pick ``hostname`` freely, so this keeps ``host`` from
+    becoming a second, unrelated address the control plane would dial with the
+    group's TSIG key (an IP literal, another service's name).
+    """
+    raw = (body.host or "").strip()
+    if not raw:
+        return None
+    own = body.hostname.strip().rstrip(".").lower()
+    low = raw.rstrip(".").lower()
+    reason: str | None = None
+    if not own or not (low == own or low.startswith(own + ".")):
+        reason = "not a qualified form of the agent's hostname"
+    else:
+        try:
+            return validate_hostname(raw, field="host")
+        except ValueError as exc:
+            reason = str(exc)
+    logger.warning(
+        "dns_agent_host_ignored",
+        hostname=body.hostname,
+        host=raw,
+        reason=reason,
+        issue="#3757",
+    )
+    return None
+
+
+def _host_is_registration_default(host: str | None, names: set[str]) -> bool:
+    """Whether ``host`` is still what registration itself wrote (#3757): empty,
+    one of the server's names, or a qualified form of one. Anything else is an
+    operator's edit, which a re-registration must not overwrite."""
+    low = (host or "").strip().rstrip(".").lower()
+    if not low:
+        return True
+    return any(n and (low == n or low.startswith(n + ".")) for n in names)
+
+
+# #2078 — every DNS agent released before this fix registered with this
+# literal, whatever build it ran (its heartbeat already sent the real stamp).
+# It names no build, so it is treated as "not reported": stored, it would show
+# a version the agent does not run until the next heartbeat corrected it.
+_UNSTAMPED_REGISTER_VERSION = "2026.04.14.1"
+
+
+def _reported_agent_version(version: str | None) -> str | None:
+    if not version or version == _UNSTAMPED_REGISTER_VERSION:
+        return None
+    return version
 
 
 class AgentRegisterResponseV2(BaseModel):
@@ -110,6 +245,11 @@ class AgentRegisterResponseV2(BaseModel):
     token_expires_at: datetime
     config_etag: str | None
     pending_approval: bool
+    # #3757 — the row's stored host after this registration. Its presence tells
+    # the agent this control plane read the ``host`` it sent (a release before
+    # #3757 ignores the field and answers without it); its value may differ from
+    # what was sent when an operator edit or the vetting rule kept the row's own.
+    host: str | None = None
 
 
 class AgentHeartbeatRequest(BaseModel):
@@ -144,6 +284,10 @@ class AgentHeartbeatRequest(BaseModel):
     # than 422-ing the heartbeat. Absent (None) on a pre-#1077 agent, which
     # leaves the stored value untouched.
     spool: dict[str, Any] | None = None
+    # #3551 — the agent container's cgroup memory limit in bytes; null when
+    # the container has none. Absent on an older agent, which leaves the
+    # stored value untouched (an explicit null clears it).
+    memory_limit_bytes: int | None = Field(default=None, ge=0)
     # Bound the ACK list so a malformed/hostile heartbeat can't pin memory.
     ops_ack: list[dict[str, Any]] = Field(default_factory=list, max_length=5000)
     # Cumulative failed APPLY ATTEMPTS since the agent started, retries
@@ -177,9 +321,21 @@ class AgentHeartbeatResponseV2(BaseModel):
     rotated_expires_at: datetime | None = None
 
 
+#: #2042 — the per-process id a DNS agent sends on every config poll (and,
+#: since #2219, heartbeat and registration). A new value for a server means a
+#: new agent process; see ``agent_config_longpoll``.
+AGENT_INSTANCE_HEADER = "X-Spatium-Agent-Instance"
+
+
 # ── Auth dependencies ──────────────────────────────────────────────────────────
 
 
+async def _bootstrap_key_from_headers(request: Request) -> None:
+    """:func:`_require_bootstrap_key`, run before the body is read."""
+    _require_bootstrap_key(request.headers.get("X-DNS-Agent-Key"))
+
+
+@header_auth(_bootstrap_key_from_headers)
 def _require_bootstrap_key(
     x_dns_agent_key: str | None = Header(default=None, alias="X-DNS-Agent-Key")
 ) -> str:
@@ -200,11 +356,23 @@ def _require_bootstrap_key(
     return x_dns_agent_key
 
 
+async def _agent_from_headers(request: Request, db: DB) -> None:
+    """:func:`_auth_agent`, run before the body is read."""
+    await _agent_from_authorization(db, request.headers.get("authorization"))
+
+
+@header_auth(_agent_from_headers)
 async def _auth_agent(
     db: DB,
     authorization: str | None = Header(default=None),
 ) -> tuple[DNSServer, dict[str, Any]]:
     """Verify the Bearer agent_token, return (server, jwt_payload)."""
+    return await _agent_from_authorization(db, authorization)
+
+
+async def _agent_from_authorization(
+    db: AsyncSession, authorization: str | None
+) -> tuple[DNSServer, dict[str, Any]]:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing Bearer token")
     token = authorization.split(None, 1)[1].strip()
@@ -225,15 +393,108 @@ async def _auth_agent(
     return server, payload
 
 
+async def _set_packed_blocklists(db: AsyncSession, server: DNSServer, features: str | None) -> None:
+    """Record whether the agent reads packed blocklist entries (#4040), and
+    re-render the server's stored bundle when that changes: the shape is part
+    of the body, and an agent rolled back to a release that cannot read it
+    must not be served the packed one."""
+    packed = renders_packed_blocklists(features)
+    if server.agent_renders_packed_blocklists == packed:
+        return
+    server.agent_renders_packed_blocklists = packed
+    await mark_bundles_dirty(db, server_ids=[server.id])
+
+
+async def _switch_soa_timers(db: AsyncSession, group_id: uuid.UUID) -> None:
+    """#1171 — after an agent says what it renders, bring its group's SOA
+    timers in line, in a transaction of its own (the caller's has committed).
+
+    Never fails the request: register and heartbeat carry the agent's token
+    and op acks, and the next heartbeat of any agent in the group retries the
+    switch. The rollback expires every instance in the session, so the caller
+    must have read what it returns before calling this.
+    """
+    try:
+        if await reconcile_soa_timers(db, group_id) is not None:
+            await db.commit()
+    except Exception:  # noqa: BLE001 — see the docstring
+        await db.rollback()
+        logger.exception("dns_group_soa_timers_failed", group_id=str(group_id))
+
+
+async def _warn_if_second_signer(db: DB, group: DNSServerGroup, server: DNSServer) -> None:
+    """#1762 — an agent that auto-registers (``AGENT_GROUP``) into a group
+    that already has a signer and holds signed zones becomes a second
+    independent signer. Registration is not refused: that would leave the
+    agent re-bootstrapping forever with no row an operator can act on. There
+    is also no safe "register but don't sign" mode — a server serving the
+    zone unsigned under the parent's DS is just as bogus as one signing with
+    its own keys. So the row is created and the hazard is made loud: a
+    warning log, an audit row, the zone's ``dnssec_multi_signer`` flag (UI
+    badge + DNSSEC card) and the default-on ``dnssec_multi_signer`` alert.
+    """
+    if server.driver not in dnssec_signers.PER_SERVER_SIGNING_DRIVERS:
+        return
+    n = await dnssec_signers.signing_server_count(db, group.id)
+    if n < 2:
+        return
+    signed = await dnssec_signers.signed_zone_count(db, group.id)
+    if not signed:
+        return
+    message = dnssec_signers.register_warning_message(group.name, server.name, signed, n)
+    logger.warning(
+        "dns_agent_registered_into_signed_group",
+        group_id=str(group.id),
+        server_id=str(server.id),
+        signed_zones=signed,
+        signing_servers=n,
+    )
+    db.add(
+        AuditLog(
+            user_display_name="system:dns-agent",
+            auth_source="system",
+            action="dns.agent.register.dnssec_multi_signer",
+            resource_type="dns_server",
+            resource_id=str(server.id),
+            resource_display=server.name,
+            new_value={
+                "group_id": str(group.id),
+                "signed_zones": signed,
+                "signing_servers": n,
+                "warning": message,
+            },
+            result="success",
+        )
+    )
+
+
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
 
-@router.post("/register", response_model=AgentRegisterResponseV2)
+@router.post(
+    "/register",
+    response_model=AgentRegisterResponseV2,
+    responses={
+        409: {
+            "description": (
+                "#2219 — another live agent process owns this server identity; "
+                "this one is its refused duplicate (header "
+                "X-Spatium-Duplicate-Agent-Instance). No token is minted."
+            )
+        }
+    },
+)
 async def agent_register(
+    request: Request,
     body: AgentRegisterRequestV2,
     db: DB,
     _psk: str = Depends(_require_bootstrap_key),
-) -> AgentRegisterResponseV2:
+    # #1171 — what the agent renders (``soa-timers``: each zone's own SOA
+    # timers). A header so an older control plane ignores it.
+    agent_features: str | None = Header(default=None, alias=AGENT_FEATURES_HEADER),
+    # #2219 — the registering process, as on its polls and heartbeats.
+    agent_instance: str | None = Header(default=None, alias=AGENT_INSTANCE_HEADER),
+) -> AgentRegisterResponseV2 | JSONResponse:
     """Bootstrap registration: PSK-authenticated; returns a per-server JWT."""
     # #1068 — see the matching guard in dhcp/agents.py. Registration is
     # the one agent call that creates a server row, so without this an
@@ -246,28 +507,12 @@ async def agent_register(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=(
                 "The DNS subsystem is disabled on this control plane, so new "
-                "agents cannot register. Enable it under Settings → Features."
+                "agents cannot register. Enable it on the Features & Integrations page."
             ),
         )
-    # Resolve or create group
-    if body.group_name:
-        res = await db.execute(select(DNSServerGroup).where(DNSServerGroup.name == body.group_name))
-        group = res.scalar_one_or_none()
-        if group is None:
-            group = DNSServerGroup(
-                name=body.group_name, description="Auto-created by agent registration"
-            )
-            db.add(group)
-            await db.flush()
-    else:
-        res = await db.execute(select(DNSServerGroup).order_by(DNSServerGroup.created_at).limit(1))
-        group = res.scalar_one_or_none()
-        if group is None:
-            group = DNSServerGroup(name="default", description="Auto-created by agent registration")
-            db.add(group)
-            await db.flush()
-
-    # Find by agent_id first (stable across restarts) then by hostname
+    # Find by agent_id first (stable across restarts, and never moved: a row
+    # the operator moved stays where they put it, whatever AGENT_GROUP says —
+    # #934), then by hostname within the group resolved below.
     server: DNSServer | None = None
     if body.agent_id:
         try:
@@ -276,6 +521,66 @@ async def agent_register(
             raise HTTPException(status_code=422, detail=f"Invalid agent_id: {e}") from e
         res = await db.execute(select(DNSServer).where(DNSServer.agent_id == aid))
         server = res.scalar_one_or_none()
+        # #2219 — the refused half of a duplicate pair (#2044) is refused here
+        # too. Registering would mint it a token and overwrite the server's
+        # one token hash, staling the owner's; the owner then re-registers,
+        # staling this one's, and the pair trade re-registrations forever.
+        # Before anything is written, so a refusal changes nothing but the
+        # duplicate episode the server chip and alert read.
+        if server is not None and await refuse_registration(
+            db,
+            server,
+            _agent_instance(agent_instance),
+            client_ip=request.client.host if request.client is not None else None,
+        ):
+            return _duplicate_instance_response(server)
+
+    # #2190 — an agent with no row yet that runs on an appliance lands in the
+    # group the APPLIANCE is assigned, not the one its pod env names. The env
+    # can be a chart revision behind: a roles save that switches the engine
+    # and the group in one go labels the node for the new engine a few seconds
+    # before helm-controller rolls the new ``AGENT_GROUP`` into its DaemonSet,
+    # and a pod started in that window registered a second row in the OLD
+    # group, where its cached token then kept it.
+    group: DNSServerGroup | None = None
+    appliance = None
+    if server is None:
+        appliance = await owning_appliance_for_dns_agent(db, body.hostname, body.driver)
+        if appliance is not None and appliance.assigned_dns_group_id is not None:
+            group = await db.get(DNSServerGroup, appliance.assigned_dns_group_id)
+            if group is not None and body.group_name != group.name:
+                logger.warning(
+                    "dns_agent_group_follows_appliance",
+                    appliance_id=str(appliance.id),
+                    hostname=body.hostname,
+                    driver=body.driver,
+                    env_group=body.group_name,
+                    assigned_group=group.name,
+                    issue="#2190",
+                )
+
+    # Resolve or create group
+    if group is None:
+        if body.group_name:
+            res = await db.execute(
+                select(DNSServerGroup).where(DNSServerGroup.name == body.group_name)
+            )
+            group = res.scalar_one_or_none()
+            if group is None:
+                group = DNSServerGroup(
+                    name=body.group_name, description="Auto-created by agent registration"
+                )
+                await add_group_with_defaults(db, group)
+        else:
+            res = await db.execute(
+                select(DNSServerGroup).order_by(DNSServerGroup.created_at).limit(1)
+            )
+            group = res.scalar_one_or_none()
+            if group is None:
+                group = DNSServerGroup(
+                    name="default", description="Auto-created by agent registration"
+                )
+                await add_group_with_defaults(db, group)
 
     if server is None:
         res = await db.execute(
@@ -309,13 +614,14 @@ async def agent_register(
     require_approval = os.environ.get("DNS_REQUIRE_AGENT_APPROVAL", "false").lower() == "true"
 
     pending_approval = False
+    reported_host = _agent_reported_host(body)
     if server is None:
         agent_id = uuid.UUID(body.agent_id) if body.agent_id else uuid.uuid4()
         server = DNSServer(
             group_id=group.id,
             name=body.hostname,
             driver=body.driver,
-            host=body.hostname,
+            host=reported_host or body.hostname,
             port=53,
             roles=body.roles,
             status="active",
@@ -323,11 +629,13 @@ async def agent_register(
             agent_fingerprint=body.fingerprint,
             pending_approval=require_approval,
             is_primary=not has_primary,
-            notes=f"agent v{body.version}" if body.version else "auto-registered",
+            # ``notes`` is the operator's field; the agent never writes it.
+            agent_version=_reported_agent_version(body.version),
         )
         pending_approval = require_approval
         db.add(server)
         await db.flush()
+        await _warn_if_second_signer(db, group, server)
     else:
         # Anti-hijack: fingerprint change → force approval IFF the
         # operator has opted into the approval gate. Otherwise the
@@ -346,8 +654,67 @@ async def agent_register(
         server.driver = body.driver
         server.roles = body.roles
         server.status = "active"
+        # #3757 — heal rows an older chart registered with a bare pod name.
+        # Only when the agent sent one, never while the row awaits approval
+        # (a fingerprint mismatch must not redirect where its zones are read
+        # from before an operator has looked), and never over an operator's
+        # own edit of the host: only a value registration itself wrote moves.
+        if (
+            reported_host
+            and not server.pending_approval
+            and _host_is_registration_default(
+                server.host,
+                {
+                    server.name.strip().rstrip(".").lower(),
+                    body.hostname.strip().rstrip(".").lower(),
+                },
+            )
+        ):
+            server.host = reported_host
+        # Only overwrite when the agent actually reported one: an older agent
+        # sends the fixed literal (or nothing) and must not overwrite the real
+        # version its own heartbeat already recorded.
+        reported = _reported_agent_version(body.version)
+        if reported:
+            server.agent_version = reported
         if server.agent_id is None:
             server.agent_id = uuid.UUID(body.agent_id) if body.agent_id else uuid.uuid4()
+        elif (
+            appliance is not None and body.agent_id and server.agent_id != uuid.UUID(body.agent_id)
+        ):
+            # #2190 — the appliance's row, found by hostname in its assigned
+            # group, still carries the agent id of the engine it ran before
+            # (a roles save moves the old engine's row for the new one to
+            # adopt, #1856). The agent registering now is the appliance's
+            # current engine, so the row takes its id: its next re-register
+            # then finds the row by id rather than by name again.
+            server.agent_id = uuid.UUID(body.agent_id)
+
+    # #1782 — Technitium cannot do catalog zones (#1766). Registration must
+    # not refuse (a refused agent re-bootstraps in a loop), and the group API
+    # / server create / move / Fleet role assignment refuse the operator-driven
+    # paths. An agent pointed straight at a catalog group lands here; say so,
+    # and the group's ``catalog_unsupported_warning`` shows it in the UI.
+    if group.catalog_zones_enabled and body.driver in CATALOG_UNSUPPORTED_DRIVERS:
+        logger.warning(
+            "dns_agent_catalog_unsupported_driver",
+            server_id=str(server.id),
+            group=group.name,
+            driver=body.driver,
+            issue="#1766",
+        )
+
+    # #1858 — same posture for a key Technitium cannot use (hmac-sha224): the
+    # agent skips installing it, the group's keys page shows why.
+    if body.driver in UNSUPPORTED_TSIG_ALGORITHMS:
+        if key_problem := await group_key_refusal(db, group.id, {body.driver}):
+            logger.warning(
+                "dns_agent_tsig_algorithm_unsupported",
+                server_id=str(server.id),
+                group=group.name,
+                driver=body.driver,
+                detail=key_problem,
+            )
 
     # Mint token
     token, exp = mint_agent_token(
@@ -357,6 +724,9 @@ async def agent_register(
     )
     server.agent_jwt_hash = hash_token(token)
     server.last_seen_at = datetime.now(UTC)
+    server.agent_renders_soa_timers = renders_soa_timers(agent_features)
+    server.agent_reports_served_serials = reports_served_serials(agent_features)
+    await _set_packed_blocklists(db, server, agent_features)
 
     db.add(
         AuditLog(
@@ -385,14 +755,20 @@ async def agent_register(
         pending_approval=pending_approval,
     )
 
-    return AgentRegisterResponseV2(
+    response = AgentRegisterResponseV2(
         server_id=str(server.id),
         agent_id=str(server.agent_id),
         agent_token=token,
         token_expires_at=exp,
         config_etag=server.last_config_etag,
         pending_approval=pending_approval,
+        host=server.host,
     )
+    # Before the agent's first poll: an agent of an older release joining a
+    # group that serves the zones' own timers switches it to the literal here,
+    # so its first bundle already carries a serial nobody served them under.
+    await _switch_soa_timers(db, server.group_id)
+    return response
 
 
 _BODY_CHUNK = 64 * 1024
@@ -487,7 +863,7 @@ async def _render_inline(db: AsyncSession, server: DNSServer) -> DNSAgentBundle 
     if outcome.bundle is not None:
         AGENT_BUNDLE_INLINE_RENDERS.labels(family="dns").inc()
         return outcome.bundle
-    await db.refresh(server)
+    await refresh_agent_server(db, server)
     return await bundle_store.newest(db, server)
 
 
@@ -583,11 +959,53 @@ async def _bounded_inline(db: AsyncSession, server: DNSServer) -> DNSAgentBundle
                 pass
 
 
+_AGENT_INSTANCE_MAX = 64  # dns_record_op.dispatched_to
+
+
+def _agent_instance(raw: str | None) -> str | None:
+    """The agent's instance id, or None when it sent none or an unusable one
+    (an older agent; its ops are left to the 5-minute reset)."""
+    value = (raw or "").strip()
+    if not value or len(value) > _AGENT_INSTANCE_MAX or not value.isprintable():
+        return None
+    return value
+
+
+#: #2044 — set on the 409 a refused duplicate agent receives, so it can tell
+#: this refusal from any other 409 without parsing the body.
+DUPLICATE_INSTANCE_HEADER = "X-Spatium-Duplicate-Agent-Instance"
+
+
+def _duplicate_instance_response(server: DNSServer) -> JSONResponse:
+    """409 for a poll (#2044) or a registration (#2219) from an agent process
+    that does not own ``server``.
+
+    Not 401 / 404: those make the agent drop its token and re-register
+    (#2052), which would not change which process owns the row. The agent logs
+    the refusal and keeps serving its cached config, polling again on a slow
+    backoff; it takes the server back by itself if the owner stops polling."""
+    return JSONResponse(
+        status_code=409,
+        headers={DUPLICATE_INSTANCE_HEADER: "1"},
+        content={
+            "detail": (
+                f"Another agent process is polling as DNS server '{server.name}'. "
+                "Two live agents share one server identity (a cloned VM or a "
+                "copied agent state directory keeps the same agent_id); only the "
+                "most recent one is served. Stop the other agent, or give it its "
+                "own identity by clearing its state directory."
+            )
+        },
+    )
+
+
 @router.get("/config")
 async def agent_config_longpoll(
+    request: Request,
     db: DB,
     response: Response,
     if_none_match: str | None = Header(default=None, alias="If-None-Match"),
+    agent_instance: str | None = Header(default=None, alias=AGENT_INSTANCE_HEADER),
     auth: tuple[DNSServer, dict[str, Any]] = Depends(_auth_agent),
 ) -> Any:
     """Long-poll for config changes.
@@ -643,11 +1061,56 @@ async def agent_config_longpoll(
     has never had one. One attempt per server at a time, none during a
     failed attempt's backoff, and a failed attempt leaves the poll on the
     worker's renders like the fallback being off.
+
+    #2042 — an agent that is replaced leaves this handler running: nothing
+    cancels a long-poll when its client goes, so a record change committed
+    in the next seconds was paged into a response nobody read and sat
+    ``in_flight`` until the 5-minute unacknowledged reset. Two guards. The
+    agent names its process on every poll (``X-Spatium-Agent-Instance``),
+    each shipped op records it and when its poll started, and every pass
+    first returns the ops ``in_flight`` to a different instance, shipped by a
+    poll that started before this one, to ``pending`` so this poll ships
+    them. And a handler whose client has disconnected rolls its page back
+    instead of committing it; that check is advisory (TCP may not have
+    noticed yet), the instance id is what makes the recovery certain.
+
+    #2044 — that recovery assumes the other instance is GONE. Two processes
+    live on one server identity took each op back from each other on every
+    poll until its retries ran out. So one instance owns the server
+    (``agent_instance.claim_poll``): a new one takes over at once, the one it
+    displaced is refused with 409 if it polls again while the owner is live,
+    and a poll whose instance lost ownership while it waited stops before it
+    pages anything.
     """
     server, _payload = auth
+    instance = _agent_instance(agent_instance)
+    # #2042 — ranks this poll against any other the API holds for the server;
+    # see ``return_ops_dispatched_elsewhere``.
+    poll_started_at = datetime.now(UTC)
     if server.pending_approval:
         response.headers["X-Spatium-Pending-Approval"] = "1"
         return {"pending_approval": True, "etag": None}
+    # #2044 — one agent process owns the server at a time. A second live one
+    # on the same identity is refused here rather than served ops, or the two
+    # take each op back from each other until its retries are spent.
+    if instance is not None and not await claim_poll(
+        db,
+        server,
+        instance,
+        now=poll_started_at,
+        client_ip=request.client.host if request.client is not None else None,
+    ):
+        return _duplicate_instance_response(server)
+
+    # #4040 — the shape this agent can read is the one its request header
+    # says, not the stored flag, which is only as fresh as its last register
+    # or heartbeat: an agent rolled back to an older image polls before it
+    # heartbeats. A change is recorded (and the bundle re-rendered) here, and
+    # a stored bundle of the other shape is never served meanwhile.
+    req_packed = renders_packed_blocklists(request.headers.get(AGENT_FEATURES_HEADER))
+    if req_packed != bool(server.agent_renders_packed_blocklists):
+        await _set_packed_blocklists(db, server, request.headers.get(AGENT_FEATURES_HEADER))
+        await db.commit()
 
     deadline = asyncio.get_running_loop().time() + LONGPOLL_TIMEOUT_SECONDS
     enqueued = False
@@ -662,13 +1125,24 @@ async def agent_config_longpoll(
             # The server row carries the dirty sequence and the watermark of
             # the newest stored bundle; refresh it so a change committed on
             # any replica, or the worker's store, is seen here
-            # (expire_on_commit=False, no in-loop commit).
-            await db.refresh(server)
+            # (expire_on_commit=False: no commit in the loop expires it).
+            await refresh_agent_server(db, server)
+            if instance is not None and server.agent_instance not in (None, instance):
+                # #2044 — another agent process took the server over while this
+                # poll waited: a replacement (this poll is the departed agent's
+                # leftover, read by nobody) or a second live agent. Either way
+                # it must not page ops; the new owner's polls ship them.
+                return _duplicate_instance_response(server)
             # The newest bundle this release stored, current or not: under a
             # write storm no render is current until the writes stop, and
             # each one that lands is served as it lands (docstring).
             bundle = await bundle_store.newest(db, server)
-            if not bundle_store.is_current(server):
+            wrong_shape = bundle is not None and bundle.packed_blocklists != req_packed
+            if wrong_shape:
+                # Rendered for an agent that read packed entries (or the
+                # reverse): this one cannot read it. Wait for the re-render.
+                bundle = None
+            if wrong_shape or not bundle_store.is_current(server):
                 if settings.dns_agent_bundle_inline_fallback and not inline_tried:
                     try:
                         rendered = await _bounded_inline(db, server)
@@ -678,21 +1152,41 @@ async def agent_config_longpoll(
                     except _InlineRenderFailed:
                         # Once per poll: the worker's renders serve it instead.
                         inline_tried = True
-                        await db.refresh(server)
+                        await refresh_agent_server(db, server)
                         bundle = await bundle_store.newest(db, server)
-                if not enqueued and not bundle_store.is_current(server):
+                        if bundle is not None and bundle.packed_blocklists != req_packed:
+                            bundle = None
+                if not enqueued and (wrong_shape or not bundle_store.is_current(server)):
                     await enqueue_renders([server.id])
                     enqueued = True
             if bundle is not None:
+                if instance is not None and await return_ops_dispatched_elsewhere(
+                    db, server.id, instance, poll_started_at=poll_started_at
+                ):
+                    # Committed on its own: this pass may ship nothing (a
+                    # paused server) and then waits, and a wait must not hold
+                    # op row locks the heartbeat needs.
+                    await db.commit()
                 ops: list[dict[str, Any]] = []
                 remaining_ops = 0
-                if bundle.ships_ops:
-                    ops, remaining_ops = await page_pending_ops(
-                        db,
-                        server,
-                        up_to=bundle.snapshot_at,
-                        visible_xacts=bundle.visible_xacts,
-                    )
+                # Under views the body carries record changes (their ops were
+                # retired by the render) but never a DNSSEC op: page those
+                # regardless (#1946).
+                ops, remaining_ops = await page_pending_ops(
+                    db,
+                    server,
+                    up_to=bundle.snapshot_at,
+                    visible_xacts=bundle.visible_xacts,
+                    non_record_only=not bundle.ships_ops,
+                    dispatched_to=instance,
+                    poll_started_at=poll_started_at,
+                )
+                if ops and await request.is_disconnected():
+                    # #2042 — the agent this poll was for is gone; marking
+                    # the page in_flight would ship it to nobody.
+                    await db.rollback()
+                    AGENT_BUNDLE_SERVED.labels(family="dns", outcome="client_gone").inc()
+                    return Response(status_code=304)
                 # Early return if there are pending ops (fast-path per §3)
                 if not etag_matches(if_none_match, bundle.etag) or ops:
                     # The body before the commit, and never assumed: the
@@ -726,7 +1220,21 @@ async def agent_config_longpoll(
                 headers = {"ETag": format_etag(bundle.etag)} if bundle is not None else {}
                 AGENT_BUNDLE_SERVED.labels(family="dns", outcome="not_modified").inc()
                 return Response(status_code=304, headers=headers)
-            await wake.wait(min(WAKE_TICK_SECONDS, remaining))
+            # #3479: end this pass's read transaction before the wait. Held
+            # through it, the reads' locks (the op queue's among them) made any
+            # ACCESS EXCLUSIVE lock wait out the whole hold: a factory reset's
+            # TRUNCATE queued behind them, every reader after it queued behind
+            # the TRUNCATE, and the minute's alert evaluation closed a deadlock
+            # in that queue. Nothing is pending here (a page with ops was
+            # answered above; return_ops_dispatched_elsewhere commits its own),
+            # and expire_on_commit=False keeps ``server`` and ``bundle`` loaded
+            # for the next pass and the 304.
+            await db.commit()
+            if await wake.wait(min(WAKE_TICK_SECONDS, remaining)) == WakeResult.SHUTDOWN:
+                # #3015 — this api process is stopping: end the hold now so the
+                # next pass makes one last ETag check and answers 304, and the
+                # agent re-polls another pod instead of being cancelled.
+                deadline = asyncio.get_running_loop().time()
 
 
 @router.post("/heartbeat", response_model=AgentHeartbeatResponseV2)
@@ -734,101 +1242,180 @@ async def agent_heartbeat(
     request: Request,
     body: AgentHeartbeatRequest,
     db: DB,
+    agent_instance: str | None = Header(default=None, alias=AGENT_INSTANCE_HEADER),
     auth: tuple[DNSServer, dict[str, Any]] = Depends(_auth_agent),
 ) -> AgentHeartbeatResponseV2:
     """Heartbeat: updates last_seen_at, processes op ACKs, rotates token if near expiry."""
     server, payload = auth
     now = datetime.now(UTC)
+    # #2044 — a process the owner displaced (the refused half of two live
+    # agents on one identity) still heartbeats. Its liveness and acks count;
+    # what it reports about its daemon, config and spool describes a process
+    # that is not being served, so it stays off the row.
+    instance = _agent_instance(agent_instance)
+    displaced = is_displaced(server, instance)
+    # #4139 — a new process announces itself with a heartbeat BEFORE its boot
+    # apply (1.4 s to a minute: a zone that will not load is waited on). The
+    # takeover that retires its predecessor's stale ``ok`` happens here, not on
+    # the first config poll, which comes only after the boot apply. A heartbeat
+    # that names no process (an older agent) is served exactly as before.
+    if (
+        instance is not None
+        and not displaced
+        and server.agent_instance not in (None, instance)
+        and not await claim_poll(
+            db,
+            server,
+            instance,
+            now=now,
+            client_ip=request.client.host if request.client is not None else None,
+        )
+    ):
+        displaced = True
+    # #1929 — the ops this heartbeat writes are locked before the server row
+    # (``row_locks``): its first write to the server row is flushed by the
+    # next statement, so the lock has to come before any of them.
+    await lock_heartbeat_ops(db, server.id, body.ops_ack, now)
     server.last_seen_at = now
     server.last_health_check_at = now
-    server.status = "active"
-    # Capture the source IP so the operator can identify which host
-    # this agent is running on — the operator-set ``host`` column is
-    # just a label that may not match the real machine in NAT /
-    # distributed deployments.
-    if request.client is not None:
-        server.last_seen_ip = request.client.host
+    # #2853 — a disabled server stays ``disabled`` (the health task's verdict):
+    # its agent is still checking in, which is liveness, not re-enablement.
+    server.status = "active" if server.is_enabled else "disabled"
+    if not displaced:
+        # Capture the source IP so the operator can identify which host
+        # this agent is running on — the operator-set ``host`` column is
+        # just a label that may not match the real machine in NAT /
+        # distributed deployments.
+        if request.client is not None:
+            server.last_seen_ip = request.client.host
 
-    # #638 — only overwrite when the agent actually reported a version. A probe
-    # that failed answers None, and clobbering a known-good value with NULL
-    # would make the PowerDNS LMDB preflight fall back to "unknown" for no
-    # reason.
-    if body.daemon_version:
-        server.daemon_version = body.daemon_version
+        # #638 — only overwrite when the agent actually reported a version. A probe
+        # that failed answers None, and clobbering a known-good value with NULL
+        # would make the PowerDNS LMDB preflight fall back to "unknown" for no
+        # reason.
+        if body.daemon_version:
+            server.daemon_version = body.daemon_version
+        # #2078 — likewise only when reported (an older agent omits it).
+        if body.agent_version:
+            server.agent_version = body.agent_version
+        # #1171 — on every heartbeat, from the header: the same server row is run
+        # by an older agent until the upgrade replaces its pod, and by an older one
+        # again if a node is rolled back.
+        server.agent_renders_soa_timers = renders_soa_timers(
+            request.headers.get(AGENT_FEATURES_HEADER)
+        )
+        server.agent_reports_served_serials = reports_served_serials(
+            request.headers.get(AGENT_FEATURES_HEADER)
+        )
+        await _set_packed_blocklists(db, server, request.headers.get(AGENT_FEATURES_HEADER))
 
-    # Phase 8f-2 — persist whatever slot state the agent reported. Only
-    # overwrite when the agent actually sent a value (older agents
-    # leave these as None, in which case we leave the DB columns
-    # untouched rather than nulling out previously-known state).
-    if body.deployment_kind is not None:
-        server.deployment_kind = body.deployment_kind
-    if body.installed_appliance_version is not None:
-        server.installed_appliance_version = body.installed_appliance_version
-    if body.current_slot is not None:
-        server.current_slot = body.current_slot
-    if body.durable_default is not None:
-        server.durable_default = body.durable_default
-    if body.is_trial_boot is not None:
-        server.is_trial_boot = body.is_trial_boot
-    if body.last_upgrade_state is not None:
-        server.last_upgrade_state = body.last_upgrade_state
-    if body.last_upgrade_state_at is not None:
-        server.last_upgrade_state_at = body.last_upgrade_state_at
+        # Phase 8f-2 — persist whatever slot state the agent reported. Only
+        # overwrite when the agent actually sent a value (older agents
+        # leave these as None, in which case we leave the DB columns
+        # untouched rather than nulling out previously-known state).
+        if body.deployment_kind is not None:
+            server.deployment_kind = body.deployment_kind
+        if body.installed_appliance_version is not None:
+            server.installed_appliance_version = body.installed_appliance_version
+        if body.current_slot is not None:
+            server.current_slot = body.current_slot
+        if body.durable_default is not None:
+            server.durable_default = body.durable_default
+        if body.is_trial_boot is not None:
+            server.is_trial_boot = body.is_trial_boot
+        if body.last_upgrade_state is not None:
+            server.last_upgrade_state = body.last_upgrade_state
+        if body.last_upgrade_state_at is not None:
+            server.last_upgrade_state_at = body.last_upgrade_state_at
 
-    # Phase 8f-7 — auto-clear the operator-intent stamp once the agent
-    # confirms it landed. The Fleet view's "pending" indicator drops
-    # to None as soon as installed_appliance_version matches the
-    # desired one + the slot upgrade reported done. Cancellation flow
-    # (operator cleared desired_ manually before the agent picked it
-    # up) is handled by the Fleet endpoint's clear handler — that
-    # already nulls both fields directly.
-    if (
-        server.desired_appliance_version is not None
-        and server.installed_appliance_version
-        and server.installed_appliance_version == server.desired_appliance_version
-        and (server.last_upgrade_state in ("done", None))
-    ):
-        server.desired_appliance_version = None
-        server.desired_slot_image_url = None
+        # Phase 8f-7 — auto-clear the operator-intent stamp once the agent
+        # confirms it landed. The Fleet view's "pending" indicator drops
+        # to None as soon as installed_appliance_version matches the
+        # desired one + the slot upgrade reported done. Cancellation flow
+        # (operator cleared desired_ manually before the agent picked it
+        # up) is handled by the Fleet endpoint's clear handler — that
+        # already nulls both fields directly.
+        if (
+            server.desired_appliance_version is not None
+            and server.installed_appliance_version
+            and is_installed_target(
+                server.installed_appliance_version, server.desired_appliance_version
+            )
+            and (server.last_upgrade_state in ("done", None))
+        ):
+            server.desired_appliance_version = None
+            server.desired_slot_image_url = None
 
-    # Phase 8f-8 — clear reboot_requested once the agent reconnects
-    # after the reboot landed. We don't have a discrete "I rebooted"
-    # signal from the agent, but: agents heartbeat every ~30 s, the
-    # host reboot takes ~30-60 s, so any heartbeat that arrives more
-    # than 15 s after the request was stamped AND finds the request
-    # still set is post-reboot by construction (a pre-reboot agent
-    # wouldn't be heartbeating — the container's down). 15 s is a
-    # safety margin to avoid races where the heartbeat arrives mid-
-    # ConfigBundle-pickup but the box hasn't actually rebooted yet.
-    if server.reboot_requested and server.reboot_requested_at is not None:
-        elapsed = (datetime.now(UTC) - server.reboot_requested_at).total_seconds()
-        if elapsed > 15:
-            server.reboot_requested = False
-            server.reboot_requested_at = None
+        # Phase 8f-8 — clear reboot_requested once the agent reconnects
+        # after the reboot landed. We don't have a discrete "I rebooted"
+        # signal from the agent, but: agents heartbeat every ~30 s, the
+        # host reboot takes ~30-60 s, so any heartbeat that arrives more
+        # than 15 s after the request was stamped AND finds the request
+        # still set is post-reboot by construction (a pre-reboot agent
+        # wouldn't be heartbeating — the container's down). 15 s is a
+        # safety margin to avoid races where the heartbeat arrives mid-
+        # ConfigBundle-pickup but the box hasn't actually rebooted yet.
+        if server.reboot_requested and server.reboot_requested_at is not None:
+            elapsed = (datetime.now(UTC) - server.reboot_requested_at).total_seconds()
+            if elapsed > 15:
+                server.reboot_requested = False
+                server.reboot_requested_at = None
 
-    # #882 — the config-apply verdict. ``body.config`` has been declared on
-    # this model since it was written and read by nothing; a server could be
-    # reachable, healthy and serving a config the operator never approved.
-    apply_reported_status(server, body.config, agent_kind="dns", server_id=str(server.id))
-    # #1077 — spool state. Only written when the heartbeat carries it.
-    apply_reported_spool(server, body.spool, agent_kind="dns", server_id=str(server.id))
-    # #1067 — the daemon state. ``body.daemon`` has been declared on this model
-    # since it was written and read by nothing: an agent whose ``named`` never
-    # started (no bundle yet — #1061 says ``degraded`` on every heartbeat) was
-    # indistinguishable from a healthy one.
-    apply_reported_daemon_state(server, body.daemon, agent_kind="dns", server_id=str(server.id))
+        # #882 — the config-apply verdict. ``body.config`` has been declared on
+        # this model since it was written and read by nothing; a server could be
+        # reachable, healthy and serving a config the operator never approved.
+        # #2018 — on the appliance the kubelet kills the whole container when
+        # named hits its memory limit, the agent with it, so the agent never
+        # records the kill and its restarted self reports ``ok``. The supervisor
+        # carries the kubelet's ``OOMKilled`` on its heartbeat; while that kill
+        # is current it is the daemon state, whatever the agent says. #3552 —
+        # and it names a death-during-apply verdict out of memory.
+        appliance = await owning_appliance_for_dns_server(db, server)
+        role_health = fresh_role_health(appliance, now)
+        apply_reported_status(
+            server,
+            body.config,
+            agent_kind="dns",
+            server_id=str(server.id),
+            container_oom=container_oom_kill(role_health, server.driver, now),
+        )
+        # #1077 — spool state. Only written when the heartbeat carries it.
+        apply_reported_spool(server, body.spool, agent_kind="dns", server_id=str(server.id))
+        # #3551 — the container's memory limit, for the group memory estimate.
+        if "memory_limit_bytes" in body.model_fields_set:
+            server.memory_limit_bytes = body.memory_limit_bytes or None
+        # #1067 — the daemon state. ``body.daemon`` has been declared on this model
+        # since it was written and read by nothing: an agent whose ``named`` never
+        # started (no bundle yet — #1061 says ``degraded`` on every heartbeat) was
+        # indistinguishable from a healthy one.
+        daemon_report, daemon_stamp = effective_daemon_report(
+            body.daemon,
+            role_health,
+            server.driver,
+            now,
+        )
+        apply_reported_daemon_state(
+            server,
+            daemon_report,
+            agent_kind="dns",
+            server_id=str(server.id),
+            now=min(daemon_stamp, now),
+        )
 
     # Process op ACKs — batched, and scoped to this agent's own ops (#1232).
-    await apply_acks(db, server.id, body.ops_ack)
+    retried_deletes = await apply_acks(db, server.id, body.ops_ack)
     # #1232 — then return any op this agent was sent and never acknowledged
     # (it restarted, or the long-poll response was lost) to the retry path.
     # After the acks, so an ack arriving now is not reset under it; here and
     # not in the long-poll, because this transaction always commits.
-    await reset_unacknowledged_ops(db, server.id)
+    await reset_unacknowledged_ops(db, server.id, now=now)
 
     rotated_token = None
     rotated_exp = None
-    if needs_rotation(payload):
+    # #2219 — not for the refused half of a duplicate pair: its new token's
+    # hash would replace the owner's and stale it. Its token runs out instead,
+    # and the re-registration that follows is refused until the owner stops.
+    if needs_rotation(payload) and not is_refused(server, _agent_instance(agent_instance), now):
         rotated_token, rotated_exp = mint_agent_token(
             server_id=str(server.id),
             agent_id=str(server.agent_id),
@@ -837,13 +1424,20 @@ async def agent_heartbeat(
         server.agent_jwt_hash = hash_token(rotated_token)
 
     await db.commit()
-    return AgentHeartbeatResponseV2(
+    response = AgentHeartbeatResponseV2(
         server_id=str(server.id),
         status=server.status,
         acknowledged_at=now,
         rotated_token=rotated_token,
         rotated_expires_at=rotated_exp,
     )
+    group_id = server.group_id
+    await _reassert_after_commit(db, server.id, retried_deletes)
+    # #1171 — the heartbeat that finishes a roll (the group's last BIND9 agent
+    # now renders the zones' own SOA timers), or brings an older agent back,
+    # switches the group and moves the serials.
+    await _switch_soa_timers(db, group_id)
+    return response
 
 
 @router.get("/record-ops")
@@ -874,19 +1468,44 @@ async def agent_ops_ack(
 ) -> dict[str, str]:
     """Out-of-band op acknowledgment (also piggybacked on heartbeat)."""
     server, _ = auth
-    op = await db.get(DNSRecordOp, op_id)
-    if op is None or op.server_id != server.id:
+    # #1929 — locked first (``row_locks``): an op a group move deleted is a
+    # 404, not a StaleDataError when the ack's flush finds it gone.
+    if not await lock_op_ids(db, DNSRecordOp.id == op_id, DNSRecordOp.server_id == server.id):
         raise HTTPException(status_code=404, detail="Op not found")
-    await ack_op(
+    retried_deletes = await ack_op(
         db, str(op_id), body.get("result", "error"), body.get("message"), server_id=server.id
     )
+    server_id = server.id
     await db.commit()
+    await _reassert_after_commit(db, server_id, retried_deletes)
     return {"status": "ok"}
+
+
+async def _reassert_after_commit(
+    db: AsyncSession, server_id: uuid.UUID, retried: list[tuple[str, dict[str, Any]]]
+) -> None:
+    """#3688: the #1800 PTR re-assert, in a transaction of its own after the
+    ack has committed, holding no op row (see ``apply_acks``).
+
+    A failure here (a deadlock, a lost connection) is logged and rolled back,
+    never raised: the acks, the reset and any rotated token are already
+    committed, and a 500 would keep the rotated token from the agent (whose
+    old one no longer matches) and have it resend acks that already landed.
+    The PTR is left for the next structural pass, as before #1800."""
+    if not retried:
+        return
+    try:
+        await reassert_after_retried_deletes(db, server_id, retried)
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        logger.warning("dns_ptr_reassert_after_ack_failed", server_id=str(server_id), exc_info=True)
 
 
 class ZoneStateEntry(BaseModel):
     zone_name: str
-    serial: int
+    # SOA serial: unsigned 32-bit (RFC 1035 §3.3.13), so 0..2^32-1, not int32.
+    serial: int = Field(ge=0, le=4294967295)
 
 
 class ZoneStateReport(BaseModel):
@@ -914,7 +1533,8 @@ async def agent_zone_state(
     does not hold (the zone was deleted from the control plane but the agent
     still serves it; the next config bundle drops it) or holds more than once
     (one zone per view, and the report names no view) is skipped, counted in
-    the answer, and logged once per report.
+    the answer, and logged once per report; the rows the server already has
+    for a name held more than once are dropped (#4133).
     """
     server, _ = auth
     now = datetime.now(UTC)
@@ -929,9 +1549,21 @@ async def agent_zone_state(
     def _key(name: str) -> str:
         return name.rstrip(".").lower()
 
+    # #1929 — lock in ``row_locks`` order before reading anything to write:
+    # this server's state rows, then the server row (``FOR KEY SHARE``, which
+    # waits only for a group move in progress). A move deletes the state rows
+    # and changes the group; read before it, the flush below updated a row
+    # that was gone (StaleDataError) and the report recorded serials for the
+    # zones of a group the server had left. Locked first, the deleted rows
+    # are not returned and the zones are looked up in the group it is in now.
+    await lock_zone_state_rows(db, DNSServerZoneState.server_id == server.id)
+    group_id = await lock_server_key_share(db, server.id)
+    if group_id is None:
+        raise HTTPException(status_code=404, detail="Server not found")
+
     res = await db.execute(
         select(DNSZone).where(
-            DNSZone.group_id == server.group_id,
+            DNSZone.group_id == group_id,
             DNSZone.deleted_at.is_(None),
             func.lower(func.rtrim(DNSZone.name, ".")).in_({_key(e.zone_name) for e in body.zones}),
         )
@@ -945,12 +1577,99 @@ async def agent_zone_state(
     serial_by_zone: dict[uuid.UUID, int] = {}
     unknown: list[str] = []
     ambiguous: list[str] = []
+    ambiguous_zone_ids: set[uuid.UUID] = set()
     for entry in body.zones:
         matches = zones_by_key.get(_key(entry.zone_name), [])
         if len(matches) == 1:
             serial_by_zone[matches[0].id] = entry.serial
         else:
             (ambiguous if matches else unknown).append(entry.zone_name)
+            ambiguous_zone_ids.update(m.id for m in matches)
+
+    # #4133 — a row written while the name was held once is the serial of one
+    # copy as it was then. Once a second view holds the name the report cannot
+    # say whose serial it is, so nothing refreshes the row and the drift
+    # report reads that copy ``behind`` for good after its next change. Drop
+    # it: with no stored serial the report falls back to the records.
+    if ambiguous_zone_ids:
+        await db.execute(
+            sa_delete(DNSServerZoneState).where(
+                DNSServerZoneState.server_id == server.id,
+                DNSServerZoneState.zone_id.in_(ambiguous_zone_ids),
+            )
+        )
+
+    # #1968 — a PowerDNS server never serves a serial below the one it already
+    # held (the agent floors it), so after the upgrade to a build that owns the
+    # serial it can serve one AHEAD of ours. Left as it is, our next bump (a
+    # small step from the lower number) is below what the server holds and the
+    # agent floors it again, so the zone never reads in sync and every change
+    # costs a floor. Move ours up to the one it serves: forward only (RFC 1982),
+    # primary zones only, and only for PowerDNS. A BIND9 agent reports the
+    # serial named serves too (#2835), and carries ours into named with every
+    # record op whenever ours is later, so the two agree; a BIND9 zone served
+    # AHEAD of ours (a third-party RFC 2136 client updated it) is reported as
+    # it is and reads out of sync, rather than moving ours.
+    if server.driver == "powerdns":
+        adopted: list[dict[str, Any]] = []
+        today_base = int(datetime.now(UTC).strftime("%Y%m%d")) * 100
+        for zone_id, serial in serial_by_zone.items():
+            zone_row = next(
+                (z for zs in zones_by_key.values() for z in zs if z.id == zone_id), None
+            )
+            if zone_row is None or (zone_row.zone_type or "primary") != "primary":
+                continue
+            ours = int(zone_row.last_serial or 0)
+            if not (0 < (serial - ours) % 2**32 < 2**31):
+                continue
+            # Bounded, because the number comes from an agent: one that is
+            # wrong (or compromised) could otherwise push the zone to the top
+            # of the signed 32-bit ``last_serial`` column, where the next bump
+            # (``compute_next_serial`` adds 1) overflows it and every write to
+            # the zone fails. A served serial is at most a few changes past
+            # ours, or past today's ``YYYYMMDD00`` (PowerDNS's own DEFAULT
+            # rewrite before the upgrade), so a year of ``YYYYMMDDNN``
+            # headroom above the later of the two is generous for any real
+            # report and keeps the column a century from its limit.
+            ceiling = max(ours, today_base) + _SERIAL_ADOPT_HEADROOM
+            if serial > min(ceiling, _SERIAL_ADOPT_MAX):
+                logger.warning(
+                    "dns_zone_serial_adoption_refused",
+                    zone=zone_row.name,
+                    server_id=str(server.id),
+                    ours=ours,
+                    reported=serial,
+                    ceiling=min(ceiling, _SERIAL_ADOPT_MAX),
+                )
+                continue
+            zone_row.last_serial = serial
+            if ours == 0 and serial == 1:
+                # A zone we have never numbered (created at 0) that the agent
+                # created at its own placeholder serial 1. Bookkeeping, not a
+                # divergence: adopted without an audit row, or every new zone
+                # on a PowerDNS group would write one.
+                continue
+            adopted.append(
+                {"zone": zone_row.name, "from": ours, "to": serial, "zone_id": str(zone_id)}
+            )
+        for a in adopted:
+            db.add(
+                AuditLog(
+                    user_display_name="system:dns-agent",
+                    auth_source="system",
+                    action="dns.zone.serial_adopted",
+                    resource_type="dns_zone",
+                    resource_id=a["zone_id"],
+                    resource_display=a["zone"],
+                    new_value={
+                        "server_id": str(server.id),
+                        "previous_serial": a["from"],
+                        "serial": a["to"],
+                        "reason": "the PowerDNS server serves a later serial than the control plane",
+                    },
+                    result="success",
+                )
+            )
 
     for zone_id, serial in serial_by_zone.items():
         # Upsert: look up existing row, update or insert.
@@ -1037,6 +1756,12 @@ class IngestedRecordsReport(BaseModel):
 
     zone_name: str
     records: list[IngestedRecord] = []
+    # The view whose copy of the zone the agent read, when it could address
+    # one (a BIND9 agent signs each view's transfer with that view's own
+    # transfer key, which selects exactly that view). None from an agent that
+    # read the zone without naming a view: an agent built before this field,
+    # a PowerDNS agent, or a group whose views carry no transfer key.
+    view_name: str | None = None
 
 
 @router.post("/ingested-records")
@@ -1052,43 +1777,52 @@ async def agent_ingested_records(
     journal; the agent AXFRs them and posts them here so they become
     UI/IPAM-visible + survive a full re-render. Gated on the zone actually
     having ``dynamic_update_enabled`` (defense-in-depth against a
-    misbehaving agent) and scoped to the posting server's group.
+    misbehaving agent) and scoped to the posting server's group. In a group
+    with several agent servers a learned record is also queued to the
+    other servers, and the report is read as a change since that server's
+    previous one rather than as the zone's whole truth (#2654; see
+    ``app.services.dns.ingest``). Under split-horizon a report is filed only
+    under the zone row whose copy it read (``_ingest_target_zone``).
     """
-    from app.services.dns.ingest import (  # noqa: PLC0415
-        IncomingRecord,
-        reconcile_external_records,
-        to_summary,
-    )
+    from app.services.dns.ingest import IncomingRecord  # noqa: PLC0415
 
     server, _ = auth
     zone_name = body.zone_name.rstrip(".")
     # Match either stored form (with/without trailing dot). Under split-horizon
-    # the same name can exist once per view, so we can't use
-    # ``scalar_one_or_none`` (it raises MultipleResultsFound): prefer the global
-    # zone (``view_id IS NULL``) and take the first — loopback AXFR is
-    # inherently view-ambiguous, and the global copy is the common case.
-    zone = (
+    # the same name can exist once per view, each copy its own zone row with
+    # its own records, so which row a report belongs to is decided by the view
+    # whose copy the agent read, never by row order.
+    candidates = list(
         (
             await db.execute(
-                select(DNSZone)
-                .where(
+                select(DNSZone).where(
                     DNSZone.group_id == server.group_id,
                     DNSZone.name.in_([zone_name + ".", zone_name]),
                     DNSZone.deleted_at.is_(None),
                 )
-                .order_by(DNSZone.view_id.nulls_first())
-                .limit(1)
             )
         )
         .scalars()
-        .first()
+        .all()
     )
-    if zone is None:
+    if not candidates:
         # Zone unknown to the control plane (deleted, or agent serving a
         # stale bundle). Silently accept — the next bundle drops it.
         return {"zone": zone_name, "skipped": "unknown_zone"}
+    zone, skipped = await _ingest_target_zone(db, candidates, body.view_name)
+    if zone is None:
+        logger.info(
+            "dns_ingest_report_not_filed",
+            server_id=str(server.id),
+            zone=zone_name,
+            view=body.view_name,
+            candidates=len(candidates),
+            reason=skipped,
+        )
+        return {"zone": zone_name, "skipped": skipped}
     if not zone.dynamic_update_enabled:
         return {"zone": zone_name, "skipped": "dynamic_update_disabled"}
+    report_view_id, stamp_view = await _ingest_report_view(db, server, zone, body.view_name)
 
     incoming = [
         IncomingRecord(
@@ -1102,17 +1836,161 @@ async def agent_ingested_records(
         )
         for r in body.records
     ]
-    result = await reconcile_external_records(db, zone, incoming)
-    await db.commit()
-    summary = to_summary(result)
+    # #2654 — in a group with several agent servers the reconcile also queues
+    # record ops to the reporter's peers (or to the reporter, when it is
+    # behind). The agent router has no ``wake_publishing`` dependency, so open
+    # a collector here: the wake goes out after the commit below, and the
+    # peers apply the op on their next poll instead of the 12 s safety tick.
+    async with collecting_wakes():
+        summary = await _reconcile_and_audit(
+            db, server, zone, zone_name, incoming, report_view_id, stamp_view
+        )
+    return {"zone": zone_name, **summary}
+
+
+# (server id, zone id) pairs already warned about by ``_ingest_report_view``.
+_REPORT_WITHOUT_VIEW_WARNED: set[tuple[uuid.UUID, uuid.UUID]] = set()
+
+
+async def _ingest_report_view(
+    db: AsyncSession, server: DNSServer, zone: DNSZone, view_name: str | None
+) -> tuple[uuid.UUID | None, bool]:
+    """The operator view whose copy of ``zone`` a filed report was read from,
+    and whether new mirror rows are stamped with it.
+
+    Under split-horizon each view loads its own copy of a dynamic zone, and an
+    RFC 2136 write lands in one copy only. A mirror row with no view renders
+    into every copy, so a record written through one view would be answered to
+    every other view's clients. So when the zone renders into more than one
+    view, a new mirror row carries the view the report was read from. In one
+    view, or with no views, it stays unscoped (the same answer either way).
+
+    A report naming no view comes from an agent built before the view field.
+    It keeps today's behaviour (unscoped rows, every mirror row in play); for a
+    zone in several views that is logged, since its rows render into all of
+    them until the agent is upgraded.
+    """
+    holding = await zone_holding_views(db, zone)
+    if view_name is None:
+        if len(holding) > 1:
+            # The agent reports every dynamic zone every few minutes, so warn
+            # once per server and zone in this process, then log at debug.
+            warned = (server.id, zone.id)
+            log_fn = logger.debug if warned in _REPORT_WITHOUT_VIEW_WARNED else logger.warning
+            _REPORT_WITHOUT_VIEW_WARNED.add(warned)
+            log_fn(
+                "dns_ingest_report_without_view",
+                server_id=str(server.id),
+                zone=zone.name,
+                views=[vd["name"] for vd in holding],
+            )
+        return None, False
+    vd = next((v for v in holding if v["name"] == view_name), None)
+    if vd is None or vd["kind"] != "operator":
+        # A geo view (no stored view to scope a row to): only a group with no
+        # operator views reads from one, and its rows carry no view anyway.
+        return None, False
+    return vd["id"], len(holding) > 1
+
+
+async def _ingest_target_zone(
+    db: AsyncSession, candidates: list[DNSZone], view_name: str | None
+) -> tuple[DNSZone | None, str | None]:
+    """The zone row an ingest report is filed under, or ``(None, reason)``.
+
+    A report that names no view is filed only when the group holds one row of
+    that name, so every copy the agent could have read is a copy of that row.
+    With two or more rows (the name in several views) an unnamed report could
+    be any view's copy: filing it under one of them would mirror one view's
+    records into another view's zone, where that view's clients are answered
+    them. So it is not filed at all.
+
+    A report that names a view is filed under the row whose copy the control
+    plane reads from that view (``transfer_view_name``, the rule drift and
+    sync-with-servers use). That is at most one row, because a view holds one
+    copy of a name. A shared zone is rendered into several views; only the
+    report from its one read view is filed, so the views' copies do not take
+    turns overwriting its mirror rows. A report naming any other view, or a
+    view the group no longer renders, is not filed, and neither is one that
+    two rows would claim.
+    """
+    if view_name is None:
+        if len(candidates) == 1:
+            return candidates[0], None
+        return None, "view_ambiguous"
+    read_here = [z for z in candidates if await transfer_view_name(db, z) == view_name]
+    if len(read_here) == 1:
+        return read_here[0], None
+    # Two rows read from one view is a placement the #2275 guard refuses; a
+    # row stored before it is not guessed between either.
+    return None, ("view_ambiguous" if read_here else "view_not_read")
+
+
+async def _reconcile_and_audit(
+    db: AsyncSession,
+    server: DNSServer,
+    zone: DNSZone,
+    zone_name: str,
+    incoming: list[Any],
+    report_view_id: uuid.UUID | None = None,
+    stamp_view: bool = False,
+) -> dict[str, Any]:
+    from app.services.dns.ingest import (  # noqa: PLC0415
+        reconcile_external_records,
+        to_summary,
+    )
+    from app.services.dns.server_resync import complete_deferred_resync  # noqa: PLC0415
+
+    result = await reconcile_external_records(
+        db,
+        zone,
+        incoming,
+        server=server,
+        report_view_id=report_view_id,
+        stamp_view=stamp_view,
+    )
+    summary: dict[str, Any] = dict(to_summary(result))
+    # #2654 — a re-enabled server's #2281 re-render waits for this: once it
+    # has reported every dynamic zone, what it learned while disabled is in
+    # the database, and the re-render keeps it instead of wiping it.
+    if await complete_deferred_resync(db, server):
+        summary["zone_resync"] = "released"
+    if result.mode == "disabled_reporter":
+        summary["skipped"] = "server_disabled"
     if summary["added"] or summary["removed"]:
+        # One summarising row per batch (not per record): an external writer
+        # churning records would otherwise flood audit_log. Names are capped.
+        cap = 50
+        db.add(
+            AuditLog(
+                user_display_name="system:dns-agent",
+                auth_source="system",
+                action="dns.record.external_ingest",
+                resource_type="dns_zone",
+                resource_id=str(zone.id),
+                resource_display=zone_name,
+                old_value=(
+                    {"removed_records": result.removed_records[:cap]} if result.removed else None
+                ),
+                new_value={
+                    "server_id": str(server.id),
+                    "server": server.name,
+                    "mode": result.mode,
+                    **summary,
+                    "added_records": result.added_records[:cap],
+                    "truncated": max(result.added, result.removed) > cap,
+                },
+                result="success",
+            )
+        )
         logger.info(
             "dns_ingested_external_records",
             server_id=str(server.id),
             zone=zone_name,
             **summary,
         )
-    return {"zone": zone_name, **summary}
+    await db.commit()
+    return summary
 
 
 @router.post("/dnssec-state")
@@ -1135,11 +2013,21 @@ async def agent_dnssec_state(
     Unknown zone names are silently skipped (deleted between sign
     and report) — same fail-soft semantic as ``/zone-state``.
     """
-    _, _ = auth
+    reporter, _ = auth
     now = datetime.now(UTC)
     updated = 0
 
     if not body.zones:
+        return {"updated": 0}
+
+    # #1762 — on a group with several agent servers each signs with its own
+    # keys, so their DS/key reports disagree and the last writer used to win,
+    # flapping the DS the UI shows. Keep one server's report: the primary's,
+    # or the oldest signer's when no signer is primary (see
+    # ``dnssec_signers.is_ds_reporter``). Multi-signer groups are refused for
+    # new signing, so this only governs zones signed before that rule and
+    # agents that auto-registered into a signed group.
+    if not await dnssec_signers.is_ds_reporter(db, reporter):
         return {"updated": 0}
 
     # DNSZone.name is stored *with* the trailing dot in the DB
@@ -1155,7 +2043,9 @@ async def agent_dnssec_state(
         name_set.add(n.rstrip("."))
         if not n.endswith("."):
             name_set.add(n + ".")
-    res = await db.execute(select(DNSZone).where(DNSZone.name.in_(name_set)))
+    res = await db.execute(
+        select(DNSZone).where(DNSZone.name.in_(name_set), DNSZone.group_id == reporter.group_id)
+    )
     zones_by_name: dict[str, DNSZone] = {z.name.rstrip("."): z for z in res.scalars().all()}
 
     for entry in body.zones:
@@ -1295,7 +2185,7 @@ class QueryLogAck(IngestAck):
     responses_unmatched: int = 0
     dropped: int = 0
     #: Query lines older than the control plane's own query-log retention
-    #: (``prune_logs.DEFAULT_RETENTION_HOURS``) — skipped rather than
+    #: (``PlatformSettings.log_retention_hours``, #2273) — skipped rather than
     #: inserted into a table the nightly prune would empty straight away.
     expired: int = 0
 
@@ -1378,7 +2268,7 @@ async def agent_query_log_entries(
     capped = body.lines[:1000]
     dropped = max(0, len(body.lines) - len(capped))
     now = datetime.now(UTC)
-    expired_cutoff = now - timedelta(hours=QUERY_LOG_RETENTION_HOURS)
+    expired_cutoff = now - timedelta(hours=await log_retention_hours(db))
     inserted = 0
     expired = 0
     rpz_inserted = 0
@@ -1598,7 +2488,14 @@ async def agent_rendered_config(
     files = body.files[:_RENDERED_FILES_MAX]
     total = 0
     sanitised: list[dict[str, str]] = []
+    skipped_binary: list[str] = []
     for f in files:
+        # PostgreSQL JSONB cannot store NUL (\u0000), and one such file would
+        # refuse the whole snapshot (#2842). A NUL means binary, not config
+        # (BIND's journals and signed-zone files): drop it, keep the rest.
+        if "\x00" in f.content or "\x00" in f.path:
+            skipped_binary.append(f.path.replace("\x00", ""))
+            continue
         if len(f.content) > _RENDERED_FILE_SIZE_MAX:
             # Truncate rather than reject — operator wants to *see*
             # something even if a single file blew the cap.
@@ -1609,6 +2506,14 @@ async def agent_rendered_config(
         if total > _RENDERED_TOTAL_SIZE_MAX:
             break
         sanitised.append({"path": f.path, "content": content})
+
+    if skipped_binary:
+        logger.warning(
+            "rendered_config_skipped_binary",
+            server_id=str(server.id),
+            paths=skipped_binary[:50],
+            count=len(skipped_binary),
+        )
 
     now = datetime.now(UTC)
     state = await db.get(DNSServerRuntimeState, server.id)

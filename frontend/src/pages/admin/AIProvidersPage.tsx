@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   CheckCircle2,
@@ -21,8 +22,17 @@ import {
   type AIProviderKind,
   type AIProviderUpdate,
   type AITestConnectionResult,
+  formatApiError,
 } from "@/lib/api";
 import { Modal, ModalTabs } from "@/components/ui/modal";
+import { ListEmpty } from "@/components/ui/list-read-error";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
+import { changedFields, refetchRow } from "@/hooks/useFreshRow";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -34,6 +44,8 @@ interface ProviderForm {
   // null = leave existing key untouched on update; "" = explicitly clear;
   // any other value = set / replace.
   api_key: string | null;
+  // Whether the stored provider has a key (always false on create).
+  has_api_key: boolean;
   default_model: string;
   is_enabled: boolean;
   priority: string;
@@ -50,6 +62,7 @@ const EMPTY: ProviderForm = {
   kind: "openai_compat",
   base_url: "http://host.docker.internal:11434/v1",
   api_key: "",
+  has_api_key: false,
   default_model: "",
   is_enabled: true,
   priority: "100",
@@ -66,8 +79,9 @@ function formFromProvider(p: AIProvider): ProviderForm {
     base_url: p.base_url,
     // Edit modal starts with api_key=null so an unchanged save leaves
     // the stored ciphertext alone. Operator can paste a new value
-    // (replaces) or click "clear" (sets to "").
+    // (replaces) or tick "Remove the stored key" (sets to "").
     api_key: null,
+    has_api_key: p.has_api_key,
     default_model: p.default_model,
     is_enabled: p.is_enabled,
     priority: String(p.priority),
@@ -109,7 +123,7 @@ function toCreatePayload(form: ProviderForm): AIProviderCreate {
   };
 }
 
-function toUpdatePayload(form: ProviderForm): AIProviderUpdate {
+function fullUpdatePayload(form: ProviderForm): AIProviderUpdate {
   let options: Record<string, unknown> = {};
   try {
     options = JSON.parse(form.optionsJson || "{}");
@@ -141,6 +155,22 @@ function toUpdatePayload(form: ProviderForm): AIProviderUpdate {
   // allowlist (revert to "all enabled"). Pydantic's exclude_unset
   // distinguishes that from absent on the backend.
   update.enabled_tools = form.enabled_tools;
+  return update;
+}
+
+// Only what the operator changed against what the dialog read when it opened
+// (#4236), so a field another client set since is not put back. An empty
+// result means the Save has nothing to send.
+function toUpdatePayload(
+  form: ProviderForm,
+  initial: ProviderForm,
+): AIProviderUpdate {
+  const { api_key: apiKey, ...full } = fullUpdatePayload(form);
+  const { api_key: _unused, ...base } = fullUpdatePayload(initial);
+  void _unused;
+  const update: AIProviderUpdate = changedFields(base, full);
+  // null on api_key means "do not touch".
+  if (apiKey !== undefined) update.api_key = apiKey;
   return update;
 }
 
@@ -179,6 +209,15 @@ function ProviderEditor({
     setForm((p) => ({ ...p, [key]: v }));
   }
 
+  // #4135 — a moved base URL needs the stored key typed again (or removed).
+  const reask = useCredentialReask(
+    { base_url: form.base_url.trim() },
+    mode === "edit" ? { base_url: initial.base_url.trim() } : null,
+    () => set("api_key", null),
+  );
+  const mustEnterKey =
+    mode === "edit" && reask.asks(initial.has_api_key) && form.api_key === null;
+
   return (
     <Modal
       title={mode === "create" ? "New AI Provider" : `Edit — ${initial.name}`}
@@ -187,9 +226,9 @@ function ProviderEditor({
     >
       <div className="space-y-4">
         {error && (
-          <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          <FormError className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
             {error}
-          </div>
+          </FormError>
         )}
 
         <ModalTabs
@@ -271,24 +310,48 @@ function ProviderEditor({
               <label className="mb-1 block text-xs font-medium text-muted-foreground">
                 API key{" "}
                 <span className="text-muted-foreground/60">
-                  (leave blank to keep unchanged
                   {mode === "edit"
-                    ? ` — currently ${initial.api_key === null ? "stored" : "—"}`
-                    : ""}
-                  )
+                    ? initial.has_api_key
+                      ? reask.reask
+                        ? `(required — ${reask.hint.toLowerCase()} Or remove it.)`
+                        : "(a key is stored — leave blank to keep it)"
+                      : "(no key stored)"
+                    : "(optional)"}
                 </span>
               </label>
               <input
                 type="password"
                 value={form.api_key ?? ""}
-                onChange={(e) => set("api_key", e.target.value)}
+                // Blank = leave the stored key alone; removing it is the
+                // explicit checkbox below, which sends api_key "" (#2622).
+                onChange={(e) =>
+                  set("api_key", e.target.value === "" ? null : e.target.value)
+                }
+                disabled={form.api_key === ""}
+                required={mustEnterKey}
                 placeholder={
                   mode === "edit"
-                    ? "Type to replace, or clear to remove"
+                    ? initial.has_api_key
+                      ? reask.reask
+                        ? reask.placeholder
+                        : "Type to replace the stored key"
+                      : "Type to set a key"
                     : "Optional — local providers (Ollama, LM Studio) don't need one"
                 }
                 className={`${inputCls} font-mono text-xs`}
               />
+              {mode === "edit" && initial.has_api_key && (
+                <label className="mt-1.5 flex items-center gap-2 text-xs text-muted-foreground">
+                  <input
+                    type="checkbox"
+                    checked={form.api_key === ""}
+                    onChange={(e) =>
+                      set("api_key", e.target.checked ? "" : null)
+                    }
+                  />
+                  Remove the stored key
+                </label>
+              )}
             </div>
             <div>
               <label className="mb-1 block text-xs font-medium text-muted-foreground">
@@ -498,7 +561,7 @@ function ProviderEditor({
               Cancel
             </button>
             <button
-              disabled={saving || !form.name.trim()}
+              disabled={saving || !form.name.trim() || mustEnterKey}
               onClick={() => onSave(form)}
               className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground disabled:opacity-50"
             >
@@ -534,10 +597,10 @@ function ModelPickerModal({
           </div>
         )}
         {modelsQ.error && (
-          <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          <FormError className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
             Failed to fetch models —{" "}
             {(modelsQ.error as Error)?.message ?? "unknown error"}
-          </div>
+          </FormError>
         )}
         {modelsQ.data && modelsQ.data.length === 0 && (
           <div className="text-sm text-muted-foreground">
@@ -591,6 +654,8 @@ function ModelPickerModal({
 
 export function AIProvidersPage() {
   const qc = useQueryClient();
+  // #2525 — the provider routes are superadmin-only whatever the grants.
+  const { isSuperadmin } = usePermissions();
   const providersQ = useQuery({
     queryKey: ["ai-providers"],
     queryFn: aiApi.listProviders,
@@ -617,10 +682,7 @@ export function AIProvidersPage() {
       setTestResult(null);
     },
     onError: (err: unknown) => {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? String(err);
-      setEditorErr(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setEditorErr(formatApiError(err, String(err)));
     },
   });
 
@@ -634,10 +696,7 @@ export function AIProvidersPage() {
       setTestResult(null);
     },
     onError: (err: unknown) => {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? String(err);
-      setEditorErr(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setEditorErr(formatApiError(err, String(err)));
     },
   });
 
@@ -690,10 +749,12 @@ export function AIProvidersPage() {
     setEditorErr("");
     if (editor?.mode === "edit") {
       try {
-        updateMut.mutate({
-          id: editor.provider.id,
-          body: toUpdatePayload(form),
-        });
+        const body = toUpdatePayload(form, editor.initial);
+        if (Object.keys(body).length === 0) {
+          setEditor(null);
+          return;
+        }
+        updateMut.mutate({ id: editor.provider.id, body });
       } catch (e) {
         setEditorErr(e instanceof Error ? e.message : String(e));
       }
@@ -741,7 +802,8 @@ export function AIProvidersPage() {
               setTestResult(null);
               setEditor({ mode: "create", initial: { ...EMPTY } });
             }}
-            className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+            {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             <Plus className="h-4 w-4" /> New provider
           </button>
@@ -778,8 +840,11 @@ export function AIProvidersPage() {
                       colSpan={7}
                       className="px-3 py-8 text-center text-muted-foreground"
                     >
-                      No providers configured. Click{" "}
-                      <strong>New provider</strong> to add one.
+                      {/* A refused read is not an empty list (#2525). */}
+                      <ListEmpty error={providersQ.error} what="AI providers">
+                        No providers configured. Click{" "}
+                        <strong>New provider</strong> to add one.
+                      </ListEmpty>
                     </td>
                   </tr>
                 )}
@@ -838,20 +903,42 @@ export function AIProvidersPage() {
                       <RefreshCw className="h-3 w-3" />
                     </button>
                     <button
-                      onClick={() => {
+                      aria-label="Edit provider"
+                      title="Edit provider"
+                      onClick={async () => {
                         setEditorErr("");
                         setTestResult(null);
-                        setEditor({
-                          mode: "edit",
-                          provider: p,
-                          initial: formFromProvider(p),
-                        });
+                        // Read the provider when Edit opens (#4236); a failed
+                        // read opens nothing rather than the stale row.
+                        try {
+                          const fresh = await refetchRow<AIProvider>(
+                            qc,
+                            [["ai-providers"]],
+                            p.id,
+                          );
+                          if (!fresh)
+                            throw new Error(
+                              "it was not found, and may have been deleted",
+                            );
+                          setEditor({
+                            mode: "edit",
+                            provider: fresh,
+                            initial: formFromProvider(fresh),
+                          });
+                        } catch (e) {
+                          setEditorErr(
+                            "Couldn't read the current values: " +
+                              formatApiError(e, "the request failed"),
+                          );
+                        }
                       }}
                       className="mr-1 rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent"
                     >
                       <Pencil className="h-3 w-3" />
                     </button>
                     <button
+                      aria-label="Delete provider"
+                      title="Delete provider"
                       onClick={() => {
                         if (confirm(`Delete provider "${p.name}"?`))
                           deleteMut.mutate(p.id);
@@ -866,6 +953,12 @@ export function AIProvidersPage() {
             </tbody>
           </table>
         </div>
+
+        {editorErr && !editor && (
+          <FormError className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+            {editorErr}
+          </FormError>
+        )}
 
         {testResult && !editor && (
           <div

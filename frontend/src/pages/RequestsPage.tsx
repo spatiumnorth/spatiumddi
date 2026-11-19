@@ -21,8 +21,14 @@
  * That means the form fields ARE the server's contract: adding a field to an
  * operation surfaces it here with no frontend change, and the two can't drift.
  */
+import { FormError } from "@/components/ui/form-error";
 import { useEffect, useMemo, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import {
   authApi,
   requestsApi,
@@ -31,11 +37,16 @@ import {
   type ResourceOptionsResponse,
   type RequestKind,
   type RequestKindId,
+  formatApiError,
 } from "@/lib/api";
 import { usePermissions } from "@/hooks/usePermissions";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { closePopupOnEscape } from "@/components/ui/use-draggable-modal";
 import { HeaderButton } from "@/components/ui/header-button";
+import { ListEmpty } from "@/components/ui/list-read-error";
+import { pollUnlessRefused } from "@/lib/refusal";
+import { fieldWords, plainText, submitErrorWords } from "@/lib/requestWords";
 import {
   Ban,
   Check,
@@ -119,16 +130,34 @@ function StateChip({ state }: { state: ChangeRequestState }) {
   );
 }
 
+// One list for the filter and the empty state, so the empty state names a
+// state by the label the filter shows (#3252), not the API's word for it.
+const STATE_FILTERS: { value: ChangeRequestState; label: string }[] = [
+  { value: "pending", label: "Pending" },
+  { value: "executed", label: "Provisioned" },
+  { value: "rejected", label: "Rejected" },
+  { value: "failed", label: "Failed" },
+  { value: "cancelled", label: "Cancelled" },
+  { value: "expired", label: "Expired" },
+];
+
+// The server's bound on a decision note and on a justification (2000); the boxes
+// stop at it so an over-long text is never sent and refused after the press (#3835).
+const NOTE_MAX = 2000;
+
 function fmtTime(iso: string | null): string {
   if (!iso) return "—";
   return new Date(iso).toLocaleString();
 }
 
+const REQUESTS_PAGE_SIZE = 100;
+
+function axiosStatus(e: unknown): number | undefined {
+  return (e as { response?: { status?: number } })?.response?.status;
+}
+
 function errMessage(e: unknown, fallback: string): string {
-  const detail = (e as { response?: { data?: { detail?: unknown } } })?.response
-    ?.data?.detail;
-  if (typeof detail === "string") return detail;
-  return e instanceof Error ? e.message : fallback;
+  return formatApiError(e, fallback);
 }
 
 // ── New-request modal ──────────────────────────────────────────────────────
@@ -140,6 +169,7 @@ type FieldSpec = {
   type: string;
   required: boolean;
   enum?: string[];
+  enumLabels?: Record<string, string>;
   // #759 — RBAC resource_type of the resource this field references
   // (server-annotated via x-resource); drives the searchable picker.
   resource?: string;
@@ -156,6 +186,7 @@ type FieldSpec = {
  * renderer.
  */
 function fieldsFrom(kind: RequestKind): FieldSpec[] {
+  const kindId = kind.kind;
   const props = kind.args_schema?.properties ?? {};
   const required = new Set(kind.args_schema?.required ?? []);
   return Object.entries(props).map(([name, raw]) => {
@@ -168,14 +199,25 @@ function fieldsFrom(kind: RequestKind): FieldSpec[] {
       const concrete = anyOf.find((b) => b.type && b.type !== "null");
       if (concrete && typeof concrete.type === "string") type = concrete.type;
     }
+    // Labels and hints are the requester's words, not the schema's (#3253).
+    const words = fieldWords(
+      kindId,
+      name,
+      typeof spec.title === "string" ? spec.title : undefined,
+      typeof spec.description === "string" ? spec.description : undefined,
+    );
     return {
       name,
-      title: typeof spec.title === "string" ? spec.title : name,
-      description:
-        typeof spec.description === "string" ? spec.description : undefined,
+      title: words.label,
+      description: words.hint,
       type,
       required: required.has(name),
-      enum: Array.isArray(spec.enum) ? (spec.enum as string[]) : undefined,
+      enum: Array.isArray(spec.enum)
+        ? (spec.enum as string[])
+        : words.options
+          ? [...words.options]
+          : undefined,
+      enumLabels: words.optionLabels,
       resource:
         typeof spec["x-resource"] === "string"
           ? (spec["x-resource"] as string)
@@ -193,7 +235,7 @@ function fieldsFrom(kind: RequestKind): FieldSpec[] {
  * install's hundreds of subnets/zones never render as one giant <select>.
  * The submitted value is the UUID; the user only ever sees labels.
  */
-function ResourcePicker({
+export function ResourcePicker({
   resource,
   value,
   onChange,
@@ -241,7 +283,18 @@ function ResourcePicker({
   }
 
   return (
-    <div className="relative">
+    <div
+      className="relative"
+      // An Esc on an option reached with Tab is the list's too (#3157).
+      onKeyDown={(e) => closePopupOnEscape(e, open, () => setOpen(false))}
+      // Close when focus leaves the picker, not when it moves onto an option:
+      // a blur timer on the input fired after Tab reached an option and made
+      // the next Esc fall through to the dialog (#3157).
+      onBlur={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null))
+          setOpen(false);
+      }}
+    >
       <input
         className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm"
         placeholder="Type to search…"
@@ -251,7 +304,7 @@ function ResourcePicker({
           setOpen(true);
         }}
         onFocus={() => setOpen(true)}
-        onBlur={() => setTimeout(() => setOpen(false), 150)}
+        onKeyDown={(e) => closePopupOnEscape(e, open, () => setOpen(false))}
       />
       {open ? (
         <div className="absolute z-50 mt-1 max-h-56 w-full overflow-y-auto rounded-md border border-border bg-background shadow-lg">
@@ -289,7 +342,7 @@ function ResourcePicker({
           )}
           {options.length > 0 && data?.truncated ? (
             <div className="border-t border-border px-2 py-1 text-[11px] text-muted-foreground">
-              More may exist — keep typing to narrow
+              Showing {options.length} — more match, keep typing to narrow
             </div>
           ) : null}
         </div>
@@ -344,7 +397,13 @@ function NewRequestModal({
       void qc.invalidateQueries({ queryKey: ["provisioning-requests"] });
       onClose();
     },
-    onError: (e) => setError(errMessage(e, "Could not submit the request")),
+    onError: (e) =>
+      setError(
+        submitErrorWords(
+          e,
+          (name) => fields.find((f) => f.name === name)?.title ?? name,
+        ) ?? errMessage(e, "Could not submit the request"),
+      ),
   });
 
   return (
@@ -406,7 +465,7 @@ function NewRequestModal({
                     <option value="">—</option>
                     {f.enum.map((o) => (
                       <option key={o} value={o}>
-                        {o}
+                        {f.enumLabels?.[o] ?? o}
                       </option>
                     ))}
                   </select>
@@ -435,6 +494,7 @@ function NewRequestModal({
           </label>
           <textarea
             rows={3}
+            maxLength={NOTE_MAX}
             className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm"
             placeholder="Context for whoever reviews this — what it's for, how long you need it."
             value={justification}
@@ -442,11 +502,9 @@ function NewRequestModal({
           />
         </div>
 
-        {error ? (
-          <p className="rounded border border-rose-500/30 bg-rose-500/10 px-2 py-1.5 text-xs text-rose-600 dark:text-rose-400">
-            {error}
-          </p>
-        ) : null}
+        <FormError className="rounded border border-rose-500/30 bg-rose-500/10 px-2 py-1.5 text-rose-600 dark:text-rose-400">
+          {error}
+        </FormError>
 
         <p className="text-xs text-muted-foreground">
           Submitting changes nothing yet. Your request goes to an approver who
@@ -473,6 +531,26 @@ function NewRequestModal({
   );
 }
 
+/**
+ * The IPAM template a subnet request names (#3251). Approving stamps its
+ * tags, zone binding, server groups and DDNS settings on the new subnet, so
+ * the approver is shown which one before deciding. The name rides on the
+ * request itself (#3649): the templates route needs a grant the Requester and
+ * Change Approver roles lack, so this never looks the template up. Falls back
+ * to the id only when the server resolved no name (template since deleted).
+ */
+function TemplateLine({ request }: { request: ProvisioningRequest }) {
+  const raw = request.args?.template_id;
+  const id = typeof raw === "string" && raw ? raw : null;
+  if (!id) return null;
+  return (
+    <p data-testid="request-template" className="mt-1 text-xs">
+      <span className="font-medium">Template applied on approval:</span>{" "}
+      {request.template_name || id}
+    </p>
+  );
+}
+
 // ── Decision modal (approve / reject / cancel with an optional note) ────────
 
 function DecisionModal({
@@ -487,6 +565,7 @@ function DecisionModal({
   const qc = useQueryClient();
   const [note, setNote] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
 
   const title =
     action === "approve"
@@ -502,22 +581,75 @@ function DecisionModal({
       if (action === "reject") return requestsApi.reject(request.id, n);
       return requestsApi.cancel(request.id, n);
     },
-    onSuccess: () => {
+    onSuccess: (done) => {
       void qc.invalidateQueries({ queryKey: ["provisioning-requests"] });
+      // An approval whose provisioning was refused answers 200 with the
+      // request in state "failed" (#2911). Say so here, with the reason,
+      // rather than closing as if it had worked (#3246).
+      if (action === "approve" && done.state === "failed") {
+        const reason = done.error?.trim()
+          ? plainText(done.error.trim())
+          : "no reason was recorded";
+        setError(
+          `Approved, but it could not be provisioned: ${reason}${
+            /[.!?]$/.test(reason) ? "" : "."
+          } The request is now marked failed.`,
+        );
+        setFailed(true);
+        return;
+      }
       onClose();
     },
-    onError: (e) => setError(errMessage(e, `Could not ${action} the request`)),
+    onError: (e) => {
+      setError(errMessage(e, `Could not ${action} the request`));
+      // A 409 means the request was decided elsewhere since the list loaded
+      // (#3935): refresh so the row stops offering the decision.
+      if (axiosStatus(e) === 409) {
+        setFailed(true);
+        void qc.invalidateQueries({ queryKey: ["provisioning-requests"] });
+      }
+    },
   });
+
+  // What approving does NOW (#3934): the stored text was composed at submit,
+  // and the approval runs against the estate as it is at the press.
+  const current = useQuery({
+    queryKey: ["provisioning-requests", "current-preview", request.id],
+    queryFn: () => requestsApi.currentPreview(request.id),
+    enabled: action === "approve",
+    staleTime: 0,
+    gcTime: 0,
+  });
+  const shownText =
+    action === "approve" && current.data?.ok
+      ? current.data.preview_text
+      : request.preview_text;
 
   return (
     <Modal title={title} onClose={onClose} wide>
       <div className="space-y-3">
         <div className="rounded border border-border bg-muted/40 p-2">
-          <p className="text-xs font-medium">{request.resource_display}</p>
-          <pre className="mt-1 whitespace-pre-wrap break-words text-[11px] leading-snug text-muted-foreground">
-            {request.preview_text}
-          </pre>
+          <p className="whitespace-pre-wrap break-words text-xs font-medium">
+            {plainText(shownText)}
+          </p>
+          <TemplateLine request={request} />
         </div>
+        {action === "approve" && current.data?.changed ? (
+          <p className="rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-xs text-amber-700 dark:text-amber-300">
+            This request changed since it was submitted. Approving does what is
+            shown above, not what the requester first read:{" "}
+            <span className="break-words">
+              {plainText(request.preview_text)}
+            </span>
+          </p>
+        ) : null}
+        {action === "approve" && current.data && !current.data.ok ? (
+          <p className="rounded border border-rose-500/30 bg-rose-500/10 px-2 py-1.5 text-xs text-rose-600 dark:text-rose-400">
+            This can no longer be provisioned as requested:{" "}
+            {plainText(current.data.detail ?? "it was refused")} Approving will
+            mark the request failed.
+          </p>
+        ) : null}
         {request.justification ? (
           <div>
             <p className="text-[11px] font-medium text-muted-foreground">
@@ -541,23 +673,22 @@ function DecisionModal({
           </label>
           <textarea
             rows={2}
+            maxLength={NOTE_MAX}
             className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm"
             value={note}
             onChange={(e) => setNote(e.target.value)}
           />
         </div>
-        {error ? (
-          <p className="rounded border border-rose-500/30 bg-rose-500/10 px-2 py-1.5 text-xs text-rose-600 dark:text-rose-400">
-            {error}
-          </p>
-        ) : null}
+        <FormError className="rounded border border-rose-500/30 bg-rose-500/10 px-2 py-1.5 text-rose-600 dark:text-rose-400">
+          {error}
+        </FormError>
         <div className="flex justify-end gap-2">
           <HeaderButton variant="secondary" onClick={onClose}>
-            Cancel
+            {failed ? "Close" : "Cancel"}
           </HeaderButton>
           <HeaderButton
             variant={action === "approve" ? "primary" : "destructive"}
-            disabled={mutation.isPending}
+            disabled={mutation.isPending || failed}
             onClick={() => {
               setError(null);
               mutation.mutate();
@@ -602,13 +733,28 @@ export default function RequestsPage() {
     enabled: canSubmit,
   });
 
-  const list = useQuery({
+  // Paged (#3937): the page used to read the newest 100 and say nothing of
+  // the rest, so the oldest pending requests (the first to expire) were
+  // unreachable once the queue passed 100.
+  const list = useInfiniteQuery({
     queryKey: ["provisioning-requests", "list", stateFilter],
-    queryFn: () => requestsApi.list(stateFilter ? { state: stateFilter } : {}),
-    refetchInterval: 30000,
+    queryFn: ({ pageParam }) =>
+      requestsApi.listPage({
+        ...(stateFilter ? { state: stateFilter } : {}),
+        limit: REQUESTS_PAGE_SIZE,
+        offset: pageParam,
+      }),
+    initialPageParam: 0,
+    getNextPageParam: (last, all) => {
+      const loaded = all.reduce((n, p) => n + p.items.length, 0);
+      return last.items.length > 0 && loaded < last.total ? loaded : undefined;
+    },
+    refetchInterval: pollUnlessRefused(30000),
   });
 
-  const rows = list.data ?? [];
+  const rows = (list.data?.pages ?? []).flatMap((p) => p.items);
+  const rowsTotal =
+    list.data?.pages[list.data.pages.length - 1]?.total ?? rows.length;
 
   return (
     <div className="space-y-4 p-4">
@@ -618,7 +764,9 @@ export default function RequestsPage() {
           <p className="text-sm text-muted-foreground">
             {canApprove
               ? "Requests waiting on an approver. Approving provisions the resource under your identity."
-              : "Ask for an IP, subnet, DNS record or DHCP reservation. An approver reviews it before anything is created."}
+              : !canSubmit
+                ? "Requests made through the self-service portal."
+                : "Ask for an IP, subnet, DNS record or DHCP reservation. An approver reviews it before anything is created."}
           </p>
         </div>
         <div className="flex shrink-0 items-center gap-2">
@@ -630,12 +778,11 @@ export default function RequestsPage() {
             }
           >
             <option value="">All states</option>
-            <option value="pending">Pending</option>
-            <option value="executed">Provisioned</option>
-            <option value="rejected">Rejected</option>
-            <option value="failed">Failed</option>
-            <option value="cancelled">Cancelled</option>
-            <option value="expired">Expired</option>
+            {STATE_FILTERS.map((f) => (
+              <option key={f.value} value={f.value}>
+                {f.label}
+              </option>
+            ))}
           </select>
           <HeaderButton variant="secondary" onClick={() => void list.refetch()}>
             Refresh
@@ -674,8 +821,16 @@ export default function RequestsPage() {
                 <td colSpan={5} className="px-3 py-10 text-center">
                   <Inbox className="mx-auto mb-2 h-6 w-6 text-muted-foreground" />
                   <p className="text-sm text-muted-foreground">
-                    No requests{stateFilter ? ` in state "${stateFilter}"` : ""}
-                    .
+                    <ListEmpty error={list.error} what="requests">
+                      No requests
+                      {stateFilter
+                        ? ` in state "${
+                            STATE_FILTERS.find((f) => f.value === stateFilter)
+                              ?.label ?? stateFilter
+                          }"`
+                        : ""}
+                      .
+                    </ListEmpty>
                   </p>
                 </td>
               </tr>
@@ -683,10 +838,10 @@ export default function RequestsPage() {
               rows.map((r) => (
                 <tr key={r.id} className="align-top">
                   <td className="px-3 py-2">
-                    <p className="font-medium">{r.resource_display}</p>
-                    <p className="whitespace-pre-wrap break-words text-xs text-muted-foreground">
-                      {r.preview_text}
+                    <p className="whitespace-pre-wrap break-words font-medium">
+                      {plainText(r.preview_text)}
                     </p>
+                    {canApprove ? <TemplateLine request={r} /> : null}
                     {r.justification ? (
                       <p className="mt-1 break-words text-xs italic text-muted-foreground">
                         “{r.justification}”
@@ -697,7 +852,7 @@ export default function RequestsPage() {
                         trust in a portal (#696). */}
                     {r.error ? (
                       <p className="mt-1 break-words rounded border border-rose-500/30 bg-rose-500/10 px-1.5 py-1 text-xs text-rose-600 dark:text-rose-400">
-                        {r.error}
+                        {plainText(r.error)}
                       </p>
                     ) : null}
                   </td>
@@ -706,6 +861,15 @@ export default function RequestsPage() {
                     {r.decided_by_display ? (
                       <p className="mt-1 text-[11px] text-muted-foreground">
                         by {r.decided_by_display}
+                      </p>
+                    ) : null}
+                    {r.decision_note ? (
+                      <p
+                        data-testid="decision-note"
+                        className="mt-1 min-w-0 max-w-xs whitespace-pre-wrap break-words text-xs text-muted-foreground"
+                      >
+                        <span className="font-medium">Note:</span>{" "}
+                        {r.decision_note}
                       </p>
                     ) : null}
                   </td>
@@ -717,7 +881,12 @@ export default function RequestsPage() {
                   </td>
                   <td className="px-3 py-2">
                     <div className="flex justify-end gap-1.5">
-                      {r.state === "pending" && canApprove ? (
+                      {/* The server refuses an approver's decision on their
+                          own request, so only the requester's Withdraw is
+                          offered on it (#3648). */}
+                      {r.state === "pending" &&
+                      canApprove &&
+                      !(myUserId && r.requested_by_user_id === myUserId) ? (
                         <>
                           <HeaderButton
                             variant="primary"
@@ -760,6 +929,21 @@ export default function RequestsPage() {
           </tbody>
         </table>
       </div>
+
+      {list.hasNextPage ? (
+        <div className="flex items-center justify-between gap-3 text-xs text-muted-foreground">
+          <span>
+            Showing the newest {rows.length} of {rowsTotal}.
+          </span>
+          <HeaderButton
+            variant="secondary"
+            disabled={list.isFetchingNextPage}
+            onClick={() => void list.fetchNextPage()}
+          >
+            {list.isFetchingNextPage ? "Loading…" : "Load more"}
+          </HeaderButton>
+        </div>
+      ) : null}
 
       {showNew ? (
         <NewRequestModal

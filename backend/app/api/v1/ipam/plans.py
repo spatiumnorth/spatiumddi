@@ -28,7 +28,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
 from app.core.permissions import require_resource_permission, user_has_permission
+from app.models.dns import DNSServerGroup, DNSZone
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet, SubnetPlan
+from app.services.api_token_scopes import read_only_post
+from app.services.ipam.custom_field_rules import (
+    inherited_block_custom_fields,
+    missing_required_custom_fields,
+)
+from app.services.ipam.gateway_rules import gateway_problem
+from app.services.ipam.subnet_placeholders import create_placeholder_rows, has_boundary_rows
+from app.services.ipam.zone_binding import stored_zone_uuid
 
 _V4_MULTICAST = ipaddress.ip_network("224.0.0.0/4")
 _V6_MULTICAST = ipaddress.ip_network("ff00::/8")
@@ -139,7 +148,9 @@ class SubnetPlanUpdate(BaseModel):
 class ValidationConflict(BaseModel):
     node_id: str
     network: str
-    kind: str  # "overlap_existing" | "out_of_parent" | "sibling_overlap" | "duplicate_id" | "missing_block"
+    # "overlap_existing" | "out_of_parent" | "sibling_overlap" | "duplicate_id"
+    # | "missing_block" | "invalid_kind" | "invalid_binding"
+    kind: str
     message: str
 
 
@@ -205,6 +216,9 @@ def _to_read(plan: SubnetPlan) -> SubnetPlanRead:
 
 # ── Validation ────────────────────────────────────────────────────────────
 
+# The node fields that name another resource by id.
+_PLAN_ID_FIELDS = ("dns_group_id", "dns_zone_id", "dhcp_server_group_id", "vlan_ref_id")
+
 
 async def _validate_tree(
     db: AsyncSession, space_id: uuid.UUID, tree: PlanNode
@@ -250,6 +264,96 @@ async def _validate_tree(
                     ),
                 )
             )
+
+    # 1c. Resource bindings are ids: apply writes ``dns_zone_id`` /
+    #     ``dns_group_id`` onto the new rows as given and parses the other two
+    #     with ``uuid.UUID``, so a value that is not a UUID either landed on a
+    #     block / subnet as a binding to nothing or raised a 500 (#2923).
+    #     Reported here, like a bad ``existing_block_id``, so a plan already
+    #     saved with one is refused with a reason instead of crashing apply.
+    for n in _walk(tree):
+        for field in _PLAN_ID_FIELDS:
+            raw = getattr(n, field)
+            if not raw:
+                continue
+            try:
+                uuid.UUID(str(raw))
+            except ValueError:
+                conflicts.append(
+                    ValidationConflict(
+                        node_id=n.id,
+                        network=n.network,
+                        kind="invalid_binding",
+                        message=f"{field} is not a valid UUID: {raw}",
+                    )
+                )
+
+    # 1d. ``dns_group_id`` lands in the new rows' ``dns_group_ids``, a JSONB
+    #     list with no foreign key, so a plan saved before its group was
+    #     deleted would bind the new blocks / subnets to a group that no
+    #     longer exists (#3433). Refused here, with the node that names it.
+    group_refs: dict[uuid.UUID, list[PlanNode]] = {}
+    for n in _walk(tree):
+        if not n.dns_group_id:
+            continue
+        try:
+            group_refs.setdefault(uuid.UUID(str(n.dns_group_id)), []).append(n)
+        except ValueError:
+            continue  # reported as invalid_binding above
+    if group_refs:
+        live = set(
+            (
+                await db.execute(
+                    select(DNSServerGroup.id).where(DNSServerGroup.id.in_(group_refs.keys()))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for gid, nodes in group_refs.items():
+            if gid in live:
+                continue
+            for n in nodes:
+                conflicts.append(
+                    ValidationConflict(
+                        node_id=n.id,
+                        network=n.network,
+                        kind="invalid_binding",
+                        message=f"dns_group_id names a DNS server group that does not exist: {gid}",
+                    )
+                )
+
+    # 1e. Likewise ``dns_zone_id`` (#3443): a zone purged after the plan was
+    #     saved would be written to the new rows as a binding to nothing.
+    zone_refs: dict[uuid.UUID, list[PlanNode]] = {}
+    for n in _walk(tree):
+        zid = stored_zone_uuid(n.dns_zone_id)
+        if zid is not None:
+            zone_refs.setdefault(zid, []).append(n)
+    if zone_refs:
+        live_zones = set(
+            (
+                await db.execute(
+                    select(DNSZone.id)
+                    .where(DNSZone.id.in_(zone_refs.keys()))
+                    .execution_options(include_deleted=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for zid, nodes in zone_refs.items():
+            if zid in live_zones:
+                continue
+            for n in nodes:
+                conflicts.append(
+                    ValidationConflict(
+                        node_id=n.id,
+                        network=n.network,
+                        kind="invalid_binding",
+                        message=f"dns_zone_id names a DNS zone that does not exist: {zid}",
+                    )
+                )
 
     # 2. If the root references an existing block, the block must exist
     #    AND its CIDR must equal the root's CIDR (the operator can't
@@ -354,6 +458,18 @@ async def _validate_tree(
     ]
 
     skip_id = tree.existing_block_id if tree.existing_block_id else None
+    # An anchored plan lives INSIDE its anchor, so the blocks that contain the
+    # anchor are not conflicts either (#2985). Only the anchor's own subtree
+    # and the space's other rows are checked.
+    skip_ids: set[str] = set()
+    if skip_id:
+        skip_ids.add(skip_id)
+        cur = await db.get(IPBlock, uuid.UUID(skip_id))
+        while cur is not None and cur.parent_block_id is not None:
+            if str(cur.parent_block_id) in skip_ids:
+                break
+            skip_ids.add(str(cur.parent_block_id))
+            cur = await db.get(IPBlock, cur.parent_block_id)
     nodes_to_check = _walk(tree)
     if skip_id:
         # The root's network IS the existing block; descendants still need checks
@@ -363,19 +479,11 @@ async def _validate_tree(
     for n in nodes_to_check:
         node_net = ipaddress.ip_network(n.network, strict=False)
         for rid, ex_net, ex_kind in existing_nets:
-            if rid == skip_id:
+            if rid in skip_ids:
                 continue
             if ex_net.version != node_net.version:
                 continue
             if node_net.overlaps(ex_net):
-                # Don't flag containment by the existing-block-root itself —
-                # that's expected (descendants live inside the root block).
-                if (
-                    skip_id
-                    and rid == skip_id
-                    and node_net.subnet_of(ex_net)  # type: ignore[arg-type]
-                ):
-                    continue
                 conflicts.append(
                     ValidationConflict(
                         node_id=n.id,
@@ -384,6 +492,50 @@ async def _validate_tree(
                         message=(f"{n.network} overlaps existing {ex_kind} {ex_net} (id={rid})"),
                     )
                 )
+
+    # 5. Rules apply would otherwise refuse mid-transaction (#2984, #2986):
+    #    the gateway of a planned subnet, and Required custom fields. Both
+    #    are the rules New Subnet / New Block use.
+    #    Planned nodes carry no custom fields of their own, so the answer
+    #    per kind is the same for every node: what the anchor chain gives.
+    inherited: dict[str, object] = {}
+    if tree.existing_block_id:
+        inherited = await inherited_block_custom_fields(db, uuid.UUID(tree.existing_block_id))
+    cf_problems: dict[str, str | None] = {}
+    for n in _walk(tree):
+        if n is tree and tree.existing_block_id:
+            continue  # the anchor already exists
+        try:
+            node_net = ipaddress.ip_network(n.network, strict=False)
+        except ValueError:
+            continue
+        if n.kind == "subnet":
+            problem = gateway_problem(
+                n.gateway or None,
+                node_net,
+                reject_reserved=has_boundary_rows(node_net, _subnet_kind(node_net)),
+            )
+            if problem:
+                conflicts.append(
+                    ValidationConflict(
+                        node_id=n.id, network=n.network, kind="invalid_gateway", message=problem
+                    )
+                )
+        cf_type = "subnet" if n.kind == "subnet" else "ip_block"
+        if cf_type not in cf_problems:
+            cf_problems[cf_type] = await missing_required_custom_fields(
+                db, cf_type, None, inherited=inherited
+            )
+        cf_problem = cf_problems[cf_type]
+        if cf_problem:
+            conflicts.append(
+                ValidationConflict(
+                    node_id=n.id,
+                    network=n.network,
+                    kind="required_custom_field",
+                    message=f"{n.network}: {cf_problem}",
+                )
+            )
 
     return conflicts
 
@@ -512,6 +664,7 @@ async def delete_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> 
 
 
 @router.post("/{plan_id}/validate", response_model=ValidationResult)
+@read_only_post
 async def validate_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> ValidationResult:
     plan = await db.get(SubnetPlan, plan_id)
     if plan is None:
@@ -531,6 +684,7 @@ async def validate_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -
 
 
 @router.post("/validate-tree", response_model=ValidationResult)
+@read_only_post
 async def validate_unsaved_tree(
     body: SubnetPlanCreate, current_user: CurrentUser, db: DB
 ) -> ValidationResult:
@@ -646,6 +800,17 @@ async def apply_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> A
         )
 
     tree = PlanNode.model_validate(plan.tree)
+    # A plan anchored on an existing block places everything under it, so the
+    # caller needs write on that block (#3425), as for a direct create.
+    if tree.existing_block_id:
+        try:
+            anchor = await db.get(IPBlock, uuid.UUID(tree.existing_block_id))
+        except ValueError:
+            anchor = None  # _validate_tree reports the bad id below
+        if anchor is not None:
+            from app.api.v1.ipam.router import require_target_block_write  # noqa: PLC0415
+
+            require_target_block_write(current_user, anchor)
     conflicts = await _validate_tree(db, plan.space_id, tree)
     if conflicts:
         raise HTTPException(
@@ -661,7 +826,7 @@ async def apply_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> A
 
     # Lazy: the IPAM router includes this module's router at import time.
     from app.api.v1.ipam.router import _sync_dns_record  # noqa: PLC0415
-    from app.services.dns.reverse_zone import ensure_reverse_zone_for_subnet  # noqa: PLC0415
+    from app.services.dns.reverse_zone import ensure_reverse_zones_for_subnet  # noqa: PLC0415
 
     async def materialise(
         node: PlanNode,
@@ -694,7 +859,7 @@ async def apply_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> A
                 name=node.name or "",
                 description=node.description or "",
                 dns_group_ids=dns_group_ids,
-                dns_zone_id=node.dns_zone_id,
+                dns_zone_id=node.dns_zone_id or None,
                 dns_inherit_settings=not dns_explicit,
                 dhcp_server_group_id=(
                     uuid.UUID(node.dhcp_server_group_id) if node.dhcp_server_group_id else None
@@ -718,23 +883,16 @@ async def apply_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> A
             dns_explicit = bool(node.dns_group_id or node.dns_zone_id)
             dhcp_explicit = bool(node.dhcp_server_group_id)
             node_kind = _subnet_kind(node_net)
-            # Validate the gateway is inside the subnet — create_subnet enforces
-            # this and plan-apply didn't, so a bad gateway could land unchecked
-            # (#505).
+            # Same rule validation applies (#505, #2984); a conflict here
+            # means validation was bypassed, so it stays a hard refusal.
             gateway = node.gateway or None
-            if gateway is not None:
-                try:
-                    gw = ipaddress.ip_address(gateway)
-                except ValueError as exc:
-                    raise HTTPException(
-                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                        detail=f"Invalid gateway {gateway!r} on {node.network}",
-                    ) from exc
-                if gw not in node_net:
-                    raise HTTPException(
-                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                        detail=f"Gateway {gateway} is not within subnet {node.network}",
-                    )
+            gw_problem = gateway_problem(
+                gateway, node_net, reject_reserved=has_boundary_rows(node_net, node_kind)
+            )
+            if gw_problem:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=gw_problem
+                )
             subnet = Subnet(
                 space_id=plan.space_id,
                 block_id=parent_block_id,
@@ -746,7 +904,7 @@ async def apply_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> A
                 utilization_percent=0.0,
                 kind=node_kind,
                 dns_group_ids=[node.dns_group_id] if node.dns_group_id else None,
-                dns_zone_id=node.dns_zone_id,
+                dns_zone_id=node.dns_zone_id or None,
                 dns_inherit_settings=not dns_explicit,
                 dhcp_server_group_id=(
                     uuid.UUID(node.dhcp_server_group_id) if node.dhcp_server_group_id else None
@@ -760,39 +918,15 @@ async def apply_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> A
             created_subnets.append(str(subnet.id))
             # Placeholder network/broadcast/gateway rows, mirroring create_subnet
             # (#505). Multicast leaves and v4 /31+/32 / v6 /127+/128 get none.
-            is_v6 = isinstance(node_net, ipaddress.IPv6Network)
             gw_row: IPAddress | None = None
-            if node_kind != "multicast" and node_net.prefixlen < (127 if is_v6 else 31):
-                db.add(
-                    IPAddress(
-                        subnet_id=subnet.id,
-                        address=str(node_net.network_address),
-                        status="network",
-                        description="Network address",
-                        created_by_user_id=current_user.id,
-                    )
-                )
-                if not is_v6:
-                    db.add(
-                        IPAddress(
-                            subnet_id=subnet.id,
-                            address=str(node_net.broadcast_address),
-                            status="broadcast",
-                            description="Broadcast address",
-                            created_by_user_id=current_user.id,
-                        )
-                    )
-                gw_addr = gateway or str(node_net.network_address + 1)
-                gw_row = IPAddress(
-                    subnet_id=subnet.id,
-                    address=gw_addr,
-                    status="reserved",
-                    description="Gateway",
-                    hostname="gateway",
+            if has_boundary_rows(node_net, node_kind):
+                _, gw_row = await create_placeholder_rows(
+                    db,
+                    subnet,
+                    node_net,
+                    gateway=gateway,
                     created_by_user_id=current_user.id,
                 )
-                db.add(gw_row)
-                subnet.gateway = gw_addr
                 await db.flush()
             # spatiumddi#1150 — the two DNS steps create_subnet runs, so a
             # planned subnet is in sync with DNS from apply rather than from
@@ -801,11 +935,31 @@ async def apply_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> A
             # PTR. Apply never ran either, so the reverse zone waited for the
             # first allocation's catch-up and the gateway's PTR was missing
             # from then on.
-            await ensure_reverse_zone_for_subnet(db, subnet, current_user)
+            await ensure_reverse_zones_for_subnet(db, subnet, current_user)
             if gw_row is not None:
                 await _sync_dns_record(db, gw_row, subnet, backfill_reverse_zone=False)
 
     await materialise(tree, None, is_root=True)
+
+    # Every created subnet holds placeholder rows and every created block
+    # rolls them up; the counters were seeded at 0 (#2412). A plan anchored to
+    # an existing block that creates no block of its own still changes that
+    # block's subnets, so the blocks the created subnets sit in are recounted
+    # too, chains included (#2981). Each block on the chains is counted once.
+    from app.api.v1.ipam.router import (  # noqa: PLC0415
+        _update_blocks_utilization,
+        _update_subnets_utilization,
+    )
+
+    subnet_ids = [uuid.UUID(sid) for sid in created_subnets]
+    await _update_subnets_utilization(db, subnet_ids)
+    await db.flush()
+    parent_ids = (
+        (await db.execute(select(Subnet.block_id).where(Subnet.id.in_(subnet_ids)))).scalars().all()
+        if subnet_ids
+        else []
+    )
+    await _update_blocks_utilization(db, [*(uuid.UUID(b) for b in created_blocks), *parent_ids])
 
     plan.applied_at = datetime.now(UTC)
     plan.applied_resource_ids = {

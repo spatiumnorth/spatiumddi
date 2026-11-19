@@ -27,6 +27,7 @@ from sqlalchemy import func, or_, select
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ownership._audit import write_audit
+from app.core.celery_dispatch import dispatch
 from app.core.permissions import require_resource_permission
 from app.models.settings import PlatformSettings
 from app.models.tls_cert import (
@@ -34,6 +35,7 @@ from app.models.tls_cert import (
     TLSCertProbe,
     TLSCertTarget,
 )
+from app.services.api_token_scopes import token_outbound
 from app.services.nettools.schemas import assert_target_allowed
 from app.services.tls_cert.probe import parse_chain_pem, probe_one
 
@@ -251,7 +253,7 @@ async def list_targets(
             )
         )
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
-    stmt = stmt.order_by(TLSCertTarget.host.asc()).limit(limit).offset(offset)
+    stmt = stmt.order_by(TLSCertTarget.host.asc(), TLSCertTarget.id).limit(limit).offset(offset)
     rows = (await db.execute(stmt)).scalars().all()
     return TLSCertTargetListResponse(
         items=[TLSCertTargetRead.model_validate(r) for r in rows],
@@ -294,7 +296,7 @@ async def create_target(body: TLSCertTargetCreate, db: DB, user: CurrentUser) ->
     try:
         from app.tasks.tls_certs import probe_one_target_by_id  # noqa: PLC0415
 
-        probe_one_target_by_id.delay(str(row.id))
+        await dispatch(probe_one_target_by_id, str(row.id))
     except Exception:  # noqa: BLE001
         pass
 
@@ -374,7 +376,13 @@ async def list_probes(
     base = select(TLSCertProbe).where(TLSCertProbe.target_id == target_id)
     total = await db.scalar(select(func.count()).select_from(base.subquery())) or 0
     rows = (
-        (await db.execute(base.order_by(TLSCertProbe.probed_at.desc()).limit(limit).offset(offset)))
+        (
+            await db.execute(
+                base.order_by(TLSCertProbe.probed_at.desc(), TLSCertProbe.id)
+                .limit(limit)
+                .offset(offset)
+            )
+        )
         .scalars()
         .all()
     )
@@ -484,6 +492,7 @@ async def get_chain(target_id: uuid.UUID, db: DB, _: CurrentUser) -> CertChainRe
 
 
 @router.get("/{target_id}/ct-log")
+@token_outbound
 async def ct_log(
     target_id: uuid.UUID,
     db: DB,

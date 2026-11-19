@@ -1,13 +1,16 @@
 import { Fragment, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { useModuleOn } from "@/hooks/useModuleOn";
+import { usePermissions } from "@/hooks/usePermissions";
+import { useSecretCloseGuard } from "@/hooks/useSecretCloseGuard";
+import { copyToClipboard } from "@/lib/clipboard";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Activity,
   AlertCircle,
   Ban,
   CheckCircle2,
-  DownloadCloud,
   FileText,
   HardDrive,
   KeyRound,
@@ -20,7 +23,6 @@ import {
   ShieldCheck,
   ShieldQuestion,
   Trash2,
-  Upload,
   XCircle,
 } from "lucide-react";
 
@@ -42,18 +44,23 @@ import {
   type StorageActionRequest,
   type StorageActionResult,
   type SupervisorCapabilities,
-  type AvailableUpgradeImage,
   type UpgradeImage,
   type SchemaRollbackCheck,
   formatApiError,
 } from "@/lib/api";
 import { schemaRollbackRefusal } from "@/lib/schema-rollback";
+import {
+  hostUpgradeActivity,
+  upgradeAlreadyStartedRefusal,
+} from "@/lib/upgrade-cancel";
 import { Modal } from "@/components/ui/modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { ReauthFields } from "@/components/ReauthFields";
 import { useSessionState } from "@/lib/useSessionState";
+import { safeLocalStorage } from "@/lib/safeStorage";
 import { cn } from "@/lib/utils";
+import { isHeartbeatStale, silenceLabel } from "@/lib/heartbeat";
 import { releaseVerdict, upgradeDirection } from "@/lib/versions";
 import {
   formatEta,
@@ -65,6 +72,7 @@ import {
 import { heldByEviction, hostnamesBeingEvicted } from "@/lib/cluster-eviction";
 import { fmtDiskBytes } from "./clusterShared";
 import { LLDPTab } from "./LLDPTab";
+import { VarDiskWarning } from "./VarDiskWarning";
 import { AptTab } from "./AptTab";
 import { NTPTab } from "./NTPTab";
 import { PairingTab } from "./PairingTab";
@@ -72,10 +80,13 @@ import { ResolverTab } from "./ResolverTab";
 import { SNMPTab } from "./SNMPTab";
 import { SSHTab } from "./SSHTab";
 import { SyslogTab } from "./SyslogTab";
+import { UpgradeDirectionNotice } from "./UpgradeDirectionNotice";
+import { UpgradeImagesTable } from "./UpgradeImagesTable";
 // #404 — these three moved out of the top-level tab bar into this sidebar.
 import { CertificatesTab } from "./CertificatesTab";
 import { ClusterUpgradeTab } from "./ClusterUpgradeTab";
 import { ReleasesTab } from "./ReleasesTab";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Appliance → Fleet tab (#170 Wave D1; supersedes Wave B3 "Approvals").
@@ -180,13 +191,17 @@ function capabilityChips(caps: SupervisorCapabilities): {
 function serviceChips(row: ApplianceRow): {
   key: string;
   label: string;
-  status: "ready" | "failed" | "pending" | "neutral";
+  status: "ready" | "failed" | "pending" | "neutral" | "stale";
 }[] {
   const roles = row.assigned_roles ?? [];
   if (roles.length === 0) return [];
   const lifecycle = row.role_switch_state;
-  const serviceStatus: "ready" | "failed" | "pending" =
-    lifecycle === "ready"
+  // #2259 — a silent supervisor's last report is history, not state:
+  // every chip (observer included) renders as "stale" instead.
+  const stale = row.state === "approved" && isHeartbeatStale(row.last_seen_at);
+  const serviceStatus: "ready" | "failed" | "pending" | "stale" = stale
+    ? "stale"
+    : lifecycle === "ready"
       ? "ready"
       : lifecycle === "failed"
         ? "failed"
@@ -194,7 +209,7 @@ function serviceChips(row: ApplianceRow): {
   const out: {
     key: string;
     label: string;
-    status: "ready" | "failed" | "pending" | "neutral";
+    status: "ready" | "failed" | "pending" | "neutral" | "stale";
   }[] = [];
   if (roles.includes("dns-bind9"))
     out.push({ key: "dns-bind9", label: "DNS · BIND9", status: serviceStatus });
@@ -219,14 +234,20 @@ function serviceChips(row: ApplianceRow): {
       status: serviceStatus,
     });
   if (roles.includes("observer"))
-    out.push({ key: "observer", label: "Observer", status: "neutral" });
+    out.push({
+      key: "observer",
+      label: "Observer",
+      status: stale ? "stale" : "neutral",
+    });
   return out;
 }
 
 const SERVICE_CHIP_STYLES: Record<
-  "ready" | "failed" | "pending" | "neutral",
+  "ready" | "failed" | "pending" | "neutral" | "stale",
   string
 > = {
+  stale:
+    "bg-muted text-muted-foreground border-dashed border-border opacity-70",
   ready:
     "bg-emerald-500/15 text-emerald-700 border-emerald-500/40 dark:text-emerald-300",
   failed: "bg-rose-500/15 text-rose-700 border-rose-500/40 dark:text-rose-300",
@@ -769,6 +790,13 @@ export function FleetTab({
     staleTime: 60_000,
   });
   const isSuperadmin = me?.is_superadmin ?? false;
+  // #3067 — the certificate store is the one Fleet section a non-superadmin
+  // can use: its routes take `certificate_store` (or the `appliance` read
+  // they took before), so a DNS Editor managing DoT / DoH / DoQ certs lands
+  // here from the DNS options card's link.
+  const { can } = usePermissions();
+  const canReadCertStore =
+    can("read", "certificate_store") || can("read", "appliance");
 
   const { data, isLoading, isFetching, refetch, error } = useQuery({
     queryKey: ["appliance", "fleet"],
@@ -863,7 +891,7 @@ export function FleetTab({
   // session) so it stays dismissed across browser restarts; the
   // checkbox gate makes dismissal deliberate rather than a stray click.
   const [vipAdvisoryDismissed, setVipAdvisoryDismissed] = useState<boolean>(
-    () => localStorage.getItem(VIP_ADVISORY_DISMISS_KEY) === "1",
+    () => safeLocalStorage.getItem(VIP_ADVISORY_DISMISS_KEY) === "1",
   );
   const [vipDismissAck, setVipDismissAck] = useState(false);
 
@@ -941,8 +969,13 @@ export function FleetTab({
         response?: { status?: number; data?: { detail?: string } };
       };
       if (e?.response?.status === 403) {
+        // The response alone, so a 403 without a detail still says why
+        // instead of axios's "Request failed with status code 403".
         setDeletePwError(
-          e.response.data?.detail || "Current password incorrect.",
+          formatApiError(
+            { response: e.response },
+            "Current password incorrect.",
+          ),
         );
       } else {
         setDeletePwError("Delete failed. Try again.");
@@ -991,7 +1024,10 @@ export function FleetTab({
       };
       if (e?.response?.status === 403) {
         setPermanentDeletePwError(
-          e.response.data?.detail || "Current password incorrect.",
+          formatApiError(
+            { response: e.response },
+            "Current password incorrect.",
+          ),
         );
       } else {
         setPermanentDeletePwError("Permanent delete failed. Try again.");
@@ -1041,7 +1077,7 @@ export function FleetTab({
 
   if (!isSuperadmin) {
     return (
-      <div className="mx-auto max-w-4xl">
+      <div className="mx-auto max-w-4xl space-y-6">
         <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-4 text-sm">
           <div className="flex items-start gap-2">
             <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0 text-amber-700 dark:text-amber-400" />
@@ -1058,6 +1094,7 @@ export function FleetTab({
             </div>
           </div>
         </div>
+        {canReadCertStore && <CertificatesTab />}
       </div>
     );
   }
@@ -1120,17 +1157,16 @@ export function FleetTab({
           summary: "GitHub import or air-gap .raw.xz upload.",
         },
         // #404 — Web UI Certificate moved here from a top-level tab.
-        // Appliance-host only (a docker/k8s control plane has no local cert
-        // to manage).
-        ...(isApplianceHost
-          ? [
-              {
-                key: "web-ui-certificate" as const,
-                label: "Web UI Certificate",
-                summary: "TLS upload / CSR / Let's Encrypt.",
-              },
-            ]
-          : []),
+        // #3061 — the certificate store is on every install type (DoT / DoH
+        // pick from it); only the Web UI activation is appliance-specific, so
+        // off-appliance the entry is the store-only view.
+        {
+          key: "web-ui-certificate" as const,
+          label: isApplianceHost ? "Web UI Certificate" : "TLS certificates",
+          summary: isApplianceHost
+            ? "TLS upload / CSR / Let's Encrypt."
+            : "Certificate store: upload / CSR / Let's Encrypt.",
+        },
       ],
     },
     {
@@ -1225,12 +1261,14 @@ export function FleetTab({
       <main className="flex-1 overflow-y-auto">
         {/* The appliances list is a wide multi-column table — let it use
             the full pane width (like the IPAM table) instead of the
-            max-w-5xl cap the narrower config forms (pairing / upgrade-images
-            / NTP / SNMP) read better at. */}
+            max-w-5xl cap the narrower config forms (pairing / NTP / SNMP)
+            read better at. Upgrade images is a wide table too (#2410). */}
         <div
           className={cn(
             "mx-auto p-6",
-            view === "appliances" ? "max-w-none" : "max-w-5xl",
+            view === "appliances" || view === "upgrade-images"
+              ? "max-w-none"
+              : "max-w-5xl",
           )}
         >
           {view === "pairing" && (
@@ -1265,15 +1303,7 @@ export function FleetTab({
                   Refresh
                 </button>
               </div>
-              <p className="mb-4 text-xs text-muted-foreground">
-                Stage an appliance OS upgrade image. Connected installs can
-                import directly from a GitHub release; air-gapped installs
-                upload the <code>.raw.xz</code> out-of-band. Either way the
-                supervisor downloads through the control plane via an
-                authenticated internal URL once an OS upgrade points at the
-                stored row.
-              </p>
-              <UpgradeImageManager />
+              <UpgradeImagesTable />
             </div>
           )}
 
@@ -1287,9 +1317,7 @@ export function FleetTab({
           )}
 
           {/* #404 — Web UI Certificate, moved from a top-level tab. */}
-          {view === "web-ui-certificate" && isApplianceHost && (
-            <CertificatesTab />
-          )}
+          {view === "web-ui-certificate" && <CertificatesTab />}
 
           {view === "lldp" && (
             <div>
@@ -1505,7 +1533,10 @@ export function FleetTab({
                           type="button"
                           disabled={!vipDismissAck}
                           onClick={() => {
-                            localStorage.setItem(VIP_ADVISORY_DISMISS_KEY, "1");
+                            safeLocalStorage.setItem(
+                              VIP_ADVISORY_DISMISS_KEY,
+                              "1",
+                            );
                             setVipAdvisoryDismissed(true);
                           }}
                           className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
@@ -1892,40 +1923,72 @@ export function FleetTab({
 
       {/* #272 Phase 9 — show the minted replacement pairing code once. */}
       {replaceResult && (
-        <Modal
-          title="Replacement pairing code"
+        <ReplacementCodeModal
+          result={replaceResult}
           onClose={() => setReplaceResult(null)}
-        >
-          <div className="space-y-3 text-sm">
-            <p>
-              <strong>{replaceResult.evicted.hostname}</strong> has been
-              evicted. Install a fresh appliance (Appliance role) and pair it
-              with this single-use code, then approve + promote it to restore
-              the cluster:
-            </p>
-            <div className="flex items-center gap-2">
-              <code className="rounded-md bg-muted px-3 py-2 font-mono text-lg tracking-widest">
-                {replaceResult.pairing_code}
-              </code>
-              <button
-                type="button"
-                onClick={() =>
-                  navigator.clipboard?.writeText(replaceResult.pairing_code)
-                }
-                className="rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-muted"
-              >
-                Copy
-              </button>
-            </div>
-            <p className="text-xs text-muted-foreground">
-              Expires{" "}
-              {new Date(replaceResult.pairing_expires_at).toLocaleString()}.
-              Shown once — regenerate from the Pairing tab if you lose it.
-            </p>
-          </div>
-        </Modal>
+        />
       )}
     </div>
+  );
+}
+
+// #272 Phase 9 — the replacement pairing code is single-use and shown once,
+// so closing before copying it asks first (#3222).
+export function ReplacementCodeModal({
+  result,
+  onClose,
+}: {
+  result: ControlPlaneReplaceResult;
+  onClose: () => void;
+}) {
+  const codes = useMemo(() => [result.pairing_code], [result.pairing_code]);
+  const guard = useSecretCloseGuard({
+    onClose,
+    secrets: codes,
+    noun: "pairing code",
+  });
+  return (
+    <>
+      <Modal title="Replacement pairing code" onClose={guard.requestClose}>
+        <div className="space-y-3 text-sm" {...guard.copyProps}>
+          <p>
+            <strong>{result.evicted.hostname}</strong> has been evicted. Install
+            a fresh appliance (Appliance role) and pair it with this single-use
+            code, then approve + promote it to restore the cluster:
+          </p>
+          <div className="flex items-center gap-2">
+            <code className="rounded-md bg-muted px-3 py-2 font-mono text-lg tracking-widest">
+              {result.pairing_code}
+            </code>
+            <button
+              type="button"
+              onClick={async () => {
+                if (await copyToClipboard(result.pairing_code)) {
+                  guard.markTaken();
+                }
+              }}
+              className="rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-muted"
+            >
+              Copy
+            </button>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Expires {new Date(result.pairing_expires_at).toLocaleString()}.
+            Shown once — regenerate from the Pairing tab if you lose it.
+          </p>
+          <div className="flex justify-end">
+            <button
+              type="button"
+              onClick={guard.requestClose}
+              className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+            >
+              Done
+            </button>
+          </div>
+        </div>
+      </Modal>
+      {guard.confirm}
+    </>
   );
 }
 
@@ -1948,13 +2011,15 @@ function ServiceChipList({ row }: { row: ApplianceRow }) {
             SERVICE_CHIP_STYLES[s.status],
           )}
           title={
-            s.status === "ready"
-              ? `Assigned + healthy (supervisor reports role_switch_state=ready)`
-              : s.status === "failed"
-                ? `Assigned, supervisor lifecycle apply failed — inspect drilldown`
-                : s.status === "pending"
-                  ? `Assigned, supervisor hasn't reported ready yet`
-                  : `Assigned (no service container — supervisor is the runtime)`
+            s.status === "stale"
+              ? `Last reported state — no heartbeat for ${silenceLabel(row.last_seen_at!)}, so this may no longer be true`
+              : s.status === "ready"
+                ? `Assigned + healthy (supervisor reports role_switch_state=ready)`
+                : s.status === "failed"
+                  ? `Assigned, supervisor lifecycle apply failed — inspect drilldown`
+                  : s.status === "pending"
+                    ? `Assigned, supervisor hasn't reported ready yet`
+                    : `Assigned (no service container — supervisor is the runtime)`
           }
         >
           {s.status === "ready" && <CheckCircle2 className="h-2.5 w-2.5" />}
@@ -2236,7 +2301,7 @@ function ApplianceTableSection({
   );
 }
 
-function ApplianceTableRow({
+export function ApplianceTableRow({
   row,
   highlight,
   busy,
@@ -2282,7 +2347,20 @@ function ApplianceTableRow({
     >
       <td className="px-4 py-3">
         <div className="flex items-center gap-2">
-          <span className="font-medium">{row.hostname}</span>
+          {/* The keyboard path to the row's detail dialog, which a
+              click on the row opens (#3158, as #2724 did for the
+              server and address rows). */}
+          <button
+            type="button"
+            title="View details"
+            onClick={(e) => {
+              e.stopPropagation();
+              onOpen();
+            }}
+            className="rounded-sm font-medium hover:underline focus-visible:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            {row.hostname}
+          </button>
           {/* #272 — installer-role chip. Two variants: control-plane
               (Control plane table) + appliance (Service agents).
               Legacy strings still render with a sensible label. */}
@@ -2368,6 +2446,15 @@ function ApplianceTableRow({
       </td>
       <td className="px-4 py-3 text-xs text-muted-foreground">
         {relativeTime(row.last_seen_at)}
+        {row.state === "approved" && isHeartbeatStale(row.last_seen_at) && (
+          <div
+            className="mt-0.5 inline-flex items-center gap-1 whitespace-nowrap rounded-full border border-amber-500/40 bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-300"
+            title="The supervisor has stopped heartbeating; role and service state shown for this node is its last report."
+          >
+            <AlertCircle className="h-2.5 w-2.5" />
+            no heartbeat for {silenceLabel(row.last_seen_at!)}
+          </div>
+        )}
       </td>
       <td className="px-4 py-3 text-right" onClick={(e) => e.stopPropagation()}>
         <div className="inline-flex items-center gap-1">
@@ -2687,6 +2774,17 @@ function ApplianceDrilldownModal({
             <ApplianceRoleHealthSection row={row} />
           )}
 
+        {row.state === "approved" && row.var_disk_finding && (
+          <div className="border-t pt-4">
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              Disk space
+            </h3>
+            <div className="mt-2">
+              <VarDiskWarning finding={row.var_disk_finding} />
+            </div>
+          </div>
+        )}
+
         {row.state === "approved" && <ApplianceStorageSection row={row} />}
 
         {row.state === "approved" && <ApplianceRemovableSection row={row} />}
@@ -2975,7 +3073,7 @@ function formatRelativeSince(iso: string): string {
 }
 
 const WATCHDOG_STATUS_STYLES: Record<
-  "healthy" | "missing" | "unhealthy" | "starting",
+  "healthy" | "missing" | "unhealthy" | "starting" | "held",
   { className: string; label: string; Icon: typeof CheckCircle2 }
 > = {
   healthy: {
@@ -3002,9 +3100,17 @@ const WATCHDOG_STATUS_STYLES: Record<
     label: "starting",
     Icon: Loader2,
   },
+  // #2808 — down on purpose: the node is revoked or not yet approved, so the
+  // supervisor keeps its role services stopped and does not heal them.
+  held: {
+    className: "bg-muted text-muted-foreground border-border",
+    label: "held",
+    Icon: Ban,
+  },
 };
 
 function ApplianceRoleHealthSection({ row }: { row: ApplianceRow }) {
+  const stale = isHeartbeatStale(row.last_seen_at);
   const entries = Object.entries(row.role_health ?? {});
   // Show services in a stable order — alphabetical by service name.
   entries.sort(([a], [b]) => a.localeCompare(b));
@@ -3014,12 +3120,28 @@ function ApplianceRoleHealthSection({ row }: { row: ApplianceRow }) {
         Service health
       </h3>
       <p className="mt-1 text-xs text-muted-foreground">
-        Supervisor watchdog snapshot — refreshed every 5 min. ``missing`` /
-        ``unhealthy`` for more than one cadence means the auto-heal kicker
-        didn&apos;t bring the container back; SSH in and check{" "}
-        <code>docker logs &lt;service&gt;</code>.
+        Supervisor watchdog snapshot — refreshed every 5 min.{" "}
+        <code className="font-mono">missing</code> /
+        <code className="font-mono">unhealthy</code> for more than one cadence
+        means the auto-heal kicker didn&apos;t bring the container back; SSH in
+        and check <code>docker logs &lt;service&gt;</code>.
       </p>
-      <div className="mt-2 overflow-hidden rounded-md border">
+      {stale && (
+        <div
+          role="alert"
+          className="mt-2 flex items-center gap-1.5 rounded-md border border-amber-500/40 bg-amber-500/15 px-3 py-1.5 text-xs text-amber-700 dark:text-amber-300"
+        >
+          <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+          No heartbeat for {silenceLabel(row.last_seen_at!)} — this is the last
+          snapshot the supervisor reported, not current state.
+        </div>
+      )}
+      <div
+        className={cn(
+          "mt-2 overflow-hidden rounded-md border",
+          stale && "opacity-60 grayscale",
+        )}
+      >
         <table className="w-full text-xs">
           <thead className="bg-muted/40 text-[10px] uppercase tracking-wide text-muted-foreground">
             <tr>
@@ -3133,8 +3255,7 @@ function StorageActionModal({
       // The FastAPI detail, not axios's "Request failed with status code
       // 422" — which is what `err.message` always is and never what the
       // operator needs (the #1009 lesson).
-      const ax = e as { response?: { data?: { detail?: string } } };
-      setError(ax.response?.data?.detail ?? "The action could not be run.");
+      setError(formatApiError(e, "The action could not be run."));
     },
   });
 
@@ -3341,9 +3462,7 @@ function MountDiskModal({
       // Matched on the FastAPI detail, never on err.message — on an
       // AxiosError that is always "Request failed with status code 422"
       // and never the reason (#1009).
-      const detail = (err as { response?: { data?: { detail?: string } } })
-        ?.response?.data?.detail;
-      setError(detail ?? "Could not mount the disk.");
+      setError(formatApiError(err, "Could not mount the disk."));
     },
   });
 
@@ -3402,7 +3521,7 @@ function MountDiskModal({
             This appliance already has a mount named “{name}”.
           </p>
         )}
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
         <div className="flex justify-end gap-2 pt-1">
           <HeaderButton variant="secondary" onClick={onClose}>
             Cancel
@@ -3453,10 +3572,11 @@ function ApplianceRemovableSection({ row }: { row: ApplianceRow }) {
     // never on err.message, which on an AxiosError is always "Request
     // failed with status code N" (#1009).
     onError: (err: unknown) => {
-      const detail = (err as { response?: { data?: { detail?: string } } })
-        ?.response?.data?.detail;
       setEjectError(
-        detail ?? "Could not eject the disk. It may still be mounted.",
+        formatApiError(
+          err,
+          "Could not eject the disk. It may still be mounted.",
+        ),
       );
     },
   });
@@ -3938,10 +4058,47 @@ const HOSTCFG_PLANE_LABELS: Record<string, string> = {
   console_mode: "Console mode",
 };
 
-function ApplianceHostConfigHealthSection({ row }: { row: ApplianceRow }) {
+// Each plane's host runner logs to its own file under
+// /var/log/spatiumddi/ (#3814); the runner script names are not all
+// ``<plane>-reload``; the firewall runner has no log file, only the journal (resolver → resolved-reload, console_mode →
+// verbose-boot-reload, timezone → tz-reload).
+const HOSTCFG_PLANE_LOGS: Record<string, string> = {
+  ntp: "chrony-reload.log",
+  snmp: "snmp-reload.log",
+  lldp: "lldp-reload.log",
+  syslog: "syslog-reload.log",
+  ssh: "ssh-reload.log",
+  resolver: "resolved-reload.log",
+  timezone: "tz-reload.log",
+  removable: "removable-reload.log",
+  apt: "apt-reload.log",
+  console_mode: "verbose-boot-reload.log",
+};
+
+function hostConfigLogHint(planes: string[]): string {
+  const hints = planes.map((p) =>
+    p === "firewall"
+      ? "journalctl -u spatium-firewall-reload"
+      : HOSTCFG_PLANE_LOGS[p]
+        ? `/var/log/spatiumddi/${HOSTCFG_PLANE_LOGS[p]}`
+        : "",
+  );
+  const uniq = [...new Set(hints.filter(Boolean))];
+  return uniq.length ? uniq.join(", ") : "/var/log/spatiumddi/";
+}
+
+export function ApplianceHostConfigHealthSection({
+  row,
+}: {
+  row: ApplianceRow;
+}) {
   const entries = Object.entries(row.host_config_health ?? {});
   entries.sort(([a], [b]) => a.localeCompare(b));
   const anyFailing = entries.some(([, h]) => h.state === "failing");
+  const anyRetrying = entries.some(([, h]) => h.state === "retrying");
+  const failingPlanes = entries
+    .filter(([, h]) => h.state === "failing")
+    .map(([p]) => p);
   return (
     <div className="border-t pt-4">
       <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
@@ -3956,8 +4113,12 @@ function ApplianceHostConfigHealthSection({ row }: { row: ApplianceRow }) {
         )}
       >
         {anyFailing
-          ? "A host-config change keeps failing to apply on this appliance — the supervisor is retrying with backoff. Check the host runner log (e.g. /var/log/spatiumddi/chrony-reload.log) for the cause."
-          : "A host-config change is still being applied (retrying)."}
+          ? "A host-config change keeps failing to apply on this appliance — the supervisor is retrying with backoff. Check the host runner log (" +
+            hostConfigLogHint(failingPlanes) +
+            ") for the cause."
+          : anyRetrying
+            ? "A host-config change is still being applied (retrying)."
+            : "A host-config change is being applied."}
       </p>
       <div className="mt-2 overflow-hidden rounded-md border">
         <table className="w-full text-xs">
@@ -3984,7 +4145,9 @@ function ApplianceHostConfigHealthSection({ row }: { row: ApplianceRow }) {
                         "inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] font-medium",
                         failing
                           ? "bg-rose-500/15 text-rose-700 border-rose-500/40 dark:text-rose-300"
-                          : "bg-amber-500/15 text-amber-700 border-amber-500/40 dark:text-amber-300",
+                          : h.state === "applying"
+                            ? "bg-muted text-muted-foreground"
+                            : "bg-amber-500/15 text-amber-700 border-amber-500/40 dark:text-amber-300",
                       )}
                     >
                       <Icon
@@ -4290,7 +4453,7 @@ function ApplianceClusterHealthSection({ row }: { row: ApplianceRow }) {
 // picks a pod from the dropdown; backend fetches the last N lines
 // via the proxy and we render in a textarea. Refresh button to
 // re-fetch.
-function PodLogsModal({
+export function PodLogsModal({
   appliance,
   onClose,
 }: {
@@ -4317,16 +4480,14 @@ function PodLogsModal({
   const selectedPodInfo = podsQuery.data?.pods.find(
     (p) => p.name === selectedPod,
   );
-  // Reset container picker when the pod changes — first container
-  // is the natural default.
-  useEffect(() => {
-    if (
-      selectedPodInfo &&
-      !selectedPodInfo.containers.includes(selectedContainer)
-    ) {
-      setSelectedContainer(selectedPodInfo.containers[0] ?? "");
-    }
-  }, [selectedPodInfo, selectedContainer]);
+  // The container is DERIVED from the pod, never stored-then-reset: an
+  // effect that resets it runs after the render that already built the
+  // logs query from the new pod and the previous pod's container, and
+  // kubeapi answers that mismatch with a 400 (#3628).
+  const effectiveContainer =
+    selectedPodInfo && selectedPodInfo.containers.includes(selectedContainer)
+      ? selectedContainer
+      : (selectedPodInfo?.containers[0] ?? "");
 
   const logsQuery = useQuery({
     queryKey: [
@@ -4335,12 +4496,12 @@ function PodLogsModal({
       appliance.id,
       "k8s-logs",
       selectedPod,
-      selectedContainer,
+      effectiveContainer,
       tailLines,
     ],
     queryFn: () =>
       applianceApprovalApi.k8sGetPodLogs(appliance.id, selectedPod, {
-        container: selectedContainer || undefined,
+        container: effectiveContainer || undefined,
         tail_lines: tailLines,
       }),
     enabled: !!selectedPod,
@@ -4382,7 +4543,7 @@ function PodLogsModal({
             <label className="text-xs">
               Container
               <select
-                value={selectedContainer}
+                value={effectiveContainer}
                 onChange={(e) => setSelectedContainer(e.target.value)}
                 className="mt-1 w-full rounded-md border bg-background px-2 py-1 text-xs"
               >
@@ -4819,7 +4980,7 @@ function RevealKubeconfigModal({
   );
 }
 
-function ApplianceRoleAssignmentSection({
+export function ApplianceRoleAssignmentSection({
   row,
   onSaved,
 }: {
@@ -4874,15 +5035,24 @@ function ApplianceRoleAssignmentSection({
   // create/edit (["dns-groups"] / ["dhcp-groups"]) — the old tuple keys
   // ["dns","groups"] / ["dhcp","groups"] never matched those invalidations,
   // so a freshly-created group didn't appear here until a full reload (#367).
+  // #2135 — the DNS roles and their group picker exist only while core.dns
+  // is on (the server refuses a new DNS role otherwise, and the group read
+  // 404s).
+  const dnsOn = useModuleOn("core.dns");
   const dnsGroupsQuery = useQuery({
     queryKey: ["dns-groups"],
     queryFn: dnsApi.listGroups,
     staleTime: 60_000,
+    enabled: dnsOn,
   });
+  // #2130 — the DHCP role and its group picker exist only while core.dhcp
+  // is on (the server refuses the role otherwise, and the group read 404s).
+  const dhcpOn = useModuleOn("core.dhcp");
   const dhcpGroupsQuery = useQuery({
     queryKey: ["dhcp-groups"],
     queryFn: dhcpApi.listGroups,
     staleTime: 60_000,
+    enabled: dhcpOn,
   });
 
   const save = useMutation({
@@ -4970,7 +5140,20 @@ function ApplianceRoleAssignmentSection({
         containers.
       </p>
       <div className="mt-2 flex flex-wrap gap-2">
-        {ROLE_OPTIONS.map((opt) => {
+        {ROLE_OPTIONS.filter(
+          // A DHCP role already on the row stays visible so it can be
+          // kept or un-assigned; it is just never offered as a new choice.
+          // Keyed on the SAVED row, not the form, so unticking it by mistake
+          // does not make it vanish before Save.
+          (opt) =>
+            (opt.value !== "dhcp" ||
+              dhcpOn ||
+              (row.assigned_roles ?? []).includes("dhcp")) &&
+            // The same for the DNS engines (#2135).
+            (!DNS_ROLES.has(opt.value) ||
+              dnsOn ||
+              (row.assigned_roles ?? []).includes(opt.value)),
+        ).map((opt) => {
           const cap = opt.capKey
             ? (caps[opt.capKey as keyof SupervisorCapabilities] as
                 | boolean
@@ -5003,7 +5186,14 @@ function ApplianceRoleAssignmentSection({
         })}
       </div>
 
-      {dnsRoleActive && (
+      {dnsRoleActive && !dnsOn && (
+        <p className="mt-3 text-xs text-amber-600">
+          DNS is switched off (Features &amp; Integrations). This appliance
+          keeps the DNS role it already holds, and its DNS group can be changed
+          once DNS is back on; untick the role to remove it.
+        </p>
+      )}
+      {dnsRoleActive && dnsOn && (
         <div className="mt-3">
           <label className="text-xs text-muted-foreground">DNS group</label>
           <select
@@ -5020,7 +5210,14 @@ function ApplianceRoleAssignmentSection({
           </select>
         </div>
       )}
-      {dhcpRoleActive && (
+      {dhcpRoleActive && !dhcpOn && (
+        <p className="mt-3 text-xs text-amber-600">
+          DHCP is switched off (Features &amp; Integrations). This appliance
+          keeps the DHCP role it already holds, and its DHCP group can be
+          changed once DHCP is back on; untick the role to remove it.
+        </p>
+      )}
+      {dhcpRoleActive && dhcpOn && (
         <div className="mt-3">
           <label className="text-xs text-muted-foreground">DHCP group</label>
           <select
@@ -5052,8 +5249,9 @@ function ApplianceRoleAssignmentSection({
       <FirewallRefusalBanner row={row} />
 
       {/* #170 Wave D follow-up — outcome of the supervisor's last
-          docker-compose apply. Red banner with stderr-first-line on
-          failure. Green-tinted chip on ready. */}
+          role apply (since #183 Phase 7, the role HelmChart written
+          through the node's kube API). Red banner with the supervisor's
+          reason on failure (#3295). Green-tinted chip on ready. */}
       <RoleSwitchStateBanner row={row} />
 
       {/* #170 Wave C3 — firewall preview + operator-override textarea.
@@ -5480,6 +5678,37 @@ function UpgradeStatusPanel({
   }
 
   const rebootPending = progress?.step === "reboot-pending" || state === "done";
+  // #2021 — the host does not stop a running apply and a clear does not
+  // disarm a staged slot, so once the runner has claimed the trigger there
+  // is nothing for Cancel to do; offering it reported a cancel that never
+  // happened.
+  const activity = hostUpgradeActivity(row);
+  const started = activity !== null;
+  // A Cancel's 200 is provisional: scheduling wakes the host, which has
+  // usually fired the trigger before the cancel lands. Until the host
+  // answers, say that rather than show the upgrade as gone.
+  if (!target && row.clear_upgrade_requested && !started) {
+    return (
+      <div className="mt-3 rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-xs">
+        <div className="flex items-center gap-2">
+          <Loader2 className="h-3.5 w-3.5 animate-spin text-amber-600 dark:text-amber-400" />
+          <span className="font-medium">
+            Waiting for the host to confirm the clear
+          </span>
+        </div>
+        <p className="mt-1 text-muted-foreground">
+          The host&rsquo;s next heartbeat (a few seconds) confirms it. A cancel
+          takes effect only if it reached the host before the slot apply
+          started; if the host had already started, the running upgrade shows
+          here instead of a cancelled one.
+        </p>
+      </div>
+    );
+  }
+  // Running or staged with nothing scheduled: a cancel that lost the race
+  // (recorded as appliance.upgrade_cancel_lost), or an apply started on the
+  // host itself. Shown, never hidden, because the node is still upgrading.
+  const unscheduled = !target && (started || state === "in-flight");
   // Where are we? -1 = desired set but no progress reported yet (the
   // supervisor hasn't fired the trigger). Otherwise the index of the
   // current phase in UPGRADE_STEPS.
@@ -5528,6 +5757,21 @@ function UpgradeStatusPanel({
           </code>
         )}
       </div>
+
+      {unscheduled && (
+        <p className="mt-2 flex items-start gap-1.5 rounded border border-amber-500/40 bg-amber-500/10 p-2 text-[11px] text-amber-800 dark:text-amber-200">
+          <AlertCircle className="mt-0.5 h-3 w-3 shrink-0" />
+          <span>
+            No upgrade is scheduled for this node, but the host reports one{" "}
+            {rebootPending ? "staged" : "in progress"}: most likely a cancel
+            that reached the host after it had started the apply, which the host
+            never stops.{" "}
+            {rebootPending
+              ? "The new slot is armed and boots on the next reboot."
+              : "It will finish (or fail) on its own, and a successful apply arms the new slot for the next reboot."}
+          </span>
+        </p>
+      )}
 
       {stepIndex === -1 &&
         (predatesProgress ? (
@@ -5629,7 +5873,14 @@ function UpgradeStatusPanel({
             <Power className="h-3 w-3" /> Reboot to boot new slot
           </button>
         )}
-        {target && (
+        {target && started && (
+          <p className="text-[11px] text-muted-foreground">
+            {activity === "staged"
+              ? "The new slot is already written and armed for the next boot, so this upgrade can no longer be cancelled — clearing it would not disarm the slot."
+              : "The host has already started this upgrade, so it can no longer be cancelled — the host never stops a running slot apply. It will finish (or fail) on its own."}
+          </p>
+        )}
+        {target && !started && (
           <button
             type="button"
             onClick={onCancel}
@@ -5676,10 +5927,15 @@ function ApplianceOsUpgradeSection({
   // #386 Part C — show the full status panel whenever there's upgrade
   // activity: a pending/in-flight desired version, or a terminal
   // in-flight/failed state the supervisor is still reporting.
+  // #2021 — also while a cancel awaits the host's answer, and whenever the
+  // host reports a staged slot: a cancel that lost the race leaves one with
+  // nothing scheduled, and hiding it would read as cancelled.
   const showUpgradeStatus =
     upgradeInFlight ||
     row.last_upgrade_state === "in-flight" ||
-    row.last_upgrade_state === "failed";
+    row.last_upgrade_state === "failed" ||
+    !!row.clear_upgrade_requested ||
+    hostUpgradeActivity(row) !== null;
 
   // Staged upgrade images — fetched only when the operator picks the
   // ``uploaded`` source, so non-air-gapped flows skip the round trip.
@@ -5751,8 +6007,13 @@ function ApplianceOsUpgradeSection({
   const direction = upgradeDirection(row.installed_appliance_version, tag);
   const clearUpgrade = useMutation({
     mutationFn: () => applianceApprovalApi.clearUpgrade(row.id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["appliance", "fleet"] }),
+    // #2021 — a 409 means the host started first: refetch so the panel
+    // shows the real state instead of a cancel that did not happen.
+    onSettled: () => qc.invalidateQueries({ queryKey: ["appliance", "fleet"] }),
   });
+  const clearRefusal = clearUpgrade.error
+    ? upgradeAlreadyStartedRefusal(clearUpgrade.error)
+    : null;
   type SlotVars = { slot: "slot_a" | "slot_b"; acknowledge: boolean };
   const setNextBoot = useMutation({
     mutationFn: ({ slot, acknowledge }: SlotVars) =>
@@ -5857,6 +6118,11 @@ function ApplianceOsUpgradeSection({
             />
           ))}
         </div>
+      )}
+      {clearRefusal && (
+        <p className="mt-1 text-xs text-amber-700 dark:text-amber-300">
+          {clearRefusal}
+        </p>
       )}
       {slotError && (
         <p className="mt-1 text-xs text-rose-700 dark:text-rose-300">
@@ -5972,30 +6238,18 @@ function ApplianceOsUpgradeSection({
               />
             </div>
           )}
-          {(direction === "backward" || direction === "same") && (
-            <p className="rounded-md border border-amber-500/40 bg-amber-500/5 px-2 py-1 text-[11px] text-amber-800 dark:text-amber-300">
-              {direction === "backward" ? (
-                <>
-                  <strong>{tag.trim()}</strong> is older than the installed{" "}
-                  <strong>{row.installed_appliance_version}</strong>: this is a
-                  rollback, not an upgrade. The older release boots against a
-                  database the newer one may already have migrated.
-                </>
-              ) : (
-                <>
-                  This node already runs <strong>{tag.trim()}</strong>. It will
-                  re-write the inactive slot with the same release and reboot
-                  into it.
-                </>
-              )}
-            </p>
-          )}
+          <UpgradeDirectionNotice
+            direction={direction}
+            tag={tag}
+            installed={row.installed_appliance_version}
+          />
           <div className="flex items-center gap-2">
             <button
               type="button"
               onClick={() => scheduleUpgrade.mutate(false)}
               disabled={
                 !tag.trim() ||
+                direction === "same" ||
                 scheduleUpgrade.isPending ||
                 (sourceKind === "url" && !imageUrl.trim()) ||
                 (sourceKind === "uploaded" && !slotImageId)
@@ -6022,8 +6276,10 @@ function ApplianceOsUpgradeSection({
             Stamps <code>desired_appliance_version</code> on the appliance row.
             The supervisor reads it on its next heartbeat + writes the
             slot-upgrade trigger; the host runner dd&apos;s the image to the
-            inactive slot + reboots into it (auto-revert if{" "}
-            <code>/health/live</code> fails).
+            inactive slot and stops there. It does not reboot: use{" "}
+            <strong>Reboot to boot new slot</strong> when you are ready. The new
+            slot boots on trial and is kept only once it comes up healthy;
+            otherwise the next reboot returns to the old one.
           </p>
         </div>
       )}
@@ -6114,410 +6370,6 @@ function ApplianceOsUpgradeSection({
           }}
           onClose={() => setSchemaRefusal(null)}
           requireCheckboxLabel="I will restore a pre-upgrade copy of the database"
-        />
-      )}
-    </div>
-  );
-}
-
-// #1026 — a release that publishes an image for both architectures is
-// TWO importable rows sharing one tag, so the picker's value has to
-// carry the architecture as well. Keyed on both rather than on an array
-// index, which would silently re-point at a different release the
-// moment the list refreshed underneath the operator.
-function availableKey(r: AvailableUpgradeImage): string {
-  return `${r.tag}\u0000${r.architecture}`;
-}
-
-function splitAvailableKey(key: string): [string, string | undefined] {
-  const [tag, arch] = key.split("\u0000");
-  return [tag, arch || undefined];
-}
-
-// ── UpgradeImageManager (#170 follow-up; GitHub import + air-gap
-// upload — #199) ──────────────────────────────────────────────────
-
-type UpgradeSourceMode = "github" | "upload";
-
-function UpgradeImageManager() {
-  const qc = useQueryClient();
-  const [file, setFile] = useState<File | null>(null);
-  const [sha256, setSha256] = useState("");
-  const [applianceVersion, setApplianceVersion] = useState("");
-  // #1026 — declared, like the version beside it. Empty means UNKNOWN
-  // and is a legitimate answer: the control-plane gate then does not
-  // block, and ``spatium-upgrade-slot`` still re-checks the real
-  // decompressed image against the node's own uname before it writes.
-  const [architecture, setArchitecture] = useState("");
-  const [notes, setNotes] = useState("");
-  const [progress, setProgress] = useState<{
-    loaded: number;
-    total: number;
-  } | null>(null);
-  // GitHub-import picker state.
-  const [selectedTag, setSelectedTag] = useState("");
-  // ``null`` = auto-detect once the ``available`` query resolves:
-  // GitHub if reachable + has matching releases, else air-gap upload.
-  const [mode, setMode] = useState<UpgradeSourceMode | null>(null);
-  // Upgrade images are heavy (typically ~700 MiB raw.xz) and a misclick
-  // wipes the only on-server copy of an air-gap-cached release — gate
-  // the delete behind a typed-confirm modal.
-  const [deleteTarget, setDeleteTarget] = useState<UpgradeImage | null>(null);
-
-  const imagesQuery = useQuery({
-    queryKey: ["appliance", "upgrade-images"],
-    queryFn: applianceUpgradeImagesApi.list,
-    staleTime: 30_000,
-  });
-
-  // Connected-install picker source. Empty / unreachable ⇒ the UI
-  // auto-defaults to the air-gap upload tab.
-  const availableQuery = useQuery({
-    queryKey: ["appliance", "upgrade-images", "available"],
-    queryFn: applianceUpgradeImagesApi.listAvailable,
-    staleTime: 60_000,
-  });
-  const available = availableQuery.data?.available ?? [];
-  const githubReachable = availableQuery.data?.github_reachable ?? false;
-  const effectiveMode: UpgradeSourceMode =
-    mode ?? (githubReachable && available.length > 0 ? "github" : "upload");
-
-  // Default-select the newest available tag once the list lands.
-  useEffect(() => {
-    if (!selectedTag && available.length > 0)
-      setSelectedTag(availableKey(available[0]));
-  }, [available, selectedTag]);
-
-  const upload = useMutation({
-    mutationFn: () =>
-      applianceUpgradeImagesApi.upload(
-        file!,
-        sha256.trim().toLowerCase(),
-        applianceVersion.trim(),
-        notes.trim() || undefined,
-        (loaded, total) => setProgress({ loaded, total }),
-        architecture || undefined,
-      ),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["appliance", "upgrade-images"] });
-      setFile(null);
-      setSha256("");
-      setApplianceVersion("");
-      setArchitecture("");
-      setNotes("");
-      setProgress(null);
-    },
-    onError: () => setProgress(null),
-  });
-
-  const importGithub = useMutation({
-    mutationFn: () => {
-      const [tag, arch] = splitAvailableKey(selectedTag);
-      return applianceUpgradeImagesApi.importFromGithub(tag, arch);
-    },
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["appliance", "upgrade-images"] });
-    },
-  });
-
-  const remove = useMutation({
-    mutationFn: (id: string) => applianceUpgradeImagesApi.remove(id),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["appliance", "upgrade-images"] });
-      setDeleteTarget(null);
-    },
-  });
-
-  return (
-    <div className="space-y-3 text-xs">
-      <p className="text-muted-foreground">
-        Connected installs import the upgrade image straight from a GitHub
-        release — the control plane downloads + verifies it for you. Air-gapped
-        installs download the <code>.raw.xz</code> + its <code>.sha256</code>{" "}
-        sidecar out-of-band and upload it here. Either way the backend verifies
-        the SHA-256 before storing, and the appliance pulls through the control
-        plane via an authenticated internal URL when an OS upgrade is scheduled.
-      </p>
-
-      {/* Source toggle — auto-defaults to GitHub when reachable. */}
-      <div className="inline-flex rounded-md border p-0.5">
-        <button
-          type="button"
-          onClick={() => setMode("github")}
-          className={cn(
-            "rounded px-3 py-1",
-            effectiveMode === "github"
-              ? "bg-primary/10 font-medium text-primary"
-              : "text-muted-foreground hover:bg-muted",
-          )}
-        >
-          Pick from GitHub Releases
-        </button>
-        <button
-          type="button"
-          onClick={() => setMode("upload")}
-          className={cn(
-            "rounded px-3 py-1",
-            effectiveMode === "upload"
-              ? "bg-primary/10 font-medium text-primary"
-              : "text-muted-foreground hover:bg-muted",
-          )}
-        >
-          Upload (air-gap)
-        </button>
-      </div>
-
-      {effectiveMode === "github" ? (
-        <div className="rounded-md border p-3">
-          {availableQuery.isLoading ? (
-            <div className="flex items-center gap-2 text-muted-foreground">
-              <Loader2 className="h-3.5 w-3.5 animate-spin" /> Checking GitHub
-              releases…
-            </div>
-          ) : !githubReachable ? (
-            <p className="text-muted-foreground">
-              GitHub isn&apos;t reachable from the control plane. Use the{" "}
-              <strong>Upload (air-gap)</strong> tab instead.
-            </p>
-          ) : available.length === 0 ? (
-            <p className="text-muted-foreground">
-              No recent GitHub release carries an importable appliance upgrade
-              image yet.
-            </p>
-          ) : (
-            <div className="space-y-3">
-              <div>
-                <label className="text-muted-foreground">Release</label>
-                <select
-                  value={selectedTag}
-                  onChange={(e) => setSelectedTag(e.target.value)}
-                  className="mt-1 w-full rounded-md border bg-background px-2 py-1"
-                >
-                  {available.map((r) => (
-                    <option key={availableKey(r)} value={availableKey(r)}>
-                      {r.tag}
-                      {` · ${r.architecture}`}
-                      {r.is_prerelease ? " (pre-release)" : ""}
-                      {r.is_installed ? " · installed" : ""}
-                      {r.size_bytes
-                        ? ` · ${(r.size_bytes / (1024 * 1024)).toFixed(0)} MiB`
-                        : ""}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => importGithub.mutate()}
-                  disabled={!selectedTag || importGithub.isPending}
-                  className="inline-flex items-center gap-1 rounded-md border border-primary bg-primary/10 px-3 py-1.5 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  {importGithub.isPending ? (
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  ) : (
-                    <DownloadCloud className="h-3.5 w-3.5" />
-                  )}
-                  Import
-                </button>
-                {importGithub.isPending && (
-                  <span className="text-[11px] text-muted-foreground">
-                    Downloading + verifying on the control plane — this can take
-                    a few minutes for a ~700 MiB image.
-                  </span>
-                )}
-                {importGithub.error && (
-                  <span className="text-rose-700 dark:text-rose-300">
-                    {formatApiError(importGithub.error)}
-                  </span>
-                )}
-              </div>
-            </div>
-          )}
-        </div>
-      ) : (
-        <div className="rounded-md border p-3">
-          <div className="grid gap-2 sm:grid-cols-2">
-            <div>
-              <label className="text-muted-foreground">.raw.xz file</label>
-              <input
-                type="file"
-                accept=".xz,.raw.xz,application/octet-stream"
-                onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-                className="mt-1 block w-full text-xs"
-              />
-              {file && (
-                <p className="mt-1 text-[11px] text-muted-foreground">
-                  {file.name} · {(file.size / (1024 * 1024)).toFixed(1)} MiB
-                </p>
-              )}
-            </div>
-            <div>
-              <label className="text-muted-foreground">Appliance version</label>
-              <input
-                value={applianceVersion}
-                onChange={(e) => setApplianceVersion(e.target.value)}
-                placeholder="e.g. 2026.06.01-1"
-                className="mt-1 w-full rounded-md border bg-background px-2 py-1"
-              />
-            </div>
-            <div>
-              <label className="text-muted-foreground">Architecture</label>
-              <select
-                value={architecture}
-                onChange={(e) => setArchitecture(e.target.value)}
-                className="mt-1 w-full rounded-md border bg-background px-2 py-1"
-              >
-                <option value="">Unknown (don't check)</option>
-                <option value="amd64">amd64 (x86-64)</option>
-                <option value="arm64">arm64 (AArch64)</option>
-              </select>
-              <p className="mt-1 text-[11px] text-muted-foreground">
-                From the asset name you downloaded. Lets the control plane
-                refuse this image for a node of the other architecture before
-                scheduling; the appliance re-checks the real image either way.
-              </p>
-            </div>
-            <div className="sm:col-span-2">
-              <label className="text-muted-foreground">SHA-256 (hex)</label>
-              <input
-                value={sha256}
-                onChange={(e) => setSha256(e.target.value)}
-                placeholder="paste from the .sha256 sidecar (64 lowercase hex chars)"
-                className="mt-1 w-full rounded-md border bg-background px-2 py-1 font-mono"
-              />
-            </div>
-            <div className="sm:col-span-2">
-              <label className="text-muted-foreground">Notes (optional)</label>
-              <input
-                value={notes}
-                onChange={(e) => setNotes(e.target.value)}
-                placeholder="e.g. RC1 — verified by ops on 2026-06-01"
-                className="mt-1 w-full rounded-md border bg-background px-2 py-1"
-              />
-            </div>
-          </div>
-          <div className="mt-3 flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => upload.mutate()}
-              disabled={
-                !file ||
-                sha256.trim().length !== 64 ||
-                !applianceVersion.trim() ||
-                upload.isPending
-              }
-              className="inline-flex items-center gap-1 rounded-md border border-primary bg-primary/10 px-3 py-1.5 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {upload.isPending ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <Upload className="h-3.5 w-3.5" />
-              )}
-              Upload
-            </button>
-            {progress && progress.total > 0 && (
-              <span className="text-[11px] text-muted-foreground">
-                {((progress.loaded / progress.total) * 100).toFixed(0)}% ·{" "}
-                {(progress.loaded / (1024 * 1024)).toFixed(1)} /{" "}
-                {(progress.total / (1024 * 1024)).toFixed(1)} MiB
-              </span>
-            )}
-            {upload.error && (
-              <span className="text-rose-700 dark:text-rose-300">
-                {formatApiError(upload.error)}
-              </span>
-            )}
-          </div>
-        </div>
-      )}
-
-      {imagesQuery.isLoading ? (
-        <div className="flex items-center gap-2 text-muted-foreground">
-          <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading…
-        </div>
-      ) : (imagesQuery.data ?? []).length === 0 ? (
-        <p className="text-muted-foreground">No uploaded upgrade images yet.</p>
-      ) : (
-        <table className="w-full">
-          <thead className="text-[10px] uppercase tracking-wide text-muted-foreground">
-            <tr>
-              <th className="px-2 py-1 text-left">Filename</th>
-              <th className="px-2 py-1 text-left">Version</th>
-              <th className="px-2 py-1 text-left">Size</th>
-              <th className="px-2 py-1 text-left">SHA-256</th>
-              <th className="px-2 py-1 text-left">Uploaded</th>
-              <th className="px-2 py-1 text-right"></th>
-            </tr>
-          </thead>
-          <tbody className="divide-y">
-            {(imagesQuery.data ?? []).map((img: UpgradeImage) => (
-              <tr key={img.id}>
-                <td className="px-2 py-1">
-                  <div className="font-medium">{img.filename}</div>
-                  {img.notes && (
-                    <div className="text-[11px] text-muted-foreground">
-                      {img.notes}
-                    </div>
-                  )}
-                </td>
-                <td className="px-2 py-1 font-mono">{img.appliance_version}</td>
-                <td className="px-2 py-1 font-mono">
-                  {(img.size_bytes / (1024 * 1024)).toFixed(0)} MiB
-                </td>
-                <td className="px-2 py-1 font-mono">
-                  {img.sha256.slice(0, 12)}…{img.sha256.slice(-6)}
-                </td>
-                <td className="px-2 py-1">{relativeTime(img.uploaded_at)}</td>
-                <td className="px-2 py-1 text-right">
-                  <button
-                    type="button"
-                    onClick={() => setDeleteTarget(img)}
-                    className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-0.5 hover:bg-muted"
-                  >
-                    <Trash2 className="h-3 w-3" />
-                    Delete
-                  </button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
-
-      {deleteTarget && (
-        <ConfirmModal
-          open
-          title="Delete upgrade image?"
-          message={
-            <>
-              <p className="text-sm">
-                Delete the staged <code>.raw.xz</code> for{" "}
-                <strong>{deleteTarget.appliance_version}</strong>? The on-server
-                copy is removed and any in-flight OS upgrade pointing at it will
-                fail with a 404 on the next fetch. Re-staging it (upload or
-                GitHub import) is operator-effort — typically a few hundred MiB.
-              </p>
-              {deleteTarget.notes && (
-                <p className="mt-2 text-xs text-muted-foreground">
-                  Notes:{" "}
-                  <span className="text-foreground">{deleteTarget.notes}</span>
-                </p>
-              )}
-              <p className="mt-2 text-xs text-muted-foreground">
-                SHA-256:{" "}
-                <code className="text-foreground">
-                  {deleteTarget.sha256.slice(0, 12)}…
-                  {deleteTarget.sha256.slice(-6)}
-                </code>
-              </p>
-            </>
-          }
-          confirmLabel="Delete"
-          tone="destructive"
-          loading={remove.isPending}
-          onConfirm={() => remove.mutate(deleteTarget.id)}
-          onClose={() => setDeleteTarget(null)}
         />
       )}
     </div>
@@ -6670,10 +6522,10 @@ function RoleSwitchStateBanner({ row }: { row: ApplianceRow }) {
             Service lifecycle apply failed
           </p>
           <p className="mt-1 text-muted-foreground">
-            The supervisor's <code>docker compose</code> against the assigned
-            role(s) returned a non-zero exit. The previous container state
-            remains; SSH into the appliance to triage, or fix the underlying
-            cause + the next heartbeat will retry automatically.
+            The supervisor could not apply the assigned role(s) through this
+            appliance&apos;s Kubernetes API (k3s). It tries again on the next
+            heartbeat; if the reason below persists, SSH into the appliance to
+            check k3s.
           </p>
           {row.role_switch_reason && (
             <p className="mt-2 font-mono text-[11px] text-foreground">

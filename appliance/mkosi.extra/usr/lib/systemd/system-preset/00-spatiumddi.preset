@@ -1,0 +1,7 @@
+# SpatiumDDI (#2376) — services the image ships but must NOT start until the
+# operator turns the matching feature on. Their host runners
+# (spatiumddi-snmp-reload / spatiumddi-lldp-reload) ``enable --now`` them.
+# Without this, mkosi's ``systemctl preset-all`` (Debian's default preset is
+# "enable") re-enables them after the postinst removed the wants/ symlinks.
+disable snmpd.service
+disable lldpd.service

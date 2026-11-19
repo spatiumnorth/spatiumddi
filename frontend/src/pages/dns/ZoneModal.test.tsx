@@ -21,6 +21,7 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import userEvent from "@testing-library/user-event";
 import type { DNSZone } from "@/lib/api";
 import { zoneKindForName } from "@/lib/dnsNames";
 
@@ -32,6 +33,9 @@ const updateZone = vi.fn(
     Promise.resolve({ id: zoneId, ...data }),
 );
 const pending = () => new Promise<never>(() => {});
+let groups: unknown[] = [];
+
+let listedZones: unknown[] = [];
 
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
@@ -42,6 +46,8 @@ vi.mock("@/lib/api", async () => {
       // The name's scope hint arrives later than an operator saves: the
       // kind must not wait for it.
       classifyZoneName: pending,
+      listGroups: () => Promise.resolve(groups),
+      listZones: () => Promise.resolve(listedZones),
       getZoneDnssecInfo: pending,
       listDnssecPolicies: pending,
       createZone: (groupId: string, data: Record<string, unknown>) =>
@@ -59,11 +65,12 @@ vi.mock("@/lib/api", async () => {
 
 const { ZoneModal } = await import("./DNSPage");
 
-function open(zone?: DNSZone) {
+function open(zone?: DNSZone, onClose: () => void = () => {}) {
+  listedZones = zone ? [zone] : [];
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={qc}>
-      <ZoneModal groupId="grp-1" views={[]} zone={zone} onClose={() => {}} />
+      <ZoneModal groupId="grp-1" views={[]} zone={zone} onClose={onClose} />
     </QueryClientProvider>,
   );
 }
@@ -93,6 +100,7 @@ async function save() {
 
 afterEach(() => {
   cleanup();
+  groups = [];
   createZone.mockClear();
   updateZone.mockClear();
 });
@@ -141,28 +149,199 @@ describe("Add Zone's Kind", () => {
   });
 
   it("shows an existing zone's kind as it is stored", async () => {
-    open({
-      id: "zone-1",
-      group_id: "grp-1",
-      view_id: null,
-      name: "88.98.10.in-addr.arpa.",
+    const onClose = vi.fn();
+    open(
+      {
+        id: "zone-1",
+        group_id: "grp-1",
+        view_id: null,
+        name: "88.98.10.in-addr.arpa.",
+        zone_type: "primary",
+        kind: "forward",
+        ttl: 3600,
+        primary_ns: "",
+        admin_email: "",
+        dnssec_enabled: false,
+        color: null,
+        forwarders: [],
+        forward_only: true,
+        masters: [],
+        domain_id: null,
+        customer_id: null,
+      } as unknown as DNSZone,
+      onClose,
+    );
+
+    await screen.findByText("Zone Name (FQDN)");
+    expect(control("Kind").value).toBe("forward");
+    // An untouched Save sends nothing (#3269): the kind stays as stored. A
+    // kind recomputed from the reverse-looking name would be a change, and
+    // would be sent before the dialog closed.
+    fireEvent.submit(control("Kind").form!);
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(updateZone).not.toHaveBeenCalled();
+    expect(createZone).not.toHaveBeenCalled();
+  });
+});
+
+describe("Add Zone on an experimental technitium_api group (#1784)", () => {
+  it("offers Primary only and hides the SOA / TTL fields the driver never writes", async () => {
+    groups = [{ id: "grp-1", server_drivers: ["technitium_api"] }];
+    open();
+    await waitFor(() =>
+      expect(
+        screen.queryByText("Primary NS", { selector: "label" }),
+      ).toBeNull(),
+    );
+    expect(screen.queryByText("Admin Email", { selector: "label" })).toBeNull();
+    expect(
+      screen.queryByText("Default TTL (seconds)", { selector: "label" }),
+    ).toBeNull();
+    const type = control("Type") as HTMLSelectElement;
+    expect([...type.options].map((o) => o.value)).toEqual(["primary"]);
+    typeName("corp.example.com");
+    await save();
+    // Defaults still sent, which the API accepts as "unchanged".
+    expect(createZone.mock.calls[0][1]).toMatchObject({
       zone_type: "primary",
-      kind: "forward",
-      ttl: 3600,
       primary_ns: "",
       admin_email: "",
-      dnssec_enabled: false,
-      color: null,
-      forwarders: [],
-      forward_only: true,
-      masters: [],
-      domain_id: null,
-      customer_id: null,
-    } as unknown as DNSZone);
+      ttl: 3600,
+    });
+  });
 
-    expect(control("Kind").value).toBe("forward");
+  it("keeps every field for other drivers", async () => {
+    groups = [{ id: "grp-1", server_drivers: ["bind9"] }];
+    open();
+    expect(screen.getByText("Primary NS", { selector: "label" })).toBeTruthy();
+    expect((control("Type") as HTMLSelectElement).options.length).toBe(4);
+  });
+});
+
+function zoneRow(primaryNs: string): DNSZone {
+  return {
+    id: "zone-1",
+    group_id: "grp-1",
+    view_id: null,
+    name: "legacy.test.",
+    zone_type: "primary",
+    kind: "forward",
+    ttl: 3600,
+    primary_ns: primaryNs,
+    admin_email: "",
+    dnssec_enabled: false,
+    color: null,
+    forwarders: [],
+    forward_only: true,
+    masters: [],
+    domain_id: null,
+    customer_id: null,
+  } as unknown as DNSZone;
+}
+
+describe("the zone dialog's Primary NS (#2075)", () => {
+  it.each(["ns_1.ns-underscore.test.", "a".repeat(64) + ".x.test.", "ns1"])(
+    "refuses %s at Add Zone, with the reason, and sends nothing",
+    async (value) => {
+      open();
+      typeName("ns-underscore.test");
+      fireEvent.change(control("Primary NS"), { target: { value } });
+      fireEvent.submit(control("Kind").form!);
+      await waitFor(() =>
+        expect(
+          screen.getAllByText(/^Primary NS (must|has|label)/).length,
+        ).toBeGreaterThan(0),
+      );
+      expect(createZone).not.toHaveBeenCalled();
+    },
+  );
+
+  it("sends a host name", async () => {
+    open();
+    typeName("corp.example.test");
+    fireEvent.change(control("Primary NS"), {
+      target: { value: "ns1.corp.example.test." },
+    });
     await save();
-    expect(updateZone.mock.calls[0][2]).toMatchObject({ kind: "forward" });
+    expect(createZone.mock.calls[0][1]).toMatchObject({
+      primary_ns: "ns1.corp.example.test.",
+    });
+  });
+
+  it("lets a zone stored with a bad value be saved unchanged, and flags it", async () => {
+    open(zoneRow("ns1"));
+    await screen.findByText("Zone Name (FQDN)");
+    expect(screen.getByText(/Stored before this was checked/)).toBeTruthy();
+    fireEvent.change(control("Default TTL (seconds)"), {
+      target: { value: "600" },
+    });
+    await save();
+    // Only the changed field is sent (#3269): the stored value is left as is.
+    expect(updateZone.mock.calls[0][2]).toEqual({ ttl: 600 });
+  });
+
+  it("refuses changing a stored value to another non-host name", async () => {
+    open(zoneRow("ns1"));
+    await screen.findByText("Zone Name (FQDN)");
+    fireEvent.change(control("Primary NS"), {
+      target: { value: "ns_1.legacy.test." },
+    });
+    fireEvent.submit(control("Kind").form!);
+    await waitFor(() =>
+      expect(screen.getAllByText(/^Primary NS label "ns_1"/).length).toBe(2),
+    );
+    expect(updateZone).not.toHaveBeenCalled();
+  });
+});
+
+describe("Default TTL field (#2073 / #2074)", () => {
+  const ttlInput = () =>
+    screen.getByPlaceholderText("3600") as HTMLInputElement;
+
+  it("is a bounded numeric input", () => {
+    groups = [{ id: "grp-1", server_drivers: ["bind9"] }];
+    open();
+    expect(ttlInput().type).toBe("number");
+    expect(ttlInput().min).toBe("0");
+    expect(ttlInput().max).toBe("2147483647");
+  });
+
+  // A number input never holds "1h": the browser drops it, leaving the field
+  // empty, which is refused rather than sent as 1 (or NaN → null).
+  it.each([["-1"], ["1.5"], [""], ["1h"]])(
+    "refuses %j with a reason and sends nothing",
+    async (typed) => {
+      open();
+      typeName("ttl.example.com");
+      fireEvent.change(ttlInput(), { target: { value: typed } });
+      fireEvent.submit(control("Kind").form!);
+      await screen.findByText(/^Default TTL (must be|is required)/);
+      expect(createZone).not.toHaveBeenCalled();
+    },
+  );
+
+  it("sends 1e3 as 1000, not 1", async () => {
+    open();
+    typeName("ttl.example.com");
+    fireEvent.change(ttlInput(), { target: { value: "1e3" } });
+    await save();
+    expect(createZone.mock.calls[0][1]).toMatchObject({ ttl: 1000 });
+  });
+});
+
+describe("a zone with both a bad Default TTL and a bad Primary NS", () => {
+  it("refuses, naming both reasons, and sends nothing", async () => {
+    open();
+    typeName("both.example.test");
+    fireEvent.change(control("Primary NS"), { target: { value: "ns1" } });
+    fireEvent.change(screen.getByPlaceholderText("3600"), {
+      target: { value: "-1" },
+    });
+    fireEvent.submit(control("Kind").form!);
+    await screen.findByText(
+      /^Primary NS must be a fully qualified host name.*; Default TTL must be a whole number/,
+    );
+    expect(createZone).not.toHaveBeenCalled();
   });
 });
 
@@ -182,5 +361,45 @@ describe("zoneKindForName", () => {
     ["", "forward"],
   ])("%s → %s", (name, kind) => {
     expect(zoneKindForName(name)).toBe(kind);
+  });
+});
+
+describe("Sub-zone's pre-filled name takes the label at the start (#2464)", () => {
+  it("typing a label where the focus lands makes <label>.<parent>", async () => {
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <ZoneModal
+          groupId="grp-1"
+          views={[]}
+          initialName=".parent.example.com"
+          onClose={() => {}}
+        />
+      </QueryClientProvider>,
+    );
+    const input = control("Zone Name (FQDN)") as HTMLInputElement;
+    expect(document.activeElement).toBe(input);
+    await userEvent.keyboard("xp");
+    expect(input.value).toBe("xp.parent.example.com");
+  });
+
+  it("a pre-fill that is not a leading-dot suffix is left alone", () => {
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <ZoneModal
+          groupId="grp-1"
+          views={[]}
+          initialName="corp.example.com"
+          onClose={() => {}}
+        />
+      </QueryClientProvider>,
+    );
+    const input = control("Zone Name (FQDN)") as HTMLInputElement;
+    expect(input.selectionStart).toBe(input.value.length);
   });
 });

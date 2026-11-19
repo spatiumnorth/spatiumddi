@@ -23,10 +23,12 @@ from unittest.mock import patch
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import encrypt_str
 from app.core.security import create_access_token, hash_password
+from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.dhcp import (
     DHCPLease,
@@ -539,7 +541,7 @@ async def test_malformed_url_is_recorded_not_raised(db_session: AsyncSession) ->
 
     result = await push_target(db_session, row, now=datetime.now(UTC))
     assert not result.ok
-    assert "InvalidURL" in (row.last_push_error or "")
+    assert "Invalid URL" in (row.last_push_error or "")
     # The cursor must not have moved — nothing was delivered.
     assert row.last_dns_bucket_at is None
 
@@ -665,6 +667,27 @@ async def test_dhcp_export_carries_the_loss_counters(db_session: AsyncSession) -
 
 
 @pytest.mark.asyncio
+async def test_dhcp_export_carries_queue_evicted_in_line_protocol(
+    db_session: AsyncSession,
+) -> None:
+    """#2889 — the third loss counter reaches InfluxDB as an integer field,
+    and is omitted (not zero-filled) when the agent did not measure it."""
+    from app.services.influxdb.collect import collect_dhcp_points
+    from app.services.influxdb.line_protocol import render_point
+
+    base = datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=10)
+    await _dhcp_sample(db_session, base, socket_drop=0, queue_evicted=403)
+    await _dhcp_sample(db_session, base + timedelta(minutes=1), socket_drop=0, queue_evicted=None)
+
+    points, _ = await collect_dhcp_points(db_session, None)
+    assert len(points) == 2
+    lines = sorted(render_point(p) for p in points)
+    measured = [ln for ln in lines if "queue_evicted" in ln]
+    assert len(measured) == 1
+    assert "queue_evicted=403i" in measured[0]
+
+
+@pytest.mark.asyncio
 async def test_dhcp_export_omits_an_unmeasured_counter(db_session: AsyncSession) -> None:
     """Line protocol has no null, so an unmeasured counter must be OMITTED.
 
@@ -683,5 +706,286 @@ async def test_dhcp_export_omits_an_unmeasured_counter(db_session: AsyncSession)
     assert len(points) == 1
     assert "socket_drop" not in points[0].fields
     assert "receive_drop" not in points[0].fields
+    assert "queue_evicted" not in points[0].fields
     # The traffic counters are unaffected — the point is still emitted.
     assert points[0].fields["discover"] == 5
+
+
+# ── #1989: a blank secret keeps the stored one; clearing is explicit ──────
+
+
+@pytest.mark.asyncio
+async def test_blank_secret_keeps_it_and_only_the_flag_clears(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h = {"Authorization": f"Bearer {await _superadmin(db_session)}"}
+    url = "/api/v1/settings/influxdb-targets"
+
+    # v2 token: ``""`` is what a form sends once its field was typed in and
+    # cleared. Before #1989 it cleared the token and the save was refused.
+    r = await client.post(url, headers=h, json=_v2_body(token="tok-secret"))
+    assert r.status_code == 201, r.text
+    tid = r.json()["id"]
+    r = await client.put(
+        f"{url}/{tid}", headers=h, json=_v2_body(token="", push_interval_seconds=90)
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["token_set"] is True
+    assert r.json()["push_interval_seconds"] == 90
+
+    # The flag removes it: a v2 target without a token fails the writable
+    # check, so the explicit clear is refused rather than silently applied.
+    r = await client.put(f"{url}/{tid}", headers=h, json=_v2_body(token="", clear_token=True))
+    assert r.status_code == 422, r.text
+    assert "token is required" in r.text
+
+    # v1 password: blank keeps, flag clears, a new value replaces and wins
+    # over the flag.
+    v1 = {
+        **_v2_body(),
+        "version": "v1",
+        "database": "ddi",
+        "username": "u",
+        "name": "v1t",
+        "password": "pw-secret",
+    }
+    r = await client.post(url, headers=h, json=v1)
+    assert r.status_code == 201, r.text
+    pid = r.json()["id"]
+    assert r.json()["password_set"] is True
+    r = await client.put(f"{url}/{pid}", headers=h, json={**v1, "password": ""})
+    assert r.json()["password_set"] is True
+    r = await client.put(f"{url}/{pid}", headers=h, json={**v1, "password": None})
+    assert r.json()["password_set"] is True
+    r = await client.put(
+        f"{url}/{pid}", headers=h, json={**v1, "password": "new", "clear_password": True}
+    )
+    assert r.json()["password_set"] is True
+    r = await client.put(
+        f"{url}/{pid}", headers=h, json={**v1, "password": "", "clear_password": True}
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["password_set"] is False
+
+
+@pytest.mark.asyncio
+async def test_clearing_a_secret_is_audited_without_the_secret(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h = {"Authorization": f"Bearer {await _superadmin(db_session)}"}
+    url = "/api/v1/settings/influxdb-targets"
+    v1 = {
+        **_v2_body(),
+        "version": "v1",
+        "database": "ddi",
+        "username": "u",
+        "name": "v1-audit",
+        "password": "pw-very-secret",
+        "token": None,
+    }
+    r = await client.post(url, headers=h, json=v1)
+    assert r.status_code == 201, r.text
+    pid = r.json()["id"]
+    # A blank-keep save changes no secret; the explicit clear does.
+    r = await client.put(f"{url}/{pid}", headers=h, json={**v1, "password": ""})
+    assert r.status_code == 200, r.text
+    r = await client.put(
+        f"{url}/{pid}", headers=h, json={**v1, "password": "", "clear_password": True}
+    )
+    assert r.status_code == 200, r.text
+
+    rows = (
+        (
+            await db_session.execute(
+                select(AuditLog)
+                .where(AuditLog.resource_type == "influxdb_target", AuditLog.resource_id == pid)
+                .order_by(AuditLog.seq)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    changes = [(a.action, a.new_value["secret_changes"]) for a in rows]
+    assert changes == [
+        ("create", ["password_set"]),
+        ("update", []),
+        ("update", ["password_cleared"]),
+    ]
+    assert rows[-1].new_value["password_set"] is False
+    assert all("pw-very-secret" not in repr(a.new_value) for a in rows)
+
+
+# ── #1990: the last SUCCESSFUL push is kept apart from the last attempt ──
+
+
+@pytest.mark.asyncio
+async def test_last_success_survives_a_later_failure(db_session: AsyncSession) -> None:
+    row = InfluxDBTarget(
+        name=f"t-{uuid.uuid4().hex[:6]}",
+        version="v2",
+        url="http://influx:8086",
+        org="acme",
+        bucket="ddi",
+        token_encrypted=encrypt_str("tok"),
+        push_dns_metrics=True,
+        push_dhcp_metrics=False,
+        push_subnet_utilization=False,
+        push_dhcp_scope_leases=False,
+    )
+    db_session.add(row)
+    await db_session.flush()
+    assert row.last_success_at is None
+
+    async def _one_dns_point(db: object, since: object) -> tuple[list[Point], None]:
+        return [Point("dns_q", {}, {"n": 1}, 1_700_000_000_000_000_000)], None
+
+    async def _boom(cfg: object, body: str) -> None:
+        raise InfluxDBWriteError("HTTP 500")
+
+    async def _ok(cfg: object, body: str) -> None:
+        return None
+
+    t1 = datetime.now(UTC) - timedelta(minutes=10)
+    with (
+        patch("app.services.influxdb.push.write_lines", new=_boom),
+        patch("app.services.influxdb.push.collect.collect_dns_points", new=_one_dns_point),
+    ):
+        await push_target(db_session, row, now=t1)
+    # Never delivered: an attempt, but no success.
+    assert row.last_push_at == t1
+    assert row.last_success_at is None
+
+    t2 = t1 + timedelta(minutes=5)
+    with (
+        patch("app.services.influxdb.push.write_lines", new=_ok),
+        patch("app.services.influxdb.push.collect.collect_dns_points", new=_one_dns_point),
+    ):
+        await push_target(db_session, row, now=t2)
+    assert row.last_success_at == t2
+
+    t3 = t2 + timedelta(minutes=5)
+    with (
+        patch("app.services.influxdb.push.write_lines", new=_boom),
+        patch("app.services.influxdb.push.collect.collect_dns_points", new=_one_dns_point),
+    ):
+        await push_target(db_session, row, now=t3)
+    assert row.last_push_at == t3
+    assert row.last_success_at == t2
+    assert row.last_push_error == "HTTP 500"
+
+
+# ── #2750: a rename onto a taken name is refused in words ──
+
+
+@pytest.mark.asyncio
+async def test_rename_onto_a_taken_name_is_a_clean_409(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h = {"Authorization": f"Bearer {await _superadmin(db_session)}"}
+    a = (
+        await client.post(
+            "/api/v1/settings/influxdb-targets", headers=h, json=_v2_body(name="rn-a")
+        )
+    ).json()
+    b = (
+        await client.post(
+            "/api/v1/settings/influxdb-targets", headers=h, json=_v2_body(name="rn-b")
+        )
+    ).json()
+    r = await client.put(
+        f"/api/v1/settings/influxdb-targets/{b['id']}",
+        headers=h,
+        json=_v2_body(name=a["name"]),
+    )
+    assert r.status_code == 409, r.text
+    for needle in ("SQL", "sqlalchemy", "IntegrityError", "sqlalche.me", "parameters"):
+        assert needle not in r.text
+    # The test client shares one session across requests; production closes
+    # it per request, so clear the failed flush here.
+    await db_session.rollback()
+    got = await client.get("/api/v1/settings/influxdb-targets", headers=h)
+    assert sorted(t["name"] for t in got.json()) == ["rn-a", "rn-b"]
+
+
+# ── #2749: a push that sent nothing is not a push the destination accepted ──
+
+
+@pytest.mark.asyncio
+async def test_empty_push_is_not_recorded_as_accepted(db_session: AsyncSession) -> None:
+    row = InfluxDBTarget(
+        name=f"t-{uuid.uuid4().hex[:6]}",
+        version="v2",
+        url="http://192.0.2.10:8086",
+        org="acme",
+        bucket="ddi",
+        token_encrypted=encrypt_str("tok"),
+        push_dns_metrics=True,
+        push_dhcp_metrics=False,
+        push_subnet_utilization=False,
+        push_dhcp_scope_leases=False,
+    )
+    db_session.add(row)
+    await db_session.flush()
+
+    async def _boom(cfg: object, body: str) -> None:
+        raise InfluxDBWriteError("ConnectTimeout")
+
+    async def _one_dns_point(db: object, since: object) -> tuple[list[Point], None]:
+        return [Point("dns_q", {}, {"n": 1}, 1_700_000_000_000_000_000)], None
+
+    t1 = datetime.now(UTC) - timedelta(minutes=10)
+    with (
+        patch("app.services.influxdb.push.write_lines", new=_boom),
+        patch("app.services.influxdb.push.collect.collect_dns_points", new=_one_dns_point),
+    ):
+        await push_target(db_session, row, now=t1)
+    assert row.last_push_error == "ConnectTimeout"
+
+    # The operator unticks everything: nothing to send, nobody contacted.
+    row.push_dns_metrics = False
+    t2 = t1 + timedelta(minutes=5)
+    res = await push_target(db_session, row, now=t2)
+    assert res.points == 0
+    assert row.last_success_at is None  # never accepted
+    assert row.last_push_error == "ConnectTimeout"  # failure not erased
+    assert row.last_push_at == t2  # interval gating still advances
+    assert row.last_push_points == 0
+
+
+@pytest.mark.asyncio
+async def test_update_applies_only_the_keys_it_carries(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#3926: a PUT of one field must not put back what another client stored."""
+    h = {"Authorization": f"Bearer {await _superadmin(db_session)}"}
+    url = "/api/v1/settings/influxdb-targets"
+    r = await client.post(url, headers=h, json=_v2_body())
+    assert r.status_code == 201, r.text
+    tid = r.json()["id"]
+
+    # Another client changes several fields.
+    other = {
+        "url": "http://influx2:8086",
+        "token": "re-entered-with-the-new-url",
+        "bucket": "other",
+        "measurement_prefix": "xq_",
+        "push_dhcp_metrics": False,
+    }
+    r = await client.put(f"{url}/{tid}", headers=h, json=other)
+    assert r.status_code == 200, r.text
+
+    # The stale dialog saves only the push interval.
+    r = await client.put(f"{url}/{tid}", headers=h, json={"push_interval_seconds": 120})
+    assert r.status_code == 200, r.text
+    got = r.json()
+    assert got["push_interval_seconds"] == 120
+    assert got["url"] == "http://influx2:8086"
+    assert got["bucket"] == "other"
+    assert got["measurement_prefix"] == "xq_"
+    assert got["push_dhcp_metrics"] is False
+    assert got["name"] == "grafana"
+    assert got["token_set"] is True
+
+    # An explicit null name is refused, not applied.
+    r = await client.put(f"{url}/{tid}", headers=h, json={"name": None})
+    assert r.status_code == 422, r.text

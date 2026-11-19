@@ -37,6 +37,8 @@ from typing import Any
 import httpx
 import structlog
 
+from app.core.exc_text import describe_exc
+
 logger = structlog.get_logger(__name__)
 
 
@@ -259,7 +261,7 @@ class PANOSClient:
         try:
             resp = await self._client.get(path, params=params)
         except httpx.HTTPError as exc:
-            raise PANOSClientError(f"{path}: {exc}") from exc
+            raise PANOSClientError(f"{path}: {describe_exc(exc)}") from exc
         if resp.status_code == 401:
             raise PANOSClientError(f"{path}: HTTP 401 — API key invalid", status_code=401)
         if resp.status_code == 403:
@@ -296,7 +298,7 @@ class PANOSClient:
         try:
             resp = await self._client.get("/api/", params=query)
         except httpx.HTTPError as exc:
-            raise PANOSClientError(f"/api/ ({params.get('type')}): {exc}") from exc
+            raise PANOSClientError(f"/api/ ({params.get('type')}): {describe_exc(exc)}") from exc
         if resp.status_code == 403:
             raise PANOSClientError(
                 f"/api/ ({params.get('type')}): HTTP 403 — key lacks privilege", status_code=403
@@ -342,7 +344,7 @@ class PANOSClient:
                     params={"type": "keygen", "user": username, "password": password},
                 )
             except httpx.HTTPError as exc:
-                raise PANOSClientError(f"keygen: {exc}") from exc
+                raise PANOSClientError(f"keygen: {describe_exc(exc)}") from exc
             if resp.status_code >= 400:
                 raise PANOSClientError(
                     f"keygen: HTTP {resp.status_code} {resp.text[:200]}",

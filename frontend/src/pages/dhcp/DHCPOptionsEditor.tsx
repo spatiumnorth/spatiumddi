@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight, Plus, X } from "lucide-react";
 import { dhcpApi, type DHCPOption, type DHCPOptionCodeDef } from "@/lib/api";
+import { closePopupOnEscape } from "@/components/ui/use-draggable-modal";
 import { Field, inputCls } from "./_shared";
 
 /**
@@ -22,7 +23,6 @@ interface StandardDef {
   label: string;
   hint?: string;
   kind: "ip-list" | "string" | "ip";
-  max?: number;
 }
 
 const STANDARD_OPTIONS: StandardDef[] = [
@@ -43,8 +43,9 @@ const STANDARD_OPTIONS: StandardDef[] = [
     name: "dns-servers",
     label: "DNS Servers (option 6)",
     kind: "ip-list",
-    max: 3,
-    hint: "Up to 3 DNS resolver IPs.",
+    // #2482 — no cap: the cut on blur dropped a stored 4th server while the
+    // input still showed it. The API stores the whole list, and so do we.
+    hint: "DNS resolver IPs; clients commonly use the first 3.",
   },
   {
     code: 15,
@@ -117,11 +118,21 @@ function CustomOptionRow({
   );
   const [open, setOpen] = useState(false);
   const wrapperRef = useRef<HTMLDivElement>(null);
-
-  // Reflect external changes to opt.code (e.g. template apply).
+  const listId = useId();
+  // Reflect changes to the row's code into the box (a catalogue pick, a
+  // typed code committed on blur / Enter, a template apply). The box never
+  // writes the code per keystroke (#1685): doing so let this effect rewrite
+  // "4" to "4 —" before the "3" of "43" landed, and turned the row into a
+  // standard option (3, 6, 15, 42…) mid-way through typing a longer code,
+  // dropping it out of the custom list.
+  //
+  // Keyed on the row object, not just its code: rows are keyed by index, so
+  // deleting one hands this instance the next row, which may carry the same
+  // code — and the box must not keep the deleted row's half-typed text.
+  // Nothing replaces the object while the operator types in the box.
   useEffect(() => {
     setQuery(opt.code ? `${opt.code} — ${opt.name ?? ""}`.trim() : "");
-  }, [opt.code, opt.name]);
+  }, [opt]);
 
   useEffect(() => {
     function onDoc(e: MouseEvent) {
@@ -156,43 +167,125 @@ function CustomOptionRow({
     [catalog, opt.code],
   );
 
+  // A standard option (Routers, DNS Servers, ...) is set in its own field
+  // above, which keeps showing the text it was drawn with. A custom row
+  // given one of those codes left this list unseen, and a save sent the
+  // row's value over what the field showed (#3543). Such a code is refused
+  // here, with a hint naming the field; any other code clears the hint.
+  const [standardField, setStandardField] = useState<string | null>(null);
+  // The hint belongs to the row it was given for. A delete above hands this
+  // instance the next row (the effect on the row object, above), which must
+  // not show it.
+  useEffect(() => {
+    setStandardField(null);
+  }, [opt]);
+
+  function refuseStandard(code: number): boolean {
+    const std = STANDARD_OPTIONS.find((s) => s.code === code);
+    setStandardField(std ? std.label : null);
+    if (std) setOpen(false);
+    return !!std;
+  }
+
   function pick(def: DHCPOptionCodeDef) {
+    if (refuseStandard(def.code)) return;
     onChange({ ...opt, code: def.code, name: def.name });
     setQuery(`${def.code} — ${def.name}`);
     setOpen(false);
   }
 
+  // Commit a typed code to the row, so an operator can type "42" + Tab and
+  // have a custom code (known to the catalogue or not) stick. Text that
+  // doesn't start with a number leaves the code alone and the box settles
+  // back to "<code> — <name>".
+  function commitTyped() {
+    const numMatch = /^(\d+)/.exec(query.trim());
+    if (numMatch) {
+      const n = parseInt(numMatch[1], 10);
+      if (!Number.isNaN(n) && n !== opt.code && !refuseStandard(n)) {
+        // The name follows the code: a stale name from the previous code
+        // would otherwise travel with the new one.
+        const def = catalog.find((d) => d.code === n);
+        onChange({ ...opt, code: n, name: def?.name });
+        return;
+      }
+    }
+    setQuery(opt.code ? `${opt.code} — ${opt.name ?? ""}`.trim() : "");
+  }
+
   return (
     <div className="space-y-1">
       <div className="flex items-start gap-2">
-        <div ref={wrapperRef} className="relative w-72 shrink-0">
+        <div
+          ref={wrapperRef}
+          className="relative w-72 shrink-0"
+          // An Esc on a suggestion reached with Tab is the list's too: it
+          // closes the list, never the dialog around it (#3157).
+          onKeyDown={(e) =>
+            closePopupOnEscape(e, open && matches.length > 0, () =>
+              setOpen(false),
+            )
+          }
+          // Focus leaving the search and its list (Tab / Shift+Tab) closes
+          // the list; a move into the list itself keeps it open (#3486).
+          // Otherwise the next Esc, now outside the wrapper, closes the
+          // dialog with the list still showing. A mouse press inside the
+          // list never moves focus (its onMouseDown below), so a click on
+          // a suggestion still lands before anything here closes the list.
+          onBlur={(e) => {
+            if (!e.currentTarget.contains(e.relatedTarget as Node | null))
+              setOpen(false);
+          }}
+        >
           <input
             className={inputCls}
             placeholder="Search code or name…"
+            role="combobox"
+            aria-autocomplete="list"
+            aria-expanded={open && matches.length > 0}
+            aria-controls={open && matches.length > 0 ? listId : undefined}
             value={query}
             onChange={(e) => {
-              const v = e.target.value;
-              setQuery(v);
+              setQuery(e.target.value);
               setOpen(true);
-              // Live numeric typing — reflect into the row immediately so
-              // the operator can still type "42" + tab and have a custom
-              // unknown code stick. Name resolution happens on pick.
-              const numMatch = /^(\d+)/.exec(v.trim());
-              if (numMatch) {
-                const n = parseInt(numMatch[1], 10);
-                if (!Number.isNaN(n) && n !== opt.code) {
-                  onChange({ ...opt, code: n });
-                }
-              }
             }}
             onFocus={() => setOpen(true)}
+            onBlur={commitTyped}
+            onKeyDown={(e) => {
+              if (
+                closePopupOnEscape(e, open && matches.length > 0, () =>
+                  setOpen(false),
+                )
+              )
+                return;
+              // Enter commits the typed code instead of submitting the
+              // surrounding form with the row still on its old code.
+              if (e.key === "Enter") {
+                e.preventDefault();
+                commitTyped();
+                setOpen(false);
+              }
+            }}
           />
           {open && matches.length > 0 && (
-            <div className="absolute left-0 right-0 top-full z-20 mt-1 max-h-72 overflow-y-auto rounded-md border bg-popover shadow-md">
+            <div
+              id={listId}
+              className="absolute left-0 right-0 top-full z-20 mt-1 max-h-72 overflow-y-auto rounded-md border bg-popover shadow-md"
+              // A press anywhere in the list, not only on a suggestion,
+              // keeps focus where it is: a press on its border would
+              // otherwise blur the search with no related target and close
+              // the list before the click (#3486).
+              onMouseDown={(e) => e.preventDefault()}
+            >
               {matches.map((def) => (
                 <button
                   key={def.code}
                   type="button"
+                  // Keep focus in the box: a blur here would commit the
+                  // partly-typed code first, and a standard code ("6" on
+                  // the way to 60) moves the row out of this list before
+                  // the click lands.
+                  onMouseDown={(e) => e.preventDefault()}
                   onClick={() => pick(def)}
                   className="block w-full px-3 py-1.5 text-left text-xs hover:bg-accent"
                 >
@@ -219,7 +312,13 @@ function CustomOptionRow({
         />
         <button
           type="button"
+          // No blur-commit on the way to a delete: committing a half-typed
+          // standard code ("6") would move this row out of the list, and the
+          // click would then land on the next row's button.
+          onMouseDown={(e) => e.preventDefault()}
           onClick={onRemove}
+          aria-label="Remove option"
+          title="Remove option"
           className="rounded p-1 text-muted-foreground hover:text-destructive"
         >
           <X className="h-4 w-4" />
@@ -228,6 +327,11 @@ function CustomOptionRow({
       {knownDef?.description && (
         <div className="ml-1 text-[11px] text-muted-foreground">
           {knownDef.description}
+        </div>
+      )}
+      {standardField && (
+        <div role="alert" className="ml-1 text-[11px] text-destructive">
+          {standardField} has its own field above. Set it there.
         </div>
       )}
     </div>
@@ -267,31 +371,27 @@ export function DHCPOptionsEditor({
       next.push({ code: def.code, name: def.name, value: clean });
     } else if (def.kind === "ip" || def.kind === "ip-list") {
       const list = splitList(clean);
-      if (def.max) list.splice(def.max);
       next.push({ code: def.code, name: def.name, value: list });
     }
     onChange(next);
   }
 
-  const customOptions = value.filter(
-    (o) => !STANDARD_OPTIONS.some((s) => s.code === o.code),
-  );
+  // Each custom row with its place in `value`. An edit or a remove goes to
+  // that place: two rows can hold the same contents (two blank rows are both
+  // `{ code: 0, value: "" }`), so a row is never found by comparing them,
+  // which wrote a pick in the second blank row into the first (#3508).
+  const customRows = value
+    .map((opt, at) => ({ opt, at }))
+    .filter(({ opt }) => !STANDARD_OPTIONS.some((s) => s.code === opt.code));
 
-  function updateCustomAt(idx: number, next: DHCPOption) {
-    const fullIdx = value.findIndex(
-      (o) =>
-        o === customOptions[idx] ||
-        (o.code === customOptions[idx].code &&
-          o.value === customOptions[idx].value),
-    );
-    if (fullIdx < 0) return;
+  function updateCustomAt(at: number, next: DHCPOption) {
     const out = [...value];
-    out[fullIdx] = next;
+    out[at] = next;
     onChange(out);
   }
 
-  function removeCustomAt(idx: number) {
-    onChange(value.filter((o) => o !== customOptions[idx]));
+  function removeCustomAt(at: number) {
+    onChange(value.filter((_, i) => i !== at));
   }
 
   return (
@@ -313,6 +413,22 @@ export function DHCPOptionsEditor({
                 }
                 defaultValue={rendered}
                 onBlur={(e) => setStandard(def, e.target.value)}
+                // #3085 — the field hands its text over on blur, and Enter
+                // submits the surrounding form with no blur: the dialog
+                // would save the options as they were before the typing.
+                // Commit the field and keep the dialog open, as the code
+                // picker above does. An Enter that confirms an IME
+                // composition is left to the IME.
+                onKeyDown={(e) => {
+                  if (
+                    e.key === "Enter" &&
+                    !e.nativeEvent.isComposing &&
+                    e.keyCode !== 229
+                  ) {
+                    e.preventDefault();
+                    setStandard(def, e.currentTarget.value);
+                  }
+                }}
               />
             </Field>
           </div>
@@ -330,19 +446,18 @@ export function DHCPOptionsEditor({
           ) : (
             <ChevronRight className="h-3.5 w-3.5" />
           )}
-          Custom options{" "}
-          {customOptions.length > 0 && `(${customOptions.length})`}
+          Custom options {customRows.length > 0 && `(${customRows.length})`}
         </button>
 
         {showCustom && (
           <div className="mt-2 space-y-3">
-            {customOptions.map((opt, idx) => (
+            {customRows.map(({ opt, at }, idx) => (
               <CustomOptionRow
                 key={idx}
                 opt={opt}
                 catalog={catalog}
-                onChange={(next) => updateCustomAt(idx, next)}
-                onRemove={() => removeCustomAt(idx)}
+                onChange={(next) => updateCustomAt(at, next)}
+                onRemove={() => removeCustomAt(at)}
               />
             ))}
             <button

@@ -13,14 +13,19 @@ from app.services.backup.targets.azure_blob import AzureBlobDestination
 from app.services.backup.targets.base import (
     ARCHIVE_NAME_RE,
     DESTINATIONS,
+    PRE_RESTORE_KEEP_LAST_N,
     ArchiveListing,
+    ArchiveNotFoundError,
+    ArchiveTooLargeError,
     BackupDestination,
     BackupDestinationError,
     DestinationConfigError,
     InvalidArchiveNameError,
     RetentionLockedError,
     UnsupportedOperationError,
+    check_config_value_types,
     get_destination,
+    is_pre_restore_archive,
     list_destination_kinds,
     safe_filename,
 )
@@ -37,7 +42,9 @@ from app.services.backup.targets.secrets_config import (
     decrypt_config_secrets,
     encrypt_config_secrets,
     merge_config_for_update,
+    normalize_config_for_create,
     redact_config_secrets,
+    secret_field_names,
 )
 from app.services.backup.targets.smb import SmbDestination
 from app.services.backup.targets.webdav import WebDAVDestination
@@ -58,6 +65,8 @@ DESTINATIONS["https_put"] = HttpsPutDestination()
 __all__ = [
     "ARCHIVE_NAME_RE",
     "ArchiveListing",
+    "ArchiveNotFoundError",
+    "ArchiveTooLargeError",
     "BackupDestination",
     "BackupDestinationError",
     "UnsupportedOperationError",
@@ -75,13 +84,18 @@ __all__ = [
     "SmbDestination",
     "WebDAVDestination",
     "DESTINATIONS",
+    "PRE_RESTORE_KEEP_LAST_N",
     "REDACTED_SENTINEL",
     "SecretFieldError",
     "decrypt_config_secrets",
     "encrypt_config_secrets",
     "get_destination",
+    "is_pre_restore_archive",
     "list_destination_kinds",
     "merge_config_for_update",
+    "normalize_config_for_create",
+    "check_config_value_types",
     "redact_config_secrets",
     "safe_filename",
+    "secret_field_names",
 ]

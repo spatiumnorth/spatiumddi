@@ -1,5 +1,6 @@
 import { useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { Pencil, Plus, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
 
 import {
@@ -10,6 +11,7 @@ import {
   type TLSCertTarget,
   type TLSCertTargetCreate,
   type TLSCertTargetUpdate,
+  formatApiError,
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
@@ -22,6 +24,8 @@ import {
   fmtDateTime,
   tlsStateCls,
 } from "@/lib/tls-cert-state";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -267,11 +271,7 @@ function CertTargetEditorModal({
       }
     },
     onError: (e: unknown) => {
-      const err = e as {
-        message?: string;
-        response?: { data?: { detail?: string } };
-      };
-      setError(err?.response?.data?.detail ?? err?.message ?? "Save failed");
+      setError(formatApiError(e, "Save failed"));
     },
   });
 
@@ -361,7 +361,9 @@ function CertTargetEditorModal({
         </div>
       </div>
 
-      {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
+      {error && (
+        <FormError className="mt-3 text-sm text-destructive">{error}</FormError>
+      )}
 
       <div className="mt-6 flex justify-end gap-2 border-t pt-3">
         <button
@@ -437,6 +439,13 @@ function CertDetailModal({
   onClose: () => void;
   onEdit: () => void;
 }) {
+  // #1340 — a read-only user is offered no write it would be refused:
+  // the router asks write (delete) on 'tls_cert'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "tls_cert"),
+    "Requires write permission on certificate targets",
+  );
   const qc = useQueryClient();
   const [showPem, setShowPem] = useState(false);
   // CT log is an off-prem call (leaks the hostname to crt.sh) — opt-in,
@@ -715,6 +724,7 @@ function CertDetailModal({
           disabled={probe.isPending}
           onClick={() => probe.mutate()}
           className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
+          {...writeGate}
         >
           <RefreshCw
             className={cn("h-3.5 w-3.5", probe.isPending && "animate-spin")}
@@ -724,7 +734,8 @@ function CertDetailModal({
         <button
           type="button"
           onClick={onEdit}
-          className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+          className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+          {...writeGate}
         >
           Edit
         </button>
@@ -743,6 +754,17 @@ function CertDetailModal({
 // ── Page ──────────────────────────────────────────────────────────────
 
 export function CertificatesPage() {
+  // #1340 — a read-only user is offered no write it would be refused:
+  // the router asks write (delete) on 'tls_cert'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "tls_cert"),
+    "Requires write permission on certificate targets",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "tls_cert"),
+    "Requires delete permission on certificate targets",
+  );
   const qc = useQueryClient();
   const { enabled, ready } = useFeatureModules();
   const moduleOn = enabled("security.tls_certs");
@@ -796,16 +818,23 @@ export function CertificatesPage() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["tls-certs"] }),
   });
 
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
   const removeOne = useMutation({
+    onMutate: () => setDeleteError(null),
     mutationFn: (id: string) => tlsCertsApi.remove(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["tls-certs"] }),
+    onError: (e: unknown) => {
+      setDeleteError(formatApiError(e, "Failed to delete TLS cert target"));
+      qc.invalidateQueries({ queryKey: ["tls-certs"] });
+    },
   });
 
   if (ready && !moduleOn) {
     return (
       <div className="flex h-full items-center justify-center p-6 text-sm text-muted-foreground">
         TLS certificate monitoring is disabled. An administrator can enable the
-        "security.tls_certs" feature module in Settings → Features.
+        "security.tls_certs" feature module on the Features & Integrations page.
       </div>
     );
   }
@@ -813,6 +842,11 @@ export function CertificatesPage() {
   return (
     <div className="h-full overflow-auto p-6">
       <div className="space-y-4">
+        {deleteError && (
+          <p role="alert" className="text-sm text-destructive">
+            {deleteError}
+          </p>
+        )}
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
             <h1 className="flex items-center gap-2 text-xl font-semibold">
@@ -842,6 +876,7 @@ export function CertificatesPage() {
               variant="primary"
               icon={Plus}
               onClick={() => setShowNew(true)}
+              {...writeGate}
             >
               New target
             </HeaderButton>
@@ -913,7 +948,24 @@ export function CertificatesPage() {
                     className="px-3 py-6 text-center text-muted-foreground"
                     colSpan={8}
                   >
-                    No targets yet — click "New target" to add one.
+                    <ListEmpty
+                      error={query.error}
+                      what="certificate targets"
+                      filtered={
+                        search !== "" ||
+                        stateFilter !== "" ||
+                        sourceFilter !== ""
+                      }
+                      onClearFilters={() => {
+                        setSearch("");
+                        setStateFilter("");
+                        setSourceFilter("");
+                      }}
+                      gate={writeGate}
+                      hint={`Click "New target" to add one.`}
+                    >
+                      No targets yet.
+                    </ListEmpty>
                   </td>
                 </tr>
               )}
@@ -925,10 +977,24 @@ export function CertificatesPage() {
                   title="View certificate details"
                 >
                   <td className="px-3 py-2 align-top break-words">
-                    <div className="font-medium">
+                    <button
+                      type="button"
+                      // Two targets may share host:port and differ only by
+                      // SNI (the dedupe key is host + port + server_name),
+                      // so the SNI is part of the name or the rows collide.
+                      aria-label={`View certificate details for ${t.host}:${t.port}${
+                        t.server_name ? ` (SNI ${t.server_name})` : ""
+                      }`}
+                      title="View certificate details"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setDetail(t);
+                      }}
+                      className="rounded text-left font-medium hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+                    >
                       {t.host}
                       <span className="text-muted-foreground">:{t.port}</span>
-                    </div>
+                    </button>
                     {t.display_name && (
                       <div className="text-[11px] text-muted-foreground">
                         {t.display_name}
@@ -963,9 +1029,11 @@ export function CertificatesPage() {
                     <button
                       type="button"
                       title="Probe now"
+                      aria-label="Probe now"
                       disabled={probeNow.isPending}
                       onClick={() => probeNow.mutate(t.id)}
                       className="ml-1 rounded p-1 hover:bg-muted disabled:opacity-50"
+                      {...writeGate}
                     >
                       <RefreshCw
                         className={cn(
@@ -979,14 +1047,17 @@ export function CertificatesPage() {
                     <button
                       type="button"
                       title="Edit"
+                      aria-label="Edit"
                       onClick={() => setEditing(t)}
-                      className="ml-1 rounded p-1 hover:bg-muted"
+                      className="ml-1 rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                      {...writeGate}
                     >
                       <Pencil className="h-3.5 w-3.5" />
                     </button>
                     <button
                       type="button"
                       title="Delete"
+                      aria-label="Delete"
                       onClick={() => {
                         setConfirm({
                           title: "Delete TLS cert target",
@@ -995,7 +1066,8 @@ export function CertificatesPage() {
                           onConfirm: () => removeOne.mutate(t.id),
                         });
                       }}
-                      className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10"
+                      className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
+                      {...deleteGate}
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                     </button>

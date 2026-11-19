@@ -79,6 +79,8 @@ def test_release_tags_are_accepted(rv: types.ModuleType, name: str, prerelease: 
     "name",
     [
         "2026.09.04",  # a CalVer tag always carries its -N
+        "2026.10.07-01",  # a second spelling of -1, published as the same chart
+        "2026.10.07-0",  # N starts at 1
         "2026.9.4",  # nor is it SemVer: that major would outrank every release
         "1.01.0",  # SemVer forbids leading zeros
         "1.0.0-rc.01",  # ...in numeric pre-release identifiers too: a second rc.1
@@ -238,7 +240,7 @@ def test_notes_reads_the_file(
         ("2026.04.20-1", "2026.4.20-1"),
         ("2026.09.04-1", "2026.9.4-1"),
         ("2026.10.10-12", "2026.10.10-12"),
-        ("2026.11.03-01", "2026.11.3-1"),
+        ("2026.11.03-1", "2026.11.3-1"),
         # A SemVer tag is already a valid chart version.
         ("1.0.0", "1.0.0"),
         ("1.0.0-rc.1", "1.0.0-rc.1"),

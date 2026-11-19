@@ -75,6 +75,28 @@ def test_ok_clears_the_stale_failure_detail() -> None:
     assert row.config_failed_etag is None
 
 
+def test_ok_without_an_etag_is_unknown_not_ok() -> None:
+    """#2258: an agent's pre-first-apply placeholder must not store ``ok``."""
+    row = _row()
+    _report(row, {"status": STATUS_OK, "etag": None})
+    assert row.config_apply_status is None
+    assert row.config_apply_at is None
+
+
+def test_ok_without_an_etag_does_not_undo_a_reset_or_a_failure() -> None:
+    row = _row()
+    _report(row, {"status": STATUS_REVERTED, "failed_etag": "bad", "error": "boom"})
+    _report(row, {"status": STATUS_OK})
+    assert row.config_apply_status == STATUS_REVERTED
+    assert row.config_failed_etag == "bad"
+
+
+def test_ok_with_an_etag_is_stored() -> None:
+    row = _row()
+    _report(row, {"status": STATUS_OK, "etag": "abc"})
+    assert row.config_apply_status == STATUS_OK
+
+
 def test_empty_report_leaves_a_recorded_failure_alone() -> None:
     """A pre-#882 agent sends ``config: {}``.
 
@@ -154,6 +176,39 @@ async def test_matcher_fires_on_a_reverted_agent(db_session: AsyncSession) -> No
     assert severity == SEVERITY_BY_STATUS[STATUS_REVERTED]
 
 
+async def test_a_partial_apply_does_not_claim_a_rollback(db_session: AsyncSession) -> None:
+    """A PowerDNS agent that served every zone but one reports ``reverted``
+    (there is no partial status) with a marked error. The alert used to say
+    the server rolled back and was NOT serving what is saved, the opposite of
+    what happened (ddi-pg's walk of #1280)."""
+    from app.services.agents.config_apply import PARTIAL_APPLY_PREFIX, is_partial_apply
+
+    error = (
+        f"{PARTIAL_APPLY_PREFIX}the daemon refused 1 zone(s); every other zone is "
+        "served: bad.test. create: HTTP 422 Duplicate record in RRset"
+    )
+    await _dns_server(
+        db_session,
+        "ns-partial",
+        config_apply_status=STATUS_REVERTED,
+        config_failed_etag="sha256:live",
+        config_apply_error=error,
+    )
+    matches = await _matching_agent_config_rejected_subjects(db_session, _RULE)
+    assert len(matches) == 1
+    _subject, _display, message, severity = matches[0]
+    assert "rolled back" not in message.replace("Nothing was rolled back", "")
+    assert "NOT serving" not in message
+    assert "applied the configuration" in message
+    assert "bad.test." in message and "Duplicate record in RRset" in message
+    assert PARTIAL_APPLY_PREFIX not in message
+    assert "sha256:live" not in message, "the 'rejected' etag is the live one"
+    assert severity == SEVERITY_BY_STATUS[STATUS_REVERTED]
+    assert is_partial_apply(STATUS_REVERTED, error)
+    assert not is_partial_apply(STATUS_REVERTED, "named-checkconf failed")
+    assert not is_partial_apply("revert_failed", error)
+
+
 async def test_matcher_ignores_ok_and_never_reported(db_session: AsyncSession) -> None:
     """NULL means the agent has never reported — a pre-#882 agent or an
     agentless driver with no apply loop. Firing on those would alarm every
@@ -195,3 +250,78 @@ def test_failed_statuses_excludes_ok() -> None:
     the alert fire on every healthy server in the fleet."""
     assert STATUS_OK not in FAILED_STATUSES
     assert FAILED_STATUSES == {STATUS_REVERTED, STATUS_REVERT_FAILED, STATUS_NO_PREVIOUS}
+
+
+# ── OOM-killed apply (#3552) ──────────────────────────────────────────────
+
+
+def test_oom_reason_is_stored_as_a_readable_error_with_the_limit() -> None:
+    row = _row()
+    _report(
+        row,
+        {
+            "status": STATUS_NO_PREVIOUS,
+            "failed_etag": "bad",
+            "error": "the DNS daemon died once while this bundle was being applied",
+            "reason": "oom",
+            "memory_limit_bytes": 512 << 20,
+        },
+    )
+    assert row.config_apply_status == STATUS_NO_PREVIOUS
+    assert (row.config_apply_error or "").startswith(
+        "out of memory while applying config (limit 512 MiB): the DNS daemon died"
+    )
+
+
+def test_oom_reason_without_a_limit_still_says_out_of_memory() -> None:
+    row = _row()
+    _report(row, {"status": STATUS_NO_PREVIOUS, "failed_etag": "b", "reason": "oom"})
+    assert row.config_apply_error == "out of memory while applying config"
+
+
+def test_an_older_agent_report_is_stored_unchanged() -> None:
+    row = _row()
+    _report(row, {"status": STATUS_NO_PREVIOUS, "failed_etag": "b", "error": "boom"})
+    assert row.config_apply_error == "boom"
+
+
+def test_an_unknown_reason_is_ignored() -> None:
+    row = _row()
+    _report(row, {"status": STATUS_REVERTED, "error": "boom", "reason": "meteor"})
+    assert row.config_apply_error == "boom"
+
+
+async def test_the_alert_text_carries_the_oom_reason(db_session: AsyncSession) -> None:
+    row = await _dns_server(
+        db_session,
+        "ns-oom",
+        config_apply_status=STATUS_NO_PREVIOUS,
+        config_failed_etag="sha256:bad",
+    )
+    _report(
+        row,
+        {
+            "status": STATUS_NO_PREVIOUS,
+            "failed_etag": "sha256:bad",
+            "reason": "oom",
+            "memory_limit_bytes": 1 << 30,
+        },
+    )
+    await db_session.flush()
+
+    matches = await _matching_agent_config_rejected_subjects(db_session, _RULE)
+    assert "out of memory while applying config (limit 1 GiB)" in matches[0][2]
+
+
+def test_daemon_died_without_kubelet_evidence_is_stored_unchanged() -> None:
+    row = _row()
+    _report(
+        row,
+        {
+            "status": STATUS_NO_PREVIOUS,
+            "failed_etag": "b",
+            "error": "died",
+            "reason": "daemon_died",
+        },
+    )
+    assert row.config_apply_error == "died"

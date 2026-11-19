@@ -2,11 +2,13 @@
 
 Scopes + client classes live on ``DHCPServerGroup`` — every server in
 a group renders the same config. HA tuning also lives on the group;
-a group with ≥ 2 Kea members emits a ``FailoverConfig`` (the first two
-sorted members are the primary + secondary/standby partners, any 3rd+
-members are ``backup`` peers), a single-member group is standalone and
-doesn't. Peer URLs are per-server (``DHCPServer.ha_peer_url``) — Kea
-uses them to reach the other peers for heartbeats + lease updates.
+an HA-mode group with ≥ 2 Kea members that carry a peer URL emits a
+``FailoverConfig`` for each of them (the first two sorted are the
+primary + secondary/standby partners, any 3rd+ are ``backup`` peers); a
+URL-less Kea member beside them is sidelined with no hook and no scopes
+(#3151, ``services/dhcp/ha_members``). Peer URLs are per-server
+(``DHCPServer.ha_peer_url``) — Kea uses them to reach the other peers
+for heartbeats + lease updates.
 
 Mirrors ``app.services.dns.config_bundle``.
 """
@@ -49,11 +51,16 @@ from app.models.dhcp import (
 )
 from app.models.dhcp_device_policy import DHCPDevicePolicy
 from app.models.ipam import Subnet
+from app.services.dhcp.class_refs import dangling_changed, dangling_restrictions
 from app.services.dhcp.device_policy import (
     compile_device_policy,
     load_fingerprint_snapshot,
 )
+from app.services.dhcp.ha_members import kea_ha_members
+from app.services.dhcp.ha_peer_auth import current_peer_credential
 from app.services.dhcp.option_validation import (
+    canonical_domain_options,
+    options_for_family,
     phone_options_loadable,
     vendor_class_match_renderable,
     vendor_class_match_test,
@@ -73,43 +80,40 @@ _dup_prefix_logged: set[tuple[str, str]] = set()
 async def _resolve_failover(
     db: AsyncSession, server: DHCPServer, group: DHCPServerGroup | None
 ) -> FailoverConfig | None:
-    """Return the FailoverConfig for ``server`` if its group is an HA group.
+    """Return the FailoverConfig for ``server`` if it takes part in its group's HA.
 
-    An HA group is a DHCPServerGroup with >= 2 Kea members. The
-    ``peers`` array carries an entry for *every* Kea member regardless
+    An HA group is a DHCPServerGroup in an HA mode with >= 2 Kea members
+    that carry an ``ha_peer_url`` (``services/dhcp/ha_members``). The
+    ``peers`` array carries an entry for every such participant regardless
     of this server's role; ``this_server_name`` tells Kea which one is
     "us". Non-Kea servers in the group (e.g. Windows DHCP read-only)
     are ignored for HA purposes — Kea HA only speaks to Kea.
 
     Kea's ``libdhcp_ha.so`` requires ``this-server-name`` to match an
-    entry in the ``peers`` array. The first sorted Kea member plays the
+    entry in the ``peers`` array. The first sorted participant plays the
     ``primary`` role, the second plays ``secondary`` (load-balancing) /
-    ``standby`` (hot-standby), and every additional member (3rd, 4th, …)
+    ``standby`` (hot-standby), and every additional one (3rd, 4th, …)
     plays the ``backup`` role. Backup servers don't partner in the
     heartbeat but receive lease updates — this keeps a group's 3rd+
     member valid instead of rendering a config whose own name is absent
     from its 2-entry peers list (issue #332).
 
-    Peer URLs come from ``DHCPServer.ha_peer_url`` on each member.
-    An empty peer URL on any Kea member suppresses HA rendering for the
-    whole group (the operator hasn't finished setting things up yet).
+    Peer URLs come from ``DHCPServer.ha_peer_url`` on each member. A Kea
+    member with no URL is not a participant: with fewer than two
+    participants nothing renders HA; otherwise the URL-less member is
+    sidelined (no hook here, and ``build_config_bundle`` gives it no
+    scopes), so a third member joining a working pair leaves the pair's
+    HA in place (#3151).
     """
     if group is None:
         return None
-    kea_peers = [s for s in group.servers if s.driver == "kea"]
-    if len(kea_peers) < 2:
-        return None
-    # Stable ordering so every member renders the same peers array
-    # regardless of which server is asking for its bundle. Sort by id
-    # (UUID) — the concept of "primary" in a group is not a model field
-    # today; whichever Kea peer ends up first in the sort plays the
-    # ``primary`` role, the second ``secondary``/``standby``, the rest
-    # ``backup``.
-    kea_peers.sort(key=lambda s: str(s.id))
-
-    # Every Kea member needs a peer URL — an HA peer with no URL can't be
-    # reached for heartbeats or lease updates, so the group isn't ready.
-    if any(not s.ha_peer_url for s in kea_peers):
+    # A standalone group never renders HA, whatever peer URLs its members
+    # carry (#2969) — ``kea_ha_members`` returns no participants for it.
+    # Stable ordering (by id) so every member renders the same peers array
+    # regardless of which server is asking for its bundle — the concept of
+    # "primary" in a group is not a model field today.
+    kea_peers = kea_ha_members(group.mode, group.servers).participants
+    if not any(s.id == server.id for s in kea_peers):
         return None
 
     secondary_role = "standby" if group.mode == "hot-standby" else "secondary"
@@ -129,7 +133,20 @@ async def _resolve_failover(
                 "auto-failover": group.auto_failover,
             }
         )
+    # The peer credential, only once every participant's agent renders it:
+    # Kea's listener cannot accept TLS and plaintext at once, so switching one
+    # peer before its partner's agent understands the fields would stop the
+    # pair talking for the length of the upgrade (ha_peer_auth module doc).
+    # Read fresh from the database, not off ``group`` / ``kea_peers``: a caller
+    # holding a long-lived session gets identity-map objects a re-query does
+    # not overwrite (``current_peer_credential`` says why that matters). The
+    # agent long-poll expires its session on every pass since #2040, so this is
+    # now belt-and-braces for any other caller.
+    tls = await current_peer_credential(db, group, kea_peers)
     return FailoverConfig(
+        tls_ca_pem=tls["ca_pem"] if tls else None,
+        tls_cert_pem=tls["cert_pem"] if tls else None,
+        tls_key_pem=tls["key_pem"] if tls else None,
         channel_id=str(group.id),
         channel_name=group.name,
         mode=group.mode,
@@ -210,6 +227,18 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
             .scalars()
             .all()
         )
+
+    # #3151 — a Kea member with no HA peer URL in a group whose other Kea
+    # members run HA is sidelined: no HA hook (``_resolve_failover``) and no
+    # scopes, so no pools, reservations or RAs. Serving the group's pools
+    # beside the running pair, with no lease sync between them, would hand one
+    # address to two clients. It serves again once it has a URL (and joins the
+    # relationship) or the group stops rendering HA. Never true in a group of
+    # one or two Kea members (``services/dhcp/ha_members``).
+    if group is not None and any(
+        s.id == server.id for s in kea_ha_members(group.mode, group.servers).sidelined
+    ):
+        scope_rows = []
 
     # Pre-fetch subnet CIDRs
     subnet_ids = [s.subnet_id for s in scope_rows]
@@ -295,6 +324,10 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
             # worth risking the lease service for.
             log.warning("dhcp_bundle_e911_lookup_failed", error=str(exc))
 
+    # #2731: assembled ahead of the scopes, because each v4 scope lists the
+    # classes of its own profile and Kea evaluates them for that scope alone.
+    pxe_classes, pxe_class_names = await _assemble_pxe_classes(db, scope_rows)
+
     scopes: list[ScopeDef] = []
     for sc in scope_rows:
         subnet = subnet_map.get(sc.subnet_id)
@@ -309,7 +342,7 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
                 name=p.name or "",
                 class_restriction=p.class_restriction,
                 lease_time_override=p.lease_time_override,
-                options_override=p.options_override or None,
+                options_override=canonical_domain_options(p.options_override) or None,
                 pd_prefix=getattr(p, "pd_prefix", None),
                 delegated_length=getattr(p, "delegated_length", None),
                 excluded_prefix=getattr(p, "excluded_prefix", None),
@@ -322,7 +355,7 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
                 mac_address=str(s.mac_address),
                 hostname=s.hostname or "",
                 client_id=s.client_id,
-                options_override=s.options_override or None,
+                options_override=canonical_domain_options(s.options_override) or None,
                 duid=getattr(s, "duid", None),
             )
             for s in sc.statics
@@ -337,7 +370,7 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
                     _with_location_options(
                         location_erls,
                         subnet,
-                        dict(sc.options or {}),
+                        canonical_domain_options(sc.options),
                         address_family=getattr(sc, "address_family", "ipv4") or "ipv4",
                     ),
                     subnet,
@@ -346,8 +379,6 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
                 ),
                 pools=pools,
                 statics=statics,
-                ddns_enabled=sc.ddns_enabled,
-                ddns_hostname_policy=sc.ddns_hostname_policy,
                 is_active=sc.is_active,
                 address_family=getattr(sc, "address_family", "ipv4") or "ipv4",
                 v6_address_mode=getattr(sc, "v6_address_mode", "stateful") or "stateful",
@@ -357,18 +388,17 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
                 # real value (caching explicitly off) and must not be coalesced.
                 lease_cache_threshold=getattr(sc, "lease_cache_threshold", None),
                 lease_cache_max_age=getattr(sc, "lease_cache_max_age", None),
+                # #2731: PXE classes are Dhcp4-only, so a v6 scope lists none.
+                pxe_class_names=(
+                    pxe_class_names.get(sc.pxe_profile_id, ())
+                    if sc.pxe_profile_id is not None
+                    and (getattr(sc, "address_family", "ipv4") or "ipv4") != "ipv6"
+                    else ()
+                ),
             )
         )
 
-    client_classes = tuple(
-        ClientClassDef(
-            name=c.name,
-            match_expression=c.match_expression or "",
-            description=c.description or "",
-            options=dict(c.options or {}),
-        )
-        for c in cc_rows
-    )
+    client_classes = tuple(_client_class_def(c) for c in cc_rows)
 
     mac_blocks = tuple(
         MACBlockDef(
@@ -379,9 +409,28 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
         for m in mb_rows
     )
 
-    pxe_classes = await _assemble_pxe_classes(db, scope_rows)
     phone_classes = await _assemble_phone_classes(db, scope_rows)
     device_policy_classes = await _assemble_device_policy_classes(db, group.id if group else None)
+
+    # #2285 — defence in depth for a pool bound to a class nothing renders.
+    # Deliberately NOT repaired: dropping the restriction would open a
+    # quarantine / allow-list pool to every client, and skipping the pool
+    # changes the scope's capacity. The restriction ships as stored (the pool
+    # matches nobody, which is what Kea does with it anyway) and we say so
+    # loudly, since Kea itself accepts the config without a word.
+    # Logged when the dangling set changes, not on every long-poll rebuild.
+    dangling = dangling_restrictions(
+        [(f"{p.start_ip}-{p.end_ip}", p.class_restriction or "") for s in scopes for p in s.pools],
+        {c.name for c in client_classes} | {d.name for d in device_policy_classes},
+    )
+    if dangling_changed(str(server.id), dangling):
+        for label, cls in dangling:
+            log.warning(
+                "dhcp_pool_restricted_to_undefined_class",
+                server_id=str(server.id),
+                pool=label,
+                client_class=cls,
+            )
 
     # IPv6 Router Advertisements (issue #524) — one radvd stanza per
     # RA-enabled IPv6 subnet in the group. The rendered radvd.conf ships in
@@ -491,7 +540,7 @@ def _build_pxe_match_expression(
 
 async def _assemble_pxe_classes(
     db: AsyncSession, scope_rows: list[DHCPScope]
-) -> tuple[PXEClassDef, ...]:
+) -> tuple[tuple[PXEClassDef, ...], dict[uuid.UUID, tuple[str, ...]]]:
     """Walk every scope with a bound PXE profile and emit one class
     per arch-match. Disabled profiles render no classes.
 
@@ -502,10 +551,14 @@ async def _assemble_pxe_classes(
     Sorted by (priority ASC, profile_id ASC, match_id ASC) so Kea's
     declared-order evaluation puts most-specific matches first when
     the operator orders priorities right.
+
+    Also returns each profile's class names, in that same order (#2731).
+    The scopes bound to a profile list them, and Kea evaluates them for
+    those scopes' clients only.
     """
     profile_ids = {sc.pxe_profile_id for sc in scope_rows if sc.pxe_profile_id is not None}
     if not profile_ids:
-        return ()
+        return (), {}
 
     matches = (
         (
@@ -525,6 +578,7 @@ async def _assemble_pxe_classes(
     )
 
     out: list[PXEClassDef] = []
+    names: dict[uuid.UUID, list[str]] = {}
     seen_names: set[str] = set()
     for m in matches:
         prof = m.profile
@@ -557,7 +611,8 @@ async def _assemble_pxe_classes(
                 is_ipxe_chain=(m.match_kind == "ipxe_chain"),
             )
         )
-    return tuple(out)
+        names.setdefault(prof.id, []).append(name)
+    return tuple(out), {pid: tuple(n) for pid, n in names.items()}
 
 
 async def _assemble_phone_classes(
@@ -698,7 +753,7 @@ async def _assemble_device_policy_classes(
             DevicePolicyClassDef(
                 name=policy.class_name,
                 match_expression=compiled.expression,
-                options=dict(policy.options or {}),
+                options=canonical_domain_options(policy.options),
                 lease_time=policy.lease_time,
             )
         )
@@ -737,6 +792,27 @@ def _with_v6_domain_search(
     if not search:
         return options
     return {**options, "domain-search": search}
+
+
+def _client_class_def(c: DHCPClientClass) -> ClientClassDef:
+    """A client class with the options each daemon gets (#1229, #1295)."""
+    options = canonical_domain_options(c.options)
+    family = c.address_family or "ipv4"
+    if family == "dual":
+        v4, v6 = options_for_family(options, "ipv4"), options_for_family(options, "ipv6")
+    elif family == "ipv6":
+        v4, v6 = {}, options
+    else:
+        v4, v6 = options, {}
+    return ClientClassDef(
+        name=c.name,
+        match_expression=c.match_expression or "",
+        description=c.description or "",
+        options=options,
+        address_family=family,
+        options_v4=v4,
+        options_v6=v6,
+    )
 
 
 def _with_location_options(

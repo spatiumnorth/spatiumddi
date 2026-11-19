@@ -24,7 +24,7 @@ async def _approved_supervisor(db: AsyncSession, version: str | None) -> tuple[A
     if settings is None:
         settings = PlatformSettings(id=1)
         db.add(settings)
-    # The supervisor endpoints 404 unless the feature flag is on.
+    # Only /supervisor/register needs the flag since #2798; kept on for parity.
     settings.supervisor_registration_enabled = True
     token, token_hash = generate_session_token()
     der = os.urandom(32)

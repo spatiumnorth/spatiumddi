@@ -512,6 +512,15 @@ def _reverse_zone_names_for(values: list[str]) -> set[str]:
     return out
 
 
+def _covering(name: str, zone_names: set[str]) -> str | None:
+    """The most specific of ``zone_names`` that ``name`` is equal to or under."""
+    best: str | None = None
+    for z in zone_names:
+        if (name == z or name.endswith("." + z)) and (best is None or len(z) > len(best)):
+            best = z
+    return best
+
+
 async def _check_reverse_zones(db: AsyncSession, zones: list[DNSZone]) -> dict[str, str]:
     """Is every reverse companion of the plan's forward zones also migrating?"""
     forward = [z for z in zones if z.kind != "reverse"]
@@ -535,7 +544,10 @@ async def _check_reverse_zones(db: AsyncSession, zones: list[DNSZone]) -> dict[s
             )
         ).all()
     ]
-    wanted = _reverse_zone_names_for(values) - in_plan
+    # A /24 is covered by the zone of its own name or by any wider reverse
+    # zone above it: SpatiumDDI gives a /16 subnet one /16 zone (#1840), so a
+    # name-equality test would report every /24 of it missing.
+    wanted = {w for w in _reverse_zone_names_for(values) if _covering(w, in_plan) is None}
     if not wanted:
         return {
             "state": STATE_OK,
@@ -551,19 +563,28 @@ async def _check_reverse_zones(db: AsyncSession, zones: list[DNSZone]) -> dict[s
     # operator to add an existing zone to the plan when what they actually need
     # is to create one — leaving the PTR gap this check exists to catch open.
     group_ids = {z.group_id for z in zones}
-    known = {
+    group_reverse = {
         name.lower()
         for (name,) in (
             await db.execute(
                 select(DNSZone.name).where(
-                    DNSZone.name.in_(sorted(wanted)),
+                    DNSZone.name.ilike("%in-addr.arpa%"),
                     DNSZone.group_id.in_(group_ids),
                 )
             )
         ).all()
     }
-    missing_from_plan = sorted(wanted & known)
-    unmanaged = sorted(wanted - known)
+    # Name the zone to add to the plan — the covering one, which for a /16
+    # subnet is not the /24 the address implies.
+    known: set[str] = set()
+    unmanaged: list[str] = []
+    for w in sorted(wanted):
+        cover = _covering(w, group_reverse)
+        if cover is None:
+            unmanaged.append(w)
+        else:
+            known.add(cover)
+    missing_from_plan = sorted(known)
 
     parts: list[str] = []
     if missing_from_plan:

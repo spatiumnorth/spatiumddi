@@ -27,11 +27,20 @@ import {
   YAxis,
 } from "recharts";
 import { Modal } from "@/components/ui/modal";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
+import { ListReadError } from "@/components/ui/list-read-error";
+import { isRefused, pollUnlessRefused } from "@/lib/refusal";
 import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import { formatBucket } from "@/lib/chart-time";
 import { ConfigApplyBanner } from "@/components/ConfigApplyChip";
 import { DaemonStateBanner } from "@/components/DaemonStateChip";
+import { DuplicateAgentChip } from "@/components/DuplicateAgentChip";
 import { SpoolChip } from "@/components/SpoolChip";
+import { syncCard } from "@/lib/dhcp-sync-label";
 import { haPillTitle } from "@/lib/dhcpHa";
 import {
   dhcpApi,
@@ -75,6 +84,11 @@ export function ServerDetailModal({
 }) {
   const [tab, setTab] = useState<Tab>("overview");
   const [showPauseModal, setShowPauseModal] = useState(false);
+  // Pause and resume are superadmin-only routes; ask the same.
+  const maintenanceGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const qc = useQueryClient();
   const isReadOnly = READ_ONLY_DRIVERS.has(server.driver);
 
@@ -131,6 +145,7 @@ export function ServerDetailModal({
                 onClick={() => resumeMut.mutate()}
                 disabled={resumeMut.isPending}
                 className="inline-flex items-center gap-1 rounded border border-emerald-600/40 bg-emerald-500/10 px-2 py-1 text-[11px] font-medium text-emerald-700 hover:bg-emerald-500/20 disabled:opacity-50 dark:text-emerald-400"
+                {...maintenanceGate}
               >
                 <Play className="h-3 w-3" />
                 {resumeMut.isPending ? "Resuming…" : "Resume"}
@@ -140,6 +155,7 @@ export function ServerDetailModal({
                 type="button"
                 onClick={() => setShowPauseModal(true)}
                 className="inline-flex items-center gap-1 rounded border border-amber-600/40 bg-amber-500/10 px-2 py-1 text-[11px] font-medium text-amber-700 hover:bg-amber-500/20 dark:text-amber-400"
+                {...maintenanceGate}
               >
                 <Pause className="h-3 w-3" />
                 Pause
@@ -258,6 +274,7 @@ function OverviewTab({ server }: { server: DHCPServer }) {
   // Kea agents send heartbeats; their ``agent_last_seen`` is the right
   // liveness signal. Windows DHCP is polled, so ``last_sync_at`` is
   // meaningful. Fall back to whichever exists.
+  const sync = syncCard(server);
   const seenAt =
     server.driver === "kea"
       ? (server.agent_last_seen ?? server.last_sync_at)
@@ -271,6 +288,7 @@ function OverviewTab({ server }: { server: DHCPServer }) {
       <DaemonStateBanner server={server} />
       <div className="flex flex-wrap gap-1.5 empty:hidden">
         <SpoolChip server={server} />
+        <DuplicateAgentChip server={server} kind="DHCP" />
       </div>
       <div className="grid grid-cols-2 gap-3">
         <InfoCard label="Status" value={server.status}>
@@ -280,7 +298,7 @@ function OverviewTab({ server }: { server: DHCPServer }) {
           </span>
         </InfoCard>
         <InfoCard label="Last heartbeat" value={fmtRelative(seenAt)} />
-        <InfoCard label="Last sync" value={fmtRelative(server.last_sync_at)} />
+        <InfoCard label={sync.label} value={fmtRelative(sync.at)} />
         <InfoCard
           label="Last seen IP"
           value={server.last_seen_ip ?? "—"}
@@ -573,7 +591,7 @@ function LogsTab({ serverId }: { serverId: string }) {
   const [ip, setIp] = useState("");
   const filterKey = `${q}|${severity}|${mac}|${ip}`;
 
-  const { data, isLoading, isError, refetch, isFetching } = useQuery({
+  const { data, isLoading, isError, error, refetch, isFetching } = useQuery({
     queryKey: ["dhcp-server-activity", serverId, filterKey],
     queryFn: () =>
       logsApi.dhcpActivity({
@@ -584,7 +602,9 @@ function LogsTab({ serverId }: { serverId: string }) {
         ip_address: ip || null,
         max_events: 200,
       }),
-    refetchInterval: 30_000,
+    // A 403 does not heal by asking again, and each refusal is a `denied`
+    // audit row (#2700).
+    refetchInterval: pollUnlessRefused(30_000),
   });
 
   return (
@@ -638,7 +658,7 @@ function LogsTab({ serverId }: { serverId: string }) {
       {isLoading ? (
         <LoadingBlock />
       ) : isError ? (
-        <ErrorBlock />
+        <ErrorBlock error={error} what="this server's activity log" />
       ) : !data || data.events.length === 0 ? (
         <p className="rounded-md border bg-card p-4 text-center text-sm text-muted-foreground">
           No activity log entries match — Kea agents ship file-output{" "}
@@ -819,10 +839,11 @@ function StatsTab({ serverId }: { serverId: string }) {
       nak: b.nak,
       decline: b.decline,
       release: b.release,
-      // #980 — DROPPED is socket_drop ALONE, and an unmeasured bucket stays
-      // null so Recharts breaks the line there: a gap where nobody looked,
-      // not a zero. See lib/dhcp-loss.ts for why receive_drop is excluded
-      // and why the coalesce matters.
+      // #980 / #2889 — DROPPED is socket_drop + queue_evicted, never
+      // receive_drop, and an unmeasured bucket stays null so Recharts breaks
+      // the line there: a gap where nobody looked, not a zero. See
+      // lib/dhcp-loss.ts for why receive_drop is excluded and why the
+      // coalesce matters.
       dropped: bucketLoss(b),
     }));
   }, [data, withDate]);
@@ -883,7 +904,14 @@ function StatsTab({ serverId }: { serverId: string }) {
               ) : loss.total > 0 ? (
                 <span
                   className="rounded bg-rose-500/15 px-1.5 py-0.5 text-[10px] font-medium text-rose-600"
-                  title="Packets the kernel discarded before the server could read them — its receive buffer filled. Most often the node is short of CPU: Kea answers 100% of what it reads, so no other signal shows this. Does not count packets Kea read and dropped on purpose, such as a blocklisted MAC."
+                  title={
+                    "Packets the kernel discarded before the server could read them — its receive buffer filled — plus DHCPv4 requests the server read and then evicted from its full packet queue during a burst" +
+                    (loss.evicted > 0 ? ` (${loss.evicted} of these)` : "") +
+                    ". Most often the node is short of CPU for the load's bursts: Kea answers 100% of what it processes, so no other signal shows this. Does not count packets Kea read and dropped on purpose, such as a blocklisted MAC." +
+                    (loss.evictionMeasured
+                      ? ""
+                      : " Queue evictions are not measured on this server (its agent has no raw-socket capability, or predates the counter).")
+                  }
                 >
                   {loss.total} dropped
                 </span>
@@ -1015,7 +1043,19 @@ function LoadingBlock() {
   );
 }
 
-function ErrorBlock() {
+function ErrorBlock({ error, what }: { error?: unknown; what?: string }) {
+  // A refusal is the reader's permissions, not a fault: say so, with the
+  // server's reason, rather than "Failed to load — try again" (#2700).
+  if (error && what && isRefused(error)) {
+    return (
+      <p
+        role="alert"
+        className="rounded-md border bg-card p-4 text-center text-sm text-muted-foreground"
+      >
+        <ListReadError error={error} what={what} />
+      </p>
+    );
+  }
   return (
     <div className="flex items-center justify-center gap-2 rounded-md border border-destructive/40 bg-destructive/5 py-8 text-sm text-destructive">
       <Activity className="h-4 w-4" />

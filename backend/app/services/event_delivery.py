@@ -37,8 +37,10 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings as _app_settings
-from app.core.crypto import decrypt_str
+from app.core.crypto import decrypt_dict, decrypt_str
+from app.core.exc_text import describe_http_exc
 from app.models.event_subscription import EventOutbox, EventSubscription
+from app.services.audit_redact import redact_audit_payload
 
 logger = structlog.get_logger(__name__)
 
@@ -62,6 +64,18 @@ def _sign(secret: str, ts: str, body: bytes) -> str:
     return f"sha256={digest}"
 
 
+def subscription_headers(sub: EventSubscription) -> dict[str, str]:
+    """The subscription's custom headers, decrypted (#1579).
+
+    Returns ``{}`` when none are stored. Raises ``ValueError`` when the
+    stored ciphertext won't decrypt under this install's key — callers
+    decide whether that fails the delivery or just the header names.
+    """
+    if not sub.headers_encrypted:
+        return {}
+    return {str(k): str(v) for k, v in decrypt_dict(sub.headers_encrypted).items()}
+
+
 async def _deliver_one(
     client: httpx.AsyncClient,
     sub: EventSubscription,
@@ -72,7 +86,13 @@ async def _deliver_one(
     """POST one outbox row. Returns ``(status_code | None, error | None)``."""
     import json as _json
 
-    body_bytes = _json.dumps(row.payload, separators=(",", ":"), default=str).encode("utf-8")
+    # ``_serialize_audit`` redacts on the way into the outbox (#2015); this
+    # second pass covers rows queued before that, and any future writer of
+    # the outbox. Idempotent, and on a copy — the outbox row is unchanged.
+    payload = row.payload
+    if isinstance(payload, dict):
+        payload = redact_audit_payload(payload)
+    body_bytes = _json.dumps(payload, separators=(",", ":"), default=str).encode("utf-8")
     ts = str(int(time.time()))
     headers: dict[str, str] = {
         "Content-Type": "application/json",
@@ -85,10 +105,32 @@ async def _deliver_one(
     if sig:
         headers["X-SpatiumDDI-Signature"] = sig
     # Operator-supplied custom headers — applied last so the SpatiumDDI-
-    # owned ones above can't be silently overridden.
-    for k, v in (sub.headers or {}).items():
+    # owned ones above can't be silently overridden. Decrypted here, at
+    # send time only (#1579); the values never leave this function.
+    try:
+        custom_headers = subscription_headers(sub)
+    except Exception as exc:  # noqa: BLE001
+        return None, f"headers decrypt failed: {exc}"
+    for k, v in custom_headers.items():
         if k.lower().startswith("x-spatiumddi-"):
             continue
+        # A header saved before the subscription schema refused non-ASCII
+        # (#1913) can't be sent. Name the header, never its value (it may be
+        # a credential), so the operator knows which one to re-save.
+        try:
+            k.encode("ascii")
+        except UnicodeEncodeError:
+            return (
+                None,
+                "headers: a stored custom header name is not ASCII; re-save the subscription",
+            )
+        try:
+            v.encode("ascii")
+        except UnicodeEncodeError:
+            return None, (
+                f"headers: stored header {k!r} has a non-ASCII value that cannot be sent; "
+                "re-save the subscription"
+            )
         headers[k] = v
 
     try:
@@ -99,7 +141,12 @@ async def _deliver_one(
             timeout=max(1, min(30, sub.timeout_seconds or 10)),
         )
     except httpx.HTTPError as exc:
-        return None, f"transport: {exc}"
+        return None, f"transport: {describe_http_exc(exc)}"
+    except ValueError as exc:
+        # A stored header httpx cannot encode (UnicodeEncodeError) saved
+        # before the subscription schema refused it (#1913): a failed
+        # delivery, not an exception out of the outbox drain.
+        return None, f"headers: {exc}"
 
     if 200 <= resp.status_code < 300:
         return resp.status_code, None
@@ -209,7 +256,7 @@ async def process_due_outbox(db: AsyncSession) -> dict[str, int]:
     return {"claimed": len(rows), "delivered": delivered, "failed": failed, "dead": dead}
 
 
-__all__ = ["process_due_outbox", "_sign", "_backoff_seconds"]
+__all__ = ["process_due_outbox", "subscription_headers", "_sign", "_backoff_seconds"]
 
 
 # Manual retry helper used by the API "retry now" endpoint. Flips a

@@ -50,9 +50,15 @@ needs_dash = pytest.mark.skipif(
     reason="dash is the appliance's /bin/sh; measuring bash here would test another shell",
 )
 
-# The one line the renderer writes to stderr by design (>&2 — its stdout is the
-# manifest), in whichever form this host's /proc/meminfo allows.
-_SIZING = ("Sizing control plane for ", "MemTotal unreadable")
+# The lines the renderer writes to stderr by design (>&2 — its stdout is the
+# manifest), in whichever form this host's /proc/meminfo and ``nproc`` allow:
+# the memory sizing, and (#2240) the CPU sizing.
+_SIZING = (
+    "Sizing control plane for ",
+    "MemTotal unreadable",
+    "Sizing control-plane CPU for ",
+    "CPU count unreadable",
+)
 
 
 def _extract_function(name: str) -> str:

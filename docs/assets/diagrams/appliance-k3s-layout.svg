@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="920" height="898" viewBox="0 0 920 898"
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="1126" viewBox="0 0 920 1126"
      preserveAspectRatio="xMidYMid meet"
      font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
   <title>Single-node k3s appliance layout</title>
-  <desc>What mkosi bakes into the appliance slot rootfs, and how firstboot's HelmChart manifest turns into the supervisor, role and control-plane pods.</desc>
+  <desc>What mkosi bakes into the appliance slot rootfs, and how the HelmChart manifests firstboot writes (plus the one the supervisor writes) turn into the supervisor, role, control-plane and MetalLB pods.</desc>
   <defs>
     <linearGradient id="appk-surface" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="#f1f5f9"/>
@@ -32,106 +32,126 @@
   </defs>
 
   <!-- outer appliance panel -->
-  <rect x="20" y="20" width="880" height="858" rx="16"
+  <rect x="20" y="20" width="880" height="1086" rx="16"
         fill="url(#appk-surface)" stroke="#94a3b8" stroke-width="2"/>
   <text x="44" y="52" font-size="18" font-weight="600" fill="#0f172a">appliance — single-node k3s</text>
   <text x="44" y="74" font-size="12" fill="#475569">Debian 13 slot rootfs · every binary, image and chart baked in for an air-gapped first boot</text>
 
   <!-- ================= on-disk layout ================= -->
-  <rect x="40" y="92" width="840" height="282" rx="12"
+  <rect x="40" y="92" width="840" height="470" rx="12"
         fill="#ffffff" stroke="#cbd5e1" stroke-dasharray="4 4" stroke-width="1.5"/>
-  <text x="60" y="116" font-size="13" font-weight="600" fill="#334155">on-disk layout — baked into the slot rootfs by mkosi</text>
-
-  <!-- row 1: k3s binary -->
+  <text x="60" y="116" font-size="13" font-weight="600" fill="#334155">on-disk layout — baked into the slot rootfs by mkosi, manifests written by firstboot</text>
   <rect x="52" y="126" width="520" height="40" rx="8" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1"/>
   <text x="68" y="144" font-size="12" fill="#0f172a"
         font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">/usr/local/bin/k3s</text>
   <text x="68" y="160" font-size="11" fill="#475569">static binary, pinned via K3S_VERSION</text>
-
-  <!-- row 2: airgap images -->
   <rect x="52" y="174" width="520" height="40" rx="8" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1"/>
   <text x="68" y="199" font-size="12" fill="#0f172a"
         font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">/var/lib/rancher/k3s/agent/images/*.tar.zst</text>
-  <rect x="610" y="181" width="140" height="26" rx="6"
+  <rect x="610" y="181" width="170" height="26" rx="6"
         fill="#ffffff" stroke="#94a3b8" stroke-dasharray="4 4" stroke-width="1"/>
   <text x="624" y="198" font-size="11" fill="#475569">air-gap-preloaded</text>
   <path d="M 606 194 H 578" stroke="#64748b" stroke-width="1.5" fill="none" marker-end="url(#appk-arrow)"/>
-
-  <!-- row 3: appliance chart -->
   <rect x="52" y="222" width="520" height="40" rx="8" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1"/>
   <text x="68" y="247" font-size="12" fill="#0f172a"
         font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">/usr/lib/spatiumddi/charts/spatiumddi-appliance.tgz</text>
-  <rect x="610" y="229" width="130" height="26" rx="6"
+  <rect x="610" y="229" width="160" height="26" rx="6"
         fill="#ffffff" stroke="#94a3b8" stroke-dasharray="4 4" stroke-width="1"/>
   <text x="624" y="246" font-size="11" fill="#475569">appliance chart</text>
   <path d="M 606 242 H 578" stroke="#64748b" stroke-width="1.5" fill="none" marker-end="url(#appk-arrow)"/>
-
-  <!-- row 4: umbrella chart -->
   <rect x="52" y="270" width="520" height="40" rx="8" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1"/>
   <text x="68" y="295" font-size="12" fill="#0f172a"
         font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">/usr/lib/spatiumddi/charts/spatiumddi.tgz</text>
-  <rect x="610" y="277" width="215" height="26" rx="6"
+  <rect x="610" y="277" width="245" height="26" rx="6"
         fill="#ffffff" stroke="#94a3b8" stroke-dasharray="4 4" stroke-width="1"/>
   <text x="624" y="294" font-size="11" fill="#475569">umbrella chart (Control plane)</text>
   <path d="M 606 290 H 578" stroke="#64748b" stroke-width="1.5" fill="none" marker-end="url(#appk-arrow)"/>
-
-  <!-- row 5: bootstrap manifest -->
-  <rect x="52" y="318" width="520" height="40" rx="8" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5"/>
+  <rect x="52" y="318" width="520" height="40" rx="8" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1"/>
   <text x="68" y="343" font-size="12" fill="#0f172a"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">/usr/lib/spatiumddi/charts/spatiumddi-metallb.tgz</text>
+  <rect x="610" y="325" width="150" height="26" rx="6"
+        fill="#ffffff" stroke="#94a3b8" stroke-dasharray="4 4" stroke-width="1"/>
+  <text x="624" y="342" font-size="11" fill="#475569">MetalLB chart</text>
+  <path d="M 606 338 H 578" stroke="#64748b" stroke-width="1.5" fill="none" marker-end="url(#appk-arrow)"/>
+  <rect x="52" y="366" width="520" height="40" rx="8" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="68" y="391" font-size="12" fill="#0f172a"
         font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">/var/lib/rancher/k3s/server/manifests/spatium-bootstrap.yaml</text>
+  <rect x="610" y="373" width="230" height="26" rx="6"
+        fill="#ffffff" stroke="#94a3b8" stroke-dasharray="4 4" stroke-width="1"/>
+  <text x="624" y="390" font-size="11" fill="#475569">→ supervisor, agent-landing</text>
+  <path d="M 606 386 H 578" stroke="#64748b" stroke-width="1.5" fill="none" marker-end="url(#appk-arrow)"/>
+  <rect x="52" y="414" width="520" height="40" rx="8" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="68" y="439" font-size="12" fill="#0f172a"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">/var/lib/rancher/k3s/server/manifests/spatium-control.yaml</text>
+  <rect x="610" y="421" width="200" height="26" rx="6"
+        fill="#ffffff" stroke="#94a3b8" stroke-dasharray="4 4" stroke-width="1"/>
+  <text x="624" y="438" font-size="11" fill="#475569">→ control plane pods</text>
+  <path d="M 606 434 H 578" stroke="#64748b" stroke-width="1.5" fill="none" marker-end="url(#appk-arrow)"/>
+  <rect x="52" y="462" width="520" height="40" rx="8" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="68" y="487" font-size="12" fill="#0f172a"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">/var/lib/rancher/k3s/server/manifests/spatium-metallb.yaml</text>
+  <rect x="610" y="469" width="140" height="26" rx="6"
+        fill="#ffffff" stroke="#94a3b8" stroke-dasharray="4 4" stroke-width="1"/>
+  <text x="624" y="486" font-size="11" fill="#475569">→ MetalLB</text>
+  <path d="M 606 482 H 578" stroke="#64748b" stroke-width="1.5" fill="none" marker-end="url(#appk-arrow)"/>
+  <rect x="52" y="510" width="520" height="40" rx="8" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="68" y="535" font-size="12" fill="#0f172a"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">/var/lib/rancher/k3s/server/manifests/spatium-appliance-tls.yaml</text>
+  <rect x="610" y="517" width="180" height="26" rx="6"
+        fill="#ffffff" stroke="#94a3b8" stroke-dasharray="4 4" stroke-width="1"/>
+  <text x="624" y="534" font-size="11" fill="#475569">Web UI cert Secret</text>
+  <path d="M 606 530 H 578" stroke="#64748b" stroke-width="1.5" fill="none" marker-end="url(#appk-arrow)"/>
 
-  <!-- manifest → helm-controller -->
-  <path d="M 200 374 V 454" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#appk-arrow)"/>
-  <text x="214" y="402" font-size="11" fill="#475569">firstboot writes on every boot — content depends on install role</text>
+  <path d="M 200 562 V 618" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#appk-arrow)"/>
+  <text x="214" y="575" font-size="11" fill="#475569">firstboot writes the manifests on every boot — content depends on install role</text>
 
   <!-- ================= boot sequence ================= -->
-  <rect x="40" y="422" width="840" height="440" rx="12"
+  <rect x="40" y="580" width="840" height="520" rx="12"
         fill="#ffffff" stroke="#cbd5e1" stroke-dasharray="4 4" stroke-width="1.5"/>
-  <text x="60" y="446" font-size="13" font-weight="600" fill="#334155">boot sequence — helm-controller reconciles the bootstrap release</text>
-
-  <!-- helm-controller -->
-  <rect x="52" y="458" width="520" height="46" rx="8" fill="#64748b"/>
-  <text x="68" y="478" font-size="13" font-weight="600" fill="#ffffff">helm-controller reconciles</text>
-  <text x="68" y="494" font-size="11" fill="#cbd5e1">→ installs the spatium-bootstrap release</text>
-
-  <path d="M 200 504 V 536" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#appk-arrow)"/>
-
-  <!-- supervisor -->
-  <rect x="52" y="540" width="520" height="50" rx="8" fill="url(#appk-worker)"/>
-  <text x="68" y="562" font-size="13" font-weight="600" fill="#ffffff">spatium-supervisor pod</text>
-  <text x="68" y="580" font-size="11" fill="#ddd6fe">DaemonSet · privileged · hostNetwork: false</text>
-  <rect x="610" y="552" width="95" height="26" rx="6"
+  <text x="60" y="604" font-size="13" font-weight="600" fill="#334155">boot sequence — helm-controller reconciles each HelmChart</text>
+  <rect x="52" y="622" width="520" height="50" rx="8" fill="#64748b"/>
+  <text x="68" y="644" font-size="13" font-weight="600" fill="#ffffff">helm-controller reconciles</text>
+  <text x="68" y="662" font-size="11" fill="#cbd5e1">→ installs spatium-bootstrap, spatium-control and spatium-metallb</text>
+  <path d="M 200 672 V 700" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#appk-arrow)"/>
+  <rect x="52" y="704" width="520" height="50" rx="8" fill="url(#appk-worker)"/>
+  <text x="68" y="726" font-size="13" font-weight="600" fill="#ffffff">spatium-supervisor pod</text>
+  <text x="68" y="744" font-size="11" fill="#ddd6fe">DaemonSet · privileged · hostNetwork: false</text>
+  <rect x="610" y="716" width="215" height="26" rx="6"
         fill="#ffffff" stroke="#94a3b8" stroke-dasharray="4 4" stroke-width="1"/>
-  <text x="624" y="569" font-size="11" fill="#475569">all roles</text>
-  <path d="M 606 565 H 578" stroke="#64748b" stroke-width="1.5" fill="none" marker-end="url(#appk-arrow)"/>
-
-  <path d="M 200 590 V 628" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#appk-arrow)"/>
-  <text x="214" y="606" font-size="11" fill="#475569">registers + heartbeats to control plane</text>
-  <text x="214" y="624" font-size="11" fill="#475569">on role assignment: labels node → DaemonSet schedules</text>
-
-  <!-- role pods -->
-  <rect x="52" y="632" width="520" height="50" rx="8" fill="url(#appk-agent)"/>
-  <text x="68" y="654" font-size="13" font-weight="600" fill="#ffffff">role pods — hostNetwork: true</text>
-  <text x="68" y="672" font-size="11" fill="#fed7aa">dns-bind9 · dns-powerdns · dns-technitium · dhcp-kea</text>
-
-  <text x="60" y="710" font-size="13" font-weight="600" fill="#334155">also owned by the spatium-bootstrap release</text>
-
-  <!-- agent-landing -->
-  <rect x="52" y="722" width="520" height="46" rx="8" fill="url(#appk-accent)"/>
-  <text x="68" y="742" font-size="13" font-weight="600" fill="#ffffff">agent-landing nginx — :80</text>
-  <text x="68" y="758" font-size="11" fill="#cffafe">always-on</text>
-  <rect x="610" y="732" width="125" height="26" rx="6"
+  <text x="624" y="733" font-size="11" fill="#475569">spatium-bootstrap · all roles</text>
+  <path d="M 606 729 H 578" stroke="#64748b" stroke-width="1.5" fill="none" marker-end="url(#appk-arrow)"/>
+  <path d="M 200 754 V 812" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#appk-arrow)"/>
+  <text x="214" y="774" font-size="11" fill="#475569">registers + heartbeats to control plane</text>
+  <text x="214" y="790" font-size="11" fill="#475569">writes the spatiumddi-appliance HelmChart (first heartbeat)</text>
+  <text x="214" y="806" font-size="11" fill="#475569">on role assignment: labels node → DaemonSet schedules</text>
+  <rect x="52" y="816" width="520" height="66" rx="8" fill="url(#appk-agent)"/>
+  <text x="68" y="838" font-size="13" font-weight="600" fill="#ffffff">role pods — hostNetwork: true *</text>
+  <text x="68" y="856" font-size="11" fill="#fed7aa">dns-bind9 · dns-powerdns · dns-technitium · dhcp-kea · looking-glass</text>
+  <text x="68" y="872" font-size="11" fill="#fed7aa">* DNS pods drop hostNetwork behind a DNS VIP (multi-node)</text>
+  <rect x="610" y="828" width="165" height="26" rx="6"
         fill="#ffffff" stroke="#94a3b8" stroke-dasharray="4 4" stroke-width="1"/>
-  <text x="624" y="749" font-size="11" fill="#475569">Appliance only</text>
-  <path d="M 606 745 H 578" stroke="#64748b" stroke-width="1.5" fill="none" marker-end="url(#appk-arrow)"/>
-
-  <!-- control plane pods -->
-  <rect x="52" y="784" width="520" height="64" rx="8" fill="url(#appk-control)"/>
-  <text x="68" y="806" font-size="13" font-weight="600" fill="#ffffff">control plane pods</text>
-  <text x="68" y="822" font-size="11" fill="#ddd6fe">api · frontend · db · redis · worker · beat · migrate</text>
-  <text x="68" y="838" font-size="11" fill="#ddd6fe">frontend on hostNetwork :80 + :443</text>
-  <rect x="610" y="803" width="120" height="26" rx="6"
+  <text x="624" y="845" font-size="11" fill="#475569">spatiumddi-appliance</text>
+  <path d="M 606 841 H 578" stroke="#64748b" stroke-width="1.5" fill="none" marker-end="url(#appk-arrow)"/>
+  <text x="60" y="912" font-size="13" font-weight="600" fill="#334155">also reconciled from the manifests above</text>
+  <rect x="52" y="924" width="520" height="46" rx="8" fill="url(#appk-accent)"/>
+  <text x="68" y="946" font-size="13" font-weight="600" fill="#ffffff">agent-landing nginx — :80</text>
+  <text x="68" y="962" font-size="11" fill="#cffafe">always-on</text>
+  <rect x="610" y="936" width="215" height="26" rx="6"
         fill="#ffffff" stroke="#94a3b8" stroke-dasharray="4 4" stroke-width="1"/>
-  <text x="624" y="820" font-size="11" fill="#475569">Control plane</text>
-  <path d="M 606 816 H 578" stroke="#64748b" stroke-width="1.5" fill="none" marker-end="url(#appk-arrow)"/>
+  <text x="624" y="953" font-size="11" fill="#475569">spatium-bootstrap · Appliance only</text>
+  <path d="M 606 945 H 578" stroke="#64748b" stroke-width="1.5" fill="none" marker-end="url(#appk-arrow)"/>
+  <rect x="52" y="982" width="520" height="50" rx="8" fill="#0f766e"/>
+  <text x="68" y="1004" font-size="13" font-weight="600" fill="#ffffff">MetalLB — metallb-system namespace</text>
+  <text x="68" y="1022" font-size="11" fill="#99f6e4">control-plane VIP (multi-node)</text>
+  <rect x="610" y="994" width="150" height="26" rx="6"
+        fill="#ffffff" stroke="#94a3b8" stroke-dasharray="4 4" stroke-width="1"/>
+  <text x="624" y="1011" font-size="11" fill="#475569">spatium-metallb</text>
+  <path d="M 606 1007 H 578" stroke="#64748b" stroke-width="1.5" fill="none" marker-end="url(#appk-arrow)"/>
+  <rect x="52" y="1044" width="520" height="46" rx="8" fill="url(#appk-control)"/>
+  <text x="68" y="1066" font-size="13" font-weight="600" fill="#ffffff">control plane pods</text>
+  <text x="68" y="1084" font-size="11" fill="#ddd6fe">api · frontend · db · redis · worker · beat · migrate</text>
+  <rect x="610" y="1056" width="215" height="26" rx="6"
+        fill="#ffffff" stroke="#94a3b8" stroke-dasharray="4 4" stroke-width="1"/>
+  <text x="624" y="1073" font-size="11" fill="#475569">spatium-control · Control plane</text>
+  <path d="M 606 1069 H 578" stroke="#64748b" stroke-width="1.5" fill="none" marker-end="url(#appk-arrow)"/>
 </svg>

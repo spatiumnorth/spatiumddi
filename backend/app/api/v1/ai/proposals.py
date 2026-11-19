@@ -25,9 +25,11 @@ from pydantic import BaseModel
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser
+from app.core.agent_wake import collecting_wakes
 from app.models.ai import AIOperationProposal
 from app.services.ai import operations
 from app.services.ai.operations_risky import RISKY_OPERATION_NAMES
+from app.services.api_token_scopes import enforce_operation_token_scope
 from app.services.approvals.gate import gate_or_execute
 
 logger = structlog.get_logger(__name__)
@@ -137,6 +139,10 @@ async def apply_proposal(
             detail=f"Operation {row.operation!r} is not registered",
         )
 
+    # A scoped API token must hold the write scope of the operation's family
+    # (#3302): the route gate only asked for "any write scope".
+    enforce_operation_token_scope(request, op.name)
+
     # SECURITY (#400, C2): authoritative RBAC backstop. The propose→apply
     # flow has NO router-level require_*_permission dependency, so without
     # this gate an authenticated Viewer who owns a proposal row could apply
@@ -198,7 +204,13 @@ async def apply_proposal(
             )
 
     try:
-        result = await op.apply(db, current_user, args)
+        # #2040 — /ai mounts without ``wake_publishing``, so an op's own
+        # ``collect_wake`` (DHCP scope delete, static create, …) was a silent
+        # no-op here and its agents converged only on the safety tick. Open the
+        # collector around the apply: it publishes after apply() commits and
+        # drops the batch if it raises.
+        async with collecting_wakes():
+            result = await op.apply(db, current_user, args)
     except operations.OperationPermissionError as exc:
         # SECURITY (#400, C2): a permission failure raised by the op's
         # own defense-in-depth check surfaces as a clean 403, not a

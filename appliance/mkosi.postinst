@@ -50,7 +50,10 @@ for unit in chrony.service ssh.service \
             spatiumddi-cluster-restore.path \
             spatiumddi-etcd-evict.path \
             spatiumddi-publish-k3s-token.service \
+            spatiumddi-publish-k3s-token.path \
             k3s.service \
+            spatiumddi-clear-shutdown-pods.service \
+            spatiumddi-reboot-handoff.service \
             spatiumddi-snmp-reload.path \
             spatiumddi-apt-reload.path \
             spatiumddi-chrony-reload.path \
@@ -64,14 +67,17 @@ for unit in chrony.service ssh.service \
             spatiumddi-storage-action.path \
             spatiumddi-removable-reload.path \
             spatiumddi-removable-boot.service \
+            spatiumddi-optin-services-boot.service \
             spatium-firewall-reload.path \
             spatiumddi-firewall-revert.timer \
             spatiumddi-image-prune.timer \
+            spatiumddi-image-unpack.service \
             spatiumddi-webui-selfcheck.timer \
             spatiumddi-helm-stuck-recover.timer \
             spatium-install.service \
             spatium-live-banner.service \
             spatium-live-bootstrap.service \
+            spatium-ssh-hostkeys.service \
             spatium-console.service \
             spatium-etc-reconcile.service \
             qemu-guest-agent.service \
@@ -120,6 +126,19 @@ rm -f "$BUILDROOT/etc/systemd/system/multi-user.target.wants/snmpd.service"
 # Disable (not mask) so the runner's enable+start works without an unmask.
 rm -f "$BUILDROOT/etc/systemd/system/multi-user.target.wants/lldpd.service"
 
+# #2376 — removing the symlink above was not enough: a fresh install came up
+# with snmpd + lldpd ``enabled`` and running (snmpd then held UDP 161, so the
+# SNMP runner's own start could never succeed). Something re-enables them
+# after this script (mkosi's preset-all, whose Debian default is "enable"), so
+# pin it with a preset (mkosi.extra/usr/lib/systemd/system-preset/) AND
+# disable them here too, wherever the wants symlink might live.
+for svc in snmpd lldpd; do
+    systemctl --root="$BUILDROOT" disable "$svc.service" >/dev/null 2>&1 || true
+    for d in etc/systemd/system usr/lib/systemd/system lib/systemd/system; do
+        rm -f "$BUILDROOT/$d/multi-user.target.wants/$svc.service"
+    done
+done
+
 # Mask systemd-networkd so it doesn't fight NetworkManager for
 # the same interfaces. The package stays installed (it ships in
 # systemd-sysv's transitive dep set on Debian) — masking the
@@ -150,6 +169,33 @@ for plym_unit in plymouth-start.service plymouth-quit.service \
     ln -sfn /dev/null "$BUILDROOT/etc/systemd/system/$plym_unit"
 done
 
+# live-config's account components never run on the live ISO.
+#
+# The ISO boots ``boot=live components`` (scripts/wrap-iso.sh), which runs
+# every script under /lib/live/config. Three of them are about a desktop
+# "live user" this appliance does not have:
+#
+#   0030-user-setup              creates the account ``user`` (password
+#                                ``live``) when the user-setup package is
+#                                installed
+#   0030-live-debconfig_passwd   the same, through live-debconfig
+#   0040-sudo                    writes /etc/sudoers.d/live, a passwordless
+#                                sudo rule for that account
+#
+# The live session needs none of them: spatium-live-bootstrap sets its own
+# random root password for SSH. And the installer copies the live root onto
+# the target disk, so whatever these write in the live session would land
+# on every installed appliance. They are removed from the image rather than
+# filtered on the kernel command line, which keeps the components the live
+# session does use (hostname, locales, keyboard, openssh-server, ...) as
+# Debian ships them. /lib is merged into /usr/lib on trixie; both spellings
+# are listed so an image without usrmerge is covered too.
+for live_cfg_dir in "$BUILDROOT/usr/lib/live/config" "$BUILDROOT/lib/live/config"; do
+    rm -f "$live_cfg_dir/0030-user-setup" \
+          "$live_cfg_dir/0030-live-debconfig_passwd" \
+          "$live_cfg_dir/0040-sudo"
+done
+
 # Template-unit instance for the serial console (Phase 4h, issue #134).
 # Template units are loaded from `<name>@.service` with %i substituted
 # at activation, so the symlink target is the bare template file but
@@ -166,6 +212,15 @@ if [ -f "$BUILDROOT/etc/systemd/system/etc.mount" ]; then
     mkdir -p "$BUILDROOT/etc/systemd/system/local-fs.target.wants"
     ln -sfn /etc/systemd/system/etc.mount \
         "$BUILDROOT/etc/systemd/system/local-fs.target.wants/etc.mount"
+fi
+
+# spatium-etc-premount runs between var.mount and etc.mount, so it is
+# wanted by local-fs.target like etc.mount itself (the multi-user loop
+# above would be far too late).
+if [ -f "$BUILDROOT/etc/systemd/system/spatium-etc-premount.service" ]; then
+    mkdir -p "$BUILDROOT/etc/systemd/system/local-fs.target.wants"
+    ln -sfn /etc/systemd/system/spatium-etc-premount.service \
+        "$BUILDROOT/etc/systemd/system/local-fs.target.wants/spatium-etc-premount.service"
 fi
 
 # Phase 8a — /home + /root bind-mount units (issue #138). These ship
@@ -202,6 +257,25 @@ EOF
 cat > "$BUILDROOT/usr/lib/tmpfiles.d/spatium-supervisor.conf" <<'EOF'
 # #170 Wave A1 — supervisor identity directory. Survives slot swaps.
 d /var/persist/spatium-supervisor 0755 root root - -
+EOF
+
+# GHSA-h2j9-qrg7-grfw — the host-runner trigger directory. Every root
+# ``spatiumddi-*.path`` runner acts on a file dropped here, so it must not
+# be writable by every local account (it used to be 1777). 1770 with group
+# ``spatium-host`` (gid 2770): the supervisor's in-pod user and the api pod
+# carry that gid, nothing else on the host does. The sticky bit stays so
+# the semantics the supervisor/api code relies on (#786) are unchanged.
+# Applied at sysinit on EVERY boot — before k3s, so before either writer
+# exists — which is what repairs an appliance installed with the 1777 mode.
+# Numeric gid: /etc/group lives in the /etc overlay and may not be mounted
+# yet, and an existing install's copy has never heard of the group.
+# ``z`` re-modes the slot-upgrade sidecars the root runner publishes for
+# the supervisor/api to reset in place (#786) — they were 0666.
+cat > "$BUILDROOT/usr/lib/tmpfiles.d/spatium-release-state.conf" <<'EOF'
+# GHSA-h2j9-qrg7-grfw — host-runner trigger directory + #786 sidecars.
+d /var/lib/spatiumddi/release-state 1770 root 2770 - -
+z /var/lib/spatiumddi/release-state/slot-upgrade-pending.state 0660 root 2770 - -
+z /var/lib/spatiumddi/release-state/slot-upgrade.progress 0660 root 2770 - -
 EOF
 
 # ── Hardening (subset of APPLIANCE.md §7 — full pass in Phase 1.x) ────────────
@@ -246,6 +320,13 @@ chmod 0755 "$BUILDROOT/usr/local/bin/spatium-etc-reconcile"
 # reports "no managed profile" and the warning never appears.
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-network-adopt"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-upgrade-slot"
+# #1630 — k3s.service's ExecStartPre (clear-ingests) and firstboot's image
+# check before a slot commit (verify --repair), and the unpack that
+# spatiumddi-image-unpack.service runs (#2788).
+chmod 0755 "$BUILDROOT/usr/local/bin/spatium-k3s-images"
+# #1215 — k3s.service's ExecStartPre=- that skips the first-boot TLS
+# manifest on an upgraded seed. The ``-`` would swallow a 203/EXEC silently.
+chmod 0755 "$BUILDROOT/usr/local/bin/spatium-tls-manifest-skip"
 # #395 — host-migration framework: renderer + orchestrator + patch registry.
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-grub-render"
 # #999 Part C2 — keeps the mirror member's ESP in step with the primary's.
@@ -266,6 +347,9 @@ chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-removable-reload"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-storage-action.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-storage-action.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-host-migrate"
+# GHSA-h2j9-qrg7-grfw — ExecCondition= owner check in front of every
+# trigger runner. Without the exec bit every guarded unit is skipped.
+chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-trigger-guard"
 chmod 0755 "$BUILDROOT/usr/lib/spatiumddi/host-patches"
 chmod 0755 "$BUILDROOT/usr/lib/spatiumddi/host-patches/001-grub-render.sh"
 chmod 0755 "$BUILDROOT/usr/lib/spatiumddi/host-patches/002-k3s-cidr-canonical.sh"
@@ -274,6 +358,8 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-firstboot.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-install.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-live-banner.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-live-bootstrap.service"
+# GHSA-vvh9-6gfw-wphp — generates SSH host keys where etc-render did not.
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-ssh-hostkeys.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-slot-upgrade.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-slot-upgrade.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-slot-rollback.path"
@@ -297,12 +383,17 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-apt-reload.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-image-prune"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-image-prune.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-image-prune.timer"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-image-unpack.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-chrony-reload"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-chrony-reload.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-chrony-reload.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-lldp-reload"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-lldp-reload.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-lldp-reload.service"
+# #2376 — starts snmpd / lldpd at boot when the operator has SNMP / LLDP on.
+# Their enable links live in the /etc overlay upper, which PID 1 has not
+# loaded at boot; see the unit.
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-optin-services-boot.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-syslog-reload"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-syslog-reload.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-syslog-reload.service"
@@ -337,6 +428,7 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-console.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-console@.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/etc.mount"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-etc-reconcile.service"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-etc-premount.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-etc-render"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-state"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-etc-render.service"
@@ -358,6 +450,23 @@ chmod 0755 "$BUILDROOT/usr/local/bin/spatium-etcd-evict"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-etcd-evict.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-etcd-evict.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-publish-k3s-token.service"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-publish-k3s-token.path"
+# #1976 — at each boot, deletes the pods the kubelet's graceful node shutdown
+# ended and nothing else deletes (a ReplicaSet's).
+chmod 0755 "$BUILDROOT/usr/local/bin/spatium-clear-shutdown-pods"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-clear-shutdown-pods.service"
+# #2849 — a Fleet reboot of the node holding the PostgreSQL primary hands it
+# off first (spatiumddi-reboot-agent); this uncordons the node at its boot.
+chmod 0755 "$BUILDROOT/usr/local/bin/spatium-reboot-handoff"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-reboot-handoff.service"
+# #2974 — the web-UI reboot and the console's reboot / poweroff go through
+# this, which runs the handoff first.
+chmod 0755 "$BUILDROOT/usr/local/bin/spatium-power-action"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-power-action@.service"
+# #2865: releases the control chart firstboot held back during a cluster
+# Rolling Upgrade, once the run's hold ends. Started by firstboot only.
+chmod 0755 "$BUILDROOT/usr/local/bin/spatium-control-release"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-control-release.service"
 
 # Issue #276 — spatium-etc-render runs in the sysinit phase (it must
 # set hostname + SSH host keys before sshd / k3s). The multi-user

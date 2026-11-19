@@ -48,6 +48,7 @@ from app.services.ai.operations import (
     RejectChangeRequestArgs,
 )
 from app.services.ai.tools.base import register_tool
+from app.services.approvals.service import approval_refusal
 
 MODULE = "governance.approvals"
 
@@ -64,8 +65,13 @@ def _can_see_all_change_requests(user: User) -> bool:
     )
 
 
-def _cr_to_dict(cr: ChangeRequest) -> dict[str, Any]:
+def _cr_to_dict(cr: ChangeRequest, user: User) -> dict[str, Any]:
+    # ``can_approve`` asks the approve endpoint's own check (#4189), so the
+    # copilot does not propose an approval the caller would be refused.
+    refusal = approval_refusal(user, cr) if cr.state == "pending" else None
     return {
+        "can_approve": cr.state == "pending" and refusal is None,
+        "approve_blocked_reason": str(refusal) if refusal is not None else None,
         "id": str(cr.id),
         "operation": cr.operation,
         "resource_type": cr.resource_type,
@@ -105,6 +111,7 @@ class FindChangeRequestsArgs(BaseModel):
 
 @register_tool(
     name="find_change_requests",
+    permission="self",
     description=(
         "List two-person approval change requests — risky operations "
         "(deletes, etc.) a policy queued for a second operator's approval. "
@@ -136,7 +143,7 @@ async def find_change_requests(
     stmt = stmt.order_by(ChangeRequest.created_at.desc()).limit(args.limit)
     rows = list((await db.execute(stmt)).scalars().all())
     return {
-        "change_requests": [_cr_to_dict(r) for r in rows],
+        "change_requests": [_cr_to_dict(r, user) for r in rows],
         "count": len(rows),
     }
 
@@ -153,6 +160,7 @@ class CountChangeRequestsArgs(BaseModel):
 
 @register_tool(
     name="count_change_requests",
+    permission="self",
     description=(
         "Count two-person approval change requests grouped by lifecycle "
         "state (pending / executed / rejected / …). Use to size the "
@@ -234,6 +242,7 @@ async def _propose_decision(
 
 @register_tool(
     name="propose_approve_change_request",
+    permission=("approve", "change_request"),
     description=(
         "Prepare an approval proposal for a pending two-person change "
         "request (#62). Pass change_request_id (UUID) and an optional note. "
@@ -261,6 +270,7 @@ async def propose_approve_change_request(
 
 @register_tool(
     name="propose_reject_change_request",
+    permission=("approve", "change_request"),
     description=(
         "Prepare a rejection proposal for a pending two-person change "
         "request (#62). Pass change_request_id (UUID) and an optional note. "

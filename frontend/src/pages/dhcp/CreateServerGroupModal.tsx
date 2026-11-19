@@ -1,22 +1,44 @@
 import { useState } from "react";
+import { isAxiosError } from "axios";
+import { useFreshRow, changedFields } from "@/hooks/useFreshRow";
+import { FreshRowError } from "@/components/FreshRowError";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { dhcpApi, type DHCPServerGroup } from "@/lib/api";
 import { Modal, Field, Btns, inputCls, errMsg } from "./_shared";
+import { FormError } from "@/components/ui/form-error";
 
-export function CreateServerGroupModal({
-  group,
-  onClose,
-}: {
+type CreateServerGroupModalProps = {
   group?: DHCPServerGroup;
   onClose: () => void;
-}) {
+};
+
+// Edit reads the group fresh on open (#3091): the row the page holds comes
+// from a cached list, and the form is seeded once.
+export function CreateServerGroupModal(props: CreateServerGroupModalProps) {
+  const fresh = useFreshRow(props.group, () =>
+    dhcpApi.getGroup(props.group!.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Server Group"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <ServerGroupModalForm {...props} group={fresh.row} />;
+}
+
+function ServerGroupModalForm({ group, onClose }: CreateServerGroupModalProps) {
   const qc = useQueryClient();
   const editing = !!group;
   const [name, setName] = useState(group?.name ?? "");
   const [description, setDescription] = useState(group?.description ?? "");
   const [mode, setMode] = useState(group?.mode ?? "standalone");
   const [heartbeat, setHeartbeat] = useState(
-    String(group?.heartbeat_delay_ms ?? 10000),
+    String(group?.heartbeat_delay_ms ?? 2000),
   );
   const [maxResponse, setMaxResponse] = useState(
     String(group?.max_response_delay_ms ?? 60000),
@@ -56,7 +78,7 @@ export function CreateServerGroupModal({
   const isHA = mode === "hot-standby" || mode === "load-balancing";
 
   const mut = useMutation({
-    mutationFn: () => {
+    mutationFn: async () => {
       // #637 — validate client-side so an out-of-range threshold surfaces as an
       // inline message instead of a raw 422, matching CreateScopeModal's handling
       // of the same field. Blank threshold falls back to 0 (caching disabled);
@@ -91,30 +113,100 @@ export function CreateServerGroupModal({
         );
       }
 
+      // #3371 — a blank HA timer is refused, never swapped for a default the
+      // field did not show (the API has no "null = default" for these). Only
+      // when the HA block is on screen: otherwise the stored values ride along.
+      const haTimer = (
+        raw: string,
+        label: string,
+        min: number,
+        dflt: number,
+      ) => {
+        const n = raw.trim() === "" ? NaN : parseInt(raw, 10);
+        // Hidden (standalone): send back what the row holds. ``|| dflt`` would
+        // turn a stored 0 (a valid Max Unacked Clients, #2480) into 5 on any
+        // unrelated save.
+        if (!isHA) return Number.isNaN(n) ? dflt : n;
+        if (Number.isNaN(n) || n < min) {
+          throw new Error(`${label} must be a number of at least ${min}.`);
+        }
+        return n;
+      };
+      const heartbeatMs = haTimer(heartbeat, "Heartbeat Delay", 1000, 2000);
+      const maxResponseMs = haTimer(
+        maxResponse,
+        "Max Response Delay",
+        1000,
+        60000,
+      );
+      const maxAckMs = haTimer(maxAck, "Max Ack Delay", 100, 10000);
+      const maxUnackedN = haTimer(maxUnacked, "Max Unacked Clients", 0, 5);
+
       const data = {
         name,
         description,
         mode: mode as "standalone" | "hot-standby" | "load-balancing",
         dhcp_socket_mode: socketMode,
-        heartbeat_delay_ms: parseInt(heartbeat, 10) || 10000,
-        max_response_delay_ms: parseInt(maxResponse, 10) || 60000,
-        max_ack_delay_ms: parseInt(maxAck, 10) || 10000,
-        max_unacked_clients: parseInt(maxUnacked, 10) || 5,
+        heartbeat_delay_ms: heartbeatMs,
+        max_response_delay_ms: maxResponseMs,
+        max_ack_delay_ms: maxAckMs,
+        // #2480 — 0 is a valid value (the field's min).
+        max_unacked_clients: maxUnackedN,
         auto_failover: autoFailover,
         lease_cache_threshold: parsedCacheThreshold,
         lease_cache_max_age: parsedCacheMaxAge,
         kea_thread_pool_size: parsedPool,
         kea_packet_logging: packetLogging,
       };
-      return editing
-        ? dhcpApi.updateGroup(group!.id, data)
-        : dhcpApi.createGroup(data);
+      if (!editing) return dhcpApi.createGroup(data);
+      // Send only what changed (#3091), so a Save that touches nothing leaves
+      // the group as it is. The baseline repeats the form's own defaults for
+      // a column the row does not carry.
+      const diff = changedFields(
+        {
+          name: group!.name,
+          description: group!.description ?? "",
+          mode: group!.mode ?? "standalone",
+          dhcp_socket_mode: group!.dhcp_socket_mode ?? "direct",
+          heartbeat_delay_ms: group!.heartbeat_delay_ms ?? 2000,
+          max_response_delay_ms: group!.max_response_delay_ms ?? 60000,
+          max_ack_delay_ms: group!.max_ack_delay_ms ?? 10000,
+          max_unacked_clients: group!.max_unacked_clients ?? 5,
+          auto_failover: group!.auto_failover ?? true,
+          lease_cache_threshold: group!.lease_cache_threshold ?? 0,
+          lease_cache_max_age: group!.lease_cache_max_age ?? null,
+          kea_thread_pool_size: group!.kea_thread_pool_size ?? 1,
+          kea_packet_logging: group!.kea_packet_logging ?? true,
+        },
+        data,
+      );
+      if (Object.keys(diff).length === 0) return group!;
+      return dhcpApi.updateGroup(group!.id, diff);
     },
-    onSuccess: () => {
+    onSuccess: (saved) => {
+      // #3369 — put the stored group into the cached list the page draws its
+      // panel from before the refetch lands.
+      if (editing && saved?.id)
+        qc.setQueriesData({ queryKey: ["dhcp-groups"] }, (old: unknown) =>
+          Array.isArray(old)
+            ? old.map((r: DHCPServerGroup) =>
+                r.id === saved.id ? { ...r, ...saved } : r,
+              )
+            : old,
+        );
       qc.invalidateQueries({ queryKey: ["dhcp-groups"] });
       onClose();
     },
-    onError: (e) => setError(errMsg(e, "Failed to save group")),
+    // A client-side refusal is a plain Error carrying its own reason; errMsg
+    // only reads API details and would answer "Failed to save group". Any
+    // axios error (a 4xx detail, or a network failure with no response,
+    // whose message is just "Network Error") still goes through errMsg.
+    onError: (e) =>
+      setError(
+        e instanceof Error && !isAxiosError(e)
+          ? e.message
+          : errMsg(e, "Failed to save group"),
+      ),
   });
 
   return (
@@ -273,8 +365,11 @@ export function CreateServerGroupModal({
             </p>
             <p className="text-[11px] text-muted-foreground">
               Rendered into <code>libdhcp_ha.so</code> on every Kea peer in this
-              group. Defaults match Kea&apos;s documented recommendations; only
-              tweak if your environment genuinely needs it.
+              group. The Max Response Delay, Max Ack Delay and Max Unacked
+              Clients defaults are Kea&apos;s documented ones. The 2 s Heartbeat
+              Delay is SpatiumDDI&apos;s own choice (Kea documents 10 s): it
+              keeps a config reload down to seconds. Only tweak these if your
+              environment genuinely needs it.
             </p>
             <div className="grid grid-cols-2 gap-3">
               <Field
@@ -285,6 +380,7 @@ export function CreateServerGroupModal({
                   type="number"
                   min={1000}
                   className={inputCls}
+                  required
                   value={heartbeat}
                   onChange={(e) => setHeartbeat(e.target.value)}
                 />
@@ -297,6 +393,7 @@ export function CreateServerGroupModal({
                   type="number"
                   min={1000}
                   className={inputCls}
+                  required
                   value={maxResponse}
                   onChange={(e) => setMaxResponse(e.target.value)}
                 />
@@ -306,6 +403,7 @@ export function CreateServerGroupModal({
                   type="number"
                   min={100}
                   className={inputCls}
+                  required
                   value={maxAck}
                   onChange={(e) => setMaxAck(e.target.value)}
                 />
@@ -318,6 +416,7 @@ export function CreateServerGroupModal({
                   type="number"
                   min={0}
                   className={inputCls}
+                  required
                   value={maxUnacked}
                   onChange={(e) => setMaxUnacked(e.target.value)}
                 />
@@ -337,7 +436,9 @@ export function CreateServerGroupModal({
           </div>
         )}
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
         <Btns onClose={onClose} pending={mut.isPending} />
       </form>
     </Modal>

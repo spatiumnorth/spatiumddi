@@ -17,6 +17,11 @@ from pydantic import BaseModel
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import require_permission
 from app.models.audit import AuditLog
+from app.services.appliance.cluster_guard import (
+    clustered_refusal,
+    control_plane_node_count,
+    reject_if_clustered,
+)
 from app.services.appliance.setup import (
     get_setup_state,
     mark_setup_complete,
@@ -31,6 +36,12 @@ logger = structlog.get_logger(__name__)
 
 router = APIRouter()
 
+_REBOOT_ALTERNATIVE = (
+    "Use Fleet's per-appliance reboot (POST /api/v1/appliance/appliances/"
+    "{appliance_id}/reboot), which targets a node by id and lets that "
+    "node's own supervisor reboot it."
+)
+
 
 class MaintenanceRequest(BaseModel):
     enabled: bool
@@ -41,8 +52,16 @@ class MaintenanceRequest(BaseModel):
     dependencies=[Depends(require_permission("read", "appliance"))],
     summary="Hostname / IPs / uptime / maintenance + reboot status",
 )
-async def info() -> dict:
-    return asdict(get_system_info())
+async def info(db: DB) -> dict:
+    out = asdict(get_system_info())
+    # #3011 — the local reboot acts on whichever node answers; on a
+    # multi-node control plane the UI shows a Fleet link instead.
+    nodes = await control_plane_node_count(db)
+    out["reboot_available"] = nodes <= 1
+    out["reboot_unavailable_reason"] = (
+        clustered_refusal("Reboot", nodes, _REBOOT_ALTERNATIVE) if nodes > 1 else None
+    )
+    return out
 
 
 @router.post(
@@ -119,6 +138,7 @@ async def complete_setup(db: DB, user: CurrentUser) -> dict:
     summary="Schedule a host reboot (10 s grace)",
 )
 async def post_reboot(db: DB, user: CurrentUser) -> dict:
+    await reject_if_clustered(db, "Reboot", _REBOOT_ALTERNATIVE)
     try:
         request_reboot(grace_seconds=10)
     except RuntimeError as exc:

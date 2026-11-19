@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Pencil, Plus, Trash2 } from "lucide-react";
 import {
@@ -8,9 +9,17 @@ import {
   type NATMapping,
   type NATMappingWrite,
   type NATProtocol,
+  formatApiError,
+  formatDialogError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { FreshRowError } from "@/components/FreshRowError";
+import { changedFields, useFreshRow } from "@/hooks/useFreshRow";
 import { cn, zebraBodyCls } from "@/lib/utils";
+import { Link } from "react-router-dom";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { FormError } from "@/components/ui/form-error";
 
 const KIND_LABEL: Record<NATKind, string> = {
   "1to1": "1:1 NAT",
@@ -28,15 +37,36 @@ function pickPort(start: number | null, end: number | null): string {
 // Modal
 // ─────────────────────────────────────────────────────────────────────
 
-function NATMappingModal({
-  initial,
-  onClose,
-  onSaved,
-}: {
+type NATMappingModalProps = {
   initial: NATMapping | null;
   onClose: () => void;
   onSaved: () => void;
-}) {
+};
+
+// Edit reads the mapping fresh on open and Save sends only what changed
+// (#3365).
+export function NATMappingModal(props: NATMappingModalProps) {
+  const fresh = useFreshRow(props.initial ?? undefined, () =>
+    natApi.get(props.initial!.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit NAT mapping"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <NATMappingModalForm {...props} initial={fresh.row ?? null} />;
+}
+
+function NATMappingModalForm({
+  initial,
+  onClose,
+  onSaved,
+}: NATMappingModalProps) {
   const editing = initial != null;
   const [name, setName] = useState(initial?.name ?? "");
   const [kind, setKind] = useState<NATKind>(initial?.kind ?? "1to1");
@@ -75,7 +105,7 @@ function NATMappingModal({
   });
 
   const saveMut = useMutation({
-    mutationFn: (body: NATMappingWrite) =>
+    mutationFn: (body: Partial<NATMappingWrite>) =>
       editing && initial
         ? natApi.update(initial.id, body)
         : natApi.create(body),
@@ -84,10 +114,7 @@ function NATMappingModal({
       onClose();
     },
     onError: (err: unknown) => {
-      const detail =
-        (err as { response?: { data?: { detail?: unknown } } })?.response?.data
-          ?.detail ?? "Save failed";
-      setError(typeof detail === "string" ? detail : JSON.stringify(detail));
+      setError(formatApiError(err, "Save failed"));
     },
   });
 
@@ -120,7 +147,34 @@ function NATMappingModal({
       device_label: deviceLabel.trim() || null,
       description: description.trim() || null,
     };
-    saveMut.mutate(body);
+    if (!initial) {
+      saveMut.mutate(body);
+      return;
+    }
+    const diff: Partial<NATMappingWrite> = changedFields(
+      {
+        name: initial.name,
+        kind: initial.kind,
+        internal_ip: initial.internal_ip ?? null,
+        internal_subnet_id: initial.internal_subnet_id ?? null,
+        internal_port_start: initial.internal_port_start ?? null,
+        internal_port_end: initial.internal_port_end ?? null,
+        external_ip: initial.external_ip ?? null,
+        external_port_start: initial.external_port_start ?? null,
+        external_port_end: initial.external_port_end ?? null,
+        protocol: initial.protocol,
+        device_label: initial.device_label ?? null,
+        description: initial.description ?? null,
+      },
+      { ...body },
+    );
+    if (Object.keys(diff).length === 0) {
+      onClose();
+      return;
+    }
+    // A change of kind reshapes which address / port fields apply, so the
+    // mapping is validated whole: send all of it then.
+    saveMut.mutate("kind" in diff ? body : diff);
   }
 
   const showInternalIp = kind === "1to1" || kind === "pat";
@@ -295,7 +349,7 @@ function NATMappingModal({
           />
         </div>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
 
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -323,7 +377,26 @@ function NATMappingModal({
 // ─────────────────────────────────────────────────────────────────────
 
 export function NATPage() {
+  // #1341 — a read-only user is offered no write it would be refused:
+  // the router asks write (delete) on 'nat_mapping'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "nat_mapping"),
+    "Requires write permission on NAT mappings",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "nat_mapping"),
+    "Requires delete permission on NAT mappings",
+  );
   const qc = useQueryClient();
+  // #2100 — NAT mappings are the ``ipam.nat`` feature module. Reached by a
+  // bookmark while it is off, or left open after deleting the LAST mapping
+  // on an install that never set the toggle (with no override the module is
+  // on only while ``nat_mapping`` holds a row), the page says so instead of
+  // firing requests the router answers 404.
+  const modules = useFeatureModules();
+  const natOn = modules.ready && modules.enabled("ipam.nat");
+  const natOff = modules.ready && !modules.enabled("ipam.nat");
   const [kindFilter, setKindFilter] = useState<NATKind | "">("");
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(1);
@@ -342,19 +415,30 @@ export function NATPage() {
     [kindFilter, search, page],
   );
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, error } = useQuery({
     queryKey: ["nat-mappings", params],
     queryFn: () => natApi.list(params),
     placeholderData: (prev) => prev,
+    enabled: natOn,
   });
 
   const deleteMut = useMutation({
     mutationFn: (id: string) => natApi.delete(id),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["nat-mappings"] });
+      // Deleting the last mapping can turn the module off (#2100); re-read
+      // the module set so the sidebar and this page follow the router.
+      qc.invalidateQueries({ queryKey: ["feature-modules"] });
       setConfirmDelete(null);
     },
   });
+
+  // A refusal belongs to the attempt it answered: closing drops it, so
+  // the next mapping's confirm does not open on someone else's error.
+  function closeDelete() {
+    deleteMut.reset();
+    setConfirmDelete(null);
+  }
 
   function refresh() {
     qc.invalidateQueries({ queryKey: ["nat-mappings"] });
@@ -363,6 +447,25 @@ export function NATPage() {
   const items = data?.items ?? [];
   const total = data?.total ?? 0;
   const totalPages = Math.max(1, Math.ceil(total / perPage));
+
+  if (natOff) {
+    return (
+      <div className="h-full overflow-auto p-6">
+        <h1 className="text-2xl font-bold tracking-tight">NAT mappings</h1>
+        <p className="mt-2 max-w-2xl text-sm text-muted-foreground">
+          NAT mappings are turned off. Any existing mappings are kept, and the
+          firewall mirrors keep recording NAT rules while the feature is off.
+          With no explicit setting, NAT mappings are on only while at least one
+          mapping exists, so deleting the last one turns them off. An
+          administrator can turn them on under{" "}
+          <Link to="/admin/features" className="text-primary hover:underline">
+            Features & Integrations
+          </Link>
+          .
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div className="h-full overflow-auto p-6">
@@ -378,7 +481,8 @@ export function NATPage() {
           </div>
           <button
             onClick={() => setShowCreate(true)}
-            className="flex flex-shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+            className="flex flex-shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+            {...writeGate}
           >
             <Plus className="h-3.5 w-3.5" />
             New mapping
@@ -415,7 +519,9 @@ export function NATPage() {
             <p className="px-4 py-6 text-sm text-muted-foreground">Loading…</p>
           ) : items.length === 0 ? (
             <p className="px-4 py-6 text-sm text-muted-foreground">
-              No NAT mappings match the current filters.
+              <ListEmpty error={error} what="NAT mappings">
+                No NAT mappings match the current filters.
+              </ListEmpty>
             </p>
           ) : (
             <table className="w-full text-sm">
@@ -463,9 +569,11 @@ export function NATPage() {
                         <span className="text-muted-foreground">
                           {m.internal_subnet_cidr ??
                             m.internal_subnet_name ??
-                            (m.internal_subnet_id
-                              ? `subnet ${m.internal_subnet_id.slice(0, 8)}…`
-                              : "—")}
+                            (m.internal_subnet_redacted
+                              ? "restricted subnet"
+                              : m.internal_subnet_id
+                                ? `subnet ${m.internal_subnet_id.slice(0, 8)}…`
+                                : "—")}
                         </span>
                       ) : (
                         (m.internal_ip ?? "—")
@@ -494,15 +602,19 @@ export function NATPage() {
                       <div className="flex justify-end gap-1">
                         <button
                           onClick={() => setEditing(m)}
-                          className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                          className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                           title="Edit"
+                          aria-label="Edit"
+                          {...writeGate}
                         >
                           <Pencil className="h-3.5 w-3.5" />
                         </button>
                         <button
                           onClick={() => setConfirmDelete(m)}
-                          className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                          className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                           title="Delete"
+                          aria-label="Delete"
+                          {...deleteGate}
                         >
                           <Trash2 className="h-3.5 w-3.5" />
                         </button>
@@ -555,19 +667,21 @@ export function NATPage() {
         />
       )}
       {confirmDelete && (
-        <Modal
-          title="Delete NAT mapping?"
-          onClose={() => setConfirmDelete(null)}
-        >
+        <Modal title="Delete NAT mapping?" onClose={closeDelete}>
           <div className="space-y-3 p-4">
             <p className="text-sm">
               Delete NAT mapping{" "}
               <span className="font-medium">{confirmDelete.name}</span>? This
               cannot be undone.
             </p>
+            {deleteMut.isError && (
+              <p role="alert" className="text-sm text-destructive">
+                {formatDialogError(deleteMut.error, "Failed to delete mapping")}
+              </p>
+            )}
             <div className="flex justify-end gap-2">
               <button
-                onClick={() => setConfirmDelete(null)}
+                onClick={closeDelete}
                 className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
               >
                 Cancel

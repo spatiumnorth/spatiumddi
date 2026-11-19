@@ -22,7 +22,7 @@ Endpoints:
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -48,6 +48,7 @@ from app.models.overlay import (
     RoutingPolicy,
 )
 from app.models.ownership import Customer, Site
+from app.services.api_token_scopes import token_write
 from app.services.tags import apply_tag_filter
 
 # Single router; sub-paths live as separate decorated handlers below.
@@ -394,7 +395,7 @@ async def _validate_match(db: Any, match_kind: str, match_value: str) -> None:
         # Allow numeric 0-63 or named DSCP. Loose validator — vendors
         # accept different naming conventions; we don't try to map.
         v = match_value.strip()
-        if v.isdigit():
+        if v.isascii() and v.isdigit():
             iv = int(v)
             if not (0 <= iv <= 63):
                 raise HTTPException(status_code=422, detail="dscp value must be 0..63")
@@ -427,7 +428,7 @@ async def list_overlays(
         stmt = stmt.where(OverlayNetwork.name.ilike(needle))
     stmt = apply_tag_filter(stmt, OverlayNetwork.tags, tag)
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
-    stmt = stmt.order_by(OverlayNetwork.name.asc()).limit(limit).offset(offset)
+    stmt = stmt.order_by(OverlayNetwork.name.asc(), OverlayNetwork.id).limit(limit).offset(offset)
     rows = (await db.execute(stmt)).scalars().all()
     items = [await _read_overlay(db, r) for r in rows]
     return OverlayListResponse(items=items, total=total, limit=limit, offset=offset)
@@ -439,6 +440,12 @@ async def create_overlay(body: OverlayCreate, db: DB, user: CurrentUser) -> Over
         c = await db.get(Customer, body.customer_id)
         if c is None or c.deleted_at is not None:
             raise HTTPException(status_code=422, detail="customer_id not found")
+    if await db.scalar(
+        select(OverlayNetwork.id).where(
+            OverlayNetwork.name == body.name, OverlayNetwork.deleted_at.is_(None)
+        )
+    ):
+        raise HTTPException(status_code=409, detail=f"Overlay named {body.name!r} already exists")
     row = OverlayNetwork(
         name=body.name,
         kind=body.kind,
@@ -478,7 +485,8 @@ async def update_overlay(
     overlay_id: uuid.UUID, body: OverlayUpdate, db: DB, user: CurrentUser
 ) -> OverlayRead:
     row = await _get_overlay(db, overlay_id)
-    if body.customer_id is not None:
+    # Unchanged reference to a trashed customer is kept (#3192).
+    if body.customer_id is not None and body.customer_id != row.customer_id:
         c = await db.get(Customer, body.customer_id)
         if c is None or c.deleted_at is not None:
             raise HTTPException(status_code=422, detail="customer_id not found")
@@ -513,12 +521,21 @@ async def update_overlay(
     return await _read_overlay(db, row)
 
 
+async def _trash(db: Any, row: Any, user: Any) -> None:
+    """Soft-delete into the Trash (own batch), so it can be restored or purged (#2738)."""
+    from app.services.soft_delete import (
+        apply_soft_delete,
+        collect_soft_delete_batch,
+    )  # noqa: PLC0415
+
+    batch = await collect_soft_delete_batch(db, row)
+    await apply_soft_delete(db, batch, user.id if user is not None else None)
+
+
 @router.delete("/{overlay_id:uuid}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_overlay(overlay_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
     row = await _get_overlay(db, overlay_id)
-    row.deleted_at = datetime.now(UTC)
-    if user is not None:
-        row.deleted_by_user_id = user.id
+    await _trash(db, row, user)
     write_audit(
         db,
         user=user,
@@ -550,11 +567,8 @@ async def bulk_delete_overlays(
     )
     found_ids = {r.id for r in rows}
     not_found = [str(i) for i in body.ids if i not in found_ids]
-    now = datetime.now(UTC)
     for r in rows:
-        r.deleted_at = now
-        if user is not None:
-            r.deleted_by_user_id = user.id
+        await _trash(db, r, user)
         write_audit(
             db,
             user=user,
@@ -601,7 +615,17 @@ async def _validate_overlay_site_fks(
 
     preferred = getattr(body, "preferred_circuits", None)
     if preferred:
-        rows = (await db.execute(select(Circuit).where(Circuit.id.in_(preferred)))).scalars().all()
+        # Circuit is outside the global soft-delete filter (``app.db``), so
+        # a deleted circuit is excluded here by hand: it is "not found" (#3191).
+        rows = (
+            (
+                await db.execute(
+                    select(Circuit).where(Circuit.id.in_(preferred), Circuit.deleted_at.is_(None))
+                )
+            )
+            .scalars()
+            .all()
+        )
         found = {r.id for r in rows}
         missing = [str(c) for c in preferred if c not in found]
         if missing:
@@ -997,6 +1021,9 @@ async def get_topology(overlay_id: uuid.UUID, db: DB, _: CurrentUser) -> Topolog
 
 
 @router.post("/{overlay_id:uuid}/simulate", response_model=SimulateResponse)
+@token_write(
+    "Pure DB what-if, never writes; kept write-scoped for now, a candidate for @read_only_post (RBAC is only CurrentUser)"
+)
 async def simulate(
     overlay_id: uuid.UUID,
     body: SimulateRequest,
@@ -1032,6 +1059,10 @@ async def simulate(
         all_circuit_ids.update(_coerce_uuid_list(os_.preferred_circuits))
     circuits_by_id: dict[uuid.UUID, Circuit] = {}
     if all_circuit_ids:
+        # Deleted circuits stay in the map: policy comparison needs their
+        # transport class, or a down deleted circuit makes a
+        # steer_to_transport_class policy read as unimpacted while the site
+        # is blackholed. Only what is *shown* is live-only (#3191).
         circuits_by_id = {
             c.id: c
             for c in (await db.execute(select(Circuit).where(Circuit.id.in_(all_circuit_ids))))
@@ -1039,12 +1070,18 @@ async def simulate(
             .all()
         }
 
+    def _shown(cid: uuid.UUID | None) -> Circuit | None:
+        """A circuit for display: a deleted one resolves to nothing, as a
+        purged one does."""
+        c = circuits_by_id.get(cid) if cid else None
+        return c if c is not None and c.deleted_at is None else None
+
     site_resolutions: list[SimulatedSiteResolution] = []
     for os_ in overlay_sites:
         original = _coerce_uuid_list(os_.preferred_circuits)
         survivors = [c for c in original if c not in down]
         primary = survivors[0] if survivors else None
-        primary_circuit = circuits_by_id.get(primary) if primary else None
+        primary_circuit = _shown(primary)
         site_resolutions.append(
             SimulatedSiteResolution(
                 overlay_site_id=os_.id,

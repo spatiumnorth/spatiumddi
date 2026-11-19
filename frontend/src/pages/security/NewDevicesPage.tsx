@@ -23,8 +23,11 @@ import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { Pager } from "@/components/ui/pager";
+import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
 import { errMsg, inputCls } from "@/pages/dhcp/_shared";
-import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { useModuleOn } from "@/hooks/useModuleOn";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const PAGE_SIZE = 100;
 
@@ -75,6 +78,13 @@ function timeAgo(iso: string): string {
 }
 
 export function NewDevicesPage() {
+  // #1341 — a read-only user is offered no write it would be refused:
+  // the router asks write on 'ip_address'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "ip_address"),
+    "Requires write permission on IP addresses",
+  );
   const qc = useQueryClient();
 
   const [classification, setClassification] =
@@ -94,8 +104,19 @@ export function NewDevicesPage() {
 
   // #601 — the "also quarantine upstream" affordance in the block modal
   // only makes sense when the active block-sync module is enabled.
-  const { enabled: moduleEnabled } = useFeatureModules();
-  const blockSyncEnabled = moduleEnabled("security.block_sync");
+  const blockSyncEnabled = useModuleOn("security.block_sync");
+  // #2134 — the DHCP half of Block writes dhcp_mac_block rows, which only
+  // exist while core.dhcp is on. With it off the action survives only as the
+  // upstream quarantine (when block-sync is on), and is hidden otherwise.
+  const dhcpOn = useModuleOn("core.dhcp");
+  // #3302 — the DHCP half also needs write on dhcp_mac_block; without it the
+  // route answers 403, so the button is disabled with the reason instead.
+  const canWriteMacBlock = perms.can("write", "dhcp_mac_block");
+  const canBlock = dhcpOn || blockSyncEnabled;
+  const blockGate =
+    dhcpOn && !canWriteMacBlock
+      ? permissionGate(false, "Requires write permission on DHCP MAC blocks")
+      : writeGate;
 
   const summaryQ = useQuery({
     queryKey: ["new-devices", "summary"],
@@ -204,6 +225,9 @@ export function NewDevicesPage() {
   });
 
   const moduleSummary = summaryQ.data;
+  // A refused summary read leaves each counter a dash, which reads as "not
+  // loaded yet" rather than "not permitted" — say so once, above them (#3836).
+  const summaryRefused = summaryQ.isError;
 
   return (
     <div className="space-y-4 p-4 md:p-6">
@@ -230,12 +254,21 @@ export function NewDevicesPage() {
         <HeaderButton icon={ListChecks} onClick={() => setShowAllowlist(true)}>
           Allowlist
         </HeaderButton>
-        <HeaderButton icon={History} onClick={() => setShowBaseline(true)}>
+        <HeaderButton
+          icon={History}
+          onClick={() => setShowBaseline(true)}
+          {...writeGate}
+        >
           Run baseline import
         </HeaderButton>
       </div>
 
       {/* Summary counts */}
+      {summaryRefused && (
+        <p className="text-xs">
+          <ListReadError error={summaryQ.error} what="new-device counts" />
+        </p>
+      )}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
         <SummaryCard
           label="New"
@@ -327,14 +360,16 @@ export function NewDevicesPage() {
         />
 
         <span className="ml-auto text-xs text-muted-foreground">
-          {total} sighting{total === 1 ? "" : "s"}
+          {sightingsQ.isError
+            ? "Sightings unavailable"
+            : `${total} sighting${total === 1 ? "" : "s"}`}
         </span>
       </div>
 
       {actionError && (
-        <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+        <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2">
           {actionError}
-        </div>
+        </FormError>
       )}
       {actionNotice && (
         <div className="flex items-start justify-between gap-2 rounded-md border border-emerald-500/40 bg-emerald-500/5 px-3 py-2 text-xs text-emerald-700 dark:text-emerald-400">
@@ -358,6 +393,7 @@ export function NewDevicesPage() {
               icon={ShieldCheck}
               onClick={() => ackMut.mutate()}
               disabled={ackMut.isPending}
+              {...writeGate}
             >
               Acknowledge
             </HeaderButton>
@@ -367,19 +403,23 @@ export function NewDevicesPage() {
                 setActionError(null);
                 setShowAddAllowlist(true);
               }}
+              {...writeGate}
             >
               Add to allowlist
             </HeaderButton>
-            <HeaderButton
-              icon={Ban}
-              variant="destructive"
-              onClick={() => {
-                setActionError(null);
-                setShowBlock(true);
-              }}
-            >
-              Block
-            </HeaderButton>
+            {canBlock && (
+              <HeaderButton
+                icon={Ban}
+                variant="destructive"
+                onClick={() => {
+                  setActionError(null);
+                  setShowBlock(true);
+                }}
+                {...blockGate}
+              >
+                {dhcpOn ? "Block" : "Quarantine upstream"}
+              </HeaderButton>
+            )}
           </div>
         </div>
       )}
@@ -388,9 +428,13 @@ export function NewDevicesPage() {
       <div className="rounded-lg border">
         {rows.length === 0 ? (
           <p className="p-8 text-center text-sm text-muted-foreground">
-            {sightingsQ.isLoading
-              ? "Loading…"
-              : "No sightings match these filters."}
+            {sightingsQ.isLoading ? (
+              "Loading…"
+            ) : (
+              <ListEmpty error={sightingsQ.error} what="sightings">
+                No sightings match these filters.
+              </ListEmpty>
+            )}
           </p>
         ) : (
           <div className="overflow-x-auto">
@@ -514,8 +558,9 @@ export function NewDevicesPage() {
           onError={(m) => setActionError(m)}
         />
       )}
-      {showBlock && (
+      {showBlock && canBlock && (
         <BlockSelectedModal
+          dhcpOn={dhcpOn}
           sightings={selectedRows}
           blockSyncEnabled={blockSyncEnabled}
           onClose={() => setShowBlock(false)}
@@ -581,6 +626,12 @@ function SummaryCard({
 // ── Allowlist management modal ────────────────────────────────────────
 function AllowlistModal({ onClose }: { onClose: () => void }) {
   const qc = useQueryClient();
+  // Allowlist writes take write on 'ip_address' (new_devices/router.py);
+  // the list itself stays readable.
+  const writeGate = permissionGate(
+    usePermissions().can("write", "ip_address"),
+    "Requires write permission on IP addresses",
+  );
   const [mac, setMac] = useState("");
   const [oui, setOui] = useState("");
   const [note, setNote] = useState("");
@@ -669,6 +720,7 @@ function AllowlistModal({ onClose }: { onClose: () => void }) {
             type="submit"
             disabled={addMut.isPending || (!mac.trim() && !oui.trim())}
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50 sm:col-span-1"
+            {...writeGate}
           >
             Add
           </button>
@@ -679,6 +731,7 @@ function AllowlistModal({ onClose }: { onClose: () => void }) {
             icon={Plus}
             onClick={() => virtMut.mutate()}
             disabled={virtMut.isPending}
+            {...writeGate}
           >
             Add common virtualization OUIs
           </HeaderButton>
@@ -688,9 +741,9 @@ function AllowlistModal({ onClose }: { onClose: () => void }) {
         </div>
 
         {error && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2">
             {error}
-          </div>
+          </FormError>
         )}
 
         <div className="max-h-72 overflow-auto rounded-md border">
@@ -728,8 +781,10 @@ function AllowlistModal({ onClose }: { onClose: () => void }) {
                     <td className="px-3 py-2 text-right">
                       <button
                         onClick={() => setDel(en)}
-                        className="rounded p-1 text-muted-foreground hover:text-destructive"
+                        className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40"
                         title="Remove"
+                        aria-label="Remove"
+                        {...writeGate}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>
@@ -840,12 +895,14 @@ function AddSelectedToAllowlistModal({
 // ── Block selected MACs across DHCP server groups ─────────────────────
 function BlockSelectedModal({
   sightings,
+  dhcpOn,
   blockSyncEnabled,
   onClose,
   onDone,
   onError,
 }: {
   sightings: NewDeviceSighting[];
+  dhcpOn: boolean;
   blockSyncEnabled: boolean;
   onClose: () => void;
   onDone: (notice?: string) => void;
@@ -862,13 +919,22 @@ function BlockSelectedModal({
           newDeviceApi.block({
             mac_address: s.mac_address,
             reason: reason.trim() || undefined,
-            block_upstream: blockUpstream || undefined,
+            block_upstream: blockUpstream || !dhcpOn || undefined,
           }),
         ),
       );
-      const failed = results.filter((r) => r.status === "rejected").length;
-      if (failed > 0)
-        throw new Error(`${failed} of ${sightings.length} failed to block`);
+      const rejected = results.filter(
+        (r): r is PromiseRejectedResult => r.status === "rejected",
+      );
+      if (rejected.length > 0)
+        // Carry the server's reason: with DHCP off a refusal (no permission,
+        // no armed target) is the whole answer, not a partial failure.
+        throw new Error(
+          `${rejected.length} of ${sightings.length} failed to block: ${errMsg(
+            rejected[0].reason,
+            "unknown error",
+          )}`,
+        );
       // Summarise the upstream outcome so the operator knows whether the
       // L2 quarantine landed or is waiting on a second approver.
       let upstreamCreated = 0;
@@ -892,7 +958,10 @@ function BlockSelectedModal({
   });
 
   return (
-    <Modal title="Block MACs" onClose={onClose}>
+    <Modal
+      title={dhcpOn ? "Block MACs" : "Quarantine MACs upstream"}
+      onClose={onClose}
+    >
       <form
         onSubmit={(e) => {
           e.preventDefault();
@@ -901,9 +970,19 @@ function BlockSelectedModal({
         className="space-y-3"
       >
         <p className="text-sm text-muted-foreground">
-          Block {sightings.length} MAC
-          {sightings.length === 1 ? "" : "s"} in <strong>every</strong> DHCP
-          server group. Blocked devices can't obtain a lease.
+          {dhcpOn ? (
+            <>
+              Block {sightings.length} MAC
+              {sightings.length === 1 ? "" : "s"} in <strong>every</strong> DHCP
+              server group. Blocked devices can't obtain a lease.
+            </>
+          ) : (
+            <>
+              Quarantine {sightings.length} MAC
+              {sightings.length === 1 ? "" : "s"} upstream (UniFi block-sta) on
+              armed block-sync targets. May queue for two-person approval.
+            </>
+          )}
         </p>
         <div className="max-h-32 overflow-auto rounded-md border bg-muted/30 p-2">
           {sightings.map((s) => (
@@ -918,7 +997,7 @@ function BlockSelectedModal({
           value={reason}
           onChange={(e) => setReason(e.target.value)}
         />
-        {blockSyncEnabled && (
+        {dhcpOn && blockSyncEnabled && (
           <label className="flex cursor-pointer items-start gap-2 text-sm">
             <input
               type="checkbox"
@@ -949,7 +1028,7 @@ function BlockSelectedModal({
             disabled={mut.isPending}
             className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
           >
-            {mut.isPending ? "Blocking…" : "Block"}
+            {mut.isPending ? "Blocking…" : dhcpOn ? "Block" : "Quarantine"}
           </button>
         </div>
       </form>

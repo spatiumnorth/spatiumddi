@@ -6,18 +6,49 @@ import {
   type DHCPStaticAssignmentWrite,
   type DHCPScope,
 } from "@/lib/api";
+import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
+import { FreshRowError } from "@/components/FreshRowError";
 import { hostnameError } from "@/lib/dnsNames";
+import { staticDuidField } from "@/lib/formPayloads";
 import { Modal, Field, Btns, inputCls, errMsg } from "./_shared";
+import { FormError } from "@/components/ui/form-error";
 
-export function CreateStaticAssignmentModal({
-  staticAssignment,
-  scope,
-  onClose,
-}: {
+type StaticModalProps = {
   staticAssignment?: DHCPStaticAssignment;
   scope: DHCPScope;
   onClose: () => void;
-}) {
+};
+
+// Edit reads the reservation fresh on open (#3076): the list row can predate
+// an inline IPAM edit of the same address, and a Save of the old hostname
+// would put it back on both the static and its IPAM row.
+export function CreateStaticAssignmentModal(props: StaticModalProps) {
+  const qc = useQueryClient();
+  const fresh = useFreshRow(props.staticAssignment, () =>
+    refetchRow<DHCPStaticAssignment>(
+      qc,
+      [["dhcp-statics", props.scope.id]],
+      props.staticAssignment!.id,
+    ),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Static Assignment"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <StaticModalForm {...props} staticAssignment={fresh.row} />;
+}
+
+function StaticModalForm({
+  staticAssignment,
+  scope,
+  onClose,
+}: StaticModalProps) {
   const qc = useQueryClient();
   const editing = !!staticAssignment;
   const [mac, setMac] = useState(staticAssignment?.mac_address ?? "");
@@ -53,16 +84,34 @@ export function CreateStaticAssignmentModal({
         hostname,
         description,
         client_id: clientId || null,
-        duid: isV6 ? duid || null : null,
+        ...staticDuidField({ isV6, duid }, editing),
       };
-      return editing
-        ? dhcpApi.updateStatic(scope.id, staticAssignment!.id, data)
-        : dhcpApi.createStatic(scope.id, data);
+      if (!editing) return dhcpApi.createStatic(scope.id, data);
+      // Send only what changed (#3076): an untouched Save writes nothing to
+      // the reservation, its IPAM address or DNS.
+      const st = staticAssignment!;
+      const was = {
+        mac_address: st.mac_address,
+        ip_address: st.ip_address,
+        hostname: st.hostname ?? "",
+        description: st.description ?? "",
+        client_id: st.client_id || null,
+        duid: isV6 ? st.duid || null : undefined,
+      };
+      const diff = changedFields(was, {
+        ...data,
+        duid: isV6 ? data.duid : undefined,
+      });
+      if (Object.keys(diff).length === 0) return Promise.resolve(st);
+      return dhcpApi.updateStatic(scope.id, st.id, diff);
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["dhcp-statics", scope.id] });
       // Static upserts an IPAM row (status=static_dhcp) — refresh IPAM views.
       qc.invalidateQueries({ queryKey: ["addresses", scope.subnet_id] });
+      // The mirror row moves the subnet's and its blocks' counts (#2533).
+      qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
       qc.invalidateQueries({ queryKey: ["subnet-dns-sync", scope.subnet_id] });
       onClose();
     },
@@ -159,9 +208,9 @@ export function CreateStaticAssignmentModal({
           />
         </Field>
         {error && (
-          <p className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
             {error}
-          </p>
+          </FormError>
         )}
         <Btns
           onClose={onClose}

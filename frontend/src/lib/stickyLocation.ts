@@ -1,6 +1,8 @@
 import { useEffect } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 
+import { safeSessionStorage } from "@/lib/safeStorage";
+
 /**
  * Remembers the last visited URL (path + search) under a key in sessionStorage
  * and restores it when the user lands on the same module with a "bare" URL
@@ -26,7 +28,7 @@ export function useStickyLocation(key: string): void {
   useEffect(() => {
     if (location.search !== "") return;
     if (location.state != null) return;
-    const saved = sessionStorage.getItem(key);
+    const saved = safeSessionStorage.getItem(key);
     if (saved && saved.startsWith(location.pathname + "?")) {
       navigate(saved, { replace: true });
     }
@@ -36,6 +38,6 @@ export function useStickyLocation(key: string): void {
   // Save current URL whenever it has params.
   useEffect(() => {
     if (location.search === "") return;
-    sessionStorage.setItem(key, location.pathname + location.search);
+    safeSessionStorage.setItem(key, location.pathname + location.search);
   }, [key, location.pathname, location.search]);
 }

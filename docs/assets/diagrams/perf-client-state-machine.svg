@@ -3,7 +3,7 @@
      preserveAspectRatio="xMidYMid meet"
      font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
   <title>Simulated DHCP client per-device state machine</title>
-  <desc>Each simulated device walks OFFLINE, DISCOVERING, ONLINE, RENEWING, REBINDING, DEPARTING and LEFT, driven by the diurnal arrival curve and the T1/T2 lease timers.</desc>
+  <desc>Each simulated device walks OFFLINE, DISCOVERING, ONLINE, RENEWING and REBINDING, driven by the diurnal arrival curve and the T1/T2 lease timers. A rebind timeout or a departure moves it to LEFT, and a re-arrival sends it back to DISCOVERING for a fresh DORA; a DORA that exhausts its retries returns it to OFFLINE.</desc>
   <defs>
     <linearGradient id="perfs-surface" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="#f1f5f9"/>
@@ -87,29 +87,26 @@
   <path d="M 780 434 H 862 V 160 H 784" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#perfs-arrow)"/>
   <text x="868" y="340" font-size="11" fill="#475569">ACK</text>
 
-  <!-- REBINDING → DEPARTING -->
-  <path d="M 680 460 V 542" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#perfs-arrow)"/>
-  <text x="692" y="500" font-size="11" fill="#475569">(rebind fails / lapse)</text>
-
-  <!-- DEPARTING -->
-  <rect x="620" y="546" width="200" height="52" rx="12" fill="url(#perfs-accent)"/>
-  <text x="720" y="577" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">DEPARTING</text>
+  <!-- REBINDING → LEFT (lapse) -->
+  <path d="M 680 460 V 572 H 484" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#perfs-arrow)"/>
+  <text x="692" y="510" font-size="11" fill="#475569">rebind timeout</text>
+  <text x="692" y="526" font-size="11" fill="#475569">(lease lapses)</text>
 
   <!-- external departure event -->
-  <circle cx="872" cy="572" r="5" fill="#64748b"/>
-  <path d="M 867 572 H 826" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#perfs-arrow)"/>
-  <text x="896" y="534" text-anchor="end" font-size="11" fill="#475569">departure</text>
-  <text x="896" y="550" text-anchor="end" font-size="11" fill="#475569">(diurnal / dwell-time)</text>
-
-  <!-- DEPARTING → LEFT -->
-  <path d="M 620 572 H 484" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#perfs-arrow)"/>
-  <text x="552" y="562" text-anchor="middle" font-size="11" fill="#475569">release</text>
+  <circle cx="872" cy="588" r="5" fill="#64748b"/>
+  <path d="M 867 588 H 484" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#perfs-arrow)"/>
+  <text x="676" y="608" text-anchor="middle" font-size="11" fill="#475569">departure from ONLINE / RENEWING / REBINDING (~5% send RELEASE)</text>
 
   <!-- LEFT -->
   <rect x="330" y="546" width="150" height="52" rx="12" fill="#64748b"/>
   <text x="405" y="577" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">LEFT</text>
 
-  <!-- LEFT → OFFLINE -->
-  <path d="M 330 572 H 60 V 168 H 116" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#perfs-arrow)"/>
-  <text x="72" y="372" font-size="11" fill="#475569">re-arrival</text>
+  <!-- LEFT → DISCOVERING (re-arrival, fresh DORA) -->
+  <path d="M 405 546 V 198" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#perfs-arrow)"/>
+  <text x="415" y="380" font-size="11" fill="#475569">re-arrival</text>
+  <text x="415" y="396" font-size="11" fill="#475569">(fresh DORA)</text>
+
+  <!-- DISCOVERING → OFFLINE (DORA gave up) -->
+  <path d="M 340 186 H 274" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#perfs-arrow)"/>
+  <text x="300" y="210" text-anchor="middle" font-size="11" fill="#475569">retries exhausted</text>
 </svg>

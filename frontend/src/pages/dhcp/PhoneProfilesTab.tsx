@@ -4,6 +4,7 @@ import { Pencil, Phone, Plus, Sparkles, Trash2 } from "lucide-react";
 
 import {
   dhcpApi,
+  formatApiError,
   ipamApi,
   type PhoneOption,
   type PhoneProfile,
@@ -18,6 +19,10 @@ import {
   errMsg,
   DeleteConfirmModal,
 } from "./_shared";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FreshRowError } from "@/components/FreshRowError";
+import { changedFields, useFreshRow } from "@/hooks/useFreshRow";
+import { FormError } from "@/components/ui/form-error";
 
 const PROFILE_KEY_BASE = "dhcp-phone-profiles";
 
@@ -29,6 +34,16 @@ const PROFILE_KEY_BASE = "dhcp-phone-profiles";
  * starter pack and tweak from there, or roll their own from scratch.
  */
 export function PhoneProfilesTab({ groupId }: { groupId: string }) {
+  // #1339, #1861 — writes take write, deletes delete, on ``dhcp_scope``.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "dhcp_scope"),
+    "Requires write permission on DHCP scopes",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "dhcp_scope"),
+    "Requires delete permission on DHCP scopes",
+  );
   const qc = useQueryClient();
   const [showCreate, setShowCreate] = useState(false);
   const [edit, setEdit] = useState<PhoneProfile | null>(null);
@@ -84,6 +99,7 @@ export function PhoneProfilesTab({ groupId }: { groupId: string }) {
               disabled={seedMut.isPending}
               title="Create disabled starter profiles for the 9 curated VoIP vendors. You'll need to fill in your provisioning server values before enabling each."
               className="inline-flex items-center gap-1 rounded-md border px-2.5 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
+              {...writeGate}
             >
               <Sparkles className="h-3 w-3" />
               {seedMut.isPending ? "Seeding…" : "Seed starter pack"}
@@ -92,7 +108,8 @@ export function PhoneProfilesTab({ groupId }: { groupId: string }) {
           <button
             type="button"
             onClick={() => setShowCreate(true)}
-            className="inline-flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90"
+            className="inline-flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+            {...writeGate}
           >
             <Plus className="h-3 w-3" /> New Phone Profile
           </button>
@@ -161,15 +178,19 @@ export function PhoneProfilesTab({ groupId }: { groupId: string }) {
                     <td className="px-3 py-2 text-right">
                       <button
                         onClick={() => setEdit(p)}
-                        className="rounded p-1 text-muted-foreground hover:text-foreground"
+                        className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                         title="Edit profile"
+                        aria-label="Edit profile"
+                        {...writeGate}
                       >
                         <Pencil className="h-3.5 w-3.5" />
                       </button>
                       <button
                         onClick={() => setDel(p)}
-                        className="rounded p-1 text-muted-foreground hover:text-destructive"
+                        className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                         title="Delete profile"
+                        aria-label="Delete profile"
+                        {...deleteGate}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>
@@ -200,8 +221,16 @@ export function PhoneProfilesTab({ groupId }: { groupId: string }) {
           title="Delete Phone Profile"
           description={`Delete profile "${del.name}"? Any client matching its vendor-class fence will stop receiving its option set on the next bundle push.`}
           onConfirm={() => delMut.mutate(del.id)}
-          onClose={() => setDel(null)}
+          onClose={() => {
+            delMut.reset();
+            setDel(null);
+          }}
           isPending={delMut.isPending}
+          error={
+            delMut.isError
+              ? formatApiError(delMut.error, "Delete failed")
+              : null
+          }
         />
       )}
     </div>
@@ -210,15 +239,38 @@ export function PhoneProfilesTab({ groupId }: { groupId: string }) {
 
 // ── Editor modal ───────────────────────────────────────────────────────────
 
-function PhoneProfileEditorModal({
-  groupId,
-  profile,
-  onClose,
-}: {
+type PhoneProfileEditorProps = {
   groupId: string;
   profile?: PhoneProfile;
   onClose: () => void;
-}) {
+};
+
+// Edit reads the profile (scope set included) fresh on open and Save sends
+// only what changed (#3379): the clicked row comes from a list loaded earlier.
+export function PhoneProfileEditorModal(props: PhoneProfileEditorProps) {
+  const fresh = useFreshRow(props.profile, () =>
+    dhcpApi
+      .listPhoneProfiles(props.groupId)
+      .then((rows) => rows.find((p) => p.id === props.profile!.id)),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Phone Profile"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <PhoneProfileEditorForm {...props} profile={fresh.row} />;
+}
+
+function PhoneProfileEditorForm({
+  groupId,
+  profile,
+  onClose,
+}: PhoneProfileEditorProps) {
   const qc = useQueryClient();
   const isEdit = !!profile;
 
@@ -286,8 +338,35 @@ function PhoneProfileEditorModal({
         scope_ids: scopeIds,
       };
       if (isEdit) {
-        const updated = await dhcpApi.updatePhoneProfile(profile.id, body);
-        await dhcpApi.setPhoneProfileScopes(profile.id, scopeIds);
+        // Only what changed against the fresh read (#3379); the scope set is
+        // its own endpoint and is replaced only when it differs.
+        const { scope_ids: _scopes, ...fields } = body;
+        void _scopes;
+        const diff = changedFields(
+          {
+            name: profile.name,
+            description: profile.description ?? "",
+            enabled: profile.enabled,
+            vendor: profile.vendor ?? null,
+            vendor_class_match: profile.vendor_class_match ?? null,
+            // Filtered the way the body is, so a stored blank-valued row
+            // does not read as a change on an untouched Save.
+            option_set: (profile.option_set ?? [])
+              .filter((o) => o.value.trim())
+              .map((o) => ({
+                code: o.code,
+                name: o.name ?? null,
+                value: o.value,
+              })),
+          },
+          fields,
+        );
+        let updated: PhoneProfile = profile;
+        if (Object.keys(diff).length > 0)
+          updated = await dhcpApi.updatePhoneProfile(profile.id, diff);
+        const sorted = (ids: string[]) => [...ids].sort().join(",");
+        if (sorted(scopeIds) !== sorted(profile.scope_ids ?? []))
+          updated = await dhcpApi.setPhoneProfileScopes(profile.id, scopeIds);
         return updated;
       }
       return dhcpApi.createPhoneProfile(groupId, body);
@@ -537,9 +616,9 @@ function PhoneProfileEditorModal({
         </Field>
 
         {error && (
-          <p className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
             {error}
-          </p>
+          </FormError>
         )}
 
         <Btns onClose={onClose} pending={saveMut.isPending} />

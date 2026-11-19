@@ -14,9 +14,11 @@ import {
   type ApplianceRelease,
   formatApiError,
 } from "@/lib/api";
+import { pollUnlessRefused } from "@/lib/refusal";
 import { Modal } from "@/components/ui/modal";
 import { safeExternalHref } from "@/lib/safeUrl";
 import { helmChartVersion } from "@/lib/versions";
+import { FormError } from "@/components/ui/form-error";
 
 // Number of most-recent releases rendered as full cards. Anything older
 // collapses behind a "Show N older releases" disclosure so the tab
@@ -47,7 +49,7 @@ export function ReleasesTab({
   const { data, isLoading, error } = useQuery({
     queryKey: ["appliance", "releases"],
     queryFn: applianceReleasesApi.list,
-    refetchInterval: 60_000,
+    refetchInterval: pollUnlessRefused(60_000),
   });
 
   return (
@@ -77,9 +79,9 @@ export function ReleasesTab({
           banner is gone; on the appliance this catalog stays read-only
           (upgrades are driven by the orchestrator above / OS Versions). */}
       {error && (
-        <div className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
+        <FormError className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
           Failed to load releases: {formatApiError(error)}
-        </div>
+        </FormError>
       )}
 
       {isLoading ? (

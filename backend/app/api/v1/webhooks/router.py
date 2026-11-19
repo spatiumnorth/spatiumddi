@@ -4,7 +4,7 @@ inspection.
 Distinct from the audit-forward surface under ``/settings/audit-
 forward-targets``. Audit-forward fires on every audit row in a syslog
 / webhook / SMTP wire format the operator picks; this surface emits
-**typed events** (``subnet.created``, ``ip.allocated``, …) shaped for
+**typed events** (``subnet.created``, ``ip.created``, …) shaped for
 downstream automation, with HMAC signing and an outbox-backed
 delivery queue.
 
@@ -36,15 +36,20 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import desc, select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
-from app.core.crypto import decrypt_str, encrypt_str
+from app.core.crypto import decrypt_str, encrypt_dict, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
+from app.core.header_credentials import header_credential_problem, header_value_problem
+from app.core.stored_secret_guard import require_secret_with_destination_change
+from app.models.audit import AuditLog
 from app.models.event_subscription import EventOutbox, EventSubscription
 from app.services import event_delivery
 from app.services.event_publisher import (
     _RESOURCE_NAMESPACE,
     _SPECIAL_EVENT_MAP,
     _VERB_MAP,
+    subscriptions_cache,
 )
+from app.services.forward_secrets import url_display
 
 router = APIRouter(tags=["webhooks"])
 
@@ -63,6 +68,11 @@ class WebhookSubscriptionWrite(BaseModel):
     # the response (``secret_plaintext``).
     secret: str | None = None
     event_types: list[str] | None = None
+    # Write-only (#1579, mirroring the #1506 contract): on update,
+    # ``None`` (or omitted) keeps the stored headers, ``{}`` clears
+    # them, any other dict replaces them. Values are Fernet-encrypted
+    # at rest and never returned — responses carry header names plus a
+    # ``headers_set`` flag only.
     headers: dict[str, str] | None = None
     timeout_seconds: int = Field(default=10, ge=1, le=30)
     max_attempts: int = Field(default=8, ge=1, le=20)
@@ -70,6 +80,56 @@ class WebhookSubscriptionWrite(BaseModel):
     @field_validator("url")
     @classmethod
     def _v_url(cls, v: str) -> str:
+        v = v.strip()
+        if not (v.startswith("http://") or v.startswith("https://")):
+            raise ValueError("url must start with http:// or https://")
+        return v
+
+    @field_validator("headers")
+    @classmethod
+    def _v_headers(cls, v: dict[str, str] | None) -> dict[str, str] | None:
+        """httpx encodes header names and values as ASCII and raises
+        UnicodeEncodeError, which no delivery path expected: the Test
+        button answered 500 and the worker's outbox drain raised (#1913).
+        Surrounding whitespace is dropped, as a pasted value carries it."""
+        if not v:
+            return v
+        out: dict[str, str] = {}
+        for raw_name, raw_value in v.items():
+            name = raw_name.strip()
+            problem = header_credential_problem(name, "header name") if name else None
+            if not name:
+                problem = "A header name is blank."
+            value = raw_value.strip()
+            problem = problem or header_value_problem(value, f"value of header {name!r}")
+            if problem:
+                raise ValueError(problem)
+            out[name] = value
+        return out
+
+
+class WebhookSubscriptionUpdate(WebhookSubscriptionWrite):
+    """PUT body: only the keys the caller sent are applied (#4236).
+
+    The Edit dialog sends just the fields the operator changed, so a field
+    another client stored since the dialog read the subscription is not put
+    back. Every plain field is optional here; ``null`` for a field that has
+    no "all" meaning is read as not sent. ``event_types: null`` still means
+    all events.
+    """
+
+    name: str | None = Field(None, min_length=1, max_length=128)  # type: ignore[assignment]
+    description: str | None = Field(None, max_length=1000)  # type: ignore[assignment]
+    enabled: bool | None = None  # type: ignore[assignment]
+    url: str | None = Field(None, min_length=1, max_length=1024)  # type: ignore[assignment]
+    timeout_seconds: int | None = Field(default=None, ge=1, le=30)  # type: ignore[assignment]
+    max_attempts: int | None = Field(default=None, ge=1, le=20)  # type: ignore[assignment]
+
+    @field_validator("url")
+    @classmethod
+    def _v_url(cls, v: str | None) -> str | None:  # type: ignore[override]
+        if v is None:
+            return None
         v = v.strip()
         if not (v.startswith("http://") or v.startswith("https://")):
             raise ValueError("url must start with http:// or https://")
@@ -84,7 +144,11 @@ class WebhookSubscriptionResponse(BaseModel):
     url: str
     secret_set: bool
     event_types: list[str] | None
-    headers: dict[str, str] | None
+    # Header VALUES are credentials (#1579) and are never returned —
+    # only their names, so the operator can still see which headers a
+    # subscription sends, plus whether any are stored at all.
+    header_names: list[str]
+    headers_set: bool
     timeout_seconds: int
     max_attempts: int
     created_at: datetime
@@ -116,6 +180,17 @@ class WebhookDeliveryResponse(BaseModel):
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 
+def _header_names(sub: EventSubscription) -> list[str]:
+    """Sorted custom-header names for the response — never the values
+    (#1579). A value that won't decrypt yields no names rather than an
+    error: the list endpoint shouldn't 500 over one bad row, and the
+    delivery path reports the decrypt failure on its own."""
+    try:
+        return sorted(event_delivery.subscription_headers(sub))
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def _to_response(
     sub: EventSubscription, *, secret_plaintext: str | None = None
 ) -> WebhookSubscriptionResponse:
@@ -127,12 +202,59 @@ def _to_response(
         url=sub.url,
         secret_set=bool(sub.secret_encrypted),
         event_types=list(sub.event_types) if sub.event_types else None,
-        headers=dict(sub.headers) if sub.headers else None,
+        header_names=_header_names(sub),
+        headers_set=bool(sub.headers_encrypted),
         timeout_seconds=sub.timeout_seconds,
         max_attempts=sub.max_attempts,
         created_at=sub.created_at,
         modified_at=sub.modified_at,
         secret_plaintext=secret_plaintext,
+    )
+
+
+def _snapshot(sub: EventSubscription) -> dict[str, Any]:
+    """Audit snapshot of a subscription. Never carries the HMAC secret or
+    header values (only ``*_set`` flags + header names), and the URL is
+    reduced to scheme://host since the path / query / userinfo is where
+    incoming-webhook credentials live (same rule as #1502 / PR #1506)."""
+    return {
+        "name": sub.name,
+        "description": sub.description,
+        "enabled": sub.enabled,
+        "url": url_display(sub.url),
+        "secret_set": bool(sub.secret_encrypted),
+        "headers_set": bool(sub.headers_encrypted),
+        "header_names": _header_names(sub),
+        "event_types": list(sub.event_types) if sub.event_types else None,
+        "timeout_seconds": sub.timeout_seconds,
+        "max_attempts": sub.max_attempts,
+    }
+
+
+def _audit(
+    db: DB,
+    user: Any,
+    action: str,
+    *,
+    resource_type: str,
+    resource_id: str,
+    display: str,
+    old_value: dict[str, Any] | None = None,
+    new_value: dict[str, Any] | None = None,
+) -> None:
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            user_display_name=user.display_name,
+            auth_source=user.auth_source,
+            action=action,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            resource_display=display,
+            result="success",
+            old_value=old_value,
+            new_value=new_value,
+        )
     )
 
 
@@ -149,7 +271,18 @@ def _apply_body(
     sub.enabled = body.enabled
     sub.url = body.url
     sub.event_types = body.event_types or None
-    sub.headers = body.headers or None
+    # Headers are write-only (#1579): ``None`` keeps the stored dict on
+    # update (on create it simply means "none"), ``{}`` clears it, and
+    # a non-empty dict is encrypted and stored.
+    if creating:
+        sub.headers_encrypted = encrypt_dict(body.headers) if body.headers else None
+    elif body.headers is not None:
+        sub.headers_encrypted = encrypt_dict(body.headers) if body.headers else None
+        # The pre-#1579 plaintext copy must not outlive a clear or a
+        # replace: a schema downgrade would bring the old value back. An
+        # old pod mid-rolling-upgrade then sends no header for this row,
+        # which is what the edit asked for.
+        sub.legacy_plaintext_headers = None
     sub.timeout_seconds = body.timeout_seconds
     sub.max_attempts = body.max_attempts
 
@@ -202,14 +335,25 @@ async def list_subscriptions(_user: SuperAdmin, db: DB) -> list[WebhookSubscript
     status_code=status.HTTP_201_CREATED,
 )
 async def create_subscription(
-    body: WebhookSubscriptionWrite, _user: SuperAdmin, db: DB
+    body: WebhookSubscriptionWrite, user: SuperAdmin, db: DB
 ) -> WebhookSubscriptionResponse:
     forbid_in_demo_mode("Webhook subscription creation is disabled")
     sub = EventSubscription()
     plaintext = _apply_body(sub, body, creating=True)
+    sub.id = sub.id or uuid.uuid4()
     db.add(sub)
+    _audit(
+        db,
+        user,
+        "create",
+        resource_type="event_subscription",
+        resource_id=str(sub.id),
+        display=sub.name,
+        new_value=_snapshot(sub),
+    )
     try:
         await db.commit()
+        subscriptions_cache.invalidate()
     except Exception as exc:  # noqa: BLE001
         await db.rollback()
         raise HTTPException(status_code=400, detail=f"create failed: {exc}") from exc
@@ -230,17 +374,57 @@ async def get_subscription(
 @router.put("/{sub_id}", response_model=WebhookSubscriptionResponse)
 async def update_subscription(
     sub_id: uuid.UUID,
-    body: WebhookSubscriptionWrite,
-    _user: SuperAdmin,
+    patch: WebhookSubscriptionUpdate,
+    user: SuperAdmin,
     db: DB,
 ) -> WebhookSubscriptionResponse:
     forbid_in_demo_mode("Webhook subscription updates are disabled")
     sub = await db.get(EventSubscription, sub_id)
     if sub is None:
         raise HTTPException(status_code=404, detail="Subscription not found")
+    old = _snapshot(sub)
+    old_url = sub.url
+    # Keys the caller did not send keep their stored value (#4236).
+    sent = patch.model_dump(exclude_unset=True)
+
+    def pick(field: str, stored: Any) -> Any:
+        return sent[field] if sent.get(field) is not None else stored
+
+    body = WebhookSubscriptionWrite(
+        name=pick("name", sub.name),
+        description=pick("description", sub.description),
+        enabled=pick("enabled", sub.enabled),
+        url=pick("url", sub.url),
+        event_types=sent["event_types"] if "event_types" in sent else sub.event_types,
+        timeout_seconds=pick("timeout_seconds", sub.timeout_seconds),
+        max_attempts=pick("max_attempts", sub.max_attempts),
+        headers=patch.headers,
+        secret=patch.secret,
+    )
+    require_secret_with_destination_change(
+        sub,
+        {k: v for k, v in (("url", sent.get("url")), ("headers", patch.headers)) if k in sent},
+        destination=("url",),
+        secrets={"headers": sub.headers_encrypted},
+    )
     plaintext = _apply_body(sub, body, creating=False)
+    new = _snapshot(sub)
+    # The displayed URL drops the path, so flag a repoint within one host.
+    new["url_changed"] = sub.url != old_url
+    new["secret_rotated"] = body.secret is not None
+    _audit(
+        db,
+        user,
+        "update",
+        resource_type="event_subscription",
+        resource_id=str(sub.id),
+        display=sub.name,
+        old_value=old,
+        new_value=new,
+    )
     try:
         await db.commit()
+        subscriptions_cache.invalidate()
     except Exception as exc:  # noqa: BLE001
         await db.rollback()
         raise HTTPException(status_code=400, detail=f"update failed: {exc}") from exc
@@ -249,12 +433,22 @@ async def update_subscription(
 
 
 @router.delete("/{sub_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_subscription(sub_id: uuid.UUID, _user: SuperAdmin, db: DB) -> None:
+async def delete_subscription(sub_id: uuid.UUID, user: SuperAdmin, db: DB) -> None:
     sub = await db.get(EventSubscription, sub_id)
     if sub is None:
         return
+    _audit(
+        db,
+        user,
+        "delete",
+        resource_type="event_subscription",
+        resource_id=str(sub.id),
+        display=sub.name,
+        old_value=_snapshot(sub),
+    )
     await db.delete(sub)
     await db.commit()
+    subscriptions_cache.invalidate()
 
 
 # ── Test + delivery inspection ─────────────────────────────────────────────
@@ -357,7 +551,7 @@ async def list_deliveries(
     response_model=WebhookDeliveryResponse,
 )
 async def retry_delivery(
-    delivery_id: uuid.UUID, _user: SuperAdmin, db: DB
+    delivery_id: uuid.UUID, user: SuperAdmin, db: DB
 ) -> WebhookDeliveryResponse:
     row = await db.get(EventOutbox, delivery_id)
     if row is None:
@@ -367,7 +561,20 @@ async def retry_delivery(
             status_code=409,
             detail="Delivery already succeeded — nothing to retry",
         )
+    old = {"state": row.state, "attempts": row.attempts, "last_status_code": row.last_status_code}
     await event_delivery.reset_outbox_row(db, row)
+    # Payload is deliberately not recorded; id + event type identify it.
+    _audit(
+        db,
+        user,
+        "retry",
+        resource_type="event_outbox",
+        resource_id=str(row.id),
+        display=f"{row.event_type} (subscription {row.subscription_id})",
+        old_value=old,
+        new_value={"state": row.state, "attempts": row.attempts},
+    )
     await db.commit()
+    subscriptions_cache.invalidate()
     await db.refresh(row)
     return WebhookDeliveryResponse.model_validate(row, from_attributes=True)

@@ -80,7 +80,8 @@ def test_l3_trustedhost_middleware_is_wired() -> None:
 
     app = create_app()
     classes = {m.cls for m in app.user_middleware}
-    assert TrustedHostMiddleware in classes
+    # Subclassed in #1868 so a refused Host is named in the log.
+    assert any(issubclass(c, TrustedHostMiddleware) for c in classes)
 
 
 async def test_l3_forged_host_rejected_when_restricted(monkeypatch) -> None:

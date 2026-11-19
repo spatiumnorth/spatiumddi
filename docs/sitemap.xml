@@ -23,10 +23,13 @@
   <url><loc>https://www.spatiumddi.com/features/LOOKING_GLASS</loc><changefreq>monthly</changefreq><priority>0.6</priority></url>
   <url><loc>https://www.spatiumddi.com/features/VERTICALS</loc><changefreq>monthly</changefreq><priority>0.6</priority></url>
   <url><loc>https://www.spatiumddi.com/features/SYSTEM_ADMIN</loc><changefreq>monthly</changefreq><priority>0.6</priority></url>
+  <url><loc>https://www.spatiumddi.com/features/COPILOT</loc><changefreq>monthly</changefreq><priority>0.6</priority></url>
   <url><loc>https://www.spatiumddi.com/deployment/DOCKER</loc><changefreq>monthly</changefreq><priority>0.8</priority></url>
   <url><loc>https://www.spatiumddi.com/deployment/KUBERNETES</loc><changefreq>monthly</changefreq><priority>0.8</priority></url>
   <url><loc>https://www.spatiumddi.com/deployment/BAREMETAL</loc><changefreq>monthly</changefreq><priority>0.6</priority></url>
   <url><loc>https://www.spatiumddi.com/deployment/APPLIANCE</loc><changefreq>monthly</changefreq><priority>0.6</priority></url>
+  <url><loc>https://www.spatiumddi.com/deployment/SIZING</loc><changefreq>monthly</changefreq><priority>0.7</priority></url>
+  <url><loc>https://www.spatiumddi.com/deployment/REVERSE_PROXY</loc><changefreq>monthly</changefreq><priority>0.7</priority></url>
   <url><loc>https://www.spatiumddi.com/deployment/DNS_AGENT</loc><changefreq>monthly</changefreq><priority>0.7</priority></url>
   <url><loc>https://www.spatiumddi.com/drivers/DNS_DRIVERS</loc><changefreq>monthly</changefreq><priority>0.6</priority></url>
   <url><loc>https://www.spatiumddi.com/drivers/DHCP_DRIVERS</loc><changefreq>monthly</changefreq><priority>0.6</priority></url>

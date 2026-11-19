@@ -1,4 +1,7 @@
+import { poolDeleteSummary } from "@/lib/pool-delete-copy";
 import { useState } from "react";
+import { humanTime } from "../network/_shared";
+import { memberCheckCell } from "@/lib/pool-health";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertCircle,
@@ -19,8 +22,25 @@ import {
   type DNSServerGroup,
   type DNSZone,
   type SiteRead,
+  formatApiError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { ListReadError } from "@/components/ui/list-read-error";
+import { FreshRowError } from "@/components/FreshRowError";
+import { changedFields, useFreshRow } from "@/hooks/useFreshRow";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
+import { poolHealthCheckFields } from "@/lib/formPayloads";
+import { parseTtlInput, POOL_TTL_BOUNDS } from "@/lib/dnsNames";
+import {
+  POOL_HC_INTERVAL_BOUNDS,
+  POOL_HC_TIMEOUT_BOUNDS,
+  secondsFieldError,
+} from "@/lib/seconds";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Pools view — manages health-checked A / AAAA pools for one zone.
@@ -42,16 +62,28 @@ export function PoolsView({
   group: DNSServerGroup;
   zone: DNSZone;
 }) {
+  // Every pool write takes a superadmin (dns/pool_router.py).
+  const poolGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const qc = useQueryClient();
   const [showCreate, setShowCreate] = useState(false);
+  // #1784 — the API refuses new pools / members on this driver.
+  const technitiumApi = (group.server_drivers ?? []).includes("technitium_api");
   const [editPool, setEditPool] = useState<DNSPool | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<DNSPool | null>(null);
 
-  const { data: pools = [], isFetching } = useQuery({
+  const {
+    data: poolsData,
+    isFetching,
+    error: poolsError,
+  } = useQuery({
     queryKey: ["dns-pools", group.id, zone.id],
     queryFn: () => dnsApi.listPools(group.id, zone.id),
     refetchInterval: 30_000,
   });
+  const pools = poolsData ?? [];
 
   const checkNow = useMutation({
     mutationFn: (poolId: string) => dnsApi.checkPoolNow(poolId),
@@ -79,23 +111,53 @@ export function PoolsView({
             <em>ttl</em> seconds.
           </p>
         </div>
-        <button
-          type="button"
-          onClick={() => setShowCreate(true)}
-          className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90"
-        >
-          <Plus className="h-3 w-3" /> New Pool
-        </button>
+        {!technitiumApi && (
+          <button
+            type="button"
+            onClick={() => setShowCreate(true)}
+            className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+            {...poolGate}
+          >
+            <Plus className="h-3 w-3" /> New Pool
+          </button>
+        )}
       </div>
+      {technitiumApi && (
+        <p className="border-b bg-amber-500/10 px-5 py-2 text-xs text-amber-800 dark:text-amber-300">
+          DNS pools are not supported by the experimental{" "}
+          <code>technitium_api</code> driver: a pool&rsquo;s members collapse to
+          one record on the Technitium server. Existing pools are listed here,
+          but new pools and members are refused.
+        </p>
+      )}
 
       <div className="flex-1 overflow-auto">
         {isFetching && pools.length === 0 && (
           <p className="px-5 py-4 text-sm text-muted-foreground">Loading…</p>
         )}
-        {pools.length === 0 && !isFetching && (
+        {/* A refused read (pools take `manage_dns_pools`, a grant apart from
+            `dns_zone`) or a failed one says so, not "No pools yet" (#3426). */}
+        {pools.length === 0 && !isFetching && poolsError != null && (
+          <p className="px-5 py-4 text-sm">
+            <ListReadError error={poolsError} what="this zone's pools" />
+          </p>
+        )}
+        {pools.length === 0 && !isFetching && poolsError == null && (
           <div className="flex h-40 flex-col items-center justify-center">
             <p className="text-sm italic text-muted-foreground">
-              No pools yet. Click <em>New Pool</em> to create one.
+              {technitiumApi ? (
+                "No pools."
+              ) : (
+                <>
+                  No pools yet.
+                  {!poolGate.disabled && (
+                    <>
+                      {" "}
+                      Click <em>New Pool</em> to create one.
+                    </>
+                  )}
+                </>
+              )}
             </p>
           </div>
         )}
@@ -154,6 +216,11 @@ function PoolCard({
   onDelete: () => void;
   onCheckNow: () => void;
 }) {
+  // Every pool write takes a superadmin (dns/pool_router.py).
+  const poolGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const fqdn =
     pool.record_name === "@"
       ? zone.name.replace(/\.$/, "")
@@ -200,6 +267,8 @@ function PoolCard({
             onClick={onCheckNow}
             className="rounded p-1 text-muted-foreground hover:text-foreground"
             title="Check now"
+            aria-label="Check now"
+            {...poolGate}
           >
             <RefreshCw className="h-3.5 w-3.5" />
           </button>
@@ -207,6 +276,8 @@ function PoolCard({
             onClick={onEdit}
             className="rounded p-1 text-muted-foreground hover:text-foreground"
             title="Edit"
+            aria-label="Edit"
+            {...poolGate}
           >
             <Pencil className="h-3.5 w-3.5" />
           </button>
@@ -214,6 +285,8 @@ function PoolCard({
             onClick={onDelete}
             className="rounded p-1 text-muted-foreground hover:text-destructive"
             title="Delete"
+            aria-label="Delete"
+            {...poolGate}
           >
             <Trash2 className="h-3.5 w-3.5" />
           </button>
@@ -259,6 +332,11 @@ function PoolCard({
 }
 
 function MemberRow({ member }: { member: DNSPoolMember }) {
+  // Every pool write takes a superadmin (dns/pool_router.py).
+  const poolGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const qc = useQueryClient();
   const toggle = useMutation({
     mutationFn: () =>
@@ -273,6 +351,7 @@ function MemberRow({ member }: { member: DNSPoolMember }) {
     ) : (
       <Clock className="h-3.5 w-3.5 text-amber-500" />
     );
+  const staleCell = memberCheckCell(member);
   const scoped =
     (member.serving_cidrs?.length ?? 0) > 0 || member.site_id != null;
   const scopeTitle = scoped
@@ -305,9 +384,18 @@ function MemberRow({ member }: { member: DNSPoolMember }) {
         </div>
       </td>
       <td className="py-1.5 text-muted-foreground">
-        {member.last_check_at
-          ? new Date(member.last_check_at).toLocaleTimeString()
-          : "—"}
+        {staleCell.stale ? (
+          <span
+            className="inline-flex items-center rounded bg-amber-500/15 px-1.5 py-0.5 text-amber-600"
+            title={staleCell.title}
+          >
+            {staleCell.text}
+          </span>
+        ) : member.last_check_at ? (
+          humanTime(member.last_check_at)
+        ) : (
+          "—"
+        )}
       </td>
       <td
         className="max-w-md truncate py-1.5 text-muted-foreground"
@@ -319,6 +407,7 @@ function MemberRow({ member }: { member: DNSPoolMember }) {
         <button
           type="button"
           onClick={() => toggle.mutate()}
+          {...poolGate}
           className={
             "rounded px-2 py-0.5 text-[10px] font-medium " +
             (member.enabled
@@ -355,17 +444,32 @@ function parseCidrs(raw: string): string[] {
     .filter(Boolean);
 }
 
-export function PoolModal({
-  group,
-  zone,
-  pool,
-  onClose,
-}: {
+type PoolModalProps = {
   group: DNSServerGroup;
   zone: DNSZone;
   pool?: DNSPool;
   onClose: () => void;
-}) {
+};
+
+// Edit reads the pool (members included) fresh on open, Save sends only the
+// changed pool fields and reconciles members against that read (#3379), so a
+// member added elsewhere since the list loaded is kept.
+export function PoolModal(props: PoolModalProps) {
+  const fresh = useFreshRow(props.pool, () => dnsApi.getPool(props.pool!.id));
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit pool"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <PoolModalForm {...props} pool={fresh.row} />;
+}
+
+function PoolModalForm({ group, zone, pool, onClose }: PoolModalProps) {
   const qc = useQueryClient();
   const editing = !!pool;
   const [name, setName] = useState(pool?.name ?? "");
@@ -374,7 +478,7 @@ export function PoolModal({
   const [recordType, setRecordType] = useState<"A" | "AAAA">(
     pool?.record_type ?? "A",
   );
-  const [ttl, setTtl] = useState(pool?.ttl ?? 30);
+  const [ttlText, setTtlText] = useState(String(pool?.ttl ?? 30));
   const [enabled, setEnabled] = useState(pool?.enabled ?? true);
   const [hcType, setHcType] = useState<DNSPoolWrite["hc_type"]>(
     pool?.hc_type ?? "tcp",
@@ -386,8 +490,12 @@ export function PoolModal({
   const [hcCodes, setHcCodes] = useState<string>(
     (pool?.hc_expected_status_codes ?? [200]).join(","),
   );
-  const [hcInterval, setHcInterval] = useState(pool?.hc_interval_seconds ?? 30);
-  const [hcTimeout, setHcTimeout] = useState(pool?.hc_timeout_seconds ?? 5);
+  const [hcInterval, setHcInterval] = useState(
+    String(pool?.hc_interval_seconds ?? 30),
+  );
+  const [hcTimeout, setHcTimeout] = useState(
+    String(pool?.hc_timeout_seconds ?? 5),
+  );
   const [hcUnhealthy, setHcUnhealthy] = useState(
     pool?.hc_unhealthy_threshold ?? 2,
   );
@@ -417,6 +525,9 @@ export function PoolModal({
         .split(/[,\s]+/)
         .map((s) => parseInt(s, 10))
         .filter((n) => !Number.isNaN(n) && n >= 100 && n <= 599);
+      // #2086 — the ttl was checked at submit; this narrows it for the types.
+      const ttl = parseTtlInput(ttlText, POOL_TTL_BOUNDS);
+      if (typeof ttl !== "number") throw new Error("invalid pool TTL");
       const body: DNSPoolWrite = {
         name,
         description,
@@ -425,20 +536,42 @@ export function PoolModal({
         ttl,
         enabled,
         hc_type: hcType,
-        hc_target_port:
-          hcType === "none" || hcType === "icmp" ? null : hcPort || null,
         hc_path: hcPath,
         hc_method: hcMethod,
-        hc_verify_tls: hcType === "https" ? hcVerifyTls : false,
+        ...poolHealthCheckFields({ hcType, hcPort, hcVerifyTls }, editing),
         hc_expected_status_codes:
           codes.length > 0 ? codes : [200, 201, 202, 204, 301, 302, 304],
-        hc_interval_seconds: hcInterval,
-        hc_timeout_seconds: hcTimeout,
+        hc_interval_seconds: Number(hcInterval.trim()),
+        hc_timeout_seconds: Number(hcTimeout.trim()),
         hc_unhealthy_threshold: hcUnhealthy,
         hc_healthy_threshold: hcHealthy,
       };
       if (editing) {
-        const updated = await dnsApi.updatePool(pool!.id, body);
+        const diff = changedFields(
+          {
+            name: pool!.name,
+            description: pool!.description ?? "",
+            record_name: pool!.record_name,
+            record_type: pool!.record_type,
+            ttl: pool!.ttl,
+            enabled: pool!.enabled,
+            hc_type: pool!.hc_type,
+            hc_target_port: pool!.hc_target_port,
+            hc_path: pool!.hc_path,
+            hc_method: pool!.hc_method,
+            hc_verify_tls: pool!.hc_verify_tls,
+            hc_expected_status_codes: pool!.hc_expected_status_codes,
+            hc_interval_seconds: pool!.hc_interval_seconds,
+            hc_timeout_seconds: pool!.hc_timeout_seconds,
+            hc_unhealthy_threshold: pool!.hc_unhealthy_threshold,
+            hc_healthy_threshold: pool!.hc_healthy_threshold,
+          },
+          { ...body },
+        );
+        const updated =
+          Object.keys(diff).length === 0
+            ? pool!
+            : await dnsApi.updatePool(pool!.id, diff);
         // Reconcile members: add new, remove deleted, update existing.
         const existing = new Map(pool!.members.map((m) => [m.id, m]));
         const desired = new Map(
@@ -459,13 +592,27 @@ export function PoolModal({
               d.weight !== m.weight ||
               scopeChanged
             ) {
-              await dnsApi.updatePoolMember(id, {
-                address: d.address,
-                enabled: d.enabled,
-                weight: d.weight,
-                serving_cidrs: dCidrs,
-                site_id: d.siteId,
-              });
+              // Only the member fields the operator changed (#3379), so an
+              // edit to one field cannot undo another made elsewhere.
+              await dnsApi.updatePoolMember(
+                id,
+                changedFields(
+                  {
+                    address: m.address,
+                    enabled: m.enabled,
+                    weight: m.weight,
+                    serving_cidrs: m.serving_cidrs ?? [],
+                    site_id: m.site_id ?? null,
+                  },
+                  {
+                    address: d.address,
+                    enabled: d.enabled,
+                    weight: d.weight,
+                    serving_cidrs: dCidrs,
+                    site_id: d.siteId ?? null,
+                  },
+                ),
+              );
             }
           }
         }
@@ -498,8 +645,7 @@ export function PoolModal({
       onClose();
     },
     onError: (err: unknown) => {
-      const e = err as { response?: { data?: { detail?: string } } };
-      setError(e?.response?.data?.detail ?? "Failed to save pool");
+      setError(formatApiError(err, "Failed to save pool"));
     },
   });
 
@@ -534,6 +680,28 @@ export function PoolModal({
         onSubmit={(e) => {
           e.preventDefault();
           setError(null);
+          // #2086 — empty is refused, not turned into 30: an edit that
+          // cleared the field would otherwise silently save a different TTL.
+          const parsed = parseTtlInput(ttlText, POOL_TTL_BOUNDS);
+          if (parsed === null || typeof parsed === "string") {
+            setError(`TTL ${parsed ?? "is required"}.`);
+            return;
+          }
+          const hcError =
+            secondsFieldError(
+              "Health-check interval",
+              hcInterval,
+              POOL_HC_INTERVAL_BOUNDS,
+            ) ??
+            secondsFieldError(
+              "Health-check timeout",
+              hcTimeout,
+              POOL_HC_TIMEOUT_BOUNDS,
+            );
+          if (hcError) {
+            setError(hcError);
+            return;
+          }
           mut.mutate();
         }}
         className="space-y-4"
@@ -577,11 +745,10 @@ export function PoolModal({
           </Field>
           <Field label="TTL (seconds)">
             <input
-              type="number"
-              min={1}
-              max={86400}
-              value={ttl}
-              onChange={(e) => setTtl(parseInt(e.target.value, 10) || 30)}
+              type="text"
+              inputMode="numeric"
+              value={ttlText}
+              onChange={(e) => setTtlText(e.target.value)}
               className={inputCls}
             />
           </Field>
@@ -698,9 +865,7 @@ export function PoolModal({
                 min={10}
                 max={3600}
                 value={hcInterval}
-                onChange={(e) =>
-                  setHcInterval(parseInt(e.target.value, 10) || 30)
-                }
+                onChange={(e) => setHcInterval(e.target.value)}
                 className={inputCls}
               />
             </Field>
@@ -710,9 +875,7 @@ export function PoolModal({
                 min={1}
                 max={60}
                 value={hcTimeout}
-                onChange={(e) =>
-                  setHcTimeout(parseInt(e.target.value, 10) || 5)
-                }
+                onChange={(e) => setHcTimeout(e.target.value)}
                 className={inputCls}
               />
             </Field>
@@ -859,9 +1022,9 @@ export function PoolModal({
         </fieldset>
 
         {error && (
-          <div className="rounded border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
             {error}
-          </div>
+          </FormError>
         )}
         <div className="flex justify-end gap-2">
           <button
@@ -884,7 +1047,7 @@ export function PoolModal({
   );
 }
 
-function ConfirmDelete({
+export function ConfirmDelete({
   pool,
   zone,
   onConfirm,
@@ -904,13 +1067,18 @@ function ConfirmDelete({
   return (
     <Modal title={`Delete pool: ${pool.name}`} onClose={onClose}>
       <p className="text-sm text-muted-foreground">
-        Delete pool <span className="font-medium">{pool.name}</span> and remove
-        the {pool.members.length} record{pool.members.length === 1 ? "" : "s"}{" "}
-        currently published as{" "}
-        <span className="font-mono">
-          {fqdn} {pool.record_type}
-        </span>
-        ?
+        {poolDeleteSummary({
+          name: pool.name,
+          fqdn,
+          recordType: pool.record_type,
+          poolEnabled: pool.enabled,
+          memberCount: pool.members.length,
+          publishedCount: pool.enabled
+            ? pool.members.filter(
+                (m) => m.enabled && m.last_check_state === "healthy",
+              ).length
+            : 0,
+        })}
       </p>
       <div className="mt-4 flex justify-end gap-2">
         <button

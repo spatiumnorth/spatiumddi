@@ -2,23 +2,32 @@
 
 Read access requires authentication only (the Auth Providers page and the
 admin pages both need to list groups). Mutations require `admin` on the
-`group` resource (or superadmin).
+`group` resource (or superadmin), and are further bounded by a privilege
+ceiling: a group's roles (and live time-bound grants) are what its members
+hold, so attaching or detaching a role, adding or removing a member, and
+deleting the group all need the caller to be able to grant those
+permissions themselves (``caller_can_grant``). No change may leave the
+install without an active superadmin.
 """
 
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable, Sequence
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser
-from app.core.permissions import caller_can_grant, require_permission
+from app.api.stepup import require_stepup_if_granting_superadmin
+from app.core.permissions import caller_can_grant, refuse_and_audit, require_permission
 from app.models.audit import AuditLog
 from app.models.auth import Group, Role, User
+from app.services.superadmin_grant import SuperadminModel, leaves_no_active_superadmin
+from app.services.time_bound_grants import load_active_grants_for_groups
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -44,6 +53,10 @@ class GroupCreate(BaseModel):
     external_dn: str | None = None
     role_ids: list[uuid.UUID] = []
     user_ids: list[uuid.UUID] = []
+    # #1412 — the caller's step-up, needed only when the group would make
+    # someone a superadmin (a ``*`` / ``*`` role with members).
+    stepup_password: str | None = None
+    stepup_totp_code: str | None = None
 
     @field_validator("name")
     @classmethod
@@ -67,6 +80,9 @@ class GroupUpdate(BaseModel):
     external_dn: str | None = None
     role_ids: list[uuid.UUID] | None = None
     user_ids: list[uuid.UUID] | None = None
+    # #1412 — needed only when the edit would make someone a superadmin.
+    stepup_password: str | None = None
+    stepup_totp_code: str | None = None
 
     @field_validator("name")
     @classmethod
@@ -106,7 +122,14 @@ async def _load_group(db: DB, group_id: uuid.UUID) -> Group:
     return g
 
 
-def _audit(actor: User, action: str, group: Group, summary: str) -> AuditLog:
+def _audit(
+    actor: User,
+    action: str,
+    group: Group,
+    summary: str,
+    stepup_method: str | None = None,
+    granted: int = 0,
+) -> AuditLog:
     return AuditLog(
         user_id=actor.id,
         user_display_name=actor.display_name,
@@ -115,6 +138,11 @@ def _audit(actor: User, action: str, group: Group, summary: str) -> AuditLog:
         resource_type="group",
         resource_id=str(group.id),
         resource_display=summary,
+        # #1412 — a change that made users superadmins records how many, and
+        # the step-up that allowed it.
+        new_value=(
+            {"granted_superadmin": granted, "stepup_method": stepup_method} if granted else None
+        ),
     )
 
 
@@ -131,31 +159,92 @@ async def _resolve_roles(db: DB, role_ids: list[uuid.UUID]) -> list[Role]:
     return roles
 
 
-def _enforce_attach_ceiling(actor: User, roles: list[Role]) -> None:
-    """SECURITY (#400, finding C4): privilege ceiling on role attachment.
+_CEILING_DETAIL = (
+    "You can only change a group's roles or members, or delete it, when you "
+    "already hold every permission its roles carry; only a superadmin can do "
+    "so for a group carrying wildcard ('*') permissions."
+)
+_LAST_SUPERADMIN_DETAIL = (
+    "This change would leave no active superadmin. Make another account a " "superadmin first."
+)
 
-    Attaching a role to a group grants its members the role's permissions. A
-    non-superadmin holding delegated ``admin:group`` could otherwise attach a
-    Superadmin-equivalent role (e.g. one carrying ``{*, *}``) to a group they
-    belong to → effective superadmin. The union of every attached role's
-    permissions must be a subset of the caller's own effective permissions
-    (and may carry no wildcard) unless the caller is an effective superadmin —
-    ``caller_can_grant`` enforces both. Members keep whatever else they hold;
-    this only bounds what THIS mutation can add.
-    """
+
+def _role_permissions(roles: list[Role]) -> list[dict]:
     union: list[dict] = []
     for role in roles:
         for perm in role.permissions or []:
             if isinstance(perm, dict):
                 union.append(perm)
-    if not caller_can_grant(actor, union):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=(
-                "You can only attach roles whose permissions you already hold, and "
-                "only a superadmin can attach a role carrying wildcard ('*') permissions."
-            ),
-        )
+    return union
+
+
+async def _enforce_ceiling(
+    db: DB,
+    actor: User,
+    request: Request,
+    *,
+    roles: list[Role],
+    extra: Sequence[object] = (),
+    action: str,
+    resource_id: str,
+    resource_display: str,
+    reason: str,
+) -> None:
+    """SECURITY (#400 C4, extended to membership): privilege ceiling.
+
+    A group's roles are what its members hold, so every mutation that
+    changes who holds them is bounded by what the caller could grant:
+    attaching a role, detaching one, adding or removing a member, deleting
+    the group. The union of the permissions in question must be a subset of
+    the caller's own effective permissions, and may carry no wildcard,
+    unless the caller is an effective superadmin — ``caller_can_grant``
+    enforces both. ``extra`` carries a group's live time-bound grants, which
+    members hold exactly as they hold its roles.
+
+    A refusal writes a ``denied`` audit row, as a ``require_permission``
+    refusal does.
+    """
+    perms: list[object] = [*_role_permissions(roles), *extra]
+    if caller_can_grant(actor, perms):
+        return
+    await refuse_and_audit(
+        db,
+        actor,
+        request,
+        action=action,
+        resource_type="group",
+        resource_id=resource_id,
+        resource_display=resource_display,
+        reason=reason,
+        detail=_CEILING_DETAIL,
+    )
+
+
+async def _enforce_superadmin_remains(
+    db: DB,
+    actor: User,
+    request: Request,
+    change: Callable[[SuperadminModel], None],
+    *,
+    action: str,
+    resource_id: str,
+    resource_display: str,
+) -> None:
+    """Refuse (409) a change that would leave no active superadmin."""
+    if not await leaves_no_active_superadmin(db, change):
+        return
+    await refuse_and_audit(
+        db,
+        actor,
+        request,
+        action=action,
+        resource_type="group",
+        resource_id=resource_id,
+        resource_display=resource_display,
+        reason="would leave no active superadmin",
+        status_code=status.HTTP_409_CONFLICT,
+        detail=_LAST_SUPERADMIN_DETAIL,
+    )
 
 
 async def _resolve_users(db: DB, user_ids: list[uuid.UUID]) -> list[User]:
@@ -196,7 +285,9 @@ async def list_groups(db: DB, _: CurrentUser) -> list[GroupResponse]:
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_permission("admin", "group"))],
 )
-async def create_group(body: GroupCreate, current_user: CurrentUser, db: DB) -> GroupResponse:
+async def create_group(
+    body: GroupCreate, request: Request, current_user: CurrentUser, db: DB
+) -> GroupResponse:
     existing = await db.scalar(select(Group).where(Group.name == body.name))
     if existing is not None:
         raise HTTPException(
@@ -204,10 +295,40 @@ async def create_group(body: GroupCreate, current_user: CurrentUser, db: DB) -> 
         )
 
     roles = await _resolve_roles(db, body.role_ids)
-    _enforce_attach_ceiling(current_user, roles)
+    # Every role here is newly attached, and every member newly added, so the
+    # one ceiling covers both: members of a new group hold only its roles.
+    await _enforce_ceiling(
+        db,
+        current_user,
+        request,
+        roles=roles,
+        action="create",
+        resource_id=body.name,
+        resource_display=f"create group {body.name}",
+        reason="role or member above the caller's privilege ceiling",
+    )
     users = await _resolve_users(db, body.user_ids)
 
+    new_group_id = uuid.uuid4()
+
+    def _change(model: SuperadminModel) -> None:
+        model.group_members[new_group_id] = {u.id for u in users}
+        model.group_roles[new_group_id] = {r.id for r in roles}
+
+    method, granted = await require_stepup_if_granting_superadmin(
+        db,
+        current_user,
+        password=body.stepup_password,
+        totp_code=body.stepup_totp_code,
+        change=_change,
+        action="create",
+        resource_type="group",
+        resource_id=body.name,
+        resource_display=f"create group {body.name}",
+    )
+
     g = Group(
+        id=new_group_id,
         name=body.name,
         description=body.description,
         auth_source=body.auth_source,
@@ -217,7 +338,7 @@ async def create_group(body: GroupCreate, current_user: CurrentUser, db: DB) -> 
     g.users = users
     db.add(g)
     await db.flush()
-    db.add(_audit(current_user, "create", g, f"Created group {g.name}"))
+    db.add(_audit(current_user, "create", g, f"Created group {g.name}", method, granted))
     await db.commit()
     # Reload with eager relationships for the response
     g = await _load_group(db, g.id)
@@ -237,7 +358,11 @@ async def get_group(group_id: uuid.UUID, db: DB, _: CurrentUser) -> GroupRespons
     dependencies=[Depends(require_permission("admin", "group"))],
 )
 async def update_group(
-    group_id: uuid.UUID, body: GroupUpdate, current_user: CurrentUser, db: DB
+    group_id: uuid.UUID,
+    body: GroupUpdate,
+    request: Request,
+    current_user: CurrentUser,
+    db: DB,
 ) -> GroupResponse:
     g = await _load_group(db, group_id)
 
@@ -247,25 +372,93 @@ async def update_group(
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT, detail="Group name already in use"
             )
+    # Resolve everything, and step up if needed, BEFORE touching the row:
+    # a refused step-up commits its audit row, which would commit any field
+    # already changed on ``g`` along with it.
+    current_roles = list(g.roles)
+    current_role_ids = {r.id for r in current_roles}
+    current_member_ids = {u.id for u in g.users}
+    new_roles = await _resolve_roles(db, body.role_ids) if body.role_ids is not None else None
+    new_users = await _resolve_users(db, body.user_ids) if body.user_ids is not None else None
+    display = f"update group {g.name}"
+
+    if new_roles is not None:
+        # Roles attached or detached by this edit; an edit that leaves the
+        # role set alone (a rename, say) is not bounded by roles it keeps.
+        new_role_ids = {r.id for r in new_roles}
+        changed = [r for r in new_roles if r.id not in current_role_ids] + [
+            r for r in current_roles if r.id not in new_role_ids
+        ]
+        await _enforce_ceiling(
+            db,
+            current_user,
+            request,
+            roles=changed,
+            reason="role change above the caller's privilege ceiling",
+            action="update",
+            resource_id=str(g.id),
+            resource_display=display,
+        )
+    if new_users is not None and {u.id for u in new_users} != current_member_ids:
+        # Adding a member gives them every role the group carries, the ones
+        # it keeps and the ones this edit attaches, plus its live time-bound
+        # grants; removing one takes the same away. A list identical to the
+        # current one (a form resending it) is not a membership change.
+        roles_held = list(current_roles)
+        if new_roles is not None:
+            roles_held += [r for r in new_roles if r.id not in current_role_ids]
+        await _enforce_ceiling(
+            db,
+            current_user,
+            request,
+            roles=roles_held,
+            extra=await load_active_grants_for_groups(db, [g.id]),
+            reason="membership change above the caller's privilege ceiling",
+            action="update",
+            resource_id=str(g.id),
+            resource_display=display,
+        )
+
+    def _change(model: SuperadminModel) -> None:
+        if new_users is not None:
+            model.group_members[g.id] = {u.id for u in new_users}
+        if new_roles is not None:
+            model.group_roles[g.id] = {r.id for r in new_roles}
+
+    await _enforce_superadmin_remains(
+        db,
+        current_user,
+        request,
+        _change,
+        action="update",
+        resource_id=str(g.id),
+        resource_display=display,
+    )
+
+    method, granted = await require_stepup_if_granting_superadmin(
+        db,
+        current_user,
+        password=body.stepup_password,
+        totp_code=body.stepup_totp_code,
+        change=_change,
+        action="update",
+        resource_type="group",
+        resource_id=str(g.id),
+        resource_display=f"update group {g.name}",
+    )
+
+    if body.name is not None:
         g.name = body.name
     if body.description is not None:
         g.description = body.description
     if body.external_dn is not None:
         g.external_dn = body.external_dn
-    if body.role_ids is not None:
-        new_roles = await _resolve_roles(db, body.role_ids)
-        # SECURITY (#400, C4): only bound roles NEWLY added by this mutation, so
-        # editing a group that already carries an over-privileged role (name /
-        # user-list edits) isn't blocked — but a delegated admin can't introduce
-        # a role above their own ceiling.
-        existing_role_ids = {r.id for r in g.roles}
-        added = [r for r in new_roles if r.id not in existing_role_ids]
-        _enforce_attach_ceiling(current_user, added)
+    if new_roles is not None:
         g.roles = new_roles
-    if body.user_ids is not None:
-        g.users = await _resolve_users(db, body.user_ids)
+    if new_users is not None:
+        g.users = new_users
 
-    db.add(_audit(current_user, "update", g, f"Updated group {g.name}"))
+    db.add(_audit(current_user, "update", g, f"Updated group {g.name}", method, granted))
     await db.commit()
     g = await _load_group(db, g.id)
     return _to_response(g)
@@ -276,9 +469,39 @@ async def update_group(
     status_code=status.HTTP_204_NO_CONTENT,
     dependencies=[Depends(require_permission("admin", "group"))],
 )
-async def delete_group(group_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
+async def delete_group(
+    group_id: uuid.UUID, request: Request, current_user: CurrentUser, db: DB
+) -> None:
     g = await _load_group(db, group_id)
     name = g.name
+    display = f"delete group {name}"
+    # Deleting the group removes every member from every role it carries.
+    await _enforce_ceiling(
+        db,
+        current_user,
+        request,
+        roles=list(g.roles),
+        extra=await load_active_grants_for_groups(db, [g.id]),
+        reason="delete of a group above the caller's privilege ceiling",
+        action="delete",
+        resource_id=str(g.id),
+        resource_display=display,
+    )
+
+    def _change(model: SuperadminModel) -> None:
+        model.group_members.pop(g.id, None)
+        model.group_roles.pop(g.id, None)
+        model.granted_groups.discard(g.id)
+
+    await _enforce_superadmin_remains(
+        db,
+        current_user,
+        request,
+        _change,
+        action="delete",
+        resource_id=str(g.id),
+        resource_display=display,
+    )
     db.add(_audit(current_user, "delete", g, f"Deleted group {name}"))
     await db.delete(g)
     await db.commit()

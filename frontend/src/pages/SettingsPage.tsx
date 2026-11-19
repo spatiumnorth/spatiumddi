@@ -1,11 +1,15 @@
-import { useEffect, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
+import { UpdateCheckError } from "@/components/UpdateCheckError";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   settingsApi,
   authApi,
+  formatApiError,
   type OUITaskStatus,
   type PlatformSettings,
+  versionApi,
 } from "@/lib/api";
+import { ResizablePane } from "@/components/ui/resizable-pane";
 import {
   AlertCircle,
   ArrowRight,
@@ -26,6 +30,9 @@ import { TldRegistrySection } from "@/components/TldRegistrySection";
 import { AgentBootstrapKeysSection } from "@/components/AgentBootstrapKeysSection";
 import { BrandLogo } from "@/components/BrandLogo";
 import { usePublicSettings } from "@/hooks/usePublicSettings";
+import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { PERMISSIONS_UNREADABLE, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const OUI_SOURCE_URL = "https://standards-oui.ieee.org/oui/oui.csv";
 
@@ -62,6 +69,25 @@ function contrastRatio(a: string, b: string): number {
   return (hi + 0.05) / (lo + 0.05);
 }
 
+// Mirrors BRANDING_ASSET_MAX_BYTES in the API's settings router.
+const LOGO_MAX_BYTES = 512 * 1024;
+const LOGO_TOO_LARGE = `Logo must be ${LOGO_MAX_BYTES / 1024} KB or smaller`;
+
+// Form controls a Field may wrap. A switch is a button, so it is listed
+// explicitly; other buttons are actions, not settings, and are left alone.
+const FIELD_CONTROLS =
+  'input:not([type="hidden"]), select, textarea, [role="switch"]';
+
+/** Does this control already have a name from somewhere other than the
+ *  Field's own label? (aria-label, aria-labelledby, an associated <label>,
+ *  or a title on a switch, which Toggle has always used as its name.) */
+function hasOwnName(el: Element): boolean {
+  if (el.getAttribute("aria-label") || el.getAttribute("aria-labelledby"))
+    return true;
+  const labels = (el as HTMLInputElement).labels;
+  return !!labels && labels.length > 0;
+}
+
 function Field({
   label,
   description,
@@ -71,21 +97,36 @@ function Field({
   description?: string;
   children: React.ReactNode;
 }) {
+  // One place names every control a Settings row edits (#2952): the visible
+  // label is tied to the control by aria-labelledby, so a caller cannot
+  // forget to and a screen reader reads "Minimum length", not just "12".
+  const labelId = useId();
+  const controlsRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    controlsRef.current?.querySelectorAll(FIELD_CONTROLS).forEach((el) => {
+      if (!hasOwnName(el)) el.setAttribute("aria-labelledby", labelId);
+    });
+  });
   return (
     <div className="flex items-center justify-between gap-8 py-3">
       <div>
-        <div className="text-sm font-medium">{label}</div>
+        <div id={labelId} className="text-sm font-medium">
+          {label}
+        </div>
         {description && (
           <div className="text-xs text-muted-foreground">{description}</div>
         )}
       </div>
-      <div className="flex-shrink-0">{children}</div>
+      <div ref={controlsRef} className="flex-shrink-0">
+        {children}
+      </div>
     </div>
   );
 }
 
 type SectionId =
   | "branding"
+  | "data-retention"
   | "dns"
   | "dns-auto-sync"
   | "reverse-dns"
@@ -129,6 +170,8 @@ interface SectionDef {
   group: SectionGroup;
   /** Search keywords (lowercased) so the section sidebar filter can match deeper terms. */
   keywords: string[];
+  /** Feature module the section belongs to. Hidden while it is off (#2130). */
+  module?: string;
 }
 
 // Group display order. Within each group, entries render in the order
@@ -161,6 +204,16 @@ const SECTION_FIELDS: Record<SectionId, (keyof PlatformSettings)[]> = {
     "env_banner_bg",
     "env_banner_fg",
     "env_banner_position",
+  ],
+  "data-retention": [
+    "log_retention_hours",
+    "metric_retention_days",
+    "dhcp_lease_history_retention_days",
+    "soft_delete_purge_days",
+    "pcap_retention_days",
+    "appliance_revoked_retention_days",
+    "e911_resolution_log_retention_days",
+    "e911_lookup_log_budget_per_minute",
   ],
   dns: [
     "dns_default_ttl",
@@ -442,7 +495,111 @@ function OUIRefreshModal({ onClose }: { onClose: () => void }) {
   );
 }
 
-function OUILookupSection({
+// #2273 — every window a nightly prune task reads. Ranges mirror the
+// server-side limits in ``SettingsUpdate``; the API rejects anything outside
+// them with a 422. ``offAtZero`` rows treat 0 as "never delete".
+type RetentionKey =
+  | "soft_delete_purge_days"
+  | "dhcp_lease_history_retention_days"
+  | "pcap_retention_days"
+  | "appliance_revoked_retention_days"
+  | "metric_retention_days"
+  | "log_retention_hours"
+  | "e911_resolution_log_retention_days"
+  | "e911_lookup_log_budget_per_minute";
+
+const RETENTION_ROWS: {
+  key: RetentionKey;
+  label: string;
+  description: string;
+  unit: "days" | "hours" | "lookups / min";
+  min: number;
+  max: number;
+  fallback: number;
+}[] = [
+  {
+    key: "log_retention_hours",
+    label: "DNS query & DHCP activity logs",
+    description:
+      "Agent-shipped query and activity log rows. 1–168 hours. Capped at a week: the nightly prune is one DELETE, and a longer window makes it larger. Ship to Loki or a SIEM for longer history.",
+    unit: "hours",
+    min: 1,
+    max: 168,
+    fallback: 24,
+  },
+  {
+    key: "metric_retention_days",
+    label: "DNS & DHCP metrics",
+    description:
+      "Per-server metric samples behind the dashboard charts. 1–365 days. InfluxDB export can only backfill what is still inside this window.",
+    unit: "days",
+    min: 1,
+    max: 365,
+    fallback: 7,
+  },
+  {
+    key: "dhcp_lease_history_retention_days",
+    label: "DHCP lease history",
+    description:
+      "Expired and released lease records. 0–3650 days; 0 keeps them forever.",
+    unit: "days",
+    min: 0,
+    max: 3650,
+    fallback: 90,
+  },
+  {
+    key: "soft_delete_purge_days",
+    label: "Trash",
+    description:
+      "Deleted items (IPAM, DNS, DHCP, customers, overlay networks and services) stay restorable this long, then are purged for good. 0–365 days; 0 turns the purge off.",
+    unit: "days",
+    min: 0,
+    max: 365,
+    fallback: 30,
+  },
+  {
+    key: "pcap_retention_days",
+    label: "Packet captures",
+    description:
+      "Finished captures and their .pcap files. 1–90 days. Captures can hold plaintext credentials, so there is no keep-forever option.",
+    unit: "days",
+    min: 1,
+    max: 90,
+    fallback: 7,
+  },
+  {
+    key: "appliance_revoked_retention_days",
+    label: "Deleted appliances",
+    description:
+      "Fleet rows in the revoked state before they are removed for good. 0–365 days; 0 keeps them until you permanently delete them.",
+    unit: "days",
+    min: 0,
+    max: 365,
+    fallback: 30,
+  },
+  {
+    key: "e911_resolution_log_retention_days",
+    label: "E911 location-lookup trail",
+    description:
+      "Who asked where a device is, and what they were told (/location and HELD). 7–3650 days. No keep-forever option: a read-only API token can add rows.",
+    unit: "days",
+    min: 7,
+    max: 3650,
+    fallback: 90,
+  },
+  {
+    key: "e911_lookup_log_budget_per_minute",
+    label: "E911 HELD lookups per caller",
+    description:
+      "Per API token or user, per minute; a device self-query has neither, so it is counted per source address. 1–6000. Past it, a HELD lookup is refused (429, Retry-After) and returns no location, so every location returned has its own trail row and a read-only token cannot grow the table without bound. Size it for the caller's busiest minute, such as phones re-registering after an outage, and give each integration its own token.",
+    unit: "lookups / min",
+    min: 1,
+    max: 6000,
+    fallback: 120,
+  },
+];
+
+function DataRetentionSection({
   values,
   set,
   isSuperadmin,
@@ -454,6 +611,46 @@ function OUILookupSection({
     value: PlatformSettings[K],
   ) => void;
   isSuperadmin: boolean;
+  inputCls: string;
+}) {
+  return (
+    <>
+      {RETENTION_ROWS.map((row) => (
+        <Field key={row.key} label={row.label} description={row.description}>
+          <div className="flex items-center gap-2">
+            <input
+              type="number"
+              min={row.min}
+              max={row.max}
+              value={values[row.key] ?? row.fallback}
+              onChange={(e) => set(row.key, Number(e.target.value))}
+              disabled={!isSuperadmin}
+              aria-label={row.label}
+              className={cn(inputCls, "w-24")}
+            />
+            <span className="text-xs text-muted-foreground">{row.unit}</span>
+          </div>
+        </Field>
+      ))}
+    </>
+  );
+}
+
+function OUILookupSection({
+  values,
+  set,
+  isSuperadmin,
+  canWrite,
+  inputCls,
+}: {
+  values: PlatformSettings;
+  set: <K extends keyof PlatformSettings>(
+    key: K,
+    value: PlatformSettings[K],
+  ) => void;
+  isSuperadmin: boolean;
+  // POST /settings/oui/refresh takes `write` on `settings`, not superadmin.
+  canWrite: boolean;
   inputCls: string;
 }) {
   const [showRefreshModal, setShowRefreshModal] = useState(false);
@@ -536,7 +733,7 @@ function OUILookupSection({
       >
         <button
           onClick={() => setShowRefreshModal(true)}
-          disabled={!isSuperadmin || !values.oui_lookup_enabled}
+          disabled={!canWrite || !values.oui_lookup_enabled}
           className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-accent disabled:opacity-40"
         >
           <RefreshCw className="h-3.5 w-3.5" />
@@ -690,6 +887,29 @@ const SECTIONS: SectionDef[] = [
     ],
   },
   {
+    id: "data-retention",
+    title: "Data Retention",
+    group: "Application",
+    description:
+      "How long SpatiumDDI keeps what it collects: query and activity logs, metrics, lease history, trash, packet captures, deleted appliances, and the E911 location-lookup trail. A nightly sweep deletes anything older. Audit log entries are never pruned.",
+    keywords: [
+      "retention",
+      "retain",
+      "prune",
+      "purge",
+      "keep",
+      "history",
+      "logs",
+      "query log",
+      "metrics",
+      "trash",
+      "pcap",
+      "lease history",
+      "disk",
+      "storage",
+    ],
+  },
+  {
     id: "updates",
     title: "Updates",
     group: "Application",
@@ -757,7 +977,7 @@ const SECTIONS: SectionDef[] = [
     title: "Audit Event Forwarding",
     group: "Security",
     description:
-      "Multi-target forwarding for AuditLog events. Add syslog (UDP/TCP/TLS with RFC 5424 JSON, CEF, LEEF, RFC 3164, or raw JSON-lines) or HTTP webhook targets; each filters independently and a dead collector never blocks the audit write.",
+      "Multi-target forwarding for AuditLog events. Add syslog (UDP/TCP/TLS with RFC 5424 JSON, CEF, LEEF, RFC 3164, or raw JSON-lines), HTTP webhook, or email (SMTP) targets; each filters independently and a dead collector never blocks the audit write.",
     keywords: [
       "syslog",
       "siem",
@@ -855,6 +1075,7 @@ const SECTIONS: SectionDef[] = [
   },
   {
     id: "device-profiling",
+    module: "core.dhcp",
     title: "Device Profiling",
     group: "IPAM",
     description:
@@ -892,6 +1113,7 @@ const SECTIONS: SectionDef[] = [
     id: "dns",
     title: "DNS Defaults",
     group: "DNS",
+    module: "core.dns",
     description: "Default values applied to new zones and server groups.",
     keywords: ["zone", "ttl", "dnssec", "recursion", "agent", "key"],
   },
@@ -899,6 +1121,7 @@ const SECTIONS: SectionDef[] = [
     id: "dns-auto-sync",
     title: "IPAM → DNS Reconciliation",
     group: "DNS",
+    module: "core.dns",
     description:
       "Catches drift between IPAM's expected records (hostname + IP) and SpatiumDDI's DNS DB. Fills in missing A/AAAA/PTR when the live sync missed one — e.g. bulk imports or a previously failed push.",
     keywords: [
@@ -934,6 +1157,7 @@ const SECTIONS: SectionDef[] = [
     id: "dns-pull-from-server",
     title: "Zone ↔ Server Reconciliation",
     group: "DNS",
+    module: "core.dns",
     description:
       "Catches drift between SpatiumDDI's DNS DB and the authoritative server's wire (Windows DNS today). AXFR imports out-of-band edits; any DB-only records get pushed back via RFC 2136. Additive only — never deletes.",
     keywords: [
@@ -957,6 +1181,7 @@ const SECTIONS: SectionDef[] = [
     id: "dns-tld-registry",
     title: "TLD Registry",
     group: "DNS",
+    module: "core.dns",
     description:
       "IANA's root-zone list, which decides whether a zone name reads as Public, Private, Undelegated or Reverse. A copy ships with every release; refresh on demand to pick up TLDs delegated since. No scheduled fetch.",
     keywords: [
@@ -980,6 +1205,7 @@ const SECTIONS: SectionDef[] = [
   // ── DHCP ─────────────────────────────────────────────────────────────
   {
     id: "dhcp",
+    module: "core.dhcp",
     title: "DHCP Defaults",
     group: "DHCP",
     description:
@@ -988,6 +1214,7 @@ const SECTIONS: SectionDef[] = [
   },
   {
     id: "dhcp-lease-sync",
+    module: "core.dhcp",
     title: "DHCP Lease Sync",
     group: "DHCP",
     description:
@@ -1093,10 +1320,9 @@ const SECTIONS: SectionDef[] = [
   },
 
   // Integrations were removed from this page in favor of a unified
-  // toggle in Settings → Features → Integrations. The corresponding
-  // ``PlatformSettings.integration_*_enabled`` columns are still
-  // mirrored by the toggle endpoint so reconciler tasks gating on
-  // them keep working.
+  // toggle in Settings → Features → Integrations. That feature module is
+  // the integration's only switch (#2196): ``GET /settings`` reports each
+  // ``integration_*_enabled`` from it, and the reconcilers gate on it.
 ];
 
 export function SettingsPage() {
@@ -1107,6 +1333,13 @@ export function SettingsPage() {
     staleTime: 60_000,
   });
   const isSuperadmin = me?.is_superadmin ?? false;
+  // PUT /settings admits a superadmin OR anyone holding `write` on
+  // `settings` (#3429), so Save follows the same check. A delegate may write
+  // only the fields the API lists in `delegate_writable_fields` (its
+  // SETTINGS_DELEGATE_WRITABLE, served rather than copied here so the two
+  // cannot drift); every other control stays superadmin-only.
+  const { can, isError: permsFailed, unanswered } = usePermissions();
+  const canWrite = isSuperadmin || can("write", "settings");
 
   const { data, isLoading } = useQuery({
     queryKey: ["settings"],
@@ -1122,7 +1355,32 @@ export function SettingsPage() {
   const [form, setForm] = useState<Partial<PlatformSettings>>({});
   const [saved, setSaved] = useState(false);
   const [activeId, setActiveId] = useState<SectionId>("branding");
+  // Shares the sidebar's ["version"] query so the Updates section shows the
+  // stored result of the last release check without a second request.
+  const { data: versionInfo } = useQuery({
+    queryKey: ["version"],
+    queryFn: versionApi.get,
+    staleTime: 60 * 60 * 1000,
+  });
   const [search, setSearch] = useState("");
+  // #2130 — sections that belong to a feature module exist only while it is
+  // on. The agent bootstrap keys deliberately do NOT carry a module: agents
+  // already deployed may still need them.
+  const { enabled: moduleEnabled, ready: modulesReady } = useFeatureModules();
+  const visibleSections = SECTIONS.filter(
+    (s) => !s.module || (modulesReady && moduleEnabled(s.module)),
+  );
+  useEffect(() => {
+    // The open section vanished (module switched off): fall back to the first.
+    if (!visibleSections.some((s) => s.id === activeId))
+      setActiveId(SECTIONS[0].id);
+  });
+
+  const delegateWritable = new Set<string>(
+    data?.delegate_writable_fields ?? [],
+  );
+  const canEdit = (key: keyof PlatformSettings): boolean =>
+    isSuperadmin || (canWrite && delegateWritable.has(key));
 
   const values: PlatformSettings = {
     ...(data ?? ({} as PlatformSettings)),
@@ -1155,9 +1413,22 @@ export function SettingsPage() {
       qc.invalidateQueries({ queryKey: ["public-settings"] });
     },
     onError: (err: unknown) => {
-      const detail = (err as { response?: { data?: { detail?: string } } })
-        ?.response?.data?.detail;
-      setLogoError(typeof detail === "string" ? detail : "Logo upload failed.");
+      const resp = (
+        err as {
+          response?: { status?: number; data?: { detail?: string } };
+        }
+      )?.response;
+      const detail = resp?.data?.detail;
+      // A 413 may come from nginx (an HTML body, no `detail`) rather than
+      // the API when the upload is over nginx's 1 MiB default (#2951), so
+      // the status alone is read as "too large".
+      setLogoError(
+        typeof detail === "string"
+          ? detail
+          : resp?.status === 413
+            ? LOGO_TOO_LARGE
+            : "Logo upload failed.",
+      );
     },
   });
   const logoDelete = useMutation({
@@ -1238,28 +1509,40 @@ export function SettingsPage() {
   const dirty = Object.keys(form).length > 0;
   const q = search.trim().toLowerCase();
   const filteredSections = q
-    ? SECTIONS.filter(
+    ? visibleSections.filter(
         (s) =>
           s.title.toLowerCase().includes(q) ||
           s.description.toLowerCase().includes(q) ||
           s.keywords.some((k) => k.includes(q)),
       )
-    : SECTIONS;
+    : visibleSections;
 
-  const active = SECTIONS.find((s) => s.id === activeId)!;
+  const active = visibleSections.find((s) => s.id === activeId) ?? SECTIONS[0];
   const inputCls =
     "rounded-md border bg-background px-3 py-1.5 text-sm disabled:opacity-60";
 
   return (
     <div className="flex h-full overflow-hidden">
       {/* ── Sidebar ── */}
-      <aside className="w-64 flex-shrink-0 border-r bg-card overflow-y-auto">
+      <ResizablePane
+        storageKey="settings"
+        defaultWidth={256}
+        label="Resize settings sections"
+        as="aside"
+        className="border-r bg-card overflow-y-auto"
+      >
         <div className="border-b px-4 py-3">
           <h1 className="text-sm font-semibold">Settings</h1>
           <p className="text-xs text-muted-foreground">
             {isSuperadmin
               ? "Configure SpatiumDDI."
-              : "View-only — superadmin required to edit."}
+              : canWrite
+                ? "You can edit the settings delegated to your role; the rest need a superadmin."
+                : permsFailed
+                  ? `View-only — ${PERMISSIONS_UNREADABLE}`
+                  : unanswered
+                    ? unanswered
+                    : "View-only — you need write access on settings to edit."}
           </p>
         </div>
         <div className="border-b p-3">
@@ -1299,7 +1582,9 @@ export function SettingsPage() {
                 // Each group keeps its declared order — the grouping
                 // is intentional (e.g. IPAM Import/Export reads
                 // naturally grouped, not alphabetized).
-                const entries = SECTIONS.filter((s) => s.group === group);
+                const entries = visibleSections.filter(
+                  (s) => s.group === group,
+                );
                 if (entries.length === 0) return null;
                 return (
                   <div
@@ -1325,7 +1610,7 @@ export function SettingsPage() {
                 );
               })}
         </nav>
-      </aside>
+      </ResizablePane>
 
       {/* ── Main pane ── */}
       <main className="flex-1 overflow-y-auto">
@@ -1337,11 +1622,15 @@ export function SettingsPage() {
                 {active.description}
               </p>
             </div>
-            {isSuperadmin && (
+            {canWrite && (
               <div className="flex flex-shrink-0 items-center gap-2">
                 <button
                   onClick={handleReset}
-                  disabled={!defaults || sectionIsDefault()}
+                  disabled={
+                    !defaults ||
+                    sectionIsDefault() ||
+                    !SECTION_FIELDS[activeId].every((k) => canEdit(k))
+                  }
                   title="Populate this section's fields with their default values — still requires Save to apply."
                   className="flex items-center gap-1.5 rounded-md border px-3 py-2 text-xs font-medium hover:bg-accent disabled:opacity-40"
                 >
@@ -1368,9 +1657,12 @@ export function SettingsPage() {
           )}
 
           {mutation.isError && (
-            <div className="rounded-md border border-destructive/30 bg-destructive/10 px-4 py-2 text-sm text-destructive">
-              Failed to save settings. Please try again.
-            </div>
+            <FormError className="rounded-md border border-destructive/30 bg-destructive/10 px-4 py-2 text-sm">
+              {formatApiError(
+                mutation.error,
+                "Failed to save settings. Please try again.",
+              )}
+            </FormError>
           )}
 
           <div className="rounded-lg border bg-card divide-y px-5">
@@ -1382,6 +1674,7 @@ export function SettingsPage() {
                 >
                   <input
                     value={values.app_title ?? ""}
+                    maxLength={255}
                     onChange={(e) => set("app_title", e.target.value)}
                     disabled={!isSuperadmin}
                     className={cn(inputCls, "w-48")}
@@ -1393,6 +1686,7 @@ export function SettingsPage() {
                 >
                   <input
                     value={values.app_base_url ?? ""}
+                    maxLength={500}
                     onChange={(e) => set("app_base_url", e.target.value)}
                     placeholder="https://ddi.example.com"
                     disabled={!isSuperadmin}
@@ -1416,7 +1710,15 @@ export function SettingsPage() {
                         // Reset the input so re-picking the same file
                         // after a failed upload still fires onChange.
                         e.target.value = "";
-                        if (file) logoUpload.mutate(file);
+                        if (!file) return;
+                        // Checked here so the reason is the real limit
+                        // whichever layer would have refused it (#2951).
+                        if (file.size > LOGO_MAX_BYTES) {
+                          setLogoError(LOGO_TOO_LARGE);
+                          return;
+                        }
+                        setLogoError("");
+                        logoUpload.mutate(file);
                       }}
                       className="max-w-[14rem] text-xs file:mr-2 file:rounded-md file:border file:bg-background file:px-2 file:py-1 file:text-xs"
                     />
@@ -1433,9 +1735,7 @@ export function SettingsPage() {
                   </div>
                 </Field>
                 {logoError && (
-                  <div className="py-2 text-xs text-destructive">
-                    {logoError}
-                  </div>
+                  <FormError className="py-2">{logoError}</FormError>
                 )}
 
                 {/* ── Login banner (#885) ──────────────────────────── */}
@@ -1608,7 +1908,7 @@ export function SettingsPage() {
                       onChange={(e) =>
                         set("dns_default_ttl", Number(e.target.value))
                       }
-                      disabled={!isSuperadmin}
+                      disabled={!canEdit("dns_default_ttl")}
                       className={cn(inputCls, "w-28")}
                     />
                     <span className="text-xs text-muted-foreground">sec</span>
@@ -1623,7 +1923,7 @@ export function SettingsPage() {
                     onChange={(e) =>
                       set("dns_default_zone_type", e.target.value)
                     }
-                    disabled={!isSuperadmin}
+                    disabled={!canEdit("dns_default_zone_type")}
                     className={inputCls}
                   >
                     <option value="primary">Primary</option>
@@ -1634,18 +1934,22 @@ export function SettingsPage() {
                 </Field>
                 <Field
                   label="Default DNSSEC Validation"
-                  description="Default DNSSEC validation mode for new server groups."
+                  description="Default DNSSEC validation mode for new server groups. A new group has no trust anchor, and BIND 9.20 will not load 'yes' without one, so 'yes' is set per group once it has an anchor."
                 >
                   <select
                     value={values.dns_default_dnssec_validation ?? "auto"}
                     onChange={(e) =>
                       set("dns_default_dnssec_validation", e.target.value)
                     }
-                    disabled={!isSuperadmin}
+                    disabled={!canEdit("dns_default_dnssec_validation")}
                     className={inputCls}
                   >
                     <option value="auto">auto (recommended)</option>
-                    <option value="yes">yes — manual trust anchors</option>
+                    {/* #3560: refused by the API; kept (disabled) so a
+                        default stored before the refusal still displays. */}
+                    <option value="yes" disabled>
+                      yes — not available as a default (needs a trust anchor)
+                    </option>
                     <option value="no">no — disabled</option>
                   </select>
                 </Field>
@@ -1656,7 +1960,7 @@ export function SettingsPage() {
                   <Toggle
                     checked={!!values.dns_recursive_by_default}
                     onChange={(v) => set("dns_recursive_by_default", v)}
-                    disabled={!isSuperadmin}
+                    disabled={!canEdit("dns_recursive_by_default")}
                   />
                 </Field>
                 <Field
@@ -1679,7 +1983,7 @@ export function SettingsPage() {
                   <Toggle
                     checked={!!values.dns_auto_sync_enabled}
                     onChange={(v) => set("dns_auto_sync_enabled", v)}
-                    disabled={!isSuperadmin}
+                    disabled={!canEdit("dns_auto_sync_enabled")}
                   />
                 </Field>
                 <Field
@@ -1697,7 +2001,10 @@ export function SettingsPage() {
                           Number(e.target.value),
                         )
                       }
-                      disabled={!isSuperadmin || !values.dns_auto_sync_enabled}
+                      disabled={
+                        !canEdit("dns_auto_sync_interval_minutes") ||
+                        !values.dns_auto_sync_enabled
+                      }
                       className={cn(inputCls, "w-24")}
                     />
                     <span className="text-xs text-muted-foreground">min</span>
@@ -1710,7 +2017,10 @@ export function SettingsPage() {
                   <Toggle
                     checked={!!values.dns_auto_sync_delete_stale}
                     onChange={(v) => set("dns_auto_sync_delete_stale", v)}
-                    disabled={!isSuperadmin || !values.dns_auto_sync_enabled}
+                    disabled={
+                      !canEdit("dns_auto_sync_delete_stale") ||
+                      !values.dns_auto_sync_enabled
+                    }
                   />
                 </Field>
                 <Field
@@ -1797,7 +2107,8 @@ export function SettingsPage() {
                     <button
                       type="button"
                       onClick={() => runReverseDns.mutate()}
-                      disabled={!isSuperadmin || runReverseDns.isPending}
+                      // POST /settings/reverse-dns/run takes `write` on `settings`.
+                      disabled={!canWrite || runReverseDns.isPending}
                       className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
                     >
                       {runReverseDns.isPending ? "Queuing…" : "Run now"}
@@ -1826,7 +2137,7 @@ export function SettingsPage() {
                   <Toggle
                     checked={!!values.dns_pull_from_server_enabled}
                     onChange={(v) => set("dns_pull_from_server_enabled", v)}
-                    disabled={!isSuperadmin}
+                    disabled={!canEdit("dns_pull_from_server_enabled")}
                   />
                 </Field>
                 <Field
@@ -1845,7 +2156,8 @@ export function SettingsPage() {
                         )
                       }
                       disabled={
-                        !isSuperadmin || !values.dns_pull_from_server_enabled
+                        !canEdit("dns_pull_from_server_interval_minutes") ||
+                        !values.dns_pull_from_server_enabled
                       }
                       className={cn(inputCls, "w-24")}
                     />
@@ -1876,7 +2188,7 @@ export function SettingsPage() {
                   <Toggle
                     checked={!!values.dhcp_pull_leases_enabled}
                     onChange={(v) => set("dhcp_pull_leases_enabled", v)}
-                    disabled={!isSuperadmin}
+                    disabled={!canEdit("dhcp_pull_leases_enabled")}
                   />
                 </Field>
                 <Field
@@ -1895,7 +2207,8 @@ export function SettingsPage() {
                         )
                       }
                       disabled={
-                        !isSuperadmin || !values.dhcp_pull_leases_enabled
+                        !canEdit("dhcp_pull_leases_interval_seconds") ||
+                        !values.dhcp_pull_leases_enabled
                       }
                       className={cn(inputCls, "w-24")}
                     />
@@ -1963,7 +2276,7 @@ export function SettingsPage() {
                       set("dhcp_default_domain_name", e.target.value)
                     }
                     placeholder="corp.example.com"
-                    disabled={!isSuperadmin}
+                    disabled={!canEdit("dhcp_default_domain_name")}
                     className={inputCls}
                   />
                 </Field>
@@ -1984,7 +2297,7 @@ export function SettingsPage() {
                       )
                     }
                     placeholder="corp.example.com, example.com"
-                    disabled={!isSuperadmin}
+                    disabled={!canEdit("dhcp_default_domain_search")}
                     className={inputCls}
                   />
                 </Field>
@@ -2021,7 +2334,7 @@ export function SettingsPage() {
                       onChange={(e) =>
                         set("dhcp_default_lease_time", Number(e.target.value))
                       }
-                      disabled={!isSuperadmin}
+                      disabled={!canEdit("dhcp_default_lease_time")}
                       className={cn(inputCls, "w-32")}
                     />
                     <span className="text-xs text-muted-foreground">sec</span>
@@ -2040,7 +2353,7 @@ export function SettingsPage() {
                   onChange={(e) =>
                     set("ip_allocation_strategy", e.target.value)
                   }
-                  disabled={!isSuperadmin}
+                  disabled={!canEdit("ip_allocation_strategy")}
                   className={inputCls}
                 >
                   <option value="sequential">Sequential</option>
@@ -2054,6 +2367,7 @@ export function SettingsPage() {
                 values={values}
                 set={set}
                 isSuperadmin={isSuperadmin}
+                canWrite={canWrite}
                 inputCls={inputCls}
               />
             )}
@@ -2158,7 +2472,7 @@ export function SettingsPage() {
                   <Toggle
                     checked={!!values.vrf_strict_rd_validation}
                     onChange={(v) => set("vrf_strict_rd_validation", v)}
-                    disabled={!isSuperadmin}
+                    disabled={!canEdit("vrf_strict_rd_validation")}
                   />
                   <span className="text-sm text-muted-foreground">
                     {values.vrf_strict_rd_validation ? "Strict" : "Warn only"}
@@ -2189,13 +2503,13 @@ export function SettingsPage() {
               <>
                 <Field
                   label="Minimum length"
-                  description="Hard floor at 6 characters. Bcrypt truncates above 72 bytes — past that the extra characters aren't actually being checked."
+                  description="Between 6 and 72 characters. Passwords longer than 72 bytes are refused (bcrypt only hashes the first 72), so the minimum cannot go above 72."
                 >
                   <div className="flex items-center gap-2">
                     <input
                       type="number"
                       min={6}
-                      max={128}
+                      max={72}
                       value={values.password_min_length ?? 12}
                       onChange={(e) =>
                         set("password_min_length", Number(e.target.value))
@@ -2392,6 +2706,15 @@ export function SettingsPage() {
               </>
             )}
 
+            {activeId === "data-retention" && (
+              <DataRetentionSection
+                values={values}
+                set={set}
+                isSuperadmin={isSuperadmin}
+                inputCls={inputCls}
+              />
+            )}
+
             {activeId === "session" && (
               <>
                 <Field
@@ -2453,7 +2776,7 @@ export function SettingsPage() {
                       Number(e.target.value),
                     )
                   }
-                  disabled={!isSuperadmin}
+                  disabled={!canEdit("subnet_tree_default_expanded_depth")}
                   className={cn(inputCls, "w-20")}
                 />
               </Field>
@@ -2461,6 +2784,7 @@ export function SettingsPage() {
 
             {activeId === "updates" && (
               <>
+                {versionInfo && <UpdateCheckError info={versionInfo} />}
                 <Field
                   label="Check for GitHub Releases"
                   description="Once a day, ask GitHub whether a newer SpatiumDDI release exists, so the UI can show an update pill."
@@ -2516,7 +2840,7 @@ export function SettingsPage() {
                           Number(e.target.value),
                         )
                       }
-                      disabled={!isSuperadmin}
+                      disabled={!canEdit("utilization_warn_threshold")}
                       className={cn(inputCls, "w-20")}
                     />
                     <span className="text-xs text-muted-foreground">%</span>
@@ -2538,7 +2862,7 @@ export function SettingsPage() {
                           Number(e.target.value),
                         )
                       }
-                      disabled={!isSuperadmin}
+                      disabled={!canEdit("utilization_critical_threshold")}
                       className={cn(inputCls, "w-20")}
                     />
                     <span className="text-xs text-muted-foreground">%</span>
@@ -2546,7 +2870,7 @@ export function SettingsPage() {
                 </Field>
                 <Field
                   label="IPv4 Max Prefix for Reporting"
-                  description="Exclude subnets smaller than this from dashboard heatmap + alerts. Default 29 excludes /30, /31, /32 (PTP links, single-host). Set to 32 to disable."
+                  description="Exclude subnets smaller than this from the dashboard heatmap, Top Subnets and alerts (the Dashboard's address totals still count every subnet). Default 29 excludes /30, /31, /32 (PTP links, single-host). Set to 32 to disable."
                 >
                   <div className="flex items-center gap-2">
                     <span className="text-xs text-muted-foreground">/</span>
@@ -2561,14 +2885,14 @@ export function SettingsPage() {
                           Number(e.target.value),
                         )
                       }
-                      disabled={!isSuperadmin}
+                      disabled={!canEdit("utilization_max_prefix_ipv4")}
                       className={cn(inputCls, "w-20")}
                     />
                   </div>
                 </Field>
                 <Field
                   label="IPv6 Max Prefix for Reporting"
-                  description="Exclude subnets smaller than this from dashboard heatmap + alerts. Default 126 excludes /127 (RFC 6164 PTP) and /128. Set to 128 to disable."
+                  description="Exclude subnets smaller than this from the dashboard heatmap, Top Subnets and alerts (the Dashboard's address totals still count every subnet). Default 126 excludes /127 (RFC 6164 PTP) and /128. Set to 128 to disable."
                 >
                   <div className="flex items-center gap-2">
                     <span className="text-xs text-muted-foreground">/</span>
@@ -2583,7 +2907,7 @@ export function SettingsPage() {
                           Number(e.target.value),
                         )
                       }
-                      disabled={!isSuperadmin}
+                      disabled={!canEdit("utilization_max_prefix_ipv6")}
                       className={cn(inputCls, "w-20")}
                     />
                   </div>

@@ -9,6 +9,10 @@ After=local-fs.target
 
 [Service]
 Type=oneshot
+# GHSA-h2j9-qrg7-grfw — act only on a trigger written by root, the
+# supervisor or the api; anything else is renamed aside and the unit
+# skips cleanly. See spatiumddi-trigger-guard.
+ExecCondition=/usr/local/bin/spatiumddi-trigger-guard /var/lib/spatiumddi/release-state/pcap/*.request
 ExecStart=/usr/local/bin/spatium-pcap-runner
 # A capture can run up to the operator's max_duration cap (≤30 min) plus
 # grace — don't let systemd's default start timeout kill a long capture.

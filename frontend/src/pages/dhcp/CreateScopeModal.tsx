@@ -1,4 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { changedFields, useFreshRow } from "@/hooks/useFreshRow";
+import { FreshRowError } from "@/components/FreshRowError";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   dhcpApi,
@@ -19,24 +21,19 @@ import { DHCPOptionsEditor } from "./DHCPOptionsEditor";
 import { optionKeyCode } from "./dhcpOptionKeys";
 import { GROUP_FAILOVER_QUERY_KEY, useGroupFailover } from "./windowsFailover";
 import { v6ScopeLacksHa, v6ScopeNoHaNote } from "@/lib/dhcpHa";
+import { FormError } from "@/components/ui/form-error";
 
-// #1308 — the scope API's own vocabulary (``VALID_HOSTNAME_POLICIES`` in
-// backend/app/api/v1/dhcp/scopes.py). The dialog used to offer client / ipam /
-// generate: create refused the last two with a 422, update stored them
-// unchecked, and a stored server_name / derived / none showed as
-// "Client-supplied".
-const DDNS_HOSTNAME_POLICIES: { value: string; label: string }[] = [
-  { value: "client", label: "Client-supplied" },
-  { value: "server_name", label: "Server name" },
-  { value: "derived", label: "Derived" },
-  { value: "none", label: "None" },
-];
+// A refusal raised by the dialog's own checks before anything is sent; its
+// message is the reason shown to the operator (#3082).
+class ScopeFormError extends Error {}
 
 // Suggest a dynamic pool range for a v4 subnet: skip the first 10 hosts
-// (reserve for infra / static) and the last host (broadcast). Returns null
-// for IPv6 or subnets too small to be useful.
+// (reserve for infra / static) and the last host (broadcast). The subnet's
+// gateway is kept out of the range (#3867): when it falls inside, the range
+// keeps its larger side. Returns null for IPv6 or subnets too small to be
+// useful.
 function suggestRange(
-  subnet: { network?: string | null } | undefined,
+  subnet: { network?: string | null; gateway?: string | null } | undefined,
 ): { start: string; end: string } | null {
   if (!subnet?.network) return null;
   const [cidr, prefixStr] = subnet.network.split("/");
@@ -52,19 +49,30 @@ function suggestRange(
   const hostBits = 32 - prefix;
   const total = 1 << hostBits;
   if (total < 16) return null;
-  const startInt = (base + 10) >>> 0;
-  const endInt = (base + total - 2) >>> 0;
+  let startInt = (base + 10) >>> 0;
+  let endInt = (base + total - 2) >>> 0;
+  const gwParts = subnet.gateway?.split(".").map((n) => parseInt(n, 10));
+  if (
+    gwParts?.length === 4 &&
+    gwParts.every((n) => n >= 0 && n <= 255) // NaN fails both comparisons
+  ) {
+    const gw =
+      ((gwParts[0] << 24) |
+        (gwParts[1] << 16) |
+        (gwParts[2] << 8) |
+        gwParts[3]) >>>
+      0;
+    if (gw >= startInt && gw <= endInt) {
+      if (gw === endInt || gw - startInt >= endInt - gw) endInt = gw - 1;
+      else startInt = gw + 1;
+    }
+  }
   const fmt = (n: number) =>
     `${(n >>> 24) & 0xff}.${(n >>> 16) & 0xff}.${(n >>> 8) & 0xff}.${n & 0xff}`;
   return { start: fmt(startInt), end: fmt(endInt) };
 }
 
-export function CreateScopeModal({
-  scope,
-  subnetId: fixedSubnetId,
-  defaultGroupId,
-  onClose,
-}: {
+type CreateScopeModalProps = {
   scope?: DHCPScope;
   /** When creating from a subnet, pin the subnet; otherwise show a picker. */
   subnetId?: string;
@@ -72,7 +80,34 @@ export function CreateScopeModal({
    * the user isn't re-picking it from the list. */
   defaultGroupId?: string;
   onClose: () => void;
-}) {
+};
+
+// Edit reads the scope fresh on open (#3077): the row the page holds comes from
+// a cached list whose refetch may not have answered since the last Save, and
+// the form is seeded once.
+export function CreateScopeModal(props: CreateScopeModalProps) {
+  const fresh = useFreshRow(props.scope, () =>
+    dhcpApi.getScope(props.scope!.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit DHCP Scope"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <ScopeModalForm {...props} scope={fresh.row} />;
+}
+
+function ScopeModalForm({
+  scope,
+  subnetId: fixedSubnetId,
+  defaultGroupId,
+  onClose,
+}: CreateScopeModalProps) {
   const qc = useQueryClient();
   const editing = !!scope;
   const [subnetId, setSubnetId] = useState<string>(
@@ -103,10 +138,6 @@ export function CreateScopeModal({
   const [leaseCacheMaxAge, setLeaseCacheMaxAge] = useState(
     scope?.lease_cache_max_age != null ? String(scope.lease_cache_max_age) : "",
   );
-  const [ddnsEnabled, setDdnsEnabled] = useState(scope?.ddns_enabled ?? false);
-  const [ddnsPolicy, setDdnsPolicy] = useState(
-    scope?.ddns_hostname_policy ?? "client",
-  );
   // When off, this scope's dynamic-pool lease mirrors are excluded from the
   // IPAM↔DNS drift check (ephemeral pulled leases don't read as "out of sync").
   const [dnsTrackDynamicLeases, setDnsTrackDynamicLeases] = useState(
@@ -119,7 +150,7 @@ export function CreateScopeModal({
   // response echoes these, so the <select> below must speak them too or edits
   // snap back to the first option (#475). Default matches the backend model.
   const [hostnameSync, setHostnameSync] = useState(
-    scope?.hostname_sync_mode ?? "on_static_only",
+    scope?.hostname_sync_mode ?? "on_lease",
   );
   const [options, setOptions] = useState<DHCPOption[]>(scope?.options ?? []);
   // DHCPv6 mode (issue #52) — only surfaced/sent for IPv6 scopes.
@@ -162,6 +193,12 @@ export function CreateScopeModal({
   // "srv:<server id>". Creating it on every member is the outage.
   const [placement, setPlacement] = useState("");
   const [error, setError] = useState("");
+  // IPAM addresses the API found inside the dynamic pool it just created (the
+  // notice New Pool shows); the dialog stays open on it (#3867).
+  const [poolNotice, setPoolNotice] = useState<
+    { address: string; status: string; hostname: string }[] | null
+  >(null);
+  const poolNoticeRef = useRef<typeof poolNotice>(null);
   // 409 + X-Adoption-Required from a cloud (FortiGate) group member: a DHCP
   // server already exists on the interface that SpatiumDDI didn't create
   // (#865). Holds the provider detail so we can offer an adopt-and-retry —
@@ -181,10 +218,15 @@ export function CreateScopeModal({
   // (subnet → block ancestry → space). If set, we default the scope's
   // group to it, so scopes land on whatever DHCP was configured at the
   // IPAM level.
-  const { data: effectiveDhcp } = useQuery({
+  // Read fresh on every open (#3865): the subnet's group may have moved since
+  // a cached answer was taken, and a scope saved in the old group is pushed to
+  // the wrong servers.
+  const { data: effectiveDhcp, isFetching: effectiveReading } = useQuery({
     queryKey: ["subnet-effective-dhcp", subnetId],
     queryFn: () => ipamApi.getEffectiveSubnetDhcp(subnetId),
     enabled: !editing && !defaultGroupId && !!subnetId,
+    staleTime: 0,
+    refetchOnMount: "always",
   });
   const effectiveGroupId = effectiveDhcp?.dhcp_server_group_id ?? null;
   const effectiveGroup = dhcpGroups.find((g) => g.id === effectiveGroupId);
@@ -194,16 +236,22 @@ export function CreateScopeModal({
       ? "the space"
       : "this subnet";
 
-  // Auto-select the inherited group on first load, unless the user has
-  // already picked one explicitly.
+  // Follow the inherited group until the operator picks one explicitly. Only a
+  // settled read counts: a cached answer is still on screen while the fresh
+  // one is on its way (#3865).
   const [groupAutoPicked, setGroupAutoPicked] = useState(!!groupId);
   useEffect(() => {
     if (editing || defaultGroupId) return;
     if (groupAutoPicked) return;
-    if (!effectiveGroupId) return;
-    setGroupId(effectiveGroupId);
-    setGroupAutoPicked(true);
-  }, [editing, defaultGroupId, groupAutoPicked, effectiveGroupId]);
+    if (effectiveReading) return;
+    setGroupId(effectiveGroupId ?? "");
+  }, [
+    editing,
+    defaultGroupId,
+    groupAutoPicked,
+    effectiveReading,
+    effectiveGroupId,
+  ]);
 
   // When the parent already chose the subnet (the "+ New Scope on subnet"
   // dropdown), the modal hides the subnet picker but we still need the
@@ -213,17 +261,30 @@ export function CreateScopeModal({
     queryFn: () => ipamApi.getSubnet(fixedSubnetId!),
     enabled: !!fixedSubnetId,
   });
-  const pinnedGroup = dhcpGroups.find((g) => g.id === defaultGroupId);
+  // #2479 — an existing scope's group is not editable (the API refuses a move),
+  // so Edit shows the stored group as a read-only pill like a pinned create.
+  const pinnedGroup = dhcpGroups.find(
+    (g) => g.id === (editing ? scope?.group_id : defaultGroupId),
+  );
   // Settings + specific subnet feed the auto-prefill for new scopes.
-  const { data: settings } = useQuery({
+  // Read fresh on open and pre-fill only from the settled answer (#4026): the
+  // tab usually holds a copy from sign-in, and another client may have changed
+  // the platform defaults since (same pattern as #3865).
+  const { data: settings, isFetching: settingsReading } = useQuery({
     queryKey: ["settings"],
     queryFn: settingsApi.get,
     enabled: !editing,
+    staleTime: 0,
+    refetchOnMount: "always",
   });
-  const { data: subnetDetail } = useQuery({
+  const { data: subnetDetail, isFetching: subnetReading } = useQuery({
     queryKey: ["subnet", subnetId],
     queryFn: () => ipamApi.getSubnet(subnetId),
     enabled: !editing && !!subnetId,
+    // Gateway + suggested pool come from here: read it fresh on open, and
+    // pre-fill only from that answer (#3865).
+    staleTime: 0,
+    refetchOnMount: "always",
   });
 
   // Is this an IPv6 scope? On edit we trust the stored family; on create
@@ -291,17 +352,33 @@ export function CreateScopeModal({
   // pre-fill and each applied template, so the dialog always shows what it
   // will send.
   const [prefillGeneration, setPrefillGeneration] = useState(0);
-  const [settingsPrefilled, setSettingsPrefilled] = useState(false);
+  // The platform-defaults half, keyed by address family (#4025): the defaults
+  // are DHCPv4 values, so a v6 scope takes only what DHCPv6 can carry (IPv6
+  // DNS / NTP addresses, domain search; no domain-name) — the API refuses the
+  // rest. A change of family (picking another subnet) replaces the rows this
+  // filled, never one the operator has since changed.
+  const [settingsPrefill, setSettingsPrefill] = useState<{
+    v6: boolean;
+    rows: DHCPOption[];
+  } | null>(null);
+  // The family is known once the subnet answered, or when no subnet is chosen.
+  const familyKnown = !subnetId || selectedNetwork !== null;
   useEffect(() => {
-    if (editing || settingsPrefilled || !settings) return;
+    if (
+      editing ||
+      !settings ||
+      settingsReading ||
+      !familyKnown ||
+      settingsPrefill?.v6 === isV6
+    )
+      return;
+    const prev = settingsPrefill;
+    const only = (xs: string[] | undefined) =>
+      (xs ?? []).filter((x) => x.includes(":") === isV6);
     const defaults: DHCPOption[] = [];
-    if (settings.dhcp_default_dns_servers?.length)
-      defaults.push({
-        code: 6,
-        name: "dns-servers",
-        value: settings.dhcp_default_dns_servers,
-      });
-    if (settings.dhcp_default_domain_name)
+    const dns = only(settings.dhcp_default_dns_servers);
+    if (dns.length) defaults.push({ code: 6, name: "dns-servers", value: dns });
+    if (settings.dhcp_default_domain_name && !isV6)
       defaults.push({
         code: 15,
         name: "domain-name",
@@ -313,23 +390,31 @@ export function CreateScopeModal({
         name: "domain-search",
         value: settings.dhcp_default_domain_search,
       });
-    if (settings.dhcp_default_ntp_servers?.length)
-      defaults.push({
-        code: 42,
-        name: "ntp-servers",
-        value: settings.dhcp_default_ntp_servers,
-      });
-    setOptions((cur) => [
-      ...cur,
-      ...defaults.filter((d) => !cur.some((o) => o.code === d.code)),
-    ]);
+    const ntp = only(settings.dhcp_default_ntp_servers);
+    if (ntp.length)
+      defaults.push({ code: 42, name: "ntp-servers", value: ntp });
+    setOptions((cur) => {
+      // Drop what an earlier pre-fill put there and the operator left alone.
+      const kept = cur.filter(
+        (o) =>
+          !prev?.rows.some(
+            (r) =>
+              r.code === o.code &&
+              JSON.stringify(r.value) === JSON.stringify(o.value),
+          ),
+      );
+      return [
+        ...kept,
+        ...defaults.filter((d) => !kept.some((o) => o.code === d.code)),
+      ];
+    });
     // Only over the field's own initial value — never over a typed one.
     const leaseDefault = settings.dhcp_default_lease_time;
-    if (leaseDefault)
+    if (leaseDefault && !prev)
       setLeaseTime((cur) => (cur === "86400" ? String(leaseDefault) : cur));
-    setSettingsPrefilled(true);
+    setSettingsPrefill({ v6: isV6, rows: defaults });
     setPrefillGeneration((g) => g + 1);
-  }, [editing, settingsPrefilled, settings]);
+  }, [editing, settings, settingsReading, familyKnown, isV6, settingsPrefill]);
 
   // The subnet half, keyed by subnet: picking another subnet in the dialog
   // replaces what this filled in for the last one — never a value the
@@ -340,7 +425,12 @@ export function CreateScopeModal({
     pool: { start: string; end: string } | null;
   } | null>(null);
   useEffect(() => {
-    if (editing || !subnetDetail || subnetPrefill?.subnetId === subnetId)
+    if (
+      editing ||
+      !subnetDetail ||
+      subnetReading ||
+      subnetPrefill?.subnetId === subnetId
+    )
       return;
     const prev = subnetPrefill;
     // Option 3 is DHCPv4-only (a v6 client learns its router from RAs), as
@@ -375,11 +465,27 @@ export function CreateScopeModal({
     }
     setSubnetPrefill({ subnetId, routers, pool });
     setPrefillGeneration((g) => g + 1);
-  }, [editing, subnetDetail, subnetId, subnetPrefill, poolStart, poolEnd]);
+  }, [
+    editing,
+    subnetDetail,
+    subnetReading,
+    subnetId,
+    subnetPrefill,
+    poolStart,
+    poolEnd,
+  ]);
 
   const mut = useMutation({
-    mutationFn: (adoptExisting: boolean) => {
-      const parsedLeaseTime = parseInt(leaseTime, 10) || 86400;
+    mutationFn: async (adoptExisting: boolean) => {
+      // #3082 — never send a lease time the field does not show. The API
+      // refuses 0 (a lease must last at least a second), so refuse it here with
+      // the reason instead of swapping in a default through a falsy `||`.
+      const parsedLeaseTime = parseInt(leaseTime, 10);
+      if (Number.isNaN(parsedLeaseTime) || parsedLeaseTime <= 0) {
+        throw new ScopeFormError(
+          "Lease time must be a whole number of seconds, at least 1.",
+        );
+      }
       const parsedMinLease = minLease ? parseInt(minLease, 10) : null;
       const parsedMaxLease = maxLease ? parseInt(maxLease, 10) : null;
       // #637 — blank means "inherit the group"; "0" means "caching off for this
@@ -399,16 +505,18 @@ export function CreateScopeModal({
           parsedCacheThreshold < 0 ||
           parsedCacheThreshold > 1)
       ) {
-        throw new Error("Lease cache threshold must be between 0 and 1.");
+        throw new ScopeFormError(
+          "Lease cache threshold must be between 0 and 1.",
+        );
       }
 
       if (parsedMinLease !== null && parsedMinLease > parsedLeaseTime) {
-        throw new Error(
+        throw new ScopeFormError(
           "Minimum lease time must be less than or equal to lease time.",
         );
       }
       if (parsedMaxLease !== null && parsedLeaseTime > parsedMaxLease) {
-        throw new Error(
+        throw new ScopeFormError(
           "Lease time must be less than or equal to maximum lease time.",
         );
       }
@@ -417,7 +525,7 @@ export function CreateScopeModal({
         parsedMaxLease !== null &&
         parsedMinLease > parsedMaxLease
       ) {
-        throw new Error(
+        throw new ScopeFormError(
           "Minimum lease time must be less than or equal to maximum lease time.",
         );
       }
@@ -439,8 +547,6 @@ export function CreateScopeModal({
         max_lease_time: parsedMaxLease,
         lease_cache_threshold: parsedCacheThreshold,
         lease_cache_max_age: parsedCacheMaxAge,
-        ddns_enabled: ddnsEnabled,
-        ddns_hostname_policy: ddnsEnabled ? ddnsPolicy : null,
         hostname_sync_mode: hostnameSync,
         dns_track_dynamic_leases: dnsTrackDynamicLeases,
         options,
@@ -477,31 +583,86 @@ export function CreateScopeModal({
         data.ra_prefix_autonomous = raAutonomous;
         data.ra_interface = raInterface.trim();
       }
-      // PXE binding (issue #51). The backend distinguishes "no
-      // change" from "explicit detach" via ``clear_pxe_profile``;
-      // pass it true when the operator picked "(none)" on an
-      // existing scope that previously had a profile bound.
-      if (pxeProfileId) {
-        data.pxe_profile_id = pxeProfileId;
-      } else if (editing && scope?.pxe_profile_id) {
-        data.clear_pxe_profile = true;
-      }
       if (needsPlacement && placement.startsWith("rel:")) {
         data.windows_placement = { failover_relationship: placement.slice(4) };
       } else if (needsPlacement && placement.startsWith("srv:")) {
         data.windows_placement = { server_id: placement.slice(4) };
       }
-      if (editing) return dhcpApi.updateScope(scope!.id, data, adoptExisting);
+      if (editing) {
+        // Send only what changed (#3091). The scope was read fresh on open,
+        // but another surface can change it while the dialog is open, and a
+        // full body would write the stale values back. The body is built
+        // from the same fields as a create, so the baseline below mirrors
+        // the form's own defaults for a column the row does not carry.
+        const was: Record<string, unknown> = {
+          name: scope!.name ?? "",
+          description: scope!.description ?? "",
+          enabled: scope!.enabled ?? true,
+          lease_time: scope!.lease_time ?? 86400,
+          min_lease_time: scope!.min_lease_time ?? null,
+          max_lease_time: scope!.max_lease_time ?? null,
+          lease_cache_threshold: scope!.lease_cache_threshold ?? null,
+          lease_cache_max_age: scope!.lease_cache_max_age ?? null,
+          hostname_sync_mode: scope!.hostname_sync_mode ?? "on_lease",
+          dns_track_dynamic_leases: scope!.dns_track_dynamic_leases ?? true,
+          options: scope!.options ?? [],
+          relay_addresses: scope!.relay_addresses ?? [],
+          v6_address_mode: scope!.v6_address_mode ?? "stateful",
+          ra_managed_flag: scope!.ra_managed_flag ?? true,
+          ra_other_flag: scope!.ra_other_flag ?? true,
+          ra_enabled: scope!.ra_enabled ?? false,
+          ra_mo_override: scope!.ra_mo_override ?? false,
+          ra_router_lifetime: scope!.ra_router_lifetime ?? 1800,
+          ra_prefix_valid_lifetime: scope!.ra_prefix_valid_lifetime ?? 86400,
+          ra_prefix_preferred_lifetime:
+            scope!.ra_prefix_preferred_lifetime ?? 14400,
+          ra_prefix_on_link: scope!.ra_prefix_on_link ?? true,
+          ra_prefix_autonomous: scope!.ra_prefix_autonomous ?? true,
+          ra_interface: scope!.ra_interface ?? "",
+          pxe_profile_id: scope!.pxe_profile_id ?? null,
+        };
+        // The group is not editable (the API refuses a move), so it is never
+        // sent; the PXE binding goes as an id, or as the explicit detach.
+        const { group_id: _group, ...rest } = data;
+        const body: Record<string, unknown> = {
+          ...rest,
+          pxe_profile_id: pxeProfileId || null,
+        };
+        const diff: Record<string, unknown> = changedFields(was, body);
+        if (!pxeProfileId && scope!.pxe_profile_id) {
+          delete diff.pxe_profile_id;
+          diff.clear_pxe_profile = true;
+        }
+        // Naming where an unheld scope goes is itself the change: the update
+        // is what puts it on that Windows member, so it rides even when no
+        // field changed.
+        if (data.windows_placement)
+          diff.windows_placement = data.windows_placement;
+        if (Object.keys(diff).length === 0) return scope!;
+        return dhcpApi.updateScope(
+          scope!.id,
+          diff as Partial<DHCPScope>,
+          adoptExisting,
+        );
+      }
+      // PXE binding (issue #51). The backend distinguishes "no
+      // change" from "explicit detach" via ``clear_pxe_profile``;
+      // pass it true when the operator picked "(none)" on an
+      // existing scope that previously had a profile bound.
+      if (pxeProfileId) data.pxe_profile_id = pxeProfileId;
+      poolNoticeRef.current = null;
       return dhcpApi
         .createScope(subnetId, data, adoptExisting)
         .then(async (created) => {
           if (poolStart && poolEnd) {
-            await dhcpApi.createPool(created.id, {
+            const pool = await dhcpApi.createPool(created.id, {
               name: "default",
               start_ip: poolStart,
               end_ip: poolEnd,
               pool_type: "dynamic",
             });
+            const existing = pool.existing_ips_in_range;
+            poolNoticeRef.current = existing?.length ? existing : null;
           }
           return created;
         });
@@ -524,7 +685,8 @@ export function CreateScopeModal({
           queryKey: ["dhcp-scopes-subnet", scope.subnet_id],
         });
       }
-      onClose();
+      if (poolNoticeRef.current) setPoolNotice(poolNoticeRef.current);
+      else onClose();
     },
     onError: (e) => {
       if (isAdoptionRequired(e)) {
@@ -536,7 +698,14 @@ export function CreateScopeModal({
         setError("");
       } else {
         setAdoptConflict(null);
-        setError(errMsg(e, "Failed to save scope"));
+        // The dialog's own refusals (lease time, cache and lease-bound
+        // checks) carry their reason; any other error without an API detail
+        // keeps the generic message rather than surfacing a raw JS error.
+        setError(
+          e instanceof ScopeFormError
+            ? e.message
+            : errMsg(e, "Failed to save scope"),
+        );
       }
     },
   });
@@ -550,6 +719,9 @@ export function CreateScopeModal({
       <form
         onSubmit={(e) => {
           e.preventDefault();
+          // The scope exists once the notice is up; Enter must not create a
+          // second one (#3867).
+          if (poolNotice) return;
           // Always try without adopting first; the 409 banner below offers
           // the explicit adopt-and-retry (#865).
           mut.mutate(false);
@@ -559,9 +731,10 @@ export function CreateScopeModal({
         {!editing && (
           <p className="rounded border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
             A DHCP scope binds an <strong>IPAM subnet</strong> to a{" "}
-            <strong>DHCP server</strong> so that server hands out leases from
-            the subnet&apos;s address range. The subnet must exist in IPAM first
-            — create it under IPAM → Subnets if it doesn&apos;t.
+            <strong>DHCP server group</strong> so every server in the group
+            hands out leases from the subnet&apos;s address range. The subnet
+            must exist in IPAM first — create it on the IPAM page if it
+            doesn&apos;t.
           </p>
         )}
 
@@ -614,7 +787,7 @@ export function CreateScopeModal({
               else show a picker. Defaults to the DHCP group inherited
               from the subnet / block / space. Scopes belong to groups,
               and every server in the group serves this scope. */}
-          {defaultGroupId && pinnedGroup ? (
+          {(editing || defaultGroupId) && pinnedGroup ? (
             <Field label="DHCP Server Group">
               <div className="flex items-center gap-2 rounded-md border bg-muted/30 px-3 py-1.5 text-sm">
                 <span className="font-medium">{pinnedGroup.name}</span>
@@ -627,11 +800,13 @@ export function CreateScopeModal({
             <Field
               label="DHCP Server Group"
               hint={
-                effectiveGroupId && effectiveGroup
-                  ? `Inherited group "${effectiveGroup.name}" from ${inheritSource}.`
-                  : effectiveGroupId === null && subnetId && !editing
-                    ? "No DHCP group set on this subnet's space/block. Edit the subnet to set one, or pick any group below."
-                    : undefined
+                effectiveReading && subnetId && !editing
+                  ? "Reading this subnet's DHCP group…"
+                  : effectiveGroupId && effectiveGroup
+                    ? `Inherited group "${effectiveGroup.name}" from ${inheritSource}.`
+                    : effectiveGroupId === null && subnetId && !editing
+                      ? "No DHCP group set on this subnet's space/block. Edit the subnet to set one, or pick any group below."
+                      : undefined
               }
             >
               <select
@@ -703,7 +878,7 @@ export function CreateScopeModal({
           <Field label="Lease Time (sec)">
             <input
               type="number"
-              min="0"
+              min="1"
               step="1"
               className={inputCls}
               value={leaseTime}
@@ -970,57 +1145,17 @@ export function CreateScopeModal({
           <span>Enabled (serve leases from this scope)</span>
         </label>
 
-        <div className="rounded-md border p-3 space-y-2">
-          <label className="flex items-center gap-2 text-sm font-medium">
-            <input
-              type="checkbox"
-              checked={ddnsEnabled}
-              onChange={(e) => setDdnsEnabled(e.target.checked)}
-            />
-            <span>DDNS — push lease updates to DNS</span>
-          </label>
-          {ddnsEnabled && (
-            <div className="space-y-2 pl-6">
-              <Field label="Hostname Policy">
-                <select
-                  className={inputCls}
-                  value={ddnsPolicy}
-                  onChange={(e) => setDdnsPolicy(e.target.value)}
-                >
-                  {DDNS_HOSTNAME_POLICIES.map((p) => (
-                    <option key={p.value} value={p.value}>
-                      {p.label}
-                    </option>
-                  ))}
-                  {/* A value stored before edits were checked (#1308) shows
-                      as itself, and is sent back unchanged until another
-                      policy is picked. */}
-                  {!DDNS_HOSTNAME_POLICIES.some(
-                    (p) => p.value === ddnsPolicy,
-                  ) && (
-                    <option value={ddnsPolicy}>
-                      {ddnsPolicy} (not a supported policy)
-                    </option>
-                  )}
-                </select>
-              </Field>
-              {/* #784 — a "Domain Override" input used to sit here. Nothing
-                  stored it: no column, no field on the create/update models,
-                  and the response hardcoded null, so a typed value was
-                  silently discarded. The setting is real one level up, on the
-                  subnet, which is where the DDNS resolution chain reads it. */}
-              <p className="text-xs text-muted-foreground">
-                The DDNS domain comes from the subnet (inherited from its block
-                or IP space unless overridden). Set it in IPAM → the subnet's
-                DDNS settings.
-              </p>
-            </div>
-          )}
-        </div>
+        {/* #2270 — a scope's DDNS toggle and hostname policy used to sit here.
+            Neither reached Kea or DNS: DDNS is gated only by the subnet's own
+            settings, so the controls were stored, shipped and ignored. */}
+        <p className="text-xs text-muted-foreground">
+          DDNS (pushing lease updates to DNS) is configured on the subnet, not
+          the scope: set it in IPAM → the subnet's DDNS settings.
+        </p>
 
         <Field
           label="Hostname → IPAM Sync"
-          hint="How learned hostnames from DHCP clients feed back into IPAM address records."
+          hint="Whether a lease's client hostname is written onto its IPAM address record. The record itself is always created."
         >
           <select
             className={inputCls}
@@ -1055,6 +1190,7 @@ export function CreateScopeModal({
             <h3 className="text-sm font-semibold">Options</h3>
             <ApplyTemplateControl
               groupId={groupId}
+              addressFamily={isV6 ? "ipv6" : "ipv4"}
               currentOptions={options}
               onApply={(next) => {
                 setOptions(next);
@@ -1077,7 +1213,7 @@ export function CreateScopeModal({
           onChange={setPxeProfileId}
         />
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
         {adoptConflict && (
           <div className="flex items-center justify-between gap-2 rounded border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-800 dark:text-amber-300">
             <span>{adoptConflict}</span>
@@ -1100,7 +1236,36 @@ export function CreateScopeModal({
             </div>
           </div>
         )}
-        <Btns onClose={onClose} pending={mut.isPending} />
+        {poolNotice && (
+          <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 space-y-2">
+            <p className="text-sm font-medium text-amber-700 dark:text-amber-400">
+              Scope and pool created — {poolNotice.length} existing IP
+              {poolNotice.length !== 1 ? "s" : ""} in the pool's range:
+            </p>
+            <ul className="text-xs space-y-0.5 max-h-32 overflow-y-auto">
+              {poolNotice.map((ip) => (
+                <li key={ip.address} className="font-mono">
+                  {ip.address}{" "}
+                  <span className="text-muted-foreground">
+                    ({ip.status}){ip.hostname ? ` — ${ip.hostname}` : ""}
+                  </span>
+                </li>
+              ))}
+            </ul>
+            <p className="text-xs text-muted-foreground">
+              These IPs may conflict with dynamic DHCP leases. Edit the pool, or
+              mark them as excluded or reserved.
+            </p>
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90"
+            >
+              OK
+            </button>
+          </div>
+        )}
+        {!poolNotice && <Btns onClose={onClose} pending={mut.isPending} />}
       </form>
     </Modal>
   );
@@ -1117,7 +1282,7 @@ export const EditScopeModal = CreateScopeModal;
  * the picker doesn't open a nested editor (keeps this modal focused
  * on the scope).
  */
-function PXEProfileSection({
+export function PXEProfileSection({
   groupId,
   value,
   onChange,
@@ -1160,6 +1325,7 @@ function PXEProfileSection({
         .
       </p>
       <select
+        aria-label="PXE profile"
         value={value}
         onChange={(e) => onChange(e.target.value)}
         className={inputCls}
@@ -1212,21 +1378,32 @@ function PXEProfileSection({
  * conflict-key list is shown in a small caption so the operator knows what
  * was overwritten.
  */
-function ApplyTemplateControl({
+export function ApplyTemplateControl({
   groupId,
+  addressFamily,
   currentOptions,
   onApply,
 }: {
   groupId: string;
+  /** Only templates of this family are offered (#4025); all when omitted. */
+  addressFamily?: "ipv4" | "ipv6";
   currentOptions: DHCPOption[];
   onApply: (next: DHCPOption[]) => void;
 }) {
-  const { data: templates = [] } = useQuery({
+  // Re-read on open and hold the picker meanwhile: applying merges the
+  // template's options into the form, and a cached copy may predate another
+  // client's change (#4029, as #3868).
+  const { data: allTemplates = [], isFetching } = useQuery({
     queryKey: ["dhcp-option-templates", groupId],
     queryFn: () =>
       groupId ? dhcpApi.listOptionTemplates(groupId) : Promise.resolve([]),
     enabled: !!groupId,
+    staleTime: 0,
+    refetchOnMount: "always",
   });
+  const templates = addressFamily
+    ? allTemplates.filter((t) => (t.address_family ?? "ipv4") === addressFamily)
+    : allTemplates;
   const [overwritten, setOverwritten] = useState<string[]>([]);
   const [pickerKey, setPickerKey] = useState(0);
 
@@ -1273,8 +1450,10 @@ function ApplyTemplateControl({
         </span>
       )}
       <select
+        aria-label="Apply template"
         key={pickerKey}
         defaultValue=""
+        disabled={isFetching}
         onChange={(e) => handleSelect(e.target.value)}
         className="rounded-md border bg-background px-2 py-1 text-xs hover:bg-accent"
       >

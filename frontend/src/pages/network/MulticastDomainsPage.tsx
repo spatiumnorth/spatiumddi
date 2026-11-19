@@ -1,3 +1,4 @@
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
@@ -7,11 +8,14 @@ import {
   type MulticastDomainRead,
   type MulticastDomainUpdate,
   type MulticastPIMMode,
+  formatApiError,
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -99,16 +103,7 @@ function MulticastDomainModal({
       onClose();
     },
     onError: (e: unknown) => {
-      const err = e as {
-        message?: string;
-        response?: { data?: { detail?: string | { msg?: string }[] } };
-      };
-      const detail = err?.response?.data?.detail;
-      if (Array.isArray(detail)) {
-        setError(detail.map((d) => d.msg ?? "validation error").join("; "));
-      } else {
-        setError(detail ?? err?.message ?? "Save failed");
-      }
+      setError(formatApiError(e, "Save failed"));
     },
   });
 
@@ -206,7 +201,9 @@ function MulticastDomainModal({
           </div>
         </div>
 
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-sm text-destructive">{error}</FormError>
+        )}
 
         <div className="mt-4 flex justify-end gap-2 border-t pt-3">
           <button
@@ -239,6 +236,17 @@ function MulticastDomainModal({
 // domain table + modal.
 
 export function MulticastDomainsTab() {
+  // #1340 — a read-only user is offered no write it would be refused:
+  // the router asks write (delete) on 'multicast'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "multicast"),
+    "Requires write permission on multicast domains",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "multicast"),
+    "Requires delete permission on multicast domains",
+  );
   const qc = useQueryClient();
   const [editing, setEditing] = useState<MulticastDomainRead | null>(null);
   const [showNew, setShowNew] = useState(false);
@@ -256,14 +264,26 @@ export function MulticastDomainsTab() {
 
   const items = query.data ?? [];
 
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
   const removeOne = useMutation({
+    onMutate: () => setDeleteError(null),
     mutationFn: (id: string) => multicastApi.deleteDomain(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["multicast-domains"] }),
+    onError: (e: unknown) => {
+      setDeleteError(formatApiError(e, "Failed to delete PIM domain"));
+      qc.invalidateQueries({ queryKey: ["multicast-domains"] });
+    },
   });
 
   return (
     <>
       <div className="space-y-4">
+        {deleteError && (
+          <p role="alert" className="text-sm text-destructive">
+            {deleteError}
+          </p>
+        )}
         <div className="flex flex-wrap items-start justify-between gap-3">
           <p className="min-w-0 flex-1 text-sm text-muted-foreground">
             Network-layer routing context for multicast groups — PIM mode,
@@ -282,6 +302,7 @@ export function MulticastDomainsTab() {
               variant="primary"
               icon={Plus}
               onClick={() => setShowNew(true)}
+              {...writeGate}
             >
               New domain
             </HeaderButton>
@@ -301,14 +322,24 @@ export function MulticastDomainsTab() {
               </tr>
             </thead>
             <tbody className={zebraBodyCls}>
-              {items.length === 0 && !query.isFetching && (
+              {items.length === 0 && (!query.isFetching || query.error) && (
                 <tr>
                   <td
                     colSpan={6}
                     className="px-3 py-10 text-center text-sm text-muted-foreground"
                   >
-                    No PIM domains yet. Click <strong>New domain</strong> to add
-                    the first.
+                    <ListEmpty
+                      error={query.error}
+                      what="PIM domains"
+                      gate={writeGate}
+                      hint={
+                        <>
+                          Click <strong>New domain</strong> to add the first.
+                        </>
+                      }
+                    >
+                      No PIM domains yet.
+                    </ListEmpty>
                   </td>
                 </tr>
               )}
@@ -340,7 +371,9 @@ export function MulticastDomainsTab() {
                       type="button"
                       onClick={() => setEditing(d)}
                       title="Edit"
-                      className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                      aria-label="Edit"
+                      className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                      {...writeGate}
                     >
                       <Pencil className="h-3.5 w-3.5" />
                     </button>
@@ -355,7 +388,9 @@ export function MulticastDomainsTab() {
                         });
                       }}
                       title="Delete"
-                      className="ml-1 rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                      aria-label="Delete"
+                      className="ml-1 rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
+                      {...deleteGate}
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                     </button>

@@ -103,6 +103,10 @@ def _policy(group_id, **kw) -> DHCPDevicePolicy:
     return DHCPDevicePolicy(**base)
 
 
+_NO_DEVICES_WARNING = "No devices have been seen in the selected classes yet"
+_UNMATCHABLE_WARNING = "in a form that can be matched"
+
+
 # ── Encoding primitives ───────────────────────────────────────────
 
 
@@ -265,6 +269,7 @@ async def test_ambiguous_signature_included_on_explicit_opt_in(
 
     out = await compile_device_policy(db_session, policy)
     assert Signature("1,3,6", None) in out.signatures
+    assert not any(_NO_DEVICES_WARNING in w for w in out.warnings)
 
 
 @pytest.mark.asyncio
@@ -308,6 +313,7 @@ async def test_truncation_is_reported_never_silent(db_session: AsyncSession) -> 
     assert len(out.signatures) == MAX_SIGNATURE_TERMS
     assert out.truncated == 5
     assert any("cap" in w for w in out.warnings)
+    assert not any(_NO_DEVICES_WARNING in w for w in out.warnings)
 
 
 @pytest.mark.asyncio
@@ -597,3 +603,178 @@ async def test_confident_classification_is_not_warned(
     assert out.confidence == 89
     assert not any("confidence" in w for w in out.warnings)
     assert out.confidence >= LOW_CONFIDENCE_SCORE
+
+
+@pytest.mark.asyncio
+async def test_classes_with_no_observed_devices_warn_why_not_rendered(
+    db_session: AsyncSession,
+) -> None:
+    """#2000: classes selected, nothing fingerprinted in them yet -> empty
+    expression, not rendered. The warning says why, and it is absent when
+    signatures exist, when a manual match is set, and when the empty result is
+    the ambiguous exclusion (which has its own message)."""
+    grp, _ = await _make_group_with_server(db_session)
+
+    # Only a device in another class: nothing in "Printer".
+    db_session.add(_fp("aa:bb:cc:00:00:09", "9,9", None, "Windows"))
+    empty = _policy(grp.id, device_classes=["Printer"])
+    manual = _policy(grp.id, device_classes=["Printer"], match_override="option[60].hex == 0x74")
+    db_session.add_all([empty, manual])
+    await db_session.flush()
+
+    out = await compile_device_policy(db_session, empty)
+    assert not out.expression
+    assert any(_NO_DEVICES_WARNING in w for w in out.warnings)
+
+    out_manual = await compile_device_policy(db_session, manual)
+    assert out_manual.expression
+    assert not any(_NO_DEVICES_WARNING in w for w in out_manual.warnings)
+
+    # Signatures exist -> compiles, no warning.
+    db_session.add(_fp("aa:bb:cc:00:00:01", "1,3,6", None, "Printer"))
+    await db_session.flush()
+    out_seen = await compile_device_policy(db_session, empty)
+    assert out_seen.expression
+    assert not any(_NO_DEVICES_WARNING in w for w in out_seen.warnings)
+
+
+@pytest.mark.asyncio
+async def test_all_ambiguous_keeps_its_own_warning_not_the_no_devices_one(
+    db_session: AsyncSession,
+) -> None:
+    grp, _ = await _make_group_with_server(db_session)
+    db_session.add_all(
+        [
+            _fp("aa:bb:cc:00:00:01", "1,3,6", None, "Printer"),
+            _fp("aa:bb:cc:00:00:02", "1,3,6", None, "Windows"),
+        ]
+    )
+    policy = _policy(grp.id, device_classes=["Printer"])
+    db_session.add(policy)
+    await db_session.flush()
+
+    out = await compile_device_policy(db_session, policy)
+    assert not out.expression
+    assert any("excluded" in w for w in out.warnings)
+    assert not any(_NO_DEVICES_WARNING in w for w in out.warnings)
+
+
+@pytest.mark.asyncio
+async def test_in_class_devices_with_unmatchable_signatures_are_not_called_unseen(
+    db_session: AsyncSession,
+) -> None:
+    """#2000 boundary: a device in the selected class that sent neither option
+    55 nor 60 is skipped by _term, so the result is empty — but devices WERE
+    seen, and "no devices have been seen" would be false."""
+    grp, _ = await _make_group_with_server(db_session)
+    db_session.add(_fp("aa:bb:cc:00:00:01", None, None, "Printer"))
+    policy = _policy(grp.id, device_classes=["Printer"])
+    db_session.add(policy)
+    await db_session.flush()
+
+    out = await compile_device_policy(db_session, policy)
+    assert not out.expression
+    assert not any(_NO_DEVICES_WARNING in w for w in out.warnings)
+    assert any(_UNMATCHABLE_WARNING in w and w.startswith("1 device") for w in out.warnings)
+
+
+@pytest.mark.asyncio
+async def test_no_devices_warning_boundaries(db_session: AsyncSession) -> None:
+    """#2000 boundaries: an unclassified device sharing nothing with the class
+    does not count as seen in it; a disabled policy still gets the (true)
+    warning; and no classes selected gets only its own warning, never both."""
+    grp, _ = await _make_group_with_server(db_session)
+    db_session.add(_fp("aa:bb:cc:00:00:01", "1,3,6", None, None))
+    disabled = _policy(grp.id, device_classes=["Printer"], enabled=False)
+    no_classes = _policy(grp.id, device_classes=[])
+    db_session.add_all([disabled, no_classes])
+    await db_session.flush()
+
+    out = await compile_device_policy(db_session, disabled)
+    assert not out.expression
+    assert out.unclassified_matches == 0
+    assert any(_NO_DEVICES_WARNING in w for w in out.warnings)
+    assert not any("renders once" in w for w in out.warnings)
+
+    out_none = await compile_device_policy(db_session, no_classes)
+    assert not any(_NO_DEVICES_WARNING in w for w in out_none.warnings)
+    assert not any(_UNMATCHABLE_WARNING in w for w in out_none.warnings)
+    assert any("No device classes selected" in w for w in out_none.warnings)
+
+
+@pytest.mark.asyncio
+async def test_manual_match_only_policy_is_not_called_unrendered(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """#1992: no classes + a manual match IS rendered, so neither the compile
+    warnings nor the REST preview may say it matches nothing / is not
+    rendered. With neither classes nor a match the warning still applies."""
+    _, token = await _make_user(db_session)
+    grp, _ = await _make_group_with_server(db_session)
+    manual = _policy(grp.id, device_classes=[], match_override="option[60].hex == 0x74657374")
+    bare = _policy(grp.id, device_classes=[])
+    db_session.add_all([manual, bare])
+    await db_session.commit()
+
+    out = await compile_device_policy(db_session, manual)
+    assert out.expression
+    assert not any("matches nothing" in w for w in out.warnings)
+    r = await client.get(
+        f"/api/v1/dhcp/device-policies/{manual.id}/preview",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    body = r.json()
+    assert body["renders"] is True
+    assert not any("not rendered and" in w or "matches nothing" in w for w in body["warnings"])
+
+    out_bare = await compile_device_policy(db_session, bare)
+    assert any("matches nothing and is not rendered" in w for w in out_bare.warnings)
+    assert not out_bare.expression
+
+    # A whitespace-only match is no match: the warning and an empty
+    # expression (renders=False) must still agree.
+    blank = _policy(grp.id, device_classes=[], match_override="   ")
+    out_blank = await compile_device_policy(db_session, blank)
+    assert not out_blank.expression
+    assert any("matches nothing and is not rendered" in w for w in out_blank.warnings)
+
+
+@pytest.mark.asyncio
+async def test_disabled_policy_manual_match_is_not_called_in_force_2753(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """#2753: the bundle omits a disabled policy, so its preview must not say
+    the manual match is in force; an enabled one still does."""
+    _, token = await _make_user(db_session)
+    grp, _ = await _make_group_with_server(db_session)
+    expr = "option[60].hex == 0x78702d6e6f6e65"
+    off = _policy(grp.id, device_classes=[], match_override=expr, enabled=False)
+    on = _policy(grp.id, device_classes=[], match_override=expr, enabled=True)
+    db_session.add_all([off, on])
+    await db_session.commit()
+
+    hdr = {"Authorization": f"Bearer {token}"}
+    r_off = (await client.get(f"/api/v1/dhcp/device-policies/{off.id}/preview", headers=hdr)).json()
+    r_on = (await client.get(f"/api/v1/dhcp/device-policies/{on.id}/preview", headers=hdr)).json()
+    assert r_off["renders"] is False
+    assert r_off["expression"] == expr
+    assert not any("in force" in w for w in r_off["warnings"])
+    assert any("disabled" in w for w in r_off["warnings"])
+    assert r_on["renders"] is True
+    assert any("in force" in w for w in r_on["warnings"])
+
+    # The bundle really omits the disabled policy.
+    srv = await _server_of(db_session, grp.id)
+    bundle = await build_config_bundle(db_session, srv)
+    names = {c.name for c in bundle.device_policy_classes}
+    assert on.class_name in names and off.class_name not in names
+
+
+async def _server_of(db: AsyncSession, group_id) -> DHCPServer:
+    from sqlalchemy import select
+
+    return (
+        (await db.execute(select(DHCPServer).where(DHCPServer.server_group_id == group_id)))
+        .scalars()
+        .first()
+    )

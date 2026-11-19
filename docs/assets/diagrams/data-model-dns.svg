@@ -41,7 +41,7 @@
   <text x="164" y="127" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">DNSServerGroup</text>
   <text x="288" y="118" font-size="12" font-weight="600" fill="#334155"
         font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">dns_server_group</text>
-  <text x="288" y="136" font-size="12" fill="#475569">logical cluster — holds the shared config and TSIG key</text>
+  <text x="288" y="136" font-size="12" fill="#475569">logical cluster — holds shared config (options, ACLs, TSIG keys, blocklists)</text>
 
   <!-- Tree spine -->
   <path d="M 76 148 V 446" stroke="#cbd5e1" stroke-width="2" fill="none"/>
@@ -94,5 +94,5 @@
   <text x="195" y="451" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">DNSPool</text>
   <text x="290" y="442" font-size="12" font-weight="600" fill="#334155"
         font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">dns_pool</text>
-  <text x="290" y="460" font-size="12" fill="#475569">health-checked A / AAAA set rendered as records</text>
+  <text x="290" y="460" font-size="12" fill="#475569">health-checked A / AAAA set (DNSPoolMember rows) rendered as records in a zone</text>
 </svg>

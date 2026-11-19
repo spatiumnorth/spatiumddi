@@ -141,6 +141,57 @@ def test_redact_catches_a_renormalised_url() -> None:
     assert "sig=s1gN4ture" not in redact(f"failed: {_TEAMS}", _TEAMS)
 
 
+def test_redact_catches_the_bare_token_and_a_single_path_segment() -> None:
+    # GHSA-5qf8-pqm4-58mj: a collector echoing only the token (no
+    # "Bearer ") or only one path segment must not leak either.
+    bare = _AUTH.split(None, 1)[1]
+    out = redact(f"invalid token {bare} for hook s3cr3tPathToken", _SLACK, _AUTH)
+    assert bare not in out and "s3cr3tPathToken" not in out
+    assert "[redacted]" in out
+    # A single query value on its own is a needle too.
+    assert "s1gN4tureFixture" not in redact("rejected sig s1gN4tureFixture", _TEAMS)
+
+
+def test_redact_catches_json_escaped_and_percent_encoded_forms() -> None:
+    # GHSA-5qf8-pqm4-58mj: re-encoded echoes defeat an exact match.
+    from urllib.parse import quote
+
+    json_escaped = _GENERIC.replace("/", r"\/")
+    assert "t0kenInPath" not in redact(f"echo {json_escaped}", _GENERIC)
+    percent_encoded = quote(_GENERIC, safe="")
+    assert "t0kenInPath" not in redact(f"echo {percent_encoded}", _GENERIC)
+    assert "hdr-fixture" not in redact(f"echo {quote(_AUTH, safe='')}", _AUTH)
+    bare = _AUTH.split(None, 1)[1]
+    bare_encoded = quote(bare, safe="")
+    assert bare not in redact(f"echo {bare_encoded}", _AUTH)
+
+
+async def test_a_non2xx_preview_is_redacted_before_it_is_truncated() -> None:
+    # GHSA-5qf8-pqm4-58mj: cutting to 200 chars first left the leading
+    # part of a straddling secret in clear.
+    body = "x" * 190 + f" {_GENERIC} {_AUTH}"
+
+    class _Client(httpx.AsyncClient):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            def _handler(request: httpx.Request) -> httpx.Response:
+                return httpx.Response(401, text=body)
+
+            kwargs["transport"] = httpx.MockTransport(_handler)
+            super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+
+    with (
+        capture_logs() as logs,
+        patch.object(svc.httpx, "AsyncClient", _Client),
+        pytest.raises(httpx.HTTPStatusError),
+    ):
+        await svc._send_webhook(_GENERIC, _AUTH, {"text": "hi"})  # noqa: SLF001
+    warned = [e for e in logs if e["event"] == "audit_forward_webhook_non2xx"]
+    assert warned, logs
+    preview = warned[0]["body_preview"]
+    assert len(preview) <= 200
+    assert "t0kenInPath" not in preview and "hdr-fixture" not in preview
+
+
 # ── send path: logs and errors ─────────────────────────────────────
 
 
@@ -248,16 +299,55 @@ async def test_an_update_without_the_secrets_keeps_them(
     assert url_ct and decrypt_str(url_ct) == _SLACK
 
 
+async def test_a_webhook_target_cannot_end_up_without_a_url(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """An omitted URL keeps the stored one, but a webhook still needs one (#1581)."""
+    headers = await _admin(db_session)
+    body = _webhook_body()
+    created = (await client.post(_TARGETS, headers=headers, json=body)).json()
+    edit = {k: v for k, v in body.items() if k not in ("url", "auth_header")}
+
+    resp = await client.put(
+        f"{_TARGETS}/{created['id']}", headers=headers, json={**edit, "url": ""}
+    )
+    assert resp.status_code == 422, resp.text
+    url_ct, _ = await _raw(db_session, created["id"])
+    assert url_ct and decrypt_str(url_ct) == _GENERIC
+
+    # A syslog target switched to webhook has no URL to keep.
+    syslog = await client.post(
+        _TARGETS,
+        headers=headers,
+        json={"name": "siem", "kind": "syslog", "host": "siem.example.test"},
+    )
+    assert syslog.status_code == 201, syslog.text
+    resp = await client.put(
+        f"{_TARGETS}/{syslog.json()['id']}",
+        headers=headers,
+        json={"name": "siem", "kind": "webhook"},
+    )
+    assert resp.status_code == 422, resp.text
+
+
 async def test_a_failed_save_does_not_echo_the_secrets(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    """SQLAlchemy's error text lists every bound parameter of the INSERT."""
+    """SQLAlchemy's error text lists every bound parameter of the statement.
+
+    A create flushes before writing its audit row, so a duplicate name there
+    surfaces as the generic 409 and never reaches ``_save_error``; an update
+    fails at commit, and its message is built here.
+    """
     headers = await _admin(db_session)
     body = _webhook_body()
     assert (await client.post(_TARGETS, headers=headers, json=body)).status_code == 201
-    resp = await client.post(_TARGETS, headers=headers, json=body)  # same name
+
+    other = await client.post(_TARGETS, headers=headers, json={**body, "name": "other"})
+    assert other.status_code == 201, other.text
+    resp = await client.put(f"{_TARGETS}/{other.json()['id']}", headers=headers, json=body)
     assert resp.status_code == 400, resp.text
-    assert "create failed" in resp.text
+    assert "update failed" in resp.text
     assert "t0kenInPath" not in resp.text and "hdr-fixture" not in resp.text
     assert "[parameters:" not in resp.text
 
@@ -364,6 +454,37 @@ async def test_the_legacy_settings_webhook_is_write_only(
     assert resp.json()["audit_forward_webhook_url_set"] is True
 
 
+# ── post-restore empty bytea ────────────────────────────────────────
+
+
+async def test_an_empty_bytea_url_is_unset_everywhere(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """An exclude-secrets restore leaves b"" in url_encrypted, not NULL."""
+    from app.api.v1.settings.router import _forward_snapshot
+
+    headers = await _admin(db_session)
+    created = (await client.post(_TARGETS, headers=headers, json=_webhook_body())).json()
+    row = await db_session.get(AuditForwardTarget, uuid.UUID(created["id"]))
+    assert row is not None
+    row.url_encrypted = b""
+    row.auth_header_encrypted = b""
+    await db_session.flush()
+
+    listed = await client.get(_TARGETS, headers=headers)
+    mine = [t for t in listed.json() if t["id"] == created["id"]]
+    assert mine and mine[0]["url_set"] is False and mine[0]["auth_header_set"] is False
+
+    snapshot = _forward_snapshot(row)
+    assert snapshot["url_set"] is False and snapshot["auth_header_set"] is False
+
+    # Keeping the (blank) URL on update is refused, not silently saved.
+    edit = {k: v for k, v in _webhook_body().items() if k not in ("url", "auth_header")}
+    edit["name"] = created["name"]
+    resp = await client.put(f"{_TARGETS}/{created['id']}", headers=headers, json=edit)
+    assert resp.status_code == 422, resp.text
+
+
 # ── support bundle ─────────────────────────────────────────────────
 
 
@@ -404,28 +525,6 @@ def test_the_support_bundle_scrubber_strips_chat_webhook_secrets(
     assert kinds
     # Idempotent: the replacement does not re-trigger the safety net.
     assert redact_secrets(cleaned)[1] == []
-
-
-# ── backups ────────────────────────────────────────────────────────
-
-
-def test_an_exclude_secrets_archive_nulls_the_plaintext_leftovers() -> None:
-    from app.services.backup.archive import _scrub_dump_text
-
-    dump = (
-        'COPY "public"."audit_forward_target" ("id", "name", "url", "auth_header", '
-        '"url_encrypted", "auth_header_encrypted") FROM stdin;\n'
-        "1\tchat\thttps://old.example/x\tBearer y\t\\\\x6162\t\\\\x6364\n"
-        "\\.\n"
-        'COPY "public"."platform_settings" ("id", "audit_forward_webhook_url", '
-        '"audit_forward_webhook_auth_header", "audit_forward_webhook_url_encrypted", '
-        '"audit_forward_webhook_auth_header_encrypted") FROM stdin;\n'
-        "1\thttps://old.example/y\tBasic z\t\\\\x6566\t\\\\x6768\n"
-        "\\.\n"
-    )
-    lines = _scrub_dump_text(dump).splitlines()
-    assert lines[1].split("\t") == ["1", "chat", "\\N", "\\N", "\\\\x", "\\\\x"]
-    assert lines[4].split("\t") == ["1", "\\N", "\\N", "\\\\x", "\\\\x"]
 
 
 # ── migration ──────────────────────────────────────────────────────
@@ -523,3 +622,34 @@ async def test_the_migration_encrypts_existing_plaintext(db_session: AsyncSessio
         )
     ).scalar_one()
     assert back == _TEAMS
+
+
+async def test_an_smtp_update_keeps_the_password_unless_told_to_clear(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#3927: omitted / null keeps the SMTP password; only ``""`` clears it."""
+    headers = await _admin(db_session)
+    body = {
+        "name": "mail",
+        "kind": "smtp",
+        "smtp_host": "smtp.example.test",
+        "smtp_username": "u",
+        "smtp_password": "s3cret-pw",
+        "smtp_from_address": "a@example.test",
+        "smtp_to_addresses": ["b@example.test"],
+    }
+    created = await client.post(_TARGETS, headers=headers, json=body)
+    assert created.status_code == 201, created.text
+    tid = created.json()["id"]
+    assert created.json()["smtp_password_set"] is True
+    edit = {k: v for k, v in body.items() if k != "smtp_password"}
+
+    for extra in ({}, {"smtp_password": None}):
+        resp = await client.put(f"{_TARGETS}/{tid}", headers=headers, json={**edit, **extra})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["smtp_password_set"] is True
+
+    resp = await client.put(
+        f"{_TARGETS}/{tid}", headers=headers, json={**edit, "smtp_password": ""}
+    )
+    assert resp.json()["smtp_password_set"] is False

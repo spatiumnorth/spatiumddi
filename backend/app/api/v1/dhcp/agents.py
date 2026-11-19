@@ -11,30 +11,44 @@ import hashlib
 import hmac
 import ipaddress
 import os
+import time
 import uuid
+from collections import Counter
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Annotated, Any
 
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
-from jose import JWTError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError, PendingRollbackError
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB
 from app.api.v1.dhcp._audit import write_audit
 from app.core.agent_wake import (
     WAKE_TICK_SECONDS,
+    WakeResult,
+    collect_wake,
     dhcp_wake_channels,
+    flush_collected_wakes,
     wake_subscription,
 )
+from app.core.celery_dispatch import dispatch
+from app.core.db_transient import is_transient_db_error
 from app.core.dns_names import sanitize_hostname
 from app.core.http_etag import etag_matches, format_etag
+from app.core.jwt_compat import JWTError
+from app.core.versions import is_installed_target
 from app.drivers.dhcp.kea import option_defs_for_option_maps
 from app.models.dhcp import (
     DHCPConfigOp,
     DHCPLease,
+    DHCPScope,
     DHCPServer,
     DHCPServerGroup,
 )
@@ -42,6 +56,7 @@ from app.models.logs import DHCPLogEntry
 from app.models.metrics import DHCPMetricSample
 from app.models.settings import PlatformSettings
 from app.services.agents.config_apply import apply_reported_status
+from app.services.agents.container_oom import effective_daemon_report, fresh_role_health
 from app.services.agents.daemon_state import apply_reported_daemon_state
 from app.services.agents.ingest_receipt import (
     BatchId,
@@ -49,9 +64,23 @@ from app.services.agents.ingest_receipt import (
     claim_batch,
     duplicate_response,
 )
+from app.services.agents.instance_ownership import (
+    AGENT_INSTANCE_HEADER,
+    claim_poll,
+    duplicate_instance_response,
+    is_displaced,
+    is_refused,
+    parse_agent_instance,
+    refuse_registration,
+)
+from app.services.agents.server_gone import refresh_agent_server
 from app.services.agents.spool_status import apply_reported_spool
 from app.services.appliance.lldp import lldp_bundle
 from app.services.appliance.ntp import ntp_bundle
+from app.services.appliance.ownership import (
+    owning_appliance_for_dhcp_agent,
+    owning_appliance_for_dhcp_server,
+)
 from app.services.appliance.resolver import resolver_bundle
 from app.services.appliance.snmp import snmp_bundle
 from app.services.appliance.ssh import ssh_bundle
@@ -63,10 +92,22 @@ from app.services.dhcp.agent_token import (
     verify_agent_token,
 )
 from app.services.dhcp.config_bundle import build_config_bundle
-from app.services.dhcp.ipam_mirror import insert_ipam_mirror_row
+from app.services.dhcp.ha_members import kea_ha_members
+from app.services.dhcp.ipam_mirror import (
+    insert_ipam_mirror_row,
+    lease_hostname_suppressed_subnets,
+)
 from app.services.dhcp.lease_cleanup import address_still_held
 from app.services.dhcp.normalize import canonical_duid, norm_duid, norm_ip, norm_mac
-from app.tasks.prune_logs import DEFAULT_RETENTION_HOURS as ACTIVITY_LOG_RETENTION_HOURS
+from app.services.dns.record_ops import purge_trashed_address_records
+from app.services.e911.address_bindings import keep_row_if_bound
+from app.services.ipam.utilization import recount_subnets_and_blocks
+from app.services.lock_order import (
+    claim_mirror_inserts,
+    lock_scope_gates,
+    lock_zones_for_addresses,
+)
+from app.tasks.prune_logs import log_retention_hours
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/agents", tags=["dhcp-agents"])
@@ -76,6 +117,30 @@ LONGPOLL_POLL_INTERVAL = 2.0
 
 
 # ── Schemas ─────────────────────────────────────────────────────────────────
+
+
+# #1567 — the only driver an agent binary can serve. The DHCP registry
+# also names agentless drivers (windows_dhcp, fortigate) that the
+# operator API accepts but no agent can register as; accepting one here
+# only wrote a junk ``active`` server row before the agent crash-looped.
+AGENT_CAPABLE_DRIVERS = frozenset({"kea"})
+
+
+def _record_capabilities(server: DHCPServer, reported: list[str]) -> None:
+    """Store what the agent says it renders; wake its group when that changes.
+
+    The HA peer credential is gated on every Kea member advertising
+    ``ha_peer_tls`` (``services/dhcp/ha_peer_auth.py``), so the moment the last
+    member of a pair upgrades, BOTH members' bundles change. Waking the group
+    channel makes the partner — parked in its long-poll — pick that up now
+    rather than on the safety tick, which keeps the window where one side has
+    switched and the other has not to seconds.
+    """
+    caps = sorted(set(reported))
+    if (server.agent_capabilities or []) == caps and server.agent_capabilities is not None:
+        return
+    server.agent_capabilities = caps
+    collect_wake(*dhcp_wake_channels(server))
 
 
 class AgentRegisterRequest(BaseModel):
@@ -90,6 +155,20 @@ class AgentRegisterRequest(BaseModel):
     group_name: str | None = Field(default=None, max_length=255)
     fingerprint: str = Field(max_length=128)
     agent_id: str | None = None
+    # What this agent renders (e.g. ``["ha_peer_tls"]``). Optional: an agent
+    # that predates the field registers exactly as before.
+    capabilities: list[Annotated[str, Field(max_length=64)]] | None = Field(
+        default=None, max_length=32
+    )
+
+    @field_validator("driver")
+    @classmethod
+    def validate_driver(cls, v: str) -> str:
+        if v not in AGENT_CAPABLE_DRIVERS:
+            raise ValueError(
+                f"driver must be one of {sorted(AGENT_CAPABLE_DRIVERS)} " "for agent registration"
+            )
+        return v
 
 
 class AgentRegisterResponse(BaseModel):
@@ -121,6 +200,13 @@ class AgentHeartbeatRequest(BaseModel):
     # this model is extra="forbid", so an undeclared field would 422 every
     # heartbeat from a current agent.
     kea_version: str | None = None
+    # What this agent renders, e.g. ``["ha_peer_tls"]``. Absent from an agent
+    # that predates the field, which the handler records as "nothing" — so a
+    # node rolled BACK to an older agent closes the HA peer-credential gate
+    # again rather than being left a credential its Kea will not load.
+    capabilities: list[Annotated[str, Field(max_length=64)]] | None = Field(
+        default=None, max_length=32
+    )
     daemon: dict[str, Any] = {}
     # #882 — the agent's last config-apply verdict:
     # ``{status, etag, failed_etag, phase, error}``. See the DNS agent's
@@ -230,6 +316,11 @@ class LeaseEvent(BaseModel):
         elif not self.mac_address:
             raise ValueError("a DHCPv4 lease needs a mac_address")
         return self
+
+
+def _utc(value: datetime) -> datetime:
+    """Treat a naive timestamp as UTC so two lease times always compare."""
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
 def _lease_identity(
@@ -343,8 +434,8 @@ class DHCPLogAck(IngestAck):
     inserted: int = 0
     dropped: int = 0
     #: Lines older than the control plane's activity-log retention
-    #: (``prune_logs.DEFAULT_RETENTION_HOURS``), skipped rather than inserted
-    #: into a table the nightly prune would empty straight away.
+    #: (``PlatformSettings.log_retention_hours``, #2273), skipped rather than
+    #: inserted into a table the nightly prune would empty straight away.
     expired: int = 0
 
 
@@ -410,15 +501,45 @@ async def _auth_agent(
     return server, payload
 
 
+def _reraise_if_database_gone(exc: Exception) -> None:
+    """The lease pass logs and skips a failed DDNS / profiling / sighting
+    step, but not one that failed because the database went away (#3017):
+    the session is unusable from then on, and swallowing it only moved the
+    failure to the next statement as a ``PendingRollbackError`` 500. Raised,
+    it is the dependency-down 503, and the agent resends the batch.
+
+    Deliberately the DATABASE classifier, not ``is_dependency_down``: that
+    one also counts any ``ConnectionError`` / ``TimeoutError``, and a DNS
+    server that refuses the DDNS update must stay a logged skip, not a 503
+    that has the agent resend the whole batch into the same refusal."""
+    if isinstance(exc, PendingRollbackError) or is_transient_db_error(exc):
+        raise exc
+
+
 # ── Endpoints ───────────────────────────────────────────────────────────────
 
 
-@router.post("/register", response_model=AgentRegisterResponse)
+@router.post(
+    "/register",
+    response_model=AgentRegisterResponse,
+    responses={
+        409: {
+            "description": (
+                "#3143 — another live agent process owns this server identity; "
+                "this one is its refused duplicate (header "
+                "X-Spatium-Duplicate-Agent-Instance). No token is minted."
+            )
+        }
+    },
+)
 async def agent_register(
+    request: Request,
     body: AgentRegisterRequest,
     db: DB,
     _psk: str = Depends(_require_bootstrap_key),
-) -> AgentRegisterResponse:
+    # #3143 — the registering process, as on its polls and heartbeats.
+    agent_instance: str | None = Header(default=None, alias=AGENT_INSTANCE_HEADER),
+) -> AgentRegisterResponse | JSONResponse:
     """Bootstrap registration — PSK → per-server JWT."""
     # #1068 — registration is the one agent call that CREATES a server
     # row, so it is the one that can undo the refuse-while-populated
@@ -439,12 +560,58 @@ async def agent_register(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=(
                 "The DHCP subsystem is disabled on this control plane, so "
-                "new agents cannot register. Enable it under Settings → "
-                "Features."
+                "new agents cannot register. Enable it on the Features & "
+                "Integrations page."
             ),
         )
+    server: DHCPServer | None = None
+    if body.agent_id:
+        try:
+            aid = uuid.UUID(body.agent_id)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=f"Invalid agent_id: {e}") from e
+        res = await db.execute(select(DHCPServer).where(DHCPServer.agent_id == aid))
+        server = res.scalar_one_or_none()
+        # #3143 (the DHCP side of #2219) — the refused half of a duplicate
+        # pair is refused here too. Registering would mint it a token and
+        # overwrite the server's one token hash, staling the owner's; the
+        # owner then re-registers, staling this one's, and the pair trade
+        # re-registrations forever. Before anything is written (the group
+        # auto-create below included), so a refusal changes nothing but the
+        # duplicate episode the server chip and alert read.
+        if server is not None and await refuse_registration(
+            db,
+            server,
+            parse_agent_instance(agent_instance),
+            kind="dhcp",
+            client_ip=request.client.host if request.client is not None else None,
+        ):
+            return duplicate_instance_response("DHCP", server.name)
+
+    # #3202: an agent with no row yet that runs on an appliance lands in the
+    # group the APPLIANCE is assigned, not the one its pod env names (DNS's
+    # #2190 rule). On a cluster the appliance chart renders ONE dhcp-kea pod
+    # template for every node, so it carries no node's DHCP group: a group in
+    # it made a Fleet group move of one node replace the Kea pod on every node.
+    # The env's group (a compose or Kubernetes agent's ``AGENT_GROUP``) still
+    # decides for an agent no appliance claims. A row found below keeps its
+    # group either way: moving a row is the control plane's job
+    # (``dhcp_group_move``), never registration's.
     group: DHCPServerGroup | None = None
-    if body.group_name:
+    if server is None:
+        appliance = await owning_appliance_for_dhcp_agent(db, body.hostname)
+        if appliance is not None and appliance.assigned_dhcp_group_id is not None:
+            group = await db.get(DHCPServerGroup, appliance.assigned_dhcp_group_id)
+            if group is not None and body.group_name and body.group_name != group.name:
+                logger.warning(
+                    "dhcp_agent_group_follows_appliance",
+                    appliance_id=str(appliance.id),
+                    hostname=body.hostname,
+                    env_group=body.group_name,
+                    assigned_group=group.name,
+                    issue="#3202",
+                )
+    if group is None and body.group_name:
         res = await db.execute(
             select(DHCPServerGroup).where(DHCPServerGroup.name == body.group_name)
         )
@@ -457,20 +624,13 @@ async def agent_register(
             db.add(group)
             await db.flush()
 
-    server: DHCPServer | None = None
-    if body.agent_id:
-        try:
-            aid = uuid.UUID(body.agent_id)
-        except ValueError as e:
-            raise HTTPException(status_code=422, detail=f"Invalid agent_id: {e}") from e
-        res = await db.execute(select(DHCPServer).where(DHCPServer.agent_id == aid))
-        server = res.scalar_one_or_none()
     if server is None:
         res = await db.execute(select(DHCPServer).where(DHCPServer.name == body.hostname))
         server = res.scalar_one_or_none()
 
     require_approval = os.environ.get("DHCP_REQUIRE_AGENT_APPROVAL", "false").lower() == "true"
     pending_approval = False
+    created = server is None
     if server is None:
         agent_id = uuid.UUID(body.agent_id) if body.agent_id else uuid.uuid4()
         server = DHCPServer(
@@ -486,6 +646,7 @@ async def agent_register(
             agent_approved=not require_approval,
             agent_fingerprint=body.fingerprint,
             agent_version=body.version,
+            agent_capabilities=sorted(set(body.capabilities or [])),
             description=(
                 f"auto-registered agent v{body.version}" if body.version else "auto-registered"
             ),
@@ -503,6 +664,7 @@ async def agent_register(
         server.roles = body.roles
         server.status = "active"
         server.agent_version = body.version
+        _record_capabilities(server, body.capabilities or [])
         server.agent_registered = True
         if server.agent_id is None:
             server.agent_id = uuid.UUID(body.agent_id) if body.agent_id else uuid.uuid4()
@@ -524,6 +686,17 @@ async def agent_register(
         resource_display=body.hostname,
         new_value={"driver": body.driver, "version": body.version, "roles": body.roles},
     )
+    # #2963 - an appliance-hosted Kea member joining an HA group gets its peer
+    # URL from the node address instead of by hand (empty URLs only). Only
+    # when this registration CREATED the row: an agent re-registers on every
+    # restart, and refilling then would undo an operator who cleared a URL to
+    # keep the pair from forming.
+    if created:
+        from app.services.dhcp.ha_peer_autofill import (  # noqa: PLC0415
+            autofill_group_ha_peer_urls,
+        )
+
+        await autofill_group_ha_peer_urls(db, server.server_group_id, via="agent_register")
     await db.commit()
     await db.refresh(server)
 
@@ -545,16 +718,35 @@ async def agent_register(
 
 @router.get("/config")
 async def agent_config_longpoll(
+    request: Request,
     db: DB,
     response: Response,
     if_none_match: str | None = Header(default=None, alias="If-None-Match"),
+    agent_instance: str | None = Header(default=None, alias=AGENT_INSTANCE_HEADER),
     auth: tuple[DHCPServer, dict[str, Any]] = Depends(_auth_agent),
 ) -> Any:
-    """Long-poll for config changes. Returns 304 if unchanged, bundle JSON otherwise."""
+    """Long-poll for config changes. Returns 304 if unchanged, bundle JSON otherwise.
+
+    #3143 — one agent process owns the server at a time
+    (``instance_ownership.claim_poll``, the DNS #2044 rules): a new process
+    takes over at once, the one it displaced is refused with 409 if it polls
+    again while the owner is live, and a poll whose process lost ownership
+    while it waited returns nothing. A poll that names no process (an older
+    agent) is served exactly as before.
+    """
     server, _payload = auth
+    instance = parse_agent_instance(agent_instance)
     if not server.agent_approved:
         response.headers["X-Spatium-Pending-Approval"] = "1"
         return {"pending_approval": True, "etag": None}
+    if instance is not None and not await claim_poll(
+        db,
+        server,
+        instance,
+        kind="dhcp",
+        client_ip=request.client.host if request.client is not None else None,
+    ):
+        return duplicate_instance_response("DHCP", server.name)
 
     deadline = asyncio.get_running_loop().time() + LONGPOLL_TIMEOUT_SECONDS
     async with wake_subscription(dhcp_wake_channels(server)) as wake:
@@ -562,11 +754,40 @@ async def agent_config_longpoll(
         # published config change wakes this poll immediately; Redis-down
         # degrades to the old LONGPOLL_POLL_INTERVAL sleep (see the DNS agent).
         while True:
+            # #2040 — this session lives for the whole wait, and the sessionmaker
+            # sets expire_on_commit=False, so no commit in the loop expires anything. A
+            # re-query hands back the instances already in the identity map
+            # WITHOUT overwriting their loaded attributes, so on every pass
+            # after the first the bundle was rebuilt from the group, its
+            # member servers, scopes, pools, classes and PlatformSettings as
+            # they were when the poll parked. The wake arrived and changed
+            # nothing; the edit reached the agent only when the long-poll timed
+            # out and the agent reconnected on a fresh session. Expiring
+            # everything makes each pass read committed state — the same thing
+            # the first pass of a fresh request reads. Nothing in the loop
+            # writes before the final commit, so no pending change is lost.
+            db.expire_all()
             # Pick up server-row column changes a wake signals (fleet markers,
-            # group, maintenance) — read off this cached instance, since the
-            # bundle re-queries collections but not the server row.
-            await db.refresh(server)
+            # group, maintenance). The bundle re-queries the group and its
+            # collections, which repopulates them; the server row it is handed
+            # rather than re-selecting, so it is refreshed here.
+            await refresh_agent_server(db, server)
+            if instance is not None and server.agent_instance not in (None, instance):
+                # #3143 — another agent process took the server over while
+                # this poll waited: a replacement (this poll is the departed
+                # agent's leftover) or a second live agent. Either way it must
+                # not ship ops; the new owner's polls do.
+                return duplicate_instance_response("DHCP", server.name)
             bundle = await build_config_bundle(db, server)
+            # #3241: a bundle with no failover block tells the agent to run no
+            # HA hook, so it stops reporting an HA state. Whatever state it
+            # reported last describes a relationship the server has left (its
+            # group's mode, its group, its partner or its peer URL changed), and
+            # every way out of HA ends in this bundle, so it is forgotten here.
+            # On every pass: a poll that answers 304 clears a stale row too.
+            if bundle.failover is None and _forget_ha_state(server):
+                await db.commit()
+                logger.info("dhcp_ha_state_cleared", server_id=str(server.id), why="no_ha_hook")
             # Issue #153 — fold the rendered snmpd.conf hash into the ETag
             # mix below so a Settings → Appliance → SNMP change wakes the
             # agent's long-poll even when nothing in the DHCP driver
@@ -745,6 +966,12 @@ async def agent_config_longpoll(
                                 # [...]}`` so a centralized Kea matches this
                                 # scope on giaddr for relayed remote subnets.
                                 "relay_addresses": list(s.relay_addresses),
+                                # #2731: the classes of the PXE profile bound
+                                # to this scope. The agent has Kea evaluate
+                                # them for this subnet alone; rendered for the
+                                # whole server, one scope's profile booted the
+                                # PXE clients of every scope on it.
+                                "pxe_class_names": list(s.pxe_class_names),
                                 "pools": [
                                     {
                                         "start_ip": p.start_ip,
@@ -787,7 +1014,6 @@ async def agent_config_longpoll(
                                     }
                                     for st in s.statics
                                 ],
-                                "ddns_enabled": s.ddns_enabled,
                             }
                             for s in bundle.scopes
                         ],
@@ -795,7 +1021,18 @@ async def agent_config_longpoll(
                             {
                                 "name": c.name,
                                 "match_expression": c.match_expression,
-                                "options": c.options,
+                                # ``options`` stays for an agent older than
+                                # #1229, which renders it into both daemons.
+                                # A newer agent reads ``address_family`` and
+                                # the per-family maps instead. It carries the
+                                # Dhcp4 share, not the whole map: an ``ipv6``
+                                # or ``dual`` class may now hold an IPv6
+                                # ``dns-servers``, which an old agent would
+                                # put into Dhcp4 and have the config refused.
+                                "options": c.options_v4,
+                                "address_family": c.address_family,
+                                "options_v4": c.options_v4,
+                                "options_v6": c.options_v6,
                             }
                             for c in bundle.client_classes
                         ],
@@ -889,6 +1126,18 @@ async def agent_config_longpoll(
                                 "max_response_delay_ms": bundle.failover.max_response_delay_ms,
                                 "max_ack_delay_ms": bundle.failover.max_ack_delay_ms,
                                 "max_unacked_clients": bundle.failover.max_unacked_clients,
+                                # HA peer credential (PEM). Absent until every
+                                # Kea member advertises ``ha_peer_tls``; an
+                                # agent that predates it ignores the key.
+                                "tls": (
+                                    {
+                                        "ca_pem": bundle.failover.tls_ca_pem,
+                                        "cert_pem": bundle.failover.tls_cert_pem,
+                                        "key_pem": bundle.failover.tls_key_pem,
+                                    }
+                                    if bundle.failover.tls_key_pem
+                                    else None
+                                ),
                             }
                             if bundle.failover is not None
                             else None
@@ -950,21 +1199,25 @@ async def agent_config_longpoll(
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 return Response(status_code=304, headers={"ETag": format_etag(etag)})
-            await wake.wait(min(WAKE_TICK_SECONDS, remaining))
+            # #3479: end this pass's read transaction before the wait, so the
+            # bundle's reads (the op queue's among them) hold no lock through
+            # it: a factory reset's TRUNCATE waited out whole holds, with every
+            # reader after it queued behind the TRUNCATE. Nothing is pending
+            # here (every write above commits on its own or answers), and the
+            # next pass expires and re-reads everything anyway.
+            await db.commit()
+            if await wake.wait(min(WAKE_TICK_SECONDS, remaining)) == WakeResult.SHUTDOWN:
+                # #3015 — this api process is stopping: end the hold now so the
+                # next pass makes one last ETag check and answers 304, and the
+                # agent re-polls another pod instead of being cancelled.
+                deadline = asyncio.get_running_loop().time()
 
 
-@router.post("/heartbeat", response_model=AgentHeartbeatResponse)
-async def agent_heartbeat(
-    request: Request,
-    body: AgentHeartbeatRequest,
-    db: DB,
-    auth: tuple[DHCPServer, dict[str, Any]] = Depends(_auth_agent),
-) -> AgentHeartbeatResponse:
-    server, payload = auth
-    now = datetime.now(UTC)
-    server.agent_last_seen = now
-    server.last_health_check_at = now
-    server.status = "active"
+async def _apply_heartbeat_reports(
+    request: Request, body: AgentHeartbeatRequest, db: AsyncSession, server: DHCPServer
+) -> None:
+    """What a heartbeat reports about the agent's host, daemon, config and
+    spool — written only for the process that owns the server (#3143)."""
     # Capture the source IP so the operator can identify which host
     # the agent is on — the operator-set ``host`` column may not
     # match the real machine in NAT / distributed deployments.
@@ -977,6 +1230,7 @@ async def agent_heartbeat(
     # make the HA-skew preflight fall back to "unknown" for no reason.
     if body.kea_version:
         server.kea_version = body.kea_version
+    _record_capabilities(server, body.capabilities or [])
 
     # Phase 8f-2 — persist whatever slot state the agent reported. Only
     # overwrite when the agent actually sent a value (older agents
@@ -1002,7 +1256,9 @@ async def agent_heartbeat(
     if (
         server.desired_appliance_version is not None
         and server.installed_appliance_version
-        and server.installed_appliance_version == server.desired_appliance_version
+        and is_installed_target(
+            server.installed_appliance_version, server.desired_appliance_version
+        )
         and (server.last_upgrade_state in ("done", None))
     ):
         server.desired_appliance_version = None
@@ -1027,7 +1283,68 @@ async def agent_heartbeat(
     # #1067 — the daemon state (the DHCP agent ships it as ``daemon`` and, from
     # the same dict, the top-level ``status``; ``daemon`` is the source). Same
     # gap as the DNS side: declared, accepted, never read.
-    apply_reported_daemon_state(server, body.daemon, agent_kind="dhcp", server_id=str(server.id))
+    # #2023 — on the appliance the kubelet kills the whole dhcp-kea container
+    # when Kea reaches its memory limit, the agent with it, so the restarted
+    # agent reports ``ok`` over a kill it never saw. The supervisor carries the
+    # kubelet's ``OOMKilled`` on its heartbeat; while that kill is current it is
+    # the daemon state, whatever the agent says (the DNS handler's #2018 rule).
+    now_utc = datetime.now(UTC)
+    appliance = await owning_appliance_for_dhcp_server(db, server)
+    daemon_report, daemon_stamp = effective_daemon_report(
+        body.daemon,
+        fresh_role_health(appliance, now_utc),
+        server.driver,
+        now_utc,
+    )
+    apply_reported_daemon_state(
+        server,
+        daemon_report,
+        agent_kind="dhcp",
+        server_id=str(server.id),
+        now=min(daemon_stamp, now_utc),
+    )
+
+
+@router.post("/heartbeat", response_model=AgentHeartbeatResponse)
+async def agent_heartbeat(
+    request: Request,
+    body: AgentHeartbeatRequest,
+    db: DB,
+    agent_instance: str | None = Header(default=None, alias=AGENT_INSTANCE_HEADER),
+    auth: tuple[DHCPServer, dict[str, Any]] = Depends(_auth_agent),
+) -> AgentHeartbeatResponse:
+    server, payload = auth
+    now = datetime.now(UTC)
+    instance = parse_agent_instance(agent_instance)
+    # #3143 — a process the owner displaced (the refused half of two live
+    # agents on one identity, #2044's DHCP side) still heartbeats. Its
+    # liveness and acks count; what it reports about its daemon, config,
+    # spool and host describes a process that is not being served, so it
+    # stays off the row.
+    displaced = is_displaced(server, instance)
+    # #4139 — the takeover that retires a predecessor's stale ``ok`` happens on
+    # the announce heartbeat a new process sends before its boot apply, not on
+    # its first config poll (which comes after). An older agent that names no
+    # process is served exactly as before.
+    if (
+        instance is not None
+        and not displaced
+        and server.agent_instance not in (None, instance)
+        and not await claim_poll(
+            db,
+            server,
+            instance,
+            kind="dhcp",
+            now=now,
+            client_ip=request.client.host if request.client is not None else None,
+        )
+    ):
+        displaced = True
+    server.agent_last_seen = now
+    server.last_health_check_at = now
+    server.status = "active"
+    if not displaced:
+        await _apply_heartbeat_reports(request, body, db, server)
 
     for ack in body.ops_ack:
         op_id = ack.get("op_id")
@@ -1042,7 +1359,11 @@ async def agent_heartbeat(
 
     rotated_token = None
     rotated_exp = None
-    if needs_rotation(payload):
+    # #3143 (the DHCP side of #2219) — not for the refused half of a duplicate
+    # pair: its new token's hash would replace the owner's and stale it. Its
+    # token runs out instead, and the re-registration that follows is refused
+    # until the owner stops.
+    if needs_rotation(payload) and not is_refused(server, instance, now):
         rotated_token, rotated_exp = mint_agent_token(
             server_id=str(server.id),
             agent_id=str(server.agent_id),
@@ -1088,15 +1409,23 @@ async def agent_lease_events(
         _find_containing_subnet,
         _load_scope_cache,
         _load_subnet_cache,
+        _load_trashed_scope_nets,
     )
+    from app.services.dns.ddns import DDNSReadCache, ddns_lease_writes_nothing
     from app.services.feature_modules import is_module_enabled
 
     server, _ = auth
+    server_id = str(server.id)
     # #1077 — a replay of a batch already committed writes nothing. Claimed
     # before any write so the receipt and the rows share one transaction.
     if not await claim_batch(
         db, server_id=server.id, batch_id=body.batch_id, stream="dhcp.lease_events"
     ):
+        # #3816 — the batch's DDNS runs after its commit, so a first attempt
+        # that lost the database in it answered 503 with the receipt already
+        # committed: this replay finishes the publishes. Idempotent: a name
+        # already published is a no-op, and a row since released is gone.
+        await _replay_deferred_ddns(db, body.leases, server)
         return duplicate_response(upserted=0)
     now = datetime.now(UTC)
     events = body.leases
@@ -1125,22 +1454,78 @@ async def agent_lease_events(
     # subnet itself is resolved correctly.
     subnets = await _load_subnet_cache(db)
     scope_cache = await _load_scope_cache(db, server.server_group_id)
+    # #3733 — and the group's scopes in the Trash, whose addresses take no event.
+    trashed_scope_nets = await _load_trashed_scope_nets(db, server.server_group_id)
+    # #2269 — scopes not set to ``on_lease`` keep the lease's hostname out of
+    # IPAM; the mirror row itself is still written.
+    no_hostname_subnets = await lease_hostname_suppressed_subnets(
+        db, group_id=server.server_group_id
+    )
     subnet_for_ip = {
         ip: _find_containing_subnet(ip, subnets, preferred_subnet_ids=set(scope_cache))
         for ip in ips
     }
 
+    # #3480: every batch writes its rows in one order: (subnet, address).
+    # The two agents of a group report the same leases, each in its own order
+    # and cut into batches at its own points. A new lease row and a new
+    # mirror row each hold their unique key until the batch commits, so two
+    # batches inserting shared keys in different orders could each hold one
+    # the other was about to insert: Postgres broke the wait with 40P01 and
+    # one batch answered 500. In one order, the second batch waits for the
+    # first and then finds its rows. The sort is stable, so one address's
+    # events keep their order (a grant then its release, #2391's replays).
+    def _write_order(ev: Any) -> tuple[str, int, int, str]:
+        subnet = subnet_for_ip.get(ev.ip_address)
+        subnet_key = str(subnet.id) if subnet is not None else ""
+        ip = norm_ip(ev.ip_address)
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return (subnet_key, 0, 0, ip)
+        return (subnet_key, addr.version, int(addr), ip)
+
+    events = sorted(events, key=_write_order)
+
     def _scope_for_ip(ip: str) -> Any:
         subnet = subnet_for_ip.get(ip)
         return scope_cache.get(subnet.id) if subnet is not None else None
 
+    # #3748 — the scopes' gates, shared, before the batch's first row lock:
+    # a delete waiting for the scope row ``FOR UPDATE`` is not starved by a
+    # second agent's batch joining the ``FOR KEY SHARE`` below.
+    live_scope_ids = {
+        scope_cache[sn.id]
+        for sn in subnet_for_ip.values()
+        if sn is not None and sn.id in scope_cache
+    }
+    await lock_scope_gates(db, live_scope_ids, exclusive=False)
+
     existing_leases = (
         (
             await db.execute(
-                select(DHCPLease).where(
+                select(DHCPLease)
+                .where(
                     DHCPLease.server_id == server.id,
                     DHCPLease.ip_address.in_(ips),
                 )
+                # #3624 — locked, by id, and re-read if the lock had to wait.
+                # The expiry sweep marks a lapsed lease ``expired`` and holds
+                # its row to commit. A plain read here returns the row as it
+                # was before that, the update below then waits for the sweep,
+                # and the session still holds ``state='active'``: assigning
+                # ``active`` again is no change, so the state was never
+                # written and a renewed lease stayed ``expired`` — which the
+                # sweep's first pass (``active`` only) never takes again, so
+                # its mirror and DNS records outlived it. Locking first makes
+                # the wait happen here, ``populate_existing`` hands back what
+                # the sweep committed, and the pass below restores the state,
+                # the mirror and the DDNS from that. Id order, the first of
+                # the batch's locks (dhcp_lease → ip_address → dns_zone →
+                # audit chain), as the sweep takes its lease rows (#3605).
+                .order_by(DHCPLease.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
             )
         )
         .scalars()
@@ -1164,11 +1549,94 @@ async def agent_lease_events(
         for lease in existing_leases
     }
 
+    # #3733 — a scope in the Trash gets no lease, mirror or DDNS record back.
+    # A scope delete stamps the scope and commits, then tears its leases down
+    # in batches. A batch that read its caches before the stamp would insert
+    # the deleted leases again (the locked read above skips them), stamped with
+    # the trashed scope, with their mirrors and live A records; one that read
+    # them after would do the same with no scope, through the global subnet
+    # match. So the scopes the events resolve to are held FOR KEY SHARE to this
+    # commit and read again here, after the lease rows (dhcp_lease, then
+    # dhcp_scope, then ip_address: ``app.services.lock_order``): the delete
+    # takes the scope row FOR UPDATE before its stamp, so it waits for a batch
+    # that holds the scope, and a batch that comes after it waits for the
+    # stamp and finds the scope gone. An event of a scope in the Trash is
+    # history, as a superseded grant is (#2391): acknowledged, never written.
+    gone_scope_ids: set[Any] = set()
+    if live_scope_ids:
+        still_live = set(
+            (
+                await db.execute(
+                    select(DHCPScope.id)
+                    .where(DHCPScope.id.in_(live_scope_ids), DHCPScope.deleted_at.is_(None))
+                    .order_by(DHCPScope.id)
+                    .with_for_update(read=True, key_share=True)
+                    .execution_options(include_deleted=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        gone_scope_ids = live_scope_ids - still_live
+    trashed_scope_ids = gone_scope_ids | {scope_id for scope_id, _net in trashed_scope_nets}
+
+    def _in_trash(ip: str) -> bool:
+        """Is ``ip`` an address of a scope of this group in the Trash, and of
+        no live one?"""
+        subnet = subnet_for_ip.get(ip)
+        if subnet is not None and subnet.id in scope_cache:
+            return scope_cache[subnet.id] in gone_scope_ids
+        try:
+            addr = ipaddress.ip_address(norm_ip(ip))
+        except ValueError:
+            return False
+        return any(addr in net for _scope_id, net in trashed_scope_nets)
+
+    in_trash = {ip for ip in ips if _in_trash(ip)}
+    if in_trash:
+        logger.info(
+            "dhcp_lease_events_for_trashed_scope_skipped",
+            server=server_id,
+            addresses=len(in_trash),
+        )
+
+    def _superseded(ev: Any, key: tuple[Any, ...]) -> bool:
+        """Is this active event older than another client's live lease? (#2391)
+
+        The agent re-sends its whole lease file after a restart, so an old
+        client's grant can arrive after the address went to a new client.
+        Such a grant is history: applying it would resurrect the old lease
+        and re-point the IPAM mirror (MAC, hostname, DDNS) to the old
+        client. Compared on the lease start Kea reports, so a genuine newer
+        grant — a renewal, or a real new client — is never held back. An
+        event with no start time carries no evidence and is applied.
+        """
+        if ev.state != "active" or ev.starts_at is None:
+            return False
+        ev_start = _utc(ev.starts_at)
+        for other_key, other in lease_by_key.items():
+            if other_key == key or other.state != "active" or other.starts_at is None:
+                continue
+            if norm_ip(str(other.ip_address)) != norm_ip(ev.ip_address):
+                continue
+            if other.expires_at is not None and _utc(other.expires_at) <= now:
+                continue
+            if _utc(other.starts_at) > ev_start:
+                return True
+        return False
+
     # Upsert every DHCPLease first, then a single flush so new rows get
     # their ids before we wire dhcp_lease_id on the IPAM mirror.
     upserted = 0
-    for ev in events:
+    stale: set[int] = set()
+    for idx, ev in enumerate(events):
+        if ev.ip_address in in_trash:
+            stale.add(idx)  # #3733: its scope is in the Trash
+            continue
         key = _lease_identity(ev.ip_address, ev.mac_address, ev.duid, ev.iaid)
+        if _superseded(ev, key):
+            stale.add(idx)
+            continue
         # #428: fall back to ends_at when the agent didn't send a distinct
         # expires_at (Kea ships the same absolute reclaim time as ends_at).
         # Without a non-NULL expires_at the time-based sweep_expired_leases
@@ -1210,18 +1678,212 @@ async def agent_lease_events(
             lease.ends_at = ev.ends_at
             lease.expires_at = expires_at
             lease.last_seen_at = now
-            if lease.scope_id is None:
+            if lease.scope_id is None or lease.scope_id in trashed_scope_ids:
                 # Backfill legacy rows created before scope stamping (#844).
+                # #3733: and a row still naming a scope in the Trash goes to
+                # the live scope its address resolves to now (a new scope on
+                # the same subnet), which keeps the old scope's teardown off it.
                 lease.scope_id = _scope_for_ip(ev.ip_address)
         upserted += 1
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        # #2262 — the lease-identity unique indexes. A unique violation here
+        # means another request for this server inserted the same lease
+        # between our SELECT and this INSERT (a timed-out snapshot page still
+        # running server-side while the tailer posts its next batch). The
+        # global handler would answer 409, which the agent's spool classifies
+        # as REJECTED and drops the whole batch with it. Answer 503 instead:
+        # the agent retries, the retry finds the committed row and updates
+        # it, and the receipt claimed above rolls back with this transaction
+        # so the retry is not mistaken for a duplicate.
+        if str(getattr(exc.orig, "sqlstate", "") or "") != "23505":
+            raise
+        # ``server`` is expired by the failed flush; log the id read up front.
+        await db.rollback()
+        logger.info("dhcp_lease_events_identity_race", server=server_id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="A concurrent lease report for this server landed first; retry.",
+            headers={"Retry-After": "1"},
+        ) from exc
+
+    mirror_subnet_ids = {sn.id for sn in subnet_for_ip.values() if sn is not None}
+
+    def _lease_row_hostname(row: IPAddress, ev: Any) -> str | None:
+        """The name a mirror row we own carries once ``ev`` is applied."""
+        if row.subnet_id in no_hostname_subnets:
+            return row.hostname
+        return (ev.hostname or row.hostname or "")[:253]
+
+    # #3789 — read before locking, to find the renewals that change nothing.
+    # Under Kea HA both members report every renewal, and each batch held all
+    # its mirror rows to its commit, so the second member's batch of the same
+    # renewals waited out the first one's whole batch (39 to 53% of its time
+    # at 10 renewals a second). A grant whose mirror row already carries what
+    # the event would write, and whose DDNS writes nothing (#3773), takes its
+    # row ``SKIP LOCKED`` below instead: if another transaction holds it (the
+    # other member's batch, writing the same values), this batch leaves the
+    # address to it. A row this batch does get is re-read and goes through the
+    # full pass as before. Only for an address with one event in the batch.
+    seen_rows = (
+        (
+            (
+                await db.execute(
+                    select(IPAddress)
+                    .where(
+                        IPAddress.address.in_(ips),
+                        IPAddress.subnet_id.in_(mirror_subnet_ids),
+                    )
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if mirror_subnet_ids
+        else []
+    )
+    seen_by_key = {(row.subnet_id, norm_ip(str(row.address))): row for row in seen_rows}
+    grants_at: Counter[tuple[Any, str]] = Counter()
+    for idx, ev in enumerate(events):
+        subnet = subnet_for_ip.get(ev.ip_address)
+        if idx not in stale and subnet is not None:
+            grants_at[(subnet.id, norm_ip(ev.ip_address))] += 1
+
+    def _mirror_unchanged(row: IPAddress, ev: Any) -> bool:
+        """Would applying ``ev`` leave ``row`` as it is, but for the sighting
+        stamp and the lease id (each member's own lease)?"""
+        if not row.auto_from_lease or row.status != "dhcp" or row.last_seen_method != "dhcp":
+            return False
+        if row.hostname != _lease_row_hostname(row, ev):
+            return False
+        if ev.mac_address and (
+            row.mac_address is None or norm_mac(str(row.mac_address)) != norm_mac(ev.mac_address)
+        ):
+            return False
+        return True
+
+    candidates: list[tuple[int, Any, Any, IPAddress]] = []
+    for idx, ev in enumerate(events):
+        subnet = subnet_for_ip.get(ev.ip_address)
+        if idx in stale or subnet is None or ev.state != "active":
+            continue
+        key = (subnet.id, norm_ip(ev.ip_address))
+        seen = seen_by_key.get(key)
+        if seen is None or grants_at[key] != 1:
+            continue
+        lease = lease_by_key[_lease_identity(ev.ip_address, ev.mac_address, ev.duid, ev.iaid)]
+        if lease.state != "active" or not _mirror_unchanged(seen, ev):
+            continue
+        candidates.append((idx, subnet, ev, seen))
+    # #3776 — these checks write nothing between them, so they share one
+    # read cache, as the under-lock checks below share theirs. Not the same
+    # cache: the rows may change between this read and the lock, and the
+    # under-lock checks must judge what they hold.
+    seen_reads = DDNSReadCache()
+    await seen_reads.prefetch_generated(db, [seen.id for *_x, seen in candidates])
+    quiet_rows: dict[Any, list[int]] = {}
+    for idx, subnet, ev, seen in candidates:
+        try:
+            quiet = await ddns_lease_writes_nothing(
+                db,
+                subnet=subnet,
+                ipam_row=seen,
+                client_hostname=ev.hostname,
+                row_hostname=_lease_row_hostname(seen, ev),
+                cache=seen_reads,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # As ``_ddns_quiet`` below: a bug in the reads is the full path.
+            _reraise_if_database_gone(exc)
+            logger.warning(
+                "dhcp_agent_lease_ddns_check_failed",
+                server=server_id,
+                ip=ev.ip_address,
+                error=str(exc),
+            )
+            quiet = False
+        if quiet:
+            quiet_rows.setdefault(seen.id, []).append(idx)
 
     # Bulk-load the existing IPAM mirror rows. Keyed by (subnet_id, address)
     # so overlapping ranges across spaces stay disambiguated (subnets were
     # resolved space-aware above).
+    #
+    # #2580 — row-locked, and only AFTER the lease upsert above has flushed.
+    # The mirror pass below decides from the row's status (take over an
+    # ``available`` row, leave a ``static_dhcp`` one alone), and a reservation
+    # DELETE decides that same row's status from the lease table. On plain
+    # reads each could read the other's pre-commit state and both commit
+    # ``available`` beside the live lease. Holding the row lock while deciding
+    # serialises the two: if the DELETE locks first, this read waits for its
+    # commit and sees ``available``; if this locks first, the DELETE waits for
+    # this commit, by which point the lease inserted above is visible to it.
+    # Ordered by id, like ``static_ipam.lock_static_rows``, so concurrent
+    # lockers never wait on each other in a cycle. Narrowed to the subnets
+    # the events resolved to, so another space's row at the same address is
+    # not locked for nothing. The #3789 renewals are not waited for (a
+    # ``static_dhcp`` row is never one): taken after every waiting lock, so
+    # this batch holds no row it took out of id order while it waits.
     ipam_existing = (
-        (await db.execute(select(IPAddress).where(IPAddress.address.in_(ips)))).scalars().all()
+        list(
+            (
+                await db.execute(
+                    select(IPAddress)
+                    .where(
+                        IPAddress.address.in_(ips),
+                        IPAddress.subnet_id.in_(mirror_subnet_ids),
+                        IPAddress.id.not_in(list(quiet_rows)),
+                    )
+                    .order_by(IPAddress.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if mirror_subnet_ids
+        else []
     )
+    if quiet_rows:
+        got = (
+            (
+                await db.execute(
+                    select(IPAddress)
+                    .where(IPAddress.id.in_(list(quiet_rows)))
+                    .order_by(IPAddress.id)
+                    # FOR NO KEY UPDATE: a renewal changes no key, and a
+                    # foreign key's FOR KEY SHARE on the row is no holder.
+                    .with_for_update(skip_locked=True, key_share=True)
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        ipam_existing.extend(got)
+        skipped = set(quiet_rows) - {row.id for row in got}
+        # A row skipped above is held, or was deleted since the read. A
+        # deleted one is no longer a renewal: its grant inserts it as usual.
+        held = (
+            set(
+                (await db.execute(select(IPAddress.id).where(IPAddress.id.in_(list(skipped)))))
+                .scalars()
+                .all()
+            )
+            if skipped
+            else set()
+        )
+        for row_id in held:
+            stale.update(quiet_rows[row_id])
+        if held:
+            logger.debug(
+                "dhcp_lease_events_renewals_left_to_holder",
+                server=server_id,
+                addresses=len(held),
+            )
     # Normalised for the same reason as ``lease_by_key`` above (#1110): the
     # stored ``address`` is an ``IPv4Address``, the event's is a string. Raw
     # keys never matched a stored row, so a release / expiry event found no
@@ -1235,7 +1897,7 @@ async def agent_lease_events(
 
     def _apply_lease_fields(row: IPAddress, ev: Any, lease: Any) -> None:
         """Stamp lease state onto a mirror row we own (auto/available)."""
-        row.hostname = (ev.hostname or row.hostname or "")[:253]
+        row.hostname = _lease_row_hostname(row, ev)
         # A DHCPv6 lease usually has no MAC (#1141) — keep what the row has
         # rather than blanking it.
         row.mac_address = ev.mac_address or row.mac_address
@@ -1248,8 +1910,143 @@ async def agent_lease_events(
         row.last_seen_at = now
         row.last_seen_method = "dhcp"
 
+    # Subnets whose mirror rows were created / taken over / deleted in this
+    # batch; recounted ONCE after the pass (#3345), never per lease.
+    recount_ids: set[Any] = set()
+
+    def _new_mirror_row(subnet: Any, ev: Any, lease: Any) -> IPAddress:
+        return IPAddress(
+            subnet_id=subnet.id,
+            address=ev.ip_address,
+            hostname=("" if subnet.id in no_hostname_subnets else (ev.hostname or "")[:253]),
+            mac_address=ev.mac_address,
+            status="dhcp",
+            auto_from_lease=True,
+            dhcp_lease_id=str(lease.id) if lease.id else None,
+            last_seen_at=now,
+            last_seen_method="dhcp",
+        )
+
+    # #3480: the batch's new mirror rows first, in the order above, before
+    # any lease's DDNS. A publish bumps its zone's serial, which holds the
+    # zone row until the batch commits: a batch that held a zone row and then
+    # waited for another batch's new row deadlocked with that batch waiting
+    # to publish, whatever the two orders. Only for an address whose first
+    # event in the pass is a grant: one that starts with a release still
+    # meets no row there, and is inserted in the pass as before.
+    created_for: dict[int, IPAddress] = {}
+    visited: set[tuple[Any, str]] = set()
+    to_create: list[tuple[int, tuple[Any, str], Any, Any, Any]] = []
+    for idx, ev in enumerate(events):
+        subnet = subnet_for_ip.get(ev.ip_address)
+        if idx in stale or subnet is None:
+            continue  # the pass skips these too
+        lease = lease_by_key[_lease_identity(ev.ip_address, ev.mac_address, ev.duid, ev.iaid)]
+        if ev.state == "active" and lease.state != "active":
+            continue  # the pass skips these too
+        key = (subnet.id, norm_ip(ev.ip_address))
+        if key in visited:
+            continue
+        visited.add(key)
+        if ev.state != "active" or key in ipam_by_key:
+            continue
+        to_create.append((idx, key, subnet, ev, lease))
+    # #3789 — a new row the other member's batch is inserting right now is
+    # left to it (its claim is held): this batch's INSERT would wait for that
+    # batch's commit, seconds at load, and the second member's batch of a
+    # first acquisition hit the 30 s command timeout. Only for an address
+    # with one event in the batch, so no later event of it here is lost.
+    claimed = await claim_mirror_inserts(
+        db, {key for _i, key, *_rest in to_create if grants_at[key] == 1}
+    )
+    for idx, key, subnet, ev, lease in to_create:
+        if grants_at[key] == 1 and key not in claimed:
+            stale.add(idx)
+            continue
+        # #564: a concurrent Sync-DHCP / static-reservation writer may have
+        # already committed this (subnet_id, address) pair. Insert inside a
+        # savepoint so a unique-violation self-heals into the incumbent row
+        # (the pass below then treats it as a row it found) instead of
+        # 500-ing on uq_ip_address_subnet_address.
+        ipam_row, created = await insert_ipam_mirror_row(db, _new_mirror_row(subnet, ev, lease))
+        ipam_by_key[key] = ipam_row
+        if created:
+            recount_ids.add(subnet.id)
+            created_for[idx] = ipam_row
+
+    # #3617: every zone the pass's DDNS may write, locked in id order before
+    # the first publish or revoke. Each one locks its own zones in order, but
+    # one address's after another's are not, and a retraction took the
+    # reverse zone before the forward zone (``app.services.lock_order``).
+    #
+    # #3773: a grant whose DDNS writes nothing (a renewal: its name already
+    # published, still free, and unchanged) locks no zone, and the pass skips
+    # its DDNS. Under Kea HA both peers report every renewal; with the zone
+    # held to each batch's commit, the two peers' batches ran one after the
+    # other, and at load stayed open past the agent's request timeout. Only
+    # for an address with one event in the batch: a later event's state is
+    # not this read's.
+    events_at: Counter[tuple[Any, str]] = Counter()
+    for idx, ev in enumerate(events):
+        subnet = subnet_for_ip.get(ev.ip_address)
+        if idx not in stale and subnet is not None:
+            events_at[(subnet.id, norm_ip(ev.ip_address))] += 1
+    ddns_quiet: set[int] = set()
+
+    async def _ddns_quiet(subnet: Any, row: IPAddress, ev: Any) -> bool:
+        # The check runs the reads the DDNS step runs, but outside its error
+        # boundary below: a bug in them is the same logged skip it is there
+        # (the grant takes the full path), never a 500 for the whole batch.
+        try:
+            return await ddns_lease_writes_nothing(
+                db,
+                subnet=subnet,
+                ipam_row=row,
+                client_hostname=ev.hostname,
+                row_hostname=_lease_row_hostname(row, ev),
+                cache=ddns_reads,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _reraise_if_database_gone(exc)
+            logger.warning(
+                "dhcp_agent_lease_ddns_check_failed",
+                server=server_id,
+                ip=ev.ip_address,
+                error=str(exc),
+            )
+            return False
+
+    # #3776 — the checks below write nothing between them, so the reads they
+    # share (each address's generated records, each subnet's reverse zones)
+    # are made once for the batch, not once per lease.
+    ddns_reads = DDNSReadCache()
+    await ddns_reads.prefetch_generated(
+        db, [row.id for row in ipam_by_key.values() if row.auto_from_lease]
+    )
+    retracting: list[IPAddress] = []
+    for idx, ev in enumerate(events):
+        subnet = subnet_for_ip.get(ev.ip_address)
+        key = (subnet.id, norm_ip(ev.ip_address)) if subnet is not None else None
+        row = ipam_by_key.get(key) if key is not None else None
+        if idx in stale or row is None or not (row.auto_from_lease or row.status == "available"):
+            continue
+        if ev.state != "active":
+            retracting.append(row)
+            continue
+        if subnet is not None and events_at[key] == 1 and await _ddns_quiet(subnet, row, ev):
+            ddns_quiet.add(idx)
+        # A grant's publish runs after this transaction commits (#3816), so
+        # it locks no zone here; only a retraction does.
+    # #3687: the zones a release's purge of a trashed record writes are named
+    # by ``retracting``; a grant's publish no longer runs in this transaction
+    # (#3816), so a mirror created later in the pass needs no zone here.
+    await lock_zones_for_addresses(db, retracting=retracting, ddns=True)
+
     # ── IPAM mirror pass ────────────────────────────────────────────────
-    for ev in events:
+    deferred_ddns: dict[tuple[Any, str], tuple[Any, str | None]] = {}
+    for idx, ev in enumerate(events):
+        if idx in stale:
+            continue  # replayed grant of a lease another client has superseded (#2391)
         subnet = subnet_for_ip.get(ev.ip_address)
         if subnet is None:
             continue  # IP not in any known subnet — can't mirror
@@ -1257,32 +2054,35 @@ async def agent_lease_events(
         ipam_row = ipam_by_key.get((subnet.id, norm_ip(ev.ip_address)))
 
         is_active = ev.state == "active"
+        # A grant whose lease ended later in this same batch (a replayed
+        # grant + release) is history too: re-pointing the row would name a
+        # client that no longer holds the address (#2391).
+        if is_active and lease.state != "active":
+            continue
         if is_active:
-            if ipam_row is None:
-                candidate = IPAddress(
-                    subnet_id=subnet.id,
-                    address=ev.ip_address,
-                    hostname=(ev.hostname or "")[:253],
-                    mac_address=ev.mac_address,
-                    status="dhcp",
-                    auto_from_lease=True,
-                    dhcp_lease_id=str(lease.id) if lease.id else None,
-                    last_seen_at=now,
-                    last_seen_method="dhcp",
+            if ipam_row is not None and created_for.get(idx) is ipam_row:
+                pass  # created for this grant above, already carrying its fields
+            elif ipam_row is None:
+                # Only an address whose first event was a release, or a row
+                # this batch already deleted (see the #3480 note above).
+                ipam_row, created = await insert_ipam_mirror_row(
+                    db, _new_mirror_row(subnet, ev, lease)
                 )
-                # #564 — a concurrent Sync-DHCP / static-reservation
-                # writer may have already committed this
-                # (subnet_id, address) pair. Insert inside a savepoint
-                # so a unique-violation self-heals into the incumbent
-                # row instead of 500-ing on uq_ip_address_subnet_address.
-                ipam_row, created = await insert_ipam_mirror_row(db, candidate)
                 ipam_by_key[(subnet.id, norm_ip(ev.ip_address))] = ipam_row
+                if created:
+                    recount_ids.add(subnet.id)
                 # A fresh insert already carries the right fields; only a
                 # race-lost incumbent we own gets the same update a
                 # pre-existing row would take (never a manual/static row).
-                if not created and (ipam_row.status == "available" or ipam_row.auto_from_lease):
+                elif ipam_row.status == "available" or ipam_row.auto_from_lease:
+                    if ipam_row.status != "dhcp":
+                        recount_ids.add(subnet.id)
                     _apply_lease_fields(ipam_row, ev, lease)
             elif ipam_row.status in ("available",) or ipam_row.auto_from_lease:
+                # Only a status change moves the count: a renewal of a row
+                # already at ``dhcp`` (the common event) costs no recount.
+                if ipam_row.status != "dhcp":
+                    recount_ids.add(subnet.id)
                 _apply_lease_fields(ipam_row, ev, lease)
             # else: manual/static — leave it alone
 
@@ -1294,26 +2094,14 @@ async def agent_lease_events(
                 to_observe.append((ipam_row, ev.mac_address))
 
             # DDNS — mirrors services/dhcp/pull_leases.py. Only fires on
-            # auto-from-lease rows inside DDNS-enabled subnets; errors are
-            # logged but never break the lease upsert pass (DNS will
-            # reconcile on the next event or sweep).
-            if ipam_row is not None and ipam_row.auto_from_lease:
-                try:
-                    from app.services.dns.ddns import apply_ddns_for_lease
-
-                    await apply_ddns_for_lease(
-                        db,
-                        subnet=subnet,
-                        ipam_row=ipam_row,
-                        client_hostname=ev.hostname,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "dhcp_agent_lease_ddns_failed",
-                        server=str(server.id),
-                        ip=ev.ip_address,
-                        error=str(exc),
-                    )
+            # auto-from-lease rows inside DDNS-enabled subnets. Not here: a
+            # publish holds its zone row to the commit, and under Kea HA the
+            # other member's batch of the same new leases queued on it for
+            # the whole batch (#3816). Collected, and run in short
+            # transactions after this one commits. The last event of an
+            # address names the hostname.
+            if ipam_row is not None and ipam_row.auto_from_lease and idx not in ddns_quiet:
+                deferred_ddns[(subnet.id, norm_ip(ev.ip_address))] = (subnet, ev.hostname)
 
             # Auto-profile (Phase 1: active layer). Subnet-level opt-in;
             # the service applies the refresh-window dedupe + per-subnet
@@ -1328,6 +2116,7 @@ async def agent_lease_events(
 
                     await maybe_enqueue_for_lease(db, subnet=subnet, ipam_row=ipam_row)
                 except Exception as exc:  # noqa: BLE001
+                    _reraise_if_database_gone(exc)
                     logger.warning(
                         "dhcp_agent_lease_auto_profile_failed",
                         server=str(server.id),
@@ -1361,13 +2150,18 @@ async def agent_lease_events(
 
                     await revoke_ddns_for_lease(db, subnet=subnet, ipam_row=ipam_row)
                 except Exception as exc:  # noqa: BLE001
+                    _reraise_if_database_gone(exc)
                     logger.warning(
                         "dhcp_agent_lease_ddns_revoke_failed",
                         server=str(server.id),
                         ip=ev.ip_address,
                         error=str(exc),
                     )
-                await db.delete(ipam_row)
+                await purge_trashed_address_records(db, [ipam_row.id])  # #3186
+                # An address an E911 binding names stays (#3899), as a free row.
+                if not await keep_row_if_bound(db, ipam_row):
+                    await db.delete(ipam_row)
+                recount_ids.add(subnet.id)
                 ipam_by_key.pop((subnet.id, norm_ip(ev.ip_address)), None)
 
     # ── New-device watch: classify the collected MAC sightings (issue #459) ──
@@ -1399,6 +2193,7 @@ async def agent_lease_events(
                 async with db.begin_nested():
                     result = await record_mac_observation(db, ipam_row.id, mac, source="dhcp_lease")
             except Exception as exc:  # noqa: BLE001
+                _reraise_if_database_gone(exc)
                 logger.warning(
                     "dhcp_agent_lease_mac_observation_failed",
                     server=str(server.id),
@@ -1429,8 +2224,223 @@ async def agent_lease_events(
                 },
             )
 
+    # #3345 — the mirror pass added / freed address rows; recount the touched
+    # subnets and their block chains once, in the batch's own transaction.
+    # No audit row follows: the only ones this batch writes (first_seen) are
+    # staged above, so the recount's flush takes the audit-chain lock before
+    # its row locks, and a batch without them never waits for that lock.
+    await recount_subnets_and_blocks(db, recount_ids, audit_lock=False)
     await db.commit()
+    await _publish_deferred_ddns(db, deferred_ddns, server_id=server_id)
     return {"upserted": upserted}
+
+
+#: A deferred DDNS transaction (#3816) holds its zone rows for at most
+#: ``_DDNS_HOLD_S`` of publishing, measured as it runs: it stops taking names
+#: once that is spent and the rest go to the next transaction. The first one
+#: takes ``_DDNS_CHUNK_START`` names; each next one is sized from what the last
+#: one's names cost each, so the stop is the exception and a 100-name batch is
+#: a few transactions. Every commit makes the DNS agents' next poll rebuild
+#: and apply, so a commit per few names (this was 8) cost more than the lock
+#: wait it saved.
+_DDNS_CHUNK_START = 40
+_DDNS_CHUNK_MIN = 8
+_DDNS_CHUNK_MAX = 100
+#: The longest the other member's batch should wait on a zone row one chunk of
+#: ours holds. The whole batch held it before (#3816).
+_DDNS_HOLD_S = 5.0
+
+
+async def _replay_deferred_ddns(db: AsyncSession, events: list[Any], server: Any) -> None:
+    """The DDNS a duplicate batch's grants still owe (#3816): each address's
+    last event, when it is a grant, in its subnet."""
+    from app.services.dhcp.pull_leases import (
+        _find_containing_subnet,
+        _load_scope_cache,
+        _load_subnet_cache,
+    )
+
+    if not events:
+        return
+    subnets = await _load_subnet_cache(db)
+    scope_cache = await _load_scope_cache(db, server.server_group_id)
+    last: dict[str, Any] = {}
+    for ev in events:
+        last[ev.ip_address] = ev
+    deferred: dict[tuple[Any, str], tuple[Any, str | None]] = {}
+    grants: dict[tuple[Any, str], tuple[str | None, str | None]] = {}
+    for ip, ev in last.items():
+        if ev.state != "active":
+            continue
+        subnet = _find_containing_subnet(ip, subnets, preferred_subnet_ids=set(scope_cache))
+        if subnet is not None:
+            key = (subnet.id, norm_ip(ip))
+            deferred[key] = (subnet, ev.hostname)
+            grants[key] = (ev.mac_address, ev.hostname)
+    await _publish_deferred_ddns(db, deferred, server_id=str(server.id), grants=grants)
+
+
+async def _still_granted(
+    db: AsyncSession,
+    by_key: dict[tuple[Any, str], Any],
+    grants: dict[tuple[Any, str], tuple[str | None, str | None]],
+    server_id: str,
+) -> dict[tuple[Any, str], Any]:
+    """``by_key`` less the addresses whose current active lease on this server
+    no longer has the MAC and hostname a replayed grant carried."""
+    from app.models.dhcp import DHCPLease
+
+    if not by_key:
+        return by_key
+    res = await db.execute(
+        select(DHCPLease)
+        .where(
+            DHCPLease.server_id == uuid.UUID(server_id),
+            DHCPLease.ip_address.in_([str(r.address) for r in by_key.values()]),
+            DHCPLease.state == "active",
+        )
+        .execution_options(populate_existing=True)
+    )
+    current = {norm_ip(str(le.ip_address)): le for le in res.scalars().all()}
+    kept = {}
+    for key, row in by_key.items():
+        lease = current.get(key[1])
+        mac, hostname = grants[key]
+        if (
+            lease is not None
+            and (str(lease.mac_address).lower() if lease.mac_address else None)
+            == (mac.lower() if mac else None)
+            and lease.hostname == hostname
+        ):
+            kept[key] = row
+    return kept
+
+
+async def _publish_deferred_ddns(
+    db: AsyncSession,
+    deferred: dict[tuple[Any, str], tuple[Any, str | None]],
+    *,
+    server_id: str,
+    grants: dict[tuple[Any, str], tuple[str | None, str | None]] | None = None,
+) -> None:
+    """Publish the DDNS of a lease-events batch's grants, after the batch's
+    own transaction committed (#3816).
+
+    Each chunk is a transaction of its own that takes the lock order the
+    batch does (``app.services.lock_order``): the chunk's mirror rows by id,
+    then their zones by id, then the writes, so it holds a zone row for about
+    ``_DDNS_HOLD_S``, never the batch. The row is read again under its lock:
+    one a later batch released and deleted, or a reservation took over,
+    publishes nothing. A name that fails is logged and skipped, as it was in
+    the batch: the address stays unpublished, so its next report is not a
+    quiet renewal and publishes it. An agent replay of the batch is a
+    duplicate by its receipt and writes nothing twice.
+
+    ``grants`` (the replay of a duplicate batch) maps each key to the (MAC,
+    hostname) that batch granted: a name is published only if this server's
+    current lease for the address still carries both, read under the same
+    locks. A later batch that renamed or reassigned the client has published
+    it, and its publish is the authoritative one."""
+    pending = sorted(deferred, key=lambda k: (str(k[0]), k[1]))
+    size = _DDNS_CHUNK_START
+    try:
+        while pending:
+            chunk, pending = pending[:size], pending[size:]
+            outcome = await _publish_ddns_chunk(db, chunk, deferred, grants, server_id)
+            if outcome is None:
+                continue
+            # Names the chunk ran out of hold before reaching go first in the next.
+            pending = outcome.unreached + pending
+            if outcome.published >= 3:
+                per_name = max(outcome.held / outcome.published, 0.001)
+                size = max(_DDNS_CHUNK_MIN, min(_DDNS_CHUNK_MAX, int(_DDNS_HOLD_S / per_name)))
+    finally:
+        # One wake for the whole POST, after the last chunk that committed,
+        # also when a database outage ends the loop with a 503: the
+        # collector's own flush drops a request that raised, and the chunks
+        # that did commit would wait for the safety tick. The agents' ETag
+        # compare stays the source of truth; this only says "look now".
+        await flush_collected_wakes()
+
+
+@dataclass
+class _DDNSChunk:
+    """What one DDNS chunk's transaction did: ``held`` seconds with its zone
+    rows locked, over ``published`` names it ran, and the ``unreached`` keys
+    it left for the next one."""
+
+    held: float
+    published: int
+    unreached: list[tuple[Any, str]]
+
+
+async def _publish_ddns_chunk(
+    db: AsyncSession,
+    chunk: list[tuple[Any, str]],
+    deferred: dict[tuple[Any, str], tuple[Any, str | None]],
+    grants: dict[tuple[Any, str], tuple[str | None, str | None]] | None,
+    server_id: str,
+) -> _DDNSChunk | None:
+    """One chunk's transaction. Returns what it did, timed from the zone locks
+    to the commit (the wait for them is the other member's hold, not ours), or
+    ``None`` when it published nothing.
+
+    Every zone the chunk writes has its serial bumped once for the chunk
+    (``coalesced_zone_serials``), not once per name: still a higher serial
+    for every chunk that changes the zone, and the agents see every op."""
+    from app.services.dns.ddns import apply_ddns_for_lease
+    from app.services.dns.serial import coalesced_zone_serials
+    from app.services.lock_order import lock_mirror_rows
+
+    try:
+        rows = await lock_mirror_rows(db, set(chunk))
+        by_key = {(r.subnet_id, norm_ip(str(r.address))): r for r in rows}
+        if grants is not None:
+            by_key = await _still_granted(db, by_key, grants, server_id)
+        await lock_zones_for_addresses(
+            db,
+            publishing=[(by_key[k].subnet, by_key[k]) for k in by_key],
+            ddns=True,
+        )
+        began = time.monotonic()
+        unreached: list[tuple[Any, str]] = []
+        published = 0
+        order = [k for k in chunk if k in by_key]
+        with coalesced_zone_serials():
+            for pos, key in enumerate(order):
+                if published and time.monotonic() - began >= _DDNS_HOLD_S:
+                    unreached = order[pos:]
+                    break
+                row = by_key[key]
+                subnet, client_hostname = deferred[key]
+                published += 1
+                try:
+                    async with db.begin_nested():
+                        await apply_ddns_for_lease(
+                            db,
+                            subnet=row.subnet or subnet,
+                            ipam_row=row,
+                            client_hostname=client_hostname,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    _reraise_if_database_gone(exc)
+                    logger.warning(
+                        "dhcp_agent_lease_ddns_failed",
+                        server=server_id,
+                        ip=str(row.address),
+                        error=str(exc),
+                    )
+        await db.commit()
+        if not by_key:
+            return None
+        return _DDNSChunk(time.monotonic() - began, published, unreached)
+    except Exception as exc:  # noqa: BLE001
+        await db.rollback()
+        # The batch is committed but its publishes are not: the 503 has
+        # the agent resend it, and the replay finishes them.
+        _reraise_if_database_gone(exc)
+        logger.warning("dhcp_agent_lease_ddns_chunk_failed", server=server_id, error=str(exc))
+        return None
 
 
 class MacSightingEntry(BaseModel):
@@ -1497,7 +2507,11 @@ async def agent_mac_sightings(
     existing = (
         (await db.execute(select(IPAddress).where(IPAddress.address.in_(ips)))).scalars().all()
     )
-    by_key: dict[tuple[Any, str], IPAddress] = {(r.subnet_id, r.address): r for r in existing}
+    # #2651 — ``IPAddress.address`` decodes to IPv4Address/IPv6Address, the
+    # event carries a string; normalise both sides (same as lease-events).
+    by_key: dict[tuple[Any, str], IPAddress] = {
+        (r.subnet_id, norm_ip(str(r.address))): r for r in existing
+    }
 
     # (ipam_row, mac) pairs to classify after the flush assigns new-row ids.
     to_observe: list[tuple[IPAddress, str]] = []
@@ -1507,7 +2521,7 @@ async def agent_mac_sightings(
         )
         if subnet is None:
             continue
-        row = by_key.get((subnet.id, s.ip_address))
+        row = by_key.get((subnet.id, norm_ip(s.ip_address)))
         if row is None:
             # #564 — a concurrent lease-event / Sync-DHCP writer may have
             # already committed this (subnet_id, address). Insert inside a
@@ -1525,7 +2539,7 @@ async def agent_mac_sightings(
                     last_seen_method="l2_sniff",
                 ),
             )
-            by_key[(subnet.id, s.ip_address)] = row
+            by_key[(subnet.id, norm_ip(s.ip_address))] = row
             if not created:
                 # Lost the race — just bump the sighting timestamp on the
                 # incumbent (don't clobber its status/mac; the observation
@@ -1575,6 +2589,32 @@ async def agent_mac_sightings(
     return {"recorded": recorded, "new": new_count}
 
 
+def _forget_ha_state(server: DHCPServer) -> bool:
+    """#3241: clear the HA state ``server`` last reported. True if it held one."""
+    if server.ha_state is None and server.ha_last_heartbeat_at is None:
+        return False
+    server.ha_state = None
+    server.ha_last_heartbeat_at = None
+    return True
+
+
+async def _takes_part_in_ha(db: AsyncSession, server: DHCPServer) -> bool:
+    """#3241: whether ``server`` is one of its group's HA participants, by the
+    rule its bundle's failover block follows (``services/dhcp/ha_members``)."""
+    if server.server_group_id is None:
+        return False
+    group = (
+        await db.execute(
+            select(DHCPServerGroup)
+            .where(DHCPServerGroup.id == server.server_group_id)
+            .options(selectinload(DHCPServerGroup.servers))
+        )
+    ).scalar_one_or_none()
+    if group is None:
+        return False
+    return any(s.id == server.id for s in kea_ha_members(group.mode, group.servers).participants)
+
+
 @router.post("/ha-status")
 async def agent_ha_status(
     body: HAStatusReport,
@@ -1588,8 +2628,18 @@ async def agent_ha_status(
     Only updates the two ``ha_*`` columns on DHCPServer; never rewrites
     config or creates audit rows. Drift-free reporting is out of band
     from the config push path.
+
+    #3241: only an HA participant's state is stored. A server that left HA
+    can still send a report, read from its Kea before its agent applied the
+    bundle that switches the hook off; storing it would bring back the state
+    its config poll cleared, so the answer is ``not_in_ha`` and the row reads
+    no HA state.
     """
     server, _ = auth
+    if not await _takes_part_in_ha(db, server):
+        if _forget_ha_state(server):
+            await db.commit()
+        return {"status": "not_in_ha"}
     server.ha_state = body.state
     server.ha_last_heartbeat_at = datetime.now(UTC)
     await db.commit()
@@ -1621,6 +2671,8 @@ class DHCPMetricReport(BaseModel):
     # un-upgraded fleet reads as a fleet that has never dropped a packet.
     receive_drop: int | None = None
     socket_drop: int | None = None
+    # #2889 — requests evicted from Kea's packet queue. Same NULL rule.
+    queue_evicted: int | None = None
     batch_id: BatchId = None
 
 
@@ -1670,6 +2722,7 @@ async def agent_metrics(
     nullable_values = {
         "receive_drop": None if body.receive_drop is None else max(0, body.receive_drop),
         "socket_drop": None if body.socket_drop is None else max(0, body.socket_drop),
+        "queue_evicted": None if body.queue_evicted is None else max(0, body.queue_evicted),
     }
     existing = await db.get(DHCPMetricSample, (server.id, body.bucket_at))
     if existing is None:
@@ -1755,7 +2808,7 @@ async def agent_log_entries(
     capped = body.lines[:1000]
     dropped = max(0, len(body.lines) - len(capped))
     now = datetime.now(UTC)
-    expired_cutoff = now - timedelta(hours=ACTIVITY_LOG_RETENTION_HOURS)
+    expired_cutoff = now - timedelta(hours=await log_retention_hours(db))
     inserted = 0
     expired = 0
     for raw in capped:
@@ -1851,7 +2904,9 @@ async def agent_dhcp_fingerprints(
             from app.tasks.dhcp_fingerprint import lookup_fingerprint_task
 
             for mac in enqueue_macs:
-                lookup_fingerprint_task.delay(mac)
+                # Carry the reporting server so the IP stamp stays in the
+                # spaces it serves (#2577).
+                await dispatch(lookup_fingerprint_task, mac, str(server.id))
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "dhcp_fingerprint_dispatch_failed",

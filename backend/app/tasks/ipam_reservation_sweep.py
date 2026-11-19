@@ -9,6 +9,7 @@ nothing new on a quiet system.
 For each match:
   * flip status → ``available``
   * clear ``reserved_until``
+  * recount the owning subnets' and blocks' cached utilization
   * write one ``audit_log`` entry per row, attributed to a synthetic
     ``system`` user (``user_id`` null), describing the transition.
 
@@ -30,6 +31,7 @@ from app.db import task_session
 from app.models.audit import AuditLog
 from app.models.ipam import IPAddress
 from app.models.settings import PlatformSettings
+from app.services.ipam.utilization import recount_subnets_and_blocks
 
 logger = structlog.get_logger(__name__)
 
@@ -83,6 +85,11 @@ async def _sweep() -> dict[str, int]:
                 )
             )
             released += 1
+
+        # An ``available`` row is free for the counters (#2981), so freeing a
+        # reservation lowers its subnet's and its blocks' figures: recount them
+        # in this pass rather than leaving it to the hourly recount (#3320).
+        await recount_subnets_and_blocks(db, (ip.subnet_id for ip in rows))
 
         await db.commit()
         return {"checked": len(rows), "released": released, "skipped_disabled": 0}

@@ -64,17 +64,18 @@ async def test_recount_corrects_subnet_and_block_rollup(db_session: AsyncSession
     assert subnet.allocated_ips == 3
     assert subnet.utilization_percent == round(3 / 254 * 100, 2)
 
-    # Child /24 rollup: full-CIDR denominator (256), BIGINT-clamped total.
+    # Child /24 rollup: full-CIDR denominator (256), BIGINT-clamped total;
+    # the subnet's network + broadcast count as used in the block (#2982).
     await db_session.refresh(child)
-    assert child.allocated_ips == 3
+    assert child.allocated_ips == 5
     assert child.total_ips == 256
-    assert child.utilization_percent == round(3 / 256 * 100, 2)
+    assert child.utilization_percent == round(5 / 256 * 100, 2)
 
     # Parent /16 recursively includes the child's subnet allocation.
     await db_session.refresh(parent)
-    assert parent.allocated_ips == 3
+    assert parent.allocated_ips == 5
     assert parent.total_ips == 65536
-    assert parent.utilization_percent == round(3 / 65536 * 100, 2)
+    assert parent.utilization_percent == round(5 / 65536 * 100, 2)
 
     # A single audit row records the correction.
     audit = (await db_session.execute(AuditLog.__table__.select())).mappings().all()

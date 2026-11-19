@@ -59,6 +59,7 @@ class ListWebhooksArgs(BaseModel):
 
 @register_tool(
     name="list_webhooks",
+    permission="superadmin",
     description=(
         "List configured webhook subscriptions. Each entry carries "
         "name / url / enabled flag / subscribed event_types / "
@@ -106,6 +107,7 @@ class GetWebhookEventTypesArgs(BaseModel):
 
 @register_tool(
     name="get_webhook_event_types",
+    permission="superadmin",
     description=(
         "Return the full typed-event vocabulary the platform emits "
         "(``space.created``, ``dns.zone.updated``, "
@@ -156,6 +158,7 @@ class FindWebhookDeliveriesArgs(BaseModel):
 
 @register_tool(
     name="find_webhook_deliveries",
+    permission="superadmin",
     description=(
         "List recent webhook deliveries from the EventOutbox — the "
         "pending / in-flight / delivered / failed / dead history. "

@@ -150,8 +150,21 @@ export function LoginPage() {
       } else {
         navigate("/dashboard");
       }
-    } catch {
-      setError("Invalid username or password.");
+    } catch (err) {
+      // A throttled sign-in (429) says so: reading it as a wrong password
+      // sends the user back to retype it, which only extends the wait.
+      const failure = (
+        err as { response?: { status?: number; data?: { detail?: unknown } } }
+      )?.response;
+      if (failure?.status === 429) {
+        setError(
+          typeof failure.data?.detail === "string"
+            ? failure.data.detail
+            : "Too many login attempts. Try again shortly.",
+        );
+      } else {
+        setError("Invalid username or password.");
+      }
     } finally {
       setLoading(false);
     }

@@ -94,14 +94,19 @@ That is the whole list.
 | Connection | Feature | What is sent |
 |---|---|---|
 | `api.github.com` | The Releases view / Appliance → Fleet → Slot images (`services/appliance/releases.py`) | Anonymous GET for the release list and appliance-image asset names. |
-| `data.iana.org`, `rdap.arin.net`, `rdap.db.ripe.net`, `rdap.apnic.net`, `rdap.lacnic.net`, `rdap.afrinic.net` | Domain + ASN registration lookup (#85) and its *Refresh now* button; Settings → DNS → TLD Registry → *Refresh now* (#986) | The domain name or ASN being looked up. RDAP is a public registry query — by nature the registry learns what you asked about. The TLD-registry refresh sends **nothing**: it is an unauthenticated GET of one public file, `data.iana.org/TLD/tlds-alpha-by-domain.txt`. |
+| `data.iana.org` | Settings → DNS → TLD Registry → *Refresh now* (#986) | **Nothing.** An unauthenticated GET of one public file, `data.iana.org/TLD/tlds-alpha-by-domain.txt`. |
+| The RDAP hosts of §3.3 (`data.iana.org`, the RIR hosts, the TLD registries' own servers) | The *Refresh now* button on a Domain or an ASN (#85) | The domain name or ASN being looked up. RDAP is a public registry query, so the registry learns what you asked about. This is the manual twin of the scheduled refresh in §3.3, which is **not** on-demand. |
 | `crt.sh` | TLS certificate → *Certificate Transparency* cross-reference | The hostname being checked. Explicitly on-demand, never run by the scheduled probe, and the matching copilot tool ships disabled. |
 | RBL / DNSBL zones (`zen.spamhaus.org`, `bl.spamcop.net`, …) | Tools → RBL check | A DNS query encoding the IP being checked, to the list operator's resolver. |
+| `registry-1.docker.io` (a name lookup only) | Appliance → Diagnostics → *Run self-test*, and the diagnostics bundle and support bundle, which each run the self-test while generating (#3307). The support bundle runs it on appliances only | A DNS query for the name `registry-1.docker.io`, through the host's own resolver (`gethostbyname`), to check that host DNS works. **No connection is made to Docker Hub** and nothing about the install is in the query; your resolver, and whatever it forwards to, sees that the name was asked for. Never scheduled, never run at startup. |
 | Public resolvers | Tools → DNS propagation check | The name being queried, to each resolver in the chosen set. |
 | Whois / RDAP servers | Tools → whois | The name or IP being looked up. |
 
-Everything in this section is a per-click action with a visible result;
-nothing here runs on a schedule.
+Everything in this section is a per-click action with a visible result
+(the self-test lookup also runs when you generate a diagnostics or support
+bundle); nothing here runs on a schedule. (The RDAP lookups behind a Domain or ASN
+*do* also run on a schedule, once you have created such a row. They are
+listed in §3.3 for that reason.)
 
 ### 3.3 Off until you configure them
 
@@ -112,10 +117,13 @@ nothing here runs on a schedule.
 | `api.fingerbank.org` | DHCP device profiling | off; requires **your** Fingerbank API key | **Sends observed fingerprints**: DHCP option 55, option 60, and the client MAC address. The most identifying outbound call in the product — read `docs/features/DHCP.md` before enabling it. |
 | `api.openai.com`, `generativelanguage.googleapis.com`, Azure OpenAI (`<your-resource>.openai.azure.com`), Anthropic | Operator Copilot | off; no provider is configured out of the box | **Sends prompts and tool results** — which can include hostnames, subnets and record data — to whichever provider you point it at. Can be fully on-prem: Ollama, vLLM and LocalAI all work through the `openai_compat` driver, in which case nothing leaves your network. |
 | `acme-v02.api.letsencrypt.org`, `acme-staging-v02.api.letsencrypt.org`, or any ACME directory you name | Embedded ACME client (#438) | off | A standard ACME order: the domains you are requesting a certificate for. Those names end up in public Certificate Transparency logs — that is how public CAs work, not something SpatiumDDI adds. |
-| Blocklist feed hosts (Hagezi, OISD, AdGuard, urlhaus, phishing.army, … — the catalogue is `backend/app/data/dns_blocklist_catalog.json`) | RPZ blocking lists | off per list | Nothing — an HTTPS download of the list, once per refresh interval, per list you subscribed to. |
-| `api.cloudflare.com`, `dns.hetzner.com`, `api.linode.com`, `api.vultr.com`, `api.digitalocean.com`, plus the AWS / Azure / Google SDK endpoints | Agentless cloud DNS drivers | off; one server row per provider | Zone and record operations, with **your** credentials, to **your** tenant. |
+| Blocklist feed hosts (Hagezi, OISD, AdGuard (incl. the HostlistsRegistry mirror that serves URLhaus), 1Hosts, StevenBlack, phishing.army, easylist.to, … — the catalogue is `backend/app/data/dns_blocklist_catalog.json`) | RPZ blocking lists | off per list | Nothing — an HTTPS download of the list, once per refresh interval, per list you subscribed to. |
+| `api.cloudflare.com`, `api.hetzner.cloud`, `api.linode.com`, `api.vultr.com`, `api.digitalocean.com`, plus the AWS / Azure / Google SDK endpoints | Agentless cloud DNS drivers | off; one server row per provider | Zone and record operations, with **your** credentials, to **your** tenant. |
 | `api.meraki.com`, `api.netbird.io`, `api.tailscale.com`, `login.tailscale.com`, `api.ui.com` | Vendor-hosted integration mirrors (Meraki, NetBird, Tailscale, UniFi cloud) | off; one target row each | Read-only API calls with your credentials to your own tenant. Self-hosted integrations (Proxmox, OPNsense, PAN-OS, FortiGate, Kubernetes, Docker, …) reach only the address you type. |
-| `stat.ripe.net`, `www.peeringdb.com`, `ris-live.ripe.net`, `rpki.cloudflare.com`, `rpki-validator.ripe.net` | BGP Looking Glass enrichment | off (`bgp.*` feature modules) | The ASN or prefix being enriched. |
+| `data.iana.org/rdap/dns.json`, then the RDAP server the IANA bootstrap names for the domain's TLD (for example `rdap.verisign.com` for `.com`; the host depends on the TLD, so it is not enumerable here) | **Scheduled domain registration refresh** (#87). Celery Beat fires `refresh_due_domains` every hour; each Domain row is re-queried once its `next_check_at` has elapsed, by default every 24 h (`domain_whois_interval_hours`, 1 to 168). Creating a Domain row also queues an immediate lookup. | **Armed by data, and switchable.** The first Domain row you create starts a daily off-prem query for that row. **Settings → Features → Domains** (`network.domains`) is the switch. It is **off on a fresh install**, so nothing is sent until you turn it on to create the first Domain row; on an install upgraded with Domain rows already present it resolves on (no row is seeded; an explicit setting always wins), so registration tracking keeps working. Off, the Domains pages and API answer 404, and the hourly sweep and the lookup queued at create time make no RDAP call at all. A name with no registry (reserved, reverse, or undelegated per the IANA list) is marked `n/a` and not queried. A fresh install makes no such call. | The domain name. The bootstrap fetch (cached 6 h) sends nothing. |
+| `rdap.arin.net`, `rdap.db.ripe.net`, `rdap.apnic.net`, `rdap.lacnic.net`, `rdap.afrinic.net` | **Scheduled ASN registration refresh** (#85). Beat fires `refresh_due_asns` every hour; each public ASN row is re-queried once due, by default every 24 h (`asn_whois_interval_hours`, minimum 1). The RIR is chosen from the bundled IANA delegation table, so this path does not contact `data.iana.org`. Private ASNs are skipped. | **Armed by data.** ASN rows can only be created through the `network.asn` module, which ships off, so a fresh install has no rows. The sweep does nothing while `network.asn` is off (#2279), so switching the module off stops it even when rows exist. | The AS number. |
+| `rpki.cloudflare.com` (default) or `rpki-validator.ripe.net` (`rpki_roa_source`) | **Scheduled RPKI ROA refresh.** Beat fires `refresh_due_roas` every hour; every public ASN row without ROAs yet, or whose ROAs are due, is reconciled against the source's global ROA dump (about 100 MB, streamed once per sweep). Default cadence is 4 h (`rpki_roa_refresh_interval_hours`, 1 to 168). | Same as the ASN refresh: no rows, no call on a fresh install, and the sweep does nothing while `network.asn` is off (#2279). | **Nothing.** A GET of the public dump; ASN numbers are matched locally. |
+| `stat.ripe.net`, `www.peeringdb.com`, `ris-live.ripe.net`, `rpki.cloudflare.com`, `rpki-validator.ripe.net` | BGP Looking Glass enrichment and prefix-hijack monitoring (`bgp_monitoring_enabled`); the two RPKI hosts are also reached by the scheduled ROA refresh above | off — the `network.asn` feature module; its scheduled ROA refresh and hijack poll do nothing while it is off (#2279), and the hijack poll also needs `bgp_monitoring_enabled`; the RIS Live stream is a separate process behind `BGP_RIS_LIVE_ENABLED` (default false) | The ASN or prefix being enriched. |
 | Your alert / notification endpoints (Slack webhook, generic webhook, SMTP relay) | Alerting | off until a channel is configured | The alert payload, to the URL or relay you entered. |
 | Your audit-forward endpoint | Audit forwarding | off | Audit rows, to the URL you entered. |
 | Your Apprise destinations — whichever service an Apprise URL names: Telegram, ntfy (`ntfy.sh` or your own server), Pushover, Matrix, Gotify, Teams Workflows, … | Audit forwarding and alerting, webhook targets with the `apprise` flavor (#1503) | off; nothing is sent until you add a target with an Apprise URL. Saving a target only checks that Apprise can read the URL, it sends nothing | A title and a short text for each event the target accepts (rule name, severity, subject and message for an alert; action, resource, user and result for an audit row), to the service and account in the URL you entered. The hostnames are not in our source: Apprise's plugins hold them, so the guard in §8 cannot list them, and this row is the only record. Apprise's default notification icons, which some services would fetch from `github.com`, are switched off. |
@@ -243,8 +251,9 @@ SpatiumDDI is built to be delegated without handing over everything:
   before the response returns (non-negotiable #4), so administrative
   access is recorded rather than assumed;
 * credentials at rest (provider secrets, agent keys, cloud tokens) are
-  Fernet-encrypted with your `CREDENTIAL_ENCRYPTION_KEY` (or a key
-  derived from `SECRET_KEY` when you have not set one) and never
+  Fernet-encrypted with your `CREDENTIAL_ENCRYPTION_KEY` (the chart
+  and appliance generate one; on Compose you set it, otherwise a key is
+  derived from `SECRET_KEY`) and never
   returned by the API — endpoints report `*_set: true`, not the value.
 
 ## 8. Keeping this page true
@@ -287,9 +296,12 @@ scanned. It looks for IP addresses in the agents only: in the backend
 they are almost all example addresses in tool descriptions, and the
 hardcoded PowerDNS resolvers in §3.5, which this page once missed,
 are IP addresses in agent code, which a hostname scan cannot see.
-Its hostname scan reads hosts out of `http://` and `https://` URLs, so
-a hostname written bare (a resolver name, a `tls://` endpoint) is not
-seen either. The things it cannot see, and which therefore need a
+Its hostname scan reads hosts out of `http://` and `https://` URLs, and
+(since #3307) also a bare hostname literal handed to a resolve or connect
+call (`gethostbyname`, `getaddrinfo`, `create_connection`, `connect`, a
+dnspython `resolve` / `query`), directly or through a variable assigned a
+literal; a hostname written bare anywhere else (a resolver name in a
+config template, a `tls://` endpoint) is not seen. The things it cannot see, and which therefore need a
 human: the hostnames inside the Apprise library that an `apprise`
 webhook target reaches (§3.3), since the guard scans our code and not
 third-party packages; hostname literals in the appliance's **shell** scripts under
@@ -322,8 +334,8 @@ client's User-Agent string, as RFC 8555 asks for), `fingerbank.org`,
 `aistudio.google.com` (the "get an API key" link in an error message),
 `appriseit.com` (the Apprise URL documentation, linked from the
 audit-forward target form),
-`bacnet.org`, `kea.readthedocs.io`, `schema.org` (a JSON-LD `@context`
-identifier in a Teams-format webhook payload — a namespace URI, not a
+`bacnet.org`, `kea.readthedocs.io`, `adaptivecards.io` (the `$schema`
+identifier in a Teams-format webhook payload — a schema URI, not a
 URL that is dereferenced), `www.opengis.net` (the GML namespace in the
 E911 PIDF-LO renderer — likewise an XML namespace identifier, written
 into the document we *emit* and never fetched; the accompanying
@@ -360,9 +372,13 @@ OIDC discovery URL) and `host.docker.internal` (a local Ollama for the
 Copilot).
 
 **In-cluster addresses**, which never leave the node:
-`spatium-control-spatiumddi-api.spatium.svc.cluster.local` — the
-Kubernetes service name an appliance supervisor uses to reach the
-control plane it is already part of.
+`spatium-control-spatiumddi-api.spatium.svc.cluster.local` and
+`spatium-control-spatiumddi-api-local.spatium.svc.cluster.local` — the
+Kubernetes service names an appliance supervisor uses to reach the
+control plane it is already part of (the `-local` one keeps that
+traffic on the supervisor's own node) — and
+`kubernetes.default.svc.cluster.local`, the API-server service name the
+cluster-health check resolves from inside its own pod.
 
 ---
 

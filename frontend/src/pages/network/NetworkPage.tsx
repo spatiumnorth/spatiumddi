@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { useNavigate } from "react-router-dom";
 import {
   AlertTriangle,
@@ -22,6 +23,7 @@ import {
   type NetworkDeviceType,
   type NetworkPollStatus,
 } from "@/lib/api";
+import { formatApiError } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
 import { Modal } from "@/components/ui/modal";
 import { TagFilterChips } from "@/components/TagFilterChips";
@@ -39,6 +41,7 @@ import {
   NetworkImportModal,
   exportDevicesCsv,
 } from "./NetworkImportExportModal";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 // ── Filter chip helper ────────────────────────────────────────────────
 
@@ -188,6 +191,17 @@ function ConfirmBulkDeleteModal({
 // ── Page ─────────────────────────────────────────────────────────────
 
 export function NetworkPage() {
+  // #1340 — a read-only user is offered no write it would be refused:
+  // the router asks write (delete) on 'manage_network_devices'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "manage_network_devices"),
+    "Requires write permission on network devices",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "manage_network_devices"),
+    "Requires delete permission on network devices",
+  );
   const qc = useQueryClient();
   const navigate = useNavigate();
 
@@ -222,7 +236,11 @@ export function NetworkPage() {
     return p;
   }, [typeFilter, statusFilter, activeFilter, tagFilters]);
 
-  const { data, isFetching } = useQuery({
+  const {
+    data,
+    isFetching,
+    error: listError,
+  } = useQuery({
     queryKey: ["network-devices", queryParams],
     queryFn: () => networkApi.listDevices(queryParams),
   });
@@ -316,7 +334,9 @@ export function NetworkPage() {
               <NetworkIcon className="h-5 w-5 text-muted-foreground" />
               <h1 className="text-lg font-semibold">Network Discovery</h1>
               <span className="text-xs text-muted-foreground">
-                {devices.length} device{devices.length === 1 ? "" : "s"}
+                {listError
+                  ? "devices unavailable"
+                  : `${devices.length} device${devices.length === 1 ? "" : "s"}`}
                 {selected.size > 0 && (
                   <span className="ml-2 text-primary">
                     {selected.size} selected
@@ -340,7 +360,11 @@ export function NetworkPage() {
             >
               Refresh
             </HeaderButton>
-            <HeaderButton icon={Upload} onClick={() => setShowImport(true)}>
+            <HeaderButton
+              icon={Upload}
+              onClick={() => setShowImport(true)}
+              {...writeGate}
+            >
               Import
             </HeaderButton>
             <HeaderButton
@@ -354,6 +378,7 @@ export function NetworkPage() {
               variant="primary"
               icon={Plus}
               onClick={() => setShowCreate(true)}
+              {...writeGate}
             >
               Add Device
             </HeaderButton>
@@ -404,6 +429,7 @@ export function NetworkPage() {
               onClick={() => bulkTestMut.mutate()}
               disabled={bulkTestMut.isPending}
               className="inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-50"
+              {...writeGate}
             >
               <TestTube2 className="h-3 w-3" /> Test
             </button>
@@ -411,6 +437,7 @@ export function NetworkPage() {
               onClick={() => bulkPollMut.mutate()}
               disabled={bulkPollMut.isPending}
               className="inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-50"
+              {...writeGate}
             >
               <Play className="h-3 w-3" /> Poll Now
             </button>
@@ -418,6 +445,7 @@ export function NetworkPage() {
               onClick={() => bulkActivateMut.mutate(true)}
               disabled={bulkActivateMut.isPending}
               className="inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-50"
+              {...writeGate}
             >
               <Power className="h-3 w-3" /> Activate
             </button>
@@ -425,12 +453,14 @@ export function NetworkPage() {
               onClick={() => bulkActivateMut.mutate(false)}
               disabled={bulkActivateMut.isPending}
               className="inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-50"
+              {...writeGate}
             >
               <Power className="h-3 w-3" /> Deactivate
             </button>
             <button
               onClick={() => setConfirmDelete(true)}
-              className="inline-flex items-center gap-1 rounded-md bg-destructive px-2 py-1 text-xs text-destructive-foreground hover:bg-destructive/90"
+              className="inline-flex items-center gap-1 rounded-md bg-destructive px-2 py-1 text-xs text-destructive-foreground hover:bg-destructive/90 disabled:cursor-not-allowed disabled:opacity-50"
+              {...deleteGate}
             >
               <Trash2 className="h-3 w-3" /> Delete {selected.size}
             </button>
@@ -446,17 +476,41 @@ export function NetworkPage() {
       </div>
 
       <div className="flex-1 overflow-auto p-6">
+        {toggleActiveMut.isError && (
+          <p role="alert" className="mb-3 text-xs text-destructive">
+            Could not change the device's Active setting:{" "}
+            {formatApiError(toggleActiveMut.error, "the request failed")}
+          </p>
+        )}
         <div className="rounded-lg border">
           {devices.length === 0 ? (
             <div className="flex flex-col items-center gap-2 p-10 text-center">
               <NetworkIcon className="h-8 w-8 text-muted-foreground" />
               <p className="text-sm text-muted-foreground">
-                No network devices yet — add a router or switch to start
-                discovering IPs.
+                <ListEmpty
+                  error={listError}
+                  what="network devices"
+                  filtered={
+                    typeFilter !== "all" ||
+                    statusFilter !== "all" ||
+                    activeFilter !== "all" ||
+                    tagFilters.length > 0
+                  }
+                  onClearFilters={() => {
+                    setTypeFilter("all");
+                    setStatusFilter("all");
+                    setActiveFilter("all");
+                    setTagFilters([]);
+                  }}
+                >
+                  No network devices yet — add a router or switch to start
+                  discovering IPs.
+                </ListEmpty>
               </p>
               <button
                 onClick={() => setShowCreate(true)}
-                className="mt-1 inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
+                className="mt-1 inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                {...writeGate}
               >
                 <Plus className="h-3 w-3" /> Add Device
               </button>
@@ -584,8 +638,10 @@ export function NetworkPage() {
                             <input
                               type="checkbox"
                               checked={d.is_active}
+                              aria-label={`Active ${d.name}`}
                               disabled={toggleActiveMut.isPending}
                               onChange={() => toggleActiveMut.mutate(d)}
+                              {...writeGate}
                             />
                           </label>
                         </td>
@@ -596,7 +652,9 @@ export function NetworkPage() {
                           <button
                             onClick={() => setEditing(d)}
                             title="Edit device"
-                            className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+                            aria-label="Edit device"
+                            className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                            {...writeGate}
                           >
                             <Pencil className="h-3 w-3" />
                           </button>

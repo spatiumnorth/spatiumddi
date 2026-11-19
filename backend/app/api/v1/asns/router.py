@@ -22,13 +22,15 @@ from typing import Any, Literal
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import String, func, or_, select
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1._common import BulkDeleteResponse
 from app.api.v1.asns._audit import write_audit
+from app.core.celery_dispatch import dispatch
 from app.core.permissions import require_resource_permission
+from app.core.update_nulls import resolve_update_changes
 from app.models.asn import ASN, ASNRpkiRoa, BGPCommunity, BGPPeering
 from app.services.asns.classifier import REGISTRIES, classify_asn
 from app.services.tags import apply_tag_filter
@@ -183,7 +185,7 @@ async def list_asns(
 
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
 
-    stmt = stmt.order_by(ASN.number.asc()).limit(limit).offset(offset)
+    stmt = stmt.order_by(ASN.number.asc(), ASN.id).limit(limit).offset(offset)
     rows = (await db.execute(stmt)).scalars().all()
 
     return ASNListResponse(
@@ -246,7 +248,7 @@ async def create_asn(body: ASNCreate, db: DB, user: CurrentUser) -> ASNRead:
     try:
         from app.tasks.asn_whois_refresh import refresh_one_asn_by_id
 
-        refresh_one_asn_by_id.delay(str(row.id))
+        await dispatch(refresh_one_asn_by_id, str(row.id))
     except Exception as exc:  # noqa: BLE001
         logger.warning("asn_whois_refresh_dispatch_failed", asn=row.number, error=str(exc))
 
@@ -267,7 +269,13 @@ async def update_asn(asn_id: uuid.UUID, body: ASNUpdate, db: DB, user: CurrentUs
     if row is None:
         raise HTTPException(status_code=404, detail="ASN not found")
 
-    changes = body.model_dump(exclude_unset=True)
+    # #1564 — same null contract as device_policies: clear nullable
+    # columns, 422 on null for the NOT NULL set instead of a 500.
+    changes = resolve_update_changes(
+        body,
+        clearable={"holder_org", "customer_id", "provider_id"},
+        non_nullable={"name", "description", "tags", "custom_fields"},
+    )
     for k, v in changes.items():
         setattr(row, k, v)
 
@@ -486,7 +494,16 @@ async def refresh_asn_rpki(asn_id: uuid.UUID, db: DB, user: CurrentUser) -> Refr
             source = candidate
 
     now = _dt.now(UTC)
-    summary = await _refresh_one_asn(db, row, source, interval_hours, now)
+    from app.services.rpki_roa import RoaFetchError  # noqa: PLC0415
+
+    try:
+        summary = await _refresh_one_asn(db, row, source, interval_hours, now)
+    except RoaFetchError as exc:
+        # The source could not be read: stored ROAs are untouched.
+        raise HTTPException(
+            status_code=502,
+            detail=f"RPKI refresh failed, stored ROAs kept: {exc}",
+        ) from exc
 
     write_audit(
         db,
@@ -765,23 +782,26 @@ class BGPCommunityCreate(BaseModel):
     outbound_action: str = ""
     tags: dict[str, Any] = Field(default_factory=dict)
 
-    @field_validator("value")
-    @classmethod
-    def _v_value(cls, v: str, info: Any) -> str:  # type: ignore[override]
-        v = v.strip()
+    # A model validator, not a ``value`` field validator: ``value`` is
+    # declared before ``kind``, so a field validator sees ``info.data``
+    # without the kind and judges every value as a regular community
+    # (#2624).
+    @model_validator(mode="after")
+    def _v_value(self) -> BGPCommunityCreate:
+        v = self.value.strip()
         if not v:
             raise ValueError("value is required")
-        kind = info.data.get("kind", "regular")
-        if kind == "standard":
+        if self.kind == "standard":
             if v not in _STANDARD_NAMES:
                 raise ValueError(f"standard community must be one of: {sorted(_STANDARD_NAMES)}")
-        elif kind == "regular":
+        elif self.kind == "regular":
             if not _REGULAR_COMMUNITY_RE.match(v):
                 raise ValueError("regular community must be ASN:N (e.g. 65000:100)")
-        elif kind == "large":
+        elif self.kind == "large":
             if not _LARGE_COMMUNITY_RE.match(v):
                 raise ValueError("large community must be ASN:N:M (e.g. 65000:100:200)")
-        return v
+        self.value = v
+        return self
 
 
 class BGPCommunityUpdate(BaseModel):

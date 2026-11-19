@@ -1,3 +1,4 @@
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -28,6 +29,7 @@ import {
   type SiteKind,
   type SiteRead,
   type SiteUpdate,
+  formatApiError,
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { useSessionState } from "@/lib/useSessionState";
@@ -36,6 +38,8 @@ import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ServicesUsingButton } from "@/components/ServicesUsingButton";
 import { SavedViewsMenu } from "@/components/SavedViewsMenu";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -82,7 +86,7 @@ const KIND_LABELS: Record<SiteKind, string> = {
   customer_premise: "Customer premise",
 };
 
-function SiteEditorModal({
+export function SiteEditorModal({
   existing,
   sites,
   onClose,
@@ -135,11 +139,7 @@ function SiteEditorModal({
       onClose();
     },
     onError: (e: unknown) => {
-      const err = e as {
-        message?: string;
-        response?: { data?: { detail?: string } };
-      };
-      setError(err?.response?.data?.detail ?? err?.message ?? "Save failed");
+      setError(formatApiError(e, "Save failed"));
     },
   });
 
@@ -210,6 +210,13 @@ function SiteEditorModal({
               onChange={(e) => setParentId(e.target.value)}
             >
               <option value="">— none —</option>
+              {/* A parent the role may not read is not in the list; keep
+                  it selected and say so rather than drawing "none" (#4188). */}
+              {parentId && !sites.some((s) => s.id === parentId) && (
+                <option value={parentId}>
+                  Linked (not visible to your role)
+                </option>
+              )}
               {sites
                 .filter((s) => !cycleBlockedIds.has(s.id))
                 .map((s) => (
@@ -231,7 +238,7 @@ function SiteEditorModal({
             />
           </div>
         </div>
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && <FormError className="text-sm">{error}</FormError>}
         <div className="flex justify-end gap-2">
           <button
             type="button"
@@ -306,11 +313,7 @@ function MoveSiteModal({
       onClose();
     },
     onError: (e: unknown) => {
-      const err = e as {
-        message?: string;
-        response?: { data?: { detail?: string } };
-      };
-      setError(err?.response?.data?.detail ?? err?.message ?? "Move failed");
+      setError(formatApiError(e, "Move failed"));
     },
   });
 
@@ -365,7 +368,7 @@ function MoveSiteModal({
             </button>
           ))}
         </div>
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && <FormError className="text-sm">{error}</FormError>}
       </div>
     </Modal>
   );
@@ -415,6 +418,24 @@ function SiteTreeRow({
   onMove: (s: SiteRead) => void;
   onDelete: (s: SiteRead) => void;
 }) {
+  // #1340 — a read-only user is offered no write it would be refused:
+  // the router asks write (delete) on 'site'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "site"),
+    "Requires write permission on sites",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "site"),
+    "Requires delete permission on sites",
+  );
+  // Edit asks what PUT /sites/{id} asks, which takes a grant scoped to this
+  // one site (#3039, #3134). Move and drag re-parent it, which a scoped
+  // holder may not, so they stay on the type-level write.
+  const editGate = permissionGate(
+    perms.can("write", "site", site.id),
+    "Requires write permission on sites",
+  );
   const kids = childrenByParent.get(site.id) ?? [];
   const hasKids = kids.length > 0;
   const isExpanded = expanded.has(site.id);
@@ -428,7 +449,7 @@ function SiteTreeRow({
     listeners,
     setNodeRef: dragRef,
     isDragging,
-  } = useDraggable({ id: site.id });
+  } = useDraggable({ id: site.id, disabled: !perms.can("write", "site") });
   const { setNodeRef: dropRef, isOver } = useDroppable({
     id: site.id,
     disabled: isBlocked,
@@ -456,8 +477,12 @@ function SiteTreeRow({
           ref={dragRef}
           {...listeners}
           {...attributes}
+          aria-label="Drag to re-parent"
           title="Drag to re-parent"
-          className="cursor-grab rounded p-0.5 text-muted-foreground/60 hover:bg-muted hover:text-foreground active:cursor-grabbing"
+          className="cursor-grab rounded p-0.5 text-muted-foreground/60 hover:bg-muted hover:text-foreground active:cursor-grabbing disabled:cursor-not-allowed disabled:opacity-40"
+          // Dropping re-parents the site: a PUT the router asks write on
+          // 'site' for, the same as the Move button.
+          {...writeGate}
         >
           <GripVertical className="h-3.5 w-3.5" />
         </button>
@@ -502,24 +527,30 @@ function SiteTreeRow({
           <button
             type="button"
             title="Move"
+            aria-label="Move"
             onClick={() => onMove(site)}
-            className="ml-1 rounded p-1 hover:bg-muted"
+            className="ml-1 rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+            {...writeGate}
           >
             <Move className="h-3.5 w-3.5" />
           </button>
           <button
             type="button"
             title="Edit"
+            aria-label="Edit"
             onClick={() => onEdit(site)}
-            className="ml-1 rounded p-1 hover:bg-muted"
+            className="ml-1 rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+            {...editGate}
           >
             <Pencil className="h-3.5 w-3.5" />
           </button>
           <button
             type="button"
             title="Delete"
+            aria-label="Delete"
             onClick={() => onDelete(site)}
-            className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10"
+            className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
+            {...deleteGate}
           >
             <Trash2 className="h-3.5 w-3.5" />
           </button>
@@ -549,15 +580,22 @@ function SiteTreeRow({
 
 function SiteTreeView({
   sites,
+  listError,
   onEdit,
   onMove,
   onDelete,
 }: {
   sites: SiteRead[];
+  /** The list query's error, so a refused read isn't drawn as an empty tree. */
+  listError?: unknown;
   onEdit: (s: SiteRead) => void;
   onMove: (s: SiteRead) => void;
   onDelete: (s: SiteRead) => void;
 }) {
+  const writeGate = permissionGate(
+    usePermissions().can("write", "site"),
+    "Requires write permission on sites",
+  );
   const qc = useQueryClient();
   const [activeId, setActiveId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -606,11 +644,7 @@ function SiteTreeView({
     mutationFn: ({ id, parentId }: { id: string; parentId: string | null }) =>
       sitesApi.update(id, { parent_site_id: parentId }),
     onError: (e: unknown) => {
-      const err = e as {
-        message?: string;
-        response?: { data?: { detail?: string } };
-      };
-      setError(err?.response?.data?.detail ?? err?.message ?? "Move failed");
+      setError(formatApiError(e, "Move failed"));
     },
     onSettled: () => qc.invalidateQueries({ queryKey: ["sites"] }),
   });
@@ -648,15 +682,18 @@ function SiteTreeView({
   return (
     <div className="space-y-2">
       {error && (
-        <p className="rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+        <FormError className="rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm">
           {error}
+        </FormError>
+      )}
+      {!writeGate.disabled && (
+        <p className="text-xs text-muted-foreground">
+          Drag the <GripVertical className="inline h-3 w-3" /> handle onto
+          another site to re-parent, or use the{" "}
+          <Move className="inline h-3 w-3" /> Move button. Drop on the zone
+          above to make a site top-level.
         </p>
       )}
-      <p className="text-xs text-muted-foreground">
-        Drag the <GripVertical className="inline h-3 w-3" /> handle onto another
-        site to re-parent, or use the <Move className="inline h-3 w-3" /> Move
-        button. Drop on the zone above to make a site top-level.
-      </p>
       <DndContext
         sensors={sensors}
         onDragStart={handleDragStart}
@@ -667,7 +704,10 @@ function SiteTreeView({
         <div className="divide-y rounded-lg border text-sm">
           {roots.length === 0 ? (
             <p className="px-3 py-6 text-center text-muted-foreground">
-              No sites yet — click “New site” to add one.
+              <ListEmpty error={listError} what="sites">
+                No sites yet.
+                {!writeGate.disabled && " Click “New site” to add one."}
+              </ListEmpty>
             </p>
           ) : (
             roots.map((s) => (
@@ -693,6 +733,24 @@ function SiteTreeView({
 }
 
 export function SitesPage() {
+  // #1340 — a read-only user is offered no write it would be refused:
+  // the router asks write (delete) on 'site'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "site"),
+    "Requires write permission on sites",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "site"),
+    "Requires delete permission on sites",
+  );
+  // A row's Edit takes a grant scoped to that one site (#3039, #3134); Move
+  // re-parents it and stays type-level, like New and Delete.
+  const editGate = (id: string) =>
+    permissionGate(
+      perms.can("write", "site", id),
+      "Requires write permission on sites",
+    );
   const qc = useQueryClient();
   const [search, setSearch] = useState("");
   const [kindFilter, setKindFilter] = useState<SiteKind | "">("");
@@ -756,17 +814,28 @@ export function SitesPage() {
     [items, selectedIds],
   );
 
+  // A delete can be refused (409) while an E911 site-default binding
+  // points at the site (#2298); show the server's reason, don't swallow it.
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const onDeleteError = (e: unknown) => {
+    setDeleteError(formatApiError(e, "Delete failed"));
+  };
+
   const bulkDelete = useMutation({
     mutationFn: (ids: string[]) => sitesApi.bulkDelete(ids),
+    onMutate: () => setDeleteError(null),
     onSuccess: () => {
       setSelectedIds(new Set());
       qc.invalidateQueries({ queryKey: ["sites"] });
     },
+    onError: onDeleteError,
   });
 
   const removeOne = useMutation({
     mutationFn: (id: string) => sitesApi.remove(id),
+    onMutate: () => setDeleteError(null),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["sites"] }),
+    onError: onDeleteError,
   });
 
   function toggle(id: string) {
@@ -789,7 +858,7 @@ export function SitesPage() {
   function askDelete(s: SiteRead) {
     setConfirm({
       title: "Delete site",
-      message: `Delete site "${s.name}"?`,
+      message: `Delete site "${s.name}"? A site that still has an E911 site-default binding cannot be deleted until that binding is removed.`,
       confirmLabel: "Delete",
       onConfirm: () => removeOne.mutate(s.id),
     });
@@ -798,6 +867,11 @@ export function SitesPage() {
   return (
     <div className="h-full overflow-auto p-6">
       <div className="space-y-4">
+        {deleteError && (
+          <p role="alert" className="text-sm text-destructive">
+            {deleteError}
+          </p>
+        )}
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
             <h1 className="text-xl font-semibold">Sites</h1>
@@ -854,6 +928,7 @@ export function SitesPage() {
               variant="primary"
               icon={Plus}
               onClick={() => setShowNew(true)}
+              {...writeGate}
             >
               New site
             </HeaderButton>
@@ -899,6 +974,7 @@ export function SitesPage() {
                   onConfirm: () => bulkDelete.mutate(ids),
                 });
               }}
+              {...deleteGate}
             >
               Delete selected
             </HeaderButton>
@@ -913,6 +989,7 @@ export function SitesPage() {
           ) : (
             <SiteTreeView
               sites={allSites}
+              listError={allSitesQuery.error}
               onEdit={(s) => setEditing(s)}
               onMove={(s) => setMoving(s)}
               onDelete={askDelete}
@@ -956,7 +1033,19 @@ export function SitesPage() {
                       className="px-3 py-6 text-center text-muted-foreground"
                       colSpan={7}
                     >
-                      No sites yet — click "New site" to add one.
+                      <ListEmpty
+                        error={query.error}
+                        what="sites"
+                        filtered={search !== "" || kindFilter !== ""}
+                        onClearFilters={() => {
+                          setSearch("");
+                          setKindFilter("");
+                        }}
+                        gate={writeGate}
+                        hint={`Click "New site" to add one.`}
+                      >
+                        No sites yet.
+                      </ListEmpty>
                     </td>
                   </tr>
                 )}
@@ -990,24 +1079,30 @@ export function SitesPage() {
                       <button
                         type="button"
                         title="Move"
+                        aria-label="Move"
                         onClick={() => setMoving(s)}
-                        className="rounded p-1 hover:bg-muted"
+                        className="rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                        {...writeGate}
                       >
                         <Move className="h-3.5 w-3.5" />
                       </button>
                       <button
                         type="button"
                         title="Edit"
+                        aria-label="Edit"
                         onClick={() => setEditing(s)}
-                        className="ml-1 rounded p-1 hover:bg-muted"
+                        className="ml-1 rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                        {...editGate(s.id)}
                       >
                         <Pencil className="h-3.5 w-3.5" />
                       </button>
                       <button
                         type="button"
                         title="Delete"
+                        aria-label="Delete"
                         onClick={() => askDelete(s)}
-                        className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10"
+                        className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
+                        {...deleteGate}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>

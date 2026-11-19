@@ -33,6 +33,7 @@ from datetime import date, datetime, timedelta
 
 import structlog
 
+from app.core.safe_fetch import TARGET_REFUSED_MESSAGE, FetchRefusedError, safe_get_text
 from app.core.ssrf import SSRFBlockedError, assert_safe_target
 
 logger = structlog.get_logger(__name__)
@@ -319,7 +320,8 @@ def normalise_ical_url(url: str) -> str:
 def _guard_target(target: str) -> None:
     """Raise a generic ``ValueError`` if ``target`` resolves to an SSRF pivot.
 
-    The full resolved target is logged server-side (via the ssrf guard's own
+    Used by the CalDAV path, whose blocking client dials on its own. The full
+    resolved target is logged server-side (via the ssrf guard's own
     structured warning) but never surfaced to the operator, so a blocked feed
     can't be used to fingerprint the internal network.
     """
@@ -333,36 +335,28 @@ def _guard_target(target: str) -> None:
 async def fetch_ical_url(url: str, *, timeout: float = 60.0) -> str:
     """Fetch a raw ``.ics`` payload over HTTP(S) (``webcal://`` normalised).
 
-    SSRF-guarded: the initial target AND every redirect hop's ``Location`` is
-    resolved and checked against the loopback / link-local / cloud-metadata
-    denylist before the request is dialled. Redirects are followed MANUALLY
-    (an origin-only check is bypassable with a 302 to an internal address).
+    Goes through :func:`app.core.safe_fetch.safe_get_text`: http/https only,
+    the target checked against the loopback / link-local / cloud-metadata
+    denylist before the request AND at connect time, and every redirect hop
+    re-checked (an origin-only check is undone by a 302 to an internal
+    address).
 
     Raises ``httpx.HTTPError`` on a transport / status failure so the caller's
     ``autoretry_for`` can back off (mirrors the DNS blocklist feed pull). A
-    blocked target / redirect-limit overflow raises a generic ``ValueError``
+    refused target / redirect-limit overflow raises a generic ``ValueError``
     (permanent — retrying won't help) with no host/IP in the message.
     """
-    import httpx  # noqa: PLC0415
-
-    current = normalise_ical_url(url)
-    _guard_target(current)
-
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
-        for _hop in range(_MAX_REDIRECTS + 1):
-            resp = await client.get(current)
-            if resp.is_redirect:
-                location = resp.headers.get("location")
-                if not location:
-                    break
-                # Resolve the redirect against the current request URL, then
-                # re-check the new target before we follow it.
-                current = str(resp.url.join(location))
-                _guard_target(current)
-                continue
-            resp.raise_for_status()
-            return resp.text
-    raise ValueError("calendar feed exceeded the redirect limit")
+    try:
+        return await safe_get_text(
+            normalise_ical_url(url),
+            label="wol_calendar",
+            timeout=timeout,
+            max_redirects=_MAX_REDIRECTS,
+        )
+    except FetchRefusedError as exc:
+        if str(exc) == TARGET_REFUSED_MESSAGE:
+            raise ValueError(_SSRF_GENERIC_MESSAGE) from None
+        raise ValueError(f"calendar {exc}") from None
 
 
 def fetch_caldav_events(

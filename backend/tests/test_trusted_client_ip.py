@@ -209,3 +209,132 @@ async def test_the_proxy_supplied_x_real_ip_is_audited(
 ) -> None:
     source = await _failed_login_source_ip(db_session, "172.18.0.5", {"X-Real-IP": "198.51.100.7"})
     assert source == "198.51.100.7"
+
+
+# ── #1868: many users behind ONE proxy keep independent throttle buckets ─────
+
+
+async def test_two_clients_behind_one_proxy_have_independent_login_buckets(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reported shape: an outer reverse proxy fronts the frontend nginx,
+    so every request reaches the api from ONE TCP peer. The api must key the
+    per-IP login budget on the real client the proxy chain reports in
+    ``X-Real-IP`` and not on that peer; otherwise a busy morning returns 429 to
+    the whole organisation. One client exhausting its budget must not touch
+    another's."""
+    from redis.asyncio import Redis
+
+    from app.config import settings
+    from app.core import auth_throttle
+
+    monkeypatch.setattr(auth_throttle, "_LOGIN_RL_MAX", 3)
+    salt = uuid.uuid4().int % 200
+    alice, bob = f"198.51.100.{salt}", f"203.0.113.{salt}"
+    proxy = "172.18.0.5"  # one trusted peer for both
+    r = Redis.from_url(settings.redis_url)
+    try:
+        await r.delete(f"login_rl:{alice}", f"login_rl:{bob}", f"login_rl:{proxy}")
+    finally:
+        await r.aclose()
+
+    async def attempt(real_ip: str) -> int:
+        transport = ASGITransport(app=app, client=(proxy, 5555))
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.post(
+                "/api/v1/auth/login",
+                json={"username": f"ghost-{uuid.uuid4().hex[:8]}", "password": "wrong"},
+                headers={"X-Real-IP": real_ip},
+            )
+        return resp.status_code
+
+    assert [await attempt(alice) for _ in range(4)] == [401, 401, 401, 429]
+    # Bob shares alice's proxy and nothing else: his budget is untouched.
+    assert [await attempt(bob) for _ in range(3)] == [401, 401, 401]
+    assert await attempt(bob) == 429
+    assert await attempt(alice) == 429
+
+
+# ── #1868: the diagnostics that name the cause of a proxy misconfiguration ───
+
+
+async def test_a_refused_host_is_named_in_the_log() -> None:
+    """``TRUSTED_HOSTS`` + a proxy that rewrites Host: Starlette answers a bare
+    400. The cause (which Host arrived) must reach the log, once per name."""
+    from structlog.testing import capture_logs
+
+    from app.core.request_meta import LoggingTrustedHostMiddleware
+
+    async def inner(scope: Any, receive: Any, send: Any) -> None:
+        raise AssertionError("must not reach the app")
+
+    sent: list[dict[str, Any]] = []
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    LoggingTrustedHostMiddleware._seen.clear()
+    mw = LoggingTrustedHostMiddleware(inner, allowed_hosts=["ddi.example.com"])
+    scope = {"type": "http", "headers": [(b"host", b"spatiumddi-frontend:8000")]}
+    with capture_logs() as logs:
+        await mw(scope, None, send)
+        await mw(scope, None, send)
+    assert sent[0]["status"] == 400
+    refused = [e for e in logs if e["event"] == "trusted_hosts_refused_host"]
+    assert len(refused) == 1 and refused[0]["host"] == "spatiumddi-frontend"
+
+
+async def test_a_forwarded_prefix_from_a_trusted_proxy_is_warned_about() -> None:
+    """Sub-paths are unsupported; a blank page is all the operator sees."""
+    from structlog.testing import capture_logs
+
+    from app.core import request_meta
+
+    request_meta._prefix_warned = False
+    with capture_logs() as logs:
+        await _through("10.0.0.9", {"x-forwarded-prefix": "/spatium"})
+    assert [
+        e["forwarded_prefix"] for e in logs if e["event"] == "reverse_proxy_sub_path_unsupported"
+    ] == ["/spatium"]
+    request_meta._prefix_warned = False
+    with capture_logs() as logs:
+        await _through("10.0.0.9", {"x-forwarded-prefix": "/"})
+        await _through("203.0.113.50", {"x-forwarded-prefix": "/spatium"})
+    assert not [e for e in logs if e["event"] == "reverse_proxy_sub_path_unsupported"]
+
+
+async def test_an_empty_external_url_logs_the_fallback(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The SSO callback URL is built from the request when External URL is
+    empty; that is the silent cause of "redirect_uri mismatch" behind a proxy."""
+    from structlog.testing import capture_logs
+
+    from app.api.v1.auth.router import _app_base_url
+    from app.models.settings import PlatformSettings
+
+    row = await db_session.get(PlatformSettings, 1)
+    if row is None:
+        row = PlatformSettings(id=1)
+        db_session.add(row)
+    row.app_base_url = ""
+    await db_session.flush()
+    request = Request(
+        {
+            "type": "http",
+            "scheme": "http",
+            "server": ("ddi.example.com", 80),
+            "path": "/api/v1/auth/x/start",
+            "headers": [(b"host", b"ddi.example.com")],
+        }
+    )
+    with capture_logs() as logs:
+        assert await _app_base_url(db_session, request) == "http://ddi.example.com"
+    assert [e["built_url"] for e in logs if e["event"] == "sso_external_url_not_set"] == [
+        "http://ddi.example.com"
+    ]
+    row.app_base_url = "https://ddi.example.com/"
+    await db_session.flush()
+    with capture_logs() as logs:
+        assert await _app_base_url(db_session, request) == "https://ddi.example.com"
+    assert not [e for e in logs if e["event"] == "sso_external_url_not_set"]

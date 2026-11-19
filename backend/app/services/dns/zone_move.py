@@ -29,19 +29,23 @@ from __future__ import annotations
 
 import uuid
 import zlib
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from typing import Any
 
 import structlog
+from fastapi import HTTPException
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select, text
 from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.core.agent_wake import collect_wake, dns_group_channel
 from app.models.acme import ACMEAccount
 from app.models.dns import (
     DNSAcl,
+    DNSIngestSnapshot,
     DNSKey,
     DNSPool,
     DNSRecord,
@@ -53,14 +57,20 @@ from app.models.dns import (
     DNSZone,
     DNSZoneUpdateAcl,
 )
+from app.services.dns import technitium_api_scope
+from app.services.dns.dnssec_signers import SIGNING_DRIVERS, lock_group, signing_server_count
 from app.services.dns.named_conf_validation import is_name_reference, key_reference
-from app.services.dns.pool_geo import build_geo_steering
+from app.services.dns.pool_geo import EXTERNAL_IMPORT_SOURCE, build_geo_steering
 from app.services.dns.record_ops import (
     clear_dnssec_key_state,
     count_queued_zone_ops,
     sweep_zone_ops,
 )
+from app.services.dns.technitium_options import allow_query_problem, allow_transfer_problem
 from app.services.dns.tsig import ensure_group_tsig_key, group_key_names
+from app.services.dns.tsig_algorithms import key_refusal
+from app.services.dns.view_collisions import ExtraZone, zone_render_collisions
+from app.services.dns.zone_forward_transport import zone_forward_transport_refusal
 
 logger = structlog.get_logger(__name__)
 
@@ -75,12 +85,13 @@ ACK_VIEW_WIDENING = "view_widening"
 ACK_DNSSEC_ROLLOVER = "dnssec_rollover"
 ACK_LOST_UPDATE_GRANTS = "lost_update_grants"
 
-#: Drivers whose agents can actually sign a zone. Mirrors the router's
-#: ``_DRIVER_GATED_OPERATIONS["dnssec_sign"]`` gate, which every other
+#: Drivers whose agents can actually sign a zone: the same set as the router's
+#: ``_DRIVER_GATED_OPERATIONS["dnssec_sign"]`` gate (both read
+#: ``dnssec_signers.SIGNING_DRIVERS``), which every other
 #: path into a signed zone goes through — a move that skipped it would
 #: leave the row saying ``dnssec_enabled`` while the zone is served
 #: unsigned, indefinitely and with nothing to notice it.
-DNSSEC_SIGN_DRIVERS = frozenset({"bind9", "powerdns"})
+DNSSEC_SIGN_DRIVERS = SIGNING_DRIVERS
 
 
 class ZoneMoveError(Exception):
@@ -129,6 +140,12 @@ class ZoneMovePlan:
 
     # Per-record view scoping, same three outcomes.
     records_total: int = 0
+    # Records in the Trash: they move with the zone, answer nowhere, and are
+    # left out of every other figure here (#3921).
+    records_trashed: int = 0
+    # Trashed records whose view the move clears: restored later they come back
+    # shared (every view), so the widening acknowledgement covers them too.
+    records_trashed_widened: int = 0
     records_remapped: int = 0
     records_widened: int = 0
     records_cleared_inert: int = 0
@@ -166,11 +183,16 @@ class ZoneMovePlan:
     target_drivers: list[str] = field(default_factory=list)
 
     name_collision: bool = False
+    #: Views of the target that would render this zone's name twice (#2275).
+    name_collision_views: list[str] = field(default_factory=list)
     target_tsig_key_generated: bool = False
     #: Target drivers that cannot sign, when the zone is signed. A move
     #: onto one is refused rather than warned: the row keeps saying
     #: ``dnssec_enabled`` while the zone is served unsigned forever.
     dnssec_unsupported_drivers: list[str] = field(default_factory=list)
+    #: Signing agent servers in the target, when the zone is signed (#1762).
+    #: More than one is refused: each would sign with its own keys.
+    dnssec_target_signers: int = 0
     #: Named ACLs cited in the zone's own address-match lists
     #: (``allow_query`` / ``allow_transfer`` / ``also_notify``). ``DNSAcl``
     #: is group-scoped, so a name that exists in the source and not the
@@ -183,6 +205,28 @@ class ZoneMovePlan:
     #: ``key {}`` is group-scoped too, so a key the target does not define
     #: is the same undefined symbol and the same whole-group failure.
     key_names_lost: list[str] = field(default_factory=list)
+    #: #1784 — why the experimental ``technitium_api`` driver in the target
+    #: cannot take this zone (non-Primary, settings it never writes, pools).
+    #: Set by the plan so the preview reports the same refusal the commit
+    #: raises; ``None`` when the target is not such a group or the zone fits.
+    technitium_api_refusal: str | None = None
+    #: #1858 — a TSIG key this zone uses (update grant or ``key <name>``)
+    #: resolves, by name, to a target key whose algorithm a target driver
+    #: cannot use (Technitium has no hmac-sha224). Refused, never waived.
+    tsig_algorithm_refusal: str | None = None
+    #: #2121 — the forward zone's own upstream transport (``forward_transport``
+    #: / ``forward_tls_hostname``) is one the target group cannot serve: a DoH
+    #: or DoQ zone landing on BIND9, a TLS zone on Windows DNS. Derived by the
+    #: same check zone create / update run, so the preview reports exactly the
+    #: refusal the commit raises. Refused, never waived.
+    forward_transport_refusal: str | None = None
+    #: #2263 — the zone's own ``allow_query`` / ``allow_transfer`` holds an
+    #: element the agent-managed Technitium driver in the target cannot
+    #: express. The zone create / update gate refuses the same list; a move
+    #: is another way into the group, and on a zone Technitium creates fresh
+    #: "left as the daemon has it" means open to every client. Refused,
+    #: never waived.
+    technitium_acl_refusal: str | None = None
 
     warnings: list[str] = field(default_factory=list)
     #: Acknowledgement keys the commit will demand.
@@ -222,6 +266,244 @@ async def _group_has_views(db: AsyncSession, group_id: uuid.UUID) -> bool:
     if has_operator:
         return True
     return bool((await build_geo_steering(db, group_id)).active)
+
+
+@dataclass
+class SharedProviderResult:
+    """Source-group agentless servers whose zone copy a move must NOT delete."""
+
+    #: Server ids to leave out of the source-group delete.
+    keep_ids: set[uuid.UUID] = field(default_factory=set)
+    #: Operator-readable reason per kept server.
+    notes: list[str] = field(default_factory=list)
+
+
+async def same_provider_target_ids(
+    db: AsyncSession, source_group_id: uuid.UUID, target_group_id: uuid.UUID
+) -> set[uuid.UUID]:
+    """Target agentless servers whose provider identity KNOWN-equals a source server's.
+
+    Such a target's create finds the zone the source group already holds,
+    through the same provider, with SpatiumDDI's own records in it. The driver
+    may then adopt it without the foreign-records refusal (#3805). An unknown
+    identity on either side never qualifies: the refusal then still runs.
+    """
+    from app.drivers.dns import get_driver  # noqa: PLC0415
+
+    sources = await _agentless_servers(db, source_group_id)
+    targets = await _agentless_servers(db, target_group_id)
+    known: set[tuple[str, str]] = set()
+    for src in sources:
+        ident = get_driver(src.driver).provider_identity(src)
+        if ident is not None:
+            known.add((src.driver, ident))
+    out: set[uuid.UUID] = set()
+    for tgt in targets:
+        ident = get_driver(tgt.driver).provider_identity(tgt)
+        if ident is not None and (tgt.driver, ident) in known:
+            out.add(tgt.id)
+    return out
+
+
+async def _agentless_servers(db: AsyncSession, group_id: uuid.UUID) -> list[DNSServer]:
+    from app.drivers.dns import is_agentless  # noqa: PLC0415
+
+    rows = (
+        (
+            await db.execute(
+                select(DNSServer).where(
+                    DNSServer.group_id == group_id,
+                    DNSServer.credentials_encrypted.isnot(None),
+                    DNSServer.is_enabled.is_(True),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [r for r in rows if is_agentless(r.driver)]
+
+
+async def shared_provider_sources(
+    db: AsyncSession,
+    source_group_id: uuid.UUID,
+    target_group_id: uuid.UUID,
+    adopted_on: Collection[str] | None = None,
+) -> SharedProviderResult:
+    """Find source servers that may reach the same provider as a target server (#3805).
+
+    The move pushes a create into the target, then a delete into the source.
+    When one provider sits behind a server on each side the create adopts the
+    existing zone and the delete then removes the only copy. Delete is the
+    destructive direction, so a source server is kept (not deleted) when ANY
+    of these says it might share a store with a target server of its driver:
+
+    * its provider identity equals a target server's;
+    * its identity, or a same-driver target's, cannot be determined;
+    * ``adopted_on`` (the commit passes the target servers whose create found
+      the zone already there) names a target server of the same driver.
+
+    The last rule is the one that does not depend on the identity being
+    right. An identity is only what the credentials say: two Route 53 keys
+    can belong to one AWS account, two Cloudflare tokens to one account, two
+    Technitium URLs (an IP and a hostname) to one daemon, and two domain
+    controllers share every AD-integrated zone by replication. In each of
+    those the target's create finds the zone already present, and that is
+    the evidence the identities cannot give.
+
+    ``adopted_on=None`` is the preview, which cannot know the create's
+    outcome yet: it says the copy WILL be kept if the target already holds
+    the zone, rather than promising a delete it may not do.
+    """
+    from app.drivers.dns import get_driver  # noqa: PLC0415
+
+    result = SharedProviderResult()
+    targets = await _agentless_servers(db, target_group_id)
+    if not targets:
+        return result
+    sources = await _agentless_servers(db, source_group_id)
+
+    def _identity(server: DNSServer) -> str | None:
+        return get_driver(server.driver).provider_identity(server)
+
+    adopted = set(adopted_on or ())
+    # Per target: (name, driver, identity). Only a same-driver target can
+    # share a provider with a source server.
+    tgt = [(t.name, t.driver, _identity(t)) for t in targets]
+    for src in sources:
+        same_driver = [(n, i) for n, d, i in tgt if d == src.driver]
+        if not same_driver:
+            continue
+        ident = _identity(src)
+        match = next((n for n, i in same_driver if ident is not None and i == ident), None)
+        adopted_by = next((n for n, _ in same_driver if n in adopted), None)
+        unknown = ident is None or any(i is None for _, i in same_driver)
+        if match is not None:
+            reason = f"it reaches the same provider as target server '{match}'"
+        elif adopted_by is not None:
+            reason = (
+                f"target server '{adopted_by}' already held the zone, which means the "
+                "two may be one provider"
+            )
+        elif unknown:
+            logger.warning(
+                "dns.zone_move.provider_identity_unknown",
+                source_server=src.name,
+                target_servers=[n for n, _ in same_driver],
+            )
+            reason = "whether it shares a provider with a target server could not be determined"
+        else:
+            if adopted_on is None:
+                result.notes.append(
+                    f"Source copy on '{src.name}' is deleted unless a target "
+                    f"{src.driver} server already holds the zone when the move "
+                    "runs; then it is kept, because the two may be one provider."
+                )
+            continue
+        result.keep_ids.add(src.id)
+        result.notes.append(
+            f"Source copy kept on '{src.name}': {reason}, so deleting it there could "
+            "remove the zone the target now serves. Remove it by hand if it is a "
+            "separate copy."
+        )
+    return result
+
+
+def provider_copies_kept_header(notes: Collection[str]) -> str:
+    """The ``X-Provider-Copies-Kept`` header value for ``notes`` (#3812).
+
+    A header must be latin-1 with no line breaks, and a server or zone name
+    may be neither; escape rather than fail a delete that has already
+    committed.
+    """
+    joined = " | ".join(" ".join(n.split()) for n in notes)
+    return joined.encode("ascii", "backslashreplace").decode("ascii")
+
+
+async def shared_zone_copy_servers(
+    db: AsyncSession, zone: DNSZone, group_id: uuid.UUID | None = None
+) -> SharedProviderResult:
+    """Servers of ``zone``'s group whose provider copy another zone still uses (#3812).
+
+    A delete (permanent, Trash purge, reverse-zone retirement, a move's source
+    delete) pushes ``delete`` to every agentless server of the group it leaves
+    (``group_id``, default the zone's own). A provider holds ONE copy of a zone
+    name, so the copy is kept on a server when another zone of the same name
+    may use it:
+
+    - a zone in another view of the same group (the same servers push it);
+    - a zone in another group that has an agentless server of the same driver
+      sharing the provider (same identity, or either identity unreadable:
+      unknown counts as shared, as in #3805). That server counts while paused
+      and the zone counts while in the Trash, because neither re-creates the
+      copy on resume or restore.
+
+    Names compare without case or the trailing dot, as the provider compares
+    them. Erring towards keeping is deliberate: a kept copy is named in the
+    caller's audit row; a wrong delete removes a zone another group serves.
+    """
+    from app.drivers.dns import get_driver, is_agentless  # noqa: PLC0415
+
+    result = SharedProviderResult()
+    source_group_id = group_id if group_id is not None else zone.group_id
+    sources = await _agentless_servers(db, source_group_id)
+    if not sources:
+        return result
+    bare = zone.name.rstrip(".").lower()
+    other_group_ids = set(
+        (
+            await db.execute(
+                select(DNSZone.group_id)
+                .where(
+                    func.lower(func.rtrim(DNSZone.name, ".")) == bare,
+                    DNSZone.id != zone.id,
+                )
+                .execution_options(include_deleted=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if source_group_id in other_group_ids:
+        for src in sources:
+            result.keep_ids.add(src.id)
+            result.notes.append(
+                f"Provider copy kept on '{src.name}': another zone '{zone.name}' in the "
+                "same server group (another view) uses the same provider copy."
+            )
+        return result
+    for gid in other_group_ids:
+        others = [
+            r
+            for r in (
+                await db.execute(
+                    select(DNSServer).where(
+                        DNSServer.group_id == gid,
+                        DNSServer.credentials_encrypted.isnot(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+            if is_agentless(r.driver)
+        ]
+        for src in sources:
+            if src.id in result.keep_ids:
+                continue
+            ident = get_driver(src.driver).provider_identity(src)
+            for oth in others:
+                if oth.driver != src.driver:
+                    continue
+                oident = get_driver(oth.driver).provider_identity(oth)
+                if ident is None or oident is None or ident == oident:
+                    result.keep_ids.add(src.id)
+                    result.notes.append(
+                        f"Provider copy kept on '{src.name}': another group still has a "
+                        f"zone '{zone.name}' that may use the same provider copy "
+                        f"(via '{oth.name}'). Remove it there by hand if it is separate."
+                    )
+                    break
+    return result
 
 
 async def _drivers_of(db: AsyncSession, group_id: uuid.UUID) -> list[str]:
@@ -297,6 +579,14 @@ async def assemble_move_plan(
             select(func.count()).select_from(DNSRecord).where(DNSRecord.zone_id == zone.id)
         )
     ).scalar_one()
+    plan.records_trashed = (
+        await db.execute(
+            select(func.count())
+            .select_from(DNSRecord)
+            .where(DNSRecord.zone_id == zone.id, DNSRecord.deleted_at.isnot(None))
+            .execution_options(include_deleted=True)
+        )
+    ).scalar_one()
 
     # Only view-scoped rows need looking at, and only their ``view_id`` —
     # so this selects two columns rather than hydrating every DNSRecord in
@@ -309,13 +599,25 @@ async def assemble_move_plan(
     # then renders into no operator view at all rather than into one.
     scoped = (
         await db.execute(
-            select(DNSRecord.id, DNSRecord.view_id)
+            select(DNSRecord.id, DNSRecord.view_id, DNSRecord.deleted_at, DNSRecord.import_source)
             .where(DNSRecord.zone_id == zone.id, DNSRecord.view_id.isnot(None))
             .execution_options(include_deleted=True)
         )
     ).all()
-    for _rid, view_id in scoped:
-        action, _new_id, old_name = _resolve(view_id)
+    # Where the zone's LIVE scoped records would place it in the target (#2275).
+    # A learned record follows the zone and does not place it (``places_zone``).
+    live_record_view_ids: set[uuid.UUID] = set()
+    for _rid, view_id, deleted_at, import_source in scoped:
+        action, new_id, old_name = _resolve(view_id)
+        if deleted_at is None and new_id is not None and import_source != EXTERNAL_IMPORT_SOURCE:
+            live_record_view_ids.add(new_id)
+        if deleted_at is not None:
+            # In the Trash: it answers nowhere now, so it stays out of the
+            # live figures — but the commit rewrites its view, and a cleared
+            # one comes back SHARED on restore. Counted apart; still acked.
+            if action == "cleared_widening":
+                plan.records_trashed_widened += 1
+            continue
         if action == "remapped":
             plan.records_remapped += 1
         elif action == "cleared_widening":
@@ -345,6 +647,27 @@ async def assemble_move_plan(
         )
     )
     plan.name_collision = clash.first() is not None
+    # #2275 — the constraint is not the whole story: a zone with no view is
+    # rendered into EVERY view of the target (and a zone's scoped records place
+    # it in their views too), so it can land beside a same-name zone pinned to
+    # one of them. BIND refuses a view declaring a zone twice, and the agent
+    # then declines the whole target group's config.
+    if zone.group_id != target_group.id:
+        render = await zone_render_collisions(
+            db,
+            target_group.id,
+            names=[zone.name],
+            extra_zones=[
+                ExtraZone(
+                    id=zone.id,
+                    name=zone.name,
+                    view_id=effective_view_id,
+                    record_view_ids=live_record_view_ids,
+                )
+            ],
+        )
+        plan.name_collision_views = sorted({c.view for c in render if str(zone.id) in c.zone_ids})
+        plan.name_collision = plan.name_collision or bool(plan.name_collision_views)
 
     # ── Dynamic-update grants ─────────────────────────────────────────
     acl_rows = (
@@ -404,6 +727,39 @@ async def assemble_move_plan(
         await group_key_names(db, target_group.id),
     )
 
+    # #1858 — the keys the zone uses, as they resolve in the target.
+    used_key_names = {
+        name
+        for values in (zone.allow_query, zone.allow_transfer, zone.also_notify)
+        for element in values or []
+        if (name := key_reference(str(element)))
+    }
+    if acl_rows:
+        granted = (
+            await db.execute(
+                select(DNSTSIGKey.name).where(
+                    DNSTSIGKey.id.in_([r.tsig_key_id for r in acl_rows if r.tsig_key_id])
+                )
+            )
+        ).scalars()
+        used_key_names |= set(granted)
+    if used_key_names and plan.target_drivers:
+        target_algos = (
+            await db.execute(
+                select(DNSTSIGKey.name, DNSTSIGKey.algorithm).where(
+                    DNSTSIGKey.group_id == target_group.id,
+                    DNSTSIGKey.name.in_(used_key_names),
+                )
+            )
+        ).all()
+        for kname, kalgo in sorted(target_algos):
+            msg = key_refusal(kalgo, plan.target_drivers, key=kname)
+            if msg:
+                plan.tsig_algorithm_refusal = (
+                    f"Group {target_group.name!r}: {msg} The zone uses that key."
+                )
+                break
+
     plan.pools_repointed = await _count(db, DNSPool, DNSPool.zone_id == zone.id)
     plan.zone_state_rows = await _count(
         db, DNSServerZoneState, DNSServerZoneState.zone_id == zone.id
@@ -417,12 +773,93 @@ async def assemble_move_plan(
     if plan.dnssec_signed:
         allowed = DNSSEC_SIGN_DRIVERS
         plan.dnssec_unsupported_drivers = sorted(set(plan.target_drivers) - allowed)
+        plan.dnssec_target_signers = await signing_server_count(db, target_group.id)
 
     # ── Named ACLs cited by the zone's own address-match lists ────────
     _scan_acl_references(plan, zone, source_acls, target_acls)
 
+    # ── Experimental technitium_api target (#1784, a refusal) ─────────
+    if technitium_api_scope.DRIVER in plan.target_drivers:
+        try:
+            technitium_api_scope.refuse_non_primary(zone.zone_type)
+            technitium_api_scope.refuse_unapplied_zone_changes(
+                {f: getattr(zone, f) for f in technitium_api_scope.ZONE_UNAPPLIED_DEFAULTS},
+                None,
+            )
+            if plan.pools_repointed:
+                raise technitium_api_scope.refusal(
+                    "DNS pools are not supported; this zone has pools."
+                )
+        except HTTPException as exc:
+            plan.technitium_api_refusal = str(exc.detail)
+
+    # ── Agent-managed Technitium target (#2263, a refusal) ────────────
+    # The agent applies a primary / secondary / stub zone's own allow_query,
+    # and a primary's allow_transfer, through the address-match translation;
+    # an inexpressible list is left unapplied, which on a zone the move makes
+    # Technitium create means open. Same checks as zone create / update.
+    if "technitium" in plan.target_drivers:
+        defs = await _acl_definitions(db, target_group.id)
+        problem = None
+        if zone.zone_type in ("primary", "secondary", "stub") and zone.allow_query:
+            problem = allow_query_problem(list(zone.allow_query), defs)
+        if problem is None and zone.zone_type == "primary" and zone.allow_transfer:
+            problem = allow_transfer_problem(list(zone.allow_transfer), defs)
+        if problem:
+            plan.technitium_acl_refusal = (
+                f"Group {target_group.name!r} has a Technitium server, which cannot apply "
+                f"this zone's {problem}. Change the zone's list first, or pick another group."
+            )
+
+    # ── The forward zone's own upstream transport (#2121, a refusal) ──
+    if zone.zone_type == "forward":
+        msg = zone_forward_transport_refusal(
+            zone_name=zone.name,
+            transport=zone.forward_transport,
+            hostname=zone.forward_tls_hostname,
+            forwarders=list(zone.forwarders or []),
+            drivers=plan.target_drivers,
+        )
+        if msg:
+            plan.forward_transport_refusal = f"Group {target_group.name!r}: {msg}"
+
     _fill_warnings(plan)
+    shared = await shared_provider_sources(db, zone.group_id, target_group.id)
+    # The commit also keeps the source copy for a third group's (or a sibling
+    # view's) zone of the same name (#3812); say so here instead of promising
+    # a delete (#3896).
+    others = await shared_zone_copy_servers(db, zone, group_id=zone.group_id)
+    notes = list(shared.notes)
+    if others.keep_ids:
+        by_id = {s_.id: s_.name for s_ in await _agentless_servers(db, zone.group_id)}
+        for sid in others.keep_ids:
+            name = by_id.get(sid)
+            notes = [n for n in notes if not n.startswith(f"Source copy on '{name}' is deleted")]
+    plan.warnings.extend(notes)
+    plan.warnings.extend(n for n in others.notes if n not in plan.warnings)
     return plan
+
+
+async def _acl_definitions(
+    db: AsyncSession, group_id: uuid.UUID
+) -> dict[str, list[tuple[str, bool]]]:
+    """The group's named ACLs as ``name -> [(value, negate)]``, for the
+    Technitium address-match translation (#1765, #2263)."""
+    rows = (
+        (
+            await db.execute(
+                select(DNSAcl)
+                .where(DNSAcl.group_id == group_id)
+                .options(selectinload(DNSAcl.entries))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {
+        a.name: [(e.value, bool(e.negate)) for e in sorted(a.entries, key=lambda x: x.order)]
+        for a in rows
+    }
 
 
 async def _count(db: AsyncSession, model: type, *criteria: Any) -> int:
@@ -518,7 +955,16 @@ def _fill_warnings(plan: ZoneMovePlan) -> None:
             f"have ({detail}). They will become unscoped, which means they start answering in "
             f"EVERY view in the target rather than in one."
         )
-    if plan.zone_view_action == "cleared_widening" or plan.records_widened:
+    if plan.records_trashed_widened:
+        plan.warnings.append(
+            f"{plan.records_trashed_widened} records in the Trash would also lose their view "
+            f"and come back shared (answering in EVERY view) if restored."
+        )
+    if (
+        plan.zone_view_action == "cleared_widening"
+        or plan.records_widened
+        or plan.records_trashed_widened
+    ):
         plan.required_acknowledgements.append(ACK_VIEW_WIDENING)
 
     if plan.zone_view_action == "cleared_inert":
@@ -541,6 +987,12 @@ def _fill_warnings(plan: ZoneMovePlan) -> None:
             "publish the new one, and the zone will fail validation in the interval."
         )
         plan.required_acknowledgements.append(ACK_DNSSEC_ROLLOVER)
+        if plan.dnssec_target_signers > 1:
+            plan.warnings.append(
+                f"The target group has {plan.dnssec_target_signers} DNS servers, each of which "
+                f"would sign this zone with its own keys. The move is refused until the zone "
+                f"is unsigned or the target has a single DNS server (#1762)."
+            )
 
     if plan.acl_keys_lost:
         plan.warnings.append(
@@ -591,8 +1043,11 @@ def _fill_warnings(plan: ZoneMovePlan) -> None:
 
     if plan.pending_ops:
         plan.warnings.append(
-            f"{plan.pending_ops} queued record update(s) for this zone will be discarded — they "
-            f"target the current group's servers."
+            f"{plan.pending_ops} queued record update(s) for this zone target the current "
+            f"group's servers and are dropped by the move; agentless target servers are given "
+            f"the zone's records as they stand now, which already include every queued add or "
+            f"update, and a queued delete is applied to a target server that already held the "
+            f"zone (a provider shared with the source group)."
         )
 
 
@@ -639,6 +1094,9 @@ async def commit_move(
             status_code=423,
         )
 
+    if zone.dnssec_enabled:
+        # #1762 — serialise with a concurrent server add to the target.
+        await lock_group(db, target_group.id)
     plan = await assemble_move_plan(db, zone, target_group)
 
     # Hard refusals that no acknowledgement can waive, because none of them
@@ -649,6 +1107,25 @@ async def commit_move(
             f"{plan.dnssec_unsupported_drivers}, which cannot sign. The zone would keep "
             f"reporting as signed while being served unsigned. Unsign it first, or pick a "
             f"group running one of {sorted(DNSSEC_SIGN_DRIVERS)}.",
+            status_code=422,
+        )
+    if plan.tsig_algorithm_refusal:
+        raise ZoneMoveError(plan.tsig_algorithm_refusal, status_code=422)
+    if plan.forward_transport_refusal:
+        raise ZoneMoveError(plan.forward_transport_refusal, status_code=422)
+    if plan.technitium_acl_refusal:
+        raise ZoneMoveError(plan.technitium_acl_refusal, status_code=422)
+    if plan.technitium_api_refusal:
+        # #1784 — refused, not warned: the zone would read as configured on
+        # a server that ignores the config. Derived in the plan so the
+        # preview shows the same refusal.
+        raise ZoneMoveError(plan.technitium_api_refusal, status_code=422)
+    if plan.dnssec_signed and plan.dnssec_target_signers > 1:
+        raise ZoneMoveError(
+            f"This zone is DNSSEC-signed and '{target_group.name}' has "
+            f"{plan.dnssec_target_signers} DNS servers; each would sign it with its own "
+            f"keys, so resolvers would see DNSKEYs the published DS does not match "
+            f"(#1762). Unsign it first, or pick a group with a single DNS server.",
             status_code=422,
         )
     if plan.acl_names_lost:
@@ -671,6 +1148,8 @@ async def commit_move(
         )
     if plan.name_collision:
         where = f"view '{plan.zone_view_from}'" if plan.zone_view_to_id is not None else "no view"
+        if plan.name_collision_views:
+            where = "view(s) " + ", ".join(f"'{v}'" for v in plan.name_collision_views)
         raise ZoneMoveError(
             f"Group '{target_group.name}' already has a zone named '{zone.name}' in {where}. "
             f"Delete or rename it first.",
@@ -777,6 +1256,8 @@ async def commit_move(
 
     # ── Purge state belonging to the old group ────────────────────────
     await db.execute(sa_delete(DNSServerZoneState).where(DNSServerZoneState.zone_id == zone.id))
+    # #2654 — the old group's servers' DDNS ingest reports for this zone.
+    await db.execute(sa_delete(DNSIngestSnapshot).where(DNSIngestSnapshot.zone_id == zone.id))
     await sweep_zone_ops(db, zone, old_group_id)
     # DNSSEC key state is a read-only mirror of what the OLD group's agents
     # reported. The target signs from scratch, so leaving it would show the
@@ -796,14 +1277,4 @@ async def commit_move(
 
     collect_wake(dns_group_channel(old_group_id), dns_group_channel(target_group.id))
 
-    logger.info(
-        "dns_zone_moved_group",
-        zone_id=str(zone.id),
-        zone_name=zone.name,
-        old_group_id=str(old_group_id),
-        new_group_id=str(target_group.id),
-        records_widened=plan.records_widened,
-        acl_keys_lost=len(plan.acl_keys_lost),
-        dnssec_signed=plan.dnssec_signed,
-    )
     return plan

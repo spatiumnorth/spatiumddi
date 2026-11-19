@@ -9,11 +9,14 @@ from typing import Any
 import httpx
 import structlog
 
-from . import __version__
+from . import __version__, features
+from .bootstrap import reauthenticate, retry_host_register
 from .cache import save_token
 from .config import AgentConfig
 from .config_apply import ApplyStatus
 from .drivers.base import DriverBase
+from .instance import AGENT_INSTANCE, AGENT_INSTANCE_HEADER
+from .oom_watch import cgroup_memory_limit_bytes
 from .spool import SpoolManager
 
 log = structlog.get_logger(__name__)
@@ -41,7 +44,7 @@ class HeartbeatClient:
         # assigns itself in). Its ``as_dict()`` rides the heartbeat's
         # ``config`` field so the control plane can tell a server that is up
         # but running a REVERTED config apart from one that converged.
-        # Defaults to a healthy ApplyStatus so a heartbeat sent before the
+        # Defaults to an empty ("nothing applied yet", #2258) ApplyStatus so a heartbeat sent before the
         # first sync doesn't report a failure that hasn't happened.
         self.config_apply: ApplyStatus = ApplyStatus()
         self.failed_ops_count = 0
@@ -61,6 +64,9 @@ class HeartbeatClient:
         # against an old control plane into a stale server. Mirrors the DHCP
         # agent's fallback.
         self._spool_field_unsupported = False
+        # #3551 — same fallback for the memory limit, which a control plane
+        # older than #3551 also refuses (extra="forbid").
+        self._memory_field_unsupported = False
 
     # A failing probe must not be retried forever. Unlike the DHCP agent's
     # ``_kea_version``, which polls a control socket that is legitimately down
@@ -99,13 +105,41 @@ class HeartbeatClient:
     def stop(self) -> None:
         self._stop.set()
 
-    def _client(self) -> httpx.Client:
+    def _client(self, timeout: float = 15.0) -> httpx.Client:
         verify = self.cfg.httpx_verify()
         return httpx.Client(
-            base_url=self.cfg.control_plane_url, verify=verify, timeout=15.0
+            base_url=self.cfg.control_plane_url,
+            verify=verify,
+            timeout=timeout,
+            headers=features.headers(),
         )
 
-    def send_once(self) -> None:
+    def _auth_headers(self) -> dict[str, str]:
+        # #2044 — the process id, so the control plane can keep a displaced
+        # process's daemon / config reports off the server row.
+        return {
+            "Authorization": f"Bearer {self.token_ref[0]}",
+            AGENT_INSTANCE_HEADER: AGENT_INSTANCE,
+        }
+
+    def announce(self) -> None:
+        """Name this process to the control plane before the boot apply (#4139).
+
+        The first heartbeat of a new process, sent before the sync loop's
+        bootstrap apply (1.4 s to a minute when a zone will not load). Its
+        ``X-Spatium-Agent-Instance`` makes the control plane take the server
+        over from the previous process and retire that process's stale ``ok``
+        now, instead of at the first config poll, which comes only after the
+        boot apply. Best effort and short: with the control plane down the
+        agent boots from its cache at once (non-negotiable #5), and a control
+        plane that predates this simply records an ordinary heartbeat.
+        """
+        try:
+            self.send_once(announce=True)
+        except Exception as exc:  # noqa: BLE001 — never costs the boot
+            log.warning("dns_agent_announce_failed", error=str(exc))
+
+    def send_once(self, *, announce: bool = False) -> None:
         # #1232 — a snapshot, and only what it holds is removed on success.
         # The sync thread appends acks while this request is in flight, and
         # ``pending_acks.clear()`` after the response dropped any ack appended
@@ -125,7 +159,7 @@ class HeartbeatClient:
             # performs a one-way LMDB schema migration, so the operator has to
             # be told before they press Start. None = probe failed; the control
             # plane must treat that as "unknown", never as a specific version.
-            "daemon_version": self._daemon_version(),
+            "daemon_version": None if announce else self._daemon_version(),
             "daemon": self.daemon_status,
             # #882 — last config-apply verdict. Before #882 this field was
             # sent as a literal ``{}``: declared on the server's request
@@ -139,27 +173,47 @@ class HeartbeatClient:
                 body["spool"] = self.spool_manager.status()
             except Exception as exc:  # noqa: BLE001 — telemetry must never cost liveness
                 log.warning("heartbeat_spool_status_failed", error=str(exc))
+        # #3551 — the container's memory limit (None = no limit), which named
+        # and this agent share. The control plane compares its estimate of
+        # the group's named memory against it and warns before an OOM loop.
+        if not self._memory_field_unsupported:
+            body["memory_limit_bytes"] = cgroup_memory_limit_bytes()
         # #170 Wave C1 — slot / deployment / upgrade-state telemetry
         # used to ship here per Phase 8f-2; now lives on the
         # supervisor's heartbeat (one producer instead of three).
         # The DNS service container drops the host bind mounts in C1
         # so it can no longer read those signals anyway.
+        sent_token = self.token_ref[0]
         try:
-            with self._client() as c:
+            with (self._client(timeout=3.0) if announce else self._client()) as c:
                 resp = c.post(
                     "/api/v1/dns/agents/heartbeat",
                     json=body,
-                    headers={"Authorization": f"Bearer {self.token_ref[0]}"},
+                    headers=self._auth_headers(),
                 )
-                if resp.status_code == 422 and "spool" in body and "spool" in resp.text:
-                    log.warning("heartbeat_spool_field_unsupported")
-                    self._spool_field_unsupported = True
-                    body.pop("spool")
-                    resp = c.post(
-                        "/api/v1/dns/agents/heartbeat",
-                        json=body,
-                        headers={"Authorization": f"Bearer {self.token_ref[0]}"},
-                    )
+                # An older control plane refuses each newer optional field
+                # by name; drop the ones it names and retry once.
+                if resp.status_code == 422:
+                    dropped = False
+                    if "spool" in body and "spool" in resp.text:
+                        log.warning("heartbeat_spool_field_unsupported")
+                        self._spool_field_unsupported = True
+                        body.pop("spool")
+                        dropped = True
+                    if (
+                        "memory_limit_bytes" in body
+                        and "memory_limit_bytes" in resp.text
+                    ):
+                        log.warning("heartbeat_memory_field_unsupported")
+                        self._memory_field_unsupported = True
+                        body.pop("memory_limit_bytes")
+                        dropped = True
+                    if dropped:
+                        resp = c.post(
+                            "/api/v1/dns/agents/heartbeat",
+                            json=body,
+                            headers=self._auth_headers(),
+                        )
             if resp.status_code == 200:
                 data = resp.json()
                 del self.pending_acks[: len(acks)]
@@ -169,15 +223,10 @@ class HeartbeatClient:
                     save_token(self.cfg.state_dir, rotated)
                     log.info("dns_agent_token_rotated")
             elif resp.status_code in (401, 404):
-                # Issue #248 — mirror sync.py's 401/404 recovery path.
-                # 401 = token expired / invalid; 404 = the server row
-                # was deleted on the control plane. Both recover by
-                # the same path: drop cached token + stop the thread.
-                # The supervisor's dead-thread watch exits the
-                # container; the next start re-bootstraps from PSK.
-                # Pre-#248 the heartbeat just spam-warned until sync
-                # noticed the same 401 (could be a full heartbeat
-                # interval later).
+                # Issue #248 / #2052 — 401 = token expired / invalid; 404 =
+                # the server row was deleted. Re-register from the PSK in
+                # this thread; stopping it would have the supervisor exit the
+                # container and stop the daemon that is serving from cache.
                 log.warning(
                     "heartbeat_will_rebootstrap",
                     status=resp.status_code,
@@ -185,8 +234,7 @@ class HeartbeatClient:
                         "token_invalid" if resp.status_code == 401 else "server_missing"
                     ),
                 )
-                save_token(self.cfg.state_dir, "")
-                self._stop.set()
+                reauthenticate(self.cfg, self.token_ref, sent_token)
             else:
                 log.warning("heartbeat_failed", status=resp.status_code)
         except httpx.HTTPError as e:
@@ -195,6 +243,12 @@ class HeartbeatClient:
     def run(self) -> None:
         while not self._stop.is_set():
             self.send_once()
+            try:
+                # #3757 — repeat a host registration an older control plane
+                # did not acknowledge; a no-op unless one is armed and due.
+                retry_host_register(self.cfg, self.token_ref)
+            except Exception as exc:  # noqa: BLE001 — never costs the heartbeat
+                log.warning("dns_agent_host_retry_failed", error=str(exc))
             # ±3s jitter on the 30s interval
             interval = self.cfg.heartbeat_interval + random.uniform(-3, 3)
             self._stop.wait(timeout=max(5.0, interval))

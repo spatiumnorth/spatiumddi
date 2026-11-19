@@ -19,25 +19,28 @@ from sqlalchemy import text as sa_text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.deps import DB, CurrentUser, ensure_superadmin
 from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp._failover_schemas import ScopeServingResponse
+from app.api.v1.dhcp.phone_profiles import refuse_scope_removal_orphaning_classes
+from app.api.v1.dhcp.pxe_profiles import refuse_if_pxe_pools_lose_class
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
-from app.models.dhcp import DHCPScope, DHCPServer, DHCPServerGroup
+from app.core.update_nulls import changed_keys, snapshot
+from app.models.dhcp import DHCPPXEProfile, DHCPScope, DHCPServer, DHCPServerGroup
 from app.models.ipam import Subnet
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteScopeArgs
 from app.services.approvals.gate import gate_or_execute
+from app.services.dhcp.option_spelling import group_raw_codes
 from app.services.dhcp.option_validation import (
     RAW_CODES_KEA,
-    RAW_CODES_NONE,
-    RAW_CODES_WINDOWS,
     changes_raw_code,
     normalize_options,
     option_key_code,
     validate_options,
 )
+from app.services.dhcp.radvd import validate_ra_interface
 from app.services.dhcp.windows_failover_report import scope_serving_report
 from app.services.dhcp.windows_writethrough import (
     WindowsPlacement,
@@ -47,7 +50,6 @@ from app.services.tags import apply_tag_filter
 
 router = APIRouter(tags=["dhcp"], dependencies=[Depends(require_resource_permission("dhcp_scope"))])
 
-VALID_HOSTNAME_POLICIES = {"client", "server_name", "derived", "none"}
 VALID_SYNC_MODES = {"disabled", "on_lease", "on_static_only", "ipam", "learned"}
 # Fields on ScopeUpdate an explicit ``null`` may CLEAR (#475). Every other
 # nullable column keeps its ``exclude_none`` behaviour — a stray null is dropped
@@ -65,25 +67,6 @@ NULLABLE_CLEARABLE_SCOPE_FIELDS = {
 VALID_V6_MODES = {"stateful", "stateless", "slaac"}
 
 
-async def group_raw_codes(db: AsyncSession, group_id: Any) -> str:
-    """The raw option-code spelling ``group_id``'s servers read (#1296).
-
-    Windows reads ``opt-NN`` and drops ``code:NN``; Kea and FortiGate read
-    ``code:NN`` and drop ``opt-NN``. A group with no servers yet follows Kea:
-    a Windows scope cannot exist without a Windows server to write it to.
-    """
-    if group_id is None:
-        return RAW_CODES_KEA
-    drivers = set(
-        (await db.execute(select(DHCPServer.driver).where(DHCPServer.server_group_id == group_id)))
-        .scalars()
-        .all()
-    )
-    if "windows_dhcp" not in drivers:
-        return RAW_CODES_KEA
-    return RAW_CODES_WINDOWS if drivers == {"windows_dhcp"} else RAW_CODES_NONE
-
-
 async def _group_has_windows(db: AsyncSession, group_id: Any) -> bool:
     """Whether ``group_id`` has a Windows DHCP member (#1480)."""
     if group_id is None:
@@ -95,6 +78,14 @@ async def _group_has_windows(db: AsyncSession, group_id: Any) -> bool:
             .limit(1)
         )
     )
+
+
+def normalize_dhcp_options(raw: Any, *, raw_codes: str = RAW_CODES_KEA) -> dict[str, Any]:
+    """``normalize_options`` for an incoming payload: a repeated option is a 422 (#3614)."""
+    try:
+        return normalize_options(raw, raw_codes=raw_codes)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 async def validate_dhcp_options(
@@ -140,22 +131,34 @@ def _normalize_sync_mode(v: str | None) -> str:
     value, which the old ``<select>`` couldn't render, so edits snapped back
     (#475). The UI now speaks the canonical vocabulary directly; these legacy
     values are still mapped in for backward-compatible API clients. Empty /
-    missing defaults to ``on_static_only`` (the model default).
+    missing defaults to ``on_lease`` (the model default).
     """
     if not v:  # None or ""
-        return "on_static_only"
+        return "on_lease"
     legacy = {"none": "disabled", "ipam": "on_static_only", "learned": "on_lease"}
     return legacy.get(v, v)
 
 
+_SCOPE_DDNS_MOVED = (
+    "DDNS is configured per subnet, not per scope: set it under IPAM -> the "
+    "subnet's DDNS settings (inherited from its block or IP space). A scope's "
+    "DDNS fields have no effect on Kea or on DNS (#2270)."
+)
+
+
 def _check_hostname_policy(v: str | None) -> str:
-    """The one vocabulary for a scope's DDNS hostname policy, on create and on
-    update (#1308). Blank means the model default, ``client``."""
-    if v in (None, ""):
+    """A scope's DDNS hostname policy is inert (#2270), so the only value
+    accepted is the model default, ``client`` (blank means the same). Any other
+    value is refused naming the field, rather than stored and ignored."""
+    if v in (None, "", "client"):
         return "client"
-    if v not in VALID_HOSTNAME_POLICIES:
-        raise ValueError(f"ddns_hostname_policy must be one of {sorted(VALID_HOSTNAME_POLICIES)}")
-    return v
+    raise ValueError(f"ddns_hostname_policy has no effect on a scope. {_SCOPE_DDNS_MOVED}")
+
+
+def _check_scope_ddns_enabled(v: bool | None) -> bool:
+    if v:
+        raise ValueError(f"ddns_enabled has no effect on a scope. {_SCOPE_DDNS_MOVED}")
+    return False
 
 
 # Fields the scope write models accept under two names, as
@@ -311,16 +314,16 @@ class ScopeCreate(BaseModel):
     # different values is refused rather than silently resolved (#774).
     is_active: bool = True
     enabled: bool | None = None
-    lease_time: int = 86400
-    min_lease_time: int | None = None
-    max_lease_time: int | None = None
+    lease_time: int = Field(default=86400, gt=0)
+    min_lease_time: int | None = Field(default=None, gt=0)
+    max_lease_time: int | None = Field(default=None, gt=0)
     # #637 — per-scope Kea lease-cache override; null = inherit the group.
     lease_cache_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     lease_cache_max_age: int | None = Field(default=None, ge=1)
     options: Any = None
     ddns_enabled: bool = False
     ddns_hostname_policy: str | None = "client"
-    hostname_to_ipam_sync: str = "on_static_only"
+    hostname_to_ipam_sync: str = "on_lease"
     hostname_sync_mode: str | None = None
     # When False, this scope's dynamic-pool lease mirrors are excluded from the
     # IPAM↔DNS drift check (ephemeral leases don't read as "out of sync").
@@ -342,6 +345,9 @@ class ScopeCreate(BaseModel):
     # Relay-agent (giaddr) IPs (issue #337) — see DHCPScope.relay_addresses.
     relay_addresses: list[str] = Field(default_factory=list)
     tags: dict[str, Any] = Field(default_factory=dict)
+    # #2705 — the create dialog offers a PXE profile; before this the field
+    # was dropped (``extra: ignore``) and the scope came back without it.
+    pxe_profile_id: uuid.UUID | None = None
     # #1110 — see ``WindowsPlacementIn``. Only consulted when no Windows
     # member holds the scope yet; an existing one stays where it is held.
     windows_placement: WindowsPlacementIn | None = None
@@ -369,6 +375,17 @@ class ScopeCreate(BaseModel):
     def _h(cls, v: str | None) -> str | None:
         return _check_hostname_policy(v)
 
+    @field_validator("ddns_enabled")
+    @classmethod
+    def _ddns(cls, v: bool) -> bool:
+        return _check_scope_ddns_enabled(v)
+
+    @field_validator("ra_interface")
+    @classmethod
+    def _ra_iface(cls, v: str) -> str:
+        v = (v or "").strip()
+        return validate_ra_interface(v) if v else ""
+
     @field_validator("v6_address_mode")
     @classmethod
     def _v6mode(cls, v: str | None) -> str:
@@ -382,6 +399,10 @@ class ScopeCreate(BaseModel):
 class ScopeUpdate(BaseModel):
     model_config = {"extra": "ignore"}
 
+    # #2479 — a scope does not move between groups here. Accepted so a body
+    # that names a DIFFERENT group is refused (422) instead of ignored (the
+    # old ``extra: ignore`` answered 200 and kept the stored group).
+    group_id: uuid.UUID | None = None
     name: str | None = None
     description: str | None = None
     # See ScopeCreate: ``enabled`` is the public name, ``is_active`` the
@@ -389,9 +410,9 @@ class ScopeUpdate(BaseModel):
     # different values is refused instead of silently resolved (#774).
     is_active: bool | None = None
     enabled: bool | None = None
-    lease_time: int | None = None
-    min_lease_time: int | None = None
-    max_lease_time: int | None = None
+    lease_time: int | None = Field(default=None, gt=0)
+    min_lease_time: int | None = Field(default=None, gt=0)
+    max_lease_time: int | None = Field(default=None, gt=0)
     lease_cache_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     lease_cache_max_age: int | None = Field(default=None, ge=1)
     options: Any = None
@@ -445,6 +466,14 @@ class ScopeUpdate(BaseModel):
             self.model_fields_set,
         )
         return self
+
+    @field_validator("ra_interface")
+    @classmethod
+    def _ra_iface(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        return validate_ra_interface(v) if v else ""
 
     @field_validator("v6_address_mode")
     @classmethod
@@ -657,7 +686,7 @@ async def create_scope(
     subnet_id: uuid.UUID,
     body: ScopeCreate,
     db: DB,
-    user: SuperAdmin,
+    user: CurrentUser,
     adopt_existing: bool = False,
 ) -> ScopeResponse:
     """Create a scope.
@@ -726,13 +755,25 @@ async def create_scope(
                 "members."
             ),
         )
-    _create_options = normalize_options(body.options)
+    _validate_lease_times(body.lease_time, body.min_lease_time, body.max_lease_time)
+    _create_options = normalize_dhcp_options(
+        body.options, raw_codes=await group_raw_codes(db, group_id)
+    )
     await validate_dhcp_options(
         db, _create_options, group_id=group_id, address_family=address_family
     )
+    if body.pxe_profile_id is not None:
+        # Same group rule as update_scope (#2650).
+        _pxe = await db.get(DHCPPXEProfile, body.pxe_profile_id)
+        if _pxe is None or _pxe.group_id != group_id:
+            raise HTTPException(
+                status_code=422,
+                detail="PXE profile does not exist in this scope's server group",
+            )
     scope = DHCPScope(
         subnet_id=subnet_id,
         group_id=group_id,
+        pxe_profile_id=body.pxe_profile_id,
         name=(body.name or "").strip(),
         description=(body.description or "").strip(),
         is_active=is_active,
@@ -760,6 +801,7 @@ async def create_scope(
         ra_prefix_autonomous=body.ra_prefix_autonomous,
         ra_interface=body.ra_interface,
         relay_addresses=body.relay_addresses,
+        tags=body.tags,
     )
     db.add(scope)
     # The pre-check above can't see a soft-deleted scope, and even for
@@ -825,12 +867,35 @@ async def get_scope_failover(scope_id: uuid.UUID, db: DB, _: CurrentUser) -> Sco
     return ScopeServingResponse.model_validate(await scope_serving_report(db, scope))
 
 
+def _validate_lease_times(lease: int, min_lease: int | None, max_lease: int | None) -> None:
+    """422 unless ``min <= lease <= max`` (a null min / max is unset).
+
+    Kea refuses the WHOLE config for an out-of-order set, which stops every
+    scope in the group converging, so it has to be refused at save (#2499).
+    """
+    if min_lease is not None and min_lease > lease:
+        raise HTTPException(
+            status_code=422,
+            detail=f"min_lease_time ({min_lease}) must not exceed lease_time ({lease})",
+        )
+    if max_lease is not None and lease > max_lease:
+        raise HTTPException(
+            status_code=422,
+            detail=f"lease_time ({lease}) must not exceed max_lease_time ({max_lease})",
+        )
+    if min_lease is not None and max_lease is not None and min_lease > max_lease:
+        raise HTTPException(
+            status_code=422,
+            detail=f"min_lease_time ({min_lease}) must not exceed max_lease_time ({max_lease})",
+        )
+
+
 @router.put("/scopes/{scope_id}", response_model=ScopeResponse)
 async def update_scope(
     scope_id: uuid.UUID,
     body: ScopeUpdate,
     db: DB,
-    user: SuperAdmin,
+    user: CurrentUser,
     adopt_existing: bool = False,
 ) -> ScopeResponse:
     # ``adopt_existing``: same opt-in as create (#865) — an edit of a scope
@@ -839,6 +904,12 @@ async def update_scope(
     scope = await db.get(DHCPScope, scope_id)
     if scope is None:
         raise HTTPException(status_code=404, detail="Scope not found")
+    if body.group_id is not None and body.group_id != scope.group_id:
+        raise HTTPException(
+            status_code=422,
+            detail="A scope cannot be moved to another DHCP server group; "
+            "delete it and create it in the target group",
+        )
     # ``exclude_unset`` (not ``exclude_none``) so an explicit null can clear a
     # nullable column (e.g. resetting min_lease_time / max_lease_time to empty),
     # while a field the client didn't send stays untouched (#475). But keep a
@@ -858,6 +929,15 @@ async def update_scope(
     # ``is_active`` with the stale ``enabled`` a GET supplied (#774).
     if "enabled" in changes:
         changes["is_active"] = changes.pop("enabled")
+    changes.pop("group_id", None)  # #2479 — equal to the stored group (checked above)
+    # #2499 — judge the MERGED lease triple (stored row under the patch), so a
+    # PUT that only sets max_lease_time cannot break an existing scope.
+    if {"lease_time", "min_lease_time", "max_lease_time"} & changes.keys():
+        _validate_lease_times(
+            changes.get("lease_time", scope.lease_time),
+            changes.get("min_lease_time", scope.min_lease_time),
+            changes.get("max_lease_time", scope.max_lease_time),
+        )
     # Same alias resolution, same guarantee: the write model refuses a body
     # where the two names disagree, so preferring one can no longer shadow a
     # deliberate edit to the other (#774).
@@ -873,23 +953,26 @@ async def update_scope(
             status_code=422,
             detail=f"invalid hostname sync mode: {changes['hostname_to_ipam_sync']}",
         )
-    # #1308 — the same vocabulary as create: the scope dialog offered
-    # ``ipam`` / ``generate``, which create refused with a 422 and this path
-    # stored. Only a CHANGED policy is checked, the way options are (#597,
-    # #1228): the dialog sends the stored policy back with every save, so one
-    # written before this check must not block an unrelated edit.
-    if (
-        "ddns_hostname_policy" in changes
-        and changes["ddns_hostname_policy"] != scope.ddns_hostname_policy
-    ):
-        try:
+    # #2270 — a scope's DDNS fields are inert (DDNS is subnet-level), so a
+    # CHANGE to either is refused with a 422 naming it. Only a change: the
+    # dialog of an older client sends the stored values back on every save, and
+    # a scope created before this check may hold ``ddns_enabled=true``.
+    try:
+        if "ddns_enabled" in changes and changes["ddns_enabled"] != scope.ddns_enabled:
+            _check_scope_ddns_enabled(changes["ddns_enabled"])
+        if (
+            "ddns_hostname_policy" in changes
+            and changes["ddns_hostname_policy"] != scope.ddns_hostname_policy
+        ):
             changes["ddns_hostname_policy"] = _check_hostname_policy(
                 changes["ddns_hostname_policy"]
             )
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     if "options" in changes:
-        normalized = normalize_options(changes["options"])
+        normalized = normalize_dhcp_options(
+            changes["options"], raw_codes=await group_raw_codes(db, scope.group_id)
+        )
         # Validate only options that CHANGED from the stored value (#597
         # review, #1228) — the scope form round-trips the full options dict,
         # so re-validating an unchanged grandfathered value would block an
@@ -907,8 +990,31 @@ async def update_scope(
     # second boolean field to disambiguate. Apply detach first; a
     # later ``pxe_profile_id`` set in the same call (operator
     # detaches one profile and binds another) still wins.
-    if changes.pop("clear_pxe_profile", False):
+    # The audit's before-image, taken ahead of the detach below (which writes
+    # the row directly) so a detach is named as a ``pxe_profile_id`` change.
+    before = snapshot(scope, [*changes, "pxe_profile_id"])
+    _clear_pxe = bool(changes.pop("clear_pxe_profile", False))
+    if scope.pxe_profile_id is not None and (
+        _clear_pxe or changes.get("pxe_profile_id") not in (None, scope.pxe_profile_id)
+    ):
+        # #3388 — the profile's classes are evaluated only in the scopes bound
+        # to it (#2731), so this scope's pools naming one would match no client.
+        _old = await db.get(DHCPPXEProfile, scope.pxe_profile_id)
+        if _old is not None:
+            await refuse_if_pxe_pools_lose_class(
+                db, _old, "unbind this PXE profile from the scope", scope_id=scope.id
+            )
+    if _clear_pxe:
         scope.pxe_profile_id = None
+    if changes.get("pxe_profile_id") is not None:
+        # #2650 — profiles are group-scoped; binding one from another group
+        # would render that group's boot server into this group's agents.
+        _pxe = await db.get(DHCPPXEProfile, changes["pxe_profile_id"])
+        if _pxe is None or _pxe.group_id != scope.group_id:
+            raise HTTPException(
+                status_code=422,
+                detail="PXE profile does not exist in this scope's server group",
+            )
     if "relay_addresses" in changes:
         # Family must match the scope's (subnet-derived) address_family;
         # address_family itself is immutable on update (#337).
@@ -916,6 +1022,10 @@ async def update_scope(
     # #844 — activation is the other door into the rendered config: a scope
     # created inactive (or deactivated to dodge the create-time guard) must
     # pass the same overlapping-CIDR check before it starts rendering.
+    if changes.get("is_active") is False and scope.is_active:
+        # #3388 — a phone class renders only while its profile is attached to
+        # an active scope; another scope's pool may still name it.
+        await refuse_scope_removal_orphaning_classes(db, scope, "deactivate this scope")
     if changes.get("is_active") is True and not scope.is_active:
         subnet = await db.get(Subnet, scope.subnet_id)
         if subnet is not None:
@@ -941,7 +1051,11 @@ async def update_scope(
         resource_type="dhcp_scope",
         resource_id=str(scope.id),
         resource_display=str(scope.id),
-        changed_fields=list(changes.keys()),
+        changed_fields=changed_keys(
+            before,
+            {**changes, "pxe_profile_id": scope.pxe_profile_id},
+            unordered={"relay_addresses"},
+        ),
         new_value=body.model_dump(mode="json", exclude_none=True),
     )
     await db.commit()
@@ -953,7 +1067,7 @@ async def update_scope(
 async def delete_scope(
     scope_id: uuid.UUID,
     db: DB,
-    user: SuperAdmin,
+    user: CurrentUser,
     request: Request,
     permanent: bool = False,
 ) -> Any:
@@ -973,8 +1087,12 @@ async def delete_scope(
     Two-person approval (#62): when the ``governance.approvals`` module is on
     and a ``delete:dhcp_scope`` policy matches, returns ``202`` with a pending
     change-request; otherwise executes inline via ``operation.apply`` exactly
-    as before (route stays SuperAdmin-gated).
+    as before. Gated on ``delete`` on ``dhcp_scope`` by the router (#1861);
+    ``?permanent=true`` stays superadmin-only, as on the IPAM deletes.
     """
+    if permanent:
+        # Refused before a change request could be queued for it.
+        ensure_superadmin(user)
     op = get_operation("delete_scope")
     assert op is not None  # registered at import
     args = DeleteScopeArgs(scope_id=scope_id, permanent=permanent)

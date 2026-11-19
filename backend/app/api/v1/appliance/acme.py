@@ -16,7 +16,13 @@ Two persistence surfaces:
   (``pending``) + enqueues the Celery task that drives the flow; reads
   surface its status + ``last_error``.
 
-Mutations require ``admin`` on ``appliance``; reads accept ``read``.
+Gated on the ``certificate_store`` resource type (#3067) — ``read`` for
+reads, ``write`` for the account and issuance, ``delete`` for the account
+delete — or on the ``appliance`` grant these routes took before (``read`` /
+``admin``). An issue with ``activate: true`` (the default, which makes the
+new cert the Web UI certificate) also needs ``admin`` on ``appliance``, as
+does re-pointing or deleting the account on an appliance whose Web UI
+certificate it renews.
 Secret material (account key, EAB HMAC) NEVER leaves the server — the
 account responses expose only an ``eab_hmac_set`` boolean. Every mutation
 is audited (mirrors ``appliance/tls.py``).
@@ -24,17 +30,27 @@ is audited (mirrors ``appliance/tls.py``).
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import datetime
+from urllib.parse import urlsplit
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser
+from app.api.v1.appliance.tls import require_web_ui_activation
+from app.config import settings as app_settings
+from app.core.celery_dispatch import dispatch
 from app.core.crypto import encrypt_str
-from app.core.permissions import require_permission
+from app.core.permissions import (
+    RESOURCE_TYPE_APPLIANCE,
+    refuse_and_audit,
+    require_certificate_store,
+    user_has_permission,
+)
 from app.models.acme_client import (
     ACME_CHALLENGE_DNS01,
     ACME_CHALLENGE_HTTP01,
@@ -44,8 +60,11 @@ from app.models.acme_client import (
     ACMEClientAccount,
     ACMEOrder,
 )
+from app.models.appliance import CERT_SOURCE_LETSENCRYPT, ApplianceCertificate
 from app.models.audit import AuditLog
 from app.models.settings import PlatformSettings
+from app.services.api_token_scopes import read_only_post
+from app.services.nettools.schemas import resolve_checked_target
 
 logger = structlog.get_logger(__name__)
 
@@ -84,6 +103,8 @@ class ACMEOrderSummary(BaseModel):
     certificate_id: uuid.UUID | None
     last_error: str | None
     allow_manual: bool
+    # #3067 — whether a successful issue makes the cert the Web UI cert.
+    activate: bool
     # While ``processing`` a manual order, the TXT records the operator
     # must add at their own DNS provider: [{fqdn, record_name, txt_value}].
     manual_challenges: list[dict]
@@ -116,6 +137,7 @@ def _order_summary(row: ACMEOrder) -> ACMEOrderSummary:
         certificate_id=row.certificate_id,
         last_error=row.last_error,
         allow_manual=row.allow_manual,
+        activate=row.activate_on_issue,
         manual_challenges=list(row.manual_challenges or []),
         created_at=row.created_at,
         modified_at=row.modified_at,
@@ -148,6 +170,11 @@ class ACMEIssueRequest(BaseModel):
     # SpatiumDDI does NOT manage (operator adds the TXT at their own
     # provider; the order waits, showing the record, until it appears).
     allow_manual: bool = Field(default=False)
+    # #3067 — make the issued cert the appliance's Web UI certificate (the
+    # behaviour issuance always had, hence the default). That deploys it to
+    # nginx, so it needs ``admin`` on ``appliance``; a certificate-store-only
+    # caller issuing a DoT / DoH / DoQ cert passes ``false``.
+    activate: bool = Field(default=True)
 
 
 class ACMEDomainResolution(BaseModel):
@@ -159,19 +186,43 @@ class ACMEDomainResolution(BaseModel):
     zone_name: str | None  # the managed zone that covers it (if any)
     record_name: str | None  # relative TXT label inside that zone
     driver: str | None  # bind9 / powerdns / cloudflare / route53 / ...
+    # Set when the choice is worth a second look, e.g. a more specific
+    # internal zone also covers the name and was skipped (#1454).
+    note: str | None = None
 
 
 class ACMEPreviewRequest(BaseModel):
     domains: list[str] = Field(min_length=1, max_length=100)
 
 
-def _require_https(directory_url: str) -> str:
+async def _require_https(directory_url: str) -> str:
+    """https only, and not a loopback / link-local / metadata host.
+
+    The host is judged however it is spelled (``localhost``, ``127.1``,
+    ``2130706433``, ``0x7f000001``) and, when it is a name, by what it
+    resolves to. A name that does not resolve here is accepted: the client
+    resolves and checks again on every connection, so the CA may simply not
+    be reachable from where the request is made.
+    """
     cleaned = directory_url.strip()
     if not cleaned.lower().startswith("https://"):
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "directory_url must be an https:// URL",
         )
+    host = urlsplit(cleaned).hostname or ""
+    blocked = HTTPException(
+        status.HTTP_422_UNPROCESSABLE_ENTITY,
+        "directory_url must not point at a loopback, link-local or metadata address",
+    )
+    if not host:
+        raise blocked
+    try:
+        _addr, err = await asyncio.wait_for(resolve_checked_target(host), timeout=5.0)
+    except TimeoutError:
+        return cleaned
+    if err is not None and "blocked range" in err:
+        raise blocked
     return cleaned
 
 
@@ -187,10 +238,57 @@ async def _get_account(db: DB) -> ACMEClientAccount | None:
 # ── Account endpoints ───────────────────────────────────────────────
 
 
+async def _require_admin_if_account_renews_web_ui(
+    db: DB, user: CurrentUser, request: Request, display: str
+) -> None:
+    """Refuse (403, audited) a store-only caller re-pointing or removing the
+    account while it renews the appliance's Web UI certificate (#3067).
+
+    The renewal beat task renews the active Let's Encrypt certificate through
+    this one account and the api deploys the result to nginx. Changing the CA
+    (directory URL, EAB binding) or deleting the account therefore decides what
+    the Web UI serves next, or lets it expire — appliance administration, not
+    certificate-store work. Off an appliance nothing serves ``is_active``, and
+    with no active Let's Encrypt cert the account renews nothing that nginx
+    serves, so ``certificate_store`` alone is enough there.
+    """
+    if not app_settings.appliance_mode:
+        return
+    if user_has_permission(user, "admin", RESOURCE_TYPE_APPLIANCE):
+        return
+    renews_web_ui = (
+        await db.execute(
+            select(ApplianceCertificate.id)
+            .where(
+                ApplianceCertificate.is_active.is_(True),
+                ApplianceCertificate.source == CERT_SOURCE_LETSENCRYPT,
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if renews_web_ui is None:
+        return
+    await refuse_and_audit(
+        db,
+        user,
+        request,
+        action="update_acme_account",
+        resource_type="acme_client_account",
+        resource_id="",
+        resource_display=display,
+        reason="permission denied (admin on appliance)",
+        detail=(
+            "This ACME account renews the appliance's Web UI certificate. "
+            "Changing its CA or EAB binding, or deleting it, needs 'admin' on "
+            "'appliance'."
+        ),
+    )
+
+
 @router.get(
     "/account",
     response_model=ACMEAccountSummary | None,
-    dependencies=[Depends(require_permission("read", "appliance"))],
+    dependencies=[Depends(require_certificate_store("read"))],
     summary="Get the ACME account (no key material)",
 )
 async def get_account(db: DB) -> ACMEAccountSummary | None:
@@ -201,13 +299,14 @@ async def get_account(db: DB) -> ACMEAccountSummary | None:
 @router.put(
     "/account",
     response_model=ACMEAccountSummary,
-    dependencies=[Depends(require_permission("admin", "appliance"))],
+    dependencies=[Depends(require_certificate_store("write"))],
     summary="Create or update the ACME account",
 )
 async def upsert_account(
     body: ACMEAccountUpsert,
     db: DB,
     user: CurrentUser,
+    request: Request,
 ) -> ACMEAccountSummary:
     """Upsert the install's ACME account.
 
@@ -217,24 +316,22 @@ async def upsert_account(
     first order. Changing ``directory_url`` on an existing row clears the
     cached ``account_url`` so the next order re-registers at the new CA.
     """
-    directory_url = _require_https(body.directory_url)
+    directory_url = await _require_https(body.directory_url)
 
     row = await _get_account(db)
     action = "update" if row is not None else "create"
+    if row is not None and (
+        row.directory_url != directory_url or row.eab_kid != body.eab_kid or body.eab_hmac_b64
+    ):
+        await _require_admin_if_account_renews_web_ui(db, user, request, row.directory_url)
 
     if row is None:
-        # Generate a fresh EC-P256 account key. Done lazily here (not in
-        # the engine) so the encrypted key is durable before any CA
+        # Generate a fresh EC-P256 account key. Done here (not in the
+        # orchestrator) so the encrypted key is durable before any CA
         # round-trip — a re-run of the order reuses the same account.
-        from cryptography.hazmat.primitives import serialization  # noqa: PLC0415
-        from cryptography.hazmat.primitives.asymmetric import ec  # noqa: PLC0415
+        from app.services.acme_client.engine import generate_account_key_pem  # noqa: PLC0415
 
-        account_key = ec.generate_private_key(ec.SECP256R1())
-        account_key_pem = account_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption(),
-        ).decode("utf-8")
+        account_key_pem = generate_account_key_pem()
         row = ACMEClientAccount(
             directory_url=directory_url,
             email=body.email,
@@ -294,13 +391,14 @@ async def upsert_account(
 @router.delete(
     "/account",
     status_code=status.HTTP_204_NO_CONTENT,
-    dependencies=[Depends(require_permission("admin", "appliance"))],
+    dependencies=[Depends(require_certificate_store("delete"))],
     summary="Delete the ACME account",
 )
-async def delete_account(db: DB, user: CurrentUser) -> None:
+async def delete_account(db: DB, user: CurrentUser, request: Request) -> None:
     row = await _get_account(db)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no ACME account configured")
+    await _require_admin_if_account_renews_web_ui(db, user, request, row.directory_url)
     account_id = row.id
     directory_url = row.directory_url
     # Removing the account is the operator's opt-out — clear the issuance
@@ -333,14 +431,16 @@ async def delete_account(db: DB, user: CurrentUser) -> None:
 @router.post(
     "/preview",
     response_model=list[ACMEDomainResolution],
-    dependencies=[Depends(require_permission("read", "appliance"))],
+    dependencies=[Depends(require_certificate_store("read"))],
     summary="Preview how each domain's DNS-01 challenge would be solved",
 )
+@read_only_post
 async def preview_domains(body: ACMEPreviewRequest, db: DB) -> list[ACMEDomainResolution]:
     """For each domain, report whether a SpatiumDDI-managed zone covers it
     (auto-solve, incl. cloud-hosted zones via the agentless drivers) or
     whether it needs the manual TXT fallback. Drives the Issue modal's
-    per-domain status table."""
+    per-domain status table. Read-only: nothing is written and no CA or
+    DNS provider is contacted."""
     from app.services.acme_client import dns01  # noqa: PLC0415
 
     out: list[ACMEDomainResolution] = []
@@ -349,6 +449,12 @@ async def preview_domains(body: ACMEPreviewRequest, db: DB) -> list[ACMEDomainRe
         if not domain:
             continue
         match = await dns01.resolve_managed(db, domain)
+        note = None
+        if match is not None and match.skipped_zone_name:
+            note = (
+                f"internal zone {match.skipped_zone_name} also covers this name; "
+                f"the TXT goes into the public zone {match.zone_name} instead"
+            )
         out.append(
             ACMEDomainResolution(
                 domain=domain,
@@ -357,6 +463,7 @@ async def preview_domains(body: ACMEPreviewRequest, db: DB) -> list[ACMEDomainRe
                 zone_name=match.zone_name if match else None,
                 record_name=match.record_name if match else None,
                 driver=match.driver if match else None,
+                note=note,
             )
         )
     return out
@@ -369,13 +476,14 @@ async def preview_domains(body: ACMEPreviewRequest, db: DB) -> list[ACMEDomainRe
     "/issue",
     response_model=ACMEOrderSummary,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(require_permission("admin", "appliance"))],
+    dependencies=[Depends(require_certificate_store("write"))],
     summary="Request a certificate via Let's Encrypt (DNS-01)",
 )
 async def issue_certificate(
     body: ACMEIssueRequest,
     db: DB,
     user: CurrentUser,
+    request: Request,
 ) -> ACMEOrderSummary:
     """Create a ``pending`` ACME order + enqueue the issuance task.
 
@@ -384,6 +492,8 @@ async def issue_certificate(
     DNS-01 flow off the request thread; poll ``GET /orders/{id}`` for
     progress (``processing`` → ``valid`` / ``invalid``).
     """
+    if body.activate:
+        await require_web_ui_activation(db, user, request, ", ".join(body.domains))
     if body.challenge_type == ACME_CHALLENGE_TLSALPN01:
         # tls-alpn-01 needs a per-challenge ``acme-tls/1`` cert served on
         # :443 — the nginx/k3s appliance terminates TLS itself and can't
@@ -426,17 +536,20 @@ async def issue_certificate(
         challenge_type=body.challenge_type,
         dns_provider=body.dns_provider,
         allow_manual=body.allow_manual,
+        activate_on_issue=body.activate,
         status=ACME_ORDER_PENDING,
     )
     db.add(order)
     await db.flush()
 
-    # Record the desired issuance shape so the deferred Phase-2 auto-renew
-    # task knows what to renew (these columns are populated here, consumed
-    # by that task).
-    settings.acme_challenge_type = body.challenge_type
-    settings.acme_dns_provider = body.dns_provider
-    settings.acme_domains = domains
+    # NOTE (#1529): the issuance shape is deliberately NOT recorded on
+    # ``platform_settings`` here. These settings used to be written at
+    # order *creation*, so a later issue attempt for different domains —
+    # even one that failed — changed what the active cert would be
+    # renewed for. The shape now lives on the order itself; the
+    # orchestrator copies it to settings only when an order SUCCEEDS,
+    # and the renewal sweep reads the per-certificate shape from the
+    # successful order that produced the cert.
 
     db.add(
         AuditLog(
@@ -463,7 +576,7 @@ async def issue_certificate(
     # include list and task_routes so this dispatch can't silently fail).
     from app.tasks.acme import run_acme_order  # noqa: PLC0415
 
-    run_acme_order.delay(str(order.id))
+    await dispatch(run_acme_order, str(order.id))
     logger.info(
         "acme_client_order_enqueued",
         order_id=str(order.id),
@@ -475,7 +588,7 @@ async def issue_certificate(
 @router.get(
     "/orders",
     response_model=list[ACMEOrderSummary],
-    dependencies=[Depends(require_permission("read", "appliance"))],
+    dependencies=[Depends(require_certificate_store("read"))],
     summary="List ACME orders (newest first)",
 )
 async def list_orders(db: DB) -> list[ACMEOrderSummary]:
@@ -486,7 +599,7 @@ async def list_orders(db: DB) -> list[ACMEOrderSummary]:
 @router.get(
     "/orders/{order_id:uuid}",
     response_model=ACMEOrderSummary,
-    dependencies=[Depends(require_permission("read", "appliance"))],
+    dependencies=[Depends(require_certificate_store("read"))],
     summary="Get one ACME order",
 )
 async def get_order(order_id: uuid.UUID, db: DB) -> ACMEOrderSummary:
@@ -499,7 +612,7 @@ async def get_order(order_id: uuid.UUID, db: DB) -> ACMEOrderSummary:
 @router.post(
     "/orders/{order_id:uuid}/cancel",
     response_model=ACMEOrderSummary,
-    dependencies=[Depends(require_permission("admin", "appliance"))],
+    dependencies=[Depends(require_certificate_store("write"))],
     summary="Cancel an in-flight ACME order",
 )
 async def cancel_order(

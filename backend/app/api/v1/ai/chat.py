@@ -21,12 +21,13 @@ from datetime import UTC, datetime
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import desc, select
 
 from app.api.deps import DB, CurrentUser
+from app.api.stream_auth import StreamAuthGuard
 from app.core.responses import EventStreamResponse
 from app.models.ai import (
     AIChatMessage,
@@ -285,7 +286,9 @@ def _sse_frame(event_kind: str, data: dict[str, Any]) -> bytes:
     response_class=EventStreamResponse,
     responses={200: {"description": "Server-sent event stream of the assistant's reply"}},
 )
-async def chat(body: ChatTurnRequest, current_user: CurrentUser, db: DB) -> StreamingResponse:
+async def chat(
+    body: ChatTurnRequest, request: Request, current_user: CurrentUser, db: DB
+) -> StreamingResponse:
     """Stream one turn of the chat conversation back as SSE events.
 
     Frontend opens an ``EventSource`` (or fetch with ``ReadableStream``)
@@ -364,11 +367,19 @@ async def chat(body: ChatTurnRequest, current_user: CurrentUser, db: DB) -> Stre
         initial_context=body.initial_context,
     )
 
+    # Re-validated on a bounded cadence while the turn streams; a caller
+    # signed out or disabled mid-turn gets an ``error`` frame and the end.
+    guard = StreamAuthGuard(request, permission=None)
+
     async def _stream():
+        events = orchestrator.stream_turn(session=session_row, user_text=body.message)
         try:
-            async for event in orchestrator.stream_turn(
-                session=session_row, user_text=body.message
-            ):
+            async for event in events:
+                if not await guard.still_authorized():
+                    yield _sse_frame(
+                        "error", {"message": "Session ended — sign in again to continue."}
+                    )
+                    return
                 yield _sse_frame(event.kind, event.data)
         except Exception:  # noqa: BLE001
             # Log full exception server-side; surface a generic message
@@ -381,6 +392,8 @@ async def chat(body: ChatTurnRequest, current_user: CurrentUser, db: DB) -> Stre
                 "error",
                 {"message": "Chat stream failed — see server logs for details."},
             )
+        finally:
+            await events.aclose()
 
     return StreamingResponse(
         _stream(),

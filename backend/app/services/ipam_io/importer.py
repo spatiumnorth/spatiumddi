@@ -35,7 +35,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.dns_names import validate_hostname
 from app.models.audit import AuditLog
 from app.models.ipam import IP_STATUSES, IPAddress, IPBlock, IPSpace, Subnet
+from app.services.ipam.address_create_rules import boundary_address_refusal
 from app.services.ipam.resize import _total_ips
+from app.services.ipam.subnet_placeholders import (
+    add_gateway_row,
+    boundary_rows,
+    create_placeholder_rows,
+    find_untouched_gateway_row,
+    gateway_target_problem,
+    has_boundary_rows,
+    holds_placeholder_rows,
+    subnet_kind_for,
+)
 from app.services.ipam_io.parser import ParsedPayload
 
 logger = structlog.get_logger(__name__)
@@ -181,6 +192,50 @@ def _first_overlap(
     return None
 
 
+def _subnet_gateway(
+    canonical: str, gateway: Any, net: ipaddress.IPv4Network | ipaddress.IPv6Network, kind: str
+) -> tuple[str | None, str | None]:
+    """``(normalised gateway, error)`` for an imported subnet's gateway, by the
+    rule New Subnet applies. Shared by preview and commit so the preview names
+    the row commit refuses (#495). The gateway must be an address inside the
+    subnet (#504), and not the network / broadcast address the subnet's own
+    rows hold (#2979), which a gateway row would collide with."""
+    if gateway is None:
+        return None, None
+    try:
+        gw_addr = ipaddress.ip_address(str(gateway).strip())
+    except ValueError:
+        return None, f"{canonical}: invalid gateway {gateway!r}"
+    if gw_addr not in net:
+        return None, f"{canonical}: gateway {gateway} is not within the subnet"
+    if gw_addr in {ipaddress.ip_address(a) for a, _s, _d in boundary_rows(net, kind)}:
+        return None, f"{canonical}: gateway {gateway} is the subnet's network or broadcast address"
+    return str(gw_addr), None
+
+
+def _gateway_moves(existing: Subnet, gateway: str | None) -> bool:
+    """``overwrite`` changes ``existing``'s stored gateway (a blank cell keeps it)."""
+    if not gateway:
+        return False
+    if existing.gateway is None:
+        return True
+    return ipaddress.ip_address(str(existing.gateway)) != ipaddress.ip_address(gateway)
+
+
+async def _overwrite_gateway_problem(
+    db: AsyncSession, existing: Subnet, canonical: str, gateway: str | None
+) -> str | None:
+    """Why ``overwrite`` cannot move ``existing``'s gateway onto ``gateway``, as
+    Edit Subnet refuses it (#3317): a host, a lease or a discovered row already
+    holds the address. Shared by preview and commit (#495)."""
+    if gateway is None or not _gateway_moves(existing, gateway):
+        return None
+    if not await holds_placeholder_rows(db, existing):
+        return None
+    problem = await gateway_target_problem(db, existing, gateway)
+    return f"{canonical}: {problem}" if problem else None
+
+
 # ── Preview ────────────────────────────────────────────────────────────────────
 
 
@@ -245,7 +300,18 @@ async def preview_import(
         seen_networks.add(canonical)
 
         subnet_net = ipaddress.ip_network(canonical, strict=False)
+        subnet_kind = subnet_kind_for(subnet_net)
         name = str(row.get("name") or "")
+        _gw, gw_error = _subnet_gateway(
+            canonical, row.get("gateway") or None, subnet_net, subnet_kind
+        )
+        if gw_error is not None:
+            preview.errors.append(
+                DiffRow(
+                    kind="subnet", action="error", network=canonical, reason=gw_error, details=row
+                )
+            )
+            continue
 
         # Parent block detection
         parent = _find_parent_block(subnet_net, existing_blocks)
@@ -306,6 +372,18 @@ async def preview_import(
         }
         diff_details = {"old": old_snapshot, "new": {**row, "network": canonical}}
         if strategy == "overwrite":
+            gw_target_error = await _overwrite_gateway_problem(db, existing, canonical, _gw)
+            if gw_target_error is not None:
+                preview.errors.append(
+                    DiffRow(
+                        kind="subnet",
+                        action="error",
+                        network=canonical,
+                        reason=gw_target_error,
+                        details=row,
+                    )
+                )
+                continue
             preview.updates.append(
                 DiffRow(
                     kind="subnet",
@@ -377,6 +455,17 @@ async def commit_import(
 
     existing_blocks = await _load_existing_blocks(db, space.id)
     existing_subnets = await _load_existing_subnets(db, space.id)
+    # Subnets created and the blocks they sit in, recounted once at the end
+    # in batches (#2981), not per row.
+    created_subnet_ids: list[uuid.UUID] = []
+    # Existing subnets whose gateway row ``overwrite`` moved (#3317).
+    recount_subnet_ids: list[uuid.UUID] = []
+    touched_blocks: set[uuid.UUID] = set()
+    from app.api.v1.ipam.router import (  # local import — avoid cycle
+        _sync_dns_record,
+        _update_blocks_utilization,
+        _update_subnets_utilization,
+    )
 
     # Pre-flight: if fail-strategy and any subnet conflicts, bail out early —
     # BEFORE the mutation loop runs any side effects. Catches both pre-existing
@@ -416,26 +505,19 @@ async def commit_import(
             continue
 
         subnet_net = ipaddress.ip_network(canonical, strict=False)
+        subnet_kind = subnet_kind_for(subnet_net)
         name = str(row.get("name") or "")
         description = str(row.get("description") or "")
         vlan_id = row.get("vlan_id")
         vxlan_id = row.get("vxlan_id")
-        gateway = row.get("gateway") or None
         # Validate the gateway before it reaches the INET column — a malformed
-        # literal would otherwise raise a DataError → 500 mid-commit (#504) —
-        # and enforce the same in-subnet / same-family invariant create_subnet
-        # applies, so the importer can't land a Subnet later endpoints assume
-        # is valid (Copilot review of #504).
-        if gateway is not None:
-            try:
-                gw_addr = ipaddress.ip_address(str(gateway).strip())
-            except ValueError:
-                result_obj.errors.append(f"{canonical}: invalid gateway {gateway!r}")
-                continue
-            if gw_addr not in subnet_net:
-                result_obj.errors.append(f"{canonical}: gateway {gateway} is not within the subnet")
-                continue
-            gateway = str(gw_addr)
+        # literal would otherwise raise a DataError → 500 mid-commit (#504).
+        gateway, gw_error = _subnet_gateway(
+            canonical, row.get("gateway") or None, subnet_net, subnet_kind
+        )
+        if gw_error is not None:
+            result_obj.errors.append(gw_error)
+            continue
         custom_fields = row.get("custom_fields") or {}
 
         existing = existing_subnets.get(canonical)
@@ -444,6 +526,18 @@ async def commit_import(
                 result_obj.skipped += 1
                 continue
             if strategy == "overwrite":
+                gw_target_error = await _overwrite_gateway_problem(db, existing, canonical, gateway)
+                if gw_target_error is not None:
+                    result_obj.errors.append(gw_target_error)
+                    continue
+                # A moved gateway takes New Subnet's reserved row and the old
+                # untouched placeholder goes, as on Edit Subnet (#3317).
+                moves_gateway_row = _gateway_moves(
+                    existing, gateway
+                ) and await holds_placeholder_rows(db, existing)
+                old_gateway_row = (
+                    await find_untouched_gateway_row(db, existing) if moves_gateway_row else None
+                )
                 old = {
                     "name": existing.name,
                     "description": existing.description,
@@ -457,8 +551,18 @@ async def commit_import(
                     existing.vlan_id = vlan_id
                 if vxlan_id is not None:
                     existing.vxlan_id = vxlan_id
+                if old_gateway_row is not None:
+                    await _sync_dns_record(db, old_gateway_row, existing, action="delete")
+                    await db.delete(old_gateway_row)
+                    await db.flush()
                 if gateway:
                     existing.gateway = gateway
+                if moves_gateway_row and gateway:
+                    await add_gateway_row(
+                        db, existing, gateway, created_by_user_id=current_user.id, user=current_user
+                    )
+                    recount_subnet_ids.append(existing.id)
+                    touched_blocks.add(existing.block_id)
                 if custom_fields:
                     merged = dict(existing.custom_fields or {})
                     merged.update(custom_fields)
@@ -557,6 +661,7 @@ async def commit_import(
             vxlan_id=vxlan_id,
             gateway=gateway,
             status="active",
+            kind=subnet_kind,
             total_ips=total,
             allocated_ips=0,
             utilization_percent=0.0,
@@ -565,6 +670,19 @@ async def commit_import(
         db.add(subnet)
         await db.flush()
         existing_subnets[canonical] = subnet
+        # The rows New Subnet makes (network, broadcast, gateway), so the
+        # counters and Next available never depend on which path created the
+        # subnet (#2979).
+        if has_boundary_rows(subnet_net, subnet_kind):
+            await create_placeholder_rows(
+                db,
+                subnet,
+                subnet_net,
+                gateway=gateway,
+                created_by_user_id=current_user.id,
+            )
+        created_subnet_ids.append(subnet.id)
+        touched_blocks.add(parent.id)
         db.add(
             _audit_entry(
                 current_user,
@@ -582,6 +700,13 @@ async def commit_import(
             )
         )
         result_obj.created_subnets += 1
+
+    # The counters follow the rows just made (#2412 / #2981): one grouped
+    # recount of the new subnets, then every block on their chains once.
+    await db.flush()
+    await _update_subnets_utilization(db, created_subnet_ids + recount_subnet_ids)
+    await db.flush()
+    await _update_blocks_utilization(db, touched_blocks)
 
     logger.info(
         "ipam_import_committed",
@@ -636,6 +761,13 @@ class AddressImportResult:
     # (subnet-wide nor any covering address set) — #103 delegation.
     skipped_no_perm: int = 0
     dns_synced: int = 0
+    # #1628 — rows whose DHCP reservation the server-side sync created or
+    # updated, and the rows it could not mirror (no scope, several
+    # candidate scopes, or a conflicting reservation). Mirrors the
+    # router's per-row ``dhcp_static_warning`` so an import reports the
+    # same outcome a UI/API create would.
+    dhcp_synced: int = 0
+    dhcp_warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
@@ -726,12 +858,86 @@ async def preview_address_import(
     *,
     subnet_id: uuid.UUID,
     strategy: Strategy = "fail",
+    current_user: Any = None,
+    can_write_ip: Callable[[str], bool] | None = None,
 ) -> ImportPreview:
+    """Dry-run of :func:`commit_address_import`.
+
+    ``can_write_ip`` is the same #103 per-address gate the commit takes: a row
+    it refuses is reported as an error (the commit skips it as
+    ``skipped_no_perm``) and the existing row at that address is not shown.
+    """
     subnet = await _load_subnet(db, subnet_id)
     preview = ImportPreview(space_id=str(subnet.id), space_name=str(subnet.network))
 
     subnet_net = ipaddress.ip_network(str(subnet.network), strict=False)
     existing = await _load_existing_addresses(db, subnet.id)
+
+    # #1628 — flag rows that will (or will not) get a DHCP reservation
+    # from the server-side sync at commit, so the preview matches what
+    # commit does: a ``static_dhcp`` row with a MAC syncs only when the
+    # subnet has exactly one matching-family scope. Candidate scopes are
+    # per (subnet, family), so cache them across rows.
+    from app.services.dhcp.static_ipam import (
+        _linked_static_for_row,
+        candidate_scopes_for_ipam_row,
+    )
+
+    scopes_by_family: dict[str, list] = {}
+
+    async def _dhcp_flag(
+        canonical: str, fields: dict[str, Any], existing_ip: IPAddress | None
+    ) -> dict[str, Any]:
+        status = fields.get("status") or (existing_ip.status if existing_ip else None)
+        mac = fields.get("mac_address") or (
+            str(existing_ip.mac_address)
+            if existing_ip is not None and existing_ip.mac_address
+            else None
+        )
+        if status != "static_dhcp" or not mac:
+            return {}
+        # #1629 (GHSA-44ph) — the commit-side sync gates on the acting
+        # user's ``dhcp_static`` grant; preview the same outcome when
+        # the caller is known, or an IPAM-only importer's preview would
+        # promise a reservation commit will refuse.
+        if current_user is not None:
+            from app.core.permissions import user_has_permission  # noqa: PLC0415
+
+            if not user_has_permission(current_user, "write", "dhcp_static"):
+                return {
+                    "dhcp_static_warning": (
+                        "No 'write' permission on DHCP reservations "
+                        "(dhcp_static) — no reservation will be created."
+                    )
+                }
+        # #1629 walk — preview must match commit for a *linked* row:
+        # commit updates the linked reservation in place whatever the
+        # candidate-scope count is (the sync's linked branch never
+        # consults candidate scopes), so a two-scope subnet must not
+        # preview "no reservation will be created" for such a row.
+        if existing_ip is not None and await _linked_static_for_row(db, existing_ip) is not None:
+            return {"dhcp_static_sync": True}
+        family = "ipv6" if ipaddress.ip_address(canonical).version == 6 else "ipv4"
+        if family not in scopes_by_family:
+            probe = IPAddress(subnet_id=subnet.id, address=canonical)
+            scopes_by_family[family] = await candidate_scopes_for_ipam_row(db, probe)
+        scopes = scopes_by_family[family]
+        if len(scopes) == 1:
+            return {"dhcp_static_sync": True}
+        if not scopes:
+            return {
+                "dhcp_static_warning": (
+                    f"No DHCP scope serves {canonical} — no reservation will be "
+                    "created. Create a scope for this subnet to pin the reservation."
+                )
+            }
+        return {
+            "dhcp_static_warning": (
+                f"{len(scopes)} DHCP scopes serve this subnet — not guessing which "
+                f"one should hold the reservation for {canonical}; no reservation "
+                "will be created."
+            )
+        }
 
     seen: set[str] = set()
     for row in payload.addresses:
@@ -780,16 +986,35 @@ async def preview_address_import(
             continue
         seen.add(canonical)
 
+        if can_write_ip is not None and not can_write_ip(canonical):
+            preview.errors.append(
+                DiffRow(
+                    kind="address",
+                    action="error",
+                    network=canonical,
+                    reason="No write permission on this address; commit will skip it",
+                )
+            )
+            continue
+
         row_hostname = fields.get("hostname") or ""
         existing_ip = existing.get(canonical)
         if existing_ip is None:
+            boundary = _boundary_host_refusal(subnet, canonical, fields)
+            if boundary is not None:
+                preview.errors.append(
+                    DiffRow(kind="address", action="error", network=canonical, reason=boundary)
+                )
+                continue
+            create_details: dict[str, Any] = {"fields": fields}
+            create_details.update(await _dhcp_flag(canonical, fields, None))
             preview.creates.append(
                 DiffRow(
                     kind="address",
                     action="create",
                     network=canonical,
                     name=row_hostname,
-                    details={"fields": fields},
+                    details=create_details,
                 )
             )
             continue
@@ -801,6 +1026,8 @@ async def preview_address_import(
             "description": existing_ip.description,
         }
         diff_details = {"old": old, "new": fields}
+        if strategy == "overwrite":
+            diff_details.update(await _dhcp_flag(canonical, fields, existing_ip))
         if strategy == "overwrite":
             preview.updates.append(
                 DiffRow(
@@ -836,6 +1063,33 @@ async def preview_address_import(
     return preview
 
 
+def _boundary_host_refusal(subnet: Any, canonical: str, fields: dict[str, Any]) -> str | None:
+    """A new imported host on an IPv4 network / broadcast address is refused,
+    as the REST create refuses it (#3321). The ``network`` / ``broadcast``
+    placeholder rows themselves are what belongs there, so they import."""
+    if (fields.get("status") or "allocated") in ("network", "broadcast"):
+        return None
+    return boundary_address_refusal(subnet, canonical)
+
+
+def _count_dns_sync(result_obj: Any, canonical: str, ip: Any, published: bool) -> None:
+    """Count a row in ``dns_synced`` only when its DNS sync published something.
+
+    ``_sync_dns_record`` returns False when there is no zone to publish into
+    or the name was skipped (over 253 characters in its zone, or an owner
+    BIND's check-names refuses). Those rows are not "DNS records published"
+    (#2921); a name skipped for a reason an operator can act on is reported in
+    ``errors``, as a sync that raised is. A subnet with no zone is the normal
+    case and says nothing.
+    """
+    if published:
+        result_obj.dns_synced += 1
+        return
+    reason = getattr(ip, "_dns_skip_reason", None)
+    if reason:
+        result_obj.errors.append(f"{canonical}: DNS record not published: {reason}")
+
+
 async def commit_address_import(
     db: AsyncSession,
     payload: ParsedPayload,
@@ -852,7 +1106,8 @@ async def commit_address_import(
     hostname get an A + PTR record published via the same RFC 2136 path
     that the interactive UI uses. The import is equivalent to N calls to
     ``POST /ipam/addresses`` / ``PUT /ipam/addresses/{id}`` — same audit
-    log, same DNS side-effects.
+    log, same DNS side-effects, and (since #1628) the same server-side
+    DHCP reservation sync for ``static_dhcp`` rows.
 
     ``can_write_ip`` is the optional #103 address-set write-delegation gate
     (a closure over the caller's writable ranges). Rows the caller can't
@@ -860,10 +1115,38 @@ async def commit_address_import(
     mutated. ``None`` means "no per-IP gate" (caller already proved
     subnet-wide write).
     """
-    from app.api.v1.ipam.router import _sync_dns_record
+    from app.api.v1.ipam.router import (
+        _sync_dns_record,
+        _update_blocks_utilization,
+        _update_utilization,
+    )
+    from app.services.dhcp.static_ipam import sync_static_for_ipam_row
+    from app.services.dns.sync_check import address_own_forward_zone_id
 
     subnet = await _load_subnet(db, subnet_id)
     result_obj = AddressImportResult(subnet_id=str(subnet.id))
+
+    async def _sync_dhcp(ip_row: IPAddress, canonical: str) -> None:
+        """Mirror the router's server-side DHCP reservation sync (#1628).
+
+        Runs for every row the import wrote, so a row flipped away from
+        ``static_dhcp`` also drops its reservation, exactly like a UI
+        edit. A warning (no scope / ambiguous scope / conflict) is
+        collected, not raised; a driver push failure is appended to the
+        per-row errors — the import never hard-fails a batch.
+        """
+        try:
+            sync = await sync_static_for_ipam_row(
+                db, ip_row, created_by_user_id=current_user.id, user=current_user
+            )
+        except Exception as exc:  # noqa: BLE001
+            result_obj.errors.append(f"{canonical}: DHCP reservation sync failed: {exc}")
+            return
+        if sync.warning:
+            result_obj.dhcp_warnings.append(f"{canonical}: {sync.warning}")
+        elif sync.action:
+            result_obj.dhcp_synced += 1
+
     subnet_net = ipaddress.ip_network(str(subnet.network), strict=False)
     existing = await _load_existing_addresses(db, subnet.id)
 
@@ -893,7 +1176,11 @@ async def commit_address_import(
                 )
             seen_addr.add(canonical)
 
-    allocated_delta = 0
+    # #3503: added after the loop, before the recount. A row's audit row
+    # flushed ahead of a later row's DNS sync takes the audit-chain lock before
+    # that sync bumps a zone serial, which deadlocks against a record create
+    # holding the zone.
+    audit_rows: list[AuditLog] = []
     for row in payload.addresses:
         canonical, fields, err = _row_address_fields(row)
         if err or canonical is None:
@@ -940,7 +1227,7 @@ async def commit_address_import(
                         existing_ip.tags = merged_tags
                     else:
                         setattr(existing_ip, k, v)
-                db.add(
+                audit_rows.append(
                     AuditLog(
                         user_id=current_user.id,
                         user_display_name=current_user.display_name,
@@ -958,17 +1245,38 @@ async def commit_address_import(
                 if existing_ip.hostname and not had_hostname:
                     # Hostname was just assigned — publish new DNS record.
                     try:
-                        await _sync_dns_record(db, existing_ip, subnet, action="create")
-                        result_obj.dns_synced += 1
+                        _count_dns_sync(
+                            result_obj,
+                            canonical,
+                            existing_ip,
+                            await _sync_dns_record(
+                                db,
+                                existing_ip,
+                                subnet,
+                                zone_id=await address_own_forward_zone_id(db, existing_ip),
+                                action="create",
+                            ),
+                        )
                     except Exception as exc:  # noqa: BLE001
                         result_obj.errors.append(f"{canonical}: DNS sync failed: {exc}")
                 elif had_hostname and "hostname" in fields:
                     # Hostname changed — republish (sync handles update via re-create).
                     try:
-                        await _sync_dns_record(db, existing_ip, subnet, action="create")
-                        result_obj.dns_synced += 1
+                        _count_dns_sync(
+                            result_obj,
+                            canonical,
+                            existing_ip,
+                            await _sync_dns_record(
+                                db,
+                                existing_ip,
+                                subnet,
+                                zone_id=await address_own_forward_zone_id(db, existing_ip),
+                                action="create",
+                            ),
+                        )
                     except Exception as exc:  # noqa: BLE001
                         result_obj.errors.append(f"{canonical}: DNS sync failed: {exc}")
+                await _sync_dhcp(existing_ip, canonical)
                 result_obj.updated += 1
                 continue
             # strategy == "fail" already raised above; unreachable.
@@ -978,6 +1286,10 @@ async def commit_address_import(
             )
 
         # New row
+        boundary = _boundary_host_refusal(subnet, canonical, fields)
+        if boundary is not None:
+            result_obj.errors.append(boundary)
+            continue
         ip_status = fields.get("status") or "allocated"
         new_ip = IPAddress(
             subnet_id=subnet.id,
@@ -992,8 +1304,7 @@ async def commit_address_import(
         db.add(new_ip)
         await db.flush()
         existing[canonical] = new_ip
-        allocated_delta += 1
-        db.add(
+        audit_rows.append(
             AuditLog(
                 user_id=current_user.id,
                 user_display_name=current_user.display_name,
@@ -1008,11 +1319,17 @@ async def commit_address_import(
         )
         if new_ip.hostname:
             try:
-                await _sync_dns_record(db, new_ip, subnet, action="create")
-                result_obj.dns_synced += 1
+                _count_dns_sync(
+                    result_obj,
+                    canonical,
+                    new_ip,
+                    await _sync_dns_record(db, new_ip, subnet, action="create"),
+                )
             except Exception as exc:  # noqa: BLE001
                 # Don't fail the whole import — user can re-run DNS Sync after.
                 result_obj.errors.append(f"{canonical}: DNS sync failed: {exc}")
+        if ip_status == "static_dhcp" and new_ip.mac_address:
+            await _sync_dhcp(new_ip, canonical)
         result_obj.created += 1
 
     # #7: surface a permission-blocked batch distinctly. ``skipped_no_perm``
@@ -1027,16 +1344,16 @@ async def commit_address_import(
             "the subnet or any address set you can write — nothing was imported."
         )
 
-    # Keep the subnet's utilization counters roughly honest by applying the
-    # net delta here — users expect the UI to reflect the new row count
-    # immediately. This is an estimate (a re-imported existing row bumps the
-    # delta but not the true count); the hourly
-    # ``app.tasks.ipam_utilization_recount.recount_ipam_utilization`` sweep
-    # reconciles any resulting drift against the live row count.
-    if allocated_delta:
-        subnet.allocated_ips = (subnet.allocated_ips or 0) + allocated_delta
-        if subnet.total_ips:
-            subnet.utilization_percent = round(100.0 * subnet.allocated_ips / subnet.total_ips, 2)
+    # Recount from the rows with the product's own rule (#2411), then roll the
+    # change up every block on the chain (#2981). A created ``available`` row is
+    # free and an overwritten status can move a row in or out of the count, so
+    # a running delta is not the answer.
+    db.add_all(audit_rows)
+    if result_obj.created or result_obj.updated:
+        await db.flush()
+        await _update_utilization(db, subnet.id)
+        await db.flush()
+        await _update_blocks_utilization(db, [subnet.block_id])
 
     logger.info(
         "ipam_address_import_committed",

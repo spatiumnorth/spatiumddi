@@ -1,6 +1,7 @@
 import json
 from datetime import datetime
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import (
     BigInteger,
@@ -182,9 +183,12 @@ class PlatformSettings(Base):
     session_timeout_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
     auto_logout_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
-    # Password policy (issue #70). Defaults are deliberately permissive so
-    # an upgrade doesn't suddenly invalidate working passwords; operators
-    # tighten in Settings → Security. ``password_history_count = 0``
+    # Password policy (issue #70). It is checked only when a password is
+    # SET, so these defaults never invalidate a working password on
+    # upgrade; operators adjust them in Settings → Security. They are also
+    # the no-row fallback (``platform_setting_default``, #3203), so the
+    # first password on a fresh install is held to them.
+    # ``password_history_count = 0``
     # disables history checking; ``password_max_age_days = 0`` disables
     # forced rotation. Validator + history live in
     # ``app.services.password_policy``.
@@ -371,10 +375,8 @@ class PlatformSettings(Base):
     )
     # The legacy single webhook's URL and optional Authorization header,
     # Fernet-encrypted at rest (#1502) like the same fields on
-    # ``audit_forward_target``. The plaintext ``audit_forward_webhook_url`` /
-    # ``audit_forward_webhook_auth_header`` columns are kept, unmapped and
-    # unread, for one release so a rolling upgrade's old pods keep working
-    # (#296); the next release drops them.
+    # ``audit_forward_target``. The plaintext columns they replaced were
+    # dropped by migration ``c2b203844c95``.
     audit_forward_webhook_url_encrypted: Mapped[bytes | None] = mapped_column(
         LargeBinary, nullable=True
     )
@@ -395,10 +397,12 @@ class PlatformSettings(Base):
         DateTime(timezone=True), nullable=True
     )
 
-    # Integrations — one toggle per integration type. Granular by design:
-    # enabling Kubernetes should not implicitly enable a future Terraform
-    # Cloud / ServiceNow integration. When a toggle is on, the
-    # corresponding top-level sidebar nav item appears.
+    # Integrations — a DERIVED copy of each ``integrations.*`` feature
+    # module's state, not a switch (#2196 / #2197). The module is the
+    # integration's only on/off: its beat sweep, alerts and dashboards all
+    # read the module, and nothing in the app reads these columns.
+    # ``feature_modules.sync_integration_settings_mirror`` rewrites them on
+    # every toggle and at API startup, for readers outside the app.
     integration_kubernetes_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False
     )
@@ -446,6 +450,33 @@ class PlatformSettings(Base):
     # sensitive (plaintext creds/PII) so the default is short (issue #59).
     pcap_retention_days: Mapped[int] = mapped_column(
         Integer, nullable=False, default=7, server_default=sa_text("7")
+    )
+
+    # How many days of per-server DNS / DHCP metric samples the nightly
+    # ``prune_metrics`` sweep keeps (#2273). The InfluxDB push (#889) can
+    # only backfill what is still inside this window.
+    metric_retention_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=7, server_default=sa_text("7")
+    )
+
+    # How many hours of agent-shipped DNS query log and DHCP activity log
+    # rows the nightly ``prune_logs`` sweep keeps (#2273). Capped at 168 by
+    # the API: the prune is one unbatched DELETE, so a longer window grows
+    # that single transaction. #2185 lifts the cap with partition drops.
+    log_retention_hours: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=24, server_default=sa_text("24")
+    )
+
+    # E911 lookup trail bounds (#3514, #3633). ``POST /held`` is read-scoped
+    # but writes one ``e911_resolution_log`` row per lookup, so the table is
+    # bounded twice: past this many lookups per caller per minute the lookup
+    # is refused (429) and writes nothing, and the daily
+    # ``prune_e911_resolution_log`` sweep drops rows older than the retention.
+    e911_lookup_log_budget_per_minute: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=120, server_default=sa_text("120")
+    )
+    e911_resolution_log_retention_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=90, server_default=sa_text("90")
     )
 
     # Fingerbank API key for passive DHCP device fingerprinting (Phase 2 of
@@ -1058,8 +1089,10 @@ class PlatformSettings(Base):
     #
     # ``dhcp_relay_vip`` — fronts the relay→server unicast forward on
     # :67 so a DHCP relay's ``forward-to`` target outlives a single Kea
-    # node. Kea KEEPS hostNetwork:67 for direct-attached broadcast reach
-    # — this VIP does NOT replace client-facing :67. Empty = no relay VIP.
+    # node. Kea KEEPS hostNetwork:67, but a group behind this VIP must use
+    # ``dhcp_socket_mode = relay``: in raw mode the announcing node's Kea
+    # drops the relays kube-proxy keeps on it (#2899, see
+    # ``services/dhcp/relay_vip.py``). Empty = no relay VIP.
     dns_vip: Mapped[str] = mapped_column(
         String(64), nullable=False, default="", server_default=sa_text("''")
     )
@@ -1105,9 +1138,12 @@ class PlatformSettings(Base):
     # ``security.certificates`` feature module is the separate discovery
     # toggle. ``acme_auto_renew`` is the seam for the deferred renewal
     # beat task (not yet consumed in Phase 1). ``acme_challenge_type`` /
-    # ``acme_dns_provider`` / ``acme_domains`` are populated by
-    # ``POST /issue`` to record the desired issuance shape for that
-    # Phase-2 renewal task to read.
+    # ``acme_dns_provider`` / ``acme_domains`` record the issuance shape
+    # of the last SUCCESSFUL order — written by the orchestrator on
+    # success only (#1529; ``POST /issue`` used to write them at order
+    # creation, so a failed attempt could retarget renewals). The
+    # renewal sweep's per-certificate source of truth is the successful
+    # order itself; these columns are its legacy fallback.
     acme_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=sa_text("false")
     )
@@ -1185,3 +1221,17 @@ class BrandingAsset(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # instead of sitting behind a stale browser cache.
     sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     byte_size: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+def platform_setting_default(name: str) -> Any:
+    """The shipped default of one ``PlatformSettings`` column.
+
+    The singleton row is created lazily, so on a fresh install the first
+    requests (the forced first-login password change among them) run with no
+    row at all. A fallback for "no row" must therefore be the column default,
+    and reading it from the mapped column keeps the two from drifting (#3203).
+    """
+    default = PlatformSettings.__table__.c[name].default
+    if default is None or not default.is_scalar:
+        raise LookupError(f"PlatformSettings.{name} has no scalar default")
+    return default.arg

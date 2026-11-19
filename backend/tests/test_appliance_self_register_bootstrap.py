@@ -4,16 +4,19 @@ The endpoint mints a one-shot pairing code for the local supervisor on
 full-stack / frontend-core appliances, where the installer wizard
 didn't capture a pairing code (the control plane is local). Gates:
 
-* Variant must be ``full-stack`` / ``frontend-core``.
+* Variant must be ``control-plane`` (or a legacy alias).
+* The caller must present the one-time token the local supervisor wrote
+  to the host release-state directory. Without it nothing else runs: no
+  orphan rows are cleared and the registration gate is not touched.
 * The api's host bind-mounted ``role-config:ROLE`` must match.
 * No LIVE ``Appliance`` row may exist (``last_seen_at IS NOT NULL``);
   orphan rows from a botched earlier attempt get cleared.
-* Module gate (``supervisor_registration_enabled``).
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 from httpx import AsyncClient
@@ -60,6 +63,29 @@ def stub_host_role(monkeypatch: pytest.MonkeyPatch):
     return _set
 
 
+_TOKEN = "a1" * 32
+
+
+@pytest.fixture(autouse=True)
+def host_token_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """The host release-state token file, holding ``_TOKEN``.
+
+    ``raising=False`` so the refusal tests below also run against a build
+    that has no token check at all.
+    """
+    path = tmp_path / "self-bootstrap.token"
+    path.write_text(_TOKEN)
+    monkeypatch.setattr(supervisor_mod, "_SELF_BOOTSTRAP_TOKEN_FILE", path, raising=False)
+    return path
+
+
+def _body(variant: str, token: str | None = _TOKEN) -> dict:
+    body: dict = {"appliance_variant": variant}
+    if token is not None:
+        body["bootstrap_token"] = token
+    return body
+
+
 # ── Tests ──────────────────────────────────────────────────────────
 
 
@@ -75,7 +101,7 @@ async def test_works_without_module_gate_enabled(
     stub_host_role("full-stack")
     resp = await client.post(
         "/api/v1/appliance/self-register-bootstrap",
-        json={"appliance_variant": "full-stack"},
+        json=_body("full-stack"),
     )
     assert resp.status_code == 200, resp.text
 
@@ -90,7 +116,7 @@ async def test_happy_path_mints_code(
 
     resp = await client.post(
         "/api/v1/appliance/self-register-bootstrap",
-        json={"appliance_variant": "full-stack"},
+        json=_body("full-stack"),
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -132,7 +158,7 @@ async def test_frontend_core_variant_accepted(
 
     resp = await client.post(
         "/api/v1/appliance/self-register-bootstrap",
-        json={"appliance_variant": "frontend-core"},
+        json=_body("frontend-core"),
     )
     assert resp.status_code == 200, resp.text
 
@@ -150,7 +176,7 @@ async def test_variant_mismatch_refused(
 
     resp = await client.post(
         "/api/v1/appliance/self-register-bootstrap",
-        json={"appliance_variant": "full-stack"},
+        json=_body("full-stack"),
     )
     assert resp.status_code == 403
     # No pairing code created.
@@ -170,7 +196,7 @@ async def test_no_host_role_config_refused(
 
     resp = await client.post(
         "/api/v1/appliance/self-register-bootstrap",
-        json={"appliance_variant": "full-stack"},
+        json=_body("full-stack"),
     )
     assert resp.status_code == 403
 
@@ -187,7 +213,7 @@ async def test_application_variant_refused(
 
     resp = await client.post(
         "/api/v1/appliance/self-register-bootstrap",
-        json={"appliance_variant": "application"},  # pydantic Literal blocks this
+        json=_body("application"),  # pydantic Literal blocks this
     )
     # Pydantic rejects the unknown literal at validation time → 422.
     assert resp.status_code == 422
@@ -215,7 +241,7 @@ async def test_single_shot_after_live_appliance(
 
     resp = await client.post(
         "/api/v1/appliance/self-register-bootstrap",
-        json={"appliance_variant": "full-stack"},
+        json=_body("full-stack"),
     )
     assert resp.status_code == 409
 
@@ -243,7 +269,7 @@ async def test_orphan_appliance_cleared_on_self_bootstrap(
 
     resp = await client.post(
         "/api/v1/appliance/self-register-bootstrap",
-        json={"appliance_variant": "full-stack"},
+        json=_body("full-stack"),
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -266,3 +292,132 @@ async def test_orphan_appliance_cleared_on_self_bootstrap(
         )
     }
     assert "appliance.self_bootstrap_orphan_cleared" in audit_actions
+
+
+# ── Local-caller proof ─────────────────────────────────────────────
+
+
+async def _assert_nothing_changed(db_session: AsyncSession, orphan_id) -> None:
+    """A refused call left the database exactly as it found it."""
+    db_session.expire_all()
+    assert (await db_session.execute(select(PairingCode))).scalars().all() == []
+    remaining = {a.id for a in (await db_session.execute(select(Appliance))).scalars().all()}
+    assert orphan_id in remaining
+    row = (
+        await db_session.execute(select(PlatformSettings).where(PlatformSettings.id == 1))
+    ).scalar_one_or_none()
+    assert row is None or row.supervisor_registration_enabled is False
+    actions = {
+        a.action
+        for a in (
+            await db_session.execute(
+                select(AuditLog).where(AuditLog.action.like("appliance.self_bootstrap%"))
+            )
+        )
+        .scalars()
+        .all()
+    }
+    assert actions == set()
+
+
+async def _seed_unheartbeated_row(db_session: AsyncSession):
+    # A row registered but not yet heartbeated — e.g. the real local
+    # supervisor between /supervisor/register and its first heartbeat.
+    row = Appliance(
+        hostname="local-supervisor",
+        public_key_der=b"\x01" * 32,
+        public_key_fingerprint="b" * 64,
+        state="approved",
+        last_seen_at=None,
+    )
+    db_session.add(row)
+    await db_session.commit()
+    return row.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "token",
+    [
+        pytest.param(None, id="no-token"),
+        pytest.param("", id="empty-token"),
+        pytest.param("b2" * 32, id="wrong-token"),
+        pytest.param(_TOKEN[:-1], id="truncated-token"),
+    ],
+)
+async def test_caller_without_the_host_token_is_refused_and_changes_nothing(
+    db_session: AsyncSession, client: AsyncClient, stub_host_role, token: str | None
+) -> None:
+    # The variant and the host role are both right — they are public
+    # strings — but the caller cannot show the token from the host file.
+    orphan_id = await _seed_unheartbeated_row(db_session)
+    stub_host_role("control-plane")
+
+    resp = await client.post(
+        "/api/v1/appliance/self-register-bootstrap",
+        json=_body("control-plane", token),
+    )
+    assert resp.status_code == 403, resp.text
+    assert "code" not in resp.json()
+    await _assert_nothing_changed(db_session, orphan_id)
+
+
+@pytest.mark.asyncio
+async def test_refused_when_the_host_token_file_is_absent(
+    db_session: AsyncSession, client: AsyncClient, stub_host_role, host_token_file: Path
+) -> None:
+    # No attempt in flight (or a non-appliance deploy): even a caller that
+    # guesses the old token value gets nothing.
+    host_token_file.unlink()
+    orphan_id = await _seed_unheartbeated_row(db_session)
+    stub_host_role("control-plane")
+
+    resp = await client.post(
+        "/api/v1/appliance/self-register-bootstrap",
+        json=_body("control-plane"),
+    )
+    assert resp.status_code == 403, resp.text
+    await _assert_nothing_changed(db_session, orphan_id)
+
+
+@pytest.mark.asyncio
+async def test_a_too_short_host_file_never_matches(
+    db_session: AsyncSession, client: AsyncClient, stub_host_role, host_token_file: Path
+) -> None:
+    # An empty or truncated file must not let an equally short claim through.
+    host_token_file.write_text("")
+    stub_host_role("control-plane")
+    resp = await client.post(
+        "/api/v1/appliance/self-register-bootstrap",
+        json=_body("control-plane", ""),
+    )
+    assert resp.status_code == 403
+
+    host_token_file.write_text("abc")
+    resp = await client.post(
+        "/api/v1/appliance/self-register-bootstrap",
+        json=_body("control-plane", "abc"),
+    )
+    assert resp.status_code == 403
+    assert (await db_session.execute(select(PairingCode))).scalars().all() == []
+
+
+@pytest.mark.asyncio
+async def test_local_supervisor_with_the_token_mints_and_opens_registration(
+    db_session: AsyncSession, client: AsyncClient, stub_host_role
+) -> None:
+    # The proven caller still gets the full first-boot behaviour: a code
+    # that auto-approves, and the registration gate switched on.
+    stub_host_role("control-plane")
+    resp = await client.post(
+        "/api/v1/appliance/self-register-bootstrap",
+        json=_body("control-plane"),
+    )
+    assert resp.status_code == 200, resp.text
+    db_session.expire_all()
+    rows = (await db_session.execute(select(PairingCode))).scalars().all()
+    assert len(rows) == 1 and rows[0].auto_approve is True
+    settings_row = (
+        await db_session.execute(select(PlatformSettings).where(PlatformSettings.id == 1))
+    ).scalar_one()
+    assert settings_row.supervisor_registration_enabled is True

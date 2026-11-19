@@ -119,6 +119,7 @@ class FindBgpRoutesArgs(BaseModel):
 
 @register_tool(
     name="find_bgp_routes",
+    permission=("read", "bgp_lg_peer"),
     description=(
         "List routes learned by a BGP Looking Glass collector — the live "
         "Adj-RIB-In mirrored from the operator's own routers (distinct from "
@@ -183,6 +184,7 @@ class CountBgpRoutesArgs(BaseModel):
 
 @register_tool(
     name="count_bgp_routes",
+    permission=("read", "bgp_lg_peer"),
     description=(
         "Count routes in the BGP Looking Glass RIB, broken down by RPKI "
         "status and by peer. Use for a quick 'how big is our learned "
@@ -230,6 +232,7 @@ class GetBgpRouteArgs(BaseModel):
 
 @register_tool(
     name="get_bgp_route",
+    permission=("read", "bgp_lg_peer"),
     description=(
         "Get every path a BGP Looking Glass collector has learned for one "
         "exact prefix — the 'show ip bgp <prefix>' detail view. Returns "
@@ -280,6 +283,7 @@ class FindBgpRouteForIpArgs(BaseModel):
 
 @register_tool(
     name="find_bgp_route_for_ip",
+    permission=("read", "bgp_lg_peer"),
     description=(
         "Reverse longest-prefix-match lookup: given a single IP address, "
         "find the most-specific active BGP Looking Glass route that covers "
@@ -326,6 +330,7 @@ class FindLgSessionsArgs(BaseModel):
 
 @register_tool(
     name="find_bgp_lg_sessions",
+    permission=("read", "bgp_lg_peer"),
     description=(
         "List BGP Looking Glass peer sessions with their current state "
         "(established/idle/etc.), uptime, and received/accepted prefix "
@@ -366,6 +371,7 @@ class FindVrfLearnedRoutesArgs(BaseModel):
 
 @register_tool(
     name="find_vrf_learned_routes",
+    permission=("read", "bgp_lg_peer"),
     description=(
         "List BGP Looking Glass routes matched to a VRF by Route-Target "
         "cross-check — the routes whose "
@@ -401,6 +407,7 @@ class FindMulticastBgpReachabilityArgs(BaseModel):
 
 @register_tool(
     name="find_multicast_bgp_reachability",
+    permission=("read", "bgp_lg_peer"),
     description=(
         "Cross-reference multicast PIM domains' rendezvous-point addresses "
         "and multicast groups' producer source subnets against the BGP "
@@ -476,6 +483,7 @@ class CreateLgPeerArgs(BaseModel):
 
 @register_tool(
     name="propose_create_lg_peer",
+    permission=("write", "bgp_lg_peer"),
     description=(
         "Prepare a proposal to create a new BGP Looking Glass peer session "
         "(a receive-only BGP session on a collector — SpatiumDDI never "

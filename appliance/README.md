@@ -214,8 +214,13 @@ the appliance's Redis then crash-loops with `exec format error`.
 leaving it to be discovered on the appliance; the cross target runs it for
 you.
 
-Empty `BAKE_SAVE_PLATFORM` is CI's default and is byte-for-byte the old
-behaviour.
+`BAKE_SAVE_PLATFORM` is always set (#2393): the Makefile passes the
+appliance architecture, and the script falls back to `APPLIANCE_ARCH`,
+then this host's own architecture. A platform-less `docker save` can write
+an index-only archive with no layers, which air-gapped k3s cannot use.
+After each save the bake reads the archive back
+(`appliance/scripts/verify-image-archive.py`) and fails, naming the image,
+if the config or any layer of the target-platform manifest is missing.
 
 **Verifying the result.** Check freshness by epoch (`stat -f %m` on macOS,
 not `-c`), and check the contents by loop-mounting the raw — root is

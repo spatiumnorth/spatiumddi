@@ -21,7 +21,8 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
-from app.api.v1._common import StatusResponse
+from app.api.v1._common import StatusResponse, add_trigger_audit
+from app.core.celery_dispatch import dispatch
 from app.core.crypto import decrypt_dict, encrypt_dict
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import require_resource_permission
@@ -34,6 +35,7 @@ from app.services.cloud.base import (
     get_connector,
     implemented_providers,
 )
+from app.services.integration_ownership import release_integration_rows
 
 router = APIRouter(
     tags=["cloud"],
@@ -366,7 +368,11 @@ async def delete_endpoint(endpoint_id: uuid.UUID, db: DB, user: SuperAdmin) -> N
     if e is None:
         raise HTTPException(status_code=404, detail="Cloud endpoint not found")
     _audit(db, user=user, action="delete", endpoint_id=e.id, endpoint_name=e.name)
-    # Mirror rows (IPBlock/Subnet/IPAddress) cascade via cloud_endpoint_id FK.
+    # #2287 — hand back operator-made rows in mirrored subnets / blocks before
+    # the FK cascade can destroy them.
+    await release_integration_rows(
+        db, own_fk="cloud_endpoint_id", target_id=e.id, user=user, target_name=e.name
+    )
     await db.delete(e)
     await db.commit()
 
@@ -376,16 +382,26 @@ async def delete_endpoint(endpoint_id: uuid.UUID, db: DB, user: SuperAdmin) -> N
     status_code=status.HTTP_202_ACCEPTED,
     response_model=StatusResponse,
 )
-async def sync_endpoint(endpoint_id: uuid.UUID, db: DB, _: SuperAdmin) -> StatusResponse:
+async def sync_endpoint(endpoint_id: uuid.UUID, db: DB, user: SuperAdmin) -> StatusResponse:
     forbid_in_demo_mode("Cloud sync is disabled")
     e = await db.get(CloudEndpoint, endpoint_id)
     if e is None:
         raise HTTPException(status_code=404, detail="Cloud endpoint not found")
 
+    add_trigger_audit(
+        db,
+        user,
+        resource_type="cloud_endpoint",
+        resource_id=e.id,
+        resource_display=str(getattr(e, "name", None) or e.id),
+        action="sync",
+    )
+    await db.commit()
+
     from app.tasks.cloud_sync import sync_endpoint_now  # noqa: PLC0415
 
     try:
-        result = sync_endpoint_now.delay(str(e.id))
+        result = await dispatch(sync_endpoint_now, str(e.id))
         return StatusResponse(status="queued", task_id=result.id)
     except Exception:  # noqa: BLE001 — broker may be down; surface gracefully
         return StatusResponse(status="broker_unavailable", task_id="")

@@ -4,10 +4,12 @@ import {
   type NmapScanCreate,
   type NmapScanRead,
   nmapApi,
+  formatApiError,
 } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
 import { cn } from "@/lib/utils";
 import { Loader2, Play } from "lucide-react";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 const PRESETS: { id: NmapPreset; label: string; hint: string }[] = [
   {
@@ -81,6 +83,16 @@ export function NmapScanForm({
   lockTarget,
   onScanStarted,
 }: NmapScanFormProps) {
+  // #1341 — a read-only user is offered no write it would be refused:
+  // the router asks write on 'manage_nmap_scans' to start a scan and read
+  // to watch it, so a role with only write would start a scan it cannot see
+  // (#3279).
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "manage_nmap_scans") &&
+      perms.can("read", "manage_nmap_scans"),
+    "Requires write and read permission on nmap scans (read shows the result)",
+  );
   const [targetIp, setTargetIp] = useState(defaultTargetIp);
   const [preset, setPreset] = useState<NmapPreset>(defaultPreset);
   const [portSpec, setPortSpec] = useState("");
@@ -106,9 +118,7 @@ export function NmapScanForm({
       const scan = await nmapApi.createScan(body);
       onScanStarted(scan);
     } catch (e: unknown) {
-      const detail = (e as { response?: { data?: { detail?: string } } })
-        ?.response?.data?.detail;
-      setError(typeof detail === "string" ? detail : "Failed to start scan");
+      setError(formatApiError(e, "Failed to start scan"));
     } finally {
       setSubmitting(false);
     }
@@ -205,7 +215,12 @@ export function NmapScanForm({
       )}
 
       <div className="flex justify-end">
-        <HeaderButton variant="primary" onClick={submit} disabled={submitting}>
+        <HeaderButton
+          variant="primary"
+          onClick={submit}
+          disabled={submitting}
+          {...writeGate}
+        >
           {submitting ? (
             <Loader2 className="h-3.5 w-3.5 animate-spin" />
           ) : (

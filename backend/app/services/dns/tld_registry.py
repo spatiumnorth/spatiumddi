@@ -180,7 +180,7 @@ def _version_sort_key(version: str) -> tuple[int, int | str]:
     crash on an unexpected shape, and never let an unparseable snapshot
     version silently outrank a numeric bundled one."""
     v = version.strip()
-    if v.isdigit():
+    if v.isascii() and v.isdigit():
         return (1, int(v))
     return (0, v)
 
@@ -273,11 +273,13 @@ async def fetch_remote_payload() -> tuple[str, list[str]]:
     """
     import httpx
 
+    from app.core.exc_text import describe_http_exc
+
     try:
         async with httpx.AsyncClient(timeout=_FETCH_TIMEOUT_SECONDS) as client:
             resp = await client.get(SOURCE_URL)
     except httpx.HTTPError as exc:
-        raise TldFetchError(f"could not reach {SOURCE_URL}: {exc}") from exc
+        raise TldFetchError(f"could not reach {SOURCE_URL}: {describe_http_exc(exc)}") from exc
     if resp.status_code != 200:
         raise TldFetchError(f"{SOURCE_URL} answered HTTP {resp.status_code}")
     return parse_tld_payload(resp.text)

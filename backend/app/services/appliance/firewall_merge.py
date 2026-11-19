@@ -181,6 +181,20 @@ _BUILTIN_SEED: list[tuple[str, str | None, bool, list[tuple]]] = [
                 "metallb-memberlist-udp",
                 _BUILTIN_GUARD,
             ),  # noqa: E501
+            # #1827 — frr-k8s's validating webhook, served on one node's host
+            # network in BGP mode; every other node's apiserver calls it there.
+            # Seeded by a9c3e5f71b28. seq 50 places it after memberlist, where
+            # both hardcoded renderers emit it, under the same guard.
+            (
+                50,
+                "accept",
+                "tcp",
+                (19443,),
+                "cluster_peers",
+                "both",
+                "frr-k8s-webhook",
+                _BUILTIN_GUARD,
+            ),
         ],
     ),
     ("role", "observer", False, []),
@@ -234,6 +248,22 @@ def builtin_policy_set() -> PolicySet:
     return ps
 
 
+def _nft_comment_text(comment: str | None) -> str | None:
+    """A stored rule comment made safe to place inside ``comment "..."``.
+
+    The rule API rejects double quotes, backslashes and control characters
+    in a comment. This covers rows stored before it did: those characters
+    are dropped rather than the rule, because the comment is a label and
+    the rule is what the operator asked for. Without this, a newline would
+    end the rule line and the rest would be read as rules of its own."""
+    if not comment:
+        return comment
+    cleaned = "".join(
+        c for c in comment if c not in '"\\' and not (ord(c) < 0x20 or ord(c) == 0x7F)
+    )
+    return cleaned or None
+
+
 def _policy_from_orm(p: FirewallPolicy) -> _Policy:
     rule_objs = tuple(
         _Rule(
@@ -245,7 +275,7 @@ def _policy_from_orm(p: FirewallPolicy) -> _Policy:
             source_cidrs=tuple(str(x) for x in (r.source_cidrs or [])),
             source_alias=r.source_alias,
             family=r.family,
-            comment=r.comment,
+            comment=_nft_comment_text(r.comment),
             render_guard=dict(r.render_guard) if r.render_guard else None,
             enabled=r.enabled,
         )
@@ -549,7 +579,8 @@ def compile_firewall_from_policies(
     lines.append("# for the operator-override surface that lands at the end of this file.")
     lines.append(f"# profile: {ctx.profile}")
     lines.append(f"# roles: {','.join(ctx.roles) if ctx.roles else '(idle)'}")
-    bootstrap_action = "retire" if ctx.cp_member_count >= 2 else "keep"
+    # #1508 — retire only on a control-plane member; an agent keeps it.
+    bootstrap_action = "retire" if ctx.cp_member_count >= 2 and ctx.is_cp else "keep"
     lines.append(f"# spatium-bootstrap: {bootstrap_action}")
     # #769 — retire the baked Web-UI sentinel (00-spatium-webui.nft) once a
     # source scope is configured; its unconditional accept sorts earlier in

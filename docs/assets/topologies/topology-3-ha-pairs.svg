@@ -37,12 +37,12 @@
         marker-end="url(#t3-arrow)"/>
 
   <!-- DNS server group (3 servers) -->
-  <text x="200" y="208" text-anchor="middle" font-size="13" font-weight="600" fill="#0f172a">DNS Server Group</text>
+  <text x="320" y="334" text-anchor="middle" font-size="13" font-weight="600" fill="#0f172a">DNS Server Group</text>
   <g>
     <rect x="60" y="220" width="160" height="92" rx="10"
           fill="url(#t3-host)" stroke="#94a3b8" stroke-width="2"/>
     <text x="140" y="244" text-anchor="middle" font-size="12" font-weight="600" fill="#0f172a">vm-dns-01</text>
-    <text x="140" y="262" text-anchor="middle" font-size="10" fill="#475569">zone master</text>
+    <text x="140" y="262" text-anchor="middle" font-size="10" fill="#475569">authoritative copy</text>
     <rect x="80" y="270" width="120" height="32" rx="6" fill="url(#t3-agent)"/>
     <text x="140" y="291" text-anchor="middle" font-size="11" fill="#ffffff">bind9 :53</text>
   </g>
@@ -50,7 +50,7 @@
     <rect x="240" y="220" width="160" height="92" rx="10"
           fill="url(#t3-host)" stroke="#94a3b8" stroke-width="2"/>
     <text x="320" y="244" text-anchor="middle" font-size="12" font-weight="600" fill="#0f172a">vm-dns-02</text>
-    <text x="320" y="262" text-anchor="middle" font-size="10" fill="#475569">slave / xfer</text>
+    <text x="320" y="262" text-anchor="middle" font-size="10" fill="#475569">authoritative copy</text>
     <rect x="260" y="270" width="120" height="32" rx="6" fill="url(#t3-agent)"/>
     <text x="320" y="291" text-anchor="middle" font-size="11" fill="#ffffff">bind9 :53</text>
   </g>
@@ -64,7 +64,7 @@
   </g>
 
   <!-- DHCP HA pair -->
-  <text x="765" y="208" text-anchor="middle" font-size="13" font-weight="600" fill="#0f172a">DHCP HA pair (Kea)</text>
+  <text x="760" y="334" text-anchor="middle" font-size="13" font-weight="600" fill="#0f172a">DHCP HA pair (Kea)</text>
   <g>
     <rect x="610" y="220" width="140" height="92" rx="10"
           fill="url(#t3-host)" stroke="#94a3b8" stroke-width="2"/>
@@ -103,12 +103,12 @@
           fill="#f8fafc" stroke="#e2e8f0" stroke-width="1.5"/>
     <text x="80" y="410" font-size="13" font-weight="600" fill="#0f172a">Configured via the UI</text>
     <text x="80" y="436" font-size="12" fill="#334155">
-      <tspan font-weight="600">DNS Server Group</tspan> — list every member; records render to all. Per-server zone-state pill
+      <tspan font-weight="600">DNS Server Group</tspan> — every member is an independent authoritative copy; records fan out to all. Per-server zone-state pill
     </text>
-    <text x="80" y="454" font-size="12" fill="#334155">on the zone page exposes any slave that hasn't transferred.</text>
+    <text x="80" y="454" font-size="12" fill="#334155">on the zone page exposes any server that hasn't converged.</text>
 
     <text x="80" y="488" font-size="12" fill="#334155">
-      <tspan font-weight="600">DHCP Server Group</tspan> with <tspan font-style="italic">ha_mode = hot-standby</tspan> (or <tspan font-style="italic">load-balancing</tspan> for higher
+      <tspan font-weight="600">DHCP Server Group</tspan> with <tspan font-style="italic">mode = hot-standby</tspan> (or <tspan font-style="italic">load-balancing</tspan> for higher
     </text>
     <text x="80" y="506" font-size="12" fill="#334155">throughput). Set ha_peer_url on each Kea server. PeerResolveWatcher self-heals when peer IPs drift.</text>
 

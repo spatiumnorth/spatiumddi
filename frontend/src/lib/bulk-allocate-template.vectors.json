@@ -1,0 +1,370 @@
+{
+  "_comment": "Bulk-allocate hostname template vectors (#2071). Read by BOTH frontend/src/lib/bulk-allocate-template.test.ts and backend/tests/test_ipam_bulk_allocate_template_vectors_2071.py, so the console's live preview and the server's stored names are pinned to the same cases. stored = the hostname the server stores for (template, ip, n); null = the template or that name is refused. template_start = the iterator bounds both sides enforce.",
+  "vectors": [
+    {
+      "template": "web{n}",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": "web1"
+    },
+    {
+      "template": "web{n:d}",
+      "ip": "10.0.0.1",
+      "n": 5,
+      "stored": "web5"
+    },
+    {
+      "template": "web{n:}",
+      "ip": "10.0.0.1",
+      "n": 5,
+      "stored": "web5"
+    },
+    {
+      "template": "Web-{n:03d}",
+      "ip": "10.0.0.1",
+      "n": 7,
+      "stored": "web-007"
+    },
+    {
+      "template": "web{n:03}",
+      "ip": "10.0.0.1",
+      "n": 7,
+      "stored": "web007"
+    },
+    {
+      "template": "web{n:x}",
+      "ip": "10.0.0.1",
+      "n": 255,
+      "stored": "webff"
+    },
+    {
+      "template": "web{n:X}",
+      "ip": "10.0.0.1",
+      "n": 255,
+      "stored": "webff"
+    },
+    {
+      "template": "web{n:04X}",
+      "ip": "10.0.0.1",
+      "n": 255,
+      "stored": "web00ff"
+    },
+    {
+      "template": "web{n:02d}",
+      "ip": "10.0.0.1",
+      "n": 1000,
+      "stored": "web1000"
+    },
+    {
+      "template": "{n}",
+      "ip": "10.0.0.1",
+      "n": 0,
+      "stored": "0"
+    },
+    {
+      "template": "h-{oct3}-{oct4}",
+      "ip": "10.0.3.4",
+      "n": 1,
+      "stored": "h-3-4"
+    },
+    {
+      "template": "h{oct1}{oct2}",
+      "ip": "192.168.3.4",
+      "n": 1,
+      "stored": "h192168"
+    },
+    {
+      "template": "h{oct4:03d}",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": "h001"
+    },
+    {
+      "template": "h{oct4:03}",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": "h001"
+    },
+    {
+      "template": "h{oct4:x}",
+      "ip": "10.0.0.10",
+      "n": 1,
+      "stored": "ha"
+    },
+    {
+      "template": "h{oct4}",
+      "ip": "2001:db8::1",
+      "n": 1,
+      "stored": "h"
+    },
+    {
+      "template": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa{n}",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1"
+    },
+    {
+      "template": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa{n}",
+      "ip": "10.0.0.1",
+      "n": 10,
+      "stored": null
+    },
+    {
+      "template": "web{n}-",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": null
+    },
+    {
+      "template": "-web{n}",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": null
+    },
+    {
+      "template": "web_{n}",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": null
+    },
+    {
+      "template": "web.{n}",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": null
+    },
+    {
+      "template": "wéb{n}",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": null
+    },
+    {
+      "template": "web{n:_}",
+      "ip": "10.0.0.1",
+      "n": 999,
+      "stored": null
+    },
+    {
+      "template": "web{n:_}",
+      "ip": "10.0.0.1",
+      "n": 1000,
+      "stored": null
+    },
+    {
+      "template": "web{n:,}",
+      "ip": "10.0.0.1",
+      "n": 1000,
+      "stored": null
+    },
+    {
+      "template": "web{n:5d}",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": null
+    },
+    {
+      "template": "web{n:3}",
+      "ip": "10.0.0.1",
+      "n": 100,
+      "stored": null
+    },
+    {
+      "template": "web{n:>3}",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": null
+    },
+    {
+      "template": "web{n:0d}",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": null
+    },
+    {
+      "template": "web{n:0100d}",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": null
+    },
+    {
+      "template": "web{n:+d}",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": null
+    },
+    {
+      "template": "web{n:b}",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": null
+    },
+    {
+      "template": "web{n!r}",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": null
+    },
+    {
+      "template": "web{oct4!s}",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": null
+    },
+    {
+      "template": "h{oct4:0>3}",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": null
+    },
+    {
+      "template": "h{oct4:.1}",
+      "ip": "10.0.0.10",
+      "n": 1,
+      "stored": null
+    },
+    {
+      "template": "web{n:{oct4}}",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": null
+    },
+    {
+      "template": "web{{n}}",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": null
+    },
+    {
+      "template": "web{n",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": null
+    },
+    {
+      "template": "web}{n}",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": null
+    },
+    {
+      "template": "web{server}",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": null
+    },
+    {
+      "template": "web{n.real}",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": null
+    },
+    {
+      "template": "web{oct5}",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": null
+    },
+    {
+      "template": "web{n}\n",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": null
+    },
+    {
+      "template": " web{n}",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": null
+    },
+    {
+      "template": "web{n}.lab",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": null
+    },
+    {
+      "template": "web{n:099d}",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": null
+    },
+    {
+      "template": "web{n:01d}",
+      "ip": "10.0.0.1",
+      "n": 7,
+      "stored": "web7"
+    },
+    {
+      "template": "web{n:03x}",
+      "ip": "10.0.0.1",
+      "n": 10,
+      "stored": "web00a"
+    },
+    {
+      "template": "h{oct4:X}",
+      "ip": "10.0.0.171",
+      "n": 1,
+      "stored": "hab"
+    },
+    {
+      "template": "r{oct3:03d}-{oct4:03d}",
+      "ip": "10.0.2.30",
+      "n": 1,
+      "stored": "r002-030"
+    },
+    {
+      "template": "h{oct1:03d}-{n}",
+      "ip": "2001:db8::1",
+      "n": 4,
+      "stored": "h-4"
+    },
+    {
+      "template": "dhcp-{n}",
+      "ip": "2001:db8::1",
+      "n": 999999999,
+      "stored": "dhcp-999999999"
+    },
+    {
+      "template": "web{a[b]}",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": null
+    },
+    {
+      "template": "web{n:[}",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": null
+    },
+    {
+      "template": "web{}",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": null
+    },
+    {
+      "template": "web{0}",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": null
+    },
+    {
+      "template": "w{{x}}{n}",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": null
+    },
+    {
+      "template": "web{n:d\n}",
+      "ip": "10.0.0.1",
+      "n": 1,
+      "stored": null
+    }
+  ],
+  "template_start": {
+    "max": 999999999,
+    "accepted": [0, 1, 999999999],
+    "refused": [-1, 1000000000, 1.5]
+  }
+}

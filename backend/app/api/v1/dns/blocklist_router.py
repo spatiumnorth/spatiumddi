@@ -16,31 +16,45 @@ produced by `app.services.dns_blocklist`.
 
 from __future__ import annotations
 
+import asyncio
+import ipaddress
 import json
 import uuid
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, field_validator
-from sqlalchemy import select
+from pydantic import BaseModel, field_validator, model_validator
+from sqlalchemy import func, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.agent_wake import collect_wake, dns_group_channel
+from app.core.celery_dispatch import dispatch
 from app.core.permissions import require_resource_permission
+from app.core.safe_fetch import (
+    FetchRefusedError,
+    check_feed_url_shape,
+    guard_url,
+    has_masked_credentials,
+    mask_url_credentials,
+)
+from app.core.update_nulls import changed_keys, resolve_update_changes, snapshot
 from app.models.audit import AuditLog
 from app.models.dns import (
+    FEED_WILDCARD_MODES,
     DNSBlockList,
     DNSBlockListEntry,
     DNSBlockListException,
     DNSServerGroup,
     DNSView,
 )
+from app.services.dns import technitium_api_scope
+from app.services.dns.blocklist_feed_health import feed_sync_state
 from app.services.dns.blocklist_templates import (
     BlocklistTemplate,
     TemplateGroupConflict,
@@ -50,6 +64,7 @@ from app.services.dns.blocklist_templates import (
     template_entries,
     template_for,
 )
+from app.services.dns.memory_estimate import warnings_by_group as memory_warnings_by_group
 from app.services.dns_blocklist import (
     build_effective_for_group,
     build_effective_for_view,
@@ -62,8 +77,108 @@ router = APIRouter(dependencies=[Depends(require_resource_permission("dns_blockl
 
 VALID_SOURCE_TYPES = {"manual", "url", "file_upload"}
 VALID_FEED_FORMATS = {"hosts", "domains", "adblock"}
-VALID_BLOCK_MODES = {"nxdomain", "sinkhole", "refused"}
+VALID_BLOCK_MODES = {"nxdomain", "sinkhole"}
 VALID_ENTRY_TYPES = {"block", "redirect", "nxdomain"}
+# update_interval_hours: 0 = manual refresh only; otherwise the hourly sweep
+# refreshes the feed once the interval has passed (#1467). Capped at a year.
+MAX_UPDATE_INTERVAL_HOURS = 8760
+
+
+def _check_wildcard_mode(v: str) -> str:
+    """``feed_wildcard_mode`` is ``by_syntax``, ``always`` or ``never`` (#4190)."""
+    if v not in FEED_WILDCARD_MODES:
+        raise ValueError(f"feed_wildcard_mode must be one of {list(FEED_WILDCARD_MODES)}")
+    return v
+
+
+def _legacy_wildcard_mode(flag: bool) -> str:
+    """The pre-#4190 boolean, read as the explicit choice it was."""
+    return "always" if flag else "never"
+
+
+def _check_block_mode(v: str | None) -> str | None:
+    """``block_mode`` is ``nxdomain`` or ``sinkhole`` (#2124).
+
+    ``refused`` used to be accepted and is now a 422 naming why: BIND's RPZ
+    has no action that answers REFUSED (its actions are NXDOMAIN, NODATA,
+    PASSTHRU, DROP, TCP-only and local data), so the mode was rendered as
+    NXDOMAIN on the agent and as a dropped query by the control-plane
+    renderer — never as what it said.
+    """
+    if v is None:
+        return v
+    if v == "refused":
+        raise ValueError(
+            "block_mode 'refused' is not supported: DNS response-policy zones "
+            "have no action that answers REFUSED. Use 'nxdomain' (fail fast "
+            "with NXDOMAIN) or 'sinkhole' (answer with a sinkhole address)."
+        )
+    if v not in VALID_BLOCK_MODES:
+        raise ValueError(f"block_mode must be one of {sorted(VALID_BLOCK_MODES)}")
+    return v
+
+
+def _check_sinkhole_ip(v: str | None) -> str | None:
+    """A sinkhole address is an IPv4 or IPv6 literal (#2124).
+
+    It is rendered into the RPZ zone as A / AAAA rdata, where anything else
+    makes BIND refuse the WHOLE zone (#878). Stored normalised, so
+    ``::0`` and ``::`` are one value. Blank means "the default"
+    (``0.0.0.0`` and ``::``) and is stored as NULL.
+    """
+    if v is None:
+        return None
+    text = v.strip()
+    if not text:
+        return None
+    try:
+        return str(ipaddress.ip_address(text))
+    except ValueError:
+        raise ValueError(f"sinkhole_ip must be an IPv4 or IPv6 address, not {v!r}") from None
+
+
+def _check_feed_url(v: str | None) -> str | None:
+    """A feed URL is ``http(s)://host…``; blank is "no feed" (stored as is).
+
+    Shape only. The address the host resolves to is checked when the list
+    is saved (:func:`_guard_feed_target`) and again on every fetch.
+    """
+    if v is None or not v.strip():
+        return v
+    return check_feed_url_shape(v)
+
+
+async def _guard_feed_target(url: str | None) -> None:
+    """Refuse a feed URL whose host resolves to loopback / link-local /
+    metadata — the same check every fetch repeats. Generic 422: the
+    resolved address is logged, not echoed back."""
+    if not url or not url.strip():
+        return
+    try:
+        await asyncio.to_thread(guard_url, url, label="dns_blocklist_feed")
+    except FetchRefusedError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+
+
+_MASKED_FEED_URL_DETAIL = (
+    "feed URL credentials are shown masked; re-enter them in full to change the URL"
+)
+
+
+def _reject_masked_feed_url(url: str | None) -> None:
+    """A masked credential (``***``) in a URL being saved is the display form
+    coming back, not a password. Saving it would replace the real credential
+    with the mask, so it is refused rather than stored."""
+    if url and has_masked_credentials(url):
+        raise HTTPException(status_code=422, detail=_MASKED_FEED_URL_DETAIL)
+
+
+def _check_interval(v: int | None) -> int | None:
+    if v is not None and not 0 <= v <= MAX_UPDATE_INTERVAL_HOURS:
+        raise ValueError(
+            f"update_interval_hours must be 0 (manual only) to {MAX_UPDATE_INTERVAL_HOURS}"
+        )
+    return v
 
 
 # ── Schemas ─────────────────────────────────────────────────────────────────
@@ -79,15 +194,43 @@ class BlockListCreate(BaseModel):
     update_interval_hours: int = 24
     block_mode: str = "nxdomain"
     sinkhole_ip: str | None = None
-    # Feed rows block subdomains too. Default on — see the model.
-    feed_entries_are_wildcard: bool = True
+    # How feed entries treat subdomains — see the model. ``by_syntax`` by default.
+    feed_wildcard_mode: str = "by_syntax"
+    # Deprecated boolean spelling (#4190): True = "always", False = "never".
+    # Ignored when ``feed_wildcard_mode`` is sent.
+    feed_entries_are_wildcard: bool | None = None
     enabled: bool = True
+
+    @field_validator("feed_wildcard_mode")
+    @classmethod
+    def _v_wildcard_mode(cls, v: str) -> str:
+        return _check_wildcard_mode(v)
+
+    @model_validator(mode="after")
+    def _fold_legacy_wildcard(self) -> Self:
+        if "feed_wildcard_mode" not in self.model_fields_set:
+            legacy = self.feed_entries_are_wildcard
+            if legacy is not None:
+                self.feed_wildcard_mode = _legacy_wildcard_mode(legacy)
+        self.feed_entries_are_wildcard = None
+        return self
 
     @field_validator("source_type")
     @classmethod
     def _v_source(cls, v: str) -> str:
         if v not in VALID_SOURCE_TYPES:
             raise ValueError(f"source_type must be one of {sorted(VALID_SOURCE_TYPES)}")
+        return v
+
+    @field_validator("feed_url")
+    @classmethod
+    def _v_feed_url(cls, v: str | None) -> str | None:
+        return _check_feed_url(v)
+
+    @field_validator("update_interval_hours")
+    @classmethod
+    def _v_interval(cls, v: int) -> int:
+        _check_interval(v)
         return v
 
     @field_validator("feed_format")
@@ -100,9 +243,13 @@ class BlockListCreate(BaseModel):
     @field_validator("block_mode")
     @classmethod
     def _v_mode(cls, v: str) -> str:
-        if v not in VALID_BLOCK_MODES:
-            raise ValueError(f"block_mode must be one of {sorted(VALID_BLOCK_MODES)}")
+        _check_block_mode(v)
         return v
+
+    @field_validator("sinkhole_ip")
+    @classmethod
+    def _v_sinkhole(cls, v: str | None) -> str | None:
+        return _check_sinkhole_ip(v)
 
 
 class BlockListUpdate(BaseModel):
@@ -115,8 +262,25 @@ class BlockListUpdate(BaseModel):
     update_interval_hours: int | None = None
     block_mode: str | None = None
     sinkhole_ip: str | None = None
+    feed_wildcard_mode: str | None = None
+    # Deprecated boolean spelling (#4190); ``feed_wildcard_mode`` wins.
     feed_entries_are_wildcard: bool | None = None
     enabled: bool | None = None
+
+    @field_validator("feed_wildcard_mode")
+    @classmethod
+    def _v_wildcard_mode(cls, v: str | None) -> str | None:
+        return None if v is None else _check_wildcard_mode(v)
+
+    @model_validator(mode="after")
+    def _fold_legacy_wildcard(self) -> Self:
+        legacy = self.feed_entries_are_wildcard
+        if legacy is not None and "feed_wildcard_mode" not in self.model_fields_set:
+            self.feed_wildcard_mode = _legacy_wildcard_mode(legacy)
+            self.model_fields_set.add("feed_wildcard_mode")
+        self.model_fields_set.discard("feed_entries_are_wildcard")
+        self.feed_entries_are_wildcard = None
+        return self
 
     @field_validator("source_type")
     @classmethod
@@ -124,6 +288,16 @@ class BlockListUpdate(BaseModel):
         if v is not None and v not in VALID_SOURCE_TYPES:
             raise ValueError(f"source_type must be one of {sorted(VALID_SOURCE_TYPES)}")
         return v
+
+    @field_validator("feed_url")
+    @classmethod
+    def _v_feed_url(cls, v: str | None) -> str | None:
+        return _check_feed_url(v)
+
+    @field_validator("update_interval_hours")
+    @classmethod
+    def _v_interval(cls, v: int | None) -> int | None:
+        return _check_interval(v)
 
     @field_validator("feed_format")
     @classmethod
@@ -135,9 +309,31 @@ class BlockListUpdate(BaseModel):
     @field_validator("block_mode")
     @classmethod
     def _v_mode(cls, v: str | None) -> str | None:
-        if v is not None and v not in VALID_BLOCK_MODES:
-            raise ValueError(f"block_mode must be one of {sorted(VALID_BLOCK_MODES)}")
-        return v
+        return _check_block_mode(v)
+
+    @field_validator("sinkhole_ip")
+    @classmethod
+    def _v_sinkhole(cls, v: str | None) -> str | None:
+        return _check_sinkhole_ip(v)
+
+
+class FeedParseSkipped(BaseModel):
+    """Rules the last adblock-format refresh could not enforce (#2123)."""
+
+    regex: int = 0
+    modifier: int = 0
+    badfilter: int = 0
+    # Total of the reason buckets below; kept so older readers still add up (#3519).
+    malformed: int = 0
+    star_in_name: int = 0
+    no_anchor: int = 0
+    trailing_dot: int = 0
+    start_anchor: int = 0
+    bare_star: int = 0
+    dotless: int = 0
+    other: int = 0
+    # hosts / domains feeds: tokens that are not DNS names (#3531).
+    invalid_name: int = 0
 
 
 class BlockListResponse(BaseModel):
@@ -151,16 +347,29 @@ class BlockListResponse(BaseModel):
     update_interval_hours: int
     block_mode: str
     sinkhole_ip: str | None
+    feed_wildcard_mode: str
+    # Legacy view of ``feed_wildcard_mode``: False only for "never".
     feed_entries_are_wildcard: bool
     enabled: bool
     last_synced_at: datetime | None
     last_sync_status: str | None
     last_sync_error: str | None
+    # Last refresh that SUCCEEDED (#2313); NULL = never has.
+    last_success_at: datetime | None = None
+    # ok | error | stale | never; NULL for a manual list (no feed). One
+    # classification shared with the ``dns_blocklist_feed_stale`` alert.
+    feed_sync_state: str | None = None
     entry_count: int
+    # NULL = no adblock refresh has recorded counts (or not an adblock feed).
+    feed_parse_skipped: FeedParseSkipped | None = None
     created_at: datetime
     modified_at: datetime
     applied_group_ids: list[uuid.UUID] = []
     applied_view_ids: list[uuid.UUID] = []
+    # #3551 — set when a BIND9 group this list is applied to (directly or
+    # through a view) is estimated at 80 % or more of its agents' memory
+    # limit. Each view that applies a list loads its own copy of it.
+    memory_warning: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -252,14 +461,29 @@ class ExceptionResponse(BaseModel):
     list_id: uuid.UUID
     domain: str
     reason: str
+    # manual | feed — a feed row is the feed's own ``@@`` rule (#2123) and is
+    # re-synced by every refresh.
+    source: str = "manual"
     created_at: datetime
 
     model_config = {"from_attributes": True}
 
 
 class AssignmentUpdate(BaseModel):
+    # Full sets REPLACE the stored membership (kept for existing clients).
     server_group_ids: list[uuid.UUID] | None = None
     view_ids: list[uuid.UUID] | None = None
+    # Deltas (#3737) change only the named ids, applied to the stored sets
+    # under a row lock, so a client that only speaks for one group / view
+    # cannot drop what another client attached since it last read. Adding an
+    # id already present, or removing one that is not, is a no-op. Per
+    # dimension a request carries EITHER the full set OR deltas, and never
+    # the same id in both add and remove: both are refused with 422 rather
+    # than resolved by an order nobody can see from the payload.
+    add_server_group_ids: list[uuid.UUID] | None = None
+    remove_server_group_ids: list[uuid.UUID] | None = None
+    add_view_ids: list[uuid.UUID] | None = None
+    remove_view_ids: list[uuid.UUID] | None = None
 
 
 class RefreshResponse(BaseModel):
@@ -312,22 +536,49 @@ def _to_response(bl: DNSBlockList) -> BlockListResponse:
         description=bl.description,
         category=bl.category,
         source_type=bl.source_type,
-        feed_url=bl.feed_url,
+        # Credentials in the feed URL (userinfo, ``?token=``) are masked for
+        # every reader; the stored URL is used only to fetch. An edit that
+        # sends the masked form back unchanged keeps the stored URL.
+        feed_url=mask_url_credentials(bl.feed_url) if bl.feed_url else bl.feed_url,
         feed_format=bl.feed_format,
         update_interval_hours=bl.update_interval_hours,
         block_mode=bl.block_mode,
         sinkhole_ip=bl.sinkhole_ip,
+        feed_wildcard_mode=bl.feed_wildcard_mode,
         feed_entries_are_wildcard=bl.feed_entries_are_wildcard,
         enabled=bl.enabled,
         last_synced_at=bl.last_synced_at,
         last_sync_status=bl.last_sync_status,
         last_sync_error=bl.last_sync_error,
+        last_success_at=bl.last_success_at,
+        feed_sync_state=feed_sync_state(bl),
         entry_count=bl.entry_count,
+        feed_parse_skipped=(
+            FeedParseSkipped(**bl.feed_parse_skipped) if bl.feed_parse_skipped else None
+        ),
         created_at=bl.created_at,
         modified_at=bl.modified_at,
         applied_group_ids=[g.id for g in bl.server_groups],
         applied_view_ids=[v.id for v in bl.views],
     )
+
+
+async def _with_memory_warnings(db: DB, lists: list[DNSBlockList]) -> list[BlockListResponse]:
+    """Responses for ``lists``, each carrying its groups' memory warning
+    (#3551). One estimate per affected group, however many lists share it."""
+    out = [_to_response(bl) for bl in lists]
+    warns = await memory_warnings_by_group(
+        db, [gid for bl in lists for gid in sorted(_blocklist_group_ids(bl))]
+    )
+    for resp, bl in zip(out, lists, strict=True):
+        hit = next((warns[g] for g in sorted(_blocklist_group_ids(bl)) if g in warns), None)
+        if hit is not None:
+            resp.memory_warning = hit.message
+    return out
+
+
+async def _respond(db: DB, bl: DNSBlockList) -> BlockListResponse:
+    return (await _with_memory_warnings(db, [bl]))[0]
 
 
 def _blocklist_group_ids(bl: DNSBlockList) -> set[uuid.UUID]:
@@ -451,6 +702,13 @@ class SubscribeFromCatalogRequest(BaseModel):
     block_mode: str = "nxdomain"
     enabled: bool = True
 
+    @field_validator("block_mode")
+    @classmethod
+    def _v_bm(cls, v: str) -> str:
+        # Was unvalidated: any string reached the row and the renderers.
+        _check_block_mode(v)
+        return v
+
 
 @router.get("/blocklists/catalog", response_model=CatalogResponse)
 async def get_blocklist_catalog(_: CurrentUser) -> CatalogResponse:
@@ -563,7 +821,7 @@ async def subscribe_from_catalog(
         list_id=str(bl.id),
         source_id=body.source_id,
     )
-    return _to_response(reloaded)
+    return await _respond(db, reloaded)
 
 
 # ── Built-in templates + profiles (issue #878) ──────────────────────────────
@@ -595,13 +853,12 @@ def _build_from_source(
         feed_format=src["feed_format"],
         update_interval_hours=update_interval_hours,
         block_mode=block_mode,
-        # Per-source, defaulting on (#894). Every catalog entry today is a
-        # "block this domain and everything under it" list, so none set it
-        # — the key exists for a host-specific feed (a threat-intel drop of
-        # individual C2 FQDNs), where blocking the parent domain would be
-        # over-blocking. Left absent rather than stamped `true` on all 19
-        # entries, which would be noise carrying no information.
-        feed_entries_are_wildcard=bool(src.get("entries_are_wildcard", True)),
+        # Per-source ``wildcard_mode`` (#4190), default ``by_syntax``: the
+        # entry follows its line's syntax. Set to ``always`` for a
+        # plain-domain feed whose publisher means "this domain and
+        # everything under it" (HaGeZi's ``wildcard/`` lists, OISD
+        # ``domainswild``), where a bare line would otherwise read as exact.
+        feed_wildcard_mode=str(src.get("wildcard_mode", "by_syntax")),
         enabled=enabled,
     )
 
@@ -640,9 +897,7 @@ class FromTemplateRequest(BaseModel):
     @field_validator("block_mode")
     @classmethod
     def _v_bm(cls, v: str | None) -> str | None:
-        if v is not None and v not in VALID_BLOCK_MODES:
-            raise ValueError(f"block_mode must be one of {sorted(VALID_BLOCK_MODES)}")
-        return v
+        return _check_block_mode(v)
 
 
 async def _materialise_template(
@@ -756,7 +1011,7 @@ async def create_from_template(
         template_id=template.id,
         entries=reloaded.entry_count,
     )
-    return _to_response(reloaded)
+    return await _respond(db, reloaded)
 
 
 class ApplyProfileRequest(BaseModel):
@@ -950,7 +1205,7 @@ async def list_blocklists(db: DB, _: CurrentUser) -> list[BlockListResponse]:
         )
         .order_by(DNSBlockList.name)
     )
-    return [_to_response(bl) for bl in result.scalars().all()]
+    return await _with_memory_warnings(db, list(result.scalars().all()))
 
 
 @router.post(
@@ -964,8 +1219,10 @@ async def create_blocklist(
     existing = await db.execute(select(DNSBlockList).where(DNSBlockList.name == body.name))
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="A blocklist with that name already exists")
+    _reject_masked_feed_url(body.feed_url)
+    await _guard_feed_target(body.feed_url)
 
-    bl = DNSBlockList(**body.model_dump())
+    bl = DNSBlockList(**body.model_dump(exclude={"feed_entries_are_wildcard"}))
     db.add(bl)
     await db.flush()
     db.add(
@@ -981,13 +1238,13 @@ async def create_blocklist(
     reloaded = await _require_list(bl.id, db)
     _wake_blocklist_groups(reloaded)
     logger.info("dns_blocklist_created", list_id=str(bl.id), name=bl.name)
-    return _to_response(reloaded)
+    return await _respond(db, reloaded)
 
 
 @router.get("/blocklists/{list_id}", response_model=BlockListResponse)
 async def get_blocklist(list_id: uuid.UUID, db: DB, _: CurrentUser) -> BlockListResponse:
     bl = await _require_list(list_id, db)
-    return _to_response(bl)
+    return await _respond(db, bl)
 
 
 @router.put("/blocklists/{list_id}", response_model=BlockListResponse)
@@ -995,15 +1252,47 @@ async def update_blocklist(
     list_id: uuid.UUID, body: BlockListUpdate, db: DB, current_user: SuperAdmin
 ) -> BlockListResponse:
     bl = await _require_list(list_id, db)
-    changes = body.model_dump(exclude_none=True)
-    wildcard_flipped = (
-        "feed_entries_are_wildcard" in changes
-        and changes["feed_entries_are_wildcard"] != bl.feed_entries_are_wildcard
+    # #1563 — explicit null clears feed_url / sinkhole_ip; null for a
+    # NOT NULL column is a 422.
+    changes = resolve_update_changes(
+        body,
+        clearable={"feed_url", "sinkhole_ip"},
+        non_nullable={
+            "name",
+            "description",
+            "category",
+            "source_type",
+            "feed_format",
+            "update_interval_hours",
+            "block_mode",
+            "feed_wildcard_mode",
+            "enabled",
+        },
     )
+    if (
+        "feed_url" in changes
+        and changes["feed_url"]
+        and bl.feed_url
+        and changes["feed_url"] != bl.feed_url
+        and changes["feed_url"] == mask_url_credentials(bl.feed_url)
+    ):
+        # The masked form the API returned, sent back as is (an edit of
+        # another field): the URL did not change, keep the stored one.
+        del changes["feed_url"]
+    if "feed_url" in changes:
+        _reject_masked_feed_url(changes["feed_url"])
+        await _guard_feed_target(changes["feed_url"])
+    wildcard_flipped = (
+        "feed_wildcard_mode" in changes and changes["feed_wildcard_mode"] != bl.feed_wildcard_mode
+    )
+    before = snapshot(bl, changes)
     for k, v in changes.items():
         setattr(bl, k, v)
 
-    if wildcard_flipped:
+    # ``by_syntax`` cannot be restamped from the stored rows (they do not
+    # remember which syntax they came from); the refresh below does it.
+    resync_for_syntax = wildcard_flipped and bl.feed_wildcard_mode == "by_syntax"
+    if wildcard_flipped and not resync_for_syntax:
         # Restamp the rows already stored (#894). The refresh task diffs by
         # domain and never revisits an unchanged one, so without this the
         # toggle would appear to do nothing until a feed's contents
@@ -1029,7 +1318,7 @@ async def update_blocklist(
                 DNSBlockListEntry.list_id == bl.id,
                 DNSBlockListEntry.source == "feed",
             )
-            .values(is_wildcard=bl.feed_entries_are_wildcard)
+            .values(is_wildcard=bl.feed_wildcard_mode == "always")
         )
 
     db.add(
@@ -1039,13 +1328,15 @@ async def update_blocklist(
             "dns_blocklist",
             str(bl.id),
             bl.name,
-            changed_fields=list(changes.keys()),
+            changed_fields=changed_keys(before, changes),
         )
     )
     await db.commit()
     reloaded = await _require_list(list_id, db)
     _wake_blocklist_groups(reloaded)
-    return _to_response(reloaded)
+    if resync_for_syntax:
+        _enqueue_initial_refresh(reloaded)
+    return await _respond(db, reloaded)
 
 
 @router.delete("/blocklists/{list_id}", status_code=204)
@@ -1069,12 +1360,60 @@ async def update_assignments(
     db: DB,
     current_user: SuperAdmin,
 ) -> BlockListResponse:
+    for dim, full, add, remove in (
+        (
+            "server_group_ids",
+            body.server_group_ids,
+            body.add_server_group_ids,
+            body.remove_server_group_ids,
+        ),
+        ("view_ids", body.view_ids, body.add_view_ids, body.remove_view_ids),
+    ):
+        if full is not None and (add or remove):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Send either {dim} (the full set) or add_{dim} / remove_{dim} "
+                    f"(changes to the stored set), not both."
+                ),
+            )
+        both = set(add or []) & set(remove or [])
+        if both:
+            raise HTTPException(
+                status_code=422,
+                detail=f"The same id is in both add_{dim} and remove_{dim}: "
+                + ", ".join(sorted(str(i) for i in both)),
+            )
+    if (
+        body.server_group_ids is None
+        and body.view_ids is None
+        and not any(
+            (
+                body.add_server_group_ids,
+                body.remove_server_group_ids,
+                body.add_view_ids,
+                body.remove_view_ids,
+            )
+        )
+    ):
+        # Nothing asked for: no audit row, no agent wake (an untouched Save
+        # scope sends ``{}``).
+        return await _respond(db, await _require_list(list_id, db))
+
+    # Serialise writers of this list's assignments: the relationships are
+    # read below and rewritten, so without the lock two requests could each
+    # start from the same stored set — a concurrent add of the same id then
+    # hits the association's unique key, a concurrent remove deletes a row
+    # the other already deleted, and a full set races a delta.
+    await db.execute(select(DNSBlockList.id).where(DNSBlockList.id == list_id).with_for_update())
     bl = await _require_list(list_id, db)
 
     # Capture the pre-change affected groups so a de-assigned group also
     # re-renders (drops the blocklist). Read from the eager-loaded relationships
     # before we reassign them.
     old_group_ids = _blocklist_group_ids(bl)
+    old_direct_group_ids = {g.id for g in bl.server_groups}
+    old_view_ids = {v.id for v in bl.views}
 
     changed: list[str] = []
     if body.server_group_ids is not None:
@@ -1089,8 +1428,42 @@ async def update_assignments(
         )
         if len(groups) != len(set(body.server_group_ids)):
             raise HTTPException(status_code=404, detail="One or more server groups not found")
+        # #1784 — only NEWLY assigned groups are refused, so a list already
+        # applied to such a group can still be edited / de-assigned.
+        for g in groups:
+            if g.id not in old_group_ids and await technitium_api_scope.group_is_technitium_api(
+                db, g.id
+            ):
+                raise technitium_api_scope.refusal(
+                    f"blocklists are not applied to the Technitium server " f"(group {g.name!r})."
+                )
+        if {g.id for g in groups} != old_direct_group_ids:
+            changed.append("server_group_ids")
         bl.server_groups = groups
-        changed.append("server_group_ids")
+
+    if body.add_server_group_ids or body.remove_server_group_ids:
+        current = {g.id: g for g in bl.server_groups}
+        remove = set(body.remove_server_group_ids or [])
+        add_ids = [i for i in (body.add_server_group_ids or []) if i not in current]
+        added = list(
+            (await db.execute(select(DNSServerGroup).where(DNSServerGroup.id.in_(add_ids))))
+            .scalars()
+            .all()
+        )
+        if len(added) != len(set(add_ids)):
+            raise HTTPException(status_code=404, detail="One or more server groups not found")
+        for g in added:
+            if g.id not in old_group_ids and await technitium_api_scope.group_is_technitium_api(
+                db, g.id
+            ):
+                raise technitium_api_scope.refusal(
+                    f"blocklists are not applied to the Technitium server (group {g.name!r})."
+                )
+            current[g.id] = g
+        new_groups = [g for gid, g in current.items() if gid not in remove]
+        if {g.id for g in new_groups} != old_direct_group_ids:
+            changed.append("server_group_ids")
+        bl.server_groups = new_groups
 
     if body.view_ids is not None:
         views = list(
@@ -1098,8 +1471,31 @@ async def update_assignments(
         )
         if len(views) != len(set(body.view_ids)):
             raise HTTPException(status_code=404, detail="One or more views not found")
+        if {v.id for v in views} != old_view_ids:
+            changed.append("view_ids")
         bl.views = views
-        changed.append("view_ids")
+
+    # #4042 — the view delta must run BEFORE the nothing-changed return below,
+    # or a request carrying only view deltas answered 200 and persisted nothing.
+    if body.add_view_ids or body.remove_view_ids:
+        vcurrent = {v.id: v for v in bl.views}
+        vremove = set(body.remove_view_ids or [])
+        vadd_ids = [i for i in (body.add_view_ids or []) if i not in vcurrent]
+        vadded = list(
+            (await db.execute(select(DNSView).where(DNSView.id.in_(vadd_ids)))).scalars().all()
+        )
+        if len(vadded) != len(set(vadd_ids)):
+            raise HTTPException(status_code=404, detail="One or more views not found")
+        for v in vadded:
+            vcurrent[v.id] = v
+        new_views = [v for vid, v in vcurrent.items() if vid not in vremove]
+        if {v.id for v in new_views} != old_view_ids:
+            changed.append("view_ids")
+        bl.views = new_views
+
+    if not changed:
+        # #3738 — nothing stored changed: no audit row, no wake.
+        return await _respond(db, bl)
 
     db.add(
         _audit(
@@ -1116,7 +1512,7 @@ async def update_assignments(
     # Wake BOTH the old and new group sets so de-assigned groups re-render too.
     for gid in old_group_ids | _blocklist_group_ids(reloaded):
         collect_wake(dns_group_channel(gid))
-    return _to_response(reloaded)
+    return await _respond(db, reloaded)
 
 
 # ── Entries ────────────────────────────────────────────────────────────────
@@ -1135,10 +1531,12 @@ async def list_entries(
     stmt = select(DNSBlockListEntry).where(DNSBlockListEntry.list_id == list_id)
     if q:
         stmt = stmt.where(DNSBlockListEntry.domain.ilike(f"%{q.lower()}%"))
-    total_stmt = stmt
-    total = len((await db.execute(total_stmt)).scalars().all())
+    # COUNT in the database; never hydrate every matching entry (#1724).
+    total = (
+        await db.execute(select(func.count()).select_from(stmt.order_by(None).subquery()))
+    ).scalar_one()
     items_result = await db.execute(
-        stmt.order_by(DNSBlockListEntry.domain).limit(limit).offset(offset)
+        stmt.order_by(DNSBlockListEntry.domain, DNSBlockListEntry.id).limit(limit).offset(offset)
     )
     return EntryPage(
         total=total,
@@ -1152,7 +1550,7 @@ async def list_entries(
     status_code=201,
 )
 async def add_entry(
-    list_id: uuid.UUID, body: EntryCreate, db: DB, current_user: SuperAdmin
+    list_id: uuid.UUID, body: EntryCreate, db: DB, current_user: CurrentUser
 ) -> EntryResponse:
     bl = await _require_list(list_id, db)
     domain = body.domain.strip().lower().strip(".")
@@ -1177,6 +1575,7 @@ async def add_entry(
         reason=body.reason,
     )
     db.add(entry)
+    await db.flush()  # column-default id must exist before the audit row reads it (#2006)
     bl.entry_count = bl.entry_count + 1
     db.add(
         _audit(
@@ -1201,18 +1600,29 @@ async def bulk_add_entries(
     list_id: uuid.UUID,
     body: BulkAddRequest,
     db: DB,
-    current_user: SuperAdmin,
+    current_user: CurrentUser,
 ) -> BulkAddResponse:
     bl = await _require_list(list_id, db)
 
     # Dedupe submitted domains + validate
     incoming = dedupe_domains(body.domains)
 
-    # Fetch existing domains in the list for the diff
-    existing_result = await db.execute(
-        select(DNSBlockListEntry.domain).where(DNSBlockListEntry.list_id == list_id)
-    )
-    existing: set[str] = set(existing_result.scalars().all())
+    # Ask only about the incoming domains — never read the whole list (#1724).
+    existing: set[str] = set()
+    for i in range(0, len(incoming), 5000):
+        chunk = incoming[i : i + 5000]
+        existing.update(
+            (
+                await db.execute(
+                    select(DNSBlockListEntry.domain).where(
+                        DNSBlockListEntry.list_id == list_id,
+                        DNSBlockListEntry.domain.in_(chunk),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
 
     added = 0
     skipped = 0
@@ -1261,7 +1671,7 @@ async def update_entry(
     entry_id: uuid.UUID,
     body: EntryUpdate,
     db: DB,
-    current_user: SuperAdmin,
+    current_user: CurrentUser,
 ) -> EntryResponse:
     bl = await _require_list(list_id, db)
     result = await db.execute(
@@ -1279,7 +1689,12 @@ async def update_entry(
             status_code=409,
             detail="Only manual entries can be edited; feed-sourced entries are refreshed from source.",
         )
-    changes = body.model_dump(exclude_none=True)
+    # #1563 — explicit null clears target; null for a NOT NULL column is a 422.
+    changes = resolve_update_changes(
+        body,
+        clearable={"target"},
+        non_nullable={"domain", "entry_type", "is_wildcard", "reason"},
+    )
     if "domain" in changes:
         domain = changes["domain"].strip().lower().strip(".")
         if not domain or "." not in domain:
@@ -1317,7 +1732,7 @@ async def delete_entry(
     list_id: uuid.UUID,
     entry_id: uuid.UUID,
     db: DB,
-    current_user: SuperAdmin,
+    current_user: CurrentUser,
 ) -> None:
     bl = await _require_list(list_id, db)
     result = await db.execute(
@@ -1369,7 +1784,7 @@ async def add_exception(
     list_id: uuid.UUID,
     body: ExceptionCreate,
     db: DB,
-    current_user: SuperAdmin,
+    current_user: CurrentUser,
 ) -> DNSBlockListException:
     bl = await _require_list(list_id, db)
     domain = body.domain.strip().lower().strip(".")
@@ -1382,16 +1797,27 @@ async def add_exception(
             DNSBlockListException.domain == domain,
         )
     )
-    if existing.scalar_one_or_none():
+    prior = existing.scalar_one_or_none()
+    if prior is not None and prior.source != "feed":
         raise HTTPException(status_code=409, detail="Exception already exists")
 
-    ex = DNSBlockListException(
-        list_id=list_id,
-        domain=domain,
-        reason=body.reason,
-        created_by_user_id=current_user.id,
-    )
-    db.add(ex)
+    if prior is not None:
+        # The feed already excepts this name (#2123). Adding it by hand makes
+        # it the operator's: a feed row is removed by the next refresh that
+        # no longer lists it, which would silently undo what was just asked.
+        ex = prior
+        ex.source = "manual"
+        ex.reason = body.reason
+        ex.created_by_user_id = current_user.id
+    else:
+        ex = DNSBlockListException(
+            list_id=list_id,
+            domain=domain,
+            reason=body.reason,
+            created_by_user_id=current_user.id,
+        )
+        db.add(ex)
+    await db.flush()  # column-default id must exist before the audit row reads it (#2006)
     db.add(
         _audit(
             current_user,
@@ -1416,7 +1842,7 @@ async def update_exception(
     exception_id: uuid.UUID,
     body: ExceptionUpdate,
     db: DB,
-    current_user: SuperAdmin,
+    current_user: CurrentUser,
 ) -> DNSBlockListException:
     bl = await _require_list(list_id, db)
     result = await db.execute(
@@ -1446,6 +1872,11 @@ async def update_exception(
         changes["domain"] = domain
     for k, v in changes.items():
         setattr(ex, k, v)
+    if changes:
+        # An edited feed row is the operator's from now on (#2123): a refresh
+        # removes any feed row the feed no longer lists, which would drop
+        # an edit — a renamed row always — at the next sync.
+        ex.source = "manual"
     db.add(
         _audit(
             current_user,
@@ -1466,7 +1897,7 @@ async def delete_exception(
     list_id: uuid.UUID,
     exception_id: uuid.UUID,
     db: DB,
-    current_user: SuperAdmin,
+    current_user: CurrentUser,
 ) -> None:
     bl = await _require_list(list_id, db)
     result = await db.execute(
@@ -1510,7 +1941,7 @@ async def refresh_blocklist(
 
     task_id: str | None = None
     try:
-        result = refresh_blocklist_feed.delay(str(bl.id))
+        result = await dispatch(refresh_blocklist_feed, str(bl.id))
         task_id = result.id
     except Exception as e:  # noqa: BLE001
         logger.warning("blocklist_refresh_enqueue_failed", list_id=str(bl.id), error=str(e))

@@ -14,13 +14,21 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import socket
+from collections.abc import Sequence
 from typing import Any
 
 import structlog
 
+from app.drivers.dns._txt import txt_value
 from app.drivers.dns.base import RecordData, TsigKey
 
 logger = structlog.get_logger(__name__)
+
+
+class UnresolvableHostError(RuntimeError):
+    """``host`` did not resolve (#3757). A RuntimeError so every caller that
+    surfaces the message verbatim keeps working; the type lets the AXFR helper
+    tell "no such name here" from every other failure."""
 
 
 def resolve_server_address(host: str, port: int, *, what: str) -> list[str]:
@@ -51,7 +59,7 @@ def resolve_server_address(host: str, port: int, *, what: str) -> list[str]:
     try:
         infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
     except OSError as exc:
-        raise RuntimeError(
+        raise UnresolvableHostError(
             f"{what} from {host}:{port} failed: could not resolve {host!r} ({exc})."
         ) from exc
 
@@ -92,6 +100,16 @@ def _hint(exc: BaseException, port: int) -> str:
             "allow-transfer permits the SpatiumDDI control plane, and that it is "
             "authoritative for this zone."
         )
+    if "SERVFAIL" in text:
+        # The server answered (so TCP is open and the ACL did not refuse), but
+        # could not serve this zone: a secondary that never transferred it from
+        # its primary, or a primary that has not loaded it.
+        return (
+            " The server answered but could not serve this zone (SERVFAIL) — for a "
+            "secondary zone, check that its primary's address is right, that the "
+            "primary answers, and that it allows this server to transfer the "
+            "zone; for a primary zone, check that the server has loaded it."
+        )
     # A signed transfer the server rejected on the signature itself. Sending
     # the operator to allow-transfer here would be actively wrong — the ACL
     # matched, the key didn't. dnspython signals these by exception TYPE and
@@ -113,7 +131,13 @@ def _hint(exc: BaseException, port: int) -> str:
 
 # Signing artefacts the authoritative server generates and owns. Never
 # modelled as SpatiumDDI records, so they must not surface as drift.
-_DNSSEC_ARTEFACTS = frozenset({"RRSIG", "NSEC", "NSEC3", "NSEC3PARAM", "DNSKEY", "CDS", "CDNSKEY"})
+# ``TYPE65534`` is BIND9's private-type signing-state record: an inline-signed
+# zone keeps one at the apex and serves it in every AXFR (verified against
+# BIND 9.20), so without it every signed zone read as drifted (#3198). The
+# agent's ingest skips it for the same reason (``services/dns/ingest.py``).
+_DNSSEC_ARTEFACTS = frozenset(
+    {"RRSIG", "NSEC", "NSEC3", "NSEC3PARAM", "DNSKEY", "CDS", "CDNSKEY", "TYPE65534"}
+)
 
 
 async def axfr_zone_records(
@@ -125,14 +149,21 @@ async def axfr_zone_records(
     log_driver: str = "dns",
     server_id: str | None = None,
     tsig: TsigKey | None = None,
+    include_apex_ns: bool = False,
+    fallback_hosts: Sequence[str] = (),
+    unresolved_fallback_hosts: Sequence[str] = (),
 ) -> list[RecordData]:
     """AXFR ``zone_name`` from ``host:port`` and return neutral record dicts.
 
     Apex SOA and NS are filtered out — SpatiumDDI manages those at the zone
     level, so importing them as user records would create duplicate control
-    surfaces. Out-of-zone glue (an NS target living in a different zone) is
+    surfaces. ``include_apex_ns`` keeps the apex NS set for a read-only
+    caller that compares rather than imports (the drift report, #1857): on an
+    agent-managed server the served NS set is rendered from the zone's own
+    apex NS rows, so dropping it there hides real drift. Out-of-zone glue (an NS target living in a different zone) is
     also skipped, as are DNSSEC signing artefacts (RRSIG / NSEC* / DNSKEY /
-    CDS / CDNSKEY), which the signing server owns and rotates itself.
+    CDS / CDNSKEY / BIND9's private TYPE65534), which the signing server owns
+    and rotates itself.
 
     ``tsig`` signs the transfer (#734). Agent-managed BIND9 and Technitium
     grant ``allow-transfer`` to the group's TSIG key rather than to a source
@@ -141,6 +172,21 @@ async def axfr_zone_records(
     have group context resolve the key and pass it; the parameter stays
     optional because the Windows Path A and cloud callers have no key and
     are authorised by address instead.
+
+    ``fallback_hosts`` (#1470) are tried, in order, only when ``host`` actively
+    REFUSED the TCP connection — the host is up and nothing listens on the
+    port. That is the signature of an appliance DNS pod behind the MetalLB
+    resolver VIP: it dropped hostNetwork, so the node address the server row
+    carries answers nothing on :53, and the caller passes the member's own
+    pod address instead. A timeout or "no route" is deliberately NOT a
+    trigger. Every fallback must address the SAME server as ``host`` — this
+    is a per-server read, and an address that reaches another member would
+    report that member's state as this one's.
+
+    ``unresolved_fallback_hosts`` (#3757) are tried, along with
+    ``fallback_hosts``, when ``host`` does not RESOLVE at all — a chart-deployed
+    agent that registered a bare pod name the API pod cannot look up. Same
+    rule: each must address the SAME server as ``host``.
 
     A key that cannot be turned into a keyring raises rather than falling
     back to an unsigned transfer: silently degrading would turn a
@@ -186,7 +232,40 @@ async def axfr_zone_records(
                 f"is valid base64 and that {tsig.algorithm!r} is a supported algorithm."
             ) from exc
 
+    # Names every address actually dialled, so a failure after a fallback
+    # does not report a pod address the operator has never seen on its own.
+    used_host = f"{host}:{port}"
+
     def _axfr() -> dns.zone.Zone:
+        nonlocal used_host
+        candidates: Sequence[str] = fallback_hosts
+        try:
+            return _axfr_host(host)
+        except ConnectionRefusedError as exc:
+            refused: Exception = exc
+        except UnresolvableHostError as exc:
+            if not (fallback_hosts or unresolved_fallback_hosts):
+                raise
+            refused = exc
+            candidates = list(dict.fromkeys([*unresolved_fallback_hosts, *fallback_hosts]))
+        for fb in candidates:
+            used_host = f"{host}:{port} (retried at {fb}:{port})"
+            try:
+                zone = _axfr_host(fb)
+            except (ConnectionRefusedError, UnresolvableHostError) as exc:
+                refused = exc
+                continue
+            logger.info(
+                f"{log_driver}.axfr_via_fallback",
+                zone=zone_name,
+                server=server_id,
+                host=host,
+                fallback=fb,
+            )
+            return zone
+        raise refused
+
+    def _axfr_host(host: str) -> dns.zone.Zone:
         # A dual-stack host can resolve to an address that isn't the one
         # permitted by allow-transfer (or isn't routable from here at all).
         # An AXFR is a read with no side effects, so walking the candidate
@@ -213,9 +292,7 @@ async def axfr_zone_records(
         # blank reason reach the operator — drift reports and pull-imports
         # both surface this string verbatim.
         detail = str(exc).strip() or type(exc).__name__
-        raise RuntimeError(
-            f"{what} from {host}:{port} failed: {detail}.{_hint(exc, port)}"
-        ) from exc
+        raise RuntimeError(f"{what} from {used_host} failed: {detail}.{_hint(exc, port)}") from exc
 
     def _absolutize(target: Any) -> str:
         """Return ``target`` as its absolute form with trailing dot.
@@ -247,7 +324,7 @@ async def axfr_zone_records(
             rtype = dns.rdatatype.to_text(rdataset.rdtype)
             if rtype == "SOA":
                 continue
-            if rtype == "NS" and rel_label == "@":
+            if rtype == "NS" and rel_label == "@" and not include_apex_ns:
                 continue
             if rtype in _DNSSEC_ARTEFACTS:
                 # The daemon owns these — it mints them when the zone is
@@ -267,6 +344,12 @@ async def axfr_zone_records(
                     value = _absolutize(rdata.target)
                 elif rtype == "PTR":
                     value = _absolutize(rdata.target)
+                elif rtype == "DNAME":
+                    value = _absolutize(rdata.target)
+                elif rtype == "NAPTR":
+                    # The replacement is a name like any other (#1759); the
+                    # derelativized text keeps an in-zone one unambiguous.
+                    value = rdata.to_text(origin=zone_origin, relativize=False)
                 elif rtype == "MX":
                     priority = rdata.preference
                     value = _absolutize(rdata.exchange)
@@ -276,7 +359,18 @@ async def axfr_zone_records(
                     port_field = rdata.port
                     value = _absolutize(rdata.target)
                 elif rtype == "TXT":
-                    value = "".join(s.decode("utf-8", errors="replace") for s in rdata.strings)
+                    # #1760: joining the strings lost an explicit split
+                    # (``"p=AAA" "BBB"`` read back as ``p=AAABBB``) and any
+                    # non-UTF-8 octet, so drift never cleared and Sync
+                    # imported a merged duplicate. Plain text where that
+                    # says the same strings, presentation form otherwise.
+                    value = txt_value(list(rdata.strings))
+                elif rtype in ("SVCB", "HTTPS"):
+                    # Same reason as ``_absolutize``: ``to_text()`` on a
+                    # relativized in-zone target gives ``svc``, which reads
+                    # as a different record from a stored ``svc.zone.``
+                    # (#1513). Derelativize so the target is unambiguous.
+                    value = rdata.to_text(origin=zone_origin, relativize=False)
                 else:
                     value = rdata.to_text()
                 out.append(
@@ -284,7 +378,7 @@ async def axfr_zone_records(
                         name=rel_label,
                         record_type=rtype,
                         value=value,
-                        ttl=int(rdataset.ttl) if rdataset.ttl else None,
+                        ttl=int(rdataset.ttl),
                         priority=priority,
                         weight=weight,
                         port=port_field,

@@ -166,3 +166,66 @@ def test_the_rule_is_peer_scoped_and_needs_the_dhcp_role() -> None:
     assert _dhcp_ha_rule({**ra, "dhcp_ha_peer_cidrs": []}, ["dhcp"]) is None
     injected = ["1.2.3.4 }, drop; tcp dport 22 accept; #"]
     assert _dhcp_ha_rule({**ra, "dhcp_ha_peer_cidrs": injected}, ["dhcp"]) is None
+
+
+@pytest.mark.asyncio
+async def test_a_revoked_namesake_does_not_supply_the_partner_address(
+    db_session: AsyncSession,
+) -> None:
+    """#1810 — a re-imaged partner leaves a revoked row under the same
+    hostname carrying its OLD node IPs. The listener must open to the live
+    (approved) partner, not to the stale address, whichever row the
+    database happens to return first."""
+    from app.models.appliance import APPLIANCE_STATE_REVOKED
+
+    grp = await _group(db_session)
+    me = _appliance("dhcp-a", group_id=grp.id, node_ips=["192.168.0.11"])
+    stale = _appliance("dhcp-b", group_id=grp.id, node_ips=["192.168.0.250"])
+    stale.state = APPLIANCE_STATE_REVOKED
+    live = _appliance("DHCP-B", group_id=grp.id, node_ips=["192.168.0.12"])
+    db_session.add_all([me, stale, live])
+    db_session.add_all(
+        [
+            _kea(grp, "dhcp-a", "http://dhcp-a:8000/"),
+            _kea(grp, "dhcp-b", "http://dhcp-b:8000/"),
+        ]
+    )
+    await db_session.flush()
+    assert await dhcp_ha_firewall_inputs(db_session, me) == (8000, ["192.168.0.12/32"])
+
+
+@pytest.mark.asyncio
+async def test_an_unapproved_namesake_has_no_own_member(db_session: AsyncSession) -> None:
+    """#1810 — a pending / revoked duplicate never ran the Kea agent, so it
+    does not own the live box's member and opens nothing for it."""
+    from app.models.appliance import APPLIANCE_STATE_PENDING_APPROVAL
+
+    grp = await _group(db_session)
+    dup = _appliance("dhcp-a", group_id=grp.id, node_ips=["192.168.0.99"])
+    dup.state = APPLIANCE_STATE_PENDING_APPROVAL
+    db_session.add(dup)
+    db_session.add_all(
+        [
+            _kea(grp, "dhcp-a", "http://192.168.0.11:8000/"),
+            _kea(grp, "dhcp-b", "http://192.168.0.12:8000/"),
+        ]
+    )
+    await db_session.flush()
+    assert await dhcp_ha_firewall_inputs(db_session, dup) == (None, [])
+
+
+@pytest.mark.asyncio
+async def test_own_member_matches_case_blind(db_session: AsyncSession) -> None:
+    """The agent on k3s registers the lowercased Node name (#1757); an
+    uppercase appliance hostname still finds its own member."""
+    grp = await _group(db_session)
+    me = _appliance("DHCP-A", group_id=grp.id, node_ips=["192.168.0.11"])
+    db_session.add(me)
+    db_session.add_all(
+        [
+            _kea(grp, "dhcp-a", "http://192.168.0.11:8000/"),
+            _kea(grp, "dhcp-b", "http://192.168.0.12:8000/"),
+        ]
+    )
+    await db_session.flush()
+    assert await dhcp_ha_firewall_inputs(db_session, me) == (8000, ["192.168.0.12/32"])

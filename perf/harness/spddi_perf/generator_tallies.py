@@ -68,38 +68,68 @@ def _pct(num: int, den: int) -> float | None:
     return round(100.0 * num / den, 3) if den > 0 else None
 
 
+def _opt_int(counters: dict[str, Any], key: str) -> int | None:
+    """A counter that older generators did not write: None when absent, so a
+    summary that predates it reads as unknown rather than as zero."""
+    return _int(counters[key]) if key in counters else None
+
+
 def handshake_summary(counters: dict[str, Any]) -> dict[str, Any]:
     """The DORA handshake figure at three strictnesses, from one counter set.
 
-    ``attempts``            = dora_ack + timeout + nak — every DORA the generator
-                              closed itself, one way or the other (unchanged
-                              denominator; a device that never got a verdict is
-                              in none of the three).
-    ``acked``               = dora_ack: ACKed before the device gave up, retries
-                              included — the pre-#1057 meaning, kept so existing
-                              consumers read the same figure.
-    ``acked_within_budget`` = acked minus ``dora_ack_over_budget``: the ACK
-                              answered the exchange within its own DORA_TIMEOUT_S
-                              (no retransmit had fired for it).
-    ``acked_late``          = dora_ack_late: the ACK arrived after the device had
-                              given up and been counted as a timeout. Each one is
-                              a timeout that turned out to be a slow ACK, so
-                              ``acked_late <= timeouts`` and ``with_late_pct``
-                              never exceeds 100.
+    A device resends like an RFC 2131 client (device_fleet.dora_retransmit_wait):
+    it waits ≈4 s after its first send, doubling after each resend, and gives
+    up after its fourth send's wait, ≈60 s into the round. Before that the wait
+    was a fixed 4 s and a round gave up at 16 s.
+
+    ``attempts``             = dora_ack + timeout + nak — every DORA the generator
+                               closed itself, one way or the other (unchanged
+                               denominator; a device that never got a verdict is
+                               in none of the three — see ``in_flight``).
+    ``acked``                = dora_ack: ACKed before the device gave up, retries
+                               included — the pre-#1057 meaning, kept so existing
+                               consumers read the same figure.
+    ``acked_after_resend``   = dora_ack_resent: of ``acked``, the round had to
+                               resend at least once first (no reply inside its
+                               first ≈4 s wait). These are the slow successes a
+                               longer round no longer counts as timeouts. None
+                               when the summary predates the counter.
+    ``acked_without_resend`` = acked minus ``acked_after_resend``: the lease came
+                               back inside the round's first wait.
+    ``acked_within_budget``  = acked minus ``dora_ack_over_budget``: the ACK
+                               answered the exchange within that exchange's own
+                               wait (no retransmit had fired for it). A device
+                               that resent its DISCOVER and was then answered
+                               promptly still counts here, so this is not the
+                               same as ``acked_without_resend``.
+    ``acked_late``           = dora_ack_late: the ACK arrived after the device had
+                               given up and been counted as a timeout. Each one is
+                               a timeout that turned out to be a slow ACK, so
+                               ``acked_late <= timeouts`` and ``with_late_pct``
+                               never exceeds 100.
+    ``in_flight``            = dora_in_flight: devices still mid-round when their
+                               shard stopped, with no verdict yet. None when the
+                               summary predates the counter.
     """
     acked = _int(counters.get("dora_ack"))
     over = _int(counters.get("dora_ack_over_budget"))
     late = _int(counters.get("dora_ack_late"))
+    resent = _opt_int(counters, "dora_ack_resent")
     timeouts = _int(counters.get("timeout"))
     naks = _int(counters.get("nak"))
     attempts = acked + timeouts + naks
+    first = None if resent is None else max(0, acked - resent)
     return {
         "attempts": attempts,
         "acked": acked,
+        "acked_without_resend": first,
+        "acked_after_resend": resent,
         "acked_within_budget": max(0, acked - over),
         "acked_late": late,
         "timeouts": timeouts,
         "naks": naks,
+        "in_flight": _opt_int(counters, "dora_in_flight"),
+        "without_resend_pct": None if first is None else _pct(first, attempts),
         "within_budget_pct": _pct(max(0, acked - over), attempts),
         "strict_pct": _pct(acked, attempts),
         "with_late_pct": _pct(min(attempts, acked + late), attempts),

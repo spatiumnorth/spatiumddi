@@ -1,4 +1,4 @@
-.PHONY: charts-lint perf-test versions-check versions-upstream workflow-shell-check image-upgrade-check help up down dev build build-supervisor migrate lint test lint-backend lint-frontend test-backend test-cov test-durations \
+.PHONY: charts-lint perf-test versions-check versions-upstream docs-drift workflow-shell-check image-upgrade-check changelog changelog-check help up down dev build build-supervisor migrate lint test lint-backend lint-frontend test-backend test-cov test-durations \
         openapi \
         lint-untyped-routes \
         lint-untyped-routes-baseline \
@@ -82,9 +82,12 @@ help:
 	@echo "  make docs-down   Stop the local documentation site"
 	@echo "  make docs-verify Check every docs SVG diagram for overflow / clipping"
 	@echo "  make versions-check     Assert every pin matches versions.json (part of make ci)"
+	@echo "  make docs-drift         Weekly docs-vs-code drift check (not part of make ci)"
 	@echo "  make versions-upstream  Current-vs-latest table for every pinned component"
 	@echo "  make workflow-shell-check  Refuse \$$? captured after a bare command under set -e"
 	@echo "  make image-upgrade-check   Refuse a shipped image that never upgrades its packages"
+	@echo "  make changelog-check    Validate the changelog.d/ fragments (part of make ci)"
+	@echo "  make changelog          Release prep: fold changelog.d/ into CHANGELOG.md, delete them"
 	@echo "  make appliance      Build the OS-appliance qcow2 (Phase 1 — Debian 13 amd64)"
 	@echo "  make appliance-iso  Wrap the Phase 1 raw image as a hybrid USB/CD ISO (Phase 2)"
 	@echo ""
@@ -110,7 +113,7 @@ build: build-supervisor
 	# where the control-plane node showed up under Service agents
 	# because the baked UI predated the two-role / promote-UI changes.
 	# Mirrors build-supervisor; the retag loop below maps it to ghcr:dev.
-	docker build -t spatiumddi-frontend:dev $(FRONTEND_DIR)
+	docker build -t spatiumddi-frontend:dev -f $(FRONTEND_DIR)/Dockerfile .
 	# #272 — explicitly build api / dns / dhcp too. The PROD compose
 	# (``$(COMPOSE)`` = docker-compose.yml) has NO ``build:`` sections —
 	# every service pins a pre-built ``image:`` — so ``docker compose
@@ -236,17 +239,24 @@ test-cov:
 	docker compose -f docker-compose.yml -f docker-compose.dev.yml exec -T api python -m pytest -n auto --cov=app --cov-report=term-missing
 
 # Refresh backend/.test_durations — the file pytest-split balances the CI
-# shards with (#1019) — from the ``test-durations`` artifact the most recent
-# successful CI run on main produced, then commit it. Run at release prep,
-# or when the ``Backend — Tests`` aggregator warns that the shards have
-# drifted. A stale file only costs balance (an unknown test is assumed
-# average), never correctness. Needs an authenticated GitHub CLI.
+# shards with (#1019) — from the ``test-durations`` artifact of the newest
+# successful CI run on main (push, the daily schedule, or a dispatch) that
+# published one, then commit it. Since #2429 most pushes skip the shards and
+# publish none; .github/scripts/latest-main-artifact.sh finds the artifact by
+# name (shared with ci.yml's impact-map lookup) and never accepts a
+# pull_request run's. Downloads into a temp dir: ``gh run download`` refuses
+# to overwrite an existing file, so extracting straight into backend/ failed
+# every time the committed file was present — that is, always. Run at
+# release prep, or when the ``Backend — Tests`` aggregator warns that the
+# shards have drifted. A stale file only costs balance (an unknown test is
+# assumed average), never correctness. Needs an authenticated GitHub CLI.
 test-durations:
 	@command -v gh >/dev/null || { echo "make test-durations needs the GitHub CLI (gh)"; exit 1; }
-	@run=$$(gh run list --workflow CI --branch main --event push --status success --limit 1 --json databaseId --jq '.[0].databaseId'); \
-	test -n "$$run" || { echo "no successful CI run on main found"; exit 1; }; \
-	echo "downloading test-durations from CI run $$run"; \
-	gh run download "$$run" -n test-durations -D backend/ && \
+	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+	run=$$(.github/scripts/latest-main-artifact.sh test-durations "$$tmp") || exit 1; \
+	[ -s "$$tmp/.test_durations" ] || { echo "the artifact from CI run $$run holds no .test_durations"; exit 1; }; \
+	mv "$$tmp/.test_durations" backend/.test_durations; \
+	echo "downloaded test-durations from CI run $$run"; \
 	echo "wrote backend/.test_durations — review the diff and commit it"
 
 # ── CI parity ──────────────────────────────────────────────────────────────────
@@ -278,9 +288,9 @@ test-durations:
 # trivy-scheduled.yml superset that nominally covers it has been exiting
 # at the backend image before reaching it — so in practice nothing scanned
 # it, and the first scan in 2026.09.04-1 found four HIGH CVEs in the
-# nginx-alpine base. Its build context is ``frontend/`` rather than the
-# repo root, which is why each spec carries one —
-# ``dockerfile:context:name``.
+# nginx-alpine base. Its build context was ``frontend/`` until #2895 (the
+# About page serves the root NOTICE and LICENSE); each spec still carries its
+# own — ``dockerfile:context:name``.
 #
 # IMAGE=<name> scans one image; omit to scan all eight.
 #
@@ -297,7 +307,7 @@ TRIVY_IMAGES ?= \
 	agent/dns/images/dnsdist/Dockerfile:.:dnsdist \
 	agent/supervisor/images/supervisor/Dockerfile:.:supervisor \
 	agent/looking-glass/images/gobgp/Dockerfile:.:looking-glass \
-	frontend/Dockerfile:frontend:frontend
+	frontend/Dockerfile:.:frontend
 
 trivy:
 	@IMAGE="$(IMAGE)" TRIVY_CACHE="$(TRIVY_CACHE)" bash scripts/trivy-scan.sh $(TRIVY_IMAGES)
@@ -393,7 +403,7 @@ lint-untyped-routes-baseline: $(UNTYPED_LIST)
 
 FORCE:
 
-ci: ci-backend-lint ci-frontend-lint ci-frontend-build charts-lint perf-test versions-check workflow-shell-check image-upgrade-check
+ci: ci-backend-lint ci-frontend-lint ci-frontend-build charts-lint perf-test versions-check workflow-shell-check image-upgrade-check changelog-check
 	@echo ""
 	@echo "✓ All CI checks passed — safe to push."
 
@@ -403,11 +413,12 @@ ci-backend-lint:
 	@# they persist until the container is recreated. It doesn't ship pip
 	@# either (#1392) — and `make build` tags its runtime-stage build as the
 	@# same `spatiumddi-api:dev` the dev compose runs — so bootstrap pip from
-	@# the interpreter's bundled ensurepip wheel when it is missing.
+	@# the interpreter's bundled ensurepip wheel when it is missing. The tool
+	@# versions come from requirements.txt (#3693), the set CI installs.
 	@$(COMPOSE_DEV) exec -T api python -m ruff --version >/dev/null 2>&1 || \
 	  $(COMPOSE_DEV) exec -T -u root api sh -c \
 	    'python -m pip --version >/dev/null 2>&1 || python -m ensurepip --default-pip >/dev/null; \
-	     python -m pip install --quiet --root-user-action=ignore ruff black mypy'
+	     python -m pip install --quiet --root-user-action=ignore -c requirements.txt ruff black mypy'
 	$(COMPOSE_DEV) exec -T api python -m ruff check app tests
 	$(COMPOSE_DEV) exec -T api python -m black --check app tests
 	$(COMPOSE_DEV) exec -T api python -m mypy app
@@ -423,7 +434,7 @@ ci-frontend-build:
 # Charts — Lint & Template (#966): the same script CI's job runs, inside a
 # helm container so a dev box with no helm / kubeconform can run it. Renders
 # land in ./.charts-render/ (gitignored) for inspection.
-HELM_IMAGE ?= alpine/helm:4.3.0
+HELM_IMAGE ?= alpine/helm:4.3.1
 charts-lint:
 	@echo "→ Charts — Lint & Template (matches .github/workflows/ci.yml)"
 	@mkdir -p .charts-render
@@ -449,6 +460,16 @@ versions-check:
 versions-upstream:
 	@python3 scripts/lint_versions.py --check-upstream
 
+# Docs drift (#3414). Do the docs diagrams and pages still match the code:
+# version labels vs versions.json, shipped workloads vs architecture.svg,
+# identifiers vs backend/app/models, and file paths named in diagrams.
+# Deterministic, offline, stdlib-only. Deliberately NOT part of `make ci` or PR
+# CI: the weekly docs-drift-scheduled workflow runs it and files the findings,
+# because a stale diagram is a chore to fix, not a reason to block an unrelated PR.
+# Exit 1 = findings, 2 = the check could not run.
+docs-drift:
+	@python3 scripts/lint_docs_drift.py
+
 # Workflow shell-status guard (#1036). GitHub Actions runs every `run:` block
 # under `bash -e`, which `set -uo pipefail` does NOT clear — so `cmd; rc=$$?`
 # is dead code on exactly the failure it was written to handle. Neither
@@ -456,6 +477,21 @@ versions-upstream:
 workflow-shell-check:
 	@echo "→ Workflow shell-status linter (matches .github/workflows/ci.yml)"
 	@python3 scripts/lint_workflow_shell.py
+
+# Changelog fragments (merge queue). A PR adds one file under changelog.d/
+# instead of editing CHANGELOG.md, so no two PRs conflict on the same
+# ``## Unreleased`` spot — a merge queue removes any entry that conflicts.
+# ``changelog-check`` validates the fragments (same check CI's Backend Lint
+# job runs). ``changelog`` is a RELEASE-PREP step: it folds every fragment
+# into ``## Unreleased`` and deletes them, and must run before that section
+# is renamed to the release version — release.yml refuses a tag whose tree
+# still carries a fragment. Stdlib-only, no container.
+changelog-check:
+	@echo "→ Changelog fragment linter (matches .github/workflows/ci.yml)"
+	@python3 scripts/changelog_assemble.py --check
+
+changelog:
+	@python3 scripts/changelog_assemble.py
 
 # Shipped-image package-upgrade guard (#1088). Every published image must
 # upgrade its base image's own packages AND declare the snapshot ARG that lets
@@ -469,13 +505,14 @@ image-upgrade-check:
 
 # Perf — Tests (#968): hermetic tests under perf/ (no network, no appliance).
 # PyYAML + dnspython are what the orchestrator and report tests import
-# (#1057); hdrhistogram has an x86_64 wheel only and builds a C extension
-# elsewhere, so it is taken as a wheel when one exists — the single assertion
-# that needs the HdrHistogram backend is gated on it in the test.
+# (#1057), httpx what the seeder's retry tests import (#2879); hdrhistogram
+# has an x86_64 wheel only and builds a C extension elsewhere, so it is taken
+# as a wheel when one exists — the single assertion that needs the
+# HdrHistogram backend is gated on it in the test.
 perf-test:
 	@echo "→ Perf — Tests (matches .github/workflows/ci.yml)"
 	docker run --rm -v "$(PWD):/repo" -w /repo python:3.12-slim sh -c \
-	  'pip -q install pytest pyyaml dnspython >/dev/null \
+	  'pip -q install pytest pyyaml dnspython httpx >/dev/null \
 	   && (pip -q install --only-binary=:all: hdrhistogram >/dev/null 2>&1 \
 	       || echo "hdrhistogram: no binary wheel for this arch; the .hdr assertion is gated") \
 	   && python -m pytest perf -q'
@@ -641,7 +678,7 @@ appliance-clean:
 # Bump in PRs alongside the slot image cut; the fetch script caches
 # downloads under mkosi.extra/ keyed on this version so re-runs are
 # cheap when nothing's changed.
-K3S_VERSION ?= v1.36.4+k3s1
+K3S_VERSION ?= v1.36.5+k3s1
 
 # Issue #183 Phase 1 — air-gap-ready k3s baking. Downloads the pinned
 # k3s static binary + airgap images tarball + LICENSE into mkosi.extra/
@@ -690,7 +727,8 @@ appliance-bake-metallb-chart:
 # BAKE_FLAGS=--allow-stale-images  (or ALLOW_STALE_IMAGES=1, which the
 # script also honours from the environment).
 appliance-bake-images: build-supervisor
-	@bash $(APPLIANCE_DIR)/scripts/bake-images.sh $(BAKE_FLAGS)
+	@BAKE_SAVE_PLATFORM="$${BAKE_SAVE_PLATFORM:-$(APPLIANCE_ARCH)}" \
+	  bash $(APPLIANCE_DIR)/scripts/bake-images.sh $(BAKE_FLAGS)
 
 # Convenience for fast laptop iteration on appliance-level changes
 # (installer, firstboot, console dashboard, partition layout,

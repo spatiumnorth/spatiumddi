@@ -43,6 +43,10 @@ fi
 # Best-effort — a fresh appliance before spatium-install completion
 # has no file here yet.
 #
+# This MUST stay above the su-exec below: the file is 0600 root
+# (GHSA-h2j9-qrg7-grfw — it holds the database password, SECRET_KEY and
+# the agent PSKs), so only this root half of the entrypoint can read it.
+#
 # Issue #238 — the pre-fix ``set -a; . "$HOST_ENV"; set +a`` shell-
 # sourced the file verbatim, executing every command-substitution
 # / arithmetic-expansion inside it. A foothold that could write a
@@ -92,7 +96,9 @@ fi
 
 # Drop privileges to the unprivileged spatium user. ``su-exec spatium``
 # (no ``:group`` suffix) calls initgroups() so the user's supplementary
-# group set comes through. Phase 7: no docker group; the only extra
-# we need is whatever the kubelet's ServiceAccount-mount projection
-# uses, which is preserved by the kernel regardless of su-exec.
+# group set comes through. Phase 7: no docker group. The one extra group
+# that matters is ``spatium-host`` (2770, baked in the Dockerfile): the
+# host's release-state trigger directory is 1770 root:2770 and its k3s
+# kubeconfig 0640 root:2770 (GHSA-h2j9-qrg7-grfw), so dropping the
+# ``:group``-less form here would cut the supervisor off from both.
 exec su-exec spatium /usr/local/bin/spatium-supervisor

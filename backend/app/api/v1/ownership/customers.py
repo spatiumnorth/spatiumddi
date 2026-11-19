@@ -23,12 +23,28 @@ from sqlalchemy import func, or_, select
 from app.api.deps import DB, CurrentUser
 from app.api.v1._common import BulkDeleteResponse
 from app.api.v1.ownership._audit import write_audit
-from app.core.permissions import require_resource_permission
+from app.core.permissions import require_resource_permission, user_has_permission
 from app.models.ownership import CUSTOMER_STATUSES, Customer
 
 router = APIRouter(
     tags=["customers"],
-    dependencies=[Depends(require_resource_permission("customer"))],
+    dependencies=[
+        Depends(
+            require_resource_permission(
+                "customer",
+                # A grant scoped to one customer (#3039) reaches that row's detail
+                # and edit and the list, which narrows to the granted rows.
+                instance_routes=(
+                    "customer",
+                    "GET /",
+                    frozenset({"GET /{customer_id}"}),
+                    frozenset({"PUT /{customer_id}"}),
+                ),
+                instance_param="customer_id",
+                prefix="/customers",
+            )
+        )
+    ],
 )
 
 
@@ -100,7 +116,7 @@ class CustomerBulkDelete(BaseModel):
 @router.get("", response_model=CustomerListResponse)
 async def list_customers(
     db: DB,
-    _: CurrentUser,
+    user: CurrentUser,
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     status: Literal["active", "inactive", "decommissioning"] | None = Query(default=None),
@@ -121,8 +137,17 @@ async def list_customers(
                 Customer.contact_email.ilike(needle),
             )
         )
+    # A caller admitted only by grants scoped to individual rows (#3039) sees
+    # those rows and no others.
+    if not user_has_permission(user, "read", "customer"):
+        ids = (await db.execute(select(Customer.id))).scalars().all()
+        stmt = stmt.where(
+            Customer.id.in_(
+                [i for i in ids if user_has_permission(user, "read", "customer", str(i))]
+            )
+        )
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
-    stmt = stmt.order_by(Customer.name.asc()).limit(limit).offset(offset)
+    stmt = stmt.order_by(Customer.name.asc(), Customer.id).limit(limit).offset(offset)
     rows = (await db.execute(stmt)).scalars().all()
     return CustomerListResponse(
         items=[CustomerRead.model_validate(r) for r in rows],
@@ -276,24 +301,31 @@ async def update_customer(
     return CustomerRead.model_validate(row)
 
 
+async def _trash(db: Any, row: Customer, user: Any) -> None:
+    """Soft-delete into the Trash (own batch), so it can be restored or purged (#2738)."""
+    from app.services.soft_delete import (
+        apply_soft_delete,
+        collect_soft_delete_batch,
+    )  # noqa: PLC0415
+
+    batch = await collect_soft_delete_batch(db, row)
+    await apply_soft_delete(db, batch, user.id if user is not None else None)
+
+
 @router.delete("/{customer_id:uuid}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_customer(customer_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
-    """Soft-delete the row. Cross-references on subnets / blocks / VRFs
+    """Soft-delete the row into Administration → Trash, where it can be
+    restored or purged. Cross-references on subnets / blocks / VRFs
     / zones / ASNs auto-null via ``ON DELETE SET NULL`` once the row
     is *hard*-deleted; until then they keep pointing at the soft-
     deleted row, which is fine — list endpoints filter on
     ``deleted_at IS NULL`` so the operator sees them as "no
     customer".
     """
-    from datetime import UTC  # noqa: PLC0415
-    from datetime import datetime as _dt  # noqa: PLC0415
-
     row = await db.get(Customer, customer_id)
     if row is None or row.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Customer not found")
-    row.deleted_at = _dt.now(UTC)
-    if user is not None:
-        row.deleted_by_user_id = user.id
+    await _trash(db, row, user)
 
     write_audit(
         db,
@@ -313,9 +345,6 @@ async def bulk_delete_customers(
     if not body.ids:
         return BulkDeleteResponse(deleted=0, not_found=[])
 
-    from datetime import UTC  # noqa: PLC0415
-    from datetime import datetime as _dt  # noqa: PLC0415
-
     rows = (
         (
             await db.execute(
@@ -328,11 +357,8 @@ async def bulk_delete_customers(
     found_ids = {r.id for r in rows}
     not_found = [str(i) for i in body.ids if i not in found_ids]
 
-    now = _dt.now(UTC)
     for r in rows:
-        r.deleted_at = now
-        if user is not None:
-            r.deleted_by_user_id = user.id
+        await _trash(db, r, user)
         write_audit(
             db,
             user=user,

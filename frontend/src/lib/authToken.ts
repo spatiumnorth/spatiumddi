@@ -23,9 +23,20 @@ type AuthSnapshot = {
    *  then a protected route should render a loader rather than bounce to
    *  /login, so a real session isn't mistaken for a logged-out one. */
   booted: boolean;
+  /** The server says this user must change their password before anything
+   *  else (``force_password_change``). The server answers every request but a
+   *  few with 403 until they do, so a protected route sends them to
+   *  /change-password instead of rendering a console of refused reads (#2440).
+   *  Memory-only like the token; it is re-learned from /auth/refresh on
+   *  reload. */
+  mustChangePassword: boolean;
 };
 
-let snapshot: AuthSnapshot = { accessToken: null, booted: false };
+let snapshot: AuthSnapshot = {
+  accessToken: null,
+  booted: false,
+  mustChangePassword: false,
+};
 const listeners = new Set<() => void>();
 
 function emit(): void {
@@ -51,7 +62,18 @@ export function getAccessToken(): string | null {
 
 export function setAccessToken(token: string | null): void {
   if (snapshot.accessToken === token) return;
-  snapshot = { ...snapshot, accessToken: token };
+  // Signing out forgets the flag with the token.
+  snapshot = {
+    ...snapshot,
+    accessToken: token,
+    mustChangePassword: token === null ? false : snapshot.mustChangePassword,
+  };
+  emit();
+}
+
+export function setMustChangePassword(flag: boolean): void {
+  if (snapshot.mustChangePassword === flag) return;
+  snapshot = { ...snapshot, mustChangePassword: flag };
   emit();
 }
 

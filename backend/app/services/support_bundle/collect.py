@@ -30,11 +30,18 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.core.versions import canonical_version
 from app.models.alerts import AlertEvent
 from app.models.audit import AuditLog
 from app.models.diagnostics import InternalError
 from app.models.settings import PlatformSettings
-from app.services.support_bundle.scrub import Scrubber, looks_secret_key
+from app.services.appliance.apt import mask_proxy_url, mask_source_uris
+from app.services.support_bundle.scrub import (
+    Scrubber,
+    env_value_is_shareable,
+    looks_secret_key,
+    render_env,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -123,7 +130,7 @@ async def collect_versions(db: AsyncSession) -> str:
 
     return _json(
         {
-            "product_version": settings.version,
+            "product_version": canonical_version(settings.version, settings.app_version),
             "appliance_mode": settings.appliance_mode,
             "appliance_version": settings.appliance_version or None,
             "schema": {
@@ -142,7 +149,8 @@ async def collect_versions(db: AsyncSession) -> str:
             "image_tags": {
                 k: v
                 for k, v in sorted(os.environ.items())
-                if k.endswith("_IMAGE") or k.endswith("_TAG") or k == "SPATIUMDDI_VERSION"
+                if (k.endswith("_IMAGE") or k.endswith("_TAG") or k == "SPATIUMDDI_VERSION")
+                and env_value_is_shareable(k)
             },
         }
     )
@@ -325,6 +333,13 @@ async def collect_platform_settings(db: AsyncSession, scrub: Scrubber) -> str:
             # exists to undo.
             out[name] = value
             continue
+        if name in ("apt_proxy_http", "apt_proxy_https"):
+            # A token-only userinfo (``http://token@proxy``) has no
+            # ``user:pass`` shape for the text scrubber to catch
+            # (GHSA-j77h-pqg7-h2g4).
+            value = mask_proxy_url(value)
+        elif name == "apt_sources":
+            value = mask_source_uris(value)
         out[name] = scrub.value(name, value)
     out["_redacted_columns"] = sorted(redacted)
     return _json(out)
@@ -350,16 +365,13 @@ async def collect_integration_state(db: AsyncSession) -> str:
 
 
 def collect_environment(scrub: Scrubber) -> str:
-    """Process environment, with credential-named vars dropped.
+    """Process environment, values shown for allowlisted names only.
 
-    Values still go through the scrubber: a DATABASE_URL is not
-    secret-*named* once its password is stripped, but it carries a
-    hostname.
+    See :func:`render_env` for why this is an allowlist when the settings
+    collector above is a denylist. The values that are shown still go
+    through the scrubber, since one may carry a hostname.
     """
-    lines = []
-    for key, value in sorted(os.environ.items()):
-        lines.append(f"{key}=[REDACTED]" if looks_secret_key(key) else f"{key}={scrub.text(value)}")
-    return "\n".join(lines)
+    return render_env(os.environ, scrub.text)
 
 
 def collect_proc(scrub: Scrubber) -> dict[str, str]:
@@ -448,7 +460,9 @@ def collect_host_logs(scrub: Scrubber) -> dict[str, str]:
     for name in names:
         try:
             raw = (_log_dir() / name).read_text(encoding="utf-8", errors="replace")
-            out[name] = cap(scrub.text(raw), CAP_LOG_BYTES)
+            # In pieces: the whole file is scrubbed before its tail is kept, and
+            # one pass over a large log holds the GIL for seconds (#3310).
+            out[name] = cap(scrub.text(raw, in_pieces=True), CAP_LOG_BYTES)
         except OSError as exc:
             out[f"{name}.error"] = f"{type(exc).__name__}: {exc}"
     if not out:
@@ -498,7 +512,7 @@ def _collect_installer_logs(scrub: Scrubber) -> dict[str, str]:
         except OSError as exc:
             out[f"install/{path.name}.error"] = f"{type(exc).__name__}: {exc}"
             continue
-        out[f"install/{path.name}"] = cap(scrub.text(raw), CAP_LOG_BYTES)
+        out[f"install/{path.name}"] = cap(scrub.text(raw, in_pieces=True), CAP_LOG_BYTES)
     return out
 
 

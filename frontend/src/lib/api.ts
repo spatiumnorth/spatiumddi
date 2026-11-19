@@ -3,7 +3,13 @@ import axios, {
   type AxiosInstance,
   type AxiosResponse,
 } from "axios";
-import { getAccessToken, setAccessToken } from "@/lib/authToken";
+import { idleHeader } from "@/lib/activity";
+import { sharedRefresh } from "@/lib/crossTabAuth";
+import {
+  getAccessToken,
+  setAccessToken,
+  setMustChangePassword,
+} from "@/lib/authToken";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "/api/v1";
 
@@ -28,6 +34,9 @@ function createClient(): AxiosInstance {
     const token = getAccessToken();
     if (token) {
       config.headers.Authorization = `Bearer ${token}`;
+      // How long the operator has been away, so a background poll does not
+      // count as activity for the Session Timeout (lib/activity.ts).
+      Object.assign(config.headers, idleHeader());
     }
     return config;
   });
@@ -111,7 +120,24 @@ function createClient(): AxiosInstance {
         }
 
         originalRequest._retry = true;
+        // The token THIS request carried, not the tab's current one: another
+        // tab's broadcast may already have moved this tab to a fresh token
+        // while the request was in flight (#2960). Then there is nothing to
+        // refresh: retry with the current token. Refreshing anyway would
+        // rotate again and kill the other tabs' tokens, the very churn this
+        // is meant to stop.
+        const sentAuth = originalRequest.headers?.Authorization;
+        const sentToken =
+          typeof sentAuth === "string" && sentAuth.startsWith("Bearer ")
+            ? sentAuth.slice("Bearer ".length)
+            : null;
+        const currentToken = getAccessToken();
+        if (sentToken && currentToken && sentToken !== currentToken) {
+          originalRequest.headers.Authorization = `Bearer ${currentToken}`;
+          return client(originalRequest);
+        }
         isRefreshing = true;
+        const staleToken = sentToken ?? currentToken;
         try {
           // The refresh token rides the HttpOnly cookie automatically; the
           // rotated refresh token comes back as a new Set-Cookie and the fresh
@@ -119,13 +145,21 @@ function createClient(): AxiosInstance {
           // cookie flow on a cross-ORIGIN (but same-site) API host when CORS
           // credentials are enabled; the cookie is SameSite=Strict, so a
           // genuinely cross-SITE SPA/API split is not supported by design.
-          const res = await client.post<RefreshResponse>(
-            "/auth/refresh",
-            {},
-            { withCredentials: true },
+          // One refresh for every tab of this browser (#2960): another tab
+          // may already have rotated, in which case its token is adopted.
+          const { access_token, force_password_change } = await sharedRefresh(
+            async (signal) =>
+              (
+                await client.post<RefreshResponse>(
+                  "/auth/refresh",
+                  {},
+                  { withCredentials: true, signal },
+                )
+              ).data,
+            staleToken,
           );
-          const { access_token } = res.data;
           setAccessToken(access_token);
+          setMustChangePassword(!!force_password_change);
           refreshQueue.forEach(({ resolve }) => resolve(access_token));
           refreshQueue = [];
           if (originalRequest?.headers)
@@ -151,6 +185,40 @@ function createClient(): AxiosInstance {
 
 export const api = createClient();
 
+/** A file download is requested with `responseType: "blob"`, so a refusal's
+ *  JSON body also arrives as a Blob and `response.data.detail` is unreadable
+ *  (#3255). Decode it in place and re-throw the same error, so the status and
+ *  `formatApiError` both still work for the caller. A JSON body keeps its
+ *  `detail`; a short plain-text body becomes the detail; an empty body, a
+ *  proxy's HTML error page or one that cannot be read leaves no detail, so
+ *  the caller says what it would say for a bodiless error rather than show
+ *  raw bytes. Decoding never throws: the caller always gets `err` back. */
+export async function rethrowBlobError(err: unknown): Promise<never> {
+  const res = (err as { response?: { data?: unknown } } | null)?.response;
+  if (res && res.data instanceof Blob) {
+    let detail: unknown = undefined;
+    try {
+      const text = (await res.data.text()).trim();
+      try {
+        const parsed: unknown = JSON.parse(text);
+        if (parsed && typeof parsed === "object" && "detail" in parsed) {
+          detail = (parsed as { detail?: unknown }).detail ?? undefined;
+        }
+      } catch {
+        // Not JSON: a short plain-text reason is still worth showing, a
+        // proxy's HTML error page is not.
+        if (text && text.length <= 300 && !text.startsWith("<")) {
+          detail = text;
+        }
+      }
+    } catch {
+      // The body could not be read at all; re-throw without a detail.
+    }
+    res.data = detail === undefined ? undefined : { detail };
+  }
+  throw err;
+}
+
 /**
  * Normalise whatever shape an API error arrives in into a single string
  * suitable for React children (issue #31) and operator-readable toasts
@@ -171,6 +239,24 @@ export const api = createClient();
  * site in the app.
  */
 export function formatApiError(err: unknown, fallback = "Error"): string {
+  return formatError(err, fallback, false);
+}
+
+/**
+ * formatApiError for a form dialog: also drops the "Value error, " pydantic
+ * puts in front of a validator's message (#2435, #3041), which names nothing
+ * the reader can act on. Only a 422 entry's own `msg` is trimmed, and only at
+ * its start, so the same words inside a real message are left alone.
+ */
+export function formatDialogError(err: unknown, fallback = "Error"): string {
+  return formatError(err, fallback, true);
+}
+
+function formatError(
+  err: unknown,
+  fallback: string,
+  stripPydanticPrefix: boolean,
+): string {
   const anyErr = err as {
     response?: { data?: { detail?: unknown } };
     message?: string;
@@ -186,7 +272,12 @@ export function formatApiError(err: unknown, fallback = "Error"): string {
         const loc = Array.isArray(rec.loc)
           ? rec.loc.filter((s) => s !== "body").join(".")
           : "";
-        const msg = typeof rec.msg === "string" ? rec.msg : JSON.stringify(e);
+        const msg =
+          typeof rec.msg === "string"
+            ? stripPydanticPrefix
+              ? rec.msg.replace(/^Value error, /, "")
+              : rec.msg
+            : JSON.stringify(e);
         return loc ? `${loc}: ${msg}` : msg;
       })
       .filter(Boolean);
@@ -198,11 +289,24 @@ export function formatApiError(err: unknown, fallback = "Error"): string {
     //   {"field": "match_clients", "value": "10.0.0.300", "message": "…"}
     // Without this the operator was shown the raw JSON, which buries the
     // one sentence that tells them what to fix.
-    const rec = detail as { message?: unknown; field?: unknown };
+    const rec = detail as {
+      message?: unknown;
+      field?: unknown;
+      errors?: unknown;
+    };
     if (typeof rec.message === "string" && rec.message.trim()) {
       return typeof rec.field === "string" && rec.field
         ? `${rec.field}: ${rec.message}`
         : rec.message;
+    }
+    // The password policy's refusal (#3040): `{reason: "password_policy",
+    // errors: ["Password must be at least 12 characters", ...]}`. The same
+    // list ChangePasswordPage reads via parsePasswordError.
+    if (Array.isArray(rec.errors)) {
+      const msgs = rec.errors.filter(
+        (e): e is string => typeof e === "string" && !!e.trim(),
+      );
+      if (msgs.length) return msgs.join("; ");
     }
     // Unexpected shape — stringify defensively so we never render an object.
     try {
@@ -310,8 +414,13 @@ export interface FreeCidrRange {
   network: string;
   first: string;
   last: string;
+  /** Saturates at 2^63 - 1; use the `_exact` string for display (#3708). */
   size: number;
+  size_exact?: string;
   prefix_len: number;
+  /** Non-zero only on the last range of a capped answer: free ranges left out
+   *  past it (#3848). */
+  more_after?: number;
 }
 
 export interface PlanRequestItem {
@@ -324,7 +433,9 @@ export interface PlannedSubnet {
   network: string;
   first: string;
   last: string;
+  /** Saturates at 2^63 - 1; use the `_exact` string for display (#3708). */
   size: number;
+  size_exact?: string;
 }
 
 export interface UnfulfilledItem {
@@ -336,7 +447,9 @@ export interface UnfulfilledItem {
 export interface AggregationSuggestion {
   supernet: string;
   prefix_len: number;
+  /** Saturates at 2^63 - 1; use the `_exact` string for display (#3708). */
   total_size: number;
+  total_size_exact?: string;
   subnet_ids: string[];
   subnet_networks: string[];
   // Stable hash that ties the suggestion to a snooze entry. The popover
@@ -438,6 +551,17 @@ export interface ProbePolicy {
   inherited: boolean;
 }
 
+/** What a subnet's DDNS resolves to and where from (#2475). */
+export interface EffectiveDdns {
+  enabled: boolean;
+  hostname_policy: DdnsHostnamePolicy;
+  domain_override: string | null;
+  ttl: number | null;
+  source: "subnet" | "block" | "space" | "none";
+  source_id: string | null;
+  source_name: string | null;
+}
+
 export interface EffectiveDns {
   dns_group_ids: string[];
   dns_zone_id: string | null;
@@ -483,6 +607,8 @@ export interface DnsSyncStale {
   name: string;
   value: string;
   reason: string;
+  /** Live IPAM row the record hangs off; null when the address is gone. */
+  ip_id?: string | null;
 }
 
 export interface DnsSyncPreview {
@@ -491,6 +617,14 @@ export interface DnsSyncPreview {
   forward_zone_name: string | null;
   reverse_zone_id: string | null;
   reverse_zone_name: string | null;
+  /** Every reverse zone the subnet's addresses resolve to, in address
+   * order — a subnet wider than a /24 spans several (#1840). The two
+   * fields above are the first of them. Empty on block/space scope. */
+  reverse_zone_names?: string[];
+  /** #1932 — why the subnet has no reverse zone when its DNS group runs a
+   * cloud driver that has not opted in to auto-created reverse zones (its
+   * PTRs are skipped). Null otherwise. */
+  reverse_zone_skipped_reason?: string | null;
   missing: DnsSyncMissing[];
   mismatched: DnsSyncMismatch[];
   stale: DnsSyncStale[];
@@ -501,6 +635,9 @@ export interface DnsSyncCommitResult {
   updated: number;
   deleted: number;
   errors: string[];
+  // #2577 — stale record IDs sent for deletion that the scope's own drift
+  // report no longer lists. The server ignored them; none were deleted.
+  skipped_stale_record_ids?: string[];
 }
 
 export interface DnsSyncSummary {
@@ -624,6 +761,12 @@ export interface Subnet {
   // ``ipamApi.probePolicy(subnetId)``.
   do_not_probe?: boolean;
   do_not_probe_reason?: string;
+  // #2137 — show the "N free · click to allocate" gap rows. null / absent
+  // = the default rule (off for integration-owned or larger-than-/16).
+  show_free_ranges?: boolean | null;
+  // Name of the integration mirroring this subnet (kubernetes, tailscale…),
+  // null when operator-owned. Read-only.
+  integration_owner?: string | null;
   // Compliance / classification flags. First-class booleans (rather
   // than freeform tags) so auditor queries — "show me every PCI
   // subnet" — are clean indexed predicates. Default false on every
@@ -812,6 +955,10 @@ export interface IPAddress {
   dns_record_id?: string | null;
   dhcp_lease_id?: string | null;
   static_assignment_id?: string | null;
+  // #1628 — transient, only set on create/update responses when a
+  // ``static_dhcp`` row could not be mirrored into a DHCP reservation
+  // server-side (no scope, several scopes, or a conflict).
+  dhcp_static_warning?: string | null;
   // True when this row is a dynamic-lease mirror created by the DHCP
   // lease-pull task. Such rows are read-only in the UI — the DHCP server
   // owns their state and any edit would get overwritten on the next pull.
@@ -1016,8 +1163,11 @@ export interface SubnetResizePreviewResponse {
   new_network_ip: string;
   old_broadcast_ip: string | null;
   new_broadcast_ip: string | null;
+  /** Saturates at 2^63 - 1; use the `_exact` string for display (#3322). */
   total_ips_before: number;
   total_ips_after: number;
+  total_ips_before_exact?: string;
+  total_ips_after_exact?: string;
   gateway_current: string | null;
   gateway_suggested_new_first_usable: string | null;
   placeholders_default_named: SubnetResizePlaceholder[];
@@ -1066,8 +1216,11 @@ export interface BlockResizePreviewResponse {
   network_address_shifts: boolean;
   old_network_ip: string;
   new_network_ip: string;
+  /** Saturates at 2^63 - 1; use the `_exact` string for display (#3322). */
   total_ips_before: number;
   total_ips_after: number;
+  total_ips_before_exact?: string;
+  total_ips_after_exact?: string;
   child_blocks_count: number;
   child_blocks: BlockResizeChildRow[];
   child_subnets_count: number;
@@ -1127,6 +1280,8 @@ export interface BlockMovePreviewResponse {
   target_space_id: string;
   target_parent_id: string | null;
   descendant_blocks_count: number;
+  /** Child blocks in the Trash: they move too, but are not counted above. */
+  descendant_blocks_trashed?: number;
   descendant_subnets_count: number;
   descendant_ip_addresses_total: number;
   reparent_chain_block_ids: string[];
@@ -1170,7 +1325,9 @@ export interface FindFreeCandidate {
   cidr: string;
   parent_block_id: string;
   parent_block_cidr: string;
+  /** Saturates at 2^63 - 1; use `free_addresses_exact` for display (#3322). */
   free_addresses?: number | null;
+  free_addresses_exact?: string | null;
 }
 
 export interface FindFreeResponse {
@@ -1279,6 +1436,9 @@ export interface BulkAllocatePreviewResponse {
   conflicts_in_use: number;
   conflicts_in_pool: number;
   conflicts_fqdn: number;
+  // Addresses outside every address set the caller holds on this subnet;
+  // the commit skips them (or, with on_collision="abort", refuses).
+  conflicts_no_perm?: number;
   sample: BulkAllocateItem[];
   warnings: string[];
 }
@@ -1391,6 +1551,7 @@ export interface TemplateReapplyAllResponse {
   instances_processed: number;
   instances_skipped: number;
   cap_reached: boolean;
+  skipped: { target_id: string; network: string; reason: string }[];
 }
 
 export const ipamApi = {
@@ -1416,6 +1577,8 @@ export const ipamApi = {
         params: spaceId ? { space_id: spaceId } : undefined,
       })
       .then((r) => r.data),
+  getBlock: (id: string) =>
+    api.get<IPBlock>(`/ipam/blocks/${id}`).then((r) => r.data),
   createBlock: (data: Partial<IPBlock> & { template_id?: string | null }) =>
     api.post<IPBlock>("/ipam/blocks", data).then((r) => r.data),
   updateBlock: (
@@ -1454,7 +1617,9 @@ export const ipamApi = {
       .then((r) => r.data),
   blockFreeSpace: (blockId: string) =>
     api
-      .get<FreeCidrRange[]>(`/ipam/blocks/${blockId}/free-space`)
+      .get<FreeCidrRange[]>(`/ipam/blocks/${blockId}/free-space`, {
+        params: { limit: 2000 },
+      })
       .then((r) => r.data),
   blockAggregationSuggestions: (
     blockId: string,
@@ -1525,6 +1690,14 @@ export const ipamApi = {
   getEffectiveSubnetDns: (subnetId: string) =>
     api
       .get<EffectiveDns>(`/ipam/subnets/${subnetId}/effective-dns`)
+      .then((r) => r.data),
+  getEffectiveBlockDdns: (blockId: string) =>
+    api
+      .get<EffectiveDdns>(`/ipam/blocks/${blockId}/effective-ddns`)
+      .then((r) => r.data),
+  getEffectiveSubnetDdns: (subnetId: string) =>
+    api
+      .get<EffectiveDdns>(`/ipam/subnets/${subnetId}/effective-ddns`)
       .then((r) => r.data),
   getEffectiveSpaceDns: (spaceId: string) =>
     api
@@ -1731,6 +1904,8 @@ export const ipamApi = {
       create_for_ip_ids?: string[];
       update_record_ids?: string[];
       delete_stale_record_ids?: string[];
+      // #2471 — missing rows left unticked; the API writes none of them.
+      skip_records?: { ip_id: string; record_type: string; zone_id: string }[];
     },
   ) =>
     api
@@ -1750,6 +1925,8 @@ export const ipamApi = {
       create_for_ip_ids?: string[];
       update_record_ids?: string[];
       delete_stale_record_ids?: string[];
+      // #2471 — missing rows left unticked; the API writes none of them.
+      skip_records?: { ip_id: string; record_type: string; zone_id: string }[];
     },
   ) =>
     api
@@ -1769,6 +1946,8 @@ export const ipamApi = {
       create_for_ip_ids?: string[];
       update_record_ids?: string[];
       delete_stale_record_ids?: string[];
+      // #2471 — missing rows left unticked; the API writes none of them.
+      skip_records?: { ip_id: string; record_type: string; zone_id: string }[];
     },
   ) =>
     api
@@ -1810,6 +1989,8 @@ export const ipamApi = {
     api
       .post<IPAddress>(`/ipam/subnets/${data.subnet_id}/addresses`, data)
       .then((r) => r.data),
+  getAddress: (id: string) =>
+    api.get<IPAddress>(`/ipam/addresses/${id}`).then((r) => r.data),
   updateAddress: (
     id: string,
     data: Partial<IPAddress> & {
@@ -1922,6 +2103,8 @@ export const ipamApi = {
         deleted_count: number;
         not_found: string[];
         skipped: string[];
+        /** Per-row reason for skips that are not system rows (#1714). */
+        skipped_reasons?: Record<string, string>;
       }>(`/ipam/addresses/bulk-delete`, data)
       .then((r) => r.data),
   bulkEditAddresses: (data: {
@@ -1945,6 +2128,10 @@ export const ipamApi = {
         updated_count: number;
         not_found: string[];
         skipped: string[];
+        /** With ``dns_zone_id: ""``: the addresses whose records were removed. */
+        dns_cleared: string[];
+        /** Why each skipped row was skipped, keyed by id (#3905). */
+        skipped_reasons?: Record<string, string>;
       }>(`/ipam/addresses/bulk-edit`, data)
       .then((r) => r.data),
   backfillReverseZonesSpace: (spaceId: string) =>
@@ -1982,6 +2169,7 @@ export const ipamApi = {
       mac_address?: string;
       description?: string;
       custom_fields?: Record<string, unknown>;
+      tags?: Record<string, unknown>;
       dns_zone_id?: string | null;
       /** Issue #25 — additional zones to publish A/AAAA records into. */
       extra_zone_ids?: string[];
@@ -2286,9 +2474,11 @@ export const ipamIoApi = {
     format: "csv" | "json" | "xlsx";
     include_addresses?: boolean;
   }) => {
-    const res = await api.get(ipamIoApi.exportUrl(params), {
-      responseType: "blob",
-    });
+    const res = await api
+      .get(ipamIoApi.exportUrl(params), {
+        responseType: "blob",
+      })
+      .catch(rethrowBlobError);
     const disp = (res.headers["content-disposition"] as string) || "";
     const match = disp.match(/filename="?([^";]+)"?/i);
     // UTC YYYYMMDD-HHMMSS matches the backend's export filename convention
@@ -2408,8 +2598,17 @@ export interface MfaStatusResponse {
   enabled: boolean;
   enrolment_pending: boolean;
   recovery_codes_remaining: number;
-  /** What starting an enrolment asks for (#1241). */
-  enrol_requires: "password" | "recent_sign_in";
+  /** What starting an enrolment asks for (#1241, #1354): the local
+   *  password; the password at the account's own LDAP / RADIUS / TACACS+
+   *  provider; a forced re-login at its OIDC / SAML IdP; or, only when the
+   *  provider is gone or off, a recent sign-in. */
+  enrol_requires:
+    | "password"
+    | "provider_password"
+    | "provider_reauth"
+    | "recent_sign_in";
+  /** The provider named by `provider_password` / `provider_reauth`. */
+  enrol_provider_name: string | null;
   /** For `recent_sign_in`: false means sign out and back in first. */
   enrol_sign_in_recent: boolean;
   /** How recent that sign-in must be, in minutes. */
@@ -2463,7 +2662,9 @@ export const usersApi = {
       username: string;
       email: string;
       display_name: string;
-      password: string;
+      // A local account. Omitted for one bound to a provider (#1291).
+      password?: string;
+      auth_provider_id?: string;
       is_superadmin: boolean;
       force_password_change: boolean;
     } & StepUp,
@@ -2585,6 +2786,12 @@ export interface AuditLogEntry {
   resource_display: string;
   result: string;
   source_ip: string | null;
+  /** Recorded details (#2009): null on the list, filled by `auditApi.get`.
+   *  Credential-shaped values arrive already redacted. */
+  old_value?: Record<string, unknown> | null;
+  new_value?: Record<string, unknown> | null;
+  changed_fields?: string[] | null;
+  error_detail?: string | null;
 }
 
 export interface AuditLogPage {
@@ -2598,12 +2805,18 @@ export interface AuditChainBreak {
   expected_hash: string;
   actual_hash: string;
   reason: "row_hash_mismatch" | "prev_hash_mismatch";
+  action: string;
+  resource_type: string;
+  resource_id: string;
 }
 
 export interface AuditIntegrity {
   ok: boolean;
   rows_checked: number;
   breaks: AuditChainBreak[];
+  first_seq?: number | null;
+  last_seq?: number | null;
+  partial?: boolean;
 }
 
 // ── AI tool catalog (issue #101 follow-up) ──────────────────────────
@@ -2769,13 +2982,18 @@ export const auditApi = {
     result?: string;
     source_ip?: string;
   }) => api.get<AuditLogPage>("/audit", { params }).then((r) => r.data),
+  /** One entry with its old / new values and changed fields (#2009). */
+  get: (id: string) =>
+    api.get<AuditLogEntry>(`/audit/${id}`).then((r) => r.data),
   /** Walk the chain and report any tampering (issue #73). The
    *  ``max_rows`` cap is for huge tables — leave unset for a full
    *  sweep. */
-  integrity: (maxRows?: number) =>
+  integrity: (maxRows?: number, newest?: boolean) =>
     api
       .get<AuditIntegrity>("/audit/integrity", {
-        params: maxRows ? { max_rows: maxRows } : undefined,
+        params: maxRows
+          ? { max_rows: maxRows, ...(newest ? { newest: true } : {}) }
+          : undefined,
       })
       .then((r) => r.data),
   /** Compliance / change report PDF (#48) — auditor-facing rollup of every
@@ -2833,6 +3051,9 @@ export const auditApi = {
 export interface BackupManifest {
   format?: string;
   format_version?: number;
+  /** "custom" (pg_dump custom format) or "plain" (SQL text). An
+   *  Exclude-secrets archive is plain, at format_version 2 (#2201). */
+  dump_format?: "custom" | "plain";
   app_version?: string;
   schema_version?: string | null;
   hostname?: string;
@@ -2868,6 +3089,19 @@ export interface BackupManifestPreviewResponse {
   manifest: BackupManifest;
   archive_bytes: number;
   format_recognised: boolean;
+  /** The dump format the restore will act on, resolved server-side by
+   *  the restore's own helper; null when the archive does not say. Absent
+   *  from a server older than #2201. */
+  dump_format?: "custom" | "plain" | null;
+  /** True only for a custom-format dump — the one shape the API accepts
+   *  a selective restore of. */
+  selective_restore_supported?: boolean;
+  /** False when the restore itself would refuse this archive (no dump, no
+   *  secrets.enc, a newer format_version, a schema head this install
+   *  cannot migrate forward); `restore_refusal` says why.
+   *  Absent from a server older than #2949. */
+  restorable?: boolean;
+  restore_refusal?: string | null;
 }
 
 export const backupApi = {
@@ -2979,6 +3213,10 @@ export interface BackupTargetConfigField {
   required: boolean;
   description: string | null;
   secret: boolean;
+  /** The value is lines (a PEM key, known_hosts, one header per line):
+   *  render a textarea, never an `<input>`, which folds each line break
+   *  into a space (#2199). Absent from a server older than that. */
+  multiline?: boolean;
 }
 
 export interface BackupTargetKind {
@@ -3017,6 +3255,12 @@ export interface BackupTarget {
   last_run_status: string;
   last_run_at: string | null;
   last_run_filename: string | null;
+  /**
+   * The node whose pod wrote `last_run_filename` (#1838). A `local_volume`
+   * target is per node on a multi-node appliance, so this is the only node
+   * that can list, download or restore that archive. Null when unknown.
+   */
+  last_run_node: string | null;
   last_run_bytes: number | null;
   last_run_duration_ms: number | null;
   last_run_error: string | null;
@@ -3123,6 +3367,18 @@ export interface BackupArchiveListing {
   filename: string;
   size_bytes: number;
   created_at: string;
+  /** The node whose disk holds the archive (`local_volume` on the
+   *  appliance, #1838); null for network destinations. */
+  node_name?: string | null;
+}
+
+/** An archive listing plus the server's `X-Archive-Listing-Note` (#1838):
+ *  on a multi-node appliance a `local_volume` listing is one node's disk,
+ *  and the note says so, or that the last run's archive is on another
+ *  node rather than missing. */
+export interface BackupArchiveList {
+  archives: BackupArchiveListing[];
+  note: string | null;
 }
 
 export interface BackupRunNowOutcome {
@@ -3132,6 +3388,8 @@ export interface BackupRunNowOutcome {
   duration_ms: number | null;
   deleted: number;
   error: string | null;
+  /** The node whose pod wrote the archive (#1838); null off the appliance. */
+  node_name?: string | null;
 }
 
 export interface BackupTestOutcome {
@@ -3168,10 +3426,16 @@ export const backupTargetsApi = {
     api
       .post<BackupTestOutcome>(`/backup/targets/${id}/test`)
       .then((r) => r.data),
-  listArchives: (id: string) =>
+  listArchives: (id: string): Promise<BackupArchiveList> =>
     api
       .get<BackupArchiveListing[]>(`/backup/targets/${id}/archives`)
-      .then((r) => r.data),
+      .then((r) => {
+        const note = r.headers?.["x-archive-listing-note"];
+        return {
+          archives: r.data,
+          note: typeof note === "string" && note ? note : null,
+        };
+      }),
   /**
    * Restore-verification drills (issue #702) — replay this target's
    * newest archive into a throwaway database and assert against the
@@ -3237,6 +3501,19 @@ export const backupTargetsApi = {
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
   },
+  /** Manifest + dump format of one stored archive (#2222) — the same
+   *  answer as ``backupApi.previewManifest``, for an archive already at
+   *  the destination. Fetches that archive server-side, so call it for
+   *  the archive the operator picked, never for the whole listing. */
+  previewArchiveManifest: (
+    id: string,
+    filename: string,
+  ): Promise<BackupManifestPreviewResponse> =>
+    api
+      .get<BackupManifestPreviewResponse>(
+        `/backup/targets/${id}/archives/${encodeURIComponent(filename)}/manifest-preview`,
+      )
+      .then((r) => r.data),
   restoreFromArchive: (
     id: string,
     body: {
@@ -3279,8 +3556,13 @@ async function _unwrapBlobError(err: unknown): Promise<Error> {
           if (typeof detail === "string") {
             return new Error(detail);
           }
-          // FastAPI 422 returns a list under ``detail``; fall back
-          // to the JSON-stringified version.
+          // FastAPI 422 returns a list under ``detail``; format it like
+          // every other error site rather than showing raw JSON.
+          if (Array.isArray(detail)) {
+            return new Error(
+              formatApiError({ response: { data: parsed } }, "Request failed"),
+            );
+          }
           return new Error(JSON.stringify(parsed));
         }
       } catch {
@@ -3531,6 +3813,8 @@ export interface SearchResponse {
   total: number;
   results: SearchResult[];
   searched_types: SearchTypeInfo[];
+  /** True when `total` is a floor — a type hit the server's fetch cap. */
+  total_capped?: boolean;
 }
 
 export const searchApi = {
@@ -3580,6 +3864,10 @@ export interface BrandingLogoInfo {
 export interface PlatformSettings {
   app_title: string;
   app_base_url: string;
+  // Read-only: the fields a non-superadmin holding `write` on `settings` may
+  // change through PUT /settings (the API's SETTINGS_DELEGATE_WRITABLE,
+  // #3429). Never sent back; the PUT body is only the edited fields.
+  delegate_writable_fields?: string[];
   // Login-screen acceptable-use banner — issue #885.
   login_banner_enabled: boolean;
   login_banner_title: string;
@@ -3769,6 +4057,17 @@ export interface PlatformSettings {
    *  firewall keeps its unconditional port-22 floor and the list is
    *  inert; on, that floor is retired and the scope applies. */
   ssh_lockdown: boolean;
+  /** Data retention (#2273) — read by the nightly prune tasks.
+   *  Superadmin-only to change. */
+  soft_delete_purge_days: number;
+  dhcp_lease_history_retention_days: number;
+  pcap_retention_days: number;
+  appliance_revoked_retention_days: number;
+  metric_retention_days: number;
+  log_retention_hours: number;
+  /** E911 lookup trail bounds (#3514). Superadmin-only. */
+  e911_resolution_log_retention_days: number;
+  e911_lookup_log_budget_per_minute: number;
   /** Write-only acknowledgement for the self-lockout pre-flight —
    *  never returned by the API. */
   ssh_lockdown_force?: boolean;
@@ -4007,7 +4306,10 @@ export interface InfluxDBTarget {
   push_dhcp_metrics: boolean;
   push_subnet_utilization: boolean;
   push_dhcp_scope_leases: boolean;
+  /** The last attempt; moves on failure. */
   last_push_at: string | null;
+  /** The last push the destination accepted; null = never. */
+  last_success_at: string | null;
   last_push_points: number;
   last_push_error: string | null;
   last_dns_bucket_at: string | null;
@@ -4025,11 +4327,15 @@ export interface InfluxDBTargetWrite {
   timeout_seconds: number;
   database: string;
   username: string;
-  /** ``null`` = keep what is stored, ``""`` = clear, else replace. */
+  /** Absent, ``null`` or ``""`` = keep what is stored; else replace. */
   password?: string | null;
+  /** Explicitly remove the stored password (a blank field never does). */
+  clear_password?: boolean;
   org: string;
   bucket: string;
   token?: string | null;
+  /** Explicitly remove the stored token (a blank field never does). */
+  clear_token?: boolean;
   measurement_prefix: string;
   push_interval_seconds: number;
   push_dns_metrics: boolean;
@@ -4214,7 +4520,7 @@ export const settingsApi = {
     api
       .post<AuditForwardTarget>("/settings/audit-forward-targets", body)
       .then((r) => r.data),
-  updateAuditTarget: (id: string, body: AuditForwardTargetWrite) =>
+  updateAuditTarget: (id: string, body: Partial<AuditForwardTargetWrite>) =>
     api
       .put<AuditForwardTarget>(`/settings/audit-forward-targets/${id}`, body)
       .then((r) => r.data),
@@ -4225,6 +4531,8 @@ export const settingsApi = {
       .post<{
         status: string;
         target: string;
+        confirmed?: boolean;
+        detail?: string;
       }>(`/settings/audit-forward-targets/${id}/test`)
       .then((r) => r.data),
   /** Issue #889 — InfluxDB push-export targets. Superadmin-only server
@@ -4235,7 +4543,7 @@ export const settingsApi = {
     api
       .post<InfluxDBTarget>("/settings/influxdb-targets", body)
       .then((r) => r.data),
-  updateInfluxTarget: (id: string, body: InfluxDBTargetWrite) =>
+  updateInfluxTarget: (id: string, body: Partial<InfluxDBTargetWrite>) =>
     api
       .put<InfluxDBTarget>(`/settings/influxdb-targets/${id}`, body)
       .then((r) => r.data),
@@ -4301,13 +4609,14 @@ export interface AuthGroupMapping {
   modified_at: string;
 }
 
-export interface AuthGroupMappingCreate {
+// #1476 — a mapping into a group that grants superadmin needs the step-up.
+export interface AuthGroupMappingCreate extends StepUp {
   external_group: string;
   internal_group_id: string;
   priority?: number;
 }
 
-export interface AuthGroupMappingUpdate {
+export interface AuthGroupMappingUpdate extends StepUp {
   external_group?: string;
   internal_group_id?: string;
   priority?: number;
@@ -4329,7 +4638,7 @@ export interface InternalGroup {
   user_ids?: string[];
 }
 
-export interface InternalGroupCreate {
+export interface InternalGroupCreate extends StepUp {
   name: string;
   description?: string;
   auth_source?: string;
@@ -4338,7 +4647,7 @@ export interface InternalGroupCreate {
   user_ids?: string[];
 }
 
-export interface InternalGroupUpdate {
+export interface InternalGroupUpdate extends StepUp {
   name?: string;
   description?: string;
   external_dn?: string | null;
@@ -4373,7 +4682,7 @@ export interface TimeBoundGrant {
   created_at: string;
 }
 
-export interface TimeBoundGrantCreate {
+export interface TimeBoundGrantCreate extends StepUp {
   group_id: string;
   action: string;
   resource_type: string;
@@ -4424,7 +4733,7 @@ export interface RoleCreate {
   permissions?: PermissionEntry[];
 }
 
-export interface RoleUpdate {
+export interface RoleUpdate extends StepUp {
   name?: string;
   description?: string;
   permissions?: PermissionEntry[];
@@ -4840,7 +5149,7 @@ export async function* streamChatTurn(
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(token ? { Authorization: `Bearer ${token}`, ...idleHeader() } : {}),
       Accept: "text/event-stream",
     },
     body: JSON.stringify(body),
@@ -4906,6 +5215,8 @@ export const customFieldsApi = {
         params: resource_type ? { resource_type } : undefined,
       })
       .then((r) => r.data),
+  get: (id: string) =>
+    api.get<CustomField>(`/custom-fields/${id}`).then((r) => r.data),
   create: (data: Omit<CustomField, "id">) =>
     api.post<CustomField>("/custom-fields", data).then((r) => r.data),
   update: (
@@ -4935,6 +5246,9 @@ export interface ZoneMovePreview {
   zone_view_action: string;
   zone_view_from: string | null;
   records_total: number;
+  /** Records in the Trash: they move too but are left out of the other counts. */
+  records_trashed: number;
+  records_trashed_widened: number;
   records_remapped: number;
   /** Records whose view scoping is lost while the TARGET renders views —
    *  they go from answering in one view to answering in every one. */
@@ -4964,6 +5278,21 @@ export interface ZoneMovePreview {
    *  doesn't define (#1316). Non-empty means the commit refuses, for the
    *  same reason as ``acl_names_lost``. */
   key_names_lost: string[];
+  /** #1784 — why the experimental technitium_api target refuses this zone.
+   *  Non-null means the commit refuses — not waivable by acknowledgement. */
+  technitium_api_refusal?: string | null;
+  /** #1858 — a TSIG key the zone uses has, in the target group, an
+   *  algorithm a target driver cannot use (Technitium has no hmac-sha224).
+   *  Non-null means the commit refuses — not waivable by acknowledgement. */
+  tsig_algorithm_refusal?: string | null;
+  /** #2121 — the forward zone's own upstream transport is one the target
+   *  group cannot serve (DoH / DoQ on BIND9, TLS on Windows DNS). Non-null
+   *  means the commit refuses — not waivable by acknowledgement. */
+  forward_transport_refusal?: string | null;
+  /** #2263 — the zone's own allow_query / allow_transfer cannot be applied
+   *  by a Technitium server in the target. Non-null means the commit
+   *  refuses — not waivable by acknowledgement. */
+  technitium_acl_refusal?: string | null;
   warnings: string[];
   /** Keys the commit will demand: view_widening | dnssec_rollover |
    *  lost_update_grants. */
@@ -4978,9 +5307,9 @@ export interface DNSServerGroup {
   group_type: string;
   default_view: string | null;
   is_recursive: boolean;
-  // RFC 9432 BIND9 catalog zones — distribute zones via one catalog
-  // instead of per-server config push. Producer is the group's primary
-  // bind9 server; consumers auto-pull members.
+  // RFC 9432 BIND9 catalog zones — the group's primary publishes a
+  // catalog for secondaries outside the group; members never consume it
+  // (#3764).
   catalog_zones_enabled: boolean;
   catalog_zone_name: string;
   // Issue #25 — flag this group as exposed to the public internet.
@@ -4988,14 +5317,70 @@ export interface DNSServerGroup {
   // operator binds a private IP into a zone in this group, forcing a
   // typed-CIDR confirm.
   is_public_facing?: boolean;
+  /** #1932 — auto-create subnet reverse zones in this group when it runs a
+   *  cloud DNS driver. Off by default: the provider bills per hosted zone.
+   *  Groups on other drivers ignore it. */
+  auto_reverse_zones_at_provider?: boolean;
   /** Distinct drivers of the servers currently in this group (#934
    *  follow-up). Empty = an empty group, compatible with anything. A group
    *  is single-driver, so one entry is normal; two or more means the group
    *  was mixed through the create path, which doesn't enforce homogeneity.
    *  Lets the move picker tell which groups a server can actually go to. */
   server_drivers?: string[];
+  /** #1782 — set when catalog zones are on for a group with a driver that
+   *  cannot do them (Technitium). */
+  catalog_unsupported_warning?: string | null;
+  /** #1784 — set for a group holding the experimental `technitium_api`
+   *  driver; says where an existing group falls outside its supported scope
+   *  (second server, pools). Empty for every other group. */
+  scope_warnings?: string[];
+  /** #3551 — estimated named memory against the agents' limit. Filled by
+   *  `getGroup` only (null on the list, and for a group with no BIND9
+   *  server); `getMemoryEstimate` returns the same object. */
+  memory_estimate?: DNSMemoryEstimate | null;
   created_at: string;
   modified_at: string;
+}
+
+/** #3551 — one blocklist (RPZ) zone as named loads it. */
+export interface DNSMemoryRpzLoad {
+  zone: string;
+  views: string[];
+  entries: number;
+  estimated_bytes: number;
+}
+
+/** #3551 — a BIND9 group's estimated named memory against the memory limit
+ *  its agents report. Each view that applies a blocklist loads its own copy
+ *  of it (BIND cannot share one between views), so `warn` is set at 80 % of
+ *  the limit. `limit_source` is `default` when no agent has reported a limit
+ *  and the shipped 2 GiB DNS pod limit is assumed. */
+export interface DNSMemoryEstimate {
+  group_id: string;
+  estimated_bytes: number;
+  limit_bytes: number;
+  limit_source: "agent" | "default";
+  limit_server: string | null;
+  unknown_limit_servers: string[];
+  percent: number;
+  warn: boolean;
+  message: string | null;
+  baseline_bytes: number;
+  zone_records_loaded: number;
+  zone_bytes: number;
+  rpz_bytes: number;
+  rpz: DNSMemoryRpzLoad[];
+  views: string[];
+}
+
+/** The non-secret WinRM settings stored for a Windows DNS / DHCP server, as
+ * the server echoes them (never the username or password). Seeds the edit
+ * dialog so an untouched save keeps what is stored. */
+export interface WinRMSettings {
+  winrm_port: number;
+  transport: string;
+  use_tls: boolean;
+  verify_tls: boolean;
 }
 
 export interface WindowsDNSCredentials {
@@ -5014,6 +5399,8 @@ export interface DNSZoneSyncItem {
   pushed: number;
   server_records: number;
   push_errors: string[];
+  /** The pushed records are queued for background delivery (#3817). */
+  queued_for_agent?: boolean;
   error: string | null;
 }
 
@@ -5023,6 +5410,8 @@ export interface DNSServerSyncResult {
   zones_failed: number;
   total_imported: number;
   total_pushed: number;
+  /** Part of total_pushed that is queued, not yet on the server. */
+  total_queued?: number;
   total_push_errors: number;
   /** Zones listed on the server via WinRM — windows_dns Path B only.
    * Empty for BIND9 and windows_dns without credentials. */
@@ -5056,6 +5445,8 @@ export interface DNSGroupSyncResult {
   servers_succeeded: number;
   total_imported: number;
   total_pushed: number;
+  /** Part of total_pushed that is queued, not yet on the server. */
+  total_queued?: number;
   total_push_errors: number;
   total_zones_imported: number;
   total_zones_pushed_to_server: number;
@@ -5070,6 +5461,9 @@ export interface DNSPerServerZoneStateEntry {
   current_serial: number | null;
   reported_at: string | null;
   in_sync: boolean;
+  // #2042 — ops for this zone the server has not acknowledged; non-zero
+  // means not in sync whatever the serial says.
+  pending_ops: number;
 }
 
 export interface DNSPerServerZoneStateResponse {
@@ -5157,6 +5551,10 @@ export interface DNSPoolMember {
   last_check_state: "unknown" | "healthy" | "unhealthy";
   last_check_at: string | null;
   last_check_error: string | null;
+  /** Verdict older than 3 x the pool's check interval; a healthy member is
+   *  still served (fail-open) (#2312). */
+  check_stale?: boolean;
+  check_age_seconds?: number | null;
   consecutive_failures: number;
   consecutive_successes: number;
   created_at: string;
@@ -5272,6 +5670,15 @@ export interface AgentSpoolStreamStatus {
   expired_entries_total: number;
   rejected_entries_total: number;
   write_failures_total: number;
+  /** #3782 — read but undelivered + unspooled events; `null`/absent = unknown. */
+  pending_events?: number | null;
+  pending_oldest_at?: string | null;
+  /** Lease-file bytes the agent has not read yet (busy posting). */
+  unread_bytes?: number | null;
+  /** How many of `pending_events` are estimated from `unread_bytes`. */
+  unread_events_estimated?: number | null;
+  /** Age of the oldest undelivered row as of the agent's report. */
+  pending_lag_seconds?: number | null;
 }
 
 /**
@@ -5293,6 +5700,15 @@ export interface AgentSpoolStatus {
   trimmed_bytes_total: number;
   last_trim_at: string | null;
   expired_entries_total: number;
+  /** #3782 — read but undelivered + unspooled events; `null`/absent = unknown. */
+  pending_events?: number | null;
+  pending_oldest_at?: string | null;
+  /** Lease-file bytes the agent has not read yet (busy posting). */
+  unread_bytes?: number | null;
+  /** How many of `pending_events` are estimated from `unread_bytes`. */
+  unread_events_estimated?: number | null;
+  /** Age of the oldest undelivered row as of the agent's report. */
+  pending_lag_seconds?: number | null;
   streams: Record<string, AgentSpoolStreamStatus>;
 }
 
@@ -5329,6 +5745,11 @@ export interface DaemonStateFields {
   daemon_reason: string | null;
   daemon_status_since: string | null;
   daemon_not_serving: boolean | null;
+  /** #2962 — who reported the current not-`ok` state: the agent itself, or
+   * the appliance's supervisor from the kubelet's container state (the agent
+   * died with its container, or has gone silent). Null on `ok` / never
+   * reported. Optional: an older server omits it, which reads as `agent`. */
+  daemon_reported_by?: "agent" | "supervisor" | null;
 }
 
 export interface DNSServer {
@@ -5352,6 +5773,8 @@ export interface DNSServer {
    * the UI to show "Credentials set" / "Clear" and gate the Path B
    * affordances without exposing the password. */
   has_credentials: boolean;
+  /** Stored WinRM settings (windows_dns with credentials), else null. */
+  winrm_settings?: WinRMSettings | null;
   /** True when the driver runs from the control plane (no agent). Used
    * by the UI to hide approval / agent-registration affordances. */
   is_agentless: boolean;
@@ -5362,6 +5785,8 @@ export interface DNSServer {
    *  to identify which host an agent is on (the operator-set ``host``
    *  is just a label; doesn't reflect NAT / distributed deployments). */
   last_seen_ip: string | null;
+  /** #2078 — the agent's own version; `null` = never reported (unknown). */
+  agent_version: string | null;
   config_apply_status: ConfigApplyStatus | null;
   config_apply_error: string | null;
   config_failed_etag: string | null;
@@ -5373,6 +5798,14 @@ export interface DNSServer {
   daemon_status_since: string | null;
   /** #1067 — derived; render from this, see `DaemonStateFields`. */
   daemon_not_serving: boolean | null;
+  /** #2044 — a second live agent process is polling as this server (a
+   * cloned VM or a copied state dir keeps the agent_id) and is being
+   * refused; only the most recent process is served. `false` with the other
+   * three `null` when no episode is current. */
+  duplicate_agent: boolean;
+  duplicate_agent_since: string | null;
+  duplicate_agent_last_at: string | null;
+  duplicate_agent_ip: string | null;
   last_config_etag: string | null;
   pending_approval: boolean;
   is_primary: boolean;
@@ -5387,17 +5820,13 @@ export interface DNSServer {
 }
 
 export interface DNSServerOptions {
-  id: string;
+  id: string | null; // null until the group's options are first saved (#3302)
   group_id: string;
   forwarders: string[];
   forward_policy: string;
   recursion_enabled: boolean;
   allow_recursion: string[];
   dnssec_validation: string;
-  gss_tsig_enabled: boolean;
-  gss_tsig_keytab_path: string | null;
-  gss_tsig_realm: string | null;
-  gss_tsig_principal: string | null;
   notify_enabled: string;
   also_notify: string[];
   allow_notify: string[];
@@ -5453,7 +5882,13 @@ export interface DNSServerOptions {
   forward_tls_hostname: string | null;
   forward_tls_verify: boolean;
   trust_anchors: DNSTrustAnchor[];
-  modified_at: string;
+  modified_at: string | null;
+  // Stored values a Technitium server in this group will not apply (#1763).
+  technitium_warnings?: string[];
+  // #2128: stored forwarders pinned to port 53 in an encrypted group.
+  forwarder_warnings?: string[];
+  // #2266: dnssec_validation "yes" with no trust anchor validates nothing.
+  dnssec_warnings?: string[];
 }
 
 /** A curated public upstream resolver (issue #877). ``tls_hostname`` is the
@@ -5524,6 +5959,9 @@ export interface DNSView {
   order: number;
   allow_query: string[] | null;
   allow_query_cache: string[] | null;
+  /** #3551 — set on the list when the group's estimated named memory is at
+   *  80 % or more of its agents' limit. */
+  memory_warning?: string | null;
   created_at: string;
   modified_at: string;
 }
@@ -5580,6 +6018,11 @@ export interface DNSZone {
   linked_subnet_id: string | null;
   domain_id?: string | null;
   dnssec_enabled: boolean;
+  // #1762 — signed on a group with more than one DNS server, each signing
+  // with its own keys (validating resolvers SERVFAIL on the mismatch).
+  dnssec_multi_signer?: boolean;
+  /** #1783 - signed on a Technitium group; SpatiumDDI won't keep it signed (#1767). */
+  dnssec_unmanaged_warning?: boolean;
   auto_tls_probe?: boolean;
   dnssec_policy_id?: string | null;
   // Dynamic-update (RFC 2136) ACL toggle (issue #641). ACL rows are
@@ -5597,6 +6040,11 @@ export interface DNSZone {
   // Conditional-forwarder config. Meaningful only when zone_type==="forward".
   forwarders: string[];
   forward_only: boolean;
+  // #2121 — the forward zone's OWN upstream transport (do53 | tls | https |
+  // quic). It does not inherit the group's forward_transport. Optional so a
+  // response from an older control plane still type-checks; absent = do53.
+  forward_transport?: "do53" | "tls" | "https" | "quic";
+  forward_tls_hostname?: string | null;
   // Secondary / stub primaries (issue #336). The master server IPs this
   // zone transfers FROM (ip or ip@port). Required when
   // zone_type==="secondary" | "stub"; empty otherwise.
@@ -5626,14 +6074,27 @@ export interface ZoneServerStateEntry {
   // server, or the zone was only just created).
   current_serial: number | null;
   reported_at: string | null;
+  // #2042 — ops for this zone the server has not acknowledged yet.
+  pending_ops: number;
+  // #2316 — `ok` counts; `unreachable` (server not active) never counts as in
+  // sync; `paused` (maintenance) and `disabled` (is_enabled false, #2927) are
+  // excluded from the count, each listed under its own name.
+  freshness: "ok" | "unreachable" | "paused" | "disabled";
+  counted: boolean;
+  // The API's verdict on this server's report (#3940): a primary zone serves
+  // our serial, a secondary / stub zone holds a copy of its primary's zone
+  // (its serial is not ours to compare) and no op is pending.
+  in_sync?: boolean;
 }
 
 export interface ZoneServerState {
   zone_id: string;
   zone_name: string;
+  zone_type?: string;
   target_serial: number;
   servers: ZoneServerStateEntry[];
-  // `false` while any server hasn't reported or is on a different serial.
+  // `false` while any server hasn't reported, is on a different serial, or
+  // still has an unacknowledged op for the zone (#2042).
   in_sync: boolean;
 }
 
@@ -5657,11 +6118,21 @@ export interface ZoneDriftServer {
   server_id: string;
   server_name: string;
   driver: string;
-  // "ok" — pulled and diffed. "error" — the pull failed (unreachable, paused,
-  // AXFR refused); counts are meaningless. "unsupported" — the driver has no
-  // `pull_zone_records`, so drift can't be computed for it at all.
-  status: "ok" | "error" | "unsupported";
+  // "ok" — pulled, nothing missing or extra, and not below the zone's serial.
+  // "syncing" — the zone changed under two minutes ago and the server has not
+  // caught up yet. "behind" — pulled, but the server is not serving the zone
+  // as saved: a saved record is missing or it sits below the zone's serial.
+  // "drift" — not behind, but the record sets differ (records SpatiumDDI
+  // doesn't hold, or a difference DNS views can explain). "error" — the pull
+  // failed (unreachable, paused, AXFR refused); counts are meaningless.
+  // "unsupported" — the driver has no `pull_zone_records`.
+  status: "ok" | "syncing" | "behind" | "drift" | "error" | "unsupported";
   error: string | null;
+  // Why a pulled server is "syncing" / "behind" / "drift".
+  reason: string | null;
+  // The serial the server reported (null = it hasn't) and the zone's target.
+  current_serial: number | null;
+  target_serial: number;
   in_sync: number;
   // `extra_on_server.length + missing_on_server.length` — the backend derives
   // it, so don't recompute it in the UI.
@@ -5815,6 +6286,8 @@ export interface UpdateAclEntryInput {
 
 export interface ZoneUpdateAcl {
   zone_id: string;
+  // Version token of the stored ACL (#3381); send it back as expected_version.
+  version: string;
   dynamic_update_enabled: boolean;
   driver_names: string[];
   caps: DynamicUpdateCaps;
@@ -5825,6 +6298,8 @@ export interface ZoneUpdateAcl {
 export interface ZoneUpdateAclReplace {
   dynamic_update_enabled?: boolean | null;
   entries: UpdateAclEntryInput[];
+  // The `version` last read; a stale one answers 409 (#3381). Omitted = unconditional.
+  expected_version?: string | null;
 }
 
 // Generic server-side pagination envelope (#455). Matches the backend
@@ -5858,6 +6333,43 @@ export interface DNSRecord {
   pool_member_id: string | null;
   created_at: string;
   modified_at: string;
+}
+
+// #3518 — the SOA and apex NS a primary zone serves from its settings. Not
+// records: nothing here is editable, exportable or counted.
+export interface ServedApex {
+  // False when the group's driver does not render the apex by the BIND9
+  // agent's rule; the rest is then only what BIND9 would serve.
+  driver_applies: boolean;
+  soa: { mname: string; rname: string };
+  ns: string[];
+  source: "declared" | "primary_ns" | "placeholder";
+  placeholder_glue_loopback: boolean;
+  // #3670 — why the placeholder is served, and the in-zone names the agent
+  // found with no A/AAAA record.
+  placeholder_reason?: "primary_ns_has_no_address" | "no_primary_ns" | null;
+  unaddressed_primary_ns?: string | null;
+  unaddressed_ns?: string[];
+  // Split-horizon views that serve different apexes, in render order; empty
+  // when they agree. The fields above are then the worst view's.
+  by_view: ServedApexInView[];
+}
+
+export interface ServedApexInView {
+  view: string;
+  soa: { mname: string; rname: string };
+  ns: string[];
+  source: "declared" | "primary_ns" | "placeholder";
+  placeholder_glue_loopback: boolean;
+  // #3670 — why the placeholder is served, and the in-zone names the agent
+  // found with no A/AAAA record.
+  placeholder_reason?: "primary_ns_has_no_address" | "no_primary_ns" | null;
+  unaddressed_primary_ns?: string | null;
+  unaddressed_ns?: string[];
+}
+
+export interface DNSRecordPage extends Page<DNSRecord> {
+  served_apex: ServedApex | null;
 }
 
 export interface DNSGroupRecord {
@@ -5908,7 +6420,10 @@ export interface PropagationCheckResult {
 export interface DNSKeyState {
   key_tag: number;
   key_type: "ksk" | "zsk" | "csk";
+  /** IANA DNSSEC algorithm number (13 = ECDSAP256SHA256). */
   algorithm: number;
+  /** IANA mnemonic; null for a number the server does not know. */
+  algorithm_name?: string | null;
   state: string;
   ds_records: string[];
   timing?: Record<string, string>;
@@ -5924,6 +6439,12 @@ export interface ZoneDnssecInfo {
   dnssec_ds_records: string[];
   dnssec_synced_at: string | null;
   keys: DNSKeyState[];
+  // #1762 — see Zone.dnssec_multi_signer; signing_servers is the group's count.
+  dnssec_multi_signer?: boolean;
+  signing_servers?: number;
+  // #1783 - the group runs Technitium; sign / re-sign are refused (#1767).
+  signing_unmanaged?: boolean;
+  dnssec_unmanaged_warning?: boolean;
 }
 
 /** A reusable BIND9 dnssec-policy definition (issue #49). */
@@ -5947,6 +6468,13 @@ export const dnsApi = {
   // Server groups
   listGroups: () =>
     api.get<DNSServerGroup[]>("/dns/groups").then((r) => r.data),
+  getGroup: (id: string) =>
+    api.get<DNSServerGroup>(`/dns/groups/${id}`).then((r) => r.data),
+  // #3551 — estimated named memory against the agents' limit.
+  getMemoryEstimate: (groupId: string) =>
+    api
+      .get<DNSMemoryEstimate | null>(`/dns/groups/${groupId}/memory-estimate`)
+      .then((r) => r.data),
   // Multi-resolver propagation check
   checkPropagation: (body: {
     name: string;
@@ -6215,8 +6743,18 @@ export const dnsApi = {
     api
       .put<DNSView>(`/dns/groups/${groupId}/views/${viewId}`, data)
       .then((r) => r.data),
-  deleteView: (groupId: string, viewId: string) =>
-    api.delete(`/dns/groups/${groupId}/views/${viewId}`),
+  // #2275 — refused (409) while the view still scopes zones or records;
+  // blocking lists scoped to it need the explicit acknowledgement.
+  deleteView: (
+    groupId: string,
+    viewId: string,
+    opts: { acknowledgeBlocklistDetach?: boolean } = {},
+  ) =>
+    api.delete(`/dns/groups/${groupId}/views/${viewId}`, {
+      params: opts.acknowledgeBlocklistDetach
+        ? { acknowledge_blocklist_detach: true }
+        : undefined,
+    }),
 
   // TLD registry (#986) — the IANA root-zone list behind zone name_scope.
   // Read by anyone who can read DNS; refresh is superadmin-only and is the
@@ -6403,7 +6941,7 @@ export const dnsApi = {
     },
   ) =>
     api
-      .get<Page<DNSRecord>>(`/dns/groups/${groupId}/zones/${zoneId}/records`, {
+      .get<DNSRecordPage>(`/dns/groups/${groupId}/zones/${zoneId}/records`, {
         params,
       })
       .then((r) => r.data),
@@ -6423,8 +6961,16 @@ export const dnsApi = {
         data,
       )
       .then((r) => r.data),
-  deleteRecord: (groupId: string, zoneId: string, recordId: string) =>
-    api.delete(`/dns/groups/${groupId}/zones/${zoneId}/records/${recordId}`),
+  // ``permanent`` is superadmin-only server-side (#4078).
+  deleteRecord: (
+    groupId: string,
+    zoneId: string,
+    recordId: string,
+    opts?: { permanent?: boolean },
+  ) =>
+    api.delete(`/dns/groups/${groupId}/zones/${zoneId}/records/${recordId}`, {
+      params: opts?.permanent ? { permanent: true } : undefined,
+    }),
 
   // Soft-deletes by default (#963) — the whole selection shares one
   // deletion_batch_id, so it restores from Admin → Trash in one action.
@@ -6440,6 +6986,7 @@ export const dnsApi = {
         deleted: number;
         skipped: { record_id: string; reason: string }[];
         deletion_batch_id: string | null;
+        provider_warning?: string | null;
       }>(
         `/dns/groups/${groupId}/zones/${zoneId}/records/bulk-delete`,
         { record_ids: recordIds },
@@ -6451,7 +6998,12 @@ export const dnsApi = {
   importZonePreview: (
     groupId: string,
     zoneId: string,
-    data: { zone_file: string; zone_name?: string; view_id?: string | null },
+    data: {
+      zone_file: string;
+      zone_name?: string;
+      view_id?: string | null;
+      conflict_strategy?: "merge" | "replace" | "append";
+    },
   ) =>
     api
       .post<DNSImportPreview>(
@@ -6489,6 +7041,78 @@ export const dnsApi = {
           r.headers["content-disposition"],
         ),
       })),
+  // #2139 — the zone's records as a CSV / XLSX sheet, a blank template, and
+  // the spreadsheet import (preview → commit).
+  exportZoneRecords: (
+    groupId: string,
+    zoneId: string,
+    format: "csv" | "xlsx",
+  ) =>
+    api
+      .get<Blob>(`/dns/groups/${groupId}/zones/${zoneId}/export`, {
+        params: { format },
+        responseType: "blob",
+      })
+      .catch(rethrowBlobError)
+      .then((r) => ({
+        data: r.data,
+        filename: _parseContentDispositionFilename(
+          r.headers["content-disposition"],
+        ),
+      })),
+  zoneImportTemplate: (
+    groupId: string,
+    zoneId: string,
+    format: "csv" | "xlsx" = "csv",
+  ) =>
+    api
+      .get<Blob>(`/dns/groups/${groupId}/zones/${zoneId}/import/template`, {
+        params: { format },
+        responseType: "blob",
+      })
+      .catch(rethrowBlobError)
+      .then((r) => ({
+        data: r.data,
+        filename: _parseContentDispositionFilename(
+          r.headers["content-disposition"],
+        ),
+      })),
+  importZoneSheetPreview: (
+    groupId: string,
+    zoneId: string,
+    file: File,
+    mode: DNSSheetImportMode,
+  ) => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("mode", mode);
+    return api
+      .post<DNSSheetImportPreview>(
+        `/dns/groups/${groupId}/zones/${zoneId}/import/spreadsheet/preview`,
+        form,
+        { headers: { "Content-Type": "multipart/form-data" } },
+      )
+      .then((r) => r.data);
+  },
+  importZoneSheetCommit: (
+    groupId: string,
+    zoneId: string,
+    file: File,
+    mode: DNSSheetImportMode,
+    confirmZone?: string,
+  ) => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("mode", mode);
+    if (confirmZone) form.append("confirm_zone", confirmZone);
+    return api
+      .post<DNSSheetImportCommit>(
+        `/dns/groups/${groupId}/zones/${zoneId}/import/spreadsheet/commit`,
+        form,
+        { headers: { "Content-Type": "multipart/form-data" } },
+      )
+      .then((r) => r.data);
+  },
   syncZoneWithServer: (groupId: string, zoneId: string, apply = true) =>
     api
       .post<{
@@ -6504,6 +7128,7 @@ export const dnsApi = {
           ttl: number | null;
         }[];
         push_candidates: number;
+        push_skipped_matching: number;
         pushed: number;
         pushed_records: {
           name: string;
@@ -6513,6 +7138,7 @@ export const dnsApi = {
           ttl: number | null;
         }[];
         push_errors: string[];
+        queued_for_agent?: boolean;
       }>(`/dns/groups/${groupId}/zones/${zoneId}/sync-with-server`, { apply })
       .then((r) => r.data),
   exportAllZones: (groupId: string, viewId?: string | null) =>
@@ -6521,6 +7147,7 @@ export const dnsApi = {
         params: viewId ? { view_id: viewId } : {},
         responseType: "blob",
       })
+      .catch(rethrowBlobError)
       .then((r) => ({
         data: r.data,
         filename: _parseContentDispositionFilename(
@@ -6558,6 +7185,63 @@ export interface DNSImportPreview {
   unchanged: DNSRecordChange[];
   soa_detected: boolean;
   record_count: number;
+  skipped: string[];
+}
+
+export type DNSSheetImportMode = "merge" | "replace";
+
+export interface DNSSheetRecordChange {
+  row: number | null;
+  op: "create" | "update" | "delete" | "unchanged";
+  name: string;
+  record_type: string;
+  value: string;
+  ttl: number | null;
+  priority: number | null;
+  weight: number | null;
+  port: number | null;
+  view: string | null;
+  comment: string | null;
+  existing_id: string | null;
+  changed_fields: string[];
+  read_only: boolean;
+}
+
+export interface DNSSheetRowIssue {
+  row: number | null;
+  reason: string;
+  name: string | null;
+  record_type: string | null;
+  value: string | null;
+}
+
+export interface DNSSheetImportPreview {
+  zone_id: string;
+  zone_name: string;
+  format: "csv" | "xlsx";
+  mode: DNSSheetImportMode;
+  row_count: number;
+  examples_ignored: number;
+  to_create: DNSSheetRecordChange[];
+  to_update: DNSSheetRecordChange[];
+  to_delete: DNSSheetRecordChange[];
+  unchanged: DNSSheetRecordChange[];
+  errors: DNSSheetRowIssue[];
+  skipped: DNSSheetRowIssue[];
+}
+
+export interface DNSSheetImportCommit {
+  zone_id: string;
+  batch_id: string;
+  format: string;
+  mode: DNSSheetImportMode;
+  created: number;
+  updated: number;
+  deleted: number;
+  unchanged: number;
+  skipped: DNSSheetRowIssue[];
+  target_serial: number | null;
+  provider_warning: string | null;
 }
 
 export interface DNSImportCommit {
@@ -6568,9 +7252,13 @@ export interface DNSImportCommit {
   deleted: number;
   unchanged: number;
   conflict_strategy: string;
+  provider_warning: string | null;
+  skipped: string[];
 }
 
 // ── DNS Blocking Lists ─────────────────────────────────────────────────────
+
+export type BlocklistWildcardMode = "by_syntax" | "always" | "never";
 
 export interface DNSBlockList {
   id: string;
@@ -6583,17 +7271,49 @@ export interface DNSBlockList {
   update_interval_hours: number;
   block_mode: string;
   sinkhole_ip: string | null;
-  /** Whether feed-sourced entries block subdomains too (#894). */
-  feed_entries_are_wildcard: boolean;
+  /**
+   * How feed entries treat subdomains (#4190): `by_syntax` follows each
+   * line's own syntax, `always` blocks subdomains of every entry, `never`
+   * is apex-only.
+   */
+  feed_wildcard_mode: BlocklistWildcardMode;
   enabled: boolean;
   last_synced_at: string | null;
   last_sync_status: string | null;
   last_sync_error: string | null;
+  /** Last refresh that SUCCEEDED (#2313); null = never. */
+  last_success_at?: string | null;
+  /** ok | error | stale | never; null for a list with no feed (#2313). */
+  feed_sync_state?: "ok" | "error" | "stale" | "never" | null;
   entry_count: number;
+  /** Rules the last adblock refresh could not enforce, by category (#2123).
+   *  null = not recorded (no adblock refresh yet, or another feed format). */
+  feed_parse_skipped: DNSBlockListFeedSkipped | null;
   created_at: string;
   modified_at: string;
   applied_group_ids: string[];
   applied_view_ids: string[];
+  /** #3551 — set when a BIND9 group this list is applied to is estimated at
+   *  80 % or more of its agents' memory limit. */
+  memory_warning?: string | null;
+}
+
+export interface DNSBlockListFeedSkipped {
+  regex: number;
+  modifier: number;
+  badfilter: number;
+  /** Total of the reason buckets below (#3519). */
+  malformed: number;
+  /** Absent on rows written before #3519, which carry only the total. */
+  star_in_name?: number;
+  no_anchor?: number;
+  trailing_dot?: number;
+  start_anchor?: number;
+  bare_star?: number;
+  dotless?: number;
+  other?: number;
+  /** hosts / domains feeds: tokens that are not DNS names (#3531). */
+  invalid_name?: number;
 }
 
 export interface DNSBlockListEntry {
@@ -6618,6 +7338,8 @@ export interface DNSBlockListException {
   list_id: string;
   domain: string;
   reason: string;
+  /** manual | feed — a feed row is the feed's own `@@` rule (#2123). */
+  source: string;
   created_at: string;
 }
 
@@ -6743,7 +7465,15 @@ export interface DNSImportedZone {
    * shape is posted back on commit, where it is ignored server-side.
    */
   name_scope?: ZoneNameScope;
+  /**
+   * #1892 — apex NS targets naming no server of the target group. Derived by
+   * the preview; ignored on commit.
+   */
+  foreign_apex_ns?: string[];
 }
+
+/** #1892 — what commit does with an apex NS outside the target group. */
+export type DNSImportApexNsPolicy = "keep" | "replace";
 
 export interface DNSImportZoneConflict {
   zone_name: string;
@@ -6810,6 +7540,11 @@ export interface CloudDNSServerOption {
   has_credentials: boolean;
 }
 
+// The client defaults to application/json, which axios honours by turning a
+// FormData into JSON (a File becomes {}). The import previews read form
+// fields, so they must say multipart (#3038).
+const MULTIPART = { headers: { "Content-Type": "multipart/form-data" } };
+
 export const dnsImportApi = {
   bind9Preview: (
     file: File,
@@ -6821,7 +7556,7 @@ export const dnsImportApi = {
     fd.append("target_group_id", target_group_id);
     if (target_view_id) fd.append("target_view_id", target_view_id);
     return api
-      .post<DNSImportPreview>("/dns/import/bind9/preview", fd)
+      .post<DNSImportPreview>("/dns/import/bind9/preview", fd, MULTIPART)
       .then((r) => r.data);
   },
   bind9Commit: (body: {
@@ -6829,6 +7564,7 @@ export const dnsImportApi = {
     target_view_id?: string | null;
     plan: DNSImportPreview;
     conflict_actions: Record<string, DNSImportConflictDecision>;
+    apex_ns_policy?: DNSImportApexNsPolicy;
   }) =>
     api
       .post<DNSImportCommitResult>("/dns/import/bind9/commit", body)
@@ -6852,6 +7588,7 @@ export const dnsImportApi = {
     target_view_id?: string | null;
     plan: DNSImportPreview;
     conflict_actions: Record<string, DNSImportConflictDecision>;
+    apex_ns_policy?: DNSImportApexNsPolicy;
   }) =>
     api
       .post<DNSImportCommitResult>("/dns/import/windows-dns/commit", body)
@@ -6887,6 +7624,7 @@ export const dnsImportApi = {
     target_view_id?: string | null;
     plan: DNSImportPreview;
     conflict_actions: Record<string, DNSImportConflictDecision>;
+    apex_ns_policy?: DNSImportApexNsPolicy;
   }) =>
     api
       .post<DNSImportCommitResult>("/dns/import/powerdns/commit", body)
@@ -6915,6 +7653,7 @@ export const dnsImportApi = {
     target_view_id?: string | null;
     plan: DNSImportPreview;
     conflict_actions: Record<string, DNSImportConflictDecision>;
+    apex_ns_policy?: DNSImportApexNsPolicy;
   }) =>
     api
       .post<DNSImportCommitResult>("/dns/import/technitium/commit", body)
@@ -6940,6 +7679,7 @@ export const dnsImportApi = {
     target_view_id?: string | null;
     plan: DNSImportPreview;
     conflict_actions: Record<string, DNSImportConflictDecision>;
+    apex_ns_policy?: DNSImportApexNsPolicy;
   }) =>
     api
       .post<DNSImportCommitResult>("/dns/import/cloud/commit", body)
@@ -7089,7 +7829,7 @@ export const dhcpImportApi = {
     fd.append("target_group_id", target_group_id);
     if (ipam_space_id) fd.append("ipam_space_id", ipam_space_id);
     return api
-      .post<DHCPImportPreview>("/dhcp/import/kea/preview", fd)
+      .post<DHCPImportPreview>("/dhcp/import/kea/preview", fd, MULTIPART)
       .then((r) => r.data);
   },
   keaCommit: (body: DHCPImportCommitBody) =>
@@ -7104,7 +7844,7 @@ export const dhcpImportApi = {
     fd.append("target_group_id", target_group_id);
     if (ipam_space_id) fd.append("ipam_space_id", ipam_space_id);
     return api
-      .post<DHCPImportPreview>("/dhcp/import/isc/preview", fd)
+      .post<DHCPImportPreview>("/dhcp/import/isc/preview", fd, MULTIPART)
       .then((r) => r.data);
   },
   iscCommit: (body: DHCPImportCommitBody) =>
@@ -7821,7 +8561,15 @@ export const dnsBlocklistApi = {
 
   updateAssignments: (
     id: string,
-    data: { server_group_ids?: string[]; view_ids?: string[] },
+    data: {
+      server_group_ids?: string[];
+      view_ids?: string[];
+      // Deltas (#3737): change only the named ids, server-side.
+      add_server_group_ids?: string[];
+      remove_server_group_ids?: string[];
+      add_view_ids?: string[];
+      remove_view_ids?: string[];
+    },
   ) =>
     api
       .put<DNSBlockList>(`/dns/blocklists/${id}/assignments`, data)
@@ -8058,6 +8806,24 @@ export interface DHCPServerGroup {
   // Number of Kea servers currently in the group. ≥ 2 means HA is
   // rendered into every peer's Kea config via libdhcp_ha.so.
   kea_member_count: number;
+  /** #2963 — names of Kea members with no `ha_peer_url` in an HA-mode group
+   *  of two or more. Empty for a standalone group. HA does not render while
+   *  fewer than two members have a URL; otherwise the URL-less ones are
+   *  listed in `ha_sidelined_members` too. Optional so fixtures predating it
+   *  still type-check. */
+  ha_peer_urls_missing?: string[];
+  /** #3151 — URL-less Kea members of a group whose other Kea members DO run
+   *  HA. They are left out of the relationship and serve none of the group's
+   *  scopes, so the pair keeps running. Empty when HA is not rendered. */
+  ha_sidelined_members?: string[];
+  /** #2963 — why the control plane did not derive the missing URL(s):
+   *  `bridged_network_mode`, or `more_than_two_kea_members` (a 3rd+ member
+   *  becomes a Kea backup and can take over the primary role, so it is left
+   *  to the operator). Null when it is derivable or nothing is missing. */
+  ha_autofill_skipped_reason?:
+    | "bridged_network_mode"
+    | "more_than_two_kea_members"
+    | null;
   // Member servers (rolled up by the /server-groups response).
   servers: DHCPServerGroupMember[];
   created_at: string;
@@ -8091,6 +8857,10 @@ export interface DHCPServer {
   roles: string[];
   status: string;
   last_sync_at: string | null;
+  /** Why the last scheduled lease pull failed (agentless drivers); null
+   * once a pull succeeds. */
+  last_sync_error?: string | null;
+  last_sync_error_at?: string | null;
   last_health_check_at: string | null;
   agent_registered: boolean;
   agent_approved: boolean;
@@ -8110,6 +8880,14 @@ export interface DHCPServer {
   daemon_status_since: string | null;
   /** #1067 — derived; render from this, see `DaemonStateFields`. */
   daemon_not_serving: boolean | null;
+  /** #3143 — a second live agent process is polling as this server (a
+   * cloned VM or a copied state dir keeps the agent_id) and is being
+   * refused; only the most recent process is served. `false` with the other
+   * three `null` when no episode is current. */
+  duplicate_agent: boolean;
+  duplicate_agent_since: string | null;
+  duplicate_agent_last_at: string | null;
+  duplicate_agent_ip: string | null;
   agent_version: string | null;
   config_etag: string | null;
   config_pushed_at: string | null;
@@ -8141,6 +8919,8 @@ export interface DHCPServer {
   // seeds the checkbox from the stored value instead of resetting it (which
   // would silently re-disable verification). Null for non-cloud drivers.
   verify_tls?: boolean | null;
+  /** Stored WinRM settings (windows_dhcp with credentials), else null. */
+  winrm_settings?: WinRMSettings | null;
   // Per-server maintenance mode (issue #182). When true the control
   // plane skips shipping pending DHCPConfigOp rows + suppresses the
   // heartbeat-stale alert; the UI renders an amber Maintenance chip.
@@ -8473,6 +9253,8 @@ export interface PXEArchMatch {
 }
 
 export interface PXEArchMatchInput {
+  /** Existing rule's id (#3374); omit for a new rule. */
+  id?: string;
   priority?: number;
   match_kind?: PXEMatchKind;
   vendor_class_match?: string | null;
@@ -8633,6 +9415,10 @@ export interface DHCPRateBucket {
    *  never as 0. Zero is a measurement; null is the absence of one. */
   receive_drop: number | null;
   socket_drop: number | null;
+  /** #2889 — DHCPv4 requests the server read and then evicted from its full
+   *  packet queue during a burst; no server counter records them. Same
+   *  `null` rule. Optional: a control plane older than #2889 omits it. */
+  queue_evicted?: number | null;
 }
 
 export interface DHCPServerStatsResponse {
@@ -9321,6 +10107,8 @@ export interface DHCPPool {
   end_ip: string;
   pool_type: string; // "dynamic" | "excluded" | "reserved" | "pd"
   class_restriction: string | null;
+  // Legacy, never served (#1689): Kea has no per-pool lease time. The API
+  // refuses a non-null value; send null only, to clear an old row.
   lease_time_override: number | null;
   options_override: Record<string, unknown> | null;
   // DHCPv6 prefix delegation (#368) — only set for pool_type === "pd".
@@ -9450,7 +10238,12 @@ export interface DHCPClientClass {
   name: string;
   description: string;
   match_expression: string;
+  // Which Kea daemons the class renders into (#1229). A `dual` class sends
+  // each option to whichever family it is valid in.
+  address_family: "ipv4" | "ipv6" | "dual";
   options: Record<string, unknown>;
+  // #2296 — a row stored before its name became reserved; rename it.
+  reserved_name?: boolean;
   created_at: string;
   modified_at: string;
 }
@@ -9569,7 +10362,8 @@ export interface DHCPMACBlock {
   id: string;
   group_id: string;
   mac_address: string;
-  reason: DHCPMACBlockReason;
+  // One of DHCPMACBlockReason, or the free text New Devices stored (#3083).
+  reason: string;
   description: string;
   enabled: boolean;
   expires_at: string | null;
@@ -9585,7 +10379,7 @@ export interface DHCPMACBlock {
 
 export interface DHCPMACBlockWrite {
   mac_address?: string;
-  reason?: DHCPMACBlockReason;
+  reason?: string;
   description?: string;
   enabled?: boolean;
   expires_at?: string | null;
@@ -9680,9 +10474,13 @@ export const authApi = {
   logout: () => api.post("/auth/logout", undefined, { withCredentials: true }),
   /** Exchange the HttpOnly refresh cookie for a fresh access token. No
    *  argument — the cookie rides the request automatically (#484). */
-  refresh: () =>
+  refresh: (signal?: AbortSignal) =>
     api
-      .post<RefreshResponse>("/auth/refresh", {}, { withCredentials: true })
+      .post<RefreshResponse>(
+        "/auth/refresh",
+        {},
+        { withCredentials: true, signal },
+      )
       .then((r) => r.data),
   changePassword: (currentPassword: string, newPassword: string) =>
     api.post("/auth/change-password", {
@@ -9714,6 +10512,13 @@ export const authApi = {
   mfaEnrollBegin: (password?: string) =>
     api
       .post<MfaEnrolBeginResponse>("/auth/mfa/enroll/begin", { password })
+      .then((r) => r.data),
+  /** #1354 — start the forced IdP re-login an OIDC / SAML account needs
+   *  before `mfaEnrollBegin`. Navigate the browser to `authorize_url`; it
+   *  returns to /account?mfa_reauth=ok|failed. */
+  mfaEnrollReauth: () =>
+    api
+      .post<{ authorize_url: string }>("/auth/mfa/enroll/reauth")
       .then((r) => r.data),
   mfaEnrollVerify: (code: string) =>
     api.post("/auth/mfa/enroll/verify", { code }),
@@ -9814,11 +10619,34 @@ export interface AgentLogSource {
   server_kind: "dns" | "dhcp";
   driver: string;
   host: string;
+  /** Server group (#2120). `null` for a DHCP server in no group. */
+  group_id?: string | null;
+  group_name?: string | null;
+}
+
+/**
+ * Scope of an agent-log read (#2120): `server_id` → that server,
+ * `group_id` → every server in the group, neither → every server the
+ * caller may read. The server always narrows to what the caller may read.
+ */
+export interface AgentLogScope {
+  server_id?: string | null;
+  group_id?: string | null;
+}
+
+/** Echoed scope + the servers a read actually covered (#2120). */
+export interface AgentLogScopeEcho {
+  server_id: string | null;
+  group_id: string | null;
+  server_ids: string[];
 }
 
 export interface DNSQueryLogRow {
   id: number;
   ts: string;
+  /** Which server logged it (#2120). */
+  server_id: string;
+  server_name: string;
   client_ip: string | null;
   client_port: number | null;
   qname: string | null;
@@ -9837,8 +10665,7 @@ export interface DNSQueryLogRow {
   raw: string;
 }
 
-export interface DNSQueryLogRequest {
-  server_id: string;
+export interface DNSQueryLogRequest extends AgentLogScope {
   since?: string | null;
   until?: string | null;
   q?: string | null;
@@ -9851,8 +10678,7 @@ export interface DNSQueryLogRequest {
   max_events?: number;
 }
 
-export interface DNSQueryLogResponse {
-  server_id: string;
+export interface DNSQueryLogResponse extends AgentLogScopeEcho {
   events: DNSQueryLogRow[];
   truncated: boolean;
 }
@@ -9860,6 +10686,9 @@ export interface DNSQueryLogResponse {
 export interface DHCPActivityLogRow {
   id: number;
   ts: string;
+  /** Which server logged it (#2120). */
+  server_id: string;
+  server_name: string;
   severity: string | null;
   code: string | null;
   mac_address: string | null;
@@ -9868,8 +10697,7 @@ export interface DHCPActivityLogRow {
   raw: string;
 }
 
-export interface DHCPActivityLogRequest {
-  server_id: string;
+export interface DHCPActivityLogRequest extends AgentLogScope {
   since?: string | null;
   until?: string | null;
   q?: string | null;
@@ -9880,8 +10708,7 @@ export interface DHCPActivityLogRequest {
   max_events?: number;
 }
 
-export interface DHCPActivityLogResponse {
-  server_id: string;
+export interface DHCPActivityLogResponse extends AgentLogScopeEcho {
   events: DHCPActivityLogRow[];
   truncated: boolean;
 }
@@ -9893,15 +10720,13 @@ export interface DNSQueryAnalyticsRow {
   count: number;
 }
 
-export interface DNSQueryAnalyticsRequest {
-  server_id: string;
+export interface DNSQueryAnalyticsRequest extends AgentLogScope {
   since?: string | null;
   until?: string | null;
   limit?: number;
 }
 
-export interface DNSQueryAnalyticsResponse {
-  server_id: string;
+export interface DNSQueryAnalyticsResponse extends AgentLogScopeEcho {
   since: string | null;
   until: string | null;
   total_queries: number;
@@ -10181,12 +11006,7 @@ export const logsApi = {
  * = enforced at the auth layer BEFORE RBAC. Multiple scopes
  * union; ``read`` covers safe-method requests across the surface.
  */
-export type ApiTokenScope =
-  | "read"
-  | "ipam:write"
-  | "dns:write"
-  | "dhcp:write"
-  | "agent";
+export type ApiTokenScope = "read" | "ipam:write" | "dns:write" | "dhcp:write";
 
 export const API_TOKEN_SCOPES: {
   value: ApiTokenScope;
@@ -10196,27 +11016,22 @@ export const API_TOKEN_SCOPES: {
   {
     value: "read",
     label: "Read-only",
-    hint: "GET / HEAD / OPTIONS only — no mutations anywhere.",
+    hint: "GET / HEAD / OPTIONS, read-only POSTs (previews, log queries) and MCP. Mutations are refused, and so is anything that makes SpatiumDDI contact another host: probes, live pulls and off-prem lookups.",
   },
   {
     value: "ipam:write",
     label: "IPAM write",
-    hint: "Mutate /ipam/*, /vlans*, /vrfs*, /network-devices*.",
+    hint: "Mutate /ipam/*, /vlans/*, /vrfs/*, /network-devices/* and other IPAM surfaces. No reads outside these paths: add Read-only. A write-only token cannot use MCP. Also creates reverse DNS zones and DNS records.",
   },
   {
     value: "dns:write",
     label: "DNS write",
-    hint: "Mutate /dns/* + /dns-pools*. Excludes the agent surface.",
+    hint: "Mutate /dns/*. Excludes the agent surface, /dnsbl/* and /dns-threat/*. No reads outside these paths: add Read-only. A write-only token cannot use MCP. Moving a server between groups repoints its appliance and changes its DoT/DoH/DoQ firewall ports.",
   },
   {
     value: "dhcp:write",
     label: "DHCP write",
-    hint: "Mutate /dhcp/*. Excludes the agent surface.",
-  },
-  {
-    value: "agent",
-    label: "Agent",
-    hint: "Bootstrap + push for /dns/agents/* and /dhcp/agents/*.",
+    hint: "Mutate /dhcp/*. Excludes the agent surface. No reads outside these paths: add Read-only. A write-only token cannot use MCP. Also mirrors leases and statics into IPAM.",
   },
 ];
 
@@ -10233,9 +11048,26 @@ export interface ApiToken {
   description: string;
   prefix: string;
   scope: string;
-  scopes: ApiTokenScope[];
+  /** What the row stores. Usually an ``ApiTokenScope``, but a token minted
+   *  before #3302 may still carry the retired ``agent`` (matches nothing). */
+  scopes: string[];
   resource_grants?: ApiTokenResourceGrant[];
   user_id: string | null;
+  /** Set by the list endpoint (#2443). */
+  owner_username?: string | null;
+  owner_display_name?: string | null;
+  /** False when the owner is disabled: the token is refused (403) whatever
+   *  its own flag says (#3431). Set by the list endpoint. */
+  owner_is_active?: boolean | null;
+  owner_password_change_required?: boolean | null;
+  /** Effective state at auth (#3784); older servers omit it. */
+  status?:
+    | "active"
+    | "revoked"
+    | "expired"
+    | "owner_disabled"
+    | "password_change_required";
+  blocked_reason?: string | null;
   expires_at: string | null;
   last_used_at: string | null;
   is_active: boolean;
@@ -10263,6 +11095,10 @@ export interface ApiTokenUpdate {
   description?: string;
   is_active?: boolean;
   scopes?: ApiTokenScope[];
+  /** Needed to re-enable an inactive token (superadmin only) or to widen
+   *  its scopes. Renaming, narrowing and revoking need neither. */
+  stepup_password?: string | null;
+  stepup_totp_code?: string | null;
 }
 
 /**
@@ -10294,28 +11130,42 @@ export const apiTokensApi = {
 
 // ── Alerts ─────────────────────────────────────────────────────────────────────
 
-export type AlertRuleType =
-  | "subnet_utilization"
-  | "server_unreachable"
-  | "asn_holder_drift"
-  | "asn_whois_unreachable"
-  | "rpki_roa_expiring"
-  | "rpki_roa_expired"
-  | "domain_expiring"
-  | "domain_nameserver_drift"
-  | "domain_registrar_changed"
-  | "domain_dnssec_status_changed"
-  | "circuit_term_expiring"
-  | "circuit_status_changed"
-  | "service_term_expiring"
-  | "service_resource_orphaned"
-  | "compliance_change"
-  | "voice_lease_count_below"
-  | "stale_ip_count"
-  | "dhcp_pool_exhaustion"
-  | "secret_expiring"
-  | "decom_expiring"
-  | "node_pressure";
+// The rule-type list is the backend's (``GET /alerts/rule-types``), not a
+// union kept here: a hand-kept union knew 23 of ~64 types (#1997).
+export type AlertRuleType = string;
+export interface AlertParamOption {
+  value: string;
+  label: string;
+}
+export interface AlertParamSpec {
+  name:
+    | "threshold_percent"
+    | "threshold_days"
+    | "min_free_addresses"
+    | "server_type"
+    | "classification"
+    | "change_scope";
+  label: string;
+  kind: "integer" | "select";
+  unit: string | null;
+  min: number | null;
+  max: number | null;
+  /** What the evaluator uses when the stored value is null. */
+  default: number | string | null;
+  /** Starting value for a new rule's form. */
+  initial: number | string | null;
+  hint: string | null;
+  options: AlertParamOption[];
+}
+export interface AlertRuleTypeSpec {
+  rule_type: string;
+  label: string;
+  group: string;
+  description: string | null;
+  params: AlertParamSpec[];
+  /** Seeded + driven by the platform: described, but not creatable (#2748). */
+  system_driven?: boolean;
+}
 export type AlertSeverity = "info" | "warning" | "critical";
 export type AlertServerType = "dns" | "dhcp" | "any";
 // ``compliance_change`` rule type — keep in lock-step with
@@ -10407,14 +11257,38 @@ export interface AlertEvaluateResult {
 
 export const alertsApi = {
   listRules: () => api.get<AlertRule[]>("/alerts/rules").then((r) => r.data),
+  ruleTypes: () =>
+    api.get<AlertRuleTypeSpec[]>("/alerts/rule-types").then((r) => r.data),
   createRule: (body: AlertRuleCreate) =>
     api.post<AlertRule>("/alerts/rules", body).then((r) => r.data),
   updateRule: (id: string, body: AlertRuleUpdate) =>
     api.patch<AlertRule>(`/alerts/rules/${id}`, body).then((r) => r.data),
   deleteRule: (id: string) => api.delete(`/alerts/rules/${id}`),
   listEvents: (
-    params: { open_only?: boolean; rule_id?: string; limit?: number } = {},
+    params: {
+      open_only?: boolean;
+      rule_id?: string;
+      limit?: number;
+      offset?: number;
+    } = {},
   ) => api.get<AlertEvent[]>("/alerts/events", { params }).then((r) => r.data),
+  // One window of events plus the number matching the filters (the
+  // X-Total-Count header), so a page can say how many it did not draw (#3830).
+  listEventsPage: (
+    params: {
+      open_only?: boolean;
+      rule_id?: string;
+      limit?: number;
+      offset?: number;
+    } = {},
+  ) =>
+    api.get<AlertEvent[]>("/alerts/events", { params }).then((r) => {
+      const header = Number(r.headers?.["x-total-count"]);
+      return {
+        items: r.data,
+        total: Number.isFinite(header) ? header : r.data.length,
+      };
+    }),
   resolveEvent: (id: string) =>
     api.post<AlertEvent>(`/alerts/events/${id}/resolve`).then((r) => r.data),
   evaluateNow: () =>
@@ -10569,10 +11443,12 @@ export const conformityApi = {
   // ``Content-Disposition`` for the backend's UTC-timestamped
   // filename, trigger a synthetic anchor click for the download.
   exportPdf: async (framework?: string): Promise<void> => {
-    const res = await api.get<Blob>("/conformity/export.pdf", {
-      params: framework ? { framework } : undefined,
-      responseType: "blob",
-    });
+    const res = await api
+      .get<Blob>("/conformity/export.pdf", {
+        params: framework ? { framework } : undefined,
+        responseType: "blob",
+      })
+      .catch(rethrowBlobError);
     const disp = (res.headers["content-disposition"] as string) || "";
     const match = disp.match(/filename="?([^";]+)"?/i);
     const ts = new Date()
@@ -10638,8 +11514,18 @@ export interface NetworkDashboardOverlayImpactRow {
   site_count: number;
   note: string;
 }
+export interface NetworkDashboardWithheld {
+  asn: boolean;
+  circuit: boolean;
+  service: boolean;
+  overlay: boolean;
+}
 export interface NetworkDashboardSummary {
   generated_at: string;
+  /** Panels the server emptied because the caller may not read them: their
+   *  zeros are "not visible to you", never an all-clear (#3449). Optional
+   *  for an older server. */
+  withheld?: Partial<NetworkDashboardWithheld>;
   asn_drift_count: number;
   rpki_expiring_count: number;
   rpki_expired_count: number;
@@ -10647,6 +11533,10 @@ export interface NetworkDashboardSummary {
    *  panel tell a real all-clear from stale or absent data (#942). */
   rpki_total_count: number;
   rpki_last_checked_at: string | null;
+  /** ROAs whose certificate lifetime is known (#3557). 0 with ROAs tracked
+   *  means the source ships no per-ROA lifetime, so the expiring / expired
+   *  counts are not measured — never an all-clear. */
+  rpki_expiry_known_count: number;
   circuit_term_expiring_count: number;
   circuit_status_changed_count: number;
   service_orphan_count: number;
@@ -10680,6 +11570,12 @@ export interface IntegrationsDashboardTargetRow {
   // #797 — non-fatal findings; null for integrations that don't compute them.
   last_sync_warning: string | null;
   is_stale: boolean;
+  // #2221 — false: switched off, so last_sync_error is history, not a problem.
+  enabled?: boolean;
+  // #2138 — credential health; null for integrations that record no expiry.
+  credential_state: CredentialState | null;
+  credential_expires_at: string | null;
+  credential_days_left: number | null;
 }
 export interface IntegrationsDashboardPanel {
   kind: IntegrationDashboardKind;
@@ -10690,6 +11586,12 @@ export interface IntegrationsDashboardPanel {
   stale_count: number;
   error_count: number;
   warning_count: number;
+  // #2221 — switched-off targets, counted outside the live buckets above.
+  disabled_count?: number;
+  // #2192 — over every target, not the capped `targets` list.
+  problem_count?: number;
+  credential_dead_count?: number;
+  credential_expiring_count?: number;
   targets: IntegrationsDashboardTargetRow[];
 }
 export interface IntegrationsDashboardErrorRow {
@@ -10703,7 +11605,14 @@ export interface IntegrationsDashboardErrorRow {
 export interface IntegrationsDashboardSummary {
   generated_at: string;
   panels: IntegrationsDashboardPanel[];
+  /** Enabled integrations the caller may not read: left out of `panels` and
+   *  of both recent lists, so the tab names them rather than reading the gap
+   *  as "nothing enabled" or an all-clear (#3456). Absent from older servers. */
+  withheld?: { kind: string; label: string }[];
   recent_errors: IntegrationsDashboardErrorRow[];
+  // #2577 — rows a sync released outside its target's IP space; same shape,
+  // `error_detail` carries what was released. Absent from older servers.
+  recent_warnings?: IntegrationsDashboardErrorRow[];
 }
 
 // Security dashboard tab (#109)
@@ -10741,6 +11650,9 @@ export interface SecurityDashboardPermissionChangeRow {
 }
 export interface SecurityDashboardSummary {
   generated_at: string;
+  /** The per-row lists were stripped for this caller (#400): empty means
+   *  "not shown to you", not "none". Absent from an older server. */
+  detail_withheld?: boolean;
   mfa_total_local_users: number;
   mfa_enrolled_count: number;
   mfa_coverage_pct: number;
@@ -10940,7 +11852,11 @@ export interface WebhookSubscription {
   // response when one was newly assigned (``secret_plaintext``).
   secret_set: boolean;
   event_types: string[] | null;
-  headers: Record<string, string> | null;
+  // Header values are credentials (#1579) — Fernet-encrypted at rest
+  // and never returned. Only their names come back, plus whether any
+  // are stored at all.
+  header_names: string[];
+  headers_set: boolean;
   timeout_seconds: number;
   max_attempts: number;
   created_at: string;
@@ -10960,6 +11876,8 @@ export interface WebhookSubscriptionWrite {
   // sent in plaintext + encrypted server-side.
   secret?: string | null;
   event_types?: string[] | null;
+  // Write-only (#1579): ``null``/omitted on edit = keep the stored
+  // headers, ``{}`` = clear them, any other dict replaces them.
   headers?: Record<string, string> | null;
   timeout_seconds?: number;
   max_attempts?: number;
@@ -10994,7 +11912,7 @@ export const webhooksApi = {
     api.get<WebhookSubscription>(`/webhooks/${id}`).then((r) => r.data),
   create: (body: WebhookSubscriptionWrite) =>
     api.post<WebhookSubscription>("/webhooks", body).then((r) => r.data),
-  update: (id: string, body: WebhookSubscriptionWrite) =>
+  update: (id: string, body: Partial<WebhookSubscriptionWrite>) =>
     api.put<WebhookSubscription>(`/webhooks/${id}`, body).then((r) => r.data),
   delete: (id: string) => api.delete(`/webhooks/${id}`),
   test: (id: string) =>
@@ -11049,6 +11967,11 @@ export interface ChangeRequest {
   executed_at: string | null;
   created_at: string;
   modified_at: string;
+  /** Whether the caller may approve this row, from the server's own approve
+   * check (#4189). False once the row is no longer pending. */
+  can_approve: boolean;
+  /** The server's refusal text when a pending row is not approvable. */
+  approve_blocked_reason: string | null;
 }
 
 export interface ChangeRequestListParams {
@@ -11208,6 +12131,9 @@ export interface ProvisioningRequest {
   executed_at: string | null;
   created_at: string;
   modified_at: string;
+  // Name of the IPAM template args.template_id names, resolved server-side so
+  // viewers without read on IPAM templates still get it (#3649).
+  template_name?: string | null;
 }
 
 export interface ProvisioningRequestListParams {
@@ -11215,6 +12141,14 @@ export interface ProvisioningRequestListParams {
   mine?: boolean;
   limit?: number;
   offset?: number;
+}
+
+// What approving a pending request would do now, re-previewed server-side (#3934).
+export interface RequestCurrentPreview {
+  preview_text: string;
+  ok: boolean;
+  detail: string | null;
+  changed: boolean;
 }
 
 export interface SubmitRequestBody {
@@ -11249,6 +12183,20 @@ export const requestsApi = {
       .then((r) => r.data),
   list: (params: ProvisioningRequestListParams = {}) =>
     api.get<ProvisioningRequest[]>("/requests", { params }).then((r) => r.data),
+  // One window plus the number matching the filter (X-Total-Count), so the
+  // page can say how many it did not draw (#3937).
+  listPage: (params: ProvisioningRequestListParams = {}) =>
+    api.get<ProvisioningRequest[]>("/requests", { params }).then((r) => {
+      const header = Number(r.headers?.["x-total-count"]);
+      return {
+        items: r.data,
+        total: Number.isFinite(header) ? header : r.data.length,
+      };
+    }),
+  currentPreview: (id: string) =>
+    api
+      .get<RequestCurrentPreview>(`/requests/${id}/current-preview`)
+      .then((r) => r.data),
   get: (id: string) =>
     api.get<ProvisioningRequest>(`/requests/${id}`).then((r) => r.data),
   submit: (body: SubmitRequestBody) =>
@@ -11328,6 +12276,10 @@ export interface DHCPMetricsPoint {
    *  never as 0. Zero is a measurement; null is the absence of one. */
   receive_drop: number | null;
   socket_drop: number | null;
+  /** #2889 — DHCPv4 requests the server read and then evicted from its full
+   *  packet queue during a burst; no server counter records them. Same
+   *  `null` rule. Optional: a control plane older than #2889 omits it. */
+  queue_evicted?: number | null;
 }
 
 export interface DHCPMetricsSeries {
@@ -11352,6 +12304,14 @@ export const metricsApi = {
 };
 
 export interface VersionInfo {
+  // Always present (#2935): enough to know this is a SpatiumDDI control plane.
+  product: string;
+  api_level: number;
+  // True for an anonymous caller: the version, release-check and appliance
+  // identity fields below are then withheld (null / false), and ``version`` is
+  // the placeholder "restricted", which parseRelease reads as unknown. The
+  // console only asks while signed in, so it always sees ``restricted: false``.
+  restricted: boolean;
   version: string;
   latest_version: string | null;
   update_available: boolean;
@@ -11839,6 +12799,8 @@ export interface ACMEDomainResolution {
   zone_name: string | null;
   record_name: string | null;
   driver: string | null;
+  // e.g. a more specific internal zone was skipped for a public one
+  note?: string | null;
 }
 
 // A manual TXT the operator must publish for an allow_manual order to
@@ -11864,6 +12826,8 @@ export interface AcmeOrder {
   last_error: string | null;
   // True when the operator opted into solving unmanaged domains by hand.
   allow_manual: boolean;
+  // #3067 — whether a successful issue makes the cert the Web UI cert.
+  activate: boolean;
   // Populated while a manual order is "processing" — the TXT records the
   // operator must add. Empty for fully-managed orders.
   manual_challenges: AcmeManualChallenge[];
@@ -11878,6 +12842,9 @@ export interface AcmeIssueRequest {
   // dns-01 only — let an unmanaged domain be solved by an operator-pasted
   // TXT (the order goes "processing" with manual_challenges populated).
   allow_manual?: boolean;
+  // #3067 — make the issued cert the Web UI certificate (the API default).
+  // Needs admin on appliance; a certificate-store-only caller sends false.
+  activate?: boolean;
 }
 
 // Well-known Let's Encrypt directory endpoints surfaced as form
@@ -12068,6 +13035,10 @@ export interface MetalLBConfig {
   // bind9/powerdns :53; dhcp_relay_vip fronts the Kea relay→server :67.
   dns_vip?: string;
   dhcp_relay_vip?: string;
+  // #2899 — DHCP server groups the relay VIP fronts that are still in
+  // direct (raw socket) mode. Relays landing on the node announcing the
+  // VIP get no answer from them. Read-only; not sent on PUT.
+  dhcp_relay_vip_direct_groups?: string[];
   // issue #566 decision D1 — BGP mode. Layered on top of the same
   // MetalLB install; requires `enabled: true`. bgp_advertisements is
   // auto-derived server-side when omitted (see the backend cross-field
@@ -12170,6 +13141,8 @@ export type ClusterUpgradeFailureCategory =
   | "node_did_not_rejoin"
   | "chart_bump_failed"
   | "uncordon_fail"
+  | "slot_image_mirror_not_ready"
+  | "release_failed"
   | "other";
 
 export type PreflightLevel = "ok" | "warn" | "fail";
@@ -12215,6 +13188,14 @@ export interface PerNodeProgress {
   // render the right operator-action hint. Absent on still-in-flight
   // nodes; set when the node's primitive returns ok=False.
   failure_category?: ClusterUpgradeFailureCategory;
+  // #1542 — set when the compensating release (uncordon + CNPG
+  // maintenance-window clear) itself failed, so the node is left held.
+  // ``stuck`` names what is still held: "cordon" / "maintenance_window".
+  release_failed?: {
+    error: string;
+    stuck: string[];
+    underlying_category?: ClusterUpgradeFailureCategory;
+  };
 }
 
 export interface ChartBumpProgress {
@@ -12306,12 +13287,24 @@ export interface ClusterUpgradePlanRequest {
 }
 
 export const clusterUpgradesApi = {
-  preflight: (target: string) =>
+  // #1919 — ``slotImageId`` is the uploaded image the Plan will name, so the
+  // disk checks size the need from it, exactly as the Plan's own preflight.
+  preflight: (target: string, slotImageId?: string) =>
     api
-      .get<PreflightReport>("/upgrades/preflight", { params: { target } })
+      .get<PreflightReport>("/upgrades/preflight", {
+        params: slotImageId
+          ? { target, slot_image_id: slotImageId }
+          : { target },
+      })
       .then((r) => r.data),
   lease: () =>
     api.get<UpgradeLeaseState>("/upgrades/lease").then((r) => r.data),
+  // #1707 — superadmin: free a Lease a dead drive left held. Refused (409)
+  // while the holder still renews it.
+  forceReleaseLease: () =>
+    api
+      .post<UpgradeLeaseState>("/upgrades/lease/force-release")
+      .then((r) => r.data),
   plan: (body: ClusterUpgradePlanRequest) =>
     api
       .post<ClusterUpgradePlanResponse>("/upgrades/plan", body)
@@ -12476,6 +13469,10 @@ export interface ApplianceUpgradeProgress {
   detail: string;
   /** ISO-8601 timestamp the step was entered. */
   at: string;
+  /** #2007 — on ``reboot-pending``: the slot armed and the boot it was
+   *  staged under, which the supervisor settles against after the reboot. */
+  staged_slot?: string;
+  staged_boot_id?: string;
 }
 
 export interface ApplianceRow {
@@ -12563,6 +13560,9 @@ export interface ApplianceRow {
   desired_default_slot: string | null;
   reboot_requested: boolean;
   reboot_requested_at: string | null;
+  // #2021 — a clear the host has not answered yet. A Cancel's 200 is
+  // provisional until then: the host may already have started the apply.
+  clear_upgrade_requested?: boolean;
   // #170 Wave C2 — role assignment + free-form tags.
   assigned_roles: string[];
   assigned_dns_group_id: string | null;
@@ -12604,9 +13604,12 @@ export interface ApplianceRow {
     string,
     {
       role: string;
-      status: "healthy" | "missing" | "unhealthy" | "starting";
+      // #2808 — ``held``: the node is revoked or not yet approved, so its
+      // role services are down on purpose (``held_by`` names the state).
+      status: "healthy" | "missing" | "unhealthy" | "starting" | "held";
       since: string;
       container_id: string | null;
+      held_by?: string;
     }
   >;
   // #387 — per-plane host-config apply health from the supervisor's
@@ -12618,7 +13621,7 @@ export interface ApplianceRow {
   host_config_health: Record<
     string,
     {
-      state: "retrying" | "failing";
+      state: "applying" | "retrying" | "failing";
       attempts: number;
       at: string | null;
     }
@@ -12663,6 +13666,9 @@ export interface ApplianceRow {
   // False = the supervisor never looked (too old to collect it), which is
   // UNKNOWN — distinct from "looked and found no arrays".
   storage_reported: boolean;
+  // #2400 — /var low or under the kubelet eviction headroom. Null = fine
+  // or unknown (no reading, or a stale one).
+  var_disk_finding?: VarDiskFinding | null;
   // #1017 — the interface MTU spatium-etc-render actually APPLIED at this
   // node's last boot, which is not what STATE asked for: the renderer
   // drops a value that is out of range, that would break a pinned IPv6
@@ -13077,7 +14083,29 @@ export interface UpgradeImage {
   uploaded_by_user_id: string | null;
   uploaded_at: string;
   notes: string | null;
+  // #2410 — derived server-side from columns that already exist. The
+  // release is null when GitHub has not been reached recently (the list
+  // is served from the release cache, never a live call).
+  release?: {
+    published_at: string;
+    is_prerelease: boolean;
+    html_url: string;
+  } | null;
+  channel?: UpgradeImageChannel;
+  fleet_architecture?: UpgradeImageFleetVerdict;
+  fleet_nodes?: number | null;
+  // Version is on a slot of these nodes. NOT in use: the bytes are written.
+  installed_on?: string[];
+  // These nodes are scheduled to fetch it, and a delete is refused (409).
+  scheduled_for?: string[];
+  rolling_run_id?: string | null;
 }
+
+export type UpgradeImageChannel = "stable" | "prerelease" | "nightly";
+// #2399's verdict: some node runs this architecture / the whole fleet has
+// reported and none does / not knowable (unlabelled image, a node that has
+// not reported, or no nodes yet).
+export type UpgradeImageFleetVerdict = "matches" | "no_node" | "unknown";
 
 // A GitHub release carrying an importable appliance upgrade image.
 export interface AvailableUpgradeImage {
@@ -13094,11 +14122,24 @@ export interface AvailableUpgradeImage {
   // #1026 — a release publishing both architectures appears as two
   // rows, one per architecture.
   architecture: string;
+  // #2410
+  staged_image_id?: string | null;
+  channel?: UpgradeImageChannel;
+  fleet_architecture?: UpgradeImageFleetVerdict;
+  fleet_nodes?: number | null;
+}
+
+export interface FleetArchitectures {
+  architectures: string[];
+  unknown_count: number;
+  counts: Record<string, number>;
+  restricted: boolean;
 }
 
 export interface AvailableUpgradeImages {
   github_reachable: boolean;
   available: AvailableUpgradeImage[];
+  fleet: FleetArchitectures;
 }
 
 export const applianceUpgradeImagesApi = {
@@ -13108,9 +14149,11 @@ export const applianceUpgradeImagesApi = {
       .then((r) => r.data.images),
   // Connected-install picker source — releases with an importable
   // upgrade-image asset + its .sha256 sidecar.
-  listAvailable: () =>
+  listAvailable: (allArchitectures = false) =>
     api
-      .get<AvailableUpgradeImages>("/appliance/upgrade-images/available")
+      .get<AvailableUpgradeImages>("/appliance/upgrade-images/available", {
+        params: allArchitectures ? { all_architectures: true } : undefined,
+      })
       .then((r) => r.data),
   // Control plane downloads + verifies + stores the release asset.
   importFromGithub: (release_tag: string, architecture?: string) =>
@@ -13149,8 +14192,14 @@ export const applianceUpgradeImagesApi = {
       })
       .then((r) => r.data);
   },
-  remove: (id: string) =>
-    api.delete<void>(`/appliance/upgrade-images/${id}`).then((r) => r.data),
+  // ``force`` deletes an image an appliance is scheduled to fetch or an
+  // active run names (otherwise a 409); audited server-side (#2410).
+  remove: (id: string, force = false) =>
+    api
+      .delete<void>(`/appliance/upgrade-images/${id}`, {
+        params: force ? { force: true } : undefined,
+      })
+      .then((r) => r.data),
 };
 
 // ── Appliance: container management (Phase 4d) ─────────────────────
@@ -13195,6 +14244,20 @@ export interface HostPartition {
   label: string;
   total_bytes: number;
   used_bytes: number;
+  // #2400 — statvfs f_bavail (the kubelet's eviction measure). Absent from
+  // a supervisor too old to send it.
+  available_bytes?: number | null;
+}
+
+/**
+ * #2400 — /var against kubelet eviction, judged server-side by the same
+ * function behind the `appliance_disk_usage` alert. Absent / null = fine or
+ * unknown.
+ */
+export interface VarDiskFinding {
+  severity: "warning" | "critical" | string;
+  free_pct: number | null;
+  detail: string;
 }
 
 /** One member of a software-RAID array (#999 Part A). */
@@ -13424,6 +14487,7 @@ export interface ClusterNodeVitals {
    * real "no arrays here" reading.
    */
   host_storage: NodeStorage | null;
+  var_disk_finding?: VarDiskFinding | null;
 }
 
 /** One /proc/pressure line's rolling averages, as % of wall time. */
@@ -13476,11 +14540,47 @@ export interface ClusterWorkloadHealth {
   kind: string | null;
   ready: number;
   total: number;
+  /** Lifetime total: informational only. */
   restarts: number;
+  /** #2945 — containers restarted in the last 15 min; drives the amber. */
+  recent_restarts?: number;
+  last_restart_at?: string | null;
   /** Job pods still running for this component (#1213), e.g. a CNPG
    *  replica join. Not in ready / total; keeps the status off healthy. */
   jobs_running: number;
   status: string;
+  /** #1387 — database row only: "cnpg" when ready / total are the CNPG
+   *  Cluster's ready / wanted instances, "pods" when it is a pod count. */
+  source?: string | null;
+  /** #2856 — database row only: one entry per PostgreSQL instance. */
+  instances?: ClusterPostgresInstance[] | null;
+  current_primary?: string | null;
+  target_primary?: string | null;
+  /** Instances that are not Ready, or standbys not streaming from the
+   *  primary. CNPG counts a Ready standby that is not replicating as
+   *  healthy, so these — not ready / total — are why the row is degraded. */
+  findings?: ClusterPostgresFinding[] | null;
+  /** Whether streaming was checked against pg_stat_replication. */
+  replication_checked?: boolean | null;
+}
+
+export interface ClusterPostgresInstance {
+  name: string;
+  node: string | null;
+  role: string;
+  ready: boolean;
+  ready_since: string | null;
+  /** Standbys only. null = not checked / not visible — never "healthy". */
+  streaming: boolean | null;
+}
+
+export interface ClusterPostgresFinding {
+  instance: string;
+  node: string | null;
+  /** "not_ready" | "not_streaming" | "supervisor_reported" */
+  kind: string;
+  detail: string;
+  since: string | null;
 }
 
 /** The resolve probe's verdict (#985). */
@@ -13577,8 +14677,16 @@ export interface ApplianceSystemInfo {
   maintenance_mode: boolean;
   reboot_pending_from_host: boolean;
   reboot_scheduled: boolean;
-  appliance_version: string;
+  reboot_in_progress?: boolean;
+  // #3008 — the node the reboot fields describe (the api pod's own node);
+  // null off-appliance.
+  node?: string | null;
+  appliance_version: string | null;
   appliance_mode: boolean;
+  /** #3011 — false on a multi-node control plane: the local reboot acts on
+   *  whichever node answers, so Fleet's per-appliance reboot is the path. */
+  reboot_available: boolean;
+  reboot_unavailable_reason: string | null;
 }
 
 export const applianceSystemApi = {
@@ -13658,9 +14766,26 @@ export const applianceDiagnosticsApi = {
     api
       .post<ApplianceSelfTestReport>("/appliance/diagnostics/self-test")
       .then((r) => r.data),
-  // Bundle download uses a direct URL — the browser handles the
-  // attachment + filename via Content-Disposition.
-  bundleUrl: () => "/api/v1/appliance/diagnostics/bundle",
+  // The API authenticates by the Authorization bearer only, so a plain
+  // <a href> navigation 401s (#3394). Fetch through the client as a blob,
+  // decode a refusal, and take the filename from Content-Disposition (the
+  // fallback matches the server's own `spatium-diagnostic-<UTC stamp>.zip`).
+  downloadBundle: async (): Promise<{ blob: Blob; filename: string }> => {
+    const res = await api
+      .get("/appliance/diagnostics/bundle", { responseType: "blob" })
+      .catch(rethrowBlobError);
+    const disp = (res.headers["content-disposition"] as string) || "";
+    const match = disp.match(/filename="?([^";]+)"?/i);
+    const ts = new Date()
+      .toISOString()
+      .slice(0, 19)
+      .replace(/[-:]/g, "")
+      .replace("T", "-");
+    return {
+      blob: new Blob([res.data as BlobPart]),
+      filename: match ? match[1] : `spatium-diagnostic-${ts}.zip`,
+    };
+  },
 };
 
 /**
@@ -13675,7 +14800,7 @@ async function* _streamApplianceLogSse(
   const token = getAccessToken();
   const res = await fetch(url, {
     headers: {
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(token ? { Authorization: `Bearer ${token}`, ...idleHeader() } : {}),
       Accept: "text/event-stream",
     },
     signal,
@@ -13751,7 +14876,7 @@ export async function* streamClusterHealth(
   const token = getAccessToken();
   const res = await fetch("/api/v1/appliance/cluster/health/stream", {
     headers: {
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(token ? { Authorization: `Bearer ${token}`, ...idleHeader() } : {}),
       Accept: "text/event-stream",
     },
     signal,
@@ -15008,6 +16133,16 @@ export const unifiApi = {
 
 // ── Tailscale integration ──────────────────────────────────────────
 
+// #2138 — see backend app/services/integration_credentials.py.
+export type CredentialState =
+  | "ok"
+  | "expiring"
+  | "expired"
+  | "rejected"
+  | "unknown"
+  // #2191 — the target is switched off; its last rejection is history.
+  | "disabled";
+
 export interface TailscaleTenant {
   id: string;
   name: string;
@@ -15015,6 +16150,11 @@ export interface TailscaleTenant {
   enabled: boolean;
   tailnet: string;
   api_key_present: boolean;
+  // #2138 — null = unknown.
+  api_key_expires_at: string | null;
+  api_key_expiry_source: "api" | "operator" | null;
+  credential_state: CredentialState;
+  credential_days_left: number | null;
   ipam_space_id: string;
   dns_group_id: string | null;
   cgnat_cidr: string;
@@ -15035,6 +16175,7 @@ export interface TailscaleTenantCreate {
   enabled?: boolean;
   tailnet?: string;
   api_key: string;
+  api_key_expires_at?: string | null;
   ipam_space_id: string;
   dns_group_id?: string | null;
   cgnat_cidr?: string;
@@ -15049,6 +16190,7 @@ export interface TailscaleTenantUpdate {
   enabled?: boolean;
   tailnet?: string;
   api_key?: string;
+  api_key_expires_at?: string | null;
   ipam_space_id?: string;
   dns_group_id?: string | null;
   cgnat_cidr?: string;
@@ -15062,6 +16204,9 @@ export interface TailscaleTestResult {
   message: string;
   tailnet_domain: string | null;
   device_count: number | null;
+  // #2138 — the tested token's expiry as Tailscale reports it.
+  api_key_expires_at?: string | null;
+  api_key_expiry_note?: string | null;
 }
 
 export const tailscaleApi = {
@@ -15183,7 +16328,10 @@ export type TrashEntryType =
   | "subnet"
   | "dns_zone"
   | "dns_record"
-  | "dhcp_scope";
+  | "dhcp_scope"
+  | "customer"
+  | "overlay_network"
+  | "network_service";
 
 export interface TrashEntry {
   id: string;
@@ -15199,12 +16347,16 @@ export interface TrashEntry {
 export interface TrashListResponse {
   items: TrashEntry[];
   total: number;
+  limit: number;
+  offset: number;
 }
 
 export interface TrashRestoreResponse {
   batch_id: string;
   restored: number;
   skipped: { type: string; id: string; display: string; reason: string }[];
+  // Rows that stayed in the Trash on purpose (a subnet's records, #2732).
+  held_back?: { type: string; id: string; display: string; reason: string }[];
 }
 
 export const trashApi = {
@@ -15216,6 +16368,7 @@ export const trashApi = {
       q?: string;
       limit?: number;
       offset?: number;
+      sort?: "newest" | "oldest";
     } = {},
   ) =>
     api.get<TrashListResponse>("/admin/trash", { params }).then((r) => r.data),
@@ -15302,6 +16455,8 @@ export interface NATMapping {
   // hide-NAT path); without these the UI can only show the bare UUID.
   internal_subnet_cidr: string | null;
   internal_subnet_name: string | null;
+  /** True when the caller cannot read the subnet, so the labels above are withheld (#3641). */
+  internal_subnet_redacted?: boolean;
   internal_port_start: number | null;
   internal_port_end: number | null;
   external_ip: string | null;
@@ -15518,12 +16673,66 @@ export interface ContainerStatsResponse {
   rows: ContainerStat[];
 }
 
+/** #3761 — which runtimes the Containers tab can see. */
+export interface ContainerBackendStatus {
+  available: boolean;
+  reason: string | null;
+  detail: string | null;
+}
+export interface ContainerBackends {
+  docker: ContainerBackendStatus;
+  kubernetes: ContainerBackendStatus;
+  appliance: boolean;
+}
+export interface PodRow {
+  name: string;
+  component: string;
+  image: string;
+  state: string;
+  status: string;
+  health: string | null;
+  started_at: string | null;
+  containers: string[];
+}
+export interface PodListResponse {
+  available: boolean;
+  reason: string | null;
+  rows: PodRow[];
+}
+
 export const containersApi = {
   stats: (params: { prefix?: string; include_stopped?: boolean } = {}) =>
     api
       .get<ContainerStatsResponse>("/admin/containers/stats", { params })
       .then((r) => r.data),
+  backends: () =>
+    api
+      .get<ContainerBackends>("/admin/containers/backends")
+      .then((r) => r.data),
+  pods: () =>
+    api.get<PodListResponse>("/admin/containers/pods").then((r) => r.data),
+  podLogs: (name: string, tail = 200) =>
+    api
+      .get<{
+        name: string;
+        tail: string;
+      }>(`/admin/containers/pods/${encodeURIComponent(name)}/logs`, {
+        params: { tail },
+      })
+      .then((r) => r.data),
 };
+
+/** Follow one release pod's logs (redacted server-side) — #3761. */
+export function streamPodLogs(
+  name: string,
+  signal?: AbortSignal,
+  tail = 100,
+): AsyncIterable<string> {
+  return _streamApplianceLogSse(
+    `/api/v1/admin/containers/pods/${encodeURIComponent(name)}/logs/stream?tail=${tail}`,
+    signal,
+  );
+}
 
 // ── Service lifecycle control (issue #890) ────────────────────────────────────
 
@@ -15617,7 +16826,7 @@ export const natApi = {
     api.get<NATMapping>(`/ipam/nat-mappings/${id}`).then((r) => r.data),
   create: (data: NATMappingWrite) =>
     api.post<NATMapping>("/ipam/nat-mappings", data).then((r) => r.data),
-  update: (id: string, data: NATMappingWrite) =>
+  update: (id: string, data: Partial<NATMappingWrite>) =>
     api.patch<NATMapping>(`/ipam/nat-mappings/${id}`, data).then((r) => r.data),
   delete: (id: string) => api.delete(`/ipam/nat-mappings/${id}`),
   byIp: (ipId: string) =>
@@ -16064,6 +17273,11 @@ export interface NmapScanRead {
   id: string;
   target_ip: string;
   ip_address_id: string | null;
+  /** IP space of the IPAM row the scan was launched from (#2577) — where
+   *  stamp-discovered writes when no space is named. Single-scan GET and the
+   *  scan list both carry it. */
+  ip_space_id?: string | null;
+  ip_space_name?: string | null;
   preset: NmapPreset;
   port_spec: string | null;
   extra_args: string | null;
@@ -16128,8 +17342,11 @@ export const nmapApi = {
    *  Existing rows in ``available`` / ``discovered`` get bumped to
    *  ``discovered``; integration / operator-owned rows get a
    *  ``last_seen`` stamp only. New rows land as ``discovered``.
+   *  ``spaceId`` picks the IP space; without it the scan's own IPAM row
+   *  space is used, and with neither, hosts that fall in subnets of more
+   *  than one space are skipped as ambiguous.
    *  Returns counters for the UI to render. */
-  stampDiscovered: (scanId: string) =>
+  stampDiscovered: (scanId: string, spaceId?: string) =>
     api
       .post<{
         created: number;
@@ -16137,7 +17354,19 @@ export const nmapApi = {
         refreshed: number;
         skipped_no_subnet: number;
         skipped_addresses: string[];
-      }>(`/nmap/scans/${scanId}/stamp-discovered`)
+        /** Hosts inside subnets of several IP spaces, skipped because no
+         *  space was chosen (#2577). */
+        skipped_ambiguous: string[];
+        /** The space hosts were stamped into and why (``requested`` /
+         *  ``scan_ip_row``); null when no single space applied (#2577). */
+        space_used: {
+          id: string;
+          name: string;
+          source: "requested" | "scan_ip_row";
+        } | null;
+      }>(`/nmap/scans/${scanId}/stamp-discovered`, null, {
+        params: spaceId ? { space_id: spaceId } : undefined,
+      })
       .then((r) => r.data),
   // SECURITY (#400, M8): the SSE stream is consumed via `streamScan`
   // (fetch + ReadableStream) so the access token rides the
@@ -16168,7 +17397,7 @@ export async function* streamNmapScan(
   const url = nmapApi.streamUrl(scanId);
   const res = await fetch(url, {
     headers: {
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(token ? { Authorization: `Bearer ${token}`, ...idleHeader() } : {}),
       Accept: "text/event-stream",
     },
     signal,
@@ -16239,6 +17468,8 @@ export interface PcapCaptureRead {
   bytes_captured: number;
   pcap_size_bytes: number | null;
   pcap_sha256: string | null;
+  // Node whose disk holds the artifact (#2866); null when unknown.
+  artifact_node: string | null;
   has_artifact: boolean;
   metadata_json: Record<string, unknown> | null;
   created_by_user_id: string | null;
@@ -16308,9 +17539,25 @@ export const pcapApi = {
    *  Uses the axios instance so the Bearer token rides the
    *  Authorization header (no `?token=` in the URL). */
   downloadCapture: async (id: string): Promise<void> => {
-    const res = await api.get<Blob>(`/pcap/captures/${id}/download`, {
-      responseType: "blob",
-    });
+    let res;
+    try {
+      res = await api.get<Blob>(`/pcap/captures/${id}/download`, {
+        responseType: "blob",
+      });
+    } catch (err) {
+      // responseType "blob" turns the JSON error body into a Blob, which
+      // formatApiError cannot read; decode it so the operator sees the
+      // server's sentence (e.g. which node holds the capture, #2866).
+      const e = err as { response?: { data?: unknown } };
+      if (e?.response?.data instanceof Blob) {
+        try {
+          e.response.data = JSON.parse(await e.response.data.text());
+        } catch {
+          // Not JSON; leave the generic message.
+        }
+      }
+      throw err;
+    }
     const disposition = (res.headers as Record<string, string>)[
       "content-disposition"
     ];
@@ -18436,6 +19683,12 @@ export interface L3VPNSummary {
   edge_circuits: L3VPNCircuitSummary[];
   edge_subnets: L3VPNSubnetSummary[];
   warnings: string[];
+  /** Section -> number of attached rows left out because the caller has no
+   *  read grant on them. Absent on an older server; a missing section was
+   *  shown in full. */
+  withheld?: Partial<
+    Record<"vrf" | "edge_sites" | "edge_circuits" | "edge_subnets", number>
+  >;
 }
 
 export interface CustomGroupedSummary {
@@ -18943,6 +20196,7 @@ export const supportBundleApi = {
         },
         { responseType: "blob" },
       )
+      .catch(rethrowBlobError)
       .then((r) => r.data as Blob),
   decodeMap: () =>
     api
@@ -20402,6 +21656,8 @@ export interface ERLBinding {
   mac_address: string | null;
   ip_address_id: string | null;
   site_id: string | null;
+  target_label?: string | null;
+  target_missing?: boolean;
   is_active: boolean;
   notes: string;
   created_at: string;
@@ -20506,10 +21762,12 @@ export const e911Api = {
   download: async (kind: "csv" | "ios", siteId?: string) => {
     const path =
       kind === "csv" ? "/e911/export.csv" : "/e911/export/ios-lldp-med.txt";
-    const res = await api.get(path, {
-      params: siteId ? { site_id: siteId } : undefined,
-      responseType: "blob",
-    });
+    const res = await api
+      .get(path, {
+        params: siteId ? { site_id: siteId } : undefined,
+        responseType: "blob",
+      })
+      .catch(rethrowBlobError);
     const disp = String(res.headers["content-disposition"] ?? "");
     const match = disp.match(/filename="?([^"]+)"?/);
     const ts = new Date()

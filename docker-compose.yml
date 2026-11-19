@@ -6,6 +6,19 @@ services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    # #3932 — end a session whose client has gone: a dead client's open
+    # transaction must not hold a migration's lock for hours. Reload-only;
+    # see docs/deployment/DOCKER.md.
+    command:
+      - postgres
+      - -c
+      - idle_in_transaction_session_timeout=1h
+      - -c
+      - tcp_keepalives_idle=60
+      - -c
+      - tcp_keepalives_interval=10
+      - -c
+      - tcp_keepalives_count=6
     networks:
       - spatiumddi
     environment:
@@ -39,6 +52,9 @@ services:
   api:
     image: ghcr.io/spatiumnorth/spatiumddi-api:${SPATIUMDDI_VERSION:-latest}
     restart: unless-stopped
+    # #2944 — above the image's uvicorn --timeout-graceful-shutdown (20 s) so
+    # lifespan shutdown runs before the kill; Docker's default is 10 s.
+    stop_grace_period: 30s
     networks:
       - spatiumddi
     ports:
@@ -62,6 +78,8 @@ services:
       # Scope is the api container's own ``com.docker.compose.project``
       # label, so it can never reach a container outside this stack.
       SERVICE_CONTROL_ENABLED: ${SERVICE_CONTROL_ENABLED:-false}
+      # #2780 — cap on a request body sent to the api (413 over it).
+      MAX_REQUEST_BODY_BYTES: ${MAX_REQUEST_BODY_BYTES:-8388608}
     # Docker integration — uncomment both entries below to poll the
     # host's Docker daemon over its local Unix socket. Required when
     # adding a Docker host with connection_type=unix, and by service
@@ -129,7 +147,7 @@ services:
     restart: unless-stopped
     networks:
       - spatiumddi
-    command: celery -A app.celery_app worker --loglevel=info --concurrency=4 -Q ipam,dns,dhcp,default,bundles
+    command: celery -A app.celery_app worker --loglevel=info --concurrency=4 --without-mingle --without-heartbeat --without-gossip -Q ipam,dns,dhcp,default,bundles
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://spatiumddi:${POSTGRES_PASSWORD:-changeme}@postgres:5432/spatiumddi
@@ -150,6 +168,10 @@ services:
       # capture, so it writes here; the api reads the same volume on
       # download. MUST stay in sync with the api mount above.
       - spatium_pcaps:/var/lib/spatiumddi/pcaps
+      # Upgrade-image store (issue #2400) — the worker's reclaim beat task
+      # deletes images every node has committed to. MUST stay in sync with
+      # the api mount above.
+      - spatium_slot_images:/var/lib/spatiumddi/slot-images
     #   - /var/run/docker.sock:/var/run/docker.sock:ro
     # group_add:
     #   - "${DOCKER_GID:-999}"
@@ -217,6 +239,15 @@ services:
       - "${HTTP_PORT:-8077}:80"
     depends_on:
       - api
+    # #1868 — the reverse proxy in front of this container, if any (its
+    # address, or the network it connects from). The frontend nginx then takes
+    # the real client address and scheme from that proxy's X-Forwarded-For /
+    # -Proto instead of overwriting them. EMPTY (unset) = trust no proxy,
+    # today's behaviour. Separate from the api's TRUSTED_PROXY_CIDRS on
+    # purpose: the api's peer is this container, the frontend's is the proxy.
+    # docs/deployment/REVERSE_PROXY.md.
+    environment:
+      FRONTEND_TRUSTED_PROXY_CIDRS: ${FRONTEND_TRUSTED_PROXY_CIDRS:-}
 
   # ── Migrations (runs once at startup) ──────────────────────────────────────
   migrate:
@@ -241,6 +272,10 @@ services:
     profiles: ["dns", "dns-bind9"]
     image: ghcr.io/spatiumnorth/dns-bind9:${SPATIUMDDI_VERSION:-latest}
     restart: unless-stopped
+    # #1725 — a memory ceiling. named plus the agent hold a large RPZ
+    # (~580k entries per zone is ~2-3.5 GB), and without a limit one big
+    # blocklist takes the host's RAM. Raise it for bigger lists (docs/features/DNS.md).
+    mem_limit: ${DNS_BIND9_MEM_LIMIT:-2g}
     networks:
       - spatiumddi
     environment:
@@ -299,8 +334,9 @@ services:
   # Third DNS driver, alongside bind9/powerdns. Distinct profile + host
   # port (6053, avoiding 1053/5453) so all three can run side-by-side in
   # a dev/migration setup. Technitium's web console + API listen on
-  # loopback :5380 inside the container only — the agent is the only
-  # caller (same trust boundary as PowerDNS's local API key).
+  # 127.0.0.1:5380 only (plain HTTP, #1776; the agent pins the bind), so no
+  # port is published and other containers cannot reach it. The admin
+  # password is random per install.
   dns-technitium:
     profiles: ["dns-technitium"]
     image: ghcr.io/spatiumnorth/dns-technitium:${SPATIUMDDI_VERSION:-latest}

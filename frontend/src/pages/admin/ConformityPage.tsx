@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import {
   AlertTriangle,
   Check,
@@ -23,10 +24,14 @@ import {
   type ConformitySeverity,
   type ConformityStatus,
   type ConformityTargetKind,
+  formatApiError,
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 import { HeaderButton } from "@/components/ui/header-button";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { exportErrorMessage, isRefused } from "@/lib/refusal";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Conformity admin page (issue #106).
@@ -43,6 +48,13 @@ import { HeaderButton } from "@/components/ui/header-button";
  * fields when editing one of those rows.
  */
 export function ConformityPage() {
+  // #1341 — a read-only user is offered no write it would be refused:
+  // the router asks admin on 'conformity'.
+  const perms = usePermissions();
+  const adminGate = permissionGate(
+    perms.can("admin", "conformity"),
+    "Requires admin permission on conformity policies",
+  );
   const qc = useQueryClient();
   const [editing, setEditing] = useState<ConformityPolicy | null>(null);
   const [creating, setCreating] = useState(false);
@@ -104,10 +116,7 @@ export function ConformityPage() {
     mutationFn: (framework: string | undefined) =>
       conformityApi.exportPdf(framework),
     onError: (e: unknown) => {
-      const err = e as { response?: { data?: { detail?: string } } };
-      alert(
-        `PDF export failed: ${err?.response?.data?.detail ?? "unknown error"}`,
-      );
+      alert(exportErrorMessage(e, "the conformity report"));
     },
   });
 
@@ -135,11 +144,21 @@ export function ConformityPage() {
               variant="secondary"
               onClick={() => exportPdfMut.mutate(undefined)}
               disabled={exportPdfMut.isPending}
+              // The PDF needs the same `read` on `conformity` the list
+              // does (#3255), as the Audit Log's does (#1865).
+              {...permissionGate(
+                !isRefused(policiesQ.error),
+                "Requires read permission on conformity",
+              )}
             >
               <FileDown className="h-4 w-4" />
               {exportPdfMut.isPending ? "Exporting…" : "Export PDF"}
             </HeaderButton>
-            <HeaderButton variant="primary" onClick={() => setCreating(true)}>
+            <HeaderButton
+              variant="primary"
+              onClick={() => setCreating(true)}
+              {...adminGate}
+            >
               <Plus className="h-4 w-4" />
               New policy
             </HeaderButton>
@@ -189,7 +208,14 @@ export function ConformityPage() {
                       colSpan={8}
                       className="px-3 py-8 text-center text-xs text-muted-foreground"
                     >
-                      No policies yet — click “New policy” to add one.
+                      <ListEmpty
+                        error={policiesQ.error}
+                        what="conformity policies"
+                        gate={adminGate}
+                        hint={`Click “New policy” to add one.`}
+                      >
+                        No policies yet.
+                      </ListEmpty>
                     </td>
                   </tr>
                 )}
@@ -241,8 +267,10 @@ export function ConformityPage() {
                         <button
                           type="button"
                           title={p.enabled ? "Disable" : "Enable"}
+                          aria-label={p.enabled ? "Disable" : "Enable"}
                           onClick={() => togglePolicyMut.mutate(p)}
-                          className="rounded p-1 hover:bg-accent"
+                          className="rounded p-1 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                          {...adminGate}
                         >
                           {p.enabled ? (
                             <PowerOff className="h-4 w-4" />
@@ -253,17 +281,21 @@ export function ConformityPage() {
                         <button
                           type="button"
                           title="Re-evaluate now"
+                          aria-label="Re-evaluate now"
                           onClick={() => evaluateMut.mutate(p.id)}
-                          className="rounded p-1 hover:bg-accent"
+                          className="rounded p-1 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
                           disabled={evaluateMut.isPending}
+                          {...adminGate}
                         >
                           <Play className="h-4 w-4" />
                         </button>
                         <button
                           type="button"
                           title="Edit"
+                          aria-label="Edit"
                           onClick={() => setEditing(p)}
-                          className="rounded p-1 hover:bg-accent"
+                          className="rounded p-1 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                          {...adminGate}
                         >
                           <Pencil className="h-4 w-4" />
                         </button>
@@ -271,6 +303,7 @@ export function ConformityPage() {
                           <button
                             type="button"
                             title="Delete"
+                            aria-label="Delete"
                             onClick={() => {
                               if (
                                 confirm(
@@ -280,7 +313,8 @@ export function ConformityPage() {
                                 deletePolicyMut.mutate(p.id);
                               }
                             }}
-                            className="rounded p-1 hover:bg-accent text-destructive"
+                            className="rounded p-1 hover:bg-accent text-destructive disabled:cursor-not-allowed disabled:opacity-50"
+                            {...adminGate}
                           >
                             <Trash2 className="h-4 w-4" />
                           </button>
@@ -769,11 +803,7 @@ function PolicyEditorModal({
       onClose();
     },
     onError: (e: unknown) => {
-      const err = e as {
-        response?: { data?: { detail?: string } };
-        message?: string;
-      };
-      setError(err?.response?.data?.detail ?? err?.message ?? "Save failed");
+      setError(formatApiError(e, "Save failed"));
     },
   });
 
@@ -929,7 +959,9 @@ function PolicyEditorModal({
           />
           Policy enabled
         </label>
-        {error && <p className="text-xs text-red-600">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-red-600">{error}</FormError>
+        )}
         <div className="flex justify-end gap-2 pt-2">
           <button
             type="button"

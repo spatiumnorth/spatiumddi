@@ -1,0 +1,89 @@
+{{- /* #1510 — the one Service that holds the DNS resolver VIP.
+
+       The three engine Services (dns-bind9 / dns-powerdns / dns-technitium)
+       are rendered whenever their ``.enabled`` is true, which since Phase 10
+       wave 2 means release ownership, not the role, so all three exist on a
+       DNS appliance. When each of them was a LoadBalancer asking MetalLB for
+       the same ``dns.vip``, MetalLB gave the address to whichever Service was
+       created first and left the others ``<pending>``. That is the empty one
+       on a fresh install, and after an engine switch the VIP stayed on the
+       Service whose engine no longer ran: the resolver address answered
+       nothing.
+
+       This Service selects on ``spatium.io/dns-vip``, a label every DNS
+       engine's pods carry, so the VIP follows whichever engine the
+       supervisor schedules (one per appliance, via the ``role-dns-*`` node
+       labels) and an engine switch needs no Service change at all. The
+       engine Services stay ClusterIP.
+
+       Encrypted transports keep working through the VIP: the port numbers
+       come from the first enabled engine that sets them, and ``targetPort``
+       is the container port NAME, so each pod is reached on its own
+       listener. */}}
+{{- if and .Values.dns.useMetalLBVIP (or .Values.dnsBind9.enabled .Values.dnsPowerdns.enabled .Values.dnsTechnitium.enabled) }}
+{{- $dot := "" }}
+{{- $doh := "" }}
+{{- $doq := "" }}
+{{- range $e := list .Values.dnsBind9 .Values.dnsPowerdns .Values.dnsTechnitium }}
+{{- if $e.enabled }}
+{{- if and (not $dot) $e.dotPort }}{{- $dot = $e.dotPort }}{{- end }}
+{{- if and (not $doh) $e.dohPort }}{{- $doh = $e.dohPort }}{{- end }}
+{{- if and (not $doq) $e.doqPort }}{{- $doq = $e.doqPort }}{{- end }}
+{{- end }}
+{{- end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: dns-vip
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dns-vip
+  annotations:
+    # #272 Phase 5 — pin the DNS resolver VIP from the MetalLB pool.
+    metallb.universe.tf/address-pool: {{ .Values.dns.vipPool | quote }}
+    metallb.universe.tf/loadBalancerIPs: {{ .Values.dns.vip | quote }}
+spec:
+  type: LoadBalancer
+  # Keep the client's source address. With the default ``Cluster`` policy
+  # kube-proxy SNATs every query that lands on the VIP to the node (or the
+  # CNI gateway), so the daemon sees two or three addresses for the whole
+  # network: per-client rate limits throttle everyone at once, and query
+  # logs, RPZ hits and ACLs all key on the wrong address. ``Local`` makes
+  # MetalLB announce the VIP from a node that runs a DNS pod and keeps the
+  # query there — every DNS node runs one engine pod, so failover is
+  # unchanged. Same reasoning as the control-plane VIP in frontend.yaml.
+  externalTrafficPolicy: Local
+  # #1550 — MetalLB (L2/BGP) never routes via NodePorts; without this
+  # every VIP port is also opened as a random NodePort on every node,
+  # served through the forward path instead of the scoped input chain.
+  allocateLoadBalancerNodePorts: false
+  selector:
+    spatium.io/dns-vip: "true"
+  ports:
+    - name: dns-udp
+      port: 53
+      targetPort: dns-udp
+      protocol: UDP
+    - name: dns-tcp
+      port: 53
+      targetPort: dns-tcp
+      protocol: TCP
+    {{- with $dot }}
+    - name: dns-dot
+      port: {{ . }}
+      targetPort: dns-dot
+      protocol: TCP
+    {{- end }}
+    {{- with $doh }}
+    - name: dns-doh
+      port: {{ . }}
+      targetPort: dns-doh
+      protocol: TCP
+    {{- end }}
+    {{- with $doq }}
+    - name: dns-doq
+      port: {{ . }}
+      targetPort: dns-doq
+      protocol: UDP
+    {{- end }}
+{{- end }}

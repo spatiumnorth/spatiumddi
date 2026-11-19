@@ -81,6 +81,11 @@ class SlotImageTarget:
     # second full slot apply of an image it already staged. Carried in the
     # run plan so every node in a run, and every resume of it, agrees.
     nonce: str | None = None
+    # #1709 — the uploaded image this URL serves, when it is one of ours. An
+    # upload streams its bytes to the slot-image mirror, so the mirror
+    # headroom check needs no room for it once the mirror holds it. None for
+    # an operator-pasted external URL.
+    image_id: uuid.UUID | None = None
 
     def as_plan_fields(self) -> dict[str, object]:
         """Serialise into an ``UpgradeRun.plan`` JSON blob."""
@@ -90,6 +95,7 @@ class SlotImageTarget:
             "slot_image_tls_insecure": self.tls_insecure,
             "slot_image_nonce": self.nonce,
             "slot_image_architecture": self.architecture,
+            "slot_image_id": str(self.image_id) if self.image_id else None,
         }
 
     @classmethod
@@ -108,7 +114,59 @@ class SlotImageTarget:
             # to UNKNOWN and fall through to the host runner's check,
             # which is the same answer they had when they were planned.
             architecture=plan.get("slot_image_architecture"),
+            # Absent in a plan written before #1709: the check then asks for
+            # room as it did when the run was planned.
+            image_id=_uuid_or_none(plan.get("slot_image_id")),
         )
+
+
+# #1752 — the schemes the supervisor will fetch a slot image over. MUST match
+# ``allowed_schemes`` in ``agent/supervisor/spatium_supervisor/appliance_state.py``
+# (#242: no cleartext ``http://`` OS-image fetch); a drift test pins the two.
+# The supervisor refuses anything else silently (a warning log, no trigger),
+# so a URL outside this set makes a rolling upgrade wait out its whole stage
+# timeout per node. Every operator-supplied slot image URL is checked here
+# (the Plan validator and ``resolve_slot_image_target``). An uploaded image's
+# URL is composed from the address the UI was reached on, which on an
+# appliance is the frontend's https:// listener.
+SUPERVISOR_ALLOWED_URL_SCHEMES: tuple[str, ...] = ("https", "file")
+
+
+def slot_image_url_problem(url: str) -> str | None:
+    """Why the supervisor would refuse ``url``, or None when it would accept it.
+
+    Mirrors the supervisor's own test exactly: the stripped, fragment-less URL
+    must START with ``https://`` or ``file://`` (case-insensitive). A parse of
+    the scheme is not the same test — ``file:/x`` parses as scheme ``file``
+    and the supervisor still refuses it.
+    """
+    fetch_url = url.strip().split("#", 1)[0]
+    lowered = fetch_url.lower()
+    if not any(lowered.startswith(f"{s}://") for s in SUPERVISOR_ALLOWED_URL_SCHEMES):
+        allowed = " or ".join(f"{x}://" for x in SUPERVISOR_ALLOWED_URL_SCHEMES)
+        got = fetch_url.split(":", 1)[0][:32] if ":" in fetch_url else ""
+        return (
+            f"slot image URL must start with {allowed} (got {got + ':' if got else 'no scheme'}): "
+            "appliances refuse any other OS-image fetch, including cleartext http://, "
+            "so the upgrade would wait for a download that never starts"
+        )
+    if lowered.startswith("https://"):
+        from urllib.parse import urlsplit  # noqa: PLC0415
+
+        try:
+            host = urlsplit(fetch_url).hostname
+        except ValueError as exc:
+            return f"slot image URL is not parseable: {exc}"
+        if not host:
+            return "slot image URL must include a host"
+    return None
+
+
+def _uuid_or_none(value: object) -> uuid.UUID | None:
+    try:
+        return uuid.UUID(str(value)) if value else None
+    except ValueError:
+        return None
 
 
 def supervisor_strips_url_fragment(row: Appliance) -> bool:
@@ -157,9 +215,20 @@ async def resolve_slot_image_target(
         raise SlotImageResolutionError("Pass exactly one of slot_image_id or slot_image_url.")
 
     if slot_image_url is not None:
+        problem = slot_image_url_problem(slot_image_url)
+        if problem:
+            raise SlotImageResolutionError(problem)
         return SlotImageTarget(url=slot_image_url)
 
     assert slot_image_id is not None  # narrowed by the check above
+    # #2400 — held until the caller's transaction ends, so the reclaim sweep
+    # (and the delete endpoint) cannot remove the image between here and
+    # the schedule this resolves into being committed.
+    from app.services.appliance.upgrade_image_catalog import (  # noqa: PLC0415
+        lock_catalog_shared,
+    )
+
+    await lock_catalog_shared(db)
     image = await db.get(ApplianceUpgradeImage, slot_image_id)
     if image is None:
         raise SlotImageResolutionError(f"Upgrade image {slot_image_id} not found.")
@@ -180,12 +249,26 @@ async def resolve_slot_image_target(
         sha256=image.sha256,
         tls_insecure=True,
         architecture=image.architecture,
+        image_id=image.id,
     )
 
 
 def new_refire_nonce() -> str:
     """Mint one ``#a=`` re-fire nonce. Call once per scheduling decision."""
     return uuid.uuid4().hex[:12]
+
+
+def desired_slot_image_url(row: Appliance, target: SlotImageTarget) -> str:
+    """The URL ``stamp_desired_slot_image`` writes onto ``row`` for ``target``.
+
+    The target's URL, with the re-fire nonce appended when the appliance's
+    runner is known to strip the fragment (#419). When it equals the row's
+    current ``desired_slot_image_url`` the stamp repeats the node's last
+    request, which the supervisor's fire-once marker does not act on again.
+    """
+    if target.nonce and supervisor_strips_url_fragment(row):
+        return f"{target.url}#a={target.nonce}"
+    return target.url
 
 
 def stamp_desired_slot_image(
@@ -205,9 +288,7 @@ def stamp_desired_slot_image(
     are known to be built for different architectures (#1026) — nothing
     is written to ``row`` in that case.
     """
-    url = target.url
-    if target.nonce and supervisor_strips_url_fragment(row):
-        url = f"{url}#a={target.nonce}"
+    url = desired_slot_image_url(row, target)
 
     if architecture_conflict(target.architecture, row.architecture):
         # #1026. The download would verify (the SHA matches — it is a
@@ -237,6 +318,7 @@ __all__ = [
     "SlotImageArchitectureMismatch",
     "SlotImageResolutionError",
     "SlotImageTarget",
+    "desired_slot_image_url",
     "new_refire_nonce",
     "resolve_slot_image_target",
     "stamp_desired_slot_image",

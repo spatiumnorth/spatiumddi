@@ -31,6 +31,7 @@ class FindResolverSettingsArgs(BaseModel):
 
 @register_tool(
     name="find_resolver_settings",
+    permission="authenticated",
     description=(
         "Return the appliance DNS resolver (systemd-resolved) configuration: "
         "the mode (``automatic`` — per-link NetworkManager / DHCP DNS, or "

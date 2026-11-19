@@ -3,7 +3,7 @@ import binascii
 import re
 import sys
 
-from pydantic import model_validator
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.core.request_meta import (
@@ -62,6 +62,19 @@ def signing_key_weakness(key: str) -> str | None:
     return None
 
 
+def credential_key_writes_deferred(since: str, version: str) -> bool:
+    """True while a dedicated credential key must be read but not written (#1358).
+
+    ``since`` is the version stamped when the key was added to a running
+    install; ``version`` is this process's own. Equal means this process is
+    part of the rollout that introduced the key, where a reader without it may
+    still be running. Any other version comes later (every reader since has
+    the key), so writes move onto it.
+    """
+    since = (since or "").strip()
+    return bool(since) and since == (version or "").strip()
+
+
 def credential_key_problem(key: str) -> str | None:
     """Why ``key`` cannot be the CREDENTIAL_ENCRYPTION_KEY, or None if it can.
 
@@ -90,6 +103,17 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://spatiumddi:changeme@postgres:5432/spatiumddi"
     database_pool_size: int = 10
     database_max_overflow: int = 20
+    # Celery-side engine bounds (#1719): ``task_session()`` and every
+    # per-task ``create_async_engine`` on the app database, via
+    # ``app.db.task_connect_args()``. A lost CNPG primary is a black hole;
+    # unbounded, a task waits out the kernel's TCP retransmit timeout
+    # (~15 min). ``connect`` bounds a fresh connect, ``command`` every
+    # statement (the pre-ping included); ``long_command`` is for the handful
+    # of tasks with legitimately slow single statements (prunes, chain
+    # verify, the DNS bundle render, the DNS threat rollup).
+    task_db_connect_timeout: float = 5
+    task_db_command_timeout: float = 120
+    task_db_long_command_timeout: float = 900
 
     # Redis
     redis_url: str = "redis://redis:6379/0"
@@ -107,6 +131,16 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 15
     refresh_token_expire_days: int = 7
     credential_encryption_key: str = ""
+    # #1358 — the release that FIRST carried ``credential_encryption_key`` on
+    # this install, stamped by the Helm chart / appliance firstboot when they
+    # add a key to an install that was already running. While the running
+    # version equals it, the dedicated key is read but never written: the
+    # rollout that introduced it may still have pods (older image, or started
+    # before the Secret had the key) that can only read the SECRET_KEY-derived
+    # key, and a value written under the dedicated key would be unreadable to
+    # them. Empty (fresh install, compose, an operator-set key) = write with
+    # it straight away. See :func:`credential_key_writes_deferred`.
+    credential_key_since: str = ""
 
     # CORS — comma-separated allowed origins (e.g.
     # "https://ddi.example.com,https://ipam.example.com"). Default "*"
@@ -153,10 +187,21 @@ class Settings(BaseSettings):
     # proxy's address. Validated at boot: a bad entry fails it.
     trusted_proxy_cidrs: str = DEFAULT_TRUSTED_PROXY_CIDRS
 
+    # Password sign-in failure ceilings on ``POST /auth/login``, per 15-minute
+    # window, kept in Redis (``app.core.auth_throttle``). One per submitted
+    # username (lower-cased, counted whether or not the account exists) and
+    # one across the whole install. Reaching the install-wide one refuses
+    # every password sign-in until its window ends: a bounded denial of
+    # service, traded for a bound on guessing spread over many addresses and
+    # names (docs/features/AUTH.md). 0 or less turns a ceiling off.
+    login_fail_max_per_username: int = 20
+    login_fail_max_global: int = 500
+
     # External auth providers (LDAP / OIDC / SAML) are configured via the GUI at
     # /admin/auth-providers — see backend/app/models/auth_provider.py. Secrets are
-    # encrypted with the Fernet helper in app.core.crypto using
-    # credential_encryption_key (or falling back to secret_key).
+    # encrypted with the Fernet helper in app.core.crypto: new writes use
+    # credential_encryption_key when set (else a key derived from secret_key),
+    # and the derived key stays a read fallback (#1358).
 
     # Celery
     celery_broker_url: str = "redis://redis:6379/1"
@@ -205,6 +250,12 @@ class Settings(BaseSettings):
     # ``finally``) frees both within one lease, instead of holding every
     # server's render for as long as a render may take.
     dns_agent_bundle_render_lease_seconds: int = 60
+    # How many bundle renders run at once fleet-wide (#2227). A render's
+    # memory is bounded since #2227 (about 4 kB per zone, a batch of records
+    # and the compressed body), so the limit now protects the database, which
+    # each render reads the whole group from; one at a time made a 7-server
+    # group of 2M records wait for seven serial whole-group renders.
+    dns_agent_bundle_render_slots: int = 2
     # The long-poll serves stored bundles only. While this is on — the
     # migration release, whose worker may still be one release behind — a
     # missing or stale bundle is built inline in the request exactly as
@@ -244,6 +295,11 @@ class Settings(BaseSettings):
     # so unversioned local builds are obvious in the sidebar and don't
     # misreport themselves as a release.
     version: str = "dev"
+    # The build's own stamp (``0.0.0-nightly-YYYYMMDD+<sha>`` on a nightly),
+    # baked by the image's ``APP_VERSION`` build arg. Only used to give
+    # ``/version`` the nightly's one canonical spelling (#2111); empty on a
+    # build that was given none.
+    app_version: str = ""
 
     # GitHub repo coordinates used by the release-check task. Overridable
     # so forks can point their update check at their own repo.
@@ -328,6 +384,15 @@ class Settings(BaseSettings):
     # because a phone has no need for those and an attacker would.
     e911_self_query_enabled: bool = False
 
+    # #2780 — app-wide cap on a request body, in bytes. The api port has no
+    # body limit of its own (nginx's 1 MiB applies only to traffic through
+    # the web tier), and FastAPI reads a JSON body whole before any check
+    # runs. Over the cap is 413, refused before the body is read when
+    # Content-Length says so. Routes that take more (backups, upgrade
+    # images, the importers) carry their own allowance in
+    # ``app.core.body_limit.ALLOWANCES``, which this never lowers.
+    max_request_body_bytes: int = Field(default=8 * 1024 * 1024, ge=64 * 1024)
+
     # Appliance mode — set true by the appliance ISO compose env so
     # the API knows it's running on an appliance image (vs. plain
     # docker-compose / k8s). Gates the "Appliance" sidebar section
@@ -341,6 +406,19 @@ class Settings(BaseSettings):
     # render "SpatiumDDI Appliance v0.1.0 @ host-name" without an
     # extra round-trip into the OS.
     appliance_mode: bool = False
+
+    # #3631 — supervisors sign their requests to the control plane. The
+    # current form (``X-Appliance-Signature-Version: 2``) covers the method,
+    # the path and query, a hash of the body, a nonce and a timestamp, and
+    # each signature is accepted once. Supervisors on older builds send no
+    # version header and sign only the method, the path and a timestamp.
+    # This flag keeps accepting that older form so an appliance keeps
+    # working while it waits for its own upgrade; every use of it is logged
+    # per appliance (``appliance_cert_auth_legacy_signature``), so the
+    # window can be closed (set false) once those lines stop appearing.
+    # A request carrying the version header is always held to the current
+    # form, whatever this says.
+    appliance_legacy_signature_allowed: bool = True
 
     # #1003 item 2 — the OS installer's "Time source" answer, stamped into
     # the api's environment by spatiumddi-firstboot from the STATE config.

@@ -42,6 +42,11 @@ vi.mock("@/lib/api", () => ({
         },
       ]),
     listGroups: () => listGroups(),
+    listStatics: () =>
+      Promise.resolve([
+        { id: "st-1", ip_address: "10.78.21.5" },
+        { id: "st-2", ip_address: "10.78.21.6" },
+      ]),
     listPools: () =>
       Promise.resolve([
         {
@@ -89,8 +94,22 @@ async function openPanel(perms: MyPermissions) {
   await act(async () => {});
 }
 
+/** A refused icon-only button is named by its action (aria-label, #3395) and
+ *  carries the refusal reason as its tooltip: find it by either. */
+function gated(name: string | RegExp): HTMLElement {
+  const byRole = screen.queryAllByRole("button", { name });
+  if (byRole.length === 1) return byRole[0];
+  // Only the icon buttons carry an aria-label; a text button's title is
+  // the same reason and must not make the lookup ambiguous.
+  const byTitle = screen
+    .queryAllByTitle(name)
+    .filter((el) => el.hasAttribute("aria-label"));
+  if (byTitle.length !== 1) return screen.getByTitle(name);
+  return byTitle[0];
+}
+
 function button(name: string | RegExp): HTMLButtonElement {
-  return screen.getByRole("button", { name }) as HTMLButtonElement;
+  return gated(name) as HTMLButtonElement;
 }
 
 afterEach(() => {
@@ -139,11 +158,13 @@ describe("DHCPSubnetPanel write controls (#1155)", () => {
       "Requires write permission on DHCP scopes",
     );
     expect(button(/Add Pool/).disabled).toBe(true);
-    // The icon buttons are named by their tooltip, which is the reason
-    // while it is denied: edit + delete scope, edit + delete pool.
-    const denied = screen.getAllByRole("button", {
-      name: /^Requires (write|delete) permission on DHCP (scopes|pools)$/,
-    }) as HTMLButtonElement[];
+    // The icon buttons carry the reason as their tooltip while denied (and
+    // keep their action as the name, #3395): edit + delete scope and pool.
+    const denied = screen
+      .getAllByTitle(
+        /^Requires (write|delete) permission on DHCP (scopes|pools)$/,
+      )
+      .filter((el) => el.hasAttribute("aria-label")) as HTMLButtonElement[];
     expect(denied).toHaveLength(4);
     expect(denied.every((b) => b.disabled)).toBe(true);
     const toggle = screen.getByRole("checkbox", { name: /Enabled/ });
@@ -166,6 +187,35 @@ describe("DHCPSubnetPanel write controls (#1155)", () => {
     );
   });
 
+  it("offers the built-in DHCP Editor every write, which the server now accepts (#1861)", async () => {
+    // The role's grants: admin on every DHCP type. The scope and pool routes
+    // took SuperAdmin until #1861, so this role filled in New DHCP Scope and
+    // met "Superadmin required"; they now check the role's own grants.
+    await openPanel(
+      grants(
+        ["admin", "dhcp_server"],
+        ["admin", "dhcp_scope"],
+        ["admin", "dhcp_pool"],
+        ["admin", "dhcp_static"],
+        ["admin", "dhcp_client_class"],
+        ["admin", "dhcp_option_template"],
+        ["admin", "dhcp_mac_block"],
+      ),
+    );
+    await waitFor(() => expect(button(/Create Scope/).disabled).toBe(false));
+    for (const name of [
+      /Add Pool/,
+      "Edit scope",
+      "Delete scope",
+      "Edit pool",
+      "Delete pool",
+    ]) {
+      expect(button(name).disabled).toBe(false);
+    }
+    const toggle = screen.getByRole("checkbox", { name: /Enabled/ });
+    expect((toggle as HTMLInputElement).disabled).toBe(false);
+  });
+
   it("offers a superadmin everything", async () => {
     await openPanel({ is_superadmin: true, grants: [] } as MyPermissions);
     await waitFor(() => expect(button(/Create Scope/).disabled).toBe(false));
@@ -178,5 +228,22 @@ describe("DHCPSubnetPanel write controls (#1155)", () => {
     ]) {
       expect(button(name).disabled).toBe(false);
     }
+  });
+});
+
+describe("DHCPSubnetPanel delete scope (#2446)", () => {
+  it("names the reservations and the Trash, not just the pools", async () => {
+    const user = (await import("@testing-library/user-event")).default.setup();
+    await openPanel(grants(["read", "*"], ["delete", "dhcp_scope"]));
+    await user.click(screen.getByTitle(/Delete scope/i));
+    await screen.findByText(/This scope currently has:/);
+    expect(screen.getByText("1 pool")).toBeTruthy();
+    expect(screen.getByText("2 reservations")).toBeTruthy();
+    expect(
+      screen.getByText(
+        /A superadmin can restore them as a set from Administration/,
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText(/cannot be undone/)).toBeNull();
   });
 });

@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="920" height="470" viewBox="0 0 920 470"
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="590" viewBox="0 0 920 590"
      preserveAspectRatio="xMidYMid meet"
      font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
   <title>SpatiumDDI login flow</title>
-  <desc>A browser posts to /auth/login, which branches into local password, LDAP/RADIUS/TACACS+ and OIDC/SAML redirect paths that all converge on sync_external_user before access and refresh tokens return to the browser.</desc>
+  <desc>A browser posts to POST /auth/login, which tries local password verification (with a TOTP step for MFA users) and then LDAP, RADIUS or TACACS+ for non-local users, returning an access token and a refresh cookie. OIDC and SAML use a separate entry point, GET /auth/{id}/authorize, which redirects to the identity provider and returns at /auth/{id}/callback. Directory logins and SSO callbacks pass through sync_external_user before tokens are issued.</desc>
   <defs>
     <linearGradient id="auth-surface" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="#f1f5f9"/>
@@ -24,16 +24,16 @@
   </defs>
 
   <text x="40" y="42" font-size="18" font-weight="600" fill="#0f172a">Login flow</text>
-  <text x="40" y="64" font-size="12" fill="#475569">One entry point, three authentication paths, one unified identity sync.</text>
+  <text x="40" y="64" font-size="12" fill="#475569">Password logins go through one endpoint; SSO (OIDC / SAML) has its own redirect entry point; external identities share one sync.</text>
 
   <!-- Browser -->
   <rect x="40" y="112" width="160" height="88" rx="8" fill="#1e293b"/>
   <text x="120" y="162" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">browser</text>
 
-  <!-- /auth/login panel -->
-  <rect x="340" y="88" width="290" height="200" rx="12"
+  <!-- POST /auth/login panel -->
+  <rect x="340" y="88" width="290" height="166" rx="12"
         fill="url(#auth-surface)" stroke="#94a3b8" stroke-width="2"/>
-  <text x="360" y="115" font-size="14" font-weight="600" fill="#0f172a">/auth/login</text>
+  <text x="360" y="115" font-size="14" font-weight="600" fill="#0f172a">POST /auth/login</text>
 
   <rect x="360" y="126" width="250" height="44" rx="8" fill="url(#auth-cp)"/>
   <text x="485" y="153" text-anchor="middle" font-size="12" font-weight="600" fill="#ffffff">local password</text>
@@ -41,39 +41,64 @@
   <rect x="360" y="178" width="250" height="44" rx="8" fill="url(#auth-cp)"/>
   <text x="485" y="205" text-anchor="middle" font-size="12" font-weight="600" fill="#ffffff">LDAP / RADIUS / TACACS+</text>
 
-  <rect x="360" y="230" width="250" height="44" rx="8" fill="url(#auth-worker)"/>
-  <text x="485" y="257" text-anchor="middle" font-size="12" font-weight="600" fill="#ffffff">OIDC / SAML: 302</text>
+  <text x="485" y="241" text-anchor="middle" font-size="11" fill="#475569">local accounts first, then directory providers</text>
 
   <!-- Handlers -->
-  <rect x="670" y="126" width="210" height="44" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="2"/>
-  <text x="775" y="153" text-anchor="middle" font-size="12" font-weight="600" fill="#334155">verify_password</text>
+  <rect x="660" y="126" width="132" height="44" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="2"/>
+  <text x="726" y="153" text-anchor="middle" font-size="12" font-weight="600" fill="#334155">verify_password</text>
 
-  <rect x="670" y="178" width="210" height="44" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="2"/>
-  <text x="775" y="205" text-anchor="middle" font-size="12" font-weight="600" fill="#334155">authenticate_*</text>
+  <rect x="806" y="126" width="94" height="44" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="2"/>
+  <text x="853" y="153" text-anchor="middle" font-size="12" font-weight="600" fill="#334155">TOTP (MFA)</text>
 
-  <rect x="670" y="230" width="210" height="44" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="2"/>
-  <text x="775" y="257" text-anchor="middle" font-size="12" font-weight="600" fill="#334155">redirect to IdP</text>
+  <rect x="660" y="178" width="240" height="44" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="2"/>
+  <text x="780" y="205" text-anchor="middle" font-size="12" font-weight="600" fill="#334155">authenticate_*</text>
 
-  <path d="M 610 148 H 668" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#auth-arrow)"/>
-  <path d="M 610 200 H 668" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#auth-arrow)"/>
-  <path d="M 610 252 H 668" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#auth-arrow)"/>
+  <path d="M 610 148 H 658" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#auth-arrow)"/>
+  <path d="M 792 148 H 804" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#auth-arrow)"/>
+  <path d="M 610 200 H 658" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#auth-arrow)"/>
+  <text x="900" y="118" text-anchor="end" font-size="11" fill="#475569">if enabled · POST /auth/login/mfa</text>
 
   <!-- Browser to login and back -->
   <path d="M 200 146 H 338" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#auth-arrow)"/>
   <text x="270" y="138" text-anchor="middle" font-size="11" fill="#475569">1. login</text>
 
   <path d="M 340 196 H 202" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#auth-arrow)"/>
-  <text x="270" y="188" text-anchor="middle" font-size="11" fill="#475569">2. access + refresh</text>
+  <text x="270" y="177" text-anchor="middle" font-size="11" fill="#475569">2. access token</text>
+  <text x="270" y="189" text-anchor="middle" font-size="11" fill="#475569">+ refresh cookie</text>
 
-  <!-- Converge on sync_external_user -->
-  <path d="M 485 288 V 328" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#auth-arrow)"/>
+  <!-- SSO panel -->
+  <rect x="340" y="276" width="290" height="94" rx="12"
+        fill="url(#auth-surface)" stroke="#94a3b8" stroke-width="2"/>
+  <text x="360" y="300" font-size="14" font-weight="600" fill="#0f172a">GET /auth/{id}/authorize</text>
+  <rect x="360" y="312" width="250" height="44" rx="8" fill="url(#auth-worker)"/>
+  <text x="485" y="339" text-anchor="middle" font-size="12" font-weight="600" fill="#ffffff">OIDC / SAML</text>
 
-  <rect x="310" y="330" width="350" height="112" rx="8" fill="url(#auth-worker)"/>
-  <text x="485" y="358" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">sync_external_user</text>
-  <path d="M 326 376 l 8 4 l -8 4 z" fill="#ddd6fe"/>
-  <text x="342" y="384" font-size="11" fill="#ddd6fe">upsert User</text>
-  <path d="M 326 396 l 8 4 l -8 4 z" fill="#ddd6fe"/>
-  <text x="342" y="404" font-size="11" fill="#ddd6fe">replace group membership</text>
-  <path d="M 326 416 l 8 4 l -8 4 z" fill="#fecaca"/>
-  <text x="342" y="424" font-size="11" fill="#fecaca">reject if no mapping match</text>
+  <path d="M 170 200 V 334 H 338" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#auth-arrow)"/>
+  <text x="178" y="324" font-size="11" fill="#475569">SSO start</text>
+
+  <rect x="670" y="312" width="210" height="44" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="2"/>
+  <text x="775" y="339" text-anchor="middle" font-size="12" font-weight="600" fill="#334155">redirect to IdP</text>
+  <path d="M 610 334 H 668" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#auth-arrow)"/>
+
+  <rect x="670" y="384" width="210" height="44" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="2"/>
+  <text x="775" y="411" text-anchor="middle" font-size="12" font-weight="600" fill="#334155">/auth/{id}/callback</text>
+  <path d="M 775 356 V 382" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#auth-arrow)"/>
+  <text x="783" y="373" font-size="11" fill="#475569">IdP returns</text>
+
+  <!-- Converge on sync_external_user (external identities only) -->
+  <path d="M 900 200 H 910 V 446 H 485 V 462" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#auth-arrow)"/>
+  <path d="M 775 428 V 446" stroke="#64748b" stroke-width="2" fill="none"/>
+
+  <rect x="310" y="464" width="350" height="112" rx="8" fill="url(#auth-worker)"/>
+  <text x="485" y="492" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">sync_external_user</text>
+  <path d="M 326 510 l 8 4 l -8 4 z" fill="#ddd6fe"/>
+  <text x="342" y="518" font-size="11" fill="#ddd6fe">upsert User</text>
+  <path d="M 326 530 l 8 4 l -8 4 z" fill="#ddd6fe"/>
+  <text x="342" y="538" font-size="11" fill="#ddd6fe">replace group membership</text>
+  <path d="M 326 550 l 8 4 l -8 4 z" fill="#fecaca"/>
+  <text x="342" y="558" font-size="11" fill="#fecaca">reject if no mapping match</text>
+
+  <!-- tokens back to the browser -->
+  <path d="M 310 520 H 70 V 202" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#auth-arrow)"/>
+  <text x="80" y="512" font-size="11" fill="#475569">tokens issued</text>
 </svg>

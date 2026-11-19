@@ -17,15 +17,20 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
-from app.api.v1._common import StatusResponse
+from app.api.v1._common import StatusResponse, add_trigger_audit
+from app.core.celery_dispatch import dispatch
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
+from app.core.exc_text import describe_exc
+from app.core.header_credentials import header_secret
 from app.core.permissions import require_resource_permission
 from app.core.ssrf import assert_safe_target
+from app.core.stored_secret_guard import require_secret_with_destination_change
 from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace
 from app.models.proxmox import ProxmoxNode
+from app.services.integration_ownership import release_integration_rows
 
 router = APIRouter(
     tags=["proxmox"],
@@ -89,6 +94,8 @@ class NodeBase(BaseModel):
             raise ValueError("sync_interval_seconds must be ≥ 30")
         return v
 
+    _check_token_id = field_validator("token_id")(header_secret)
+
 
 class NodeCreate(NodeBase):
     # The PVE token secret (UUID). Encrypted before persist. Required
@@ -102,6 +109,8 @@ class NodeCreate(NodeBase):
         if not v:
             raise ValueError("token_secret is required")
         return v
+
+    _check_token_secret = field_validator("token_secret")(header_secret)
 
 
 class NodeUpdate(BaseModel):
@@ -122,6 +131,9 @@ class NodeUpdate(BaseModel):
     include_stopped: bool | None = None
     infer_vnet_subnets: bool | None = None
     sync_interval_seconds: int | None = None
+
+    _check_token_id = field_validator("token_id")(header_secret)
+    _check_token_secret = field_validator("token_secret")(header_secret)
 
 
 class NodeResponse(BaseModel):
@@ -163,6 +175,9 @@ class TestConnectionRequest(BaseModel):
     ca_bundle_pem: str | None = None
     token_id: str | None = None
     token_secret: str | None = None
+
+    _check_token_id = field_validator("token_id")(header_secret)
+    _check_token_secret = field_validator("token_secret")(header_secret)
 
 
 class TestConnectionResponse(BaseModel):
@@ -289,8 +304,8 @@ async def _probe(
             )
     except httpx.HTTPStatusError as exc:
         return TestConnectionResponse(ok=False, message=f"HTTP {exc.response.status_code} from PVE")
-    except httpx.ConnectError as exc:
-        return TestConnectionResponse(ok=False, message=f"Could not reach PVE: {exc}")
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        return TestConnectionResponse(ok=False, message=f"Could not reach PVE: {describe_exc(exc)}")
     except ssl.SSLError as exc:
         return TestConnectionResponse(
             ok=False,
@@ -300,7 +315,7 @@ async def _probe(
             ),
         )
     except Exception as exc:  # noqa: BLE001
-        return TestConnectionResponse(ok=False, message=str(exc))
+        return TestConnectionResponse(ok=False, message=describe_exc(exc))
 
 
 async def _validate_bindings(
@@ -404,6 +419,12 @@ async def update_node(
         raise HTTPException(status_code=404, detail="Proxmox endpoint not found")
 
     changes = body.model_dump(exclude_unset=True)
+    require_secret_with_destination_change(
+        n,
+        changes,
+        destination=["host", "port"],
+        secrets={"token_secret": n.token_secret_encrypted},
+    )
     new_ipam = changes.get("ipam_space_id", n.ipam_space_id)
     new_dns = changes.get("dns_group_id", n.dns_group_id)
     if "ipam_space_id" in changes or "dns_group_id" in changes:
@@ -436,6 +457,11 @@ async def delete_node(node_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     if n is None:
         raise HTTPException(status_code=404, detail="Proxmox endpoint not found")
     _audit(db, user=user, action="delete", node_id=n.id, node_name=n.name)
+    # #2287 — hand back operator-made rows in mirrored subnets / blocks before
+    # the FK cascade can destroy them.
+    await release_integration_rows(
+        db, own_fk="proxmox_node_id", target_id=n.id, user=user, target_name=n.name
+    )
     await db.delete(n)
     await db.commit()
 
@@ -444,15 +470,25 @@ async def delete_node(node_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     "/nodes/{node_id}/sync",
     status_code=status.HTTP_202_ACCEPTED,
 )
-async def sync_node(node_id: uuid.UUID, db: DB, _: SuperAdmin) -> StatusResponse:
+async def sync_node(node_id: uuid.UUID, db: DB, user: SuperAdmin) -> StatusResponse:
     n = await db.get(ProxmoxNode, node_id)
     if n is None:
         raise HTTPException(status_code=404, detail="Proxmox endpoint not found")
 
+    add_trigger_audit(
+        db,
+        user,
+        resource_type="proxmox_node",
+        resource_id=n.id,
+        resource_display=str(getattr(n, "name", None) or n.id),
+        action="sync",
+    )
+    await db.commit()
+
     from app.tasks.proxmox_sync import sync_node_now  # noqa: PLC0415
 
     try:
-        result = sync_node_now.delay(str(n.id))
+        result = await dispatch(sync_node_now, str(n.id))
         return StatusResponse(status="queued", task_id=result.id)
     except Exception:  # noqa: BLE001
         return StatusResponse(status="broker_unavailable", task_id="")

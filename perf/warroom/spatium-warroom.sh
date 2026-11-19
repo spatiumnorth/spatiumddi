@@ -68,8 +68,16 @@ api_get() {  # $1 = path under /api/v1
   [[ -z "$ADMIN_TOKEN" ]] && { echo ""; return; }
   curl "${CURL_OPTS[@]}" -H "Authorization: Bearer ${ADMIN_TOKEN}" "${V1}$1" 2>/dev/null || echo ""
 }
-# Unauthenticated GET against host-root (for /health/platform).
-root_get() { curl "${CURL_OPTS[@]}" "${ROOT}$1" 2>/dev/null || echo ""; }
+# GET against host-root (for /health/platform). Sends the admin token when
+# set: since #2935 an anonymous caller gets the rollup status only, without
+# the components[] list the platform panel draws.
+root_get() {
+  if [[ -n "$ADMIN_TOKEN" ]]; then
+    curl "${CURL_OPTS[@]}" -H "Authorization: Bearer ${ADMIN_TOKEN}" "${ROOT}$1" 2>/dev/null || echo ""
+  else
+    curl "${CURL_OPTS[@]}" "${ROOT}$1" 2>/dev/null || echo ""
+  fi
+}
 
 # redis-cli wrapper — prefers kubectl exec when REDIS_POD set, else direct args.
 rcli() {  # passes args straight to redis-cli

@@ -36,8 +36,12 @@ name different failures:
 * ``receive_drop`` — packets Kea read off the socket and then discarded
   (unparseable, matched the ``DROP`` class, no subnet selected).
 * ``socket_drop`` — packets the kernel dropped because Kea's receive
-  buffer was full, so Kea never saw them at all. Read from
-  ``/proc/net/udp`` by :mod:`.socket_drops`, not from Kea.
+  buffer was full, so Kea never saw them at all. Read by
+  :mod:`.socket_drops`, not from Kea: the DHCP-port UDP sockets from
+  ``/proc/net/udp``. In ``dhcp-socket-type: raw``, kea-dhcp4 serves from
+  its AF_PACKET sockets, relayed traffic too, and its port-67 UDP sockets
+  are only fallbacks, so those AF_PACKET sockets are read through sock_diag
+  instead (#1283).
 
 The distinction is the point. Measured against kea-dhcp4 3.0.3 on
 2026-09-06, a run that lost 9,700 datagrams to buffer overflow reported
@@ -48,6 +52,14 @@ healthy. Only ``socket_drop`` moves.
 Both are ``None`` — not 0 — when they could not be measured, so an agent
 that cannot read them, or one older than this change, is reported as
 UNKNOWN rather than as a server with no loss.
+
+A third, ``queue_evicted`` (#2889), covers the loss neither of those sees:
+requests Kea read and then evicted from its multi-threading packet queue
+when a burst outran its worker. Kea keeps no statistic for that, so it is
+derived — DHCPv4 arrivals at Kea's intake (counted in the kernel by
+:class:`.intake.ArrivalCounter`), less the DHCPv4 share of ``socket_drop``,
+less ``pkt4-received`` — by :class:`.intake.QueueEvictionEstimator`. It is
+``None`` whenever any of the three was not measured over the interval.
 
 Delivery (#1077): a bucket the control plane does not accept is kept in the
 ``metrics`` stream of the durable spool and replayed, oldest first, when it
@@ -65,6 +77,7 @@ from __future__ import annotations
 
 import random
 import threading
+import time
 from datetime import UTC, datetime
 from typing import Any
 
@@ -72,9 +85,16 @@ import httpx
 import structlog
 
 from .config import AgentConfig
+from .intake import (
+    ArrivalCounter,
+    QueueEvictionEstimator,
+    arrival_age_seconds,
+    kea_intake_config,
+    kea_packet_queue_size,
+)
 from .kea_ctrl import KeaCtrlError, send_command
 from .push import CPPoster, disabled_spool, drain_for, late_bound
-from .socket_drops import SocketDropCounter
+from .socket_drops import SocketDropCounter, kea_socket_type
 from .spool import RETRY, Shipper, Spool
 
 log = structlog.get_logger(__name__)
@@ -109,6 +129,12 @@ _STAT_MAP = {
 # ``_compute_delta`` so a multi-stat → single-column mapping doesn't
 # re-diff the same column twice.
 _METRIC_COLUMNS = sorted(set(_STAT_MAP.values()))
+
+# #2889 — every DHCPv4 packet the worker took off the queue. Not a column of
+# its own: it is one of the three terms of ``queue_evicted``, and is kept in
+# the snapshot under a key ``_compute_delta`` does not ship.
+_RECEIVED4_STAT = "pkt4-received"
+_RECEIVED4_KEY = "_received4"
 
 METRICS_PATH = "/api/v1/dhcp/agents/metrics"
 # #1077 — how long one poll tick may spend replaying a backlog. A day-long
@@ -152,6 +178,12 @@ def _parse_snapshot(resp: dict[str, Any]) -> dict[str, int]:
         v = _extract_counter(args.get(stat_name))
         if v is not None:
             out[col] = out.get(col, 0) + v
+    # Present only when Kea published it: a v6-only server has no kea-dhcp4,
+    # and a missing term must make ``queue_evicted`` unknown, not 0.
+    if _RECEIVED4_STAT in args:
+        received = _extract_counter(args.get(_RECEIVED4_STAT))
+        if received is not None:
+            out[_RECEIVED4_KEY] = received
     return out
 
 
@@ -171,8 +203,25 @@ class MetricsPoller:
         # bucket is absorbed (no baseline to diff against).
         self._prev: dict[str, int] | None = None
         # #980 — kernel-side loss, sampled in lockstep with the Kea
-        # counters so both deltas always cover the same interval.
-        self._socket = SocketDropCounter()
+        # counters so both deltas always cover the same interval. #1283 —
+        # which sockets follows kea-dhcp4's socket mode, read from the
+        # config this agent rendered for it.
+        self._socket = SocketDropCounter(
+            socket_type=lambda: kea_socket_type(cfg.kea_config_path)
+        )
+        # #2889 — the other two terms of ``queue_evicted``. Sampled on the
+        # same ticks as everything above, for the same reason.
+        self._arrivals = ArrivalCounter(lambda: kea_intake_config(cfg.kea_config_path))
+        self._evictions = QueueEvictionEstimator()
+        # Arrivals read before Kea's counters but not yet handed to the
+        # estimator: carried over a tick whose Kea poll failed, because the
+        # next successful one diffs Kea's counters across both. ``None``
+        # once a read in that span was unmeasured.
+        self._arrivals_pending: int | None = 0
+        # Last ``pkt4-received`` seen, for its delta. Kept beside ``_prev``
+        # rather than in it so ``_compute_delta`` stays the one place the
+        # shipped columns are diffed.
+        self._prev_received: int | None = None
 
     def stop(self) -> None:
         self._stop.set()
@@ -215,8 +264,30 @@ class MetricsPoller:
             return None
         return delta
 
+    def _arrival_age(self) -> float:
+        """Seconds to age the first arrivals read (see ``arrival_age_seconds``)."""
+        return arrival_age_seconds(kea_packet_queue_size(self.cfg.kea_config_path))
+
+    def _received_delta(self, current: dict[str, int], baseline_ok: bool) -> int | None:
+        """``pkt4-received`` over this interval, or ``None`` if unknown.
+
+        ``baseline_ok`` is whether ``_compute_delta`` produced a bucket: on
+        the first poll and after a Kea restart it did not, and the received
+        delta over the same interval is no more meaningful than the rest.
+        """
+        now = current.get(_RECEIVED4_KEY)
+        prev = self._prev_received
+        self._prev_received = now
+        if not baseline_ok or now is None or prev is None or now < prev:
+            return None
+        return now - prev
+
     def _report(
-        self, bucket_at: datetime, delta: dict[str, int], socket_drop: int | None
+        self,
+        bucket_at: datetime,
+        delta: dict[str, int],
+        socket_drop: int | None,
+        queue_evicted: int | None = None,
     ) -> str:
         """Returns the spool outcome (``sent`` / ``retry`` / ``rejected``)."""
         # Sent now, or spooled (behind any backlog) for replay — never dropped
@@ -225,6 +296,7 @@ class MetricsPoller:
             {
                 "bucket_at": bucket_at.isoformat(),
                 "socket_drop": socket_drop,
+                "queue_evicted": queue_evicted,
                 **delta,
             }
         )
@@ -232,6 +304,23 @@ class MetricsPoller:
     def run(self) -> None:
         while not self._stop.is_set():
             self._shipper.last_send_outcome = None
+            aged = 0.0
+            # #2889 — arrivals are read on both sides of Kea's snapshot, so
+            # the estimator can bracket the remainder at the instant Kea took
+            # it. A single read on one side turns read-ordering skew into
+            # spurious "evictions" on any server with steady traffic.
+            before = self._arrivals.sample()
+            pending = self._arrivals_pending
+            self._arrivals_pending = None if pending is None or before is None else pending + before
+            # ... and the first read is AGED before Kea is asked: long enough
+            # that anything in a queue below its depth has been taken by the
+            # worker. Otherwise a packet still waiting at two consecutive
+            # reads was confirmed as an eviction (the walk's case 3).
+            if before is not None:
+                started = time.monotonic()
+                if self._stop.wait(timeout=self._arrival_age()):
+                    break
+                aged = time.monotonic() - started
             current = self._poll_kea()
             if current is not None:
                 delta = self._compute_delta(current)
@@ -243,6 +332,17 @@ class MetricsPoller:
                 # into a bucket whose Kea counters exclude them, and the
                 # first comparison anyone makes is drops against DISCOVERs.
                 socket_drop = self._socket.sample()
+                # #2889 — the second arrivals read, after Kea's snapshot and
+                # the socket drops. What arrived between the two reads
+                # belongs to the next interval.
+                during = self._arrivals.sample()
+                queue_evicted = self._evictions.update(
+                    self._arrivals_pending,
+                    self._socket.last_v4 if socket_drop is not None else None,
+                    self._received_delta(current, delta is not None),
+                    during,
+                )
+                self._arrivals_pending = 0
                 if delta is not None:
                     # Bucket timestamp is "now, rounded to the poll
                     # interval". The server ACCUMULATES per
@@ -251,7 +351,7 @@ class MetricsPoller:
                     # bucket being counted twice (#1077).
                     now = datetime.now(UTC).replace(microsecond=0)
                     bucket = now.replace(second=(now.second // 60) * 60)
-                    self._report(bucket, delta, socket_drop)
+                    self._report(bucket, delta, socket_drop, queue_evicted)
             # Replay whatever the spool still holds — covers a tick with no
             # bucket to report (first poll, Kea down) as well as a backlog
             # longer than the slice ``ship`` drains ahead of a live bucket.
@@ -266,4 +366,9 @@ class MetricsPoller:
             # 60s base + small jitter so paired peers don't hit the
             # control plane in lockstep.
             interval = 60.0 + random.uniform(-3, 3)
+            # The aging wait is inside the tick, so it is taken off this one
+            # and the period between Kea snapshots stays what it was. (The
+            # period was never exactly a minute: 60 s ± 3 s jitter plus the
+            # tick's own work, since #980.)
+            interval -= aged
             self._stop.wait(timeout=max(30.0, interval))

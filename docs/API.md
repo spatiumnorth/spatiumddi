@@ -42,17 +42,26 @@ infrastructure rather than application surface:
 | Path | Purpose | Auth |
 |---|---|---|
 | `/health/live` | Liveness probe — 200 if the process is up | none |
-| `/health/ready` | Readiness probe — DB connectivity + **schema-at-head** + Redis | none |
+| `/health/ready` | Readiness probe — DB connectivity + **schema-at-head** + Redis; a pod already ready stays ready on a schema a newer release migrated while every table and column it uses is present (#2777) | none |
 | `/health/startup` | Same logic as `/health/ready`, for slow-start k8s containers | none |
-| `/health/platform` | Per-component rollup (db / redis / celery workers / beat) for the dashboard | none |
+| `/health/platform` | Per-component rollup (db / redis / celery workers / beat) for the dashboard. Anonymous callers get the rollup `status` only; the component list needs a signed-in caller (#2935) | optional |
 | `/.well-known/acme-challenge/{token}` | HTTP-01 ACME challenge (issue #438) | none |
 | `/metrics` | Prometheus exposition (when `PROMETHEUS_METRICS_ENABLED`) | bearer: the scrape token (`PROMETHEUS_METRICS_TOKEN`) or any API token (#1159) |
 
-`/api/v1` is the only API version. When the surface changes shape in a
-non-additive way a `/api/v2` prefix would be introduced alongside it;
-today there is exactly one version. New routers are inserted into
-`router.py` in **alphabetical order** so the generated docs list
-sections A → Z.
+`/api/v1` is the only API version, and from 1.0.0 it is stable. Within
+1.x it only grows: a release may add routes, optional parameters and
+response fields, but it does not remove any of them or change what an
+existing one means. Anything that is going away is marked deprecated,
+in the changelog's `Deprecated` section and as `deprecated` in the
+OpenAPI schema, at least one minor release before it can be removed,
+and the removal itself waits for the next major release. A surface
+that has to change shape in a non-additive way gets a `/api/v2` prefix,
+introduced alongside `/api/v1`. The one exception is a security fix,
+which may tighten what a route allows without notice; its changelog
+entry says so.
+
+New routers are inserted into `router.py` in **alphabetical order** so
+the generated docs list sections A → Z.
 
 ---
 
@@ -67,7 +76,7 @@ and [`backend/app/api/docs.py`](https://github.com/spatiumnorth/spatiumddi/blob/
 |---|---|
 | `/api/docs` | Swagger UI |
 | `/api/redoc` | ReDoc |
-| `/api/openapi.json` | The OpenAPI 3.x schema document |
+| `/api/openapi.json` | The OpenAPI 3.x schema document — **signed in only** |
 
 Note the `/api/` prefix on the docs routes — they are **not** under
 `/api/v1`. The api serves the Swagger UI and ReDoc bundles itself, from
@@ -78,6 +87,25 @@ response models on every route, so it always reflects the running
 build. Each router carries a `tags=[...]` label (alphabetised in
 `router.py`) so the Swagger / ReDoc sidebar groups endpoints by
 feature area.
+
+**Signed in only (#2935).** The schema names every route and carries the
+exact running version in `info.version`, so `/api/openapi.json` needs a
+session or an API token (`Authorization: Bearer …`) and answers 401
+otherwise. The two HTML pages still load for anyone, but they carry only
+the page title. Each fetches the schema from `/api/v1/auth/openapi.json`,
+which accepts the browser's sign-in cookie and reads it **without rotating
+it**: a refresh (`POST /api/v1/auth/refresh`) would revoke the session the
+console tab's token belongs to, and a console refresh racing the docs
+page's would log the operator out. Signed in, the docs render as before;
+"Try it out" carries no token until you use **Authorize**, as before.
+Signed out, the page says so and links to the sign-in page. From a script,
+fetch the schema with an API token:
+
+```bash
+curl -H "Authorization: Bearer $SPATIUM_TOKEN" https://ddi.example.com/api/openapi.json
+```
+
+The release asset below is unaffected and needs no credential.
 
 ### 2.1 The versioned contract (`openapi.json` release asset)
 
@@ -119,8 +147,8 @@ guarantees and a hand-rolled dump would not:
   public API.
 
 **Version handshake.** A client knows which spec it was built against, and
-`GET /api/v1/version` (unauthenticated — see §7.2) reports what the server
-is running. Gating a feature is then a version comparison rather than
+`GET /api/v1/version` (see §7.2) reports what the server is running, to a
+signed-in caller. Gating a feature is then a version comparison rather than
 probing for an endpoint and interpreting the 404.
 
 The document declares no `servers` block. That is deliberate: there is no
@@ -318,12 +346,14 @@ returns `403`.
 { "username": "admin", "password": "admin" }
 ```
 
-On success (and no MFA) the response is:
+The refresh token is never in a response body. On success the server sets it
+as the HttpOnly `spatium_refresh` cookie (`Set-Cookie`), and the same holds for
+the response of `POST /api/v1/auth/login/mfa`. On success (and no MFA) the
+body is:
 
 ```json
 {
   "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-  "refresh_token": "9c2f...e1",
   "token_type": "bearer",
   "force_password_change": true,
   "mfa_required": false,
@@ -338,7 +368,6 @@ factor at `POST /api/v1/auth/login/mfa`:
 ```json
 {
   "access_token": null,
-  "refresh_token": null,
   "token_type": "bearer",
   "force_password_change": false,
   "mfa_required": true,
@@ -358,12 +387,11 @@ password-recovery allowlist (`/auth/change-password`, `/auth/logout`,
 
 `POST /api/v1/auth/refresh`
 
-```json
-{ "refresh_token": "9c2f...e1" }
-```
-
-returns a fresh `{ access_token, refresh_token, token_type,
-force_password_change }`. Refresh is **rotating**: the presented
+takes no body: the refresh token is read from the `spatium_refresh` cookie
+the login set. Without the cookie the answer is 401 "Missing refresh token".
+It returns a fresh `{ access_token, token_type, force_password_change }`
+and sets the rotated
+refresh token as the cookie again. Refresh is **rotating**: the presented
 refresh token's session is revoked and a new session (and new refresh
 token) is issued. Each access token carries the issuing session's UUID
 as its `jti` claim, so revoking the session (`POST /api/v1/auth/logout`
@@ -382,20 +410,64 @@ Two narrowing mechanisms apply, both enforced in `deps.py`
 
 - **Scopes** (`scopes: [...]`) — a coarse, closed vocabulary defined in
   [`backend/app/services/api_token_scopes.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/services/api_token_scopes.py):
-  `read`, `ipam:write`, `dns:write`, `dhcp:write`, `agent`. An empty
+  `read`, `ipam:write`, `dns:write`, `dhcp:write`. (An `agent` scope was
+  retired in #3302: the agent routes take the agent's own JWT or PSK, never an
+  API token. Create and update refuse it with 422.) An empty
   list means no scope restriction. A non-empty list is checked against
   the request method + path; a request matching none of the token's
-  scopes returns `401 "Token scope insufficient for this request"`.
+  scopes returns `403 "Token scope insufficient for this request"` (the
+  credential is valid, so it is not a 401; invalid, revoked and expired tokens
+  stay 401).
+  Path prefixes match on a whole segment: `dns:write` covers
+  `/api/v1/dns/...` but not `/api/v1/dnsbl/...` or `/api/v1/dns-threat/...`.
   `read` permits only safe methods (`GET` / `HEAD` / `OPTIONS`) — plus
-  a JSON-RPC `POST` to the read-only MCP endpoint.
+  a JSON-RPC `POST` to the MCP endpoint (`/api/v1/ai/mcp`, which dispatches no write tool), plus the POST routes
+  that only read (a filter or preview body, no mutation, no outbound probe):
+  those carry the `@read_only_post` marker from `api_token_scopes.py`
+  (the DNS query log, its analytics and the DHCP activity log under
+  `/logs/`, `/tools/mac-vendor`, and the side-effect-free previews /
+  validations). The Windows Event Log and DHCP audit pulls (`/logs/query`,
+  `/logs/dhcp-audit`) are not marked: they run PowerShell on the Windows
+  server over WinRM, and no write scope covers `/logs`, so they need an
+  unrestricted token. The set is pinned by
+  `tests/test_token_read_only_post_3223.py`.
 - **Per-resource grants** (`resource_grants: [...]`) — bind a token to a
   specific `subnet` or `dns_zone` instance with an
   `{action, resource_type, resource_id}` triple (issue #374). At
   mint time the issuer must already hold the grant ("a token cannot
   grant more than its creator"), and the bound resource must exist.
+  Over the Operator Copilot and MCP endpoint, a bound token reaches only
+  the tools that narrow their answers to the bound zones / subnets
+  (`honours_token_binding` in `app/services/ai/tools/base.py`); the rest
+  are not listed and are refused if called.
+  Over REST, a bound token is served by the IPAM and DNS routers and a
+  short list of routes that narrow to its grants (see
+  [`features/AUTH.md`](features/AUTH.md)); every other endpoint answers
+  `403` to it.
 
 A token can never exceed its owner's RBAC: the scope / grant check is
 an *additional* gate, applied on top of the owning user's permissions.
+
+**Declaring a new POST route.** The token-scope gate reads every POST as a
+write unless the handler says otherwise, so each POST outside the agent
+surfaces (`/api/v1/dns/agents`, `/api/v1/dhcp/agents`) must state which it is,
+directly under its `@router.post(...)` decorator:
+
+- `@read_only_post` when the body is only a filter, preview or dry run: no row
+  written (an audit row for the read excepted), no queued op, nothing sent
+  outward. A `read` token may then call it.
+- `@token_write("reason")` for everything else, with a real reason: it mutates
+  state, queues an op, sends traffic outward (a probe, a live pull from a
+  managed server), or is a read deliberately kept write-scoped. "Not reviewed"
+  is refused when the module imports. This changes no behaviour; it records the
+  decision.
+
+Both live in `app/services/api_token_scopes.py`.
+`tests/test_token_post_classification_3302.py` fails CI for a new POST with
+neither. The ~390 older unclassified routes sit in
+`backend/token_unclassified_posts_baseline.txt`, which may only shrink:
+annotate a handler, then re-record with
+`python tests/test_token_post_classification_3302.py --baseline`.
 
 See [`features/AUTH.md`](features/AUTH.md) for the full auth provider,
 MFA, and session model.
@@ -437,13 +509,24 @@ feature simply isn't installed
 { "detail": "Feature 'network.circuit' is disabled." }
 ```
 
+Disabling a module also stops its **scheduled work**, not just its routes
+([#2279](https://github.com/spatiumnorth/spatiumddi/issues/2279)): every
+module-owned Celery task carries `@module_gated("<module id>")`
+(`backend/app/tasks/module_gate.py`) and does nothing while the module,
+or a parent in its `requires=` chain, is off — no SNMP polls, TLS probes,
+conformity runs, RDAP / RPKI / RIPEstat fetches, or nmap auto-profile of
+new DHCP clients. Core, retention and prune tasks run regardless; each is
+listed with its reason in `UNGATED_BEAT_TASKS`, and
+`tests/test_module_gated_tasks_2279.py` fails any beat task that is in
+neither place.
+
 A module's shipped default lives in `default_enabled` on its catalog
 entry and nowhere else — a `feature_module` row means an operator
 changed it. A module ships **enabled** only if it is core IPAM / DNS /
 DHCP workflow, a zero-footprint UI convenience, or a hand-invoked
 read-only diagnostic; everything else ships **disabled**
-([#1069](https://github.com/spatiumnorth/spatiumddi/issues/1069)). 14 of
-53 are on out of the box. Settings → Features lists every module with
+([#1069](https://github.com/spatiumnorth/spatiumddi/issues/1069)). 16 of
+57 are on out of the box. Settings → Features lists every module with
 its description either way, so a disabled one is still discoverable.
 Examples of gated prefixes (from `router.py`):
 
@@ -464,10 +547,31 @@ Operators toggle modules via the admin feature-modules surface under
 
 ## 6. Pagination
 
-There are two list shapes in the codebase. New routers should use the
-envelope; the legacy core routers return bare arrays.
+There are three list shapes in the codebase: the `{items, total, limit,
+offset}` envelope (6.1), bare arrays (6.2), and `Page[T]`
+(`{items, total, page, page_size}`, `backend/app/api/pagination.py`), which
+DNS records and DHCP leases answer and which that module names as the shape
+for new endpoints that can grow unbounded. The audit list answers
+`{total, items}`. Check the route's schema in `/api/docs` rather than
+assuming one shape.
 
-### 6.1 `{items, total, limit, offset}` envelope (preferred)
+### Stable ordering and moving data
+
+Pagination is offset-based. Every paginated list ends its ordering in a unique
+column (the primary key), so rows that share a sort value (DHCP leases with the
+same `last_seen_at`) always fall on the same page across requests. Offset
+paging over a set that is being written is still not a snapshot: a row whose
+*sort key itself* changes between page requests (a lease renewal bumping
+`last_seen_at`, a new audit row arriving at the head of a newest-first list)
+can move across a page boundary, so a client can see it twice or miss it. To
+read a busy list completely, sort on a column that does not change
+(`expired_at` on lease history, `timestamp` on the audit log) or restrict by a
+time window, and dedupe by `id`. Keyset paging for the live lease list was
+considered and not built: the list is a live operator view, the shipped
+ordering is already deterministic, and the remaining drift is bounded to rows
+that were touched mid-read.
+
+### 6.1 `{items, total, limit, offset}` envelope
 
 The network-modeling and newer routers (circuits, services, ASNs,
 VRFs, overlays, multicast, TLS certs, …) accept `limit` + `offset`
@@ -566,14 +670,62 @@ with `{"detail": "An IP space named 'Corporate' already exists"}`.
 Every mutation is written to the append-only `audit_log` before the
 response returns (non-negotiable #4).
 
-### 7.2 Read the running version (public)
+Read an entry's recorded details with `GET /api/v1/audit/{id}`, which
+returns `old_value`, `new_value`, `changed_fields` and `error_detail`
+(for example a scheduled upgrade's `direction` and `schema_check`).
+`GET /api/v1/audit` leaves them `null` unless called with
+`include_details=true`, since a page can be 500 rows. Values are
+redacted on read: a key that looks like a credential (password, token,
+secret, `*_key`, `*_encrypted`, ...) comes back as `[redacted]`, and
+secret-shaped strings (JWTs, Fernet tokens, bearer values, chat-webhook
+URLs, the signing parameters of a presigned S3 / GCS / Azure SAS URL, a
+storage connection string's `AccountKey`) are masked wherever they appear; a string carrying a PEM private
+key is replaced whole. A boolean or integer under a credential-shaped
+key is kept, so a writer's `smtp_password_set: true` still says whether
+the secret was set. Both endpoints need `read` on `audit_log`.
 
-`GET /api/v1/version` is unauthenticated (the login page calls it for
-the release-check banner); the host-identity fields are only populated
-for authenticated callers:
+### 7.2 Read the running version (public, details signed in)
+
+`GET /api/v1/version` answers everyone, but version and stack details are
+for signed-in users only (#2935). An anonymous caller gets a coarse
+handshake: enough to know it reached a SpatiumDDI control plane, and
+nothing about which release. `restricted: true` says the other fields
+were withheld rather than empty. `version` carries the placeholder
+`"restricted"` rather than null, so an installer ISO built before this
+change, which checks only for a non-empty `version` string, still reports
+the control plane as reachable; it is not a release, and SpatiumDDI's own
+version parsers read it as an unknown version:
 
 ```json
 {
+  "product": "SpatiumDDI",
+  "api_level": 1,
+  "restricted": true,
+  "version": "restricted",
+  "latest_version": null,
+  "update_available": false,
+  "latest_release_url": null,
+  "latest_checked_at": null,
+  "release_check_enabled": false,
+  "latest_check_error": null,
+  "appliance_mode": false,
+  "appliance_version": null,
+  "appliance_hostname": null
+}
+```
+
+`api_level` is the major version of the REST surface (the `/api/v1`
+prefix), and changes only when a v1 client can no longer talk to the
+server. The appliance installer uses `product` to check that the URL it was
+given is a control plane before it wipes a disk.
+
+A signed-in caller (a session or an API token) gets the full answer:
+
+```json
+{
+  "product": "SpatiumDDI",
+  "api_level": 1,
+  "restricted": false,
   "version": "2026.06.25-1",
   "latest_version": null,
   "update_available": false,
@@ -608,13 +760,51 @@ Common status codes across the surface:
 | Status | Meaning |
 |---|---|
 | `400 Bad Request` | Semantically invalid input (e.g. wrong current password) |
-| `401 Unauthorized` | Missing / invalid / expired credential, or insufficient token scope |
-| `403 Forbidden` | Authenticated but not permitted (RBAC denial, superadmin-only, disabled account, forced password change) |
+| `401 Unauthorized` | Missing / invalid / revoked / expired credential |
+| `403 Forbidden` | Authenticated but not permitted (RBAC denial, insufficient API-token scope, superadmin-only, disabled account, forced password change) |
 | `404 Not Found` | Resource doesn't exist **or** its feature module is disabled |
 | `409 Conflict` | Uniqueness / overlap / collision conflict, or a delete refused because rows still reference the target |
+| `413 Content Too Large` | The request body is over the API's body cap (see below) |
 | `422 Unprocessable Entity` | Pydantic request-body / query-param validation failure, or a request-supplied reference to a row that does not exist |
-| `429 Too Many Requests` | Per-IP login rate limit tripped |
+| `429 Too Many Requests` | A rate limit or attempt budget tripped: the per-IP, per-username or install-wide sign-in ceilings, the MFA wrong-code and step-up budgets, appliance registration, and a few others (some carry `Retry-After`) |
 | `503 Service Unavailable` | Maintenance mode, transient DB-connection-closed (carries `Retry-After`), or a failing readiness check |
+
+### Request body limits
+
+**Every request body is capped** ([#2780](https://github.com/spatiumnorth/spatiumddi/issues/2780)).
+The api answers `413` to a body over the cap. A declared `Content-Length`
+over it is refused before any of the body is read; a body sent without one
+is counted as it arrives and refused once it passes the cap. The cap is
+`MAX_REQUEST_BODY_BYTES` (default **8 MiB**, minimum 64 KiB), set in the
+api's environment: `.env` on Docker Compose, `api.env` in the Helm chart.
+It applies to the api port itself. The bundled nginx admits 1 MiB on
+`/api/`, except on the routes below, which each have an nginx location
+that passes the body through to the api unbuffered. For the importers,
+the zone spreadsheet, the pcap upload and the agents' ingested-records
+push, that location's limit is exactly the route's own limit in the table
+below, and nginx answers a body over it with the same JSON 413 the api
+sends, before any of it is proxied
+([#3036](https://github.com/spatiumnorth/spatiumddi/issues/3036)). Backups
+(2 GiB) and upgrade images (4 GiB) pass through at those sizes.
+
+Routes that take larger bodies keep their own limits, which the cap never
+lowers:
+
+| Route | Limit |
+|---|---|
+| `POST /appliance/upgrade-images` | 4 GiB image |
+| `POST /backup/…` | 2 GiB archive |
+| `POST /dns/import/…` | 50 MiB (BIND9 archive, and its preview sent back to commit) |
+| `POST /dhcp/import/…`, `POST /ipam/import/…` | 25 MiB |
+| `POST /dns/groups/{id}/zones/{id}/import/spreadsheet/{preview,commit}` | 10 MiB |
+| `POST /appliance/supervisor/pcap/upload/{id}` | 116 MiB capture |
+| `POST /dns/agents/ingested-records` | 64 MiB (one dynamic zone per request) |
+
+The upload routes (the importers, the zone spreadsheet import, the
+branding logo, upgrade images and backups) **check the login before
+reading the upload**: a request without a valid login, or without the
+permission, is answered 401 / 403 before any of the file is read. The HELD
+endpoints read at most their 64 KiB document limit.
 
 A `422` validation error carries FastAPI's structured field-error list:
 
@@ -686,7 +876,9 @@ server-side log lines for that request (non-negotiable #7).
 - **CORS** — origins come from the `CORS_ORIGINS` env var (comma-
   separated; default `*`). With a wildcard, credentialed CORS is
   disabled by construction (the API authenticates via the
-  `Authorization` header, not cookies). Pin explicit origins to enable
+  `Authorization` header; the HttpOnly `spatium_refresh` cookie and the
+  short-lived OIDC / SAML sign-in flow cookies are scoped to
+  `/api/v1/auth`). Pin explicit origins to enable
   `allow_credentials`.
 - **Trusted hosts** — `TRUSTED_HOSTS` (default `*`) gates the inbound
   `Host` header; set it to your real hostnames to harden against
@@ -713,7 +905,16 @@ the same auth surface as the rest of the API: a session JWT for browser
 clients, or an API token for external MCP clients (Claude Desktop /
 Cursor / any MCP-speaking client). External clients use a token with
 the `read` scope, which is explicitly allowed to `POST` the JSON-RPC
-frame even though it is a write method.
+frame even though it is a write method. A `read` token never makes
+SpatiumDDI send traffic outward (#3302), so for a token with no write scope
+the tools that probe a host, pull live state from a managed server or look
+something up off-prem are neither listed by `tools/list` nor callable by
+`tools/call` for any scoped token (a scoped token reaches MCP only through
+`read`). The one exception follows REST: a token also holding the write
+scope that covers a tool's REST route keeps that tool (`dns:write` keeps
+`find_dns_zone_drift`, as it reaches `GET /dns/.../drift`). A probe or an
+off-prem lookup needs a session or an unrestricted token, as `/tools/*`,
+`/bgp/*` and the rest do over REST.
 
 A bare `GET /api/v1/ai/mcp` returns server identity (handy for a sanity
 check; auth still required):

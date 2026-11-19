@@ -47,6 +47,7 @@ class FindBlocklistedIPsArgs(BaseModel):
 
 @register_tool(
     name="find_blocklisted_ips",
+    permission=("read", "dnsbl"),
     description=(
         "List public-facing IPs currently on one or more enabled DNS "
         "blocklists (Spamhaus, Barracuda, SpamCop, SORBS, …). Each row "
@@ -109,6 +110,7 @@ class CountBlocklistedIPsArgs(BaseModel):
 
 @register_tool(
     name="count_blocklisted_ips",
+    permission=("read", "dnsbl"),
     description=(
         "Count how many public-facing IPs are currently blocklisted, "
         "broken down by list and by candidate source. Use for 'how bad is "
@@ -156,6 +158,7 @@ class FindDNSBLListsArgs(BaseModel):
 
 @register_tool(
     name="find_dnsbl_lists",
+    permission=("read", "dnsbl"),
     description=(
         "List the curated DNS blocklist catalog: name, DNS zone suffix, "
         "category, whether it's enabled, whether it requires registration, "
@@ -199,6 +202,7 @@ async def find_dnsbl_lists(
 
 @register_tool(
     name="propose_pin_ip_for_dnsbl",
+    permission=("write", "dnsbl"),
     description=(
         "Prepare a proposal to pin an IP for DNSBL / RBL reputation "
         "monitoring. The operator must click Apply for the pin to be "

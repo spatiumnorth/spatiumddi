@@ -2,11 +2,7 @@ import { type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { X } from "lucide-react";
 import { cn } from "@/lib/utils";
-import {
-  MODAL_BACKDROP_CLS,
-  useDraggableModal,
-  useFocusTrap,
-} from "./use-draggable-modal";
+import { MODAL_BACKDROP_CLS, useModalDialog } from "./use-draggable-modal";
 
 /** Tab strip for breaking long modals into themed sub-sections.
  *
@@ -61,7 +57,7 @@ export function ModalTabs<T extends string>({
 //     Users can pull the modal out of the way to see content behind it.
 //   * Backdrop is ``bg-black/20`` so the underlying page is still readable
 //     while the modal is open (previous dim was ``/40``).
-//   * Esc closes the modal — defense against dragging the dialog off-screen.
+//   * Esc closes the topmost modal only — defense against dragging the dialog off-screen.
 //   * Clicking the close button (the X in the title) or anywhere inside the
 //     dialog body does NOT start a drag; only the title text / empty areas
 //     of the header do.
@@ -86,8 +82,8 @@ export function Modal({
   children: ReactNode;
   wide?: boolean;
 }) {
-  const { dialogStyle, dragHandleProps } = useDraggableModal(onClose);
-  const trapRef = useFocusTrap<HTMLDivElement>();
+  const { dialogProps, titleProps, dialogStyle, dragHandleProps } =
+    useModalDialog(onClose);
 
   // Portal to <body> so nested modals (e.g. the IPSpacePicker quick-create
   // popping up from inside the UniFi / Proxmox / Docker / Kubernetes /
@@ -99,10 +95,7 @@ export function Modal({
   const node = (
     <div className={MODAL_BACKDROP_CLS}>
       <div
-        ref={trapRef}
-        role="dialog"
-        aria-modal="true"
-        aria-label={title}
+        {...dialogProps}
         className={cn(
           // Flex column with header pinned + body scroll so the
           // ``Appliance · <name>`` title + close button stay visible
@@ -121,7 +114,9 @@ export function Modal({
             dragHandleProps.className,
           )}
         >
-          <h2 className="text-base font-semibold">{title}</h2>
+          <h2 {...titleProps} className="text-base font-semibold">
+            {title}
+          </h2>
           <button
             onClick={onClose}
             aria-label="Close dialog"

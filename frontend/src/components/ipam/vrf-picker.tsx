@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 
+import { usePermissions } from "@/hooks/usePermissions";
 import { vrfsApi, type VRF } from "@/lib/api";
 
 interface VrfPickerProps {
@@ -16,12 +17,60 @@ export function VrfPicker({
   className,
   disabled,
 }: VrfPickerProps) {
+  // The list route needs read on "vrf"; without it the list is never
+  // asked (#3451) and the picker says why instead of offering only "None".
+  const perms = usePermissions();
+  const canRead = perms.can("read", "vrf");
   const { data } = useQuery({
     queryKey: ["vrfs-picker"],
     queryFn: () => vrfsApi.list(),
     staleTime: 60_000,
+    enabled: canRead,
   });
   const vrfs = data ?? [];
+
+  if (!canRead) {
+    // Permissions not read yet, or the read failed, is not a role without
+    // the grant (#3546): say so, still disabled so the unchanged id is sent
+    // back.
+    if (perms.unanswered) {
+      return (
+        <select
+          className={className}
+          value={value ? "linked" : ""}
+          disabled
+          title={perms.unanswered}
+        >
+          <option value="">
+            {perms.isError
+              ? "— permissions could not be read —"
+              : "— checking permissions —"}
+          </option>
+          {value && (
+            <option value="linked">
+              {perms.isError
+                ? "Linked (could not be read)"
+                : "Linked (kept as is)"}
+            </option>
+          )}
+        </select>
+      );
+    }
+    // Disabled, so the form still sends the unchanged id (never a clear).
+    return (
+      <select
+        className={className}
+        value={value ? "linked" : ""}
+        disabled
+        title="Your role cannot read VRFs, so this cannot be changed here."
+      >
+        <option value="">— None —</option>
+        {value && (
+          <option value="linked">Linked (not visible to your role)</option>
+        )}
+      </select>
+    );
+  }
 
   return (
     <select

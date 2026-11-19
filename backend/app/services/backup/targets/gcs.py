@@ -40,15 +40,18 @@ from typing import Any
 
 import structlog
 
+from app.core.exc_text import describe_exc
 from app.services.backup.targets.base import (
     ARCHIVE_NAME_RE,
     ArchiveListing,
+    ArchiveTooLargeError,
     BackupDestination,
     BackupDestinationError,
     ConfigFieldSpec,
     DestinationConfigError,
     safe_filename,
 )
+from app.services.backup.targets.secrets_config import ENC_PREFIX
 
 logger = structlog.get_logger(__name__)
 
@@ -114,6 +117,7 @@ class GcsDestination(BackupDestination):
             name="service_account_json",
             label="Service-account key JSON",
             type="password",
+            multiline=True,
             required=True,
             secret=True,
             description=(
@@ -136,6 +140,11 @@ class GcsDestination(BackupDestination):
         # Sanity-check JSON syntax up-front so the operator gets a
         # clear error from validate_config rather than a 500 from
         # the first write.
+        # A value still wrapped with ``__enc__:`` is the stored key an Edit
+        # kept (a blank secret field): it was checked when it was saved, and
+        # is ciphertext, not JSON. Only a newly-supplied key is parsed.
+        if config["service_account_json"].startswith(ENC_PREFIX):
+            return
         try:
             info = json.loads(config["service_account_json"])
         except json.JSONDecodeError as exc:
@@ -169,7 +178,7 @@ class GcsDestination(BackupDestination):
                     content_type="application/zip",
                 )
             except GoogleAPIError as exc:
-                raise BackupDestinationError(f"GCS upload failed: {exc}") from exc
+                raise BackupDestinationError(f"GCS upload failed: {describe_exc(exc)}") from exc
 
         await asyncio.to_thread(_do)
 
@@ -201,13 +210,15 @@ class GcsDestination(BackupDestination):
                         )
                     )
             except GoogleAPIError as exc:
-                raise BackupDestinationError(f"GCS list_blobs failed: {exc}") from exc
+                raise BackupDestinationError(f"GCS list_blobs failed: {describe_exc(exc)}") from exc
             rows.sort(key=lambda r: r.created_at, reverse=True)
             return rows
 
         return await asyncio.to_thread(_do)
 
-    async def download(self, *, config: dict[str, Any], filename: str) -> bytes:
+    async def download(
+        self, *, config: dict[str, Any], filename: str, max_bytes: int | None = None
+    ) -> bytes:
         name = _object_name(config, filename)
 
         def _do() -> bytes:
@@ -220,13 +231,21 @@ class GcsDestination(BackupDestination):
             try:
                 bucket = client.bucket(config["bucket"])
                 blob = bucket.blob(name)
-                return blob.download_as_bytes()
+                if max_bytes is None:
+                    return blob.download_as_bytes()
+                # Ask for at most one byte past the cap (``end`` is
+                # inclusive): an archive within the cap arrives whole, and
+                # one past it is detected without fetching the rest.
+                data = blob.download_as_bytes(start=0, end=max_bytes)
+                if len(data) > max_bytes:
+                    raise ArchiveTooLargeError(filename, max_bytes)
+                return data
             except NotFound as exc:
                 raise BackupDestinationError(
                     f"archive {filename!r} not found in bucket {config['bucket']!r}"
                 ) from exc
             except GoogleAPIError as exc:
-                raise BackupDestinationError(f"GCS download failed: {exc}") from exc
+                raise BackupDestinationError(f"GCS download failed: {describe_exc(exc)}") from exc
 
         return await asyncio.to_thread(_do)
 
@@ -246,7 +265,7 @@ class GcsDestination(BackupDestination):
             except NotFound:
                 return  # idempotent
             except GoogleAPIError as exc:
-                raise BackupDestinationError(f"GCS delete failed: {exc}") from exc
+                raise BackupDestinationError(f"GCS delete failed: {describe_exc(exc)}") from exc
 
         await asyncio.to_thread(_do)
 

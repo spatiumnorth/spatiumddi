@@ -11,17 +11,20 @@ Two surfaces:
   platform-level allowlist with an explicit list, or send ``null``
   to revert to per-tool registry defaults. Per-provider
   ``AIProvider.enabled_tools`` narrows further; both layers
-  compose.
+  compose. A list naming a tool the catalog cannot keep (an unknown
+  name, or a tool that writes) is refused with a 422 that names it,
+  and nothing is saved (#3415).
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 
 from app.api.deps import DB, SuperAdmin
+from app.models.audit import AuditLog
 from app.models.settings import PlatformSettings
 from app.services import feature_modules as fm_svc
 from app.services.ai.tools import REGISTRY, effective_tool_names
@@ -94,6 +97,27 @@ async def list_tools(current_user: SuperAdmin, db: DB) -> ToolCatalogResponse:
     )
 
 
+def _refusal(names: list[str]) -> str | None:
+    """Why the catalog cannot enable some of ``names``, naming each one, or
+    None when it can keep them all. An unknown name is most likely a typo or
+    a tool a newer release renamed; a ``writes=True`` tool is never offered
+    to the model (``effective_tool_names``), and a Copilot write is a
+    ``propose_*`` tool instead."""
+    by_name = {t.name: t for t in REGISTRY.all()}
+    why = {
+        name: (
+            "no tool by that name"
+            if name not in by_name
+            else "it writes directly, and the Copilot never offers such a tool"
+        )
+        for name in sorted(set(names))
+        if name not in by_name or by_name[name].writes
+    }
+    if not why:
+        return None
+    return "Cannot enable " + "; ".join(f"{name}: {w}" for name, w in why.items()) + "."
+
+
 @router.put("/tools/catalog", response_model=ToolCatalogResponse)
 async def update_tool_catalog(
     body: ToolCatalogUpdate,
@@ -104,12 +128,50 @@ async def update_tool_catalog(
     if settings_row is None:
         settings_row = PlatformSettings(id=1)
         db.add(settings_row)
+    # Platform-layer effective set before the write (registry defaults
+    # when the override is NULL). Modules / providers are deliberately
+    # left out: the audit row records what THIS write changed.
+    before_override = (
+        list(settings_row.ai_tools_enabled) if settings_row.ai_tools_enabled is not None else None
+    )
+    before = effective_tool_names(platform_enabled=before_override, provider_enabled=None)
     if body.enabled is None:
         settings_row.ai_tools_enabled = None
     else:
-        # Strip unknown names so a typo doesn't permanently shadow
-        # a renamed tool. Same forward-compat we apply when reading.
-        registered = {t.name for t in REGISTRY.all() if not t.writes}
-        settings_row.ai_tools_enabled = sorted(set(body.enabled) & registered)
+        # A name the save cannot keep is refused, never dropped in silence
+        # (#3415): the Tool Catalog page shows this detail, so the operator
+        # learns why a toggle did not hold.
+        refusal = _refusal(body.enabled)
+        if refusal is not None:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=refusal)
+        settings_row.ai_tools_enabled = sorted(set(body.enabled))
+    after_override = (
+        list(settings_row.ai_tools_enabled) if settings_row.ai_tools_enabled is not None else None
+    )
+    after = effective_tool_names(platform_enabled=after_override, provider_enabled=None)
+    # Non-negotiable #4: the audit row rides the same transaction as the
+    # write. A diff, not the catalog; nothing changed => nothing written.
+    enabled_now = sorted(after - before)
+    disabled_now = sorted(before - after)
+    if enabled_now or disabled_now or before_override != after_override:
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="update",
+                resource_type="platform_settings",
+                resource_id="ai_tools_catalog",
+                resource_display="Copilot tool catalog",
+                changed_fields=["ai_tools_enabled"],
+                old_value={"platform_override": before_override},
+                new_value={
+                    "platform_override": after_override,
+                    "enabled": enabled_now,
+                    "disabled": disabled_now,
+                },
+                result="success",
+            )
+        )
     await db.commit()
     return await list_tools(current_user, db)

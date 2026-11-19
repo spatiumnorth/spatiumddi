@@ -43,7 +43,7 @@
   <rect x="160" y="180" width="600" height="130" rx="12"
         fill="url(#t2-host)" stroke="#94a3b8" stroke-width="2"/>
   <text x="180" y="208" font-size="15" font-weight="600" fill="#0f172a">vm-spatium-cp.corp.local</text>
-  <text x="180" y="226" font-size="11" fill="#475569">control plane — 4 vCPU · 8 GB · exposes :8000 / :80 (LB-terminated 443)</text>
+  <text x="180" y="226" font-size="11" fill="#475569">control plane — 4 vCPU · 8 GB · agents reach the frontend (host :8077 by default)</text>
 
   <g>
     <rect x="180" y="244" width="80" height="50" rx="6" fill="url(#t2-cp)"/>
@@ -79,13 +79,10 @@
     <text x="100" y="378" font-size="14" font-weight="600" fill="#0f172a">vm-dns.corp.local</text>
     <text x="100" y="394" font-size="11" fill="#475569">docker-compose.agent-dns-bind9.yml</text>
 
-    <rect x="110" y="412" width="120" height="58" rx="8" fill="url(#t2-agent)"/>
-    <text x="170" y="438" text-anchor="middle" font-size="13" font-weight="600" fill="#ffffff">bind9</text>
-    <text x="170" y="456" text-anchor="middle" font-size="10" fill="#fed7aa">:53 udp/tcp</text>
-
-    <rect x="240" y="412" width="130" height="58" rx="8" fill="#475569"/>
-    <text x="305" y="438" text-anchor="middle" font-size="13" font-weight="600" fill="#ffffff">dns-agent</text>
-    <text x="305" y="456" text-anchor="middle" font-size="10" fill="#cbd5e1">long-poll JWT</text>
+    <rect x="110" y="412" width="260" height="58" rx="8" fill="url(#t2-agent)"/>
+    <text x="240" y="436" text-anchor="middle" font-size="13" font-weight="600" fill="#ffffff">dns-bind9 (one container)</text>
+    <text x="240" y="452" text-anchor="middle" font-size="10" fill="#fed7aa">BIND9 + spatium-dns-agent · :53 udp/tcp</text>
+    <text x="240" y="464" text-anchor="middle" font-size="10" fill="#fed7aa">long-poll JWT</text>
   </g>
 
   <!-- DHCP VM -->
@@ -95,20 +92,17 @@
     <text x="540" y="378" font-size="14" font-weight="600" fill="#0f172a">vm-dhcp.corp.local</text>
     <text x="540" y="394" font-size="11" fill="#475569">docker-compose.agent-dhcp.yml</text>
 
-    <rect x="550" y="412" width="120" height="58" rx="8" fill="url(#t2-agent)"/>
-    <text x="610" y="438" text-anchor="middle" font-size="13" font-weight="600" fill="#ffffff">kea</text>
-    <text x="610" y="456" text-anchor="middle" font-size="10" fill="#fed7aa">:67 udp</text>
-
-    <rect x="680" y="412" width="140" height="58" rx="8" fill="#475569"/>
-    <text x="750" y="438" text-anchor="middle" font-size="13" font-weight="600" fill="#ffffff">dhcp-agent</text>
-    <text x="750" y="456" text-anchor="middle" font-size="10" fill="#cbd5e1">long-poll JWT</text>
+    <rect x="550" y="412" width="270" height="58" rx="8" fill="url(#t2-agent)"/>
+    <text x="685" y="436" text-anchor="middle" font-size="13" font-weight="600" fill="#ffffff">dhcp-kea (one container)</text>
+    <text x="685" y="452" text-anchor="middle" font-size="10" fill="#fed7aa">Kea + spatium-dhcp-agent · :67 udp</text>
+    <text x="685" y="464" text-anchor="middle" font-size="10" fill="#fed7aa">long-poll JWT</text>
   </g>
 
   <!-- Long-poll arrows -->
-  <line x1="305" y1="412" x2="380" y2="310" stroke="#fb923c" stroke-width="2"
+  <line x1="300" y1="412" x2="380" y2="310" stroke="#fb923c" stroke-width="2"
         stroke-dasharray="6 4" marker-end="url(#t2-arrow)"/>
-  <line x1="750" y1="412" x2="540" y2="310" stroke="#fb923c" stroke-width="2"
+  <line x1="790" y1="412" x2="640" y2="310" stroke="#fb923c" stroke-width="2"
         stroke-dasharray="6 4" marker-end="url(#t2-arrow)"/>
-  <text x="248" y="340" font-size="10" fill="#ea580c" font-style="italic">long-poll /api/v1/dns/agents/config (ETag)</text>
-  <text x="612" y="340" font-size="10" fill="#ea580c" font-style="italic">long-poll /api/v1/dhcp/agents/config (ETag)</text>
+  <text x="345" y="340" text-anchor="end" font-size="10" fill="#ea580c" font-style="italic">long-poll /api/v1/dns/agents/config (ETag)</text>
+  <text x="690" y="336" font-size="10" fill="#ea580c" font-style="italic">long-poll /api/v1/dhcp/agents/config (ETag)</text>
 </svg>

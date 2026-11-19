@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import ipaddress
 import json
 from collections.abc import Sequence
 from typing import Any
@@ -42,6 +43,8 @@ from app.drivers._winrm import (
     MAX_ENCODED_COMMAND,
     WinRMCommandTooLong,
     encoded_command_len,
+    ps_single_quote,
+    ps_single_quote_escape,
 )
 from app.drivers._winrm import (
     run_ps as _winrm_run_ps,
@@ -58,6 +61,7 @@ from app.drivers.dns.base import (
     ServerOptions,
     TsigKey,
     ZoneData,
+    first_ttl,
 )
 
 logger = structlog.get_logger(__name__)
@@ -195,6 +199,41 @@ class WindowsDNSDriver(DNSDriver):
 
     name: str = "windows_dns"
 
+    def provider_identity(self, server: Any) -> str | None:
+        """The AD domain this DC replicates zones in (#3888).
+
+        Zones the driver creates are AD-integrated (``-ReplicationScope
+        Domain``): replicated to every DC of the domain, so two rows for two
+        DCs of one domain share every zone, while host + port told them apart
+        and let one group's delete remove the zone for the other. The domain
+        is the DNS suffix of the host's FQDN, else (an IP or short host name)
+        the UPN realm of the service account. ``None`` (an IP address with a
+        NetBIOS-style login, no credentials) means unknown, which callers
+        treat as "might be shared".
+        """
+        host = (getattr(server, "host", "") or "").strip().lower().rstrip(".")
+        if not host:
+            return None
+        try:
+            creds = _load_credentials(server)
+        except Exception:  # noqa: BLE001 — unknown identity, caller fails safe
+            return None
+        # The host's own DNS suffix first: a DC's FQDN is its AD DNS domain,
+        # while a UPN suffix can be any alternate (user@contoso.com on a
+        # corp.contoso.com domain) and would split two DCs of one domain.
+        realm = ""
+        try:
+            ipaddress.ip_address(host.strip("[]"))
+        except ValueError:
+            labels = host.split(".")
+            if len(labels) >= 2 and labels[1]:
+                realm = ".".join(labels[1:])
+        if not realm:
+            username = str(creds.get("username") or "")
+            if "@" in username:
+                realm = username.rsplit("@", 1)[1].strip().lower().rstrip(".")
+        return f"windows_dns:ad:{realm}" if realm else None
+
     # ── Rendering (all no-ops; Windows manages its own zones) ─────────────
 
     def render_server_config(
@@ -291,7 +330,11 @@ class WindowsDNSDriver(DNSDriver):
             # named a single value while the wire operation addressed the
             # whole RRset, so the siblings the op never mentioned were lost.
             members = change.rrset.members
-            ttl = change.rrset.ttl or rr.ttl or 3600
+            # #2942 — a stored 0 is sent as 0 here and over WinRM. Whether
+            # Windows then serves 0 or substitutes the zone's minimum TTL has
+            # not been verified against a live server; drift cannot flag it
+            # either way, since it never compares TTLs.
+            ttl = first_ttl(change.rrset.ttl, rr.ttl, default=3600)
             if not members:
                 update.delete(rel_name, rdtype)
             else:
@@ -302,11 +345,18 @@ class WindowsDNSDriver(DNSDriver):
                     *[_format_rdata(r) for r in change.rrset.as_records(rr)],
                 )
         elif change.op == "delete":
-            update.delete(rel_name, rdtype)
+            # #1980 — a delete with no resolved RRset (a DNS pool member's
+            # removal) names ONE value; RFC 2136 can address exactly that RR,
+            # so the siblings at the name survive. Same type set as the WinRM
+            # path, so the two paths agree on what a delete touches.
+            if _delete_match_value(change, rtype) is not None:
+                update.delete(rel_name, rdtype, _format_rdata(rr))
+            else:
+                update.delete(rel_name, rdtype)
         else:  # create | update
             if change.op == "update":
                 update.delete(rel_name, rdtype)
-            update.add(rel_name, rr.ttl or 3600, rtype, _format_rdata(rr))
+            update.add(rel_name, first_ttl(rr.ttl, default=3600), rtype, _format_rdata(rr))
 
         logger.info(
             "windows_dns.apply_record_change",
@@ -463,7 +513,7 @@ class WindowsDNSDriver(DNSDriver):
                 final.append(entry)
         return final
 
-    async def apply_zone_change(self, server: Any, zone: Any, op: str) -> None:
+    async def apply_zone_change(self, server: Any, zone: Any, op: str) -> bool:
         """Create / delete a zone on the Windows DC over WinRM.
 
         Only meaningful when the server has stored credentials — without
@@ -482,14 +532,21 @@ class WindowsDNSDriver(DNSDriver):
             )
         creds = _load_credentials(server)
         script = _ps_apply_zone(zone, op)
-        await asyncio.to_thread(_run_ps, server, creds, script)
+        out = await asyncio.to_thread(_run_ps, server, creds, script)
+        # #1537 — the script says when the server was already in the
+        # requested state. Report that as "no change" so the caller's
+        # partial-failure compensation never deletes a zone this request
+        # found already there (or re-creates one it found already gone).
+        changed = not any(marker in (out or "") for marker in _ZONE_NOOP_MARKERS)
         logger.info(
             "windows_dns.apply_zone_change",
             server=str(getattr(server, "id", "")),
             zone=getattr(zone, "name", ""),
             op=op,
             kind=getattr(zone, "kind", None),
+            changed=changed,
         )
+        return changed
 
     async def reload_config(self, server: Any) -> None:
         # Windows handles its own config lifecycle; nothing to do remotely.
@@ -608,7 +665,7 @@ class WindowsDNSDriver(DNSDriver):
         name = _ps_escape_single_quoted((zone_name or "").rstrip("."))
         script = (
             f"Set-DnsServerPrimaryZone -Name '{name}' -DynamicUpdate {mode} -ErrorAction Stop; "
-            f"Write-Output \"zone '{name}' DynamicUpdate set to {mode}\""
+            f"Write-Output 'zone ''{name}'' DynamicUpdate set to {mode}'"
         )
         await asyncio.to_thread(_run_ps, server, creds, script)
         logger.info(
@@ -702,12 +759,13 @@ _PS_LIST_ZONES = (
 def _ps_escape_single_quoted(value: str) -> str:
     """Escape ``value`` for use inside a PowerShell single-quoted literal.
 
-    PS single-quoted strings have exactly one escape rule — double the
-    inner single quote. No backticks, no variable expansion, nothing to
-    worry about. Keeps zone names with apostrophes (unlikely but legal)
-    from breaking the script.
+    Single-quoted strings have one escape rule — double the quote — but
+    PowerShell recognises several quote characters; see
+    :func:`app.drivers._winrm.ps_single_quote_escape`. Operator values are
+    only ever placed in single-quoted literals, never in double-quoted
+    (expandable) strings.
     """
-    return (value or "").replace("'", "''")
+    return ps_single_quote_escape(value)
 
 
 def _ps_list_records(zone_name: str) -> str:
@@ -881,6 +939,12 @@ def _parse_zones(raw: str) -> list[dict[str, Any]]:
     return out
 
 
+# Output lines ``_ps_apply_zone`` writes when the server was already in
+# the requested state (#1537). ``apply_zone_change`` keys "no change" off
+# these, so the script and the parser must agree — pinned by a test.
+_ZONE_NOOP_MARKERS = ("already exists on server", "was not present on server")
+
+
 def _ps_apply_zone(zone: Any, op: str) -> str:
     """PowerShell script for ``apply_zone_change(op=create|delete)``.
 
@@ -896,29 +960,64 @@ def _ps_apply_zone(zone: Any, op: str) -> str:
     if not name:
         raise ValueError("windows_dns._ps_apply_zone: zone name is required")
 
+    # #1537 — probe for the zone with ``-ErrorAction Stop`` and treat ONLY
+    # DNS_ERROR_ZONE_DOES_NOT_EXIST (Win32 9601) as "absent". The old
+    # ``SilentlyContinue`` probe also swallowed access-denied (Win32 5), a
+    # dead DNS service and a bad WinRM session, so a delete "succeeded" on a
+    # server the account could not even read. Anything else rethrows and
+    # fails the script, which ``_run_ps`` surfaces.
+    probe = f"""$zone = $null
+try {{
+    $zone = Get-DnsServerZone -Name '{name}' -ErrorAction Stop
+}} catch {{
+    if ($_.FullyQualifiedErrorId -notmatch 'WIN32 9601') {{
+        throw
+    }}
+}}"""
     if op == "create":
         # Existing zone → no-op with a reassuring log line rather than a
         # hard error. The common case is: operator seeded the zone in
         # DNS Manager, imported it via sync, then edited it in SpatiumDDI
-        # — we don't want to "re-create" it.
+        # — we don't want to "re-create" it. A concurrent create that
+        # loses the race reports DNS_ERROR_ZONE_ALREADY_EXISTS (Win32
+        # 9609), which is the same converged state.
         return f"""
-if (Get-DnsServerZone -Name '{name}' -ErrorAction SilentlyContinue) {{
-    Write-Output "zone '{name}' already exists on server"
+{probe}
+if ($zone) {{
+    Write-Output 'zone ''{name}'' already exists on server'
 }} else {{
-    Add-DnsServerPrimaryZone -Name '{name}' -ReplicationScope Domain -DynamicUpdate Secure -ErrorAction Stop
-    Write-Output "zone '{name}' created"
+    try {{
+        Add-DnsServerPrimaryZone -Name '{name}' -ReplicationScope Domain -DynamicUpdate Secure -ErrorAction Stop
+        Write-Output 'zone ''{name}'' created'
+    }} catch {{
+        if ($_.FullyQualifiedErrorId -match 'WIN32 9609') {{
+            Write-Output 'zone ''{name}'' already exists on server'
+        }} else {{
+            throw
+        }}
+    }}
 }}
 """.strip()
     if op == "delete":
-        # ``-Force`` skips the prompt. SilentlyContinue on the probe so
-        # we turn "already gone" into a clean success — idempotent
-        # delete matches the DHCP-side semantics.
+        # ``-Force`` skips the prompt. A zone that is gone (probe, or
+        # Win32 9601 from the remove itself when it vanishes between the
+        # two) is a clean success — idempotent delete matches the
+        # DHCP-side semantics.
         return f"""
-if (Get-DnsServerZone -Name '{name}' -ErrorAction SilentlyContinue) {{
-    Remove-DnsServerZone -Name '{name}' -Force -ErrorAction Stop
-    Write-Output "zone '{name}' deleted"
+{probe}
+if ($zone) {{
+    try {{
+        Remove-DnsServerZone -Name '{name}' -Force -ErrorAction Stop
+        Write-Output 'zone ''{name}'' deleted'
+    }} catch {{
+        if ($_.FullyQualifiedErrorId -match 'WIN32 9601') {{
+            Write-Output 'zone ''{name}'' was not present on server'
+        }} else {{
+            throw
+        }}
+    }}
 }} else {{
-    Write-Output "zone '{name}' was not present on server"
+    Write-Output 'zone ''{name}'' was not present on server'
 }}
 """.strip()
 
@@ -1000,6 +1099,75 @@ def _ps_add_record(zone: str, name: str, record: RecordData, ttl: int) -> str:
     return create
 
 
+# Types whose rdata ``Get-DnsServerResourceRecord`` exposes as ONE comparable
+# value, so a per-value delete can target just the matching record (#1980).
+# Anything else (CNAME is single-valued; SRV / CAA / TLSA have no single
+# property) keeps the delete-the-whole-RRset behaviour.
+_PS_VALUE_PROP = {
+    "A": "IPv4Address",
+    "AAAA": "IPv6Address",
+    "NS": "NameServer",
+    "PTR": "PtrDomainName",
+    "MX": "MailExchange",
+    "TXT": "DescriptiveText",
+}
+_PS_HOSTNAME_TYPES = frozenset({"NS", "PTR", "MX"})
+
+
+def _delete_match_value(change: RecordChange, rtype: str) -> str | None:
+    """The value a per-value delete must match, or ``None`` to delete all.
+
+    Only a delete with no resolved RRset (``rrset_action`` callers: DNS pool
+    member removal, #1980) is value-targeted. A resolved RRset already says
+    exactly what survives, so those keep the whole-RRset write.
+    """
+    if change.op != "delete" or change.rrset is not None:
+        return None
+    if rtype not in _PS_VALUE_PROP:
+        return None
+    raw = change.record.value or ""
+    if rtype == "TXT":
+        raw = _strip_txt_quotes(raw)
+    else:
+        raw = raw.strip()
+    if not raw:
+        return None
+    if rtype in ("A", "AAAA"):
+        try:
+            return str(ipaddress.ip_address(raw))
+        except ValueError:
+            return None
+    if rtype in _PS_HOSTNAME_TYPES:
+        return raw.rstrip(".")
+    return raw
+
+
+def _ps_value_predicate(rtype: str, rd: str, value: str) -> str:
+    """PowerShell boolean: does record data ``rd`` hold ``value`` (#1980)?
+
+    ``rd`` is an expression for a record's ``RecordData``; ``value`` one for
+    the string ``_delete_match_value`` produced. Shared by the singular and
+    batched scripts so the two cannot match differently.
+
+    * A / AAAA compare as ``[ipaddress]`` (``IPAddress.Equals`` is a byte
+      compare), not as text: ``RecordData.IPv4Address`` / ``IPv6Address`` are
+      ``IPAddress`` objects, and .NET's IPv6 text form need not agree with
+      Python's canonical one.
+    * NS / PTR / MX: Windows returns the FQDN with its trailing dot; the
+      value has it stripped. PowerShell ``-eq`` on strings is
+      case-insensitive, which is right for a DNS name.
+    * TXT: joined exactly as ``_ps_list_records`` reads it, so a value pulled
+      from the server matches itself, and compared case-SENSITIVELY
+      (``-ceq``) — two TXT strings differing only in case are two records.
+    """
+    prop = _PS_VALUE_PROP[rtype]
+    if rtype in ("A", "AAAA"):
+        return f'([ipaddress]"$({rd}.{prop})").Equals([ipaddress]{value})'
+    if rtype == "TXT":
+        return f"((@({rd}.{prop}) -join '') -ceq {value})"
+    return f"(\"$({rd}.{prop})\".TrimEnd('.') -eq {value})"
+
+
 def _ps_apply_record(change: RecordChange) -> str:
     """PowerShell script for ``apply_record_change`` create/update/delete.
 
@@ -1028,7 +1196,7 @@ def _ps_apply_record(change: RecordChange) -> str:
     rel_name = change.record.name if change.record.name not in ("", "@") else "@"
     name = _ps_escape_single_quoted(rel_name)
     members = _rrset_members_or_self(change)
-    ttl = int((change.rrset.ttl if change.rrset else None) or change.record.ttl or 3600)
+    ttl = first_ttl(change.rrset.ttl if change.rrset else None, change.record.ttl, default=3600)
     create = (
         "\n".join(_ps_add_record(zone, name, m, ttl) for m in members)
         if members
@@ -1045,16 +1213,25 @@ def _ps_apply_record(change: RecordChange) -> str:
     # zone in SpatiumDDI but the operator never ran Sync with Servers,
     # so deleting an IP tries to delete a PTR from a zone Windows
     # doesn't know about.
+    # #1980 — a per-value delete (no resolved RRset) removes only the record
+    # whose rdata matches the op's value; ``Get-… | Remove-…`` over the whole
+    # (name, type) took every healthy sibling with it.
+    value_filter = ""
+    match_value = _delete_match_value(change, rtype)
+    if match_value is not None:
+        mv = ps_single_quote(match_value)
+        pred = _ps_value_predicate(rtype, "$_.RecordData", mv)
+        value_filter = f" | Where-Object {{ {pred} }}"
     delete = f"""
 if (-not (Get-DnsServerZone -Name '{zone}' -ErrorAction SilentlyContinue)) {{
-    Write-Output "zone '{zone}' not present on server; delete is a no-op"
+    Write-Output 'zone ''{zone}'' not present on server; delete is a no-op'
 }} else {{
-    $rrs = Get-DnsServerResourceRecord -ZoneName '{zone}' -Name '{name}' -RRType {rtype} -ErrorAction SilentlyContinue
+    $rrs = Get-DnsServerResourceRecord -ZoneName '{zone}' -Name '{name}' -RRType {rtype} -ErrorAction SilentlyContinue{value_filter}
     if ($rrs) {{
         $rrs | Remove-DnsServerResourceRecord -ZoneName '{zone}' -Force -ErrorAction Stop
-        Write-Output "record '{name}' {rtype} deleted from '{zone}'"
+        Write-Output 'record ''{name}'' {rtype} deleted from ''{zone}'''
     }} else {{
-        Write-Output "record '{name}' {rtype} not present in '{zone}'; delete is a no-op"
+        Write-Output 'record ''{name}'' {rtype} not present in ''{zone}''; delete is a no-op'
     }}
 }}
 """.strip()
@@ -1065,7 +1242,7 @@ if (-not (Get-DnsServerZone -Name '{zone}' -ErrorAction SilentlyContinue)) {{
     # fix is one click on Sync with Servers.
     create_with_zone_guard = f"""
 if (-not (Get-DnsServerZone -Name '{zone}' -ErrorAction SilentlyContinue)) {{
-    throw "Zone '{zone}' not found on Windows server. Click 'Sync with Servers' on the server group to push SpatiumDDI zones first."
+    throw 'Zone ''{zone}'' not found on Windows server. Click ''Sync with Servers'' on the server group to push SpatiumDDI zones first.'
 }}
 {create}
 """.strip()
@@ -1149,10 +1326,12 @@ def _ps_apply_record_batch(changes: Sequence[RecordChange]) -> str:
         #   adds nothing. Getting this wrong turns a legacy delete into a
         #   remove-then-re-add, i.e. a silent no-op.
         members = _rrset_members_or_self(change)
+        dv: str | None = None
         if members is not None:
             to_add, remove_first = members, True
         elif change.op == "delete":
             to_add, remove_first = [], True
+            dv = _delete_match_value(change, rtype)
         else:
             to_add, remove_first = [change.record], change.op == "update"
         ops.append(
@@ -1164,11 +1343,14 @@ def _ps_apply_record_batch(changes: Sequence[RecordChange]) -> str:
                 "t": rtype,
                 "m": [_member(r) for r in to_add],
                 "rm": 1 if remove_first else 0,
-                "ttl": int(
-                    (change.rrset.ttl if change.rrset else None) or change.record.ttl or 3600
+                "ttl": first_ttl(
+                    change.rrset.ttl if change.rrset else None, change.record.ttl, default=3600
                 ),
             }
         )
+        if dv is not None:
+            # #1980 — per-value delete: only the record with this rdata goes.
+            ops[-1]["dv"] = dv
     blob = json.dumps(ops, separators=(",", ":")).encode("utf-8")
     payload_b64 = base64.b64encode(blob).decode("ascii")
 
@@ -1180,6 +1362,21 @@ def _ps_apply_record_batch(changes: Sequence[RecordChange]) -> str:
     # (_pack_record_chunks) measures the built script's encoded length
     # and packs each chunk under MAX_ENCODED_COMMAND, so this wrapper's
     # size is accounted for automatically rather than via a fixed count.
+    # #1980 — only ships when some op is a per-value delete, so every other
+    # batch keeps its existing size against the encoded-command budget. The
+    # record data is captured as ``$rd`` before the ``switch``, because a
+    # switch rebinds ``$_`` to its own subject inside each branch. ``dv`` is
+    # only ever set for a type with a branch here; ``default`` keeps the
+    # record (never delete-all on a value the script can't compare).
+    value_filter = ""
+    if any("dv" in o for o in ops):
+        branches = "".join(
+            f"'{t}'{{{_ps_value_predicate(t, '$rd', '$d')}}}" for t in _PS_VALUE_PROP
+        )
+        value_filter = (
+            "$d=$_.dv;if($null -ne $d -and $x){"
+            f"$x=@($x|?{{$rd=$_.RecordData;switch($t){{{branches}default{{$false}}}}}})}};"
+        )
     return (
         # #426: was "$E='Continue'" — a no-op (PS vars are case-insensitive,
         # so it aliased the loop's $e and was immediately overwritten). The
@@ -1209,7 +1406,8 @@ def _ps_apply_record_batch(changes: Sequence[RecordChange]) -> str:
         '  if($m.Count -gt 0 -and !$ze){throw "Zone $z not found"}\n'
         "  if($ze -and [int]$_.rm -eq 1){$x=Get-DnsServerResourceRecord -ZoneName $z -Name $n"
         " -RRType $t -EA SilentlyContinue;"
-        "if($x){$x|Remove-DnsServerResourceRecord -ZoneName $z -Force -EA Stop}}\n"
+        + value_filter
+        + "if($x){$x|Remove-DnsServerResourceRecord -ZoneName $z -Force -EA Stop}}\n"
         "  foreach($mm in $m){\n"
         "   $v=$mm.v\n"
         "   switch($t){\n"

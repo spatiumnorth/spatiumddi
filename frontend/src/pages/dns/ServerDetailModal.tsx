@@ -29,11 +29,20 @@ import {
   YAxis,
 } from "recharts";
 import { Modal } from "@/components/ui/modal";
+import { ListReadError } from "@/components/ui/list-read-error";
+import { isRefused, pollUnlessRefused } from "@/lib/refusal";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
 import { formatBucket } from "@/lib/chart-time";
 import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import { ConfigApplyBanner } from "@/components/ConfigApplyChip";
 import { DaemonStateBanner } from "@/components/DaemonStateChip";
+import { DuplicateAgentChip } from "@/components/DuplicateAgentChip";
 import { SpoolChip } from "@/components/SpoolChip";
+import { syncCard } from "@/lib/dhcp-sync-label";
 import {
   dnsApi,
   formatApiError,
@@ -83,6 +92,9 @@ export function ServerDetailModal({
 }) {
   const [tab, setTab] = useState<Tab>("overview");
   const [showPauseModal, setShowPauseModal] = useState(false);
+  // Pause and resume are superadmin-only routes; ask the same.
+  const { isSuperadmin } = usePermissions();
+  const maintenanceGate = permissionGate(isSuperadmin, NEEDS_SUPERADMIN);
   const qc = useQueryClient();
   const isBind9 = server.driver === BIND9_DRIVER;
 
@@ -110,6 +122,14 @@ export function ServerDetailModal({
           <span className="rounded border px-1.5 py-0.5 text-[10px]">
             {server.driver}
           </span>
+          {server.driver === "technitium_api" && (
+            <span
+              className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-400"
+              title="technitium_api is experimental in 1.0: one server per group, zones SpatiumDDI creates, no DNS pools, no group or zone options."
+            >
+              Experimental
+            </span>
+          )}
           <span className="rounded border px-1.5 py-0.5 text-[10px] font-mono">
             {server.host}:{server.port}
           </span>
@@ -137,6 +157,7 @@ export function ServerDetailModal({
                 onClick={() => resumeMut.mutate()}
                 disabled={resumeMut.isPending}
                 className="inline-flex items-center gap-1 rounded border border-emerald-600/40 bg-emerald-500/10 px-2 py-1 text-[11px] font-medium text-emerald-700 hover:bg-emerald-500/20 disabled:opacity-50 dark:text-emerald-400"
+                {...maintenanceGate}
               >
                 <Play className="h-3 w-3" />
                 {resumeMut.isPending ? "Resuming…" : "Resume"}
@@ -146,6 +167,7 @@ export function ServerDetailModal({
                 type="button"
                 onClick={() => setShowPauseModal(true)}
                 className="inline-flex items-center gap-1 rounded border border-amber-600/40 bg-amber-500/10 px-2 py-1 text-[11px] font-medium text-amber-700 hover:bg-amber-500/20 dark:text-amber-400"
+                {...maintenanceGate}
               >
                 <Pause className="h-3 w-3" />
                 Pause
@@ -205,12 +227,16 @@ export function ServerDetailModal({
                 icon={<BarChart3 className="h-3.5 w-3.5" />}
                 label="Stats"
               />
-              <TabButton
-                active={tab === "config"}
-                onClick={() => setTab("config")}
-                icon={<FileText className="h-3.5 w-3.5" />}
-                label="Config"
-              />
+              {/* The rendered-config read is superadmin-only (#869), so the
+                  tab is kept from users the API refuses (#2530). */}
+              {isSuperadmin && (
+                <TabButton
+                  active={tab === "config"}
+                  onClick={() => setTab("config")}
+                  icon={<FileText className="h-3.5 w-3.5" />}
+                  label="Config"
+                />
+              )}
             </>
           )}
         </div>
@@ -224,7 +250,9 @@ export function ServerDetailModal({
           {tab === "events" && <EventsTab serverId={server.id} />}
           {tab === "logs" && isBind9 && <LogsTab serverId={server.id} />}
           {tab === "stats" && isBind9 && <StatsTab serverId={server.id} />}
-          {tab === "config" && isBind9 && <ConfigTab serverId={server.id} />}
+          {tab === "config" && isBind9 && isSuperadmin && (
+            <ConfigTab serverId={server.id} />
+          )}
         </div>
       </div>
     </Modal>
@@ -277,6 +305,7 @@ function OverviewTab({
       <DaemonStateBanner server={server} />
       <div className="flex flex-wrap gap-1.5 empty:hidden">
         <SpoolChip server={server} />
+        <DuplicateAgentChip server={server} />
       </div>
       <div className="grid grid-cols-2 gap-3">
         <OverviewInfo server={server} />
@@ -287,6 +316,7 @@ function OverviewTab({
 }
 
 function OverviewInfo({ server }: { server: DNSServer }) {
+  const sync = syncCard(server);
   return (
     <>
       <InfoCard label="Status" value={server.status}>
@@ -301,6 +331,15 @@ function OverviewInfo({ server }: { server: DNSServer }) {
       />
       <InfoCard label="Agent ID" value={server.agent_id ?? "—"} mono />
       <InfoCard
+        label="Agent version"
+        value={
+          server.is_agentless
+            ? "n/a (agentless)"
+            : (server.agent_version ?? "unknown")
+        }
+        mono
+      />
+      <InfoCard
         label="Pending approval"
         value={server.pending_approval ? "yes" : "no"}
         accent={server.pending_approval ? "warning" : undefined}
@@ -313,7 +352,18 @@ function OverviewInfo({ server }: { server: DNSServer }) {
         label="Last health check"
         value={fmtRelative(server.last_health_check_at)}
       />
-      <InfoCard label="Last sync" value={fmtRelative(server.last_sync_at)} />
+      {/* #3046 — nothing records a sync for an agentless DNS server
+          (Windows, cloud, technitium_api): no code writes its last_sync_at
+          and it has no agent apply report. Say so, rather than show the
+          placeholder that reads as "never synced". */}
+      <InfoCard
+        label={sync.label}
+        value={
+          !sync.at && server.is_agentless
+            ? "Not recorded for agentless servers"
+            : fmtRelative(sync.at)
+        }
+      />
       <InfoCard
         label="Config ETag (last acked)"
         value={server.last_config_etag ?? "—"}
@@ -321,7 +371,7 @@ function OverviewInfo({ server }: { server: DNSServer }) {
       />
       <InfoCard
         label="Enabled"
-        value={server.is_enabled ? "yes" : "no (paused)"}
+        value={server.is_enabled ? "yes" : "no (disabled)"}
         accent={server.is_enabled ? undefined : "warning"}
       />
       <InfoCard label="Primary" value={server.is_primary ? "yes" : "no"} />
@@ -519,7 +569,17 @@ function ZoneRow({ z }: { z: DNSPerServerZoneStateEntry }) {
         {fmtRelative(z.reported_at)}
       </td>
       <td className="px-3 py-1.5">
-        <div className="flex items-center justify-center">{indicator}</div>
+        <div
+          className="flex items-center justify-center"
+          title={
+            // #2042 — the serials can match while a change is still queued.
+            z.pending_ops
+              ? `${z.pending_ops} change${z.pending_ops === 1 ? "" : "s"} not yet applied`
+              : undefined
+          }
+        >
+          {indicator}
+        </div>
       </td>
     </tr>
   );
@@ -712,7 +772,7 @@ function LogsTab({ serverId }: { serverId: string }) {
   // Drop empty fields rather than sending "" — the backend ILIKEs the
   // empty string against every row, which is technically correct but
   // wastes a query.
-  const { data, isLoading, isError, refetch, isFetching } = useQuery({
+  const { data, isLoading, isError, error, refetch, isFetching } = useQuery({
     queryKey: ["dns-server-query-log", serverId, filterKey],
     queryFn: () =>
       logsApi.dnsQueries({
@@ -722,7 +782,7 @@ function LogsTab({ serverId }: { serverId: string }) {
         client_ip: clientIp || null,
         max_events: 200,
       }),
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
 
   return (
@@ -765,7 +825,7 @@ function LogsTab({ serverId }: { serverId: string }) {
       {isLoading ? (
         <LoadingBlock />
       ) : isError ? (
-        <ErrorBlock />
+        <ErrorBlock error={error} what="this server's query log" />
       ) : !data || data.events.length === 0 ? (
         <p className="rounded-md border bg-card p-4 text-center text-sm text-muted-foreground">
           No query log entries match — agents tail{" "}
@@ -841,7 +901,7 @@ function StatsTab({ serverId }: { serverId: string }) {
     queryKey: ["dns-server-query-analytics", serverId],
     queryFn: () =>
       logsApi.dnsQueryAnalytics({ server_id: serverId, limit: 10 }),
-    refetchInterval: 60_000,
+    refetchInterval: pollUnlessRefused(60_000),
   });
 
   // Convert per-bucket counters to per-second rates so the chart axis
@@ -971,24 +1031,40 @@ function StatsTab({ serverId }: { serverId: string }) {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-        <AnalyticsCard
-          title="Top qnames"
-          rows={analytics.data?.top_qnames ?? []}
-          isLoading={analytics.isLoading}
-        />
-        <AnalyticsCard
-          title="Top clients"
-          rows={analytics.data?.top_clients ?? []}
-          isLoading={analytics.isLoading}
-        />
-        <AnalyticsCard
-          title="qtype distribution"
-          rows={analytics.data?.qtype_distribution ?? []}
-          isLoading={analytics.isLoading}
-          spanFull
-        />
-      </div>
+      {analytics.error != null && !analytics.data && (
+        <p
+          role="alert"
+          className="rounded-md border bg-card p-3 text-center text-xs text-muted-foreground"
+        >
+          <ListReadError
+            error={analytics.error}
+            what="this server's query analytics"
+          />
+        </p>
+      )}
+      {/* The cards would read "No data in window." over a read that was
+          refused or failed (#3148): withhold them, the sentence above says
+          why. */}
+      {!(analytics.error != null && !analytics.data) && (
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+          <AnalyticsCard
+            title="Top qnames"
+            rows={analytics.data?.top_qnames ?? []}
+            isLoading={analytics.isLoading}
+          />
+          <AnalyticsCard
+            title="Top clients"
+            rows={analytics.data?.top_clients ?? []}
+            isLoading={analytics.isLoading}
+          />
+          <AnalyticsCard
+            title="qtype distribution"
+            rows={analytics.data?.qtype_distribution ?? []}
+            isLoading={analytics.isLoading}
+            spanFull
+          />
+        </div>
+      )}
       {analytics.data && (
         <p className="text-[11px] text-muted-foreground">
           Top-N rollups computed against the parsed BIND9 query log (24&nbsp;h
@@ -1062,14 +1138,24 @@ function AnalyticsCard({
 // ── Config tab ────────────────────────────────────────────────────────────
 
 function ConfigTab({ serverId }: { serverId: string }) {
-  const { data, isLoading, isError } = useQuery({
+  const { data, isLoading, isError, error } = useQuery({
     queryKey: ["dns-server-rendered-config", serverId],
     queryFn: () => dnsApi.getServerRenderedConfig(serverId),
-    refetchInterval: 60_000,
+    refetchInterval: pollUnlessRefused(60_000),
   });
   const [selected, setSelected] = useState<string | null>(null);
 
   if (isLoading) return <LoadingBlock />;
+  if (isRefused(error)) {
+    return (
+      <p
+        role="alert"
+        className="rounded-md border bg-card p-4 text-center text-sm text-muted-foreground"
+      >
+        <ListReadError error={error} what="the rendered configuration" />
+      </p>
+    );
+  }
   if (isError || !data) return <ErrorBlock />;
 
   if (data.files.length === 0) {
@@ -1206,7 +1292,18 @@ function LoadingBlock() {
   );
 }
 
-function ErrorBlock() {
+function ErrorBlock({ error, what }: { error?: unknown; what?: string }) {
+  // A refusal is the reader's permissions, not a fault (#2700).
+  if (error && what && isRefused(error)) {
+    return (
+      <p
+        role="alert"
+        className="rounded-md border bg-card p-4 text-center text-sm text-muted-foreground"
+      >
+        <ListReadError error={error} what={what} />
+      </p>
+    );
+  }
   return (
     <div className="flex items-center justify-center gap-2 rounded-md border border-destructive/40 bg-destructive/5 py-8 text-sm text-destructive">
       <Activity className="h-4 w-4" />

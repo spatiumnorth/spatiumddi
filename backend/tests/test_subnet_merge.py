@@ -269,3 +269,116 @@ async def test_endpoint_smoke(client: AsyncClient, db_session: AsyncSession) -> 
     body = resp.json()
     assert body["merged_subnet"]["network"] == "10.0.0.0/24"
     assert sorted(body["deleted_subnet_ids"]) == sorted([str(a.id), str(b.id)])
+
+
+_FLAGS = dict(
+    pci_scope=True,
+    hipaa_scope=True,
+    internet_facing=True,
+    subnet_role="management",
+    do_not_probe=True,
+    discovery_enabled=True,
+)
+
+
+@pytest.mark.asyncio
+async def test_merge_of_agreeing_sources_keeps_settings(db_session: AsyncSession) -> None:
+    """#2414: a merge of two sources that agree keeps their settings."""
+    a, b = await _make_pair(db_session)
+    for s in (a, b):
+        for k, v in _FLAGS.items():
+            setattr(s, k, v)
+    await db_session.flush()
+    preview = await preview_subnet_merge(db_session, a, [b.id])
+    assert preview.conflicts == []
+    result = await commit_subnet_merge(db_session, a, [b.id], confirm_cidr="10.0.0.0/24")
+    for k, v in _FLAGS.items():
+        assert getattr(result.merged_subnet, k) == v, k
+
+
+@pytest.mark.asyncio
+async def test_merge_unions_compliance_flags_and_previews_it(db_session: AsyncSession) -> None:
+    """#2414: PCI on one source only -> merged is PCI, preview says so."""
+    a, b = await _make_pair(db_session)
+    b.pci_scope = True
+    b.do_not_probe = True
+    b.do_not_probe_reason = "fragile"
+    await db_session.flush()
+    preview = await preview_subnet_merge(db_session, a, [b.id])
+    assert preview.conflicts == []
+    assert any("pci_scope" in w for w in preview.warnings)
+    assert any("do_not_probe" in w for w in preview.warnings)
+    result = await commit_subnet_merge(db_session, a, [b.id], confirm_cidr="10.0.0.0/24")
+    assert result.merged_subnet.pci_scope is True
+    assert result.merged_subnet.do_not_probe is True
+    assert result.merged_subnet.do_not_probe_reason == "fragile"
+    assert result.merged_subnet.hipaa_scope is False
+
+
+@pytest.mark.asyncio
+async def test_merge_site_disagreement_is_a_conflict(db_session: AsyncSession) -> None:
+    """#2414: sources in different kinds/sites are refused, not silently picked."""
+    a, b = await _make_pair(db_session)
+    a.subnet_role = "management"
+    b.discovery_interval_minutes = 99
+    b.kind = "multicast"
+    await db_session.flush()
+    preview = await preview_subnet_merge(db_session, a, [b.id])
+    assert any(c.type == "metadata_mismatch:kind" for c in preview.conflicts)
+    assert any("subnet_role" in w for w in preview.warnings)
+    assert any("discovery_interval_minutes" in w for w in preview.warnings)
+
+
+@pytest.mark.asyncio
+async def test_merge_previews_every_setting_the_target_wins_3326(
+    db_session: AsyncSession,
+) -> None:
+    """#3326: tags / custom fields / VXLAN / domain / DNS servers that
+    disagree are named in the preview, with the value the merge keeps."""
+    a, b = await _make_pair(db_session)
+    a.tags, b.tags = {"env": "xp-a", "only-a": "1"}, {"env": "xp-b", "only-b": "1"}
+    a.custom_fields, b.custom_fields = {"xp_note": "a"}, {"xp_note": "b"}
+    a.vxlan_id, b.vxlan_id = 2361, 2362
+    a.domain_name, b.domain_name = "a.example.test", "b.example.test"
+    a.dns_servers, b.dns_servers = ["192.0.2.53"], ["192.0.2.54"]
+    await db_session.flush()
+    preview = await preview_subnet_merge(db_session, a, [b.id])
+    assert preview.conflicts == []
+    for col in ("tags", "custom_fields", "vxlan_id", "domain_name", "dns_servers"):
+        assert any(f"disagree on {col}:" in w for w in preview.warnings), col
+    vx = next(w for w in preview.warnings if "vxlan_id" in w)
+    assert "2361" in vx and "2362" in vx and "target's value (2361)" in vx
+    result = await commit_subnet_merge(db_session, a, [b.id], confirm_cidr="10.0.0.0/24")
+    assert result.merged_subnet.vxlan_id == 2361
+
+
+@pytest.mark.asyncio
+async def test_merge_does_not_warn_when_target_wins_settings_agree_3326(
+    db_session: AsyncSession,
+) -> None:
+    a, b = await _make_pair(db_session)
+    a.tags, b.tags = {"env": "x"}, {"env": "x"}
+    a.custom_fields, b.custom_fields = {}, None
+    await db_session.flush()
+    preview = await preview_subnet_merge(db_session, a, [b.id])
+    assert not any("disagree on" in w for w in preview.warnings)
+
+
+@pytest.mark.asyncio
+async def test_merge_target_wins_comparison_and_rendering_3326(
+    db_session: AsyncSession,
+) -> None:
+    """DNS group ids in another order are the same answer; DNS servers in
+    another order are not (resolver order); a large custom-fields dict is
+    cut short in the warning rather than dumped whole."""
+    a, b = await _make_pair(db_session)
+    g1, g2 = str(uuid.uuid4()), str(uuid.uuid4())
+    a.dns_group_ids, b.dns_group_ids = [g1, g2], [g2, g1]
+    a.dns_servers, b.dns_servers = ["192.0.2.53", "192.0.2.54"], ["192.0.2.54", "192.0.2.53"]
+    a.custom_fields, b.custom_fields = {"blob": "x" * 5000}, {"blob": "y"}
+    await db_session.flush()
+    preview = await preview_subnet_merge(db_session, a, [b.id])
+    assert not any("dns_group_ids" in w for w in preview.warnings)
+    assert any("disagree on dns_servers:" in w for w in preview.warnings)
+    cf = next(w for w in preview.warnings if "disagree on custom_fields:" in w)
+    assert "x" * 200 not in cf and len(cf) < 600

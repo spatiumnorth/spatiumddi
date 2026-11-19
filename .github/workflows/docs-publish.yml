@@ -103,6 +103,28 @@ jobs:
             echo "version=${GITHUB_REF_NAME}@$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Stamp the version banner data
+        # Feeds the banner in docs/_layouts/default.html (#1164) through
+        # _data/build.yml in the PUBLISHED copy only; nothing is committed to
+        # main. Without it the layout falls back to the generic banner, so a
+        # failure to resolve the release must not fail the publish. The tag is
+        # validated to a strict charset before being written as YAML, and an
+        # empty value is omitted (an empty string is truthy in Liquid).
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p build-data
+          sha="$(git rev-parse HEAD)"
+          date="$(git show -s --format=%cs HEAD)"
+          release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name 2>/dev/null || true)"
+          case "$release" in *[!A-Za-z0-9._+-]*) release="" ;; esac
+          {
+            echo "sha: \"${sha}\""
+            echo "date: \"${date}\""
+            if [ -n "$release" ]; then echo "release: \"${release}\""; fi
+          } > build-data/build.yml
+          cat build-data/build.yml
+
       - name: Configure deploy key
         run: |
           mkdir -p ~/.ssh
@@ -133,6 +155,9 @@ jobs:
             --exclude '.github' \
             --exclude 'CNAME' \
             docs/ site/
+
+          mkdir -p site/_data
+          cp build-data/build.yml site/_data/build.yml
 
           mkdir -p site/.github
           cat > site/.github/README.md <<'EOF'

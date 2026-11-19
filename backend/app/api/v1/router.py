@@ -1,5 +1,7 @@
 from fastapi import APIRouter, Depends
 
+from app.api.token_path_scope import include_token_scoped
+from app.api.v1.about import router as about_router
 from app.api.v1.acme import router as acme_router
 from app.api.v1.address_sets import router as address_sets_router
 from app.api.v1.admin.agent_keys import router as agent_keys_router
@@ -53,6 +55,7 @@ from app.api.v1.firewall_feeds.router import router as firewall_feeds_router
 from app.api.v1.fortinet.router import router as fortinet_router
 from app.api.v1.groups.router import router as groups_router
 from app.api.v1.groups.time_bound_grants import router as time_bound_grants_router
+from app.api.v1.ipam.integration_space_audit import router as integration_space_audit_router
 from app.api.v1.ipam.router import router as ipam_router
 from app.api.v1.kubernetes import router as kubernetes_router
 from app.api.v1.logs import logs_router
@@ -281,13 +284,16 @@ api_v1_router.include_router(
     tags=["dicom"],
     dependencies=[Depends(require_module("network.dicom"))],
 )
+# wake_publishing (#2040): an ERL or binding edit changes the DHCP options
+# 99 / 123 the agents render, so its handlers ``collect_wake`` the DHCP groups.
 api_v1_router.include_router(
     e911_router,
     prefix="/e911",
     tags=["e911"],
-    dependencies=[Depends(require_module("network.e911"))],
+    dependencies=[Depends(require_module("network.e911")), Depends(wake_publishing)],
 )
-api_v1_router.include_router(
+include_token_scoped(
+    api_v1_router,
     dns_router,
     prefix="/dns",
     tags=["dns"],
@@ -297,6 +303,8 @@ api_v1_router.include_router(
     # the long-poll and never enqueues record ops, and since #1068 that
     # separation is also what keeps the fleet reachable when core.dns is
     # off (the gate answers 404, which re-bootstraps agents).
+    # GHSA-46mq-mpwf-xxwv: a zone-scoped token is held to its zones on
+    # every route keyed on {zone_id}, before any handler runs.
     dependencies=[Depends(require_module("core.dns")), Depends(wake_publishing)],
 )
 api_v1_router.include_router(dns_agents_router, prefix="/dns", tags=["dns-agents"])
@@ -313,7 +321,8 @@ api_v1_router.include_router(
     tags=["dns-import"],
     dependencies=[Depends(require_module("dns.import")), Depends(wake_publishing)],
 )
-api_v1_router.include_router(
+include_token_scoped(
+    api_v1_router,
     dns_pool_router,
     prefix="/dns",
     tags=["dns-pools"],
@@ -344,18 +353,32 @@ api_v1_router.include_router(
     tags=["docker"],
     dependencies=[Depends(require_module("integrations.docker"))],
 )
-api_v1_router.include_router(domains_router, tags=["domains"])
+# Gated (#2325): Domain rows trigger off-prem RDAP lookups, so the module is
+# the one switch that stops them. Ships default-ON — see its ModuleSpec.
+api_v1_router.include_router(
+    domains_router,
+    tags=["domains"],
+    dependencies=[Depends(require_module("network.domains"))],
+)
 # Mount the time-bound-grant routes BEFORE the groups router: the groups
 # router carries a ``GET /{group_id}`` that would otherwise shadow
 # ``/groups/time-bound-grants`` (the literal path would be parsed as a UUID
 # path param and 422). Registering the static-prefix router first wins.
 api_v1_router.include_router(time_bound_grants_router, prefix="/groups", tags=["time-bound-grants"])
 api_v1_router.include_router(groups_router, prefix="/groups", tags=["groups"])
-api_v1_router.include_router(
+# #2577 — superadmin read-only report of rows an integration took from another
+# IP space. Deliberately NOT token-scoped: it spans every space, so a
+# resource-bound token is refused on it. Mounted before the IPAM router so no
+# parameterised IPAM path can shadow the literal one.
+api_v1_router.include_router(integration_space_audit_router, prefix="/ipam", tags=["ipam"])
+include_token_scoped(
+    api_v1_router,
     ipam_router,
     prefix="/ipam",
     tags=["ipam"],
     # #358 — IPAM→DNS auto-sync calls enqueue_record_op; publish on commit.
+    # GHSA-46mq-mpwf-xxwv: a subnet-scoped token is held to its subnets on
+    # every route keyed on {subnet_id} / {address_id}.
     dependencies=[Depends(wake_publishing)],
 )
 api_v1_router.include_router(
@@ -421,9 +444,12 @@ api_v1_router.include_router(
     tags=["network"],
     dependencies=[Depends(require_module("network.device"))],
 )
+# wake_publishing (#2040): ``POST /new-devices/block`` creates dhcp_mac_block
+# rows and ``collect_wake``s their groups, which without a collector here was a
+# silent no-op — the block reached agents only on the safety tick.
 api_v1_router.include_router(
     new_devices_router,
-    dependencies=[Depends(require_module("security.new_device_watch"))],
+    dependencies=[Depends(require_module("security.new_device_watch")), Depends(wake_publishing)],
 )
 api_v1_router.include_router(
     block_sync_router,
@@ -561,6 +587,8 @@ api_v1_router.include_router(
 api_v1_router.include_router(upgrades_router, prefix="/upgrades", tags=["upgrades"])
 api_v1_router.include_router(users_router, prefix="/users", tags=["users"])
 api_v1_router.include_router(version_router, prefix="/version", tags=["version"])
+# #2895 — the About page's data sources; signed-in callers only (see the module).
+api_v1_router.include_router(about_router, prefix="/about", tags=["about"])
 api_v1_router.include_router(
     vlans_router,
     prefix="/vlans",

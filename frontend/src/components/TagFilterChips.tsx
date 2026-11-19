@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Tag, X } from "lucide-react";
 import { tagsApi } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { closePopupOnEscape } from "@/components/ui/use-draggable-modal";
 
 /**
  * Free-form tag filter chips with key/value autocomplete (issue #104
@@ -130,6 +131,20 @@ export function TagFilterChips({
         className,
       )}
       onClick={() => inputRef.current?.focus()}
+      // An Esc on a suggestion reached with Tab is the list's too (#3157).
+      onKeyDown={(e) => {
+        if (e.target === inputRef.current) return;
+        closePopupOnEscape(e, focused && dropdownItems.length > 0, () =>
+          setFocused(false),
+        );
+      }}
+      // Focus leaving the control (Tab / Shift+Tab past it) closes the list,
+      // or the next Esc, now outside it, closes the dialog with the list
+      // still showing (#3486). A move onto a suggestion keeps it open.
+      onBlur={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null))
+          setFocused(false);
+      }}
     >
       <Tag className="h-3 w-3 text-muted-foreground" />
       {value.map((chip, idx) => (
@@ -163,9 +178,17 @@ export function TagFilterChips({
             return;
           }
           if (e.key === "Escape") {
-            e.preventDefault();
-            setInput("");
-            setFocused(false);
+            // An IME composition's Esc belongs to the input method.
+            if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+            // Esc closes the open list and clears the draft; it is this
+            // control's Esc, so the dialog around it must not also close
+            // (#2720). With nothing open, let it through.
+            if (focused && dropdownItems.length > 0) {
+              e.preventDefault();
+              e.stopPropagation();
+              setInput("");
+              setFocused(false);
+            }
             return;
           }
           // Backspace on an empty textbox deletes the most recent
@@ -179,7 +202,12 @@ export function TagFilterChips({
         className="min-w-[8rem] flex-1 border-0 bg-transparent px-1 py-0.5 outline-none placeholder:text-muted-foreground/70"
       />
       {focused && dropdownItems.length > 0 && (
-        <div className="absolute left-0 right-0 top-full z-20 mt-1 max-h-64 overflow-auto rounded-md border bg-popover py-1 shadow-md">
+        <div
+          className="absolute left-0 right-0 top-full z-20 mt-1 max-h-64 overflow-auto rounded-md border bg-popover py-1 shadow-md"
+          // A press in the list (its padding included) keeps focus in the
+          // input, so the blur above cannot close it mid-click.
+          onMouseDown={(e) => e.preventDefault()}
+        >
           {dropdownItems.map((item) => (
             <button
               key={item}

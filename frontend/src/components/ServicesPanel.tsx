@@ -18,6 +18,7 @@
  * into a "reconnecting" state instead of reporting failure.
  */
 
+import { pollUnlessRefused } from "@/lib/refusal";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, Info, Play, RefreshCw, Square } from "lucide-react";
@@ -27,6 +28,7 @@ import {
   serviceControlApi,
   type ServiceAction,
   type ServiceRow,
+  formatApiError,
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 
@@ -66,11 +68,7 @@ function stateTone(state: string): string {
 }
 
 function errorDetail(e: unknown, fallback: string): string {
-  if (e && typeof e === "object" && "response" in e) {
-    const resp = (e as { response?: { data?: { detail?: unknown } } }).response;
-    if (resp?.data?.detail) return String(resp.data.detail);
-  }
-  return fallback;
+  return formatApiError(e, fallback);
 }
 
 export function ServicesPanel() {
@@ -78,7 +76,7 @@ export function ServicesPanel() {
   const query = useQuery({
     queryKey: ["service-control"],
     queryFn: serviceControlApi.list,
-    refetchInterval: 10_000,
+    refetchInterval: pollUnlessRefused(10_000),
   });
 
   const [pending, setPending] = useState<{

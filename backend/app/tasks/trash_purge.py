@@ -17,17 +17,26 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import and_, delete, or_, select
+from sqlalchemy import and_, delete, exists, func, or_, select, union
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import aliased
 
 from app.celery_app import celery_app
+from app.config import settings
 from app.core.agent_wake import dns_group_channel, publish_wake
 from app.db import task_session
 from app.models.audit import AuditLog
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
 from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPBlock, IPSpace, Subnet
+from app.models.network_service import NetworkService
+from app.models.overlay import OverlayNetwork
+from app.models.ownership import Customer
 from app.models.settings import PlatformSettings
 from app.services.dhcp.static_ipam import remove_ipam_for_static
+from app.services.e911.delete_guard import subnet_e911_bound_clause
+from app.services.ipam.orphan_aliases import is_withdrawn_alias, withdrawn_alias_owners
+from app.services.ipam.utilization import recount_subnets_and_blocks
 
 logger = structlog.get_logger(__name__)
 
@@ -50,10 +59,14 @@ _PURGE_MODELS_LEAF_FIRST: tuple[type, ...] = (
     Subnet,
     IPBlock,
     IPSpace,
+    # #2738 — leaves, but a customer goes after its services (RESTRICT).
+    NetworkService,
+    OverlayNetwork,
+    Customer,
 )
 
 
-async def _release_ipam_mirrors(db: Any, cutoff: datetime) -> int:
+async def _release_ipam_mirrors(db: Any, cutoff: datetime, touched_subnets: set[Any]) -> int:
     """Release the IPAM row behind every reservation this sweep is about to purge.
 
     The purge is a Core ``DELETE`` — it runs no per-row Python, so nothing would
@@ -71,6 +84,11 @@ async def _release_ipam_mirrors(db: Any, cutoff: datetime) -> int:
 
     ``include_deleted`` because these rows are soft-deleted by definition — the
     global filter would hide the very rows we need to clean up.
+
+    Adds every subnet a removed row sat in to ``touched_subnets`` and does not
+    recount: the sweep recounts them once, last, just before its commit
+    (#3354), because the recount holds the audit-chain lock and subnet / block
+    row locks to commit and the sweep goes on to call DNS providers.
     """
     res = await db.execute(
         select(DHCPStaticAssignment)
@@ -81,17 +99,27 @@ async def _release_ipam_mirrors(db: Any, cutoff: datetime) -> int:
                     DHCPStaticAssignment.deleted_at.is_not(None),
                     DHCPStaticAssignment.deleted_at < cutoff,
                 ),
-                and_(DHCPScope.deleted_at.is_not(None), DHCPScope.deleted_at < cutoff),
+                # The same predicate the scope DELETE uses: a scope held back
+                # because a live pool / reservation sits on it (#1957) keeps its
+                # reservations, so their mirrors must stay too.
+                and_(*_expired_where(DHCPScope, cutoff)),
             )
         )
         .execution_options(include_deleted=True)
     )
     statics = list(res.scalars().all())
     for st in statics:
-        await remove_ipam_for_static(db, st)
+        await remove_ipam_for_static(db, st, touched_subnets=touched_subnets)
     if statics:
         await db.flush()
     return len(statics)
+
+
+async def _held_for_an_orphan(db: Any) -> Any:
+    """Records the retention purge must leave alone (#2604): the aliases an
+    address that is still an orphan withdrew, which its Restore brings back.
+    See :mod:`app.services.ipam.orphan_aliases`."""
+    return is_withdrawn_alias(await withdrawn_alias_owners(db))
 
 
 async def _retract_records_from_providers(
@@ -110,7 +138,7 @@ async def _retract_records_from_providers(
     Scoped to records whose zone's *primary* is agentless AND enabled: that
     mirrors ``enqueue_record_op``'s dispatch (agent-based BIND9 / PowerDNS records
     dropped from their bundle 30 days ago, and a disabled agentless primary, both
-    push nothing), so ``retracted`` only counts pushes that actually applied.
+    push nothing), so ``retracted`` only counts retractions that were actually queued.
     Records whose whole zone is being purged this sweep are excluded in the query
     — the zone teardown in ``_purge_dns_zones`` retracts them wholesale, and the
     explicit record DELETE in ``_sweep`` likewise skips them.
@@ -127,7 +155,11 @@ async def _retract_records_from_providers(
         resolve_primary_server,
     )
 
-    stmt = select(DNSRecord).where(DNSRecord.deleted_at.is_not(None), DNSRecord.deleted_at < cutoff)
+    stmt = select(DNSRecord).where(
+        DNSRecord.deleted_at.is_not(None),
+        DNSRecord.deleted_at < cutoff,
+        ~(await _held_for_an_orphan(db)),
+    )
     if purged_zone_ids:
         # Records inside a zone being purged this sweep ride the zone teardown;
         # keep them out of both the load here and the DELETE in _sweep.
@@ -150,9 +182,11 @@ async def _retract_records_from_providers(
         if primary is None or not is_agentless(primary.driver) or not primary.is_enabled:
             continue
         op = await enqueue_record_op(db, zone, "delete", record_op_payload(record))
-        # Count only pushes that actually landed — a disabled primary returns
-        # None (handled above) and a rejecting provider lands ``failed``.
-        if op is not None and op.state == "applied":
+        # Count retractions that were queued — the provider is called after
+        # the sweep commits (#1539) and a refusing provider is retried from
+        # the op row, which carries the whole payload. A disabled primary
+        # returns None (handled above).
+        if op is not None and op.state in ("applied", "pending"):
             retracted += 1
     if retracted:
         await db.flush()
@@ -170,7 +204,11 @@ async def _purge_dns_records(db: Any, cutoff: datetime, purged_zone_ids: set[Any
     ones are counted by the zone CASCADE, not here. ``include_deleted`` because
     these are soft-deleted rows by definition.
     """
-    stmt = delete(DNSRecord).where(DNSRecord.deleted_at.is_not(None), DNSRecord.deleted_at < cutoff)
+    stmt = delete(DNSRecord).where(
+        DNSRecord.deleted_at.is_not(None),
+        DNSRecord.deleted_at < cutoff,
+        ~(await _held_for_an_orphan(db)),
+    )
     if purged_zone_ids:
         stmt = stmt.where(DNSRecord.zone_id.notin_(purged_zone_ids))
     res = await db.execute(stmt.execution_options(include_deleted=True))
@@ -194,19 +232,23 @@ async def _purge_dns_zones(db: Any, cutoff: datetime) -> tuple[int, int]:
     agent-based zone, so those purge normally. Returns ``(purged, skipped)``.
     ``include_deleted`` because these rows are soft-deleted by definition.
 
-    Retry caveat (#632): the provider teardown is not transactional with the DB,
-    and the cloud / Windows drivers raise "zone not found" on a delete of an
-    already-absent zone (they resolve the provider zone-id first). So a zone that
-    was partially torn down (one agentless member deleted, another failed) — or
-    torn down just before a failed terminal ``_sweep`` commit — can stay
-    ``skipped`` every later sweep, lingering soft-deleted rather than orphaning at
-    the provider. That is the safe failure (the DB keeps the row; an operator can
-    permanent-delete it). Making the drivers treat absent-on-delete as success —
-    which also hardens the permanent zone-delete path — is the real fix, tracked
-    separately.
+    Retry (#632): the provider teardown is not transactional with the DB, so a
+    zone torn down just before a failed terminal ``_sweep`` commit, or torn down
+    on one agentless member while another failed, is pushed again on the next
+    sweep. Windows DNS, ``technitium_api``, Cloudflare, Route 53, Azure, Google
+    and Hetzner report a delete of an already-absent zone as a no-op (#1528,
+    #1537), so the retry converges. DigitalOcean, Linode and Vultr still raise
+    on an absent zone, so such a zone stays ``skipped`` every later sweep: the
+    safe failure (the row is kept, nothing is orphaned), but no delete path
+    can remove it until those drivers treat absence as done too. The Trash
+    page's permanent delete goes through the same helper and fails the same
+    way (#1830).
     """
-    from app.api.v1.dns.router import _push_zone_to_agentless_servers  # noqa: PLC0415
-    from app.services.dns.record_ops import sweep_zone_ops  # noqa: PLC0415
+    from app.services.dns.reverse_zone import (  # noqa: PLC0415
+        hand_over_zone_to_trashed_sharer,
+        trashed_sharers,
+    )
+    from app.services.dns.zone_purge import purge_trashed_zone  # noqa: PLC0415
 
     res = await db.execute(
         select(DNSZone)
@@ -215,9 +257,79 @@ async def _purge_dns_zones(db: Any, cutoff: datetime) -> tuple[int, int]:
     )
     purged = 0
     skipped = 0
-    for zone in res.scalars().all():
+    zones = list(res.scalars().all())
+    # #3751 — every zone's address rows in ONE ascending pass, before any zone
+    # row: an auto-sync batch locks its rows in one ascending pass across zones
+    # (#3726), and a pass per zone interleaves with it into a 40P01. The sweep
+    # commits once at its end (never per zone), so these locks are held for all
+    # the purges below, whose own per-zone lock then re-takes rows already held.
+    # No sync gate here: #3726 found it deadlocks.
+    from app.services.lock_order import lock_addresses_of_zones  # noqa: PLC0415
+
+    await lock_addresses_of_zones(db, [z.id for z in zones])
+    for zone in zones:
+        # Read before the savepoint: rolling it back may expire the row.
+        zone_name, zone_id = zone.name, zone.id
         try:
-            await _push_zone_to_agentless_servers(db, zone, "delete")
+            # #3751 — a savepoint per zone: a database error here (a 40P01, a
+            # lock or statement timeout) aborts the transaction, and the
+            # sweep's closing COMMIT would then roll everything back without
+            # an error. Rolled back to the savepoint, only this zone is undone;
+            # the address locks above were taken outside it and stay held.
+            async with db.begin_nested():
+                # #3190 — a shared auto reverse zone holding the PTRs of a trashed
+                # subnet that has NOT expired is handed to that subnet's batch, not
+                # purged out from under it.
+                heir = await hand_over_zone_to_trashed_sharer(db, zone)
+                if heir is not None:
+                    db.add(
+                        AuditLog(
+                            user_id=None,
+                            user_display_name="system",
+                            auth_source="system",
+                            action="update",
+                            resource_type="dns_zone",
+                            resource_id=str(zone.id),
+                            resource_display=zone.name,
+                            new_value={
+                                "handed_over_to_subnet": str(heir.id),
+                                "deletion_batch_id": str(heir.deletion_batch_id),
+                                "reason": "another trashed subnet's records still sit in the zone",
+                            },
+                            result="success",
+                        )
+                    )
+                    continue
+                # #3889 — an expired zone the operator made (not handed over above)
+                # still holding another trashed subnet's records is kept until that
+                # subnet is purged or restored: its FK cascade would take them.
+                held_by = [] if zone.is_auto_generated else await trashed_sharers(db, zone)
+                if held_by:
+                    logger.info(
+                        "trash_purge.zone_held_for_trashed_subnet",
+                        zone=zone_name,
+                        zone_id=str(zone_id),
+                        subnets=[str(s.network) for s in held_by],
+                        hint="kept until those subnets leave the Trash",
+                    )
+                    continue
+                kept = await purge_trashed_zone(db, zone)
+                if kept:
+                    # #3812: the copy another zone of the same name may use stays at
+                    # the provider; say so where an operator will look for it.
+                    db.add(
+                        AuditLog(
+                            user_id=None,
+                            user_display_name="system",
+                            auth_source="system",
+                            action="permanent_delete",
+                            resource_type="dns_zone",
+                            resource_id=str(zone_id),
+                            resource_display=zone_name,
+                            new_value={"provider_copies_kept": kept},
+                            result="success",
+                        )
+                    )
         except Exception as exc:  # noqa: BLE001 — best-effort; retry next sweep
             # A dead / rejecting provider must NOT let the row Core-DELETE (that
             # orphans the hosted zone forever). Leave it soft-deleted + logged;
@@ -225,35 +337,166 @@ async def _purge_dns_zones(db: Any, cutoff: datetime) -> tuple[int, int]:
             skipped += 1
             logger.warning(
                 "trash_purge.zone_retract_failed",
-                zone=zone.name,
-                zone_id=str(zone.id),
+                zone=zone_name,
+                zone_id=str(zone_id),
                 error=str(exc),
                 hint="left soft-deleted; next daily sweep retries the provider push",
             )
             continue
-        # Ops queued before the soft-delete started sweeping them (#964 review)
-        # have no zone FK to cascade through; sweep defensively so a pre-fix
-        # trash row does not leave a failed queue behind.
-        await sweep_zone_ops(db, zone, zone.group_id)
-        # Core DELETE (not ORM ``db.delete``) — leans on the DB-level FK ON
-        # DELETE CASCADE to remove this zone's still-present soft-deleted records
-        # (they were excluded from the record pass precisely so they'd ride this
-        # delete, atomic with the teardown). An ORM delete would instead fire an
-        # ``all, delete-orphan`` cascade lazy-load per zone — wasted work that
-        # also couples correctness to the soft-delete filter hiding those rows.
-        # ``include_deleted`` bypasses that filter so the WHERE matches this
-        # tombstoned row.
-        await db.execute(
-            delete(DNSZone).where(DNSZone.id == zone.id).execution_options(include_deleted=True)
-        )
         purged += 1
     if purged:
         await db.flush()
     return purged, skipped
 
 
+def _blocks_with_live_descendants() -> Any:
+    """Ids of every block with a LIVE block or subnet anywhere beneath it.
+
+    Recursive, not one level: ``ip_block.parent_block_id`` is ON DELETE
+    CASCADE, so deleting an expired block whose direct child is trashed would
+    take a live grandchild block through that child. (A live subnet is held by
+    its RESTRICT key, but is covered too so the row is skipped rather than
+    refused.) ``UNION``, not ``UNION ALL``, so the walk terminates.
+    """
+    anchor_src = union(
+        select(IPBlock.id.label("id")).where(IPBlock.deleted_at.is_(None)),  # type: ignore[attr-defined]
+        select(Subnet.block_id.label("id")).where(Subnet.deleted_at.is_(None)),  # type: ignore[attr-defined]
+    ).subquery()
+    live_under = select(anchor_src.c.id).cte("live_under", recursive=True)
+    parent = aliased(IPBlock)
+    live_under = live_under.union(
+        select(parent.parent_block_id).where(
+            parent.id == live_under.c.id, parent.parent_block_id.is_not(None)
+        )
+    )
+    return select(live_under.c.id)
+
+
+def _scopes_with_live_children() -> Any:
+    """Ids of every DHCP scope holding a LIVE pool or reservation (FK CASCADE)."""
+    return union(
+        select(DHCPPool.scope_id).where(DHCPPool.deleted_at.is_(None)),  # type: ignore[attr-defined]
+        select(DHCPStaticAssignment.scope_id).where(
+            DHCPStaticAssignment.deleted_at.is_(None)  # type: ignore[attr-defined]
+        ),
+    )
+
+
+def _expired_where(model: type, cutoff: datetime) -> list[Any]:
+    """The rows of ``model`` the sweep may delete: expired, and with nothing LIVE under them.
+
+    A live child under a trashed parent (a restore before #1957 could leave one)
+    is destroyed by the parent's FK CASCADE, or refused by its RESTRICT: the
+    first loses data unannounced, the second raised out of the single sweep
+    transaction and rolled the whole night back, every night. Such a parent is
+    skipped, not deleted, until its child is restored or moved; ``_sweep``
+    reports how many it skipped. A subnet carrying an E911 binding (its own, or
+    on one of its addresses) is held back the same way (#3891).
+    """
+    where: list[Any] = [model.deleted_at.is_not(None), model.deleted_at < cutoff]  # type: ignore[attr-defined]
+    if model is IPBlock:
+        where.append(IPBlock.id.not_in(_blocks_with_live_descendants()))
+    elif model is IPSpace:
+        where += [
+            ~exists().where(IPBlock.space_id == model.id).where(IPBlock.deleted_at.is_(None)),  # type: ignore[attr-defined]
+            ~exists().where(Subnet.space_id == model.id).where(Subnet.deleted_at.is_(None)),  # type: ignore[attr-defined]
+        ]
+    elif model is Subnet:
+        where += [
+            ~exists().where(DHCPScope.subnet_id == model.id).where(DHCPScope.deleted_at.is_(None)),  # type: ignore[attr-defined]
+            ~exists()
+            .where(DHCPScope.subnet_id == model.id)  # type: ignore[attr-defined]
+            .where(DHCPScope.id.in_(_scopes_with_live_children())),
+            # An E911 binding on the subnet, or on an address in it, goes with
+            # the cascade: held back for the operator to move it (#3891).
+            ~subnet_e911_bound_clause(),
+        ]
+    elif model is DHCPScope:
+        where.append(DHCPScope.id.not_in(_scopes_with_live_children()))
+    elif model is Customer:
+        # network_service.customer_id is RESTRICT: a customer with any service
+        # (live, or trashed but not yet expired) waits for it (#2738).
+        where.append(
+            ~exists().where(NetworkService.customer_id == model.id)  # type: ignore[attr-defined]
+        )
+    return where
+
+
+async def _count_held_back(db: Any, model: type, cutoff: datetime) -> int:
+    """Expired rows of ``model`` the sweep leaves because something live is under them."""
+    expired = func.count().filter(
+        model.deleted_at.is_not(None), model.deleted_at < cutoff  # type: ignore[attr-defined]
+    )
+    total = (
+        await db.execute(select(expired).select_from(model).execution_options(include_deleted=True))
+    ).scalar_one()
+    if not total:
+        return 0
+    eligible = (
+        await db.execute(
+            select(func.count())
+            .select_from(model)
+            .where(*_expired_where(model, cutoff))
+            .execution_options(include_deleted=True)
+        )
+    ).scalar_one()
+    return int(total) - int(eligible)
+
+
+async def _delete_expired(db: Any, model: type, cutoff: datetime) -> tuple[int, int]:
+    """Bulk-delete the expired rows of ``model``; one refusing row must not sink the sweep.
+
+    A block or space can still be refused by a subnet that is in the Trash but
+    not yet expired (RESTRICT). That used to raise out of the one sweep
+    transaction. The bulk delete now runs in a savepoint and, if the database
+    refuses, falls back to one savepoint per row, leaving the refused rows for a
+    later night. Returns ``(removed, refused)``; the refused rows are logged
+    once per table per sweep, not once each.
+    """
+    where = _expired_where(model, cutoff)
+    try:
+        async with db.begin_nested():
+            res = await db.execute(
+                delete(model).where(*where).execution_options(include_deleted=True)
+            )
+        return int(res.rowcount or 0), 0
+    except IntegrityError:
+        pass  # fall back to per-row below; the refused rows are logged there
+    ids = (
+        (
+            await db.execute(
+                select(model.id).where(*where).execution_options(include_deleted=True)  # type: ignore[attr-defined]
+            )
+        )
+        .scalars()
+        .all()
+    )
+    removed = 0
+    refused: list[str] = []
+    for row_id in ids:
+        try:
+            async with db.begin_nested():
+                res = await db.execute(
+                    delete(model)
+                    .where(model.id == row_id)  # type: ignore[attr-defined]
+                    .execution_options(include_deleted=True)
+                )
+            removed += int(res.rowcount or 0)
+        except IntegrityError:
+            refused.append(str(row_id))
+    if refused:
+        logger.warning(
+            "trash_purge.rows_refused",
+            table=model.__tablename__,  # type: ignore[attr-defined]
+            count=len(refused),
+            row_ids=refused[:10],
+            hint="something still references them; left in the Trash for a later sweep",
+        )
+    return removed, len(refused)
+
+
 async def _sweep() -> dict[str, Any]:
-    async with task_session() as db:
+    async with task_session(command_timeout=settings.task_db_long_command_timeout) as db:
         ps_res = await db.execute(select(PlatformSettings).limit(1))
         ps = ps_res.scalar_one_or_none()
         purge_days = 30
@@ -271,7 +514,8 @@ async def _sweep() -> dict[str, Any]:
         total_removed = 0
 
         # Release IPAM mirrors before the Core DELETEs wipe the reservations.
-        ipam_released = await _release_ipam_mirrors(db, cutoff)
+        touched_subnets: set[Any] = set()
+        ipam_released = await _release_ipam_mirrors(db, cutoff, touched_subnets)
 
         # Zones about to be per-row purged — records inside them are retracted
         # by the zone teardown, so the record pre-pass skips them (#632).
@@ -305,7 +549,7 @@ async def _sweep() -> dict[str, Any]:
             (
                 await db.execute(
                     select(Subnet.id)
-                    .where(Subnet.deleted_at.is_not(None), Subnet.deleted_at < cutoff)
+                    .where(*_expired_where(Subnet, cutoff))
                     .execution_options(include_deleted=True)
                 )
             )
@@ -316,17 +560,32 @@ async def _sweep() -> dict[str, Any]:
             db, purged_subnet_ids
         )
 
+        # Counted before the deletes: what is held back because a LIVE row sits
+        # under it (#1957) stays in the Trash until that row is restored or
+        # moved, and says so once per sweep rather than vanishing silently.
+        held_back: dict[str, int] = {}
         for model in _PURGE_MODELS_LEAF_FIRST:
-            stmt = (
-                delete(model)
-                .where(model.deleted_at.is_not(None))
-                .where(model.deleted_at < cutoff)
-                .execution_options(include_deleted=True)
+            n = await _count_held_back(db, model, cutoff)
+            if n:
+                held_back[model.__tablename__] = n
+        if held_back:
+            logger.warning(
+                "trash_purge.held_back_live_children",
+                counts=held_back,
+                hint=(
+                    "expired rows with a live row under them, or a subnet an E911 location "
+                    "binding names (its own or on an address), are kept; restore or move the "
+                    "live row, or remove the binding under Network > E911 > Bindings"
+                ),
             )
-            res = await db.execute(stmt)
-            removed = int(res.rowcount or 0)
+
+        refused: dict[str, int] = {}
+        for model in _PURGE_MODELS_LEAF_FIRST:
+            removed, n_refused = await _delete_expired(db, model, cutoff)
             per_type[model.__tablename__] = removed
             total_removed += removed
+            if n_refused:
+                refused[model.__tablename__] = n_refused
 
         # Zones purge per-row AFTER the record DELETE so the provider teardown
         # gates each DB delete and (for excluded in-zone records) the CASCADE has
@@ -352,10 +611,16 @@ async def _sweep() -> dict[str, Any]:
                         "records_retracted_at_provider": records_retracted,
                         "address_records_retracted": address_records_retracted,
                         "zones_retract_skipped": zones_skipped,
+                        "held_back_live_children": held_back,
+                        "refused": refused,
                     },
                     result="success",
                 )
             )
+        # #3354 — the subnets whose reservation mirrors were freed above, and
+        # their blocks. Last, after every provider call and the audit row, so
+        # the audit-chain and subnet / block locks are held only to commit.
+        await recount_subnets_and_blocks(db, touched_subnets)
         await db.commit()
         # The ops above are committed; wake the agents rather than leave the
         # withdrawal to their safety tick (a task has no request collector).
@@ -369,6 +634,8 @@ async def _sweep() -> dict[str, Any]:
             "records_retracted_at_provider": records_retracted,
             "address_records_retracted": address_records_retracted,
             "zones_retract_skipped": zones_skipped,
+            "held_back_live_children": held_back,
+            "refused": refused,
             "purge_days": purge_days,
             "skipped": False,
         }

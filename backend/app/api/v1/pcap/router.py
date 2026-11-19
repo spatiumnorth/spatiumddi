@@ -38,6 +38,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
 from app.api.pagination import MAX_PAGE
+from app.config import settings
+from app.core.celery_dispatch import dispatch
 from app.core.permissions import require_permission
 from app.core.responses import PcapResponse
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
@@ -110,6 +112,7 @@ def _to_read(row: PacketCapture) -> PcapCaptureRead:
         bytes_captured=row.bytes_captured,
         pcap_size_bytes=row.pcap_size_bytes,
         pcap_sha256=row.pcap_sha256,
+        artifact_node=row.artifact_node,
         has_artifact=_has_artifact(row),
         metadata_json=row.metadata_json,
         created_by_user_id=row.created_by_user_id,
@@ -187,8 +190,8 @@ async def list_interfaces(
         else:
             note = (
                 "No interfaces reported yet — the supervisor enumerates them on "
-                'its heartbeat (~30 s). Type a NIC name (e.g. eth0) or "any" '
-                "meanwhile."
+                "its heartbeat (~30 s). Re-open this page shortly, or type the "
+                'host NIC name (as `ip link` shows it on the appliance) or "any".'
             )
         return PcapInterfacesResponse(interfaces=ifaces, note=note)
     raise HTTPException(status_code=422, detail=f"unknown vantage: {vantage!r}")
@@ -299,7 +302,7 @@ async def create_capture(
         try:
             from app.tasks.pcap import run_capture_task  # noqa: PLC0415
 
-            run_capture_task.delay(str(cap.id))
+            await dispatch(run_capture_task, str(cap.id))
         except Exception as exc:  # noqa: BLE001 — broker down
             logger.warning("pcap_dispatch_failed", capture_id=str(cap.id), error=str(exc))
 
@@ -330,7 +333,7 @@ async def list_captures(
 
     total = int((await db.execute(select(func.count()).select_from(base.subquery()))).scalar_one())
     stmt = (
-        base.order_by(PacketCapture.created_at.desc())
+        base.order_by(PacketCapture.created_at.desc(), PacketCapture.id)
         .limit(page_size)
         .offset((page - 1) * page_size)
     )
@@ -455,6 +458,19 @@ async def download_capture(
     if not _has_artifact(row):
         raise HTTPException(status_code=404, detail="Capture has no downloadable artifact yet")
     if not row.pcap_path or not Path(row.pcap_path).exists():
+        holder = (row.artifact_node or "").strip()
+        here = (settings.node_name or "").strip()
+        if holder and here and holder != here:
+            # #2866 — the artifact is on another node's disk, not gone. The
+            # same status #1901 uses for a backup archive held elsewhere.
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"This capture is stored on node {holder}; this request was served "
+                    f"by node {here}, whose disk does not have it. Download it again "
+                    f"through node {holder} (open the Web UI at that node's address)."
+                ),
+            )
         raise HTTPException(
             status_code=404,
             detail="capture artifact no longer on disk (pruned or volume drift)",

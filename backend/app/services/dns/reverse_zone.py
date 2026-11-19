@@ -15,16 +15,27 @@ from __future__ import annotations
 
 import ipaddress
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
 
+from app.core.agent_wake import collect_wake, dns_group_channel
 from app.models.audit import AuditLog
-from app.models.dns import DNSServerGroup, DNSZone
-from app.models.ipam import Subnet
-from app.services.dns.sync_check import _effective_dns
+from app.models.dns import DNSRecord, DNSServerGroup, DNSZone
+from app.models.ipam import IPAddress, Subnet
+from app.services.dns.new_object_defaults import default_zone_ttl
+from app.services.dns.sync_check import (  # noqa: F401 — cidrs_overlap, reverse_zone_network re-exported
+    _effective_dns,
+    cidrs_overlap,
+    ipam_authors_zone,
+    reverse_zone_network,
+    reverse_zone_pieces,
+)
+from app.services.ipam.zone_binding import prune_zone_ids
+from app.services.lock_order import lock_zone_rows
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -39,69 +50,68 @@ logger = structlog.get_logger(__name__)
 # per allocation forever; warn once per (subnet, zone) pair per process, and
 # demote repeats to debug. Log suppression only — never consulted for logic.
 _cross_space_warned: set[tuple[str, str]] = set()
+# #1932 — the same dedupe for the cloud opt-out skip below.
+_cloud_optout_warned: set[tuple[str, str]] = set()
 
 
-def cidrs_overlap(a: object, b: object) -> bool:
-    """True when two CIDR strings are the same address family and overlap.
-
-    #844 uses this instead of a bare space-id comparison: IPv4 reverse zones
-    aggregate to /24 (``compute_reverse_zone_name``), so two NON-overlapping
-    subnets in different spaces legitimately share one reverse zone — their
-    PTR names are disjoint and nothing leaks. Only an actual CIDR overlap
-    can fold two tenants' PTRs onto the same names.
-    """
-    try:
-        na = ipaddress.ip_network(str(a), strict=False)
-        nb = ipaddress.ip_network(str(b), strict=False)
-    except (ValueError, TypeError):
-        return False
-    return na.version == nb.version and na.overlaps(nb)
+def cloud_reverse_optout_message(group_name: str, driver: str) -> str:
+    """Why a subnet in a cloud DNS group gets no reverse zone (#1932). One
+    sentence, shown in the IPAM DNS sync report and logged."""
+    return (
+        f"No reverse zone is created for this subnet: DNS group {group_name!r} "
+        f"runs the cloud driver {driver!r}, which bills per hosted zone, and "
+        f"auto-creating reverse zones there is off. PTR records are skipped. "
+        f"Turn on 'Auto-create reverse zones at the provider' on the group to "
+        f"create them, or create the reverse zone yourself."
+    )
 
 
-def compute_reverse_zone_name(network: str) -> str:
-    """Return the canonical reverse-zone FQDN (with trailing dot) for ``network``.
+async def cloud_reverse_optout_driver(db: AsyncSession, group: DNSServerGroup) -> str | None:
+    """The cloud driver that keeps reverse zones from being auto-created in
+    ``group``, or None when they may be (#1932): the group runs a
+    ``CLOUD_DNS_DRIVERS`` driver and has not opted in."""
+    if group.auto_reverse_zones_at_provider:
+        return None
+    from app.drivers.dns import CLOUD_DNS_DRIVERS  # noqa: PLC0415
+    from app.models.dns import DNSServer  # noqa: PLC0415
 
-    Uses ``ipaddress.ip_network(...).reverse_pointer`` which always produces a
-    properly aligned in-addr.arpa / ip6.arpa name for byte/nibble-aligned
-    prefixes. For non-aligned IPv4 prefixes (e.g. /23) we fall back to the
-    nearest enclosing octet boundary, which is the standard BIND convention for
-    an "aggregated" reverse zone covering multiple smaller subnets.
+    drivers = (
+        (await db.execute(select(DNSServer.driver).where(DNSServer.group_id == group.id)))
+        .scalars()
+        .all()
+    )
+    return next((d for d in sorted(set(drivers)) if d in CLOUD_DNS_DRIVERS), None)
+
+
+def compute_reverse_zone_names(network: str) -> list[str]:
+    """The reverse-zone FQDNs (trailing dot) that cover ``network``, in address
+    order — one zone per /24 the subnet spans (spatiumddi#1840).
+
+    One zone PER PIECE, never one enclosing zone: a /16 zone for a /23 would
+    make SpatiumDDI authoritative for 510 addresses that are not the subnet's,
+    shadowing reverse DNS someone else serves. The piece is the zone boundary
+    that lies inside the subnet:
+
+    * IPv4 /17–/32: the /24 (a /23 gets two zones, a /20 sixteen, a /17 128; a
+      /25 or longer shares its /24's zone with its neighbours).
+    * IPv4 /9–/16: the /16 (a /16 gets its one zone, a /12 sixteen). Per-/24
+      would be up to 32,768 zones; each /16 here lies wholly inside the
+      subnet, so the zone still claims nothing that is not its own.
+    * IPv4 /0–/8: the /8 (up to 256 zones).
+    * IPv6: the next nibble boundary at or past the prefix length — a /44,
+      /48, /56 and /64 each get one zone, a non-aligned /55 its two /56 zones,
+      a /45 its eight /48s (never more than 8 for a real prefix).
     """
     net = ipaddress.ip_network(network, strict=False)
-    if isinstance(net, ipaddress.IPv4Network):
-        # Align to the next-smaller /8, /16, or /24 boundary.
-        if net.prefixlen <= 8:
-            aligned_prefix = 8
-        elif net.prefixlen <= 16:
-            aligned_prefix = 16
-        elif net.prefixlen <= 24:
-            aligned_prefix = 24
-        else:
-            aligned_prefix = 24  # zones at /24 cover sub-prefixes
-        aligned = ipaddress.ip_network(f"{net.network_address}/{aligned_prefix}", strict=False)
-        name = aligned.network_address.reverse_pointer
-        # reverse_pointer for 10.0.0.0 returns "0.0.0.10.in-addr.arpa"
-        # We need to drop leading octets outside the /aligned_prefix.
-        octets_kept = aligned_prefix // 8
-        parts = name.split(".")
-        # first 4 entries are the 4 IPv4 octets in reverse
-        reversed_octets = parts[:4]
-        suffix = ".".join(parts[4:])  # "in-addr.arpa"
-        keep = reversed_octets[4 - octets_kept :]
-        fqdn = ".".join(keep + [suffix])
-    else:
-        # IPv6 — reverse_pointer already yields a full nibble-aligned name.
-        # For prefixes that aren't nibble-aligned, round up to the next nibble.
-        aligned_prefix = ((net.prefixlen + 3) // 4) * 4
-        aligned = ipaddress.ip_network(f"{net.network_address}/{aligned_prefix}", strict=False)
-        name = aligned.network_address.reverse_pointer
-        nibbles_kept = aligned_prefix // 4
-        parts = name.split(".")
-        reversed_nibbles = parts[:32]
-        suffix = ".".join(parts[32:])  # "ip6.arpa"
-        keep = reversed_nibbles[32 - nibbles_kept :]
-        fqdn = ".".join(keep + [suffix])
-    return fqdn if fqdn.endswith(".") else fqdn + "."
+    # bits per reverse label, and labels in a full reverse pointer
+    bits, total = (8, 4) if isinstance(net, ipaddress.IPv4Network) else (4, 32)
+    names: list[str] = []
+    for piece in reverse_zone_pieces(net):
+        parts = piece.network_address.reverse_pointer.split(".")
+        labels = piece.prefixlen // bits  # octets (IPv4) or nibbles (IPv6) kept
+        keep = parts[:total][total - labels :]
+        names.append(".".join(keep + parts[total:]) + ".")
+    return names
 
 
 async def _inherited_dns_group(db: AsyncSession, subnet: Subnet) -> uuid.UUID | None:
@@ -129,15 +139,23 @@ async def _inherited_dns_group(db: AsyncSession, subnet: Subnet) -> uuid.UUID | 
     return None
 
 
-async def ensure_reverse_zone_for_subnet(
+async def ensure_reverse_zones_for_subnet(
     db: AsyncSession,
     subnet: Subnet,
     current_user: User | None,
     *,
     dns_group_id: uuid.UUID | None = None,
     dns_zone_id: uuid.UUID | None = None,
-) -> DNSZone | None:
-    """Create the matching reverse zone for ``subnet`` if one does not exist.
+    honour_opt_out: bool = True,
+) -> list[DNSZone]:
+    """Create the matching reverse zones for ``subnet`` where they do not exist:
+    one per /24 it spans (``compute_reverse_zone_names``, spatiumddi#1840).
+
+    A subnet created with ``skip_reverse_zone`` opted out and stays out
+    (spatiumddi#2735): every path here — the address-sync catch-up, a resize,
+    the bulk backfills — returns ``[]`` for it. Only an operator asking for
+    THIS subnet's zone by name (``honour_opt_out=False``, the per-subnet
+    backfill endpoint) overrides it.
 
     Resolution of the server group:
 
@@ -149,15 +167,21 @@ async def ensure_reverse_zone_for_subnet(
        with inheritance off, else its space — the same walk
        ``GET /subnets/{id}/effective-dns`` answers with: the effective zone's
        group, then the effective ``dns_group_ids[0]`` (spatiumddi#1149).
-    4. If no group can be resolved the call is a no-op and returns ``None``.
+    4. If no group can be resolved the call is a no-op and returns ``[]``.
 
-    The function is idempotent: if a reverse zone with the computed FQDN
-    already exists in the resolved group it is returned unchanged (or, #844,
+    The function is idempotent, per zone of the set: one that already exists
+    in the resolved group is returned unchanged (or, #844,
     refused when an overlapping subnet in another IP space owns it — however
-    the group was resolved).
+    the group was resolved). A zone of that name SpatiumDDI does not author —
+    a forwarder, a secondary or a stub — is not adopted: another server owns
+    the subnet's reverse names, so that zone is left out of the result and
+    nothing is created beside it (spatiumddi#1419).
 
     Writes an ``audit_log`` entry on newly-created zones.
     """
+    if honour_opt_out and getattr(subnet, "skip_reverse_zone", False):
+        return []
+
     # 1. Resolve the server group
     group_id = dns_group_id
     if group_id is None:
@@ -190,7 +214,7 @@ async def ensure_reverse_zone_for_subnet(
             subnet_id=str(subnet.id),
             network=str(subnet.network),
         )
-        return None
+        return []
 
     group = await db.get(DNSServerGroup, group_id)
     if group is None:
@@ -199,27 +223,126 @@ async def ensure_reverse_zone_for_subnet(
             subnet_id=str(subnet.id),
             group_id=str(group_id),
         )
-        return None
+        return []
 
-    # 2. Compute reverse FQDN
+    # 2. Compute the reverse FQDNs — one per /24 (nibble piece) the subnet spans
     try:
-        reverse_name = compute_reverse_zone_name(str(subnet.network))
+        names = compute_reverse_zone_names(str(subnet.network))
     except ValueError:
         logger.warning(
             "reverse_zone_compute_failed",
             subnet_id=str(subnet.id),
             network=str(subnet.network),
         )
-        return None
+        return []
 
-    # 3. Idempotency — return any existing zone with this FQDN in this group
-    existing_q = await db.execute(
-        select(DNSZone).where(
-            DNSZone.group_id == group.id,
-            DNSZone.name == reverse_name,
+    # 3. Zones of the set that already exist (one query, not one per name)
+    found = (
+        (
+            await db.execute(
+                select(DNSZone).where(DNSZone.group_id == group.id, DNSZone.name.in_(names))
+            )
         )
+        .scalars()
+        .all()
     )
-    existing = existing_q.scalar_one_or_none()
+    by_name = {z.name: z for z in found}
+    if found and any(n not in by_name for n in names):
+        # #3503 — a zone created below is audited, and that audit row's flush
+        # takes the audit-chain lock. The caller's PTR may then go into one of
+        # the zones that ALREADY exist (a /23 with one /24 zone in place), and
+        # bumping its serial after that lock deadlocks against a record create
+        # holding the row. Take those rows first, in id order. Only on this
+        # path: with nothing to create there is no audit row and no lock.
+        await db.execute(
+            select(DNSZone.id)
+            .where(DNSZone.id.in_(sorted(z.id for z in found)))
+            .order_by(DNSZone.id)
+            .with_for_update(key_share=True)
+        )
+    # #1932 — a cloud group that has not opted in gets no NEW reverse zone.
+    # Ones it already holds are still returned, as they were.
+    optout_driver = (
+        await cloud_reverse_optout_driver(db, group)
+        if any(n not in by_name for n in names)
+        else None
+    )
+    if optout_driver is not None:
+        key = (str(subnet.id), str(group.id))
+        log_fn = logger.debug if key in _cloud_optout_warned else logger.warning
+        _cloud_optout_warned.add(key)
+        log_fn(
+            "reverse_zone_skipped_cloud_optout",
+            subnet_id=str(subnet.id),
+            network=str(subnet.network),
+            group_id=str(group.id),
+            driver=optout_driver,
+            missing=sum(1 for n in names if n not in by_name),
+        )
+    out: list[DNSZone] = []
+    for name in names:
+        if optout_driver is not None and name not in by_name:
+            continue
+        zone = await _ensure_zone_named(db, subnet, group, name, by_name.get(name), current_user)
+        if zone is not None:
+            out.append(zone)
+    if any(z.name not in by_name for z in out):
+        # One wake for the whole set, however many zones it created (a /17
+        # makes 128): the collector is a set, flushed once after the commit,
+        # so the agents re-render once rather than waiting for the safety
+        # tick. No-op outside a request (Celery callers converge on the
+        # bundle-dirty render, which wakes its own servers).
+        collect_wake(dns_group_channel(group.id))
+    return out
+
+
+async def ensure_reverse_zone_for_subnet(
+    db: AsyncSession,
+    subnet: Subnet,
+    current_user: User | None,
+    *,
+    dns_group_id: uuid.UUID | None = None,
+    dns_zone_id: uuid.UUID | None = None,
+    honour_opt_out: bool = True,
+) -> DNSZone | None:
+    """:func:`ensure_reverse_zones_for_subnet`, returning the first zone of the
+    set (or ``None``)."""
+    zones = await ensure_reverse_zones_for_subnet(
+        db,
+        subnet,
+        current_user,
+        dns_group_id=dns_group_id,
+        dns_zone_id=dns_zone_id,
+        honour_opt_out=honour_opt_out,
+    )
+    return zones[0] if zones else None
+
+
+async def _ensure_zone_named(
+    db: AsyncSession,
+    subnet: Subnet,
+    group: DNSServerGroup,
+    reverse_name: str,
+    existing: DNSZone | None,
+    current_user: User | None,
+) -> DNSZone | None:
+    """Idempotently ensure ONE reverse zone of ``subnet``'s set exists.
+    ``existing`` is the zone of that name already in the group, if any."""
+    # Idempotency — an existing zone with this FQDN in this group is returned.
+    if existing is not None and not ipam_authors_zone(existing):
+        # #1419 — a forwarder, a secondary or a stub of this name: another
+        # server owns the subnet's reverse names. It is not the subnet's
+        # reverse zone (IPAM writes no PTR into it), and the (group_id,
+        # view_id, name) unique constraint leaves no room for a primary
+        # beside it.
+        logger.debug(
+            "reverse_zone_not_authored",
+            subnet_id=str(subnet.id),
+            zone_id=str(existing.id),
+            name=reverse_name,
+            zone_type=existing.zone_type,
+        )
+        return None
     if existing is not None:
         # #844 — an OVERLAPPING CIDR in another IP space computes the same
         # reverse zone name, and the (group_id, view_id, name) unique
@@ -282,11 +405,23 @@ async def ensure_reverse_zone_for_subnet(
         name=reverse_name,
         zone_type="primary",
         kind="reverse",
+        ttl=await default_zone_ttl(db, group.id),  # #3087
         is_auto_generated=True,
         linked_subnet_id=subnet.id,
     )
     db.add(zone)
     await db.flush()
+    # #1932 — an agentless group (technitium_api / Windows Path B / cloud)
+    # only gets the zone when it is pushed; the zone endpoints do that, this
+    # path used to create the row alone, so every PTR op failed with "No such
+    # zone". Marked and queued for after the commit, ahead of the record ops;
+    # every create path that reaches the provider for an auto zone is here
+    # (IPAM create / auto-sync / DDNS / subnet create all call this).
+    from app.services.dns.record_ops import (  # noqa: PLC0415
+        provision_zone_at_agentless_servers,
+    )
+
+    await provision_zone_at_agentless_servers(db, zone)
 
     db.add(
         AuditLog(
@@ -327,36 +462,22 @@ async def ensure_reverse_zone_for_subnet(
 # subnet sharing the aggregated /24. Both paths now go through here.
 
 
-def reverse_zone_network(name: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
-    """The network an octet-aligned ``in-addr.arpa`` (nibble-aligned
-    ``ip6.arpa``) zone name covers — the inverse of
-    :func:`compute_reverse_zone_name`. ``None`` for any other name."""
-    labels = name.lower().rstrip(".").split(".")
-    if labels[-2:] == ["in-addr", "arpa"]:
-        octets = labels[:-2][::-1]
-        if not 1 <= len(octets) <= 3 or not all(o.isdigit() and int(o) <= 255 for o in octets):
-            return None
-        addr = ".".join(octets + ["0"] * (4 - len(octets)))
-        return ipaddress.ip_network(f"{addr}/{8 * len(octets)}")
-    if labels[-2:] == ["ip6", "arpa"]:
-        nibbles = labels[:-2][::-1]
-        if not 1 <= len(nibbles) <= 32 or not all(
-            len(n) == 1 and n in "0123456789abcdef" for n in nibbles
-        ):
-            return None
-        hexstr = "".join(nibbles).ljust(32, "0")
-        addr = ":".join(hexstr[i : i + 4] for i in range(0, 32, 4))
-        return ipaddress.ip_network(f"{addr}/{4 * len(nibbles)}")
-    return None
-
-
-async def surviving_sharer(db: AsyncSession, zone: DNSZone, subnet: Subnet) -> uuid.UUID | None:
+async def surviving_sharer(
+    db: AsyncSession,
+    zone: DNSZone,
+    subnet: Subnet,
+    *,
+    exclude_ids: frozenset[uuid.UUID] = frozenset(),
+) -> uuid.UUID | None:
     """The id of another live subnet whose addresses fall inside the network
     ``zone`` covers — a /25 beside the one being deleted in an aggregated /24
     zone — or ``None``. Such a zone must outlive the subnet: it is re-linked
     to the survivor (the same-space one first) instead of retired, the way
     :func:`ensure_reverse_zone_for_subnet` already re-links a dangling zone
-    to the next subnet that needs it."""
+    to the next subnet that needs it.
+
+    ``exclude_ids`` are subnets going away in the same operation (a block or
+    space delete, not yet stamped): none of them can be the survivor."""
     covered = reverse_zone_network(zone.name)
     if covered is None:
         return None
@@ -364,17 +485,57 @@ async def surviving_sharer(db: AsyncSession, zone: DNSZone, subnet: Subnet) -> u
         await db.execute(
             text(
                 "SELECT id FROM subnet WHERE id != CAST(:sid AS uuid) "
+                "AND id != ALL(CAST(:excl AS uuid[])) "
                 "AND deleted_at IS NULL AND network <<= CAST(:covered AS cidr) "
                 "ORDER BY (space_id = CAST(:space AS uuid)) DESC, network LIMIT 1"
             ),
-            {"sid": str(subnet.id), "covered": str(covered), "space": str(subnet.space_id)},
+            {
+                "sid": str(subnet.id),
+                "covered": str(covered),
+                "space": str(subnet.space_id),
+                "excl": [str(i) for i in exclude_ids],
+            },
         )
     ).first()
     return row[0] if row else None
 
 
+async def _retirement_plan(
+    db: AsyncSession,
+    subnet: Subnet,
+    exclude_ids: frozenset[uuid.UUID],
+    *,
+    refresh: bool = False,
+) -> list[tuple[DNSZone, uuid.UUID | None]]:
+    """Each reverse zone ``subnet`` auto-created, with the live subnet that
+    keeps it (:func:`surviving_sharer`), or ``None`` when the zone goes with
+    ``subnet``. It only reads, so a delete's approval preview decides which
+    zones the delete takes by the delete's own rule (spatiumddi#3511).
+    ``refresh`` re-reads zones already loaded, as their locks found them."""
+    stmt = select(DNSZone).where(
+        DNSZone.linked_subnet_id == subnet.id,
+        DNSZone.is_auto_generated.is_(True),
+    )
+    if refresh:
+        stmt = stmt.execution_options(populate_existing=True)
+    zones = (await db.execute(stmt)).scalars().all()
+    return [
+        (zone, await surviving_sharer(db, zone, subnet, exclude_ids=exclude_ids)) for zone in zones
+    ]
+
+
+def _batch_subnets(batch: SoftDeleteBatch) -> tuple[list[Subnet], frozenset[uuid.UUID]]:
+    """The subnets ``batch`` trashes, and their ids: none of them keeps a zone."""
+    subnets = [row.obj for row in batch.rows if isinstance(row.obj, Subnet)]
+    return subnets, frozenset(sub.id for sub in subnets)
+
+
 async def retire_auto_reverse_zones(
-    db: AsyncSession, subnet: Subnet, *, batch: SoftDeleteBatch | None = None
+    db: AsyncSession,
+    subnet: Subnet,
+    *,
+    batch: SoftDeleteBatch | None = None,
+    exclude_ids: frozenset[uuid.UUID] = frozenset(),
 ) -> tuple[list[DNSZone], list[DNSZone], set[uuid.UUID]]:
     """Take the reverse zones ``subnet`` auto-created out of service with it.
 
@@ -387,7 +548,10 @@ async def retire_auto_reverse_zones(
       one deletion and a restore brings subnet and zone back together; without
       one (the permanent path) it is hard-deleted the way the zone-delete
       operation does it: agentless servers told, queued ops swept, records
-      deleted set-based, the zone row deleted.
+      deleted set-based, the zone row deleted — unless a trashed sibling's
+      records still sit in it (spatiumddi#3190): then it goes to the Trash in
+      that sibling's batch instead (``relinked``), so a permanent delete never
+      takes rows of another deletion with it.
 
     Returns ``(retired, relinked, dns_group_ids_to_wake)``; the caller wakes
     the groups after its commit so the agents re-render without waiting for
@@ -395,27 +559,23 @@ async def retire_auto_reverse_zones(
     """
     from sqlalchemy import delete as sa_delete  # noqa: PLC0415
 
-    from app.models.dns import DNSRecord  # noqa: PLC0415
     from app.services.dns.record_ops import sweep_zone_ops  # noqa: PLC0415
     from app.services.soft_delete import add_to_batch  # noqa: PLC0415
 
-    zones = (
-        (
-            await db.execute(
-                select(DNSZone).where(
-                    DNSZone.linked_subnet_id == subnet.id,
-                    DNSZone.is_auto_generated.is_(True),
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
     retired: list[DNSZone] = []
     relinked: list[DNSZone] = []
     wake: set[uuid.UUID] = set()
-    for zone in zones:
-        survivor = await surviving_sharer(db, zone, subnet)
+    # #3688: the plan's zone rows before anything of theirs is written, in id
+    # order (``lock_order``), so the sweep below (queued ops) never runs ahead
+    # of the zone row: a zone delete takes the row, then the ops. The plan is
+    # read again once the rows are held, so a zone a delete removed meanwhile
+    # is not retired twice, and one a move re-homed meanwhile is swept in the
+    # group it is in now.
+    plan = await _retirement_plan(db, subnet, exclude_ids)
+    if plan:
+        await lock_zone_rows(db, [zone.id for zone, _ in plan])
+        plan = await _retirement_plan(db, subnet, exclude_ids, refresh=True)
+    for zone, survivor in plan:
         if survivor is not None:
             zone.linked_subnet_id = survivor
             relinked.append(zone)
@@ -429,6 +589,15 @@ async def retire_auto_reverse_zones(
             )
             continue
         await sweep_zone_ops(db, zone, zone.group_id)
+        heir = await _trashed_sharer(db, zone, exclude_ids | {subnet.id}) if batch is None else None
+        if heir is not None:
+            # #3190 — a trashed sibling's PTRs sit in the zone; deleting it would
+            # take them out of that sibling's batch. The zone goes to the Trash
+            # with the sibling instead, and comes back with its restore.
+            await _hand_over(db, zone, heir)
+            wake.add(zone.group_id)
+            relinked.append(zone)
+            continue
         if batch is not None:
             await add_to_batch(db, batch, zone)
         else:
@@ -437,6 +606,7 @@ async def retire_auto_reverse_zones(
             await _push_zone_to_agentless_servers(db, zone, "delete")
             await db.execute(sa_delete(DNSRecord).where(DNSRecord.zone_id == zone.id))
             await db.delete(zone)
+            await prune_zone_ids(db, [zone.id])
         wake.add(zone.group_id)
         retired.append(zone)
         logger.info(
@@ -447,3 +617,263 @@ async def retire_auto_reverse_zones(
             mode="trash" if batch is not None else "delete",
         )
     return retired, relinked, wake
+
+
+async def retire_auto_reverse_zones_for_batch(
+    db: AsyncSession, batch: SoftDeleteBatch
+) -> set[uuid.UUID]:
+    """The block / space delete's half of :func:`retire_auto_reverse_zones`
+    (spatiumddi#2734): every subnet the batch is about to trash takes the
+    reverse zones it auto-created into the same batch, so the Trash shows one
+    deletion and one restore brings all of it back. Call BEFORE
+    ``apply_soft_delete``. The batch's own subnets are never a survivor — they
+    are all going — so only a subnet outside the batch keeps a shared zone
+    alive. Returns the DNS group ids to wake after the commit."""
+    subnets, going = _batch_subnets(batch)
+    wake: set[uuid.UUID] = set()
+    for sub in subnets:
+        _retired, _relinked, groups = await retire_auto_reverse_zones(
+            db, sub, batch=batch, exclude_ids=going
+        )
+        wake |= groups
+    return wake
+
+
+async def add_retiring_reverse_zones(db: AsyncSession, batch: SoftDeleteBatch) -> None:
+    """Add to ``batch`` the reverse zones a soft delete of it retires into it,
+    with their records: the zones :func:`retire_auto_reverse_zones_for_batch`
+    adds, by the same plan, and for one subnet's batch the zones
+    :func:`retire_auto_reverse_zones` adds (the subnet is never its own
+    survivor either way). It only reads: no queued op is swept, no zone is
+    re-linked, no group is woken. The approval preview of a subnet, block or
+    space delete counts the batch this leaves, so it names the zones and
+    records the delete trashes and the approve-time drift check sees them
+    change (spatiumddi#3511)."""
+    from app.services.soft_delete import add_to_batch  # noqa: PLC0415
+
+    subnets, going = _batch_subnets(batch)
+    for sub in subnets:
+        for zone, survivor in await _retirement_plan(db, sub, going):
+            if survivor is None:
+                await add_to_batch(db, batch, zone)
+
+
+async def _trashed_sharer(
+    db: AsyncSession, zone: DNSZone, exclude_ids: frozenset[uuid.UUID]
+) -> Subnet | None:
+    """The trashed subnet, outside ``exclude_ids``, whose trashed records still
+    sit in ``zone`` under a batch other than the zone's own (spatiumddi#3190),
+    the most recently deleted first; or ``None``."""
+    stmt: Any = (
+        select(Subnet)
+        .join(IPAddress, IPAddress.subnet_id == Subnet.id)
+        .join(DNSRecord, DNSRecord.ip_address_id == IPAddress.id)
+        .where(
+            DNSRecord.zone_id == zone.id,
+            DNSRecord.deleted_at.is_not(None),
+            DNSRecord.deletion_batch_id.is_distinct_from(zone.deletion_batch_id),
+            Subnet.deleted_at.is_not(None),
+            Subnet.deletion_batch_id.is_not(None),
+            Subnet.id.not_in(list(exclude_ids)),
+        )
+        .order_by(Subnet.deleted_at.desc(), Subnet.id)
+        .limit(1)
+        .execution_options(include_deleted=True)
+    )
+    return (await db.execute(stmt)).scalars().first()
+
+
+async def trashed_sharers(db: AsyncSession, zone: DNSZone) -> list[Subnet]:
+    """Every trashed subnet whose trashed records still sit in ``zone`` under a
+    batch other than the zone's own (spatiumddi#3504): the subnets a purge of the
+    zone's own Trash row would take records from. A LIVE zone counts too
+    (spatiumddi#3826), and so does one the operator made (spatiumddi#3889, a
+    forward zone holding a trashed subnet's A records): a permanent delete of
+    any of them cascades the same records away."""
+    stmt: Any = (
+        select(Subnet)
+        .join(IPAddress, IPAddress.subnet_id == Subnet.id)
+        .join(DNSRecord, DNSRecord.ip_address_id == IPAddress.id)
+        .where(
+            DNSRecord.zone_id == zone.id,
+            DNSRecord.deleted_at.is_not(None),
+            DNSRecord.deletion_batch_id.is_distinct_from(zone.deletion_batch_id),
+            Subnet.deleted_at.is_not(None),
+            Subnet.deletion_batch_id.is_not(None),
+        )
+        .distinct()
+        .order_by(Subnet.network)
+        .execution_options(include_deleted=True)
+    )
+    return list((await db.execute(stmt)).scalars().all())
+
+
+async def refuse_delete_with_trashed_sharers(db: AsyncSession, zone: DNSZone) -> None:
+    """409 when deleting ``zone`` (live, auto or operator-made) for good would take the
+    trashed records of other subnets' Trash batches with it (spatiumddi#3826):
+    the guard the Trash's own purge of the zone has had since #3504, for the
+    permanent delete through the zone route and the copilot. Nothing is touched."""
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    sharers = await trashed_sharers(db, zone)
+    if not sharers:
+        return
+    names = [f"subnet {sub.network}" for sub in sharers]
+    shown = ", ".join(names[:5]) + (f" and {len(names) - 5} more" if len(names) > 5 else "")
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"Cannot permanently delete {zone.name}: it still holds the trashed DNS records "
+            f"of {shown}, in another Trash batch, and that batch's restore needs them. "
+            "Purge those subnets from the Trash first, or restore them; nothing was deleted."
+        ),
+    )
+
+
+async def _hand_over(db: AsyncSession, zone: DNSZone, heir: Subnet) -> None:
+    """Re-link ``zone`` to the trashed ``heir`` and stamp it, with the records
+    riding it, into the heir's deletion batch (spatiumddi#3190).
+
+    The records that ride it: every live one when the zone is live (the
+    permanent-delete paths, which used to delete them with the zone), else the
+    ones carrying the zone's own batch, less any auto-generated record bound to
+    an address OUTSIDE the heir: that one was published for another subnet and
+    keeps its own batch, or the heir's restore would publish it. (Both callers
+    retract the purged subnets' own records first, so on the live path none of
+    those is left to move.)"""
+    if zone.deleted_at is None:
+        rides: Any = DNSRecord.deleted_at.is_(None)
+    elif zone.deletion_batch_id is not None:
+        rides = (DNSRecord.deletion_batch_id == zone.deletion_batch_id) & ~(
+            DNSRecord.auto_generated.is_(True)
+            & DNSRecord.ip_address_id.in_(
+                select(IPAddress.id).where(IPAddress.subnet_id != heir.id)
+            )
+        )
+    else:
+        rides = None
+    if rides is not None:
+        await db.execute(
+            update(DNSRecord)
+            .where(DNSRecord.zone_id == zone.id, rides)
+            .values(
+                deleted_at=heir.deleted_at,
+                deleted_by_user_id=heir.deleted_by_user_id,
+                deletion_batch_id=heir.deletion_batch_id,
+            )
+            .execution_options(include_deleted=True, synchronize_session=False)
+        )
+    zone.linked_subnet_id = heir.id
+    zone.deleted_at = heir.deleted_at
+    zone.deleted_by_user_id = heir.deleted_by_user_id
+    zone.deletion_batch_id = heir.deletion_batch_id
+    logger.info(
+        "reverse_zone_handed_over",
+        zone_id=str(zone.id),
+        name=zone.name,
+        subnet_id=str(heir.id),
+        reason="trashed records of another batch still live in the zone",
+    )
+
+
+async def hand_over_zone_to_trashed_sharer(
+    db: AsyncSession,
+    zone: DNSZone,
+    *,
+    exclude_ids: frozenset[uuid.UUID] = frozenset(),
+) -> Subnet | None:
+    """Keep a TRASHED auto reverse zone alive for another batch that still needs it
+    (spatiumddi#3190).
+
+    Two /25s share one /24 zone. The first one's delete re-links the zone to the
+    second; the second's delete then retires the zone into ITS batch, so the first
+    batch's PTRs sit in a zone owned by someone else's batch. Purging that zone
+    drops the first batch's PTRs through the zone's FK cascade, though the purge
+    dialog never named them, and the first subnet's restore then comes back with
+    no reverse zone and no PTRs.
+
+    When ``zone`` (trashed) still holds trashed records of an address of a trashed
+    subnet outside ``exclude_ids`` (the subnets going away in this purge), the zone
+    is not purged: it is handed over to that subnet's batch (re-linked to it, with
+    the records of the zone's own batch, see :func:`_hand_over`), so the subnet's
+    restore brings zone and PTRs back and its own purge takes them. Returns that
+    subnet, or ``None`` when nothing needs the zone and it may go.
+    """
+    if zone.deleted_at is None or not zone.is_auto_generated:
+        return None
+    heir = await _trashed_sharer(db, zone, exclude_ids)
+    if heir is None:
+        return None
+    await _hand_over(db, zone, heir)
+    return heir
+
+
+async def purge_auto_reverse_zones(
+    db: AsyncSession,
+    subnets: list[Subnet],
+    *,
+    audit: Callable[[DNSZone], None] | None = None,
+    audit_handover: Callable[[DNSZone, Subnet], None] | None = None,
+) -> set[uuid.UUID]:
+    """Take the auto-created reverse zones of subnets being purged from the
+    Trash with them (spatiumddi#2734). Two shapes, both reached before the
+    subnet rows go (``dns_zone.linked_subnet_id`` is SET NULL, so afterwards
+    nothing says whose zone it was):
+
+    * a zone that went to the Trash with its subnet is purged through the one
+      teardown every trashed zone uses (agentless servers told first; raises
+      without touching the row when a provider refuses, or while a live record
+      sits under it);
+    * a zone still LIVE and linked to a trashed subnet — what the block and
+      space deletes used to leave behind — is retired the way a permanent
+      subnet delete does it (re-linked to a surviving sharer, else deleted).
+
+    A trashed zone still holding another trashed subnet's records is handed
+    to that subnet's batch instead of purged (spatiumddi#3190).
+
+    The caller owns the commit; ``audit`` is called with each trashed zone
+    purged, and ``audit_handover`` with each one handed over and its new
+    subnet, for the caller's own audit rows. Returns the group ids to wake."""
+    if not subnets:
+        return set()
+    from app.services.dns.zone_purge import purge_trashed_zone  # noqa: PLC0415
+
+    ids = [sub.id for sub in subnets]
+    going = frozenset(ids)
+    wake: set[uuid.UUID] = set()
+    trashed = (
+        (
+            await db.execute(
+                select(DNSZone)
+                .where(
+                    DNSZone.linked_subnet_id.in_(ids),
+                    DNSZone.is_auto_generated.is_(True),
+                    DNSZone.deleted_at.is_not(None),
+                )
+                .execution_options(include_deleted=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    # #3751 — all the zones' address rows in one ascending pass before any
+    # zone row (the caller's transaction holds them through every purge below),
+    # the order an auto-sync batch takes its rows in. No sync gate (#3726).
+    from app.services.lock_order import lock_addresses_of_zones  # noqa: PLC0415
+
+    await lock_addresses_of_zones(db, [z.id for z in trashed])
+    for zone in trashed:
+        # #3190 — another trashed subnet's PTRs in a shared zone are not ours to take.
+        heir = await hand_over_zone_to_trashed_sharer(db, zone, exclude_ids=going)
+        if heir is not None:
+            if audit_handover is not None:
+                audit_handover(zone, heir)
+            continue
+        await purge_trashed_zone(db, zone)
+        if audit is not None:
+            audit(zone)
+        wake.add(zone.group_id)
+    for sub in subnets:
+        _retired, _relinked, groups = await retire_auto_reverse_zones(db, sub, exclude_ids=going)
+        wake |= groups
+    return wake

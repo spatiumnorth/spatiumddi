@@ -4,11 +4,10 @@ Mirrors the DNS agent's ``supervisor.py``: the Python agent process owns
 the daemon subprocess directly (``gobgp.start_daemon`` — there is exactly
 one daemon to manage here, same as BIND9's single ``named``), rather than
 a shell-level supervise loop. If gobgpd dies, or any agent thread dies
-(and doesn't recover — a 401/404 sets its own stop event, see ``sync.py``
-/ ``heartbeat.py``), the process exits non-zero so the container
-orchestrator restarts everything, which re-bootstraps from the cached PSK
-and re-launches gobgpd from the last-known-good on-disk config (non-
-negotiable #5).
+(a 401/404 no longer ends one: it re-registers in process, #2052 — see
+``bootstrap.reauthenticate``), the process exits non-zero so the container
+orchestrator restarts everything, which re-launches gobgpd from the
+last-known-good on-disk config (non-negotiable #5).
 """
 
 from __future__ import annotations
@@ -90,10 +89,9 @@ def run(cfg: AgentConfig) -> int:
         if not gobgp.daemon_running(proc):
             log.error("lg_gobgpd_exited")
             return 2
-        # If any agent thread died (e.g. sync/heartbeat dropped its token
-        # after a 401/404 and self-stopped), exit so the container
-        # orchestrator restarts us — bootstrap then re-registers from PSK
-        # with a fresh empty token cache.
+        # If any agent thread died, exit so the container orchestrator
+        # restarts us. A 401/404 is not a death: the thread re-registers in
+        # process (#2052), so the daemon is never taken down for one.
         dead = [t.name for t in threads if not t.is_alive()]
         if dead:
             log.error("lg_agent_thread_died", threads=dead)

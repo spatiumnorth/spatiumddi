@@ -46,6 +46,7 @@ class FindBrandingSettingsArgs(BaseModel):
 
 @register_tool(
     name="find_branding_settings",
+    permission="authenticated",
     description=(
         "Return the platform branding configuration — the product title "
         "shown in the browser tab / sign-in heading / sidebar wordmark, "
@@ -102,6 +103,6 @@ async def find_branding_settings(
         "note": (
             "Branding writes are superadmin-only because these fields render "
             "to anonymous visitors on the login page. Change them in "
-            "Settings -> Branding."
+            "Settings -> Branding & URL."
         ),
     }

@@ -18,11 +18,14 @@ import {
   type MetalLBBgpPeer,
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
+import { pollUnlessRefused } from "@/lib/refusal";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { Field, errMsg, humanDuration, humanTime, inputCls } from "../_shared";
 import { PeerDetailModal } from "./PeerDetailModal";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 // Established = green, the transitional FSM states = amber, Idle = rose.
 // Exported so PeerDetailModal's header chip reuses the exact same
@@ -64,7 +67,19 @@ export function SessionsTab({
   onViewRoutes: (peerId: string) => void;
 }) {
   const qc = useQueryClient();
+  // #3104 — peers sit under the router's 'bgp_lg_peer' gate; a read-only
+  // user is offered no write on them.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "bgp_lg_peer"),
+    "Requires write permission on BGP peers",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "bgp_lg_peer"),
+    "Requires delete permission on BGP peers",
+  );
   const [deleteTarget, setDeleteTarget] = useState<BGPLGPeer | null>(null);
+  const [deleteErr, setDeleteErr] = useState<string | null>(null);
   const [viewingPeerId, setViewingPeerId] = useState<string | null>(null);
 
   // Session-state rows are live telemetry — poll modestly so a flap shows up
@@ -72,7 +87,7 @@ export function SessionsTab({
   const sessionsQ = useQuery({
     queryKey: ["bgp-lg-sessions"],
     queryFn: () => lookingGlassApi.listSessions(),
-    refetchInterval: 15_000,
+    refetchInterval: pollUnlessRefused(15_000),
   });
   // Peers carry the full config (matched_asn_id, collector, description, …)
   // that SessionRead doesn't — needed for the ASN link + the edit/delete
@@ -80,7 +95,7 @@ export function SessionsTab({
   const peersQ = useQuery({
     queryKey: ["bgp-lg-peers"],
     queryFn: () => lookingGlassApi.listPeers(),
-    refetchInterval: 15_000,
+    refetchInterval: pollUnlessRefused(15_000),
   });
 
   const peersById = useMemo(() => {
@@ -93,6 +108,8 @@ export function SessionsTab({
 
   const deleteM = useMutation({
     mutationFn: (id: string) => lookingGlassApi.deletePeer(id),
+    onMutate: () => setDeleteErr(null),
+    onError: (e) => setDeleteErr(errMsg(e, "Failed to delete peer.")),
     onSuccess: () => {
       setDeleteTarget(null);
       void qc.invalidateQueries({ queryKey: ["bgp-lg-sessions"] });
@@ -124,7 +141,10 @@ export function SessionsTab({
   if (sessions.length === 0) {
     return (
       <div className="rounded-md border border-dashed p-8 text-center text-sm text-muted-foreground">
-        No peers configured yet — click "Add Peer" above to peer with a router.
+        No peers configured yet
+        {writeGate.disabled
+          ? "."
+          : ' — click "Add Peer" above to peer with a router.'}
       </div>
     );
   }
@@ -225,16 +245,20 @@ export function SessionsTab({
                         <button
                           type="button"
                           title="Edit peer"
+                          aria-label="Edit peer"
                           className="rounded p-1 hover:bg-muted"
                           onClick={() => onEdit(peer)}
+                          {...writeGate}
                         >
                           <Pencil className="h-3.5 w-3.5" />
                         </button>
                         <button
                           type="button"
                           title="Delete peer"
+                          aria-label="Delete peer"
                           className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
                           onClick={() => setDeleteTarget(peer)}
+                          {...deleteGate}
                         >
                           <Trash2 className="h-3.5 w-3.5" />
                         </button>
@@ -252,14 +276,24 @@ export function SessionsTab({
         open={!!deleteTarget}
         title="Delete peer"
         message={
-          deleteTarget
-            ? `Delete the BGP session to "${deleteTarget.name}" (AS${deleteTarget.peer_asn} at ${deleteTarget.peer_address})? Its learned routes are removed too. This only tears down the receive-only session on the collector — it does not affect the router on the other end.`
-            : ""
+          deleteTarget ? (
+            <>
+              {`Delete the BGP session to "${deleteTarget.name}" (AS${deleteTarget.peer_asn} at ${deleteTarget.peer_address})? Its learned routes are removed too. This only tears down the receive-only session on the collector — it does not affect the router on the other end.`}
+              {deleteErr && (
+                <span className="mt-2 block text-destructive">{deleteErr}</span>
+              )}
+            </>
+          ) : (
+            ""
+          )
         }
         confirmLabel="Delete"
         tone="destructive"
         loading={deleteM.isPending}
-        onClose={() => setDeleteTarget(null)}
+        onClose={() => {
+          setDeleteTarget(null);
+          setDeleteErr(null);
+        }}
         onConfirm={() => deleteTarget && deleteM.mutate(deleteTarget.id)}
       />
 
@@ -479,9 +513,9 @@ export function PeerFormModal({
         </div>
 
         {err && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
             {err}
-          </div>
+          </FormError>
         )}
 
         {!isEdit && metallbBgpPeers.length > 0 && (

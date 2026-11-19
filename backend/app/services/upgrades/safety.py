@@ -33,6 +33,8 @@ error a race would otherwise produce.
 
 from __future__ import annotations
 
+import asyncio
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -48,6 +50,13 @@ logger = structlog.get_logger(__name__)
 
 
 _NON_TERMINAL_STATES = ("planned", "running", "halted")
+
+# #1829 — how long the post-upgrade verify waits for CNPG to report every
+# instance ready before it judges, and how often it reads. The roll's last
+# events (the last node's uncordon, the end-of-roll Deployment roll) can
+# leave an instance rejoining for a while; one read failed a healthy run.
+_CNPG_READY_WAIT_S = 600.0
+_CNPG_POLL_INTERVAL_S = 5.0
 
 
 async def is_upgrade_in_flight(db: AsyncSession) -> SystemUpgradeRun | None:
@@ -264,6 +273,7 @@ async def verify_post_upgrade(
     cnpg_cluster_name: str = "",
     cnpg_namespace: str | None = None,
     ds_namespace: str = "kube-system",
+    cnpg_wait_s: float | None = None,
 ) -> list[VerificationCheck]:
     """Run the cluster-wide post-upgrade verification suite.
 
@@ -273,11 +283,23 @@ async def verify_post_upgrade(
     ``run.progress.post_upgrade_verify`` so the Fleet UI can render
     a checklist alongside the per-node progress.
 
+    #1829 — the CNPG check is not one read: while it reads fewer ready
+    instances than the spec asks for, it reads again, for up to
+    ``cnpg_wait_s`` (default ``_CNPG_READY_WAIT_S``), and judges the last
+    read. Only that "not yet ready" fail is waited on; a 404 or an
+    unreachable kubeapi is reported as before.
+
     Returns the list of checks (caller decides whether any failure
     should flip the run to ``failed``).
     """
+    wait_s = _CNPG_READY_WAIT_S if cnpg_wait_s is None else cnpg_wait_s
+    deadline = time.monotonic() + wait_s
+    cnpg = check_cnpg_instances_ready(cnpg_cluster_name, namespace=cnpg_namespace)
+    while cnpg.level == "fail" and time.monotonic() < deadline:
+        await asyncio.sleep(_CNPG_POLL_INTERVAL_S)
+        cnpg = check_cnpg_instances_ready(cnpg_cluster_name, namespace=cnpg_namespace)
     return [
-        check_cnpg_instances_ready(cnpg_cluster_name, namespace=cnpg_namespace),
+        cnpg,
         check_daemonset_pods_ready(namespace=ds_namespace),
     ]
 

@@ -37,6 +37,7 @@ from app.services.firewall_mirror import (
     apply_objects,
     apply_subnets,
 )
+from app.services.integration_ownership import refuse_sync_into_trashed_space
 from app.services.meraki.client import (
     MerakiClient,
     MerakiClientError,
@@ -103,6 +104,10 @@ def _to_client(c: _MerakiClientRow) -> MirrorAddress:
 
 async def reconcile_org(db: AsyncSession, org: MerakiOrg) -> MirrorSummary:
     summary = MirrorSummary(ok=False)
+    # #2577 — a target whose IP space is in Trash syncs nothing: it would
+    # rebuild its rows as live rows inside the trashed space.
+    if await refuse_sync_into_trashed_space(db, org, summary):
+        return summary
 
     api_key = ""
     if org.api_key_encrypted:
@@ -196,6 +201,8 @@ async def reconcile_org(db: AsyncSession, org: MerakiOrg) -> MirrorSummary:
             resource_id=str(org.id),
             resource_display=org.name,
             new_value={
+                # #2577 — what the sync released outside the target's IP space.
+                "released": summary.released.as_dict(),
                 "networks": network_count,
                 "objects": {
                     "created": summary.objects_created,
@@ -225,6 +232,7 @@ async def reconcile_org(db: AsyncSession, org: MerakiOrg) -> MirrorSummary:
     summary.ok = True
     logger.info(
         "meraki_reconcile_ok",
+        **summary.released.log_fields(),
         org=str(org.id),
         networks=network_count,
         objects=summary.object_count,

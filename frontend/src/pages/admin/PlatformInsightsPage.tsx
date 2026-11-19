@@ -27,9 +27,13 @@ import {
   type PostgresConnection,
   type PostgresSlowQuery,
   type ContainerStat,
+  type ContainerBackendStatus,
   type RedisOverview,
 } from "@/lib/api";
 import { ServicesPanel } from "@/components/ServicesPanel";
+import { KubePodsPanel } from "@/components/KubePodsPanel";
+import { ListReadError } from "@/components/ui/list-read-error";
+import { isRefused, pollUnlessRefused } from "@/lib/refusal";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Link } from "react-router-dom";
 import { ShieldCheck } from "lucide-react";
@@ -103,26 +107,38 @@ function StatCard({
   );
 }
 
+/** What a panel says when the server refused its reads (#2528): once, in
+ *  words, instead of cards of dashes. The polls stop on a refusal. */
+function RefusedNotice({ errors, what }: { errors: unknown[]; what: string }) {
+  const refused = errors.find((e) => isRefused(e));
+  if (!refused) return null;
+  return (
+    <p role="alert" className="text-sm">
+      <ListReadError error={refused} what={what} />
+    </p>
+  );
+}
+
 function PostgresPanel() {
   const overview = useQuery({
     queryKey: ["pg-overview"],
     queryFn: () => postgresApi.overview(),
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
   const tables = useQuery({
     queryKey: ["pg-tables"],
     queryFn: () => postgresApi.tables(50),
-    refetchInterval: 60_000,
+    refetchInterval: pollUnlessRefused(60_000),
   });
   const connections = useQuery({
     queryKey: ["pg-conns"],
     queryFn: () => postgresApi.connections(),
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
   const slow = useQuery({
     queryKey: ["pg-slow"],
     queryFn: () => postgresApi.slowQueries(20),
-    refetchInterval: 60_000,
+    refetchInterval: pollUnlessRefused(60_000),
   });
   // #272 follow-up — alembic schema-head divergence (cold-boot / rolling
   // upgrade visibility). Polls a touch faster than the rest so a pending
@@ -130,10 +146,17 @@ function PostgresPanel() {
   const schema = useQuery({
     queryKey: ["pg-schema-health"],
     queryFn: () => postgresApi.schemaHealth(),
-    refetchInterval: 15_000,
+    refetchInterval: pollUnlessRefused(15_000),
   });
 
   const ov: PostgresOverview | undefined = overview.data;
+  const refusals = [
+    overview.error,
+    tables.error,
+    connections.error,
+    slow.error,
+    schema.error,
+  ];
 
   const cachePct =
     ov?.cache_hit_ratio == null ? null : ov.cache_hit_ratio * 100;
@@ -151,6 +174,7 @@ function PostgresPanel() {
 
   return (
     <div className="space-y-6">
+      <RefusedNotice errors={refusals} what="Postgres statistics" />
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <StatCard
           label="Database size"
@@ -434,9 +458,36 @@ function PostgresPanel() {
   );
 }
 
+function BackendNotice({
+  title,
+  status,
+}: {
+  title: string;
+  status: ContainerBackendStatus;
+}) {
+  return (
+    <div
+      className="rounded border border-amber-500/40 bg-amber-500/5 p-4"
+      data-testid={`backend-unavailable-${title.toLowerCase()}`}
+    >
+      <div className="flex items-center gap-2 text-sm font-medium text-amber-800 dark:text-amber-300">
+        <AlertTriangle className="h-4 w-4" />
+        {title} not available
+      </div>
+      <p className="mt-2 text-xs text-muted-foreground">{status.reason}</p>
+    </div>
+  );
+}
+
 function ContainersPanel() {
   const version = useQuery({ queryKey: ["version"], queryFn: versionApi.get });
   const isAppliance = !!version.data?.appliance_mode;
+  const backends = useQuery({
+    queryKey: ["container-backends"],
+    queryFn: containersApi.backends,
+    enabled: !isAppliance,
+  });
+  const dockerAvailable = backends.data?.docker.available ?? true;
   const [prefix, setPrefix] = useState("spatiumddi-");
   const [includeStopped, setIncludeStopped] = useState(false);
   const stats = useQuery({
@@ -445,8 +496,9 @@ function ContainersPanel() {
       containersApi.stats({ prefix, include_stopped: includeStopped }),
     refetchInterval: 5_000,
     // No operator-facing Docker socket on the k3s appliance — don't poll it;
-    // we point at Appliance → Pods instead (below).
-    enabled: !isAppliance,
+    // we point at Appliance → Pods instead (below). Also skipped once the
+    // backends probe says there is no docker socket (#3761).
+    enabled: !isAppliance && dockerAvailable,
   });
 
   // On a k3s appliance the control-plane workloads run as Kubernetes pods,
@@ -474,6 +526,26 @@ function ContainersPanel() {
     );
   }
 
+  if (backends.data) {
+    const b = backends.data;
+    if (!b.docker.available && !b.kubernetes.available) {
+      return (
+        <div className="space-y-3">
+          <BackendNotice title="Docker" status={b.docker} />
+          <BackendNotice title="Kubernetes" status={b.kubernetes} />
+        </div>
+      );
+    }
+    if (!b.docker.available) {
+      return (
+        <div className="space-y-3">
+          <KubePodsPanel namespace={b.kubernetes.detail} />
+          <BackendNotice title="Docker" status={b.docker} />
+        </div>
+      );
+    }
+  }
+
   if (stats.data && !stats.data.available) {
     return (
       <div className="rounded border border-amber-500/40 bg-amber-500/5 p-4">
@@ -490,6 +562,9 @@ function ContainersPanel() {
 
   return (
     <div className="space-y-4">
+      {backends.data?.kubernetes.available && (
+        <KubePodsPanel namespace={backends.data.kubernetes.detail} />
+      )}
       <div className="flex flex-wrap items-center gap-3">
         <div className="flex items-center gap-2">
           <label className="text-xs text-muted-foreground">Name filter</label>
@@ -736,17 +811,17 @@ function RedisPanel() {
   const overview = useQuery({
     queryKey: ["redis-overview"],
     queryFn: () => redisApi.overview(),
-    refetchInterval: 15_000,
+    refetchInterval: pollUnlessRefused(15_000),
   });
   const keyspace = useQuery({
     queryKey: ["redis-keyspace"],
     queryFn: () => redisApi.keyspace(),
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
   const wakeBus = useQuery({
     queryKey: ["redis-wake-bus"],
     queryFn: () => redisApi.wakeBus(),
-    refetchInterval: 10_000,
+    refetchInterval: pollUnlessRefused(10_000),
   });
 
   const ov: RedisOverview | undefined = overview.data;
@@ -778,6 +853,10 @@ function RedisPanel() {
 
   return (
     <div className="space-y-6">
+      <RefusedNotice
+        errors={[overview.error, keyspace.error, wakeBus.error]}
+        what="Redis statistics"
+      />
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <StatCard
           label="Role"

@@ -27,11 +27,13 @@ from app.api.deps import DB, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
 from app.core.crypto import encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
+from app.core.stored_secret_guard import require_secret_with_destination_change
 from app.drivers.llm import get_driver
 from app.drivers.llm.registry import known_kinds
 from app.models.ai import AI_PROVIDER_KINDS, AIProvider
 from app.services.ai.chat import _STATIC_SYSTEM_PROMPT
 from app.services.ai.tools import REGISTRY
+from app.services.api_token_scopes import token_outbound
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -329,6 +331,12 @@ async def update_provider(
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
     changes = body.model_dump(exclude_unset=True)
+    require_secret_with_destination_change(
+        row,
+        changes,
+        destination=("base_url",),
+        secrets={"api_key": row.api_key_encrypted},
+    )
     for k, v in changes.items():
         if k == "api_key":
             # None already excluded by exclude_unset; "" clears, anything else replaces.
@@ -456,6 +464,7 @@ async def test_saved_provider(
     "/providers/{provider_id}/models",
     response_model=ListModelsResponse,
 )
+@token_outbound
 async def list_models(
     provider_id: uuid.UUID, current_user: SuperAdmin, db: DB
 ) -> ListModelsResponse:

@@ -49,10 +49,40 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     "test_appliance_firewall_render.py": (
         "agent/supervisor/spatium_supervisor/firewall_renderer.py"
     ),
+    # #1468 — the group-name rule must match the supervisor's own pattern.
+    "test_appliance_group_names.py": ("agent/supervisor/spatium_supervisor/role_orchestrator.py"),
+    # #3026 — the supervisor's "is the booted slot the target?" copy must
+    # answer exactly as the control plane's.
+    "test_nightly_upgrade_cleared_3026.py": (
+        "agent/supervisor/spatium_supervisor/appliance_state.py"
+    ),
+    # #3172 — the supervisor's booted-slot reader must agree with the api's.
+    "test_appliance_current_slot_mirror_3172.py": (
+        "agent/supervisor/spatium_supervisor/appliance_state.py"
+    ),
     "test_ci_backend_relevant.py": ".github/scripts/ci-backend-relevant.sh",
     "test_openapi_export.py": "scripts/export_openapi.py",
+    # #1465: runs the demo seeder's own template payloads through the API model.
+    "test_seed_demo_templates.py": "scripts/seed_demo.py",
     "test_merge_test_durations.py": "scripts/merge_test_durations.py",
     "test_test_impact_selection.py": ".github/scripts/select_impacted_tests.py",
+    # #2815: the worker liveness probe must agree between the chart and k8s/base.
+    "test_rolling_upgrade_redis_master_2815.py": (
+        "charts/spatiumddi/templates/worker.yaml",
+        "k8s/base/worker.yaml",
+    ),
+    # #2944: uvicorn's graceful-shutdown timeout must stay below the api's grace periods.
+    "test_api_graceful_shutdown.py": (
+        "k8s/base/api.yaml",
+        "charts/spatiumddi/templates/api.yaml",
+        "docker-compose.yml",
+        "docker-compose.dev.yml",
+    ),
+    "test_ci_tested_on_pr_head.py": (
+        ".github/scripts/ci-tested-on-pr-head.sh",
+        ".github/scripts/ci-full-suite-passed.sh",
+        ".github/scripts/latest-main-artifact.sh",
+    ),
     # #1353 — the outbound-host guard scans the four shipped agent packages
     # as well as backend/app, so an agent-only PR adding a host must run it.
     "test_outbound_hosts_documented.py": (
@@ -66,10 +96,17 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     ),
     "test_zone_name_scope.py": "scripts/refresh_iana_tlds.py",
     "test_lint_versions.py": "scripts/lint_versions.py",
+    "test_lint_docs_drift.py": "scripts/lint_docs_drift.py",
+    "test_check_blocklist_catalog.py": "scripts/check_blocklist_catalog.py",
     "test_lint_workflow_shell.py": "scripts/lint_workflow_shell.py",
     "test_lint_image_upgrades.py": "scripts/lint_image_upgrades.py",
     "test_release_version_script.py": "scripts/release_version.py",
+    "test_changelog_assemble.py": "scripts/changelog_assemble.py",
     "test_format_release_notes.py": "scripts/format_release_notes.py",
+    "test_check_contributors.py": (
+        ".github/scripts/check_contributors.py",
+        ".github/contributors-ignore.txt",
+    ),
     "test_release_tags_script.py": ".github/scripts/release-tags.sh",
     "test_trivy_scan_script.py": ("scripts/trivy-scan.sh", "Makefile"),
     "test_trivy_scheduled_report.py": ".github/workflows/trivy-scheduled.yml",
@@ -80,12 +117,87 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
         ".github/workflows/build-supervisor-image.yml",
     ),
     "test_dhcp_packet_loss.py": "agent/dhcp/spatium_dhcp_agent/metrics.py",
+    # #1513 — the SVCB block is duplicated in the agent's Technitium driver.
+    "test_technitium_svcb_parity.py": ("agent/dns/spatium_dns_agent/drivers/technitium.py"),
+    # #1760 — the TXT helper is duplicated, whole, in the agent.
+    "test_txt_helper_parity.py": ("agent/dns/spatium_dns_agent/drivers/_txt.py"),
+    "test_caa_helper_parity.py": ("agent/dns/spatium_dns_agent/drivers/_caa.py"),
+    # #1765 — the BIND address-match translator is duplicated in the agent.
+    "test_technitium_acl_parity.py": ("agent/dns/spatium_dns_agent/drivers/technitium.py"),
+    # #2121 — the forward-zone transport helper is duplicated, whole, in the
+    # agent; covered by the agent/dns/spatium_dns_agent/ carve-out.
+    "test_zone_forward_transport.py": ("agent/dns/spatium_dns_agent/drivers/_forwarders.py"),
+    # #3518 — the served-apex rule is duplicated in the agent's BIND9 driver.
+    "test_zone_apex_parity_3518.py": ("agent/dns/spatium_dns_agent/drivers/bind9.py"),
+    "test_zone_apex_bundle_parity_3518.py": ("agent/dns/spatium_dns_agent/drivers/bind9.py"),
     "test_ntp_initial_seed.py": ("appliance/mkosi.extra/usr/local/bin/spatiumddi-firstboot"),
     # #972 — the HELD endpoint is mounted at the application root, so it needs
     # its own nginx location block in BOTH shipped templates or it falls
     # through to the SPA and a PBX asking where a phone is gets index.html.
     # The test reads both; both must therefore run this suite when edited.
+    # #1752: parity between the control plane's slot-image URL rule and
+    # the supervisor's own ``allowed_schemes``.
+    "test_slot_image_url_scheme_1752.py": (
+        "agent/supervisor/spatium_supervisor/appliance_state.py",
+    ),
+    # #2071 — the bulk-allocate template vectors are shared with the console's
+    # live preview, so an edit to them must run the server's half too.
+    "test_ipam_bulk_allocate_template_vectors_2071.py": (
+        "frontend/src/lib/bulk-allocate-template.vectors.json"
+    ),
+    # #4143 — the delete dialogs' cascade registry is read by the console too.
+    "test_delete_cascade_copy_4143.py": ("frontend/src/lib/delete-cascade.json"),
+    # #3119 — every resource type the server checks must be offered by New Role.
+    "test_grant_vocabulary_covers_routes_3119.py": ("frontend/src/lib/permissionVocabulary.ts"),
     "test_e911_held.py": (
+        "frontend/default.conf.template",
+        "charts/spatiumddi/templates/frontend-tls-config.yaml",
+    ),
+    # #3061 — both templates must proxy the ACME http-01 challenge.
+    "test_acme_client.py": (
+        "frontend/default.conf.template",
+        "charts/spatiumddi/templates/frontend-tls-config.yaml",
+    ),
+    # #3036 — each nginx location's body limit must cover the api allowance
+    # (body_limit.ALLOWANCES) of the routes it fronts, in both templates.
+    "test_nginx_body_limit_matches_api_3036.py": (
+        "frontend/default.conf.template",
+        "charts/spatiumddi/templates/frontend-tls-config.yaml",
+    ),
+    # #1868 — the frontend nginx trusts an outer proxy's X-Forwarded-Proto only
+    # from FRONTEND_TRUSTED_PROXY_CIDRS; the renderer and both templates are read.
+    "test_frontend_proxy_trust.py": (
+        "frontend/default.conf.template",
+        "frontend/16-trusted-proxies.envsh",
+        "charts/spatiumddi/templates/frontend-tls-config.yaml",
+    ),
+    # #2308 — runs the frontend's IPv6 renderer and reads both nginx templates +
+    # the image that ships it.
+    "test_frontend_ipv6_2308.py": (
+        "frontend/17-ipv6.envsh",
+        "frontend/default.conf.template",
+        "frontend/Dockerfile",
+        "charts/spatiumddi/templates/frontend-tls-config.yaml",
+    ),
+    # #3852 — runs the frontend's listen-port renderer and reads the template +
+    # the image that ships it.
+    "test_frontend_http_port_3852.py": (
+        "frontend/14-http-port.envsh",
+        "frontend/17-ipv6.envsh",
+        "frontend/default.conf.template",
+        "frontend/Dockerfile",
+    ),
+    # #1173 — runs the frontend's TLS reload watcher and checks it is copied into
+    # the image and that the chart no longer rolls the frontend on a cert change.
+    "test_frontend_tls_reload_1173.py": (
+        "frontend/40-tls-reload-watch.sh",
+        "frontend/Dockerfile",
+        "charts/spatiumddi/templates/frontend.yaml",
+    ),
+    # #2895 — the About page's legal files sit outside the web root and both
+    # nginx configs serve them only behind the api's session check.
+    "test_about_files_gated_2895.py": (
+        "frontend/Dockerfile",
         "frontend/default.conf.template",
         "charts/spatiumddi/templates/frontend-tls-config.yaml",
     ),
@@ -199,7 +311,7 @@ def test_must_run_carveouts_run_the_suite(path: str, why: str) -> None:
         "frontend/src/App.tsx",
         "frontend/package.json",
         "charts/spatiumddi/values.yaml",
-        "k8s/base/api.yaml",
+        "k8s/base/frontend.yaml",
         # #968 — perf/ has its own Perf — Tests job; before it was denied a
         # perf-only PR ran all 8 backend shards (PR #955, measured).
         "perf/generators/orchestrator/relay_sockets.py",
@@ -207,6 +319,9 @@ def test_must_run_carveouts_run_the_suite(path: str, why: str) -> None:
         "perf/requirements.txt",
         "perf/README.md",
         "CHANGELOG.md",
+        # #2431 — a PR's changelog fragment is prose, like CHANGELOG.md.
+        "changelog.d/2431-merge-queue.md",
+        "changelog.d/README.md",
         "README.md",
         "CLAUDE.md",
         "NOTICE",

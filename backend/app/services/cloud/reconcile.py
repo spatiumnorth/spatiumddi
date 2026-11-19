@@ -56,12 +56,28 @@ from app.core.crypto import decrypt_dict
 from app.models.audit import AuditLog
 from app.models.cloud import CloudEndpoint
 from app.models.ipam import IPAddress, IPBlock, Subnet
+from app.services._mirror_hostname import normalize_desired_hostname
 from app.services.cloud.base import (
     CloudConnectorError,
     CloudInventory,
     get_connector,
 )
-from app.services.integration_ownership import owned_by_other_integration, owning_integration
+from app.services.dns.record_ops import retract_address_dns
+from app.services.integration_ownership import (
+    SpaceRelease,
+    address_taken,
+    addresses_in_space,
+    drop_wrapper_block,
+    gateway_changed,
+    move_stays_in_space,
+    owned_addresses_in_space,
+    owned_by_other_integration,
+    owned_subnets_in_space,
+    owning_integration,
+    refuse_sync_into_trashed_space,
+    retire_vanished_subnet,
+)
+from app.services.ipam.utilization import counts_toward_utilization
 
 logger = structlog.get_logger(__name__)
 
@@ -98,6 +114,9 @@ class _DesiredAddress:
     # other row (and the fallback) lands in ``ipam_space_id``.
     public: bool = False
 
+    def __post_init__(self) -> None:
+        normalize_desired_hostname(self)
+
 
 @dataclass
 class ReconcileSummary:
@@ -120,6 +139,9 @@ class ReconcileSummary:
     addresses_deleted: int = 0
     skipped_no_subnet: int = 0
     warnings: list[str] = field(default_factory=list)
+    # #2577 — what this sync released outside the target's IP space
+    # (``integration_ownership.release_outside_space``).
+    released: SpaceRelease = field(default_factory=SpaceRelease)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -217,7 +239,7 @@ async def _recompute_subnet_utilization(db: AsyncSession, subnet_id: Any) -> Non
             select(func.count())
             .select_from(IPAddress)
             .where(IPAddress.subnet_id == subnet_id)
-            .where(IPAddress.status != "available")
+            .where(counts_toward_utilization())
         )
         or 0
     )
@@ -330,7 +352,10 @@ def _compute_desired(
                         status="cloud-instance",
                         hostname=inst.name,
                         description=desc,
-                        mac=nic.mac,
+                        # MACADDR loads as lowercase colon form; Azure
+                        # reports ``00-0D-3A-…``, which would compare
+                        # unequal on every sync (#3596).
+                        mac=nic.mac.lower().replace("-", ":") if nic.mac else None,
                     )
                 )
             if nic.public_ip:
@@ -461,8 +486,15 @@ async def _apply_blocks_and_subnets(
         for net_str, row in current_subnets.items():
             if net_str in desired_map:
                 continue
-            await db.delete(row)
-            summary.subnets_deleted += 1
+            # #1558 / #3532: a subnet carrying operator content (addresses,
+            # a DHCP scope live or in Trash, tags, links …) is un-claimed,
+            # not cascade-deleted with it; either way it is audited.
+            if await retire_vanished_subnet(
+                db, row, "cloud_endpoint_id", warnings=summary.warnings
+            ):
+                summary.subnets_updated += 1
+            else:
+                summary.subnets_deleted += 1
 
     for net_str, d in desired_map.items():
         # An operator subnet at this exact CIDR wins — reused untouched.
@@ -532,7 +564,7 @@ async def _apply_blocks_and_subnets(
                 changed = True
             # Only set the gateway when we know one; never clear an
             # operator-set value back to None on a sync.
-            if d.gateway and str(existing.gateway or "") != d.gateway:
+            if gateway_changed(existing.gateway, d.gateway):
                 existing.gateway = d.gateway
                 changed = True
             if existing.total_ips != expected_total:
@@ -549,9 +581,7 @@ async def _apply_blocks_and_subnets(
         for net_str, block in endpoint_blocks.items():
             if net_str in desired_block_cidrs:
                 continue
-            refs = await db.execute(select(Subnet).where(Subnet.block_id == block.id))
-            if refs.scalar_one_or_none() is None:
-                await db.delete(block)
+            if await drop_wrapper_block(db, block, "cloud_endpoint_id", warnings=summary.warnings):
                 summary.blocks_deleted += 1
 
 
@@ -566,11 +596,6 @@ async def _apply_addresses(
     *,
     allow_delete: bool = True,
 ) -> None:
-    subnet_rows = (
-        (await db.execute(select(Subnet).where(Subnet.cloud_endpoint_id == endpoint.id)))
-        .scalars()
-        .all()
-    )
     # Also consider operator subnets in the same space(s) for IP
     # containment — an instance IP may land in an operator-curated subnet
     # the reconciler reused (subnets_matched). We restrict to the bound
@@ -578,10 +603,16 @@ async def _apply_addresses(
     space_ids = [endpoint.ipam_space_id]
     if endpoint.public_space_id is not None and endpoint.public_space_id != endpoint.ipam_space_id:
         space_ids.append(endpoint.public_space_id)
+    # #2577 — the endpoint's own subnets in its bound space(s) only; anything
+    # it owns elsewhere (a previous space) is released first.
+    subnet_rows = await owned_subnets_in_space(
+        db, "cloud_endpoint_id", endpoint.id, space_ids, summary=summary
+    )
     all_space_subnets = (
         (await db.execute(select(Subnet).where(Subnet.space_id.in_(space_ids)))).scalars().all()
     )
     subnets = list(all_space_subnets)
+    space_subnet_ids = {s.id for s in subnets}
     endpoint_subnet_ids = {s.id for s in subnet_rows}
 
     # Dedupe by address — the same IP reported twice (NIC + public IP, or
@@ -596,11 +627,9 @@ async def _apply_addresses(
     # addresses, stamping ``user_modified_at`` so their soft fields lock.
     desired_addrs = list(desired_map.keys())
     if desired_addrs:
-        existing_rows = (
-            (await db.execute(select(IPAddress).where(IPAddress.address.in_(desired_addrs))))
-            .scalars()
-            .all()
-        )
+        # #2577 — adoption candidates come from this target's own space
+        # only. The same address in another space is a different host.
+        existing_rows = await addresses_in_space(db, space_ids, desired_addrs)
         for row in existing_rows:
             if row.cloud_endpoint_id == endpoint.id:
                 continue  # already ours
@@ -624,8 +653,14 @@ async def _apply_addresses(
                 row.user_modified_at = datetime.now(UTC)
         await db.flush()
 
-    res = await db.execute(select(IPAddress).where(IPAddress.cloud_endpoint_id == endpoint.id))
-    current = {str(a.address): a for a in res.scalars().all()}
+    # #2577 — the rows we may update, move and absence-delete: ours AND in
+    # our space. One carrying our FK in another space is released first (#2577).
+    current = {
+        str(a.address): a
+        for a in await owned_addresses_in_space(
+            db, "cloud_endpoint_id", endpoint.id, space_ids, summary=summary
+        )
+    }
 
     dirty_subnets: set[Any] = set(endpoint_subnet_ids)
 
@@ -633,6 +668,7 @@ async def _apply_addresses(
     # rows by releasing the FK instead of deleting). Skipped on a partial
     # pull (#430) — a failed scope makes "no longer desired" unreliable.
     if allow_delete:
+        gone: list[IPAddress] = []
         for addr, row in current.items():
             if addr not in desired_map:
                 dirty_subnets.add(row.subnet_id)
@@ -640,8 +676,12 @@ async def _apply_addresses(
                     row.cloud_endpoint_id = None
                     summary.addresses_updated += 1
                 else:
-                    await db.delete(row)
+                    gone.append(row)
                     summary.addresses_deleted += 1
+        # #3200 — one retraction for the whole sweep, before the deletes flush.
+        await retract_address_dns(db, [r.id for r in gone])
+        for row in gone:
+            await db.delete(row)
 
     for addr, d in desired_map.items():
         subnet = _find_subnet_for_ip(subnets, d.address)
@@ -654,6 +694,23 @@ async def _apply_addresses(
             changed = False
             # subnet_id is factual — always correct it.
             if row.subnet_id != subnet.id:
+                # #2577 — never re-parent a row across IP spaces.
+                if not move_stays_in_space(row.subnet_id, space_subnet_ids):
+                    summary.warnings.append(
+                        f"address {addr}: current subnet is outside this target's "
+                        f"IP space; not moving"
+                    )
+                    continue
+                # Another integration's row (or another Cloud endpoint's) may
+                # already sit at the target (subnet, address); moving onto
+                # it would hit ``uq_ip_address_subnet_address`` and roll
+                # back the whole sync. Leave our row where it is.
+                if await address_taken(db, subnet.id, d.address, exclude_id=row.id):
+                    summary.warnings.append(
+                        f"address {addr}: subnet {subnet.network} already has a row "
+                        f"for it; not moving"
+                    )
+                    continue
                 dirty_subnets.add(row.subnet_id)
                 row.subnet_id = subnet.id
                 changed = True
@@ -674,6 +731,12 @@ async def _apply_addresses(
                 dirty_subnets.add(subnet.id)
                 summary.addresses_updated += 1
         else:
+            # The claim pass above took every row we may claim; one
+            # still at this (subnet, address) has another owner
+            # (warned there). Inserting next to it would hit
+            # ``uq_ip_address_subnet_address``.
+            if await address_taken(db, subnet.id, d.address):
+                continue
             db.add(
                 IPAddress(
                     subnet_id=subnet.id,
@@ -788,6 +851,12 @@ def _build_discovery_payload(
 
 async def reconcile_endpoint(db: AsyncSession, endpoint: CloudEndpoint) -> ReconcileSummary:
     summary = ReconcileSummary(ok=False)
+    # #2577 — a target whose IP space is in Trash syncs nothing: it would
+    # rebuild its rows as live rows inside the trashed space.
+    if await refuse_sync_into_trashed_space(
+        db, endpoint, summary, space_ids=[endpoint.ipam_space_id, endpoint.public_space_id]
+    ):
+        return summary
 
     if not endpoint.credentials_encrypted:
         summary.error = "credentials not set"
@@ -870,6 +939,8 @@ async def reconcile_endpoint(db: AsyncSession, endpoint: CloudEndpoint) -> Recon
             resource_id=str(endpoint.id),
             resource_display=endpoint.name,
             new_value={
+                # #2577 — what the sync released outside the target's IP space.
+                "released": summary.released.as_dict(),
                 "provider": endpoint.provider,
                 "account_id": inv.account_id,
                 "blocks": {
@@ -895,6 +966,7 @@ async def reconcile_endpoint(db: AsyncSession, endpoint: CloudEndpoint) -> Recon
     summary.ok = True
     logger.info(
         "cloud_reconcile_ok",
+        **summary.released.log_fields(),
         endpoint=str(endpoint.id),
         provider=endpoint.provider,
         account_id=inv.account_id,

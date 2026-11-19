@@ -29,6 +29,8 @@ on:
       # change guaranteed to need the proof was the one change that
       # could not get it.
       - ".github/workflows/build-dns-images.yml"
+      # #3464 — the shared Trivy install step this lane scans with.
+      - ".github/actions/install-trivy/**"
   workflow_dispatch:
 
 # Read-only (#1022): this workflow builds and scans, it never publishes.
@@ -112,9 +114,101 @@ jobs:
             --entrypoint python3 \
             ghcr.io/spatiumnorth/dns-bind9:pr-scan /checks/live_axfr_check.py
 
+      # Issue #3563 — a blocklist must not switch DNSSEC validation off. Signs
+      # example.com. locally, serves it from a second named, and asserts that
+      # the agent-rendered resolver rewrites a blocked signed name for DO=1
+      # and DO=0 clients, answers a SafeSearch-style redirect (#878) of a
+      # signed name with its target, sets AD on an unblocked one, and
+      # SERVFAILs a bogus-signed one (global and per-view response-policy).
+      # Exits non-zero on any failed expectation; never skips.
+      - name: RPZ + DNSSEC validation check (bind9)
+        if: matrix.flavor == 'bind9'
+        run: |
+          docker run --rm \
+            -v "$PWD/agent/dns/tests:/checks:ro" \
+            --entrypoint python3 \
+            ghcr.io/spatiumnorth/dns-bind9:pr-scan /checks/live_rpz_dnssec_check.py
+
+      # Issue #2249 — toggling query / response logging on a RUNNING named,
+      # through the agent's real render + reload path. `rndc reconfig`
+      # applies neither switch, so this is the only proof the explicit
+      # `rndc querylog|responselog on|off` after each reload took effect;
+      # asserted on `rndc status` and on the lines named writes. Runs as
+      # `spatium`, like the agent: named started as root drops the
+      # capabilities it would need to write the spatium-owned directories.
+      - name: Query-logging toggle check (bind9)
+        if: matrix.flavor == 'bind9'
+        run: |
+          docker run --rm --user spatium \
+            -v "$PWD/agent/dns/tests:/checks:ro" \
+            --entrypoint python3 \
+            ghcr.io/spatiumnorth/dns-bind9:pr-scan /checks/live_query_log_check.py
+
+      # Issue #2850 — a record a third party added by RFC 2136 must outlive
+      # an agent start (the boot-from-cache apply used to render the zone
+      # afresh and set named's file and journal aside) and a structural
+      # re-render, while a record the control plane deleted stays deleted.
+      # Drives the real driver against a real named, stopped by SIGTERM and
+      # by SIGKILL, with and without views. Runs as `spatium`, like the agent.
+      - name: Dynamic-update restart check (bind9)
+        if: matrix.flavor == 'bind9'
+        run: |
+          docker run --rm --user spatium \
+            -v "$PWD/agent/dns/tests:/checks:ro" \
+            --entrypoint python3 \
+            ghcr.io/spatiumnorth/dns-bind9:pr-scan /checks/live_dynamic_restart_check.py
+
+      # Issue #3551 — under split-horizon an identical zone is defined in
+      # one view and referenced from the others with `in-view`, so it loads
+      # once instead of once per view. Proves named accepts the result, that
+      # the shared zone answers in every view (picked by client source), that
+      # a record change and a shared <-> per-view transition both converge on
+      # a running named, and that a view's #920 transfer key is answered from
+      # the shared zone. Runs as `spatium`, like the agent.
+      - name: Views zone-sharing check (bind9)
+        if: matrix.flavor == 'bind9'
+        run: |
+          docker run --rm --user spatium \
+            -v "$PWD/agent/dns/tests:/checks:ro" \
+            --entrypoint python3 \
+            ghcr.io/spatiumnorth/dns-bind9:pr-scan /checks/live_views_share_check.py
+
+      # Issue #3672 — a zone too long for named to keep its files (the zone
+      # file, its journal, with DNSSEC its signed copy) must be held back
+      # alone: named refuses such a zone at load, which used to fail the
+      # reload verification and with it the whole apply. Proves named starts
+      # and reloads with a held zone's stanza and no file, answers SERVFAIL
+      # for it, applies every other change, and that the longest zones it can
+      # load (248, 214 inline-signed, #3750) are served. Runs as `spatium`.
+      - name: Long zone name check (bind9)
+        if: matrix.flavor == 'bind9'
+        run: |
+          docker run --rm --user spatium \
+            -v "$PWD/agent/dns/tests:/checks:ro" \
+            --entrypoint python3 \
+            ghcr.io/spatiumnorth/dns-bind9:pr-scan /checks/live_long_zone_check.py
+
+      # #3764: catalog zones are producer-only for an agent group. The
+      # producer's config and catalog zone pass the agent's real
+      # named-checkconf / named-checkzone, and a consumer block from an older
+      # control plane renders nothing. Runs as `spatium`.
+      - name: Catalog producer check (bind9)
+        if: matrix.flavor == 'bind9'
+        run: |
+          docker run --rm --user spatium \
+            -v "$PWD/agent/dns/tests:/checks:ro" \
+            --entrypoint python3 \
+            ghcr.io/spatiumnorth/dns-bind9:pr-scan /checks/live_catalog_producer_check.py
+
+      # get.trivy.dev, which trivy-action's own setup downloads from,
+      # is gone (#3464): install from the GitHub release instead.
+      - name: Install Trivy
+        uses: ./.github/actions/install-trivy
+
       - name: Trivy scan
         uses: aquasecurity/trivy-action@v0.36.0
         with:
+          skip-setup-trivy: true
           # Reference the locally-loaded image from the PR build
           # step above. Previously this referenced
           # ``ghcr.io/...:${{ github.sha }}`` which is never produced

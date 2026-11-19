@@ -75,6 +75,7 @@ from app.models.av import (
 from app.models.ipam import IPSpace
 from app.models.multicast import MulticastGroup
 from app.models.vlans import VLAN
+from app.services.api_token_scopes import read_only_post
 from app.services.av.ranges import (
     AllocationConflictReport,
     check_allocation_conflict,
@@ -658,7 +659,9 @@ async def list_flows(
         )
 
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
-    stmt = stmt.order_by(MulticastGroup.address.asc()).limit(limit).offset(offset)
+    stmt = (
+        stmt.order_by(MulticastGroup.address.asc(), MulticastGroup.id).limit(limit).offset(offset)
+    )
     rows = (await db.execute(stmt)).all()
     return AVFlowListResponse(
         items=[_flow_read(profile, group) for profile, group in rows],
@@ -744,6 +747,7 @@ async def delete_flow(group_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
 
 
 @router.post("/allocation-preview", response_model=AVAllocationPreviewResponse)
+@read_only_post
 async def allocation_preview(
     body: AVAllocationPreviewRequest, db: DB, _: CurrentUser
 ) -> AVAllocationPreviewResponse:

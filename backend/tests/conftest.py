@@ -177,7 +177,8 @@ async def _reset_global_caches() -> AsyncGenerator[None, None]:
     couldn't see. Individual suites used to opt in to a local reset
     fixture; doing it globally fixes the whole class.
     """
-    from app.core import maintenance_mode
+    from app.api import health
+    from app.core import maintenance_mode, session_idle
     from app.services import feature_modules
     from app.services.appliance import cluster_health
     from app.services.dns import tld_registry
@@ -193,11 +194,79 @@ async def _reset_global_caches() -> AsyncGenerator[None, None]:
     # stubbed verdict outlives the per-test TRUNCATE and would answer for
     # unrelated tests.
     cluster_health.invalidate_probe_cache()
+    # GHSA-c58p-8cq9-g3gm — /health/platform caches its Celery worker ping.
+    health.invalidate_worker_ping_cache()
+    # #2777: /health/ready remembers whether this process has been ready
+    # at its own head; a test that got there would carry it into every
+    # later test on the same worker, and a newer schema the test expects
+    # refused would pass instead.
+    health.reset_schema_readiness()
+    # The idle-session timeout is cached the same way.
+    session_idle.invalidate_cache()
+    # #2782 — "nothing to deliver to" is cached per process on a monotonic
+    # clock, so a test that ran with no subscription / target would keep the
+    # next test's after-commit publish and forward from running.
+    from app.services import audit_forward, event_publisher
+
+    event_publisher.subscriptions_cache.invalidate()
+    audit_forward.targets_cache.invalidate()
+    # #3015 — the api-shutdown flag is process-global: a test that sets it
+    # (or runs a lifespan to its end) would make every later long-poll on
+    # the same worker answer at once.
+    from app.core import shutdown
+
+    shutdown.reset()
     yield
+    shutdown.reset()
+    event_publisher.subscriptions_cache.invalidate()
+    audit_forward.targets_cache.invalidate()
     maintenance_mode.invalidate_cache()
+    session_idle.invalidate_cache()
     feature_modules.invalidate_cache()
     tld_registry.invalidate_effective_cache()
     cluster_health.invalidate_probe_cache()
+    health.invalidate_worker_ping_cache()
+    health.reset_schema_readiness()
+
+
+@pytest.fixture(autouse=True)
+def _audit_lock_order_guard() -> Iterator[None]:
+    """#3503 — fail a test whose request wrote a ``dns_zone`` row after its
+    transaction took the audit-chain lock: that order deadlocks against a
+    concurrent record create on the same zone (#3389). See
+    ``tests/_audit_lock_order_guard.py``."""
+    from tests import _audit_lock_order_guard as guard
+
+    guard.install()
+    guard.violations.clear()
+    yield
+    found = list(guard.violations)
+    guard.violations.clear()
+    if found:
+        pytest.fail(
+            "zone row written after the audit-chain lock (#3503):\n" + "\n".join(found),
+            pytrace=False,
+        )
+
+
+@pytest.fixture(autouse=True)
+def _row_lock_order_guard() -> Iterator[None]:
+    """#3617 — fail a test whose transaction took ``dns_zone`` rows out of id
+    order, or a ``dhcp_lease`` row after an ``ip_address`` row: both orders
+    deadlock against the lease path's writers. See
+    ``app/services/lock_order.py`` and ``tests/_row_lock_order_guard.py``."""
+    from tests import _row_lock_order_guard as guard
+
+    guard.install()
+    guard.violations.clear()
+    yield
+    found = list(guard.violations)
+    guard.violations.clear()
+    if found:
+        pytest.fail(
+            "rows locked out of the lease → mirror → zone order (#3617):\n" + "\n".join(found),
+            pytrace=False,
+        )
 
 
 @pytest.fixture(autouse=True)
@@ -270,6 +339,39 @@ def _all_feature_modules_enabled() -> Iterator[None]:
         fm.MODULES_BY_ID = original_by_id
 
 
+async def _drain_after_commit_dispatch() -> None:
+    """Let this test's fire-and-forget after-commit dispatches finish, and
+    release the shared dispatch engine's connections, before the TRUNCATE.
+
+    ``event_publisher`` / ``audit_forward`` dispatch tasks (#2782) run a
+    multi-statement transaction on ``dispatch_db``'s pooled engine (read a
+    target table, then fall back to ``platform_settings``). A task still
+    in flight when the TRUNCATE queues its ACCESS EXCLUSIVE locks holds an
+    ACCESS SHARE on the first table while waiting for the second, which the
+    TRUNCATE already holds: a deadlock the server resolves by killing the
+    TRUNCATE (seen as a fixture-setup error in an unrelated test)."""
+    import asyncio
+
+    from app.services import after_commit_dispatch, dispatch_db
+
+    loop = asyncio.get_running_loop()
+    for _ in range(5):
+        pending = [
+            t for t in list(after_commit_dispatch._tasks) if not t.done() and t.get_loop() is loop
+        ]
+        if not pending:
+            break
+        await asyncio.wait(pending, timeout=30)
+    engine, state_loop = dispatch_db._state.engine, dispatch_db._state.loop
+    if engine is not None:
+        if state_loop is loop:
+            await dispatch_db.dispose()
+        else:
+            # Pool belongs to a finished loop; its sockets are not ours to await on.
+            engine.sync_engine.dispose(close=False)
+            dispatch_db._state.engine = None
+
+
 @pytest_asyncio.fixture(autouse=True)
 async def _isolate_db() -> AsyncGenerator[None, None]:
     """Truncate every table after each test so state doesn't leak.
@@ -282,6 +384,7 @@ async def _isolate_db() -> AsyncGenerator[None, None]:
     NullPool gives us a fresh connection.
     """
     yield
+    await _drain_after_commit_dispatch()
     tables = ", ".join(f'"{t.name}"' for t in reversed(Base.metadata.sorted_tables))
     if not tables:
         return
@@ -307,3 +410,39 @@ async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         yield ac
     app.dependency_overrides.clear()
+
+
+# A full or selective restore replays the whole schema in ONE transaction, which
+# takes a lock on every relation it creates (about a thousand). The lock table
+# is shared by the whole Postgres server, and under ``-n auto`` every xdist
+# worker's test database lives on that one server, so two replays running at
+# the same time on two workers can exhaust it ("out of shared memory", HINT:
+# max_locks_per_transaction). Which tests land on which worker at the same
+# moment depends on the shard's file list, so it surfaced only once a new test
+# file reshuffled shard 9 (#3945). Serialise replays across workers with a file
+# lock on the runner; a single replay is far under the limit.
+_RESTORE_LOCK_PATH = os.path.join(
+    os.environ.get("TMPDIR", "/tmp"), "spatiumddi-test-restore-replay.lock"
+)
+
+
+@pytest.fixture(autouse=True)
+def _serialise_restore_replays(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    import asyncio
+    import fcntl
+
+    from app.services.backup import restore as _restore
+
+    original = _restore._replay_clean
+
+    async def _locked_replay(*args, **kwargs):
+        fd = os.open(_RESTORE_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o666)
+        try:
+            await asyncio.to_thread(fcntl.flock, fd, fcntl.LOCK_EX)
+            return await original(*args, **kwargs)
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    monkeypatch.setattr(_restore, "_replay_clean", _locked_replay)
+    yield

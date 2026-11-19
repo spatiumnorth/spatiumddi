@@ -27,8 +27,6 @@ No network I/O — this is CSV text in, database rows out.
 
 from __future__ import annotations
 
-import csv
-import io
 import ipaddress
 import re
 import uuid
@@ -50,6 +48,7 @@ from app.models.ot import (
     PURDUE_LEVELS,
     OTDevice,
 )
+from app.services.csv_text import CSVReadError, read_csv_table
 
 logger = structlog.get_logger(__name__)
 
@@ -296,8 +295,8 @@ def parse_rows(
     importer.
 
     Raises :class:`OTImportError` for whole-request problems (empty body,
-    missing mapped column, over the row cap). Per-row problems are
-    reported on the row.
+    missing mapped column, over the row cap, text the CSV reader cannot
+    read). Per-row problems are reported on the row.
     """
     if len(csv_text) > MAX_CSV_CHARS:
         raise OTImportError(f"CSV body exceeds {MAX_CSV_CHARS} characters")
@@ -307,12 +306,18 @@ def parse_rows(
     if not body:
         raise OTImportError("CSV body is empty")
 
-    reader = csv.DictReader(io.StringIO(body), delimiter=delimiter)
-    headers = _resolve_headers(reader.fieldnames, column_map)
+    # The shared reader handles \n, \r\n and a bare \r alike, and raises
+    # anything else the csv module refuses as CSVReadError: a property of
+    # the file, so a 422 that says why rather than a 500 (#1637, #1711).
+    try:
+        table = read_csv_table(body, delimiter=delimiter)
+    except CSVReadError as exc:
+        raise OTImportError(str(exc)) from exc
+    headers = _resolve_headers(table.fieldnames, column_map)
 
     default_protocol = _normalize_token(default_ot_protocol) if default_ot_protocol else ""
     rows: list[ParsedRow] = []
-    for line, raw_row in enumerate(reader, start=1):
+    for line, raw_row in enumerate(table.rows, start=1):
         if line > MAX_IMPORT_ROWS:
             raise OTImportError(
                 f"CSV has more than {MAX_IMPORT_ROWS} data rows; split the export by area"

@@ -12,9 +12,11 @@ this module.
 from __future__ import annotations
 
 import uuid
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
+from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -26,6 +28,36 @@ from app.models.dns import (
     DNSView,
 )
 
+# Feed parsing lives in a dependency-free module (#3522) so the monthly
+# catalog check can load the same parser without the app; re-exported here
+# for the callers that import it from this module.
+from app.services.dns_blocklist_parse import (  # noqa: F401
+    FeedSkipCounts,
+    ParsedFeed,
+    dedupe_domains,
+    looks_like_html,
+    parse_feed,
+    parse_feed_detailed,
+)
+
+__all__ = [
+    "EffectiveBlocklist",
+    "EffectiveEntry",
+    "FeedSkipCounts",
+    "ParsedFeed",
+    "build_effective_for_group",
+    "build_effective_for_view",
+    "dedupe_domains",
+    "effective_lists_for_group",
+    "effective_lists_for_view",
+    "exception_domains",
+    "has_entries",
+    "parse_feed",
+    "looks_like_html",
+    "parse_feed_detailed",
+    "stream_entries",
+]
+
 
 @dataclass(frozen=True, slots=True)
 class EffectiveEntry:
@@ -34,7 +66,7 @@ class EffectiveEntry:
     domain: str
     # action: block | redirect | nxdomain
     action: str
-    # block_mode inherited from the list: nxdomain | sinkhole | refused
+    # block_mode inherited from the list: nxdomain | sinkhole
     block_mode: str
     sinkhole_ip: str | None
     target: str | None
@@ -57,11 +89,24 @@ class EffectiveBlocklist:
     lists: list[uuid.UUID] = field(default_factory=list)
 
 
+def _entry_rows(list_id: uuid.UUID) -> Any:
+    """One list's entries as column rows, in ``domain`` order (see below)."""
+    return (
+        select(
+            DNSBlockListEntry.domain,
+            DNSBlockListEntry.entry_type,
+            DNSBlockListEntry.target,
+            DNSBlockListEntry.is_wildcard,
+        )
+        .where(DNSBlockListEntry.list_id == list_id)
+        .order_by(DNSBlockListEntry.domain)
+    )
+
+
 async def _collect_lists(
     db: AsyncSession, lists: list[DNSBlockList]
 ) -> tuple[list[EffectiveEntry], set[str], list[uuid.UUID]]:
     entries: list[EffectiveEntry] = []
-    exceptions: set[str] = set()
     list_ids: list[uuid.UUID] = []
 
     # Column rows, not ORM entities (#1109, the #948 pattern): a Family
@@ -79,17 +124,13 @@ async def _collect_lists(
             continue
         list_ids.append(bl.id)
 
-        entry_result = await db.execute(
-            select(
-                DNSBlockListEntry.domain,
-                DNSBlockListEntry.entry_type,
-                DNSBlockListEntry.target,
-                DNSBlockListEntry.is_wildcard,
-            )
-            .where(DNSBlockListEntry.list_id == bl.id)
-            .order_by(DNSBlockListEntry.domain)
+        entry_result = await db.execute(_entry_rows(bl.id))
+        block_mode, sinkhole_ip, list_id, list_name = (
+            bl.block_mode,
+            bl.sinkhole_ip,
+            bl.id,
+            bl.name,
         )
-        block_mode, sinkhole_ip, list_id, list_name = bl.block_mode, bl.sinkhole_ip, bl.id, bl.name
         entries.extend(
             EffectiveEntry(
                 domain=domain.lower(),
@@ -104,11 +145,7 @@ async def _collect_lists(
             for domain, entry_type, target, is_wildcard in entry_result.tuples()
         )
 
-        exc_result = await db.execute(
-            select(DNSBlockListException.domain).where(DNSBlockListException.list_id == bl.id)
-        )
-        exceptions.update(domain.lower() for domain in exc_result.scalars())
-
+    exceptions = await exception_domains(db, lists)
     return entries, exceptions, list_ids
 
 
@@ -126,13 +163,12 @@ def _stable_list_order(lists: list[DNSBlockList]) -> list[DNSBlockList]:
     return sorted(lists, key=lambda bl: bl.name)
 
 
-async def build_effective_for_view(db: AsyncSession, view_id: uuid.UUID) -> EffectiveBlocklist:
-    """Compute the effective blocklist for a DNS view.
-
-    Combines:
-      - Blocklists assigned directly to the view
-      - Blocklists assigned to the view's parent server group
-    """
+async def effective_lists_for_view(
+    db: AsyncSession, view_id: uuid.UUID
+) -> list[DNSBlockList] | None:
+    """The lists a view's RPZ zone draws on, in the order that decides a
+    duplicate owner name: the view's own, then its group's. ``None`` when
+    the view does not exist."""
     view = (
         await db.execute(
             select(DNSView)
@@ -145,7 +181,7 @@ async def build_effective_for_view(db: AsyncSession, view_id: uuid.UUID) -> Effe
     ).scalar_one_or_none()
 
     if view is None:
-        return EffectiveBlocklist(scope="view", scope_id=view_id)
+        return None
 
     # View-scoped lists precede the group's, so a view's own list wins a
     # duplicate owner name; each tier is in a stable order of its own.
@@ -153,8 +189,39 @@ async def build_effective_for_view(db: AsyncSession, view_id: uuid.UUID) -> Effe
     if view.group is not None:
         for bl in _stable_list_order(list(view.group.blocklists)):
             combined.setdefault(bl.id, bl)
+    return list(combined.values())
 
-    entries, exceptions, list_ids = await _collect_lists(db, list(combined.values()))
+
+async def effective_lists_for_group(
+    db: AsyncSession, group_id: uuid.UUID
+) -> list[DNSBlockList] | None:
+    """The lists a server group's RPZ zone draws on, in a stable order.
+    ``None`` when the group does not exist."""
+    group = (
+        await db.execute(
+            select(DNSServerGroup)
+            .where(DNSServerGroup.id == group_id)
+            .options(selectinload(DNSServerGroup.blocklists))
+        )
+    ).scalar_one_or_none()
+
+    if group is None:
+        return None
+    return _stable_list_order(list(group.blocklists))
+
+
+async def build_effective_for_view(db: AsyncSession, view_id: uuid.UUID) -> EffectiveBlocklist:
+    """Compute the effective blocklist for a DNS view.
+
+    Combines:
+      - Blocklists assigned directly to the view
+      - Blocklists assigned to the view's parent server group
+    """
+    lists = await effective_lists_for_view(db, view_id)
+    if lists is None:
+        return EffectiveBlocklist(scope="view", scope_id=view_id)
+
+    entries, exceptions, list_ids = await _collect_lists(db, lists)
     return EffectiveBlocklist(
         scope="view",
         scope_id=view_id,
@@ -166,20 +233,11 @@ async def build_effective_for_view(db: AsyncSession, view_id: uuid.UUID) -> Effe
 
 async def build_effective_for_group(db: AsyncSession, group_id: uuid.UUID) -> EffectiveBlocklist:
     """Compute the effective blocklist for a DNS server group (all views)."""
-    group = (
-        await db.execute(
-            select(DNSServerGroup)
-            .where(DNSServerGroup.id == group_id)
-            .options(selectinload(DNSServerGroup.blocklists))
-        )
-    ).scalar_one_or_none()
-
-    if group is None:
+    lists = await effective_lists_for_group(db, group_id)
+    if lists is None:
         return EffectiveBlocklist(scope="group", scope_id=group_id)
 
-    entries, exceptions, list_ids = await _collect_lists(
-        db, _stable_list_order(list(group.blocklists))
-    )
+    entries, exceptions, list_ids = await _collect_lists(db, lists)
     return EffectiveBlocklist(
         scope="group",
         scope_id=group_id,
@@ -189,109 +247,171 @@ async def build_effective_for_group(db: AsyncSession, group_id: uuid.UUID) -> Ef
     )
 
 
-# ── Feed parsing (manual / hosts / domains / adblock) ────────────────────────
+# ── Streaming the entries (#1662) ─────────────────────────────────────────────
+#
+# The DNS agent bundle carries every entry of every list a zone draws on. The
+# catalog's largest feed is ~582k domains, and ``_collect_lists`` holds all of
+# them at once, as rows and then as one ``EffectiveEntry`` each: the render of
+# such a bundle took the whole 1 GiB worker. The render reads them through
+# these instead, one batch at a time, in exactly ``_collect_lists``'s order.
+
+#: (domain, action, block_mode, target, is_wildcard, sinkhole_ip) — what the
+#: bundle ships.
+RenderEntry = tuple[str, str, str, str | None, bool, str | None]
 
 
-@dataclass(frozen=True)
-class ParsedFeed:
-    """A parsed feed plus what its syntax said about subdomains.
+def _enabled(lists: list[DNSBlockList]) -> list[DNSBlockList]:
+    return [bl for bl in lists if bl.enabled]
 
-    ``wildcard_count`` is how many lines arrived `*.`-prefixed. The
-    caller needs it because that prefix is the feed *declaring* it means
-    "and every subdomain" — so a list configured apex-only
-    (``feed_entries_are_wildcard=False``, #894) against such a feed is
-    overriding a stated intent, which is worth saying out loud rather
-    than doing silently.
+
+async def has_entries(db: AsyncSession, lists: list[DNSBlockList]) -> bool:
+    """Does any enabled list of ``lists`` carry an entry?"""
+    ids = [bl.id for bl in _enabled(lists)]
+    if not ids:
+        return False
+    return bool(await db.scalar(select(exists().where(DNSBlockListEntry.list_id.in_(ids)))))
+
+
+def _ancestors(name: str) -> list[str]:
+    """``a.b.example.com`` → ``[b.example.com, example.com, com]``."""
+    labels = name.split(".")
+    return [".".join(labels[i:]) for i in range(1, len(labels))]
+
+
+def _like_escape(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+async def _pooled_feed_exceptions(
+    db: AsyncSession, enabled: list[DNSBlockList], feed: dict[uuid.UUID, set[str]]
+) -> set[str]:
+    """The feed exceptions (``source='feed'``, adblock ``@@``) that may join
+    the pooled exception set (#2123, decided on #2124).
+
+    Every renderer applies the pooled set to EVERY list of the zone: BIND
+    emits ``N`` and ``*.N`` as ``rpz-passthru`` and drops any entry equal to
+    ``N``; Technitium puts ``N`` in its allowed set, which unblocks ``N`` and
+    everything under it. A remote feed may only carve exceptions out of its
+    OWN blocks, so a feed's exception ``N`` is pooled only when:
+
+    * the feed's own list blocks it through a wildcard ancestor (``||p^``
+      with ``@@||n.p^``) — otherwise there is nothing of its own to carve
+      out of, and an exact block of ``N`` the parser already dropped;
+    * no OTHER list of the zone blocks ``N`` itself or through a wildcard
+      ancestor; and
+    * no other list blocks a name under ``N`` (Technitium's allowed set
+      covers the whole subtree).
+
+    Every other feed exception is stored, shown and has no effect. That
+    over-blocks rather than under-blocks: a carve-out lost to another list
+    is what that other list asked for.
     """
+    candidates: dict[uuid.UUID, set[str]] = {}
+    for bl in enabled:
+        names = feed.get(bl.id)
+        if not names:
+            continue
+        lookup = {a for n in names for a in _ancestors(n)}
+        if not lookup:
+            continue
+        rows = await db.execute(
+            select(DNSBlockListEntry.domain).where(
+                DNSBlockListEntry.list_id == bl.id,
+                DNSBlockListEntry.is_wildcard.is_(True),
+                DNSBlockListEntry.domain.in_(lookup),
+            )
+        )
+        own = {d.lower() for d in rows.scalars()}
+        useful = {n for n in names if any(a in own for a in _ancestors(n))}
+        if useful:
+            candidates[bl.id] = useful
 
-    domains: list[str]
-    wildcard_count: int
+    pooled: set[str] = set()
+    for list_id, names in candidates.items():
+        others = [bl.id for bl in enabled if bl.id != list_id]
+        if not others:
+            pooled |= names
+            continue
+        lookup = set(names) | {a for n in names for a in _ancestors(n)}
+        cover = await db.execute(
+            select(DNSBlockListEntry.domain, DNSBlockListEntry.is_wildcard).where(
+                DNSBlockListEntry.list_id.in_(others),
+                DNSBlockListEntry.domain.in_(lookup),
+            )
+        )
+        exact: set[str] = set()
+        wild: set[str] = set()
+        for d, is_wild in cover.tuples():
+            exact.add(d.lower())
+            if is_wild:
+                wild.add(d.lower())
+        safe = {n for n in names if n not in exact and not any(a in wild for a in _ancestors(n))}
+        if not safe:
+            continue
+        # A name UNDER a carve-out, blocked by another list. One pass over
+        # the other lists' entries, and only for the few carve-outs that
+        # survived the indexed checks above.
+        patterns = [f"%.{_like_escape(n)}" for n in sorted(safe)]
+        rows = await db.execute(
+            select(DNSBlockListEntry.domain).where(
+                DNSBlockListEntry.list_id.in_(others),
+                or_(*(DNSBlockListEntry.domain.like(p) for p in patterns)),
+            )
+        )
+        under = {d.lower() for d in rows.scalars()}
+        pooled |= {n for n in safe if not any(u.endswith("." + n) for u in under)}
+    return pooled
 
 
-def parse_feed(content: str, feed_format: str) -> list[str]:
-    """Parse raw feed text into a deduped list of domains.
+async def exception_domains(db: AsyncSession, lists: list[DNSBlockList]) -> set[str]:
+    """The exceptions every renderer applies across all of ``lists``.
 
-    Thin wrapper over :func:`parse_feed_detailed` for the many callers
-    (and tests) that only want the names.
+    An operator's exception (``source='manual'``) applies to every list of
+    the zone, as it always has. A feed's own ``@@`` rule (``source='feed'``,
+    #2123) applies only to that feed's list: see
+    :func:`_pooled_feed_exceptions`.
     """
-    return parse_feed_detailed(content, feed_format).domains
-
-
-def parse_feed_detailed(content: str, feed_format: str) -> ParsedFeed:
-    """Parse raw feed text into deduped domains + wildcard-syntax count.
-
-    Accepts:
-      - `hosts`: `0.0.0.0 ads.example.com` (or `127.0.0.1`)
-      - `domains`: one domain per line, optionally `*.`-prefixed
-      - `adblock`: `||ads.example.com^`
-
-    Ignores blank lines and comments (`#`, `!`). A leading `*.` is
-    stripped rather than kept — see the comment at the strip site.
-    """
-    out: list[str] = []
-    seen: set[str] = set()
-    wildcard_count = 0
-
-    for raw in content.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or line.startswith("!"):
-            continue
-
-        domain: str | None = None
-
-        if feed_format == "adblock":
-            # ||ads.example.com^  or ||ads.example.com
-            if line.startswith("||"):
-                rest = line[2:]
-                for sep in ("^", "$", "/"):
-                    idx = rest.find(sep)
-                    if idx != -1:
-                        rest = rest[:idx]
-                        break
-                domain = rest
-        elif feed_format == "hosts":
-            # Strip inline comment
-            line = line.split("#", 1)[0].strip()
-            parts = line.split()
-            if len(parts) >= 2:
-                domain = parts[1]
-            elif len(parts) == 1:
-                domain = parts[0]
-        else:  # "domains"
-            line = line.split("#", 1)[0].strip()
-            if line:
-                domain = line.split()[0]
-
-        if not domain:
-            continue
-        domain = domain.lower().strip(".")
-        # Several feeds publish wildcard syntax (`*.example.com` — OISD's
-        # `domainswild`, Hagezi's `wildcard/`). The star is how the feed
-        # says "and every subdomain", which is what a blocklist entry
-        # means here anyway, so it is stripped rather than stored: kept
-        # literally it produces an RPZ rule matching subdomains ONLY,
-        # leaving the apex resolving normally.
-        if domain.startswith("*."):
-            domain = domain[2:]
-            wildcard_count += 1
-        if not domain or "." not in domain:
-            continue
-        if domain in seen:
-            continue
-        seen.add(domain)
-        out.append(domain)
-
-    return ParsedFeed(domains=out, wildcard_count=wildcard_count)
-
-
-def dedupe_domains(domains: list[str]) -> list[str]:
-    """Return a deduped, lowercased, sorted-by-input-order list of valid domains."""
-    seen: set[str] = set()
-    out: list[str] = []
-    for d in domains:
-        dd = d.strip().lower().strip(".")
-        if not dd or "." not in dd or dd in seen:
-            continue
-        seen.add(dd)
-        out.append(dd)
+    enabled = _enabled(lists)
+    out: set[str] = set()
+    feed: dict[uuid.UUID, set[str]] = {}
+    for bl in enabled:
+        rows = await db.execute(
+            select(DNSBlockListException.domain, DNSBlockListException.source).where(
+                DNSBlockListException.list_id == bl.id
+            )
+        )
+        for domain, source in rows.tuples():
+            name = domain.lower().rstrip(".")
+            if source == "feed":
+                feed.setdefault(bl.id, set()).add(name)
+            else:
+                out.add(domain.lower())
+    if feed:
+        out |= await _pooled_feed_exceptions(db, enabled, feed)
     return out
+
+
+async def stream_entries(
+    db: AsyncSession, lists: list[DNSBlockList], batch: int
+) -> AsyncGenerator[list[RenderEntry], None]:
+    """Every entry ``_collect_lists`` collects for ``lists``, in the same order,
+    at most ``batch`` at a time: one server-side cursor per list, so neither
+    the driver nor this process ever holds more than a batch of a list."""
+    for bl in _enabled(lists):
+        block_mode, sinkhole_ip = bl.block_mode, bl.sinkhole_ip
+        result = await db.stream(_entry_rows(bl.id).execution_options(yield_per=batch))
+        try:
+            async for rows in result.partitions():
+                yield [
+                    (
+                        domain.lower(),
+                        entry_type,
+                        block_mode,
+                        target,
+                        is_wildcard,
+                        sinkhole_ip,
+                    )
+                    for domain, entry_type, target, is_wildcard in rows
+                ]
+        finally:
+            await result.close()

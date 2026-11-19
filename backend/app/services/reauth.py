@@ -17,8 +17,9 @@ This helper unifies the re-confirmation:
 * **External-auth users** (no local password): a correct TOTP code passes. MFA
   enrolment is now open to every auth source (#408), so an SSO superadmin can
   enrol TOTP and then re-confirm with it. Enrolment itself is gated by
-  :func:`reverify_for_mfa_enrolment` (#1241): a password for local users, a
-  recent sign-in for external ones. If they have NOT enrolled, the helper
+  :func:`reverify_for_mfa_enrolment` (#1241) for the window fallback, and by
+  ``services/mfa_enrol_stepup.py`` (#1354) per account type: a password for
+  local users, the provider's own check for external ones. If they have NOT enrolled, the helper
   returns ``MFA_REQUIRED`` so the caller can tell them to enrol rather than
   dead-ending on a password they don't have.
 
@@ -51,6 +52,8 @@ class ReauthOutcome(Enum):
     BAD_CREDENTIAL = "bad_credential"  # wrong password / wrong or missing TOTP
     MFA_REQUIRED = "mfa_required"  # external-auth user with no MFA enrolled
     SIGN_IN_TOO_OLD = "sign_in_too_old"  # external-auth user; sign in again (#1241)
+    REAUTH_REQUIRED = "reauth_required"  # OIDC / SAML user; re-authenticate at the IdP (#1354)
+    PROVIDER_UNAVAILABLE = "provider_unavailable"  # directory could not answer (#1354)
 
 
 def _totp_ok(user: User, code: str | None) -> bool:
@@ -123,6 +126,11 @@ def reverify_for_mfa_enrolment(
     now: datetime | None = None,
 ) -> ReauthOutcome:
     """Step-up for STARTING an MFA enrolment (#1241).
+
+    Since #1354 this is the step-up for local users and the FALLBACK for an
+    external account whose own provider cannot be asked (deleted, disabled);
+    every other external account is checked at its provider by
+    ``services/mfa_enrol_stepup.verify_enrol_stepup``.
 
     Enrolment used to need only a session, and it is the one step-up that
     cannot fall back on TOTP — there is none yet. So a hijacked session

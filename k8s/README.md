@@ -8,7 +8,8 @@ k8s/
 ├── dns/               # Managed DNS server StatefulSets (bind9)
 ├── dhcp/              # Managed DHCP server StatefulSets (kea)
 ├── ha/                # High-availability add-ons (CloudNativePG, Redis Sentinel; the Patroni Compose overlay does not work, #1236)
-└── service-control/   # Opt-in RBAC + api patch for GUI service restart (#890)
+├── service-control/   # Opt-in RBAC + api patch for GUI service restart (#890)
+└── pod-logs/           # Opt-in pod list + log read RBAC for Platform Insights > Containers (#3761)
 ```
 
 ## Managed DHCP servers (Kea)
@@ -28,8 +29,10 @@ kubectl apply -f k8s/dhcp/service-dhcp.yaml
 
 DHCPv4 requires broadcast reception on the client LAN. In most clusters you
 either run the pod with `hostNetwork: true` or front it with a DHCP relay
-(option 82). The stock manifests expose UDP/67 via `NodePort` for lab use
-only.
+(option 82) pointed at a LoadBalancer Service on UDP/67. The stock
+manifests use that LoadBalancer Service: on a `NodePort` Service the
+declared `port: 67` is in-cluster only and the node-facing port is a
+random 30000–32767 pick, which a relay cannot target.
 
 
 ## Quick Start (single-node / dev)
@@ -40,6 +43,7 @@ kubectl apply -f k8s/base/namespace.yaml
 kubectl create secret generic spatiumddi-secrets \
   --from-literal=postgres-password=CHANGEME \
   --from-literal=secret-key=$(openssl rand -hex 32) \
+  --from-literal=redis-password=$(openssl rand -hex 32) \
   --from-literal=metrics-token=$(openssl rand -hex 32) \
   -n spatiumddi
 # metrics-token is the bearer token /metrics accepts (#1159). It's optional:
@@ -53,7 +57,16 @@ kubectl create secret generic spatiumddi-secrets \
 kubectl run postgres --image=postgres:16-alpine -n spatiumddi \
   --env=POSTGRES_USER=spatiumddi \
   --env=POSTGRES_PASSWORD=CHANGEME \
-  --env=POSTGRES_DB=spatiumddi
+  --env=POSTGRES_DB=spatiumddi \
+  -- postgres -c max_connections=369   # see "Postgres connection budget" below
+# Give it a Service under the name DATABASE_URL expects. In the HA
+# path CNPG creates `postgres-rw` itself; here the expose creates it
+# (#1547 — a bare `kubectl run` pod has no Service at all).
+kubectl expose pod postgres --name=postgres-rw --port=5432 -n spatiumddi
+
+# 2b. Deploy a standalone Redis (not HA — for dev/test only)
+kubectl run redis --image=redis:8-alpine -n spatiumddi
+kubectl expose pod redis --port=6379 -n spatiumddi
 
 # 3. Run migrations
 kubectl apply -f k8s/base/migrate-job.yaml
@@ -63,6 +76,15 @@ kubectl wait --for=condition=complete job/spatiumddi-migrate -n spatiumddi --tim
 kubectl apply -f k8s/base/configmap.yaml
 kubectl apply -f k8s/base/api.yaml
 kubectl apply -f k8s/base/worker.yaml
+# The stock api / worker / beat env targets the HA Sentinel topology
+# (k8s/ha/redis-sentinel.yaml, #1547): sentinel:// URLs with the
+# Secret's redis-password interpolated in. For this standalone
+# (no-auth) Redis, override the env on the Deployments instead:
+kubectl -n spatiumddi set env deployment/api deployment/worker deployment/beat \
+  REDIS_URL="redis://redis:6379/0" \
+  CELERY_BROKER_URL="redis://redis:6379/1" \
+  CELERY_RESULT_BACKEND="redis://redis:6379/2" \
+  REDIS_SENTINEL_PASSWORD="" REDIS_PASSWORD=""
 kubectl apply -f k8s/base/frontend.yaml
 ```
 
@@ -130,9 +152,53 @@ kubectl apply --server-side -f \
 kubectl apply -f k8s/ha/postgres-cluster.yaml
 ```
 
-The operator creates two Services automatically:
-- `postgres-primary` → always points to the current primary (read/write)
-- `postgres-replica` → load-balances across read replicas
+The operator creates three Services automatically, named after the
+Cluster (`postgres`):
+- `postgres-rw` → always points to the current primary (read/write)
+- `postgres-ro` → load-balances across read replicas
+- `postgres-r` → any instance (primary or replica)
+
+`DATABASE_URL` in `k8s/base/` uses `postgres-rw`.
+
+The Cluster sets `primaryUpdateMethod: switchover` (#2831): a rolling update
+promotes an already-updated replica before it touches the primary, so new
+connections wait seconds. CNPG's default, `restart`, restarts the primary
+under its pooled sessions and refuses new connections for over three minutes
+(the 180 s `smartShutdownTimeout`, then the restart). Change `imageName` and
+`postgresql.parameters` in separate applies: the operator's webhook refuses an
+update that changes both.
+
+### Postgres connection budget (#2955)
+
+The manifests carry static numbers, so `max_connections` is sized for the
+defaults in `k8s/base/` and has to be re-derived if you change them. The rule
+is the one the appliance's supervisor applies
+(`k8s_api.postgres_connection_budget`) and the umbrella chart derives with a
+template helper (`spatiumddi.postgresMaxConnections`):
+
+```
+api pods x (DATABASE_POOL_SIZE + DATABASE_MAX_OVERFLOW + 2 hooks + 1 readiness probe)
++ worker replicas x (concurrency x 3 + 1)
++ celery-beat 3
++ CNPG replicas (WAL senders: instances - 1)
++ 10 reserve (superuser_reserved_connections 3, a migrate Job, psql)
+```
+
+The api count is the HPA's `maxReplicas` (10). Defaults: 10 x (30 + 3) = 330,
+worker 2 x (4 x 3 + 1) = 26, beat 3, 2 WAL senders, 10 reserve = **371**,
+which is what `k8s/ha/postgres-cluster.yaml` sets (it was 200, under the 330
+the api alone can open at the HPA maximum). Changing `max_connections` on
+CloudNativePG rolls the instances; on a standalone Postgres it restarts it. A
+single Postgres with no WAL senders (the `kubectl run` above) needs 369.
+
+Memory: a busy backend costs ~14 MiB of private memory (measured, #2156), so a
+Postgres that can hold 371 connections needs shared_buffers + 256 MiB + 371 x
+(14 + shared_buffers / 512) MiB, about 6 GiB at 256MB of shared_buffers, when
+all of them are in use. `k8s/ha/postgres-cluster.yaml` sets no `resources`, so
+the instances are bounded only by their node; if you add a memory limit, size
+it from that formula (the umbrella chart raises its own limit this way while it
+derives `max_connections`). The CI chart gate (`chart-postgres-connections.py`)
+holds the Helm chart to both.
 
 ### PostgreSQL HA — Patroni (Docker Compose): not supported in 1.0
 
@@ -151,6 +217,17 @@ kubectl apply -f k8s/ha/redis-sentinel.yaml
 ```
 
 Three Redis nodes with Sentinel provides automatic failover with quorum of 2.
+
+The control plane finds the current master through Sentinel (#1547):
+the api / worker / beat env in `k8s/base/` builds `sentinel://` URLs —
+`REDIS_URL` lists every Sentinel by its per-pod headless DNS name, the
+Celery URLs go through the `redis-sentinel` Service the manifest
+creates, and the password in the URLs is interpolated from the
+`redis-password` key of the `spatiumddi-secrets` Secret — the same
+key the manifest's init container renders into `redis.conf` as the
+`requirepass`, so there is exactly one place to rotate. A plain
+`redis://` URL against the headless Service would land on a replica
+~2 times in 3 and fail with `READONLY` / `NOAUTH`.
 
 **Surviving a hard node loss (#590).** Three properties of the manifest are
 load-bearing, and all three were learned the hard way:
@@ -222,7 +299,7 @@ have served straight through starts evicting them instead.
 
 ### Worker capability — `NET_RAW`
 
-The worker pod ships with `securityContext.capabilities.add: ["NET_RAW"]` so `nmap` can run SYN scans + `-O` OS detection from the device-profiling auto-nmap path. The image already grants the cap to the `nmap` binary via `setcap` — this line keeps it in the pod's bounding set so restricted Pod Security Admission (`restricted` profile), OpenShift SCC, and GKE Autopilot don't drop it. The cap is in containerd's default cap set on permissive clusters, so it's a no-op there. If you've turned device profiling off cluster-wide and want a tighter security posture, drop the `securityContext` block from `k8s/base/worker.yaml` (or set `worker.netRawCapability: false` in the Helm chart).
+The worker pod ships with `securityContext.capabilities.add: ["NET_RAW"]` so `nmap` can run SYN scans + `-O` OS detection from the device-profiling auto-nmap path. The image already grants the cap to the `nmap` binary via `setcap` — this line keeps it in the pod's bounding set so restricted Pod Security Admission (`restricted` profile), OpenShift SCC, and GKE Autopilot don't drop it. These raw manifests are not OpenShift-ready (they pin uids and use `:80`); for OpenShift use the Helm chart, which detects the platform. See [`docs/deployment/KUBERNETES.md`](../docs/deployment/KUBERNETES.md), "OpenShift". The cap is in containerd's default cap set on permissive clusters, so it's a no-op there. If you've turned device profiling off cluster-wide and want a tighter security posture, drop the `securityContext` block from `k8s/base/worker.yaml` (or set `worker.netRawCapability: false` in the Helm chart).
 
 ### Pod posture — seccomp + Pod Security Admission (issue #983)
 
@@ -231,6 +308,10 @@ Every pod template in these manifests carries `securityContext.seccompProfile.ty
 The `spatiumddi` namespace carries `pod-security.kubernetes.io/warn: baseline` and `.../audit: baseline`. Both are report-only and neither can reject a pod. `enforce` is deliberately absent and is not usable here — the Kea StatefulSet needs `hostNetwork` to see DHCPDISCOVER broadcasts and the BIND9 StatefulSet binds `:53` on the host, both of which violate `baseline` by design. What warn/audit buy you is that a workload added *later* which quietly starts wanting `hostPath` or `privileged` shows up in `kubectl apply` output and the apiserver audit log rather than nowhere.
 
 These manifests set no `priorityClassName`. That is the correct default for a bring-your-own cluster: a pod naming a PriorityClass the cluster does not define is refused by the apiserver. If you have a priority policy, the Helm chart exposes `global.priorityClassName` / `global.servicePriorityClassName` — see [`docs/deployment/KUBERNETES.md`](../docs/deployment/KUBERNETES.md).
+
+## api shutdown and readiness (#2944)
+
+The api image runs uvicorn with `--timeout-graceful-shutdown 20`, and the `api` Deployment's `terminationGracePeriodSeconds` is 30. After SIGTERM uvicorn waits at most 20 s for in-flight requests, then runs lifespan shutdown (which closes the after-commit hooks' database engine) with 10 s to spare before the SIGKILL. If you raise or lower either number keep the flag below the grace period; `backend/tests/test_api_graceful_shutdown.py` pins that for the manifests, the Helm chart and the compose files. `/health/ready` checks the database over its own one-connection engine, so a request pool saturated by load does not fail the probe. That connection is held open at idle, so each api pod counts 30 (its request pool, `DATABASE_POOL_SIZE` + `DATABASE_MAX_OVERFLOW`) + 2 (after-commit hooks, #2782) + 1 (the probe) against Postgres' `max_connections`: at the HPA's 10 replicas that is 330, more than `k8s/ha/postgres-cluster.yaml`'s 200. Lower the pool, cap the HPA, or raise `max_connections` to match.
 
 ## TLS / Ingress
 
@@ -300,7 +381,17 @@ helm install ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
 ```
 
 Declare each DNS server under `.dnsAgents.servers[]` in `values.yaml`.
-The chart renders a StatefulSet + LoadBalancer Service per entry.
+The chart renders a StatefulSet + Service per entry, named
+`dns-<flavor>-<name>`; `dnsAgents.prefixWithFullname=true` prefixes them with
+the release fullname (new installs only: it recreates a live StatefulSet with
+new PVCs, #3209). The Service is `ClusterIP` unless you set `service.type`
+(#3229). `servers[].affinity` / `storageClass` (or `dnsAgents.storageClass`)
+set placement and the claims' StorageClass (#3206).
+The stock manifests in `k8s/dns/` and `k8s/dhcp/` still use
+`type: LoadBalancer`. On k3s with its bundled servicelb, a LoadBalancer on
+UDP/53 or UDP/67 binds that host port on every node and captures the node's
+own resolver, so image pulls fail. Use MetalLB (with `--disable servicelb`)
+or another load balancer for those Services, not servicelb.
 Set `flavor: powerdns` or `flavor: technitium` on a server to pull the
 `ghcr.io/spatiumnorth/dns-powerdns` / `ghcr.io/spatiumnorth/dns-technitium`
 image instead of BIND9 — same `DNS_AGENT_KEY` bootstrap, image-baked
@@ -411,7 +502,25 @@ kubectl apply -f base/migrate-job.yaml -n spatiumddi
 kubectl wait --for=condition=complete job/spatiumddi-migrate -n spatiumddi --timeout=10m
 ```
 
-Helm chart users: `helm upgrade spatiumddi charts/spatiumddi -n spatiumddi --set image.tag=$NEW_TAG`. The chart's pre-upgrade hook re-runs the migrate job; the `alembic upgrade head` invocation honours the same DATABASE_URL the api uses.
+Helm chart users: `helm upgrade spatiumddi charts/spatiumddi -n spatiumddi --set image.tag=$NEW_TAG`. The chart renders a new migrate Job per Helm revision (`<release>-migrate-r<revision>`, a regular Job, not a hook), and the api / worker / beat pods wait for it in their `wait-for-migrate` init containers.
+
+**GitOps over these manifests.** `base/migrate-job.yaml` has a fixed name, and a Job's pod template is immutable. The `kubectl delete` above is what makes a re-apply work. A controller that only applies (Argo CD, Flux's `Kustomization`) cannot do that step, so the first image bump fails with `spec.template: field is immutable`. Patch the Job into a sync hook in your overlay instead of editing the base, e.g. for Argo CD:
+
+```yaml
+# kustomization.yaml
+patches:
+  - target: { kind: Job, name: spatiumddi-migrate }
+    patch: |-
+      - op: add
+        path: /metadata/annotations
+        value:
+          argocd.argoproj.io/hook: Sync
+          argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+```
+
+The Helm chart exposes the same thing as `migrate.annotations`.
+
+`spatiumddi-secrets` may also carry `credential-key`, the Fernet key stored credentials are encrypted under (`CREDENTIAL_ENCRYPTION_KEY`; `secrets.yaml.example` shows the command). Optional: without it the key is derived from `SECRET_KEY`. Adding it to a running install is safe, since the derived key stays a read fallback. Add `credential-key-since` set to the running version with it, so pods that have not restarted yet never meet a value written under a key they do not have (that version reads the key and keeps writing under the old one); after the next upgrade, run `python -m app.core.rotate_credential_key` in the api pod to move existing values onto it. The Helm chart generates and keeps one for you.
 
 The migrate job needs the api's `SECRET_KEY` (and `CREDENTIAL_ENCRYPTION_KEY`, if you set one on the api): since #1364 a migration can encrypt existing values under the install's credential key, and refuses to start without it. `base/migrate-job.yaml` reads `SECRET_KEY` from `spatiumddi-secrets`; if you keep the migrate job in your own manifests, add it there too.
 

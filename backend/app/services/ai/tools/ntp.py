@@ -32,6 +32,7 @@ class FindNTPSettingsArgs(BaseModel):
 
 @register_tool(
     name="find_ntp_settings",
+    permission="authenticated",
     description=(
         "Return the appliance NTP / chrony configuration: source "
         "mode (``pool`` / ``servers`` / ``mixed``), the list of "

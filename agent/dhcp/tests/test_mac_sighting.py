@@ -113,3 +113,46 @@ def test_sighting_payload_round_trips() -> None:
     obs = MacSighting(mac_address="aa:bb:cc:dd:ee:ff", ip_address="10.0.0.5")
     payload = obs.to_payload()
     assert payload == {"mac_address": "aa:bb:cc:dd:ee:ff", "ip_address": "10.0.0.5"}
+
+
+# --- #1109 Part 4: no per-packet imports / layer-chain re-walks ----------
+
+
+def test_parse_does_not_import_scapy_per_packet(monkeypatch):
+    import builtins
+
+    parse_sighting_packet(Ether(src="aa:bb:cc:00:00:01") / ARP(psrc="10.0.0.1"))  # warm
+    real = builtins.__import__
+    seen: list[str] = []
+
+    def spy(name, *a, **kw):
+        if name.startswith("scapy"):
+            seen.append(name)
+        return real(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", spy)
+    for _ in range(5):
+        obs = parse_sighting_packet(Ether(src="aa:bb:cc:00:00:01") / ARP(psrc="10.0.0.1"))
+        assert obs is not None and obs.ip_address == "10.0.0.1"
+    assert seen == []
+
+
+def test_parse_walks_layer_chain_once(monkeypatch):
+    from scapy.packet import Packet
+
+    calls = {"n": 0}
+    real = Packet.haslayer
+
+    def counting(self, *a, **kw):
+        calls["n"] += 1
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(Packet, "haslayer", counting)
+    pkt = (
+        Ether(src="aa:bb:cc:00:00:02")
+        / IPv6(src="fe80::2")
+        / ICMPv6ND_NS(tgt="fe80::2")
+        / ICMPv6NDOptSrcLLAddr(lladdr="aa:bb:cc:00:00:02")
+    )
+    assert parse_sighting_packet(pkt) is not None
+    assert calls["n"] == 0

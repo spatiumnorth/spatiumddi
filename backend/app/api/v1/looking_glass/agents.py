@@ -19,7 +19,6 @@ from typing import Any
 
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
-from jose import JWTError
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 
@@ -27,12 +26,15 @@ from app.api.deps import DB
 from app.api.v1.dhcp._audit import write_audit
 from app.core.agent_wake import (
     WAKE_TICK_SECONDS,
+    WakeResult,
     looking_glass_wake_channels,
     wake_subscription,
 )
 from app.core.http_etag import etag_matches, format_etag
+from app.core.jwt_compat import JWTError
 from app.models.bgp_looking_glass import BGPLGPeer, LookingGlassCollector
 from app.services.agents.config_apply import apply_reported_status
+from app.services.agents.server_gone import refresh_agent_server
 from app.services.looking_glass.agent_token import (
     hash_token,
     mint_agent_token,
@@ -304,6 +306,17 @@ async def agent_config_longpoll(
         # degrades to the WAKE_TICK_SECONDS sleep (the ETag compare stays
         # authoritative either way).
         while True:
+            # #2040 — this session lives for the whole wait (expire_on_commit=
+            # False: no commit in the loop expires anything). A re-query hands back the peer
+            # rows already in the identity map without overwriting them, and
+            # the collector row was never re-read at all, so a woken pass
+            # rebuilt the bundle from the state the poll parked on: a peer
+            # edit (address, ASN, MD5 secret, filter) or a collector disable
+            # reached the agent only when the long-poll timed out. Expire
+            # everything and refresh the collector so each pass reads
+            # committed state, as the DHCP long-poll does.
+            db.expire_all()
+            await refresh_agent_server(db, collector)
             bundle = await build_lg_config_bundle(db, collector)
             etag = bundle.etag
             if not etag_matches(if_none_match, etag):
@@ -342,7 +355,16 @@ async def agent_config_longpoll(
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 return Response(status_code=304, headers={"ETag": format_etag(etag)})
-            await wake.wait(min(WAKE_TICK_SECONDS, remaining))
+            # #3479: end this pass's read transaction before the wait, so the
+            # bundle's reads hold no lock through it (the DNS and DHCP polls
+            # made a factory reset's TRUNCATE wait out whole holds). Nothing is
+            # pending here, and the next pass expires and re-reads everything.
+            await db.commit()
+            if await wake.wait(min(WAKE_TICK_SECONDS, remaining)) == WakeResult.SHUTDOWN:
+                # #3015 — this api process is stopping: end the hold now so the
+                # next pass makes one last ETag check and answers 304, and the
+                # agent re-polls another pod instead of being cancelled.
+                deadline = asyncio.get_running_loop().time()
 
 
 @router.post("/heartbeat", response_model=AgentHeartbeatResponse)

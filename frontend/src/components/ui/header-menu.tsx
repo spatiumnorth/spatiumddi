@@ -1,15 +1,9 @@
-import {
-  useCallback,
-  useEffect,
-  useId,
-  useLayoutEffect,
-  useRef,
-  useState,
-} from "react";
+import { useCallback, useId, useLayoutEffect, useRef, useState } from "react";
 import { ChevronDown } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { HeaderButton } from "@/components/ui/header-button";
+import { useDismissableMenu } from "@/hooks/useDismissableMenu";
 
 // Dropdown companion to HeaderButton (#996).
 //
@@ -57,6 +51,12 @@ export type HeaderMenuItem = {
   destructive?: boolean;
   /** Draws a divider ABOVE this item. */
   separatorBefore?: boolean;
+  /**
+   * Makes this a checkbox item (`menuitemcheckbox`): `onSelect` toggles
+   * the option and the menu STAYS OPEN, so the choice can be made before
+   * the action it modifies (Export's "Include IP addresses", #2722).
+   */
+  checked?: boolean;
 };
 
 type HeaderMenuProps = {
@@ -91,21 +91,14 @@ export function HeaderMenu({
   const menuRef = useRef<HTMLDivElement>(null);
   const menuId = useId();
 
-  const close = useCallback((focusTrigger: boolean) => {
-    setOpen(false);
-    if (focusTrigger) triggerRef.current?.focus();
-  }, []);
-
-  useEffect(() => {
-    if (!open) return;
-    const onDocMouseDown = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) {
-        setOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", onDocMouseDown);
-    return () => document.removeEventListener("mousedown", onDocMouseDown);
-  }, [open]);
+  const dismiss = useCallback(() => setOpen(false), []);
+  // Esc / outside press / focus leaving: the shared popover contract.
+  const { onBlur } = useDismissableMenu({
+    open,
+    onClose: dismiss,
+    containerRef: ref,
+    triggerRef,
+  });
 
   // Flip to the left edge when the panel would overflow the viewport. A
   // header menu near the right edge is the common case, so `right-0` is
@@ -144,10 +137,9 @@ export function HeaderMenu({
   };
 
   const onMenuKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Escape") {
-      e.preventDefault();
-      close(true);
-    } else if (e.key === "ArrowDown") {
+    // Escape is handled by the document listener above, which also
+    // covers focus on the trigger.
+    if (e.key === "ArrowDown") {
       e.preventDefault();
       focusItem(1);
     } else if (e.key === "ArrowUp") {
@@ -170,7 +162,7 @@ export function HeaderMenu({
   if (items.length === 0) return null;
 
   return (
-    <div ref={ref} className={cn("relative", className)}>
+    <div ref={ref} className={cn("relative", className)} onBlur={onBlur}>
       <HeaderButton
         ref={triggerRef}
         icon={Icon}
@@ -209,11 +201,22 @@ export function HeaderMenu({
               {it.separatorBefore && <div className="border-t" />}
               <button
                 type="button"
-                role="menuitem"
+                role={
+                  it.checked === undefined ? "menuitem" : "menuitemcheckbox"
+                }
+                aria-checked={it.checked}
                 title={it.title}
                 disabled={it.disabled}
                 onClick={() => {
-                  setOpen(false);
+                  if (it.checked === undefined) {
+                    // Hand focus back to the trigger BEFORE the item runs, so
+                    // a dialog that opens later (after an async fresh read,
+                    // once this item has unmounted) records the trigger as its
+                    // opener instead of <body> (#3485). An onSelect that moves
+                    // focus itself still wins: it runs after this.
+                    triggerRef.current?.focus();
+                    setOpen(false);
+                  }
                   it.onSelect();
                 }}
                 className={cn(
@@ -227,6 +230,14 @@ export function HeaderMenu({
                   <it.icon
                     className={cn("h-3.5 w-3.5 shrink-0", it.iconClassName)}
                   />
+                )}
+                {it.checked !== undefined && (
+                  <span
+                    aria-hidden="true"
+                    className="inline-block w-3 shrink-0 text-center"
+                  >
+                    {it.checked ? "✓" : ""}
+                  </span>
                 )}
                 <span className="min-w-0">{it.label}</span>
               </button>

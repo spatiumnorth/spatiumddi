@@ -38,6 +38,7 @@ from typing import Any
 import httpx
 import structlog
 
+from app.core.exc_text import describe_exc
 from app.services._mirror_shape import require_list
 
 logger = structlog.get_logger(__name__)
@@ -171,7 +172,7 @@ class DockerClient:
         try:
             resp = await self._client.get(path, params=params or None)
         except httpx.HTTPError as exc:
-            raise DockerClientError(f"{path}: {exc}") from exc
+            raise DockerClientError(f"{path}: {describe_exc(exc)}") from exc
         if resp.status_code in (401, 403):
             raise DockerClientError(f"{path}: HTTP {resp.status_code} — TLS / permission issue")
         if resp.status_code >= 400:

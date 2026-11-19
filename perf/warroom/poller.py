@@ -8,7 +8,7 @@ gracefully — an unavailable endpoint records ``{available: false}`` and is nev
 fatal; the loop keeps every other surface flowing.
 
 Surfaces (cadence key -> file):
-  health_platform_s    -> warroom/health_platform.ndjson   (GET /health/platform, unauth)
+  health_platform_s    -> warroom/health_platform.ndjson   (GET /health/platform + token)
   postgres_overview_s  -> warroom/pg_overview.ndjson        (GET /admin/postgres/overview)
                        -> warroom/pg_connections.ndjson     (GET /admin/postgres/connections)
   postgres_tables_s    -> warroom/pg_tables.ndjson          (GET /admin/postgres/tables)

@@ -41,6 +41,7 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.config import settings
+from app.db import task_connect_args
 from app.models.pcap import PacketCapture
 
 logger = structlog.get_logger(__name__)
@@ -155,7 +156,8 @@ def validate_bpf_filter(bpf: str | None) -> str | None:
     This is an *argv-injection* sanity bound, not a target-authorization
     control — it deliberately admits ``host 10.0.0.1`` / ``port 53``. The
     real safety is that the result is passed as tcpdump's single trailing
-    argv element, never through a shell.
+    argv element, never through a shell, and a leading ``-`` is refused
+    (``build_pcap_argv`` also puts ``--`` before it).
     """
     if bpf is None:
         return None
@@ -167,6 +169,8 @@ def validate_bpf_filter(bpf: str | None) -> str | None:
             "BPF filter contains characters that aren't valid in a capture "
             "expression (shell metacharacters are rejected)"
         )
+    if bpf.startswith("-"):
+        raise PcapArgError("BPF filter must not start with '-'")
     return bpf
 
 
@@ -227,8 +231,9 @@ def build_pcap_argv(
         argv.extend(["-c", str(max_packets)])
     if bpf_filter:
         # SINGLE trailing argv element — tcpdump parses it as BPF. Never
-        # shlex.split, never shell.
-        argv.append(bpf_filter)
+        # shlex.split, never shell. ``--`` ends option parsing so the
+        # filter can never be read as a tcpdump option.
+        argv.extend(["--", bpf_filter])
     return argv
 
 
@@ -236,7 +241,9 @@ def build_pcap_argv(
 
 
 def _new_engine_factory() -> tuple[Any, async_sessionmaker[AsyncSession]]:
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     factory = async_sessionmaker(engine, expire_on_commit=False)
     return engine, factory
 
@@ -408,6 +415,7 @@ async def run_pcap(capture_id: uuid.UUID) -> None:
 
             if file_size > 0:
                 cap_row.pcap_path = str(out_path)
+                cap_row.artifact_node = (settings.node_name or "").strip() or None
                 cap_row.pcap_size_bytes = file_size
                 with contextlib.suppress(OSError):
                     cap_row.pcap_sha256 = _sha256_file(out_path)
@@ -442,8 +450,16 @@ async def run_pcap(capture_id: uuid.UUID) -> None:
                 cap_row.status = "completed"
             else:
                 cap_row.status = "failed"
+                # Raw tcpdump stderr stays in the server log; the caller
+                # only gets a fixed message.
+                logger.warning(
+                    "pcap_tcpdump_failed",
+                    capture_id=str(capture_id),
+                    returncode=proc.returncode,
+                    stderr=stderr_text.strip()[-500:],
+                )
                 cap_row.error_message = (
-                    stderr_text.strip()[-500:] or f"tcpdump exited with code {proc.returncode}"
+                    f"tcpdump exited with status {proc.returncode}; see the server log"
                 )
 
             await db.commit()

@@ -26,16 +26,18 @@ import uuid
 from datetime import UTC, datetime
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser
+from app.api.stepup import require_stepup_if_granting_superadmin
 from app.api.v1.roles.router import _VALID_ACTIONS
-from app.core.permissions import caller_can_grant, require_permission
+from app.core.permissions import caller_can_grant, refuse_and_audit, require_permission
 from app.models.audit import AuditLog
 from app.models.auth import Group
 from app.models.time_bound_grant import TimeBoundGrant
+from app.services.superadmin_grant import SuperadminModel, permissions_grant_superadmin
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -51,6 +53,10 @@ class TimeBoundGrantCreate(BaseModel):
     resource_id: str | None = None
     expires_at: datetime
     reason: str = ""
+    # #1412 — the caller's step-up, needed only when the grant is ``*`` / ``*``
+    # and the group has members who are not already superadmins.
+    stepup_password: str | None = None
+    stepup_totp_code: str | None = None
 
     @field_validator("action")
     @classmethod
@@ -190,6 +196,29 @@ async def create_time_bound_grant(
             ),
         )
 
+    # A ``*`` / ``*`` grant makes every member a superadmin until it expires
+    # (#1412). Checked before the row is written: a refused step-up commits
+    # its audit row.
+    method: str | None = None
+    granted = 0
+    if permissions_grant_superadmin(requested):
+        group_id = body.group_id
+
+        def _change(model: SuperadminModel) -> None:
+            model.granted_groups.add(group_id)
+
+        method, granted = await require_stepup_if_granting_superadmin(
+            db,
+            current_user,
+            password=body.stepup_password,
+            totp_code=body.stepup_totp_code,
+            change=_change,
+            action="permission_change",
+            resource_type="time_bound_grant",
+            resource_id=str(body.group_id),
+            resource_display=f"grant * on * to group {group.name}",
+        )
+
     grant = TimeBoundGrant(
         group_id=body.group_id,
         action=body.action,
@@ -223,6 +252,7 @@ async def create_time_bound_grant(
                 "resource_id": body.resource_id,
                 "expires_at": expires.isoformat(),
                 "reason": body.reason,
+                **({"granted_superadmin": granted, "stepup_method": method} if granted else {}),
             },
         )
     )
@@ -245,7 +275,7 @@ async def create_time_bound_grant(
     dependencies=[Depends(require_permission("admin", "group"))],
 )
 async def revoke_time_bound_grant(
-    grant_id: uuid.UUID, current_user: CurrentUser, db: DB
+    grant_id: uuid.UUID, request: Request, current_user: CurrentUser, db: DB
 ) -> TimeBoundGrantResponse:
     """Soft-revoke a grant now — sets ``revoked_at`` and keeps the row for
     audit / history. Idempotent: re-revoking an already-revoked grant is a
@@ -257,6 +287,29 @@ async def revoke_time_bound_grant(
     if grant.revoked_at is not None:
         return _to_response(grant)
 
+    display = (
+        f"revoke {grant.action} on {grant.resource_type}"
+        f"{('/' + grant.resource_id) if grant.resource_id else ''} for group {grant.group_id}"
+    )
+    # Revoking a grant only narrows access, so a group admin may revoke one
+    # they do not hold themselves. A wildcard grant is the exception: only a
+    # superadmin can mint one, and only a superadmin can take one away.
+    wildcard = grant.action == "*" or grant.resource_type == "*"
+    if wildcard and not caller_can_grant(current_user, [grant]):
+        await refuse_and_audit(
+            db,
+            current_user,
+            request,
+            action="permission_change",
+            resource_type="time_bound_grant",
+            resource_id=str(grant.id),
+            resource_display=display,
+            reason="above the caller's privilege ceiling",
+            detail=("Only a superadmin can revoke a grant carrying wildcard ('*') " "permissions."),
+        )
+    # No last-superadmin check here: a ``*`` / ``*`` grant lapses on its own,
+    # so a superadmin who holds only one is never counted as the one that
+    # keeps the install administrable (``leaves_no_active_superadmin``).
     grant.revoked_at = datetime.now(UTC)
     db.add(
         AuditLog(

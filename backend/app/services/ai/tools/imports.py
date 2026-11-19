@@ -39,6 +39,9 @@ def _superadmin_gate(user: User) -> dict[str, Any] | None:
 
 @register_tool(
     name="find_dns_import_preview",
+    outbound=True,
+    outbound_scope="dns:write",
+    permission="superadmin",
     description=(
         "Preview what a DNS config import from a live source would bring "
         "in, without importing anything. source='windows_dns' (pass "
@@ -58,6 +61,8 @@ async def find_dns_import_preview(
     gate = _superadmin_gate(user)
     if gate is not None:
         return gate
+    from app.services.dns_import.cname_check import count_cname_warnings  # noqa: PLC0415
+
     try:
         preview = await _dns_import_pull(db, args)
     except ValueError as exc:
@@ -67,11 +72,15 @@ async def find_dns_import_preview(
         "zone_count": len(preview.zones),
         "total_records": preview.total_records,
         "conflict_count": len(preview.conflicts),
+        # #2089 — records the commit will skip under the CNAME rule; counted
+        # here because ``warnings`` below is truncated.
+        "records_not_imported": count_cname_warnings(preview.warnings),
         "zones": [
             {
                 "name": z.name,
                 "kind": z.kind,
                 "records": len(z.records),
+                "foreign_apex_ns": list(z.foreign_apex_ns),
             }
             for z in preview.zones[:100]
         ],
@@ -81,6 +90,9 @@ async def find_dns_import_preview(
 
 @register_tool(
     name="find_dhcp_import_preview",
+    outbound=True,
+    outbound_scope="dhcp:write",
+    permission="superadmin",
     description=(
         "Preview what a DHCP config import from a live Windows DHCP "
         "server would bring in, without importing. Pass "
@@ -124,6 +136,9 @@ async def find_dhcp_import_preview(
 
 @register_tool(
     name="find_netbox_import_preview",
+    outbound=True,
+    outbound_scope="ipam:write",
+    permission="superadmin",
     description=(
         "Preview what a one-shot NetBox import would bring into IPAM "
         "without importing anything. Pass base_url + token (+ verify_tls, "

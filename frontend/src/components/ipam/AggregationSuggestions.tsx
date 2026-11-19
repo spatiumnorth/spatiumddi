@@ -1,9 +1,11 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useCallback, useMemo, useRef } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { BellOff, Combine, Lightbulb, RotateCcw, X } from "lucide-react";
 import { ipamApi, type AggregationSuggestion } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { useSessionState } from "@/lib/useSessionState";
+import { useDismissableMenu } from "@/hooks/useDismissableMenu";
 
 /**
  * Passive badge button + popover that surfaces contiguous sibling subnets
@@ -18,9 +20,15 @@ import { useSessionState } from "@/lib/useSessionState";
  * doesn't have to re-click on every nav) is keyed on the block id —
  * different blocks remember their own popover state.
  */
+// The snooze map is platform-wide — it changes the badge for every
+// operator — so the API requires write on IP blocks for all three actions.
+const NEEDS_BLOCK_WRITE = "Requires write permission on IP blocks";
+
 export function AggregationCandidatesBadge({ blockId }: { blockId: string }) {
   const qc = useQueryClient();
+  const canEdit = usePermissions().can("write", "ip_block");
   const wrapperRef = useRef<HTMLDivElement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
 
   const [open, setOpen] = useSessionState(
     `ipam-aggregation-popover-${blockId}`,
@@ -58,21 +66,15 @@ export function AggregationCandidatesBadge({ blockId }: { blockId: string }) {
     onSuccess: invalidate,
   });
 
-  // Close on outside click — but only when open, so we don't churn
-  // listeners on every render.
-  useEffect(() => {
-    if (!open) return;
-    function onDoc(e: MouseEvent) {
-      if (
-        wrapperRef.current &&
-        !wrapperRef.current.contains(e.target as Node)
-      ) {
-        setOpen(false);
-      }
-    }
-    document.addEventListener("mousedown", onDoc);
-    return () => document.removeEventListener("mousedown", onDoc);
-  }, [open, setOpen]);
+  // Esc, an outside press and focus leaving close the popover, and Esc
+  // returns focus to the badge (#3159).
+  const closePopover = useCallback(() => setOpen(false), [setOpen]);
+  const { onBlur } = useDismissableMenu({
+    open,
+    onClose: closePopover,
+    containerRef: wrapperRef,
+    triggerRef,
+  });
 
   const activeCount = useMemo(
     () => data.filter((s) => s.snoozed_until === null).length,
@@ -85,9 +87,12 @@ export function AggregationCandidatesBadge({ blockId }: { blockId: string }) {
   if (activeCount === 0 && snoozedCount === 0) return null;
 
   return (
-    <div className="relative" ref={wrapperRef}>
+    <div className="relative" ref={wrapperRef} onBlur={onBlur}>
       <button
+        ref={triggerRef}
         type="button"
+        aria-haspopup="true"
+        aria-expanded={open}
         onClick={() => setOpen(!open)}
         title={
           activeCount > 0
@@ -117,8 +122,15 @@ export function AggregationCandidatesBadge({ blockId }: { blockId: string }) {
               </span>
             </div>
             <button
+              aria-label="Close"
+              title="Close"
               type="button"
-              onClick={() => setOpen(false)}
+              onClick={() => {
+                setOpen(false);
+                // The button unmounts with the panel; hand focus back to
+                // the badge as Esc does (#3823).
+                triggerRef.current?.focus();
+              }}
               className="rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-foreground"
             >
               <X className="h-3.5 w-3.5" />
@@ -137,6 +149,7 @@ export function AggregationCandidatesBadge({ blockId }: { blockId: string }) {
                 <CandidateRow
                   key={s.candidate_key}
                   candidate={s}
+                  canEdit={canEdit}
                   onSnooze={() => snoozeMut.mutate(s.candidate_key)}
                   onDismiss={() => dismissMut.mutate(s.candidate_key)}
                   onClear={() => clearMut.mutate(s.candidate_key)}
@@ -166,17 +179,22 @@ export function AggregationCandidatesBadge({ blockId }: { blockId: string }) {
 
 function CandidateRow({
   candidate,
+  canEdit,
   onSnooze,
   onDismiss,
   onClear,
 }: {
   candidate: AggregationSuggestion;
+  canEdit: boolean;
   onSnooze: () => void;
   onDismiss: () => void;
   onClear: () => void;
 }) {
   const isSnoozed = candidate.snoozed_until !== null;
   const isPermanent = candidate.snoozed_until === "permanent";
+  const gate = permissionGate(canEdit, NEEDS_BLOCK_WRITE);
+  const btn =
+    "inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50";
 
   let snoozeLabel: string | null = null;
   if (isPermanent) {
@@ -203,11 +221,7 @@ function CandidateRow({
       ) : null}
       <div className="mt-2 flex items-center gap-1.5">
         {isSnoozed ? (
-          <button
-            type="button"
-            onClick={onClear}
-            className="inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] hover:bg-accent"
-          >
+          <button type="button" onClick={onClear} className={btn} {...gate}>
             <RotateCcw className="h-3 w-3" />
             Re-enable
           </button>
@@ -216,8 +230,9 @@ function CandidateRow({
             <button
               type="button"
               onClick={onSnooze}
-              className="inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] hover:bg-accent"
+              className={btn}
               title="Hide for 30 days"
+              {...gate}
             >
               <BellOff className="h-3 w-3" />
               Snooze 30 days
@@ -225,8 +240,9 @@ function CandidateRow({
             <button
               type="button"
               onClick={onDismiss}
-              className="inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-accent hover:text-foreground"
+              className={cn(btn, "text-muted-foreground hover:text-foreground")}
               title="Don't suggest this candidate again"
+              {...gate}
             >
               Don't suggest again
             </button>

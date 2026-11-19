@@ -34,18 +34,27 @@ the supervisor.
 from __future__ import annotations
 
 import hashlib
+import threading
 import time
 import uuid
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import structlog
 
 from . import appliance_state, approval_state, etcd_evict, firewall_peer_audit, watchdog
 from . import cp_tls
-from .cert_auth import build_auth_headers, load_cert, save_cert
+from . import sealed_token
+from .cert_auth import (
+    JSON_CONTENT_TYPE,
+    build_auth_headers,
+    encode_json,
+    load_cert,
+    note_control_plane_signature_support,
+    save_cert,
+)
 from .config import SupervisorConfig
 from .firewall_renderer import FirewallProfile, render_drop_in
 from .identity import Identity
@@ -59,11 +68,16 @@ from .role_orchestrator import (
 # (compose vs k3s on ``detect_runtime()``) is gone with the rest of
 # docker; this is the only path now.
 from .service_lifecycle import (
+    LifecycleResult,
     apply_role_assignment,
     reconcile_node_labels,
+    record_shared_chart_hold,
     role_release_fingerprint,
     tear_down_supervised_services,
 )
+
+if TYPE_CHECKING:
+    from . import k8s_api
 
 log = structlog.get_logger(__name__)
 
@@ -73,6 +87,8 @@ log = structlog.get_logger(__name__)
 # subprocess piece). C2 ships only the env render; C3 wires the
 # actual ``docker compose up -d`` invocation.
 _ROLE_ENV_FILENAME = "role-compose.env"
+# #2801 — read by the re-register path in ``__main__``.
+ROLE_ENV_FILENAME = _ROLE_ENV_FILENAME
 
 # #170 Wave C3 — nftables drop-in path. Lives under /etc/nftables.d
 # (bind-mounted rw on the supervisor compose entry). The host's
@@ -129,18 +145,94 @@ def _is_control_plane_member() -> bool:
     return appliance_state.is_control_plane_member()
 
 
+# #3645 — the node-local api Service (``internalTrafficPolicy: Local``). Plain
+# http is only ever sent to the api pod on this node, so it never crosses the
+# node LAN (pod traffic between nodes is flannel host-gw: routed, not
+# encrypted). A control plane that predates the Service has no such name; the
+# lookup fails and ``_effective_control_plane_url`` falls back like it does for
+# a node with no ready api pod of its own.
+_IN_CLUSTER_NODE_LOCAL_URL = (
+    "http://spatium-control-spatiumddi-api-local.spatium.svc.cluster.local.:8000"
+)
+
+# Connection failures to the node-local Service before the supervisor stops
+# using it, and how long it then waits before trying it again. One is enough:
+# the Service has no endpoint only while this node has no ready api pod.
+_LOCAL_API_FAIL_THRESHOLD = 1
+_LOCAL_API_RETRY_S = 60.0
+# A node with no ready api pod makes the Service DROP traffic (no refusal), so
+# the node-local attempt must not wait out the request timeout to find out.
+_LOCAL_API_CONNECT_TIMEOUT_S = 4.0
+
+_local_api: dict[str, Any] = {"failures": 0, "last_failure": 0.0, "fallback_logged": False}
+
+
+def note_local_api_result(url: str, ok: bool) -> None:
+    """Record whether a call to the node-local Service reached an api pod.
+
+    ``ok`` is True for any HTTP answer (even a 5xx: the pod is there) and
+    False for a connection-level failure. Calls to any other URL are ignored.
+    """
+    if not url.startswith(_IN_CLUSTER_NODE_LOCAL_URL):
+        return
+    if ok:
+        if _local_api["failures"] >= _LOCAL_API_FAIL_THRESHOLD:
+            log.info("supervisor.control_plane.node_local_restored")
+        _local_api["failures"] = 0
+        _local_api["fallback_logged"] = False
+        return
+    _local_api["failures"] += 1
+    _local_api["last_failure"] = time.monotonic()
+
+
+def _local_api_usable() -> bool:
+    if _local_api["failures"] < _LOCAL_API_FAIL_THRESHOLD:
+        return True
+    # Down: use the fallback, but let one call through now and then so a
+    # restarted local api pod is picked up again.
+    return time.monotonic() - _local_api["last_failure"] >= _LOCAL_API_RETRY_S
+
+
+def _fallback_client(cfg: SupervisorConfig, url: str) -> httpx.Client | None:
+    """The client for the same-call fallback attempt to ``url``.
+
+    Built from the pin file as it is now, exactly as the ordinary heartbeat
+    client for that URL is. A TLS target with nothing pinned yet gets no
+    client at all (the caller skips the attempt) rather than one that
+    verifies against the system trust store.
+    """
+    if (
+        not cp_tls.skip_verify()
+        and cp_tls.tls_url(url) is not None
+        and cp_tls.load_pins(cfg.state_dir) is None
+    ):
+        return None
+    return cp_tls.client(cfg.state_dir, url, first_contact=False)
+
+
 def _effective_control_plane_url(cfg: SupervisorConfig) -> str:
     """Resolve the heartbeat target.
 
-    Cluster members talk to the in-cluster api Service (resilient to
-    any single node loss + load-balanced); everyone else uses the
-    configured ``CONTROL_PLANE_URL``. Returns ``""`` only when a
-    non-member has no configured URL — the caller skips the
-    heartbeat in that case.
+    Cluster members talk to the api pod on their own node through the
+    node-local Service (#3645), so the plain-http hop never leaves the node.
+    While that node has no ready api pod, they use the configured
+    ``CONTROL_PLANE_URL``, which goes over https against the pinned
+    certificate (``cp_tls``), never plain http across the node LAN. A
+    member with none configured (the seed: firstboot writes it empty on a
+    control-plane install) uses the cluster-wide api Service, as it did
+    before #3645, so no node is ever left without a path. Everyone else
+    uses the configured URL. Returns ``""`` only when a non-member has no
+    configured URL — the caller skips the heartbeat.
     """
-    if _is_control_plane_member():
-        return _IN_CLUSTER_CONTROL_PLANE_URL
-    return cfg.control_plane_url
+    if not _is_control_plane_member():
+        return cfg.control_plane_url
+    if _local_api_usable():
+        return _IN_CLUSTER_NODE_LOCAL_URL
+    fallback = cfg.control_plane_url or _IN_CLUSTER_CONTROL_PLANE_URL
+    if not _local_api["fallback_logged"]:
+        _local_api["fallback_logged"] = True
+        log.warning("supervisor.control_plane.node_local_unavailable", fallback=fallback)
+    return fallback
 
 
 # Issue #183 Phase 7 — capability reporting is now trivially true on
@@ -218,23 +310,16 @@ def _detect_storage_type() -> str:
 
 
 def _detect_host_nics() -> list[str]:
-    """Return the appliance's physical / virtual NIC names (e.g.
-    ``["ens18", "eth0"]``). Skips loopback, docker bridges, virtual
-    veth pairs, and the container's own bridge interface so the list
-    is the operator-visible host hardware."""
-    nics: list[str] = []
-    try:
-        import os
+    """Host NIC names for ``capabilities.host_nics`` (#2884).
 
-        for name in sorted(os.listdir("/sys/class/net")):
-            if name == "lo":
-                continue
-            if name.startswith(("docker", "br-", "veth", "virbr", "tailscale")):
-                continue
-            nics.append(name)
-    except OSError:
-        pass
-    return nics
+    Delegates to ``appliance_state.host_network_interfaces()`` — the
+    udev-based source that also feeds ``appliance.host_interfaces`` — so
+    Fleet's "Host NICs" and the packet-capture picker can never disagree.
+    The supervisor pod is not ``hostNetwork``, so reading its own
+    ``/sys/class/net`` (the old implementation) reported the pod's
+    ``eth0``, which does not exist on the host.
+    """
+    return appliance_state.host_network_interfaces()
 
 
 def _capabilities_payload() -> dict[str, Any]:
@@ -257,8 +342,8 @@ def _capabilities_payload() -> dict[str, Any]:
     * ``supervisor_version`` — packaging metadata.
     * ``cpu_count`` / ``memory_mb`` — host capacity from /proc.
     * ``storage_type`` — ``"ssd"`` / ``"hdd"`` / ``"unknown"``.
-    * ``host_nics`` — physical / virtual NIC names (lo + docker
-      bridges filtered out).
+    * ``host_nics`` — the host's NIC names (udev, same list as
+      ``host_interfaces``; loopback / pod veths / docker filtered).
     """
     out: dict[str, Any] = {
         "has_baked_images": appliance_state.detect_deployment_kind() == "appliance",
@@ -267,6 +352,14 @@ def _capabilities_payload() -> dict[str, Any]:
         # "always compatible") — no service container needed, the
         # supervisor itself is the observer.
         "can_run_observer": True,
+        # #3631 — this supervisor sends a join-token key in its signed
+        # heartbeat and opens ``desired_k3s_join_token_sealed``. A control
+        # plane refuses to promote a node whose supervisor does not say so,
+        # since it would never be handed the join token.
+        "sealed_join_token": True,
+        # Registrations are signed with the supervisor's own key; once a row
+        # has reported this, an unsigned registration of it is refused.
+        "register_proof": True,
     }
     # Every baked appliance has every service image preloaded; the
     # control plane's role-checkbox UI uses these flags to gate
@@ -311,6 +404,10 @@ def _supervisor_version() -> str:
 # spamming the docker daemon every minute.
 _WATCHDOG_INTERVAL_S = 300.0  # 5 minutes
 _last_watchdog_at: float = 0.0
+# #2833 — while any service reads missing / starting the verdict is likely to
+# change within seconds (a pod coming up), so re-check this soon rather than
+# holding it for the full interval.
+_WATCHDOG_RECHECK_S = 20.0
 _cached_role_health: dict[str, Any] = {}
 
 # #285 Phase 5 — throttle for the warn-only etcd/peer-drift cross-check.
@@ -327,6 +424,11 @@ _evicted_pending: set[str] = set()
 # ``evict_pending`` so the row shows it.
 _nodes_deleted: set[str] = set()
 _evict_reasons: dict[str, str] = {}
+# #3020 — the seed's housekeeping writes the two reports above on its worker
+# (``_Housekeeper``) and the next heartbeat's body reads them, possibly while
+# that work is still running. Held only around those reads and writes, never
+# across a kube API call.
+_evict_lock = threading.Lock()
 _etcd_evictions = etcd_evict.EtcdEvictions()
 
 # #1058 — hostnames whose stranded CNPG claims the reclaim still owes (a
@@ -334,6 +436,46 @@ _etcd_evictions = etcd_evict.EtcdEvictions()
 # back to the sweep as evicted names next tick so it scans past its
 # "Postgres is whole" early-out; cleared by the tick that settles them.
 _stranded_pending: set[str] = set()
+
+# #2132 — CNPG instances seen looping on WAL they can never get, and since
+# when (``k8s_api.reclone_stuck_postgres_instances``). Module state: a
+# supervisor restart starts each clock again, which only delays a re-clone.
+_stuck_postgres: dict[str, k8s_api.StuckSighting] = {}
+# What has been logged per looping instance ("looping" at info on the first
+# tick, "stuck" at warning once the loop has held STUCK_REPORT_AFTER_S), so
+# each is logged once and not on every tick after.
+_stuck_postgres_reported: dict[str, str] = {}
+# The held reason last logged per due instance that is NOT re-cloned (its WAL
+# still exists, or that cannot be told), so each reason is logged once.
+_stuck_postgres_held: dict[str, str] = {}
+# Why the primary's slot state could not be read (the CA ConfigMap missing,
+# the status endpoint's certificate not verifying against the cluster CA, the
+# endpoint unreachable), each logged once until a read succeeds; "ok" once a
+# verified read has been logged.
+_slot_state_logged: set[str] = set()
+
+# #1541 — slot-image mirror claims the seed deleted off an evicted node and
+# still owes the cluster a fresh copy of (``{claim_name: manifest}``). Nothing
+# else re-creates them — the claim is a plain Helm-owned PVC — so they are
+# retried every tick until the old claim has finished terminating. Module
+# state: a restart in between leaves the claim missing until the next Helm
+# upgrade of the control-plane release, which re-creates absent objects.
+_mirror_claims_owed: dict[str, dict] = {}
+
+# #2404: what the Redis reclaim (_reclaim_stranded_redis) keeps between seed
+# ticks. The hostnames a failed sweep still owes, handed back next tick (as
+# ``_stranded_pending`` is for Postgres) and freed there while the Node list
+# still lacks them, so an outage drops no eviction and a node that rejoined
+# under the name keeps its replica; and the kinds of failure logged since the
+# last clean sweep (the request and its status, never the answer's body), so
+# one that repeats tick after tick is logged once. A restart forgets both, and
+# the sweep needs neither to converge: it finds a stranded claim from the Node
+# list.
+_redis_stranded_pending: set[str] = set()
+_redis_failures_logged: set[str] = set()
+# Review of #2433: the most kinds kept between clean sweeps. One more starts
+# them over, so the set cannot grow with an outage, however long.
+_REDIS_FAILURE_KINDS_KEPT = 8
 
 
 class _ReplaceHold:
@@ -345,10 +487,15 @@ class _ReplaceHold:
     Node, so from the eviction tick until the replacement is promoted the
     count the heartbeat carries is one short of what the cluster is
     committed to — and a replace is never a scale-down by intent (the
-    product refuses an even count). Only ``/replace`` sets
-    ``evict_requested``; a demote is a ``leaving`` row, never an eviction —
-    so an eviction tick is a replace tick by construction. The hold is
-    armed on it and kept until the count is back at the size CNPG has
+    product refuses an even count). #1541 — a demoted node's ``left`` is an
+    eviction too now (the seed deletes its stale Node and confirms etcd), so
+    an eviction tick is no longer a replace tick by construction: the backend
+    names the Replaces in ``replace_node_names`` (:func:`_replace_names`),
+    and only those arm the hold. A demote's cleanup must not — nothing is
+    coming to fill the slot, and armed on it neither release below could
+    fire, which held a cluster demoted to one node at three of everything
+    (see :class:`_DemoteShrink` for what a demote gets instead). The hold is
+    armed on a replace tick and kept until the count is back at the size CNPG has
     (``settle``: the replacement settled) or the operator shrinks the
     control plane below the count the eviction tick carried (a deliberate
     demote: the slot is abandoned). Module state, like ``_evicted_pending``:
@@ -397,6 +544,182 @@ class _ReplaceHold:
 _replace_hold = _ReplaceHold()
 
 
+def _reclone_stuck_postgres(log: Any, now: float | None = None) -> k8s_api.PostgresReclone:
+    """#2132 — one seed tick of the stuck-instance re-clone, with its journal.
+
+    ``postgres_instance_looping`` (info) is logged once when an instance's
+    log shows a never-heals loop that is still logging new lines on a later
+    tick (``confirmed``). ``postgres_instance_stuck`` (warning) is logged once
+    the same loop has held for ``STUCK_REPORT_AFTER_S`` across ticks, naming
+    the loop, its slot on the primary and the manual fix, so a deployment
+    whose supervisor cannot act (an older Role without ``pods/log``) still
+    says what is wrong. A replica that logs a line or two while it joins, or
+    a follower that logs a burst across a switchover, logs neither (#2765).
+    ``postgres_instance_reclone_held`` (info) is logged once per reason when a
+    due loop is NOT re-cloned because nothing proves its WAL is gone.
+    ``postgres_instance_stuck_clock_reset`` (info) is logged when a reported
+    loop's clock restarts under a new primary. ``postgres_slot_state_unknown``
+    (warning) is logged once per reason the primary's slot state could not
+    be read or its TLS did not verify against the cluster CA (every loop is
+    then held), and ``postgres_slot_state_read`` (info) once when a verified
+    read succeeds again. ``postgres_instance_reclone``
+    is logged when CNPG is asked to rebuild one."""
+    from . import k8s_api  # noqa: PLC0415
+
+    result = k8s_api.reclone_stuck_postgres_instances(
+        _stuck_postgres, now=time.monotonic() if now is None else now
+    )
+    if result.slot_state_error and result.slot_state_error not in _slot_state_logged:
+        _slot_state_logged.discard("ok")
+        _slot_state_logged.add(result.slot_state_error)
+        log.warning(
+            "supervisor.heartbeat.postgres_slot_state_unknown",
+            reason=result.slot_state_error,
+            effect="no instance is re-cloned while its slot state is unknown",
+        )
+    elif result.slot_state_read and "ok" not in _slot_state_logged:
+        _slot_state_logged.clear()
+        _slot_state_logged.add("ok")
+        log.info(
+            "supervisor.heartbeat.postgres_slot_state_read",
+            tls="verified against the cluster CA",
+            ca_configmap=k8s_api.cnpg_ca_configmap_name(),
+        )
+    for instance, reason in result.clock_reset.items():
+        if instance in _stuck_postgres_reported:
+            log.info(
+                "supervisor.heartbeat.postgres_instance_stuck_clock_reset",
+                instance=instance,
+                reason=reason,
+            )
+            # Still looping under the new primary: it is reported as stuck
+            # again once it has held STUCK_REPORT_AFTER_S under that one.
+            _stuck_postgres_reported[instance] = "looping"
+            _stuck_postgres_held.pop(instance, None)
+    for instance, seen in result.stuck.items():
+        if not seen.get("confirmed"):
+            # Lines in the window but none new since the first tick: a burst
+            # that has stopped (a follower across a switchover), not a loop.
+            continue
+        level = _stuck_postgres_reported.get(instance)
+        if level is None:
+            _stuck_postgres_reported[instance] = "looping"
+            log.info(
+                "supervisor.heartbeat.postgres_instance_looping",
+                instance=instance,
+                signature=seen["signature"],
+                slot=seen.get("slot", "unknown"),
+            )
+        if (
+            _stuck_postgres_reported[instance] != "stuck"
+            and seen["seconds"] >= k8s_api.STUCK_REPORT_AFTER_S
+        ):
+            _stuck_postgres_reported[instance] = "stuck"
+            slot = seen.get("slot", "unknown")
+            log.warning(
+                "supervisor.heartbeat.postgres_instance_stuck",
+                instance=instance,
+                signature=seen["signature"],
+                slot=slot,
+                looping_for_s=seen["seconds"],
+                reclone_in_s=max(0, k8s_api.STUCK_INSTANCE_AFTER_S - seen["seconds"]),
+                reclone_held=k8s_api.reclone_blocker(
+                    seen["signature"],
+                    _stuck_postgres[instance].evidence if instance in _stuck_postgres else set(),
+                    slot,
+                )
+                or "",
+                manual_fix=f"kubectl cnpg destroy <cluster> {instance}, or delete its PVC then its pod",
+            )
+    for gone in set(_stuck_postgres_reported) - set(_stuck_postgres):
+        _stuck_postgres_reported.pop(gone, None)
+    for gone in set(_stuck_postgres_held) - set(_stuck_postgres):
+        _stuck_postgres_held.pop(gone, None)
+    for instance, reason in result.held.items():
+        if _stuck_postgres_held.get(instance) != reason:
+            _stuck_postgres_held[instance] = reason
+            log.info(
+                "supervisor.heartbeat.postgres_instance_reclone_held",
+                instance=instance,
+                signature=result.stuck.get(instance, {}).get("signature", ""),
+                slot=result.stuck.get(instance, {}).get("slot", "unknown"),
+                reason=reason,
+            )
+    for instance in result.marked:
+        log.warning(
+            "supervisor.heartbeat.postgres_instance_reclone",
+            instance=instance,
+            annotation="alpha.cnpg.io/unrecoverable",
+        )
+    if result.deferred_reason and any(
+        s.get("confirmed") and s["seconds"] >= k8s_api.STUCK_INSTANCE_AFTER_S
+        for s in result.stuck.values()
+    ):
+        log.info(
+            "supervisor.heartbeat.postgres_instance_reclone_deferred",
+            reason=result.deferred_reason,
+        )
+    if result.error:
+        log.warning("supervisor.heartbeat.postgres_instance_reclone_failed", error=result.error)
+    return result
+
+
+def _replace_names(body_out: dict[str, Any]) -> list[str]:
+    """#1541 — the evictions that are dead-node Replaces, i.e. the ones that
+    arm :class:`_ReplaceHold`. A backend that predates the split sends no
+    ``replace_node_names`` (the key is absent, not empty): then every
+    eviction counts, as it did before, because that backend never evicted a
+    demoted node."""
+    if "replace_node_names" in body_out and body_out["replace_node_names"] is not None:
+        return [str(n) for n in body_out["replace_node_names"] if n]
+    return [str(n) for n in (body_out.get("evict_node_names") or []) if n]
+
+
+class _DemoteShrink:
+    """#1541 — lets a demote's scale-down past CloudNativePG's readiness
+    deferral (``patch_cnpg_instances(shrink_past_unready=True)``).
+
+    A demote drops the committed count only when the leaving node reports
+    ``left`` — after it has stopped k3s and reset — so by the time the seed
+    is asked for the smaller size, the departed nodes' instances are unready
+    and stay that way: ``readyInstances`` is below ``instances`` for good and
+    the plain deferral would keep the old size forever, exactly like the
+    replace hold did (the walk's finding 1). Armed on any tick whose
+    heartbeat names a demote's eviction (``demote_evict_node_names``), and
+    kept, past the eviction settling, until the Cluster's spec is at (or
+    below) the committed count, or the count rises again (a promote: the
+    shrink is no longer wanted). Module state, like :class:`_ReplaceHold`: a
+    supervisor restart between the eviction settling and the scale-down
+    landing forgets it — the plain deferral then holds the old size until an
+    operator acts, which is the pre-#1541 behaviour, never a wrong one."""
+
+    def __init__(self) -> None:
+        self.armed = False
+        self.cp_size = 0
+
+    def allow(self, demote_names: Iterable[str], cp_size: int) -> bool:
+        if any(n for n in demote_names):
+            self.armed, self.cp_size = True, cp_size
+            return True
+        if not self.armed:
+            return False
+        if cp_size > self.cp_size:
+            self.clear()
+            return False
+        self.cp_size = cp_size
+        return True
+
+    def settle(self, cp_size: int, spec_after: int | None) -> None:
+        if self.armed and spec_after is not None and spec_after <= cp_size:
+            self.clear()
+
+    def clear(self) -> None:
+        self.armed, self.cp_size = False, 0
+
+
+_demote_shrink = _DemoteShrink()
+
+
 def _release_size(cp_size: int, hold: str, cnpg_instances: int) -> int:
     """#1313 — the control-plane size the spatium-control release renders.
 
@@ -429,11 +752,75 @@ def _carry_stranded(previous: set[str], evicted_now: list[str], outcome) -> set[
     return set(outcome.pending_nodes)
 
 
+def _reclaim_stranded_redis(evicted_now: list[str], log: structlog.stdlib.BoundLogger) -> None:
+    """#590 / #2404: one seed tick of the Redis reclaim.
+
+    The names evicted this tick go in as authoritative, and any a failed
+    sweep left owed go in apart, to be freed only while the Node list still
+    lacks them (review of #2433); on any other tick the sweep looks for a
+    claim pinned to a node that is no longer a Node
+    (``k8s_api.reclaim_stranded_redis_storage``). A claim is logged as
+    reclaimed once, on the tick its DELETE lands; a failure is logged once
+    per kind (the request and its status, never the answer's body), until a
+    sweep comes back clean."""
+    from . import k8s_api  # noqa: PLC0415
+
+    out = k8s_api.reclaim_stranded_redis_storage(
+        evicted_now, owed_nodes=set(_redis_stranded_pending)
+    )
+    # Mutated in place, like _stranded_pending. As _carry_stranded does for
+    # Postgres: a failed sweep keeps everything owed plus this tick's
+    # evictions; a clean one owes nothing (a Redis claim is never deferred).
+    if out.error is None:
+        _redis_stranded_pending.clear()
+        _redis_failures_logged.clear()
+    else:
+        _redis_stranded_pending.update(str(n) for n in evicted_now)
+    if out.reclaimed:
+        log.info(
+            "supervisor.heartbeat.redis_storage_reclaimed",
+            pvcs=out.reclaimed,
+            nodes=out.nodes,
+            evicted=list(evicted_now),
+            # which read decided each claim was stranded: the PV's node
+            # affinity ("pv") or the selected-node annotation ("annotation",
+            # only when the PV is gone)
+            affinity_source=dict(out.sources),
+        )
+    # Review of #2433: keyed on the kind, not the error text, which quotes the
+    # answer's body; an error that quotes none is its own kind.
+    kind = out.error_kind or out.error
+    if kind is not None and kind not in _redis_failures_logged:
+        if len(_redis_failures_logged) >= _REDIS_FAILURE_KINDS_KEPT:
+            _redis_failures_logged.clear()
+        _redis_failures_logged.add(kind)
+        log.warning(
+            "supervisor.heartbeat.redis_storage_reclaim_failed",
+            error=out.error,
+            # what this line stands for until a sweep comes back clean
+            kind=kind,
+            owed=sorted(_redis_stranded_pending),
+        )
+
+
 def _watchdog_check_due() -> bool:
     """First call always returns True (forces a probe within the
     first watchdog cadence after startup); subsequent calls gate on
-    monotonic elapsed."""
-    return time.monotonic() - _last_watchdog_at >= _WATCHDOG_INTERVAL_S
+    monotonic elapsed.
+
+    ``_last_watchdog_at == 0.0`` means "never ran / invalidated" and is due
+    at once. It used to be compared like a timestamp, but ``time.monotonic()``
+    counts from boot, so within the first ``_WATCHDOG_INTERVAL_S`` of host
+    uptime neither the first probe nor the invalidation after a role apply
+    (#2808's first approved heartbeat) was due until 5 min after boot."""
+    if _last_watchdog_at == 0.0:
+        return True
+    unsettled = any(
+        isinstance(e, dict) and e.get("status") in ("missing", "starting")
+        for e in _cached_role_health.values()
+    )
+    interval = _WATCHDOG_RECHECK_S if unsettled else _WATCHDOG_INTERVAL_S
+    return time.monotonic() - _last_watchdog_at >= interval
 
 
 # Phase 9 rewrite — the pre-Phase-9 drift detector (live nft -j
@@ -625,6 +1012,65 @@ def _maybe_apply_firewall(
         log.warning("supervisor.firewall.trigger_write_failed", error=str(exc))
 
 
+def _dispatch_firewall(
+    fw_settings: object,
+    role_assignment: dict[str, Any] | None,
+    log: structlog.stdlib.BoundLogger,
+    cluster_peer_cidrs: list[Any] | None = None,
+    *,
+    pod_cidrs: list[Any] | None = None,
+    service_cidrs: list[Any] | None = None,
+    cp_member_count: int = 1,
+    vip_configured: bool = False,
+    web_ui_allowed_cidrs: list[Any] | None = None,
+    ssh_scope_cidrs: list[Any] | None = None,
+) -> None:
+    """#285 Phase 2a bundle-first / renderer-fallback dispatch, one tick.
+
+    Extracted from ``heartbeat_once`` (#2774) so the guard and its fallback are
+    tested as the single decision they are: a refused server body must still
+    leave the node converging on the in-pod render.
+    """
+    use_bundle = _server_firewall_body_is_usable(fw_settings, log)
+
+    if use_bundle:
+        if appliance_state.maybe_fire_firewall_reload(fw_settings):
+            log.info(
+                "supervisor.heartbeat.firewall_trigger_fired", source="control-plane"
+            )
+    else:
+        # #5 fallback — control plane too old to render, firewall_enabled
+        # still off, or its body refused by the #593 guard; render in-pod from
+        # the same derived inputs. The in-pod render carries NO fleet-policy
+        # rules (those are server-only), so a refusal costs enforcement on this
+        # node until the server body is acceptable — which is why the guard
+        # must refuse only a body that would really partition (#2774).
+        #
+        # #285 Phase 6 — this branch now fires UNCONDITIONALLY (it used to gate
+        # on ``cfg.in_pod_firewall_enabled or cluster_peer_cidrs or fw_pod_cidrs``).
+        # The base /etc/nftables.conf no longer opens the Web UI (80/443); the
+        # rendered drop-in is now the SOLE source of that accept, so it must be
+        # present on EVERY appliance node — including idle / non-CP nodes that
+        # carry no roles, no peers and no pods. ``_maybe_apply_firewall`` already
+        # self-gates on ``detect_deployment_kind() == "appliance"`` and the host
+        # runner short-circuits on an unchanged body hash, so an unconditional
+        # call is cheap + idempotent. SSH/22 is opened by the baked sentinel
+        # 00-spatium-ssh.nft (#1009 — it used to be in the base conf), which is
+        # a separate file the glob pulls in, so even a total drop-in failure
+        # still leaves the node SSH-recoverable.
+        _maybe_apply_firewall(
+            role_assignment,
+            log,
+            cluster_peer_cidrs,
+            pod_cidrs=pod_cidrs,
+            service_cidrs=service_cidrs,
+            cp_member_count=cp_member_count,
+            vip_configured=vip_configured,
+            web_ui_allowed_cidrs=web_ui_allowed_cidrs,
+            ssh_scope_cidrs=ssh_scope_cidrs,
+        )
+
+
 def _server_firewall_body_is_usable(
     fw_settings: object, log: structlog.stdlib.BoundLogger
 ) -> bool:
@@ -644,14 +1090,38 @@ def _server_firewall_body_is_usable(
 
     The structural test runs first, so a body that already opens 2380 — every
     healthy control-plane node — costs no apiserver read.
+
+    #2774 — the decision is the SAME predicate the in-pod path uses
+    (``would_self_partition`` over the live peer set), so the two paths cannot
+    disagree about a node. A readable sole etcd member (a one-node install) has
+    no raft peer to be cut off from, so the server's correct body has no peer
+    rule and must be used: refusing it sent every one-node install down the
+    in-pod renderer, which carries no fleet-policy rules, so an enforced fleet
+    rule never reached the host and the Firewall view reported drift forever.
+    The in-pod path got this exemption in #610; this path never did.
     """
     if not isinstance(fw_settings, dict) or not fw_settings.get("config_hash"):
         return False
 
     conf = str(fw_settings.get("firewall_conf") or "")
     if firewall_peer_audit.body_opens_etcd_peers(conf):
+        # A body we are willing to pipe is, by construction, one that keeps
+        # this node in raft — drop any earlier refusal marker, or a node that
+        # healed keeps reporting a divergence it no longer has. The in-pod
+        # path clears it the same way when it writes.
+        appliance_state.clear_firewall_refusal()
         return True
-    if firewall_peer_audit.local_node_is_etcd_member() is not True:
+
+    is_etcd_member = firewall_peer_audit.local_node_is_etcd_member()
+    live_peers = None
+    if is_etcd_member is True:
+        live_peers = firewall_peer_audit.observed_peer_cidrs(
+            appliance_state.read_node_ips() or []
+        )
+    if not firewall_peer_audit.would_self_partition(
+        conf, is_etcd_member=is_etcd_member, live_peers=live_peers
+    ):
+        appliance_state.clear_firewall_refusal()
         return True
 
     reason = (
@@ -667,6 +1137,239 @@ def _server_firewall_body_is_usable(
     return False
 
 
+def _strip_nul(value: Any, path: str, hits: list[str]) -> Any:
+    """A copy of ``value`` with U+0000 removed from every string (keys
+    included); the dotted path of each value that carried one is appended
+    to ``hits`` (#1747)."""
+    if isinstance(value, str):
+        if "\x00" in value:
+            hits.append(path or "<body>")
+            return value.replace("\x00", "")
+        return value
+    if isinstance(value, dict):
+        return {
+            _strip_nul(k, path, hits): _strip_nul(v, f"{path}.{k}" if path else str(k), hits)
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_strip_nul(v, f"{path}[{i}]", hits) for i, v in enumerate(value)]
+    return value
+
+
+#: #1805 — the first re-send after a heartbeat that never reached the control
+#: plane, doubled for each further one in a row up to the interval. A node
+#: loss makes such failures for a few seconds to a minute: a lookup routed to
+#: the lost node's DNS, a connection to its api pod, the api Service empty while
+#: the api waits for Redis. Each used to cost the whole interval (30 s) on top,
+#: so two in a row put a healthy node's heartbeat past the 90 s after which
+#: the demote guard and every other reader call it unhealthy.
+FAILED_RETRY_FIRST_S = 5.0
+
+
+def next_heartbeat_delay(
+    held: bool | None,
+    consecutive_failures: int,
+    interval_s: float,
+    rearm_floor_s: float,
+) -> float:
+    """Seconds to wait before the next heartbeat.
+
+    ``held`` is what ``heartbeat_once`` returned. A held heartbeat already
+    paced the loop server-side, so the next goes after ``rearm_floor_s``. One
+    answered without a hold (an old control plane) waits the interval. One that
+    never reached the control plane (``None``) is re-sent after
+    ``FAILED_RETRY_FIRST_S``, doubled for each further failure in a row
+    (``consecutive_failures`` counts this one), never beyond the interval.
+    """
+    if held is None:
+        step = FAILED_RETRY_FIRST_S * (2 ** max(0, consecutive_failures - 1))
+        return min(float(interval_s), step)
+    return rearm_floor_s if held else float(interval_s)
+
+
+#: #3020 — how long a heartbeat waits for its kube API housekeeping (the seed's
+#: control-plane block, and the role lifecycle on every node) before the loop
+#: sends the next heartbeat without it. A healthy tick's work takes about 1.5 s,
+#: so in steady state the wait never expires and nothing changes. Through a node
+#: loss it did not: every kube API call opens a new connection to the
+#: kubernetes Service, one that went to the lost node's apiserver waited out its
+#: 10 s timeout, and the #2132 reclone check's read of the lost node's pod log
+#: did on every tick. The work took 20 to 30 s, the next heartbeat waited for all
+#: of it, and the seed's heartbeat landed 92 s apart.
+HOUSEKEEPING_WAIT_S = 5.0
+
+
+class _Housekeeper:
+    """#3020 — runs a heartbeat's kube API housekeeping on one worker thread.
+
+    ``run`` hands the work over and waits for it at most ``wait_s``. Work that
+    finishes inside the wait is today's inline call: it is done, in the same
+    order, before the heartbeat returns. Work that does not keeps running on the
+    worker while the loop sends the next heartbeat. A heartbeat answered
+    meanwhile queues its own work behind it, and only the newest waits: every
+    input is desired state the control plane sends again on each heartbeat. One
+    job runs at a time, so the housekeeping never overlaps itself."""
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._pending: tuple[Callable[[], None], float, Any] | None = None
+        self._pending_seq = 0
+        self._done_seq = 0
+        # #3735 — the seqs whose run() gave up waiting. The worker logs
+        # housekeeping_done for exactly those jobs, decided under the lock, so
+        # the line no longer depends on two clocks agreeing about a near-tie.
+        self._deferred: set[int] = set()
+        self._running = False
+        self._thread: threading.Thread | None = None
+
+    def busy(self) -> bool:
+        """True while work runs or waits to run."""
+        with self._cond:
+            return self._running or self._pending is not None
+
+    def run(self, job: Callable[[], None], wait_s: float, log: Any) -> bool:
+        """Queue ``job`` and wait for it at most ``wait_s``. True when it (or
+        newer work queued over it) finished inside the wait."""
+        started = time.monotonic()
+        with self._cond:
+            behind = self._running
+            if self._pending is not None:
+                log.info("supervisor.heartbeat.housekeeping_superseded")
+            self._pending_seq += 1
+            seq = self._pending_seq
+            self._pending = (job, wait_s, log)
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(
+                    target=self._work, name="spatium-housekeeping", daemon=True
+                )
+                self._thread.start()
+            self._cond.notify_all()
+            while self._done_seq < seq:
+                left = started + wait_s - time.monotonic()
+                if left <= 0:
+                    self._deferred.add(seq)
+                    log.info(
+                        "supervisor.heartbeat.housekeeping_deferred",
+                        waited_s=round(time.monotonic() - started, 1),
+                        behind_running_work=behind,
+                    )
+                    return False
+                self._cond.wait(left)
+        return True
+
+    def drain(self, timeout_s: float) -> bool:
+        """Wait at most ``timeout_s`` for queued and running work (shutdown)."""
+        deadline = time.monotonic() + timeout_s
+        with self._cond:
+            while self._running or self._pending is not None:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return False
+                self._cond.wait(left)
+        return True
+
+    def _work(self) -> None:
+        while True:
+            with self._cond:
+                while self._pending is None:
+                    self._cond.wait()
+                (job, _wait_s, log), seq = self._pending, self._pending_seq
+                self._pending = None
+                self._running = True
+            started = time.monotonic()
+            try:
+                job()
+            except Exception as exc:  # noqa: BLE001 — the worker outlives any one job
+                log.warning("supervisor.heartbeat.housekeeping_crashed", error=str(exc))
+            finally:
+                took = time.monotonic() - started
+                with self._cond:
+                    # #3735 — log the job a run() deferred, and do it before
+                    # publishing completion: drain() may return the moment
+                    # notify_all() fires.
+                    if seq in self._deferred:
+                        log.info(
+                            "supervisor.heartbeat.housekeeping_done",
+                            elapsed_s=round(took, 1),
+                        )
+                    # A superseded job never runs; forget its seq with this one.
+                    self._deferred = {s for s in self._deferred if s > seq}
+                    self._running = False
+                    self._done_seq = seq
+                    self._cond.notify_all()
+
+
+_housekeeper = _Housekeeper()
+
+
+def drain_housekeeping(timeout_s: float) -> bool:
+    """#3020 — at shutdown, let housekeeping still running finish (bounded)."""
+    return _housekeeper.drain(timeout_s)
+
+
+
+# #2798 — how the control plane says "this appliance is revoked" on a
+# heartbeat: a 403 carrying this header (``revoked`` for a revoked row,
+# ``unknown`` when no row accepts the credential). Mirrors
+# ``REVOCATION_HEADER`` in ``backend/app/api/v1/appliance/supervisor.py``.
+REVOCATION_HEADER = "X-Spatium-Revocation"
+# The 403 details a control plane from before the header answered for the
+# same two refusals. Recognised so a supervisor upgraded ahead of its
+# control plane still stops when it is revoked or deleted.
+_LEGACY_REVOCATION_DETAILS = (
+    ("Appliance has been revoked.", "revoked"),
+    ("Invalid appliance or session.", "unknown"),
+)
+
+
+def _refusal_detail(resp: httpx.Response) -> str | None:
+    try:
+        detail = resp.json().get("detail")
+    except (ValueError, AttributeError):
+        return None
+    return detail if isinstance(detail, str) else None
+
+
+def revocation_reason(resp: httpx.Response) -> str | None:
+    """The revocation the control plane stated on this heartbeat response,
+    or None when it stated none (#2798).
+
+    Only a 403 can be one: the marked 403 from a current control plane, or
+    one of the two legacy 403 details. A 404 never is — it said "registration
+    is switched off" on older control planes and says "nothing is mounted
+    here" behind a proxy, and reading it as a revocation took DNS and DHCP
+    down on every appliance when pairing was switched off."""
+    if resp.status_code != 403:
+        return None
+    marker = resp.headers.get(REVOCATION_HEADER)
+    if marker:
+        return marker.strip().lower() or "revoked"
+    detail = _refusal_detail(resp)
+    if detail:
+        for prefix, reason in _LEGACY_REVOCATION_DETAILS:
+            if detail.startswith(prefix):
+                return reason
+    return None
+
+
+def _join_token(
+    body_out: dict[str, Any],
+    appliance_id: uuid.UUID,
+    log: structlog.stdlib.BoundLogger,
+) -> str | None:
+    """The k3s join token from a heartbeat response (#3631): sealed to this
+    process's key by a current control plane. A plaintext token is still
+    read, for the window where this supervisor is newer than the api."""
+    sealed = body_out.get("desired_k3s_join_token_sealed")
+    if isinstance(sealed, str) and sealed:
+        token = sealed_token.open_sealed(sealed, appliance_id)
+        if token is None:
+            log.warning("supervisor.heartbeat.join_token_unsealable")
+        return token
+    plain = body_out.get("desired_k3s_join_token")
+    return plain if isinstance(plain, str) else None
+
+
 def heartbeat_once(
     cfg: SupervisorConfig,
     appliance_id: uuid.UUID,
@@ -674,11 +1377,21 @@ def heartbeat_once(
     identity: Identity,
     client: httpx.Client,
     log: structlog.stdlib.BoundLogger,
-) -> bool:
+) -> bool | None:
     """One heartbeat round-trip + trigger-file follow-up.
 
     Never raises. Logs every error path so a real outage shows up in
     journalctl without taking down the supervisor process.
+
+    Returns True when the control plane long-poll-held the heartbeat, False
+    when it answered without holding, and None when the heartbeat did not land:
+    it never answered (a transport error: DNS, connect, timeout, #1805) or it
+    answered 5xx (#3020). The loop re-sends a None sooner than the interval
+    (``next_heartbeat_delay``).
+
+    #3020 — the kube API housekeeping after an accepted heartbeat runs on the
+    housekeeping worker, and this waits for it at most ``HOUSEKEEPING_WAIT_S``
+    (``_Housekeeper``).
     """
     state = appliance_state.collect()
     # #358 Phase 1b — ask the control plane to long-poll-hold this
@@ -686,6 +1399,10 @@ def heartbeat_once(
     # in ~0 s. Old control planes ignore it + return at once; the widened
     # client timeout below covers the hold.
     hold_s = max(0, int(cfg.heartbeat_interval_seconds))
+    # #3020 — the previous tick's housekeeping may still be writing these.
+    with _evict_lock:
+        evicted_report = sorted(_evicted_pending)
+        evict_pending_report = dict(_evict_reasons)
     body: dict[str, Any] = {
         "appliance_id": str(appliance_id),
         "wait_seconds": hold_s,
@@ -710,8 +1427,8 @@ def heartbeat_once(
         # to ``left``. Empty on non-seed / nothing-evicted. #1284 — only once
         # etcd no longer lists the node; ``evict_pending`` says why the rest
         # are still waiting.
-        "evicted_node_names": sorted(_evicted_pending),
-        "evict_pending": dict(_evict_reasons),
+        "evicted_node_names": evicted_report,
+        "evict_pending": evict_pending_report,
     }
     # #170 Wave D follow-up — surface the outcome of the previous
     # heartbeat's compose-lifecycle apply. Empty / None on the first
@@ -731,10 +1448,18 @@ def heartbeat_once(
     # lifecycle path, so the watchdog has nothing to watch.
     global _last_watchdog_at, _cached_role_health
     if appliance_state.detect_deployment_kind() == "appliance":
-        if _watchdog_check_due():
+        # #3020 — not while the previous tick's housekeeping is still running:
+        # a heal must never race the role lifecycle's apply. It stays due and
+        # runs on the next heartbeat.
+        if _watchdog_check_due() and not _housekeeper.busy():
             try:
                 env_file = cfg.state_dir / _ROLE_ENV_FILENAME
-                _cached_role_health = watchdog.check_health(env_file)
+                # #2808 — no heal while the node is not approved: the revoked
+                # teardown keeps the role env, and healing from it brought
+                # DNS and DHCP back on a node taken out of service.
+                _cached_role_health = watchdog.check_health(
+                    env_file, held_by=approval_state.role_services_hold(cfg.state_dir)
+                )
                 _last_watchdog_at = time.monotonic()
             except Exception as exc:  # noqa: BLE001
                 # Never let a watchdog crash kill the heartbeat path.
@@ -780,11 +1505,36 @@ def heartbeat_once(
     # timestamp skew. When no cert yet (pre-approval), fall through
     # to the session_token body field — same shape as today.
     cached_cert = load_cert(cfg.state_dir)
-    headers: dict[str, str] = {}
+    if cached_cert is not None:
+        # #3631 — a join token for this node comes back sealed to this key
+        # (only on a cert-signed heartbeat, the only kind that gets one).
+        body["join_token_public_key"] = sealed_token.public_key_b64()
+
+    # #1747 — Postgres refuses U+0000 in a text value, so ONE NUL anywhere in
+    # this body (a host sidecar left NUL-filled by a power loss) makes the
+    # api answer 422 to every heartbeat and the node's Fleet row freezes for
+    # good. The slot-upgrade readers scrub their own values; this is the
+    # backstop for every other field read off a host file.
+    nul_fields: list[str] = []
+    body = _strip_nul(body, "", nul_fields)
+    if nul_fields:
+        log.warning("supervisor.heartbeat.nul_stripped", fields=nul_fields[:20])
+    # #3631 — the signature covers the body, so serialise it once and send
+    # exactly the bytes that were signed.
+    body_bytes = encode_json(body)
+
+    headers: dict[str, str] = dict(JSON_CONTENT_TYPE)
     if cached_cert is not None:
         try:
-            headers = build_auth_headers(
-                "POST", url_path, cached_cert, identity.private_key, appliance_id
+            headers.update(
+                build_auth_headers(
+                    "POST",
+                    url_path,
+                    cached_cert,
+                    identity.private_key,
+                    appliance_id,
+                    body_bytes,
+                )
             )
             # #411 — KEEP the session token in the body as a fallback even
             # when we present a cert. The server prefers the cert; if cert-
@@ -799,34 +1549,86 @@ def heartbeat_once(
         except Exception as exc:  # noqa: BLE001
             log.warning("supervisor.heartbeat.cert_auth_skipped", error=str(exc))
 
-    try:
-        resp = client.post(
-            url, json=body, headers=headers, timeout=float(hold_s) + 10.0
+    read_timeout = float(hold_s) + 10.0
+    resp = None
+    # Two attempts at most: the node-local Service, then (when that had no
+    # answer) the fallback target, in the same call so a node whose api pod is
+    # away loses one connect timeout, not a whole heartbeat interval.
+    send = client
+    retry_client: httpx.Client | None = None
+    for _attempt in range(2):
+        timeout = httpx.Timeout(read_timeout)
+        if url.startswith(_IN_CLUSTER_NODE_LOCAL_URL):
+            timeout = httpx.Timeout(read_timeout, connect=_LOCAL_API_CONNECT_TIMEOUT_S)
+        try:
+            resp = send.post(url, content=body_bytes, headers=headers, timeout=timeout)
+        except httpx.HTTPError as exc:
+            # A read timeout means an api pod took the request; anything else
+            # (refused, connect timeout, no endpoint, DNS) means the node-local
+            # Service has none.
+            note_local_api_result(url, isinstance(exc, httpx.ReadTimeout))
+            # Transient network / DNS / timeout — don't count toward
+            # revocation strikes. The control plane is unreachable, not
+            # rejecting us; once it comes back the 200 path resumes.
+            log.warning("supervisor.heartbeat.failed", error=str(exc))
+            # #1219 — the control plane presented a certificate other than the
+            # pinned one. Re-pin if its CA vouches for the new one (a rotation),
+            # refuse if not (an interception). The next heartbeat uses the result.
+            if cp_tls.is_verification_failure(exc):
+                cp_tls.try_repin(cfg.state_dir, _effective_control_plane_url(cfg))
+                if retry_client is not None:
+                    retry_client.close()
+                return None
+            retry = _effective_control_plane_url(cfg).rstrip("/") + url_path
+            if retry == url:
+                if retry_client is not None:
+                    retry_client.close()
+                return None
+            url = retry
+            # ``client`` was built for the node-local URL (plain http, no
+            # certificate), so it carries no pin. The fallback gets a client
+            # built the way an ordinary heartbeat to that URL is: from the
+            # CURRENT pin file, so a re-pin since this process started is
+            # honoured, and never from the default trust store.
+            retry_client = _fallback_client(cfg, retry)
+            if retry_client is None:
+                return None
+            send = retry_client
+            continue
+        note_local_api_result(url, True)
+        break
+    if retry_client is not None:
+        retry_client.close()
+    if resp is None:
+        return None
+    revocation = revocation_reason(resp)
+    if revocation is None and resp.status_code in (403, 404):
+        # #2798 — a refusal that is NOT the control plane's revocation
+        # answer: a 404 (a proxy, an api whose router is not mounted, an
+        # older api whose registration flag was switched off) or a 403
+        # without the marker. None of these says the row is gone, so it is
+        # no strike and nothing is torn down: the role services keep
+        # serving from the last applied assignment (non-negotiable #5) and
+        # this keeps being logged until the heartbeat is accepted again.
+        log.warning(
+            "supervisor.heartbeat.refused_not_revocation",
+            status_code=resp.status_code,
+            detail=_refusal_detail(resp),
+            appliance_id=str(appliance_id),
         )
-    except httpx.HTTPError as exc:
-        # Transient network / DNS / timeout — don't count toward
-        # revocation strikes. The control plane is unreachable, not
-        # rejecting us; once it comes back the 200 path resumes.
-        log.warning("supervisor.heartbeat.failed", error=str(exc))
-        # #1219 — the control plane presented a certificate other than the
-        # pinned one. Re-pin if its CA vouches for the new one (a rotation),
-        # refuse if not (an interception). The next heartbeat uses the result.
-        if cp_tls.is_verification_failure(exc):
-            cp_tls.try_repin(cfg.state_dir, _effective_control_plane_url(cfg))
         return False
-    if resp.status_code == 403 or resp.status_code == 404:
-        # 403 = approval revoked or cert no longer valid for any
-        # known appliance row. 404 = appliance row deleted, or the
-        # control plane's supervisor_registration_enabled flag is
-        # off. Both mean "you shouldn't be talking to me anymore" —
-        # increment the consecutive-strike counter; flip to
-        # ``revoked`` once REVOCATION_STRIKE_LIMIT in a row, which
-        # de-noises a short control-plane restart.
+    if revocation is not None:
+        # 403 marked as a revocation: the row is revoked, or no row
+        # accepts our credential (deleted, or re-keyed). Increment the
+        # consecutive-strike counter; flip to ``revoked`` once
+        # REVOCATION_STRIKE_LIMIT in a row, which de-noises a short
+        # control-plane restart.
         prior_state = approval_state.read_state(cfg.state_dir)
         new_state, strikes = approval_state.record_revocation_signal(cfg.state_dir)
         log.warning(
             "supervisor.heartbeat.rejected",
             status_code=resp.status_code,
+            revocation=revocation,
             strikes=strikes,
             new_state=new_state,
             appliance_id=str(appliance_id),
@@ -846,11 +1648,31 @@ def heartbeat_once(
             if appliance_state.detect_deployment_kind() == "appliance":
                 try:
                     lifecycle = tear_down_supervised_services()
+                    # #2801 — the stamp says the role chart for this env is
+                    # applied, and the teardown just un-applied it. Left in
+                    # place, the first accepted heartbeat after the node is
+                    # approved again (same row, or a re-registration that
+                    # restored its roles) renders the same env, matches the
+                    # stamp and skips the apply, so DNS and DHCP stayed down
+                    # until the watchdog's next pass (up to 5 min).
+                    _clear_last_apply_hash(cfg.state_dir)
                     if lifecycle.stopped:
                         log.warning(
                             "supervisor.heartbeat.revoked_teardown",
                             state=lifecycle.state,
                             stopped=list(lifecycle.stopped),
+                            reason=lifecycle.reason,
+                            transition=(prior_state != "revoked"),
+                        )
+                    else:
+                        # #1884 — a teardown that took nothing down says why. It
+                        # returned in silence while the kubeapi was out of reach
+                        # (a revoked member its peers had already fenced out),
+                        # on every revoked heartbeat. It is tried again on the
+                        # next one.
+                        log.warning(
+                            "supervisor.heartbeat.revoked_teardown_incomplete",
+                            state=lifecycle.state,
                             reason=lifecycle.reason,
                             transition=(prior_state != "revoked"),
                         )
@@ -863,11 +1685,19 @@ def heartbeat_once(
     if resp.status_code >= 500:
         # 5xx is the control plane crashing mid-flight, not a
         # deliberate rejection — don't count toward revocation.
+        #
+        # #3020 — and it did not land, so it is re-sent as soon as one that
+        # never reached the control plane (None: #1805's 5 s, doubling). The
+        # heartbeat handler answers a database outage (a failover, a restarted
+        # primary) with 503 and Retry-After: 1, and the maintenance middleware's
+        # own database read with a bare 500; returning False waited the whole
+        # interval after either, which after a held heartbeat made a gap of
+        # about 60 s, and with the housekeeping stall before it 92 s.
         log.warning(
             "supervisor.heartbeat.server_error",
             status_code=resp.status_code,
         )
-        return False
+        return None
     if resp.status_code != 200:
         log.warning(
             "supervisor.heartbeat.unexpected_status",
@@ -876,7 +1706,33 @@ def heartbeat_once(
         return False
     # Heartbeat accepted — clear any prior strike counter and stamp
     # ``approved`` if we weren't there yet.
+    #
+    # #2808 — remember whether the role services were held (revoked or
+    # pending) up to now. The watchdog no longer heals a held node, so the
+    # first accepted heartbeat is what brings its roles back, and it must
+    # apply whatever the stamp says: the stamp may still name the env the
+    # teardown un-applied.
+    held_until_now = approval_state.role_services_hold(cfg.state_dir)
     approval_state.record_success(cfg.state_dir)
+
+    # #3631 — a control plane that checks the current signature form says so
+    # on every heartbeat answer. One that does not (an older build: a remote
+    # appliance paired to a control plane not yet upgraded, or a pod not yet
+    # rolled) refused our signature, accepted this heartbeat on the session
+    # token, and would refuse every proxy request too; sign the form it
+    # checks until it advertises the current one.
+    switched = note_control_plane_signature_support(resp.headers)
+    if switched is not None:
+        log.warning(
+            "supervisor.heartbeat.signature_form",
+            signing=switched,
+            reason=(
+                "control plane does not check the current signature form; "
+                "using the older one until it is upgraded"
+                if switched == "legacy"
+                else "control plane checks the current signature form"
+            ),
+        )
 
     try:
         body_out = resp.json()
@@ -886,6 +1742,9 @@ def heartbeat_once(
     # #358 Phase 1b — True when the control plane long-poll-held this
     # heartbeat (new server); lets the loop re-arm the hold immediately.
     held = bool(body_out.get("long_poll"))
+    # #1710 — keep the rolling upgrade's hold on the shared charts (or clear
+    # it) before anything below applies the role chart.
+    record_shared_chart_hold(cfg.state_dir / _ROLE_ENV_FILENAME, body_out.get("shared_chart_hold"))
 
     # #170 Wave D follow-up — pick up cert + CA chain on the first
     # heartbeat after approval. Subsequent heartbeats include the
@@ -911,6 +1770,14 @@ def heartbeat_once(
     desired_next_boot_slot = body_out.get("desired_next_boot_slot")
     desired_default_slot = body_out.get("desired_default_slot")
     reboot_requested = bool(body_out.get("reboot_requested"))
+    # #3008 — the cancel this heartbeat reported is done with only when the
+    # response proves the request retired (``reboot_requested`` false); an
+    # older api ignores the report and still sends ``true``.
+    reboot_in_response = body_out.get("reboot_requested")
+    appliance_state.ack_reboot_cancel(
+        state.get("reboot_cancelled_boot_id"),  # type: ignore[arg-type]
+        reboot_in_response if isinstance(reboot_in_response, bool) else None,
+    )
     clear_upgrade_requested = bool(body_out.get("clear_upgrade_requested"))
 
     # #786 — an explicit "Clear failed upgrade" outranks everything below.
@@ -953,6 +1820,10 @@ def heartbeat_once(
                 "supervisor.heartbeat.set_next_boot_trigger_fired",
                 desired_slot=desired_next_boot_slot,
             )
+    else:
+        # #3284: no Boot once on the row (retired, or never made): the next
+        # request is a new one, so forget the run fired for the last.
+        appliance_state.forget_set_next_boot_fire()
     if desired_default_slot:
         if appliance_state.maybe_fire_set_default(
             desired_default_slot,
@@ -1031,7 +1902,9 @@ def heartbeat_once(
         if appliance_state.maybe_fire_cluster_join(
             desired_cluster_role,
             body_out.get("desired_k3s_server_url"),  # type: ignore[arg-type]
-            body_out.get("desired_k3s_join_token"),  # type: ignore[arg-type]
+            _join_token(body_out, appliance_id, log),
+            body_out.get("desired_cluster_transition_id"),  # type: ignore[arg-type]
+            body_out.get("desired_cluster_transition_age_s"),  # type: ignore[arg-type]
         ):
             log.info(
                 "supervisor.heartbeat.cluster_join_trigger_fired",
@@ -1072,11 +1945,19 @@ def heartbeat_once(
     # only when the rendered cp-size differs, so it converges one tick
     # after a promote/demote settles and stays quiet otherwise.
     cp_size = body_out.get("control_plane_size")
-    if (
+    run_seed_housekeeping = (
         isinstance(cp_size, int)
         and cp_size >= 1
         and appliance_state.detect_appliance_variant() == "control-plane"
-    ):
+    )
+
+    def _seed_housekeeping() -> None:
+        # #3020 — the seed's kube API work, run on the housekeeping worker with
+        # the role lifecycle at the end of this function (``_Housekeeper``), not
+        # inline here: through a node loss its calls that reach the lost node
+        # time out at 10 s each, and the next heartbeat waited for every one.
+        # It reads only this heartbeat's answer, so the firewall dispatch and the
+        # role env render below no longer wait for it either.
         from . import k8s_api  # noqa: PLC0415
 
         # #272 — write the supervisor-owned overrides to HelmChartConfigs
@@ -1084,8 +1965,10 @@ def heartbeat_once(
         # when k3s re-applies the on-disk firstboot manifest on restart;
         # a HelmChartConfig is a separate CR helm-controller merges on top
         # + the deploy controller never reverts. cp-size + the VIP go on
-        # spatium-control; the MetalLB pool on spatium-bootstrap.
-        # Idempotent — only writes when the rendered values differ.
+        # spatium-control; the MetalLB pool on spatium-metallb.
+        # Each write MERGES the supervisor's own keys into the live
+        # document (operator keys survive, #2024) and only writes when that
+        # changes the effective values.
         ml_enabled = bool(body_out.get("desired_metallb_enabled"))
         ml_pool = body_out.get("desired_metallb_pool_addresses") or []
         ml_vip = body_out.get("desired_control_plane_vip") or ""
@@ -1119,11 +2002,19 @@ def heartbeat_once(
         # eviction tick arms _replace_hold, which keeps the size until the
         # committed count is back (or the operator shrinks on purpose), and
         # patch_cnpg_instances itself defers any scale-down the Cluster
-        # reports it cannot take. Scale-up is untouched; a real demote lands
-        # on the first tick the cluster is whole.
-        hold = _replace_hold.reason(body_out.get("evict_node_names") or [], cp_size)
-        pg_scale = k8s_api.patch_cnpg_instances(cp_size, scale_down=not hold, hold_reason=hold)
+        # reports it cannot take. Scale-up is untouched.
+        #
+        # #1541 — only a Replace arms the hold (_replace_names); a demote's
+        # cleanup eviction instead lets the scale-down past the readiness
+        # deferral (_DemoteShrink), because the departed nodes' instances
+        # never report ready again.
+        hold = _replace_hold.reason(_replace_names(body_out), cp_size)
+        shrink = _demote_shrink.allow(body_out.get("demote_evict_node_names") or [], cp_size)
+        pg_scale = k8s_api.patch_cnpg_instances(
+            cp_size, scale_down=not hold, hold_reason=hold, shrink_past_unready=shrink
+        )
         _replace_hold.settle(cp_size, pg_scale.current)
+        _demote_shrink.settle(cp_size, pg_scale.spec_after(cp_size))
         if pg_scale.scaled:
             log.info("supervisor.heartbeat.cnpg_instances_scaled", size=cp_size)
         elif pg_scale.deferred:
@@ -1146,6 +2037,11 @@ def heartbeat_once(
         # sized from this node's RAM (k8s_api.control_plane_resources) — the
         # chart's BYO-cluster defaults gave way before the VM did on the
         # appliance, and a kubectl patch never survived a k3s restart.
+        # #2240 — and the api / Postgres CPU limits, sized from this node's
+        # CPU count (none when it is unknown: the chart's stand). An
+        # appliance upgrading into a new sizing takes one CNPG rolling
+        # restart (and an api / worker rollout) on the first heartbeat that
+        # writes it; the #1005 guard keeps every later heartbeat quiet.
         #
         # #1313 — CNPG's instance count is the one the patch above left on
         # the Cluster, not cp_size. While #1059's hold keeps the Cluster at
@@ -1174,7 +2070,8 @@ def heartbeat_once(
                 release_size,
                 str(ml_vip),
                 web_ui_allowed_cidrs=list(web_ui_cidrs),
-                mem_total_mib=k8s_api.node_memory_mib(),
+                mem_total_mib=k8s_api.sizing_memory_mib(cfg.state_dir),
+                cpu_count=k8s_api.node_cpu_count(),
                 cnpg_instances=cnpg_instances,
             )
             if cp_changed:
@@ -1209,10 +2106,11 @@ def heartbeat_once(
         elif bs_err:
             log.warning("supervisor.heartbeat.metallb_overrides_failed", error=bs_err)
 
-        # #272 Phase 10 — data-plane resolver VIPs. Patches
-        # dns.useMetalLBVIP / dns.vip / dhcpKea.relayVIP onto the
-        # spatiumddi-appliance HelmChartConfig (a no-op merge until the
-        # chart exists, i.e. until a DNS/DHCP role is assigned somewhere).
+        # #272 Phase 10 — data-plane resolver VIPs. Merges
+        # dns.useMetalLBVIP / dns.vip / dhcpKea.relayVIP into the
+        # spatiumddi-appliance HelmChartConfig, leaving every other key
+        # (an operator's dnsBind9.resources, #2024) as it is. Inert until
+        # the chart exists, i.e. until a DNS/DHCP role is assigned.
         dns_vip = body_out.get("desired_dns_vip") or ""
         relay_vip = body_out.get("desired_dhcp_relay_vip") or ""
         dp_changed, dp_err = k8s_api.apply_dataplane_vip_overrides(
@@ -1253,30 +2151,40 @@ def heartbeat_once(
                 _nodes_deleted.add(name)
                 evicted_now.append(name)
                 log.info("supervisor.heartbeat.node_deleted", node=name)
-                # #590 — the deleted node strands any local-path Redis PVC
-                # provisioned on it (node-affine PV): the replacement
-                # replica sits Pending forever and its missing sentinel
-                # silently halves the failover quorum, so the NEXT node
-                # loss takes the whole API down. Reclaim now — the
-                # StatefulSet recreates pod + claim on a live node and the
-                # replica resyncs from the master (cache/broker data;
-                # Postgres is the store of record).
-                pvcs, pvc_err = k8s_api.reclaim_stranded_redis_storage(str(name))
-                if pvcs:
+                # #1541 — the slot-image mirror's local-path claim is
+                # stranded like Redis's (its pod sits Pending on the dead
+                # node's PV affinity), and only this re-creates it.
+                owed, mirror_err = k8s_api.reclaim_stranded_mirror_storage(str(name))
+                if owed:
+                    _mirror_claims_owed.update(owed)
                     log.info(
-                        "supervisor.heartbeat.redis_storage_reclaimed",
+                        "supervisor.heartbeat.mirror_storage_reclaimed",
                         node=name,
-                        pvcs=pvcs,
+                        pvcs=sorted(owed),
                     )
-                elif pvc_err:
+                if mirror_err:
                     log.warning(
-                        "supervisor.heartbeat.redis_storage_reclaim_failed",
+                        "supervisor.heartbeat.mirror_storage_reclaim_failed",
                         node=name,
-                        error=pvc_err,
+                        error=mirror_err,
                     )
             else:
                 log.warning(
                     "supervisor.heartbeat.node_evict_failed", node=name, error=evict_err
+                )
+        if _mirror_claims_owed:
+            created, still_owed, recreate_err = k8s_api.recreate_reclaimed_claims(
+                dict(_mirror_claims_owed)
+            )
+            _mirror_claims_owed.clear()
+            _mirror_claims_owed.update(still_owed)
+            if created:
+                log.info("supervisor.heartbeat.mirror_storage_recreated", pvcs=created)
+            if recreate_err:
+                log.warning(
+                    "supervisor.heartbeat.mirror_storage_recreate_failed",
+                    error=recreate_err,
+                    owed=sorted(still_owed),
                 )
         confirmed, reasons = _etcd_evictions.tick(
             {
@@ -1288,16 +2196,33 @@ def heartbeat_once(
             # etcd member is not a late arrival of the evicted one.
             wanted=[str(n) for n in (body_out.get("join_node_names") or [])],
         )
-        for name in confirmed:
-            _evicted_pending.add(name)
-            log.info("supervisor.heartbeat.node_evicted", node=name)
-        for name, reason in reasons.items():
-            if _evict_reasons.get(name) != reason:
-                log.info("supervisor.heartbeat.node_evict_pending", node=name, reason=reason)
-        _evict_reasons.clear()
-        _evict_reasons.update(reasons)
-        _evicted_pending.intersection_update(set(evict_names))
+        with _evict_lock:  # #3020: the next heartbeat's body reads these two
+            for name in confirmed:
+                _evicted_pending.add(name)
+                log.info("supervisor.heartbeat.node_evicted", node=name)
+            for name, reason in reasons.items():
+                if _evict_reasons.get(name) != reason:
+                    log.info("supervisor.heartbeat.node_evict_pending", node=name, reason=reason)
+            _evict_reasons.clear()
+            _evict_reasons.update(reasons)
+            _evicted_pending.intersection_update(set(evict_names))
         _nodes_deleted.intersection_update(set(evict_names))
+
+        # #590: the deleted Node strands any local-path Redis claim on it
+        # (node-affine PV): the re-created replica sits Pending and its
+        # missing sentinel silently halves the failover quorum, so the NEXT
+        # node loss takes the whole API down. The StatefulSet recreates pod
+        # and claim on a live node once the claim is gone, and the replica
+        # resyncs from the master (cache/broker data; Postgres is the store
+        # of record). #2404: every seed tick, not only the eviction one. The
+        # names evicted THIS tick go at once (and any a failed sweep left
+        # owed, while the Node list still lacks them), and on any other tick
+        # a claim pinned to a node that is no longer a Node is found and
+        # freed while a Redis pod is Pending. So a failed answer, a Node
+        # removed another way, and an eviction a restarted supervisor never
+        # saw all converge; one read of the Pending pods per tick while
+        # Redis is whole.
+        _reclaim_stranded_redis(evicted_now, log)
 
         # #1058 — the deleted Node strands the CloudNativePG instance claim
         # provisioned on it exactly as it strands Redis's, and the operator
@@ -1348,6 +2273,14 @@ def heartbeat_once(
         if pg_err:
             log.warning("supervisor.heartbeat.postgres_storage_reclaim_failed", error=pg_err)
 
+        # #2132 — a former primary that cannot pg_rewind, or a standby whose
+        # slot #2317's cap invalidated, loops for ever: no WAL archive exists
+        # to restore from and CNPG never re-clones on its own. After 10
+        # minutes of the same loop under the same primary the seed asks CNPG
+        # for the re-clone a person would do by hand (one instance at a time,
+        # never the primary).
+        _reclone_stuck_postgres(log)
+
         # #590 — cluster DNS must survive a node loss. k3s's bundled
         # CoreDNS is a single replica that deterministically sits on the
         # seed and takes the k8s-default 300 s to evict, so a hard seed
@@ -1364,6 +2297,22 @@ def heartbeat_once(
         _dns_changed, dns_err = k8s_api.ensure_coredns_ha()
         if dns_err:
             log.warning("supervisor.heartbeat.coredns_ha_failed", error=dns_err)
+        # #1718 — with a CoreDNS replica on every node, keep each node's
+        # lookups on its own: a lost node's CoreDNS pod, still a ready
+        # endpoint until the node reads NotReady, otherwise stalls half of
+        # every other node's lookups (Redis Sentinel into TILT, the
+        # supervisor's own heartbeat into EAI_AGAIN).
+        _local_changed, local_err = k8s_api.ensure_kube_dns_node_local()
+        if local_err:
+            log.warning("supervisor.heartbeat.kube_dns_node_local_failed", error=local_err)
+        # #2240: the CNPG operator IS Postgres failover, and firstboot starts
+        # both its replicas on the seed while the seed is alone; preferred
+        # anti-affinity never moves them. From three nodes the reconciler
+        # makes the spread required (a two-replica rollout needs a third node
+        # for its surge pod), and removes it again below three.
+        _op_changed, op_err = k8s_api.ensure_cnpg_operator_spread()
+        if op_err:
+            log.warning("supervisor.heartbeat.cnpg_operator_spread_failed", error=op_err)
 
     # #170 Wave C2 — render the role-driven compose env. C3 will
     # consume this via ``docker compose --env-file`` to actually
@@ -1414,41 +2363,18 @@ def heartbeat_once(
     # the BYTE-IDENTICAL body, so applied state is the same whichever ran —
     # this is what makes the rolling upgrade (supervisor/control-plane skew in
     # either direction) safe.
-    fw_settings = body_out.get("firewall_settings")
-    use_bundle = _server_firewall_body_is_usable(fw_settings, log)
-
-    if use_bundle:
-        if appliance_state.maybe_fire_firewall_reload(fw_settings):
-            log.info(
-                "supervisor.heartbeat.firewall_trigger_fired", source="control-plane"
-            )
-    else:
-        # #5 fallback — control plane too old to render, or firewall_enabled
-        # still off; render in-pod from the same derived inputs.
-        #
-        # #285 Phase 6 — this branch now fires UNCONDITIONALLY (it used to gate
-        # on ``cfg.in_pod_firewall_enabled or cluster_peer_cidrs or fw_pod_cidrs``).
-        # The base /etc/nftables.conf no longer opens the Web UI (80/443); the
-        # rendered drop-in is now the SOLE source of that accept, so it must be
-        # present on EVERY appliance node — including idle / non-CP nodes that
-        # carry no roles, no peers and no pods. ``_maybe_apply_firewall`` already
-        # self-gates on ``detect_deployment_kind() == "appliance"`` and the host
-        # runner short-circuits on an unchanged body hash, so an unconditional
-        # call is cheap + idempotent. SSH/22 is opened by the baked sentinel
-        # 00-spatium-ssh.nft (#1009 — it used to be in the base conf), which is
-        # a separate file the glob pulls in, so even a total drop-in failure
-        # still leaves the node SSH-recoverable.
-        _maybe_apply_firewall(
-            role_assignment,
-            log,
-            cluster_peer_cidrs,
-            pod_cidrs=fw_pod_cidrs,
-            service_cidrs=fw_service_cidrs,
-            cp_member_count=fw_cp_member_count,
-            vip_configured=fw_vip_configured,
-            web_ui_allowed_cidrs=fw_web_ui_cidrs,
-            ssh_scope_cidrs=fw_ssh_scope_cidrs,
-        )
+    _dispatch_firewall(
+        body_out.get("firewall_settings"),
+        role_assignment,
+        log,
+        cluster_peer_cidrs,
+        pod_cidrs=fw_pod_cidrs,
+        service_cidrs=fw_service_cidrs,
+        cp_member_count=fw_cp_member_count,
+        vip_configured=fw_vip_configured,
+        web_ui_allowed_cidrs=fw_web_ui_cidrs,
+        ssh_scope_cidrs=fw_ssh_scope_cidrs,
+    )
 
     target = compute_target_env(role_assignment)
     # #170 Wave D follow-up — the role env file carries ONLY role-
@@ -1472,8 +2398,7 @@ def heartbeat_once(
         # subprocess below if the supervisor crashed mid-write.
         # #555 — owner-only (0600) at creation: role-compose.env carries
         # DNS_AGENT_KEY / DHCP_AGENT_KEY bootstrap PSKs, and a plain
-        # write_text lands it at the umask default (0644, world-readable in
-        # the 1777 release-state dir) before any chmod. Reuse the shared
+        # write_text lands it at the umask default (0644) before any chmod. Reuse the shared
         # O_NOFOLLOW+0600 writer.
         tmp = env_path.with_suffix(".tmp")
         appliance_state._write_owner_only(tmp, rendered)
@@ -1520,71 +2445,145 @@ def heartbeat_once(
     # toward a state the control plane no longer expects. The console
     # dashboard surfaces the red ``Approval revoked`` chip so the
     # operator knows the recovery is "re-pair from /appliance/pairing".
-    if approval_state.read_state(cfg.state_dir) == "revoked":
-        log.info("supervisor.heartbeat.lifecycle_skipped_revoked")
-        _ = identity
-        return False
+    lifecycle_held = approval_state.role_services_hold(cfg.state_dir) is not None
+    run_lifecycle = (
+        not lifecycle_held
+        and not env_write_failed
+        and appliance_state.detect_deployment_kind() == "appliance"
+    )
 
-    if not env_write_failed and appliance_state.detect_deployment_kind() == "appliance":
-        # Phase 10 wave 2 — reconcile node labels every heartbeat
-        # regardless of the env-hash skip below. patch_node_labels is
-        # idempotent (same-value = no-op), so the cost is one PATCH
-        # per minute; the win is catching drift from out-of-band
-        # ``kubectl label node`` runs or manual unlabeling without
-        # waiting for the operator to flip a role.
-        try:
-            label_ok, label_err = reconcile_node_labels(target.profiles)
-            if not label_ok:
-                log.warning(
-                    "supervisor.heartbeat.labels_reconcile_failed",
-                    error=label_err,
-                )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("supervisor.heartbeat.labels_reconcile_crashed", error=str(exc))
+    def _housekeeping() -> None:
+        if run_seed_housekeeping:
+            _seed_housekeeping()
+        if run_lifecycle:
+            _run_role_lifecycle(
+                cfg.state_dir,
+                target.profiles,
+                rendered,
+                env_path,
+                force=held_until_now is not None,
+            )
 
-        apply_due, env_hash = _role_apply_due(cfg.state_dir, rendered, env_path)
-        if not apply_due:
-            log.info(
-                "supervisor.heartbeat.lifecycle_skipped",
-                reason="env_unchanged",
-                env_hash=env_hash[:12],
-            )
-        else:
-            lifecycle = apply_role_assignment(target.profiles, env_path)
-            log.info(
-                "supervisor.heartbeat.lifecycle_applied",
-                state=lifecycle.state,
-                reason=lifecycle.reason,
-                started=list(lifecycle.started),
-                stopped=list(lifecycle.stopped),
-            )
-            # The state + reason are returned on the NEXT heartbeat (not
-            # this one — we've already POSTed). Cache them on disk so a
-            # supervisor restart doesn't lose them.
-            _persist_lifecycle_state(cfg.state_dir, lifecycle.state, lifecycle.reason)
-            # The runtime set just changed (or attempted to) — invalidate
-            # the watchdog cache so the next heartbeat re-probes
-            # immediately rather than rendering 5-min-stale health.
-            # ``_last_watchdog_at`` is already declared global at the
-            # top of this function (one declaration per scope rule).
-            _last_watchdog_at = 0.0
-            # Only stamp the hash on success — a failed apply should
-            # re-attempt on the next heartbeat (the failure may have
-            # been transient: image pull glitch, transient port
-            # conflict, etc).
-            if lifecycle.state in ("ready", "idle"):
-                _write_last_apply_hash(cfg.state_dir, env_hash)
+    # #3020 — the kube API work of this heartbeat (the seed's block above, the
+    # role lifecycle) runs on the housekeeping worker; the loop waits for it at
+    # most HOUSEKEEPING_WAIT_S, so a node loss's 10 s timeouts no longer hold
+    # the next heartbeat back.
+    if run_seed_housekeeping or run_lifecycle:
+        _housekeeper.run(_housekeeping, HOUSEKEEPING_WAIT_S, log)
 
     # Identity unused in C2's payload but kept on the signature so
     # C2's mTLS upgrade doesn't need to thread it back in. Silence
     # the linter without adding a runtime cost.
     _ = identity
 
+    if lifecycle_held:
+        log.info("supervisor.heartbeat.lifecycle_skipped_revoked")
+        return False
     return held
+
+
+def _run_role_lifecycle(
+    state_dir: Path,
+    profiles: list[str],
+    rendered: str,
+    env_path: Path,
+    *,
+    force: bool = False,
+) -> None:
+    """Write the role chart (when due), THEN reconcile the node labels (#2190).
+
+    The order is the fix. The labels used to be reconciled first, on every
+    tick, so a role swap that also moved the DNS group (BIND9 in A → PowerDNS
+    in B, one save) labelled the node for PowerDNS while the dns-powerdns
+    DaemonSet still carried the previous chart's ``AGENT_GROUP=A``: the pod it
+    started registered a new server row in A, and the agent's cached token
+    kept it there after helm-controller rolled the template to B a second
+    later. Now the values are written first, ``apply_role_assignment`` labels
+    only what its new template can serve, and the reconcile after it — which
+    still runs on every tick, to catch an out-of-band ``kubectl label`` — gates
+    the same way.
+
+    ``force`` applies even when the stamp matches: the first accepted
+    heartbeat after the node was held (revoked or pending, #2808), whose
+    role chart was torn down under an env the stamp still names.
+    """
+    global _last_watchdog_at
+    apply_due, env_hash = _role_apply_due(state_dir, rendered, env_path)
+    if force and not apply_due:
+        log.info("supervisor.heartbeat.lifecycle_forced", reason="approved_again")
+        apply_due = True
+    if not apply_due:
+        log.info(
+            "supervisor.heartbeat.lifecycle_skipped",
+            reason="env_unchanged",
+            env_hash=env_hash[:12],
+        )
+    else:
+        lifecycle = apply_role_assignment(profiles, env_path)
+        log.info(
+            "supervisor.heartbeat.lifecycle_applied",
+            state=lifecycle.state,
+            reason=lifecycle.reason,
+            started=list(lifecycle.started),
+            stopped=list(lifecycle.stopped),
+        )
+        # The state + reason are returned on the NEXT heartbeat (not
+        # this one — we've already POSTed). Cache them on disk so a
+        # supervisor restart doesn't lose them.
+        _persist_lifecycle_state(state_dir, lifecycle.state, lifecycle.reason)
+        # The runtime set just changed (or attempted to) — invalidate
+        # the watchdog cache so the next heartbeat re-probes
+        # immediately rather than rendering 5-min-stale health.
+        _last_watchdog_at = 0.0
+        # #2833 — the chart is written but its pod is not up yet: the pass
+        # that is now due must read that as starting, not missing.
+        watchdog.note_apply()
+        # Only stamp the hash on success — a failed apply should
+        # re-attempt on the next heartbeat (the failure may have
+        # been transient: image pull glitch, transient port
+        # conflict, etc).
+        if _apply_settled(lifecycle):
+            _write_last_apply_hash(state_dir, env_hash)
+        elif not lifecycle.deferred:
+            # #3285 — a failed apply must not leave a MATCHING stamp behind.
+            # The forced path (above) applies while the stamp still names
+            # this key; if that apply fails, every later tick would read
+            # "env unchanged" and report the persisted failure forever.
+            # Dropping the stamp makes the next heartbeat retry, as it does
+            # when no stamp was ever written. A deferred apply (#1750) wrote
+            # nothing and is not a failure: it keeps its semantics.
+            _clear_last_apply_hash(state_dir)
+
+    # Phase 10 wave 2 — reconcile node labels every heartbeat
+    # regardless of the env-hash skip above. patch_node_labels is
+    # idempotent (same-value = no-op), so the cost is one PATCH
+    # per minute; the win is catching drift from out-of-band
+    # ``kubectl label node`` runs or manual unlabeling without
+    # waiting for the operator to flip a role.
+    try:
+        label_ok, label_err = reconcile_node_labels(profiles, env_path)
+        if not label_ok:
+            log.warning(
+                "supervisor.heartbeat.labels_reconcile_failed",
+                error=label_err,
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("supervisor.heartbeat.labels_reconcile_crashed", error=str(exc))
 
 
 _LIFECYCLE_STATE_FILE = "role-switch-state"
 _LAST_APPLY_HASH_FILE = "role-compose.env.hash"
+
+
+def _apply_settled(lifecycle: LifecycleResult) -> bool:
+    """Whether the heartbeat stamps the apply key after ``lifecycle``.
+
+    Only on success: a failed apply re-attempts on the next heartbeat. #1750 —
+    nor on a deferred one: a node sharing a cluster it is not a member of wrote
+    nothing, and stamping the key would skip the apply once it may write again
+    (a demoted node's fresh standalone cluster after ``left`` renders the same
+    key its ``leaving`` did, so it would never get its own role chart)."""
+    return lifecycle.state in ("ready", "idle") and not lifecycle.deferred
 
 
 def _role_apply_key(rendered_env: str, env_path: Path) -> str:
@@ -1635,6 +2634,17 @@ def _write_last_apply_hash(state_dir: Path, env_hash: str) -> None:
         pass
 
 
+def _clear_last_apply_hash(state_dir: Path) -> None:
+    """Drop the apply stamp so the next accepted heartbeat re-applies the role
+    chart (#2801), whatever env it renders."""
+    try:
+        (state_dir / _LAST_APPLY_HASH_FILE).unlink(missing_ok=True)
+    except OSError as exc:
+        # Best effort: a stamp left behind only means the next apply may be
+        # skipped as unchanged, which the role watchdog then re-fires.
+        log.warning("supervisor.heartbeat.apply_stamp_clear_failed", error=str(exc))
+
+
 def _persist_lifecycle_state(state_dir: Path, state: str, reason: str | None) -> None:
     """Write the most recent compose-lifecycle outcome to disk so the
     NEXT heartbeat reports it (this one has already left)."""
@@ -1663,3 +2673,8 @@ def _read_lifecycle_state(state_dir: Path) -> tuple[str | None, str | None]:
     state = body[0].strip() if body else None
     reason = "\n".join(body[1:]).strip() or None if len(body) > 1 else None
     return state, reason
+
+
+# #2801 — the re-register path reports the last apply's outcome with the roles
+# it asks the control plane to restore.
+read_lifecycle_state = _read_lifecycle_state

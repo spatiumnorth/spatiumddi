@@ -1,8 +1,18 @@
 import { useState } from "react";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { customFieldsApi, authApi, type CustomField } from "@/lib/api";
+import { customFieldsApi, formatApiError, type CustomField } from "@/lib/api";
+import {
+  customFieldCreatePayload,
+  customFieldUpdatePayload,
+  type CustomFieldForm,
+} from "@/lib/formPayloads";
 import { Plus, Pencil, Trash2, X, Check } from "lucide-react";
+import { usePermissions } from "@/hooks/usePermissions";
+import { useFreshRow, changedFields } from "@/hooks/useFreshRow";
+import { FreshRowError } from "@/components/FreshRowError";
 import { useModalDialog } from "@/components/ui/use-draggable-modal";
+import { FormError } from "@/components/ui/form-error";
 
 const RESOURCE_TYPES = ["ip_space", "ip_block", "subnet", "ip_address"];
 const FIELD_TYPES = ["text", "number", "boolean", "select", "url", "email"];
@@ -25,18 +35,7 @@ const FIELD_TYPE_LABELS: Record<string, string> = {
 
 type ModalMode = "create" | "edit";
 
-interface FieldForm {
-  resource_type: string;
-  name: string;
-  label: string;
-  field_type: string;
-  options: string;
-  is_required: boolean;
-  is_searchable: boolean;
-  default_value: string;
-  display_order: number;
-  description: string;
-}
+type FieldForm = CustomFieldForm;
 
 const EMPTY_FORM: FieldForm = {
   resource_type: "subnet",
@@ -50,6 +49,46 @@ const EMPTY_FORM: FieldForm = {
   display_order: 0,
   description: "",
 };
+
+// Edit reads the field when it opens (#3863), not from the list's copy.
+function EditFieldModal({
+  field,
+  onClose,
+  onSave,
+  error,
+  saving,
+}: {
+  field: CustomField;
+  onClose: () => void;
+  onSave: (form: FieldForm, base: CustomField) => void;
+  error?: string;
+  saving: boolean;
+}) {
+  const fresh = useFreshRow<CustomField>(field, () =>
+    customFieldsApi.get(field.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Custom Field"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={onClose}
+      />
+    );
+  if (!fresh.ready || !fresh.row) return null;
+  const base = fresh.row;
+  return (
+    <FieldModal
+      mode="edit"
+      initial={fieldToForm(base)}
+      onClose={onClose}
+      onSave={(f) => onSave(f, base)}
+      error={error}
+      saving={saving}
+    />
+  );
+}
 
 function FieldModal({
   mode,
@@ -95,9 +134,9 @@ function FieldModal({
         </div>
         <div className="space-y-4 px-5 py-4">
           {error && (
-            <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            <FormError className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm">
               {error}
-            </div>
+            </FormError>
           )}
           <div className="grid grid-cols-2 gap-4">
             <div>
@@ -266,27 +305,6 @@ function FieldModal({
   );
 }
 
-function formToPayload(form: FieldForm): Omit<CustomField, "id"> {
-  return {
-    resource_type: form.resource_type,
-    name: form.name,
-    label: form.label,
-    field_type: form.field_type,
-    options:
-      form.field_type === "select"
-        ? form.options
-            .split(",")
-            .map((s) => s.trim())
-            .filter(Boolean)
-        : null,
-    is_required: form.is_required,
-    is_searchable: form.is_searchable,
-    default_value: form.default_value || null,
-    display_order: form.display_order,
-    description: form.description,
-  };
-}
-
 function fieldToForm(field: CustomField): FieldForm {
   return {
     resource_type: field.resource_type,
@@ -353,12 +371,13 @@ function DeleteFieldDialog({
 
 export function CustomFieldsPage() {
   const qc = useQueryClient();
-  const { data: me } = useQuery({
-    queryKey: ["me"],
-    queryFn: authApi.me,
-    staleTime: 60_000,
-  });
-  const isSuperadmin = me?.is_superadmin ?? false;
+  // The router takes `require_resource_permission("custom_field")`: write for
+  // create / update, delete for delete. Gate on those grants, not on
+  // superadmin (#2697): the built-in IPAM Editor holds admin on it.
+  const perms = usePermissions();
+  const canWrite = perms.can("write", "custom_field");
+  const canDelete = perms.can("delete", "custom_field");
+  const canAct = canWrite || canDelete;
 
   const [filterType, setFilterType] = useState<string>("all");
   const [modal, setModal] = useState<{
@@ -368,7 +387,11 @@ export function CustomFieldsPage() {
   const [deleteConfirm, setDeleteConfirm] = useState<CustomField | null>(null);
   const [modalError, setModalError] = useState<string>("");
 
-  const { data: fields = [], isLoading } = useQuery({
+  const {
+    data: fields = [],
+    isLoading,
+    error: fieldsError,
+  } = useQuery({
     queryKey: ["custom-fields"],
     queryFn: () => customFieldsApi.list(),
   });
@@ -381,10 +404,7 @@ export function CustomFieldsPage() {
       setModalError("");
     },
     onError: (e: unknown) => {
-      const msg =
-        (e as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to create field";
-      setModalError(msg);
+      setModalError(formatApiError(e, "Failed to create field"));
     },
   });
 
@@ -402,10 +422,7 @@ export function CustomFieldsPage() {
       setModalError("");
     },
     onError: (e: unknown) => {
-      const msg =
-        (e as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to update field";
-      setModalError(msg);
+      setModalError(formatApiError(e, "Failed to update field"));
     },
   });
 
@@ -417,18 +434,22 @@ export function CustomFieldsPage() {
     },
   });
 
-  function handleSave(form: FieldForm) {
+  // `base` is the field as read when Edit opened (#3863): the Save sends only
+  // what the operator changed against it.
+  function handleSave(form: FieldForm, base?: CustomField) {
     setModalError("");
     if (modal?.mode === "create") {
-      createMutation.mutate(formToPayload(form));
-    } else if (modal?.mode === "edit" && modal.field) {
-      const {
-        resource_type: _rt,
-        name: _n,
-        field_type: _ft,
-        ...editable
-      } = formToPayload(form);
-      updateMutation.mutate({ id: modal.field.id, data: editable });
+      createMutation.mutate(customFieldCreatePayload(form));
+    } else if (modal?.mode === "edit" && base) {
+      const data = changedFields(
+        customFieldUpdatePayload(fieldToForm(base)),
+        customFieldUpdatePayload(form),
+      );
+      if (Object.keys(data).length === 0) {
+        setModal(null);
+        return;
+      }
+      updateMutation.mutate({ id: base.id, data });
     }
   }
 
@@ -458,7 +479,7 @@ export function CustomFieldsPage() {
             Define extra metadata fields for IPAM resources.
           </p>
         </div>
-        {isSuperadmin && (
+        {canWrite && (
           <button
             onClick={() => {
               setModal({ mode: "create" });
@@ -493,8 +514,10 @@ export function CustomFieldsPage() {
 
       {fields.length === 0 && (
         <div className="rounded-lg border border-dashed py-12 text-center text-sm text-muted-foreground">
-          No custom fields defined yet.
-          {isSuperadmin && ' Click "New Field" to add one.'}
+          <ListEmpty error={fieldsError} what="custom fields">
+            No custom fields defined yet.
+            {canWrite && ' Click "New Field" to add one.'}
+          </ListEmpty>
         </div>
       )}
 
@@ -514,7 +537,7 @@ export function CustomFieldsPage() {
                     <th className="px-5 py-2 text-left font-medium">Label</th>
                     <th className="px-5 py-2 text-left font-medium">Type</th>
                     <th className="px-5 py-2 text-left font-medium">Flags</th>
-                    {isSuperadmin && (
+                    {canAct && (
                       <th className="px-5 py-2 text-right font-medium">
                         Actions
                       </th>
@@ -548,26 +571,30 @@ export function CustomFieldsPage() {
                           )}
                         </div>
                       </td>
-                      {isSuperadmin && (
+                      {canAct && (
                         <td className="px-5 py-2 text-right">
                           <div className="flex justify-end gap-1">
-                            <button
-                              onClick={() => {
-                                setModal({ mode: "edit", field });
-                                setModalError("");
-                              }}
-                              className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
-                              title="Edit"
-                            >
-                              <Pencil className="h-3.5 w-3.5" />
-                            </button>
-                            <button
-                              onClick={() => setDeleteConfirm(field)}
-                              className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
-                              title="Delete"
-                            >
-                              <Trash2 className="h-3.5 w-3.5" />
-                            </button>
+                            {canWrite && (
+                              <button
+                                onClick={() => {
+                                  setModal({ mode: "edit", field });
+                                  setModalError("");
+                                }}
+                                className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
+                                title="Edit"
+                              >
+                                <Pencil className="h-3.5 w-3.5" />
+                              </button>
+                            )}
+                            {canDelete && (
+                              <button
+                                onClick={() => setDeleteConfirm(field)}
+                                className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                                title="Delete"
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </button>
+                            )}
                           </div>
                         </td>
                       )}
@@ -581,14 +608,23 @@ export function CustomFieldsPage() {
       })}
 
       {/* Create/Edit Modal */}
-      {modal && (
-        <FieldModal
-          mode={modal.mode}
-          initial={modal.field ? fieldToForm(modal.field) : EMPTY_FORM}
+      {modal?.mode === "edit" && modal.field && (
+        <EditFieldModal
+          field={modal.field}
           onClose={() => setModal(null)}
           onSave={handleSave}
           error={modalError}
-          saving={createMutation.isPending || updateMutation.isPending}
+          saving={updateMutation.isPending}
+        />
+      )}
+      {modal?.mode === "create" && (
+        <FieldModal
+          mode="create"
+          initial={EMPTY_FORM}
+          onClose={() => setModal(null)}
+          onSave={(f) => handleSave(f)}
+          error={modalError}
+          saving={createMutation.isPending}
         />
       )}
 

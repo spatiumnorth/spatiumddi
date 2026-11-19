@@ -34,6 +34,7 @@ import ipaddress
 import os
 import re
 import shlex
+import socket
 import tempfile
 import time
 import uuid
@@ -46,6 +47,7 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.config import settings
+from app.db import task_connect_args
 from app.models.nmap import NmapScan
 
 logger = structlog.get_logger(__name__)
@@ -132,6 +134,40 @@ _HOSTNAME_RE: Final = re.compile(
 )
 
 
+_NUMERIC_LABEL_RE: Final = re.compile(r"^[0-9-]+$")
+
+
+_BLOCKED_TARGET_MESSAGE = (
+    "target is in a blocked range (loopback / link-local / cloud-metadata) " "and cannot be scanned"
+)
+
+
+def _blocked_networks() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    from app.services.nettools.schemas import _BLOCKED_NETWORKS
+
+    return _BLOCKED_NETWORKS
+
+
+def _refuse_blocked(value: str) -> None:
+    from app.services.nettools.schemas import is_blocked_target
+
+    if is_blocked_target(value):
+        raise NmapArgError(_BLOCKED_TARGET_MESSAGE)
+
+
+def _refuse_resolved_blocked(host: str) -> None:
+    """Refuse a hostname any of whose addresses is in a blocked range. A name
+    that does not resolve is left for nmap to report."""
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError):
+        return
+    for info in infos:
+        addr = info[4][0]
+        if isinstance(addr, str):
+            _refuse_blocked(addr.split("%", 1)[0])
+
+
 def _validate_target(target: str) -> str:
     """Accept a literal IPv4/IPv6 address, a CIDR range, or a hostname / FQDN.
 
@@ -155,9 +191,11 @@ def _validate_target(target: str) -> str:
         raise NmapArgError("target is required")
     try:
         addr = ipaddress.ip_address(target)
-        return str(addr)
     except ValueError:
         pass
+    else:
+        _refuse_blocked(target)
+        return str(addr)
     if "/" in target:
         try:
             net = ipaddress.ip_network(target, strict=False)
@@ -168,8 +206,23 @@ def _validate_target(target: str) -> str:
                 f"CIDR is too large ({net.num_addresses} hosts) — limit is "
                 f"{MAX_CIDR_HOST_COUNT} (≤ /{net.max_prefixlen - MAX_CIDR_HOST_BITS} for IPv4)"
             )
+        _refuse_blocked(str(net.network_address))
+        _refuse_blocked(str(net.broadcast_address))
+        if any(blocked.overlaps(net) for blocked in _blocked_networks()):
+            raise NmapArgError(_BLOCKED_TARGET_MESSAGE)
         return str(net)
     if _HOSTNAME_RE.match(target):
+        # nmap reads dotted digit / dash spellings (``10.0.0.1-20``,
+        # ``10.0-255.0-255.0-255``) as octet ranges, expanding to many hosts.
+        # A real name's final label is never made of digits and dashes only
+        # (RFC 3696 section 2), so refuse that shape instead of passing it on.
+        if _NUMERIC_LABEL_RE.match(target.rstrip(".").rsplit(".", 1)[-1]):
+            raise NmapArgError(
+                f"target looks like an address range, which is not supported (got {target!r}); "
+                "use a single address, a CIDR, or a hostname"
+            )
+        _refuse_blocked(target)
+        _refuse_resolved_blocked(target)
         return target
     raise NmapArgError(
         f"target must be a valid IPv4/IPv6 address, CIDR, or hostname (got {target!r})"
@@ -545,20 +598,43 @@ def _parse_host(host: ET.Element) -> dict[str, Any]:
     }
 
 
-def parse_nmap_xml(xml_str: str) -> dict:
+def is_sweep(target: str, preset: str) -> bool:
+    """True when a scan covers a range rather than one address: a CIDR
+    target or the ``subnet_sweep`` preset. Decides the summary's shape."""
+    return "/" in str(target) or preset == "subnet_sweep"
+
+
+def parse_nmap_xml(xml_str: str, *, sweep: bool = False) -> dict:
     """Parse the XML emitted by ``nmap -oX -`` into a compact summary.
 
-    Single-host scans return ``{host_state, ports, os, hosts: None}``.
-    CIDR / multi-target scans additionally populate ``hosts`` with one
-    entry per ``<host>`` in the XML — the single-host fields then
-    reflect the first parsed host so existing callers (auto-profile
-    stamper, IP detail panel) keep working without a shape check.
+    Single-host scans return ``{address, host_state, ports, os,
+    hosts: None}``. CIDR / multi-target scans additionally populate
+    ``hosts`` with one entry per ``<host>`` in the XML — the single-host
+    fields then reflect the first parsed host so existing callers
+    (auto-profile stamper, IP detail panel) keep working without a shape
+    check. ``address`` says WHICH host the single-host fields describe:
+    a CIDR sweep where only one host answered also yields ``hosts: None``,
+    and the conformity ``no_open_ports`` check must not read that host's
+    ports as another address's (#2257).
+
+    ``sweep=True`` (a CIDR / ``subnet_sweep`` scan) always stores ``hosts``
+    -- a one-element list when one host answered, ``[]`` when none did --
+    so a sweep that found one host is still a sweep to the console and to
+    ``stamp-discovered`` (#2581). Single-address scans keep ``hosts: None``.
+
+    ``scanned_ports`` maps each probed protocol to nmap's ``<scaninfo
+    services>`` range list (``{"tcp": "1,3-4,6-7,..."}``). nmap lists only
+    ports in a non-default state, so a port absent from ``ports`` was
+    either closed or never probed; this says which. A ping-only ``-sn``
+    scan emits no ``<scaninfo>`` and so yields ``{}``.
     """
     out: dict[str, Any] = {
+        "address": None,
         "host_state": "unknown",
         "ports": [],
         "os": None,
         "hosts": None,
+        "scanned_ports": {},
     }
     if not xml_str:
         return out
@@ -568,16 +644,26 @@ def parse_nmap_xml(xml_str: str) -> dict:
         logger.debug("nmap_xml_parse_failed", error=str(exc))
         return out
 
+    for info in root.findall("scaninfo"):
+        proto = info.get("protocol")
+        services = info.get("services")
+        if proto and services:
+            prior = out["scanned_ports"].get(proto)
+            out["scanned_ports"][proto] = f"{prior},{services}" if prior else services
+
     host_elems = root.findall("host")
     if not host_elems:
+        if sweep:
+            out["hosts"] = []
         return out
 
     parsed = [_parse_host(h) for h in host_elems]
     first = parsed[0]
+    out["address"] = first["address"]
     out["host_state"] = first["host_state"]
     out["ports"] = first["ports"]
     out["os"] = first["os"]
-    if len(parsed) > 1:
+    if sweep or len(parsed) > 1:
         out["hosts"] = parsed
     return out
 
@@ -586,7 +672,9 @@ def parse_nmap_xml(xml_str: str) -> dict:
 
 
 def _new_engine_factory() -> tuple[Any, async_sessionmaker[AsyncSession]]:
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     factory = async_sessionmaker(engine, expire_on_commit=False)
     return engine, factory
 
@@ -731,7 +819,10 @@ async def run_scan(scan_id: uuid.UUID) -> None:
                             scan_row.raw_stdout = (scan_row.raw_stdout or "") + "".join(buffer)
                             scan_row.raw_xml = _read_xml_artefact(xml_path)
                             try:
-                                scan_row.summary_json = parse_nmap_xml(scan_row.raw_xml or "")
+                                scan_row.summary_json = parse_nmap_xml(
+                                    scan_row.raw_xml or "",
+                                    sweep=is_sweep(str(scan_row.target_ip), scan_row.preset),
+                                )
                             except Exception:  # noqa: BLE001 — best-effort
                                 scan_row.summary_json = None
                             await db.commit()
@@ -791,7 +882,10 @@ async def run_scan(scan_id: uuid.UUID) -> None:
             scan_row.finished_at = datetime.now(UTC)
             scan_row.duration_seconds = time.monotonic() - started_monotonic
             try:
-                scan_row.summary_json = parse_nmap_xml(full_xml or "")
+                scan_row.summary_json = parse_nmap_xml(
+                    full_xml or "",
+                    sweep=is_sweep(str(scan_row.target_ip), scan_row.preset),
+                )
             except Exception as exc:  # noqa: BLE001 — best-effort
                 logger.warning("nmap_summary_parse_failed", error=str(exc))
                 scan_row.summary_json = None

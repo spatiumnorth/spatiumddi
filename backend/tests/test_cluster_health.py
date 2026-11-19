@@ -67,16 +67,20 @@ def _pod(
     restarts: int = 0,
     owner: str = "ReplicaSet",
     waiting: str | None = None,
+    cnpg: str | None = None,
 ) -> dict:
     state: dict = (
         {"running": {}} if ready else {"waiting": {"reason": waiting or "ContainerCreating"}}
     )
+    labels = {"app.kubernetes.io/component": comp}
+    if cnpg:
+        labels["cnpg.io/cluster"] = cnpg
     return {
         "metadata": {
             "name": name,
             "namespace": ns,
             "creationTimestamp": "2026-06-12T19:00:00Z",
-            "labels": {"app.kubernetes.io/component": comp},
+            "labels": labels,
             "ownerReferences": [{"kind": owner}],
         },
         "spec": {"nodeName": node},
@@ -238,6 +242,63 @@ def test_the_database_reads_healthy_once_the_join_job_is_done(monkeypatch) -> No
     db = comps["database"]
     assert (db["ready"], db["total"], db["status"]) == (3, 3, "healthy")
     assert db["jobs_running"] == 0
+
+
+# ── #1387: the database verdict comes from CNPG ─────────────────────────────
+
+
+def _cnpg(monkeypatch, status: int, wanted: int = 3, ready: int = 0) -> None:
+    body = {"spec": {"instances": wanted}, "status": {"readyInstances": ready}}
+    monkeypatch.setattr(
+        "app.services.appliance.k8s.get_cnpg_cluster",
+        lambda name, namespace=None: (status, body if status == 200 else None),
+    )
+
+
+def test_a_join_that_failed_for_good_is_not_healthy(monkeypatch) -> None:
+    """Its pods are all Failed and skipped, so a pod count read 2/2 healthy
+    while CNPG wants three instances."""
+    _cnpg(monkeypatch, 200, wanted=3, ready=2)
+    comps = _rollup_with(
+        monkeypatch,
+        [
+            _pod("postgresql-1", comp="database", owner="Cluster", cnpg="postgresql"),
+            _pod("postgresql-2", comp="database", owner="Cluster", cnpg="postgresql"),
+            _pod(
+                "postgresql-3-join-abcde",
+                comp="database",
+                owner="Job",
+                phase="Failed",
+                ready=False,
+                cnpg="postgresql",
+            ),
+        ],
+    )
+    db = comps["database"]
+    assert (db["ready"], db["total"], db["status"], db["source"]) == (2, 3, "degraded", "cnpg")
+
+
+def test_first_bootstrap_has_a_database_row(monkeypatch) -> None:
+    _cnpg(monkeypatch, 200, wanted=3, ready=0)
+    comps = _rollup_with(
+        monkeypatch,
+        [_pod("postgresql-1-initdb-abcde", comp="database", owner="Job", cnpg="postgresql")],
+    )
+    db = comps["database"]
+    assert (db["ready"], db["total"], db["status"]) == (0, 3, "down")
+
+
+def test_an_unreadable_cnpg_cluster_falls_back_to_the_pod_count(monkeypatch) -> None:
+    _cnpg(monkeypatch, 403)
+    comps = _rollup_with(
+        monkeypatch,
+        [
+            _pod("postgresql-1", comp="database", owner="Cluster", cnpg="postgresql"),
+            _pod("postgresql-2", comp="database", owner="Cluster", cnpg="postgresql"),
+        ],
+    )
+    db = comps["database"]
+    assert (db["ready"], db["total"], db["source"]) == (2, 2, "pods")
 
 
 def test_a_component_made_only_of_jobs_is_not_a_workload(monkeypatch) -> None:
@@ -707,3 +768,58 @@ async def test_host_state_merge_failure_is_logged_not_raised(monkeypatch) -> Non
     assert snap["nodes"][0]["host_storage"] is None
     assert events and events[0][0] == "cluster_health_host_state_unavailable"
     assert events[0][1]["error_class"] == "TimeoutError"
+
+
+# ── #2945 — recent vs lifetime restarts ────────────────────────────────────
+
+
+def _restarted_pod(name: str, finished_ago_s: float | None, *, restarts: int = 1) -> dict:
+    from datetime import timedelta
+
+    p = _pod(name, restarts=restarts)
+    if finished_ago_s is not None:
+        ts = (datetime.now(UTC) - timedelta(seconds=finished_ago_s)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        p["status"]["containerStatuses"][0]["lastState"] = {
+            "terminated": {"finishedAt": ts, "exitCode": 0}
+        }
+    return p
+
+
+def test_a_restart_inside_the_window_is_recent(monkeypatch) -> None:
+    api = _rollup_with(monkeypatch, [_restarted_pod("a", 120)])["api"]
+    assert api["restarts"] == 1
+    assert api["recent_restarts"] == 1
+    assert api["last_restart_at"] is not None
+
+
+def test_an_old_restart_is_lifetime_only(monkeypatch) -> None:
+    api = _rollup_with(monkeypatch, [_restarted_pod("a", 3 * 3600, restarts=7)])["api"]
+    assert api["restarts"] == 7
+    assert api["recent_restarts"] == 0
+    assert api["last_restart_at"] is None
+
+
+def test_a_restart_with_no_finished_time_is_not_recent(monkeypatch) -> None:
+    api = _rollup_with(monkeypatch, [_restarted_pod("a", None)])["api"]
+    assert api["restarts"] == 1
+    assert api["recent_restarts"] == 0
+
+
+def test_a_never_restarted_pod_has_no_recent_restarts(monkeypatch) -> None:
+    api = _rollup_with(monkeypatch, [_pod("a")])["api"]
+    assert api["recent_restarts"] == 0
+    assert api["last_restart_at"] is None
+
+
+def test_recent_restarts_sum_across_pods_and_skip_a_far_future_stamp(monkeypatch) -> None:
+    api = _rollup_with(
+        monkeypatch,
+        [
+            _restarted_pod("a", 60),
+            _restarted_pod("b", 600),
+            _restarted_pod("c", 7200),
+            _restarted_pod("d", -3600),  # clock a long way ahead: ignored
+        ],
+    )["api"]
+    assert api["restarts"] == 4
+    assert api["recent_restarts"] == 2

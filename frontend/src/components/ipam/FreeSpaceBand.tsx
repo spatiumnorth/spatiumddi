@@ -1,3 +1,4 @@
+import { ListReadError } from "@/components/ui/list-read-error";
 import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import {
@@ -6,7 +7,7 @@ import {
   type IPBlock,
   type Subnet,
 } from "@/lib/api";
-import { parseCidr } from "@/lib/cidr";
+import { bigFraction, cidrSpan } from "@/lib/cidr";
 import { cn } from "@/lib/utils";
 
 interface Segment {
@@ -14,7 +15,7 @@ interface Segment {
   width: number; // fraction width
   kind: "block" | "subnet" | "free";
   label: string;
-  size: number;
+  size: bigint;
   network?: string;
   utilization?: number; // 0..100 — only set for blocks/subnets
 }
@@ -34,13 +35,21 @@ export function FreeSpaceBand({
   directSubnets,
   childBlocks,
   onSelectFree,
+  createDisabledReason,
 }: {
   block: IPBlock;
   directSubnets: Subnet[];
   childBlocks: IPBlock[];
   onSelectFree: (range: FreeCidrRange) => void;
+  /** Set when the caller may not create a subnet (#3391): a free segment is
+   *  then disabled and this is its tooltip. */
+  createDisabledReason?: string;
 }) {
-  const { data: freeRanges = [], isLoading } = useQuery({
+  const {
+    data: freeRanges = [],
+    isLoading,
+    error,
+  } = useQuery({
     queryKey: [
       "block-free-space",
       block.id,
@@ -51,9 +60,9 @@ export function FreeSpaceBand({
   });
 
   const segments = useMemo<Segment[]>(() => {
-    const parent = parseCidr(block.network);
+    // Exact BigInt spans, so an IPv6 block draws like an IPv4 one (#3707).
+    const parent = cidrSpan(block.network);
     if (!parent) return [];
-    const parentSize = Math.pow(2, 32 - parent.prefix);
 
     const mapRange = (
       net: string,
@@ -61,16 +70,14 @@ export function FreeSpaceBand({
       label: string,
       utilization?: number,
     ): Segment | null => {
-      const p = parseCidr(net);
+      const p = cidrSpan(net);
       if (!p) return null;
-      const size = Math.pow(2, 32 - p.prefix);
-      const start = (p.base - parent.base) / parentSize;
       return {
-        start,
-        width: size / parentSize,
+        start: bigFraction(p.base - parent.base, parent.size),
+        width: bigFraction(p.size, parent.size),
         kind,
         label,
-        size,
+        size: p.size,
         network: net,
         utilization,
       };
@@ -99,18 +106,46 @@ export function FreeSpaceBand({
       const s = mapRange(
         fr.network,
         "free",
-        `Free ${fr.network} (${fr.size.toLocaleString()} addrs)`,
+        `Free ${fr.network} (${(cidrSpan(fr.network)?.size ?? BigInt(fr.size)).toLocaleString()} addrs)`,
       );
       if (s) out.push(s);
+    }
+    // A capped answer names the rest on its last range (#3848): draw the
+    // block's remainder as one free span instead of leaving it blank.
+    const last = freeRanges[freeRanges.length - 1];
+    const lastSpan = last ? cidrSpan(last.network) : null;
+    if (last?.more_after && lastSpan) {
+      const start = lastSpan.base + lastSpan.size - parent.base;
+      const size = parent.size - start;
+      if (size > 0n) {
+        out.push({
+          start: bigFraction(start, parent.size),
+          width: bigFraction(size, parent.size),
+          kind: "free",
+          label: `Free — rest of the block after ${last.network} (${last.more_after.toLocaleString()} more free ranges not listed)`,
+          size,
+        });
+      }
     }
     out.sort((a, b) => a.start - b.start);
     return out;
   }, [block.network, childBlocks, directSubnets, freeRanges]);
+  const omitted = freeRanges[freeRanges.length - 1]?.more_after ?? 0;
 
   const [hovered, setHovered] = useState<Segment | null>(null);
 
   if (isLoading) {
     return <div className="h-5 w-full animate-pulse rounded-sm bg-muted/40" />;
+  }
+
+  // A refused or failed read says so, not "No allocation data" (#3337): the
+  // block's own grant may not reach the subnets the free-space walk needs.
+  if (error != null) {
+    return (
+      <p className="text-[11px]">
+        <ListReadError error={error} what="this block's allocation map" />
+      </p>
+    );
   }
 
   if (segments.length === 0) {
@@ -136,7 +171,11 @@ export function FreeSpaceBand({
                 if (fr) onSelectFree(fr);
               }
             }}
-            title={seg.label}
+            title={
+              seg.kind === "free" && createDisabledReason
+                ? createDisabledReason
+                : seg.label
+            }
             style={{
               left: `${seg.start * 100}%`,
               width: `${Math.max(seg.width * 100, 0.25)}%`,
@@ -151,7 +190,9 @@ export function FreeSpaceBand({
                 "cursor-pointer bg-[repeating-linear-gradient(45deg,theme(colors.zinc.400/.5)_0_4px,transparent_4px_8px)] dark:bg-[repeating-linear-gradient(45deg,theme(colors.zinc.500/.6)_0_4px,transparent_4px_8px)] hover:bg-[repeating-linear-gradient(45deg,theme(colors.emerald.500/.6)_0_4px,transparent_4px_8px)] dark:hover:bg-[repeating-linear-gradient(45deg,theme(colors.emerald.400/.5)_0_4px,transparent_4px_8px)]",
             )}
             aria-label={seg.label}
-            disabled={seg.kind !== "free"}
+            disabled={
+              seg.kind !== "free" || !seg.network || !!createDisabledReason
+            }
           >
             {(seg.kind === "block" || seg.kind === "subnet") && (
               <span
@@ -177,6 +218,13 @@ export function FreeSpaceBand({
         <span className="text-muted-foreground/70">
           (saturated portion = % allocated)
         </span>
+        {omitted > 0 && (
+          <span className="text-amber-600 dark:text-amber-400">
+            Showing {freeRanges.length.toLocaleString()} of{" "}
+            {(freeRanges.length + omitted).toLocaleString()} free ranges; the
+            rest of the block is drawn as one free span.
+          </span>
+        )}
         {hovered && (
           <span className="ml-auto font-mono text-foreground">
             {hovered.label}

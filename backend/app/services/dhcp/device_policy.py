@@ -361,7 +361,11 @@ async def compile_device_policy(
     selected = {c for c in (policy.device_classes or []) if isinstance(c, str) and c}
     result = CompiledPolicy(class_name=policy.class_name, expression="", source="empty")
 
-    if not selected:
+    # A manual match expression is rendered whether or not any class is
+    # selected (config_bundle renders every enabled policy with a non-empty
+    # expression), so "matches nothing and is not rendered" is only true with
+    # neither (#1992).
+    if not selected and not (policy.match_override or "").strip():
         result.warnings.append(
             "No device classes selected — this policy matches nothing and is not rendered."
         )
@@ -437,16 +441,47 @@ async def compile_device_policy(
     if override:
         result.expression = override
         result.source = "override"
-        result.warnings.append(
-            "A manual match expression is in force; the compiled expression below "
-            "is shown for comparison and is not rendered."
-        )
+        # The bundle renders only enabled policies, so "in force" is false for
+        # a disabled one (#2753).
+        if policy.enabled:
+            result.warnings.append(
+                "A manual match expression is in force; the compiled expression below "
+                "is shown for comparison and is not rendered."
+            )
+        else:
+            result.warnings.append(
+                "This policy is disabled, so its manual match expression is not "
+                "applied: nothing is rendered to Kea until it is enabled. When "
+                "enabled, the manual expression is used and the compiled expression "
+                "below is shown for comparison only."
+            )
     elif compiled:
         result.expression = compiled
         result.source = "compiled"
     else:
         result.expression = ""
         result.source = "empty"
+        # Classes selected but nothing to match: say why it is not rendered.
+        # Not the ambiguous case, which has its own warning above (signatures
+        # exist but were excluded). With no ambiguous signature, an empty
+        # result means either nothing was seen in the selected classes, or
+        # every in-class device sent options 55/60 that _term cannot encode;
+        # "no devices seen" would be false for the second (#2000). Worded
+        # without "renders once", which a disabled policy never does.
+        if selected and not ambiguous:
+            if inside:
+                seen = sum(len(macs) for macs in inside.values())
+                result.warnings.append(
+                    f"{seen} device(s) in the selected classes were seen, but none "
+                    "sent DHCP options 55 or 60 in a form that can be matched, so "
+                    "this policy matches nothing and is not rendered."
+                )
+            else:
+                result.warnings.append(
+                    "No devices have been seen in the selected classes yet, so this "
+                    "policy matches nothing and is not rendered. It compiles once a "
+                    "device in one of them is fingerprinted."
+                )
 
     return result
 

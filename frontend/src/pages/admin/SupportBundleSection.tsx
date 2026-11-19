@@ -15,6 +15,7 @@ import {
   type SupportBundleDecodeMap,
   type SupportBundlePreview,
 } from "@/lib/api";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Support bundle (#875) — generate a scrubbed diagnostics archive for a
@@ -59,24 +60,9 @@ export function SupportBundleSection() {
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
     },
-    // The download is requested with responseType "blob", so an error
-    // response arrives as a Blob too — formatApiError finds no `.detail`
-    // on it and falls back to axios's "Request failed with status code
-    // 403", hiding the reason the server actually gave.
-    onError: async (e) => {
-      const data = (e as { response?: { data?: unknown } })?.response?.data;
-      if (data instanceof Blob) {
-        try {
-          const parsed = JSON.parse(await data.text()) as { detail?: unknown };
-          if (typeof parsed.detail === "string" && parsed.detail.trim()) {
-            setError(parsed.detail);
-            return;
-          }
-        } catch {
-          // Not JSON (a proxy error page, an empty body) — fall through
-          // to the generic formatter rather than showing raw bytes.
-        }
-      }
+    // supportBundleApi.download decodes the Blob error body
+    // (rethrowBlobError), so formatApiError reads the server's reason.
+    onError: (e) => {
       setError(formatApiError(e, "Download failed"));
     },
   });
@@ -140,9 +126,9 @@ export function SupportBundleSection() {
       </div>
 
       {error && (
-        <p className="rounded border border-destructive/40 bg-destructive/5 p-2 text-xs text-destructive">
+        <FormError className="rounded border border-destructive/40 bg-destructive/5 p-2 text-xs text-destructive">
           {error}
-        </p>
+        </FormError>
       )}
 
       {preview && (

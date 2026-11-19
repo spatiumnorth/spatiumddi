@@ -1,17 +1,40 @@
 import { useState } from "react";
+import { useFreshRow, changedFields } from "@/hooks/useFreshRow";
+import { FreshRowError } from "@/components/FreshRowError";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { dhcpApi, type DHCPPool, type DHCPScope } from "@/lib/api";
 import { Modal, Field, Btns, inputCls, errMsg } from "./_shared";
+import { FormError } from "@/components/ui/form-error";
 
-export function CreatePoolModal({
-  pool,
-  scope,
-  onClose,
-}: {
+type CreatePoolModalProps = {
   pool?: DHCPPool;
   scope: DHCPScope;
   onClose: () => void;
-}) {
+};
+
+// Edit reads the pool fresh on open (#3091): the row the page holds comes from
+// a cached list, and the form is seeded once. A pool has no read of its own,
+// so it is looked up in its scope's list.
+export function CreatePoolModal(props: CreatePoolModalProps) {
+  const fresh = useFreshRow(props.pool, async () =>
+    (await dhcpApi.listPools(props.scope.id)).find(
+      (p) => p.id === props.pool!.id,
+    ),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Pool"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <PoolModalForm {...props} pool={fresh.row} />;
+}
+
+function PoolModalForm({ pool, scope, onClose }: CreatePoolModalProps) {
   const qc = useQueryClient();
   const editing = !!pool;
   const [name, setName] = useState(pool?.name ?? "");
@@ -20,9 +43,6 @@ export function CreatePoolModal({
   const [poolType, setPoolType] = useState(pool?.pool_type ?? "dynamic");
   const [classRestriction, setClassRestriction] = useState(
     pool?.class_restriction ?? "",
-  );
-  const [leaseOverride, setLeaseOverride] = useState(
-    pool?.lease_time_override != null ? String(pool.lease_time_override) : "",
   );
   // DHCPv6 prefix delegation (#368) — only offered on v6 scopes.
   const isV6 = scope.address_family === "ipv6";
@@ -48,8 +68,20 @@ export function CreatePoolModal({
     enabled: !!scope.group_id,
   });
 
+  // #2752 — the class each device policy of this group generates. The API
+  // takes it as a pool's class_restriction (known_class_names), and the Device
+  // Policies tab says a pool binds to that exact string.
+  const { data: devicePolicies = [] } = useQuery({
+    queryKey: ["dhcp-device-policies", scope.group_id],
+    queryFn: () =>
+      scope.group_id
+        ? dhcpApi.listDevicePolicies(scope.group_id)
+        : Promise.resolve([]),
+    enabled: !!scope.group_id,
+  });
+
   const mut = useMutation({
-    mutationFn: () => {
+    mutationFn: async () => {
       const data: Partial<DHCPPool> = isPd
         ? {
             name,
@@ -67,13 +99,32 @@ export function CreatePoolModal({
             end_ip: endIp,
             pool_type: poolType,
             class_restriction: classRestriction || null,
-            lease_time_override: leaseOverride
-              ? parseInt(leaseOverride, 10)
-              : null,
+            // Kea has no per-pool lease time (#1689): clear any stored
+            // override instead of offering one the server would refuse.
+            ...(pool?.lease_time_override != null
+              ? { lease_time_override: null }
+              : {}),
           };
-      return editing
-        ? dhcpApi.updatePool(scope.id, pool!.id, data)
-        : dhcpApi.createPool(scope.id, data);
+      if (!editing) return dhcpApi.createPool(scope.id, data);
+      // Send only what changed (#3091), so a Save that touches nothing leaves
+      // the pool as it is, and an edit cannot write back a range or class
+      // another surface has since changed.
+      const diff = changedFields(
+        {
+          name: pool!.name,
+          start_ip: pool!.start_ip,
+          end_ip: pool!.end_ip,
+          pool_type: pool!.pool_type,
+          class_restriction: pool!.class_restriction ?? null,
+          lease_time_override: pool!.lease_time_override ?? null,
+          pd_prefix: pool!.pd_prefix ?? null,
+          delegated_length: pool!.delegated_length ?? null,
+          excluded_prefix: pool!.excluded_prefix ?? null,
+        },
+        data,
+      );
+      if (Object.keys(diff).length === 0) return pool!;
+      return dhcpApi.updatePool(scope.id, pool!.id, diff);
     },
     onSuccess: (result) => {
       qc.invalidateQueries({ queryKey: ["dhcp-pools", scope.id] });
@@ -167,16 +218,6 @@ export function CreatePoolModal({
               </Field>
             </>
           )}
-          {!isPd && (
-            <Field label="Lease Time Override (sec)">
-              <input
-                type="number"
-                className={inputCls}
-                value={leaseOverride}
-                onChange={(e) => setLeaseOverride(e.target.value)}
-              />
-            </Field>
-          )}
           <Field label="Restrict to Client Class">
             <select
               className={inputCls}
@@ -189,14 +230,35 @@ export function CreatePoolModal({
                   {c.name}
                 </option>
               ))}
+              {devicePolicies
+                .filter((p) => !classes.some((c) => c.name === p.class_name))
+                .map((p) => (
+                  <option key={p.id} value={p.class_name}>
+                    {p.class_name} (device policy {p.name}
+                    {p.enabled ? "" : ", disabled"})
+                  </option>
+                ))}
+              {/* #2481 — the API also takes names that are not a row of this
+                  group (Kea's built-in KNOWN, generated PXE / phone /
+                  device-policy classes). Show a stored one as itself. */}
+              {classRestriction &&
+                !classes.some((c) => c.name === classRestriction) &&
+                !devicePolicies.some(
+                  (p) => p.class_name === classRestriction,
+                ) && (
+                  <option value={classRestriction}>
+                    {classRestriction} (built-in or generated class)
+                  </option>
+                )}
             </select>
           </Field>
         </div>
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
         {existingWarning && (
           <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 space-y-2">
             <p className="text-sm font-medium text-amber-700 dark:text-amber-400">
-              Pool created — {existingWarning.length} existing IP
+              Pool {editing ? "saved" : "created"} — {existingWarning.length}{" "}
+              existing IP
               {existingWarning.length !== 1 ? "s" : ""} in this range:
             </p>
             <ul className="text-xs space-y-0.5 max-h-32 overflow-y-auto">

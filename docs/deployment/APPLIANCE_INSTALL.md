@@ -34,6 +34,10 @@ UTM, or a bare-metal box. Size it for the role you will pick in the wizard:
 | **First node** (control plane: api, web UI, worker, PostgreSQL, Redis, k3s) | 4 | 8 GiB | 40 GiB SSD |
 | **Additional node** (DNS / DHCP agent, promotable to the control plane later) | 2 | 4 GiB | 32 GiB SSD |
 
+Size a node you mean to promote into the control plane like the first node.
+Measured figures, the minimums, and the 48 GiB disk advice for a three-node
+control plane are in [`SIZING.md`](SIZING.md).
+
 The installer **refuses any disk under 32 GiB** — the A/B upgrade layout
 needs two 8 GiB OS slots plus a `/var` that holds the image store, the
 database and the logs. Below the recommended figures on a first node it
@@ -181,7 +185,7 @@ a real password when prompted.
 
 Two things worth doing straight away:
 
-- **Replace the certificate** under **Appliance → Web UI Certificate** —
+- **Replace the certificate** under **Appliance → Fleet → Web UI Certificate** —
   paste a PEM and key, generate a CSR on the server, or issue one from
   Let's Encrypt with the built-in ACME client. The web tier reloads on its
   own.
@@ -238,11 +242,13 @@ layouts.
 ## Upgrades
 
 Every appliance has two identical OS slots. An upgrade writes the new image
-into the inactive slot, reboots into it, and reverts automatically if the
-health check fails — the worst case is one wasted reboot. Schedule it per
-node from **Appliance → Fleet**, or roll a whole cluster one node at a time
-from **Rolling Upgrade**. Air-gapped sites mirror the slot image from
-**Upgrade images** instead of fetching it from GitHub.
+into the inactive slot, and the node then boots it and reverts automatically
+if the health check fails — the worst case is one wasted reboot. Scheduling
+it per node from **Appliance → Fleet** only stages the image: the node keeps
+running the old slot until you press **Reboot to boot new slot**.
+**Rolling Upgrade** reboots each node itself, one node at a time. Air-gapped
+sites mirror the slot image from **Upgrade images** instead of fetching it
+from GitHub.
 
 ---
 

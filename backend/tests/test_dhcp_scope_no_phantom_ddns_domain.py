@@ -63,7 +63,7 @@ async def _setup(client: AsyncClient, db: AsyncSession) -> tuple[dict[str, str],
     resp = await client.post(
         f"/api/v1/dhcp/subnets/{subnet.id}/dhcp-scopes",
         headers=headers,
-        json={"group_id": str(grp.id), "name": "s", "ddns_enabled": True},
+        json={"group_id": str(grp.id), "name": "s"},
     )
     assert resp.status_code in (200, 201), resp.text
     return headers, resp.json()

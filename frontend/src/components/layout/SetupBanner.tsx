@@ -3,6 +3,7 @@ import { Link, useLocation } from "react-router-dom";
 import { ArrowRight, Sparkles } from "lucide-react";
 
 import { applianceSetupApi, versionApi } from "@/lib/api";
+import { usePermissions } from "@/hooks/usePermissions";
 
 /**
  * Phase 4g — first-boot setup-wizard banner.
@@ -18,6 +19,9 @@ import { applianceSetupApi, versionApi } from "@/lib/api";
  * polish steps.
  */
 export function SetupBanner() {
+  // #1342 — finishing first-boot setup takes `admin` on `appliance`;
+  // the call to action is for a user who can answer it.
+  const canFinishSetup = usePermissions().can("admin", "appliance");
   const location = useLocation();
 
   const version = useQuery({
@@ -29,12 +33,15 @@ export function SetupBanner() {
     queryKey: ["appliance", "setup"],
     queryFn: applianceSetupApi.state,
     // Only run when we know it's an appliance deploy — otherwise
-    // /appliance/system/setup returns 401/403 noise on plain deploys.
-    enabled: !!version.data?.appliance_mode,
+    // /appliance/system/setup returns 401/403 noise on plain deploys — and
+    // only for a user who may act on the answer: the route needs `read` on
+    // `appliance`, and every refusal is an audited `denied` row (#1864).
+    enabled: !!version.data?.appliance_mode && canFinishSetup,
     staleTime: 60 * 1000,
   });
 
   if (!version.data?.appliance_mode) return null;
+  if (!canFinishSetup) return null;
   if (!setup.data || setup.data.complete) return null;
   if (location.pathname.startsWith("/appliance/setup")) return null;
 

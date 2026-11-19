@@ -12,13 +12,20 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp.scopes import validate_dhcp_options
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
-from app.models.dhcp import DHCPLease, DHCPPool, DHCPScope, DHCPServerGroup
+from app.core.update_nulls import changed_keys, resolve_update_changes, snapshot
+from app.models.dhcp import DHCPClientClass, DHCPLease, DHCPPool, DHCPScope, DHCPServerGroup
 from app.models.ipam import IPAddress, Subnet
+from app.services.dhcp.class_refs import (
+    generated_class_problem,
+    is_builtin_or_generated,
+    is_generated,
+    known_class_names,
+)
 from app.services.dhcp.option_validation import normalize_options
 from app.services.dhcp.pool_occupancy import (
     PoolOccupancy,
@@ -32,6 +39,39 @@ router = APIRouter(tags=["dhcp"], dependencies=[Depends(require_resource_permiss
 # start_ip/end_ip range is ignored — the delegation is described by
 # pd_prefix / delegated_length / excluded_prefix instead.
 VALID_POOL_TYPES = {"dynamic", "excluded", "reserved", "pd"}
+
+# #1689 — Kea has no per-pool lifetime: a ``pools`` entry takes ``pool``,
+# ``option-data``, ``client-classes`` and ``pool-id`` only (valid-lifetime
+# lives on the subnet, shared-network, global scope or a client class, and a
+# class's lifetime only applies to clients matching its test, which would also
+# restrict who may use the pool). The field used to be accepted, stored, echoed
+# and never rendered, so a "guest pool, 10 minute lease" quietly served the
+# scope's lease. Refuse a value rather than store a no-op; null (clear) stays
+# legal so an existing row can still be reset.
+LEASE_OVERRIDE_UNSUPPORTED = (
+    "lease_time_override is not supported: Kea has no per-pool lease time, so the "
+    "pool would be served the scope's lease_time. Set the lease on the scope "
+    "(or use a separate scope), or clear this field"
+)
+
+
+def _check_ip_literal(v: str | None) -> str | None:
+    """A non-IP start/end is a 422, not a ValueError out of the overlap scan
+    (#2500). Empty / null pass: pd pools ignore the range and create
+    reports a missing one itself."""
+    if v:
+        try:
+            ipaddress.ip_address(v.strip())
+        except ValueError as exc:
+            raise ValueError(f"{v!r} is not a valid IP address") from exc
+        return v.strip()
+    return v
+
+
+def _refuse_lease_override(v: int | None) -> int | None:
+    if v is not None:
+        raise ValueError(LEASE_OVERRIDE_UNSUPPORTED)
+    return v
 
 
 class PoolCreate(BaseModel):
@@ -48,12 +88,22 @@ class PoolCreate(BaseModel):
     delegated_length: int | None = None
     excluded_prefix: str | None = None
 
+    @field_validator("start_ip", "end_ip")
+    @classmethod
+    def _ip_literal(cls, v: str | None) -> str | None:
+        return _check_ip_literal(v)
+
     @field_validator("pool_type")
     @classmethod
     def _p(cls, v: str) -> str:
         if v not in VALID_POOL_TYPES:
             raise ValueError(f"pool_type must be one of {sorted(VALID_POOL_TYPES)}")
         return v
+
+    @field_validator("lease_time_override")
+    @classmethod
+    def _no_lease_override(cls, v: int | None) -> int | None:
+        return _refuse_lease_override(v)
 
 
 class PoolUpdate(BaseModel):
@@ -67,6 +117,16 @@ class PoolUpdate(BaseModel):
     pd_prefix: str | None = None
     delegated_length: int | None = None
     excluded_prefix: str | None = None
+
+    @field_validator("start_ip", "end_ip")
+    @classmethod
+    def _ip_literal(cls, v: str | None) -> str | None:
+        return _check_ip_literal(v)
+
+    @field_validator("lease_time_override")
+    @classmethod
+    def _no_lease_override(cls, v: int | None) -> int | None:
+        return _refuse_lease_override(v)
 
 
 class PoolResponse(BaseModel):
@@ -149,6 +209,55 @@ def _validate_pd(
     return net, str(net.network_address)
 
 
+async def _check_class_family(db: AsyncSession, scope: DHCPScope, name: str | None) -> None:
+    """422 when a pool restricts to an operator client class its daemon does
+    not define (#1229). Kea accepts the reference, so the pool would silently
+    match no one. A name that is not an operator class must be a device-policy class, a
+    generated PXE / phone class, or a Kea built-in such as ``KNOWN``; anything
+    else is a typo and a 422 (#2285)."""
+    if not name:
+        return
+    cc = (
+        await db.execute(
+            select(DHCPClientClass).where(
+                DHCPClientClass.group_id == scope.group_id, DHCPClientClass.name == name
+            )
+        )
+    ).scalar_one_or_none()
+    family = scope.address_family or "ipv4"
+    if cc is None and is_generated(name):
+        # #3388 — shaped like a generated class is not the same as being one.
+        problem = await generated_class_problem(db, scope, name)
+        if problem:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Client class '{name}' cannot restrict this pool: {problem}, so the pool "
+                "would match no client.",
+            )
+    if (
+        cc is None
+        and not is_builtin_or_generated(name)
+        and name not in await known_class_names(db, scope.group_id)
+    ):
+        # A typo (#2285): Kea accepts it and the pool would never match.
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Client class '{name}' does not exist in this scope's server group, so "
+                "the pool would match no client. Create the class first, or pick an existing one."
+            ),
+        )
+    if cc is not None and cc.address_family not in (family, "dual"):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Client class '{name}' is {cc.address_family}-only, so it is not "
+                f"defined in this {family} scope's daemon and the pool would match "
+                "no client. Change the class's address family first."
+            ),
+        )
+
+
 async def _check_pool_overlap(
     db: AsyncSession,
     scope_id: uuid.UUID,
@@ -176,6 +285,34 @@ async def _check_pool_overlap(
                 f"'{p.name or p.id}' ({p.start_ip}–{p.end_ip})"
             )
     return None
+
+
+async def _check_range_in_subnet(db: AsyncSession, scope: DHCPScope, start: str, end: str) -> None:
+    """422 unless ``start <= end`` and both lie inside the scope's subnet, in
+    the subnet's address family (#2500). Kea rejects a pool that does not
+    match its subnet's prefix, which stops the whole group converging while
+    the save reported success. Applies to every range type: an excluded or
+    reserved range outside the subnet is equally meaningless."""
+    subnet = await db.get(Subnet, scope.subnet_id)
+    if subnet is None:
+        return
+    net = ipaddress.ip_network(str(subnet.network), strict=False)
+    a, b = ipaddress.ip_address(start), ipaddress.ip_address(end)
+    if a.version != net.version or b.version != net.version:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Pool range {start}-{end} is not an IPv{net.version} range, but the "
+                f"scope's subnet {net} is"
+            ),
+        )
+    if a > b:
+        raise HTTPException(status_code=422, detail=f"start_ip ({start}) must be <= end_ip ({end})")
+    if a not in net or b not in net:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Pool range {start}-{end} is not inside the scope's subnet {net}",
+        )
 
 
 async def _existing_ips_in_range(
@@ -210,7 +347,7 @@ async def list_pools(scope_id: uuid.UUID, db: DB, _: CurrentUser) -> list[DHCPPo
     status_code=status.HTTP_201_CREATED,
 )
 async def create_pool(
-    scope_id: uuid.UUID, body: PoolCreate, db: DB, user: SuperAdmin
+    scope_id: uuid.UUID, body: PoolCreate, db: DB, user: CurrentUser
 ) -> PoolResponse:
     scope = await db.get(DHCPScope, scope_id)
     if scope is None:
@@ -223,6 +360,7 @@ async def create_pool(
             group_id=None,  # rendered by Kea / FortiGate only (#1296)
             address_family=scope.address_family or "ipv4",
         )
+    await _check_class_family(db, scope, body.class_restriction)
 
     if body.pool_type == "pd":
         # DHCPv6 prefix-delegation pool (issue #368). No v4 range / overlap
@@ -251,6 +389,7 @@ async def create_pool(
 
     if not body.start_ip or not body.end_ip:
         raise HTTPException(status_code=422, detail="start_ip and end_ip are required")
+    await _check_range_in_subnet(db, scope, body.start_ip, body.end_ip)
     overlap = await _check_pool_overlap(db, scope_id, body.start_ip, body.end_ip)
     if overlap:
         raise HTTPException(status_code=409, detail=overlap)
@@ -270,14 +409,22 @@ async def create_pool(
     )
     await db.commit()
     await db.refresh(pool)
-    existing = await _existing_ips_in_range(db, scope.subnet_id, body.start_ip, body.end_ip)
+    # #2445 — the "may conflict with dynamic leases" notice is only true of a
+    # dynamic pool; excluded / reserved pools hand out no dynamic leases.
+    existing = (
+        await _existing_ips_in_range(db, scope.subnet_id, body.start_ip, body.end_ip)
+        if body.pool_type == "dynamic"
+        else []
+    )
     resp = PoolResponse.model_validate(pool, from_attributes=True)
     resp.existing_ips_in_range = existing or None
     return resp
 
 
 @router.put("/pools/{pool_id}", response_model=PoolResponse)
-async def update_pool(pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: SuperAdmin) -> DHCPPool:
+async def update_pool(
+    pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: CurrentUser
+) -> PoolResponse:
     pool = await db.get(DHCPPool, pool_id)
     if pool is None:
         raise HTTPException(status_code=404, detail="Pool not found")
@@ -299,14 +446,41 @@ async def update_pool(pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: SuperA
         )
         pool.start_ip = net_addr  # type: ignore[assignment]
         pool.end_ip = net_addr  # type: ignore[assignment]
-    elif body.start_ip or body.end_ip:
+    elif body.start_ip or body.end_ip or pool.pool_type == "pd":
+        # Merged range (stored row under the patch). Only checked when the
+        # range itself is edited, so renaming a pre-existing out-of-subnet
+        # pool (an importer / Windows-pull row) is not blocked (#2500). A pd
+        # pool turned into an address pool is checked too: its stored
+        # start/end are the prefix placeholder, not a range, and a body that
+        # names only the new type (#3091 — the dialog sends only changes)
+        # would otherwise render that placeholder as a pool.
+        parent = await db.get(DHCPScope, pool.scope_id)
+        if parent is not None:
+            await _check_range_in_subnet(db, parent, new_start, new_end)
         overlap = await _check_pool_overlap(
             db, pool.scope_id, new_start, new_end, exclude_id=pool.id
         )
         if overlap:
             raise HTTPException(status_code=409, detail=overlap)
-    changes = body.model_dump(exclude_none=True)
+    # #1563 — explicit null CLEARS the nullable pool fields (the UI's
+    # "none" for class_restriction / PD fields sent null and the old
+    # exclude_none silently kept the old value); null for a NOT NULL
+    # pool column is a 422 instead.
+    changes = resolve_update_changes(
+        body,
+        clearable={
+            "class_restriction",
+            "lease_time_override",
+            "options_override",
+            "pd_prefix",
+            "delegated_length",
+            "excluded_prefix",
+        },
+        non_nullable={"name", "start_ip", "end_ip", "pool_type"},
+    )
     scope = await db.get(DHCPScope, pool.scope_id)
+    if scope is not None and changes.get("class_restriction") not in (None, pool.class_restriction):
+        await _check_class_family(db, scope, changes["class_restriction"])
     if changes.get("options_override"):
         changes["options_override"] = normalize_options(changes["options_override"])
         await validate_dhcp_options(
@@ -316,6 +490,7 @@ async def update_pool(pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: SuperA
             address_family=(scope.address_family if scope else None) or "ipv4",
             previous=pool.options_override or {},
         )
+    before = snapshot(pool, changes)
     for k, v in changes.items():
         setattr(pool, k, v)
     await db.flush()
@@ -329,16 +504,28 @@ async def update_pool(pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: SuperA
         resource_type="dhcp_pool",
         resource_id=str(pool.id),
         resource_display=f"{pool.start_ip}-{pool.end_ip}",
-        changed_fields=list(changes.keys()),
-        new_value=body.model_dump(mode="json", exclude_none=True),
+        changed_fields=changed_keys(before, changes),
+        new_value=body.model_dump(mode="json", exclude_unset=True),
     )
     await db.commit()
     await db.refresh(pool)
-    return pool
+    resp = PoolResponse.model_validate(pool, from_attributes=True)
+    # #4027 — same notice as create (#2445), when the edit moved the range or
+    # made the pool dynamic; a rename of an unchanged range stays quiet.
+    if (
+        scope is not None
+        and pool.pool_type == "dynamic"
+        and ({"start_ip", "end_ip", "pool_type"} & changes.keys())
+    ):
+        existing = await _existing_ips_in_range(
+            db, scope.subnet_id, str(pool.start_ip), str(pool.end_ip)
+        )
+        resp.existing_ips_in_range = existing or None
+    return resp
 
 
 @router.delete("/pools/{pool_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_pool(pool_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
+async def delete_pool(pool_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
     pool = await db.get(DHCPPool, pool_id)
     if pool is None:
         raise HTTPException(status_code=404, detail="Pool not found")
@@ -502,9 +689,11 @@ class FleetPoolOccupancyResponse(BaseModel):
     pools: list[FleetPoolOccupancyRow]
 
 
-#: Occupancy bands for the fleet rollup. Same numbers the subnet
-#: utilization heatmap uses, so "amber" means the same thing wherever an
-#: operator sees it on this dashboard.
+#: Occupancy bands for the fleet rollup. The pool bars on the Dashboard
+#: and the DHCP page band at these same lines (``poolOccupancyTone`` in
+#: frontend/src/lib/pool-occupancy-tone.ts), so a bar is never amber beside
+#: a "Pools >= 80%" card that reads 0. Subnet utilization follows Settings'
+#: thresholds instead (#3539); pools have no such setting.
 _POOL_WARNING_PERCENT = 80.0
 _POOL_CRITICAL_PERCENT = 95.0
 

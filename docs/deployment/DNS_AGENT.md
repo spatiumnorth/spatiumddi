@@ -150,6 +150,28 @@ The hold is cleared through the API with `POST /api/v1/dns/groups/{group_id}/ser
 
 On restart, the agent tries its cached token first. If the control plane returns `401`, it falls back to bootstrap with the PSK. If the PSK has rotated too, the agent logs and enters a retry loop with jittered backoff (cap 5 min).
 
+### Duplicate agent processes
+
+Two agent processes can run on one server identity at once: a cloned VM
+keeps its `agent_id`, and so do two containers given one state directory.
+Both authenticate as the same server, against its one token. Each agent
+therefore sends a random per-process id (`X-Spatium-Agent-Instance`, never
+persisted) and the control plane serves only one process per server; the
+full rules, and the DNS record-op consequences, are under §5 *Retries,
+unacknowledged ops and supersession* (#2044, #2219). The **DHCP agent**
+follows the same rules since
+[#3143](https://github.com/spatiumnorth/spatiumddi/issues/3143): the newest
+process owns the server (`dhcp_server.agent_instance`), the one it
+displaced is answered `409` + `X-Spatium-Duplicate-Agent-Instance: 1` on
+its config polls and registrations while the owner is live, is never
+minted or rotated a token, keeps Kea on its cached config and retries every
+30 s, and takes the server back by itself once the owner has been silent
+for 5 minutes. Its heartbeats count for liveness and op acks, but not for
+the row's daemon / config-apply / spool state. A persisting episode shows
+the **Duplicate agent** chip on the DHCP server and raises the default-on
+`dhcp_agent_duplicate_instance` alert. An agent that sends no id (older
+than these changes) is never judged and registers and polls as before.
+
 ### Alternatives considered
 
 - **mTLS with internal CA** — more robust but requires a CA pipeline (cert-manager in K8s, something custom in Docker Compose). Deferred to Phase 4; the token model is a clean superset.
@@ -181,6 +203,37 @@ Three channels:
 **Why not WebSocket / SSE?**
 - We considered it. Long-poll is simpler, survives hostile proxies, does not need sticky-session affinity on a multi-replica API. We can upgrade to SSE in a later phase without changing the agent contract (long-poll remains a compatible fallback).
 
+### Blocklist entries in the bundle — packed runs (#4040)
+
+A blocklist's `entries` list used to hold one JSON object per entry (~108
+bytes each): 69 MB for AdGuard + OISD + Hagezi, which the agent parsed whole
+and kept twice on disk (`current.json`, `previous.json`). An agent that sends
+`packed-blocklists` in its `X-Spatium-Agent-Features` header (register and
+every heartbeat, recorded as `dns_server.agent_renders_packed_blocklists`) is
+sent each run of **consecutive** entries that share every field but the
+domain as one element:
+
+```json
+{"packed": {"action": "block", "block_mode": "nxdomain", "target": null,
+            "is_wildcard": true},
+ "count": 100000, "domains_gz": "<base64 of gzip of the domains, one per line>"}
+```
+
+Runs are never regrouped, because the renderer keeps the first writer of an
+owner name (#878) and a reordered list would render a different zone. An
+entry a run cannot carry (a `target`, a newline in the name, a run under 32)
+stays an object, in place; a run is cut at 100,000 domains. The agent expands
+runs a line at a time (`blocklist_entries.iter_entries`), and the zone it
+writes is byte-identical to the per-entry one: `rpz_sha256`, and the SOA serial
+derived from it, are computed over the per-entry form in both shapes, so a
+server whose agent starts reading packed entries keeps its zone files. The
+bundle ETag is over the bundle as sent, so it differs between the two shapes
+and moves with every entry in either. An agent that has not advertised the
+feature (an older release, or one rolled back, which re-renders the bundle on
+its next heartbeat) is sent the per-entry shape. The cache holds the packed
+bundle as received, so a restart with the control plane down renders from it
+alone. Measured on three catalogue lists: 69 MB down to the figures in the PR.
+
 ### Stored bundles — rendered once, served as bytes (#1111)
 
 The bundle the long-poll hands out is **not assembled in the request**. It
@@ -193,8 +246,11 @@ front of the stored bytes and streams them. Whatever the group's record
 count, the api never holds the group's record set as Python objects and
 never serialises a multi-megabyte body on the request loop; the DB runs
 the records query once per change, not once per agent per poll. The worker
-has no HTTP liveness probe and its per-task engine carries no
-`command_timeout`, so a render of a million-row group simply runs.
+has no HTTP liveness probe, and the render's engine carries the long
+per-statement bound (`TASK_DB_LONG_COMMAND_TIMEOUT`, 900 s) rather than the
+120 s every other Celery task gets, so a render of a million-row group runs
+to completion while a black-holed database still fails it in minutes
+(#1719).
 
 *What says a stored bundle is current.* `dns_server.bundle_dirty_seq` is
 bumped **in the same transaction** as every change that feeds the bundle
@@ -230,7 +286,18 @@ while it runs and releases only while it still holds it: a render the OOM
 killer takes mid-flight frees the slot within one lease instead of holding
 every server's render for the render ceiling. A render waiting for the slot
 keeps its server's lock, so the duplicates the sweep and further marks
-enqueue meanwhile coalesce into it.
+enqueue meanwhile coalesce into it. A render killed mid-flight records
+nothing, and the broker redelivers its task, so each render raises a
+per-server count in Redis before it runs and clears it when it returns or
+raises (#2227): once two renders of a server have died without finishing,
+the next records why on the server row (`bundle_render_status = failed`,
+the `agent_bundle_render_failed` alert) and holds that server for five
+minutes before letting one more through. Up to `dns_agent_bundle_render_slots` (2) renders run at
+once, and a server that changed again while it rendered hands its slot to a
+waiting render rather than rendering again in place. The render reads the
+group's records a batch of zones at a time and never holds them whole; for what it
+needs per zone and per record see "Control-plane memory for large groups"
+in [`DNS.md`](../features/DNS.md).
 
 *Every process that writes DNS rows must carry the listener.* It is
 installed by importing `bundle_dirty`: `app.main` does so for the api,
@@ -277,6 +344,16 @@ decides which queued ops a split-horizon render retires as applied, so an
 ACME DNS-01 wait never reads an op as applied that no body carries. An op
 the snapshot does not cover rides with the next render, whose dirty mark
 its own commit made.
+
+Only record ops (`create` / `update` / `delete`) are retired that way,
+because only they are carried in the zone payload. A DNSSEC op
+(`dnssec_rollover`, and `dnssec_sign` / `dnssec_unsign`, which PowerDNS and
+Technitium act on only from the op) has no carrier in a bundle, so under
+views the stored bundle still ships those, and nothing else, as the ops page
+(#1946). Under views BIND loads the zone once per view, so the BIND9 agent
+runs a rollover (and its DNSSEC status read) per view with
+`rndc dnssec … <zone> IN <view>`; a bare zone name fails there with "zone was
+found in multiple views".
 
 Three cases keep the time gate (`created_at <= snapshot_at`):
 - ops and bundles from before these columns;
@@ -334,6 +411,19 @@ api's 30 s `command_timeout`) is logged and counted
 (`spatiumddi_agent_bundle_inline_failures_total`) and the poll waits for
 the worker's render; it is never recorded as the server's render failure.
 
+*A re-enabled server re-renders every zone (#2281).* A disabled server gets
+no record ops and no renders, and its agent keeps serving the config it
+last applied. In a group without views records are not part of the
+structural etag, so the bundle it gets when it is enabled again carries the
+current records but would not make the agent render them. Re-enabling
+therefore bumps `dns_server.zone_resync_seq`, which is folded into that
+server's structural etag, and retires the record ops still queued for it
+from before the disable (each carries an RRset as it was then, and shipped
+after the re-render it could put back a record deleted in between). Expect
+one full reload of that server's zones after you enable it. Moving a server
+to another group bumps the same counter. Maintenance mode does not: a
+paused server keeps receiving queued ops, which ship in order on resume.
+
 ### RFC 2136 `nsupdate` responsibility
 
 **Agent-local.** The control-plane BIND9 driver does **not** connect to `named` directly. Instead:
@@ -358,9 +448,11 @@ bootstrap.last                   # last-used PSK hash (for rotation detect)
 config/
   current.json                   # last AgentConfigBundle FETCHED from the control plane
   current.etag
+  fetch.json.part                # a fetched body while it is parsed (#2029); removed after, and at start
   previous.json                  # last bundle that APPLIED cleanly — the revert target
   previous.etag
   quarantine.json                # etag of a bundle that failed to apply, + its backoff
+  apply_guard.json               # bundle being applied or settling, + deaths (and watched deaths) per bundle (#2019)
 rendered/
   zones/
     example.com.db
@@ -394,6 +486,25 @@ ops/
 
 **Offline operation**: if the control plane is unreachable on boot, the agent loads `config/current.json`, renders configs if not already rendered, starts the daemon, and continues serving DNS. It enters a retry loop and resumes sync when the control plane returns. No query path ever depends on control-plane reachability.
 
+### BIND9 memory: jemalloc (#4192)
+
+Alpine's `named` is built without jemalloc and runs on musl's malloc, which
+keeps freed pages. With split-horizon every view loads its own copy of each
+RPZ (BIND refuses an RPZ defined by `in-view`), so removing a view or
+reloading a large list left the memory resident until the container
+restarted. The `dns-bind9` image links `libjemalloc` into `named` and ships
+`/etc/malloc.conf` as `background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0`,
+so freed pages return to the OS about a second later. Measured with two
+views each loading a 300k-entry RPZ: removing one view took RSS from 439 MB
+to 274 MB (stock image: 439 MB stays).
+
+`MALLOC_CONF` and `LD_PRELOAD` do nothing here: `named` carries a file
+capability for port 53, and a binary with one ignores both. Set
+`SPATIUM_MALLOC_CONF` to replace the options instead. The entrypoint can
+only apply it when the container starts as root; under a random uid
+(OpenShift restricted SCC) it logs that it was ignored and the image default
+stays.
+
 ### Last-known-good revert (issue #882)
 
 Offline operation covers a *missing* control plane. It does not cover a
@@ -425,7 +536,7 @@ the recovery. BIND renders and validates into `rendered.new`, so a
 state a revert would produce, and re-rendering the previous bundle there would
 bounce a healthy server for nothing. Only a swap/reload failure, where the
 live config directory has already been replaced, re-renders the previous
-bundle. Kea is the mirror image — `config-test` rejects without disturbing the
+bundle. Kea is the mirror image — `kea-dhcp4 -t` rejects without disturbing the
 running server, but the refused document has already been written to
 `kea_config_path`, and that file is what Kea reads on its next start, so a
 rejection there always rewrites the files even though the daemon is fine.
@@ -449,6 +560,72 @@ exits during its first start is reported as such instead of as started.
 On restart the agent checks the quarantine before re-applying `current.json`:
 a container that crash-loops must not re-break itself with the bundle that
 broke it.
+
+**A bundle the daemon dies on is not re-applied blindly either (#2019).**
+The quarantine only hears of failures the agent survives. A bundle too big
+for the container's memory limit (a large RPZ blocklist set; on the appliance
+that limit is sized from node RAM, see `APPLIANCE.md` "Memory sizing for
+named") applies cleanly
+and then named is OOM-killed while it loads the zones; nothing is caught, and
+the agent used to re-apply that same cached bundle at every start, before
+its sync thread existed, so the server crash-looped even after the operator
+removed the cause. Before every apply the agent now writes
+`config/apply_guard.json` naming the bundle, and clears it once named has
+stayed up for 5 minutes after the apply. A process that dies with it armed,
+however it died, leaves it behind, and the next start counts one death of
+that bundle. A SIGTERM or a re-bootstrap disarms it first and is not counted.
+
+- **One death:** the cached bundle is not applied at startup, and its
+  rendered tree is set aside (`rendered.held`) so named does not start on it
+  either. The agent asks the control plane first and applies whatever it
+  serves, the fixed bundle included. Only if the control plane cannot be
+  reached, or its own bundle fails to apply, does it apply the cache after
+  all: one death can be a power cut, and a healthy server must not stay dark
+  over it (non-negotiable #5).
+- **No bundle within the max wait (#2241):** a control plane that answers
+  but cannot produce a bundle (renders OOM-killed or killed at their time
+  limit at scale, a long-poll that only ever ends in `304`, a
+  re-registration backing off) never reads as unreachable, and used to keep
+  servers with a valid cache dark for hours. Once the hold has lasted
+  `AGENT_BOOT_HOLD_MAX_WAIT_S` seconds (default `600`, 10 minutes; a value
+  that is not a positive number is ignored) with no bundle applied, the control plane counts as unreachable: the agent logs
+  `bootstrap_hold_max_wait_elapsed_applying_cache`, serves the cache under
+  the same rules as offline, and keeps polling. The apply starts the
+  deferred named; a bundle that arrives later is applied the normal way, as
+  a reload (or not at all, if its structure is the cache's). A bundle the
+  daemon was *seen* dying on twice (below) is never re-applied by this
+  timer, not even on its quarantine backoff: only a different
+  last-known-good may serve (one with no recorded etag, as agents upgraded
+  in the field can carry, does not count: nothing says it is not the same
+  bundle), and with none named stays down until the control plane sends a
+  bundle or becomes unreachable.
+- **Two watched deaths:** the bundle is also quarantined. A death is
+  *watched* when named exited while the agent stayed alive to see it (the
+  agent's `dns_daemon_exited`). A marker left armed by a process that simply
+  ended (a power cut, a node reboot or eviction that SIGKILLed the
+  container, or the whole-container OOM kill of #2018) is not evidence
+  against the bundle, however many times it happens: it only ever buys
+  "ask the control plane first, then serve the cache". Once condemned,
+  offline or while the control plane still serves it, the agent serves the
+  last-known-good bundle if that is a different one the daemon was not seen
+  dying on. `previous.json` is committed as soon as an apply returns, so
+  after a kill it is often the killing bundle itself, and is then not used.
+  With nothing safe to serve, named stays down and the cached bundle is
+  retried on the quarantine's backoff (1 min, 5 min, then every 15 min):
+  one crash per interval instead of a crash loop, and never no config
+  forever. A retried bundle that then stays up for 5 minutes leaves the
+  quarantine.
+
+While the bundle is held the server row reads `no_previous` (or `reverted`
+when the last-known-good is serving) with an error that says named died on
+the bundle, how many times, when the OOM record is present that the memory
+limit killed it, and how long the hold waits before the cache serves anyway.
+Once the cache serves, the row reads `ok` with the cached bundle's etag in
+`config_apply_etag`, as it does after an offline fallback. A revert never goes back to a bundle the daemon was
+seen dying on, and at startup, before the control plane has been asked, not to
+one it died on at all. Technitium keeps its own configuration under `/etc/dns`, so for it the
+guard can only change the order (sync first); it cannot keep the daemon off
+a configuration it has already stored.
 
 **A revert is reported, never silent.** That matters more than it sounds: a
 reverted agent keeps serving and keeps heartbeating, so `status`, the health
@@ -478,7 +655,12 @@ on its last-known-good config — so the chip, the banner and the alert all
 leave it to `agent_config_rejected`. They read one server-side
 classification, `daemon_not_serving` on the server response, so they
 cannot disagree. NULL means the agent has never reported one — a
-pre-#1061 agent, or an agentless driver — and is unknown, never healthy.
+pre-#1061 agent, or an agentless driver — and is unknown, never healthy;
+it is also what a row reads once its agent has been silent long enough for
+the health sweep to call the server `unreachable` (#2961), instead of the
+last `ok`. On an appliance the supervisor supplies the verdict the agent
+cannot (OOM kill, crash loop, a silent agent) from the kubelet's container
+state; the alert says so (`Supervisor reported: …`).
 
 ### Push spool — the reporting half of an outage (issue #1077)
 
@@ -578,6 +760,33 @@ during the maintenance window?".
 }
 ```
 
+### What the agent renders (`X-Spatium-Agent-Features`, #1171)
+
+Every agent request carries `X-Spatium-Agent-Features`, a comma list of what
+the agent renders. A header rather than a heartbeat field, because the
+heartbeat body is strict and an agent can be upgraded before its control plane.
+
+- `soa-timers`: the BIND9 driver writes each zone's own refresh / retry /
+  expire / minimum into its SOA. Agents before #1171 send no header and write
+  `3600 600 86400 300` for every zone.
+- `served-serials` (#3940): the BIND9 driver reports a secondary / stub zone's
+  serial as named serves it, and nothing for a zone named holds no copy of,
+  instead of the bundle's 0. Stored as `dns_server.agent_reports_served_serials`.
+  The control plane reads a secondary at a non-zero serial as in sync and 0
+  as not synced for every BIND9 agent: an older agent's start-up report also
+  reads each zone from named, and its 0 means "not reported".
+- Register and heartbeat store it as `dns_server.agent_renders_soa_timers`.
+  A group's bundles carry each zone's own timers only while every BIND9 server
+  of the group (run by an agent, enabled, approved) says `soa-timers`
+  (`dns_server_group.serves_soa_timers`). Until then they carry the literal,
+  so agents old and new serve one SOA under each serial.
+- When the group switches, either way, the serial of each of its zones whose
+  timers differ from the literal moves in the same transaction. The changed
+  SOA then goes out under a serial no agent served with the other one, and
+  NOTIFY sends secondaries to transfer it. During an upgrade the switch is the
+  heartbeat of the group's last replaced DNS pod. Nothing else is held back
+  meanwhile: a stalled roll delays the timers, not a record.
+
 ### Endpoints
 
 | Endpoint | Direction | Cadence |
@@ -592,7 +801,7 @@ during the maintenance window?".
 - Control plane marks `DNSServer.status = unreachable` if no heartbeat for **3 × heartbeat_interval** (90 s default).
 - UI: the existing server-group view shows colored status dots; a new "Last seen" column uses `last_health_check_at`.
 - A Celery beat job `dns_agent_stale_sweep` runs every 60 s, flips statuses, emits an audit entry, and triggers notifications (Phase 4).
-- Metrics: Prometheus gauges `spatium_dns_agent_up`, `spatium_dns_agent_config_lag_seconds`, `spatium_dns_zone_serial`, `spatium_dns_failed_ops_total` — scraped from the control plane (agent does not expose a scrape endpoint; keeps it egress-only).
+- Metrics: no per-agent Prometheus series yet (planned in [#2146](https://github.com/spatiumnorth/spatiumddi/issues/2146)); the heartbeat age, config apply status and per-server zone serials are on the server row in the console and the API. The agent does not expose a scrape endpoint, which keeps it egress-only. See [OBSERVABILITY.md](../OBSERVABILITY.md#dns-agent-telemetry).
 
 ---
 
@@ -658,6 +867,56 @@ An op moves `pending` → `in_flight` when a long-poll ships it, then
   arriving then wins. That also recovers ops already stranded on an
   upgraded install. Re-applying one the agent did apply is harmless:
   every op is a whole-RRset write.
+- **An op shipped to a replaced agent is re-sent at once
+  ([#2042](https://github.com/spatiumnorth/spatiumddi/issues/2042)).** A
+  long-poll the API holds for an agent that has gone (a pod roll, a
+  restart) runs on to its deadline, and could page a new op into a
+  response nobody reads. The agent sends a per-process id on every config
+  poll (`X-Spatium-Agent-Instance`), and the control plane records it on
+  each op it ships (`dns_record_op.dispatched_to`), with the time the
+  shipping poll started. A poll from a different process returns ops
+  still in flight to the old one to `pending` and ships them on that
+  poll, counted as an attempt but with no backoff. Only a poll that
+  started after the shipping one may take an op back, so the old agent's
+  leftover poll, which is always the older of the two, never takes an op
+  from its replacement. A poll whose client has already disconnected rolls its page
+  back. An agent that sends no id falls back to the 5-minute reset above.
+- **Only one agent process is served per server
+  ([#2044](https://github.com/spatiumnorth/spatiumddi/issues/2044)).** The
+  take-back above assumes the other process is gone. Two processes live on
+  one server identity at once (a cloned VM that kept its `agent_id`, two
+  containers given one state directory) used to take each op back from
+  each other on every poll until its retries ran out. The control plane
+  now records which process owns the server (`dns_server.agent_instance`).
+  A process it has never seen takes over at once, so replacing an agent is
+  unchanged. The one it replaced is remembered, and if it polls again
+  while the owner is still polling it is answered `409` with
+  `X-Spatium-Duplicate-Agent-Instance: 1`. That agent logs
+  `sync_duplicate_agent_instance`, keeps serving its cached config and asks
+  again every 30 s; it does not re-register, because a new token would not
+  change which process owns the row. If the owner stops polling for 5
+  minutes, the refused agent takes the server back by itself. A long-poll
+  whose process lost ownership while it waited stops before shipping
+  anything. Refusals that go on for over 2 minutes show a **Duplicate
+  agent** chip on the server, with the address the refused agent polled
+  from, and raise the default-on `dns_agent_duplicate_instance` alert
+  ("Two DNS agents on one server"). Both clear 10 minutes after the extra
+  agent stops. The 2-minute wait is so an overlapping rollout, where the
+  old pod finishes one last poll before it exits, does not alarm. The
+  agent also sends its process id on heartbeats: a refused process's
+  heartbeats still count for liveness and op acks, but its daemon,
+  config-apply and spool reports are kept off the server row, which shows
+  the owner's. Both processes also share the server's one token
+  ([#2219](https://github.com/spatiumnorth/spatiumddi/issues/2219)), so a
+  token issued to either would make the other's stale and the two would
+  take turns re-registering. The agent therefore sends its process id when
+  it registers too: the refused process is answered the same `409` at
+  registration, nothing is minted, it logs
+  `register_duplicate_agent_instance` and tries again every 30 s, and its
+  heartbeats never rotate the token. The owner keeps a working token, and
+  the pair settles. An agent older than this sends no id at registration
+  and registers as before. To fix it, stop the extra agent, or clear its
+  state directory so it registers as a server of its own.
 - **A late ack is not charged twice.** Each shipped op carries a
   `dispatch` number (its attempt count), which the agent echoes in its
   ack. An error that answers an earlier dispatch was already counted when
@@ -728,16 +987,16 @@ them nor manages that transfer.
 
 ### Base
 
-**Alpine 3.23** for every agent image — *except* `dns-technitium`, which is **not Alpine at all** (see below). Multi-arch: `linux/amd64`, `linux/arm64/v8` via `docker buildx`.
+**Alpine 3.24** (pinned in `versions.json`) for every agent image — *except* `dns-technitium`, which is **not Alpine at all** (see below). Multi-arch: `linux/amd64`, `linux/arm64/v8` via `docker buildx`.
 
-> **`dns-powerdns` carries an LMDB schema guard.** Alpine 3.23 ships pdns 5.0.5 (3.22 shipped 4.9.5), and PowerDNS 5.0 performs an automatic, silent, **irreversible** LMDB schema upgrade (v5 → v6) the first time it opens the database — a read is enough, and there is no opt-out. Afterwards pdns 4.9 cannot open the database at all (`Somehow, we are not at schema version 5. Giving up`). Because the LMDB is persisted on `/var` in every deployment shape, and the appliance A/B slot rollback swaps only the *rootfs*, an upgrade-then-rollback would otherwise leave pdns crash-looping with DNS down and no automatic recovery. [#638](https://github.com/spatiumnorth/spatiumddi/issues/638) closed that: the entrypoint runs `spatium-pdns-lmdb-guard snapshot` before the agent spawns `pdns_server`, copying the database aside whenever the pdns major version changed and failing closed if it cannot. **Rolling a PowerDNS node back is therefore a two-step operation — redeploy the old image AND run `spatium-pdns-lmdb-guard restore latest`.** Full mechanics in [DNS_DRIVERS.md §4.9](../drivers/DNS_DRIVERS.md).
+> **`dns-powerdns` carries an LMDB schema guard.** Since Alpine 3.23 the image carries pdns 5.0 (3.22 shipped 4.9.5), and PowerDNS 5.0 performs an automatic, silent, **irreversible** LMDB schema upgrade (v5 → v6) the first time it opens the database — a read is enough, and there is no opt-out. Afterwards pdns 4.9 cannot open the database at all (`Somehow, we are not at schema version 5. Giving up`). Because the LMDB is persisted on `/var` in every deployment shape, and the appliance A/B slot rollback swaps only the *rootfs*, an upgrade-then-rollback would otherwise leave pdns crash-looping with DNS down and no automatic recovery. [#638](https://github.com/spatiumnorth/spatiumddi/issues/638) closed that: the entrypoint runs `spatium-pdns-lmdb-guard snapshot` before the agent spawns `pdns_server`, copying the database aside whenever the pdns major version changed and failing closed if it cannot. **Rolling a PowerDNS node back is therefore a two-step operation — redeploy the old image AND run `spatium-pdns-lmdb-guard restore latest`.** Full mechanics in [DNS_DRIVERS.md §4.9](../drivers/DNS_DRIVERS.md).
 
 > **Why `dns-technitium` is glibc/Ubuntu-based, not Alpine.** Technitium ships no Alpine package and no binary release assets on GitHub at all (its releases carry notes only, zero attached artifacts — confirmed empirically). The only reproducible, versioned, multi-arch artifact it publishes is its own official Docker image (`technitium/dns-server`, Ubuntu 24.04 + .NET 10 aspnet runtime), so `agent/dns/images/technitium/Dockerfile` builds `FROM` that image and layers the `spatium_dns_agent` wheel on top rather than fetching a build artifact that doesn't exist. The builder stage matches (Debian `python:3.12-slim-bookworm`, not Alpine) since `spatium_dns_agent` depends on `cryptography`, which ships compiled wheels — a musllinux wheel built on Alpine wouldn't load on the Ubuntu-based runtime. The image also explicitly upgrades to the distro's patched `aspnetcore-runtime-10.0` package and deletes the vendored `/usr/share/dotnet` copy the upstream image ships, since Trivy's .NET scanner reads shared-framework directories directly (not `dotnet --list-runtimes`) and would otherwise keep flagging CVEs in files nothing loads.
 
 ### `dns-bind9` image
 
 ```
-FROM alpine:3.23 AS runtime
+FROM alpine:3.24 AS runtime
 RUN apk add --no-cache bind bind-tools tini python3 py3-pip libcap ca-certificates tzdata
 # Agent
 COPY --from=agent-build /install /usr/local
@@ -764,12 +1023,16 @@ codebase and the same `spatium-dns-entrypoint`, and exposes the same
 
 The `dns-technitium` image follows the same agent/entrypoint shape too,
 but has no config file for the agent to render at all — Technitium is
-configured entirely over its own HTTP API (`http://127.0.0.1:5380`), so
+configured entirely over its own HTTP API (the agent calls
+`http://127.0.0.1:5380`; the daemon listens on loopback only, see the note
+below), so
 `render()`/`validate()`/`swap_and_reload()` collapse into "stash the
 desired zone/record state as JSON, then reconcile it against the live
 API." The agent provisions a permanent API bearer token on first-ever
 boot (via `DNS_SERVER_ADMIN_PASSWORD` + `/api/user/createToken`) the same
 way the PowerDNS driver provisions its local API key.
+
+**Technitium console reachability (#1776).** The daemon's web console and API listen on loopback only (`127.0.0.1:5380`, plaintext HTTP), so nothing outside the container, pod or host can reach them ([#1776](https://github.com/spatiumnorth/spatiumddi/issues/1776)). A fresh `/etc/dns` takes the bind from `DNS_SERVER_WEB_SERVICE_LOCAL_ADDRESSES=127.0.0.1`, which the agent sets on every daemon start; Technitium reads that variable only when `webservice.config` does not exist yet, so on an existing `/etc/dns` the agent sends `settings/set webServiceLocalAddresses=127.0.0.1` once (it restarts the web service) after reading `settings/get`, and does nothing once pinned. Loopback is IPv4 only on purpose: Kestrel fails to start on `::1` where IPv6 is disabled in the container. The `admin` account still carries a random 192-bit password generated at first boot. To reach the console for debugging, run `curl` inside the container with `docker exec` / `kubectl exec`; `kubectl port-forward` does not work, as it connects to the pod IP rather than loopback. An operator who sets a different bind in the console will see it reset on the next structural apply.
 
 
 ### Volumes
@@ -874,10 +1137,34 @@ dns-bind9-ns1:
 ```
 
 > The agent reads `AGENT_ROLES` (default `authoritative`), `AGENT_GROUP`,
-> and `AGENT_HOSTNAME` / `SERVER_NAME` from the environment
+> `SERVER_HOST` and `AGENT_HOSTNAME` / `SERVER_NAME` from the environment
 > (`agent/dns/spatium_dns_agent/config.py`). The role is a label only —
 > the control plane fans record ops out to every enabled agent-based
 > server in the group regardless of role.
+>
+> **`SERVER_HOST` is where the control plane reads zones back from** (drift,
+> pull-from-server). `SERVER_NAME` stays the server's name; `SERVER_HOST`, when
+> set, is registered as `DNSServer.host` and updated on every re-registration.
+> A StatefulSet pod's bare name resolves only inside the pod, so the Helm chart
+> and `k8s/dns/` set it to `<pod>.<instance>-headless.<namespace>.svc.cluster.local`
+> (#3757). It must be `SERVER_NAME` or a qualified form of it; anything else
+> (an IP, another name) is ignored with a `dns_agent_host_ignored` warning.
+> Re-registration moves the host only while it is still a value registration
+> wrote, never over an operator's edit and never while the server awaits
+> approval. An agent that already holds a token never calls `/register` on a
+> restart, so it records the `SERVER_HOST` it last registered in its state dir
+> (`registered_host`) and registers once more at startup when the configured
+> value differs. That is what heals an install upgraded from a chart that set
+> none: the upgrade restarts the agent pod, which registers once with the new
+> value. The value is recorded only when the response echoes the row's `host`,
+> which says the control plane read the field; `helm upgrade` restarts the
+> agent and the api together, and an api pod of the previous release answers
+> 200 while ignoring `host`. With no echo, or no answer at all, the agent keeps
+> serving on its cached token and config and repeats the registration from its
+> heartbeat loop every 5 minutes for up to an hour, then on its next start.
+> Without `SERVER_HOST` the host is `SERVER_NAME`. As a
+> backstop, an agent-managed server whose host does not resolve is read at its
+> `last_seen_ip` instead, with or without a DNS VIP.
 
 > **`AGENT_GROUP` only decides where a BRAND-NEW agent lands.** On
 > re-registration the control plane resolves the existing row by `agent_id`
@@ -889,6 +1176,34 @@ dns-bind9-ns1:
 > [`DNS.md` §1](../features/DNS.md)). Naming a group that does not exist
 > still auto-creates an empty one, so a stale value here is untidy rather
 > than harmful.
+>
+> On an appliance, changing the DNS or DHCP group in **Fleet** is that move:
+> it moves the appliance's own registered DNS / DHCP server into the new
+> group in the same request, and refuses the change (409 / 422, naming the
+> server) when the move itself is refused — a name clash or a mixed-driver
+> group (#1565). Before, Fleet moved only the appliance's pointer, so its
+> env and firewall followed the new group while the server kept serving the
+> old one.
+>
+> A save that switches the DNS engine and the group together moves the row
+> too (#1856): the row still carries the old engine's driver, but it is the
+> one the new engine's agent adopts (by agent id, or by hostname in the new
+> group), so it moves as the new engine's row. A new group that runs another
+> driver is a 422 before anything changes. If the appliance holds two or more
+> rows of engines it no longer runs, the save is a 409 naming them: the new
+> agent goes to whichever row carries its own agent id, which the control
+> plane cannot tell, so delete the stale row(s) under DNS → Server groups and
+> save again. The Operator Copilot's role assignment moves the row the same
+> way.
+>
+> On an appliance, a brand-new agent lands in the appliance's assigned DNS
+> group, not the one its `AGENT_GROUP` names (#2190). The supervisor writes
+> the new chart values before it labels the node for a new engine, and labels
+> it only once the engine's DaemonSet carries the new group, but the
+> registration does not rely on that: an agent whose hostname is one approved
+> appliance's, running that appliance's current engine, registers into the
+> appliance's group and adopts its row there by hostname. A row the agent
+> already has (found by agent id) still never moves.
 
 ---
 

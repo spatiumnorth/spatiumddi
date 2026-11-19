@@ -24,7 +24,10 @@ Every integration follows the same reconciler pattern:
 4. **Sync Now** button per target fires the reconciler on demand, bypassing the interval gate.
 5. **Provenance FK** on every mirrored row (`kubernetes_cluster_id`, `docker_host_id`, …) with `ON DELETE CASCADE` so removing a target sweeps every row it created.
 6. **Status surfacing** — each target row carries `last_synced_at` + `last_sync_error`. Dashboard folds these into a green / amber / red dot on the Integrations panel.
-7. **Smart parent-block detection** — when a mirrored CIDR is an RFC 1918 or CGNAT range (`10/8`, `172.16/12`, `192.168/16`, `100.64/10`) and no enclosing operator block exists in the target space, the reconciler auto-creates the canonical private supernet as an **unowned** top-level block. Unowned = no integration FK, so it survives removal of the integration and can be shared with manual allocations.
+7. **Legal host names** (#1459) — an address's hostname is copied from an upstream name (a UniFi client alias, a VM name, a Meraki client description). A name that is already a legal host name is kept as written. Anything else is folded before it reaches IPAM, so the record IPAM's DNS sync publishes is one the DNS servers accept: umlauts spelled out, accents and apostrophes dropped, other characters outside letters / digits / hyphens turned into `-`, lower-cased (`Sonos Büro` → `sonos-buero`). The upstream name is kept at the end of the address's description (`… — name: Sonos Büro`). Two devices with the same upstream name still get the same hostname.
+8. **Stays inside its space** (#2577) — a reconciler reads, adopts, moves, dedupes and deletes `IPAddress` rows only inside its target's IP space (a Cloud endpoint's public space counts too). The same address in another space is a different host and is never touched, so pointing an integration at a second space that overlaps an operator's range is safe. Changing a target's IP space is supported: on the next sync, whatever the target owns outside its current space (addresses, subnets, blocks) is **released**, never moved. A pure mirror row the integration created and nobody touched is deleted, and the integration re-creates it in the new space; anything else (an adopted operator row, a row with an operator edit or audit entry, a subnet still holding other rows or a DHCP scope) is un-claimed in place: the integration's column is cleared and the row stays in its space with `user_modified_at` as it was. When the evidence is unclear the row is un-claimed, not deleted. The sync warnings say what was released. Every reconciler loads rows through `addresses_in_space` / `owned_addresses_in_space` / `owned_subnets_in_space` in `app/services/integration_ownership.py`, and `tests/test_integration_space_scoping.py` fails a reconciler address, subnet or block query that bypasses them. Builds before #2577 moved operator rows across spaces; see [Troubleshooting](../TROUBLESHOOTING.md#an-integration-took-ip-addresses-from-another-ip-space) to find and repair them.
+9. **Smart parent-block detection** — when a mirrored CIDR is an RFC 1918 or CGNAT range (`10/8`, `172.16/12`, `192.168/16`, `100.64/10`) and no enclosing operator block exists in the target space, the reconciler auto-creates the canonical private supernet as an **unowned** top-level block. Unowned = no integration FK, so it survives removal of the integration and can be shared with manual allocations.
+10. **A vanished network keeps the operator's content** (#3532) — when an upstream network leaves the desired set, its mirrored subnet goes through one shared keep test (`subnet_operator_state` in `app/services/integration_ownership.py`, the same one a target delete uses). A subnet carrying anything of the operator's (a DHCP scope, live or in Trash; an address that is not a pure mirror row; tags or custom fields; a domain link; an OT zone, E911 binding or address set; an operator edit) is **un-claimed**, not deleted, and the sync warnings name it. A purely mirrored subnet is deleted as before. Either way the subnet gets a system audit row saying its source network is gone. Because the DHCP scope cascade goes with the subnet, deleting such a subnet used to destroy the scope, its pools and its reservations outright.
 
 ---
 
@@ -53,7 +56,7 @@ Per-cluster config (`KubernetesCluster` rows):
 - **Ingresses** with `status.loadBalancer.ingress[0].ip` → A record per `rules[].host` in the longest-suffix-matching zone in the bound DNS group. `ingress[0].hostname` (cloud LBs) → CNAME. `auto_generated=True` + fixed 300 s TTL.
 - **Pods** (opt-in) → `IPAddress` per pod with `status="kubernetes-pod"`.
 
-**Delete semantics**: removed cluster objects immediately drop their mirror rows (not orphaned). Deleting the cluster itself cascades every mirror via the FK.
+**Delete semantics**: removed cluster objects immediately drop their mirror rows (not orphaned). Deleting the cluster itself removes purely mirrored rows; anything an operator added inside a mirrored block or subnet (addresses, DHCP scopes, reservations, edited rows) is kept and detached from the cluster (#2287).
 
 ### Setup
 
@@ -169,6 +172,7 @@ Per-tenant config (`TailscaleTenant` rows):
 |---|---|
 | `tailnet` | Tailnet slug from <https://login.tailscale.com/admin/settings/general>, or `-` for the API key's default tailnet (works for solo accounts and any PAT issued without an explicit tailnet override). |
 | `api_key` | Personal-access token (`tskey-api-…`). Generate at <https://login.tailscale.com/admin/settings/keys>. Fernet-encrypted at rest; tokens carry the issuing user's permissions but SpatiumDDI only ever reads. |
+| `api_key_expires_at` | When the API access token expires; null means unknown. Read from Tailscale (see [Token expiry](#token-expiry)) or, failing that, typed into the form. |
 | `ipam_space_id` | Required. The CGNAT IPv4 + IPv6 ULA blocks land here. |
 | `dns_group_id` | Optional. Held for Phase 2 — unused today. |
 | `cgnat_cidr` | Default `100.64.0.0/10` (Tailscale's standard CGNAT slice). Override only if your tailnet was provisioned with a custom slice. |
@@ -200,10 +204,22 @@ Same shape as Proxmox / Docker / Kubernetes:
 The admin page ships a copy-paste guide:
 
 1. Open <https://login.tailscale.com/admin/settings/keys>, click **Generate API key…**.
-2. Pick an expiry window (90 days minimum). Tailscale doesn't support non-expiring API keys.
+2. Pick an expiry between 1 and 90 days. 90 is Tailscale's maximum; there are no non-expiring API access tokens.
 3. Copy the printed value (`tskey-api-…`).
 4. Open <https://login.tailscale.com/admin/settings/general> for the **Organization** slug — paste it into **Tailnet**, or leave the default `-` for solo / single-tailnet accounts.
 5. Hit **Test Connection** to verify before save.
+
+### Token expiry
+
+Tailscale caps an API access token at 90 days, and an expired token turns every sync into an HTTP 401 ([#2138](https://github.com/spatiumnorth/spatiumddi/issues/2138)). SpatiumDDI records when the token expires and warns before it does.
+
+- **Read from Tailscale.** An access token is `tskey-api-<keyId>-<secret>`, and Tailscale's keys endpoint `GET /api/v2/tailnet/{tailnet}/keys/{keyId}` returns that key's `expires`, using the same token. SpatiumDDI reads it on **Test Connection**, when a tenant is created or its key replaced, and once a day (`refresh_tailscale_token_expiry`, 04:40). The call goes to `api.tailscale.com` like the device poll and sends nothing but the token.
+- **Operator fallback.** If the token isn't a `tskey-api-` token, or the keys endpoint refuses (for instance a token whose user can't read keys), the form's **Token expires on** date is used instead. It defaults to 90 days from today. A date read from Tailscale always replaces it, and a failed read never clears a stored one.
+- **Alert.** The `secret_expiring` rule covers each enabled tenant as subject `tailscale_tenant:<id>`, with the rule's threshold and severity escalation, and fires **critical** when the last sync got HTTP 401, whatever date is recorded. The upgrade adds an enabled `secret_expiring` rule ("Credential expiring or rejected", 30 days) unless one already exists. It is added once, by the migration, so a deleted rule stays deleted.
+- **Chip.** The Tailscale page, the IPAM-tab integrations panel and the Integrations dashboard tab show *Token expires in N days* (amber, red within 7), *Token expired* or *Token rejected*. On the Tailscale page it opens the tenant form, where entering a new key replaces the token and clears the 401.
+- **MCP.** `list_tailscale_targets` returns `api_key_expires_at`, `api_key_expiry_source`, `credential_state` and `credential_days_left`.
+
+Tailscale's OAuth clients, whose secrets don't expire, would avoid the rotation altogether; supporting them as an alternative auth mode is a possible follow-up.
 
 ### Phase 2 — synthetic tailnet DNS surface
 
@@ -508,7 +524,7 @@ Separately, a non-empty interface payload that parses to zero interfaces is trea
 
 ### Lock semantics
 
-Same ownership shape as the other integrations: pre-existing operator rows at a desired address are adopted (FK stamped, `user_modified_at` set so soft fields lock); rows owned by another OPNsense firewall or another integration are skipped with a warning; locked rows whose upstream entry disappears release the FK (appear as "manually managed") instead of being deleted. An operator subnet at an exact-CIDR match is reused untouched (`subnets_matched`); a router-owned subnet that still has non-OPNsense addresses living in it is un-claimed rather than cascade-deleted. The reconciler always corrects the factual `subnet_id`.
+Same ownership shape as the other integrations: pre-existing operator rows at a desired address are adopted (FK stamped, `user_modified_at` set so soft fields lock); rows owned by another OPNsense firewall or another integration are skipped with a warning; locked rows whose upstream entry disappears release the FK (appear as "manually managed") instead of being deleted. An operator subnet at an exact-CIDR match is reused untouched (`subnets_matched`); a router-owned subnet that still has non-OPNsense addresses or other operator content (a DHCP scope, …) on it is un-claimed rather than cascade-deleted. The reconciler always corrects the factual `subnet_id`.
 
 ### Setup — read-only API key
 
@@ -551,7 +567,7 @@ Per-scope config (`PANOSFirewall` rows): connection (`host` / `port` / `verify_t
 
 ### Lock semantics
 
-Same ownership shape as the other integrations: pre-existing operator rows at a desired address are adopted (FK stamped, `user_modified_at` set); rows owned by another integration are skipped with a warning (`panos_firewall_id` is threaded through every reconciler's sibling-ownership guard); operator subnets at an exact-CIDR match are reused untouched; a PAN-owned subnet that still has non-PAN addresses in it is un-claimed rather than cascade-deleted.
+Same ownership shape as the other integrations: pre-existing operator rows at a desired address are adopted (FK stamped, `user_modified_at` set); rows owned by another integration are skipped with a warning (`panos_firewall_id` is threaded through every reconciler's sibling-ownership guard); operator subnets at an exact-CIDR match are reused untouched; a PAN-owned subnet that still has non-PAN addresses or other operator content (a DHCP scope, …) on it is un-claimed rather than cascade-deleted.
 
 ### Setup
 
@@ -613,6 +629,7 @@ It is off by default and layered behind several independent gates so it can neve
 4. **RBAC `manage_block_sync`** on every endpoint (Network Editor builtin role; superadmin bypasses). Palo Alto DAG enforcement additionally requires **`manage_firewall_enforcement`** to arm.
 5. **Preview + confirm + full audit** on every push — `POST /block-sync/blocks/preview` (and `?preview` on reconcile) returns the exact per-target add/remove diff without writing.
 6. **Two-person approval** — creating/arming a block routes through the approval workflow (#62) as `admin:manage_block_sync` when a policy matches.
+7. **Deleting a target is refused while it is armed (#2291).** A delete would drop the record of what was pushed while the device keeps enforcing it (PAN-OS tags are registered with no timeout; UniFi MACs stay quarantined; Meraki clients stay `Blocked`). **Disarm first** — that lifts every pushed block — then delete. If the lift has not finished or failed (device unreachable) the target still has push rows and delete is refused with a 409 until they are lifted; `?force=true` deletes anyway and leaves cleanup on the device to you. `force` never overrides an armed target.
 
 ### Desired-state model
 

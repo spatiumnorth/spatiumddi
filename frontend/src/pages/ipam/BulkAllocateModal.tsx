@@ -14,6 +14,7 @@
  * operator types so they see the rendered hostnames before posting.
  */
 
+import { useModuleOn } from "@/hooks/useModuleOn";
 import { useEffect, useMemo, useState } from "react";
 import {
   useMutation,
@@ -45,34 +46,15 @@ import {
   ipamApi,
   type Subnet,
 } from "@/lib/api";
-
-const BULK_TEMPLATE_RE = /\{(n|oct[1-4])(?::([^}]+))?\}/g;
-const HOSTNAME_LABEL_RE = /^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}$/;
-
-function expandTemplate(
-  template: string,
-  ip: string,
-  n: number,
-  v6: boolean,
-): string {
-  const octets = v6 ? [] : ip.split(".");
-  return template.replace(
-    BULK_TEMPLATE_RE,
-    (_match, token: string, fmt: string | undefined) => {
-      if (token === "n") {
-        if (!fmt) return String(n);
-        // Support {n:03d} (zero-pad), {n:x} (hex), {n:X} (upper hex).
-        const padMatch = /^0?(\d+)d$/.exec(fmt);
-        if (padMatch) return String(n).padStart(Number(padMatch[1]), "0");
-        if (fmt === "x") return n.toString(16);
-        if (fmt === "X") return n.toString(16).toUpperCase();
-        return String(n);
-      }
-      const idx = Number(token[3]) - 1;
-      return octets[idx] ?? "";
-    },
-  );
-}
+import { zoneKindForName } from "@/lib/dnsNames";
+import {
+  expandTemplate,
+  hostLabelError,
+  storedHostname,
+  templateFormatError,
+  templateStartError,
+} from "@/lib/bulk-allocate-template";
+import { FormError } from "@/components/ui/form-error";
 
 function ipToBigInt(ip: string): bigint | null {
   if (ip.includes(":")) {
@@ -197,18 +179,30 @@ export function BulkAllocateModal({
   const v6 = subnet.network.includes(":");
 
   // Sensible default range: skip the network address (IPv4) and broadcast,
-  // start two in. For /24 192.168.0.0/24 that's 192.168.0.10 → 192.168.0.20.
-  const defaultStart = useMemo(() => {
-    const networkOnly = subnet.network.split("/")[0];
+  // start ten in. For /24 192.168.0.0/24 that's 192.168.0.10 → 192.168.0.20.
+  // Clamped to the subnet's usable addresses so a small subnet (a /29 ends at
+  // .7) never opens with a range the server refuses (#2422).
+  const [defaultStart, defaultEnd] = useMemo(() => {
+    const [networkOnly, prefix] = subnet.network.split("/");
     const base = ipToBigInt(networkOnly);
-    if (base === null) return networkOnly;
-    return bigIntToIp(base + (v6 ? 1n : 10n), v6);
-  }, [subnet.network, v6]);
-  const defaultEnd = useMemo(() => {
-    const networkOnly = subnet.network.split("/")[0];
-    const base = ipToBigInt(networkOnly);
-    if (base === null) return networkOnly;
-    return bigIntToIp(base + (v6 ? 16n : 20n), v6);
+    if (base === null) return [networkOnly, networkOnly];
+    const bits = v6 ? 128 : 32;
+    const plen = Number(prefix);
+    const size = Number.isInteger(plen) ? 1n << BigInt(bits - plen) : null;
+    let lo = base + (v6 || (size !== null && size <= 2n) ? 0n : 1n);
+    let hi = size === null ? base + 20n : base + size - 1n;
+    if (!v6 && size !== null && size > 2n) hi -= 1n; // broadcast
+    if (hi < lo) {
+      lo = base;
+      hi = base;
+    }
+    const clamp = (n: bigint) => (n < lo ? lo : n > hi ? hi : n);
+    // Past the subnet's end the start falls back to its first usable address.
+    const first = base + (v6 ? 1n : 10n);
+    return [
+      bigIntToIp(first > hi ? lo : clamp(first), v6),
+      bigIntToIp(clamp(base + (v6 ? 16n : 20n)), v6),
+    ];
   }, [subnet.network, v6]);
 
   const [phase, setPhase] = useState<"form" | "previewed" | "committed">(
@@ -221,7 +215,12 @@ export function BulkAllocateModal({
   const [statusValue, setStatusValue] = useState("allocated");
   const [description, setDescription] = useState("");
   const [dnsZoneId, setDnsZoneId] = useState<string>("");
-  const [createDnsRecords, setCreateDnsRecords] = useState(true);
+  const [dnsZoneTouched, setDnsZoneTouched] = useState(false);
+  const [createDnsRecordsChoice, setCreateDnsRecords] = useState(true);
+  // #2135 — with core.dns off there is no zone to read and no record to
+  // create: the choice is hidden and the request asks for none.
+  const dnsOn = useModuleOn("core.dns");
+  const createDnsRecords = dnsOn && createDnsRecordsChoice;
   const [onCollision, setOnCollision] = useState<"skip" | "abort">("skip");
 
   const [serverError, setServerError] = useState<string | null>(null);
@@ -232,10 +231,13 @@ export function BulkAllocateModal({
 
   // Pull effective DNS so we can populate the zone dropdown with just the
   // zones that actually apply to this subnet (mirrors AddAddressModal).
-  const { data: effectiveDns } = useQuery({
+  const { data: effectiveDns, isFetching: effectiveFetching } = useQuery({
     queryKey: ["effective-dns-subnet", subnet.id],
     queryFn: () => ipamApi.getEffectiveSubnetDns(subnet.id),
-    staleTime: 30_000,
+    // Always re-read on open: Edit Subnet can have moved the primary zone
+    // since the last read (#3078).
+    staleTime: 0,
+    refetchOnMount: "always",
   });
 
   const zoneGroupIds: string[] = effectiveDns?.dns_group_ids ?? [];
@@ -243,12 +245,16 @@ export function BulkAllocateModal({
     queries: zoneGroupIds.map((gId) => ({
       queryKey: ["dns-zones", gId],
       queryFn: () => dnsApi.listZones(gId),
-      staleTime: 60_000,
+      // Re-read on open too: the primary may be a zone created since the
+      // cached list was taken (#4028, as #3078).
+      staleTime: 0,
+      refetchOnMount: "always" as const,
+      enabled: dnsOn,
     })),
   });
   const allGroupZones: DNSZone[] = zoneQueries
     .flatMap((q) => (q.data as DNSZone[] | undefined) ?? [])
-    .filter((z) => !z.name.toLowerCase().includes("arpa"));
+    .filter((z) => zoneKindForName(z.name) !== "reverse");
   const explicitZoneIds = [
     ...(effectiveDns?.dns_zone_id ? [effectiveDns.dns_zone_id] : []),
     ...(effectiveDns?.dns_additional_zone_ids ?? []),
@@ -258,21 +264,37 @@ export function BulkAllocateModal({
       ? allGroupZones.filter((z) => explicitZoneIds.includes(z.id))
       : allGroupZones;
 
+  // Pre-select the primary zone, as Allocate IP does (#2469 / #3079): the
+  // subnet's zones can come from several DNS groups, each its own request, so
+  // the primary may land after another group's zones. Wait for it (falling
+  // back to the first zone once every group has answered) and re-pick when it
+  // lands, until the operator has chosen.
+  const primaryZoneId = effectiveDns?.dns_zone_id;
+  const zonesSettled = zoneQueries.every((q) => !q.isLoading && !q.isFetching);
+  // Zones still on their way, or the subnet's DNS being re-read over a cached
+  // copy: the pick is not final yet, so Preview waits (#3080).
+  const zonesPending =
+    dnsOn &&
+    ((effectiveFetching && effectiveDns !== undefined) || !zonesSettled);
   useEffect(() => {
-    if (!dnsZoneId && availableZones.length > 0) {
-      const primary = effectiveDns?.dns_zone_id;
-      setDnsZoneId(
-        primary && availableZones.some((z) => z.id === primary)
-          ? primary
-          : availableZones[0].id,
-      );
-    }
-  }, [availableZones.length, effectiveDns?.dns_zone_id]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (dnsZoneTouched || availableZones.length === 0) return;
+    const target =
+      primaryZoneId && availableZones.some((z) => z.id === primaryZoneId)
+        ? primaryZoneId
+        : !primaryZoneId || zonesSettled
+          ? availableZones[0].id
+          : null;
+    if (target && target !== dnsZoneId) setDnsZoneId(target);
+  }, [availableZones.length, primaryZoneId, zonesSettled, dnsZoneTouched]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Client-side live preview: shows the first few rendered hostnames as
   // the operator types so they see the template effect before posting.
-  // Errors are silent — the real validation happens server-side.
+  // Names are normalized as the server stores them; a name it would refuse
+  // is reported by `hostnameError` below, which gates Preview.
   const livePreview = useMemo(() => {
+    // The template as sent (buildBody trims it), so the preview and the
+    // check below see the same string the server renders.
+    const template = hostnameTemplate.trim();
     const startInt = ipToBigInt(rangeStart);
     const endInt = ipToBigInt(rangeEnd);
     if (startInt === null || endInt === null || endInt < startInt) return null;
@@ -284,11 +306,8 @@ export function BulkAllocateModal({
       const ipStr = bigIntToIp(startInt + BigInt(i), v6);
       samples.push({
         ip: ipStr,
-        hostname: expandTemplate(
-          hostnameTemplate,
-          ipStr,
-          templateStart + i,
-          v6,
+        hostname: storedHostname(
+          expandTemplate(template, ipStr, templateStart + i, v6),
         ),
       });
     }
@@ -300,34 +319,39 @@ export function BulkAllocateModal({
       });
       samples.push({
         ip: lastIp,
-        hostname: expandTemplate(
-          hostnameTemplate,
-          lastIp,
-          templateStart + total - 1,
-          v6,
+        hostname: storedHostname(
+          expandTemplate(template, lastIp, templateStart + total - 1, v6),
         ),
       });
     }
     return { total, samples };
   }, [rangeStart, rangeEnd, hostnameTemplate, templateStart, v6]);
 
-  // Quick local validation: does the rendered hostname match RFC 1035?
-  // Server enforces the same rule; this just gives instant feedback.
+  // Local validation of EVERY generated name with the server's rule, so the
+  // form refuses what the server would (and the live preview above shows the
+  // same names the server stores).
   const hostnameError = useMemo(() => {
+    const template = hostnameTemplate.trim();
+    const startErr = templateStartError(templateStart);
+    if (startErr) return startErr;
     const startInt = ipToBigInt(rangeStart);
-    if (startInt === null) return null;
-    const probe = expandTemplate(
-      hostnameTemplate,
-      rangeStart,
-      templateStart,
-      v6,
-    );
-    if (!probe) return "Template is empty";
-    if (!HOSTNAME_LABEL_RE.test(probe)) {
-      return `Renders to '${probe}' — must match ^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}$`;
+    const endInt = ipToBigInt(rangeEnd);
+    if (startInt === null || !template) return null;
+    const fmt = templateFormatError(template);
+    if (fmt) return fmt;
+    const total =
+      endInt !== null && endInt >= startInt
+        ? Math.min(Number(endInt - startInt + 1n), 1024)
+        : 1;
+    for (let i = 0; i < total; i++) {
+      const ipStr = bigIntToIp(startInt + BigInt(i), v6);
+      const err = hostLabelError(
+        expandTemplate(template, ipStr, templateStart + i, v6),
+      );
+      if (err) return `#${i + 1} (${ipStr}): ${err}`;
     }
     return null;
-  }, [rangeStart, hostnameTemplate, templateStart, v6]);
+  }, [rangeStart, rangeEnd, hostnameTemplate, templateStart, v6]);
 
   const buildBody = (): BulkAllocateRequest => ({
     range_start: rangeStart.trim(),
@@ -359,6 +383,7 @@ export function BulkAllocateModal({
       setServerError(null);
       qc.invalidateQueries({ queryKey: ["addresses", subnet.id] });
       qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
       qc.invalidateQueries({ queryKey: ["dns-records"] });
       qc.invalidateQueries({ queryKey: ["dns-zones"] });
       onCommitted?.();
@@ -385,7 +410,12 @@ export function BulkAllocateModal({
         </button>
         <button
           type="button"
-          disabled={formInvalid || previewMut.isPending}
+          disabled={formInvalid || zonesPending || previewMut.isPending}
+          title={
+            zonesPending
+              ? "Waiting for the subnet's DNS zones to load"
+              : undefined
+          }
           onClick={() => previewMut.mutate()}
           className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
         >
@@ -419,7 +449,8 @@ export function BulkAllocateModal({
               previewData &&
               previewData.conflicts_in_use +
                 previewData.conflicts_in_pool +
-                previewData.conflicts_fqdn >
+                previewData.conflicts_fqdn +
+                (previewData.conflicts_no_perm ?? 0) >
                 0)
           }
           onClick={() => commitMut.mutate()}
@@ -554,40 +585,55 @@ export function BulkAllocateModal({
             />
           </div>
 
-          <div className="rounded-md border bg-muted/30 p-3">
-            <label className="flex cursor-pointer items-center gap-2 text-sm">
-              <input
-                type="checkbox"
-                checked={createDnsRecords}
-                onChange={(e) => setCreateDnsRecords(e.target.checked)}
-              />
-              <span>Create DNS records (forward A/AAAA + reverse PTR)</span>
-            </label>
-            {createDnsRecords && availableZones.length > 0 && (
-              <div className="mt-2">
-                <label className="mb-1 block text-xs font-medium text-muted-foreground">
-                  Forward zone
-                </label>
-                <select
-                  className={inputCls}
-                  value={dnsZoneId}
-                  onChange={(e) => setDnsZoneId(e.target.value)}
-                >
-                  {availableZones.map((z) => (
-                    <option key={z.id} value={z.id}>
-                      {z.name}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            )}
-            {createDnsRecords && availableZones.length === 0 && (
-              <p className="mt-1 text-xs text-muted-foreground">
-                No DNS zones are pinned to this subnet — A records will fall
-                through to the effective default zone if one exists.
-              </p>
-            )}
-          </div>
+          {dnsOn && (
+            <div className="rounded-md border bg-muted/30 p-3">
+              <label className="flex cursor-pointer items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={createDnsRecords}
+                  onChange={(e) => setCreateDnsRecords(e.target.checked)}
+                />
+                <span>Create DNS records (forward A/AAAA + reverse PTR)</span>
+              </label>
+              {createDnsRecords && availableZones.length > 0 && (
+                <div className="mt-2">
+                  <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                    Forward zone
+                  </label>
+                  <select
+                    className={inputCls}
+                    value={dnsZoneId}
+                    onChange={(e) => {
+                      setDnsZoneId(e.target.value);
+                      setDnsZoneTouched(true);
+                    }}
+                  >
+                    {availableZones.map((z) => (
+                      <option key={z.id} value={z.id}>
+                        {z.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+              {createDnsRecords &&
+                availableZones.length === 0 &&
+                zonesSettled &&
+                (effectiveDns?.dns_zone_id ? (
+                  // #3903: the zone list wants a read this caller may lack,
+                  // while the subnet's own effective DNS names the zone.
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    A records are published in this subnet&apos;s DNS zone. Your
+                    permissions do not list DNS zones, so its name is not shown.
+                  </p>
+                ) : (
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    No DNS zones are pinned to this subnet — A records will fall
+                    through to the effective default zone if one exists.
+                  </p>
+                ))}
+            </div>
+          )}
 
           {livePreview && (
             <div className="rounded-md border bg-muted/20 p-3">
@@ -610,10 +656,10 @@ export function BulkAllocateModal({
           )}
 
           {serverError && (
-            <div className="flex items-start gap-2 rounded border border-red-300 bg-red-50 p-3 text-xs text-red-900 dark:border-red-900 dark:bg-red-900/20 dark:text-red-200">
+            <FormError className="flex items-start gap-2 rounded border border-red-300 bg-red-50 p-3 dark:border-red-900 dark:bg-red-900/20 dark:text-red-200">
               <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0" />
               <span>{serverError}</span>
-            </div>
+            </FormError>
           )}
         </>
       )}
@@ -637,7 +683,10 @@ function PreviewResults({
   onCollision: "skip" | "abort";
 }) {
   const totalConflicts =
-    data.conflicts_in_use + data.conflicts_in_pool + data.conflicts_fqdn;
+    data.conflicts_in_use +
+    data.conflicts_in_pool +
+    data.conflicts_fqdn +
+    (data.conflicts_no_perm ?? 0);
   const blockedByAbort = onCollision === "abort" && totalConflicts > 0;
 
   return (
@@ -683,6 +732,12 @@ function PreviewResults({
               <li>
                 {data.conflicts_fqdn} IP(s) collide on hostname+zone with
                 existing rows
+              </li>
+            )}
+            {(data.conflicts_no_perm ?? 0) > 0 && (
+              <li>
+                {data.conflicts_no_perm} IP(s) outside the address sets you can
+                edit
               </li>
             )}
           </ul>

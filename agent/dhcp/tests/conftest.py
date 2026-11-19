@@ -41,3 +41,13 @@ def _no_host_ipv6_unicast(monkeypatch: pytest.MonkeyPatch) -> None:
     rendered document does not depend on the machine running it; tests of
     the unicast path patch ``sync.global_ipv6_addresses`` themselves."""
     monkeypatch.setattr("spatium_dhcp_agent.sync.global_ipv6_addresses", lambda: [])
+
+
+@pytest.fixture(autouse=True)
+def _reset_reauth_state() -> Iterator[None]:
+    """#2052 — re-registration pacing is process-wide; tests start clean."""
+    from spatium_dhcp_agent import bootstrap
+
+    bootstrap._reset_reauth_state()
+    yield
+    bootstrap._reset_reauth_state()

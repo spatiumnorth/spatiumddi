@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListReadError } from "@/components/ui/list-read-error";
 import {
   AlertTriangle,
   Eraser,
@@ -11,6 +12,7 @@ import {
 
 import {
   factoryResetApi,
+  formatApiError,
   type FactoryResetExecuteRequest,
   type FactoryResetSection,
 } from "@/lib/api";
@@ -18,6 +20,7 @@ import {
   MODAL_BACKDROP_CLS,
   useModalDialog,
 } from "@/components/ui/use-draggable-modal";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Admin → Backup → Factory Reset tab (issue #116).
@@ -91,8 +94,11 @@ export function FactoryResetSection() {
           Loading section catalog…
         </div>
       ) : sectionsQ.isError ? (
-        <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
-          Failed to load section catalog.
+        <div className="rounded-md border bg-card px-3 py-2 text-sm">
+          <ListReadError
+            error={sectionsQ.error}
+            what="the factory reset section catalog"
+          />
         </div>
       ) : (
         <div className="space-y-6">
@@ -306,7 +312,7 @@ function ResetModal({
           ) : previewQ.isError ? (
             <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
               Failed to compute preview:{" "}
-              {(previewQ.error as Error)?.message || "unknown"}
+              {formatApiError(previewQ.error, "unknown")}
             </div>
           ) : (
             <PreviewBlock previewData={previewQ.data!} />
@@ -391,9 +397,9 @@ function ResetModal({
 
           {/* Error / success */}
           {executeMut.isError && (
-            <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
-              {(executeMut.error as Error)?.message || "Reset failed"}
-            </div>
+            <FormError className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+              {formatApiError(executeMut.error, "Reset failed")}
+            </FormError>
           )}
           {executeMut.isSuccess && executeMut.data && (
             <div className="rounded-md border border-emerald-500/30 bg-emerald-500/5 px-3 py-2 text-xs text-emerald-700 dark:text-emerald-300">

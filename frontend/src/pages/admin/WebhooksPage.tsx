@@ -1,3 +1,4 @@
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 /**
  * WebhooksPage — admin surface for typed-event subscriptions.
  *
@@ -30,12 +31,22 @@ import {
   type WebhookSubscriptionWrite,
   type WebhookTestResult,
   webhooksApi,
+  formatApiError,
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { ListReadError } from "@/components/ui/list-read-error";
 import { copyToClipboard } from "@/lib/clipboard";
+import { useSecretCloseGuard } from "@/hooks/useSecretCloseGuard";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
+import { FreshRowError } from "@/components/FreshRowError";
+import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -62,7 +73,7 @@ function Field({
 
 // ── Subscription editor ────────────────────────────────────────────────────
 
-function SubscriptionEditor({
+export function SubscriptionEditor({
   existing,
   eventTypeVocab,
   onClose,
@@ -77,17 +88,31 @@ function SubscriptionEditor({
   const [enabled, setEnabled] = useState(existing?.enabled ?? true);
   const [url, setUrl] = useState(existing?.url ?? "");
   const [secret, setSecret] = useState("");
+  // Edit only: send `secret: ""`, which the API reads as "store no secret".
+  // An empty field is `null` ("keep"), so without this the console could
+  // not remove a webhook's secret at all (#1397).
+  const [removeSecret, setRemoveSecret] = useState(false);
   const [eventTypes, setEventTypes] = useState<string[]>(
     existing?.event_types ?? [],
   );
   const [eventFilter, setEventFilter] = useState("");
-  const [headers, setHeaders] = useState<string>(
-    existing?.headers
-      ? Object.entries(existing.headers)
-          .map(([k, v]) => `${k}: ${v}`)
-          .join("\n")
-      : "",
+  // Header values are never returned by the API (#1579) — the editor
+  // starts blank on edit: blank = keep the stored headers, typed lines
+  // replace them, and the checkbox below clears them.
+  const [headers, setHeaders] = useState<string>("");
+  const [clearHeaders, setClearHeaders] = useState(false);
+  // #4135 — a moved URL needs the stored custom headers (they carry the
+  // credentials) typed again, or removed.
+  const reask = useCredentialReask(
+    { url },
+    existing && { url: existing.url },
+    () => {
+      setHeaders("");
+      setClearHeaders(false);
+    },
   );
+  const mustEnterHeaders =
+    reask.asks(existing?.headers_set) && !clearHeaders && !headers.trim();
   const [timeoutSeconds, setTimeoutSeconds] = useState(
     existing?.timeout_seconds ?? 10,
   );
@@ -97,6 +122,19 @@ function SubscriptionEditor({
   // a "secret revealed" panel inside the modal so the operator can
   // copy it before the modal closes. The list query never sees it.
   const [revealedSecret, setRevealedSecret] = useState<string | null>(null);
+  // #3222 — a generated secret is shown once; closing before copying it
+  // loses it, so the reveal step asks first. One the operator typed into
+  // the form is already theirs, so that one closes as before.
+  const secretValues = useMemo(
+    () => (revealedSecret ? [revealedSecret] : []),
+    [revealedSecret],
+  );
+  const secretGuard = useSecretCloseGuard({
+    onClose,
+    secrets: secretValues,
+    noun: "secret",
+    active: !!revealedSecret && revealedSecret !== secret,
+  });
 
   const parseHeaders = (): Record<string, string> | null => {
     const lines = headers
@@ -117,6 +155,40 @@ function SubscriptionEditor({
 
   const mut = useMutation({
     mutationFn: async () => {
+      if (existing) {
+        // Edit sends only what the operator changed against what the dialog
+        // read when it opened (#4236), so a field another client set since is
+        // not put back. A blank secret / headers field keeps the stored one.
+        const body: Partial<WebhookSubscriptionWrite> = changedFields(
+          {
+            name: existing.name,
+            description: existing.description,
+            enabled: existing.enabled,
+            url: existing.url,
+            event_types: existing.event_types,
+            timeout_seconds: existing.timeout_seconds,
+            max_attempts: existing.max_attempts,
+          },
+          {
+            name: name.trim(),
+            description: description.trim(),
+            enabled,
+            url: url.trim(),
+            event_types: eventTypes.length > 0 ? eventTypes : null,
+            timeout_seconds: timeoutSeconds,
+            max_attempts: maxAttempts,
+          },
+        );
+        // Write-only headers (#1579): an explicit ``{}`` clears, typed lines
+        // replace, and an absent key keeps the stored values.
+        const typedHeaders = clearHeaders ? {} : parseHeaders();
+        if (typedHeaders) body.headers = typedHeaders;
+        // ``""`` removes the secret; absent keeps it.
+        if (removeSecret) body.secret = "";
+        else if (secret.length > 0) body.secret = secret;
+        if (Object.keys(body).length === 0) return null;
+        return webhooksApi.update(existing.id, body);
+      }
       const body: WebhookSubscriptionWrite = {
         name: name.trim(),
         description: description.trim(),
@@ -126,33 +198,22 @@ function SubscriptionEditor({
         headers: parseHeaders(),
         timeout_seconds: timeoutSeconds,
         max_attempts: maxAttempts,
-        // ``null`` on edit when the operator didn't retype it = keep
-        // existing. On create we let the server auto-generate.
-        secret: existing
-          ? secret.length > 0
-            ? secret
-            : null
-          : secret.length > 0
-            ? secret
-            : undefined,
+        // On create we let the server auto-generate a blank secret.
+        secret: secret.length > 0 ? secret : undefined,
       };
-      if (existing) {
-        return webhooksApi.update(existing.id, body);
-      }
       return webhooksApi.create(body);
     },
     onSuccess: (sub) => {
       qc.invalidateQueries({ queryKey: ["webhooks"] });
       // Show the cleartext secret one final time before closing.
-      if (sub.secret_plaintext) {
+      if (sub?.secret_plaintext) {
         setRevealedSecret(sub.secret_plaintext);
       } else {
         onClose();
       }
     },
     onError: (e: unknown) => {
-      const err = e as { response?: { data?: { detail?: string } } };
-      setError(err?.response?.data?.detail ?? "Save failed");
+      setError(formatApiError(e, "Save failed"));
     },
   });
 
@@ -164,53 +225,61 @@ function SubscriptionEditor({
 
   if (revealedSecret) {
     return (
-      <Modal
-        onClose={onClose}
-        title="Webhook secret — copy now, this is the only chance"
-        wide
-      >
-        <div className="space-y-3">
-          <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-900/20 dark:text-amber-200">
-            <div className="mb-1 flex items-center gap-2 font-medium">
-              <AlertTriangle className="h-4 w-4" />
-              Stored encrypted at rest. The server will not display it again —
-              copy it now into your receiver's HMAC verifier.
+      <>
+        <Modal
+          onClose={secretGuard.requestClose}
+          title="Webhook secret — copy now, this is the only chance"
+          wide
+        >
+          <div className="space-y-3" {...secretGuard.copyProps}>
+            <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-900/20 dark:text-amber-200">
+              <div className="mb-1 flex items-center gap-2 font-medium">
+                <AlertTriangle className="h-4 w-4" />
+                Stored encrypted at rest. The server will not display it again —
+                copy it now into your receiver's HMAC verifier.
+              </div>
+              Use it as the HMAC-SHA256 key over{" "}
+              <span className="font-mono">{`<X-SpatiumDDI-Timestamp>`}</span> +{" "}
+              <span className="font-mono">"."</span> + the raw request body.
+              Compare against the{" "}
+              <span className="font-mono">{`X-SpatiumDDI-Signature`}</span>{" "}
+              header (format{" "}
+              <span className="font-mono">sha256=&lt;hex&gt;</span>).
             </div>
-            Use it as the HMAC-SHA256 key over{" "}
-            <span className="font-mono">{`<X-SpatiumDDI-Timestamp>`}</span> +{" "}
-            <span className="font-mono">"."</span> + the raw request body.
-            Compare against the{" "}
-            <span className="font-mono">{`X-SpatiumDDI-Signature`}</span> header
-            (format <span className="font-mono">sha256=&lt;hex&gt;</span>).
-          </div>
-          <div className="rounded-md border bg-muted/30 p-3">
-            <div className="mb-1 flex items-center justify-between">
-              <span className="text-xs font-medium text-muted-foreground">
-                Secret
-              </span>
+            <div className="rounded-md border bg-muted/30 p-3">
+              <div className="mb-1 flex items-center justify-between">
+                <span className="text-xs font-medium text-muted-foreground">
+                  Secret
+                </span>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    if (await copyToClipboard(revealedSecret)) {
+                      secretGuard.markTaken();
+                    }
+                  }}
+                  className="inline-flex items-center gap-1 rounded border px-2 py-0.5 text-xs hover:bg-accent"
+                >
+                  <Copy className="h-3 w-3" /> Copy
+                </button>
+              </div>
+              <code className="block break-all font-mono text-sm">
+                {revealedSecret}
+              </code>
+            </div>
+            <div className="flex justify-end">
               <button
                 type="button"
-                onClick={() => copyToClipboard(revealedSecret)}
-                className="inline-flex items-center gap-1 rounded border px-2 py-0.5 text-xs hover:bg-accent"
+                onClick={secretGuard.requestClose}
+                className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:opacity-90"
               >
-                <Copy className="h-3 w-3" /> Copy
+                Done — I've stored the secret
               </button>
             </div>
-            <code className="block break-all font-mono text-sm">
-              {revealedSecret}
-            </code>
           </div>
-          <div className="flex justify-end">
-            <button
-              type="button"
-              onClick={onClose}
-              className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:opacity-90"
-            >
-              Done — I've stored the secret
-            </button>
-          </div>
-        </div>
-      </Modal>
+        </Modal>
+        {secretGuard.confirm}
+      </>
     );
   }
 
@@ -266,7 +335,9 @@ function SubscriptionEditor({
           label={existing ? "Rotate secret (optional)" : "Secret (optional)"}
           hint={
             existing
-              ? "Leave blank to keep the stored secret. Type a new one to rotate; clearing the field stores no secret (HMAC header omitted)."
+              ? existing.secret_set
+                ? "Leave blank to keep the stored secret, or type a new one to rotate it."
+                : "No secret is stored, so deliveries go unsigned. Type one to sign them."
               : "Leave blank and the server will auto-generate a 32-byte secret. We surface it once after create — copy and store it on your receiver."
           }
         >
@@ -274,10 +345,24 @@ function SubscriptionEditor({
             type="password"
             autoComplete="new-password"
             className={cn(inputCls, "font-mono")}
-            value={secret}
+            value={removeSecret ? "" : secret}
+            disabled={removeSecret}
             onChange={(e) => setSecret(e.target.value)}
-            placeholder={existing && existing.secret_set ? "(stored)" : ""}
+            placeholder={
+              existing && existing.secret_set && !removeSecret ? "(stored)" : ""
+            }
           />
+          {existing?.secret_set && (
+            <label className="flex cursor-pointer items-center gap-2 text-xs">
+              <input
+                type="checkbox"
+                checked={removeSecret}
+                onChange={(e) => setRemoveSecret(e.target.checked)}
+              />
+              Remove the stored secret: deliveries then go unsigned, with no
+              X-SpatiumDDI-Signature header.
+            </label>
+          )}
         </Field>
 
         <div className="rounded-md border p-3">
@@ -323,15 +408,43 @@ function SubscriptionEditor({
         </div>
 
         <Field
-          label="Custom headers (optional)"
-          hint="One header per line, ``Key: value`` format. ``X-SpatiumDDI-*`` reserved for the platform."
+          label={
+            reask.asks(existing?.headers_set)
+              ? "Custom headers (required)"
+              : "Custom headers (optional)"
+          }
+          hint={
+            reask.asks(existing?.headers_set)
+              ? `${reask.hint} Or tick the box to remove them.`
+              : existing && existing.headers_set
+                ? `Stored headers: ${existing.header_names.join(", ")} — values are encrypted and never shown. Leave blank to keep them, type new lines to replace them all, or tick the box to remove them.`
+                : "One header per line, ‘Key: value’ format. Values are encrypted at rest and never shown again. ‘X-SpatiumDDI-*’ reserved for the platform."
+          }
         >
           <textarea
             className={cn(inputCls, "font-mono min-h-[60px]")}
             value={headers}
+            disabled={clearHeaders}
             onChange={(e) => setHeaders(e.target.value)}
-            placeholder={`Authorization: Bearer …\nX-Custom: value`}
+            placeholder={
+              reask.asks(existing?.headers_set)
+                ? reask.placeholder
+                : existing && existing.headers_set
+                  ? "(stored — leave blank to keep)"
+                  : `Authorization: Bearer …\nX-Custom: value`
+            }
+            required={mustEnterHeaders}
           />
+          {existing && existing.headers_set && (
+            <label className="mt-1 flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+              <input
+                type="checkbox"
+                checked={clearHeaders}
+                onChange={(e) => setClearHeaders(e.target.checked)}
+              />
+              Remove all stored headers
+            </label>
+          )}
         </Field>
 
         <div className="grid grid-cols-2 gap-3">
@@ -371,7 +484,9 @@ function SubscriptionEditor({
           </Field>
         </div>
 
-        {error && <p className="text-xs text-red-600">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-red-600">{error}</FormError>
+        )}
         <div className="flex justify-end gap-2 pt-2">
           <button
             type="button"
@@ -382,7 +497,9 @@ function SubscriptionEditor({
           </button>
           <button
             type="button"
-            disabled={!name.trim() || !url.trim() || mut.isPending}
+            disabled={
+              !name.trim() || !url.trim() || mustEnterHeaders || mut.isPending
+            }
             onClick={() => mut.mutate()}
             className="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50"
           >
@@ -391,6 +508,41 @@ function SubscriptionEditor({
         </div>
       </div>
     </Modal>
+  );
+}
+
+// Edit reads the subscription when it opens (#4236): the row the list holds
+// can be 30 s old and the form is seeded once. The Save then sends only what
+// the operator changed against what was read.
+function EditSubscription({
+  row,
+  eventTypeVocab,
+  onClose,
+}: {
+  row: WebhookSubscription;
+  eventTypeVocab: string[];
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const fresh = useFreshRow<WebhookSubscription>(row, () =>
+    refetchRow<WebhookSubscription>(qc, [["webhooks"]], row.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit webhook subscription"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={onClose}
+      />
+    );
+  if (!fresh.ready || !fresh.row) return null;
+  return (
+    <SubscriptionEditor
+      existing={fresh.row}
+      eventTypeVocab={eventTypeVocab}
+      onClose={onClose}
+    />
   );
 }
 
@@ -524,6 +676,12 @@ function DeliveryRow({
 // ── Page ───────────────────────────────────────────────────────────────────
 
 export function WebhooksPage() {
+  // #1341 — every write on this page takes a superadmin (its handlers
+  // take SuperAdmin), so a read-only user is offered none of them.
+  const superadminGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const qc = useQueryClient();
   const [editing, setEditing] = useState<WebhookSubscription | null>(null);
   const [showCreate, setShowCreate] = useState(false);
@@ -587,7 +745,8 @@ export function WebhooksPage() {
           <button
             type="button"
             onClick={() => setShowCreate(true)}
-            className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:opacity-90"
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+            {...superadminGate}
           >
             <Plus className="h-4 w-4" />
             New subscription
@@ -652,14 +811,16 @@ export function WebhooksPage() {
                       disabled={test.isPending}
                       onClick={() => test.mutate(s.id)}
                       className="inline-flex items-center gap-1 rounded border px-2 py-1 text-xs hover:bg-accent disabled:opacity-50"
-                      title="Send a synthetic ``test.ping`` event through the same signing + transport path the worker uses"
+                      title="Send a synthetic ‘test.ping’ event through the same signing + transport path the worker uses"
+                      {...superadminGate}
                     >
                       <Send className="h-3 w-3" /> Test
                     </button>
                     <button
                       type="button"
                       onClick={() => setEditing(s)}
-                      className="inline-flex items-center gap-1 rounded border px-2 py-1 text-xs hover:bg-accent"
+                      className="inline-flex items-center gap-1 rounded border px-2 py-1 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                      {...superadminGate}
                     >
                       <Pencil className="h-3 w-3" /> Edit
                     </button>
@@ -671,7 +832,8 @@ export function WebhooksPage() {
                           onConfirm: () => del.mutate(s.id),
                         });
                       }}
-                      className="inline-flex items-center gap-1 rounded border border-rose-300 px-2 py-1 text-xs text-rose-600 hover:bg-rose-50 dark:border-rose-900 dark:hover:bg-rose-900/20"
+                      className="inline-flex items-center gap-1 rounded border border-rose-300 px-2 py-1 text-xs text-rose-600 hover:bg-rose-50 dark:border-rose-900 dark:hover:bg-rose-900/20 disabled:cursor-not-allowed disabled:opacity-50"
+                      {...superadminGate}
                     >
                       <Trash2 className="h-3 w-3" /> Delete
                     </button>
@@ -738,8 +900,8 @@ export function WebhooksPage() {
         />
       )}
       {editing && (
-        <SubscriptionEditor
-          existing={editing}
+        <EditSubscription
+          row={editing}
           eventTypeVocab={vocab}
           onClose={() => setEditing(null)}
         />

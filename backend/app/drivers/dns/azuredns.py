@@ -29,6 +29,9 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import structlog
+
+from app.drivers.dns._caa import caa_value_octets, parse_caa
 from app.drivers.dns._cloud_base import (
     CloudDNSDriverBase,
     CloudDNSError,
@@ -69,6 +72,15 @@ _RECORD_TYPE_TO_AZURE_ATTR = {
 }
 
 
+logger = structlog.get_logger(__name__)
+
+
+def _http_status(exc: Exception) -> int | None:
+    """HTTP status carried by an Azure SDK ``HttpResponseError``, else None."""
+    status = getattr(exc, "status_code", None)
+    return status if isinstance(status, int) else None
+
+
 def _zone_label(zone_name: str) -> str:
     """Azure zone resource names carry no trailing dot — strip it."""
     return normalize_fqdn(zone_name).rstrip(".")
@@ -84,6 +96,12 @@ class AzureDNSDriver(CloudDNSDriverBase):
     """Agentless Azure DNS driver via the ``azure-mgmt-dns`` SDK."""
 
     name = "azure_dns"
+
+    def _account_identity(self, creds: dict[str, Any]) -> str | None:
+        sub_id = str(creds.get("subscription_id") or "").strip().lower()
+        rg = str(creds.get("resource_group") or "").strip().lower()
+        return f"{sub_id}/{rg}" if sub_id and rg else None
+
     credential_fields = (
         "tenant_id",
         "client_id",
@@ -93,6 +111,36 @@ class AzureDNSDriver(CloudDNSDriverBase):
     )
 
     # ── SDK client factory (lazy import; patched in tests) ───────────────
+    def _validate_credentials(self, creds: dict[str, Any]) -> None:
+        """Require every credential field, naming the missing ones (#1534).
+
+        Previously the fields were indexed directly, so a missing field
+        surfaced as a raw ``KeyError('tenant_id')``, and an empty
+        ``resource_group`` passed the zone-listing probe while every
+        record path failed on the empty group. ``resource_group`` is
+        required: every Azure DNS call is scoped by it.
+        """
+        missing = [
+            field for field in self.credential_fields if not str(creds.get(field) or "").strip()
+        ]
+        if missing:
+            raise CloudDNSError(
+                "azure_dns credentials are missing required field(s): "
+                + ", ".join(missing)
+                + ". All of tenant_id, client_id, client_secret, "
+                "subscription_id and resource_group are required."
+            )
+
+    def _resource_group(self, creds: dict[str, Any]) -> str:
+        """Return the configured resource group, or raise (#1534)."""
+        rg = str(creds.get("resource_group") or "").strip()
+        if not rg:
+            raise CloudDNSError(
+                "azure_dns credentials require a non-empty 'resource_group': "
+                "every zone and record call is scoped by it."
+            )
+        return rg
+
     def _client(self, creds: dict[str, Any]) -> Any:
         """Build a ``DnsManagementClient`` from a service-principal secret.
 
@@ -101,6 +149,9 @@ class AzureDNSDriver(CloudDNSDriverBase):
         :class:`CloudDNSError` on a missing dependency so the operator gets
         an actionable message rather than a bare ``ImportError``.
         """
+        # #1534 — validate before indexing so a missing field is a named
+        # CloudDNSError, never a raw KeyError.
+        self._validate_credentials(creds)
         try:
             from azure.identity import ClientSecretCredential
             from azure.mgmt.dns import DnsManagementClient
@@ -140,12 +191,13 @@ class AzureDNSDriver(CloudDNSDriverBase):
     # ── Zone listing ─────────────────────────────────────────────────────
     async def _list_zones(self, server: Any, creds: dict[str, Any]) -> list[CloudDNSZone]:
         client = self._client(creds)
-        rg = (creds.get("resource_group") or "").strip()
+        rg = self._resource_group(creds)
 
         def _list() -> list[Any]:
-            if rg:
-                return list(client.zones.list_by_resource_group(rg))
-            return list(client.zones.list())
+            # #1534 — always scoped by resource group, the same scope the
+            # record paths use, so probe() (which lists zones) can no
+            # longer pass for a server whose record ops would all fail.
+            return list(client.zones.list_by_resource_group(rg))
 
         try:
             zones = await asyncio.to_thread(_list)
@@ -170,7 +222,7 @@ class AzureDNSDriver(CloudDNSDriverBase):
         self, server: Any, creds: dict[str, Any], zone_name: str
     ) -> list[RecordData]:
         client = self._client(creds)
-        rg = (creds.get("resource_group") or "").strip()
+        rg = self._resource_group(creds)
         zone_label = _zone_label(zone_name)
 
         def _list() -> list[Any]:
@@ -215,7 +267,17 @@ class AzureDNSDriver(CloudDNSDriverBase):
                 add(cname.cname)
         elif rtype == "MX":
             for r in getattr(rs, "mx_records", None) or []:
-                add(f"{r.preference} {r.exchange}")
+                # Split form (#1526): bare exchange in value, preference in
+                # its own column — NOT the composed "10 mail.example.com".
+                out.append(
+                    RecordData(
+                        name=name,
+                        record_type=rtype,
+                        value=r.exchange,
+                        ttl=ttl,
+                        priority=int(r.preference),
+                    )
+                )
         elif rtype == "TXT":
             for r in getattr(rs, "txt_records", None) or []:
                 add("".join(r.value))
@@ -224,7 +286,17 @@ class AzureDNSDriver(CloudDNSDriverBase):
                 add(r.nsdname)
         elif rtype == "SRV":
             for r in getattr(rs, "srv_records", None) or []:
-                add(f"{r.priority} {r.weight} {r.port} {r.target}")
+                out.append(
+                    RecordData(
+                        name=name,
+                        record_type=rtype,
+                        value=r.target,
+                        ttl=ttl,
+                        priority=int(r.priority),
+                        weight=int(r.weight),
+                        port=int(r.port),
+                    )
+                )
         elif rtype == "PTR":
             for r in getattr(rs, "ptr_records", None) or []:
                 add(r.ptrdname)
@@ -236,7 +308,7 @@ class AzureDNSDriver(CloudDNSDriverBase):
     # ── Record write ─────────────────────────────────────────────────────
     async def _apply_record(self, server: Any, creds: dict[str, Any], change: RecordChange) -> None:
         client = self._client(creds)
-        rg = (creds.get("resource_group") or "").strip()
+        rg = self._resource_group(creds)
         zone_label = _zone_label(change.zone_name)
         relative = _relative_name(change.record.name)
         rtype = change.record.record_type.upper()
@@ -317,8 +389,14 @@ class AzureDNSDriver(CloudDNSDriverBase):
             existing = self._get_record_set(client, rg, zone_label, relative, rtype)
             entries = [] if existing is None else self._existing_entries(existing, rtype)
             # Dedupe: if this value is already in the set, it's a no-op.
-            present = {self._entry_key(rtype, e) for e in entries}
-            if self._entry_key(rtype, new_entry) not in present:
+            new_key = self._entry_key(rtype, new_entry)
+            if rtype == "CAA":
+                # Replace rather than keep: a CAA entry a release before
+                # #2943 wrote with its literal quotes keys as this one, and
+                # keeping it would go on serving the quotes.
+                entries = [e for e in entries if self._entry_key(rtype, e) != new_key]
+                entries = entries + [new_entry]
+            elif new_key not in {self._entry_key(rtype, e) for e in entries}:
                 entries = entries + [new_entry]
             # TTL: prefer the change's ttl, fall back to the existing set's,
             # then the driver default.
@@ -371,7 +449,9 @@ class AzureDNSDriver(CloudDNSDriverBase):
             if not remaining:
                 client.record_sets.delete(rg, zone_label, relative, rtype)
                 return
-            ttl = getattr(existing, "ttl", None) or 3600
+            ttl = getattr(existing, "ttl", None)
+            if ttl is None:
+                ttl = 3600
             params = {"ttl": ttl, _RECORD_TYPE_TO_AZURE_ATTR[rtype]: remaining}
             client.record_sets.create_or_update(rg, zone_label, relative, rtype, params)
 
@@ -474,14 +554,25 @@ class AzureDNSDriver(CloudDNSDriverBase):
         """
         if rtype == "TXT":
             return ("TXT", "".join(entry.get("value", [])))
+        if rtype == "CAA":
+            # Tag case-insensitive (RFC 8659 §4.1); a value written with its
+            # literal quotes before #2943 is the same record as the bare one,
+            # so an upgrade can still delete or correct it.
+            return (
+                "CAA",
+                int(entry.get("flags") or 0),
+                str(entry.get("tag") or "").lower(),
+                caa_value_octets(str(entry.get("value") or "")),
+            )
         return (rtype, tuple(sorted(entry.items(), key=lambda kv: kv[0])))
 
     def _build_record_set_params(self, record: RecordData) -> dict[str, Any]:
         """Build the create_or_update body for one neutral record.
 
         Returns the loosely-typed dict form the SDK accepts (``ttl`` plus
-        the type-specific record list); MX / SRV string values are split
-        back into their structured components.
+        the type-specific record list). MX / SRV take their structured
+        components from the record's own columns (#1526) — ``value`` is
+        the bare target, never a composed string to split back apart.
         """
         rtype = record.record_type.upper()
         ttl = record.ttl if record.ttl is not None else 3600
@@ -495,47 +586,84 @@ class AzureDNSDriver(CloudDNSDriverBase):
         elif rtype == "CNAME":
             params["cname_record"] = {"cname": value}
         elif rtype == "MX":
-            pref, _, exch = value.partition(" ")
-            params["mx_records"] = [{"preference": int(pref), "exchange": exch.strip()}]
+            pref = record.priority if record.priority is not None else 10
+            params["mx_records"] = [{"preference": pref, "exchange": value}]
         elif rtype == "TXT":
             params["txt_records"] = [{"value": [value]}]
         elif rtype == "NS":
             params["ns_records"] = [{"nsdname": value}]
         elif rtype == "SRV":
-            prio, weight, port, target = (value.split(None, 3) + ["", "", "", ""])[:4]
             params["srv_records"] = [
                 {
-                    "priority": int(prio),
-                    "weight": int(weight),
-                    "port": int(port),
-                    "target": target.strip(),
+                    "priority": record.priority if record.priority is not None else 0,
+                    "weight": record.weight if record.weight is not None else 0,
+                    "port": record.port if record.port is not None else 0,
+                    "target": value,
                 }
             ]
         elif rtype == "PTR":
             params["ptr_records"] = [{"ptrdname": value}]
         elif rtype == "CAA":
-            flags, tag, caa_value = (value.split(None, 2) + ["", "", ""])[:3]
-            params["caa_records"] = [{"flags": int(flags), "tag": tag, "value": caa_value.strip()}]
+            # Azure takes the value itself, never its quoted presentation
+            # form: a stored ``0 issue "ca.org"`` would otherwise be served
+            # with the literal quotes (#2943).
+            parsed = parse_caa(value)
+            if parsed is None:
+                flags, tag, caa_value = (value.split(None, 2) + ["", "", ""])[:3]
+                params["caa_records"] = [
+                    {"flags": int(flags), "tag": tag, "value": caa_value.strip()}
+                ]
+            else:
+                params["caa_records"] = [
+                    {
+                        "flags": parsed[0],
+                        "tag": parsed[1],
+                        "value": parsed[2].decode("utf-8", errors="replace"),
+                    }
+                ]
         else:
             raise CloudDNSError(f"azure_dns: unsupported record type {rtype!r}")
         return params
 
     # ── Zone write ───────────────────────────────────────────────────────
-    async def _apply_zone(self, server: Any, creds: dict[str, Any], zone: Any, op: str) -> None:
+    async def _apply_zone(
+        self,
+        server: Any,
+        creds: dict[str, Any],
+        zone: Any,
+        op: str,
+        *,
+        managed_records: list[RecordData] | None = None,
+    ) -> bool | None:
         client = self._client(creds)
-        rg = (creds.get("resource_group") or "").strip()
+        rg = self._resource_group(creds)
         zone_label = _zone_label(getattr(zone, "name", ""))
 
         if op == "create":
 
+            # #1537 — ``If-None-Match: *`` makes the PUT create-only: an
+            # existing zone of this name in this resource group answers
+            # 412 Precondition Failed, which is the converged state (a zone
+            # name is unique per resource group, so it IS the same zone).
+            # Without it the PUT silently overwrote the existing zone's
+            # tags / properties.
             def _create() -> None:
-                client.zones.create_or_update(rg, zone_label, {"location": "global"})
+                client.zones.create_or_update(
+                    rg, zone_label, {"location": "global"}, if_none_match="*"
+                )
 
             try:
                 await asyncio.to_thread(_create)
             except Exception as exc:  # noqa: BLE001 — wrapped into CloudDNSError
+                if _http_status(exc) == 412:
+                    logger.info(
+                        "azure_dns.apply_zone.create_already_exists",
+                        server=str(getattr(server, "id", "")),
+                        zone=zone_label,
+                    )
+                    return False
                 raise self._wrap_errors(exc) from exc
-            return
+            return True
 
         # delete — zone delete is a long-running operation; block on the
         # poller. Some SDK versions expose a synchronous ``delete`` instead.
@@ -548,7 +676,18 @@ class AzureDNSDriver(CloudDNSDriverBase):
         try:
             await asyncio.to_thread(_delete)
         except Exception as exc:  # noqa: BLE001 — wrapped into CloudDNSError
+            # #1537 — ResourceNotFound (HTTP 404) on delete means the zone
+            # is already gone. Auth failures (401/403), throttling (429)
+            # and 5xx are not this and still raise.
+            if _http_status(exc) == 404:
+                logger.info(
+                    "azure_dns.apply_zone.delete_noop_absent",
+                    server=str(getattr(server, "id", "")),
+                    zone=zone_label,
+                )
+                return False
             raise self._wrap_errors(exc) from exc
+        return True
 
     # ── Capabilities ─────────────────────────────────────────────────────
     def capabilities(self) -> dict[str, Any]:

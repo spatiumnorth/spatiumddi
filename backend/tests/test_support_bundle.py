@@ -68,6 +68,20 @@ def test_secret_shapes_are_removed(blob: str, kind: str) -> None:
     assert "prefix" in cleaned and "suffix" in cleaned
 
 
+@pytest.mark.parametrize("newline", ["\n", "\\n"])
+def test_a_pem_private_key_is_removed_through_its_end_line(newline: str) -> None:
+    """The base64 body is the key. ``\\n`` is the same block inside a JSON
+    string, which is how it reaches a bundle section."""
+    body = ["MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgGCQt3cpfmuqApyuA", "iKny2SvmwVH6"]
+    block = newline.join(["-----BEGIN PRIVATE KEY-----", *body, "-----END PRIVATE KEY-----"])
+    cleaned, kinds = redact_secrets(f"prefix {block} suffix")
+    assert kinds == ["pem"]
+    for line in body:
+        assert line not in cleaned
+    assert "PRIVATE KEY" not in cleaned
+    assert cleaned.startswith("prefix ") and cleaned.endswith(" suffix")
+
+
 def test_secrets_are_removed_even_when_scrubbing_is_off() -> None:
     """The unscrubbed bundle exists so an operator can read their own
     hostnames. There is no version of that which is improved by shipping

@@ -591,6 +591,86 @@ async def test_commit_addresses_land_under_subnet(
 
 
 @pytest.mark.asyncio
+async def test_commit_drops_fqdn_when_hostname_sanitises_to_nothing(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3348 — a dns_name whose host label folds to nothing stores no fqdn.
+
+    An fqdn only reads as current with a hostname (#3297), so storing one
+    alone would show the address with no name at all.
+    """
+    fixture = json.loads(json.dumps(_FIXTURE))
+    for ip in fixture["/api/ipam/ip-addresses/"]:
+        if ip["address"] == "10.10.20.6/24":
+            ip["dns_name"] = "___.acme.example"
+    _patch_client(monkeypatch, fixture)
+    actor = await _make_admin(db_session)
+    await db_session.commit()
+
+    await _preview_then_commit(db_session, actor)
+
+    addr = (
+        await db_session.execute(select(IPAddress).where(IPAddress.address == "10.10.20.6"))
+    ).scalar_one()
+    assert not addr.hostname
+    assert addr.fqdn is None
+
+
+@pytest.mark.asyncio
+async def test_overwrite_keeps_the_name_when_hostname_sanitises_to_nothing(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3348 — an overwrite whose host label folds to nothing keeps the row's
+    hostname AND its fqdn, rather than pairing the old hostname with an fqdn
+    that names some other host."""
+    _patch_client(monkeypatch, _FIXTURE)
+    actor = await _make_admin(db_session)
+    await db_session.commit()
+    await _preview_then_commit(db_session, actor)
+
+    fixture = json.loads(json.dumps(_FIXTURE))
+    for ip in fixture["/api/ipam/ip-addresses/"]:
+        if ip["address"] == "10.10.20.5/24":
+            ip["dns_name"] = "___.other.example"
+    _patch_client(monkeypatch, fixture)
+    await _preview_then_commit(
+        db_session,
+        actor,
+        conflict_actions={"ip_address:10.10.20.0/24:10.10.20.5": "overwrite"},
+    )
+
+    addr = (
+        await db_session.execute(select(IPAddress).where(IPAddress.address == "10.10.20.5"))
+    ).scalar_one()
+    await db_session.refresh(addr)
+    assert addr.hostname == "host5"
+    assert addr.fqdn == "host5.acme.example"
+
+
+@pytest.mark.asyncio
+async def test_commit_fqdn_is_the_folded_name_3348(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3348 — the stored fqdn starts with the stored (folded) hostname, so the
+    row never shows a name that is not the one it holds."""
+    fixture = json.loads(json.dumps(_FIXTURE))
+    for ip in fixture["/api/ipam/ip-addresses/"]:
+        if ip["address"] == "10.10.20.6/24":
+            ip["dns_name"] = "Web_01.Acme.Example."
+    _patch_client(monkeypatch, fixture)
+    actor = await _make_admin(db_session)
+    await db_session.commit()
+
+    await _preview_then_commit(db_session, actor)
+
+    addr = (
+        await db_session.execute(select(IPAddress).where(IPAddress.address == "10.10.20.6"))
+    ).scalar_one()
+    assert addr.hostname == "web-01"
+    assert addr.fqdn == "web-01.acme.example"
+
+
+@pytest.mark.asyncio
 async def test_commit_rerun_is_noop(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -616,3 +696,63 @@ async def test_commit_rerun_is_noop(
     assert len({s.name for s in spaces}) == 3
     subnets = (await db_session.execute(select(Subnet))).scalars().all()
     assert len(subnets) == 4
+
+
+@pytest.mark.asyncio
+async def test_commit_failed_entity_does_not_poison_the_rest_2816(
+    db_session: AsyncSession,
+) -> None:
+    """A VRF whose write raises rolls back only itself (#2816).
+
+    The old per-entity ``db.rollback()`` expired the signed-in user, so the
+    NEXT entity's audit row read ``actor.id`` outside the greenlet and failed
+    too. Every entity after the bad one must still be created and audited.
+    """
+    from app.services.netbox_import.canonical import ImportedVRF
+
+    actor = await _make_admin(db_session)
+    await db_session.commit()
+    preview = ImportPreview(
+        source="netbox",
+        vrfs=[
+            ImportedVRF(name="good-before"),
+            ImportedVRF(name="x" * 300),  # over String(255): the INSERT raises
+            ImportedVRF(name="good-after"),
+        ],
+    )
+
+    result = await commit_import(
+        db_session, preview=preview, conflict_actions={}, space_strategy="per_vrf", actor=actor
+    )
+
+    taken = [e.action_taken for e in result.entities]
+    assert taken == ["created", "failed", "created"], [e.error for e in result.entities]
+    names = {v.name for v in (await db_session.execute(select(VRF))).scalars()}
+    assert names == {"good-before", "good-after"}
+    audited = {
+        a.resource_display
+        for a in (
+            await db_session.execute(select(AuditLog).where(AuditLog.resource_type == "vrf"))
+        ).scalars()
+    }
+    assert audited == {"good-before", "good-after"}
+
+
+@pytest.mark.asyncio
+async def test_commit_does_not_attach_to_trashed_customer_3192(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A customer in the Trash is not a match for a NetBox tenant (#3192)."""
+    from datetime import UTC, datetime  # noqa: PLC0415
+
+    _patch_client(monkeypatch, _FIXTURE)
+    actor = await _make_admin(db_session)
+    trashed = Customer(name="Acme Corp", status="active", deleted_at=datetime.now(UTC))
+    db_session.add(trashed)
+    await db_session.commit()
+
+    await _preview_then_commit(db_session, actor)
+
+    vrf_a = (await db_session.execute(select(VRF).where(VRF.name == "cust-a"))).scalar_one()
+    assert vrf_a.customer_id is not None
+    assert vrf_a.customer_id != trashed.id

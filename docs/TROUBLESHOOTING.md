@@ -302,7 +302,8 @@ permanent (hard) delete path, which refuses unless you either:
   WinRM remove-scope, agent-based Kea gets its bundle ETag bumped — so
   no lease is orphaned on a running server.
 
-System placeholder rows (the `.0` network and `.255` broadcast) and
+System placeholder rows (the `.0` network and `.255` broadcast, and the reserved
+"Gateway" row while it is still untouched) and
 DHCP-lease mirrored rows (`auto_from_lease=True`) do **not** count as
 blockers — they're cleaned up automatically on delete.
 
@@ -372,6 +373,179 @@ made in SQL bypass the audit log.
 
 ---
 
+## An integration took IP addresses from another IP space
+
+**Symptom** — Hand-allocated addresses disappeared from one IP space after
+an integration (UniFi, Docker, Kubernetes, Proxmox, Tailscale, NetBird or
+Cloud) was pointed at a *different* space covering the same range. Trying
+to allocate a missing address again says it is already allocated, and the
+address shows up in the integration's space instead. A Sync DNS on the
+original subnet may also offer to delete many DNS records.
+
+**What happened** — Before #2577 those seven reconcilers looked existing
+addresses up across **every** IP space instead of only their own. When an
+integration saw an address that an operator had allocated in another space,
+it adopted that row: it set the integration's ownership column, stamped
+`user_modified_at`, and moved the row into the integration's own space.
+The row's DNS records moved with it. Later passes could delete the row
+outright (a duplicate in the target subnet, or the host leaving the
+integration's view), and deleting the integration's target or its space
+deleted every row it had taken. A deleted row leaves its auto-generated DNS
+records behind with no address, which is what Sync DNS then offers to
+delete.
+
+Upgrading stops it: every reconciler now only reads, adopts, moves, dedupes
+and deletes rows inside its target's own space. Nothing already moved is put
+back automatically, because the row's original subnet was never recorded,
+and a wrong guess would move it a second time.
+
+One kind of damage does repair itself. An operator row the old build
+claimed but never managed to move still sits in its home space carrying the
+integration's column. On the first sync after the upgrade the integration
+**releases** everything it owns outside its own space: it clears its column
+on such a row and leaves the row where it is, `user_modified_at` included.
+It only ever deletes a row it can show is a pure mirror row of its own
+(created after the integration, never edited or audited by a person, no
+DHCP reservation, no other owner); when in doubt it un-claims. The same
+release is what happens when you change an integration's IP space on
+purpose. The sync warnings say what was released.
+
+**Before anything else** — Upgrade first, so the integration stops moving
+rows while you repair them. If the integration is still pointed at an
+overlapping space, leave it running: it no longer touches the other space.
+Do **not** commit DNS deletions from Sync DNS on an affected subnet until
+the rows are back; those records are what you will be restoring.
+
+### Find the rows it moved
+
+As a superadmin, call the read-only report:
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://<spatiumddi>/api/v1/ipam/integration-space-audit" | jq .
+```
+
+or ask the Operator Copilot to run `find_cross_space_integration_adoptions`.
+Each row lists the address, the integration and target that own it now, the
+subnet and space it sits in now, and:
+
+- `evidence` — why it is suspected. `operator_create_audit` means someone
+  created it through IPAM (`created_by` names them).
+  `created_before_target` means the row is older than the integration
+  target, which an integration-created row can't be.
+  `outside_target_space` means it carries the integration's column but sits
+  outside the integration's space; the integration's next sync releases it
+  (see above), so these only show up until then.
+  `dhcp_reservation_in_other_space` means a DHCP reservation linked to the
+  row belongs to a scope in another space: it was made there.
+  `predates_its_space_subnets` means the row is older than every subnet of
+  its current space that contains it, while a subnet in another space that
+  contains it is older than the row. A row can't be created before its
+  subnet, so it was moved in. (A subnet split in its own space can produce
+  this too, so it is evidence, not proof.)
+- `likely_cross_space` — the row has operator-origin evidence AND one of
+  the last two pieces of evidence that it lived in another space. These are
+  the rows to repair.
+- `needs_review` — the row has operator-origin evidence and some subnet in
+  another space contains its address, but nothing shows it ever lived
+  there. That is exactly what an ordinary adoption in the integration's
+  **own** space looks like whenever the range also exists in another space,
+  so do not move these on the report's word: confirm with whoever owns the
+  address first. A row the old build stole after the integration was set
+  up, and without a DHCP reservation, also lands here — which is why they
+  are listed at all.
+- `home_candidates` — the subnets in other spaces that contain the address,
+  and `address_free`, whether nothing holds that address there now. The
+  one with `address_free: true` in the space the address went missing from
+  is almost always where the row came from.
+
+`?include_same_space=true` also lists operator rows an integration adopted
+inside its own space whose address exists in no other space. That is
+normal, documented adoption, not this bug. `truncated: true` means more
+rows matched than `limit` returned; raise `limit` (up to 5000).
+
+### Put a row back
+
+For each `likely_cross_space` row — and each `needs_review` row its owner
+confirms came from another space — confirm the home subnet with whoever
+owns the address, then move it back and release the integration's claim.
+Use the column for the integration the report names (`unifi_controller_id`,
+`docker_host_id`, `kubernetes_cluster_id`, `proxmox_node_id`,
+`tailscale_tenant_id`, `netbird_instance_id`, `cloud_endpoint_id`):
+
+```sql
+BEGIN;
+UPDATE ip_address
+SET subnet_id = '<home_candidates[].subnet_id>',
+    unifi_controller_id = NULL
+WHERE id = '<ip_address_id>';
+COMMIT;
+```
+
+Keep `user_modified_at` as it is: the row holds an operator's hostname,
+description and MAC, and clearing it would let some later integration
+overwrite them. If the `UPDATE` fails on `uq_ip_address_subnet_address`,
+something now holds the address in the home subnet; decide which of the two
+to keep before going further. Subnet and block utilization counters correct
+themselves within the hour (the `recount_ipam_utilization` sweep). Edits
+made in SQL bypass the audit log, so note what you changed.
+
+Once the row is back, the integration creates its own row for the address
+in its own space on its next sync. Then run **Sync DNS** on the home subnet
+and confirm the address's records are reported in sync.
+
+### Rows that were already deleted
+
+The report can only find rows that still exist. A row the integration
+deleted, or that went with a deleted integration target or space, is gone,
+but its IPAM create audit row is not. This lists addresses created through
+IPAM that no longer exist and were not deleted through IPAM:
+
+```sql
+SELECT c.timestamp, c.user_display_name, c.resource_display AS address,
+       c.new_value
+FROM audit_log c
+WHERE c.resource_type = 'ip_address' AND c.action = 'create'
+  AND c.resource_display NOT LIKE 'profile\_scan %'
+  AND NOT EXISTS (SELECT 1 FROM ip_address a WHERE a.id::text = c.resource_id)
+  AND NOT EXISTS (SELECT 1 FROM audit_log d
+                  WHERE d.resource_type = 'ip_address' AND d.action = 'delete'
+                    AND d.resource_id = c.resource_id)
+ORDER BY c.timestamp;
+```
+
+This also lists rows removed by deleting their subnet, block or space,
+which writes no per-address audit row, so read it next to what you know was
+deleted on purpose. `new_value` carries what was typed at creation
+(hostname, description, status, MAC); later edits are in `update` rows for
+the same `resource_id`. Re-create the ones you want through IPAM. Their
+orphaned DNS records stay where they are until Sync DNS on the subnet
+reports them, so re-create the address before committing any deletions.
+
+---
+
+## A Postgres standby is `lost` and never rejoins (CNPG)
+
+With no WAL archive, WAL lives only in each instance's `pg_wal`. The Cluster caps
+what a replication slot may hold back (`max_slot_wal_keep_size: 3GB`, #2317), so
+a standby that falls further behind than that loses its slot (`wal_status =
+lost`) and can never catch up by streaming. A former primary whose `pg_rewind`
+needs WAL that is gone loops the same way. CNPG retries both for ever, and the
+cluster-health database row reads `degraded` (`readyInstances` below `instances`).
+
+Rebuild that one instance from the primary. Never the primary itself:
+
+```bash
+# k3s appliance; <n> is the stuck instance's number, not the primary's.
+kubectl -n spatium cnpg destroy <cluster> <n>
+# or, without the plugin: delete its PVC, then its pod
+kubectl -n spatium delete pvc <cluster>-<n>
+kubectl -n spatium delete pod <cluster>-<n>
+```
+
+CNPG joins a fresh copy from the primary. Do one instance at a time and wait for it
+to be Ready.
+
 ## `/health/platform` says `celery-beat` is unhealthy
 
 **Read the component name as a symptom, not a diagnosis.** Beat only
@@ -422,3 +596,45 @@ make this symptom permanent.)
 A `warn` reading `last tick Ns in the future (clock skew)` means the node
 that ran the tick and the node serving this endpoint disagree about the
 time — check NTP on both rather than looking at Celery.
+
+---
+
+## Pods stuck in `ErrImageNeverPull` after a slot rollback
+
+Appliance only. Tracked in [#3169](https://github.com/spatiumnorth/spatiumddi/issues/3169).
+
+**Symptom.** After rolling an appliance back to its previous slot (`spatium-upgrade-slot rollback` / `set-default`, or Fleet → OS Versions), the `spatium-supervisor` and the DNS / DHCP agent pods on that node (and the control plane, on a control-plane node) sit in `ErrImageNeverPull` at the old tag. `kubectl get pods -A` shows them; `kubectl describe pod` names an image that `k3s crictl images` does not list.
+
+**Cause.** k3s imports image tarballs from one directory on the shared `/var` (`/var/lib/rancher/k3s/agent/images`), not from the running slot. A slot upgrade copies the *new* slot's tarballs into it, and k3s's import cache (`.cache.json`, keyed on path, size and mtime) records them as imported. After a rollback the old slot's k3s therefore imports nothing, and every SpatiumDDI pod is `imagePullPolicy: Never`, so it only starts if containerd still holds the old images. A cluster join, promote or demote made on the newer slot, or kubelet image GC, removes them. The old slot's own tarballs are still on its root filesystem, but at the same path, so the `/var` mount hides them.
+
+Since [#3169](https://github.com/spatiumnorth/spatiumddi/issues/3169)'s fix, `spatium-upgrade-slot rollback`, `set-default` to the other slot and `set-next-boot` to the other slot copy the target slot's tarballs into that directory with a fresh mtime before they switch, so the running k3s imports them before the reboot. This recipe is still needed when that copy could not run: the slot-switch log (`/var/log/spatiumddi/slot-upgrade.log`, or the console's output) then carries `WARNING: could not re-copy … baked images`. The usual reason is a slot laid down by an installer that predates the fix (see *When this does not apply* below). A node that fell back to its previous slot on its own, after a trial boot that failed, also never ran the copy.
+
+**Recovery.** Run as root on the affected node, on the slot you rolled back to:
+
+```bash
+# 1. Reach the running slot's own /var directory, which the /var mount hides.
+#    A plain (non-recursive) bind mount of / does not carry the /var mount.
+mkdir -p /run/slotroot && mount --bind / /run/slotroot
+ls /run/slotroot/var/lib/rancher/k3s/agent/images/*.tar.zst   # must list files; see below if empty
+
+# 2. Copy them into the live directory. No -p: the copies need a NEW mtime.
+cp /run/slotroot/var/lib/rancher/k3s/agent/images/*.tar.zst \
+   /var/lib/rancher/k3s/agent/images/
+
+# 3. Reset k3s's import cache. A file with the same size and an older mtime
+#    than its cache entry is skipped, so without this an equal-size tarball
+#    would not be re-imported.
+echo '{}' > /var/lib/rancher/k3s/agent/images/.cache.json
+
+umount /run/slotroot
+systemctl restart k3s
+```
+
+Wait 2-3 minutes: k3s re-imports the whole set at start. Then verify:
+
+```bash
+k3s crictl images | grep <old tag>      # the tag the pods were asking for
+kubectl get pods -A                     # pods leave ErrImageNeverPull
+```
+
+**When this does not apply.** Step 1's `ls` must list tarballs. A slot written by a slot upgrade carries its images in its own filesystem. A slot laid down by an installer from before [#3169](https://github.com/spatiumnorth/spatiumddi/issues/3169)'s fix does not: it mounted `/var` before it copied the live root, so the tarballs landed on `/var` and the slot's own `/var` directory is empty. Newer installers also place them on the slot's own filesystem. If the `ls` is empty, do not copy anything from the *other* slot's partition: those are the wrong version's images. Instead, get that release's slot image, boot the other slot, and apply the image to the inactive slot with `spatium-upgrade-slot`, which writes a root filesystem that does carry them, then switch back. The same recipe does not help a node whose pods are already pulling at the *current* slot's tag; this is only for images that belong to the slot that is running.

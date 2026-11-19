@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, ArrowRight, CheckCircle2, Loader2 } from "lucide-react";
 import { Modal } from "@/components/ui/modal";
 import { dnsApi, formatApiError, type DelegationRecord } from "@/lib/api";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Zone-delegation wizard.
@@ -53,9 +54,9 @@ export function DelegationModal({
           </p>
         )}
         {error && (
-          <p className="text-xs text-destructive">
+          <FormError className="text-xs text-destructive">
             {formatApiError(error, "Could not load delegation preview")}
-          </p>
+          </FormError>
         )}
 
         {data && data.has_parent === false && (
@@ -132,9 +133,9 @@ export function DelegationModal({
             )}
 
             {applyMut.isError && (
-              <p className="text-xs text-destructive">
+              <FormError className="text-xs text-destructive">
                 {formatApiError(applyMut.error, "Apply failed")}
-              </p>
+              </FormError>
             )}
             {applyMut.isSuccess && (
               <p className="flex items-center gap-1.5 text-xs text-emerald-600">

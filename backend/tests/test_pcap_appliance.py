@@ -367,3 +367,34 @@ async def test_appliance_interfaces_empty_before_first_report(
     body = r.json()
     assert body["interfaces"] == []
     assert "reported yet" in body["note"]
+
+
+async def test_appliance_interfaces_never_the_container_list_2884(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#2884 — the appliance vantage lists ONLY what the supervisor reported,
+    never the api container's own NICs; the server vantage still does; and
+    an appliance that has not reported says so without suggesting ``eth0``."""
+    _, token = await _superadmin(db_session)
+    reported = await _appliance(db_session)
+    reported.host_interfaces = ["enp1s0"]
+    unreported = await _appliance(db_session)
+    await db_session.commit()
+    container = ["any", "eth0"]
+    with patch("app.api.v1.pcap.router.enumerate_interfaces", return_value=container):
+        r = await client.get(
+            f"/api/v1/pcap/interfaces?vantage=appliance&appliance_id={reported.id}",
+            headers=_hdr(token),
+        )
+        assert r.json()["interfaces"] == ["any", "enp1s0"]
+        r = await client.get(
+            f"/api/v1/pcap/interfaces?vantage=appliance&appliance_id={unreported.id}",
+            headers=_hdr(token),
+        )
+        body = r.json()
+        assert body["interfaces"] == []
+        assert "eth0" not in body["note"]
+        r = await client.get("/api/v1/pcap/interfaces?vantage=appliance", headers=_hdr(token))
+        assert r.json()["interfaces"] == []
+        r = await client.get("/api/v1/pcap/interfaces?vantage=server", headers=_hdr(token))
+        assert r.json()["interfaces"] == container

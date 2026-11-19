@@ -26,6 +26,7 @@ from app.api.deps import DB, CurrentUser
 from app.api.v1._common import BulkDeleteResponse
 from app.api.v1.ownership._audit import write_audit
 from app.core.permissions import require_resource_permission
+from app.core.update_nulls import resolve_update_changes
 from app.models.circuit import (
     CIRCUIT_STATUSES,
     TRANSPORT_CLASSES,
@@ -175,14 +176,28 @@ async def _check_optional_fk(db: Any, model: Any, fk_id: uuid.UUID | None, label
         raise HTTPException(status_code=422, detail=f"{label} not found")
 
 
-async def _check_fks(db: Any, body: CircuitCreate | CircuitUpdate) -> None:
+async def _check_customer(
+    db: Any, customer_id: uuid.UUID | None, current: uuid.UUID | None = None
+) -> None:
+    """A NEW or changed customer must be live; keeping the one the circuit
+    already names is fine even once it is in the Trash (#3192)."""
+    if customer_id is None or customer_id == current:
+        return
+    customer = await db.get(Customer, customer_id)
+    if customer is None or customer.deleted_at is not None:
+        raise HTTPException(status_code=422, detail="customer_id not found")
+
+
+async def _check_fks(
+    db: Any, body: CircuitCreate | CircuitUpdate, current_customer_id: uuid.UUID | None = None
+) -> None:
     """Resolve every FK on the body in one place. ``provider_id`` is
     only checked when the operator actually supplied it (Update path
     leaves it None to mean "don't change"); Create's required-ness is
     enforced by the type system."""
     if body.provider_id is not None:
         await _check_provider(db, body.provider_id)
-    await _check_optional_fk(db, Customer, body.customer_id, "customer_id")
+    await _check_customer(db, body.customer_id, current_customer_id)
     from app.models.ipam import Subnet  # noqa: PLC0415
 
     await _check_optional_fk(db, Site, body.a_end_site_id, "a_end_site_id")
@@ -257,7 +272,7 @@ async def list_circuits(
     stmt = apply_tag_filter(stmt, Circuit.tags, tag)
 
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
-    stmt = stmt.order_by(Circuit.name.asc()).limit(limit).offset(offset)
+    stmt = stmt.order_by(Circuit.name.asc(), Circuit.id).limit(limit).offset(offset)
     rows = (await db.execute(stmt)).scalars().all()
     return CircuitListResponse(
         items=[CircuitRead.model_validate(r) for r in rows],
@@ -328,9 +343,39 @@ async def update_circuit(
     if row is None or row.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Circuit not found")
 
-    await _check_fks(db, body)
+    # #1564 — resolve nulls BEFORE _check_fks / the status stamp: a null
+    # ``status`` fed to _stamp_status_transition (or a null ``name`` /
+    # ``provider_id`` reaching Postgres) was a 500; it is now a 422,
+    # while null for a nullable FK / date / cost clears the column.
+    changes = resolve_update_changes(
+        body,
+        clearable={
+            "ckt_id",
+            "customer_id",
+            "a_end_site_id",
+            "a_end_subnet_id",
+            "z_end_site_id",
+            "z_end_subnet_id",
+            "term_start_date",
+            "term_end_date",
+            "monthly_cost",
+        },
+        non_nullable={
+            "name",
+            "provider_id",
+            "transport_class",
+            "bandwidth_mbps_down",
+            "bandwidth_mbps_up",
+            "currency",
+            "status",
+            "notes",
+            "tags",
+            "custom_fields",
+        },
+    )
 
-    changes = body.model_dump(exclude_unset=True)
+    await _check_fks(db, body, row.customer_id)
+
     if "status" in changes and changes["status"] != row.status:
         _stamp_status_transition(row, changes["status"])
         # ``_stamp_status_transition`` already set row.status; remove

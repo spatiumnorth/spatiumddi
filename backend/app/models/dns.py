@@ -2,6 +2,7 @@
 
 import uuid
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import (
     BigInteger,
@@ -13,6 +14,7 @@ from sqlalchemy import (
     Index,
     Integer,
     LargeBinary,
+    Sequence,
     String,
     Table,
     Text,
@@ -21,9 +23,24 @@ from sqlalchemy import (
 )
 from sqlalchemy import text as sa_text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from app.models.base import Base, SoftDeleteMixin, TimestampMixin, UUIDPrimaryKeyMixin
+
+#: Stored default of ``DNSServerOptions.allow_recursion`` (#1817).
+#: Stored default for ``DNSServerOptions.allow_query_cache``. Not rendered
+#: into named.conf (#2264): only a value that differs from it is shipped.
+DEFAULT_ALLOW_QUERY_CACHE: tuple[str, ...] = ("localhost", "localnets")
+
+DEFAULT_ALLOW_RECURSION: tuple[str, ...] = (
+    "localhost",
+    "localnets",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "fc00::/7",
+    "fe80::/10",
+)
 
 
 class DNSServerZoneState(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -62,7 +79,49 @@ class DNSServerZoneState(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         ForeignKey("dns_zone.id", ondelete="CASCADE"),
         nullable=False,
     )
-    current_serial: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    current_serial: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    reported_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class DNSIngestSnapshot(Base):
+    """What one agent last reported for one dynamic zone's external records (#2654).
+
+    The ingest-back loop (#641) mirrors records an RFC 2136 writer injected
+    into a live daemon. In a group with several agent servers each one is an
+    independent primary and the writer usually talks to only one of them, so
+    "absent from this server's report" cannot mean "the writer withdrew it":
+    the other servers may simply not have it yet. The reconcile therefore
+    works on CHANGE (what appeared on or vanished from a server since its
+    previous report), and this row is that previous report: the external
+    ``(name, type, value)`` keys the server held, after the managed-name and
+    daemon-owned filters. See ``app.services.dns.ingest``.
+
+    One row per ``(server, zone)``, replaced on every report from an enabled
+    server (a paused one keeps its pre-pause row). Purged with the other
+    per-server zone state when a server or zone changes group. Never aged
+    out: however long a server was away, what it held when it left is the
+    right baseline for what changed on it since.
+    """
+
+    __tablename__ = "dns_ingest_snapshot"
+
+    server_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dns_server.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    zone_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dns_zone.id", ondelete="CASCADE"),
+        primary_key=True,
+        index=True,
+    )
+    # ``[[name_lower, TYPE, value], ...]``: the ingest ``_key`` of each record.
+    record_keys: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default=sa_text("'[]'::jsonb")
+    )
     reported_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -126,12 +185,12 @@ class DNSServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         String(50), nullable=False, default="hmac-sha256"
     )
 
-    # ── BIND9 catalog zones (RFC 9432) — distribute zones across the
-    # group via one catalog instead of per-server config push. BIND 9.18+
-    # only. The producer is the group's `is_primary=True` server; every
-    # other bind9 member joins as a consumer. ``catalog_zone_serial`` is
-    # bumped by the bundle builder whenever the membership list changes,
-    # so a NOTIFY fires automatically on add/remove.
+    # ── BIND9 catalog zones (RFC 9432) — the group's `is_primary=True`
+    # server publishes one catalog of the group's primary zones, for
+    # secondaries OUTSIDE the group. BIND 9.18+ only. Other members never
+    # consume it: each already gets every zone in its bundle, and consuming
+    # would load every zone twice (#3764). The agent stamps the catalog's
+    # serial each time the membership in its bundle changes.
     catalog_zones_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
@@ -148,6 +207,24 @@ class DNSServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # exposing internal IPs through a publicly-facing resolver. Off by
     # default; existing groups stay unaffected.
     is_public_facing: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+
+    # #1171 — the group's bundles carry each zone's own SOA timers. False while
+    # any BIND9 agent of the group writes the literal 3600 600 86400 300 (an
+    # older release): the bundles then carry that literal, so every agent
+    # serves one SOA under each serial. ``services.dns.soa_timers`` switches it
+    # and moves the serial of each zone whose timers differ, in one
+    # transaction.
+    serves_soa_timers: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
+
+    # #1932 — whether IPAM / DDNS auto-create a subnet's reverse zones in this
+    # group when it runs a cloud DNS driver (``CLOUD_DNS_DRIVERS``). Off by
+    # default: a cloud provider bills per hosted zone and a /17 makes 128 of
+    # them (#1840). Groups on any other driver ignore it.
+    auto_reverse_zones_at_provider: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
 
@@ -240,6 +317,35 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # crosses that boundary. NULL = not reported yet (agentless drivers never
     # report one) and must be treated as UNKNOWN, never as "old".
     daemon_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # #2078 — the python AGENT's own version (the image's stamped release, or
+    # ``dev`` for an unstamped build), reported on register and each heartbeat.
+    # Distinct from ``daemon_version`` above. NULL = never reported (an older
+    # agent, or an agentless driver): UNKNOWN, never a made-up value.
+    agent_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # #1171 — this server's agent writes each zone's own SOA timers into its
+    # SOA: it sent ``soa-timers`` in ``X-Spatium-Agent-Features`` on its last
+    # register or heartbeat. False for an agent of an older release, which
+    # writes 3600 600 86400 300 for every zone. A group serves the zones' own
+    # timers only while every BIND9 agent in it does
+    # (``services.dns.soa_timers``).
+    agent_renders_soa_timers: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    # #3940 — this server's agent reports a secondary / stub zone's SERVED
+    # serial (``served-serials`` in ``X-Spatium-Agent-Features``) and nothing
+    # for a zone named holds no copy of. An older agent reports the bundle's
+    # serial, 0, whatever named holds, so a serving-0 secondary is "not
+    # synced" only for an agent that says so (``zone_state_in_sync``).
+    agent_reports_served_serials: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    # #4040 — this server's agent reads blocklist entries packed as gzip +
+    # base64 runs of domains: it sent ``packed-blocklists`` in
+    # ``X-Spatium-Agent-Features`` on its last register or heartbeat. False for
+    # an agent of an older release, which is sent one JSON object per entry.
+    agent_renders_packed_blocklists: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
 
     # ── #882 last config-apply verdict ────────────────────────────────────
     #
@@ -275,6 +381,13 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # carries the field. Read by the server-list chip and the
     # ``agent_spool_trimmed`` alert.
     spool_status: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # #3551 — the agent container's own memory limit in bytes (its cgroup
+    # ``memory.max``), as last reported on the heartbeat. named and the agent
+    # share it, so it is what a group's RPZ and zone data must fit inside.
+    # NULL means UNKNOWN: an agent too old to report, an agentless driver, or
+    # a container with no limit at all. Only overwritten when a heartbeat
+    # carries the field. Read by ``services/dns/memory_estimate``.
+    memory_limit_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     # ── #1067 daemon state ──
     #
@@ -314,6 +427,36 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         index=True,
     )
     last_config_etag: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    # ── #2044 which agent PROCESS owns this server identity ──
+    #
+    # A DNS agent names its process on every config poll
+    # (``X-Spatium-Agent-Instance``, #2042). Only the owner is served record
+    # ops; ``services.dns.agent_instance.claim_poll`` decides who that is. A new
+    # instance takes over at once (an agent was replaced) and the one it
+    # replaced goes into ``agent_instances_displaced``; a displaced instance
+    # that polls again while the owner is live is a SECOND live agent on one
+    # identity (a cloned VM, two containers on one state dir) and is refused
+    # with 409, so the two do not pass record ops back and forth until the
+    # ops' retries run out. NULL = no agent that sends an instance id has
+    # polled yet.
+    agent_instance: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    agent_instance_seen_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    agent_instances_displaced: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    # The current duplicate episode: the first and latest refused poll and
+    # where the latest came from. Read through
+    # ``agent_instance.duplicate_active`` by the server row and the
+    # ``dns_agent_duplicate_instance`` alert.
+    duplicate_agent_first_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    duplicate_agent_last_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    duplicate_agent_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
+
     pending_approval: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_primary: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
@@ -427,6 +570,28 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # that finishes still behind. NULL while current. The stalled-render
     # alert measures from here.
     bundle_dirty_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # #2281 — bumped when the server is re-enabled. A disabled server gets no
+    # record ops and no renders while its agent keeps serving the old config,
+    # and in a group without views records are left out of the structural
+    # etag, so the next bundle would carry the current records and the agent
+    # would never re-render them. Folded into the structural fingerprint
+    # (``agent_config``) when non-zero, so a bump forces one full re-render
+    # of every zone on that server. Zero adds nothing, so a server that was
+    # never re-enabled keeps the structural etag it had.
+    zone_resync_seq: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=sa_text("0")
+    )
+    # #2654 — set instead of bumping ``zone_resync_seq`` when a server that
+    # reads dynamic zones back (BIND9 / PowerDNS agent ingest) is re-enabled:
+    # the re-render would replace each zone with the database's copy and drop
+    # whatever an RFC 2136 writer added on it while it was disabled, before
+    # its next ingest report could mirror it. The bump happens once that
+    # server has reported every dynamic zone of its group since this time
+    # (``server_resync.complete_deferred_resync``), or after
+    # ``RESYNC_INGEST_WAIT`` regardless. Never rendered. NULL = nothing owed.
+    zone_resync_pending_since: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # Fernet-encrypted JSON blob for driver-specific admin credentials.
     # windows_dns Path B stores a dict:
@@ -442,6 +607,14 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __table_args__ = (UniqueConstraint("group_id", "name", name="uq_dns_server_group_name"),)
 
 
+# #1489 — the order ops were queued in. ``created_at`` is the transaction
+# START, so every op one transaction queues ties on it, and ``id`` is a random
+# UUID: a delete + create of one record could reach each server in either
+# order. Rows queued before the column existed keep NULL (no table rewrite on
+# upgrade) and the old ``id`` tie-break.
+DNS_RECORD_OP_SEQ = Sequence("dns_record_op_seq_seq", metadata=Base.metadata)
+
+
 class DNSRecordOp(UUIDPrimaryKeyMixin, Base):
     """Per-record mutation queued for an agent to apply via RFC 2136."""
 
@@ -449,7 +622,20 @@ class DNSRecordOp(UUIDPrimaryKeyMixin, Base):
     # #1232 — the successor lookup (``record_ops._successors``) and the page
     # query both read a server's ops from a point in time onward; the table
     # is never pruned, so without this they scan every op the server ever had.
-    __table_args__ = (Index("ix_dns_record_op_server_created", "server_id", "created_at"),)
+    #
+    # #2289 — every op page looks up the ops still backing off for its RRsets
+    # (``agent_config._backed_off_candidates``); without this it read every
+    # queued op the server had, so its cost grew with the whole backlog.
+    # Partial: only the ops actually waiting out a backoff.
+    __table_args__ = (
+        Index("ix_dns_record_op_server_created", "server_id", "created_at"),
+        Index(
+            "ix_dns_record_op_server_backoff",
+            "server_id",
+            "next_attempt_at",
+            postgresql_where=sa_text("state = 'pending' AND next_attempt_at IS NOT NULL"),
+        ),
+    )
 
     server_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -458,9 +644,21 @@ class DNSRecordOp(UUIDPrimaryKeyMixin, Base):
         index=True,
     )
     zone_name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    # The zone the op was queued for. ``zone_name`` alone is ambiguous where
+    # two views of one group serve the same name, so the pending-ops list
+    # narrowed to a token's zones keys on this. The queued-op sweeps stay
+    # name-scoped on purpose (see ``record_ops.queued_zone_ops_where``). NULL
+    # on ops queued before the column existed, and after the zone row itself
+    # is purged.
+    zone_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dns_zone.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     op: Mapped[str] = mapped_column(String(20), nullable=False)  # create | update | delete
     record: Mapped[dict] = mapped_column(JSONB, nullable=False)
-    target_serial: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    target_serial: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     state: Mapped[str] = mapped_column(String(20), nullable=False, default="pending", index=True)
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -491,6 +689,32 @@ class DNSRecordOp(UUIDPrimaryKeyMixin, Base):
         BigInteger,
         nullable=True,
         server_default=sa_text("(pg_current_xact_id()::text)::bigint"),
+    )
+    # #1489 — queue order; see ``DNS_RECORD_OP_SEQ``. Ops ship and supersede in
+    # ``(created_at, seq)`` order, so one transaction's ops keep the order they
+    # were queued in while ops of different transactions compare exactly as
+    # before.
+    seq: Mapped[int | None] = mapped_column(
+        BigInteger,
+        DNS_RECORD_OP_SEQ,
+        server_default=DNS_RECORD_OP_SEQ.next_value(),
+        nullable=True,
+    )
+    # #2042 — the agent PROCESS the op was last shipped to: the instance id the
+    # agent sends on every config poll (``X-Spatium-Agent-Instance``). A
+    # long-poll the API still holds for an agent that has since been replaced
+    # can page an op into a connection nobody reads; the replacement's polls
+    # carry a different id, which is how the op is recognised as undelivered
+    # and returned to ``pending`` at once instead of after the 5-minute
+    # unacknowledged reset. NULL = shipped to an agent too old to say, or
+    # never shipped; NULL is never treated as "another instance".
+    dispatched_to: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # #2042 — when the long-poll that shipped the op STARTED. Ranks two polls
+    # the API holds at once for one server: only a poll that started after the
+    # one that shipped an op may take it back, so a replaced agent's leftover
+    # poll (the older one) never takes an op from its replacement's poll.
+    dispatched_poll_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
 
@@ -564,6 +788,12 @@ class DNSAgentBundle(UUIDPrimaryKeyMixin, Base):
     # ``RENDERER_REVISION`` of the code that rendered it (#1185); NULL on
     # bundles rendered before the column existed, which read as stale.
     renderer_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # #4040 — the blocklist entries are packed runs (the server's agent read
+    # them at render time). The long-poll serves a bundle only in the shape
+    # THIS request's agent can read.
+    packed_blocklists: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     built_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -589,16 +819,23 @@ class DNSServerOptions(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     # Recursion
     recursion_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    allow_recursion: Mapped[list] = mapped_column(JSONB, nullable=False, default=lambda: ["any"])
+    # #1817: local + private networks, not ``any`` — a group nobody
+    # configured is not an open resolver. Rendered literally by every driver.
+    allow_recursion: Mapped[list] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=lambda: list(DEFAULT_ALLOW_RECURSION),
+    )
 
     # DNSSEC — auto | yes | no
     dnssec_validation: Mapped[str] = mapped_column(String(10), nullable=False, default="auto")
 
-    # GSS-TSIG (Kerberos)
-    gss_tsig_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    gss_tsig_keytab_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
-    gss_tsig_realm: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    gss_tsig_principal: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # The four ``gss_tsig_*`` columns (#3561) are no longer mapped: they were
+    # stored and never rendered. They stay in the database for one release so
+    # a rolling upgrade's old api pods, which still map them, keep serving
+    # (expand/contract, docs/DEVELOPMENT.md); ``gss_tsig_enabled`` carries a
+    # ``false`` server default, so inserts from this model still satisfy its
+    # NOT NULL. The contract migration that drops them comes in the next release.
 
     # Notify — yes | no | explicit | master-only | primary-only
     notify_enabled: Mapped[str] = mapped_column(String(20), nullable=False, default="yes")
@@ -608,7 +845,7 @@ class DNSServerOptions(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # Query / Transfer ACLs
     allow_query: Mapped[list] = mapped_column(JSONB, nullable=False, default=lambda: ["any"])
     allow_query_cache: Mapped[list] = mapped_column(
-        JSONB, nullable=False, default=lambda: ["localhost", "localnets"]
+        JSONB, nullable=False, default=lambda: list(DEFAULT_ALLOW_QUERY_CACHE)
     )
     allow_transfer: Mapped[list] = mapped_column(JSONB, nullable=False, default=lambda: ["none"])
     blackhole: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
@@ -871,12 +1108,70 @@ class DNSView(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
 
+# The SOA timers a zone gets when none are given: REFRESH, RETRY, EXPIRE and
+# MINIMUM (the negative-cache TTL). They are what the BIND9 agent served for
+# every zone before it rendered the stored ones (#1171), so a new zone serves
+# what every zone always has. The old defaults (86400 / 7200 / 3600000 / 3600)
+# were stored but never served, and a one-hour negative TTL is long for a DDI:
+# a name looked up before its DDNS record exists stays NXDOMAIN for the hour.
+ZONE_DEFAULT_REFRESH = 3600
+ZONE_DEFAULT_RETRY = 600
+ZONE_DEFAULT_EXPIRE = 86400
+ZONE_DEFAULT_MINIMUM = 300
+
+# The largest TTL a zone ($TTL), a record or an SOA timer may carry: RFC 2181
+# section 8 bounds a TTL at 2^31 - 1, and it is also what the int4 columns hold.
+# A negative one is never servable: BIND refuses the whole zone file over it
+# (#2073). Every API that stores an operator's TTL bounds it 0..DNS_TTL_MAX.
+DNS_TTL_MAX = 2**31 - 1
+# A zone's default TTL ($TTL) when none is given at create.
+ZONE_DEFAULT_TTL = 3600
+
+
+def _initial_zone_serial(context: Any) -> int:
+    """A new zone's first ``last_serial`` (#2835).
+
+    A primary zone starts at today's ``YYYYMMDD00``, like every later serial.
+    At 0 the agents served it at their placeholder 1 (``serial or 1``) until
+    its first change. A secondary / stub / forward zone's serial is not ours
+    to number and stays 0 (``zone_state_in_sync``). Imported here, not at the
+    top, so the models stay importable without the service layer.
+    """
+    zone_type = context.get_current_parameters().get("zone_type") or "primary"
+    if zone_type != "primary":
+        return 0
+    from app.services.dns.serial import compute_next_serial
+
+    return compute_next_serial(0)
+
+
+def servable_ttl(ttl: int | None) -> int | None:
+    """``ttl`` when a server can serve it, else ``None``.
+
+    The API bounds every TTL it stores (#2073), but rows written before the
+    bound can hold a negative one. Shipping it makes BIND refuse the whole
+    zone file, so the senders map it to ``None``: a record then inherits the
+    zone's ``$TTL``, and a zone falls back to ``ZONE_DEFAULT_TTL``.
+    """
+    if ttl is None or ttl < 0 or ttl > DNS_TTL_MAX:
+        return None
+    return ttl
+
+
 class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     """DNS zone — authoritative, secondary, stub, or forward."""
 
     __tablename__ = "dns_zone"
     __table_args__ = (
-        UniqueConstraint("group_id", "view_id", "name", name="uq_dns_zone_group_view_name"),
+        # Partial: a trashed zone must not hold its name in a view (#3824).
+        Index(
+            "uq_dns_zone_group_view_name",
+            "group_id",
+            "view_id",
+            "name",
+            unique=True,
+            postgresql_where=sa_text("deleted_at IS NULL"),
+        ),
         Index("ix_dns_zone_name", "name"),
     )
 
@@ -894,17 +1189,30 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     )
     # name: FQDN with trailing dot, e.g. "example.com."
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    @validates("name")
+    def _check_name(self, _key: str, value: str) -> str:
+        # Every path that creates a zone (REST, Copilot, importers,
+        # reconcilers) lands here, so a name the DNS server cannot take
+        # as a config statement / file name is refused at the row.
+        from app.core.dns_names import zone_name_storage_error  # noqa: PLC0415
+
+        err = zone_name_storage_error(value)
+        if err is not None:
+            raise ValueError(err)
+        return value
+
     # zone_type values: primary | secondary | stub | forward
     zone_type: Mapped[str] = mapped_column(String(20), nullable=False, default="primary")
     # kind: forward | reverse
     kind: Mapped[str] = mapped_column(String(10), nullable=False, default="forward")
 
     # SOA fields
-    ttl: Mapped[int] = mapped_column(Integer, nullable=False, default=3600)
-    refresh: Mapped[int] = mapped_column(Integer, nullable=False, default=86400)
-    retry: Mapped[int] = mapped_column(Integer, nullable=False, default=7200)
-    expire: Mapped[int] = mapped_column(Integer, nullable=False, default=3600000)
-    minimum: Mapped[int] = mapped_column(Integer, nullable=False, default=3600)
+    ttl: Mapped[int] = mapped_column(Integer, nullable=False, default=ZONE_DEFAULT_TTL)
+    refresh: Mapped[int] = mapped_column(Integer, nullable=False, default=ZONE_DEFAULT_REFRESH)
+    retry: Mapped[int] = mapped_column(Integer, nullable=False, default=ZONE_DEFAULT_RETRY)
+    expire: Mapped[int] = mapped_column(Integer, nullable=False, default=ZONE_DEFAULT_EXPIRE)
+    minimum: Mapped[int] = mapped_column(Integer, nullable=False, default=ZONE_DEFAULT_MINIMUM)
     primary_ns: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     admin_email: Mapped[str] = mapped_column(String(255), nullable=False, default="")
 
@@ -978,8 +1286,20 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         ForeignKey("dnssec_policy.id", ondelete="SET NULL"),
         nullable=True,
     )
-    last_serial: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # #2835 — a primary zone is numbered from the moment it exists.
+    last_serial: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=_initial_zone_serial
+    )
     last_pushed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # #1932 — set when SpatiumDDI auto-created this zone (a subnet's reverse
+    # zone) in a group with agentless servers and has not yet confirmed the
+    # zone at the provider; the value is when the agentless retry sweep may
+    # next try. NULL means nothing is outstanding. It is what lets a record op
+    # create its zone first without ever re-creating a zone that already
+    # reached the provider once (an operator may have deleted it there).
+    agentless_create_due_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # Zone-level ACL overrides (inherit from server options if null)
     allow_query: Mapped[list | None] = mapped_column(JSONB, nullable=True)
@@ -1010,6 +1330,18 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     forward_only: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default=sa_text("true")
     )
+    # A forward zone's OWN upstream transport (#2121): ``do53`` | ``tls``, plus
+    # ``https`` | ``quic`` on a Technitium group. It does NOT inherit the
+    # group's ``DNSServerOptions.forward_transport`` — that one applies to the
+    # group's resolver forwarders only. A conditional forwarder usually points
+    # at something internal that speaks plain DNS (Tailscale MagicDNS, an AD
+    # DC), and inheriting the group's DoT sent it TLS it never answers.
+    # ``forward_tls_hostname`` is the name the upstream's certificate is
+    # checked against; required for every encrypted transport.
+    forward_transport: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="do53", server_default=sa_text("'do53'")
+    )
+    forward_tls_hostname: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     # Primary (master) server IPs this zone transfers FROM (issue #336).
     # Required + non-empty for ``zone_type`` in {secondary, stub}: a
@@ -1067,6 +1399,8 @@ class DNSRecord(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     __tablename__ = "dns_record"
     __table_args__ = (
         Index("ix_dns_record_zone_name", "zone_id", "name"),
+        # The DDNS name-holder check (#3807) matches ``lower(name)``.
+        Index("ix_dns_record_zone_lower_name", "zone_id", sa_text("lower(name)")),
         Index("ix_dns_record_fqdn", "fqdn"),
     )
 
@@ -1094,6 +1428,14 @@ class DNSRecord(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     weight: Mapped[int | None] = mapped_column(Integer, nullable=True)
     port: Mapped[int | None] = mapped_column(Integer, nullable=True)
     auto_generated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # #2084 — True for a user-added alias (CNAME or secondary A/AAAA) of an IP
+    # address, written by IPAM's alias paths; False for the address's own host
+    # record(s) (one per forward zone it publishes into) and its PTR. Stored
+    # rather than inferred from name / zone / ``IPAddress.dns_record_id``,
+    # which cannot tell the two apart once a host record sits in an extra zone.
+    ip_alias: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     # TLS certificate monitoring (#118) — per-record opt-in for cert
     # probing (the parent zone's auto_tls_probe opts in the whole zone).
     auto_tls_probe: Mapped[bool] = mapped_column(
@@ -1359,9 +1701,10 @@ class DNSPoolMember(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         JSONB, nullable=False, default=list, server_default="[]"
     )
     # Optional Site whose linked subnets contribute client CIDRs to this
-    # member's serving scope. ON DELETE SET NULL — deleting a Site just
-    # drops the association; the member reverts to whatever ``serving_cidrs``
-    # remain (default target if none).
+    # member's serving scope. ON DELETE SET NULL is a backstop only: the site
+    # delete endpoints return 409 while a member references the site (#2292),
+    # because the nulled member would revert to a default served to everyone.
+    # A member whose site has no subnets left serves nobody (fail closed).
     site_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("site.id", ondelete="SET NULL"),
@@ -1381,6 +1724,9 @@ class DNSPoolMember(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
 
 # ── Blocking Lists / RPZ ────────────────────────────────────────────────────
+
+#: Values of ``DNSBlockList.feed_wildcard_mode`` (#4190).
+FEED_WILDCARD_MODES = ("by_syntax", "always", "never")
 
 # Association tables: a blocklist can be applied to many server groups and/or
 # many views. A view or group can reference many blocklists.
@@ -1442,39 +1788,80 @@ class DNSBlockList(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     feed_format: Mapped[str] = mapped_column(String(20), nullable=False, default="hosts")
     # 0 = manual refresh only
     update_interval_hours: Mapped[int] = mapped_column(Integer, nullable=False, default=24)
-    # block_mode: nxdomain | sinkhole | refused
+    # block_mode: nxdomain | sinkhole. ``refused`` was retired in #2124 —
+    # BIND's RPZ has no REFUSED action — and stored rows were rewritten to
+    # ``nxdomain``, which is what the agent always served for them.
     block_mode: Mapped[str] = mapped_column(String(20), nullable=False, default="nxdomain")
+    # What a ``sinkhole`` list answers with. NULL = the unspecified
+    # addresses (0.0.0.0 and ::); a v4 address replaces 0.0.0.0, a v6 one
+    # replaces :: (#2124).
     sinkhole_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
     # Whether a feed-sourced entry blocks the named domain's SUBDOMAINS too
-    # (#894). Default on, because that is what every one of these feeds
-    # means — a list naming ``tracker.example`` intends
-    # ``cdn.tracker.example`` as well, and the manual add-entry form has
-    # always defaulted the same way. Off suits a host-specific feed (a
-    # threat-intel drop of individual C2 FQDNs), where blocking the parent
-    # domain would be over-blocking.
+    # (#894, tri-state since #4190):
+    #
+    # * ``by_syntax`` (default) — each entry follows what its own source
+    #   line says. An adblock ``||name^`` is "name and every subdomain"
+    #   (wildcard); a hosts line (``0.0.0.0 name``) or a bare domain names
+    #   exactly that host (exact trigger only), as AdGuard Home and every
+    #   hosts-file resolver read them. A ``*.name`` line of a domains feed is
+    #   wildcard. Halves the RPZ for a hosts-format list.
+    # * ``always`` — every feed entry blocks subdomains too, whatever the
+    #   syntax (the pre-#4190 behaviour). For a plain-domain feed whose
+    #   publisher means "this domain and everything under it" (HaGeZi's
+    #   ``wildcard/`` lists).
+    # * ``never`` — apex only; suits a host-specific feed (a threat-intel
+    #   drop of individual C2 FQDNs) where blocking the parent is over-blocking.
     #
     # Only feed entries consult it; a manual entry's ``is_wildcard`` is the
     # operator's own per-row choice and is never rewritten by this flag.
-    feed_entries_are_wildcard: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=True, server_default=sa_text("true")
+    feed_wildcard_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="by_syntax", server_default="by_syntax"
     )
 
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
+    # DEPRECATED (#4190), removed in a later release: the pre-tri-state
+    # boolean, kept so an api pod still on the old release works during a
+    # rolling upgrade (expand/contract, #296). Derived from
+    # ``feed_wildcard_mode`` on every write (false only for ``never``); the
+    # API still returns it for old clients.
+    feed_entries_are_wildcard: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=sa_text("true")
+    )
+
+    @validates("feed_wildcard_mode")
+    def _sync_legacy_wildcard(self, _key: str, value: str) -> str:
+        self.feed_entries_are_wildcard = value != "never"
+        return value
+
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_sync_status: Mapped[str | None] = mapped_column(String(50), nullable=True)
     last_sync_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Moves on a SUCCESSFUL refresh only (#2313). ``last_synced_at`` is stamped
+    # on failure too, so it cannot say how long a feed has been failing.
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     entry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Rules the last adblock-format refresh could not enforce, by category
+    # (#2123): ``{"regex", "modifier", "badfilter", "malformed"}`` → count, where
+    # ``malformed`` is the total of the reason buckets (#3519: ``star_in_name``,
+    # ``no_anchor``, ``trailing_dot``, ``start_anchor``, ``bare_star``,
+    # ``dotless``, ``other``); rows written before #3519 carry only the total.
+    # NULL = no adblock refresh yet, or a format with no rule syntax to lose.
+    feed_parse_skipped: Mapped[dict[str, int] | None] = mapped_column(JSONB, nullable=True)
 
     entries: Mapped[list["DNSBlockListEntry"]] = relationship(
         "DNSBlockListEntry",
         back_populates="blocklist",
         cascade="all, delete-orphan",
+        # The FK is ON DELETE CASCADE; never load a (catalog-sized) child
+        # collection into the session just to delete it (#1724).
+        passive_deletes=True,
     )
     exceptions: Mapped[list["DNSBlockListException"]] = relationship(
         "DNSBlockListException",
         back_populates="blocklist",
         cascade="all, delete-orphan",
+        passive_deletes=True,
     )
 
     server_groups: Mapped[list["DNSServerGroup"]] = relationship(
@@ -1541,6 +1928,12 @@ class DNSBlockListException(UUIDPrimaryKeyMixin, Base):
     )
     domain: Mapped[str] = mapped_column(String(512), nullable=False)
     reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # source: manual | feed. ``feed`` rows are an adblock feed's own ``@@``
+    # rules (#2123), added and removed by the refresh; a manual row is
+    # never touched by it.
+    source: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="manual", server_default="manual"
+    )
     created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
     )
@@ -1573,6 +1966,36 @@ DNSSEC_ALGORITHMS: frozenset[str] = frozenset(
         "rsasha512",
     }
 )
+
+# IANA "DNS Security Algorithm Numbers" registry → mnemonic, for every key
+# algorithm a DNSKEY can carry (deprecated ones included: an old zone can still
+# report them). ``DNSKey.algorithm`` stores the number (#1812); the mnemonic
+# is derived for display, never stored. Reserved / unassigned → None.
+DNSSEC_ALGORITHM_NAMES: dict[int, str] = {
+    1: "RSAMD5",
+    3: "DSA",
+    5: "RSASHA1",
+    6: "DSA-NSEC3-SHA1",
+    7: "RSASHA1-NSEC3-SHA1",
+    8: "RSASHA256",
+    10: "RSASHA512",
+    12: "ECC-GOST",
+    13: "ECDSAP256SHA256",
+    14: "ECDSAP384SHA384",
+    15: "ED25519",
+    16: "ED448",
+    17: "SM2SM3",
+    18: "MLDSA44",
+    23: "ECC-GOST12",
+    253: "PRIVATEDNS",
+    254: "PRIVATEOID",
+}
+
+
+def dnssec_algorithm_name(algorithm: int | None) -> str | None:
+    """IANA mnemonic for a DNSSEC algorithm number, or None when unknown."""
+    return None if algorithm is None else DNSSEC_ALGORITHM_NAMES.get(algorithm)
+
 
 # Per-key lifecycle states BIND reports via ``rndc dnssec -status`` (the
 # RFC 7583 key-timing "states"). Stored verbatim on DNSKey.state.
@@ -1650,7 +2073,7 @@ class DNSKey(UUIDPrimaryKeyMixin, Base):
     """Public DNSSEC key state for one zone, reported by the agent.
 
     Populated from ``rndc dnssec -status <zone>`` (per-key states + timing)
-    plus ``dnssec-dsfromkey`` for the KSK DS rrset. **No private key
+    plus a DS computed in-process from the KSK key files (#1854). **No private key
     material** — BIND holds and rotates the private keys; these rows are a
     read-only mirror for the operator's "is it signed / what do I give the
     registrar / where is the rollover" view. Replaced wholesale per zone on

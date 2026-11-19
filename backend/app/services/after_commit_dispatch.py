@@ -125,7 +125,35 @@ def wait_for_pending(timeout: float = 5.0) -> bool:
     return not _futures
 
 
+async def shutdown(timeout: float = 5.0) -> None:
+    """Let in-flight dispatches finish (up to ``timeout``), then close the
+    shared dispatch engine (#2782). Awaited from the api lifespan on its own
+    loop; the Celery background loop is handled by ``shutdown_background``."""
+    pending = [t for t in _tasks if not t.done()]
+    if pending:
+        await asyncio.wait(pending, timeout=timeout)
+    from app.services import dispatch_db  # noqa: PLC0415
+
+    await dispatch_db.dispose()
+
+
+def shutdown_background(timeout: float = 5.0) -> None:
+    """Celery ``worker_shutdown`` (beat has no shutdown signal; it exits with the process): drain, then dispose the
+    engine on the background loop that owns it, and stop that loop."""
+    wait_for_pending(timeout)
+    loop = _state.loop
+    if loop is None or _state.pid != os.getpid() or not loop.is_running():
+        return
+    try:
+        asyncio.run_coroutine_threadsafe(shutdown(0), loop).result(timeout=timeout)
+    except Exception:  # noqa: BLE001 — exiting anyway; the server reaps the sockets
+        logger.debug("after_commit_dispatch_shutdown_failed")
+    loop.call_soon_threadsafe(loop.stop)
+
+
 __all__ = [
+    "shutdown",
+    "shutdown_background",
     "dispatch",
     "use_background_loop",
     "using_background_loop",

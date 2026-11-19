@@ -28,9 +28,12 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+import structlog
 from sqlalchemy import select
+from sqlalchemy.exc import StatementError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.dns_names import validate_optional_hostname
 from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.dhcp import (
@@ -41,15 +44,30 @@ from app.models.dhcp import (
     DHCPStaticAssignment,
 )
 from app.models.ipam import IPBlock, IPSpace, Subnet
+from app.services.dhcp.class_refs import reserved_name_reason
+from app.services.dhcp.option_spelling import group_raw_codes
+from app.services.dhcp.option_validation import (
+    canonical_domain_options,
+    raw_code_keys,
+    rekey_raw_options,
+    validate_options,
+)
 from app.services.dhcp.static_ipam import remove_ipam_for_scope_statics
+from app.services.import_savepoint import entity_savepoint
+from app.services.ipam.resize import _total_ips
+from app.services.ipam.utilization import recount_subnets_and_blocks
 
 from .canonical import (
     ConflictAction,
+    ImportedClientClass,
     ImportedScope,
     ImportPreview,
     ImportSource,
     ScopeConflict,
+    pool_problem,
 )
+
+logger = structlog.get_logger(__name__)
 
 
 @dataclass
@@ -105,8 +123,189 @@ class CommitResult:
         return sum(s.reservations_created for s in self.scopes)
 
 
+def drop_unservable_hostnames(scopes: list[ImportedScope]) -> list[str]:
+    """Blank every reservation hostname the static form would refuse (#2919).
+
+    A reservation's hostname is mirrored into IPAM and published as a DNS
+    owner by its next save, so an imported name must meet the same rule the
+    static form holds (``validate_optional_hostname``: letters, digits and
+    hyphens). A name that does not is imported with no hostname, and each is
+    named in the returned warnings. Runs on the preview and again on the
+    commit, which takes the plan the client sends back, not the parser's.
+    """
+    warnings: list[str] = []
+    for scope in scopes:
+        for r in scope.reservations:
+            if not r.hostname:
+                continue
+            try:
+                cleaned = validate_optional_hostname(r.hostname) or ""
+            except ValueError as exc:
+                # The warning carries the source name whole (the validator's
+                # message names only the offending label), so it is not lost.
+                warnings.append(
+                    f"{scope.subnet_cidr}: reservation {r.ip_address} ({r.mac_address}) "
+                    f"imported with no hostname (source hostname {r.hostname!r}): {exc}"
+                )
+                r.hostname = ""
+            else:
+                r.hostname = cleaned
+    return warnings
+
+
+def drop_invalid_pools(scopes: list[ImportedScope]) -> list[str]:
+    """Remove every pool that is not a range of its scope's subnet (#3037).
+
+    The parsers already drop these with a parse warning; this runs again on
+    the commit, which takes the plan the client sends back rather than the
+    parser's, and on a source whose parser does not check (Windows). The
+    scope is still imported, as with every other per-item drop here, and
+    each dropped pool is named in the returned warnings.
+    """
+    warnings: list[str] = []
+    for scope in scopes:
+        kept = []
+        for pool in scope.pools:
+            problem = pool_problem(pool.start_ip, pool.end_ip, scope.subnet_cidr)
+            if problem is None:
+                kept.append(pool)
+            else:
+                warnings.append(
+                    f"{scope.subnet_cidr}: pool {pool.start_ip!r} - {pool.end_ip!r} "
+                    f"not imported: {problem}"
+                )
+        scope.pools = kept
+    return warnings
+
+
+def _drop_refused_options(options: dict[str, Any], *, address_family: str, owner: str) -> list[str]:
+    """Remove each option ``validate_options`` refuses from ``options``.
+
+    Raw-code keys (``code:NN`` / ``opt-NN``) are left to ``rekey_raw_options``,
+    which re-spells them for the target group at commit. Returns one warning
+    per removed option, naming it and the reason.
+    """
+    warnings: list[str] = []
+    raw = set(raw_code_keys(options))
+    for key in list(options):
+        if str(key) in raw:
+            continue
+        try:
+            validate_options({key: options[key]}, address_family=address_family)
+        except ValueError as exc:
+            warnings.append(f"{owner}: option {str(key)!r} not imported: {exc}")
+            del options[key]
+    return warnings
+
+
+def drop_invalid_options(
+    scopes: list[ImportedScope], client_classes: list[ImportedClientClass]
+) -> list[str]:
+    """Remove every option the scope / static / client-class API would refuse.
+
+    The importers kept an ``option-data`` / ``option`` name as the source wrote
+    it, so an option the save-time check (``validate_options``) refuses — a
+    name the platform does not map (``dhcp-renewal-time``), or a value Kea
+    cannot load (``routers`` ``10.250.4.999``) — was stored and reached the
+    rendered Kea config, whose load then fails for the whole server group
+    (#3730). Same contract as the other ``drop_*`` checks: runs on the preview
+    and again on the commit, the scope / reservation / class is still
+    imported, and each dropped option is named in the returned warnings.
+    """
+    warnings: list[str] = []
+    for scope in scopes:
+        warnings.extend(
+            _drop_refused_options(
+                scope.options, address_family=scope.address_family, owner=scope.subnet_cidr
+            )
+        )
+        for r in scope.reservations:
+            warnings.extend(
+                _drop_refused_options(
+                    r.options,
+                    address_family=scope.address_family,
+                    owner=f"{scope.subnet_cidr}: reservation {r.ip_address}",
+                )
+            )
+    for cc in client_classes:
+        if not cc.supported:
+            continue
+        warnings.extend(
+            _drop_refused_options(
+                cc.options,
+                address_family=cc.address_family or "ipv4",
+                owner=f"client class {cc.name!r}",
+            )
+        )
+    return warnings
+
+
+def reservation_problem(ip: str, subnet_cidr: str) -> str | None:
+    """Why ``ip`` cannot be a reservation of ``subnet_cidr``, or None (#3335).
+
+    The static form's rule (``static_conflicts``: the address must sit inside
+    the subnet its scope serves) plus the two things the form's typed field
+    already guarantees: it is an address, of the subnet's family. Kea rejects
+    its whole config at load for one out-of-range host, so none is stored.
+    """
+    try:
+        net = ipaddress.ip_network(subnet_cidr, strict=False)
+    except ValueError:
+        return f"its scope's subnet {subnet_cidr!r} is not a valid CIDR"
+    try:
+        addr = ipaddress.ip_address(str(ip).strip())
+    except ValueError:
+        return "not an IP address"
+    if addr.version != net.version:
+        return "address family does not match the subnet"
+    if addr not in net:
+        return f"outside {net}"
+    return None
+
+
+def drop_invalid_reservations(scopes: list[ImportedScope]) -> list[str]:
+    """Remove every reservation whose address is not in its scope's subnet (#3335).
+
+    Same contract as ``drop_invalid_pools``: runs on the preview and again on
+    the commit (which takes the plan the client sends back), the scope is
+    still imported, and each dropped reservation is named in the warnings.
+    A kept address is rewritten in its canonical spelling, so the commit's
+    same-IP de-duplication sees ``fd00::0:1`` and ``fd00::1`` as one address.
+    Only the subnet is tested: an address inside a pool, or outside the
+    pools but inside the subnet, is a valid reservation on every driver.
+    """
+    warnings: list[str] = []
+    for scope in scopes:
+        kept = []
+        for r in scope.reservations:
+            problem = reservation_problem(r.ip_address, scope.subnet_cidr)
+            if problem is None:
+                r.ip_address = str(ipaddress.ip_address(str(r.ip_address).strip()))
+                kept.append(r)
+            else:
+                warnings.append(
+                    f"{scope.subnet_cidr}: reservation {r.ip_address!r} ({r.mac_address}) "
+                    f"not imported: {problem}"
+                )
+        scope.reservations = kept
+    return warnings
+
+
 def _canonical_cidr(raw: str) -> str:
     return str(ipaddress.ip_network(raw, strict=False))
+
+
+def _scope_error(exc: Exception) -> str:
+    """Operator-facing reason a scope failed. A statement error's own text
+    (a driver error, or a bind value SQLAlchemy could not process) carries
+    the SQL statement and bound values, so it never goes out."""
+    if isinstance(exc, StatementError):
+        logger.warning("dhcp_import_scope_db_error", error=str(exc.orig))
+        return (
+            "the database refused this scope's data (a value is not valid for its "
+            "column); check the scope's pools, reservations and options"
+        )
+    return str(exc)
 
 
 async def _find_subnet(db: AsyncSession, cidr: str, space_id: uuid.UUID | None) -> Subnet | None:
@@ -258,7 +457,7 @@ async def _create_subnet(
         network=cidr,
         name="",
         kind="multicast" if is_multicast else "unicast",
-        total_ips=net.num_addresses,
+        total_ips=_total_ips(net),
         utilization_percent=0.0,
         allocated_ips=0,
     )
@@ -286,7 +485,7 @@ def _scope_kwargs(
         lease_time=parsed.lease_time,
         min_lease_time=parsed.min_lease_time,
         max_lease_time=parsed.max_lease_time,
-        options=dict(parsed.options or {}),
+        options=canonical_domain_options(parsed.options),
         ddns_enabled=parsed.ddns_enabled,
         ddns_hostname_policy=parsed.ddns_hostname_policy or "client",
         import_source=source,
@@ -305,6 +504,7 @@ async def _commit_one_scope(
     action: ConflictAction,
     current_user: User,
     now: datetime,
+    touched_subnets: set[uuid.UUID],
 ) -> CommitScopeResult:
     """Apply one parsed scope: resolve its IPAM subnet, honour the
     operator's skip/overwrite choice on an existing scope, then create
@@ -351,7 +551,7 @@ async def _commit_one_scope(
         # ``status="static_dhcp"`` pointing at rows Postgres has dropped (#618).
         # Delete the mirror rows (not just free them) so the IPs fold back into
         # free gaps in the subnet view.
-        await remove_ipam_for_scope_statics(db, existing.id)
+        await remove_ipam_for_scope_statics(db, existing.id, touched_subnets=touched_subnets)
         await db.delete(existing)
         await db.flush()
         overwrote = True
@@ -398,7 +598,7 @@ async def _commit_one_scope(
                 mac_address=r.mac_address,
                 hostname=r.hostname or "",
                 client_id=r.client_id,
-                options_override=dict(r.options) if r.options else None,
+                options_override=canonical_domain_options(r.options) if r.options else None,
                 import_source=source,
                 imported_at=now,
             )
@@ -447,57 +647,70 @@ async def _commit_client_classes(
     source: ImportSource,
     now: datetime,
     current_user: User,
+    warnings: list[str],
 ) -> int:
     """Create the supported client classes group-wide, skipping any that
     already exist by name and any flagged unsupported (manual review).
-    Each class commits in its own savepoint."""
+    Each class commits in its own savepoint.
+
+    A class whose name is reserved (``reserved_name_reason``: Kea built-ins
+    such as ``DROP``, Kea's own prefixes, and names SpatiumDDI generates) is
+    never created, and the skip is reported in ``warnings``. The check sits
+    here rather than only in the parsers because the commit takes the
+    preview from the request body.
+    """
     created = 0
     for cc in preview.client_classes:
         if not cc.supported:
             continue
+        if (reason := reserved_name_reason(cc.name)) is not None:
+            warnings.append(f"Client class '{cc.name}' was not imported: {reason}.")
+            continue
         try:
-            existing = (
-                (
-                    await db.execute(
-                        select(DHCPClientClass).where(
-                            DHCPClientClass.group_id == target_group_id,
-                            DHCPClientClass.name == cc.name,
+            async with entity_savepoint(db):
+                existing = (
+                    (
+                        await db.execute(
+                            select(DHCPClientClass).where(
+                                DHCPClientClass.group_id == target_group_id,
+                                DHCPClientClass.name == cc.name,
+                            )
                         )
                     )
+                    .scalars()
+                    .first()
                 )
-                .scalars()
-                .first()
-            )
-            if existing is not None:
-                continue
-            row = DHCPClientClass(
-                group_id=target_group_id,
-                name=cc.name,
-                match_expression=cc.match_expression or "",
-                description=cc.description or "",
-                options=dict(cc.options or {}),
-                import_source=source,
-                imported_at=now,
-            )
-            db.add(row)
-            await db.flush()
-            db.add(
-                AuditLog(
-                    user_id=current_user.id,
-                    user_display_name=current_user.display_name,
-                    auth_source=current_user.auth_source,
-                    action="create",
-                    resource_type="dhcp_client_class",
-                    resource_id=str(row.id),
-                    resource_display=cc.name,
-                    result="success",
-                    new_value={"import_source": source},
+                if existing is not None:
+                    continue
+                row = DHCPClientClass(
+                    group_id=target_group_id,
+                    name=cc.name,
+                    match_expression=cc.match_expression or "",
+                    description=cc.description or "",
+                    address_family=cc.address_family or "ipv4",
+                    options=canonical_domain_options(cc.options),
+                    import_source=source,
+                    imported_at=now,
                 )
-            )
-            await db.commit()
-            created += 1
+                db.add(row)
+                await db.flush()
+                db.add(
+                    AuditLog(
+                        user_id=current_user.id,
+                        user_display_name=current_user.display_name,
+                        auth_source=current_user.auth_source,
+                        action="create",
+                        resource_type="dhcp_client_class",
+                        resource_id=str(row.id),
+                        resource_display=cc.name,
+                        result="success",
+                        new_value={"import_source": source},
+                    )
+                )
+                await db.commit()
+                created += 1
         except Exception:  # noqa: BLE001 — one bad class shouldn't poison the rest
-            await db.rollback()
+            logger.warning("dhcp_import.client_class_failed", name=cc.name, exc_info=True)
     return created
 
 
@@ -535,7 +748,65 @@ async def commit_import(
 
     now = datetime.now(UTC)
     results: list[CommitScopeResult] = []
+    warnings = list(preview.warnings)
+    # Reservations first, so a dropped one is not also named for its hostname.
+    warnings.extend(drop_invalid_reservations(preview.scopes))
+    warnings.extend(drop_unservable_hostnames(preview.scopes))
+    warnings.extend(drop_invalid_pools(preview.scopes))
+    warnings.extend(drop_invalid_options(preview.scopes, preview.client_classes))
 
+    # #1347 — options arrive in the SOURCE server's raw spelling (the Windows
+    # importer keeps an unmapped option as ``opt-NN``), whatever the target
+    # group's servers read. Stored as-is, a Kea group dropped every one of
+    # them at render, and the only signal was an import warning. Re-key them
+    # to the target's spelling, and drop (and say so) the ones no server in
+    # the group can serve.
+    raw_codes = await group_raw_codes(db, target_group_id)
+    for parsed in preview.scopes:
+        if not parsed.options:
+            continue
+        rekeyed, dropped = rekey_raw_options(
+            parsed.options, raw_codes=raw_codes, address_family=parsed.address_family
+        )
+        parsed.options = rekeyed
+        if dropped:
+            warnings.append(
+                f"{parsed.subnet_cidr}: dropped raw option(s) {', '.join(dropped)}, which "
+                "no server in the target group can serve; set them again as named "
+                "options if they are needed"
+            )
+
+    # #3730 — the same re-spell + value check for the raw codes on reservations
+    # and client classes; ``drop_invalid_options`` leaves every raw key to here.
+    for parsed in preview.scopes:
+        for res in parsed.reservations:
+            if not res.options:
+                continue
+            res.options, dropped = rekey_raw_options(
+                res.options, raw_codes=raw_codes, address_family=parsed.address_family
+            )
+            if dropped:
+                warnings.append(
+                    f"{parsed.subnet_cidr}: reservation {res.ip_address}: dropped raw "
+                    f"option(s) {', '.join(dropped)}, which no server in the target group "
+                    "can serve"
+                )
+    for cc in preview.client_classes:
+        if not cc.supported or not cc.options:
+            continue
+        cc.options, dropped = rekey_raw_options(
+            cc.options, raw_codes=raw_codes, address_family=cc.address_family or "ipv4"
+        )
+        if dropped:
+            warnings.append(
+                f"client class {cc.name!r}: dropped raw option(s) {', '.join(dropped)}, "
+                "which no server in the target group can serve"
+            )
+
+    # Subnets whose reservation mirrors an overwrite removed; recounted once
+    # after every scope, not per scope (#3354). A scope whose savepoint rolled
+    # back may leave its subnet here: recounting an unchanged subnet is a no-op.
+    touched_subnets: set[uuid.UUID] = set()
     for parsed in preview.scopes:
         try:
             cidr = _canonical_cidr(parsed.subnet_cidr)
@@ -550,25 +821,32 @@ async def commit_import(
             continue
         action: ConflictAction = conflict_actions.get(cidr, "skip")
         try:
-            result = await _commit_one_scope(
-                db,
-                parsed=parsed,
-                target_group_id=target_group_id,
-                ipam_space_id=ipam_space_id,
-                ipam_block_id=ipam_block_id,
-                source=preview.source,
-                action=action,
-                current_user=current_user,
-                now=now,
-            )
+            async with entity_savepoint(db):
+                result = await _commit_one_scope(
+                    db,
+                    parsed=parsed,
+                    target_group_id=target_group_id,
+                    ipam_space_id=ipam_space_id,
+                    ipam_block_id=ipam_block_id,
+                    source=preview.source,
+                    action=action,
+                    current_user=current_user,
+                    now=now,
+                    touched_subnets=touched_subnets,
+                )
         except Exception as exc:  # noqa: BLE001 — operator-facing error capture
-            await db.rollback()
             result = CommitScopeResult(
                 subnet_cidr=cidr,
                 action_taken="failed",
-                error=str(exc),
+                error=_scope_error(exc),
             )
         results.append(result)
+    await recount_subnets_and_blocks(db, touched_subnets)
+    # Every scope above has already committed, so this commits only the recount.
+    # It must not ride on _commit_client_classes' commit: that one runs only
+    # when a class is created, and an import without one would otherwise close
+    # the session with the corrected counters rolled back.
+    await db.commit()
 
     classes_created = await _commit_client_classes(
         db,
@@ -577,11 +855,12 @@ async def commit_import(
         source=preview.source,
         now=now,
         current_user=current_user,
+        warnings=warnings,
     )
 
     return CommitResult(
         target_group_id=target_group_id,
         scopes=results,
         client_classes_created=classes_created,
-        warnings=list(preview.warnings),
+        warnings=warnings,
     )

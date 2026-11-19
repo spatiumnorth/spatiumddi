@@ -1,73 +1,36 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="920" height="400" viewBox="0 0 920 400"
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="220" viewBox="0 0 920 220"
      preserveAspectRatio="xMidYMid meet"
      font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
-  <title>System Health component grid</title>
-  <desc>The health overview page renders one status tile per managed component — API backend, database, Redis, Celery, DHCP servers, DNS servers and the log store — with healthy components marked green and degraded ones flagged amber.</desc>
+  <title>Platform Health strip</title>
+  <desc>The Platform Health card on the dashboard, fed by /health/platform: five cells (API, PostgreSQL, Redis, Workers, Beat), each a status dot and a one-line detail.</desc>
 
-  <rect x="0" y="0" width="920" height="400" fill="#f8fafc"/>
+  <rect x="0" y="0" width="920" height="220" fill="#f8fafc"/>
+  <text x="40" y="42" font-size="18" font-weight="600" fill="#0f172a">Platform Health strip</text>
 
-  <text x="40" y="42" font-size="18" font-weight="600" fill="#0f172a">Component health grid</text>
-
-  <!-- Card -->
-  <rect x="40" y="70" width="840" height="302" rx="12" fill="#ffffff" stroke="#e2e8f0" stroke-width="2"/>
-
-  <text x="64" y="104" font-size="12" font-weight="600" fill="#0f172a" letter-spacing="1.2">SYSTEM HEALTH</text>
-  <text x="856" y="104" text-anchor="end" font-size="11" fill="#64748b">Last updated: 2s</text>
-  <path d="M 64 120 H 856" stroke="#e2e8f0" stroke-width="2" fill="none"/>
-
-  <!-- Row 1 -->
-  <rect x="64" y="140" width="186" height="96" rx="8" fill="#fbfdff" stroke="#e2e8f0" stroke-width="2"/>
-  <text x="80" y="166" font-size="12" font-weight="600" fill="#475569">API Backend</text>
-  <circle cx="85" cy="193" r="5" fill="#22c55e"/>
-  <text x="98" y="198" font-size="14" font-weight="600" fill="#0f172a">ONLINE</text>
-  <text x="80" y="220" font-size="11" fill="#64748b">3 replicas</text>
-
-  <rect x="266" y="140" width="186" height="96" rx="8" fill="#fbfdff" stroke="#e2e8f0" stroke-width="2"/>
-  <text x="282" y="166" font-size="12" font-weight="600" fill="#475569">Database</text>
-  <circle cx="287" cy="193" r="5" fill="#22c55e"/>
-  <text x="300" y="198" font-size="14" font-weight="600" fill="#0f172a">PRIMARY</text>
-  <text x="282" y="220" font-size="11" fill="#64748b">+ 2 replicas</text>
-
-  <rect x="468" y="140" width="186" height="96" rx="8" fill="#fbfdff" stroke="#e2e8f0" stroke-width="2"/>
-  <text x="484" y="166" font-size="12" font-weight="600" fill="#475569">Redis</text>
-  <circle cx="489" cy="193" r="5" fill="#22c55e"/>
-  <text x="502" y="198" font-size="14" font-weight="600" fill="#0f172a">ONLINE</text>
-  <text x="484" y="220" font-size="11" fill="#64748b">Sentinel</text>
-  <path d="M 540 217 l 4 4 l 8 -9" stroke="#16a34a" stroke-width="2" fill="none"
-        stroke-linecap="round" stroke-linejoin="round"/>
-
-  <rect x="670" y="140" width="186" height="96" rx="8" fill="#fbfdff" stroke="#e2e8f0" stroke-width="2"/>
-  <text x="686" y="166" font-size="12" font-weight="600" fill="#475569">Celery</text>
-  <circle cx="691" cy="193" r="5" fill="#22c55e"/>
-  <text x="704" y="198" font-size="14" font-weight="600" fill="#0f172a">3 workers</text>
-  <text x="686" y="220" font-size="11" fill="#64748b">0 pending</text>
-
-  <!-- Row 2 -->
-  <rect x="64" y="252" width="186" height="96" rx="8" fill="#fbfdff" stroke="#e2e8f0" stroke-width="2"/>
-  <rect x="64" y="252" width="4" height="96" rx="2" fill="#f59e0b"/>
-  <text x="80" y="278" font-size="12" font-weight="600" fill="#475569">DHCP Servers</text>
-  <text x="80" y="310" font-size="14" font-weight="600" fill="#0f172a">2/2 online</text>
-  <path d="M 86 321 L 93 333 L 79 333 Z" fill="#f59e0b"/>
-  <rect x="85" y="325" width="2" height="4" fill="#ffffff"/>
-  <rect x="85" y="330" width="2" height="2" fill="#ffffff"/>
-  <text x="99" y="332" font-size="11" fill="#b45309">kea-02</text>
-
-  <rect x="266" y="252" width="186" height="96" rx="8" fill="#fbfdff" stroke="#e2e8f0" stroke-width="2"/>
-  <rect x="266" y="252" width="4" height="96" rx="2" fill="#f59e0b"/>
-  <text x="282" y="278" font-size="12" font-weight="600" fill="#475569">DNS Servers</text>
-  <text x="282" y="310" font-size="14" font-weight="600" fill="#0f172a">3/4 online</text>
-  <path d="M 288 321 L 295 333 L 281 333 Z" fill="#f59e0b"/>
-  <rect x="287" y="325" width="2" height="4" fill="#ffffff"/>
-  <rect x="287" y="330" width="2" height="2" fill="#ffffff"/>
-  <text x="301" y="332" font-size="11" fill="#b45309">bind-03</text>
-
-  <rect x="468" y="252" width="186" height="96" rx="8" fill="#fbfdff" stroke="#e2e8f0" stroke-width="2"/>
-  <text x="484" y="278" font-size="12" font-weight="600" fill="#475569">Log Store</text>
-  <circle cx="489" cy="305" r="5" fill="#22c55e"/>
-  <text x="502" y="310" font-size="14" font-weight="600" fill="#0f172a">ONLINE</text>
-  <text x="484" y="332" font-size="11" fill="#64748b">12.4 GB used</text>
-
-  <rect x="670" y="252" width="186" height="96" rx="8" fill="#f8fafc"
-        stroke="#e2e8f0" stroke-width="2" stroke-dasharray="4 4"/>
+  <rect x="40" y="62" width="840" height="120" rx="12" fill="#ffffff" stroke="#e2e8f0" stroke-width="2"/>
+  <circle cx="64" cy="87" r="4" fill="#22c55e"/>
+  <text x="76" y="91" font-size="12" font-weight="600" fill="#0f172a" letter-spacing="1.2">PLATFORM HEALTH</text>
+  <text x="238" y="91" font-size="11" fill="#64748b">all good</text>
+  <path d="M 40 106 H 880" stroke="#e2e8f0" stroke-width="2" fill="none"/>
+  <circle cx="62" cy="144" r="5" fill="#22c55e"/>
+  <text x="76" y="141" font-size="13" font-weight="600" fill="#0f172a">API</text>
+  <text x="76" y="159" font-size="11" fill="#64748b">responding</text>
+  <path d="M 208 106 V 182" stroke="#e2e8f0" stroke-width="2" fill="none"/>
+  <circle cx="230" cy="144" r="5" fill="#22c55e"/>
+  <text x="244" y="141" font-size="13" font-weight="600" fill="#0f172a">PostgreSQL</text>
+  <text x="244" y="159" font-size="11" fill="#64748b">SELECT 1 in 2 ms</text>
+  <path d="M 376 106 V 182" stroke="#e2e8f0" stroke-width="2" fill="none"/>
+  <circle cx="398" cy="144" r="5" fill="#22c55e"/>
+  <text x="412" y="141" font-size="13" font-weight="600" fill="#0f172a">Redis</text>
+  <text x="412" y="159" font-size="11" fill="#64748b">ping in 1 ms</text>
+  <path d="M 544 106 V 182" stroke="#e2e8f0" stroke-width="2" fill="none"/>
+  <circle cx="566" cy="144" r="5" fill="#22c55e"/>
+  <text x="580" y="141" font-size="13" font-weight="600" fill="#0f172a">Workers</text>
+  <text x="580" y="159" font-size="11" fill="#64748b">1 alive</text>
+  <path d="M 712 106 V 182" stroke="#e2e8f0" stroke-width="2" fill="none"/>
+  <circle cx="734" cy="144" r="5" fill="#22c55e"/>
+  <text x="748" y="141" font-size="13" font-weight="600" fill="#0f172a">Beat</text>
+  <text x="748" y="159" font-size="11" fill="#64748b">last tick 12s ago</text>
+  <text x="880" y="206" text-anchor="end" font-size="11" fill="#64748b">dot: green ok · amber warn · red error</text>
 </svg>

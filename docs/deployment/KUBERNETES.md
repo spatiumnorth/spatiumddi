@@ -61,6 +61,123 @@ resolves as the latest on its own (#1182).
 - An Ingress controller or `LoadBalancer` for external access (optional —
   you can `port-forward` for a quick look)
 
+### OpenShift
+
+The chart installs on OpenShift under its **default** SecurityContextConstraints:
+the control plane runs under plain `restricted-v2`, with no grant. It is the
+same chart, not a fork. Tested on OpenShift 5.0.0 (Kubernetes 1.36, OpenShift
+Local): every control-plane pod admitted by `restricted-v2`, the BIND9 and Kea
+agents by the chart's own SCCs, DNS and DHCP serving. OpenShift 4.22 has the
+same SCCs and is being verified. OKD is not tested.
+
+```bash
+helm install ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
+  --version <CHART_VERSION> \
+  --namespace spatiumddi --create-namespace
+```
+
+The platform is detected from the cluster (`security.openshift.io/v1`). Where
+there is no cluster to ask (`helm template`, Argo CD), say so with
+`--api-versions security.openshift.io/v1 --api-versions route.openshift.io/v1`,
+or set `global.platform: openshift` (the values are `auto`, `kubernetes` and
+`openshift`). On any other platform nothing below applies and the chart renders
+exactly as before.
+
+**Checking an install.** Every pod should be Ready, and the SCC that admitted
+each one is on its `openshift.io/scc` annotation:
+
+```bash
+oc get pods -n spatiumddi \
+  -o custom-columns='NAME:.metadata.name,READY:.status.containerStatuses[*].ready,SCC:.metadata.annotations.openshift\.io/scc'
+oc get route -n spatiumddi        # the UI's hostname
+```
+
+The api, worker, beat, frontend, migrate Job, Postgres and Redis should show
+`restricted-v2` (or `restricted-v3`); the DNS and DHCP agents show the chart's
+`<fullname>-<namespace>-dns-agent` / `-dhcp-agent`. An agent shown under
+`restricted-v2` means the chart's SCC was not created or not granted (see
+`openshift.scc.create` below). Log in at the Route's hostname as `admin` /
+`admin`; you are asked to change the password at once.
+
+**What the chart does differently on OpenShift**
+
+- `restricted-v2` assigns each pod a random uid and fsGroup from the namespace's
+  range and refuses a pinned one, so the api's `runAsUser`, the cnpg-ca-publisher
+  Job's `runAsUser`, and the in-chart Postgres and Redis `fsGroup`s are omitted.
+  `seccompProfile: RuntimeDefault` is kept. Celery beat keeps its schedule file
+  in `/tmp` instead of its working directory, which only the image's own user
+  may write.
+- The images run as any uid in group 0: every path they write is group-0 owned
+  and group-writable. The frontend nginx listens on `:8080` (`FRONTEND_HTTP_PORT`;
+  the Service keeps its own port) because a random uid cannot bind `:80`.
+- A `Route` in front of the frontend Service (`openshift.route`): edge TLS with
+  the router's certificate, plain HTTP redirected, a 1 h timeout for the
+  streaming pages. Set `openshift.route.host` for a fixed hostname, or
+  `openshift.route.enabled: false` to bring your own. Behind the router, set
+  `frontend.trustedProxyCidrs` to the router's network so the api sees the real
+  client address and `https` (see the reverse-proxy page).
+- **SecurityContextConstraints for the DNS and DHCP agents only**
+  (`openshift.scc.create`). BIND9 binds `:53` and Kea binds `:67` and opens raw
+  sockets through *file capabilities* on the daemon binaries. Those work only
+  when the capability is in the container's bounding set and `no_new_privs` is
+  off, which `restricted-v2` forbids (`allowPrivilegeEscalation: false`, and
+  `NET_RAW` is not allowed). The chart therefore renders, per agent kind, a
+  ServiceAccount, a SCC, and a Role + RoleBinding letting only that
+  ServiceAccount `use` it. Each SCC is `restricted-v2` with three differences:
+  the capabilities it allows (`NET_BIND_SERVICE`; plus `NET_RAW` for Kea),
+  `allowPrivilegeEscalation: true`, and `allowHostNetwork` / `allowHostPorts`
+  only if a DHCP server sets `hostNetwork: true`. The pods still run as a
+  non-root uid from the namespace range with `runtime/default` seccomp; the SCC
+  is not privileged. The containers add their capabilities explicitly, because
+  CRI-O's default set differs from containerd's (it has no `NET_RAW`), and set
+  `allowPrivilegeEscalation: true` explicitly, so `restricted-v2` (which also
+  allows `NET_BIND_SERVICE`) can never be the SCC that admits them. Where
+  cluster admins manage SCCs, set `openshift.scc.create: false`: the chart
+  still creates the ServiceAccounts, and you grant an equivalent SCC to
+  `<fullname>-dns-agent` / `<fullname>-dhcp-agent` yourself (`<fullname>` is
+  `<release>-spatiumddi`, or the release name when it already contains
+  `spatiumddi`). `anyuid` is not a substitute: it has no `seccompProfiles`, so it
+  rejects every pod that sets `seccompProfile: RuntimeDefault`.
+- The worker adds nothing: under `restricted-v2` there is no `NET_RAW`, so `nmap`
+  raw scans and the `tcpdump` capture on the Tools page fall back to what an
+  unprivileged process can do. To keep them, set `openshift.workerNetRaw: true`
+  with `worker.serviceAccount.enabled: true`; the chart then renders a SCC for
+  the worker's own ServiceAccount.
+
+**Limits.** Only the `bind9` DNS flavor and Kea DHCP run under these SCCs; a
+PowerDNS or Technitium server is refused at render time (their images still
+chown and drop privileges at start). `frontend.tls.enabled` (the appliance's
+`:80` / `:443` nginx) and `frontend.hostNetwork` are refused: let the Route
+terminate TLS. Kea's opt-in
+rogue-DHCP probe and fingerprint sniffer need `NET_RAW` in a process that is not
+Kea, and are unavailable. `restricted-v3` (4.22+) also requires `hostUsers:
+false`; set the per-workload `hostUsers` values where the chart offers them
+(api, worker, beat, redis).
+
+**Red Hat certification status.** The chart and images are **not** Red Hat
+certified. What ships today is the part that needs no Red Hat account: every
+image carries `name`, `vendor`, `version`, `release`, `summary`, `description`,
+`maintainer` and `url` labels (plus the `org.opencontainers.image.*` set) and the
+project `LICENSE` and `NOTICE` under `/licenses`; the chart has a
+`values.schema.json`, `charts.openshift.io/*` annotations in `Chart.yaml` and a
+`helm test` hook (`helm test <release>` checks the api and the frontend answer).
+Not done, and tracked in
+[#4020](https://github.com/spatiumnorth/spatiumddi/issues/4020) for 1.1.0: UBI-based
+image variants (the images keep their current Alpine / Debian bases) and the
+certification submission itself, which needs a Red Hat Partner Connect
+account. Two image checks are knowingly unmet: the frontend, `dns-bind9` and
+`dhcp-kea` images still start as root and drop privileges themselves (the
+chart already runs them under a random uid on OpenShift), so a `USER` line would
+break Docker Compose, which relies on the start-as-root volume chown.
+
+To run Red Hat's checks yourself, install
+[`openshift-preflight`](https://github.com/redhat-openshift-ecosystem/openshift-preflight)
+and run `preflight check container ghcr.io/spatiumnorth/spatiumddi-api:<version>`
+(add `--platform amd64`). Check-only mode needs no account; do not pass
+`--submit`. Expect `RunAsNonRoot` and `BasedOnUbi` failures on the images
+described above. For the chart, `chart-verifier verify` against the packaged
+`.tgz` runs the offline checks (`helm lint`, schema, annotations).
+
 ---
 
 ## 2. Install
@@ -146,6 +263,12 @@ non-default topologies (separate namespace, custom api Service name, or a
 pinned external resolver). Full details:
 [chart README → Exposing the UI](https://github.com/spatiumnorth/spatiumddi/blob/main/charts/spatiumddi/README.md#exposing-the-ui).
 
+Behind an Ingress or any TLS-terminating proxy, also set `frontend.trustedProxyCidrs`
+and add the streaming annotations (`proxy-buffering: "off"`,
+`proxy-read-timeout: "3600"`); without them the login throttle keys on the
+ingress address and the AI chat stream hangs. See
+[`REVERSE_PROXY.md`](REVERSE_PROXY.md).
+
 ### External Postgres / Redis
 
 To skip the in-chart database or cache and point at an existing one:
@@ -189,7 +312,7 @@ dnsAgents:
     - name: ns1
       role: primary
       group: internal-resolvers
-      service: { type: LoadBalancer }
+      service: { type: LoadBalancer }   # opt-in; see "Serving DNS on :53" below
     # PowerDNS (issue #127 — ALIAS, LUA, online DNSSEC, catalog zones).
     # Lives in its own group: the control plane rejects mixed-driver
     # groups for those PowerDNS-only features.
@@ -197,7 +320,7 @@ dnsAgents:
       flavor: powerdns
       role: primary
       group: powerdns-edge
-      service: { type: LoadBalancer }
+      service: { type: LoadBalancer }   # opt-in; see "Serving DNS on :53" below
     # Technitium (issue #746 — native DoT / DoH / DoQ with no sidecar,
     # encrypted upstream forwarding, online DNSSEC, catalog zones both
     # ways). Also its own group, same single-driver rule.
@@ -205,7 +328,7 @@ dnsAgents:
       flavor: technitium
       role: primary
       group: technitium-edge
-      service: { type: LoadBalancer }
+      service: { type: LoadBalancer }   # opt-in; see "Serving DNS on :53" below
 
 dhcpAgents:
   enabled: true
@@ -216,6 +339,34 @@ dhcpAgents:
       role: primary
       hostNetwork: true   # required for real DHCPv4 unless relay-only
 ```
+
+#### Serving DNS on :53 to clients (k3s and others)
+
+The agent Services default to `ClusterIP` (#3229), reachable in-cluster only.
+To answer clients on your LAN you must expose them, and on k3s the obvious
+choice is a trap: the bundled **servicelb** turns a `LoadBalancer` Service
+into an `svclb-*` pod with `hostPort: 53` on every node, and the CNI hostPort
+DNAT also captures the node's own resolver stub at `127.0.0.53:53`. The node
+then cannot resolve anything, so image pulls fail (`lookup ghcr.io: Try
+again`), local-path provisioning times out and the install never converges.
+UDP 67 for DHCP has the same mechanism.
+
+- **MetalLB** (recommended): start k3s with `--disable servicelb`, install
+  MetalLB, then set `service: { type: LoadBalancer }` on the DNS server with
+  a pool or `loadBalancerIP`. The VIP is announced by MetalLB, so nothing
+  binds :53 on the node.
+- **Another LB** (kube-vip, Cilium LB-IPAM, a cloud LB): same rule, disable
+  servicelb and make sure the implementation does not use hostPort 53.
+- **`NodePort`**: works behind your own forwarder or external load balancer,
+  but :53 is outside the NodePort range, so clients cannot use it directly.
+- **`hostNetwork`**: offered for DHCP only. Binding the node's own :53 would
+  collide with `systemd-resolved` on most distributions.
+
+Upgrading from a chart that defaulted to `LoadBalancer`: a server that never
+set `service.type` becomes `ClusterIP` and **releases its external IP**. Add
+`service: { type: LoadBalancer }` (with the same address) to each server that
+must keep serving clients before you upgrade. See the
+[chart README](https://github.com/spatiumnorth/spatiumddi/blob/main/charts/spatiumddi/README.md#exposing-dns-and-dhcp-to-clients).
 
 Pre-create the bootstrap PSK Secrets (or use `agentKey.value` inline for lab
 use only):
@@ -228,7 +379,7 @@ kubectl -n spatiumddi create secret generic spatium-dhcp-agent-key \
 ```
 
 Each server entry renders a StatefulSet + a Service (default type
-`LoadBalancer` for DNS). The image is selected by `flavor`: the default
+`ClusterIP`; `LoadBalancer` and `NodePort` are opt-in, see below). The image is selected by `flavor`: the default
 `dnsAgents.image` configures BIND9; `flavor: powerdns` pulls
 `ghcr.io/spatiumnorth/dns-powerdns` and switches the state-volume mount path to
 `/var/lib/powerdns` for the LMDB store; `flavor: technitium` pulls
@@ -239,12 +390,41 @@ rotating JWT, and long-polls the config bundle — the full bootstrap +
 registration flow is in [`DNS_AGENT.md`](DNS_AGENT.md) and summarised in
 [`k8s/README.md` → How servers register](https://github.com/spatiumnorth/spatiumddi/blob/main/k8s/README.md#how-servers-register).
 
-> **DHCPv4 needs broadcast reception on the client LAN.** Run the pod with
-> `hostNetwork: true`, or front it with a DHCP relay (option 82). The static
-> manifests under `k8s/dhcp/` expose UDP/67 via `NodePort` for lab use only.
+**Naming of agent objects (#3209).** The StatefulSet, Service and headless
+Service are named `dns-<flavor>-<name>` (DHCP: `dhcp-<flavor>-<name>`), without
+the release fullname, so two releases in one namespace collide. Set
+`dnsAgents.prefixWithFullname: true` (and `dhcpAgents.prefixWithFullname`) to
+get `<fullname>-dns-<flavor>-<name>` (a name over 52 characters is cut to 43
+plus a hash of the whole, so it stays unique). It defaults to `false` because a
+StatefulSet cannot be renamed: changing it on a live install deletes the old
+StatefulSet and creates a new one with **new PVCs** and a new pod name (the
+server's registered identity), so the agent registers again as a new server.
+Set it at install time; the default is expected to flip in a later release.
 
-Per-server entry fields (`name`, `role`, `group`, `storage.*`, `service.type`,
-`hostNetwork`, `resources`) are documented in the
+**Placement and storage (#3206).** A server's `affinity` is merged with the
+chart's preferred one-per-node anti-affinity, so you can *prefer* a node
+without pinning it; `dnsAgents.storageClass` / `dhcpAgents.storageClass` (and
+`servers[].storageClass`) set the class of both volume claims, which otherwise
+use the cluster's default StorageClass. Set it before the first install: claim
+templates are immutable, so Kubernetes refuses the change on a live
+StatefulSet, and a PVC that already exists keeps the class it was created with.
+On an existing install, `kubectl delete sts <name> -n <ns> --cascade=orphan`
+(pod and PVCs survive) and then upgrade or sync again; `helm upgrade` stops
+with that command when it detects the change. See the chart README,
+[Adopting `storageClass` on an existing install](https://github.com/spatiumnorth/spatiumddi/blob/main/charts/spatiumddi/README.md#adopting-storageclass-on-an-existing-install).
+
+> **DHCPv4 needs broadcast reception on the client LAN.** Run the pod with
+> `hostNetwork: true`, or front it with a DHCP relay (option 82) pointed
+> at a LoadBalancer Service on UDP/67 you opted into. The static manifests under
+> `k8s/dhcp/` use that LoadBalancer Service: on a `NodePort` Service the
+> declared `port: 67` is in-cluster only, and the node-facing port is a
+> random 30000–32767 pick. Pinning it (`service.nodePort` in the chart)
+> only helps a relay that can forward to a non-standard port; most,
+> including `ip helper-address`, send to UDP/67 only.
+
+Per-server entry fields (`name`, `role`, `group`, `storage.*`, `storageClass`,
+`service.type`, `service.nodePort`, `hostNetwork`, `resources`, `nodeSelector`,
+`tolerations`, `affinity`) are documented in the
 [chart README → Agents](https://github.com/spatiumnorth/spatiumddi/blob/main/charts/spatiumddi/README.md#agents) table.
 
 ---
@@ -264,6 +444,83 @@ header.
 
 Alembic is idempotent, so re-running the migrate Job is always safe.
 
+**A migration never waits silently on a dead client's lock (#3932).** The
+1.0.0 upgrade drill left the API "initialising" for over two hours: the
+migration's `ALTER TABLE` queued behind a session an old api pod had left *idle
+in transaction*. The pod was gone, but PostgreSQL never noticed (the primary had
+moved to another node, and the default TCP keepalive is about 2 h 11 min), and
+nothing ended the session. Three layers now stop that, none needing a restart:
+
+- **Server side.** `postgresql.cnpg.parameters` sets the TCP keepalives
+  (`tcp_keepalives_idle` 60 s, `_interval` 10 s, `_count` 6), so a silent
+  peer's session is dropped in about two minutes: that is what fixes the
+  drill's case. It also sets `idle_in_transaction_session_timeout` to 1 h, a
+  backstop for a client that is alive but stuck in an open transaction. It is
+  an hour rather than minutes on purpose: some work legitimately idles in a
+  transaction for a while (a scheduled backup's session waits through the
+  whole `pg_dump`, up to 30 min, and the upload; a bundle render for a very
+  large DNS group computes between statements; a batched WinRM push waits
+  between chunks), and Postgres ending that session turns slow work into an
+  error. All four are reloads: CNPG applies them to a formed cluster without a
+  rolling restart. The in-chart standalone Postgres takes the same values as
+  `-c` arguments (`postgresql.idleInTransactionSessionTimeout`); that one
+  changes the pod template, so the first upgrade to this chart restarts it
+  once. Set `"0"` to turn the idle timeout off.
+- **The migrate command** (`alembic upgrade`, so the Job and the compose
+  `migrate` service alike) sets `lock_timeout` to
+  `MIGRATION_LOCK_TIMEOUT_SECONDS` (default 30), so a revision waiting on a
+  lock leaves the lock queue instead of stalling every query queued behind it.
+  While a revision waits it samples `pg_blocking_pids` of the migrating backend
+  from a second connection; after each timed-out wait it logs `migration
+  waiting on lock held by pid N (state, age, application name)` for those
+  blockers, and ends the ones that are `idle in transaction`, belong to the
+  app's own database role and have been idle longer than `MIGRATION_STALE_IDLE_TXN_SECONDS` (default 300,
+  `0` disables), logging each pid, and retries after a pause of up to 30 s.
+  It retries **without limit** by default: a migration held up by a
+  legitimate long holder, such as a backup's `pg_dump` (which holds a lock on
+  every table and is active, not idle; a backup's own idle session holds no
+  lock the migration waits on, so it is left alone), waits it out and then succeeds, as it
+  did before. `MIGRATION_LOCK_RETRIES` bounds it (`0` gives up on the first
+  timeout). Nothing is ended unless a lock wait has actually timed out.
+  Revisions commit one by one, so a retry resumes where it stopped. `alembic
+  current`, `stamp` and `downgrade` never end a session.
+- A session the old api opened before this release's settings applied keeps the
+  old keepalive (about 2 h 11 min), since a reloaded setting only reaches a
+  session when its client next sends a message; the migration ends it itself
+  through the rule above.
+- **Still stuck?** Find the holder with `SELECT pid, state, state_change FROM
+  pg_stat_activity WHERE state LIKE 'idle in transaction%'` and end it with
+  `pg_terminate_backend(pid)`.
+
+**Placement (#3207).** The Job's pod follows the api: `migrate.nodeSelector`,
+`migrate.tolerations` and `migrate.affinity` default to unset, meaning
+`api.nodeSelector` / `api.tolerations` / `api.affinity.nodeAffinity` (the
+api's pod anti-affinity is about api pods and is not copied), with
+`global.controlPlaneNodeSelector` merged into the selector as for every
+control-plane workload. Set one to `{}` / `[]` to give the Job none of the api's
+values. The `wait-for-postgres` / `wait-for-migrate` init containers carry
+`initContainers.resources` (#3208; requests `10m` / `32Mi`, limit `256Mi`), so a
+namespace LimitRange or a policy that wants resources on every container,
+init containers included, admits them.
+
+**GitOps with `helm template` (Argo CD).** A controller that renders with
+`helm template` always sees revision `1`, so the Job is `<release>-migrate-r1` on every sync,
+and the first image bump fails with `spec.template: field is immutable`. Set
+`migrate.annotations` to make the Job a sync hook that is deleted and recreated
+on every sync:
+
+```yaml
+migrate:
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+```
+
+`helm template` also defeats the chart's `lookup()`, so generated secrets change
+on every render. Pre-create them and set the matching `existingSecret` values;
+the [chart README](https://github.com/spatiumnorth/spatiumddi/blob/main/charts/spatiumddi/README.md#gitops-with-helm-template-argo-cd)
+lists which keys each Secret needs.
+
 ---
 
 ## 5. Replicas, resources, and autoscaling
@@ -273,37 +530,86 @@ Every workload has `resources.requests`/`limits` defaults in
 blocks) and a per-component `nodeSelector` / `tolerations` / `affinity` /
 `podAnnotations`. Override them under the matching key.
 
+Per-pod memory and CPU, measured on a one-node k3s cluster (amd64 and
+arm64) and on the appliance, which runs this same chart, are in
+[`SIZING.md`](SIZING.md#kubernetes), and the api and worker defaults are
+sized from them (#3110). One api process holds about 300 MiB at rest and
+held 0.4 to 0.85 GiB on the appliance, hence its 512Mi request and 1Gi
+limit; the worker levels off near 1 GiB, hence its 2Gi limit.
+
 The **api Deployment has a HorizontalPodAutoscaler** (`autoscaling/v2`), gated
 on `api.autoscaling.enabled` (**default `true`**):
 
 ```yaml
 api:
-  replicas: 2
+  replicas: 2                            # only with autoscaling.enabled: false
   autoscaling:
     enabled: true
     minReplicas: 2
     maxReplicas: 10
-    targetCPUUtilizationPercentage: 70
-    targetMemoryUtilizationPercentage: 80
+    targetCPUUtilizationPercentage: 70   # of the 200m request
+    targetMemoryUtilizationPercentage:   # unset: memory is opt-in
+  resources:
+    requests: { cpu: 200m, memory: 512Mi }
+    limits:   { cpu: 1000m, memory: 1Gi }
 ```
 
-The HPA scales on both CPU and memory utilisation. It requires a running
-metrics-server in the cluster (most managed Kubernetes offerings ship one); if
-yours doesn't, install
-[metrics-server](https://github.com/kubernetes-sigs/metrics-server) or set
+The HPA scales on CPU. Memory is opt-in (#3110): an api process holds about
+300 MiB from the moment it starts, and that does not fall as replicas are
+added, so a memory target below it holds the HPA at `maxReplicas` for good. If
+you set one, use 73 or more with the 512Mi request.
+
+While the HPA is on, the chart renders no `replicas` on the api Deployment, so
+the HPA alone sets the count and `helm upgrade` keeps it (#3111); `api.replicas`
+applies only with `api.autoscaling.enabled: false`. The HPA needs a running
+metrics-server in the cluster (most managed Kubernetes offerings ship one), and
+without one it holds the api at `minReplicas`. Install
+[metrics-server](https://github.com/kubernetes-sigs/metrics-server), or set
 `api.autoscaling.enabled: false` and manage `api.replicas` directly. No other
 workload defines an HPA — `frontend` / `worker` are fixed-replica Deployments
 (scale by editing `*.replicas`) and `beat` is a hard singleton.
 
 ### Worker `NET_RAW`
 
-The worker pod adds `CAP_NET_RAW` (`worker.netRawCapability: true`, default on)
-so `nmap` can run SYN scans + `-O` OS detection from the device-profiling
-auto-nmap path. `NET_RAW` is in containerd's default cap set, so this is a
-no-op on permissive clusters; on restricted Pod Security Admission, OpenShift
-SCC, or GKE Autopilot it's required to keep the cap in the bounding set. Set
-`worker.netRawCapability: false` if device profiling is off cluster-wide and you
-want a tighter posture.
+`nmap`'s SYN scans and `-O` OS detection (the device-profiling auto-nmap path)
+use a file capability on the image's `nmap` binary, which works only while
+`NET_RAW` is in the container's bounding set. containerd's default capability
+set already includes `NET_RAW`, so on k3s, Talos, EKS, AKS and GKE the worker
+has it with no setting at all.
+
+`worker.netRawCapability` (default `false`, [#3952](https://github.com/spatiumnorth/spatiumddi/issues/3952))
+adds `NET_RAW` explicitly. You need it only on a runtime whose default set lacks
+it, which in practice means CRI-O outside OpenShift. Turning it on makes Pod
+Security `baseline` and `restricted` **refuse the worker pod at admission**.
+They do not drop the capability. A namespace that enforces either level then
+needs `pod-security.kubernetes.io/enforce: privileged`, or an exemption. On
+OpenShift use `openshift.workerNetRaw` instead (see above).
+
+Verified on k3s with the default (`false`): the worker's bounding set carries
+`NET_RAW`, and `nmap -sS` and `-O` both run. Where `NET_RAW` is absent, nmap can
+do only what an unprivileged process can, a TCP connect scan with no OS
+detection.
+
+### Pod Security levels
+
+The [Pod Security Standards](https://kubernetes.io/docs/concepts/security/pod-security-standards/)
+level each component needs with the chart's defaults:
+
+| Component | Highest level that admits it |
+|---|---|
+| api, worker, beat, frontend, migrate Job, Postgres, Redis | `baseline` |
+| DNS agents (`dns-bind9-*`), DHCP agents with `hostNetwork: false` | `baseline` |
+| DHCP agents with `hostNetwork: true` (relay-less LAN) | `privileged`: `baseline` forbids host networking |
+| worker with `worker.netRawCapability: true` | `privileged`: `baseline` forbids adding `NET_RAW` |
+
+None of them pass `restricted`: every container fails its
+`allowPrivilegeEscalation: false`, `capabilities.drop: ["ALL"]` and
+`runAsNonRoot` checks. Measured with
+`kubectl label --dry-run=server ns spatiumddi pod-security.kubernetes.io/enforce=<level>`
+on a default single-node install with one BIND9 and one Kea agent (#3952).
+
+So a default install, with DHCP agents off host networking, runs in a namespace
+that enforces `baseline`. Talos enforces `baseline` cluster-wide by default.
 
 ---
 
@@ -334,8 +640,15 @@ postgresql:
   cnpg:
     instances: 3        # smallest quorum-friendly default; 5 / 7 for larger
     imageName: "ghcr.io/cloudnative-pg/postgresql:16"
-    enablePDB: true
+    # enablePDB: unset = on only with instances > 1 (#3204). With a single
+    # instance the PDB allows 0 disruptions and `kubectl drain` of its node
+    # hangs, protecting nothing; set true / false to override.
 ```
+
+Postgres placement: `postgresql.nodeSelector` hard-pins the instances, and
+`postgresql.affinity.nodeAffinity` (#3205) is rendered into the Cluster's
+`spec.affinity.nodeAffinity` for a preference ("this node, elsewhere if it is
+full") beside it.
 
 This requires the **CloudNativePG operator already installed** in the cluster.
 The appliance chart bundles it; for a plain Kubernetes install, apply it
@@ -348,7 +661,7 @@ kubectl apply --server-side -f \
 
 > **Match the operator line to your cluster, not to this page.** CNPG
 > publishes a support matrix per minor: 1.30.x covers Kubernetes
-> 1.34-1.36, which is what the appliance ships (k3s v1.36.4+k3s1). On an
+> 1.34-1.36, which is what the appliance ships (k3s v1.36.5+k3s1). On an
 > older cluster, apply the CNPG line whose matrix includes your version
 > instead — a newer operator against an untested Kubernetes is the one
 > combination CNPG will not support.
@@ -381,9 +694,11 @@ steps in [`k8s/README.md`](https://github.com/spatiumnorth/spatiumddi/blob/main/
 ### Redis — Sentinel
 
 Set `redis.kind: sentinel` to render a StatefulSet where each pod runs a
-`redis-server` + a `redis-sentinel` sidecar. Pod-0 starts as master; the rest
-replicate from it; the sentinels elect a new master and fail over
-automatically. The api / worker / beat pick up a `sentinel://` URL and resolve
+`redis-server` + a `redis-sentinel` sidecar. A starting pod asks the running
+sentinels which pod is the master and replicates from it (or starts as master
+when they name the pod itself); only when no sentinel answers, the whole set
+starting cold, does pod-0 start as master with the rest replicating from it.
+The sentinels elect a new master and fail over automatically. The api / worker / beat pick up a `sentinel://` URL and resolve
 the live master through the sentinels — no static master Service needed.
 
 ```yaml
@@ -445,6 +760,12 @@ so a hard node loss reschedules them promptly. Under `hard` a
 when `replicas == eligible nodes`, required anti-affinity makes a surge
 pod unschedulable, so the default surge-first rollout would deadlock
 forever. Retiring one old pod first frees a node for its replacement.
+Under `hard` this holds at one replica too (#1541): a demote from three
+nodes to one renders a single replica with no anti-affinity, but the old
+pod it replaces still carries the 3-node required term, which keeps a
+surged pod off the only node. So a one-node appliance takes a brief api /
+worker outage on each rollout, as its frontend already does with
+`Recreate`.
 
 > **The raw HA prototypes in `k8s/ha/`** (`postgres-cluster.yaml`,
 > `redis-sentinel.yaml`, `postgres-docker-compose.yaml`) are non-Helm
@@ -615,10 +936,70 @@ helm upgrade ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
   --namespace spatiumddi --reuse-values
 ```
 
+`--reuse-values` keeps the defaults of the chart the release was installed
+from, so upgrade once with `--reset-then-reuse-values` to take a new chart's
+defaults, such as the #3110 api sizing
+([chart README](https://github.com/spatiumnorth/spatiumddi/blob/main/charts/spatiumddi/README.md#taking-a-new-charts-defaults-3110)).
+At the first upgrade to a chart with #3111 the api's replica count changes
+hands; the [chart README](https://github.com/spatiumnorth/spatiumddi/blob/main/charts/spatiumddi/README.md#the-apis-replica-count-under-the-autoscaler-3111)
+says what each kind of release sees.
+
 Each upgrade renders a fresh per-revision migrate Job; the api / worker / beat
 pods' `wait-for-migrate` init containers hold their rollout until the new
 schema lands, so the new control-plane pods never come up against an
 un-migrated database.
+
+Meanwhile the previous release's api pods stay in service: a pod that has
+already been ready keeps answering `/health/ready` while the database is at the
+new release's schema, as long as every table and column it uses is still there
+(#2777). Under `hard` anti-affinity on a one-node control
+plane the only api pod is replaced first, so that install still takes its brief
+api outage on every rollout.
+
+### Upgrading from CalVer on Helm with DHCP agents
+
+A Helm install of `2026.10.02-1` or older with `dhcpAgents.enabled` cannot roll
+its Kea pod to a newer chart by itself (#3907). That release's readiness probe
+was a `tcpSocket` on `:8000`, which a standalone Kea never binds (#1589), so
+the pod is never Ready. The `dhcp-kea-*` StatefulSet is `OrderedReady` +
+`RollingUpdate`, and Kubernetes does not roll a StatefulSet whose pod is
+unready, so the pod stays on the old image and `helm upgrade --wait` times out.
+
+The chart handles this with a `pre-upgrade` hook (a Job, plus a ServiceAccount,
+a namespaced Role and a RoleBinding that exist only for the hook). It lists the
+DHCP agent StatefulSets of the release and, for one whose pod is Running but
+has not been Ready for 2 minutes, deletes the StatefulSet and that pod. Deleting
+only the pod would not help, because the hook runs before Helm updates the
+StatefulSet and the controller would recreate the pod from the old template.
+The volume claims are kept, and `helm upgrade` then creates the StatefulSet from
+the new template, so the new pod starts on the new image and probe. A
+StatefulSet whose pods are Ready is never touched, a fresh install never runs it, and an
+error in the hook is logged without failing the upgrade. DNS agents are not
+covered: their probe is the `:53` listener, which no release shipped in a form
+that could never pass.
+
+The hook Job runs the **new** release's api image, so an air-gapped site must
+load that image into the cluster (or its mirror registry) **before** `helm
+upgrade`, as it must for every other pod of the release. If the image cannot be
+pulled the Job hits its 120 s deadline and, because Helm waits for hooks, the
+upgrade fails; set `dhcpAgents.upgradeUnstickPods=false` to skip the hook.
+The hook runs on `helm upgrade` only, not on `helm rollback`: a rollback
+re-applies the old template, which cannot be rolled any better than before.
+A Job that starts but cannot reach the API server logs the error and exits 0,
+leaving the upgrade to proceed (a stuck pod then needs the manual step below);
+the hook never fails an upgrade on a cluster error, only on a missing image.
+
+To turn the hook off (`dhcpAgents.upgradeUnstickPods: false`), delete the pod
+by hand once `helm upgrade` has applied the new template; the StatefulSet
+recreates it from that template, on the new image and probe (the upgrade itself
+times out with `--wait`, or run it without):
+
+```bash
+kubectl -n <namespace> delete pod <dhcp-kea-name>-0
+```
+
+For the version path from 2026.10.02-1 to 1.0.0, and for the appliance and
+Compose shapes, see [Upgrading to 1.0.0](APPLIANCE.md#upgrading-to-100).
 
 ### Manual (manifest) upgrades
 
@@ -662,6 +1043,8 @@ The Kubernetes-specific shape:
   values reference, troubleshooting, and a `helm template` dev loop
 - [`k8s/README.md`](https://github.com/spatiumnorth/spatiumddi/blob/main/k8s/README.md) — raw `k8s/base/` manifests, the
   `k8s/ha/` prototypes, the static DNS/DHCP StatefulSets, and TLS/Ingress notes
+- [`REVERSE_PROXY.md`](REVERSE_PROXY.md) — Ingress / reverse-proxy settings,
+  trusted proxies, streaming, troubleshooting
 - [`TOPOLOGIES.md`](TOPOLOGIES.md) — reference production topologies + sizing
 - [`APPLIANCE.md`](APPLIANCE.md) — the self-contained OS appliance (k3s-based,
   multi-node control-plane HA, MetalLB VIP)

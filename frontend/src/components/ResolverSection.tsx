@@ -3,6 +3,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AlertCircle } from "lucide-react";
 
 import {
+  formatDialogError,
   settingsApi,
   type PlatformSettings,
   type ResolverDnssec,
@@ -102,8 +103,11 @@ export function ResolverSection({
       setSavedAt(Date.now());
       setTimeout(() => setSavedAt(null), 2500);
     },
+    // formatDialogError, not err.message: on an AxiosError the latter is only
+    // "Request failed with status code N", which hides the server's reason,
+    // the validator's sentence naming the refused value (#3424).
     onError: (err: unknown) => {
-      setSaveErr(err instanceof Error ? err.message : String(err));
+      setSaveErr(formatDialogError(err));
     },
   });
 

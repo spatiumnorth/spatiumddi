@@ -1,6 +1,8 @@
+import { useOwnershipModules } from "@/hooks/useOwnershipModules";
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
 import {
   customersApi,
@@ -11,13 +13,19 @@ import {
   type OverlayRead,
   type OverlayStatus,
   type OverlayUpdate,
+  formatApiError,
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { TagFilterChips } from "@/components/TagFilterChips";
-import { CustomerChip } from "@/components/ownership/pickers";
+import {
+  CustomerChip,
+  MissingCustomerOption,
+} from "@/components/ownership/pickers";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -117,13 +125,14 @@ function KindBadge({ kind }: { kind: OverlayKind }) {
 
 // ── Editor modal ───────────────────────────────────────────────────
 
-function OverlayEditorModal({
+export function OverlayEditorModal({
   existing,
   onClose,
 }: {
   existing: OverlayRead | null;
   onClose: () => void;
 }) {
+  const own = useOwnershipModules();
   const qc = useQueryClient();
   const [name, setName] = useState(existing?.name ?? "");
   const [kind, setKind] = useState<OverlayKind>(existing?.kind ?? "sdwan");
@@ -147,6 +156,7 @@ function OverlayEditorModal({
     queryKey: ["customers", "all"],
     queryFn: () => customersApi.list({ limit: 500 }),
     staleTime: 60_000,
+    enabled: own.customer,
   });
   const customers = customersQ.data?.items ?? [];
 
@@ -171,11 +181,7 @@ function OverlayEditorModal({
       onClose();
     },
     onError: (e: unknown) => {
-      const err = e as {
-        message?: string;
-        response?: { data?: { detail?: string } };
-      };
-      setError(err?.response?.data?.detail ?? err?.message ?? "Save failed");
+      setError(formatApiError(e, "Save failed"));
     },
   });
 
@@ -214,23 +220,29 @@ function OverlayEditorModal({
             ))}
           </select>
         </div>
-        <div>
-          <label className="text-xs font-medium text-muted-foreground">
-            Customer (optional)
-          </label>
-          <select
-            className={inputCls}
-            value={customerId ?? ""}
-            onChange={(e) => setCustomerId(e.target.value || null)}
-          >
-            <option value="">— None —</option>
-            {customers.map((c) => (
-              <option key={c.id} value={c.id}>
-                {c.name}
-              </option>
-            ))}
-          </select>
-        </div>
+        {own.customer && (
+          <div>
+            <label className="text-xs font-medium text-muted-foreground">
+              Customer (optional)
+            </label>
+            <select
+              className={inputCls}
+              value={customerId ?? ""}
+              onChange={(e) => setCustomerId(e.target.value || null)}
+            >
+              <option value="">— None —</option>
+              <MissingCustomerOption
+                customerId={customerId}
+                list={customersQ}
+              />
+              {customers.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
         <div>
           <label className="text-xs font-medium text-muted-foreground">
             Vendor
@@ -313,7 +325,9 @@ function OverlayEditorModal({
         </div>
       </div>
 
-      {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
+      {error && (
+        <FormError className="mt-3 text-sm text-destructive">{error}</FormError>
+      )}
 
       <div className="mt-6 flex justify-end gap-2 border-t pt-3">
         <button
@@ -339,6 +353,17 @@ function OverlayEditorModal({
 // ── Page ───────────────────────────────────────────────────────────
 
 export function OverlaysPage() {
+  // #1340 — a read-only user is offered no write it would be refused:
+  // the overlay_network router asks write (delete) on 'overlay_network'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "overlay_network"),
+    "Requires write permission on overlay networks",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "overlay_network"),
+    "Requires delete permission on overlay networks",
+  );
   const qc = useQueryClient();
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<OverlayStatus | "">("");
@@ -388,17 +413,27 @@ export function OverlaysPage() {
     [items, selectedIds],
   );
 
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
   const bulkDelete = useMutation({
+    onMutate: () => setDeleteError(null),
     mutationFn: (ids: string[]) => overlaysApi.bulkDelete(ids),
     onSuccess: () => {
       setSelectedIds(new Set());
       qc.invalidateQueries({ queryKey: ["overlays"] });
     },
+    onError: (e: unknown) =>
+      setDeleteError(formatApiError(e, "Failed to delete overlays")),
   });
 
   const removeOne = useMutation({
+    onMutate: () => setDeleteError(null),
     mutationFn: (id: string) => overlaysApi.remove(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["overlays"] }),
+    onError: (e: unknown) => {
+      setDeleteError(formatApiError(e, "Failed to delete overlay"));
+      qc.invalidateQueries({ queryKey: ["overlays"] });
+    },
   });
 
   function toggle(id: string) {
@@ -417,6 +452,11 @@ export function OverlaysPage() {
   return (
     <div className="h-full overflow-auto p-6">
       <div className="space-y-4">
+        {deleteError && (
+          <p role="alert" className="text-sm text-destructive">
+            {deleteError}
+          </p>
+        )}
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
             <h1 className="text-xl font-semibold">SD-WAN overlays</h1>
@@ -440,6 +480,7 @@ export function OverlaysPage() {
               variant="primary"
               icon={Plus}
               onClick={() => setShowNew(true)}
+              {...writeGate}
             >
               New overlay
             </HeaderButton>
@@ -515,6 +556,7 @@ export function OverlaysPage() {
                   onConfirm: () => bulkDelete.mutate(ids),
                 });
               }}
+              {...deleteGate}
             >
               Delete selected
             </HeaderButton>
@@ -561,7 +603,28 @@ export function OverlaysPage() {
                     className="px-3 py-6 text-center text-muted-foreground"
                     colSpan={10}
                   >
-                    No overlays yet — click "New overlay" to add one.
+                    <ListEmpty
+                      error={query.error}
+                      what="overlays"
+                      filtered={
+                        search !== "" ||
+                        statusFilter !== "" ||
+                        kindFilter !== "" ||
+                        customerFilter !== "" ||
+                        tagFilters.length > 0
+                      }
+                      onClearFilters={() => {
+                        setSearch("");
+                        setStatusFilter("");
+                        setKindFilter("");
+                        setCustomerFilter("");
+                        setTagFilters([]);
+                      }}
+                      gate={writeGate}
+                      hint={`Click "New overlay" to add one.`}
+                    >
+                      No overlays yet.
+                    </ListEmpty>
                   </td>
                 </tr>
               )}
@@ -611,14 +674,17 @@ export function OverlaysPage() {
                     <button
                       type="button"
                       title="Edit"
+                      aria-label="Edit"
                       onClick={() => setEditing(o)}
-                      className="rounded p-1 hover:bg-muted"
+                      className="rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                      {...writeGate}
                     >
                       <Pencil className="h-3.5 w-3.5" />
                     </button>
                     <button
                       type="button"
                       title="Delete"
+                      aria-label="Delete"
                       onClick={() => {
                         setConfirm({
                           title: "Delete overlay",
@@ -627,7 +693,8 @@ export function OverlaysPage() {
                           onConfirm: () => removeOne.mutate(o.id),
                         });
                       }}
-                      className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10"
+                      className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
+                      {...deleteGate}
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                     </button>

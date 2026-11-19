@@ -22,11 +22,11 @@ from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
-from app.api.deps import DB, CurrentUser
+from app.api.deps import DB, SuperAdmin
 from app.config import settings
 from app.core.demo_mode import forbid_in_demo_mode
-from app.core.permissions import is_effective_superadmin
 from app.models.backup import BackupTarget
+from app.services.api_token_scopes import token_write
 from app.services.factory_reset import (
     FACTORY_SECTIONS,
     FACTORY_SECTIONS_BY_KEY,
@@ -36,20 +36,13 @@ from app.services.factory_reset import (
     preview_factory_reset,
 )
 from app.services.factory_reset.runner import (
+    FactoryResetBlockedError,
     FactoryResetCooldownError,
     verify_user_password,
 )
 
 router = APIRouter()
 logger = structlog.get_logger(__name__)
-
-
-def _require_superadmin(current_user: CurrentUser) -> None:
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Factory reset is restricted to superadmin",
-        )
 
 
 # ── Schemas ──────────────────────────────────────────────────────────
@@ -111,9 +104,8 @@ class FactorySectionCatalog(BaseModel):
 
 
 @router.get("/sections", response_model=FactorySectionCatalog)
-async def list_sections(current_user: CurrentUser) -> FactorySectionCatalog:
+async def list_sections(current_user: SuperAdmin) -> FactorySectionCatalog:
     """Section catalog the UI reflects on to render the page."""
-    _require_superadmin(current_user)
     return FactorySectionCatalog(
         sections=[
             SectionCatalogEntry(
@@ -130,11 +122,13 @@ async def list_sections(current_user: CurrentUser) -> FactorySectionCatalog:
 
 
 @router.post("/preview", response_model=PreviewResponse)
-async def preview(body: PreviewRequest, db: DB, current_user: CurrentUser) -> PreviewResponse:
+@token_write(
+    "Read-only dry run of a factory reset, but SuperAdmin-only and a step of a destructive flow"
+)
+async def preview(body: PreviewRequest, db: DB, current_user: SuperAdmin) -> PreviewResponse:
     """Read-only dry-run. Returns the row counts that would be
     deleted plus diagnostic flags (backup warning, cooldown).
     """
-    _require_superadmin(current_user)
     for k in body.section_keys:
         if k not in FACTORY_SECTIONS_BY_KEY:
             raise HTTPException(status_code=422, detail=f"unknown section key: {k!r}")
@@ -157,7 +151,8 @@ async def preview(body: PreviewRequest, db: DB, current_user: CurrentUser) -> Pr
         backup_detail = (
             "No enabled backup target is configured. The factory reset is "
             "destructive and there's no built-in undo. Configure a backup "
-            "destination at Settings → Backup, run a backup, and only then "
+            "destination under Administration → Backup → Destinations, run a "
+            "backup, and only then "
             "proceed — or acknowledge the risk by setting "
             "acknowledge_no_backup=true on the execute call."
         )
@@ -198,12 +193,11 @@ async def preview(body: PreviewRequest, db: DB, current_user: CurrentUser) -> Pr
 
 
 @router.post("/execute", response_model=ExecuteResponse)
-async def execute(body: ExecuteRequest, db: DB, current_user: CurrentUser) -> ExecuteResponse:
+async def execute(body: ExecuteRequest, db: DB, current_user: SuperAdmin) -> ExecuteResponse:
     """Run the destructive factory reset. Validates every guardrail
     server-side before any TRUNCATE runs.
     """
     forbid_in_demo_mode("Factory reset is disabled")
-    _require_superadmin(current_user)
     # #296 Phase H — refuse if a rolling upgrade is in flight. A
     # mid-upgrade factory reset would leave the orchestrator's
     # SystemUpgradeRun row pointing at a wiped cluster. The Lease
@@ -269,6 +263,8 @@ async def execute(body: ExecuteRequest, db: DB, current_user: CurrentUser) -> Ex
             calling_user_display=current_user.username,
             db_url=str(settings.database_url),
         )
+    except FactoryResetBlockedError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except FactoryResetMutexError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except FactoryResetCooldownError as exc:

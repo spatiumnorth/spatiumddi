@@ -21,6 +21,7 @@ them, and a transient 5xx just gets retried on the next tick.
 
 from __future__ import annotations
 
+import json
 import random
 import re
 import shutil
@@ -39,7 +40,43 @@ log = structlog.get_logger(__name__)
 # Skip files that the agent writes alongside the rendered tree but
 # aren't meaningful for the operator (binary state, locks, etc).
 _SKIP_FILE_NAMES: frozenset[str] = frozenset()
+# Bookkeeping, not config (#2157): an RPZ zone file's content-hash sidecar,
+# and a temp file a crash left behind mid-write.
+#
+# Plus the binary companions BIND writes beside the zone files once a zone is
+# inline-signed (#2842): ``.jnl`` (dynamic-update journal), ``.jbk``
+# (journal backup), ``.signed`` / ``.raw`` (raw-format signed zone). They are
+# not config, and their NUL bytes still decode as UTF-8, so the control plane
+# could not store them. ``_walk_rendered`` also drops any file holding a NUL
+# byte, which catches binary files whatever they are called.
+# And a dynamic zone's ``.owned`` sidecar: the RRsets the control plane owns
+# in it, bookkeeping for carrying RFC 2136 records across a render (#2850),
+# and a static zone's ``.unrendered`` marker (#3632), bookkeeping for keeping
+# a view's copy apart while named still holds a client's names in it.
+_SKIP_FILE_SUFFIXES: tuple[str, ...] = (
+    ".sha256",
+    ".owned",
+    ".unrendered",
+    ".tmp",
+    ".jnl",
+    ".jbk",
+    ".signed",
+    ".raw",
+)
 _RENDERED_DIR_NAME = "rendered"
+
+# Limits the control plane enforces on ``POST /admin/rendered-config``
+# (``_RENDERED_FILE_SIZE_MAX`` / ``_RENDERED_TOTAL_SIZE_MAX`` in
+# backend/app/api/v1/dns/agents.py). The agent is a separate package and
+# cannot import the backend, so they are mirrored here and
+# tests/test_rendered_config_trim_2858.py fails if the two drift.
+RENDERED_FILE_SIZE_MAX = 256 * 1024
+RENDERED_TOTAL_SIZE_MAX = 8 * 1024 * 1024
+# The request body is capped at 8 MiB (#2796) counting the JSON envelope and
+# string escaping, so the encoded body is budgeted below that with headroom.
+RENDERED_REQUEST_BUDGET = 7 * 1024 * 1024
+_TRUNCATED_MARKER = "\n... [truncated by agent]\n"
+_OMITTED_FILE = "_omitted_by_agent.txt"
 
 _REDACTED = "***REDACTED***"
 
@@ -100,23 +137,97 @@ def _walk_rendered(rendered_dir: Path) -> Iterable[tuple[str, str]]:
     for path in sorted(rendered_dir.rglob("*")):
         if not path.is_file():
             continue
-        if path.name in _SKIP_FILE_NAMES:
+        if path.name in _SKIP_FILE_NAMES or path.name.endswith(_SKIP_FILE_SUFFIXES):
             continue
         try:
             content = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             continue
         rel = path.relative_to(rendered_dir).as_posix()
+        if "\x00" in content:
+            # Binary, not config (#2842): PostgreSQL JSONB cannot store NUL.
+            log.debug("rendered_config_skip_binary", path=rel)
+            continue
         # Redact on the way OUT of the appliance, not at the call site — this
         # generator is the single chokepoint every pushed file passes through,
         # so a future caller can't accidentally bypass it (#869).
         yield rel, redact_secrets(content)
 
 
+def _encoded_size(entry: dict[str, str]) -> int:
+    """Bytes one file entry adds to the JSON body (incl. the separator)."""
+    return len(json.dumps(entry).encode("utf-8")) + 1
+
+
+def _is_zone_data(rel: str) -> bool:
+    parts = rel.split("/")
+    return (
+        "zones" in parts[:-1]
+        or "views" in parts[:-1]
+        or parts[-1].endswith((".db", ".zone", ".rpz"))
+    )
+
+
+def _priority(rel: str) -> int:
+    if rel == "named.conf":
+        return 0
+    return 2 if _is_zone_data(rel) else 1
+
+
+def trim_rendered_files(
+    pairs: Iterable[tuple[str, str]],
+    budget: int = RENDERED_REQUEST_BUDGET,
+) -> list[dict[str, str]]:
+    """Fit the rendered tree under the control plane's limits (#2858).
+
+    Each file is cut to 256 KB, then files are kept in priority order
+    (``named.conf``, other config, zone data; smallest first within a
+    class, so the most files survive) until the measured JSON-encoded body
+    reaches ``budget``. A cut file ends in a visible marker, and any file
+    left out is listed in ``_omitted_by_agent.txt`` so the console view says
+    so rather than silently showing a partial tree.
+    """
+    entries: list[tuple[int, int, str, str, bool]] = []
+    for rel, content in pairs:
+        cut = len(content) > RENDERED_FILE_SIZE_MAX
+        if cut:
+            content = content[: RENDERED_FILE_SIZE_MAX - len(_TRUNCATED_MARKER)] + _TRUNCATED_MARKER
+        entries.append((_priority(rel), len(content), rel, content, cut))
+    entries.sort(key=lambda e: (e[0], e[1], e[2]))
+
+    # Reserve room for the omitted-files note and the {"files": [...]} wrapper.
+    reserve = 16 * 1024
+    used = 32
+    total_chars = 0
+    kept: list[dict[str, str]] = []
+    omitted: list[str] = []
+    for _prio, _size, rel, content, cut in entries:
+        entry = {"path": rel, "content": content}
+        size = _encoded_size(entry)
+        if used + size > budget - reserve or total_chars + len(content) > RENDERED_TOTAL_SIZE_MAX:
+            omitted.append(rel)
+            continue
+        used += size
+        total_chars += len(content)
+        kept.append(entry)
+        if cut:
+            log.warning("rendered_config_file_truncated", path=rel)
+    if omitted:
+        log.warning("rendered_config_files_omitted", count=len(omitted), paths=omitted[:50])
+        note = (
+            "These rendered files were left out of this snapshot because the "
+            "tree is larger than the control plane accepts. They are on the "
+            "server's disk.\n" + "\n".join(omitted) + "\n"
+        )
+        note = note[: reserve // 2]  # bounded however many files were dropped
+        kept.append({"path": _OMITTED_FILE, "content": note})
+    return kept
+
+
 def push_rendered_config(cfg: AgentConfig, token: str) -> None:
-    """One-shot push of every text file under ``state_dir/rendered/``."""
+    """One-shot push of the text files under ``state_dir/rendered/``, trimmed."""
     rendered = cfg.state_dir / _RENDERED_DIR_NAME
-    files = [{"path": rel, "content": content} for rel, content in _walk_rendered(rendered)]
+    files = trim_rendered_files(_walk_rendered(rendered))
     if not files:
         log.debug("rendered_config_push_skipped", reason="no_files")
         return

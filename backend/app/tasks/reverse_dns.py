@@ -22,8 +22,10 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.celery_app import celery_app
 from app.config import settings
+from app.db import task_connect_args
 from app.models.audit import AuditLog
 from app.models.settings import PlatformSettings
+from app.tasks._interval_gate import interval_skip
 
 logger = structlog.get_logger(__name__)
 
@@ -33,7 +35,9 @@ _SINGLETON_ID = 1
 async def _run_sweep(force: bool = False) -> dict[str, Any]:
     from app.services.ipam.reverse_dns import populate_reverse_dns  # noqa: PLC0415
 
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
@@ -42,15 +46,14 @@ async def _run_sweep(force: bool = False) -> dict[str, Any]:
                 return {"status": "disabled"}
 
             now = datetime.now(UTC)
-            if not force and ps.reverse_dns_last_run_at is not None:
-                interval = timedelta(minutes=max(1, ps.reverse_dns_interval_minutes))
-                elapsed = now - ps.reverse_dns_last_run_at
-                if elapsed < interval:
-                    return {
-                        "status": "skipped",
-                        "reason": "interval_not_elapsed",
-                        "wait_seconds": int((interval - elapsed).total_seconds()),
-                    }
+            if not force:
+                skip = interval_skip(
+                    now,
+                    ps.reverse_dns_last_run_at,
+                    timedelta(minutes=max(1, ps.reverse_dns_interval_minutes)),
+                )
+                if skip is not None:
+                    return skip
 
             counts = await populate_reverse_dns(db, resolvers=ps.reverse_dns_resolvers or None)
             ps.reverse_dns_last_run_at = now

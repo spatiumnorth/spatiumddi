@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import {
   Building2,
   Loader2,
@@ -25,6 +26,7 @@ import { cn } from "@/lib/utils";
 
 import { errMsg, humanTime } from "./_shared";
 import { AsnFormModal } from "./AsnFormModal";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 // ── Badges ──────────────────────────────────────────────────────────
 
@@ -169,9 +171,11 @@ function ConfirmBulkDeleteModal({
       <div className="space-y-3 text-sm">
         <p>
           Delete <span className="font-semibold">{count}</span> ASN
-          {count === 1 ? "" : "s"}? Linked RPKI ROA rows are removed (CASCADE).
-          This won't touch IPAM rows or BGP-relationship FKs (those land in
-          follow-up issues with their own delete policy).
+          {count === 1 ? "" : "s"}? The ASN's RPKI ROA rows, BGP peerings (on
+          either side), communities, BGP tracked prefixes (hand-tracked ones
+          too) and hijack detections are deleted with it. IP spaces, IP blocks,
+          VRFs, routers, providers and Looking Glass peers and routes that carry
+          it are kept and have their ASN cleared.
         </p>
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -207,6 +211,13 @@ function AsnRow({
   onToggle: () => void;
   onEdit: () => void;
 }) {
+  // #1340 — a read-only user is offered no write it would be refused:
+  // the router asks write on 'manage_asns'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "manage_asns"),
+    "Requires write permission on ASNs",
+  );
   const qc = useQueryClient();
   const refreshMut = useMutation({
     mutationFn: () => asnsApi.refreshWhois(a.id),
@@ -277,7 +288,9 @@ function AsnRow({
                 ? "Private ASN — no public WHOIS"
                 : "Refresh WHOIS"
             }
+            aria-label="Refresh WHOIS"
             className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
+            {...writeGate}
           >
             {refreshMut.isPending ? (
               <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -288,7 +301,9 @@ function AsnRow({
           <button
             onClick={onEdit}
             title="Edit ASN"
-            className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+            aria-label="Edit ASN"
+            className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+            {...writeGate}
           >
             <Pencil className="h-3 w-3" />
           </button>
@@ -301,6 +316,17 @@ function AsnRow({
 // ── Page ────────────────────────────────────────────────────────────
 
 export function AsnsPage() {
+  // #1340 — a read-only user is offered no write it would be refused:
+  // the router asks write (delete) on 'manage_asns'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "manage_asns"),
+    "Requires write permission on ASNs",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "manage_asns"),
+    "Requires delete permission on ASNs",
+  );
   const qc = useQueryClient();
 
   const [kindFilter, setKindFilter] = useState<ASNKind | "all">("all");
@@ -327,7 +353,11 @@ export function AsnsPage() {
     return p;
   }, [kindFilter, registryFilter, whoisFilter, search, tagFilters]);
 
-  const { data, isFetching } = useQuery({
+  const {
+    data,
+    isFetching,
+    error: listError,
+  } = useQuery({
     queryKey: ["asns", queryParams],
     queryFn: () => asnsApi.list(queryParams),
     // #278 follow-up — a freshly-created ASN's RDAP/RPKI data lands a few
@@ -381,7 +411,7 @@ export function AsnsPage() {
               <Building2 className="h-5 w-5 text-muted-foreground" />
               <h1 className="text-lg font-semibold">ASNs</h1>
               <span className="text-xs text-muted-foreground">
-                {total} ASN{total === 1 ? "" : "s"}
+                {listError ? "—" : `${total} ASN${total === 1 ? "" : "s"}`}
                 {selected.size > 0 && (
                   <span className="ml-2 text-primary">
                     {selected.size} selected
@@ -390,9 +420,8 @@ export function AsnsPage() {
               </span>
             </div>
             <p className="mt-1 max-w-3xl text-xs text-muted-foreground">
-              The autonomous systems carrying our IP space. Foundation for RDAP
-              refresh, RPKI ROA tracking, and BGP-relationship FKs in follow-up
-              phases.
+              The autonomous systems carrying our IP space, with RDAP refresh,
+              RPKI ROA tracking, and BGP peerings and communities.
             </p>
           </div>
           <div className="flex flex-shrink-0 items-center gap-2">
@@ -407,6 +436,7 @@ export function AsnsPage() {
               variant="primary"
               icon={Plus}
               onClick={() => setShowCreate(true)}
+              {...writeGate}
             >
               New ASN
             </HeaderButton>
@@ -465,7 +495,8 @@ export function AsnsPage() {
             <span className="text-xs font-medium">Bulk:</span>
             <button
               onClick={() => setConfirmDelete(true)}
-              className="inline-flex items-center gap-1 rounded-md bg-destructive px-2 py-1 text-xs text-destructive-foreground hover:bg-destructive/90"
+              className="inline-flex items-center gap-1 rounded-md bg-destructive px-2 py-1 text-xs text-destructive-foreground hover:bg-destructive/90 disabled:cursor-not-allowed disabled:opacity-50"
+              {...deleteGate}
             >
               <Trash2 className="h-3 w-3" /> Delete {selected.size}
             </button>
@@ -489,11 +520,31 @@ export function AsnsPage() {
             <div className="flex flex-col items-center gap-2 p-10 text-center">
               <Building2 className="h-8 w-8 text-muted-foreground" />
               <p className="text-sm text-muted-foreground">
-                No ASNs tracked yet — add one to start the registry.
+                <ListEmpty
+                  error={listError}
+                  what="ASNs"
+                  filtered={
+                    kindFilter !== "all" ||
+                    registryFilter !== "all" ||
+                    whoisFilter !== "all" ||
+                    search.trim() !== "" ||
+                    tagFilters.length > 0
+                  }
+                  onClearFilters={() => {
+                    setKindFilter("all");
+                    setRegistryFilter("all");
+                    setWhoisFilter("all");
+                    setSearch("");
+                    setTagFilters([]);
+                  }}
+                >
+                  No ASNs tracked yet — add one to start the registry.
+                </ListEmpty>
               </p>
               <button
                 onClick={() => setShowCreate(true)}
-                className="mt-1 inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
+                className="mt-1 inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                {...writeGate}
               >
                 <Plus className="h-3 w-3" /> New ASN
               </button>

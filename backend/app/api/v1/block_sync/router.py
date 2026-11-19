@@ -33,6 +33,8 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB
+from app.api.stepup import require_operator_stepup
+from app.api.v1._common import add_trigger_audit
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import require_permission
@@ -49,6 +51,7 @@ from app.models.panos import PANOSFirewall
 from app.models.unifi import UnifiController
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import CreateNetworkBlockArgs
+from app.services.api_token_scopes import token_write
 from app.services.approvals.gate import gate_or_execute
 from app.services.block_sync.reconcile import (
     applicable_targets_for_kind,
@@ -62,7 +65,6 @@ from app.services.block_sync.reconcile import (
     preview_unifi,
     unifi_config_error,
 )
-from app.services.reauth import ReauthOutcome, reverify_operator
 
 PERMISSION = "manage_block_sync"
 
@@ -365,6 +367,9 @@ async def list_blocks(db: DB, _: ManageUser) -> list[BlockOut]:
 
 
 @router.post("/blocks/preview", response_model=list[TargetDiffOut])
+@token_write(
+    "DB-only dry run of a block-sync add, no push and no write; kept write-scoped behind ManageUser as the preview half of the block-sync write flow"
+)
 async def preview_block(body: BlockCreate, db: DB, _: ManageUser) -> list[TargetDiffOut]:
     """Show which armed targets a new block would land on, and the exact
     add — WITHOUT persisting or pushing anything (NN#5)."""
@@ -730,6 +735,18 @@ async def reconcile_target(
 
     if not preview and diff.error is None:
         forbid_in_demo_mode("Block-sync writes are disabled in demo mode")
+        # #2303 — who forced this push; the worker's ``block_sync_push`` row
+        # is attributed to "system".
+        add_trigger_audit(
+            db,
+            user,
+            resource_type="network_block_target",
+            resource_id=target_id,
+            resource_display=f"{target_kind}:{diff.target_name}",
+            action="reconcile",
+            new_value={"to_add": len(diff.to_add), "to_remove": len(diff.to_remove)},
+        )
+        await db.commit()
         _enqueue_reconcile([(target_kind, target_id)])
     return TargetDiffOut(
         target_kind=diff.target_kind,
@@ -752,22 +769,18 @@ async def reveal_credentials(
     """Reveal the stored write-scoped secret after re-confirming the
     operator (password / TOTP), mirroring the agent-bootstrap-key reveal.
     Audited. ``manage_block_sync`` holders only (router-level gate)."""
-    outcome = reverify_operator(user, password=body.password, totp_code=body.totp_code)
-    if outcome is not ReauthOutcome.OK:
-        db.add(
-            AuditLog(
-                user_id=user.id,
-                user_display_name=user.display_name,
-                auth_source=user.auth_source,
-                action="block_sync_reveal_denied",
-                resource_type="network_block_target",
-                resource_id=str(target_id),
-                resource_display=f"{target_kind}:{target_id}",
-                result="forbidden",
-            )
-        )
-        await db.commit()
-        raise HTTPException(status_code=403, detail="Password or TOTP code is incorrect")
+    # #1413 — through the shared step-up, so a wrong answer spends the
+    # per-account budget like every other step-up.
+    await require_operator_stepup(
+        db,
+        user,
+        password=body.password,
+        totp_code=body.totp_code,
+        action="block_sync_reveal_denied",
+        resource_type="network_block_target",
+        resource_id=str(target_id),
+        resource_display=f"{target_kind}:{target_id}",
+    )
 
     revealed: dict[str, str] = {}
     if target_kind == "opnsense":

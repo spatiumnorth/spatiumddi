@@ -25,6 +25,11 @@ SECURITY (#400 / GHSA-mj4g-hw3m-62rm, finding L5):
         * cloud metadata   169.254.169.254 (a link-local address; called
                            out explicitly because it is the canonical
                            SSRF-to-cloud-creds pivot)
+        * unspecified      0.0.0.0/8, :: (a connect() to these is routed
+                           to the local host)
+
+    IPv4-mapped IPv6 addresses (``::ffff:127.0.0.1``) are judged by the
+    IPv4 address they carry.
 
     ``assert_safe_target`` resolves the host and, by default, *logs* the
     resolved IP plus a ``ssrf_guard_*`` structured event so an operator
@@ -51,6 +56,8 @@ logger = structlog.get_logger(__name__)
 
 # Cloud-metadata service address — the canonical SSRF-to-creds pivot.
 _CLOUD_METADATA = ipaddress.ip_address("169.254.169.254")
+# RFC 1122 "this network" — the kernel routes a connect() to it locally.
+_THIS_NETWORK = ipaddress.ip_network("0.0.0.0/8")
 
 
 class SSRFBlockedError(Exception):
@@ -63,13 +70,31 @@ def _classify(ip: ipaddress._BaseAddress) -> str | None:
     target, else ``None``. Note RFC1918 / unique-local are intentionally
     NOT classified — those are legitimate on-prem integration targets."""
 
+    # ``::ffff:127.0.0.1`` is 127.0.0.1 on the wire; judge the v4 address.
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
     if ip == _CLOUD_METADATA:
         return "cloud_metadata"
     if ip.is_loopback:  # 127.0.0.0/8, ::1
         return "loopback"
     if ip.is_link_local:  # 169.254.0.0/16, fe80::/10
         return "link_local"
+    # 0.0.0.0/8 and ``::`` — a connect() to these reaches the local host.
+    if ip.is_unspecified or (ip.version == 4 and ip in _THIS_NETWORK):
+        return "unspecified"
     return None
+
+
+def classify_address(value: str) -> str | None:
+    """Public form of the classifier for an IP-literal string: the reason it
+    is a forbidden target, or ``None`` (including for a non-IP string)."""
+
+    try:
+        ip = ipaddress.ip_address(value.split("%", 1)[0])
+    except ValueError:
+        return None
+    return _classify(ip)
 
 
 def extract_host(target: str) -> str:
@@ -154,11 +179,9 @@ def assert_safe_target(
 
     flagged: list[str] = []
     for ip_str in resolved:
-        try:
-            ip = ipaddress.ip_address(ip_str)
-        except ValueError:
-            continue
-        reason = _classify(ip)
+        # classify_address drops an IPv6 ``%zone`` suffix, which a
+        # link-local answer carries and ``ip_address`` rejects.
+        reason = classify_address(ip_str)
         if reason is not None:
             flagged.append(f"{ip_str} ({reason})")
 
@@ -182,4 +205,4 @@ def assert_safe_target(
     return resolved
 
 
-__all__ = ["assert_safe_target", "extract_host", "SSRFBlockedError"]
+__all__ = ["assert_safe_target", "classify_address", "extract_host", "SSRFBlockedError"]

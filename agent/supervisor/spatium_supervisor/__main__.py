@@ -23,16 +23,24 @@ import os
 import signal
 import sys
 import time
+from collections.abc import Callable
 
 import httpx
 import structlog
 
 import dataclasses
 
-from . import appliance_state, approval_state, cp_tls
+from . import appliance_state, approval_state, cp_tls, self_bootstrap_token
 from .cert_auth import clear_cert
 from .config import SupervisorConfig
-from .heartbeat import _effective_control_plane_url, heartbeat_once
+from .heartbeat import (
+    ROLE_ENV_FILENAME,
+    _effective_control_plane_url,
+    drain_housekeeping,
+    heartbeat_once,
+    next_heartbeat_delay,
+    read_lifecycle_state,
+)
 from .k8s_proxy import start_proxy_thread
 from .identity import (
     clear_appliance_id,
@@ -52,6 +60,7 @@ from .register import (
     RegisterThrottled,
     register,
 )
+from .role_orchestrator import last_assigned_roles
 from .state import ensure_layout
 
 
@@ -65,10 +74,13 @@ def _self_bootstrap_or_skip(
 
     Only fires on the control-plane appliance where the
     installer wizard didn't capture a pairing code (the control plane
-    IS local). The api gates the endpoint on (1) the host bind-mounted
-    ``role-config:ROLE`` matching this claim and (2) no existing
-    Appliance rows, so calling it from anywhere other than the local
-    supervisor on a fresh install fails 403/409.
+    IS local). The api gates the endpoint on (1) a one-time token this
+    function writes to the host release-state directory and presents in
+    the body — the proof that the caller is on this host, since the
+    endpoint is also reachable through the frontend's ``/api/`` proxy —
+    (2) the host bind-mounted ``role-config:ROLE`` matching this claim
+    and (3) no live Appliance rows. The token file is removed again once
+    the call returns, whatever its outcome.
 
     On success we return a frozen copy of ``cfg`` with the new code +
     control-plane URL stamped in. On any failure (api not reachable,
@@ -94,11 +106,20 @@ def _self_bootstrap_or_skip(
     # makes the name absolute and skips the search list entirely.
     api_url = "http://spatium-control-spatiumddi-api.spatium.svc.cluster.local.:8000"
     log.info("supervisor.self_bootstrap.attempting", variant=variant, api_url=api_url)
+    token = self_bootstrap_token.write()
+    if token is None:
+        # The api refuses a call without the token, so there is no point
+        # sending one; the next register-loop tick tries again.
+        log.warning(
+            "supervisor.self_bootstrap.skipped",
+            reason="could not write the self-bootstrap token",
+        )
+        return cfg
     try:
         with httpx.Client(timeout=10.0) as client:
             resp = client.post(
                 f"{api_url}/api/v1/appliance/self-register-bootstrap",
-                json={"appliance_variant": variant},
+                json={"appliance_variant": variant, "bootstrap_token": token},
             )
     except httpx.HTTPError as exc:
         log.warning(
@@ -107,6 +128,8 @@ def _self_bootstrap_or_skip(
             hint="will retry on next register-loop tick",
         )
         return cfg
+    finally:
+        self_bootstrap_token.remove()
     if resp.status_code == 409:
         log.info("supervisor.self_bootstrap.already_registered")
         return cfg
@@ -137,8 +160,60 @@ def _self_bootstrap_or_skip(
     )
 
 
+# #2789: how long the revoke recovery waits after an attempt that brought no fresh
+# pairing code back. The self-bootstrap refuses (409) while any live appliance row
+# exists, and a node whose own row is still there (a row revoked but not deleted,
+# or any node of a multi-node cluster) changes nothing by asking again a heartbeat later:
+# each attempt writes and removes the self-bootstrap token file, holds the api
+# through its failure delay and logs four lines. So the next attempt waits a minute,
+# then two, then four, and every four minutes from then on. Four minutes caps the
+# one delay this adds: a row revoked first and deleted minutes later is replaced at
+# most four minutes and a heartbeat after the delete, instead of a heartbeat after.
+REVOKED_RETRY_FIRST_S = 60.0
+REVOKED_RETRY_MAX_S = 240.0
+
+# The retry schedule's clock: a module name, so a test can move it.
+_monotonic = time.monotonic
+
+
+class RevokedReregisterRetry:
+    """When the revoke recovery may ask the self-bootstrap again (#2789).
+
+    Due at once until an attempt brings no code back; ``defer()`` then sets the
+    wait: REVOKED_RETRY_FIRST_S, doubling up to REVOKED_RETRY_MAX_S. The main loop
+    calls ``reset()`` on every tick the node is not revoked, so a node approved
+    again starts over: its next revocation is handled at once, and the waits after
+    it start from the first again.
+    """
+
+    def __init__(self, clock: Callable[[], float] | None = None) -> None:
+        self._clock = clock or _monotonic
+        self._wait = 0.0
+        self._next_at: float | None = None
+
+    def due(self) -> bool:
+        return self._next_at is None or self._clock() >= self._next_at
+
+    def defer(self) -> float:
+        """An attempt brought no code back: wait before the next. Returns the
+        wait, in seconds."""
+        if self._wait:
+            self._wait = min(self._wait * 2, REVOKED_RETRY_MAX_S)
+        else:
+            self._wait = REVOKED_RETRY_FIRST_S
+        self._next_at = self._clock() + self._wait
+        return self._wait
+
+    def reset(self) -> None:
+        self._wait = 0.0
+        self._next_at = None
+
+
 def _maybe_register(
-    cfg: SupervisorConfig, log: structlog.stdlib.BoundLogger
+    cfg: SupervisorConfig,
+    log: structlog.stdlib.BoundLogger,
+    *,
+    retry: RevokedReregisterRetry | None = None,
 ) -> SupervisorConfig:
     """Run identity generation + register-if-needed in one shot. Logs
     its own status; never raises into the caller (the main loop
@@ -150,6 +225,9 @@ def _maybe_register(
     refreshed in the returned config so the caller's heartbeat
     loop can use the new control-plane URL going forward.
     Otherwise returns the input verbatim.
+
+    ``retry`` (#2789), when given, is told when the revoke recovery's
+    self-bootstrap brings no code back, so the caller waits before asking again.
     """
     identity, generated = load_or_generate(cfg.state_dir)
     if generated:
@@ -164,6 +242,7 @@ def _maybe_register(
         )
 
     cached_appliance_id = load_appliance_id(cfg.state_dir)
+    restore_roles: dict[str, object] | None = None
     if cached_appliance_id is not None:
         # Issue #170 Wave E follow-up + #272 Phase 1 audit — revoke
         # recovery. If the supervisor flipped to
@@ -191,11 +270,39 @@ def _maybe_register(
         if approval_state.read_state(cfg.state_dir) == "revoked" and (
             cfg.bootstrap_pairing_code or can_self_bootstrap
         ):
+            via_self_bootstrap = can_self_bootstrap and not cfg.bootstrap_pairing_code
+            if via_self_bootstrap:
+                # #2696: mint the new code BEFORE clearing anything. The
+                # self-bootstrap mints only while no live appliance row
+                # exists (409 otherwise). This node's own row can still be
+                # there: a revoked row stays until it is deleted. Clearing
+                # first would then leave the node with no identity and no
+                # code, and nothing could bring it back. Kept, it is approved
+                # again on its own row as soon as its heartbeats are accepted.
+                minted = _self_bootstrap_or_skip(cfg, "control-plane", log)
+                if not minted.bootstrap_pairing_code:
+                    log.info(
+                        "supervisor.register.revoked_reregister_deferred",
+                        appliance_id=str(cached_appliance_id),
+                        reason="no fresh pairing code; keeping this identity",
+                        # #2789: the next attempt waits this long.
+                        retry_in_seconds=retry.defer() if retry is not None else None,
+                    )
+                    return cfg
+                cfg = minted
+                # #2801 — the roles this node was serving, read back from its
+                # role env before the new registration can overwrite it. The
+                # lost row took the assignment with it; without this the node
+                # came back approved and serving nothing.
+                restore_roles = last_assigned_roles(
+                    cfg.state_dir / ROLE_ENV_FILENAME,
+                    read_lifecycle_state(cfg.state_dir)[0],
+                )
             log.info(
                 "supervisor.register.revoked_reregister",
                 stale_appliance_id=str(cached_appliance_id),
-                via_self_bootstrap=can_self_bootstrap
-                and not cfg.bootstrap_pairing_code,
+                via_self_bootstrap=via_self_bootstrap,
+                restore_roles=(restore_roles or {}).get("roles", []),
             )
             clear_appliance_id(cfg.state_dir)
             clear_session_token(cfg.state_dir)
@@ -244,6 +351,7 @@ def _maybe_register(
                 # waiting for the first heartbeat. None on docker / k8s
                 # supervisors (no role-config bind mount).
                 appliance_variant=appliance_state.detect_appliance_variant(),
+                restore_roles=restore_roles,
             )
     except RegisterDisabled as exc:
         log.warning("supervisor.register.disabled", reason=str(exc))
@@ -317,7 +425,11 @@ def main() -> int:
         heartbeat_interval_seconds=cfg.heartbeat_interval_seconds,
     )
 
-    cfg = _maybe_register(cfg, log)
+    # #2789: paces the revoke recovery while the node stays revoked. An attempt here
+    # that brings no code back counts too, so the loop's first tick does not ask
+    # again at once.
+    reregister_retry = RevokedReregisterRetry()
+    cfg = _maybe_register(cfg, log, retry=reregister_retry)
 
     # Issue #183 Phase 4 — k3s proxy thread. Daemon thread that
     # long-polls the control plane for queued kubeapi requests +
@@ -325,7 +437,8 @@ def main() -> int:
     # (no cert / no registration / no k3s → sleep + retry); safe
     # to spawn even on legacy compose deployments. The proxy is
     # net-new for #183; pre-#183 control planes don't enqueue
-    # anything so the loop just sees empty polls.
+    # anything so the loop just sees empty polls. On by default
+    # (#3618); K8S_PROXY_ENABLED=false opts out.
     if cfg.k8s_proxy_enabled:
         identity_for_proxy, _ = load_or_generate(cfg.state_dir)
         start_proxy_thread(cfg, identity_for_proxy)
@@ -404,6 +517,9 @@ def main() -> int:
     # (~heartbeat_interval server-side); this only bounds the re-post rate
     # if a server ever returns held=True fast in a loop.
     held_rearm_floor_s = 2.0
+    # #1805 — heartbeats in a row that never reached the control plane; the
+    # next one goes sooner than the interval (``next_heartbeat_delay``).
+    failures = 0
 
     while not stop:
         try:
@@ -421,6 +537,35 @@ def main() -> int:
         if appliance_id is None:
             cfg = _maybe_register(cfg, log)
             appliance_id = load_appliance_id(cfg.state_dir)
+        elif (
+            approval_state.read_state(cfg.state_dir) == "revoked"
+            and appliance_state.detect_appliance_variant() == "control-plane"
+        ):
+            # #2696: the revoke recovery runs while the supervisor runs, not
+            # only at start-up. A Fleet row that went away leaves the cached
+            # appliance id in place, so the branch above never ran it, and
+            # the node stayed revoked (role services torn down) until its pod
+            # restarted. Control-plane nodes only: they re-register through
+            # the self-bootstrap, which mints a code only once no live row is
+            # left. A data-plane appliance keeps its identity, so Re-authorize
+            # on the Fleet page restores it on the same row. A code this
+            # process registered with earlier is spent, so the recovery asks
+            # for a fresh one instead of presenting it again.
+            # #2789: not on every tick. While a live row is left (this node's own,
+            # revoked but not deleted, or a cluster peer's) the
+            # self-bootstrap refuses, so an attempt that brought no code back
+            # waits a minute, doubling to four, before the next.
+            if reregister_retry.due():
+                cfg = _maybe_register(
+                    dataclasses.replace(cfg, bootstrap_pairing_code=""),
+                    log,
+                    retry=reregister_retry,
+                )
+                appliance_id = load_appliance_id(cfg.state_dir)
+        else:
+            # #2789: not revoked (or not a node that runs the recovery), so a later
+            # revocation is handled at once and its waits start from the first again.
+            reregister_retry.reset()
         # #272 — cluster members heartbeat the in-cluster api Service
         # (resolved here so the skip-gate matches what heartbeat_once
         # will actually POST to). A control-plane member always has a
@@ -428,8 +573,10 @@ def main() -> int:
         # agent only proceeds when its configured URL is present.
         effective_url = _effective_control_plane_url(cfg)
         # #358 Phase 1b — True when the control plane long-poll-held this
-        # heartbeat (and thus already paced us ~heartbeat_interval).
-        held = False
+        # heartbeat (and thus already paced us ~heartbeat_interval); None when
+        # it did not land: it never reached the control plane (#1805), or the
+        # control plane answered 5xx (#3020).
+        held: bool | None = False
         if appliance_id is not None and effective_url:
             session_token = load_session_token(cfg.state_dir)
             identity, _ = load_or_generate(cfg.state_dir)
@@ -468,9 +615,18 @@ def main() -> int:
         # heartbeat it already blocked ~heartbeat_interval server-side, so
         # re-arm the hold after a short floor instead of sleeping the full
         # interval again (which would roughly halve hold coverage). Old
-        # control planes / errors (held=False) keep the full interval.
-        sleep_budget = (
-            held_rearm_floor_s if held else float(cfg.heartbeat_interval_seconds)
+        # control planes and crashes (held=False) keep the full interval.
+        # #1805 — a heartbeat that never reached the control plane (None) is
+        # re-sent after 5 s, doubling while they keep failing, up to the
+        # interval: a node loss's few seconds of unreachable api no longer cost
+        # a whole interval each. #3020 — one answered 5xx (a database outage
+        # behind the api) is None too, and is re-sent the same way.
+        failures = failures + 1 if held is None else 0
+        sleep_budget = next_heartbeat_delay(
+            held,
+            failures,
+            float(cfg.heartbeat_interval_seconds),
+            held_rearm_floor_s,
         )
         waited = 0.0
         while waited < sleep_budget:
@@ -479,6 +635,10 @@ def main() -> int:
             time.sleep(1)
             waited += 1.0
 
+    # #3020 — housekeeping still running on its worker (a heartbeat stopped
+    # waiting for it) gets a bounded chance to finish before the process ends.
+    if not drain_housekeeping(20.0):
+        log.warning("supervisor.stop.housekeeping_unfinished")
     log.info("supervisor.stop")
     return 0
 

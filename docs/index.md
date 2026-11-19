@@ -23,7 +23,7 @@ description: SpatiumDDI documentation — setup, architecture, feature specs, de
   <dl class="idx-facts">
     <div class="idx-fact"><dt>DNS engines</dt><dd>BIND9 · PowerDNS · Technitium · Windows DNS · Cloudflare · Route 53 · Azure · Google</dd></div>
     <div class="idx-fact"><dt>DHCP engines</dt><dd>Kea · Windows DHCP</dd></div>
-    <div class="idx-fact"><dt>Deploy as</dt><dd>OS appliance · Docker Compose · Kubernetes</dd></div>
+    <div class="idx-fact"><dt>Deploy as</dt><dd>OS appliance · Docker Compose · Kubernetes · OpenShift</dd></div>
     <div class="idx-fact"><dt>Telemetry</dt><dd><a href="PRIVACY.html">None — ever</a></dd></div>
     <div class="idx-fact"><dt>License</dt><dd>Apache 2.0 · <a href="{{ site.links.github }}">source on GitHub</a></dd></div>
   </dl>
@@ -172,6 +172,10 @@ description: SpatiumDDI documentation — setup, architecture, feature specs, de
       <span class="idx-card-title">Vertical Network Awareness</span>
       <span class="idx-card-desc">AV-over-IP, BACnet/IP, industrial OT and DICOM registries, plus the do-not-probe flag</span>
     </a>
+    <a class="idx-card" href="features/COPILOT.html">
+      <span class="idx-card-title">Operator Copilot</span>
+      <span class="idx-card-desc">Provider failover, tool registry, MCP endpoint, chat surface and token caps</span>
+    </a>
     <a class="idx-card" href="features/E911.html">
       <span class="idx-card-title">E911 Dispatchable Location</span>
       <span class="idx-card-desc">A Location Information Server: ERLs, port and subnet bindings, HELD and DHCP delivery</span>
@@ -206,7 +210,15 @@ description: SpatiumDDI documentation — setup, architecture, feature specs, de
     </a>
     <a class="idx-card" href="deployment/KUBERNETES.html">
       <span class="idx-card-title">Kubernetes</span>
-      <span class="idx-card-desc">Umbrella Helm chart, HPA, Ingress / LoadBalancer, CloudNativePG + Redis Sentinel HA</span>
+      <span class="idx-card-desc">Umbrella Helm chart, HPA, Ingress / LoadBalancer, CloudNativePG + Redis Sentinel HA; installs on OpenShift under its default SCCs</span>
+    </a>
+    <a class="idx-card" href="deployment/SIZING.html">
+      <span class="idx-card-title">Sizing</span>
+      <span class="idx-card-desc">Measured memory, CPU and disk per deployment shape, the minimums, and how to measure your own install</span>
+    </a>
+    <a class="idx-card" href="deployment/REVERSE_PROXY.html">
+      <span class="idx-card-title">Behind a Reverse Proxy</span>
+      <span class="idx-card-desc">nginx, Caddy, Traefik, HAProxy, Nginx Proxy Manager, K8s Ingress: headers, trusted proxies, streaming, troubleshooting</span>
     </a>
     <a class="idx-card" href="deployment/APPLIANCE.html">
       <span class="idx-card-title">OS Appliance Design</span>

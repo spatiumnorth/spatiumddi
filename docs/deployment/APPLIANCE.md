@@ -33,16 +33,23 @@ mkosi bakes everything the appliance needs to come up fully air-gapped:
 
 - **k3s static binary** (~70 MB) at `/usr/local/bin/k3s`; `kubectl` / `crictl` / `ctr` symlink to it.
 - **k3s airgap images** (CoreDNS / local-path / pause / metrics-server) as zst-compressed tarballs at `/var/lib/rancher/k3s/agent/images/*.tar.zst`. k3s auto-imports them into containerd at boot.
-- **SpatiumDDI container images** as zst tarballs at `/usr/lib/spatiumddi/images/`. firstboot imports them into k3s containerd via `ctr -n k8s.io images import`. Includes api / frontend / worker / beat / migrate / dns-bind9 / dns-powerdns / dns-technitium / dhcp-kea / supervisor / nginx + postgres:16-alpine + redis:8.10.2-alpine for the Control plane role.
+- **SpatiumDDI container images** as zst tarballs at `/var/lib/rancher/k3s/agent/images/`, the k3s airgap directory; k3s imports them into its containerd store when it starts. Includes api / frontend / worker / beat / migrate / dns-bind9 / dns-powerdns / dns-technitium / dhcp-kea / supervisor / nginx + postgres:16-alpine + redis:8.10.2-alpine for the Control plane role.
+- **Control-plane environment** is written once, under the chart's `sharedEnv` value, which the umbrella chart appends to the api, worker AND beat containers (#1826). That is where `APPLIANCE_MODE`, `APPLIANCE_HOSTNAME`, `APPLIANCE_HOST_IPS` and `INITIAL_NTP_SERVERS` live. `APPLIANCE_VERSION` joins them from a value of its own, `applianceVersion`: it is re-read from the booted slot's `/etc/spatiumddi/appliance-release` on every boot, so it follows an upgrade or rollback, and on a multi-node cluster it is the seed's, since only the seed renders this manifest. It is not a `sharedEnv` entry because a cluster Rolling Upgrade holds it with `image.tag` until every node runs the target (#2176): a HelmChartConfig can pin a single value but replaces a list whole, so as an entry the seed's boot onto its new slot rolled the api, worker and beat mid-run. When the slot-image mirror is on, its URL and secret go to the api and the worker (the worker's upgrade preflight checks the mirror's free space), not to beat. The worker runs alert evaluation (`node_pressure`, `cluster_dns_degraded`) and the rolling-upgrade orchestrator, so a variable only the api carries makes every `appliance_mode` gate read as off there. Agent pre-shared keys stay under `api.env`: only the api reads them. `charts-render-check.sh` fails a render where api, worker and beat disagree on the shared set, or where beat carries the mirror secret.
 - **Helm chart tarballs** at `/usr/lib/spatiumddi/charts/`. The appliance chart drives Appliance installs (and the supervisor on the Control plane); the umbrella chart drives the Control plane. Built at release time + signed.
 - **bash-completion + `k` alias** for kubectl — operator SSHing in for triage drops straight into a usable shell.
 
 A fresh appliance boot never reaches out to ghcr.io or any external registry. The first time it does is when an operator explicitly applies a new release through `/appliance → OS Versions` or `/appliance → Releases`.
 
-### Two HelmChart CRs
+### HelmChart CRs
 
-- **`spatium-bootstrap`** — written by `spatiumddi-firstboot` into k3s's auto-deploy directory on every boot. Content depends on install role (Control plane / Appliance). Owns the always-on resources (supervisor on every role; agent-landing on Appliance; control plane pods on Control plane).
-- **`spatiumddi-appliance`** — written by the supervisor on its first successful heartbeat (every role runs a supervisor). Deploys the role DaemonSets (dns-bind9 / dns-powerdns / dns-technitium / dhcp-kea). After #183 Phase 10, this release is installed once and never re-PATCHed for role changes — role swaps happen through node labels (`spatium.io/role-<role>=true`); the DaemonSet's matching-nodes semantics mean an unassigned role produces zero pods rather than a Pending one.
+Four HelmChart CRs make up an appliance. Firstboot writes three of them into k3s's auto-deploy directory on every boot; the supervisor writes the fourth.
+
+- **`spatium-bootstrap`** — written by `spatiumddi-firstboot` as `spatium-bootstrap.yaml`, from the `spatiumddi-appliance` chart tarball. Content depends on install role (Control plane / Appliance). Owns only the always-on resources: the supervisor on every role, plus agent-landing on an Appliance. It does **not** own the control plane pods.
+- **`spatium-control`** — written by firstboot as `spatium-control.yaml`, from the `spatiumddi` umbrella chart tarball, on the Control plane role. Owns the control plane pods (api, frontend, worker, beat, migrate, Postgres, Redis). The supervisor's sizing overrides land in the `spatium-control` HelmChartConfig.
+- **`spatium-metallb`** — written by firstboot as `spatium-metallb.yaml`, from the `spatiumddi-metallb` chart tarball. Runs MetalLB in its own `metallb-system` namespace for the shared control-plane VIP; the seed supervisor enables it and writes the pool through its HelmChartConfig.
+- **`spatiumddi-appliance`** — written by the supervisor on its first successful heartbeat (every role runs a supervisor). Deploys the role DaemonSets (dns-bind9 / dns-powerdns / dns-technitium / dhcp-kea / looking-glass). After #183 Phase 10, this release is installed once and never re-PATCHed for role changes — role swaps happen through node labels (`spatium.io/role-<role>=true`); the DaemonSet's matching-nodes semantics mean an unassigned role produces zero pods rather than a Pending one.
+
+Firstboot also stages `spatium-appliance-tls.yaml` (the Web UI certificate Secret) beside them; it is a plain manifest, not a HelmChart.
 
 ### Why k3s
 
@@ -62,6 +69,10 @@ The trade-off: k3s adds ~70 MB to the slot rootfs and a steady ~150 MB RAM footp
 |---|---|---|---|
 | **Control plane** (api + worker + frontend + Postgres + Redis + k3s etcd seed) | 4 | 8 GiB | 40 GiB SSD |
 | **Appliance** (DNS / DHCP agent) | 2 | 4 GiB | 32 GiB SSD |
+
+Measured memory, CPU and disk for these roles and for a three-node control
+plane, the minimums, and how to measure your own install are in
+[`SIZING.md`](SIZING.md).
 
 **Measured floors (single node, 2026-09).** The recommendation above was
 tested against a fixed load rather than guessed: a single-node control
@@ -83,17 +94,39 @@ generator's view alone.
 Three things shape those numbers, and all three are the appliance's job,
 not the operator's:
 
-- The chart's default api limit (512Mi) cannot build the agent config
-  bundle for a group of this size, and the default worker limit (1Gi with
-  four prefork processes) is OOM-killed under lease/DDNS churn long before
-  the VM runs short. The supervisor therefore sizes both from the node's
-  RAM — api = ½ RAM (1–8 GiB), worker = ¼ RAM (1–4 GiB), two worker
-  processes on nodes of 12 GiB or less — and writes them into the
-  `spatium-control` HelmChartConfig, where they survive k3s restarts and
-  helm re-applies. (`kubectl set resources` on the Deployment does not:
-  k3s re-applies the on-disk HelmChart manifest on every restart.) If you
-  need different limits, put them in that HelmChartConfig, not on the
-  Deployment.
+- The chart's default limits (api 1Gi, worker 2Gi since #3110) are sized
+  for everyday use, not for this load. At the older defaults the api
+  (512Mi) could not build the agent config bundle for a group of this
+  size, and the worker (1Gi with four prefork processes) was OOM-killed
+  under lease/DDNS churn long before the VM ran short. The supervisor
+  therefore sizes both from the node's
+  RAM — api = ½ RAM (1–8 GiB), worker = ⅖ RAM (1–16 GiB, but never more
+  than the api and Postgres leave), two worker processes on nodes of 12 GiB
+  or less — and writes them into the `spatium-control` HelmChartConfig,
+  where they survive k3s restarts and helm re-applies. (`kubectl set
+  resources` on the Deployment does not: k3s re-applies the on-disk
+  HelmChart manifest on every restart.) The api and Postgres CPU limits are
+  sized the same way from the node's CPU count (#2240): the api a quarter
+  of the cores (1–4), Postgres half (1–8), where both were a fixed 1 core.
+  The Postgres memory limit also has to hold the connections the cluster
+  can open, which grow with the control-plane node count (#2156): every
+  node runs an api pod with its own database pool and a worker, every api,
+  worker and beat process holds up to two more for the after-commit hooks
+  (#2782), every api pod holds one more for its readiness probe (#2944), and
+  the primary runs a WAL sender per replica. So the api's pool
+  per pod shrinks past four nodes (10 + 20 up to four, 10 + 3 at nine;
+  about 120 api connections in all), and the limit is never below
+  shared_buffers + 256 MiB + those connections × ~15 MiB each. The cluster
+  can open 52 connections at one node, 134 at three and 227 at nine (two
+  worker processes); `max_connections` stays at the appliance floor of 200
+  until that passes it, then follows it. One node of 8 GiB or more keeps the share
+  above; a three-node cluster on a 12 GiB seed gets 3019Mi, a nine-node one
+  4507Mi. A promote or demote that moves the limit is one CloudNativePG
+  rolling restart.
+  These limits are keys the supervisor **owns**, so a different value written
+  into that HelmChartConfig by hand is put back on the next heartbeat; there
+  is no supported per-install override for them today (see "Who owns which
+  HelmChartConfig key" below).
 - A bulk load creates one queued record op per record per agent server;
   the api ships them to the agent a page at a time (5000 by default,
   `dns_agent_ops_batch`). A group of 250k records drains in ~50 polls; the
@@ -114,9 +147,13 @@ not the operator's:
   A larger socket receive buffer does not help: with 8 MiB of buffer the drops
   vanish but a DORA takes 34 s instead of 1.5 s, because Kea then answers
   stale requests whole retransmit rounds late. Nor does a larger Kea
-  `packet-queue-size`: 64 → 2048 changed neither throughput nor drops, because
-  that queue sits behind the receive thread and the problem is the receive
-  thread not being scheduled.
+  `packet-queue-size` raise throughput. 64 → 2048 changed neither throughput
+  nor drops at a sustained 12,000 pkt/s, because that queue sits behind the
+  receive thread and the problem is the receive thread not being scheduled.
+  Short bursts are different (spatiumddi#1283). Kea's default queue of 64
+  evicts the oldest requests when a burst outruns the worker (counted, since
+  #2889, as `queue_evicted`), so SpatiumDDI renders `packet-queue-size: 1024`. See
+  [`DHCP.md`](../features/DHCP.md#keas-packet-queue).
 - Kea's own packet-worker pool is sized from the **machine's** CPU count, not
   from the container's cgroup share, so on a 4 vCPU appliance it starts four
   workers that compete with the one thread draining the receive socket
@@ -132,7 +169,10 @@ not the operator's:
   only signals that name it — and note it is `socket_drop` specifically:
   Kea's own `pkt4-receive-drop` also counts deliberate drops (a blocklisted
   MAC, an HA standby declining an out-of-scope query) and is not a fault
-  signal. See [`DHCP.md` §4c](../features/DHCP.md).
+  signal. A burst deeper than Kea's 1,024-packet queue loses requests one
+  stage later, after Kea has read them; that is the `queue_evicted` metric
+  (#2889), which the same alert also fires on. See
+  [`DHCP.md` §4c](../features/DHCP.md).
 
 Beyond that: **500k records in one group** is not a supported single-node
 size at any RAM tested (up to 10 GiB) — the api's bundle build for the
@@ -144,7 +184,14 @@ recommendation (4 vCPU / 8 GiB); the members carry the same api / worker /
 Postgres / Redis replicas. Measured on `main` (2026-09-03): three 6.5 GiB /
 4 vCPU nodes formed cleanly and kept every api replica and every k3s
 server up through the same 250k-record / 20k-device load and a kill-leader
-drill (0 k3s restarts, at most one api restart).
+drill (0 k3s restarts, at most one api restart). Measured again on 1.0
+pre-release builds (October 2026): a first node of 4 vCPU / 8 GiB with two
+of 2 vCPU / 6 GiB ran the realistic load, the HA drills and a rolling
+upgrade with no OOM kill, using at most 4.4 GiB on any node. Give every node
+48 GiB of disk: a slot upgrade followed by a rolling upgrade took `/var` on
+40 GiB disks to the 80% disk warning. See [`SIZING.md`](SIZING.md).
+
+**Data disk for large installs (#2240).** Everything that grows with the data lives on `/var`: the Postgres volumes, etcd, the container images and the logs. `/var` is what the disk has left after about 17 GiB of fixed partitions (`spatium-install`: the boot partitions, a 256 MiB state partition and two 8 GiB root slots), so a 40 GiB disk gives 23 GiB of `/var` and a 64 GiB disk 47 GiB. On a seven-node test cluster with 40 GiB disks and every node serving DNS, `/var` reached 88 to 91% on every node at about 1.5M records (about 770,000 devices, an A record and its PTR each), growing about 2 GB an hour per node while records were added at 80 to 190 a second. With the disks grown online to 64 GiB, `/var` read 43 to 45%, and the cluster went on to store 1M devices (2M records). So **for about 1M devices, give every control-plane node a disk of 64 GiB or more**: the 40 GiB above goes with the load the floors were measured at (250k A records and their PTRs). Leave room beyond that for Postgres WAL. After a failover, a primary that still holds replication slots for standbys that cannot follow keeps every WAL segment, and on 64 GiB disks one node's `/var` reached 87% with 26 GB of WAL against 3.3 GB of data (#2317). The default-on `appliance_disk_usage` alert watches `/var` on every node: a warning at 80% and critical at 87%, a few points before the kubelet starts evicting pods at about 90%. Those figures count the 5% that ext4 keeps for root as free, so `df` shows a few points more (see [`OBSERVABILITY.md`](../OBSERVABILITY.md)).
 
 **Control-plane HA is not serving HA.** The DNS and DHCP roles are assigned
 per appliance, and only the nodes that carry a role run the `dns-bind9` /
@@ -154,16 +201,17 @@ answered ~5 % of the queries the load generator sent — the control plane
 had failed over, the data plane had nothing to serve with. Assign the DNS
 and DHCP roles on every node you expect to keep serving during a failover.
 
-The installer's **hard disk floor is 32 GiB** for every role (raised from 24 GiB — issue #312: a 24 GiB disk left `/var` only ~7 GiB, and the Control plane's first boot tipped the kubelet DiskPressure threshold into an eviction storm). RAM has a hard floor as well, and the installer does not enforce it: the kubelet sets aside 2 GiB on every node (`kube-reserved` 1 GiB, `system-reserved` 512 MiB and the 512 MiB `memory.available` eviction threshold — #1124) and schedules pods only into what is left. A single-node control plane requests about 1.6 GiB, so it needs **at least 4 GiB of RAM** to start at all, and a DNS / DHCP appliance **at least 3 GiB**; below that the pods stay `Pending` on `Insufficient memory`. That includes an existing install: a slot upgrade to a release carrying #1124 on a smaller box comes back with nothing schedulable. 8 GiB remains the comfortable recommendation for a control plane. When the operator picks the **Control plane** role on a box below the recommended 40 GiB disk / 8 GiB RAM, `spatium-install` shows a soft sizing warning before proceeding (the lighter Appliance/agent role is fine at the 32 GiB floor and gets no warning). Each control-plane **HA member** sizes the same as a standalone control plane (4 vCPU / 8 GiB) — every member runs a full api / worker / Postgres replica / Redis. SSD is strongly preferred for the etcd + Postgres write path; the installer's disk floor assumes the baked image set lands on the slots, not RAM.
+The installer's **hard disk floor is 32 GiB** for every role (raised from 24 GiB — issue #312: a 24 GiB disk left `/var` only ~7 GiB, and the Control plane's first boot tipped the kubelet DiskPressure threshold into an eviction storm). RAM has a hard floor as well, and the installer does not enforce it: the kubelet sets aside 2 GiB on every node (`kube-reserved` 1 GiB, `system-reserved` 512 MiB and the 512 MiB `memory.available` eviction threshold — #1124) and schedules pods only into what is left. A single-node control plane requests about 1.6 GiB, so it needs **at least 4 GiB of RAM** to start at all, and a DNS / DHCP appliance **at least 3 GiB**; below that the pods stay `Pending` on `Insufficient memory`. The serving roles add their own requests on top of that: BIND and Technitium 256Mi (BIND's is an eighth of its RAM-sized memory limit, so 256Mi up to a ~10 GB node and more above, #2223), Kea, PowerDNS and the looking-glass collector 128Mi each. They are sized above the pods' idle working sets because the kubelet evicts a pod running over its memory request before any pod within its request, whatever the PriorityClasses say (#1828). A single node with the control plane plus the DNS and DHCP roles therefore requests about 2 GiB, which uses up all the allocatable memory a 4 GiB node has. That includes an existing install: a slot upgrade to a release carrying #1124 on a smaller box comes back with nothing schedulable. 8 GiB remains the comfortable recommendation for a control plane. When the operator picks the **Control plane** role on a box below the recommended 40 GiB disk / 8 GiB RAM, `spatium-install` shows a soft sizing warning before proceeding (the lighter Appliance/agent role is fine at the 32 GiB floor and gets no warning). Each control-plane **HA member** sizes the same as a standalone control plane (4 vCPU / 8 GiB) — every member runs a full api / worker / Postgres replica / Redis. SSD is strongly preferred for the etcd + Postgres write path; the installer's disk floor assumes the baked image set lands on the slots, not RAM.
 
 ### Appliance management surfaces (k3s-aware)
 
 The `/appliance` section in the SpatiumDDI UI talks to k3s directly via the api pod's mounted ServiceAccount:
 
 - **Cluster tab** (#402 — folds the former Containers/Pods tab + the etcd-snapshots section into one tab via a left sub-nav, named *Cluster* rather than *Kubernetes* for operator clarity). Three sub-sections: **Overview** — a live SSE-fed (2 s) health dashboard (KPI ribbon, CPU / memory hero chart, per-node radial gauges with the host's real partition list, workload-health panel, top-pods leaderboard) built from kubeapi node / pod listings + per-node kubelet `stats/summary` (there is no Prometheus on the appliance); **Pods** — lists every pod in the spatium namespace via kubeapi `GET /api/v1/namespaces/spatium/pods`, restart = `DELETE` the pod (owning Deployment / DaemonSet recreates it), logs = SSE wrapping kubeapi's `?follow=true` pod-log endpoint; **etcd** — the recoverable `ETCDSnapshotFile` inventory.
-- **TLS cert manager**. Patches the `spatium-appliance-tls` Secret in place via `kubectl patch secret`. Bumps a checksum annotation on the frontend Deployment to trigger a rollout (k8s doesn't auto-roll on Secret changes — the annotation acts as the trigger).
+- **TLS cert manager**. Patches the `spatium-appliance-tls` Secret in place via `kubectl patch secret`, and that is all. The frontend mounts the Secret as a directory, so the kubelet updates the certificate files in its running pods (at each pod's next sync, within about 90 s), and the frontend image's `40-tls-reload-watch.sh` reloads nginx in place when they change. A reload keeps the web ports open; until #1173 a certificate change rolled the frontend Deployment, which on a multi-node control plane closed each node's :80/:443 in turn.
 - **Logs & Diagnostics → Self-test**. Five-check battery: external DNS resolution, kubeapi reachability via the ServiceAccount, every spatium pod's health (Running + healthy / Succeeded Jobs OK), informational DHCP + DNS role presence (OK when not assigned).
-- **Diagnostic bundle**. Per-pod log tails (last 500 lines via kubeapi) + host logs + system info + redacted env, zipped for support tickets.
+- **Log text needs `admin` on `appliance`**. The host log viewer, a pod's logs (one-shot and streamed) and the Cluster live log pane take `admin` on `appliance`, the same permission as the diagnostic bundle, because a log line can carry whatever a process printed. A role with only `read` on `appliance` keeps the pod list, the cluster health view and the self-test, and the console does not draw the log panes for it. A running log stream re-checks the permission, so cutting a role back to `read` ends it. Every line is passed through the same credential sweep as the bundle before it is sent.
+- **Diagnostic bundle**. Per-pod log tails (last 500 lines via kubeapi) + host logs + system info + redacted env, zipped for support tickets. Environment values appear only for known non-secret settings (every other variable is listed with its value replaced), and every file is swept for credential-shaped values such as keys, tokens and passwords embedded in URLs. That sweep is best effort, so review the bundle before sharing it.
 - **OS Versions**. Atomic A/B slot upgrades — same machinery as pre-#183 (Phase 8); the slot raw.xz carries a complete rootfs with k3s + baked images + chart tarballs. A slot upgrade is also an effective container upgrade because images are baked. For an upgrade scheduled from an imported/uploaded image (#199), the download is **verified by the stored sha256** (the integrity guarantee), which lets the host runner relax TLS cert-verify *only* for the appliance's own self-served URL behind the self-signed web cert — external public-CA URLs stay fully verified (#386). The Fleet drilldown shows a **live per-phase progress stepper** (download % → verify → write → bootloader → reboot-pending) with an expandable `slot-upgrade.log` tail and an honest failure card, and a stuck apply re-fires once per distinct desired-state rather than looping (#386). Uploaded/imported image bytes are persisted on a host-path mount so they survive an api restart (#386).
 
 The api pod's ServiceAccount keeps minimal RBAC: namespace-scoped pods + pods/log read, the specific `spatium-appliance-tls` Secret patch, and the frontend Deployment annotation patch. The only cluster-scoped grant is **read-only** `nodes` + `nodes/proxy [get]` (added in #402) so the Cluster Overview dashboard can read per-node kubelet stats. Nothing destructive.
@@ -349,7 +397,7 @@ separate profiles that STATE does not model.
 k3s runs CoreDNS in `kube-system`, and every pod on the appliance resolves
 `*.svc.cluster.local` through it: the api pod finds Postgres and Redis that
 way, the frontend nginx finds the api, and on a multi-node control plane a
-member's supervisor heartbeats the in-cluster api Service name. Nothing on
+member's supervisor heartbeats the node-local api Service name. Nothing on
 the appliance talks to it from the LAN — it is not a DNS server operators put
 zones on, and it is unrelated to the BIND9 / Kea role containers.
 
@@ -365,11 +413,47 @@ that is a function of the **registered node count**:
 | Nodes | Target |
 |---|---|
 | 1 | Stock: 1 replica, no fast-evict toleration, no anti-affinity — both buy nothing with one node, and a 20 s toleration would evict the only DNS pod with nowhere to put it |
-| ≥2 | `min(nodes, 2)` replicas, fast-evict tolerations, and **required** (not preferred) pod anti-affinity |
+| ≥2 | One replica per node, k3s's own tolerations, and **required** (not preferred) pod anti-affinity; the kube-dns Service gets `trafficDistribution: PreferSameNode` |
 
 Required anti-affinity is deliberate and #633 has the evidence: *preferred*
 parked both replicas on the seed, and Kubernetes never rebalances running
 pods, so the "HA" DNS died with the seed anyway.
+
+One replica per node, with node-local routing, is #1718. Until a lost node
+reads NotReady (about 40 s), its CoreDNS pod stays a ready kube-dns endpoint.
+With replicas load-balanced across nodes, about half of every other node's
+lookups went to that pod and stalled for the resolver's whole timeout. Redis
+Sentinel resolves its peers inside its event loop, so the stalls put the
+surviving sentinels into TILT, and the Redis failover took 77 s instead of
+seconds. Each node now resolves through its own replica, falling back to the
+others only while its own is not ready. A lost node takes only its own pods'
+DNS with it.
+
+The template keeps k3s's own tolerations (#1753). Earlier builds added a 20 s
+fast-evict pair. The tolerations list is the one template field both the
+supervisor and k3s's bundled manifest set, and k3s force re-applies that
+manifest at every server start. So each node's return rolled CoreDNS out
+twice: once for k3s's re-apply, once for the supervisor's patch back. Each
+rollout replaced every CoreDNS pod. With one replica per node, a fast
+eviction has nowhere to put the evicted pod anyway. k3s's re-apply now
+changes nothing.
+
+The api Service gets the same node-local routing as kube-dns (#1805), from the
+appliance's own values rather than the chart's: firstboot renders
+`api.service.trafficDistribution: PreferSameNode` into the `spatium-control`
+HelmChart, and the seed supervisor writes the same key into the
+`spatium-control` HelmChartConfig on every heartbeat, which is what a grown
+or upgraded cluster renders. Every control-plane node runs one api pod, so
+each node's in-cluster callers (its supervisor's heartbeat, the DNS and DHCP
+agents, the frontend's `/api` proxy) use that node's api pod while it is
+ready. A lost node's api pod stays listed until the node reads NotReady, and
+before this a share of every other node's heartbeats waited out their 40 s
+timeout on it, which left a healthy node's heartbeat stale past the demote
+guard's 90 s. The umbrella chart's default is `""`, so an install on your own
+Kubernetes keeps kube-proxy's spread over every api pod. One consequence on
+the appliance: traffic through the control-plane VIP enters through the
+frontend on the node announcing the VIP, and that node's api pod serves it
+alone while it is ready.
 
 **What the Cluster DNS card means** (Cluster → Overview, #985). Until now the
 appliance acted on cluster DNS and showed nothing about it, so a CoreDNS that
@@ -445,7 +529,9 @@ the reference topologies are in
   cluster-identity reset + rejoin** — wiping only the etcd `db` is not
   enough, the server CA / TLS / node password / flannel subnet all have
   to go too, then the node rejoins the seed via
-  `https://<seed-node-ip>:6443` with the Fernet'd join token. The
+  `https://<seed-node-ip>:6443` with the seed's join token (Fernet'd at
+  rest, and sealed in the heartbeat response to a one-off X25519 key the
+  joining supervisor sent in its signed request, never sent in clear). The
   host-side runner is `spatium-cluster-join` (etcd backup + rollback +
   a confirmation-marker guardrail so a stray trigger file can't fire a
   destructive wipe). **Even counts (2 / 4) are refused at the API** for
@@ -461,6 +547,53 @@ the reference topologies are in
   BestEffort operator restart triggers a watched-volume reconciliation
   storm (issue #315). Its startup probe is also loosened to a 60s window
   for slow VMs. Budget ~128 MiB for it when sizing a control node.
+  - **WAL retention and stuck instances (#2132, #2317).** No WAL archive
+    is configured, so WAL lives only in each instance's `pg_wal` on the
+    node's `/var` (local-path does not enforce the PVC's 8Gi). The Cluster
+    keeps `wal_keep_size: 2GB` so a former primary can `pg_rewind` after a
+    failover, and caps what a replication slot may hold back at
+    `max_slot_wal_keep_size: 3GB`. PostgreSQL keeps the larger of the two,
+    plus up to `max_wal_size` (1GB) since the last checkpoint, so `pg_wal`
+    stays near 4GB even when a slot's standby never follows a new primary;
+    before the cap, one primary's `pg_wal` reached 26 GB while CNPG read
+    healthy. A standby past the cap loses its slot and needs a re-clone, as
+    does a former primary whose rewind needs WAL that is gone. CNPG retries
+    those for ever, so the seed supervisor watches each non-primary
+    instance's log for the loops that never end on their own (`pg_rewind`
+    failing, "Refusing to restore future timeline history file", "requested
+    WAL segment … has already been removed", an invalidated slot). A loop
+    counts only while it repeats (at least three lines in the last 90 s),
+    so a replica that logs a refusal or two while it joins and then streams
+    is never counted. A repeating loop is logged once at info
+    (`supervisor.heartbeat.postgres_instance_looping`), at warning once it
+    has held for 2 minutes (`supervisor.heartbeat.postgres_instance_stuck`),
+    and after 10 minutes of the same loop under the same primary the
+    supervisor annotates the pod `alpha.cnpg.io/unrecoverable`, CNPG's documented request to delete
+    the instance's pod and PVCs and join a fresh copy from the primary
+    (`supervisor.heartbeat.postgres_instance_reclone`). One instance at a
+    time, never the primary, never during a failover or switchover, and
+    only while the primary is Ready. And only with proof the WAL the
+    instance needs is gone, because a re-clone copies the whole database:
+    the supervisor reads the primary's replication slots from CNPG's
+    instance status (`/pg/status` on port 8000 of the primary pod), with
+    the endpoint's TLS verified against the cluster CA under the name
+    `<cluster>-rw` (the certificate names the cluster's services, never a
+    pod IP). The CA reaches the supervisor as its public certificate only,
+    in the ConfigMap `<cluster>-ca-crt` that the control chart's
+    `cnpg-ca-publisher` CronJob copies from the CA secret every 10 minutes;
+    the supervisor is never granted the secret, which also holds the CA
+    private key. It re-clones when the instance's slot is `lost` or gone, when its
+    log shows the WAL-removed or invalidated-slot line, or when `pg_rewind`
+    keeps failing. A standby that only cannot reach the primary logs the
+    future-timeline refusal too, but its slot still reads `reserved`: it is
+    held (`supervisor.heartbeat.postgres_instance_reclone_held`, with the
+    reason) and catches up once it reconnects. If the primary's status
+    cannot be read, or its certificate does not verify, or the CA ConfigMap
+    is missing, nothing is re-cloned
+    (`supervisor.heartbeat.postgres_slot_state_unknown`, once per reason). While it runs, the database row on the
+    cluster-health page reads `degraded` (`readyInstances` below
+    `instances`). The manual equivalent is `kubectl cnpg destroy <cluster>
+    <n>`, or deleting the instance's PVC and then its pod.
 - **Redis HA = Sentinel.** Each member pairs a redis-server + a sentinel
   sidecar; app / worker / beat resolve the master via a `sentinel://`
   URL. `sentinel.replicas` scales with the member count.
@@ -488,7 +621,8 @@ state on its heartbeat:
   `k8s_api.apply_control_plane_overrides()` upserts the `spatium-control`
   override (api/frontend/worker `replicas` + CNPG `instances` + Redis
   `sentinel.replicas` = committed member count, plus
-  `frontend.controlPlaneVIP`). helm-controller *merges* a
+  `frontend.controlPlaneVIP`, plus the api Service's
+  `trafficDistribution: PreferSameNode`). helm-controller *merges* a
   HelmChartConfig on top of its same-named HelmChart on every reconcile.
   Crucially the HelmChartConfig is **not** in the auto-deploy manifests
   dir, so a k3s restart's re-apply of the firstboot HelmChart defaults
@@ -507,6 +641,31 @@ state on its heartbeat:
   whenever merging the supervisor's keys in would leave them exactly as they
   are, whether or not a Config already exists.
 
+  A Config that survives a slot upgrade can still carry the *previous*
+  release's sizing ([#1210](https://github.com/spatiumnorth/spatiumddi/issues/1210)):
+  2026.09.04-1 sized api / worker as fractions of `MemTotal`, #1115 as a
+  whole-node budget, and helm-controller merges the stale Config over the new
+  HelmChart, so the first rollout ran the old limits and the new supervisor's
+  first heartbeat rewrote them, a second `spatium-control` revision, a second
+  migrate Job (which replaces a running one) and a second api / worker
+  rollout. firstboot now brings the sizing keys an existing Config already
+  carries (api / worker memory and concurrency, the api and Postgres CPU
+  limits, the Postgres request and `shared_buffers`) to the values
+  this boot's HelmChart renders. The Postgres memory limit is not among
+  them (#2156): the supervisor sizes it for the cluster's node count and
+  firstboot renders one node, so reconciling it would restart Postgres
+  twice on every seed reboot.
+  It computes them while that HelmChart is still held back as `.deferred`
+  and writes them as soon as k3s has applied it, so helm-controller's job
+  for the new chart is replaced, before it runs, by one carrying the new
+  sizing too. Patching earlier would re-run the previous release's chart: a
+  rollout on the old image followed by a second one. It only updates keys
+  already present and writes only on a difference (a Config write is itself
+  a helm revision), so a reboot of an up-to-date node changes nothing. The
+  fix lives in the release being upgraded **to**; the release being left
+  cannot be changed, and any future release that retunes the sizing is
+  covered the same way.
+
   Deliberately **not** restricted to the create case. `chart_bump`'s
   `_patch_image_tag` *creates* this CR carrying only `image.tag` to roll the
   control plane to a new version, so from the next heartbeat — at most 30 s
@@ -524,23 +683,56 @@ state on its heartbeat:
   real `_render_control_helmchart` and fails, naming the keys, if the merge
   stops being a no-op. Add an override key without rendering it in firstboot
   and every install silently goes back to two revisions.
+
+  **Who owns which HelmChartConfig key
+  ([#2024](https://github.com/spatiumnorth/spatiumddi/issues/2024)).** The
+  supervisor owns individual keys, never a whole document: on every heartbeat
+  it reads the live `valuesContent`, merges its own keys on top, and writes
+  only when that changes something, with the PATCH conditional on the
+  `resourceVersion` it read (an edit landing in between is a 409, retried
+  against the new document on the next beat). Every key not listed here is
+  the operator's and survives. A key that *is* listed is the supervisor's:
+  setting it by hand lasts until the next heartbeat.
+
+  | HelmChartConfig | Supervisor-owned keys (source) |
+  |---|---|
+  | `spatium-control` | `api` / `frontend` / `worker`: `replicas`, `podAntiAffinity`, `tolerations` (committed control-plane size); `api.service.trafficDistribution` (`PreferSameNode` at every size, #1805); `api.service.nodeLocal` (`true` at every size, #3645); `api.resources.limits.memory`, `worker.resources.limits.memory`, `worker.concurrency` (node RAM); `api.resources.limits.cpu`, `postgresql.resources.limits.cpu` (node CPU count, #2240); `frontend.controlPlaneVIP`, `frontend.loadBalancerSourceRanges` (MetalLB settings, Web UI source CIDRs); `slotImageMirror.enabled`; `postgresql.cnpg.instances`, `postgresql.cnpg.parameters.shared_buffers`, `postgresql.cnpg.parameters.max_connections` (connection budget, #2156), `postgresql.resources.requests.memory` + `.limits.memory` (size, node RAM, and the connection budget of the control-plane size, #2156); `api.databasePool.size` / `.maxOverflow` (control-plane size, #2156); `redis.kind`, `redis.sentinel.replicas` |
+  | `spatium-metallb` | `metallb.enabled`, `metallb.ipPool.addresses`, `metallb.frrk8s.enabled`, `metallb.bgp.enabled` / `.peers` / `.advertisements` (Network & Host → MetalLB) |
+  | `spatiumddi-appliance` | `dns.useMetalLBVIP`, `dns.vip`, `dhcpKea.relayVIP` (MetalLB → Advanced) |
+
+  `image.tag` on `spatium-control` is written by the backend's chart bump,
+  not the supervisor, and the supervisor's merge leaves it alone. Lists are
+  owned whole (`tolerations`, `peers`, `addresses`): a merge replaces a list,
+  it never appends to one. An owned key is always written explicitly, `false`
+  or `""` when off, because a merge cannot remove a key by leaving it out. A
+  HelmChartConfig whose `valuesContent` will not parse as a YAML mapping is
+  never overwritten; the supervisor logs
+  `supervisor.helmchartconfig.unparseable_values` (or `values_not_a_mapping`)
+  and `…_overrides_failed` on every heartbeat and changes none of its own
+  keys in that CR until it is fixed or deleted.
 - **MetalLB / VIP (Phase 7c).** The operator's pool + VIP live on the
   `platform_settings` singleton (`metallb_enabled` /
   `metallb_pool_addresses` / `control_plane_vip`); the seed supervisor
-  upserts the `spatium-bootstrap` HelmChartConfig (`metallb.enabled` +
-  `ipPool.addresses`) via `k8s_api.apply_bootstrap_overrides()`, and
+  merges `metallb.enabled` + `ipPool.addresses` (and the BGP keys) into the
+  `spatium-metallb` HelmChartConfig via `k8s_api.apply_metallb_overrides()`, and
   `frontend.controlPlaneVIP` rides the `spatium-control` override above.
   The VIP also auto-threads into the api's `APPLIANCE_EXTRA_CERT_SANS` so
   the served cert validates on it.
 - **Data-plane VIPs (Phase 10).** Two optional resolver VIPs share the
   same pool: `dns_vip` (one floating :53 the bind9 / powerdns /
   technitium DaemonSets
-  drop `hostNetwork` to sit behind, an L2 LoadBalancer Service) and
+  drop `hostNetwork` to sit behind, an L2 LoadBalancer Service with
+  `externalTrafficPolicy: Local`, so the DNS server sees each client's
+  own address rather than the node's, #1487; one `dns-vip` Service
+  selects every engine's pods, so the VIP follows an engine switch,
+  #1510) and
   `dhcp_relay_vip` (an additional :67 LoadBalancer fronting the Kea
-  relay→server unicast forward — Kea keeps `hostNetwork` for
-  direct-attached broadcast). Both live on the same `platform_settings`
-  singleton + the `…/control-plane/metallb` endpoint; the seed upserts
-  the `spatiumddi-appliance` HelmChartConfig (`dns.useMetalLBVIP` /
+  relay→server unicast forward — Kea keeps `hostNetwork`, but every DHCP
+  group behind the VIP must use `relay` client reachability, or relays
+  landing on the announcing node get no answer; see
+  [DHCP.md](../features/DHCP.md) §Client reachability, #2899). Both live on the same `platform_settings`
+  singleton + the `…/control-plane/metallb` endpoint; the seed merges
+  them into the `spatiumddi-appliance` HelmChartConfig (`dns.useMetalLBVIP` /
   `dns.vip` / `dhcpKea.relayVIP`) via
   `k8s_api.apply_dataplane_vip_overrides()`. Each must fall in the pool
   and differ from the control-plane VIP + each other; empty = the
@@ -549,8 +741,9 @@ state on its heartbeat:
 - **Cert SAN reconcile (Phase 7c).** A periodic loop in the api lifespan
   (`reconcile_cluster_cert_sans`, advisory-locked across the api
   replicas, appliance-mode only) grows the self-signed cert as members
-  join, updates the Secret + rolls the frontend pods. Coverage only ever
-  grows, so a demote never churns the cert.
+  join and updates the Secret; each frontend pod then reloads nginx in
+  place, so a join no longer closes any node's web port (#1173).
+  Coverage only ever grows, so a demote never churns the cert.
 - **Per-role node-label gating** keeps control-plane workloads on
   control-plane nodes (`spatium.io/role-control-plane=true`), so
   promoting a DNS-only appliance never schedules Postgres onto it
@@ -568,6 +761,53 @@ demoted, and a node can't be **revoked** while it's a live cluster member
 — it must be demoted first (revoking a live etcd member would break
 quorum).
 
+A demoted member's row reads `leaving` from the moment of the demote. Until
+its leave runner starts, the node goes on reporting `ready`, and that report
+is ignored (#1806): only the runner's own `leaving`, `left` or `failed` moves
+the row. A promoted node's row reads `joining` the same way, ignoring a
+`left` left over from an earlier demote.
+
+A demoted node leaves etcd **before** it resets itself (#1541). Its leave
+runner removes its own etcd member while the node still votes, stops k3s,
+and asks the node it joined whether the member is gone; only then does it
+wipe and come back as a standalone appliance. If etcd refuses the removal,
+or the node it joined answers and still lists the member, the leave fails
+and the node is left as it was, still a member; a survivor that cannot be
+reached does not fail it, since etcd accepting the removal is the removal.
+The row then reads `evicting` until the seed has deleted the node's stale
+k8s Node and confirmed etcd agrees, and settles `left` on that. The seed
+then scales Postgres and the control-plane replicas down to the new member
+count (a dead-node Replace, by contrast, holds the old size until the
+replacement is promoted), and re-creates the slot-image mirror's volume on
+a live node if the removed node held it. On a one-node control plane the
+api and worker roll out by retiring the old pod first, so each rollout there
+costs a brief api outage.
+
+A promote stamps a fresh transition id and time on the row, and the heartbeat
+hands the node the id and the promote's age (#1903). The node's join sidecar can
+still say `ready <seed>` from an earlier membership, as on a box Replace evicted
+that is still running, so the node echoes the id of the join it actually fired,
+and only for a verdict written after that fire. The control plane applies a
+reported `ready` or `failed` for a promote only when the ids match or the verdict
+is younger than the promote. Ages are compared, never timestamps, so a node clock
+that disagrees with the control plane's cannot settle or block a promote. The
+supervisor fires the join over a same-seed `ready` only when that `ready` is
+provably older than the promote; anything ambiguous, such as a node whose join an
+older supervisor fired before being upgraded, is reported and not re-fired. On a
+box that still holds the seed's join drop-in, the fired join re-drives without
+wiping k3s (#1052) and settles once the node is Ready.
+
+A demote is refused (409) while any control-plane member is unhealthy — no
+heartbeat for 90 s, or a k8s Node that is NotReady or missing — and the
+error names every unhealthy member. The seed is judged by its k8s Node
+alone, since its own heartbeat can stall for a couple of minutes when
+another member dies. The one exception is demoting the unhealthy member itself,
+allowed when a majority of the voters stays live throughout; its row waits
+in `leaving` until the node comes back to run its leave (use Replace for a
+node that never will). The check exists because the leaving node removes its
+member through its own etcd, whose view of the other members can be stale:
+with a member powered off, that removal can cost the survivors their quorum.
+
 Once a multi-node control plane exists, the **Control plane** table
 surfaces a dismissible amber banner prompting the operator to configure a
 VIP if none is set yet (a single-node-IP URL is a latent SPOF for every
@@ -575,15 +815,51 @@ agent). Dismissal requires a deliberate checkbox and is remembered
 client-side.
 
 **Heartbeat targets.** A supervisor that is itself a control-plane
-cluster member heartbeats the **in-cluster api Service**
-(`spatium-control-spatiumddi-api.spatium.svc.cluster.local:8000`) rather
-than the seed node's IP it was installed/promoted against — so losing any
-single node never strands a member's control plane, and kube-proxy
-load-balances heartbeats across the ready api pods. Off-cluster DNS/DHCP
+cluster member heartbeats the **node-local api Service**
+(`spatium-control-spatiumddi-api-local.spatium.svc.cluster.local:8000`, #3645:
+only ever the api pod on its own node) rather than the seed node's IP it was
+installed/promoted against. With no ready api pod on its node it falls back to
+its configured `CONTROL_PLANE_URL` over https (pinned certificate), so losing
+a node's api pod never strands a member's control plane and no plain http
+crosses the node LAN. The seed has no `CONTROL_PLANE_URL` (firstboot writes it
+empty on a control-plane install), so it falls back to the cluster-wide api
+Service, as before #3645: a path through another node's api pod beats none.
+Off-cluster DNS/DHCP
 agents have no in-cluster DNS to resolve that name, so they keep using
 their configured `CONTROL_PLANE_URL` — which should be the **VIP** on an
 HA cluster (see `_effective_control_plane_url` in the supervisor's
 `heartbeat.py`).
+
+**Node-local api traffic (#3645).** Pod-to-pod traffic between nodes is flannel
+`host-gw`: routed over the node LAN, not tunnelled or encrypted, and the api
+speaks plain http. So the two callers that carry credentials keep that hop on
+their own node: firstboot and the seed supervisor set `api.service.nodeLocal`,
+which renders a second Service, `spatium-control-spatiumddi-api-local`, with
+`internalTrafficPolicy: Local`. It answers only from an api pod on the caller's
+node. A member's supervisor uses it; the original `-api` Service is unchanged,
+for the frontend nginx, the worker, the role agents and the probes, and an
+older supervisor keeps using it.
+
+The requirement is **a ready api pod on every control-plane node** (the
+appliance already runs one per node: `replicas` equals the control-plane size,
+with required anti-affinity). A node whose api pod is down (crashed, rolling,
+or not yet scheduled after a node join) has no local endpoint, and its
+supervisor does not wait:
+the Service drops traffic rather than refusing it, so the node-local attempt has
+a 4 s connect timeout, and after the first failed attempt the same heartbeat is
+re-sent to its `CONTROL_PLANE_URL` over https against the pinned certificate
+(`cp_tls`; the seed uses the cluster Service). It tries the local Service again
+once 60 s have passed, on its next heartbeat, and goes back to it when that
+lands. Plain http is therefore only ever node-local, except for the seed's
+fallback. The frontend's `/api` proxy is deliberately not on the
+node-local Service: the node-local path has no fallback there, so it would turn
+an api pod rolling on a node into a UI outage on that node. It keeps the
+cluster Service (`PreferSameNode`, #1805, so it uses the local pod while one is
+ready). Not covered yet, and tracked in #4019: the frontend's fallback window,
+the role agents, the worker and beat still reach the api over the
+cluster-wide Service, and the Postgres and Redis traffic is unencrypted too.
+On a network where the node LAN is not trusted, put a WireGuard-capable CNI
+under the cluster instead of relying on this alone.
 
 ### Guided etcd restore (Phase 9b)
 
@@ -1052,6 +1328,90 @@ Nothing is emitted in `hard` mode (the appliance's shape — required
 anti-affinity already pins one replica per node, #590), in `none` mode, at
 `replicas: 1`, or when the operator supplied their own list.
 
+### Memory sizing for named (#1725, #2223)
+
+`dns-bind9` carries a memory limit and request sized from node RAM: a
+quarter of the RAM of the **smallest** node labelled for dns-bind9, rounded
+to whole GiB, at least 2Gi and at most 8Gi, with the request an eighth of
+the limit. So a 4 GB node gets 2Gi / 256Mi (the floor), a 16 GB node
+4Gi / 512Mi, and a 64 GB node 8Gi / 1Gi (the cap). The supervisor writes it
+into the role chart as `dnsBind9.memory`; the chart's own default there,
+2Gi / 256Mi, is what a render with no supervisor gets. Without a limit, one
+~580k-entry catalog blocklist in a group with a view took the pod to
+2.8-3.6 GB on a 6 GiB node; the kubelet then evicted the worker, Postgres
+and the api, and the kernel killed named. With the limit the kernel kills
+named inside the pod's own cgroup instead, and the control plane stays up.
+Before #2223 the limit was a fixed 2Gi, which ddi-pg's scale lab hit at
+about 2M records.
+
+It is one value for the cluster, not each node's own. The role chart is one
+HelmChart for the whole cluster and every member's supervisor writes it, so
+it must render the same everywhere (#1137), and a DaemonSet has one limit
+for all its pods, so the smallest node it runs on decides. The size is the
+kubelet's `status.capacity.memory`, which a virtio balloon does not move. A
+node that joins with less RAM lowers it for every DNS node, which is a
+rolling restart of named. If the node list cannot be read the supervisor
+writes nothing that heartbeat rather than fall back to the 2Gi default.
+
+To pin a value instead, set `dnsBind9.resources.limits.memory` (and, if you
+like, `requests.memory`) in the `spatiumddi-appliance` HelmChartConfig: a
+memory value in `dnsBind9.resources` always wins over the sizing. Edit it in
+place rather than applying a fresh manifest:
+
+```sh
+kubectl -n kube-system edit helmchartconfig spatiumddi-appliance
+```
+
+and add the key beside whatever `spec.valuesContent` already holds (the
+supervisor writes the document with sorted keys and single-quoted empty
+strings, so this is roughly what you will see):
+
+```yaml
+spec:
+  valuesContent: |
+    dhcpKea:
+      relayVIP: ''
+    dns:
+      useMetalLBVIP: false
+      vip: ''
+    dnsBind9:
+      resources:
+        limits:
+          memory: 4Gi
+```
+
+The supervisor writes the same CR on every heartbeat, but it owns only its
+data-plane VIP keys (`dns.useMetalLBVIP`, `dns.vip`, `dhcpKea.relayVIP`): it
+merges them into the live document and leaves every other key as you wrote
+it (#2024). The supervisor creates this CR on its first heartbeat, so on a
+running appliance it already exists. Do not `kubectl apply` a manifest over
+it: `valuesContent` is a single string, so an apply replaces all of it, the
+VIP keys vanish until the next heartbeat puts them back, and
+with a DNS VIP configured that is two helm upgrades, the first moving named
+back onto hostNetwork and the second moving it off again. Only if the CR is
+absent (`kubectl -n kube-system get helmchartconfig spatiumddi-appliance`
+answers NotFound) is creating it with `kubectl apply` and only the
+`dnsBind9` block fine; the supervisor adds its keys beside it. Two things
+the supervisor's merge does not keep: a value you set for one of its three
+keys (the supervisor's wins), and YAML comments, which are dropped the next
+time it has to change one of its keys and rewrites the document.
+
+Size it from the table in [`DNS.md` section 8.0](../features/DNS.md): a
+582k-entry list in a group with one view needs about 4 GiB for named, so a
+node of 8 GiB or more. On a 6 GiB floor node, expect that list to be killed
+by its limit rather than to fit; the server then reports its daemon as not
+serving, naming the OOM kill, and the **Agent daemon not serving** alert
+fires (see `DNS.md` 8.0). The agent also derives named's `max-cache-size`
+from the limit (a quarter of it, split across the recursive views), so the
+resolver caches cannot take the RPZ's share.
+
+The request (an eighth of the limit) is what the scheduler reserves; the limit is a ceiling,
+so the pod is Burstable and a 3 GiB DNS-only node still schedules. Under node
+memory pressure the kubelet evicts pods using more than their request in
+PriorityClass order, and `dns-bind9` runs in `spatium-service`, the highest
+of the three (#983), so the control plane is evicted before it: the limit,
+not eviction, is what stops it.
+
 ### What is deliberately not set
 
 `disable-network-policy: true` stays on. The old rationale ("single node,
@@ -1139,12 +1499,15 @@ on 22); everything else is advisory (`nft -c -f` on the host is the final
 authority), and the lint runs delta-only so pre-existing values are
 grandfathered.
 
+**SNMP and `firewall_extra` (#3819).** UDP 161 is accepted only from the sources in `snmp_allowed_sources` (Fleet → Services → SNMP). `firewall_extra` lands in the same input chain, whose policy is drop, and the SNMP rule only ever accepts. So a `firewall_extra` rule that accepts UDP 161 **adds** its sources to the allowed list rather than being narrowed by it. If you scope SNMP to a list, remove any older custom accept for port 161. IPv6 sources work: snmpd listens on all IPv6 addresses (`udp6:161`) whenever the list holds an IPv6 prefix or is empty, and stays on `::1` for an IPv4-only list (#3813).
+
 **Compliance + Copilot.** The `no_lanwide_control_plane_ports` conformity check
 (platform-kind, PCI-DSS 1.2.1 / HIPAA segmentation) fails only on a *confirmed*
-LAN-wide node and reports **PASS-stale** for nodes it can't currently reach
-(never connectivity-FAIL, per #5). Five Operator-Copilot MCP tools
+LAN-wide node and reports **warn** for stale or unverified nodes (unknown is
+not compliant, but lost contact is never a FAIL), and **not applicable** when no
+appliance reports at all (#2259). Six Operator-Copilot MCP tools
 (`find_firewall_policies` / `count_firewall_policies` / `find_firewall_aliases`
-/ `find_firewall_effective` reads + the default-off `propose_toggle_firewall_policy`)
+/ `find_firewall_effective` / `find_web_ui_access` reads + the default-off `propose_toggle_firewall_policy`)
 surface the model to the chat, tagged `module="appliance.firewall"`.
 
 **Web UI source restriction (Phase 6).** A `Web UI access` card on the same tab
@@ -1253,9 +1616,9 @@ The fix:
   - **Frontend / core** (was `control-only`): control plane only.
   - **Application**: supervisor only; pairs against a remote control plane.
 - **Pairing codes** are kind-agnostic (no more `deployment_kind` field) with two flavours: ephemeral (single-use, short expiry) and persistent (multi-claim, optional max_claims, disable/enable, password-gated reveal).
-- **Ed25519 identity + mTLS**. The supervisor generates an Ed25519 keypair on first boot, submits the pubkey when claiming a pairing code, and gets an X.509 cert signed by the control plane's internal CA on admin approval. Cert lifetime is 90 days; the supervisor auto-renews. (The mTLS *verifier* middleware lands in a follow-up — the cert pipeline is in place; heartbeat + poll endpoints currently auth via session-token.)
+- **Ed25519 identity + mTLS**. The supervisor generates an Ed25519 keypair on first boot, submits the pubkey when claiming a pairing code, and gets an X.509 cert signed by the control plane's internal CA on admin approval. Cert lifetime is 90 days; the supervisor auto-renews. Every request the supervisor makes with the cert carries an Ed25519 signature over the method, the path and query string, a SHA-256 of the body, a nonce and a timestamp (±300 s), and the control plane accepts each signature once (recorded in Redis; if Redis is unreachable the check is skipped with a warning rather than stopping the fleet's heartbeats). Supervisors older than #3631 sign only the method, path and timestamp; that form is accepted while `APPLIANCE_LEGACY_SIGNATURE_ALLOWED` is true (the default) and logged per appliance as `appliance_cert_auth_legacy_signature`, so set it to `false` once those lines stop. Every heartbeat answer carries `X-Appliance-Signature-Versions: 2`; a supervisor that gets an answer without it (an older control plane, e.g. between a node's slot upgrade and the application roll) signs the older form until one carries it, and never falls back again in that process once it has. The heartbeat still accepts the session token as a fallback when the cert does not validate. Registration is signed too: the request carries the registering key's Ed25519 signature over a fresh timestamp and nonce, and re-registering an existing appliance (which returns a new session token) needs it. A supervisor that has reported it signs registrations is refused when it sends one unsigned; a supervisor from before that was added is accepted unsigned, and logged as `supervisor_register_unsigned`, while `APPLIANCE_LEGACY_SIGNATURE_ALLOWED` is true. On a multi-node control plane the supervisor-to-api hop inside the cluster is plain HTTP (it is not given TLS in this release); the join token is the only secret answered on it, and is sealed to a one-off key, but the request bodies a supervisor sends (heartbeat state, kubeconfig, join token it reports) are not encrypted on that hop.
 - **Per-role nftables firewall**. The supervisor renders `/etc/nftables.d/spatium-role.nft` every heartbeat with always-open management rules (tcp/22, icmp echo, loopback) + per-role service ports (udp+tcp/53 for DNS; udp/67-68, plus udp/547 for DHCPv6, for DHCP; the Kea HA listener, scoped to the other HA members, when the DHCP group is an HA pair; tcp/179 for Looking Glass) + an operator-pasted override fragment. `nft -c -f` dry-run before live-swap rejects syntax errors without putting the firewall in a half-rendered state.
-- **Baked-in container images**. Every container image needed for any install role is baked into the OS rootfs at release time at `/usr/lib/spatiumddi/images/*.tar.zst`. First boot loads them into the local docker daemon; subsequent boots never reach out to ghcr.io. Air-gapped installs are first-class.
+- **Baked-in container images**. Every container image needed for any install role is baked in at release time as `/var/lib/rancher/k3s/agent/images/*.tar.zst`, which k3s imports into its containerd store at start; no boot ever reaches out to ghcr.io. Air-gapped installs are first-class.
 - **A/B slot upgrades and container upgrades are one unit**. A slot upgrade is also a container upgrade — operators can't get out of sync between OS and container versions.
 
 ### Fleet management surface
@@ -1265,7 +1628,7 @@ The fix:
 - Identity (hostname, full cert fingerprint, paired-at + paired-from-ip, last-seen).
 - **Role assignment** — pick a subset of `dns-bind9` / `dns-powerdns` / `dns-technitium` / `dhcp` / `observer`. DNS engines are mutually exclusive; chips for capabilities the supervisor doesn't advertise dim with a tooltip. DNS / DHCP group dropdowns appear conditionally on the selection.
 - **Firewall preview + operator override** — live preview of the role-driven profile (idle / dns-only / dhcp-only / dns-and-dhcp), always-open + per-role port summary, raw-nft textarea for operator overrides.
-- **OS & lifecycle** — installed appliance version, running + durable-default slots (with trial-boot chip), last upgrade state, Schedule OS upgrade form, Cancel pending upgrade, Reboot host (with a double-confirm modal requiring an "I understand this will go offline" checkbox).
+- **OS & lifecycle** — installed appliance version, running + durable-default slots (with trial-boot chip), last upgrade state, Schedule OS upgrade form, Cancel pending upgrade (only until the host starts the apply: once the host reports it applying or staged it is refused with a 409, and a cancel sent before the host reported is confirmed by its next heartbeat, which records `appliance.upgrade_cancel_lost` and shows the running upgrade if the host had already started, #2021), Reboot host (with a double-confirm modal requiring an "I understand this will go offline" checkbox).
 - **Certificate** — serial, issued/expires timestamps. Re-key + Delete actions on the modal footer.
 
 ### Operator Copilot tools (#170 Wave D2)
@@ -1370,6 +1733,7 @@ Surfacing: a fresh `blocked` verdict renders in bold red on the console identity
 The Talos-style console got a wave of usability fixes:
 
 - F9 / Diag chip removed (handler was a no-op). *(Later, #556) F9 is repurposed to **Cancel pending reboot** — shown only while a reboot is queued; it stops the reboot service mid-grace and removes the trigger, aborting a web-UI / Fleet reboot from the physical console. The Slot-box indicator reads `REBOOT pending — F5 now · F9 cancel`.*
+- *(#2974)* **Every operator-initiated reboot or power-off hands the PostgreSQL primary off first.** The web-UI reboot (`spatiumddi-reboot.service`) and the console's F5 / F6 (`spatium-power-action@reboot|poweroff.service`, started without waiting, so the dashboard keeps rendering and a console restart cannot kill the run) all go through `spatium-power-action`, which runs `spatium-reboot-handoff --before-reboot` (as the Fleet reboot does, #2849) and then `systemctl reboot` / `poweroff`. On the node holding the primary that adds up to a few minutes, bounded: the handoff is capped at 240 s and the reboot goes on whatever it did. The Slot box reads `REBOOT under way — handing off DB primary · F9 cancel` meanwhile (just `REBOOT under way · F9 cancel` on a one-node install, which has no primary to hand off; the console's run holds a 10 s grace first, `SPATIUM_POWER_ACTION_GRACE_S`, so the web UI sees it under way), and F9 stops it and uncordons the node. *(#3162)* F9 within the console's grace asks the database for nothing; once the handoff has cordoned the node, CloudNativePG has been asked to switch the primary over and that switchover still completes (a few seconds of API unavailability, with no reboot), which the console says after the cancel. A cancelled run ends by the stop's signal rather than `exit 1`, and the units running it list `SIGTERM` / `SIGINT` / `SIGHUP` in `SuccessExitStatus=` (a `Type=oneshot` unit otherwise counts death by a signal as a failure), so its unit is left inactive, not `failed`. The node stays cordoned through the reboot and uncordons itself at its next boot (`spatiumddi-reboot-handoff.service`); **a node powered off for good stays cordoned in the cluster** until it is booted again or removed from the cluster. *(#3008)* The Fleet reboot (`spatiumddi-reboot-agent`) now runs the same wrapper after its 5 s grace, so it gets the same banner and F9 cancel. While the wrapper runs it holds an `flock` on the release-state directory, which `GET /api/v1/appliance/system/info` reports as `reboot_in_progress` (with `node`, the node whose api pod answered): the web UI's Reboot button stays disabled through the handoff. `reboot_in_progress` also reads a pending web-UI or Fleet trigger, the Fleet agent's `reboot-fleet-grace` marker (held from taking its trigger until it exits, so the console's F9 can cancel a Fleet reboot during its grace too), and `power-action-issued`, which the wrapper writes just before `systemctl reboot` stamped with the host's boot id, so the flag holds until the node is actually down and clears itself with the reboot.
 - Control-plane reachability chip (#556, appliance role only) — a ≤ 2 s TCP probe of `CONTROL_PLANE_URL`, fanned out in the data-tier pool so it overlaps the kubectl forks. Rendered on the header identity row so an operator can distinguish "network-partitioned" from "unapproved" (which `pairing_status` alone can't). Off on the control-plane role (empty URL).
 - Live-log noise filter — Python traceback frames, caret indicators, systemd restart-counter spam dropped before they hit the renderer; `--since` window 10 min → 2 min so crash spam clears 5× faster.
 - CPU usage 92 % → 1.4 % — Rich Live had its background `auto_refresh` thread + main loop both rendering at 4 Hz. Fixed with `auto_refresh=False` + main-loop tick 0.25 s → 0.5 s.
@@ -1392,7 +1756,7 @@ By default the appliance boots quietly (`loglevel=3` — only kernel errors reac
 - **`text_console`** — verbose boot, then a standard getty login (`spatium-console=off`) instead of the cockpit — boot looks like a regular Linux server end-to-end.
 
 - **Mechanism.** Backed by `platform_settings.console_mode` (Literal-validated to the three values; migration `a7c3e9f1b405` adds it, backfills from the old `verbose_boot` flag — `True` → `text_console` — then drops `verbose_boot`). It rides the same host-config plane as timezone / NTP / SNMP (PlatformSettings → supervisor heartbeat `console_mode` → `maybe_fire_console_mode` → host runner). Because the kernel cmdline lives in `grub.cfg` (not a file the running OS re-reads), the runner flips a **grubenv variable** (`spatium_verbose`) that a `0` / `1` / `2` conditional in the per-slot menuentries reads (rendered by #395's `spatium-grub-render`). The mode → grubenv map keeps `dashboard = 0` + `text_console = 1` so pre-#393 grubenv values still resolve fail-closed; `verbose_dashboard = 2` is the new branch. grubenv lives on the shared ESP, so the setting **survives A/B slot upgrades + rollbacks + the /etc overlay** verbatim.
-- **Applies on the next reboot** (GRUB only reads the cmdline at boot) — the UI says so and points at the Maintenance-tab reboot.
+- **Applies on the next reboot** (GRUB only reads the cmdline at boot) — the UI says so and points at the Maintenance-tab reboot. On a multi-node control plane that tab links to Fleet instead, because the local reboot acts on whichever node answers the request and is refused there (#3011); reboot each node from its Fleet drilldown.
 - **`text_console` gets a real login.** `getty@tty1` is gated on `spatium-console=off` (the mirror of the dashboard's gate) and enabled into `getty.target.wants`, so the dashboard and getty are mutually exclusive by their opposite conditions and `text_console` lands a standard agetty login. (A unit-load-time `Conflicts=getty` leak that left `text_console` with *no* login was fixed in #393 / #394 — see CHANGELOG.)
 - **Anti-brick.** Only changes log verbosity + which process owns the TTY — never the slot / root UUID / kernel. A missing or corrupt grubenv makes the menuentry's conditional fail closed to `loglevel=3` + the dashboard. The always-present GRUB verbose-boot menuentry remains the zero-config one-shot fallback (drops the loglevel cap for a single boot, selectable from the boot menu with no reinstall).
 
@@ -2167,7 +2531,8 @@ set-default / set-next-boot writes `grubenv`. All of that lands on the
 leaves the survivor booting the **old kernel from a stale menu** — a
 mirror that protected the data and lost the appliance. So
 `spatiumddi-esp-sync` is called from `spatium-install`,
-`spatium-upgrade-slot apply`, `set-next-boot` and `set-default`, and is
+`spatium-upgrade-slot apply`, `set-next-boot`, `set-default` and
+`rollback`, and from firstboot when it commits a trial boot, and is
 a no-op on a single-disk box so every caller can invoke it
 unconditionally. `spatiumddi-esp-sync --check` reports drift without
 changing anything.
@@ -2227,6 +2592,34 @@ with ARRAY lines — written from `mdadm --detail --scan` at install and
 **checked**, because a conf with no ARRAY line produces an initrd that
 cannot find root, and the install aborts there rather than at the first
 reboot.
+
+**Slot upgrades and rollbacks on a mirror (#3172).** On a mirrored box
+a slot is the md array (`/dev/md/root_a`, `/dev/md/root_b`), not the
+`root_A` / `root_B` partitions: those are its two members, and a member
+carries the array's UUID rather than the filesystem's that
+`root=UUID=` names. `spatium-upgrade-slot`, the console, firstboot's
+trial-boot commit and the supervisor's Fleet telemetry all resolve the
+booted slot through the array. Before this, every
+`spatium-upgrade-slot` subcommand on a mirror exited with
+"couldn't detect A/B slots".
+
+`apply` writes the inactive **array**, never a member. The array is
+9 MiB smaller than its 8 GiB partition (metadata 1.2 keeps its data
+offset at the start of each member), and the slot image is built for the
+bare partition, so a straight `dd` would run out of room at the end.
+The image is written through a device-mapper concatenation of the array
+and a small sparse overflow file under
+`/var/lib/spatiumddi/slot-staging`; `resize2fs` then moves whatever
+landed past the array's end back inside it, the mapping is removed, and
+`e2fsck -n` checks the result through the array alone before the
+bootloader is touched. Only the overflow is staged, a few MiB. If the
+mapping cannot be removed the apply fails and says so: it holds the
+array open, and a slot that cannot be mounted cannot be booted. The
+mapping is also torn down when the write fails or the upgrade unit is
+stopped or times out (SIGTERM). Finally, an image whose root filesystem
+carries no `mdadm` (anything built before #999 added it) is refused
+before GRUB is pointed at it: its initrd could not assemble the array,
+and the node would stop in the initramfs.
 
 ### Installing onto a multipath SAN LUN (#999 Part C3)
 
@@ -2405,7 +2798,9 @@ be a reserved system account that already exists in the image (`root`,
 `useradd` *after* the disk was already wiped — or, with a colon in it,
 split the `user:password` line piped to `chpasswd`. Since #995 item 4
 the interactive prompt calls the same rule, via
-`spatium-preseed-parse --check-field admin_user <name>`.
+`spatium-preseed-parse --check-field admin_user <name>`. `user` and
+`debian` are refused too, as names reserved by the live installer:
+they are the names Debian's live tooling gives its live-session account.
 
 **`timezone` shape (#995 item 3).** Three tests, in order: the name
 must look like an IANA zone (`[A-Za-z0-9+_-]` segments joined by `/`),
@@ -2474,6 +2869,173 @@ After completion, the appliance reboots into normal operation.
 
 ---
 
+## Upgrading to 1.0.0
+
+SpatiumDDI 1.0.0 is the first SemVer release. Every SemVer release ranks
+above every CalVer one, but only a release that carries that ranking can
+tell (`backend/app/core/versions.py`, #1182). So **2026.10.02-1, the last
+CalVer release, is the bridge**: an install on anything older upgrades to
+2026.10.02-1 first, then to 1.0.0 (#1195, #1207, #1286). Take a database
+backup before you upgrade, and do not roll back to a CalVer release
+afterwards: 1.0.0 adds migrations the CalVer releases cannot run on
+(#1227; see [Rolling back](#rolling-back-the-database-stays-on-var-1227)).
+The 1.0.0 release notes carry the full upgrade checklist; this section
+covers how to get off 2026.10.02-1 on each deployment shape (#3915).
+
+### Single appliance, from 2026.10.02-1
+
+The normal [slot upgrade](#5b-phase-8-atomic-ab-image-upgrades-slot-upgrade)
+works: it was verified from 2026.10.02-1 to 1.0.0-rc.2 on real release
+images (#1181). It went through in under 10 minutes, with DNS down for
+about 4 minutes during the reboot. A second, shorter DNS and DHCP
+interruption of a few seconds can follow about 3 minutes after boot
+(#3919).
+
+### Multi-node cluster, from 2026.10.02-1
+
+**Do not use the Rolling Upgrade tab on a cluster still on
+2026.10.02-1.** Both ways it can start are refused, for reasons already
+fixed in 1.0.0 but not in the release you are running:
+
+- **Upload** answers 502, `Mirror upload failed: All connection attempts
+  failed`. The slot-image mirror pod runs out of memory at its 256Mi limit
+  and crash-loops (#1174, fixed by #1738).
+- **By URL**, Plan answers 409, `preflight failed; refusing to plan:
+  replication_lag`, naming replicas "not streaming" while
+  `pg_stat_replication` shows them streaming and CNPG reports every
+  instance healthy. It is a false alarm (#1445, item 6).
+
+Nothing is harmed by either refusal: no run is created and no node is
+touched. The way off 2026.10.02-1 is **Fleet, node by node**. The order
+below converged a three-node cluster on 1.0.0-rc.2 with DNS and DHCP
+serving on at least two nodes throughout, and every zone, record,
+subnet, block, pool, reservation, lease and address came through
+unchanged by name.
+
+1. **Stage every node first, with no reboot.** On the node's page in
+   **Fleet**, press **Upgrade**, choose **From external URL**, and give
+   the 1.0.0 slot asset's release URL for your architecture. The node
+   fetches the image itself (about 1.9 GB) and writes it to its inactive
+   slot, which takes about 4 to 5 minutes per node. Its runner ends with
+   `next-boot armed. Operator needs to reboot to switch slots.` Do the
+   nodes one at a time, and start the next only once the previous node's
+   Fleet row shows the upgrade done and a reboot pending. Fleet shows the
+   upgrade still in flight, at step `bootloader`, for a while after the
+   runner has armed the next boot, so give it time.
+2. **Wait about 5 minutes after the last stage.** Each node's k3s keeps
+   importing the 1.0.0 images for about 3.5 minutes after its stage ends,
+   and the shared chart moves to 1.0.0's image tag about 80 seconds after
+   the first member boots 1.0.0. A node still importing when the chart
+   moves would meet the DNS and DHCP gap in #3136.
+3. **Reboot the members one at a time, then the seed.** The reboot is
+   your step: the Upgrade form in 2026.10.02-1 says the runner "reboots
+   into it", but the runner only writes the inactive slot and arms the
+   next boot. (1.0.0's form says "Reboot to boot the new slot".) Press
+   **Reboot** on the first member. Before pressing it on the next node,
+   wait until **every node is Ready, DNS and DHCP answer on each of them,
+   and the database has a primary**. Do not wait for all three database
+   replicas: a member that has booted 1.0.0 while the supervisor
+   DaemonSet is still 2026.10.02-1 loses its `spatium.io/role-control-plane`
+   label at every heartbeat, because the old supervisor cannot read the
+   host's cluster-join state through 1.0.0's tighter release-state
+   permissions. A database replica that has to move off that member then
+   cannot be placed again, so the database can sit at 2 of 3 replicas
+   until the seed has rebooted and the supervisors move to 1.0.0.
+4. **The seed's Fleet Reboot does nothing on 2026.10.02-1.** It is
+   accepted and then nothing happens (2 of 2 runs, #1445 item 7). Reboot
+   the seed from its hypervisor, as a guest reboot request rather than a
+   reset; that worked both times. Rebooting from its console was not
+   tested. Then see the API bullet under "What to expect".
+5. After the seed's first boot on 1.0.0 the supervisor and the
+   control-plane Deployments start moving to 1.0.0's images within about
+   3 minutes. How long the API then takes to become Ready depends on the
+   migration; see below.
+
+<!-- #3915-order -->
+Staging every node before rebooting any is the recommended order. In the
+drill it kept DNS and DHCP on at least two nodes at every 10-second
+sample, and no node was without DNS for more than 30 seconds or without
+DHCP for more than 40 seconds outside its own reboot, which took 2 to
+3.5 minutes. The other order, upgrading and rebooting each member in turn
+before the next, is the one #3136 describes: with it, nodes not yet
+upgraded lose DNS and DHCP.
+<!-- #3915-order -->
+
+What to expect:
+
+- **After the seed's reboot, the API and the console can show
+  "initialising" for a long time.** The 1.0.0 migration (`ff32b91acad8`)
+  waits for a lock held by a database session that the seed's old
+  2026.10.02-1 api left idle in a transaction, a parked DNS agent
+  long-poll. If the database primary is not on the seed, that session
+  outlives the pod that opened it, and nothing on the database ends it:
+  no idle-in-transaction timeout, no lock timeout, default keepalives. By
+  those settings it lasts about 2 hours 11 minutes after the seed went
+  down. In the drill the API answered 502 for about 2 hours 4 minutes;
+  then the session was dropped, the migration finished, and the cluster
+  converged by itself within 3 minutes. DNS and DHCP kept serving
+  throughout.
+  - **A manual way out (not yet drilled).** From the node holding the
+    database primary, end the stale sessions. The CNPG cluster in the
+    `spatium` namespace is `spatium-control-spatiumddi-postgresql`:
+
+    ```bash
+    kubectl -n spatium get pods \
+      -l cnpg.io/cluster=spatium-control-spatiumddi-postgresql,cnpg.io/instanceRole=primary
+    kubectl -n spatium exec -it <primary-pod> -c postgres -- \
+      psql -U postgres -d spatiumddi -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE state = 'idle in transaction' AND state_change < now() - interval '5 minutes';"
+    ```
+
+    The migration is expected to continue within a minute.
+  - 1.0.0 shortens this (#3932): when its migration has waited 30 seconds
+    on a lock, it ends any session of the app's own role that is blocking
+    it and has been idle in a transaction for more than 5 minutes, and logs
+    each one as `migration_terminated_stale_session`. In testing, a
+    three-node upgrade from 2026.10.02-1 had the API back about 10 minutes
+    after the seed's reboot. The new Postgres settings also drop a dead
+    client's session within about 2 minutes, but only for sessions opened
+    after those settings apply. The session the old release left behind
+    still carries the old 2 hour 11 minute keepalive, so it is the
+    migration step that ends it. Check the 1.0.0 release notes to confirm
+    #3932 is included. If the console still shows "initialising" more than
+    about 15 minutes after the seed's reboot, use the manual way out above.
+- **Other things you will see.** The database primary moves four times (the last when the database
+  rolls its instances after the migration, with the API not ready for up
+  to 30 seconds);
+  every DNS and DHCP agent restarts twice (once when the chart moves,
+  once after the seed's boot), each restart a gap of 10 to 40 seconds on
+  that node; and a database replica on a member can crash-loop after the
+  seed's boot until the 1.0.0 API is back.
+- **No drain at each reboot (#1976).** A node goes down with its pods
+  still Ready, so API requests through the other nodes can fail for up to
+  about two minutes at a member's reboot. A node's k3s can also restart
+  while its slot is being written (#1804).
+- **Time.** Staging all three nodes takes about 14 minutes, and each
+  reboot about 3 minutes. The total depends on the migration wait above:
+  the drill took 3 hours 24 minutes in all, about 2 hours of it that
+  wait.
+- **Kea leases are per node.** Each node's Kea keeps its own leases with
+  no HA, so a member asked directly can offer addresses another node has
+  leased. A site whose relay points at several nodes needs HA for shared
+  scopes.
+
+A cluster already on 1.0.0 or later uses the Rolling Upgrade tab as
+normal.
+
+### Helm, from 2026.10.02-1
+
+A Helm install with DHCP agents can stall on the old Kea pod, which was
+never Ready under the 2026.10.02-1 probe, so its StatefulSet will not roll
+(#1589, #3907). The recovery, and what the chart now does about it, are in
+[`KUBERNETES.md` → Upgrading](KUBERNETES.md#8-upgrading); an air-gapped
+site must load the new api image before upgrading (#3907).
+
+### Docker Compose, from 2026.10.02-1
+
+The normal pull, migrate and `up -d` works (verified, #1181).
+
+---
+
 ## 5. Appliance Update Mechanism
 
 Two update paths exist, addressing different operator workflows.
@@ -2491,7 +3053,7 @@ runner PATCHes each HelmChart CR's `spec.set.image.tag` with the
 new release tag. helm-controller picks up the change and runs
 `helm upgrade` against the chart in `/usr/lib/spatiumddi/charts/`
 — which pulls images from the local containerd image store (already
-loaded from `/usr/lib/spatiumddi/images/*.tar.zst` at firstboot).
+imported by k3s from `/var/lib/rancher/k3s/agent/images/*.tar.zst`).
 Pod rollouts happen with the chart's existing strategies
 (RollingUpdate for non-hostNetwork pods; Recreate for frontend
 when hostNetwork is on). No host reboot needed. Pre-#183 this
@@ -2540,7 +3102,23 @@ config, ssh host keys, user accounts — land in the upper on the
 persistent `/var` partition, so they survive a slot swap
 verbatim. A `spatium-etc-reconcile` boot step merges system uid
 /gid/shadow entries from lower → upper so new system users
-introduced by an upgrade don't clobber operator-created ones.
+introduced by an upgrade don't clobber operator-created ones. The
+same step removes `/etc/sudoers.d/live` when its whole content is the
+one line Debian's live-config writes during the live ISO session
+(`user ALL=(ALL) NOPASSWD: ALL`), and live-config's
+`/var/lib/live/config` markers: installers before this change copied
+both from the live session onto the disk, into the `/etc` baseline of
+**both** slots. A slot upgrade replaces only one slot's baseline, so a
+second step, `spatium-etc-premount.service` (`spatium-etc-reconcile
+--before-mount`), runs after `/var` is mounted and before `etc.mount`,
+and writes an overlay whiteout for `sudoers.d/live` into
+`/var/persist/etc`. Both slots mount that upper, so neither slot's
+baseline can show the file, including after a rollback. It runs only
+while `/etc` is not mounted, since overlayfs does not define changes to
+an upper under a live mount. A file of the upper's own at that path
+(an operator's `/etc/sudoers.d/live`) is left alone by both steps. The
+image no longer ships live-config's account components, and the
+installer excludes both paths from the live-root copy.
 
 **Slot upgrade flow:**
 
@@ -2559,18 +3137,44 @@ introduced by an upgrade don't clobber operator-created ones.
    - Re-stamps the slot filesystem UUID into `/boot/efi/grub/
      grub.cfg` (since the slot raw.xz carries its own UUID
      baked at build time, the menuentry has to be patched).
+   - Copies the new slot's image tarballs to `/var/lib/rancher/
+     k3s/agent/images/`, each under a hidden `.part` name and
+     then renamed into place, so the running k3s never imports a
+     half-written tarball (#1630).
    - The active slot is never touched.
 4. `spatium-upgrade-slot set-next-boot` writes
    `next_entry=slot_b` (one-shot) via grub-reboot.
 5. Operator reboots. Grub honours `next_entry`, clears it,
    and falls back to `saved_entry` (the durable default) if
    anything in steps 6-8 fails before they finish.
-6. New slot boots. `spatiumddi-firstboot.service` waits for
-   `/health/live` to return 200.
+6. New slot boots. Before k3s starts, `k3s.service` clears
+   containerd's unfinished content writes (`spatium-k3s-images
+   clear-ingests`), so a write an earlier import left behind
+   cannot fail this boot's imports (#1630). k3s imports the new
+   tarballs. `spatiumddi-firstboot.service` waits for k3s's
+   `/readyz` to answer `ok`. It then waits until k3s holds
+   none of the tarballs open, which is how long each import
+   lasts (#2109), checks that k3s imported every baked tarball
+   and that every image is in containerd, and has k3s
+   re-import whatever is missing, never one it is still
+   importing (`spatium-k3s-images verify --repair`, #1630).
+   It waits at most what is left of firstboot's 10-minute
+   start timeout. If k3s is still importing when that runs
+   out, the slot is not committed; once
+   `spatium-k3s-images verify` passes, **Approve trial** in
+   Fleet keeps it before the next reboot reverts it.
+   Once k3s's import is over, `spatiumddi-image-unpack.service`
+   unpacks the new release of each image the node runs, one at a
+   time at 32 MiB/s (`spatium-k3s-images unpack`, #2788). The
+   kubelet unpacks whatever it leaves.
 7. On health-OK: `grub-set-default <new_slot>` commits the
    swap durably. The next reboot stays on the new slot.
 8. On health-fail (kernel panic, initramfs failure, api stack
-   broken): no commit happens. Next reboot reverts to the
+   broken, or an image still missing after the re-import,
+   which would leave a workload in `ErrImageNeverPull`, or k3s
+   still importing when that time runs out; for those
+   firstboot exits 1 before the commit): no commit
+   happens. Next reboot reverts to the
    previous `saved_entry` automatically. If the new slot's
    migrate step had already run, the reverted release cannot
    start on the migrated database: see
@@ -2598,7 +3202,7 @@ sudo spatium-upgrade-slot set-next-boot
 sudo reboot
 
 # Emergency: durably commit without waiting for firstboot
-sudo spatium-upgrade-slot commit slot_b
+sudo spatium-upgrade-slot set-default slot_b
 
 # Refresh /var/lib/spatiumddi/release-state/slot-versions.json
 # (called automatically by spatiumddi-firstboot at every boot + at
@@ -2633,6 +3237,24 @@ baseline fstab + a snapshotted `/usr/lib/etc.image/`. Every
 GitHub release attaches the slot image + its SHA-256 sidecar
 at versioned + `/latest/` URLs.
 
+#### Upgrading from a build older than #1621: a short window of 500s (#1661)
+
+Since #1621 `/var/lib/spatiumddi/release-state` is `1770 root:2770` and
+the api pod carries `supplementalGroups: [2770]`. The booted slot applies
+that mode at sysinit, but k3s first restarts the previous release's api,
+which has no gid 2770 and cannot be changed after the fact. Until the new
+control chart replaces it, that api answers `500` on reads of the
+directory: `GET /api/v1/appliance/slot-upgrade`, and the setup-state and
+system-info reads. In testing this lasted about 90 s and overlapped the
+502s the pod rollout causes anyway. The upgrade itself is unaffected;
+retry once the new api serves. It happens once, on the upgrade that
+introduces the tightened directory.
+
+This is documented rather than bridged on purpose. Bridging it means a
+boot-time unit that hands the trigger directory to the api's uid until
+the new api is up, in the directory every root host runner trusts, to
+avoid a one-time status-read error that no UI page depends on.
+
 ### Rolling back: the database stays on `/var` (#1227)
 
 A slot swap replaces the root filesystem. PostgreSQL lives on the
@@ -2641,8 +3263,21 @@ migrate step moves the schema forward, and the release you left cannot
 run on that schema afterwards. Alembic cannot migrate backwards from a
 revision it has never heard of. Its migrate Job fails with
 `Can't locate revision`, its api / worker / beat wait for migrate
-forever, and on a single node the newer release's api keeps serving
-behind the older UI. Nothing retries.
+forever, and nothing retries. Whether the newer release's api keeps
+serving meanwhile is decided by the chart of the release you go back
+TO:
+
+- **1.0.0-rc.1 and later** (#3780): at one replica, a rollback from a
+  newer release that is still serving rolls the api and the worker out
+  surge-first, so the newer release's pods keep serving behind the older
+  UI, and re-applying the newer release through the API works (below).
+  Beat stops either way: it can only be replaced, not surged.
+- **1.0.0-beta.1 to 1.0.0-beta.5** (#1659): on a single node the rollout
+  retires the newer release's only api and worker pods first, so the API
+  and the web UI answer `502` until the newer release is booted again
+  from the console (below). The Fleet UI cannot reach the node either.
+- **2026.10.02-1 and earlier**: the newer api keeps serving, as for
+  1.0.0-rc.1.
 
 **What is checked before you go back.** Every path that moves a
 control-plane node to an older release first compares the database's
@@ -2694,6 +3329,26 @@ so a reinstall during the rollback can mint a new `SECRET_KEY` and
 leave every credential encrypted at rest unreadable. If you must go
 back, restore the pre-upgrade backup together with the older release.
 
+**Where SECRET_KEY lives (#1448).** From the release after 2026.10.02-1,
+firstboot keeps `SECRET_KEY` in `spatium-control-app-keys` in the
+`spatium` namespace, a Secret no Helm release owns, and points the
+control chart at it with `auth.existingSecret`. A failed install and the
+helm-controller's uninstall can therefore no longer delete it. On the
+first boot of that release it copies the key from the chart's own
+`spatium-control-spatiumddi-app`; it never overwrites an existing
+`spatium-control-app-keys`, and never generates a key while the chart's
+Secret exists without one. That is the Secret to back up:
+
+```bash
+kubectl -n spatium get secret spatium-control-app-keys -o yaml > app-keys.yaml
+```
+
+An appliance upgraded straight from 2026.09.04-1 loses
+`spatium-control-spatiumddi-app` on that upgrade, because the stored
+2026.09.04-1 manifest does not keep it. Going back to 2026.10.02-1 from
+there makes that chart generate a new key, so don't; if you must, restore
+the pre-upgrade backup together with it, as above.
+
 **If an appliance is already stuck.** The older release's
 `wait-for-migrate` init container prints the cause once, including
 `The database was migrated by a NEWER SpatiumDDI release`, then keeps
@@ -2703,11 +3358,28 @@ logging `current=<written by a newer release, see above>`:
 kubectl -n spatium logs deploy/spatium-control-spatiumddi-api -c wait-for-migrate
 ```
 
-Re-applying the newer release recovers it. Its migrate step finds
-nothing to do, and every workload rolls out:
+Booting the newer release again recovers it. Its migrate step finds
+nothing to do, and every workload rolls out. While the newer api still
+serves (see the list above), re-apply it through the API:
 `POST /api/v1/appliance/slot-upgrade/apply` with the same image, or
-**Schedule OS upgrade** in the Fleet UI. The only other way out is to
-restore a pre-upgrade copy of the database by hand.
+**Schedule OS upgrade** in the Fleet UI.
+
+When the API answers `502` (a rollback onto a 1.0.0 beta on a single
+node), it cannot take that request, so boot the newer release from the
+console, or over SSH, as root. The inactive slot still holds it:
+
+```bash
+sudo spatium-upgrade-slot status          # the inactive slot holds the newer release
+sudo spatium-upgrade-slot set-next-boot   # re-copies its images, arms ONE boot of it
+sudo reboot
+```
+
+No api is needed: firstboot commits the slot as the durable default once
+k3s's `/readyz` answers and every baked image is in containerd, as for an
+upgrade (step 7 above), and the database is left as it is. If that boot
+fails, the next reboot falls back to the older slot, as any trial boot
+does. The only other way out is to restore a pre-upgrade copy of the
+database by hand.
 
 ### 5c. Phase 8f fleet upgrade orchestration
 
@@ -2856,6 +3528,73 @@ slot is a spare, so a wrong-arch rootfs sitting in it costs nothing (the
 node keeps running on the active slot and the next apply overwrites it),
 whereas pointing the bootloader at it cannot be undone remotely.
 
+### Free space is checked before an upgrade image is stored (#2400)
+
+The kubelet evicts pods at `nodefs.available<5%` and then keeps evicting
+until a further 10% (`evictionMinimumReclaim`) is free, so a node that
+dips under 5% stays in DiskPressure, evicting the api, worker and
+supervisor, until **15% of `/var` is free**. An image that fits on disk
+can therefore still take the control plane down. Upload and
+import-from-GitHub now refuse with a 422 that names the numbers when
+storing the image would leave less than 15% of the volume free (the
+mirror's volume when the slot-image mirror is on), before any byte is
+written. The node-side staging download in `spatium-upgrade-slot` applies
+the same rule and exits 7, which the slot-upgrade wrapper reports as "not
+enough free space on /var". Free space by deleting unused upgrade images
+in Fleet, then retry. On a 15 GB `/var` that is about 2.25 GB of headroom
+on top of the image.
+
+Scheduling a slot upgrade on one appliance (Fleet → **Schedule OS
+upgrade**) applies the same rule to the node itself before anything is
+stamped: the node downloads the image onto its own `/var`, so the request
+is refused with a 422 naming the node and the numbers when its last
+reported `/var` reading (statvfs `f_bavail`, which is what the kubelet
+measures; `total - used` also counts ext4's 5% root reserve) would drop
+under 15% free. A node with no reading, or one older than 10 minutes, is
+not refused; the host runner's own check (rc 7) still applies.
+
+**Low-disk warning.** The alert is the default-on `appliance_disk_usage`
+rule (#2240; see the data-disk section above): a warning at 80% used and
+critical at 87%. This change adds no second alert. The Fleet drilldown
+(**Disk space**) and the Cluster → Overview node card show a finding from an
+evaluator that uses the same two lines in the same terms (and a test pins
+them equal), plus the kubelet's `DiskPressure` condition (critical), which
+those two screens can read and the alert, evaluated in the worker, cannot.
+
+**Cached images are cleaned up.** `spatium-upgrade-slot` removes its
+staged copy in `/var/lib/spatiumddi/slot-staging/` as soon as the slot
+write is over, success or failure (a failed run's copy was never reused:
+the next apply discards it before fetching). On the control plane, a
+periodic task (every 10 minutes, on the worker) deletes a stored upgrade
+image, audited as `appliance.upgrade_image_reclaimed`, once:
+
+- every appliance it applies to (same architecture, or either side
+  unlabelled), approved **or still pending approval**, *runs* its
+  version durably: installed, on a committed boot (durable default slot
+  = current slot, not a trial boot). A version that is only written to
+  the inactive slot does not count, because the node can still roll back
+  or the write was cancelled;
+- no node is scheduled to fetch it and no active rolling run names it;
+- it was uploaded more than an hour ago, or more than **7 days** ago when
+  nothing (no per-node schedule, no rolling run) ever named it, since such
+  an image was most likely uploaded ahead for a node not paired yet.
+
+The sweep takes the upgrade-image catalogue lock exclusively, the same lock
+scheduling takes shared from resolving the image until it commits, so an
+image cannot be deleted under a schedule that is being written. The row is
+deleted and committed before the bytes are removed. Re-import it from
+GitHub (or upload it again) to re-apply.
+
+**No swapfile.** Releases before #2400 created a 2 GiB
+`/var/lib/spatiumddi/swapfile` on first boot. Its `/etc/fstab` entry was
+written into the `/etc` overlay, which mounts after systemd has generated
+its units from the image's own `/etc/fstab`, so the swap was active until
+the first reboot and never again. `spatiumddi-firstboot` now deletes an
+inactive swapfile and its fstab line on boot and no longer creates one; an
+active one is left alone until a later boot. Memory sizing and the
+memory-eviction thresholds were calibrated on appliances that in practice
+ran without swap.
+
 **Two source modes for the upgrade image:**
 
 1. **Uploaded / imported image** (staged). Operator stages the image
@@ -2864,11 +3603,56 @@ whereas pointing the bootloader at it cannot be undone remotely.
    its sha256 sidecar out-of-band (air-gap), or — on a connected
    install — **import from GitHub** straight from the release-asset
    picker, where the control plane downloads + sha256-verifies the
-   image for you (no out-of-band round trip). On the Rolling Upgrade tab
+   image for you (no out-of-band round trip). Only architectures an
+   approved appliance runs are offered, and the API refuses (422) an
+   import or upload for any other (#2399); while any appliance has not
+   reported its architecture yet, nothing is filtered or refused. On the Rolling Upgrade tab
    the operator picks it from the dropdown — the control plane composes
    an authenticated download URL with an HMAC token, and every per-node
    host runner pulls bytes back through the control plane. No node ever
    talks to github.com.
+
+   **The Upgrade images page is one table** (#2410), one row per
+   version + architecture, built from the GitHub releases and the staged
+   images together (an air-gap upload with no matching release is a row
+   too, and a staged release is one row, not two). An uploaded image
+   with no recorded architecture is shown on the release's row only when
+   that release publishes a single architecture; otherwise it is its own
+   row with architecture `unknown`, since it could be either. Columns: version
+   (linked to the release), architecture (`unknown` is shown as such),
+   channel (nightly / pre-release / stable, derived from the tag), release
+   date, size, staged, the fleet-architecture verdict (how many nodes run
+   that architecture, or "no node runs this"), and an **In use** column.
+   Rows are grouped by release, newest first, and sort by any column
+   header. Filters (kept for the browser session): this fleet's
+   architecture vs all, nightlies (hidden by default, with a count of how
+   many are hidden), staged / not staged, and version text. The GitHub
+   listing walks past nightlies until it has 25 stable and pre-release
+   releases, so a month of nightlies cannot push the last stable release
+   out of the table.
+
+   A checkbox column and a bulk toolbar act on the selection: **Delete N**
+   (staged rows, through a confirmation that lists the versions, their
+   total size and any in-use image) and **Import N** (un-staged rows,
+   downloaded one at a time). Each delete is its own request and its own
+   audit row; refused and failed rows stay selected with the reason. A
+   filter that hides a selected row unselects it, so an action only ever
+   covers rows on screen, and rows no node can boot are left out of
+   **Import N**. The air-gap upload is behind the **Upload image…**
+   button; once every approved appliance has reported its architecture it
+   offers only those (plus "unknown"), because the server refuses any
+   other only after the whole file has been sent.
+
+   **A delete is refused (409) while an image is in use**: an appliance's
+   `desired_slot_image_url` points at it (an upgrade is scheduled and the
+   node has not fetched it yet) or an active (planned / running / halted)
+   rolling run names it. The answer names the appliance or run. An image
+   that is merely *installed* on a slot is not in use (the bytes are
+   already written) and deletes normally; the row says "installed on" so
+   you know re-staging means another download. For a stale schedule you
+   have already cancelled on the host, `DELETE …/upgrade-images/{id}?force=true`
+   (the single-image dialog offers it as a checkbox) overrides the refusal;
+   the audit row records `force` and what it overrode.
 
    > **Multi-node uses the mirror, and turns it on for you.** Where those
    > bytes live depends on `slotImageMirror.enabled` (`slot-image-mirror`
@@ -2925,10 +3709,22 @@ whereas pointing the bootloader at it cannot be undone remotely.
    >
    > Upload works normally once the appliance is on `2026.07.30-1` or
    > later. See [#787](https://github.com/spatiumnorth/spatiumddi/issues/787).
+
+   A scripted upload must send a `Content-Length` header, as browsers,
+   `curl -F` and the common HTTP client libraries do; one without it is
+   answered **411**, because the receiving node's free space is checked
+   against that size before the image is buffered. The caller's
+   credentials are checked from the request headers first, so a missing
+   or insufficient one is answered 401 / 403 before any of the image is
+   read.
 2. **URL** (connected install). Operator pastes the GitHub release
    asset URL — same `https://github.com/.../spatiumddi-appliance-
    slot-amd64.raw.xz` shape the per-box flow uses. Each node fetches
-   independently.
+   independently. The URL must start with `https://` (or `file://`, for an
+   image already placed on every node): the supervisor refuses any other
+   scheme, cleartext `http://` included, so Plan — and the per-box
+   schedule — answer 422 for one rather than letting each node's stage step
+   wait out its timeout for a download that never starts (#1752).
 
 The tab's source toggle defaults to **Uploaded** when at least one
 image is on file; otherwise falls back to **URL**. The empty-state
@@ -2957,9 +3753,19 @@ so a first-time operator never gets stuck looking for the upload.
    unknown and only warns (#1182).
 3. Picks source (Uploaded or URL — see above).
 4. Clicks **Run preflight**. Verdict surfaces inline as a checklist:
-   `inflight_conflict`, `replication_lag`, `disk_headroom`,
-   `mirror_disk_headroom` (mirror PVC; skipped if not configured),
-   `version_path`, `quorum`. Any `fail` blocks Plan; `warn` lets
+   `inflight_conflict` (or `kubeapi_unreachable` when the API did not answer the
+   lease read, #2779), `replication_lag`, `disk_headroom` (each
+   node's reported `/var`; a missing or stale report warns; a node
+   already on the target stages nothing and is named instead of
+   judged), `mirror_disk_headroom` (mirror PVC; skipped if not
+   configured; an uploaded target the mirror already holds needs only
+   the margin),
+   `version_path`, `quorum`. With an uploaded image the disk checks
+   size the need from it (#1919): a node needs twice the image + 1 GiB
+   (the staged `.raw.xz`, then the new slot's container images
+   imported beside the old slot's on its first boot), the mirror the
+   image + 1 GiB. A URL source, whose size is unknown until it is
+   downloaded, is judged as a 4 GiB image. Any `fail` blocks Plan; `warn` lets
    Plan proceed but flags the row.
 5. Clicks **Plan**. A `system_upgrade_run` row is inserted in
    `state='planned'` with the captured node order + the preflight
@@ -2972,21 +3778,164 @@ so a first-time operator never gets stuck looking for the upload.
    health-gate → DaemonSet-ready gate → uncordon → settle pause.
 7. Live progress streams into the Plan banner (per-node state pills
    + ETA). Halt / Resume / Abort buttons exposed.
-8. After every node is on the new slot, the orchestrator patches the
-   spatiumddi chart's `image.tag` via a HelmChartConfig (so api /
-   frontend / worker container images land too), waits for the
-   rollout, runs the migrate Job, and posts the cluster-wide
-   verification suite (CNPG instance count, DaemonSet pods Ready).
+   A Halt or Abort takes effect when the node in flight ends: the drive
+   finishes the node it is on (cutting a drain or an apply short would
+   leave it half-changed), then writes what happened to that node into
+   the run's history and stops, leaving the run `halted` or `aborted` and
+   the run's events as the operator left them (#1702). Abort does not
+   free the upgrade Lease: the drive releases its own once it has
+   stopped, so a new Plan and Start are refused meanwhile (#1707). A
+   drive whose Lease was taken over by another writes nothing to the run
+   (#1704). A Lease read the API did not answer counts as unknown,
+   not lost: the drive starts no new node until a renewal lands, and
+   gives up (finishing only the node it is on) 8 minutes after its last
+   renewal, before the Lease could lapse for anyone else. If a drive
+   exits with the run still `running`, a beat sweep re-drives it once
+   the Lease has been free on two sweeps a minute apart (#1713). After the shared-tag
+   hand-off the hop chain refreshes a 45 s heartbeat; if it stops (the worker holding
+   the hop was killed) the sweep re-drives the run on its second sighting, about
+   two minutes after the last hop when beat keeps running. The shared-tag flip
+   also recreates beat, and a restarted beat runs one sweep as it starts, so on
+   a rolling upgrade expect the re-drive within a few minutes (about five
+   measured on a three-node roll) rather than two. Otherwise (a hand-off from a
+   build without the heartbeat, or Redis unreadable) the sweep waits out the
+   15-minute grace (#3851). If the drive itself died, the Lease lapses after its
+   10-minute duration; a superadmin can free it sooner with
+   **Force release** beside the Lease pill (`POST
+   /api/v1/upgrades/lease/force-release`). That is refused while the
+   holder has renewed the Lease within the last 300 s (a live drive
+   renews every 200 s), and it is audited
+   (`upgrade.lease_force_released`) and recorded on the run. A failed or
+   aborted run's shared-tag hold (#1710) is not ended by the beat task
+   while the aborted drive still holds the Lease: the node it is
+   finishing may yet boot the new slot.
+   Each node's own preflight judges `/var` only on the nodes the run
+   has still to upgrade: upgrading a node is what shrinks its `/var`,
+   so the nodes already done are not asked again (#1709).
+8. After every node is on the new slot, the shared image tags move,
+   once (see *The shared image tags* below), the drive hands the rest
+   of the run to a worker already on the target, and that worker waits
+   until every moved Deployment and DaemonSet runs the target and has
+   rolled out, then posts the cluster-wide verification suite (CNPG
+   instance count, re-read for up to 10 minutes while an instance
+   rejoins; DaemonSet pods Ready) (#1829). A single-node run has no
+   mixed-version window and patches the control chart's `image.tag`
+   at the end as before.
 9. Run flips to `state='succeeded'` (or `failed` / `halted` /
    `aborted`). Lease is released. The OS Versions tab shows the new
    default slot on every node.
 
+**The shared image tags (#1710).** A cluster shares three k3s
+HelmCharts, each carrying one image tag for workloads on every node:
+`spatium-bootstrap` (the supervisor DaemonSet), `spatium-control` (api,
+worker, beat, frontend, slot-image mirror) and `spatiumddi-appliance`
+(the DNS / DHCP agents). Every pod is `imagePullPolicy: Never`, so a tag
+moved while a node is still on the old slot hands that node images it
+does not have. A rolling run therefore holds all three on the version
+the cluster runs until every node reports the target:
+
+- Before its first node, and again before each one, the run pins
+  `global.imageTag` / `image.tag` in the bootstrap and control charts'
+  HelmChartConfigs, so the seed's firstboot re-render cannot move them.
+- The supervisor heartbeat tells each cluster member of the hold. A
+  supervisor whose host already runs the target writes nothing to the
+  agents chart until the hold ends; the nodes still on the old slot keep
+  writing it, with the old tag.
+- When every node is done, the run removes the pins and ends the hold in
+  one step. Each node's DNS and DHCP pods restart once at that moment.
+  Each node unpacked their new images right after its own reboot
+  (`spatiumddi-image-unpack.service`), so little or nothing is left to
+  unpack then. Before #2788 every node unpacked 1-2 GB of image layers
+  at this moment, all at once on the `/var` etcd writes its WAL to, and
+  on a shared disk that stalled etcd until a k3s server exited.
+
+A pin, or the removal of the pins, that the kubeapi does not take (a
+request refused or unanswered, as while a k3s server restarts) does
+not end the run. The drive tries it again every 15 s, reading Halt,
+Abort and the Lease between tries, and starts no node and moves no tag
+until it lands. Only once it has kept failing for 5 minutes does the
+run fail on it, with the kubeapi's answer as its error (#2028). Only an
+answer a later try can change is retried: no answer at all, a 5xx, or a
+408, 409 or 429. A refusal that will not change (a 403 from RBAC, a 422
+for an invalid object) fails the run at once, as before.
+
+A run that fails or is aborted keeps its hold, because nodes on two
+versions are exactly what it protects. A new run's Start takes it over,
+and a beat task ends it once every cluster member reports one installed
+version, for a roll the operator finished (or took back) node by node.
+To back out by hand, delete the `global.imageTag` key from the
+`spatium-bootstrap` HelmChartConfig and `image.tag` from
+`spatium-control` in `kube-system`.
+
+**Upgrading a cluster node by node from Fleet (#3136).** With no Rolling
+Upgrade running, a cluster upgraded one node at a time (Fleet's Schedule
+OS upgrade, then the node's reboot) has nodes on two versions all the
+same. While the cluster members report different installed versions, no
+member writes the agents chart: it stays on the image tag every node is
+running, so the DNS and DHCP pods of the nodes not yet upgraded keep
+running. A node Fleet has scheduled hears of this before its reboot,
+so its first pass on the new slot already leaves the chart alone. Once
+every member reports one version, the next heartbeat moves the chart to
+the new tag and each node's DNS and DHCP pods restart once. A role change
+made while the versions differ is applied then too. A member that is
+down while on the old version counts at the version it last reported,
+so the chart waits for it: bring it back and upgrade it, or replace it
+from Fleet. Nothing pins the
+bootstrap and control charts on this path, and the seed's own boot
+renders them from its new slot: upgrade the members first and the seed
+last, or use the Rolling Upgrade, which holds those too.
+
+**One DNS server group per cluster (#1427).** The cluster has one
+`spatiumddi-appliance` chart and so one DNS agent group. Giving a
+cluster member (or a joiner) DNS in a group other than the one the
+cluster's other DNS members serve is refused with 422, whether through
+the Fleet roles save, the Operator Copilot, a DNS server move or a
+control-plane promote. Re-saving an existing assignment and taking DNS
+off a member are never refused.
+
+**When a node's upgrade fails.** If a step fails after the run has
+cordoned the node or set the CNPG maintenance window, the orchestrator
+releases the node before it stops: it uncordons it (unless the node was
+already cordoned before the upgrade, which is left as the operator set
+it) and clears the window. If that release fails too, the node is left
+held and needs a manual release. The run's `cluster-upgrade-failed`
+alert then carries category `release_failed` instead of the step's own
+category, its message says "Still held after the failed release:"
+followed by `cordon` and/or `maintenance_window`, and the node's progress records
+`release_failed` with the error, what is still held, and the category
+the step failure itself had (#1542).
+
 **Rolling back, and why a Kubernetes minor is different (#974).**
 
 For a same-minor release an **A/B slot revert is a rollback**: boot the
-previous slot and the node is as it was. Across a Kubernetes *minor* it
-is not, and the difference is easy to miss because the slot machinery
-behaves identically.
+previous slot and the node is as it was, with one exception, the node's
+container images. k3s imports its image tarballs from the shared `/var`,
+which holds the newest upgraded slot's set, so a rolled-back slot can
+come up with pods in `ErrImageNeverPull` if containerd no longer holds
+its images (a cluster join on the newer slot, or kubelet image GC,
+removes them). A rollback, a set-default to the other slot and a
+"boot this slot next" therefore first copy the target slot's own tarballs
+into that directory with a fresh mtime, so k3s re-imports them before the
+reboot ([#3169](https://github.com/spatiumnorth/spatiumddi/issues/3169)).
+The copy is about 1 GB, and a reboot requested meanwhile waits for it.
+The installer also places the tarballs on root_A's own filesystem
+(under the `/var` mountpoint, so they stay hidden at runtime), which is
+what lets a rollback to a node's original slot restore them; an install
+that cannot fit them fails rather than leave a partial set. Nodes
+installed before that change carry none on root_A. Nothing is copied
+when GRUB falls back on its own after a failed trial boot, so the slot
+it falls back to runs with the *other* slot's tarballs in that
+directory (an upgrade's trial leaves the new slot's set, a "boot this
+slot next" the old slot's). That slot's pods keep running, but its
+images are no longer pinned and a later cluster join on it rebuilds the
+store without them; the next upgrade puts a matching set back. A tarball
+only the newer slot ships also stays in the directory after a switch;
+it is imported but harmless. Recovery by hand is in
+[Troubleshooting](../TROUBLESHOOTING.md#pods-stuck-in-errimageneverpull-after-a-slot-rollback).
+Across a
+Kubernetes *minor* the revert is not a rollback at all, and the
+difference is easy to miss because the slot machinery behaves
+identically.
 
 The k3s datastore (`/var/lib/rancher/k3s`) lives on the persistent
 `/var`, **outside the A/B slot**. Booting a slot that carries the older
@@ -3101,7 +4050,8 @@ Same-minor bumps are unaffected — revert the slot and you are done.
    3-node cluster; nodes go offline ~30-60 s each during reboot.
 ```
 
-**Required RBAC.** The api pod's ServiceAccount needs the
+**Required RBAC.** The api pod's ServiceAccount, and the worker's,
+which runs the orchestrator as a Celery task (#1445), need the
 `api.upgradeOrchestratorRBAC` grants (namespace-scoped Deployments
 + Jobs + CNPG Cluster patch + Lease CRUD; cluster-scoped Nodes +
 Pods + pods/eviction; helm.cattle.io HelmChartConfigs in
@@ -3110,8 +4060,8 @@ kube-system). Appliance installs flip this on at firstboot via
 HelmChart's `valuesContent` (committed in `spatiumddi-firstboot`).
 Docker / plain-k8s installs leave it off by default — the rolling
 upgrade flow doesn't apply there. If preflight surfaces
-`inflight_conflict: lease held by '<rbac-missing>'`, the api SA is
-missing this grant; the live appliance fix is one `kubectl patch`
+`inflight_conflict: lease held by '<rbac-missing>'`, the api or the
+worker SA is missing this grant; the live appliance fix is one `kubectl patch`
 on the seed `HelmChart spatium-control` (see #298 PR description
 for the one-liner).
 
@@ -3178,7 +4128,7 @@ Applied to both Alpine and Debian appliance images:
 - ASLR enabled (`/proc/sys/kernel/randomize_va_space = 2`)
 - Core dumps disabled
 - `/tmp` mounted as `tmpfs` (no-exec, no-suid)
-- SSH: `PermitRootLogin no`, `PasswordAuthentication no` (key-only), `Protocol 2`
+- SSH: `PermitRootLogin no`, `Protocol 2`. Password login is on by default, because the installer takes the admin password as the first credential. To go key-only, choose **Key only** when the installer takes your key, or add an authorized key later and turn **Password authentication** off under Appliance, Fleet, SSH
 - All services run as non-root system users (`spatiumddi`, `kea`, `named`)
 - AppArmor profiles (Debian) or seccomp profiles (Docker) for service isolation
 - CIS Benchmark hardening script applied at image build time
@@ -3188,12 +4138,16 @@ Applied to both Alpine and Debian appliance images:
 
 ## 8. Environment Variables for Appliance
 
-```bash
-SPATIUMDDI_FIRSTBOOT=true          # Set to false after first-boot wizard completes
-SPATIUMDDI_APPLIANCE_MODE=true     # Enables appliance-specific UI flows
-SPATIUMDDI_UPDATE_CHANNEL=stable
-SPATIUMDDI_LICENSE_ACCEPTED=false  # Must be true to complete first-boot
-```
+The appliance does not read `SPATIUMDDI_*` environment variables, and there is no first-boot wizard flag or licence-acceptance gate to set. First boot writes the control-plane chart's `sharedEnv` (the Helm values the api, worker and beat pods all receive; see `appliance/mkosi.extra/usr/local/bin/spatiumddi-firstboot`), which carries:
+
+| Variable | Meaning |
+|---|---|
+| `APPLIANCE_MODE` | Set to `"true"`. The backend reads it as `appliance_mode` and enables the appliance-specific UI flows and the Kubernetes-Secret certificate path. |
+| `APPLIANCE_VERSION` | The installed appliance version (rendered from the chart's `applianceVersion` value). |
+| `INITIAL_NTP_SERVERS` | The installer's Time source answer; it seeds the initial `ntp_pool_servers` setting and is ignored once that settings row exists. |
+| `APPLIANCE_HOSTNAME` / `APPLIANCE_HOST_IPS` | The host's hostname and global addresses, so every api replica builds the same self-signed Web UI certificate identity. |
+
+Update channels are future work (Phase 8d, pending).
 
 ---
 
@@ -3226,7 +4180,7 @@ the operator installing a CA anywhere:
    is sent to a server that does not hold the pinned key. The hostname does
    not have to match, so an IP works. The supervisor logs the fingerprint as
    `supervisor.tls.pinned_on_first_contact`; it should match the one shown
-   under **Appliance → TLS** on the control plane. If it does not, something
+   under **Appliance → Fleet → Web UI Certificate** on the control plane. If it does not, something
    intercepted the connection.
 2. **Rotation goes through the appliance CA.** The Web UI certificate changes
    in normal operation: a self-signed one is re-minted when a member joins or
@@ -3256,7 +4210,8 @@ unconditionally, and nothing was pinned in its place).
 **Limit, stated plainly.** Trust on first use is as good as the first
 contact. An attacker on the path at pairing time who also substitutes the CA
 certificate the supervisor receives at approval is not caught automatically;
-comparing the logged fingerprint with **Appliance → TLS** is the check.
+comparing the logged fingerprint with **Appliance → Fleet → Web UI
+Certificate** is the check.
 
 **The role pods use the same pin (#1281).** On an off-cluster appliance the
 DNS, DHCP and looking-glass pods reach the control plane at the same external
@@ -3296,6 +4251,25 @@ the long ``DNS_AGENT_KEY`` / ``DHCP_AGENT_KEY`` hex string.
 > *before* the first pairing — otherwise
 > ``POST /api/v1/appliance/supervisor/register`` returns 404 and the
 > supervisor idles (#407).
+>
+> The flag refuses **new** pairings only. Appliances already registered
+> keep heartbeating and serving while it is off: `/supervisor/heartbeat`
+> and `/supervisor/poll` are not behind it (#2798). Before that fix,
+> switching it off answered every heartbeat 404, every supervisor read
+> that as a revocation, and DNS and DHCP stopped fleet-wide.
+
+**How a supervisor knows it was revoked (#2798).** A heartbeat the control
+plane refuses on purpose is a **403 carrying the `X-Spatium-Revocation`
+header**: `revoked` when the row is revoked on the Fleet page, `unknown`
+when no row accepts the presented credential (the row was deleted, or the
+appliance was re-keyed). Two of those in a row put the supervisor in
+`revoked` and take its role services down; a control-plane node then
+re-registers through the self-bootstrap once its row is gone (#2696). Any
+other refusal — a 404 from a proxy or a router that is not mounted, a 403
+without the header — is logged as `supervisor.heartbeat.refused_not_revocation`
+and nothing is torn down: the node keeps serving its last applied roles.
+For a control plane that predates the header, the supervisor also accepts
+the two 403 details it answered for the same refusals.
 
 1. On the control plane, open **Appliance → Pairing**.
 2. Click **New pairing code**. Codes are now kind-agnostic (the
@@ -3549,3 +4523,23 @@ success) commits the slot durable. **No reinstall required.**
 If the patch calls `spatium-grub-render`, it inherits all the renderer's
 safety guarantees: `grub-script-check` before swap, `.bak` preservation,
 atomic rename, and the boot-revert on failure.
+
+### Database sessions of a dead client (#3932)
+
+The control-plane CNPG cluster inherits the chart's `postgresql.cnpg.parameters`
+(the supervisor's HelmChartConfig only overrides `shared_buffers` and
+`max_connections`), so every appliance carries
+TCP keepalives of 60 s / 10 s / 6 and `idle_in_transaction_session_timeout=1h`.
+A session whose pod or node died is dropped within minutes, instead of holding a
+migration's lock for 2 h+ as in the 1.0.0 upgrade drill. These are reloads, not
+restarts. The migrate Job also bounds each lock wait, ends stale idle-in-transaction
+sessions of the app role that it is actually waiting on, and retries until the
+lock is free; see [Kubernetes](KUBERNETES.md). A session the old api opened
+before this release's database settings applied keeps the old keepalive, about
+2 h 11 min to notice a dead client (a reloaded setting only reaches a session
+when its client next sends a message, which a dead client never does). The
+migration ends it itself: when a lock wait times out (30 s), it ends sessions of
+its own role that block it and have been idle in a transaction for over 5
+minutes, and logs each one as `migration_terminated_stale_session`. A session
+that only holds a lock the migration does not wait on, such as a running
+backup's, is never ended.

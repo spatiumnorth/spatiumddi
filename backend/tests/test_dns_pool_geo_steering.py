@@ -529,3 +529,107 @@ async def test_noop_serving_scope_change_does_not_wake(
         user,
     )
     assert dns_group_channel(grp.id) not in woke
+
+
+# ── #2292: site delete / emptied site scope must not become a default ──
+
+
+async def _site_with_member(db: AsyncSession, with_subnet: bool):
+    grp, zone, server = await _bind9_group(db)
+    site = Site(name=f"s-{uuid.uuid4().hex[:6]}")
+    db.add(site)
+    await db.flush()
+    if with_subnet:
+        space = IPSpace(name=f"sp-{uuid.uuid4().hex[:6]}")
+        db.add(space)
+        await db.flush()
+        block = IPBlock(space_id=space.id, network="10.20.0.0/16", name="b")
+        db.add(block)
+        await db.flush()
+        db.add(
+            Subnet(
+                space_id=space.id,
+                block_id=block.id,
+                network="10.20.30.0/24",
+                name="n",
+                site_id=site.id,
+            )
+        )
+        await db.flush()
+    await _pool_with_members(
+        db,
+        grp,
+        zone,
+        [{"address": "10.0.0.1"}, {"address": "10.0.0.2", "site_id": site.id}],
+    )
+    return grp, server, site
+
+
+def _view_addrs(bundle: dict, view_name: str) -> set[str]:
+    out: set[str] = set()
+    for z in bundle["zones"]:
+        if z["view_name"] == view_name and z["name"] == "example.com.":
+            out |= {r["value"] for r in z["records"] if r["type"] == "A"}
+    return out
+
+
+async def test_site_scoped_member_with_no_subnets_serves_nobody(
+    db_session: AsyncSession,
+) -> None:
+    _, server, _ = await _site_with_member(db_session, with_subnet=False)
+    bundle = await build_agent_bundle(db_session, server)
+    for v in bundle["views"]:
+        assert "10.0.0.2" not in _view_addrs(bundle, v["name"])
+    assert "10.0.0.2" not in {
+        r["value"] for z in bundle["zones"] for r in z["records"] if r["type"] == "A"
+    }
+    # The default member is unaffected.
+    assert "10.0.0.1" in {
+        r["value"] for z in bundle["zones"] for r in z["records"] if r["type"] == "A"
+    }
+
+
+async def test_site_scoped_member_with_subnet_still_geo_served(
+    db_session: AsyncSession,
+) -> None:
+    grp, _, _ = await _site_with_member(db_session, with_subnet=True)
+    geo = await build_geo_steering(db_session, grp.id)
+    assert geo.active and not geo.unreachable_members
+
+
+async def test_unscoped_member_is_still_default(db_session: AsyncSession) -> None:
+    grp, zone, server = await _bind9_group(db_session)
+    await _pool_with_members(db_session, grp, zone, [{"address": "10.0.0.1"}])
+    bundle = await build_agent_bundle(db_session, server)
+    assert "10.0.0.1" in {
+        r["value"] for z in bundle["zones"] for r in z["records"] if r["type"] == "A"
+    }
+
+
+async def test_site_delete_refused_while_pool_member_references_it(
+    db_session: AsyncSession,
+) -> None:
+    from fastapi import HTTPException
+
+    from app.api.v1.ownership.sites import SiteBulkDelete, bulk_delete_sites, delete_site
+
+    _, _, site = await _site_with_member(db_session, with_subnet=True)
+    user = User(
+        username=f"u{uuid.uuid4().hex[:6]}",
+        email="u@example.com",
+        display_name="u",
+        hashed_password=hash_password("x"),
+        is_superadmin=True,
+    )
+    db_session.add(user)
+    await db_session.flush()
+
+    with pytest.raises(HTTPException) as ei:
+        await delete_site(site.id, db_session, user)
+    assert ei.value.status_code == 409
+    assert "www" in ei.value.detail and "10.0.0.2" in ei.value.detail
+
+    with pytest.raises(HTTPException) as ei:
+        await bulk_delete_sites(SiteBulkDelete(ids=[site.id]), db_session, user)
+    assert ei.value.status_code == 409
+    assert await db_session.get(Site, site.id) is not None

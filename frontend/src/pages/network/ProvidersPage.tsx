@@ -1,8 +1,10 @@
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
 import {
   asnsApi,
+  formatApiError,
   providersApi,
   type ProviderCreate,
   type ProviderKind,
@@ -13,6 +15,8 @@ import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -56,9 +60,15 @@ function ProviderEditorModal({
   const [notes, setNotes] = useState(existing?.notes ?? "");
   const [error, setError] = useState<string | null>(null);
 
+  // The ASN routes take read on `manage_asns`. A user without it is not
+  // asked, and a stored Default ASN is shown as set-but-hidden, never as
+  // none (#2703).
+  const asnPerms = usePermissions();
+  const canReadAsns = asnPerms.can("read", "manage_asns");
   const asnsQuery = useQuery({
     queryKey: ["asns", "all"],
     queryFn: () => asnsApi.list({ limit: 500 }),
+    enabled: canReadAsns,
   });
 
   const mut = useMutation({
@@ -92,11 +102,7 @@ function ProviderEditorModal({
       onClose();
     },
     onError: (e: unknown) => {
-      const err = e as {
-        message?: string;
-        response?: { data?: { detail?: string } };
-      };
-      setError(err?.response?.data?.detail ?? err?.message ?? "Save failed");
+      setError(formatApiError(e, "Save failed"));
     },
   });
 
@@ -174,10 +180,26 @@ function ProviderEditorModal({
             <select
               className={inputCls}
               value={defaultAsnId}
+              aria-label="Default ASN"
               onChange={(e) => setDefaultAsnId(e.target.value)}
-              disabled={asnsQuery.isLoading}
+              disabled={asnsQuery.isLoading || !canReadAsns}
+              title={
+                canReadAsns
+                  ? undefined
+                  : (asnPerms.unanswered ??
+                    "You may not read ASNs (manage_asns)")
+              }
             >
               <option value="">— none —</option>
+              {!canReadAsns && defaultAsnId && (
+                <option value={defaultAsnId}>
+                  {asnPerms.isError
+                    ? "set — could not be read"
+                    : asnPerms.unanswered
+                      ? "set — kept as is"
+                      : "set — you may not read ASNs"}
+                </option>
+              )}
               {(asnsQuery.data?.items ?? []).map((a) => (
                 <option key={a.id} value={a.id}>
                   AS{a.number}
@@ -201,7 +223,9 @@ function ProviderEditorModal({
             />
           </div>
         </div>
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-sm text-destructive">{error}</FormError>
+        )}
         <div className="flex justify-end gap-2">
           <button
             type="button"
@@ -225,6 +249,25 @@ function ProviderEditorModal({
 }
 
 export function ProvidersPage() {
+  // #1340 — a read-only user is offered no write it would be refused:
+  // the provider router asks write (delete) on 'provider'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "provider"),
+    "Requires write permission on providers",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "provider"),
+    "Requires delete permission on providers",
+  );
+  // A row's Edit asks what PUT /providers/{id} asks, which takes a grant
+  // scoped to that one provider (#3039, #3134); New and Delete stay
+  // type-level, as their routes do.
+  const editGate = (id: string) =>
+    permissionGate(
+      perms.can("write", "provider", id),
+      "Requires write permission on providers",
+    );
   const qc = useQueryClient();
   const [search, setSearch] = useState("");
   const [kindFilter, setKindFilter] = useState<ProviderKind | "">("");
@@ -248,9 +291,15 @@ export function ProvidersPage() {
       }),
   });
 
+  // The ASN routes take read on `manage_asns`. A user without it is not
+  // asked, and a stored Default ASN is shown as set-but-hidden, never as
+  // none (#2703).
+  const asnPerms = usePermissions();
+  const canReadAsns = asnPerms.can("read", "manage_asns");
   const asnsQuery = useQuery({
     queryKey: ["asns", "all"],
     queryFn: () => asnsApi.list({ limit: 500 }),
+    enabled: canReadAsns,
   });
 
   const items = query.data?.items ?? [];
@@ -266,17 +315,27 @@ export function ProvidersPage() {
     [items, selectedIds],
   );
 
+  // #2707 — a refused delete (409 while circuits reference the provider, 403)
+  // used to close the confirm and say nothing.
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
   const bulkDelete = useMutation({
     mutationFn: (ids: string[]) => providersApi.bulkDelete(ids),
+    onMutate: () => setDeleteError(null),
     onSuccess: () => {
       setSelectedIds(new Set());
       qc.invalidateQueries({ queryKey: ["providers"] });
     },
+    onError: (e: unknown) =>
+      setDeleteError(formatApiError(e, "Failed to delete providers")),
   });
 
   const removeOne = useMutation({
     mutationFn: (id: string) => providersApi.remove(id),
+    onMutate: () => setDeleteError(null),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["providers"] }),
+    onError: (e: unknown) =>
+      setDeleteError(formatApiError(e, "Failed to delete provider")),
   });
 
   function toggle(id: string) {
@@ -320,11 +379,18 @@ export function ProvidersPage() {
               variant="primary"
               icon={Plus}
               onClick={() => setShowNew(true)}
+              {...writeGate}
             >
               New provider
             </HeaderButton>
           </div>
         </div>
+
+        {deleteError && (
+          <p role="alert" className="text-sm text-destructive">
+            {deleteError}
+          </p>
+        )}
 
         <div className="flex flex-wrap items-center gap-2">
           <input
@@ -363,6 +429,7 @@ export function ProvidersPage() {
                   onConfirm: () => bulkDelete.mutate(ids),
                 });
               }}
+              {...deleteGate}
             >
               Delete selected
             </HeaderButton>
@@ -406,7 +473,19 @@ export function ProvidersPage() {
                     className="px-3 py-6 text-center text-muted-foreground"
                     colSpan={7}
                   >
-                    No providers yet — click "New provider" to add one.
+                    <ListEmpty
+                      error={query.error}
+                      what="providers"
+                      filtered={search !== "" || kindFilter !== ""}
+                      onClearFilters={() => {
+                        setSearch("");
+                        setKindFilter("");
+                      }}
+                      gate={writeGate}
+                      hint={`Click "New provider" to add one.`}
+                    >
+                      No providers yet.
+                    </ListEmpty>
                   </td>
                 </tr>
               )}
@@ -433,7 +512,20 @@ export function ProvidersPage() {
                       {p.account_number ?? "—"}
                     </td>
                     <td className="px-3 py-2 align-top text-muted-foreground tabular-nums">
-                      {asnNum !== undefined ? `AS${asnNum}` : "—"}
+                      {asnNum !== undefined ? (
+                        `AS${asnNum}`
+                      ) : p.default_asn_id && !canReadAsns ? (
+                        <span
+                          title={
+                            asnPerms.unanswered ??
+                            "You may not read ASNs (manage_asns)"
+                          }
+                        >
+                          set, hidden
+                        </span>
+                      ) : (
+                        "—"
+                      )}
                     </td>
                     <td className="px-3 py-2 align-top break-all text-muted-foreground">
                       {p.contact_email ?? p.contact_phone ?? "—"}
@@ -442,14 +534,17 @@ export function ProvidersPage() {
                       <button
                         type="button"
                         title="Edit"
+                        aria-label="Edit"
                         onClick={() => setEditing(p)}
-                        className="rounded p-1 hover:bg-muted"
+                        className="rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                        {...editGate(p.id)}
                       >
                         <Pencil className="h-3.5 w-3.5" />
                       </button>
                       <button
                         type="button"
                         title="Delete"
+                        aria-label="Delete"
                         onClick={() => {
                           setConfirm({
                             title: "Delete provider",
@@ -458,7 +553,8 @@ export function ProvidersPage() {
                             onConfirm: () => removeOne.mutate(p.id),
                           });
                         }}
-                        className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10"
+                        className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
+                        {...deleteGate}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>

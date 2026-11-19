@@ -11,7 +11,14 @@
  * client-classes.
  */
 
-import { useEffect, useState } from "react";
+import {
+  Children,
+  cloneElement,
+  isValidElement,
+  useEffect,
+  useId,
+  useState,
+} from "react";
 import { Link, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft, Pencil, Plus, Trash2, X, Loader2 } from "lucide-react";
@@ -23,15 +30,26 @@ import {
   type PXEProfile,
   type PXEProfileCreate,
   type PXEProfileUpdate,
+  formatApiError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { FreshRowError } from "@/components/FreshRowError";
+import { changedFields, useFreshRow } from "@/hooks/useFreshRow";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
 
+// #1861 — PXE profiles ride on ``dhcp_scope`` (pxe_profiles.py): writes take
+// write and a delete takes delete. A read-only user is offered none of them.
+const NEEDS_PXE_WRITE = "Requires write permission on DHCP scopes";
+const NEEDS_PXE_DELETE = "Requires delete permission on DHCP scopes";
+
 export function PXEProfilesPage() {
   const { groupId = "" } = useParams<{ groupId: string }>();
   const qc = useQueryClient();
+  const perms = usePermissions();
   const [editing, setEditing] = useState<PXEProfile | null>(null);
   const [creating, setCreating] = useState(false);
   const [deleting, setDeleting] = useState<PXEProfile | null>(null);
@@ -55,6 +73,12 @@ export function PXEProfilesPage() {
       setDeleting(null);
     },
   });
+  // A refusal is shown in the dialog (#3396), so closing it forgets the
+  // refusal: the next profile's dialog starts clean.
+  function closeDelete() {
+    deleteMut.reset();
+    setDeleting(null);
+  }
 
   return (
     <div className="flex h-full flex-col overflow-hidden">
@@ -77,7 +101,11 @@ export function PXEProfilesPage() {
           </div>
           <button
             onClick={() => setCreating(true)}
-            className="inline-flex flex-shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+            className="inline-flex flex-shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+            {...permissionGate(
+              perms.can("write", "dhcp_scope"),
+              NEEDS_PXE_WRITE,
+            )}
           >
             <Plus className="h-3.5 w-3.5" />
             New profile
@@ -134,16 +162,27 @@ export function PXEProfilesPage() {
         />
       )}
       {deleting && (
-        <Modal title="Delete PXE profile" onClose={() => setDeleting(null)}>
+        <Modal title="Delete PXE profile" onClose={closeDelete}>
           <div className="space-y-4 text-sm">
             <p>
               Permanently delete <strong>{deleting.name}</strong>? Any scope
               currently bound to this profile will detach automatically (FK SET
               NULL).
             </p>
+            {/* #3396: the server's reason when it refuses the delete (a pool
+                whose class restriction names one of the profile's rule
+                classes answers 409, #3374); the dialog stays open. */}
+            {deleteMut.isError && (
+              <div
+                role="alert"
+                className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive"
+              >
+                {formatApiError(deleteMut.error, "Delete failed.")}
+              </div>
+            )}
             <div className="flex justify-end gap-2">
               <button
-                onClick={() => setDeleting(null)}
+                onClick={closeDelete}
                 className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
               >
                 Cancel
@@ -172,6 +211,7 @@ function ProfileCard({
   onEdit: () => void;
   onDelete: () => void;
 }) {
+  const perms = usePermissions();
   return (
     <div className="rounded-lg border bg-card">
       <div className="flex items-center justify-between border-b px-4 py-2">
@@ -190,15 +230,25 @@ function ProfileCard({
         <div className="flex gap-1">
           <button
             onClick={onEdit}
-            className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+            className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-40"
             title="Edit"
+            aria-label="Edit"
+            {...permissionGate(
+              perms.can("write", "dhcp_scope"),
+              NEEDS_PXE_WRITE,
+            )}
           >
             <Pencil className="h-3.5 w-3.5" />
           </button>
           <button
             onClick={onDelete}
-            className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+            className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:opacity-40"
             title="Delete"
+            aria-label="Delete"
+            {...permissionGate(
+              perms.can("delete", "dhcp_scope"),
+              NEEDS_PXE_DELETE,
+            )}
           >
             <Trash2 className="h-3.5 w-3.5" />
           </button>
@@ -249,19 +299,59 @@ function ProfileCard({
   );
 }
 
-function ProfileEditor({
-  mode,
-  groupId,
-  existing,
-  onClose,
-  onSaved,
-}: {
+type ProfileEditorProps = {
   mode: "create" | "edit";
   groupId: string;
   existing?: PXEProfile;
   onClose: () => void;
   onSaved: () => void;
-}) {
+};
+
+// Edit reads the profile fresh on open and Save sends only what changed
+// (#3365): the row the page holds is from a list loaded earlier, and the
+// rule list is replaced wholesale, so a rule added elsewhere would be deleted.
+export function ProfileEditor(props: ProfileEditorProps) {
+  const fresh = useFreshRow(props.existing, () =>
+    dhcpApi.getPxeProfile(props.existing!.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit PXE profile"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <ProfileEditorForm {...props} existing={fresh.row} />;
+}
+
+function sanitizeMatches(matches: PXEArchMatchInput[]) {
+  return matches.map((m) => ({
+    // An existing rule names its row (#3374) so an edit to its arch codes or
+    // vendor class keeps the Kea class a pool may be bound to; new rules send
+    // none.
+    ...(m.id ? { id: m.id } : {}),
+    priority: m.priority ?? 100,
+    match_kind: m.match_kind ?? "first_stage",
+    vendor_class_match:
+      m.vendor_class_match && m.vendor_class_match.trim()
+        ? m.vendor_class_match.trim()
+        : null,
+    arch_codes: m.arch_codes && m.arch_codes.length > 0 ? m.arch_codes : null,
+    boot_filename: m.boot_filename.trim(),
+    boot_file_url_v6: m.boot_file_url_v6 ?? null,
+  }));
+}
+
+function ProfileEditorForm({
+  mode,
+  groupId,
+  existing,
+  onClose,
+  onSaved,
+}: ProfileEditorProps) {
   const [name, setName] = useState(existing?.name ?? "");
   const [description, setDescription] = useState(existing?.description ?? "");
   const [nextServer, setNextServer] = useState(existing?.next_server ?? "");
@@ -269,6 +359,7 @@ function ProfileEditor({
   const [matches, setMatches] = useState<PXEArchMatchInput[]>(
     () =>
       existing?.matches.map((m) => ({
+        id: m.id,
         priority: m.priority,
         match_kind: m.match_kind,
         vendor_class_match: m.vendor_class_match,
@@ -306,18 +397,7 @@ function ProfileEditor({
 
   const mut = useMutation({
     mutationFn: () => {
-      const sanitized = matches.map((m) => ({
-        priority: m.priority ?? 100,
-        match_kind: m.match_kind ?? "first_stage",
-        vendor_class_match:
-          m.vendor_class_match && m.vendor_class_match.trim()
-            ? m.vendor_class_match.trim()
-            : null,
-        arch_codes:
-          m.arch_codes && m.arch_codes.length > 0 ? m.arch_codes : null,
-        boot_filename: m.boot_filename.trim(),
-        boot_file_url_v6: m.boot_file_url_v6 ?? null,
-      }));
+      const sanitized = sanitizeMatches(matches);
       if (mode === "create") {
         const body: PXEProfileCreate = {
           name,
@@ -328,20 +408,29 @@ function ProfileEditor({
         };
         return dhcpApi.createPxeProfile(groupId, body);
       }
-      const body: PXEProfileUpdate = {
-        name,
-        description,
-        next_server: nextServer,
-        enabled,
-        matches: sanitized,
-      };
-      return dhcpApi.updatePxeProfile(existing!.id, body);
+      const was = existing!;
+      const body: PXEProfileUpdate = changedFields(
+        {
+          name: was.name,
+          description: was.description ?? "",
+          next_server: was.next_server,
+          enabled: was.enabled,
+          matches: sanitizeMatches(was.matches),
+        },
+        {
+          name,
+          description,
+          next_server: nextServer,
+          enabled,
+          matches: sanitized,
+        },
+      );
+      if (Object.keys(body).length === 0) return Promise.resolve(was);
+      return dhcpApi.updatePxeProfile(was.id, body);
     },
     onSuccess: () => onSaved(),
     onError: (err: unknown) => {
-      const detail = (err as { response?: { data?: { detail?: unknown } } })
-        ?.response?.data?.detail;
-      setError(typeof detail === "string" ? detail : "Save failed.");
+      setError(formatApiError(err, "Save failed."));
     },
   });
 
@@ -438,6 +527,7 @@ function ProfileEditor({
             <ArchMatchRow
               key={idx}
               row={m}
+              index={idx}
               onChange={(p) => patchMatch(idx, p)}
               onRemove={() => removeMatch(idx)}
             />
@@ -445,9 +535,9 @@ function ProfileEditor({
         </div>
 
         {error && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
             {error}
-          </div>
+          </FormError>
         )}
         <div className="flex justify-end gap-2 pt-1">
           <button
@@ -472,17 +562,24 @@ function ProfileEditor({
 
 function ArchMatchRow({
   row,
+  index,
   onChange,
   onRemove,
 }: {
   row: PXEArchMatchInput;
+  index: number;
   onChange: (p: Partial<PXEArchMatchInput>) => void;
   onRemove: () => void;
 }) {
+  const n = `Match ${index + 1}`;
   return (
-    <div className="space-y-2 rounded border bg-muted/20 p-2 text-xs">
+    <div
+      role="group"
+      aria-label={`Match rule ${index + 1}`}
+      className="space-y-2 rounded border bg-muted/20 p-2 text-xs"
+    >
       <div className="grid gap-2 sm:grid-cols-[6rem_8rem_1fr_auto]">
-        <Field label="Priority">
+        <Field label="Priority" accessibleName={`${n}: Priority`}>
           <input
             type="number"
             value={row.priority ?? 100}
@@ -492,7 +589,7 @@ function ArchMatchRow({
             className={inputCls}
           />
         </Field>
-        <Field label="Match kind">
+        <Field label="Match kind" accessibleName={`${n}: Match kind`}>
           <select
             value={row.match_kind ?? "first_stage"}
             onChange={(e) =>
@@ -504,7 +601,10 @@ function ArchMatchRow({
             <option value="ipxe_chain">ipxe_chain</option>
           </select>
         </Field>
-        <Field label="Vendor class (option 60 substring)">
+        <Field
+          label="Vendor class (option 60 substring)"
+          accessibleName={`${n}: Vendor class (option 60 substring)`}
+        >
           <input
             value={row.vendor_class_match ?? ""}
             onChange={(e) => onChange({ vendor_class_match: e.target.value })}
@@ -517,11 +617,15 @@ function ArchMatchRow({
           onClick={onRemove}
           className="self-end rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
           title="Remove match"
+          aria-label={`Remove match ${index + 1}`}
         >
           <X className="h-4 w-4" />
         </button>
       </div>
-      <Field label="Arch codes (option 93)">
+      <Field
+        label="Arch codes (option 93)"
+        accessibleName={`${n}: Arch codes (option 93)`}
+      >
         <div className="flex flex-wrap gap-1">
           {Object.entries(DHCP_PXE_ARCH_LABELS).map(([codeStr, label]) => {
             const code = parseInt(codeStr, 10);
@@ -538,6 +642,7 @@ function ArchMatchRow({
                 <input
                   type="checkbox"
                   className="h-3 w-3"
+                  aria-label={`${n}: arch ${code} · ${label}`}
                   checked={checked}
                   onChange={(e) => {
                     const cur = row.arch_codes ?? [];
@@ -559,7 +664,10 @@ function ArchMatchRow({
           Empty = match any arch (combine with vendor-class to filter).
         </span>
       </Field>
-      <Field label="Boot filename / URL">
+      <Field
+        label="Boot filename / URL"
+        accessibleName={`${n}: Boot filename / URL`}
+      >
         <input
           value={row.boot_filename}
           onChange={(e) => onChange({ boot_filename: e.target.value })}
@@ -576,17 +684,65 @@ function ArchMatchRow({
   );
 }
 
+const CONTROL_TAGS = new Set(["input", "select", "textarea"]);
+
+type ControlElement = React.ReactElement<{ id?: string }>;
+
+function isControlElement(node: React.ReactNode): node is ControlElement {
+  return (
+    isValidElement(node) &&
+    typeof node.type === "string" &&
+    CONTROL_TAGS.has(node.type)
+  );
+}
+
+/** A visible label that names its control (#2016). A lone input / select /
+ *  textarea child is linked by htmlFor/id; anything else is wrapped in a
+ *  role="group" labelled by the label, so "Arch codes" names the SET of
+ *  checkboxes rather than being a <label> around their own labels.
+ *  `accessibleName` (the row-qualified name, e.g. "Match 2: Priority") is
+ *  set as aria-label so the same label in two rows names two controls. */
 function Field({
   label,
+  accessibleName,
   children,
 }: {
   label: string;
+  accessibleName?: string;
   children: React.ReactNode;
 }) {
+  const uid = useId();
+  const controls = Children.toArray(children).filter(isControlElement);
+  const control = controls.length === 1 ? controls[0] : null;
+  const controlId = control ? (control.props.id ?? uid) : undefined;
   return (
-    <label className="block space-y-1 text-[11px]">
-      <span className="font-medium text-muted-foreground">{label}</span>
-      {children}
-    </label>
+    <div className="block space-y-1 text-[11px]">
+      <label
+        id={control ? undefined : uid}
+        htmlFor={controlId}
+        className="block font-medium text-muted-foreground"
+      >
+        {label}
+      </label>
+      {control ? (
+        Children.map(children, (c) =>
+          isControlElement(c)
+            ? cloneElement(c, {
+                id: controlId,
+                ...(accessibleName ? { "aria-label": accessibleName } : {}),
+              } as Partial<ControlElement["props"]>)
+            : c,
+        )
+      ) : (
+        <div
+          role="group"
+          aria-labelledby={accessibleName ? undefined : uid}
+          aria-label={accessibleName}
+          className="space-y-1"
+        >
+          {children}
+        </div>
+      )}
+    </div>
   );
 }

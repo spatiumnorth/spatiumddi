@@ -331,6 +331,15 @@ _LOADABLE = {
     "ns1-addressed-v6": _zone(
         "corp.example.test.", [_rec("ns1", "AAAA", "2001:db8::53")]
     ),
+    # #3003: a zone whose own name is not a host name.
+    "underscore-unconfigured": _zone("_msdcs.corp.example.test."),
+    "underscore-primary-ns-elsewhere": _zone(
+        "_msdcs.corp.example.test.", primary_ns="dc1.corp.example.test"
+    ),
+    "underscore-declared-ns": _zone(
+        "_msdcs.corp.example.test.",
+        [_rec("@", "NS", "dc1.corp.example.test."), _rec("gc", "A", "10.0.0.5")],
+    ),
 }
 
 
@@ -367,8 +376,11 @@ def test_named_checkzone_loads_every_rendered_apex(tmp_path: Path, case: str) ->
     zone = _LOADABLE[case]
     _write(tmp_path, zone)
     path = tmp_path / "zones" / f"{zone['name'].rstrip('.')}.db"
+    # ``-k fail``: check-names as the agent's own zone check applies it
+    # (``_checkzone``). named-checkzone only warns by default, which let a
+    # placeholder BIND refuses pass here (#3003).
     res = subprocess.run(
-        ["named-checkzone", zone["name"], str(path)],
+        ["named-checkzone", "-k", "fail", zone["name"], str(path)],
         capture_output=True,
         text=True,
         check=False,
@@ -446,3 +458,103 @@ def test_the_apex_is_a_pure_function_of_the_zone() -> None:
     (``_changed_zones``) is what keeps an unchanged zone from reloading."""
     zone = _zone("corp.example.test.", [_rec("@", "NS", "a.ns.example.net.")])
     assert _zone_apex(zone) == _zone_apex(dict(zone))
+
+
+# #2075 — the control plane's ``primary_ns_error`` vectors. The same lists
+# are in backend/tests/test_zone_primary_ns_host_name_2075.py and
+# frontend/src/lib/primary-ns.test.ts: change all three together, or the API,
+# the dialog and the renderer disagree about which Primary NS is served.
+PRIMARY_NS_BAD = [
+    "ns_1.example.test.",
+    "a" * 64 + ".example.test.",
+    "ns1",
+    "ns1.",
+    "ns1..example.test.",
+    ".example.test.",
+    "-ns1.example.test.",
+    "ns1-.example.test.",
+    "ns1.example.test..",
+    "b\u00fccher.example.test.",
+    ("a" * 63 + ".") * 4 + "test.",
+]
+PRIMARY_NS_GOOD = [
+    "ns1.example.test.",
+    "ns1.example.test",
+    "NS1.Other-Corp.net.",
+    "a" * 63 + ".test.",
+    "ns1.xn--bcher-kva.example.",
+    "1ns.example.test.",
+]
+
+
+@pytest.mark.parametrize("bad", PRIMARY_NS_BAD)
+def test_a_primary_ns_that_is_not_a_host_name_is_healed_to_the_placeholder(bad: str) -> None:
+    """#2075 — rows stored before the API refused them must not make named
+    reject the zone (check-names) and stop the group applying, nor serve a
+    single label as a name at the root."""
+    zone = _zone("corp.example.test.")
+    zone["primary_ns"] = bad
+    apex = _zone_apex(zone)
+    assert apex.soa_mname == "ns1.corp.example.test."
+    assert apex.ns == ("ns1.corp.example.test.",)
+    assert ("unusable_field", f"primary_ns={bad!r}") in apex.notes
+
+
+@pytest.mark.parametrize("good", PRIMARY_NS_GOOD)
+def test_a_host_name_primary_ns_is_served(good: str) -> None:
+    zone = _zone("corp.example.test.")
+    zone["primary_ns"] = good
+    apex = _zone_apex(zone)
+    want = good if good.endswith(".") else good + "."
+    assert apex.soa_mname == want
+    assert not [n for n in apex.notes if n[0] == "unusable_field"]
+
+
+def test_an_unusable_primary_ns_falls_back_to_the_declared_ns() -> None:
+    """With NS records of its own the zone's SOA names the first of them, so
+    the SOA and the NS set still agree."""
+    zone = _zone("corp.example.test.", [_rec("@", "NS", "a.ns.example.net.")])
+    zone["primary_ns"] = "ns_1.corp.example.test."
+    apex = _zone_apex(zone)
+    assert apex.soa_mname == "a.ns.example.net."
+    assert apex.ns == ()
+
+
+# #2916 — the control plane's ``admin_email_error`` vectors (see
+# backend/tests/test_zone_write_paths_2915.py). BIND reads the RNAME as a
+# mailbox: any printable local part, then host-name labels.
+ADMIN_EMAIL_BAD = [
+    "hostmaster.under_score.example.test.",
+    "hostmaster.-lead.example.test.",
+    "hostmaster." + "a" * 64 + ".test.",
+    "a" * 64 + ".example.test.",
+    "hostmaster",
+    "hostmaster.",
+]
+ADMIN_EMAIL_GOOD = [
+    "hostmaster.example.test.",
+    "hostmaster.example.test",
+    "dns_admin.example.test.",
+    "admin+dns.example.test.",
+    "hostmaster.xn--bcher-kva.example.",
+]
+
+
+@pytest.mark.parametrize("bad", ADMIN_EMAIL_BAD)
+def test_an_admin_email_bind_refuses_is_healed_to_the_placeholder(bad: str) -> None:
+    """#2916 — a row stored before the API refused it must not make named
+    reject the zone (check-names) and stop it being served."""
+    zone = _zone("corp.example.test.")
+    zone["admin_email"] = bad
+    apex = _zone_apex(zone)
+    assert apex.soa_rname == "admin.corp.example.test."
+    assert ("unusable_field", f"admin_email={bad!r}") in apex.notes
+
+
+@pytest.mark.parametrize("good", ADMIN_EMAIL_GOOD)
+def test_a_mailbox_admin_email_is_served(good: str) -> None:
+    zone = _zone("corp.example.test.")
+    zone["admin_email"] = good
+    apex = _zone_apex(zone)
+    assert apex.soa_rname == (good if good.endswith(".") else good + ".")
+    assert not [n for n in apex.notes if n[0] == "unusable_field"]

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { Field } from "@/pages/dhcp/_shared";
 import { useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -30,8 +31,12 @@ import {
   dhcpApi,
   type PlanNode,
   type PlanValidationConflict,
+  formatDialogError,
 } from "@/lib/api";
 import { newNodeId } from "@/lib/uuid";
+import { suggestChildCidr } from "@/lib/plan-suggest";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { useModuleOn } from "@/hooks/useModuleOn";
 import { Modal } from "@/components/ui/modal";
 
 /**
@@ -44,6 +49,17 @@ export function SubnetPlannerEditorPage() {
   const { id = "" } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const qc = useQueryClient();
+  // #1341 — the plans router asks write on 'ip_block' (save, reopen), and
+  // apply also asks write on 'subnet' since it creates subnets (plans.py).
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "ip_block"),
+    "Requires write permission on IP blocks",
+  );
+  const applyGate = permissionGate(
+    perms.can("write", "ip_block") && perms.can("write", "subnet"),
+    "Requires write permission on IP blocks and subnets",
+  );
 
   const { data: plan, isLoading } = useQuery({
     queryKey: ["subnet-plan", id],
@@ -80,6 +96,9 @@ export function SubnetPlannerEditorPage() {
         tree: t,
       }),
     onSuccess: (r) => setConflicts(r.conflicts),
+    // A 422 (e.g. an invalid CIDR) leaves the last answer's conflicts stale;
+    // clear them and let the refusal's own message show instead.
+    onError: () => setConflicts([]),
   });
 
   // Re-validate whenever the tree changes (debounced inline by React's batch).
@@ -203,6 +222,7 @@ export function SubnetPlannerEditorPage() {
                 disabled={reopenMut.isPending}
                 title="Re-open this plan as a draft. Only succeeds if every block / subnet it created has been deleted from IPAM."
                 className="inline-flex items-center gap-1 rounded border px-3 py-1.5 text-sm hover:bg-muted/50 disabled:opacity-50"
+                {...writeGate}
               >
                 {reopenMut.isPending ? (
                   <Loader2 className="h-3 w-3 animate-spin" />
@@ -214,9 +234,12 @@ export function SubnetPlannerEditorPage() {
             )}
             <button
               type="button"
-              disabled={!dirty || saveMut.isPending || applied}
+              disabled={
+                !dirty || saveMut.isPending || applied || validateMut.isError
+              }
               onClick={() => saveMut.mutate()}
               className="inline-flex items-center gap-1 rounded border px-3 py-1.5 text-sm hover:bg-muted/50 disabled:opacity-50"
+              {...writeGate}
             >
               {saveMut.isPending ? (
                 <Loader2 className="h-3 w-3 animate-spin" />
@@ -230,7 +253,11 @@ export function SubnetPlannerEditorPage() {
               disabled={
                 applied || conflicts.length > 0 || applyMut.isPending || dirty
               }
-              onClick={() => setShowApplyConfirm(true)}
+              onClick={() => {
+                // A refusal from an earlier attempt belongs to that attempt.
+                applyMut.reset();
+                setShowApplyConfirm(true);
+              }}
               className="inline-flex items-center gap-1 rounded bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
               title={
                 dirty
@@ -239,6 +266,7 @@ export function SubnetPlannerEditorPage() {
                     ? "Resolve conflicts before applying"
                     : ""
               }
+              {...applyGate}
             >
               {applyMut.isPending && (
                 <Loader2 className="h-3 w-3 animate-spin" />
@@ -247,7 +275,17 @@ export function SubnetPlannerEditorPage() {
             </button>
           </div>
         </div>
-        {applyMut.isError && (
+        {validateMut.isError && (
+          <p role="alert" className="mt-3 text-xs text-destructive">
+            This plan can't be validated: {formatDialogError(validateMut.error)}
+          </p>
+        )}
+        {saveMut.isError && (
+          <p role="alert" className="mt-3 text-xs text-destructive">
+            Not saved: {formatDialogError(saveMut.error)}
+          </p>
+        )}
+        {applyMut.isError && !showApplyConfirm && (
           <ApplyErrorBanner error={applyMut.error as unknown} />
         )}
         {reopenMut.isError && (
@@ -340,28 +378,34 @@ export function SubnetPlannerEditorPage() {
           spaceName={spaceName}
           onCancel={() => setShowApplyConfirm(false)}
           onConfirm={() => {
-            setShowApplyConfirm(false);
-            applyMut.mutate();
+            // Stay open while the call runs: a refusal shows here, where
+            // this confirm said it would (#2984); success closes it.
+            applyMut.mutate(undefined, {
+              onSuccess: () => setShowApplyConfirm(false),
+            });
           }}
           isPending={applyMut.isPending}
+          error={applyMut.isError ? (applyMut.error as unknown) : null}
         />
       )}
     </div>
   );
 }
 
-function ApplyConfirmModal({
+export function ApplyConfirmModal({
   tree,
   spaceName,
   onCancel,
   onConfirm,
   isPending,
+  error,
 }: {
   tree: PlanNode;
   spaceName: string | undefined;
   onCancel: () => void;
   onConfirm: () => void;
   isPending: boolean;
+  error?: unknown;
 }) {
   const counts = useMemo(() => countNodes(tree), [tree]);
   return (
@@ -397,6 +441,7 @@ function ApplyConfirmModal({
           If anything fails (overlap, missing parent, drifted state) the whole
           transaction rolls back and you'll see the conflicts here.
         </p>
+        {error != null && <ApplyErrorBanner error={error} />}
         <div className="flex justify-end gap-2 pt-2">
           <button
             type="button"
@@ -474,7 +519,7 @@ function TreeNodeRow({
           ...node.children,
           {
             id: newNodeId(),
-            network: suggestChildCidr(node, node.children),
+            network: suggestChildCidr(node, node.children, kind),
             name: "",
             description: "",
             kind,
@@ -599,7 +644,8 @@ function TreeNodeRow({
 
 // ── Properties panel ────────────────────────────────────────────────────
 
-function PropertiesPanel({
+// eslint-disable-next-line react-refresh/only-export-components -- exported for its test
+export function PropertiesPanel({
   node,
   isRoot,
   readOnly,
@@ -612,15 +658,21 @@ function PropertiesPanel({
 }) {
   // Canonical group keys (#367) — match the rest of the app so create/edit
   // invalidations refresh these pickers without a full reload.
+  // #2135 — DNS server groups only exist while core.dns is on.
+  const dnsOn = useModuleOn("core.dns");
   const { data: dnsGroups = [] } = useQuery({
     queryKey: ["dns-groups"],
     queryFn: () => dnsApi.listGroups(),
     staleTime: 5 * 60 * 1000,
+    enabled: dnsOn,
   });
+  // #2130 — DHCP server groups only exist while core.dhcp is on.
+  const dhcpOn = useModuleOn("core.dhcp");
   const { data: dhcpGroups = [] } = useQuery({
     queryKey: ["dhcp-groups"],
     queryFn: () => dhcpApi.listGroups(),
     staleTime: 5 * 60 * 1000,
+    enabled: dhcpOn,
   });
 
   const isSubnet = node.kind === "subnet";
@@ -707,38 +759,44 @@ function PropertiesPanel({
         <p className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
           Resources (optional — blank = inherit)
         </p>
-        <Field label="DNS server group">
-          <select
-            value={node.dns_group_id ?? ""}
-            onChange={(e) => onChange({ dns_group_id: e.target.value || null })}
-            disabled={readOnly}
-            className="w-full rounded border bg-background px-2 py-1 text-sm disabled:opacity-50"
-          >
-            <option value="">— inherit —</option>
-            {dnsGroups.map((g) => (
-              <option key={g.id} value={g.id}>
-                {g.name}
-              </option>
-            ))}
-          </select>
-        </Field>
-        <Field label="DHCP server group">
-          <select
-            value={node.dhcp_server_group_id ?? ""}
-            onChange={(e) =>
-              onChange({ dhcp_server_group_id: e.target.value || null })
-            }
-            disabled={readOnly}
-            className="w-full rounded border bg-background px-2 py-1 text-sm disabled:opacity-50"
-          >
-            <option value="">— inherit —</option>
-            {dhcpGroups.map((g) => (
-              <option key={g.id} value={g.id}>
-                {g.name}
-              </option>
-            ))}
-          </select>
-        </Field>
+        {dnsOn && (
+          <Field label="DNS server group">
+            <select
+              value={node.dns_group_id ?? ""}
+              onChange={(e) =>
+                onChange({ dns_group_id: e.target.value || null })
+              }
+              disabled={readOnly}
+              className="w-full rounded border bg-background px-2 py-1 text-sm disabled:opacity-50"
+            >
+              <option value="">— inherit —</option>
+              {dnsGroups.map((g) => (
+                <option key={g.id} value={g.id}>
+                  {g.name}
+                </option>
+              ))}
+            </select>
+          </Field>
+        )}
+        {dhcpOn && (
+          <Field label="DHCP server group">
+            <select
+              value={node.dhcp_server_group_id ?? ""}
+              onChange={(e) =>
+                onChange({ dhcp_server_group_id: e.target.value || null })
+              }
+              disabled={readOnly}
+              className="w-full rounded border bg-background px-2 py-1 text-sm disabled:opacity-50"
+            >
+              <option value="">— inherit —</option>
+              {dhcpGroups.map((g) => (
+                <option key={g.id} value={g.id}>
+                  {g.name}
+                </option>
+              ))}
+            </select>
+          </Field>
+        )}
         {isSubnet && (
           <Field label="Gateway IP">
             <input
@@ -753,27 +811,10 @@ function PropertiesPanel({
         )}
         {isSubnet ? null : (
           <p className="text-[11px] text-muted-foreground">
-            Gateway / VLAN appear when this node is a subnet.
+            Gateway IP appears when this node is a subnet.
           </p>
         )}
       </div>
-    </div>
-  );
-}
-
-function Field({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div>
-      <label className="mb-1 block text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
     </div>
   );
 }
@@ -808,6 +849,7 @@ function ApplyErrorBanner({ error }: { error: unknown }) {
             {conflicts.slice(0, 8).map((c, i) => (
               <li key={i}>{c.message}</li>
             ))}
+            {conflicts.length > 8 && <li>…and {conflicts.length - 8} more</li>}
           </ul>
         )}
         {survivors.length > 0 && (
@@ -882,79 +924,4 @@ function reparentNode(
   return mutateNode(detached, dropId, {
     children: [...(findNode(detached, dropId)?.children ?? []), dragged],
   });
-}
-
-function suggestChildCidr(parent: PlanNode, existing: PlanNode[]): string {
-  // Choose a target prefix that's smaller than the parent (default +8, capped
-  // so the parent can fit the result). Then walk aligned slots of that size
-  // inside the parent and return the first one that doesn't overlap any
-  // existing sibling. If everything's taken at +8, step the slot size down by
-  // one bit (= halve it) and retry, up to /30.
-  const isV6 = parent.network.includes(":");
-  if (isV6) {
-    // No bigint helpers in this file yet — for v6 we just stamp parent's base
-    // with a guessed prefix and let the operator edit. Validation will flag
-    // any clash.
-    const slash = parent.network.indexOf("/");
-    const prefix = parseInt(parent.network.slice(slash + 1), 10);
-    const childPrefix = Math.min(prefix + 16, 127);
-    return `${parent.network.slice(0, slash)}/${childPrefix}`;
-  }
-  const parsed = parseCidrV4(parent.network);
-  if (!parsed) return parent.network;
-  const existingRanges = existing
-    .map((c) => parseCidrV4(c.network))
-    .filter((c): c is V4 => c !== null);
-
-  for (let target = parsed.prefix + 8; target <= 30; target++) {
-    if (target <= parsed.prefix) continue;
-    const slotSize = 2 ** (32 - target);
-    const start = parsed.base;
-    const end = start + 2 ** (32 - parsed.prefix);
-    for (let addr = start; addr < end; addr += slotSize) {
-      const candidate: V4 = { base: addr, prefix: target };
-      if (!existingRanges.some((e) => v4Overlaps(candidate, e))) {
-        return `${intToIp(addr)}/${target}`;
-      }
-    }
-  }
-  // No room at any size — return the parent's base as a placeholder.
-  return parent.network;
-}
-
-interface V4 {
-  base: number;
-  prefix: number;
-}
-
-function parseCidrV4(cidr: string): V4 | null {
-  const [ip, prefixStr] = cidr.split("/");
-  if (!ip || !prefixStr) return null;
-  const prefix = parseInt(prefixStr, 10);
-  if (!Number.isInteger(prefix) || prefix < 0 || prefix > 32) return null;
-  const parts = ip.split(".");
-  if (parts.length !== 4) return null;
-  let n = 0;
-  for (const p of parts) {
-    const v = Number(p);
-    if (!Number.isInteger(v) || v < 0 || v > 255) return null;
-    n = n * 256 + v;
-  }
-  const mask = prefix === 0 ? 0 : (~0 << (32 - prefix)) >>> 0;
-  return { base: (n & mask) >>> 0, prefix };
-}
-
-function v4Overlaps(a: V4, b: V4): boolean {
-  const aSize = 2 ** (32 - a.prefix);
-  const bSize = 2 ** (32 - b.prefix);
-  return a.base < b.base + bSize && b.base < a.base + aSize;
-}
-
-function intToIp(n: number): string {
-  return [
-    (n >>> 24) & 0xff,
-    (n >>> 16) & 0xff,
-    (n >>> 8) & 0xff,
-    n & 0xff,
-  ].join(".");
 }

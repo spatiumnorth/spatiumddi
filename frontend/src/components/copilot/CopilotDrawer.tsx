@@ -1,7 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { hasOpenModal } from "@/components/ui/use-draggable-modal";
+import { captureSuccessors, returnFocus } from "@/components/ui/focus-return";
 import { useSessionState } from "@/lib/useSessionState";
 import {
   Archive,
@@ -20,8 +22,14 @@ import {
   X,
 } from "lucide-react";
 import { copyToClipboard } from "@/lib/clipboard";
+import { PERMISSIONS_UNREADABLE, usePermissions } from "@/hooks/usePermissions";
+import {
+  APPROVAL_QUEUED_MESSAGE,
+  CHANGE_REQUEST_QUERY_KEY,
+} from "@/lib/approvalQueue";
 import {
   aiApi,
+  formatApiError,
   nmapApi,
   streamChatTurn,
   type AIChatMessage,
@@ -29,6 +37,7 @@ import {
   type AIPrompt,
   type NmapScanRead,
 } from "@/lib/api";
+import { FormError } from "@/components/ui/form-error";
 
 /** Render assistant content as Markdown with a curated set of element
  *  overrides tuned for the chat-bubble aesthetic. Used by both the
@@ -397,10 +406,35 @@ export function CopilotDrawer({
     }
   }, [pendingContext]);
 
+  // Closing the drawer gives focus back to what opened it (Ask AI), not the
+  // page body (#3910). The opener is read at first render, before the
+  // drawer's own focus calls move focus into it.
+  const titleId = useId();
+  const drawerRef = useRef<HTMLDivElement | null>(null);
+  const openerRef = useRef<HTMLElement | null | undefined>(undefined);
+  if (openerRef.current === undefined) {
+    openerRef.current = document.activeElement as HTMLElement | null;
+  }
+  useEffect(() => {
+    const node = drawerRef.current;
+    const opener = openerRef.current;
+    return () => {
+      // StrictMode's simulated unmount leaves the drawer in the page.
+      if (node?.isConnected) return;
+      returnFocus([opener], captureSuccessors(opener));
+    };
+  }, []);
+
   // Esc closes the drawer.
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") onClose();
+      // A dialog over the drawer owns this Esc (#1947).
+      // An Esc that ends an IME composition belongs to the input method.
+      if (e.isComposing || e.keyCode === 229) return;
+      // An open popup inside the drawer (the Prompts list) owns this Esc and
+      // marks it handled: one Esc closes the topmost layer only (#3910).
+      if (e.defaultPrevented) return;
+      if (e.key === "Escape" && !hasOpenModal()) onClose();
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -644,8 +678,12 @@ export function CopilotDrawer({
     // Bubble — positioned, draggable, resizable; doesn't block the
     // page behind it (no backdrop). Operator can keep the chat open
     // while clicking around IPAM / DNS / DHCP, dragging it out of the
-    // way as needed (Gmail-compose pattern).
+    // way as needed (Gmail-compose pattern). A non-modal dialog named by
+    // its heading (#3910).
     <div
+      ref={drawerRef}
+      role="dialog"
+      aria-labelledby={titleId}
       className="fixed z-50 flex flex-col rounded-lg border bg-card shadow-2xl"
       style={{
         left: `${effectiveGeom.left}px`,
@@ -673,7 +711,9 @@ export function CopilotDrawer({
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
             <Sparkles className="h-4 w-4 text-primary" />
-            <h2 className="text-sm font-semibold">Operator Copilot</h2>
+            <h2 id={titleId} className="text-sm font-semibold">
+              Operator Copilot
+            </h2>
           </div>
           {sessionLabel && (
             <div className="mt-0.5 truncate text-xs text-muted-foreground font-mono">
@@ -1011,8 +1051,8 @@ function EmptyState({ onPick }: { onPick: (text: string) => void }) {
         </p>
         <p className="mt-1 text-xs text-muted-foreground">
           Pick a category to see example prompts, or type your own. Some
-          examples need their underlying tool turned on in Settings → AI → Tool
-          Catalog.
+          examples need their underlying tool turned on in Administration → AI
+          Tool Catalog.
         </p>
       </div>
       <div className="mt-4 space-y-2">
@@ -1336,7 +1376,7 @@ function YesNoCard({
  *  rejected earlier). The DB / API still call the fields
  *  ``applied_at`` and ``discarded_at`` — the rename is UI-only.
  */
-function ProposalCard({
+export function ProposalCard({
   proposalId,
   operation,
   previewText,
@@ -1356,6 +1396,12 @@ function ProposalCard({
 
   const applyMut = useMutation({
     mutationFn: () => aiApi.applyProposal(proposalId),
+    onSuccess: (resp) => {
+      // A risky op the two-person approval gate took (#62) is queued, not
+      // done: refresh the approval queue so the request shows (#1915).
+      if (resp?.result?.queued_for_approval === true)
+        qc.invalidateQueries({ queryKey: CHANGE_REQUEST_QUERY_KEY });
+    },
     onSettled: () => {
       qc.invalidateQueries({ queryKey: ["ai-proposal", proposalId] });
     },
@@ -1376,9 +1422,18 @@ function ProposalCard({
     !discarded &&
     new Date(proposal.expires_at).getTime() < Date.now();
   const pending = !applied && !discarded && !expired;
+  // The server stamps ``applied_at`` on a proposal the approval gate queued
+  // (#62) and returns ``result.queued_for_approval``: nothing has changed
+  // yet, so it must not read as done (#1915).
+  const queued = applied && proposal?.result?.queued_for_approval === true;
 
   let badge: { text: string; cls: string };
-  if (applied) {
+  if (queued) {
+    badge = {
+      text: "awaiting approval",
+      cls: "bg-blue-500/10 text-blue-600 border-blue-500/30",
+    };
+  } else if (applied) {
     badge = {
       text: "approved",
       cls: "bg-emerald-500/10 text-emerald-600 border-emerald-500/30",
@@ -1415,6 +1470,14 @@ function ProposalCard({
         <div className="mt-2 whitespace-pre-wrap break-words font-sans text-xs text-foreground/90">
           {proposal?.preview_text || previewText || "(no preview)"}
         </div>
+        {queued && (
+          <div
+            role="status"
+            className="mt-2 rounded border border-blue-500/30 bg-blue-500/5 p-2 text-xs text-blue-600 dark:text-blue-400"
+          >
+            {APPROVAL_QUEUED_MESSAGE}
+          </div>
+        )}
         {applied && proposal?.result && (
           <details className="mt-2 text-xs">
             <summary className="cursor-pointer text-muted-foreground">
@@ -1434,9 +1497,9 @@ function ProposalCard({
             />
           )}
         {proposal?.error && (
-          <div className="mt-2 rounded border border-destructive/30 bg-destructive/5 p-2 text-xs text-destructive">
+          <FormError className="mt-2 rounded border border-destructive/30 bg-destructive/5 p-2">
             {proposal.error}
-          </div>
+          </FormError>
         )}
         {pending && (
           <div className="mt-3 flex items-center gap-2">
@@ -1513,12 +1576,19 @@ function ToolCard({ message }: { message: AIChatMessage }) {
  *  the per-host list when present.
  */
 function NmapScanLiveResult({ scanId }: { scanId: string }) {
+  // Running the scan proposal takes write on 'manage_nmap_scans', reading it
+  // back takes read: a role holding only write is told so rather than
+  // polling a 403 behind a spinner that never ends (#3279).
+  const perms = usePermissions();
+  const canRead = perms.can("read", "manage_nmap_scans");
   const scanQ = useQuery({
     queryKey: ["nmap-scan", scanId],
     queryFn: () => nmapApi.getScan(scanId),
-    // Poll until terminal state lands. ``refetchInterval`` returns
-    // false once we're done so React Query stops the timer.
+    enabled: canRead,
+    // Poll until terminal state lands, or the read fails. ``refetchInterval``
+    // returns false once we're done so React Query stops the timer.
     refetchInterval: (q) => {
+      if (q.state.status === "error") return false;
       const s = (q.state.data as NmapScanRead | undefined)?.status;
       if (s && ["completed", "failed", "cancelled"].includes(s)) return false;
       return 2000;
@@ -1527,6 +1597,20 @@ function NmapScanLiveResult({ scanId }: { scanId: string }) {
   });
 
   const scan = scanQ.data;
+  if (!scan && !perms.isLoading && (!canRead || scanQ.isError)) {
+    return (
+      <div className="mt-2 rounded border border-destructive/30 bg-destructive/5 px-2 py-1.5 text-[11px] text-destructive">
+        {!canRead && perms.isError
+          ? `The scan started, but its progress was not requested. ${PERMISSIONS_UNREADABLE}`
+          : !canRead
+            ? "The scan started, but you don't have permission to see its progress (read on nmap scans)."
+            : formatApiError(
+                scanQ.error,
+                "The scan started, but its progress could not be read",
+              )}
+      </div>
+    );
+  }
   if (!scan) {
     return (
       <div className="mt-2 flex items-center gap-2 rounded border bg-background/40 px-2 py-1.5 text-[11px] text-muted-foreground">
@@ -1779,9 +1863,9 @@ function StreamingBubble({
           </div>
         )}
         {error && (
-          <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          <FormError className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm">
             {error}
-          </div>
+          </FormError>
         )}
       </div>
     </div>
@@ -2038,6 +2122,8 @@ function ChatComposer({
           </button>
         ) : (
           <button
+            aria-label="Send message"
+            title="Send message"
             type="submit"
             disabled={!text.trim() || disabled}
             className="self-end rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
@@ -2095,7 +2181,12 @@ function PromptsPopover({
       }
     }
     function onEsc(e: KeyboardEvent) {
-      if (e.key === "Escape") onClose();
+      if (e.isComposing || e.keyCode === 229) return;
+      if (e.key === "Escape") {
+        // Handled here: the drawer's own Esc listener must not also close.
+        e.preventDefault();
+        onClose();
+      }
     }
     document.addEventListener("mousedown", onDocClick);
     document.addEventListener("keydown", onEsc);

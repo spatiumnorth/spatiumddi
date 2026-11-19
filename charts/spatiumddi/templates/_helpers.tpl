@@ -124,7 +124,21 @@ survivable. Only an override that declares its OWN ``podAntiAffinity``
 key wins — that one is an explicit opt-out, and merging the two would
 render a duplicate key.
 
-Nothing is spread below 2 replicas (nothing to spread).
+Nothing is spread below 2 replicas (nothing to spread), unless the pods run
+on the host network (below).
+
+``hostNetwork`` (optional, the frontend's) renders the spread at ONE replica
+too (#2450). A host-network pod binds its ports on the node itself, so a
+second pod of the component can never share its node anyway, and the term
+changes nothing about where a lone replica can run. What it changes is the
+first promotion: the supervisor raises the replicas from 1 to the node count
+and nothing else, and a term that appeared only above one replica changed the
+pod template there, so the frontend rolled, and it retires its old pod first.
+The seed's one frontend pod, holding the node's ports 80 and 443, went before
+its replacement could bind them, and the seed refused connections while the
+browser that drives the promotion was on it. With the term in place at one
+replica the promotion is a scale-up: the seed's pod keeps serving and the new
+pods start on the new nodes. (A demote is the same scale, the other way.)
 
 #590 — api/worker/frontend previously defaulted to no affinity at all,
 so a 3-node cluster could (and did) land 3 of 4 api pods on the seed.
@@ -140,7 +154,9 @@ anti-affinity (#590).
 
   {{- include "spatiumddi.deploymentStrategy" (dict
         "mode" .Values.api.podAntiAffinity
-        "replicas" .Values.api.replicas) | nindent 2 }}
+        "replicas" .Values.api.replicas
+        "root" $ "deployment" (printf "%s-api" (include "spatiumddi.fullname" $))
+        "container" "api") | nindent 2 }}
 
 Required anti-affinity + ``replicas == number of eligible nodes`` makes the
 default surge pod UNSCHEDULABLE, and the default ``maxUnavailable: 0`` then
@@ -157,13 +173,67 @@ So under ``hard`` we invert the knobs — retire one old pod, then schedule its
 replacement onto the node it just freed. Costs one replica of capacity during
 a rollout instead of deadlocking. (frontend's hostNetwork path uses Recreate
 for the same underlying reason: an exclusive per-node resource.)
+
+#1541 — under ``hard`` this holds at ONE replica too, although a one-replica
+render carries no anti-affinity of its own. The pods a rollout replaces were
+rendered by the PREVIOUS values, and required anti-affinity is symmetric: an
+existing pod's term keeps an incoming pod that matches it off its node just
+as the incoming pod's own term would. A demote from three nodes to one
+renders ``replicas: 1``, and the one surviving old pod still carries the
+3-node spec's required term. Surge-first then puts the new pod beside it on
+the only node, where it is refused ("didn't satisfy existing pods
+anti-affinity rules"), ``maxUnavailable: 0`` forbids retiring the old pod
+first, and the rollout wedges for good with the old 3-node pods serving
+(observed on the #1659 walk). The chart cannot see the previous render
+offline, so ``hard`` at one replica retires first unconditionally.
+
+The cost: a one-node control plane takes a brief api / worker outage on
+every rollout, the time a fresh pod takes to become ready. A one-node
+cluster has no second node to surge onto in the shape that matters, and the
+frontend's hostNetwork path already accepts the same trade with Recreate.
+The opposite direction (1 → 3) is the ``replicas > 1`` case above and is
+unchanged.
+
+#3780 — except on a ROLLBACK at one replica. Retiring first there deletes
+the newer release's only pod, and when the older release cannot run on the
+schema the newer one migrated (#1227), its pod waits in ``wait-for-migrate``
+forever: no api, no web UI, and so no way to re-apply the newer release from
+the API, which is the documented recovery. Surge-first keeps the newer pod
+serving until the older one is ready, which is never in that case, and only
+a moment in the ordinary one. The release rolled back TO decides this, so it
+has to be in the chart being installed, not the one being left.
+
+So pass ``root`` (the chart root), ``deployment`` (the Deployment's name) and
+``container`` (its main container) as well, and at one replica under ``hard``
+the helper surges first when the live ReplicaSets (``lookup``) say:
+
+  * a pod of this Deployment runs a SemVer release NEWER than this
+    render's image tag: this render is a rollback. Ready or not: after the
+    reboot onto the older slot, firstboot releases the control chart once
+    k3s and the CNPG webhook answer, which is routinely before the newer
+    pod has passed its readiness probe again, and a render that required
+    it ready would retire it first after all. It stays true on every later
+    render of the same release while the newer pod exists (the template
+    already carries the older tag by then), and stops being true once the
+    older pod is ready and the newer ReplicaSet scaled to 0; and
+  * no ReplicaSet of it with pods carries a required anti-affinity term,
+    so the #1541 wedge (a surviving 3-node pod) still retires first.
+
+Anything it cannot read (``helm template``, a tag that is not a 1.x+ SemVer
+release, a CalVer or nightly build, an image pinned by digest, no live
+Deployment) retires first, as
+before. An ordinary upgrade is never a rollback, so it keeps #1659's
+strategy, and ``replicas > 1`` is untouched. ``replicaSets`` replaces the
+lookup with a given list (the chart tests, which have no cluster).
 */}}
 {{- define "spatiumddi.deploymentStrategy" -}}
 {{- $mode := default "soft" .mode -}}
+{{- $keepServing := and (eq $mode "hard") (eq (int .replicas) 1) .root
+      (eq (include "spatiumddi.newerReleaseServing" .) "true") -}}
 strategy:
   type: RollingUpdate
   rollingUpdate:
-  {{- if and (gt (int .replicas) 1) (eq $mode "hard") }}
+  {{- if and (eq $mode "hard") (not $keepServing) }}
     maxSurge: 0
     maxUnavailable: 1
   {{- else }}
@@ -172,10 +242,54 @@ strategy:
   {{- end }}
 {{- end -}}
 
+{{/*
+"true" when this render rolls ``deployment`` back from a newer release that
+still serves (#3780; see spatiumddi.deploymentStrategy). Only 1.x and later
+SemVer tags count: a CalVer tag (YYYY.MM.DD-N), a nightly (0.0.0-...), "dev"
+or "latest" is an unknown version, never an older one (core/versions.py).
+*/}}
+{{- define "spatiumddi.newerReleaseServing" -}}
+{{- $root := .root -}}
+{{- $release := `^[1-9][0-9]{0,2}\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$` -}}
+{{- $ours := toString ($root.Values.image.tag | default $root.Chart.AppVersion) -}}
+{{- $newer := false -}}
+{{- $blocked := false -}}
+{{- if regexMatch $release $ours -}}
+  {{- $items := .replicaSets -}}
+  {{- if not (hasKey . "replicaSets") -}}
+    {{- $items = get (default (dict) (lookup "apps/v1" "ReplicaSet" $root.Release.Namespace "")) "items" -}}
+  {{- end -}}
+  {{- range $rs := (default (list) $items) -}}
+    {{- $owned := false -}}
+    {{- range $ref := (default (list) (dig "metadata" "ownerReferences" (list) $rs)) -}}
+      {{- if and (eq (toString $ref.kind) "Deployment") (eq (toString $ref.name) (toString $.deployment)) -}}
+        {{- $owned = true -}}
+      {{- end -}}
+    {{- end -}}
+    {{- if and $owned (gt (int (dig "status" "replicas" 0 $rs)) 0) -}}
+      {{- $podSpec := dig "spec" "template" "spec" (dict) $rs -}}
+      {{- if dig "affinity" "podAntiAffinity" "requiredDuringSchedulingIgnoredDuringExecution" (list) $podSpec -}}
+        {{- $blocked = true -}}
+      {{- end -}}
+      {{- range $c := (default (list) $podSpec.containers) -}}
+        {{- if eq (toString $c.name) (toString $.container) -}}
+          {{- $tag := last (splitList ":" (last (splitList "/" (toString $c.image)))) -}}
+          {{- if and (regexMatch $release $tag) (gt ((semver $tag).Compare (semver $ours)) 0) -}}
+            {{- $newer = true -}}
+          {{- end -}}
+        {{- end -}}
+      {{- end -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+{{- if and $newer (not $blocked) }}true{{ end -}}
+{{- end -}}
+
 {{- define "spatiumddi.podAntiAffinity" -}}
 {{- $mode := default "soft" .mode -}}
 {{- $affinity := deepCopy (default (dict) .override) -}}
-{{- if and (gt (int .replicas) 1) (ne $mode "none") (not (hasKey $affinity "podAntiAffinity")) -}}
+{{- $spread := or (gt (int .replicas) 1) (get . "hostNetwork") -}}
+{{- if and $spread (ne $mode "none") (not (hasKey $affinity "podAntiAffinity")) -}}
   {{- $selector := dict "matchLabels" (include "spatiumddi.componentSelectorLabels" . | fromYaml) -}}
   {{- $term := dict "labelSelector" $selector "topologyKey" "kubernetes.io/hostname" -}}
   {{- if eq $mode "hard" -}}
@@ -188,6 +302,117 @@ strategy:
 {{- if $affinity }}
 affinity:
   {{- toYaml $affinity | nindent 2 }}
+{{- end }}
+{{- end -}}
+
+{{/*
+Object name of one agent server's StatefulSet / Service / headless Service
+(#3209). Pass ``root`` (the chart root), ``instance`` (``dns-bind9-ns1``) and
+``prefix`` (``<kind>Agents.prefixWithFullname``).
+
+Off (the default) it is ``instance`` unchanged: renaming a StatefulSet
+recreates it, and through the claim-template names its PVCs, so the new
+naming is opt-in for an existing install. On, it is prefixed with the release
+fullname like every other object in the chart (which honours
+``fullnameOverride``). Capped at 52 characters: the longest suffix added
+to it is ``-headless`` (9) and Kubernetes caps a Service name at 63; a
+StatefulSet's pods and ControllerRevision labels need the same headroom.
+
+A name over 52 is NOT plainly truncated: two servers that differ only past
+the cut (``...-ns1`` / ``...-ns2``), or every agent under a long
+``fullnameOverride``, would come out identical and Helm would apply one
+object over the other. It keeps the first 43 characters and appends ``-``
+plus 8 hex characters of the full name's sha256, so distinct full names stay
+distinct and the result is stable across renders. A name that fits is used
+as is.
+
+The Service must be a DNS-1035 label, which starts with a letter. The
+fullname follows the release name, and Helm accepts a release named
+``1dev``, so a prefixed name starting with anything else fails the render
+here, naming the fix, instead of at the API server on the first Service.
+*/}}
+{{- define "spatiumddi.agentObjectName" -}}
+{{- if .prefix -}}
+{{- $full := printf "%s-%s" (include "spatiumddi.fullname" .root) .instance -}}
+{{- if not (regexMatch "^[a-z]" $full) -}}
+{{- fail (printf "agent object name %q (dnsAgents/dhcpAgents.prefixWithFullname) must start with a lowercase letter to be a valid Service name (DNS-1035); use a release name or fullnameOverride that starts with one, or leave prefixWithFullname false" $full) -}}
+{{- end -}}
+{{- if le (len $full) 52 -}}
+{{- $full -}}
+{{- else -}}
+{{- printf "%s-%s" ($full | trunc 43 | trimSuffix "-") ($full | sha256sum | trunc 8) -}}
+{{- end -}}
+{{- else -}}
+{{- .instance -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+#3209 — refuse two agent servers that would render the same object name.
+Helm does not: the later StatefulSet and Services silently replace the
+earlier ones, so one configured server never runs. Covers both agent kinds,
+since a fullname-prefixed DNS and DHCP name share one namespace of objects.
+Called from dns-agent.yaml and dhcp-agent.yaml; ``.`` is the chart root.
+*/}}
+{{- define "spatiumddi.agentNamesUnique" -}}
+{{- $seen := dict -}}
+{{- if .Values.dnsAgents.enabled -}}
+{{- range .Values.dnsAgents.servers -}}
+{{- $n := include "spatiumddi.agentObjectName" (dict "root" $ "instance" (printf "dns-%s-%s" (.flavor | default "bind9") .name) "prefix" $.Values.dnsAgents.prefixWithFullname) -}}
+{{- $sname := .name -}}
+{{- range $obj := list $n (printf "%s-headless" $n) -}}
+{{- if hasKey $seen $obj -}}
+{{- fail (printf "dnsAgents server %q renders object name %q, already used by server %q; server names must be unique (each server owns <name> and <name>-headless)" $sname $obj (get $seen $obj)) -}}
+{{- end -}}
+{{- $_ := set $seen $obj $sname -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if .Values.dhcpAgents.enabled -}}
+{{- range .Values.dhcpAgents.servers -}}
+{{- $n := include "spatiumddi.agentObjectName" (dict "root" $ "instance" (printf "dhcp-%s-%s" (.flavor | default "kea") .name) "prefix" $.Values.dhcpAgents.prefixWithFullname) -}}
+{{- $sname := .name -}}
+{{- range $obj := list $n (printf "%s-headless" $n) -}}
+{{- if hasKey $seen $obj -}}
+{{- fail (printf "dhcpAgents server %q renders object name %q, already used by server %q; server names must be unique (each server owns <name> and <name>-headless)" $sname $obj (get $seen $obj)) -}}
+{{- end -}}
+{{- $_ := set $seen $obj $sname -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+``affinity:`` block of a DNS / DHCP agent pod (#3206). The chart's own
+preferred one-agent-per-node anti-affinity is MERGED into the per-server
+``affinity`` rather than replaced by it, so an operator who adds
+``nodeAffinity`` keeps the spread; only a ``podAntiAffinity`` of their own
+wins (an explicit opt-out). With no per-server ``affinity`` the block is the
+literal the templates always rendered.
+
+  {{- include "spatiumddi.agentAffinity" (dict "root" $root "component" "dns-agent" "override" $server.affinity) | nindent 6 }}
+*/}}
+{{- define "spatiumddi.agentAffinity" -}}
+{{- $override := default (dict) .override -}}
+{{- $label := dict "app.kubernetes.io/name" (include "spatiumddi.name" .root) "app.kubernetes.io/component" .component -}}
+affinity:
+{{- if $override }}
+  {{- $merged := deepCopy $override -}}
+  {{- if not (hasKey $merged "podAntiAffinity") -}}
+    {{- $term := dict "labelSelector" (dict "matchLabels" $label) "topologyKey" "kubernetes.io/hostname" -}}
+    {{- $_ := set $merged "podAntiAffinity" (dict "preferredDuringSchedulingIgnoredDuringExecution" (list (dict "weight" 100 "podAffinityTerm" $term))) -}}
+  {{- end }}
+  {{- toYaml $merged | nindent 2 }}
+{{- else }}
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ include "spatiumddi.name" .root }}
+              app.kubernetes.io/component: {{ .component }}
+          topologyKey: kubernetes.io/hostname
 {{- end }}
 {{- end -}}
 
@@ -330,6 +555,57 @@ the same set for kombu.
 {{- end -}}
 
 {{/*
+Env shared by the api, worker AND beat — and deliberately NOT by the migrate
+Job or the slot-image mirror, which also include commonEnv. (#1826) The three
+run the same image and read the same ``settings``, but their env used to be
+written three times with the api getting the appliance block: the worker and
+beat ran with ``APPLIANCE_MODE`` unset, so every ``appliance_mode`` gate
+(``node_pressure``, ``cluster_dns_degraded``, the rolling-upgrade
+orchestrator, ...) evaluated as off in the one process that runs alert
+evaluation. Put anything the Celery side reads in ``sharedEnv`` (values.yaml),
+not in ``api.env``. ``.github/scripts/chart-shared-env.py`` fails a render
+where one of the three lacks a variable another carries from this list.
+
+``applianceVersion`` (#2004, #2176) is appended to the same list as
+APPLIANCE_VERSION. It is a value of its own so that a cluster Rolling Upgrade
+can hold it with ``image.tag``: a HelmChartConfig can pin a scalar, never one
+entry of a list.
+
+The slot-image mirror client env is a separate helper
+(``spatiumddi.slotImageMirrorClientEnv``) because beat never talks to the
+mirror and has no use for its shared secret.
+*/}}
+{{- define "spatiumddi.sharedEnv" -}}
+{{- $env := .Values.sharedEnv | default list }}
+{{- with .Values.applianceVersion }}
+{{- $env = append $env (dict "name" "APPLIANCE_VERSION" "value" (toString .)) }}
+{{- end }}
+{{- with $env }}
+{{- toYaml . }}
+{{- end }}
+{{- end -}}
+
+{{/*
+Slot-image mirror client env, for the api AND the worker (#1826). The api
+proxies upgrade-image byte ops to the mirror; the worker runs the
+rolling-upgrade preflight, whose mirror disk-headroom check needs the URL and
+signs its request with the secret. Before #1826 only the api had them, so the
+worker's preflight reported "no mirror configured". Not beat: it only
+enqueues, so it gets no copy of the secret.
+*/}}
+{{- define "spatiumddi.slotImageMirrorClientEnv" -}}
+{{- if .Values.slotImageMirror.enabled }}
+- name: SLOT_IMAGE_MIRROR_URL
+  value: "http://{{ include "spatiumddi.fullname" . }}-slot-image-mirror.{{ .Release.Namespace }}.svc:8000"
+- name: SLOT_IMAGE_MIRROR_SECRET
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "spatiumddi.fullname" . }}-slot-image-mirror-auth
+      key: secret
+{{- end }}
+{{- end -}}
+
+{{/*
 Common env block for api / worker / beat. Only $(POSTGRES_PASSWORD) and
 $(REDIS_PASSWORD) reference secrets; everything else is inline.
 */}}
@@ -357,6 +633,24 @@ $(REDIS_PASSWORD) reference secrets; everything else is inline.
     secretKeyRef:
       name: {{ include "spatiumddi.appSecretName" . }}
       key: secret-key
+# #1358 — the dedicated key stored credentials are encrypted under. Optional:
+# a Secret supplied through auth.existingSecret may not carry it, and the api
+# then derives the key from SECRET_KEY as before.
+- name: CREDENTIAL_ENCRYPTION_KEY
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "spatiumddi.appSecretName" . }}
+      key: credential-key
+      optional: true
+# #1358 — the release whose rollout added credential-key to a running
+# install; while the api runs that release it reads the key but does not
+# write with it (see templates/secret.yaml). Optional, like the key.
+- name: CREDENTIAL_KEY_SINCE
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "spatiumddi.appSecretName" . }}
+      key: credential-key-since
+      optional: true
 # #1159 — the /metrics scrape token. Optional: a Secret supplied through
 # auth.existingSecret may not carry it, and then only API tokens can scrape.
 - name: PROMETHEUS_METRICS_TOKEN
@@ -447,6 +741,15 @@ $(REDIS_PASSWORD) reference secrets; everything else is inline.
 {{- end -}}
 
 {{/*
+#3208 — resources of the ``wait-for-*`` init containers (``initContainers.
+resources``). ``alembic`` in the wait-for-migrate loop imports the whole app's
+model tree, so the memory limit leaves room for that.
+*/}}
+{{- define "spatiumddi.initContainerResources" -}}
+{{- toYaml (default (dict "requests" (dict "cpu" "10m" "memory" "32Mi") "limits" (dict "memory" "256Mi")) (.Values.initContainers).resources) -}}
+{{- end -}}
+
+{{/*
 Init container that blocks until the bundled / external Postgres is
 accepting connections. Used by the migrate Job. ``pg_isready`` ships in
 the api image (postgresql-client-16, see backend/Dockerfile).
@@ -473,6 +776,8 @@ the api image (postgresql-client-16, see backend/Dockerfile).
       value: {{ include "spatiumddi.postgresUser" . | quote }}
     - name: PGDATABASE
       value: {{ include "spatiumddi.postgresDatabase" . | quote }}
+  resources:
+    {{- include "spatiumddi.initContainerResources" . | nindent 4 }}
 {{- end -}}
 
 {{/*
@@ -530,6 +835,8 @@ URL comes from commonEnv.
       done
   env:
     {{- include "spatiumddi.commonEnv" . | nindent 4 }}
+  resources:
+    {{- include "spatiumddi.initContainerResources" . | nindent 4 }}
 {{- end -}}
 
 {{/*
@@ -689,4 +996,289 @@ Args: ``value`` (bool or nil), ``conflict`` (bool), ``workload``, ``why``.
 {{- end -}}
 hostUsers: {{ .value }}
 {{- end -}}
+{{- end -}}
+
+{{/*
+#2955 — the Postgres ``max_connections`` the configured pools can hold, the
+same rule the appliance applies (``k8s_api.postgres_connection_budget``):
+
+  api pods   x (pool size + maxOverflow + 2 hooks + 1 readiness probe)
+  workers    x (concurrency x (1 + 2 hooks) + 1)
+  celery-beat  2 hooks + 1
+  WAL senders  one per CNPG replica
+  reserve      10 (superuser_reserved_connections' 3, a migrate Job, psql)
+
+The api count is the HPA's maxReplicas while autoscaling is on (the replica
+count the HPA can reach), else ``api.replicas``. An unset
+``api.databasePool`` is the application's own 10 + 20. Used by the standalone
+Postgres StatefulSet and by the CNPG Cluster whenever the operator leaves
+``max_connections`` empty; the appliance sets its own explicitly.
+*/}}
+{{- define "spatiumddi.postgresMaxConnections" -}}
+{{- $pool := .Values.api.databasePool | default dict -}}
+{{- $size := 10 -}}
+{{- if not (kindIs "invalid" $pool.size) }}{{ $size = int $pool.size }}{{ end -}}
+{{- $overflow := 20 -}}
+{{- if not (kindIs "invalid" $pool.maxOverflow) }}{{ $overflow = int $pool.maxOverflow }}{{ end -}}
+{{- $apiPods := int .Values.api.replicas -}}
+{{- if .Values.api.autoscaling.enabled }}{{ $apiPods = max (int .Values.api.autoscaling.maxReplicas) (int .Values.api.autoscaling.minReplicas) }}{{ end -}}
+{{- $api := mul $apiPods (add $size $overflow 2 1) -}}
+{{- $worker := mul (int .Values.worker.replicas) (add (mul (int .Values.worker.concurrency) 3) 1) -}}
+{{- $senders := 0 -}}
+{{- if eq (.Values.postgresql.kind | default "standalone") "cnpg" }}{{ $senders = sub (int .Values.postgresql.cnpg.instances) 1 }}{{ end -}}
+{{- add $api $worker 3 $senders 10 -}}
+{{- end }}
+
+{{/*
+#2955 — Postgres ``shared_buffers`` in MiB: the CNPG parameter (kB / MB / GB /
+TB, or a bare count of 8 kB pages, as Postgres reads it), else the image's
+own 128MB, which the standalone StatefulSet does not override.
+*/}}
+{{- define "spatiumddi.postgresSharedBuffersMiB" -}}
+{{- $sb := 128 -}}
+{{- if eq (.Values.postgresql.kind | default "standalone") "cnpg" -}}
+{{- $raw := toString ((.Values.postgresql.cnpg.parameters | default dict).shared_buffers | default "128MB") | trim -}}
+{{- $n := regexFind "^[0-9]+" $raw | int -}}
+{{- $unit := regexFind "[A-Za-z]+$" $raw -}}
+{{- if eq $unit "kB" }}{{ $sb = div $n 1024 }}
+{{- else if eq $unit "MB" }}{{ $sb = $n }}
+{{- else if eq $unit "GB" }}{{ $sb = mul $n 1024 }}
+{{- else if eq $unit "TB" }}{{ $sb = mul $n 1048576 }}
+{{- else if eq $unit "" }}{{ $sb = div (mul $n 8) 1024 }}
+{{- else }}{{ fail (printf "postgresql.cnpg.parameters.shared_buffers %q: use kB, MB, GB or TB" $raw) }}
+{{- end -}}
+{{- end -}}
+{{- $sb -}}
+{{- end }}
+
+{{/*
+#2955 — a Kubernetes memory quantity in MiB (rounded down), or -1 when it is
+not one this helper reads (an exponent form, say), in which case the caller
+leaves the operator's value alone.
+*/}}
+{{- define "spatiumddi.quantityMiB" -}}
+{{- $q := toString . | trim -}}
+{{- $n := regexFind "^[0-9]+" $q | int64 -}}
+{{- $unit := trimPrefix (regexFind "^[0-9]+" $q) $q -}}
+{{- $mib := -1 -}}
+{{- if eq $unit "Ki" }}{{ $mib = div $n 1024 }}
+{{- else if eq $unit "Mi" }}{{ $mib = $n }}
+{{- else if eq $unit "Gi" }}{{ $mib = mul $n 1024 }}
+{{- else if eq $unit "Ti" }}{{ $mib = mul $n 1048576 }}
+{{- else if eq $unit "k" }}{{ $mib = div (mul $n 1000) 1048576 }}
+{{- else if eq $unit "M" }}{{ $mib = div (mul $n 1000000) 1048576 }}
+{{- else if eq $unit "G" }}{{ $mib = div (mul $n 1000000000) 1048576 }}
+{{- else if eq $unit "" }}{{ $mib = div $n 1048576 }}
+{{- end -}}
+{{- $mib -}}
+{{- end }}
+
+{{/*
+#2955 — ``postgresql.resources`` with the memory LIMIT raised, when needed, to
+hold the connections the chart derived. Postgres' shared memory per slot is
+small; what a limit has to carry is the backends themselves, ~14 MiB of
+private memory each under load (measured, #2156, with transparent huge pages)
+plus the page tables mapping shared_buffers (shared_buffers / 512). So the
+limit is never below shared_buffers + 256 MiB + max_connections x
+(14 + shared_buffers / 512) MiB: the rule the appliance's supervisor applies
+(``k8s_api.control_plane_sizing``). Only RAISED, only when the chart derived
+max_connections (an operator or the appliance that sets max_connections owns
+the memory too), never added where no limit is set, and the request is left
+alone (scheduling is unchanged: a limit is a ceiling, not a reservation).
+Args: the root context.
+*/}}
+{{- define "spatiumddi.postgresResources" -}}
+{{- $res := deepCopy (.Values.postgresql.resources | default dict) -}}
+{{- $derived := false -}}
+{{- if eq (.Values.postgresql.kind | default "standalone") "cnpg" -}}
+{{- $derived = not (.Values.postgresql.cnpg.parameters | default dict).max_connections -}}
+{{- else -}}
+{{- $derived = not .Values.postgresql.maxConnections -}}
+{{- end -}}
+{{- $limits := $res.limits | default dict -}}
+{{- if and $derived $limits.memory -}}
+{{- $sb := include "spatiumddi.postgresSharedBuffersMiB" . | int -}}
+{{- $conns := include "spatiumddi.postgresMaxConnections" . | int -}}
+{{- $need := add $sb 256 (mul $conns (add 14 (div (add $sb 511) 512))) -}}
+{{- $have := include "spatiumddi.quantityMiB" $limits.memory | int -}}
+{{- if and (ge $have 0) (lt $have $need) -}}
+{{- $_ := set $limits "memory" (printf "%dMi" $need) -}}
+{{- $_ := set $res "limits" $limits -}}
+{{- end -}}
+{{- end -}}
+{{- toYaml $res -}}
+{{- end }}
+
+{{/*
+#3206 follow-up — refuse an in-place storageClass adoption on a live agent
+StatefulSet with the fix in the message, instead of the API server's
+"updates to statefulset spec for fields other than ... are forbidden".
+volumeClaimTemplates are immutable, so setting dnsAgents/dhcpAgents
+.storageClass (or servers[].storageClass) on an existing install can only be
+applied after the StatefulSet is deleted with --cascade=orphan.
+
+Takes (dict "root" $ "name" <statefulset name> "class" <class this render sets>).
+Fires only when this render SETS a class and the live object has a claim
+template whose class is absent or different. An install that never set a
+class renders no storageClassName and never reaches the comparison. `lookup`
+returns an empty map under `helm template` and in Argo CD's render, so this
+only ever fires for a real `helm install/upgrade` against a cluster; those
+render paths get the static NOTES.txt pointer instead. A storage SIZE change
+is the same immutability but is not checked here: the API server normalises
+quantities (1024Mi reads back as 1Gi), so a string compare could refuse a
+render that changes nothing.
+*/}}
+{{- define "spatiumddi.checkAgentClaimClass" -}}
+{{- if .class -}}
+{{- $live := lookup "apps/v1" "StatefulSet" .root.Release.Namespace .name -}}
+{{- range $t := (dig "spec" "volumeClaimTemplates" (list) $live) -}}
+{{- $old := dig "spec" "storageClassName" "" $t -}}
+{{- if ne $old $.class -}}
+{{- fail (printf "StatefulSet %q has a %q claim template with storageClassName %s, and this render sets %q. Kubernetes forbids updating a StatefulSet's volumeClaimTemplates, so this upgrade would be refused. Delete the StatefulSet without deleting its pod or PVCs, then upgrade again:\n  kubectl delete sts %s -n %s --cascade=orphan\nExisting PVCs keep their old class; only new claims get %q. See the chart README, \"Adopting storageClass on an existing install\"." $.name (dig "metadata" "name" "?" $t) (ternary "unset" (quote $old) (eq $old "")) $.class $.name $.root.Release.Namespace $.class) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+#3852 — are we installing onto OpenShift?
+
+``global.platform`` is ``auto`` (the default), ``kubernetes`` or ``openshift``.
+``auto`` asks the cluster: OpenShift serves ``security.openshift.io/v1``
+(SecurityContextConstraints), which no other distribution does. Without a
+cluster — ``helm template``, Argo CD, a CI render — nothing answers, so those
+pass ``--api-versions security.openshift.io/v1`` or set the value outright.
+
+Renders ``true`` or nothing, so call sites read
+``{{ if include "spatiumddi.isOpenShift" . }}``. Pass the ROOT context (``$``
+inside a ``range``).
+
+Everything OpenShift-specific hangs off this one answer, and every branch it
+opens is additive or removes a pinned uid / gid / fsGroup: with it false the
+render is byte-identical to a chart that never heard of OpenShift.
+*/}}
+{{- define "spatiumddi.isOpenShift" -}}
+{{- $p := default "auto" (.Values.global).platform -}}
+{{- if not (has $p (list "auto" "kubernetes" "openshift")) -}}
+{{- fail (printf "global.platform=%q is not valid: use auto, kubernetes or openshift" $p) -}}
+{{- end -}}
+{{- if or (eq $p "openshift") (and (eq $p "auto") (.Capabilities.APIVersions.Has "security.openshift.io/v1")) -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
+#3852 — the port the frontend's nginx listens on. :80 everywhere except
+OpenShift, where the pod runs as a random unprivileged uid and cannot bind it.
+The Service keeps its own port and reaches this one by the container port's
+name (``http``), so nothing else has to know.
+*/}}
+{{- define "spatiumddi.frontendHttpPort" -}}
+{{- if include "spatiumddi.isOpenShift" . -}}8080{{- else -}}80{{- end -}}
+{{- end -}}
+
+{{/*
+#3852 — one SecurityContextConstraints + the Role / RoleBinding that lets a
+fixed set of ServiceAccounts ``use`` it, and nobody else.
+
+Args: ``root``, ``name`` (the SCC's name; also the Role / RoleBinding's),
+``component``, ``serviceAccounts`` (list of names), ``capabilities`` (list),
+``hostNetwork`` (bool), ``why`` (text, rendered as the SCC's description
+annotation).
+
+It is the ``restricted-v2`` SCC with exactly three differences, each of which
+the workload needs and cannot get from any built-in SCC:
+
+  * ``allowedCapabilities`` — the file capabilities on the daemon binaries
+    (``named``, ``kea-dhcp4`` ...) only work when the capability is in the
+    container's bounding set, so the pod has to be allowed to add it.
+  * ``allowPrivilegeEscalation: true`` — the kernel ignores file capabilities
+    for a process with ``no_new_privs`` set, and ``restricted-v2``'s ``false``
+    sets it. The pod does not escalate to root: it stays a non-root uid.
+  * ``allowHostNetwork`` / ``allowHostPorts`` — only when a server asks for
+    ``hostNetwork: true``.
+
+Everything else is kept at ``restricted-v2``'s values: a uid from the
+namespace's range, an SELinux level from the namespace, an fsGroup from its
+range, ``runtime/default`` seccomp, no privileged containers, and the
+volume types the workload uses. ``anyuid`` is NOT a substitute: it has no
+``seccompProfiles``, so it rejects every pod this chart gives a seccomp
+profile.
+*/}}
+{{- define "spatiumddi.openshiftScc" -}}
+{{- $root := .root -}}
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: {{ .name }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" .component) $root) | nindent 4 }}
+  annotations:
+    kubernetes.io/description: {{ .why | quote }}
+allowHostDirVolumePlugin: false
+allowHostIPC: false
+allowHostNetwork: {{ .hostNetwork | default false }}
+allowHostPID: false
+allowHostPorts: {{ .hostNetwork | default false }}
+allowPrivilegeEscalation: true
+allowPrivilegedContainer: false
+allowedCapabilities:
+  {{- range .capabilities }}
+  - {{ . }}
+  {{- end }}
+defaultAddCapabilities: null
+requiredDropCapabilities:
+  - ALL
+readOnlyRootFilesystem: false
+fsGroup:
+  type: MustRunAs
+runAsUser:
+  type: MustRunAsRange
+seLinuxContext:
+  type: MustRunAs
+supplementalGroups:
+  type: MustRunAs
+seccompProfiles:
+  - runtime/default
+volumes:
+  - configMap
+  - downwardAPI
+  - emptyDir
+  - ephemeral
+  - persistentVolumeClaim
+  - projected
+  - secret
+users: []
+groups: []
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .name }}-scc
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" .component) $root) | nindent 4 }}
+rules:
+  - apiGroups: ["security.openshift.io"]
+    resources: ["securitycontextconstraints"]
+    resourceNames: [{{ .name | quote }}]
+    verbs: ["use"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .name }}-scc
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" .component) $root) | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .name }}-scc
+subjects:
+  {{- range .serviceAccounts }}
+  - kind: ServiceAccount
+    name: {{ . }}
+    namespace: {{ $root.Release.Namespace }}
+  {{- end }}
 {{- end -}}

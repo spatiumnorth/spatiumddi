@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import {
   AlertTriangle,
   Database,
@@ -12,7 +12,9 @@ import {
 } from "lucide-react";
 
 import {
+  authApi,
   backupApi,
+  formatApiError,
   type BackupManifestPreviewResponse,
   type BackupRestoreResponse,
 } from "@/lib/api";
@@ -44,6 +46,14 @@ type Tab = "manual" | "destinations" | "drills" | "factory-reset";
 
 export function BackupPage() {
   const [tab, setTab] = useState<Tab>("manual");
+  // Every backup route requires a superadmin (server-side, authoritative);
+  // the page only stops offering writes the API will refuse (#2204).
+  const { data: me } = useQuery({
+    queryKey: ["me"],
+    queryFn: authApi.me,
+    staleTime: 60_000,
+  });
+  const isSuperadmin = me?.is_superadmin ?? false;
   return (
     <div className="flex h-full flex-col overflow-hidden">
       <div className="border-b bg-card px-6 py-4">
@@ -53,12 +63,13 @@ export function BackupPage() {
         </div>
         <p className="mt-1 text-xs text-muted-foreground">
           <strong>Manual</strong> — one-off download + restore-from-file.{" "}
-          <strong>Destinations</strong> — configure local volumes, S3, SCP,
-          Azure Blob. Schedule a recurring backup, view archives at the
-          destination, restore from any archive. <strong>Restore Drills</strong>{" "}
-          — prove an archive is actually restorable by test-restoring it into a
-          throwaway database. <strong>Factory Reset</strong> — wipe
-          configuration back to defaults per-section or everything-at-once.
+          <strong>Destinations</strong> — configure where scheduled backups go
+          (Add target lists every destination kind). Schedule a recurring
+          backup, view archives at the destination, restore from any archive.{" "}
+          <strong>Restore Drills</strong> — prove an archive is actually
+          restorable by test-restoring it into a throwaway database.{" "}
+          <strong>Factory Reset</strong> — wipe configuration back to defaults
+          per-section or everything-at-once.
         </p>
         <div className="-mb-px mt-3 flex gap-1 border-b">
           {(
@@ -86,7 +97,17 @@ export function BackupPage() {
       </div>
 
       <div className="flex-1 overflow-auto p-6">
-        <div className="mx-auto flex max-w-6xl flex-col gap-6">
+        {me && !isSuperadmin && (
+          <div className="mx-auto mb-4 max-w-6xl rounded-md border border-dashed px-3 py-2 text-xs text-muted-foreground">
+            You don&rsquo;t have permission to use backup &amp; restore. Every
+            backup action requires a superadmin, so the controls below are
+            disabled.
+          </div>
+        )}
+        <fieldset
+          disabled={me ? !isSuperadmin : false}
+          className="mx-auto flex min-w-0 max-w-6xl flex-col gap-6 border-0 p-0"
+        >
           {tab === "manual" && (
             <>
               {/* Manual download + restore — stack on narrow, sit
@@ -106,7 +127,7 @@ export function BackupPage() {
           )}
           {tab === "drills" && <RestoreDrillsSection />}
           {tab === "factory-reset" && <FactoryResetSection />}
-        </div>
+        </fieldset>
       </div>
     </div>
   );
@@ -161,6 +182,7 @@ function CreateBackupCard() {
         <Field label="Passphrase" required>
           <input
             type="password"
+            maxLength={512}
             value={passphrase}
             onChange={(e) => setPassphrase(e.target.value)}
             placeholder="At least 8 characters"
@@ -171,6 +193,7 @@ function CreateBackupCard() {
         <Field label="Confirm passphrase" required>
           <input
             type="password"
+            maxLength={512}
             value={passphrase2}
             onChange={(e) => setPassphrase2(e.target.value)}
             placeholder="Retype to catch typos"
@@ -209,12 +232,14 @@ function CreateBackupCard() {
             className="mt-0.5"
           />
           <span>
-            <strong>Exclude secrets (diagnostic mode).</strong> NULL every
-            credential / api-key / TSIG-key / TOTP secret in the archive at dump
-            time. Use when sharing a snapshot with support / consultants — the
-            archive is shareable but a restore yields an install with empty
-            credential fields, so operators re-enter integration / auth-provider
-            creds by hand.
+            <strong>Exclude secrets (diagnostic mode).</strong> Remove every
+            credential / api-key / TSIG-key / TOTP secret, the appliance CA key,
+            k3s join token and cluster kubeconfig, password and token hashes,
+            and the install&rsquo;s own encryption key from the archive at dump
+            time. Use when sharing a snapshot with support / consultants — a
+            restore yields an install with empty credential fields: operators
+            re-enter integration / auth-provider creds, reset local passwords
+            and re-key appliances.
           </span>
         </label>
         <div className="flex items-center gap-2">
@@ -269,8 +294,8 @@ function RestoreBackupCard() {
       setPreview(data);
       setPreviewError(null);
     },
-    onError: (err: Error) => {
-      setPreviewError(err.message || "Manifest preview failed");
+    onError: (err: unknown) => {
+      setPreviewError(formatApiError(err, "Manifest preview failed"));
       setPreview(null);
     },
   });
@@ -296,11 +321,24 @@ function RestoreBackupCard() {
     if (f) previewMut.mutate(f);
   }
 
-  const archiveIsCustomFormat =
-    preview?.manifest?.format_version === 2 ||
-    preview?.manifest?.format_version === undefined;
+  // The dump format decides whether a selective restore can run, and the
+  // API refuses one of a plain-SQL dump. ``format_version`` cannot tell:
+  // every archive is version 2, an Exclude-secrets one included, and that
+  // one's dump is plain (#2201). So read the format the server resolved
+  // with the restore's own helper, falling back to the manifest's field
+  // for a server too old to send it.
+  const dumpFormat = preview
+    ? (preview.dump_format ?? preview.manifest?.dump_format ?? null)
+    : null;
+  // The restore's own refusals (no dump, no secrets.enc, a newer
+  // format_version, a schema head this install cannot migrate forward), read
+  // from the same checks server-side (#2949, #3287). Blocks both modes.
+  const restoreRefused = !!preview && preview.restorable === false;
   const selectiveBlockedByPlainFormat =
-    mode === "selective" && preview && !archiveIsCustomFormat;
+    mode === "selective" &&
+    !!preview &&
+    !restoreRefused &&
+    dumpFormat !== "custom";
 
   const canSubmit =
     !!file &&
@@ -308,6 +346,7 @@ function RestoreBackupCard() {
     passphrase.length >= 8 &&
     confirm === CONFIRM_PHRASE &&
     !restoreMut.isPending &&
+    !restoreRefused &&
     !selectiveBlockedByPlainFormat &&
     (mode !== "selective" || sections.length > 0);
 
@@ -321,10 +360,21 @@ function RestoreBackupCard() {
         <div className="flex items-start gap-2">
           <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0" />
           <div>
-            Restore is a <strong>hard overwrite</strong>. Every table on this
-            install is replaced with what&rsquo;s in the archive. A pre-restore
-            safety dump is taken first so a botched restore can be rolled back,
-            but you should still take a fresh backup before running this.
+            Restore is a <strong>hard overwrite</strong>.{" "}
+            {mode === "selective" ? (
+              <>
+                Only the sections you tick below are replaced with what&rsquo;s
+                in the archive; the rest of the install is left as it is.
+              </>
+            ) : (
+              <>
+                Every table on this install is replaced with what&rsquo;s in the
+                archive.
+              </>
+            )}{" "}
+            A pre-restore safety dump is taken first so a botched restore can be
+            rolled back, but you should still take a fresh backup before running
+            this.
           </div>
         </div>
       </div>
@@ -367,19 +417,34 @@ function RestoreBackupCard() {
             onChange={setSections}
           />
         )}
+        {restoreRefused && (
+          <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+            This archive cannot be restored:{" "}
+            {preview?.restore_refusal ?? "the restore refuses it"}
+          </div>
+        )}
         {selectiveBlockedByPlainFormat && (
           <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
             Selective restore needs an archive whose database dump is in
-            pg_dump&rsquo;s custom format. This archive&rsquo;s dump is plain
-            SQL (an older build, or <em>Exclude secrets</em> diagnostic mode,
-            wrote it) — switch to <em>Full restore</em>, or take a regular
-            backup of the source install on a current build.
+            pg_dump&rsquo;s custom format.{" "}
+            {dumpFormat === "plain" ? (
+              <>
+                This archive&rsquo;s dump is plain SQL (an older build, or{" "}
+                <em>Exclude secrets</em> diagnostic mode, wrote it)
+              </>
+            ) : (
+              <>This archive does not say what format its dump is in</>
+            )}{" "}
+            — switch to <em>Full restore</em>, or take a regular backup of the
+            source install on a current build with <em>Exclude secrets</em>{" "}
+            unticked.
           </div>
         )}
 
         <Field label="Passphrase" required>
           <input
             type="password"
+            maxLength={512}
             value={passphrase}
             onChange={(e) => setPassphrase(e.target.value)}
             placeholder="The passphrase used at backup time"
@@ -426,7 +491,7 @@ function RestoreBackupCard() {
           </button>
           {restoreMut.isError && (
             <span className="text-xs text-destructive">
-              {(restoreMut.error as Error)?.message || "Restore failed."}
+              {formatApiError(restoreMut.error, "Restore failed.")}
             </span>
           )}
         </div>
@@ -443,7 +508,8 @@ function ManifestPreview({
   preview: BackupManifestPreviewResponse;
 }) {
   const m = preview.manifest;
-  const recognised = preview.format_recognised;
+  const refused = preview.restorable === false;
+  const recognised = preview.format_recognised && !refused;
   return (
     <div
       className={`rounded-md border px-3 py-2 text-xs ${
@@ -455,9 +521,11 @@ function ManifestPreview({
       <div className="mb-1 flex items-center gap-1.5">
         <FileArchive className="h-3.5 w-3.5" />
         <span className="font-medium">
-          {recognised
-            ? "Recognised SpatiumDDI backup"
-            : "Format unrecognised — proceed with care"}
+          {refused
+            ? "SpatiumDDI backup that cannot be restored"
+            : recognised
+              ? "Recognised SpatiumDDI backup"
+              : "Format unrecognised — proceed with care"}
         </span>
       </div>
       <dl className="grid grid-cols-2 gap-x-3 gap-y-0.5">

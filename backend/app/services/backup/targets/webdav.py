@@ -44,19 +44,24 @@ import os
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
-from urllib.parse import quote, unquote, urljoin
+from urllib.parse import quote, unquote, urljoin, urlsplit
 
 import httpx
 import structlog
 
+from app.core.exc_text import describe_exc
 from app.services.backup.targets.base import (
     ARCHIVE_NAME_RE,
     ArchiveListing,
+    ArchiveTooLargeError,
     BackupDestination,
     BackupDestinationError,
     ConfigFieldSpec,
     DestinationConfigError,
+    check_size,
     safe_filename,
+    safe_url,
+    scrub_url,
 )
 
 logger = structlog.get_logger(__name__)
@@ -141,6 +146,15 @@ class WebDAVDestination(BackupDestination):
         url = config["url"]
         if not (url.startswith("http://") or url.startswith("https://")):
             raise DestinationConfigError("'url' must start with http:// or https://")
+        try:
+            parts = urlsplit(url)
+        except ValueError as exc:
+            raise DestinationConfigError(f"'url' is not a parseable URL: {exc}") from exc
+        if not parts.hostname:
+            # A scheme-prefixed string with no host ("https:///x")
+            # passed the prefix check and only failed later, inside
+            # httpx, as an InvalidURL the old catches missed (#1515).
+            raise DestinationConfigError("'url' must name a host, e.g. https://host/path")
 
     def _client(self, config: dict[str, Any]) -> httpx.AsyncClient:
         verify = (config.get("verify_tls") or "true").strip().lower() != "false"
@@ -179,8 +193,15 @@ class WebDAVDestination(BackupDestination):
                     content=archive_bytes,
                     headers={"Content-Type": "application/zip"},
                 )
-            except httpx.HTTPError as exc:
-                raise BackupDestinationError(f"WebDAV PUT failed: {exc}") from exc
+            except (httpx.HTTPError, httpx.InvalidURL) as exc:
+                # ``httpx.InvalidURL`` does not derive from
+                # ``httpx.HTTPError`` (the #889 trap, #1515) — caught
+                # explicitly at every call site in this driver, like
+                # https_put, so a malformed stored URL is a 502-shaped
+                # destination error, not a runner-escaping exception.
+                raise BackupDestinationError(
+                    f"WebDAV PUT failed: {scrub_url(describe_exc(exc), target)}"
+                ) from exc
         if resp.status_code not in (200, 201, 204):
             raise BackupDestinationError(
                 f"WebDAV PUT returned {resp.status_code}: {resp.text[:300]}"
@@ -201,11 +222,13 @@ class WebDAVDestination(BackupDestination):
                         "Content-Type": "application/xml",
                     },
                 )
-            except httpx.HTTPError as exc:
-                raise BackupDestinationError(f"WebDAV PROPFIND failed: {exc}") from exc
+            except (httpx.HTTPError, httpx.InvalidURL) as exc:
+                raise BackupDestinationError(
+                    f"WebDAV PROPFIND failed: {scrub_url(describe_exc(exc), url)}"
+                ) from exc
         if resp.status_code == 404:
             raise BackupDestinationError(
-                f"WebDAV collection {url!r} not found — verify the URL is correct"
+                f"WebDAV collection {safe_url(url)!r} not found — verify the URL is correct"
             )
         if resp.status_code != 207:
             raise BackupDestinationError(
@@ -214,7 +237,9 @@ class WebDAVDestination(BackupDestination):
         try:
             tree = ET.fromstring(resp.content)  # noqa: S314 - server-controlled XML
         except ET.ParseError as exc:
-            raise BackupDestinationError(f"WebDAV PROPFIND xml parse failed: {exc}") from exc
+            raise BackupDestinationError(
+                f"WebDAV PROPFIND xml parse failed: {describe_exc(exc)}"
+            ) from exc
 
         rows: list[ArchiveListing] = []
         for response in tree.findall(f"{_DAV_NS}response"):
@@ -261,30 +286,46 @@ class WebDAVDestination(BackupDestination):
         rows.sort(key=lambda r: r.created_at, reverse=True)
         return rows
 
-    async def download(self, *, config: dict[str, Any], filename: str) -> bytes:
+    async def download(
+        self, *, config: dict[str, Any], filename: str, max_bytes: int | None = None
+    ) -> bytes:
         target = self._archive_url(config, filename)
+        name = safe_filename(filename)
         async with self._client(config) as client:
             try:
-                resp = await client.get(target)
-            except httpx.HTTPError as exc:
-                raise BackupDestinationError(f"WebDAV GET failed: {exc}") from exc
-        if resp.status_code == 404:
-            raise BackupDestinationError(
-                f"archive {safe_filename(filename)!r} not found at {target}"
-            )
-        if resp.status_code != 200:
-            raise BackupDestinationError(
-                f"WebDAV GET returned {resp.status_code}: {resp.text[:300]}"
-            )
-        return resp.content
+                # Streamed, so an archive past ``max_bytes`` is abandoned
+                # as the running total crosses the cap rather than read
+                # into memory whole first.
+                async with client.stream("GET", target) as resp:
+                    if resp.status_code == 404:
+                        raise BackupDestinationError(
+                            f"archive {name!r} not found at {safe_url(target)}"
+                        )
+                    if resp.status_code != 200:
+                        body = (await resp.aread()).decode("utf-8", errors="replace")
+                        raise BackupDestinationError(
+                            f"WebDAV GET returned {resp.status_code}: "
+                            f"{scrub_url(body, target)[:300]}"
+                        )
+                    length = resp.headers.get("content-length")
+                    if length and length.isascii() and length.isdigit():
+                        check_size(name, int(length), max_bytes)
+                    out = bytearray()
+                    async for chunk in resp.aiter_bytes():
+                        out += chunk
+                        if max_bytes is not None and len(out) > max_bytes:
+                            raise ArchiveTooLargeError(name, max_bytes)
+                    return bytes(out)
+            except (httpx.HTTPError, httpx.InvalidURL) as exc:
+                raise BackupDestinationError(f"WebDAV GET failed: {describe_exc(exc)}") from exc
 
     async def delete(self, *, config: dict[str, Any], filename: str) -> None:
         target = self._archive_url(config, filename)
         async with self._client(config) as client:
             try:
                 resp = await client.delete(target)
-            except httpx.HTTPError as exc:
-                raise BackupDestinationError(f"WebDAV DELETE failed: {exc}") from exc
+            except (httpx.HTTPError, httpx.InvalidURL) as exc:
+                raise BackupDestinationError(f"WebDAV DELETE failed: {describe_exc(exc)}") from exc
         # 404 is idempotent; 200 / 204 are success
         if resp.status_code in (200, 204, 404):
             return
@@ -340,9 +381,12 @@ class WebDAVDestination(BackupDestination):
                             "fix permissions before scheduling"
                         ),
                     }
-            except httpx.HTTPError as exc:
-                return {"ok": False, "error": f"webdav: {exc}"}
+            except (httpx.HTTPError, httpx.InvalidURL) as exc:
+                return {
+                    "ok": False,
+                    "error": f"webdav: {scrub_url(describe_exc(exc), probe_target)}",
+                }
         return {
             "ok": True,
-            "detail": f"wrote + verified + deleted probe at {probe_target}",
+            "detail": f"wrote + verified + deleted probe at {safe_url(probe_target)}",
         }

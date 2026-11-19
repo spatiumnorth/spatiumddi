@@ -11,7 +11,9 @@ Three tools, all wrapping existing helpers:
 All three are ``default_enabled=False`` — they make outbound HTTP
 requests to public RDAP servers, which some operators (air-gapped /
 strict egress) want to opt into explicitly. Surfaces with a clear
-``[disabled]`` annotation in the LLM's tool catalog when off.
+``[disabled]`` annotation in the LLM's tool catalog when off. Each also
+spends the caller's ``offprem`` network-tool budget, shared with the
+Tools page's whois / DNS-propagation routes.
 """
 
 from __future__ import annotations
@@ -42,6 +44,9 @@ class LookupWhoisIpArgs(BaseModel):
 
 @register_tool(
     name="lookup_whois_ip",
+    outbound=True,
+    rate_limit="offprem",
+    permission=("read", "use_network_tools"),
     description=(
         "Look up the public WHOIS / RDAP record for an IP address — "
         "answers 'who owns this IP?'. Resolves the responsible RIR via "
@@ -90,6 +95,9 @@ class LookupWhoisAsnArgs(BaseModel):
 
 @register_tool(
     name="lookup_whois_asn",
+    outbound=True,
+    rate_limit="offprem",
+    permission=("read", "use_network_tools"),
     description=(
         "Look up the public WHOIS / RDAP record for an AS number — "
         "answers 'who runs this ASN?'. Returns the holder org, the "
@@ -145,6 +153,9 @@ class LookupWhoisDomainArgs(BaseModel):
 
 @register_tool(
     name="lookup_whois_domain",
+    outbound=True,
+    rate_limit="offprem",
+    permission=("read", "use_network_tools"),
     description=(
         "Look up the public WHOIS / RDAP record for a domain name — "
         "answers 'who owns this domain?'. Returns the registrar, the "

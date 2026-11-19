@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Router as RouterIcon,
@@ -9,6 +10,8 @@ import {
   Tag,
 } from "lucide-react";
 import { Modal } from "@/components/ui/modal";
+import { useFreshRow, changedFields } from "@/hooks/useFreshRow";
+import { FreshRowError } from "@/components/FreshRowError";
 import { HeaderButton } from "@/components/ui/header-button";
 import {
   vlansApi,
@@ -18,7 +21,9 @@ import {
   type VLAN,
   type Subnet,
   type SubnetRole,
+  formatApiError,
 } from "@/lib/api";
+import { ResizablePane } from "@/components/ui/resizable-pane";
 import { copyToClipboard } from "@/lib/clipboard";
 import { cn, zebraBodyCls } from "@/lib/utils";
 
@@ -56,6 +61,8 @@ import {
   ContextMenuSeparator,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -83,6 +90,13 @@ type Selection =
   | null;
 
 export function VLANsPage() {
+  // #1340 — a read-only user is offered no write it would be refused:
+  // the router asks write on 'vlan'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "vlan"),
+    "Requires write permission on VLANs",
+  );
   const qc = useQueryClient();
   const [selection, setSelection] = useState<Selection>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -92,6 +106,7 @@ export function VLANsPage() {
     data: routers = [],
     isLoading,
     isFetching,
+    error: routersError,
   } = useQuery({
     queryKey: ["vlans", "routers"],
     queryFn: vlansApi.listRouters,
@@ -117,7 +132,13 @@ export function VLANsPage() {
   return (
     <div className="flex h-[calc(100vh-3.5rem)]">
       {/* Sidebar */}
-      <aside className="w-72 flex-shrink-0 border-r bg-card overflow-y-auto">
+      <ResizablePane
+        storageKey="vlans"
+        defaultWidth={288}
+        label="Resize routers tree"
+        as="aside"
+        className="border-r bg-card overflow-y-auto"
+      >
         <div className="flex items-center justify-between px-3 py-2 border-b">
           <h2 className="text-sm font-semibold">Routers</h2>
           <div className="flex items-center gap-1">
@@ -134,7 +155,9 @@ export function VLANsPage() {
             <button
               onClick={() => setShowCreateRouter(true)}
               title="New Router"
-              className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+              aria-label="New Router"
+              className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:cursor-not-allowed disabled:opacity-50"
+              {...writeGate}
             >
               <Plus className="h-4 w-4" />
             </button>
@@ -148,7 +171,14 @@ export function VLANsPage() {
           )}
           {!isLoading && routers.length === 0 && (
             <p className="text-xs text-muted-foreground italic px-2 py-4">
-              No routers yet. Click + to add one.
+              <ListEmpty
+                error={routersError}
+                what="routers"
+                gate={writeGate}
+                hint="Click + to add one."
+              >
+                No routers yet.
+              </ListEmpty>
             </p>
           )}
           {routers.map((r) => (
@@ -162,7 +192,7 @@ export function VLANsPage() {
             />
           ))}
         </div>
-      </aside>
+      </ResizablePane>
 
       {/* Main detail */}
       <main className="flex-1 overflow-y-auto p-6">
@@ -292,6 +322,17 @@ function RouterDetail({
   onSelectVlan: (vlanId: string, routerId: string) => void;
   onDeleted: () => void;
 }) {
+  // #1340 — a read-only user is offered no write it would be refused:
+  // the router asks write (delete) on 'vlan'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "vlan"),
+    "Requires write permission on VLANs",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "vlan"),
+    "Requires delete permission on VLANs",
+  );
   const qc = useQueryClient();
   const [showEdit, setShowEdit] = useState(false);
   const [showCreateVlan, setShowCreateVlan] = useState(false);
@@ -332,10 +373,7 @@ function RouterDetail({
       onDeleted();
     },
     onError: (err: unknown) => {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to delete router";
-      setDeleteError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setDeleteError(formatApiError(err, "Failed to delete router"));
     },
   });
 
@@ -349,7 +387,11 @@ function RouterDetail({
           <h1 className="text-lg font-semibold">{router.name}</h1>
         </div>
         <div className="flex items-center gap-2">
-          <HeaderButton icon={Pencil} onClick={() => setShowEdit(true)}>
+          <HeaderButton
+            icon={Pencil}
+            onClick={() => setShowEdit(true)}
+            {...writeGate}
+          >
             Edit
           </HeaderButton>
           <HeaderButton
@@ -360,6 +402,7 @@ function RouterDetail({
               setDeleteError(null);
               setDeleteStep(1);
             }}
+            {...deleteGate}
           >
             Delete
           </HeaderButton>
@@ -367,6 +410,7 @@ function RouterDetail({
             variant="primary"
             icon={Plus}
             onClick={() => setShowCreateVlan(true)}
+            {...writeGate}
           >
             New VLAN
           </HeaderButton>
@@ -461,8 +505,11 @@ function RouterDetail({
               Delete <strong className="text-foreground">{router.name}</strong>?
               All {vlans.length} VLAN
               {vlans.length === 1 ? "" : "s"} under this router will be removed.
-              Deletion is blocked if any subnet still references a VLAN on this
-              router — reassign those subnets first.
+              Deletion is blocked if any subnet, including one in the Trash,
+              still references a VLAN on this router — reassign those subnets
+              first (or permanently delete the ones in the Trash). It is also
+              blocked while an E911 location binding names one of its VLANs:
+              remove the binding first.
             </p>
             <div className="flex justify-end gap-2">
               <button
@@ -509,9 +556,9 @@ function RouterDetail({
               <strong>{router.name}</strong> and all its VLANs.
             </label>
             {deleteError && (
-              <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+              <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2">
                 {deleteError}
-              </div>
+              </FormError>
             )}
             <div className="flex justify-end gap-2">
               <button
@@ -587,6 +634,17 @@ function VLANDetail({
   routerId: string;
   onDeleted: () => void;
 }) {
+  // #1340 — a read-only user is offered no write it would be refused:
+  // the router asks write (delete) on 'vlan'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "vlan"),
+    "Requires write permission on VLANs",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "vlan"),
+    "Requires delete permission on VLANs",
+  );
   const qc = useQueryClient();
   const [showEdit, setShowEdit] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -613,10 +671,7 @@ function VLANDetail({
       onDeleted();
     },
     onError: (err: unknown) => {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to delete VLAN";
-      setDeleteError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setDeleteError(formatApiError(err, "Failed to delete VLAN"));
     },
   });
 
@@ -635,13 +690,18 @@ function VLANDetail({
           </h1>
         </div>
         <div className="flex items-center gap-2">
-          <HeaderButton icon={Pencil} onClick={() => setShowEdit(true)}>
+          <HeaderButton
+            icon={Pencil}
+            onClick={() => setShowEdit(true)}
+            {...writeGate}
+          >
             Edit
           </HeaderButton>
           <HeaderButton
             variant="destructive"
             icon={Trash2}
             onClick={() => setConfirmDelete(true)}
+            {...deleteGate}
           >
             Delete
           </HeaderButton>
@@ -742,11 +802,13 @@ function VLANDetail({
             ) : (
               <p className="text-sm">
                 Delete VLAN <strong>{vlan.vlan_id}</strong> ({vlan.name})? No
-                subnets currently reference it.
+                live subnets reference it. It cannot be deleted while a subnet
+                in the Trash still carries it (its restore would come back
+                without the VLAN) or while an E911 location binding names it.
               </p>
             )}
             {deleteError && (
-              <p className="text-sm text-destructive">{deleteError}</p>
+              <FormError className="text-sm">{deleteError}</FormError>
             )}
             <div className="flex justify-end gap-2">
               <button
@@ -812,7 +874,7 @@ function CreateRouterModal({ onClose }: { onClose: () => void }) {
   );
 }
 
-function EditRouterModal({
+export function EditRouterModal({
   router,
   onClose,
 }: {
@@ -820,13 +882,45 @@ function EditRouterModal({
   onClose: () => void;
 }) {
   const qc = useQueryClient();
+  // Read the router when Edit opens and send only what changed (#3869): the
+  // page's copy may predate another client's edit.
+  const fresh = useFreshRow<Router>(router, () =>
+    vlansApi.getRouter(router.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Router"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={onClose}
+      />
+    );
+  if (!fresh.ready || !fresh.row) return null;
+  const base = fresh.row;
   return (
     <RouterFormModal
-      title={`Edit ${router.name}`}
-      initial={router}
+      title={`Edit ${base.name}`}
+      initial={base}
       onClose={onClose}
       onSubmit={async (data) => {
-        await vlansApi.updateRouter(router.id, data);
+        const diff = changedFields(
+          {
+            name: base.name,
+            description: base.description,
+            location: base.location,
+            management_ip: base.management_ip,
+            vendor: base.vendor,
+            model: base.model,
+            notes: base.notes,
+          },
+          data,
+        );
+        if (Object.keys(diff).length === 0) {
+          onClose();
+          return;
+        }
+        await vlansApi.updateRouter(router.id, diff);
         qc.invalidateQueries({ queryKey: ["vlans", "routers"] });
         qc.invalidateQueries({ queryKey: ["vlans", "router", router.id] });
         onClose();
@@ -874,10 +968,7 @@ function RouterFormModal({
         notes,
       });
     } catch (e: unknown) {
-      const msg =
-        (e as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to save";
-      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setError(formatApiError(e, "Failed to save"));
     } finally {
       setSubmitting(false);
     }
@@ -940,7 +1031,7 @@ function RouterFormModal({
             onChange={(e) => setNotes(e.target.value)}
           />
         </Field>
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
         <div className="flex justify-end gap-2 pt-2">
           <button
             onClick={onClose}
@@ -987,7 +1078,7 @@ function CreateVLANModal({
   );
 }
 
-function EditVLANModal({
+export function EditVLANModal({
   vlan,
   routerId,
   onClose,
@@ -997,17 +1088,42 @@ function EditVLANModal({
   onClose: () => void;
 }) {
   const qc = useQueryClient();
+  // Read the VLAN when Edit opens and send only what changed (#3869).
+  const fresh = useFreshRow<VLAN>(vlan, () => vlansApi.getVlan(vlan.id));
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit VLAN"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={onClose}
+      />
+    );
+  if (!fresh.ready || !fresh.row) return null;
+  const base = fresh.row;
   return (
     <VLANFormModal
-      title={`Edit VLAN ${vlan.vlan_id}`}
-      initial={vlan}
+      title={`Edit VLAN ${base.vlan_id}`}
+      initial={base}
       onClose={onClose}
       onSubmit={async (data) => {
-        await vlansApi.updateVlan(vlan.id, {
-          vlan_id: Number(data.vlan_id),
-          name: data.name,
-          description: data.description,
-        });
+        const diff = changedFields(
+          {
+            vlan_id: base.vlan_id,
+            name: base.name,
+            description: base.description,
+          },
+          {
+            vlan_id: Number(data.vlan_id),
+            name: data.name,
+            description: data.description,
+          },
+        );
+        if (Object.keys(diff).length === 0) {
+          onClose();
+          return;
+        }
+        await vlansApi.updateVlan(vlan.id, diff);
         qc.invalidateQueries({ queryKey: ["vlans", routerId] });
         qc.invalidateQueries({ queryKey: ["vlans", "vlan", vlan.id] });
         onClose();
@@ -1052,10 +1168,7 @@ function VLANFormModal({
     try {
       await onSubmit({ vlan_id: n, name: name.trim(), description });
     } catch (e: unknown) {
-      const msg =
-        (e as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to save";
-      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setError(formatApiError(e, "Failed to save"));
     } finally {
       setSubmitting(false);
     }
@@ -1087,7 +1200,7 @@ function VLANFormModal({
             onChange={(e) => setDescription(e.target.value)}
           />
         </Field>
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
         <div className="flex justify-end gap-2 pt-2">
           <button
             onClick={onClose}

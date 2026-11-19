@@ -18,6 +18,7 @@ from sqlalchemy.pool import NullPool
 
 from app.celery_app import celery_app
 from app.config import settings as _app_settings
+from app.db import task_connect_args
 from app.services.event_delivery import process_due_outbox
 
 logger = structlog.get_logger(__name__)
@@ -48,7 +49,9 @@ def process_event_outbox(self: object) -> dict[str, object]:  # type: ignore[typ
     """
 
     async def _run() -> dict[str, int]:
-        engine = create_async_engine(_app_settings.database_url, poolclass=NullPool)
+        engine = create_async_engine(
+            _app_settings.database_url, poolclass=NullPool, connect_args=task_connect_args()
+        )
         try:
             async with AsyncSession(engine, expire_on_commit=False) as session:
                 return await process_due_outbox(session)

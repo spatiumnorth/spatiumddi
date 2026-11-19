@@ -101,7 +101,6 @@ async def test_heartbeat_wrong_session_token_is_rejected(
 async def test_unknown_appliance_uuid_is_rejected(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    # Module must be enabled or the endpoint 404s for an unrelated reason.
     await _approved_appliance(db_session)
     r = await client.post(
         "/api/v1/appliance/supervisor/heartbeat",

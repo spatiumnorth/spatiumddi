@@ -14,7 +14,10 @@ Design rules the commit path enforces:
 2. **Same address family.** Output children inherit the parent's family.
 3. **Children inherit the parent's metadata.** ``vlan_id`` /
    ``vxlan_id`` / ``vlan_ref_id`` / ``custom_fields`` / ``tags`` /
-   DDNS / DHCP / DNS group settings / ``router_zone_id`` / ``status``.
+   DDNS / DHCP / DNS group settings / ``router_zone_id`` / ``status``,
+   plus the compliance / discovery / ownership settings in
+   ``subnet_carry.CARRIED_COLUMNS`` / ``UNION_FLAGS`` (PCI / HIPAA
+   scope, internet-facing, role, do-not-probe, kind, customer, site …).
    ``name`` / ``description`` are not inherited — children get an
    empty name (operator can rename).
 4. **Default-named placeholder rows are recreated at child boundaries.**
@@ -65,6 +68,18 @@ from app.models.dhcp import (
 )
 from app.models.ipam import IPAddress, Subnet, SubnetDomain
 from app.services.dhcp.config_bundle import build_config_bundle
+from app.services.ipam.subnet_boundary import (
+    boundary_addresses,
+    boundary_host_conflicts,
+    ensure_boundary_rows,
+)
+from app.services.ipam.subnet_carry import NOT_CARRIED_PROVENANCE, split_inherited
+from app.services.ipam.subnet_dependents import (
+    carry_for_split,
+    load_dependents,
+    split_warnings,
+)
+from app.services.ipam.subnet_placeholders import registry_referenced_ip_ids
 
 logger = structlog.get_logger(__name__)
 
@@ -411,6 +426,33 @@ async def preview_subnet_split(
                 )
             )
 
+    # Hosts that would land on a child's network or broadcast address
+    # (#2415). The commit leaves such a row where it is and skips the
+    # child's placeholder, so the host would sit on an address no client
+    # can use. network / broadcast rows are the placeholders themselves
+    # (or an operator's renamed one, which survives by design) — only a
+    # row with another status is a host.
+    # A host already on the parent's own network address (a subnet created
+    # with skip_auto_addresses, or an IPv6 one from before #506) stays where
+    # it was: existing data, not a boundary the split creates.
+    for detail in boundary_host_conflicts(
+        addr_rows,
+        children_nets,
+        kind=subnet.kind,
+        already=boundary_addresses(parent, subnet.kind),
+    ):
+        conflicts.append(
+            SplitConflict(
+                type="host_on_child_boundary",
+                detail=detail.replace(" first.", " before splitting."),
+            )
+        )
+
+    warnings.append(
+        f"Hosts move into children with a /{new_prefix_length} netmask; "
+        "every client on the parent must be reconfigured with that netmask."
+    )
+
     # Warning when active leases would be impacted — they survive (the
     # FK is to scope, not subnet, and the scope rebinds), but operators
     # should know.
@@ -432,12 +474,20 @@ async def preview_subnet_split(
                 "their lease IP."
             )
 
+    if any(getattr(subnet, c) for c in NOT_CARRIED_PROVENANCE):
+        warnings.append(
+            "The parent is owned by an integration or was imported; the children "
+            "are new rows and do not carry that ownership or import provenance."
+        )
+
     if domain_rows:
         warnings.append(
             f"{len(domain_rows)} DNS zone binding(s) on the parent will be "
             "duplicated onto each child. Each child keeps the same primary "
             "and additional zones."
         )
+
+    warnings.extend(split_warnings(await load_dependents(db, [subnet.id]), list(children_nets)))
 
     return SubnetSplitPreview(
         parent_cidr=str(parent),
@@ -531,6 +581,7 @@ async def commit_subnet_split(
         status=subnet.status,
         custom_fields=dict(subnet.custom_fields or {}),
         tags=dict(subnet.tags or {}),
+        **split_inherited(subnet),
     )
 
     # Build the children. We don't recompute total_ips / utilization at
@@ -581,15 +632,23 @@ async def commit_subnet_split(
         .scalars()
         .all()
     )
-    parent_boundary_ips = {str(parent.network_address)}
-    if isinstance(parent, ipaddress.IPv4Network) and parent.prefixlen <= 30:
-        parent_boundary_ips.add(str(parent.broadcast_address))
+    parent_boundary_ips = boundary_addresses(parent)
+
+    # A boundary row a registry record (E911 binding, device) is keyed to is the
+    # operator's: it moves to its child instead of being deleted (#3899).
+    registry_kept = await registry_referenced_ip_ids(
+        db, [r.id for r in addr_rows if str(r.address) in parent_boundary_ips]
+    )
 
     deleted_default_count = 0
     moved_count = 0
     for row in addr_rows:
         addr_str = str(row.address)
-        if addr_str in parent_boundary_ips and _is_default_placeholder(row):
+        if (
+            addr_str in parent_boundary_ips
+            and row.id not in registry_kept
+            and _is_default_placeholder(row)
+        ):
             await db.delete(row)
             deleted_default_count += 1
             continue
@@ -612,40 +671,13 @@ async def commit_subnet_split(
     # Recreate default-named placeholders on each child.
     placeholders_created = 0
     for cnet, child in zip(children_nets, new_children, strict=True):
-        if cnet.prefixlen >= 31:
-            # /31 / /32 / /127 / /128 — no placeholders.
-            continue
-        existing = (
-            (await db.execute(select(IPAddress.address).where(IPAddress.subnet_id == child.id)))
-            .scalars()
-            .all()
+        placeholders_created += await ensure_boundary_rows(
+            db,
+            child.id,
+            cnet,
+            current_user.id if current_user is not None else None,
+            kind=subnet.kind,
         )
-        existing_set = {str(a) for a in existing}
-        net_addr = str(cnet.network_address)
-        if net_addr not in existing_set:
-            db.add(
-                IPAddress(
-                    subnet_id=child.id,
-                    address=net_addr,
-                    status="network",
-                    description="Network address",
-                    created_by_user_id=(current_user.id if current_user is not None else None),
-                )
-            )
-            placeholders_created += 1
-        if isinstance(cnet, ipaddress.IPv4Network) and cnet.prefixlen <= 30:
-            bcast = str(cnet.broadcast_address)
-            if bcast not in existing_set:
-                db.add(
-                    IPAddress(
-                        subnet_id=child.id,
-                        address=bcast,
-                        status="broadcast",
-                        description="Broadcast address",
-                        created_by_user_id=(current_user.id if current_user is not None else None),
-                    )
-                )
-                placeholders_created += 1
     await db.flush()
 
     # Re-bind DHCP scopes. We use the same fits-cleanly arithmetic as
@@ -776,10 +808,13 @@ async def commit_subnet_split(
         # utilisation queries count subnets too.
         await _update_block_utilization(db, subnet.block_id)
 
-    # Finally, delete the parent. We delete via session.delete so the
-    # ondelete=RESTRICT FKs fire one last sanity check — anything we
-    # missed will surface here as a clean DB error rather than silent
-    # orphaning.
+    # Address sets, the OT zone and the SET NULL links follow the children
+    # (#3957): their FKs are CASCADE / SET NULL, so the delete below would
+    # otherwise take or cut them without a word.
+    await carry_for_split(db, subnet.id, list(children_nets), new_children)
+
+    # Finally, delete the parent. Nothing keyed to it is RESTRICT, so every
+    # row that should survive has to be carried above.
     await db.delete(subnet)
     await db.flush()
 

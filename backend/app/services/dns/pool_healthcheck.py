@@ -25,6 +25,7 @@ from dataclasses import dataclass
 import httpx
 import structlog
 
+from app.core.exc_text import describe_http_exc
 from app.models.dns import DNSPool, DNSPoolMember
 
 logger = structlog.get_logger(__name__)
@@ -187,7 +188,7 @@ async def _check_http(
     except httpx.TimeoutException:
         return CheckResult(healthy=False, error=f"http timeout ({timeout}s)")
     except (httpx.HTTPError, OSError) as exc:
-        return CheckResult(healthy=False, error=f"http error: {exc}")
+        return CheckResult(healthy=False, error=f"http error: {describe_http_exc(exc)}")
 
 
 @dataclass(frozen=True)

@@ -35,6 +35,7 @@ import {
 import {
   applianceApi,
   applianceSystemApi,
+  formatApiError,
   streamApplianceWorkloadLogs,
   versionApi,
   type ClusterDns,
@@ -45,6 +46,7 @@ import {
   type NodeStorage,
   type SelfApplianceInfo,
 } from "@/lib/api";
+import { pollUnlessRefused } from "@/lib/refusal";
 import {
   formatEta,
   mdChipLabel,
@@ -68,6 +70,12 @@ import {
   useClusterHealthStream,
   type HistPoint,
 } from "./clusterShared";
+import {
+  useApplianceAdminGate,
+  useCanReadApplianceLogs,
+} from "@/hooks/useApplianceAdmin";
+import { VarDiskWarning } from "./VarDiskWarning";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Cluster → Overview (#402 / #416) — one cohesive, near-real-time dashboard
@@ -846,6 +854,11 @@ function NodeCard({ node }: { node: ClusterNodeVitals }) {
             with neither, so a single-disk appliance is unchanged.
           */}
           <StorageRow storage={node.host_storage ?? null} />
+          {/*
+            #2400 — /var low or under the kubelet's eviction headroom, judged
+            by the evaluator that shares the appliance_disk_usage alert's warning and critical lines.
+          */}
+          <VarDiskWarning finding={node.var_disk_finding} compact />
         </div>
       </div>
     </div>
@@ -1085,11 +1098,39 @@ export function WorkloadHealth({
               <div className="flex shrink-0 items-center gap-3 text-muted-foreground">
                 {w.restarts > 0 && (
                   <span
-                    className="flex items-center gap-0.5 text-amber-600 dark:text-amber-400"
-                    title={`${w.restarts} restarts`}
+                    data-testid="restart-chip"
+                    className={
+                      (w.recent_restarts ?? 0) > 0
+                        ? "flex items-center gap-0.5 text-amber-600 dark:text-amber-400"
+                        : "flex items-center gap-0.5 text-muted-foreground/60"
+                    }
+                    title={
+                      (w.recent_restarts ?? 0) > 0
+                        ? `${w.recent_restarts} restarted in the last 15 min (${w.restarts} lifetime)`
+                        : `${w.restarts} lifetime restarts, none in the last 15 min`
+                    }
                   >
                     <RotateCcw className="h-3 w-3" />
                     {w.restarts}
+                  </span>
+                )}
+                {(w.findings?.length ?? 0) > 0 && (
+                  <span
+                    className="max-w-[16rem] truncate text-amber-600 dark:text-amber-400"
+                    title={(w.findings ?? [])
+                      .map(
+                        (f) =>
+                          `${f.instance}${f.node ? ` (${f.node})` : ""} ${f.detail}`,
+                      )
+                      .join("\n")}
+                  >
+                    {w.findings!.length === 1
+                      ? `${w.findings![0].instance} ${
+                          w.findings![0].kind === "not_ready"
+                            ? "not ready"
+                            : "not replicating"
+                        }`
+                      : `${w.findings!.length} instances unhealthy`}
                   </span>
                 )}
                 {w.jobs_running > 0 && (
@@ -1100,7 +1141,16 @@ export function WorkloadHealth({
                     +{w.jobs_running} job{w.jobs_running === 1 ? "" : "s"}
                   </span>
                 )}
-                <span className="tabular-nums text-foreground">
+                <span
+                  className="tabular-nums text-foreground"
+                  title={
+                    w.source === "cnpg"
+                      ? `ready ${w.ready} of ${w.total} wanted (from the CNPG Cluster)`
+                      : w.source === "pods"
+                        ? "pod count: the CNPG Cluster could not be read"
+                        : undefined
+                  }
+                >
                   {w.ready}/{w.total}
                 </span>
               </div>
@@ -1160,18 +1210,26 @@ function LiveLogPane({ workload }: { workload: string }) {
     setPaused(false);
     const ctrl = new AbortController();
     (async () => {
+      // The server ends a log stream periodically (it re-validates the
+      // session and the token's lifetime); reconnect without re-tailing
+      // so lines aren't repeated.
+      let tail = 200;
       try {
-        for await (const line of streamApplianceWorkloadLogs(
-          workload,
-          ctrl.signal,
-          200,
-        )) {
-          setLines((prev) => {
-            const next = [...prev, line];
-            // Cap at 2000 lines so a chatty pod doesn't blow up memory / DOM.
-            if (next.length > 2000) next.splice(0, next.length - 2000);
-            return next;
-          });
+        while (!ctrl.signal.aborted) {
+          for await (const line of streamApplianceWorkloadLogs(
+            workload,
+            ctrl.signal,
+            tail,
+          )) {
+            setLines((prev) => {
+              const next = [...prev, line];
+              // Cap at 2000 lines so a chatty pod doesn't blow up memory / DOM.
+              if (next.length > 2000) next.splice(0, next.length - 2000);
+              return next;
+            });
+          }
+          tail = 0;
+          await new Promise((r) => setTimeout(r, 2000));
         }
       } catch (e) {
         if (!ctrl.signal.aborted) {
@@ -1214,10 +1272,10 @@ function LiveLogPane({ workload }: { workload: string }) {
         )}
       </div>
       {error && (
-        <div className="flex items-start gap-2 rounded-md border border-destructive/50 bg-destructive/10 p-2 text-xs text-destructive">
+        <FormError className="flex items-start gap-2 rounded-md border border-destructive/50 bg-destructive/10 p-2 text-xs text-destructive">
           <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
           <span>{error}</span>
-        </div>
+        </FormError>
       )}
       <div
         ref={boxRef}
@@ -1243,6 +1301,11 @@ function LiveLogPane({ workload }: { workload: string }) {
 export function ClusterOverview({
   onViewPods,
 }: { onViewPods?: () => void } = {}) {
+  // #1342 — every appliance action takes `admin` on `appliance`.
+  const applianceGate = useApplianceAdminGate();
+  // The live log pane streams pod log text, which takes `admin` on
+  // `appliance`; it is not drawn for a read-only role.
+  const canReadLogs = useCanReadApplianceLogs();
   const { snapshot, history, connected } = useClusterHealthStream();
 
   // Identity + lifecycle for the header / reboot action (folds in the former
@@ -1252,7 +1315,7 @@ export function ClusterOverview({
     queryKey: ["appliance", "info"],
     queryFn: applianceApi.getInfo,
     staleTime: 20_000,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
   const { data: version } = useQuery({
     queryKey: ["version"],
@@ -1265,6 +1328,7 @@ export function ClusterOverview({
 
   const [confirmReboot, setConfirmReboot] = useState(false);
   const [rebooting, setRebooting] = useState(false);
+  const [rebootError, setRebootError] = useState<string | null>(null);
 
   // ── log workload picker — tail a deployment/daemonset by its component ──
   // The operator picks a stable workload (api / worker / frontend / …) and
@@ -1283,9 +1347,14 @@ export function ClusterOverview({
 
   const doReboot = async () => {
     setRebooting(true);
+    setRebootError(null);
     try {
       await applianceSystemApi.reboot();
       setConfirmReboot(false);
+    } catch (err) {
+      // A refused reboot (403, or the host runner unavailable) used to
+      // leave the dialog open with no word (#1342): say why instead.
+      setRebootError(formatApiError(err, "Reboot failed"));
     } finally {
       setRebooting(false);
     }
@@ -1571,36 +1640,41 @@ export function ClusterOverview({
       </div>
 
       {/* Live log pane */}
-      <div className="rounded-xl border bg-card p-4 shadow-sm">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <h3 className="flex items-center gap-1.5 text-sm font-semibold">
-            <ScrollText className="h-4 w-4 text-muted-foreground" />
-            Live log
-          </h3>
-          {workloadNames.length > 0 && (
-            <select
-              value={effectiveWorkload}
-              onChange={(e) => setSelectedWorkload(e.target.value)}
-              className="rounded-md border bg-background px-2 py-1 text-xs"
-            >
-              {workloadNames.map((n) => (
-                <option key={n} value={n}>
-                  {n}
-                </option>
-              ))}
-            </select>
-          )}
+      {canReadLogs && (
+        <div className="rounded-xl border bg-card p-4 shadow-sm">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h3 className="flex items-center gap-1.5 text-sm font-semibold">
+              <ScrollText className="h-4 w-4 text-muted-foreground" />
+              Live log
+            </h3>
+            {workloadNames.length > 0 && (
+              <select
+                value={effectiveWorkload}
+                onChange={(e) => setSelectedWorkload(e.target.value)}
+                className="rounded-md border bg-background px-2 py-1 text-xs"
+              >
+                {workloadNames.map((n) => (
+                  <option key={n} value={n}>
+                    {n}
+                  </option>
+                ))}
+              </select>
+            )}
+          </div>
+          <div className="mt-3">
+            {effectiveWorkload ? (
+              <LiveLogPane
+                key={effectiveWorkload}
+                workload={effectiveWorkload}
+              />
+            ) : (
+              <p className="text-xs text-muted-foreground">
+                No workloads to tail yet.
+              </p>
+            )}
+          </div>
         </div>
-        <div className="mt-3">
-          {effectiveWorkload ? (
-            <LiveLogPane key={effectiveWorkload} workload={effectiveWorkload} />
-          ) : (
-            <p className="text-xs text-muted-foreground">
-              No workloads to tail yet.
-            </p>
-          )}
-        </div>
-      </div>
+      )}
 
       {/* Action bar */}
       <div className="flex flex-wrap items-center gap-2">
@@ -1614,6 +1688,7 @@ export function ClusterOverview({
               : "Reboot is only available on appliance hosts"
           }
           className="inline-flex items-center gap-1.5 rounded-md border border-destructive/40 bg-background px-3 py-1.5 text-sm font-medium text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
+          {...applianceGate}
         >
           <Power className="h-3.5 w-3.5" />
           Reboot host
@@ -1638,12 +1713,19 @@ export function ClusterOverview({
             The host will power-cycle in ~10 seconds. Existing DHCP leases keep
             their state (DB-backed); DNS zones reload from the served config;
             the web UI will be unreachable for ~1 minute.
+            {rebootError && (
+              <span className="mt-2 block text-destructive">{rebootError}</span>
+            )}
           </span>
         }
         confirmLabel="Reboot now"
         tone="destructive"
         requireCheckboxLabel="I understand the appliance will go offline for ~1 minute."
-        onClose={() => !rebooting && setConfirmReboot(false)}
+        onClose={() => {
+          if (rebooting) return;
+          setRebootError(null);
+          setConfirmReboot(false);
+        }}
         onConfirm={() => void doReboot()}
         loading={rebooting}
       />

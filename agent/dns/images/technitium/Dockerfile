@@ -30,8 +30,8 @@
 #     --format '{{.Manifest.Digest}}'
 # and paste the result below. Both must move together — a mismatched pair
 # fails the pull outright rather than silently preferring one.
-ARG TECHNITIUM_VERSION=15.4.0
-ARG TECHNITIUM_DIGEST=sha256:df7d90ef0f7b6fff6916d291a7022cd902290cc31c3141d4158b6c375a641b41
+ARG TECHNITIUM_VERSION=15.6.2
+ARG TECHNITIUM_DIGEST=sha256:eb48ac5c135f4ab936b536f74f853d53e15ab39ef37fdbc9598a089b90d9f245
 ARG PYTHON_VERSION=3.12
 
 # Builder matches the RUNTIME's libc family (glibc/Debian), not Alpine —
@@ -181,3 +181,23 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30s \
 # "dev". Last, so a new version only rebuilds this layer.
 ARG APP_VERSION=dev
 ENV SPATIUM_AGENT_VERSION=${APP_VERSION}
+
+# #3913 — image metadata the OCI spec and Red Hat's preflight expect, plus the
+# project licence texts at /licenses. ``release`` is the image build number,
+# not the product version; ``version`` follows APP_VERSION from release.yml.
+ARG IMAGE_RELEASE=1
+COPY LICENSE NOTICE /licenses/
+LABEL name="dns-technitium" \
+      vendor="Spatium North Inc." \
+      version="${APP_VERSION:-dev}" \
+      release="${IMAGE_RELEASE}" \
+      summary="SpatiumDDI managed Technitium DNS server" \
+      description="Technitium DNS server with the SpatiumDDI agent, configured by the SpatiumDDI control plane." \
+      maintainer="Spatium North Inc. <https://www.spatiumddi.com/>" \
+      url="https://www.spatiumddi.com/" \
+      org.opencontainers.image.title="dns-technitium" \
+      org.opencontainers.image.vendor="Spatium North Inc." \
+      org.opencontainers.image.url="https://www.spatiumddi.com/" \
+      org.opencontainers.image.source="https://github.com/spatiumnorth/spatiumddi" \
+      org.opencontainers.image.documentation="https://www.spatiumddi.com/" \
+      org.opencontainers.image.licenses="Apache-2.0"

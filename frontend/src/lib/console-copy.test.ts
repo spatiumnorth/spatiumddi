@@ -34,6 +34,12 @@ const PHRASES: { re: RegExp; why: string }[] = [
     re: /\b(?:coming soon|not yet (?:implemented|supported|available))\b/i,
     why: "roadmap language",
   },
+  {
+    // #3114: four shipped features were each called roadmap or follow-up
+    // work in exactly these words.
+    re: /\b(?:is|are) on the roadmap\b|\broadmap items?\b|\(follow-up\)/i,
+    why: "roadmap language",
+  },
 ];
 
 /**
@@ -106,7 +112,9 @@ function sourceFiles(dir: string): string[] {
   return out;
 }
 
-describe("console copy (#1161)", () => {
+// These walk the whole source tree: about 2.5 s alone, but past vitest's
+// default 5 s under the full parallel run (#3165).
+describe("console copy (#1161)", { timeout: 30_000 }, () => {
   it("describes no shipped feature as future work", () => {
     const hits: string[] = [];
     for (const file of sourceFiles(SRC)) {

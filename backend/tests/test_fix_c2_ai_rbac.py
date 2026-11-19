@@ -11,7 +11,7 @@ each ``_apply_*`` (defense in depth).
 
 M1 (MEDIUM) — MCP ``tools/call`` read-only gating. ``mcp_post`` dispatched
 ANY registered tool by name (including ``propose_*`` writes) ignoring the
-read-only advertised set. The fix passes ``effective={read-only names}``
+read-only advertised set. The fix passes ``effective={MCP tool names}``
 so a read-scoped MCP caller can't invoke a write/propose tool.
 """
 
@@ -127,7 +127,7 @@ def test_core_write_ops_declare_a_gate() -> None:
     inline-superadmin ops (create_alert_rule, grant_temporary_access)
     gate inside their own apply instead and are excluded here."""
     expected = {
-        "create_ip_address": ("write", "ip_address"),
+        "create_ip_address": ("write", "subnet"),
         "allocate_subnet": ("write", "subnet"),
         "run_nmap_scan": ("write", "manage_nmap_scans"),
         "create_dns_record": ("write", "dns_record"),
@@ -138,6 +138,12 @@ def test_core_write_ops_declare_a_gate() -> None:
         "approve_appliance": ("admin", "appliance"),
         "assign_appliance_role": ("admin", "appliance"),
         "toggle_firewall_policy": ("admin", "appliance"),
+        "create_conformity_policy": ("admin", "conformity"),
+        "update_conformity_policy": ("admin", "conformity"),
+        "evaluate_conformity_policy": ("admin", "conformity"),
+        "create_multicast_domain": ("write", "multicast"),
+        "update_multicast_domain": ("write", "multicast"),
+        "delete_multicast_domain": ("delete", "multicast"),
     }
     for name, gate in expected.items():
         op = get_operation(name)
@@ -149,7 +155,7 @@ def test_core_write_ops_declare_a_gate() -> None:
 async def test_enforce_operation_permission_raises_for_viewer(db_session: AsyncSession) -> None:
     op = get_operation("create_ip_address")
     assert op is not None
-    # A bare user with no groups → no write on ip_address.
+    # A bare user with no groups → no write on subnet.
     viewer = await _user(db_session)
     with pytest.raises(OperationPermissionError):
         enforce_operation_permission(viewer, op)
@@ -186,13 +192,14 @@ async def test_apply_proposal_403_for_unprivileged_owner(db_session: AsyncSessio
 
 @pytest.mark.asyncio
 async def test_apply_proposal_succeeds_for_authorized_writer(db_session: AsyncSession) -> None:
-    """A user granted ('write','ip_address') — the same grant the REST
-    route requires — can apply the proposal and the row lands."""
+    """A user granted ('write','subnet') — the grant the REST address write
+    requires (#3058), which also passes the REST create's per-resource gate
+    on that subnet (#2934) — can apply the proposal and the row lands."""
     subnet = await _subnet(db_session)
     writer = await _user(
         db_session,
         name="ipam-editor",
-        permissions=[{"action": "write", "resource_type": "ip_address"}],
+        permissions=[{"action": "write", "resource_type": "subnet"}],
     )
     proposal = await _make_proposal(
         db_session,
@@ -272,7 +279,7 @@ async def test_mcp_tools_call_rejects_propose_tool(db_session: AsyncSession) -> 
         "method": "tools/call",
         "params": {"name": target, "arguments": {}},
     }
-    resp = await mcp_mod._dispatch_one(frame, db_session, user)
+    resp = await mcp_mod._dispatch_one(frame, db_session, user, token_scopes=[])
     assert "error" in resp, resp
     # -32601 = method not found (we deliberately mask disabled→not-found
     # so the existence of non-exposed tools doesn't leak).
@@ -303,7 +310,7 @@ async def test_mcp_tools_call_rejects_write_tool(db_session: AsyncSession) -> No
         "method": "tools/call",
         "params": {"name": write_names[0], "arguments": {}},
     }
-    resp = await mcp_mod._dispatch_one(frame, db_session, user)
+    resp = await mcp_mod._dispatch_one(frame, db_session, user, token_scopes=[])
     assert resp["error"]["code"] == mcp_mod._METHOD_NOT_FOUND
 
 
@@ -314,8 +321,9 @@ async def test_mcp_tools_list_excludes_write_and_propose(db_session: AsyncSessio
     advertised (single source of truth: _mcp_tools)."""
     user = await _user(db_session, superadmin=True, name="mcp2")
     frame = {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
-    resp = await mcp_mod._dispatch_one(frame, db_session, user)
+    resp = await mcp_mod._dispatch_one(frame, db_session, user, token_scopes=[])
     listed = {t["name"] for t in resp["result"]["tools"]}
     excluded = {t.name for t in REGISTRY.all() if t.writes or t.name.startswith("propose_")}
     assert listed.isdisjoint(excluded)
-    assert listed == mcp_mod._mcp_tool_names()
+    assert listed == {t.name for t in await mcp_mod._mcp_tools(db_session, user, token_scopes=[])}
+    assert listed <= await mcp_mod._mcp_tool_names(db_session, token_scopes=[])

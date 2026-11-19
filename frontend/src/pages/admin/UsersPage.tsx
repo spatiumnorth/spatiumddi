@@ -2,6 +2,11 @@ import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { ListReadError } from "@/components/ui/list-read-error";
 import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
+import {
   Plus,
   Pencil,
   Trash2,
@@ -13,50 +18,51 @@ import {
 } from "lucide-react";
 import {
   authProvidersApi,
+  formatApiError,
+  formatDialogError,
   usersApi,
   type AppUser,
-  type StepUp,
 } from "@/lib/api";
+import { apiErrorStatus } from "@/lib/refusal";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
-import { ReauthFields } from "@/components/ReauthFields";
+import { StepUpSection } from "@/components/StepUpSection";
+import { stepUpBody } from "@/lib/stepup";
+import { parsePasswordError } from "@/lib/password-policy";
+import { FormError } from "@/components/ui/form-error";
+
+/** A refused user dialog says what is wrong in words (#2435, #3040). */
+const userDialogError = formatDialogError;
+
+/**
+ * A password-policy refusal's rules (#3040): the 400's
+ * `{reason: "password_policy", errors: [...]}`, listed one per line as
+ * ChangePasswordPage lists them (#1004). Empty for any other refusal, which
+ * goes through userDialogError instead.
+ */
+function passwordPolicyErrors(err: unknown): string[] {
+  const detail = (err as { response?: { data?: { detail?: unknown } } })
+    ?.response?.data?.detail;
+  return detail && typeof detail === "object" && !Array.isArray(detail)
+    ? parsePasswordError(detail, "").fieldErrors
+    : [];
+}
+
+function PolicyErrorList({ errors }: { errors: string[] }) {
+  if (errors.length === 0) return null;
+  return (
+    <ul className="list-disc space-y-1 pl-5 text-xs text-destructive">
+      {errors.map((e) => (
+        <li key={e}>{e}</li>
+      ))}
+    </ul>
+  );
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
-
-function stepUpBody(password: string, totp: string): StepUp {
-  return { stepup_password: password || null, stepup_totp_code: totp || null };
-}
-
-/** #1355 — confirming yourself before handing out a credential that passes
- *  every later step-up (a superadmin, or a superadmin's password). */
-function StepUpSection({
-  reason,
-  password,
-  onPassword,
-  totp,
-  onTotp,
-}: {
-  reason: string;
-  password: string;
-  onPassword: (v: string) => void;
-  totp: string;
-  onTotp: (v: string) => void;
-}) {
-  return (
-    <div className="rounded-md border bg-amber-500/5 p-3">
-      <p className="mb-2 text-xs text-muted-foreground">{reason}</p>
-      <ReauthFields
-        password={password}
-        onPassword={onPassword}
-        totp={totp}
-        onTotp={onTotp}
-      />
-    </div>
-  );
-}
 
 function Field({
   label,
@@ -83,11 +89,21 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
   const [email, setEmail] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [password, setPassword] = useState("");
+  // #1291 — "" is a local account; a provider id pre-creates one that signs
+  // in through that provider, which its first sign-in claims. That is how a
+  // provider with auto-create off admits a new user.
+  const [providerId, setProviderId] = useState("");
   const [isSuperadmin, setIsSuperadmin] = useState(false);
   const [forceChange, setForceChange] = useState(true);
   const [stepPassword, setStepPassword] = useState("");
   const [stepTotp, setStepTotp] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [policyErrors, setPolicyErrors] = useState<string[]>([]);
+  const providers = useQuery({
+    queryKey: ["auth-providers"],
+    queryFn: authProvidersApi.list,
+  });
+  const external = providerId !== "";
 
   const mutation = useMutation({
     mutationFn: () =>
@@ -95,9 +111,9 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
         username,
         email,
         display_name: displayName,
-        password,
+        ...(external ? { auth_provider_id: providerId } : { password }),
         is_superadmin: isSuperadmin,
-        force_password_change: forceChange,
+        force_password_change: external ? false : forceChange,
         ...(isSuperadmin ? stepUpBody(stepPassword, stepTotp) : {}),
       }),
     onSuccess: () => {
@@ -105,10 +121,11 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
       onClose();
     },
     onError: (err: unknown) => {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to create user";
-      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      const rules = passwordPolicyErrors(err);
+      setPolicyErrors(rules);
+      setError(
+        rules.length ? null : userDialogError(err, "Failed to create user"),
+      );
     },
   });
 
@@ -138,14 +155,35 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
             onChange={(e) => setEmail(e.target.value)}
           />
         </Field>
-        <Field label="Password">
-          <input
+        <Field label="Signs in through">
+          <select
             className={inputCls}
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-          />
+            value={providerId}
+            onChange={(e) => setProviderId(e.target.value)}
+          >
+            <option value="">Local account (password)</option>
+            {(providers.data ?? []).map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name} ({p.type})
+              </option>
+            ))}
+          </select>
         </Field>
+        {external ? (
+          <p className="text-xs text-muted-foreground">
+            The account is claimed the first time this username signs in through
+            the provider, even with auto-create off. It has no password here.
+          </p>
+        ) : (
+          <Field label="Password">
+            <input
+              className={inputCls}
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+            />
+          </Field>
+        )}
         <div className="flex flex-col gap-2">
           <label className="flex cursor-pointer items-center gap-2 text-sm">
             <input
@@ -155,14 +193,16 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
             />
             Superadmin
           </label>
-          <label className="flex cursor-pointer items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={forceChange}
-              onChange={(e) => setForceChange(e.target.checked)}
-            />
-            Require password change on first login
-          </label>
+          {!external && (
+            <label className="flex cursor-pointer items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={forceChange}
+                onChange={(e) => setForceChange(e.target.checked)}
+              />
+              Require password change on first login
+            </label>
+          )}
         </div>
         {isSuperadmin && (
           <StepUpSection
@@ -173,7 +213,10 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
             onTotp={setStepTotp}
           />
         )}
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
+        <PolicyErrorList errors={policyErrors} />
         <div className="flex justify-end gap-2 pt-2">
           <button
             onClick={onClose}
@@ -184,12 +227,13 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
           <button
             onClick={() => {
               setError(null);
+              setPolicyErrors([]);
               mutation.mutate();
             }}
             disabled={
               !username ||
               !email ||
-              !password ||
+              (!external && !password) ||
               (isSuperadmin && !stepPassword && !stepTotp) ||
               mutation.isPending
             }
@@ -236,10 +280,7 @@ function EditUserModal({
       onClose();
     },
     onError: (err: unknown) => {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to update";
-      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setError(userDialogError(err, "Failed to update"));
     },
   });
 
@@ -279,6 +320,12 @@ function EditUserModal({
             />
             Active
           </label>
+          <p
+            className={`text-xs ${isActive ? "text-muted-foreground" : "text-amber-600 dark:text-amber-400"}`}
+          >
+            Disabling this account ends its sessions and revokes its API tokens.
+            Re-enabling it does not bring the tokens back; mint new ones.
+          </p>
         </div>
         {user.auth_source !== "local" && <ProviderLink user={user} />}
         {promoting && (
@@ -290,7 +337,9 @@ function EditUserModal({
             onTotp={setStepTotp}
           />
         )}
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
         <div className="flex justify-end gap-2 pt-2">
           <button
             onClick={onClose}
@@ -338,10 +387,7 @@ function ProviderLink({ user }: { user: AppUser }) {
       qc.invalidateQueries({ queryKey: ["users"] });
     },
     onError: (err: unknown) => {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to link";
-      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setError(userDialogError(err, "Failed to link"));
     },
   });
   // ``user`` is the modal's snapshot, so after a link read the provider
@@ -391,7 +437,9 @@ function ProviderLink({ user }: { user: AppUser }) {
           Linked. The next sign-in as {user.username} claims the account.
         </p>
       )}
-      {error && <p className="text-xs text-destructive">{error}</p>}
+      {error && (
+        <FormError className="text-xs text-destructive">{error}</FormError>
+      )}
     </div>
   );
 }
@@ -410,6 +458,7 @@ function ResetPasswordModal({
   const [stepPassword, setStepPassword] = useState("");
   const [stepTotp, setStepTotp] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [policyErrors, setPolicyErrors] = useState<string[]>([]);
   // The server asks for a step-up on an effective superadmin (flag or a
   // wildcard role), the caller's own account included.
   const needsStepUp = user.is_effective_superadmin ?? user.is_superadmin;
@@ -423,10 +472,11 @@ function ResetPasswordModal({
       ),
     onSuccess: onClose,
     onError: (err: unknown) => {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to reset password";
-      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      const rules = passwordPolicyErrors(err);
+      setPolicyErrors(rules);
+      setError(
+        rules.length ? null : userDialogError(err, "Failed to reset password"),
+      );
     },
   });
 
@@ -467,7 +517,10 @@ function ResetPasswordModal({
             onTotp={setStepTotp}
           />
         )}
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
+        <PolicyErrorList errors={policyErrors} />
         <div className="flex justify-end gap-2 pt-2">
           <button
             onClick={onClose}
@@ -478,6 +531,7 @@ function ResetPasswordModal({
           <button
             onClick={() => {
               setError(null);
+              setPolicyErrors([]);
               mutation.mutate();
             }}
             disabled={
@@ -512,6 +566,14 @@ function DeleteUserModal({
       qc.invalidateQueries({ queryKey: ["users"] });
       onClose();
     },
+    // 404: already gone (another tab or admin), which is what was asked for,
+    // so refresh the list and close. Any other refusal is shown (#2436).
+    onError: (err: unknown) => {
+      if (apiErrorStatus(err) === 404) {
+        qc.invalidateQueries({ queryKey: ["users"] });
+        onClose();
+      }
+    },
   });
 
   return (
@@ -522,6 +584,11 @@ function DeleteUserModal({
           <strong className="text-foreground">{user.username}</strong>? This
           cannot be undone.
         </p>
+        {mutation.isError && apiErrorStatus(mutation.error) !== 404 && (
+          <FormError className="text-xs text-destructive">
+            {formatApiError(mutation.error)}
+          </FormError>
+        )}
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}
@@ -545,6 +612,12 @@ function DeleteUserModal({
 // ── Main Page ─────────────────────────────────────────────────────────────────
 
 export function UsersPage() {
+  // #1341 — every write on this page takes a superadmin (its handlers
+  // take SuperAdmin), so a read-only user is offered none of them.
+  const superadminGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const [showCreate, setShowCreate] = useState(false);
   const [editUser, setEditUser] = useState<AppUser | null>(null);
   const [resetUser, setResetUser] = useState<AppUser | null>(null);
@@ -569,7 +642,8 @@ export function UsersPage() {
           </h1>
           <button
             onClick={() => setShowCreate(true)}
-            className="flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+            className="flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+            {...superadminGate}
           >
             <Plus className="h-3.5 w-3.5" />
             New User
@@ -637,9 +711,19 @@ export function UsersPage() {
                     )}
                   </td>
                   <td className="px-4 py-3">
-                    {user.is_superadmin ? (
-                      <span className="flex items-center gap-1 text-xs text-amber-600 dark:text-amber-400">
+                    {(user.is_effective_superadmin ?? user.is_superadmin) ? (
+                      <span
+                        className="flex items-center gap-1 text-xs text-amber-600 dark:text-amber-400"
+                        title={
+                          user.is_superadmin
+                            ? undefined
+                            : "Superadmin through a group's role (#1412)"
+                        }
+                      >
                         <ShieldCheck className="h-3.5 w-3.5" /> superadmin
+                        {!user.is_superadmin && (
+                          <span className="text-muted-foreground">(role)</span>
+                        )}
                       </span>
                     ) : (
                       <span className="flex items-center gap-1 text-xs text-muted-foreground">
@@ -684,8 +768,10 @@ export function UsersPage() {
                     <div className="flex items-center justify-end gap-1">
                       <button
                         onClick={() => setEditUser(user)}
-                        className="rounded p-1 text-muted-foreground hover:text-foreground"
+                        className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                         title="Edit"
+                        aria-label="Edit"
+                        {...superadminGate}
                       >
                         <Pencil className="h-3.5 w-3.5" />
                       </button>
@@ -694,8 +780,10 @@ export function UsersPage() {
                       {user.auth_source === "local" && (
                         <button
                           onClick={() => setResetUser(user)}
-                          className="rounded p-1 text-muted-foreground hover:text-foreground"
+                          className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                           title="Reset password"
+                          aria-label="Reset password"
+                          {...superadminGate}
                         >
                           <KeyRound className="h-3.5 w-3.5" />
                         </button>
@@ -703,8 +791,10 @@ export function UsersPage() {
                       {user.locked && <UnlockButton userId={user.id} />}
                       <button
                         onClick={() => setDeleteUser(user)}
-                        className="rounded p-1 text-muted-foreground hover:text-destructive"
+                        className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                         title="Delete"
+                        aria-label="Delete"
+                        {...superadminGate}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>

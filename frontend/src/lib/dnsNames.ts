@@ -16,6 +16,8 @@
  * silently converted, since the browser can't run IDNA reliably.
  */
 
+import { parseSecondsInput } from "./seconds";
+
 export const MAX_LABEL_LEN = 63;
 export const MAX_NAME_LEN = 253;
 
@@ -58,13 +60,48 @@ export function hostnameError(name: string): string | null {
   return null;
 }
 
-/** Validate a DNS record owner (RFC 2181 — permits `_`, leftmost `*`, and `@`). */
-export function recordOwnerError(name: string): string | null {
+/**
+ * Whether `<hostname>.<zone>` fits a DNS name (issue #2072): at most 253
+ * characters of dotted presentation form (255 octets on the wire), the
+ * whole name and not just the hostname. Mirrors `name_in_zone_error` in
+ * `app/core/dns_names.py`.
+ */
+export function nameInZoneError(host: string, zone: string): string | null {
+  const h = host.trim().replace(/\.+$/, "");
+  const z = zone.trim().replace(/\.+$/, "");
+  if (!h || !z) return null;
+  const full = `${h}.${z}`;
+  if (full.length > MAX_NAME_LEN)
+    return `"${h.length > 40 ? h.slice(0, 37) + "..." : h}" in zone "${z}" makes a ${full.length}-character name; a DNS name holds at most ${MAX_NAME_LEN}. Shorten the hostname or choose another zone.`;
+  return null;
+}
+
+/**
+ * Validate a DNS record owner (RFC 2181 — permits `_`, leftmost `*`, and `@`).
+ * With the record's type and zone, a lone `<octet>/<prefix>` owner is also
+ * accepted for the RFC 2317 delegation NS / DS of a classless child (#4166).
+ * Mirror of `validate_record_owner` + `classless_owner_error`.
+ */
+export function recordOwnerError(
+  name: string,
+  recordType?: string,
+  zoneName?: string,
+): string | null {
   const raw = name.trim();
   if (raw === "" || raw === "@") return null; // apex
   if (CONTROL_RE.test(raw)) return "contains a control character";
   const body = raw.endsWith(".") ? raw.slice(0, -1) : raw;
   if (!body) return null;
+  if (CLASSLESS_LABEL_RE.test(body)) {
+    const zone = (zoneName ?? "").trim().replace(/\.+$/, "");
+    if (
+      zone &&
+      ["NS", "DS"].includes((recordType ?? "").toUpperCase()) &&
+      isClasslessReverse([body, ...zone.split(".")])
+    )
+      return null;
+    return `"${body}" holds a "/", which is only valid as the NS (or DS) delegating an RFC 2317 classless reverse zone, such as "64/26" in 2.0.192.in-addr.arpa`;
+  }
   const parts = body.split(".");
   for (let i = 0; i < parts.length; i++) {
     const part = parts[i];
@@ -84,13 +121,52 @@ export function recordOwnerError(name: string): string | null {
   return null;
 }
 
+const CLASSLESS_LABEL_RE = /^(\d{1,3})\/(\d{1,2})$/;
+
+/**
+ * RFC 2317 classless reverse zone (#4156): `<octet>/<prefix>.<1-3 octets>.in-addr.arpa`,
+ * the one place a `/` is legal in a zone name. Mirror of `_is_classless_reverse`
+ * (`app/core/dns_names.py`): the prefix must reach past the octets the parent
+ * labels already name (3 parents -> /25../32).
+ */
+export function isClasslessReverse(labels: string[]): boolean {
+  const l = labels.map((x) => x.toLowerCase());
+  if (l.length < 4 || l.length > 6) return false;
+  if (l[l.length - 2] !== "in-addr" || l[l.length - 1] !== "arpa") return false;
+  const m = CLASSLESS_LABEL_RE.exec(l[0]);
+  if (!m) return false;
+  const parents = l.slice(1, -2);
+  if (!parents.every((p) => /^\d{1,3}$/.test(p) && Number(p) <= 255))
+    return false;
+  const prefix = Number(m[2]);
+  return Number(m[1]) <= 255 && prefix > 8 * parents.length && prefix <= 32;
+}
+
+/**
+ * The target of an RFC 2317 CNAME in the parent zone (#4166): one numeric host
+ * label in front of a classless reverse name (`65.64/26.2.0.192.in-addr.arpa`).
+ * Mirror of `is_classless_cname_target`.
+ */
+export function isClasslessCnameTarget(target: string): boolean {
+  const t = target.trim();
+  const labels = (t.endsWith(".") ? t.slice(0, -1) : t).split(".");
+  return (
+    labels.length >= 5 &&
+    /^\d{1,3}$/.test(labels[0]) &&
+    Number(labels[0]) <= 255 &&
+    isClasslessReverse(labels.slice(1))
+  );
+}
+
 /** Validate an FQDN (zone name, domain-name option). Permits `_` labels. */
 export function fqdnError(name: string): string | null {
   const raw = name.trim();
   if (!raw) return "must not be empty";
   const body = raw.endsWith(".") ? raw.slice(0, -1) : raw;
   if (!body) return "must not be the root domain";
-  for (const label of body.split(".")) {
+  const parts = body.split(".");
+  if (isClasslessReverse(parts)) return null;
+  for (const label of parts) {
     if (!label) return "contains an empty label";
     if (!isAscii(label))
       return `label "${label}" must be ASCII (use its punycode xn-- form)`;
@@ -116,4 +192,83 @@ export function zoneKindForName(name: string): "forward" | "reverse" {
   const labels = name.trim().toLowerCase().split(".").filter(Boolean);
   const tree = labels.slice(-2).join(".");
   return tree === "in-addr.arpa" || tree === "ip6.arpa" ? "reverse" : "forward";
+}
+
+/**
+ * A list of zone names for one line of text, cut to the first `max` with a
+ * count of the rest: a subnet wider than a /24 has a reverse zone per /24
+ * (#1840), so a /17 has 128 and a plain join would fill the dialog.
+ */
+export function summarizeZoneNames(names: string[], max = 4): string {
+  if (names.length <= max) return names.join(", ");
+  return `${names.slice(0, max).join(", ")} + ${names.length - max} more`;
+}
+
+/** RFC 2181 §8: the largest TTL, and what the API accepts (#2073). */
+export const DNS_TTL_MAX = 2147483647;
+
+/**
+ * A TTL field's text as seconds (#2073 / #2074): `null` when blank, a reason
+ * string when it is not a whole number in 0..DNS_TTL_MAX. Never `parseInt`:
+ * it reads `"1h"` as 1 and `"1e3"` (a number input accepts it) as 1.
+ */
+export function parseTtlInput(
+  text: string,
+  bounds: { min: number; max: number } = { min: 0, max: DNS_TTL_MAX },
+): number | null | string {
+  return parseSecondsInput(text, bounds);
+}
+
+/** A DNS pool's TTL bounds: the API's `ge=1, le=86400` (`api/v1/dns/pools.py`). */
+export const POOL_TTL_BOUNDS = { min: 1, max: 86400 } as const;
+
+/** Whether a typed confirmation names the zone (trailing dot optional,
+ *  case-insensitive) — the same comparison the server makes. */
+export function confirmsZone(typed: string, zoneName: string): boolean {
+  const norm = (s: string) => s.trim().replace(/\.$/, "").toLowerCase();
+  return typed.trim() !== "" && norm(typed) === norm(zoneName);
+}
+
+/** An IPv6 address written out in full (eight 4-digit hextets), or null when
+ *  it is not one this can expand (an embedded IPv4 tail, a malformed value). */
+function expandIpv6(ip: string): string | null {
+  const dblIdx = ip.indexOf("::");
+  let hextets: string[];
+  if (dblIdx === -1) {
+    hextets = ip.split(":");
+  } else {
+    const left = ip.slice(0, dblIdx).split(":").filter(Boolean);
+    const right = ip
+      .slice(dblIdx + 2)
+      .split(":")
+      .filter(Boolean);
+    const fill = 8 - left.length - right.length;
+    if (fill < 0) return null;
+    hextets = [...left, ...Array(fill).fill("0"), ...right];
+  }
+  if (hextets.length !== 8) return null;
+  if (!hextets.every((h) => /^[0-9A-Fa-f]{1,4}$/.test(h))) return null;
+  return hextets.map((h) => h.padStart(4, "0")).join(":");
+}
+
+/** The owner name of the PTR record for `ip` (#3210): `22.0.168.192.in-addr.arpa`
+ *  for IPv4, the nibble form under `ip6.arpa` for IPv6. Null when `ip` is
+ *  neither. Mirror of `ipaddress.ip_address(ip).reverse_pointer`. */
+export function reversePointerName(ip: string): string | null {
+  if (ip.includes(":")) {
+    const full = expandIpv6(ip);
+    if (full === null) return null;
+    return (
+      full.replace(/:/g, "").toLowerCase().split("").reverse().join(".") +
+      ".ip6.arpa"
+    );
+  }
+  const octets = ip.split(".");
+  if (
+    octets.length !== 4 ||
+    !octets.every((o) => /^\d{1,3}$/.test(o) && Number(o) <= 255)
+  ) {
+    return null;
+  }
+  return `${octets.reverse().join(".")}.in-addr.arpa`;
 }

@@ -84,11 +84,13 @@ ENCRYPTED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("bgp_lg_peer", "id", "md5_password_encrypted"),
     ("cloud_endpoint", "id", "credentials_encrypted"),
     ("dhcp_server", "id", "credentials_encrypted"),
+    ("dhcp_server_group", "id", "ha_peer_credential_encrypted"),
     ("dns_server", "id", "api_key_encrypted"),
     ("dns_server", "id", "credentials_encrypted"),
     ("dns_server_group", "id", "tsig_key_secret_encrypted"),
     ("dns_tsig_key", "id", "secret_encrypted"),
     ("docker_host", "id", "client_key_encrypted"),
+    ("event_subscription", "id", "headers_encrypted"),
     ("event_subscription", "id", "secret_encrypted"),
     ("firewall_feed", "id", "token_encrypted"),
     ("fortinet_firewall", "id", "api_token_encrypted"),
@@ -209,25 +211,51 @@ class RewrapOutcome:
     aborted: bool = False
 
 
-def _fernet_from_keys(secret_key: str, credential_encryption_key: str) -> Fernet:
-    """Build a Fernet using the same precedence rules as
-    :func:`app.core.crypto._fernet`. ``credential_encryption_key``
-    wins when set + parseable; otherwise SHA-256 over
-    ``secret_key`` produces the 32-byte key material.
+class _KeyRing:
+    """Fernet-compatible view of a key pair, in :func:`app.core.crypto._fernet`
+    order: ``encrypt`` uses the first key, ``decrypt`` tries each."""
 
-    Raises :class:`ValueError` only when *neither* path yields a
-    usable key — in practice the SHA-256 fallback always works.
+    def __init__(self, *fernets: Fernet) -> None:
+        self._fernets = fernets
+
+    def encrypt(self, data: bytes) -> bytes:
+        return self._fernets[0].encrypt(data)
+
+    def decrypt(self, token: bytes) -> bytes:
+        for f in self._fernets:
+            try:
+                return f.decrypt(token)
+            except InvalidToken:
+                continue
+        raise InvalidToken
+
+
+def _fernet_from_keys(
+    secret_key: str, credential_encryption_key: str, *, defer_dedicated_writes: bool = False
+) -> _KeyRing:
+    """Build a key ring using the same precedence rules as
+    :func:`app.core.crypto._fernet`: a dedicated ``credential_encryption_key``
+    encrypts and is tried first, and the key derived from ``secret_key``
+    (SHA-256) is always a read fallback (#1358: values written before the
+    dedicated key was configured are still under it). With no usable
+    dedicated key the derived one does both. ``defer_dedicated_writes``
+    mirrors crypto.py during the rollout that introduced the dedicated key:
+    the derived key encrypts and the dedicated one is only read.
     """
+    digest = hashlib.sha256((secret_key or "").encode()).digest()
+    derived = Fernet(base64.urlsafe_b64encode(digest))
     raw = (credential_encryption_key or "").strip()
     if raw:
         try:
-            return Fernet(raw.encode())
+            dedicated = Fernet(raw.encode())
+            if defer_dedicated_writes:
+                return _KeyRing(derived, dedicated)
+            return _KeyRing(dedicated, derived)
         except (ValueError, Exception):  # noqa: BLE001
             # Mirrors crypto.py: malformed explicit key → fall back
             # to the derived key so the install still functions.
             pass
-    digest = hashlib.sha256((secret_key or "").encode()).digest()
-    return Fernet(base64.urlsafe_b64encode(digest))
+    return _KeyRing(derived)
 
 
 def _keys_identical(
@@ -236,16 +264,20 @@ def _keys_identical(
     dest_secret: str,
     dest_cred: str,
 ) -> bool:
-    """Return True when the source + destination Fernet keys would
-    produce identical decryption results. We compare the *derived*
-    32-byte key material — the explicit-credential-key path takes
-    precedence over the derived-from-secret_key path in both
-    crypto.py + _fernet_from_keys above, so the comparison must
-    match that precedence.
+    """Return True when the source + destination key rings would produce
+    identical decryption results, so there is nothing to rewrap.
+
+    The dedicated key takes precedence over the derived one (as in
+    crypto.py), but the derived key is also a read fallback whenever a
+    dedicated one is set (#1358), so two installs sharing a dedicated key but
+    not ``SECRET_KEY`` are NOT identical: values still under the old derived
+    key would be orphaned.
     """
-    source = (source_cred or "").strip() or _derived_b64(source_secret)
-    dest = (dest_cred or "").strip() or _derived_b64(dest_secret)
-    return source == dest
+    src_cred = (source_cred or "").strip()
+    dst_cred = (dest_cred or "").strip()
+    if src_cred or dst_cred:
+        return src_cred == dst_cred and _derived_b64(source_secret) == _derived_b64(dest_secret)
+    return _derived_b64(source_secret) == _derived_b64(dest_secret)
 
 
 def _derived_b64(secret_key: str) -> str:
@@ -253,7 +285,7 @@ def _derived_b64(secret_key: str) -> str:
     return base64.urlsafe_b64encode(digest).decode()
 
 
-def _rewrap_value(source: Fernet, dest: Fernet, ciphertext: bytes) -> tuple[bytes | None, str]:
+def _rewrap_value(source: _KeyRing, dest: _KeyRing, ciphertext: bytes) -> tuple[bytes | None, str]:
     """Decrypt ``ciphertext`` with the source key and re-encrypt
     with the destination key. Returns:
 
@@ -279,35 +311,55 @@ def _rewrap_value(source: Fernet, dest: Fernet, ciphertext: bytes) -> tuple[byte
         return None, f"failed:re-encrypt:{exc}"
 
 
-# Columns the exclude-secrets diagnostic scrub must NOT blank (#781).
+# Machine identity in the exclude-secrets diagnostic scrub.
 #
-# ``archive.py:_scrub_dump_text`` shares ENCRYPTED_COLUMNS as its
-# redaction list, so widening the rewrap list widened what a diagnostic
-# archive destroys. These columns are machine identity with no
-# re-entry path: blanking them yields an empty bytea that satisfies
-# NOT NULL, so a restore of such an archive SUCCEEDS and then
-# permanently breaks the install — ``ensure_ca`` returns the existing
-# row without regenerating, and every supervisor approval and cert
-# re-issue fails on ``decrypt_str(b"")`` forever, with no rotate
-# endpoint anywhere in the API.
+# These are scrubbed like every other secret, but NOT to an empty bytea:
+# that satisfies NOT NULL, so the restore succeeds and the install is then
+# broken for good — ``ensure_ca`` returns the existing row without
+# regenerating, and every approval fails on ``decrypt_str(b"")`` (#781).
+# Each is instead written in the shape its reader already treats as
+# "absent, regenerate":
 #
-# The bar is "can an operator put this back", not "is it important".
-# ``appliance_certificate.key_encrypted`` is deliberately NOT here even
-# though it is a private key: the Web-UI TLS cert has real recovery paths
-# (``POST /appliance/tls/upload`` and ``/csr`` + ``/import-cert``), and a
-# diagnostic archive that still carried it would defeat the point of
-# scrubbing. ``appliance_ca.key_encrypted`` has no equivalent — there is
-# no CA rotate endpoint anywhere in the API — which is what puts it here.
-NON_REDACTABLE_COLUMNS: frozenset[tuple[str, str]] = frozenset(
+# * ``appliance_ca`` rows are left out of the archive entirely. The CA is a
+#   lazily-created singleton, so ``ensure_ca`` mints a fresh one on the next
+#   approval; supervisors approved against the old CA re-key against it.
+# * The k3s join tokens, the cluster kubeconfig and a persistent pairing
+#   code's reveal are written as NULL — every reader tests ``is None``, the
+#   supervisor re-reports the kubeconfig and join token on its heartbeat,
+#   and a code with no reveal is simply not revealable.
+# * ``acme_client_account.account_key_encrypted`` is NOT NULL and keeps the
+#   empty-bytea placeholder; the ACME orchestrator mints a new account key
+#   (and re-registers) when it finds one empty.
+SCRUB_OMITTED_TABLES: frozenset[str] = frozenset({"appliance_ca"})
+
+SCRUB_NULLED_ENCRYPTED_COLUMNS: frozenset[tuple[str, str]] = frozenset(
     {
-        ("appliance_ca", "key_encrypted"),
         ("appliance", "k3s_join_token_encrypted"),
         ("appliance", "desired_k3s_join_token_encrypted"),
         ("appliance", "kubeconfig_encrypted"),
         ("pairing_code", "code_encrypted"),
-        ("acme_client_account", "account_key_encrypted"),
     }
 )
+
+
+# Stored digests of a credential. Not Fernet, so nothing above covers them,
+# and a digest of a low-entropy secret (a password, an 8-digit pairing code)
+# is as good as the secret to anyone holding the archive. ``"null"`` writes
+# NULL — what the reader treats as "no credential set". ``"unmatchable"``
+# writes a fresh value no credential hashes to, for NOT NULL / UNIQUE
+# columns: the token, session or code simply stops working (agents
+# re-bootstrap from their PSK on the resulting 401).
+SCRUB_CREDENTIAL_DIGEST_COLUMNS: dict[tuple[str, str], str] = {
+    ("user", "hashed_password"): "null",
+    ("appliance", "session_token_hash"): "null",
+    ("api_token", "token_hash"): "unmatchable",
+    ("user_session", "refresh_token_hash"): "unmatchable",
+    ("pairing_code", "code_hash"): "unmatchable",
+    ("acme_account", "password_hash"): "unmatchable",
+    ("dns_server", "agent_jwt_hash"): "unmatchable",
+    ("dhcp_server", "agent_token_hash"): "unmatchable",
+    ("looking_glass_collector", "agent_token_hash"): "unmatchable",
+}
 
 
 # Plaintext copies of a secret that an expand/contract migration has moved
@@ -320,27 +372,26 @@ LEGACY_PLAINTEXT_SECRET_COLUMNS: frozenset[tuple[str, str]] = frozenset(
     {
         # #1364 — moved to ``tsig_key_secret_encrypted``.
         ("dns_server_group", "tsig_key_secret"),
-        # #1502 — moved to ``url_encrypted`` / ``auth_header_encrypted``.
-        # Made nullable by that migration so the scrubber's NULL restores.
-        ("audit_forward_target", "url"),
-        ("audit_forward_target", "auth_header"),
-        ("platform_settings", "audit_forward_webhook_url"),
-        ("platform_settings", "audit_forward_webhook_auth_header"),
+        # #1579 — moved to ``headers_encrypted``. JSONB, not text, but
+        # the scrubber writes NULL for these columns either way, which
+        # a nullable JSONB column accepts.
+        ("event_subscription", "headers"),
     }
 )
 
 
 def redactable_columns() -> tuple[tuple[str, str, str], ...]:
-    """ENCRYPTED_COLUMNS minus the machine identity that cannot be re-entered.
+    """ENCRYPTED_COLUMNS the diagnostic scrub blanks to an empty bytea.
 
-    The diagnostic-export scrubber consumes this, not ENCRYPTED_COLUMNS
-    directly, so the rewrap list can grow without silently widening what
-    an "exclude secrets" archive destroys.
+    Every encrypted column is scrubbed; this is all of them except the
+    machine identity written as NULL or left out (see above), which takes
+    a different shape so the restored install regenerates it.
     """
     return tuple(
         (table, pk, column)
         for table, pk, column in ENCRYPTED_COLUMNS
-        if (table.strip('"'), column) not in NON_REDACTABLE_COLUMNS
+        if (table.strip('"'), column) not in SCRUB_NULLED_ENCRYPTED_COLUMNS
+        and table.strip('"') not in SCRUB_OMITTED_TABLES
     )
 
 
@@ -351,6 +402,7 @@ async def rewrap_secrets(
     source_credential_key: str,
     dest_secret_key: str,
     dest_credential_key: str,
+    dest_defer_dedicated_writes: bool = False,
 ) -> RewrapOutcome:
     """Walk every Fernet-encrypted column + every JSONB-embedded Fernet
     string, rewrapping each value from ``source`` to ``dest``.
@@ -370,7 +422,11 @@ async def rewrap_secrets(
         return outcome
 
     source_fernet = _fernet_from_keys(source_secret_key, source_credential_key)
-    dest_fernet = _fernet_from_keys(dest_secret_key, dest_credential_key)
+    dest_fernet = _fernet_from_keys(
+        dest_secret_key,
+        dest_credential_key,
+        defer_dedicated_writes=dest_defer_dedicated_writes,
+    )
 
     # asyncpg uses ``postgresql://`` (or ``postgres://``) URLs —
     # SQLAlchemy's ``postgresql+asyncpg://`` is unparseable. Strip
@@ -446,8 +502,8 @@ async def _rewrap_column(
     table: str,
     pk_col: str,
     enc_col: str,
-    source: Fernet,
-    dest: Fernet,
+    source: _KeyRing,
+    dest: _KeyRing,
     outcome: RewrapOutcome,
 ) -> None:
     """Rewrap every non-null value in one column. The whole
@@ -484,11 +540,20 @@ async def _rewrap_column(
             ciphertext = bytes(row[enc_col])
             new_value, status = _rewrap_value(source, dest, ciphertext)
             if status == "rewrapped":
-                await conn.execute(
-                    f"UPDATE {table} SET {enc_col} = $1 WHERE {pk_col} = $2",
+                # Compare-and-swap on the value read (#1358): the rotation
+                # runs with the stack up, so the app may have written a new
+                # credential since the SELECT. Overwriting it would silently
+                # put the OLD secret back; a value the app wrote is already
+                # under a key every reader has, so leaving it is correct.
+                updated = await conn.execute(
+                    f"UPDATE {table} SET {enc_col} = $1 WHERE {pk_col} = $2 AND {enc_col} = $3",
                     new_value,
                     pk,
+                    ciphertext,
                 )
+                if updated.endswith(" 0"):
+                    outcome.skipped_idempotent_rows += 1
+                    continue
                 outcome.rewrapped_rows += 1
             elif status == "idempotent":
                 outcome.skipped_idempotent_rows += 1
@@ -519,8 +584,8 @@ async def _rewrap_jsonb_field(
     *,
     conn: asyncpg.Connection,
     spec: JsonbSecret,
-    source: Fernet,
-    dest: Fernet,
+    source: _KeyRing,
+    dest: _KeyRing,
     outcome: RewrapOutcome,
 ) -> None:
     """Rewrap every Fernet string inside one JSONB column.
@@ -547,7 +612,7 @@ async def _rewrap_jsonb_field(
             doc = _decode_jsonb(row["doc"])
             if doc is None:
                 continue
-            mutated = False
+            mutated = 0
             for holder, key, ciphertext in _jsonb_secret_sites(spec, doc):
                 new_value, status = _rewrap_value(source, dest, ciphertext)
                 if status == "rewrapped":
@@ -556,8 +621,7 @@ async def _rewrap_jsonb_field(
                     # string literal.
                     assert new_value is not None
                     holder[key] = spec.prefix + new_value.decode("utf-8")
-                    mutated = True
-                    outcome.rewrapped_jsonb_fields += 1
+                    mutated += 1
                 elif status == "idempotent":
                     outcome.skipped_idempotent_rows += 1
                 else:
@@ -580,12 +644,21 @@ async def _rewrap_jsonb_field(
                         reason=status,
                     )
             if mutated:
-                await conn.execute(
+                # Compare-and-swap on the document read (#1358): the whole
+                # document is rewritten, so a concurrent edit to ANY field of
+                # it (not just the secret) would otherwise be reverted.
+                original = row["doc"]
+                updated = await conn.execute(
                     f"UPDATE {spec.table} SET {spec.column} = $1::jsonb "  # noqa: S608
-                    f"WHERE {spec.pk_col} = $2",
+                    f"WHERE {spec.pk_col} = $2 AND {spec.column}::jsonb = $3::jsonb",
                     json.dumps(doc),
                     row["pk"],
+                    original if isinstance(original, str) else json.dumps(original),
                 )
+                if updated.endswith(" 0"):
+                    outcome.skipped_idempotent_rows += mutated
+                else:
+                    outcome.rewrapped_jsonb_fields += mutated
 
 
 def _decode_jsonb(raw: Any) -> Any:

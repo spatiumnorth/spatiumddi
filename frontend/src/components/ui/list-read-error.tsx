@@ -1,3 +1,5 @@
+import type { ReactNode } from "react";
+
 import { isRefused, listReadErrorMessage } from "@/lib/refusal";
 import { cn } from "@/lib/utils";
 
@@ -27,5 +29,82 @@ export function ListReadError({
     >
       {listReadErrorMessage(error, what)}
     </span>
+  );
+}
+
+/**
+ * The one way a list page fills the spot where its empty-state copy goes
+ * (#1865). `error` is the list query's error: when the read failed, in
+ * particular when the server refused the reader (403), it renders
+ * {@link ListReadError} in place of `children`, since an empty-state sentence
+ * ("No VRFs yet.") over a list the reader may not see is false. With no
+ * error it renders `children` untouched, so a list that really is empty
+ * still says so.
+ *
+ * `filtered` (#2616) is for a list that holds rows but hides them all under
+ * a search, filter, chip or tag: "No VRFs yet." over a list the filter
+ * emptied is false, so it says the filter matches nothing instead, and
+ * offers `onClearFilters` when given. The "yet" copy stays for a list that
+ * is really empty.
+ *
+ * `hint` + `gate` (#3885) keep the "click the button" half of an empty state
+ * from a reader whose button is disabled.
+ *
+ * Wrap only the empty branch: the caller has already decided there are no
+ * rows to show.
+ */
+export function ListEmpty({
+  error,
+  what,
+  children,
+  className,
+  filtered = false,
+  onClearFilters,
+  hint,
+  gate,
+}: {
+  error: unknown;
+  what: string;
+  children: ReactNode;
+  /**
+   * A sentence that tells the reader to use a write button ("Click New X to
+   * add one."), drawn after `children` only when `gate` does not disable that
+   * button (#3885). Keep `children` true for every reader ("No X yet.").
+   */
+  hint?: ReactNode;
+  /** The `permissionGate(...)` the button named in `hint` spreads. */
+  gate?: { disabled?: boolean; title?: string };
+  className?: string;
+  /** A search, filter, chip or tag is active, so an empty result is not an empty list. */
+  filtered?: boolean;
+  onClearFilters?: () => void;
+}) {
+  if (error) {
+    return <ListReadError error={error} what={what} className={className} />;
+  }
+  if (filtered) {
+    return (
+      <span className={className}>
+        No {what} match the current search or filter.
+        {onClearFilters && (
+          <>
+            {" "}
+            <button
+              type="button"
+              onClick={onClearFilters}
+              className="text-primary underline hover:no-underline"
+            >
+              Clear filters
+            </button>
+          </>
+        )}
+      </span>
+    );
+  }
+  return (
+    <>
+      {children}
+      {hint && !gate?.disabled ? <> {hint}</> : null}
+    </>
   );
 }

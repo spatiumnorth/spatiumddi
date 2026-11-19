@@ -85,19 +85,65 @@ spec:
   # upgrade (#1313). ``keep`` only keeps it, and the database with it,
   # through a Helm-driven delete.
 
-  # #296 Phase A — PDB on by default (set in values.yaml). Suspended
-  # during a rolling-upgrade node's maintenance window — the api-side
-  # orchestrator stamps + clears
+  # #296 Phase A — PDB on whenever there is a replica (see #3204 below).
+  # Suspended during a rolling-upgrade node's maintenance window — the
+  # api-side orchestrator stamps + clears
   # ``spec.nodeMaintenanceWindow.inProgress``. Outside the upgrade flow
   # the PDB prevents accidental simultaneous primary eviction (e.g. a
   # manual ``kubectl drain`` of two nodes at once). Sprig's ``| default``
-  # treats ``false`` as falsy and would emit ``true``, so we read the
-  # value directly and require the user to set it in values.yaml.
-  enablePDB: {{ .Values.postgresql.cnpg.enablePDB }}
+  # treats ``false`` as falsy and would emit ``true``, so unset is told
+  # apart from an explicit ``false`` with ``kindIs "invalid"`` (null).
+  {{- /* #3204: unset (null) means "on when there is a replica": a single
+         instance has nothing to fail over to, and its PDB allows 0
+         disruptions, so ``kubectl drain`` of the node could never evict it.
+         An explicit true or false always wins. */}}
+  {{- $pdb := .Values.postgresql.cnpg.enablePDB }}
+  enablePDB: {{ if kindIs "invalid" $pdb }}{{ gt (int .Values.postgresql.cnpg.instances) 1 }}{{ else }}{{ $pdb }}{{ end }}
+  {{- if gt (int .Values.postgresql.cnpg.instances) 1 }}
+
+  # #2831: a rolling update reaches the primary last. With replicas,
+  # promote an updated one first instead of deleting the primary's pod
+  # under its clients (CNPG's default ``restart``: the smart shutdown
+  # refuses every new connection for the full ``smartShutdownTimeout``
+  # while the services' pooled sessions hold it). One instance keeps
+  # CNPG's default; see values.yaml.
+  primaryUpdateMethod: {{ .Values.postgresql.cnpg.primaryUpdateMethod | default "switchover" | quote }}
+  {{- end }}
+
+  # #2878: how long an instance's smart shutdown may turn new connections
+  # away before the instance manager fast-shuts it. One instance has no
+  # replica to switch to, so a spec change that rolls it (the Postgres
+  # limit a demote to one node moves, #2156) restarts it in place, and
+  # CNPG's default 180 s was the whole outage: the services' pooled
+  # sessions never end on their own. Rendered at every instance count, so
+  # a Cluster already carries it when a demote leaves it one instance.
+  smartShutdownTimeout: {{ .Values.postgresql.cnpg.smartShutdownTimeout }}
+  {{- if .Values.postgresql.cnpg.nodeLocalApiServer.enabled }}
+
+  # #3021: the instance pods reach the API server on their own node (see
+  # values.yaml). The kubernetes Service sends the primary's one long-lived
+  # API connection to any node's API server; when that node was the one
+  # lost, the primary's liveness isolation check failed on the replica on
+  # it and kubelet restarted the primary although it had lost no peer it
+  # needed. CNPG hands ``env`` to the instance pods; an explicit variable
+  # outranks the one kubelet injects for the kubernetes Service.
+  env:
+    - name: KUBERNETES_SERVICE_HOST
+      valueFrom:
+        fieldRef:
+          fieldPath: status.hostIP
+    - name: KUBERNETES_SERVICE_PORT
+      value: {{ .Values.postgresql.cnpg.nodeLocalApiServer.port | default 6443 | quote }}
+  {{- end }}
 
   postgresql:
     parameters:
-      {{- toYaml .Values.postgresql.cnpg.parameters | nindent 6 }}
+      {{- /* #2955 — an empty max_connections is derived from the pools. */}}
+      {{- $params := deepCopy .Values.postgresql.cnpg.parameters }}
+      {{- if not $params.max_connections }}
+      {{- $_ := set $params "max_connections" (include "spatiumddi.postgresMaxConnections" . | trim) }}
+      {{- end }}
+      {{- toYaml $params | nindent 6 }}
 
   bootstrap:
     initdb:
@@ -135,8 +181,9 @@ spec:
     storageClass: {{ . | quote }}
     {{- end }}
 
+  # #2955 — the memory limit holds the derived max_connections.
   resources:
-    {{- toYaml .Values.postgresql.resources | nindent 4 }}
+    {{- include "spatiumddi.postgresResources" . | nindent 4 }}
 
   {{- /* CNPG nests nodeSelector + tolerations + pod anti-affinity under
          spec.affinity. Inline the standard control-plane label merge from
@@ -171,6 +218,13 @@ spec:
     {{- if $mergedSel }}
     nodeSelector:
       {{- toYaml $mergedSel | nindent 6 }}
+    {{- end }}
+    {{- /* #3205 — "prefer this node, schedule elsewhere if it is full".
+           CNPG's spec.affinity carries nodeAffinity verbatim (a
+           corev1.NodeAffinity); the nodeSelector above stays the hard pin. */}}
+    {{- with (.Values.postgresql.affinity | default dict).nodeAffinity }}
+    nodeAffinity:
+      {{- toYaml . | nindent 6 }}
     {{- end }}
     {{- with .Values.postgresql.tolerations }}
     tolerations:

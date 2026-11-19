@@ -11,6 +11,7 @@ import {
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { cn } from "@/lib/utils";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Web UI source restriction (#285 Phase 6) + the cross-setting lockout
@@ -21,7 +22,13 @@ import { cn } from "@/lib/utils";
  * same reason: this card owns two acknowledgement paths whose failure mode is
  * that a modal never opens, which neither review nor ``tsc`` can see.
  */
-export function WebUIAccessCard() {
+export function WebUIAccessCard({
+  editDisabledReason,
+}: {
+  /** #1342 — set when the caller may not change Web UI access (it takes
+   *  `admin` on `appliance`): Edit… stays, disabled, with this reason. */
+  editDisabledReason?: string;
+} = {}) {
   const qc = useQueryClient();
   const { data: w } = useQuery({
     queryKey: ["firewall", "web-ui-access"],
@@ -105,7 +112,9 @@ export function WebUIAccessCard() {
           <button
             type="button"
             onClick={() => setEditing(true)}
-            className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
+            disabled={!!editDisabledReason}
+            title={editDisabledReason}
+            className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
           >
             Edit…
           </button>
@@ -291,9 +300,9 @@ function WebUIAccessModal({
           </label>
         )}
         {save.isError && (
-          <p className="text-xs text-destructive">
+          <FormError className="text-xs text-destructive">
             {formatApiError(save.error)}
-          </p>
+          </FormError>
         )}
         <div className="flex justify-end gap-2 pt-1">
           <button

@@ -1,60 +1,28 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 
-import { timeBoundGrantsApi, type TimeBoundGrantCreate } from "@/lib/api";
+import {
+  formatApiError,
+  timeBoundGrantsApi,
+  type TimeBoundGrantCreate,
+} from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { StepUpSection } from "@/components/StepUpSection";
+import { isStepUpRequired, stepUpBody } from "@/lib/stepup";
 import { ResourceIdPicker } from "@/components/ownership/ResourceIdPicker";
+import {
+  GRANT_ACTIONS,
+  GRANT_RESOURCE_TYPES,
+} from "@/lib/permissionVocabulary";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
 
-// Static action vocabulary (docs/PERMISSIONS.md → Actions). 'admin'
-// implies read/write/delete on the type.
-const ACTIONS = ["read", "write", "delete", "admin", "*"] as const;
-
-// Static resource_type vocabulary mirrored from docs/PERMISSIONS.md.
-// No server enumeration endpoint by design — keep this list in sync
-// with the spec table when new resource_types land.
-const RESOURCE_TYPES: string[] = [
-  "*",
-  "ip_space",
-  "ip_block",
-  "subnet",
-  "ip_address",
-  "address_set",
-  "vlan",
-  "vrf",
-  "asn",
-  "domain",
-  "dns_zone",
-  "dns_record",
-  "dns_group",
-  "dns_blocklist",
-  "dhcp_server",
-  "dhcp_scope",
-  "dhcp_pool",
-  "dhcp_static",
-  "dhcp_client_class",
-  "audit_log",
-  "user",
-  "group",
-  "role",
-  "auth_provider",
-  "custom_field",
-  "manage_ipam_templates",
-  "settings",
-  "api_token",
-  "acme_account",
-  "customer",
-  "site",
-  "provider",
-  "circuit",
-  "network_service",
-  "overlay_network",
-  "routing_policy",
-  "application_category",
-  "conformity",
-];
+// The same vocabulary the role editor offers (lib/permissionVocabulary), so a
+// grant the role editor can make can also be made temporary (#1631).
+const ACTIONS = GRANT_ACTIONS;
+const RESOURCE_TYPES: readonly string[] = GRANT_RESOURCE_TYPES;
 
 function Field({
   label,
@@ -100,6 +68,11 @@ export function CreateTimeBoundGrantModal({
   const [expiresAt, setExpiresAt] = useState<string>(defaultExpiry());
   const [reason, setReason] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
+  // #1412 — shown once the server says this change makes someone a
+  // superadmin; the dialog cannot work that out itself.
+  const [needsStepUp, setNeedsStepUp] = useState(false);
+  const [stepPassword, setStepPassword] = useState("");
+  const [stepTotp, setStepTotp] = useState("");
 
   const mutation = useMutation({
     mutationFn: () => {
@@ -113,6 +86,7 @@ export function CreateTimeBoundGrantModal({
         resource_id: resourceId.trim() || null,
         expires_at: iso,
         reason: reason.trim(),
+        ...(needsStepUp ? stepUpBody(stepPassword, stepTotp) : {}),
       };
       return timeBoundGrantsApi.create(payload);
     },
@@ -121,10 +95,12 @@ export function CreateTimeBoundGrantModal({
       onClose();
     },
     onError: (err: unknown) => {
-      const msg =
-        (err as { response?: { data?: { detail?: unknown } } })?.response?.data
-          ?.detail ?? "Failed to create grant";
-      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      if (isStepUpRequired(err)) {
+        setNeedsStepUp(true);
+        setError(null);
+        return;
+      }
+      setError(formatApiError(err, "Failed to create grant"));
     },
   });
 
@@ -196,7 +172,18 @@ export function CreateTimeBoundGrantModal({
           />
         </Field>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {needsStepUp && (
+          <StepUpSection
+            reason="A * on * grant makes every member of this group a superadmin until it expires. Confirm it's you to grant it."
+            password={stepPassword}
+            onPassword={setStepPassword}
+            totp={stepTotp}
+            onTotp={setStepTotp}
+          />
+        )}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
         <div className="flex justify-end gap-2 pt-2">
           <button
             onClick={onClose}
@@ -209,7 +196,12 @@ export function CreateTimeBoundGrantModal({
               setError(null);
               mutation.mutate();
             }}
-            disabled={!resourceType || !expiresAt || mutation.isPending}
+            disabled={
+              !resourceType ||
+              !expiresAt ||
+              mutation.isPending ||
+              (needsStepUp && !stepPassword && !stepTotp)
+            }
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {mutation.isPending ? "Granting…" : "Grant access"}

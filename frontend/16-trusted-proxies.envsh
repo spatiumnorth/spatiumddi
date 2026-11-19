@@ -1,0 +1,73 @@
+#!/bin/sh
+# Render FRONTEND_TRUSTED_PROXY_CIDRS into the two nginx fragments the
+# template interpolates (spatiumddi #1868):
+#
+#   * SPATIUM_REAL_IP_FROM   one ``set_real_ip_from <cidr>;`` per entry
+#   * SPATIUM_TRUSTED_GEO    one ``<cidr> 1;`` per entry, for the ``geo``
+#                            block that decides whether an X-Forwarded-Proto
+#                            header may be believed
+#
+# envsubst can substitute a variable but cannot repeat a directive once per
+# list element, so the lines are built here and handed over as two
+# multi-line variables. This file is SOURCED by the nginx entrypoint (the
+# .envsh suffix), so the exports reach the envsubst step that follows.
+#
+# FRONTEND_TRUSTED_PROXY_CIDRS names the operator's reverse proxy in FRONT of
+# this nginx (comma-separated CIDRs or addresses, ``*`` for any peer). It is
+# deliberately NOT the api's TRUSTED_PROXY_CIDRS. The two name different
+# hops: the api's peer is always this nginx, which the api's private-range
+# default already covers, while this nginx's peer is the browser or the
+# operator's proxy. Sharing one list forces both to trust the union, so the
+# frontend would trust the whole compose / pod network (and, for anyone who
+# had uncommented the api's private-range default, every private address),
+# letting a LAN client that reaches this nginx directly choose the address
+# the login throttle and audit rows record.
+#
+# UNSET or EMPTY means "trust no proxy", which is today's behaviour for a
+# direct install: nginx overwrites X-Real-IP / X-Forwarded-Proto from its own
+# TCP peer. See docs/deployment/REVERSE_PROXY.md.
+
+set -eu
+
+_spatium_real_ip_from=""
+_spatium_trusted_geo=""
+_spatium_nl='
+'
+
+_cidrs="${FRONTEND_TRUSTED_PROXY_CIDRS:-}"
+# Entries are written into nginx config, so accept only what an address or
+# CIDR can contain. Anything else (a ``;``, a newline, a brace, a hostname)
+# fails the container start, the way the api refuses to boot on a bad entry,
+# instead of rendering a config nginx would reject or one that smuggles a
+# directive in.
+_old_ifs="$IFS"
+set -f   # a bare * must reach the loop as a word, not as a glob
+IFS=','
+for _entry in $_cidrs; do
+    IFS="$_old_ifs"
+    # trim surrounding whitespace
+    _entry=$(printf '%s' "$_entry" | tr -d ' \t')
+    [ -n "$_entry" ] || { IFS=','; continue; }
+    if [ "$_entry" = "*" ]; then
+        _entries="0.0.0.0/0 ::/0"
+    else
+        case "$_entry" in
+            *[!0-9a-fA-F:./]*)
+                echo "16-trusted-proxies: FRONTEND_TRUSTED_PROXY_CIDRS entry '$_entry' is not an address or CIDR" >&2
+                exit 1
+                ;;
+        esac
+        _entries="$_entry"
+    fi
+    for _e in $_entries; do
+        _spatium_real_ip_from="${_spatium_real_ip_from}    set_real_ip_from ${_e};${_spatium_nl}"
+        _spatium_trusted_geo="${_spatium_trusted_geo}    ${_e} 1;${_spatium_nl}"
+    done
+    IFS=','
+done
+IFS="$_old_ifs"
+set +f
+
+SPATIUM_REAL_IP_FROM="${_spatium_real_ip_from}"
+SPATIUM_TRUSTED_GEO="${_spatium_trusted_geo}"
+export SPATIUM_REAL_IP_FROM SPATIUM_TRUSTED_GEO

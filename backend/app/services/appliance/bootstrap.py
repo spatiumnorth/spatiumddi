@@ -7,9 +7,8 @@ Runs on appliance api startup, and settles on ONE active
    a previous bootstrap) — re-deploy it to the TLS Secret, but ONLY if
    the Secret doesn't already hold exactly it. Handles the case where the
    Secret was wiped (fresh upgrade, factory reset) but the DB row
-   survived; nginx then reloads via the deployer. In the steady state
-   this is a no-op, because re-pushing an identical cert would still roll
-   the frontend via the rollout annotation.
+   survived; each frontend pod reloads nginx once the kubelet updates
+   its mounted copy (#1173). In the steady state this is a no-op.
 
 2. **No active row, but the TLS Secret already holds a usable cert** —
    adopt it (#767). On a fresh appliance, firstboot mints a self-signed
@@ -28,6 +27,7 @@ Runs on appliance api startup, and settles on ONE active
 
 from __future__ import annotations
 
+import asyncio
 import datetime as _dt
 import ipaddress
 import uuid
@@ -37,7 +37,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -48,7 +48,11 @@ from app.models.appliance import (
     CERT_SOURCE_UPLOADED,
     ApplianceCertificate,
 )
-from app.services.appliance.deployment import deploy_and_reload, read_deployed_cert
+from app.services.appliance.deployment import (
+    deploy_active_cert,
+    deploy_and_reload,
+    read_deployed_cert,
+)
 from app.services.appliance.tls import (
     TLSValidationError,
     _format_fingerprint,
@@ -69,9 +73,13 @@ async def ensure_self_signed_cert() -> None:
     """Idempotent: ensure an active cert exists + is materialised on disk.
 
     Path A — active row already exists:
-        Re-deploy the cert to the TLS Secret and roll the frontend so it
-        re-reads — but ONLY when the Secret doesn't already hold this
+        Re-deploy the cert to the TLS Secret (the frontend reloads it in
+        place) — but ONLY when the Secret doesn't already hold this
         exact cert. Covers wipe-of-Secret edge cases; a no-op otherwise.
+        The row is read and the Secret written under the reconcile
+        advisory lock (#4164), so a pod starting mid-roll cannot write a
+        stale copy over a cert a sibling just regenerated; a pod that
+        loses the lock does nothing and the periodic loops converge.
 
     Path B — no active row, but the TLS Secret holds a usable cert
     covering every desired SAN (the fresh-appliance case: firstboot
@@ -114,6 +122,24 @@ async def ensure_self_signed_cert() -> None:
     desired_sans = _desired_sans(hostname, ips, extra_sans)
 
     async with AsyncSessionLocal() as db:
+        # #4164 — the same advisory lock the reconcile loops take, held while
+        # the active row is read and (on the regenerate branch) replaced.
+        # Without it a pod starting during a roll read the active row, a
+        # sibling pod then committed a regenerated cert, and this pod
+        # PATCHed its stale copy over the Secret: the Web UI certificate
+        # flipped to the old one and back within a tick, and every member
+        # supervisor saw a certificate it had not pinned. A pod that loses
+        # the lock changes nothing; the reconcile loops converge on the
+        # active row (``sync_active_cert_to_secret`` re-checks every tick).
+        got = (
+            await db.execute(
+                text("select pg_try_advisory_xact_lock(:k)"), {"k": _CERT_RECONCILE_LOCK_KEY}
+            )
+        ).scalar()
+        if not got:
+            logger.info("appliance_cert_bootstrap_deferred", reason="reconcile-lock-held")
+            return
+
         active_row = (
             await db.execute(
                 select(ApplianceCertificate).where(ApplianceCertificate.is_active.is_(True))
@@ -138,18 +164,6 @@ async def ensure_self_signed_cert() -> None:
                 await _generate_activate_deploy(db, hostname, ips, extra_sans)
                 return
 
-            # Path A — replay the active cert to disk in case the volume
-            # was reset. Decrypts the key inside this function only; the
-            # plaintext never leaves the deployer's scope.
-            try:
-                key_pem = decrypt_str(active_row.key_encrypted)
-            except Exception as exc:  # noqa: BLE001
-                logger.error(
-                    "appliance_active_cert_decrypt_failed",
-                    cert_id=str(active_row.id),
-                    error=str(exc),
-                )
-                return
             if not covered:
                 logger.warning(
                     "appliance_active_cert_missing_sans",
@@ -157,34 +171,33 @@ async def ensure_self_signed_cert() -> None:
                     source=active_row.source,
                     missing=[s for s in desired_sans if not _sans_cover(active_row.sans_json, [s])],
                 )
-            # Only deploy when the Secret doesn't ALREADY hold exactly this
-            # cert (#767). Path A exists to recover a wiped Secret, not to
-            # re-push a cert that is already deployed — and re-pushing is
-            # not free: ``reload_frontend_nginx`` writes the
-            # ``tls-secret-checksum`` pod-template annotation, and on a
-            # fresh appliance that annotation does not exist yet (adoption
-            # deploys nothing), so setting it the first time is itself a
-            # template change and rolls the frontend. Observed live on the
-            # #767 test appliance: the first api restart after adoption
-            # rolled the frontend to a new ReplicaSet for no reason. An
-            # unchanged Secret means the mounted copy is already correct,
-            # so there is nothing for a reload to pick up.
-            if read_deployed_cert() == (active_row.cert_pem, key_pem):
+            cert_id, cert_name, cert_source = str(active_row.id), active_row.name, active_row.source
+            # End this transaction (releasing the lock) before the sync
+            # below takes it again in its own session.
+            await db.rollback()
+
+            # Path A — replay the active cert to the Secret in case it was
+            # wiped or reverted. Only deploys when the Secret doesn't
+            # ALREADY hold exactly this cert (#767; until #1173 a re-push
+            # also rolled the frontend). Shared with the periodic tick so
+            # the read-compare-patch is one locked step that re-reads the
+            # active row, never a copy this function read earlier.
+            result = await sync_active_cert_to_secret()
+            status = result.get("status")
+            if status == "in-sync":
                 logger.info(
                     "appliance_active_cert_already_deployed",
-                    cert_id=str(active_row.id),
-                    name=active_row.name,
-                    source=active_row.source,
+                    cert_id=cert_id,
+                    name=cert_name,
+                    source=cert_source,
                 )
-                return
-
-            deploy_and_reload(active_row.cert_pem, key_pem, name=active_row.name)
-            logger.info(
-                "appliance_active_cert_redeployed",
-                cert_id=str(active_row.id),
-                name=active_row.name,
-                source=active_row.source,
-            )
+            elif status == "deployed":
+                logger.info(
+                    "appliance_active_cert_redeployed",
+                    cert_id=cert_id,
+                    name=cert_name,
+                    source=cert_source,
+                )
             return
 
         # Path B — no active row. Before minting anything, try to ADOPT
@@ -194,8 +207,8 @@ async def ensure_self_signed_cert() -> None:
         # bootstraps, so the frontend nginx has been serving it since
         # its very first request — including on the "still initialising"
         # page the operator is looking at right now. Generating a rival
-        # cert here would swap it out, roll the frontend Deployment
-        # mid-boot, and force a SECOND browser trust prompt.
+        # cert here would swap it out mid-boot and force a SECOND browser
+        # trust prompt.
         if await _adopt_deployed_cert(db, desired_sans):
             return
 
@@ -208,7 +221,7 @@ async def _adopt_deployed_cert(db: AsyncSession, desired_sans: list[str]) -> boo
     Returns True when adoption succeeded — in which case the caller must
     NOT generate or deploy anything: the Secret already holds this cert,
     so there is deliberately no ``deploy_and_reload`` call (no Secret
-    PATCH, no rollout annotation bump, no frontend restart).
+    PATCH, so nothing for the frontend to reload).
 
     Returns False — leaving the caller to generate a fresh cert — when
     there is nothing to adopt: not on k8s, Secret absent, cert or key
@@ -276,7 +289,7 @@ async def _adopt_deployed_cert(db: AsyncSession, desired_sans: list[str]) -> boo
                 "this is the cert the OS wrote at first boot, kept so the "
                 "appliance presents one cert identity across the whole boot. "
                 "Replace it with an uploaded cert, a CSR-signed cert, or a "
-                "Let's Encrypt cert via the Appliance → Web UI Certificate tab."
+                "Let's Encrypt cert via Appliance → Fleet → Web UI Certificate."
             )
             if self_signed
             else (
@@ -285,7 +298,7 @@ async def _adopt_deployed_cert(db: AsyncSession, desired_sans: list[str]) -> boo
                 "database row — most likely a factory reset or a restore into "
                 "an empty schema. Recorded as operator-owned so nothing "
                 "auto-replaces it. It will NOT auto-renew: re-issue or "
-                "re-upload it via the Appliance → Web UI Certificate tab "
+                "re-upload it via Appliance → Fleet → Web UI Certificate "
                 "before it expires."
             )
         ),
@@ -332,8 +345,8 @@ async def _generate_activate_deploy(
         valid_to=info["valid_to"],
         notes=(
             "Auto-generated on first boot. Replace with an uploaded "
-            "cert, a CSR-signed cert, or a Let's Encrypt cert via the "
-            "Appliance → Web UI Certificate tab."
+            "cert, a CSR-signed cert, or a Let's Encrypt cert via "
+            "Appliance → Fleet → Web UI Certificate."
         ),
     )
     db.add(row)
@@ -359,6 +372,154 @@ async def _generate_activate_deploy(
 _CERT_RECONCILE_LOCK_KEY = 0x5350433727  # "SPC7c"-ish
 
 
+# Where the api records the certificate the TLS Secret holds, for the
+# ``secret_expiring`` alert (#1895). The alert is evaluated in the Celery
+# worker, whose ServiceAccount cannot read the Secret (#983 / #1445), so
+# the api — which reads it on every deploy tick anyway — publishes what it
+# saw here. The TTL makes a snapshot nobody refreshes (api down) expire
+# rather than describe the past; the alert then falls back to the stored
+# row, which is what it judged before #1895.
+SERVED_CERT_SNAPSHOT_KEY = "spatium:appliance:served-cert"
+_SERVED_CERT_SNAPSHOT_TTL = 300
+
+
+async def _write_served_cert_snapshot(cert_pem: str) -> None:
+    """Publish the served cert's fingerprint + expiry. Best-effort."""
+    import json  # noqa: PLC0415
+
+    from app.core.redis_client import make_async_redis  # noqa: PLC0415
+
+    try:
+        info = parse_pem_certificate(cert_pem)
+    except TLSValidationError:
+        return
+    payload = json.dumps(
+        {
+            "fingerprint_sha256": info.fingerprint_sha256,
+            "valid_to": info.valid_to.isoformat() if info.valid_to else None,
+        }
+    )
+    client = None
+    try:
+        client = make_async_redis(settings.redis_url, socket_connect_timeout=2, socket_timeout=2)
+        await client.set(SERVED_CERT_SNAPSHOT_KEY, payload, ex=_SERVED_CERT_SNAPSHOT_TTL)
+    except Exception as exc:  # noqa: BLE001 — advisory; the alert falls back
+        logger.warning("appliance_served_cert_snapshot_failed", error=str(exc))
+    finally:
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+async def read_served_cert_snapshot() -> tuple[_dt.datetime | None, str | None]:
+    """``(valid_to, sha256 fingerprint)`` of the cert the api last saw in
+    the TLS Secret, or ``(None, None)`` when there is no fresh snapshot
+    (not an appliance, api not running, Redis unreachable).
+
+    Readable from any process — the worker included — which is the point:
+    the worker cannot read the Secret itself.
+    """
+    import json  # noqa: PLC0415
+
+    from app.core.redis_client import make_async_redis  # noqa: PLC0415
+
+    client = None
+    try:
+        client = make_async_redis(settings.redis_url, socket_connect_timeout=2, socket_timeout=2)
+        raw = await client.get(SERVED_CERT_SNAPSHOT_KEY)
+    except Exception as exc:  # noqa: BLE001 — unknown, fall back to the row
+        logger.info("appliance_served_cert_snapshot_unreadable", error=str(exc))
+        return None, None
+    finally:
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception:  # noqa: BLE001
+                pass
+    if not raw:
+        return None, None
+    try:
+        data = json.loads(raw)
+        valid_to = _dt.datetime.fromisoformat(data["valid_to"]) if data.get("valid_to") else None
+        fingerprint = data.get("fingerprint_sha256") or None
+    except (ValueError, TypeError, KeyError):
+        return None, None
+    return valid_to, fingerprint
+
+
+async def sync_active_cert_to_secret() -> dict[str, object]:
+    """Deploy the active DB certificate into the TLS Secret when they differ.
+
+    The api-side half of #1895: ACME issuance / renewal runs in the Celery
+    worker, whose ServiceAccount cannot patch ``spatium-appliance-tls``, so
+    the worker commits the row and wakes the api, which calls this. Also
+    run on a periodic tick, so a missed wake only delays the deploy.
+
+    The active row is the source of truth, exactly as for the startup
+    bootstrap's Path A (which has always overwritten a Secret that differs
+    from it); this makes that reconcile continuous instead of once per api
+    start. A cert set by hand in the Secret is therefore replaced within a
+    tick — upload it under Appliance → Fleet → Web UI Certificate instead.
+
+    The Secret PATCH is the whole deploy: the frontend pods reload nginx
+    themselves when their mounted copy changes (#1173), so there is no
+    roll to start or to retry.
+
+    Idempotent: when the Secret already holds exactly the active cert + key
+    nothing is written. It shares the
+    advisory lock of ``reconcile_cluster_cert_sans`` (held for the whole
+    read-compare-patch), so N api replicas make one patch, and the SAN
+    reconcile cannot commit a regenerated cert between this reading the
+    active row and patching it.
+    """
+    if not settings.appliance_mode:
+        return {"status": "disabled"}
+
+    async with AsyncSessionLocal() as db:
+        # Transaction-scoped: held until this session's transaction ends,
+        # i.e. across the kubeapi calls below.
+        got = (
+            await db.execute(
+                text("select pg_try_advisory_xact_lock(:k)"), {"k": _CERT_RECONCILE_LOCK_KEY}
+            )
+        ).scalar()
+        if not got:
+            return {"status": "locked"}
+        active_row = (
+            await db.execute(
+                select(ApplianceCertificate).where(ApplianceCertificate.is_active.is_(True))
+            )
+        ).scalar_one_or_none()
+        if active_row is None or not active_row.cert_pem:
+            return {"status": "no-active-cert"}
+        try:
+            key_pem = decrypt_str(active_row.key_encrypted)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "appliance_active_cert_decrypt_failed",
+                cert_id=str(active_row.id),
+                error=str(exc),
+            )
+            return {"status": "decrypt-failed"}
+        cert_pem = active_row.cert_pem
+        name = active_row.name
+
+        # Blocking kubeapi round-trips: off the event loop (non-negotiable #2).
+        deployed = await asyncio.to_thread(read_deployed_cert)
+        if deployed is not None:
+            await _write_served_cert_snapshot(deployed[0])
+        if deployed == (cert_pem, key_pem):
+            return {"status": "in-sync"}
+
+        if not await asyncio.to_thread(deploy_active_cert, cert_pem, key_pem, name=name):
+            return {"status": "deploy-failed"}
+        await _write_served_cert_snapshot(cert_pem)
+        logger.info("appliance_active_cert_synced", cert_id=str(active_row.id), name=name)
+        return {"status": "deployed"}
+
+
 async def reconcile_cluster_cert_sans() -> dict[str, object]:
     """Grow the self-signed Web UI cert's SANs to cover every settled
     control-plane member (hostname + node IP) plus the control-plane VIP
@@ -367,18 +528,17 @@ async def reconcile_cluster_cert_sans() -> dict[str, object]:
     Only ever touches a **self-signed** active cert — an operator-uploaded
     or CSR-signed cert is left alone (the operator owns those SANs). SAN
     coverage only GROWS: a demoted node's SAN stays in the cert (harmless),
-    so a demote never rolls the frontend. Idempotent + coverage-gated, so
-    it's a cheap no-op once converged; on growth it regenerates the cert,
-    updates the ``spatium-appliance-tls`` Secret, and rolls the frontend
-    pods (via ``_generate_activate_deploy`` → ``deploy_and_reload``).
+    so a demote never changes the cert. Idempotent + coverage-gated, so
+    it's a cheap no-op once converged; on growth it regenerates the cert
+    and updates the ``spatium-appliance-tls`` Secret (via
+    ``_generate_activate_deploy`` → ``deploy_and_reload``), and every
+    frontend pod reloads nginx in place (#1173).
 
     Runs from a periodic api-side loop (main.lifespan); a per-transaction
     advisory lock keeps the api replicas from regenerating concurrently.
     """
     if not settings.appliance_mode:
         return {"status": "disabled"}
-
-    from sqlalchemy import text  # noqa: PLC0415
 
     from app.models.appliance import (  # noqa: PLC0415
         APPLIANCE_STATE_APPROVED,

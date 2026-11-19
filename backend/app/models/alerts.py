@@ -168,7 +168,8 @@ class AlertEvent(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # 40 chars accommodates the longest type today
     # (``network_service_resource`` = 25) with room for future families.
     subject_type: Mapped[str] = mapped_column(String(40), nullable=False)
-    subject_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    # 128: a conformity subject is "<policy>:<kind>:<target>", up to 89 (#2277).
+    subject_id: Mapped[str] = mapped_column(String(128), nullable=False)
     subject_display: Mapped[str] = mapped_column(String(500), nullable=False, default="")
 
     severity: Mapped[str] = mapped_column(String(10), nullable=False, default="warning")
@@ -200,13 +201,31 @@ class AlertEvent(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # Other rule types may write None.
     last_observed_value: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
+    # #2261 — set when an evaluator pass queues this event's delivery to run
+    # after its commit; cleared the moment a sender claims it. Still set long
+    # after the pass means the worker died between the commit and the send,
+    # and ``alerts.redeliver_stranded`` sends it. NULL for every event
+    # delivered inline, which the sweep ignores.
+    delivery_pending_since: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     __table_args__ = (
+        # #2261 — UNIQUE: at most one open event per (rule, subject). Two
+        # overlapping evaluator passes used to open a pair, and only one of
+        # the pair was ever resolved.
         Index(
             "ix_alert_event_rule_subject_open",
             "rule_id",
             "subject_type",
             "subject_id",
+            unique=True,
             postgresql_where=sa_text("resolved_at IS NULL"),
         ),
         Index("ix_alert_event_fired_at", "fired_at"),
+        Index(
+            "ix_alert_event_delivery_pending",
+            "delivery_pending_since",
+            postgresql_where=sa_text("delivery_pending_since IS NOT NULL"),
+        ),
     )

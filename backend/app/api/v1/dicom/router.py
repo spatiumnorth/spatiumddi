@@ -56,7 +56,7 @@ from sqlalchemy.orm import aliased
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ownership._audit import write_audit
-from app.core.permissions import require_resource_permission
+from app.core.permissions import require_permission, require_resource_permission
 from app.models.auth import User
 from app.models.dicom import (
     DICOM_AE_ROLES,
@@ -67,6 +67,7 @@ from app.models.dicom import (
     DICOMPeer,
 )
 from app.models.ipam import IPAddress, IPSpace
+from app.services.api_token_scopes import read_only_post
 from app.services.dicom.importer import (
     MAX_IMPORT_ROWS,
     DICOMImportError,
@@ -81,6 +82,7 @@ from app.services.dicom.registry import (
     sync_subnet_id,
 )
 from app.services.dicom.titles import AETitleError, is_vendor_default, validate_ae_title
+from app.services.ipam.live_address import get_live_address
 from app.services.tags import apply_tag_filter
 
 router = APIRouter(
@@ -526,7 +528,7 @@ async def _load_ip(db: AsyncSession, ip_address_id: uuid.UUID, user: User) -> IP
     """
     from app.api.v1.ipam.router import _enforce_subnet_token_scope  # noqa: PLC0415
 
-    ip = await db.get(IPAddress, ip_address_id)
+    ip = await get_live_address(db, ip_address_id)
     if ip is None:
         raise HTTPException(status_code=422, detail="ip_address_id not found")
     _enforce_subnet_token_scope(user, ip.subnet_id)
@@ -695,7 +697,9 @@ async def list_aes(
     )
     rows = (
         await db.execute(
-            stmt.order_by(DICOMApplicationEntity.ae_title.asc()).limit(limit).offset(offset)
+            stmt.order_by(DICOMApplicationEntity.ae_title.asc(), DICOMApplicationEntity.id)
+            .limit(limit)
+            .offset(offset)
         )
     ).all()
     return DICOMAEListResponse(
@@ -929,7 +933,7 @@ async def get_ae_by_address(ip_address_id: uuid.UUID, db: DB, user: CurrentUser)
     """
     from app.api.v1.ipam.router import _enforce_subnet_token_scope  # noqa: PLC0415
 
-    ip = await db.get(IPAddress, ip_address_id)
+    ip = await get_live_address(db, ip_address_id)
     if ip is None:
         raise HTTPException(
             status_code=404,
@@ -1119,7 +1123,14 @@ def _rows_out(plan: list[PlannedRow]) -> list[DICOMAEImportRow]:
     ]
 
 
-@router.post("/aes/import/preview", response_model=DICOMAEImportPreviewResponse)
+@router.post(
+    "/aes/import/preview",
+    response_model=DICOMAEImportPreviewResponse,
+    # ``@read_only_post`` relaxes the router gate to ``read``; an import
+    # preview still needs what the commit needs (#3302).
+    dependencies=[Depends(require_permission("write", "dicom_ae"))],
+)
+@read_only_post
 async def import_preview(
     body: DICOMAEImportRequest, db: DB, user: CurrentUser
 ) -> DICOMAEImportPreviewResponse:

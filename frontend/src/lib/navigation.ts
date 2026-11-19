@@ -25,6 +25,7 @@ import {
   HardDrive,
   Hash,
   History,
+  Info,
   Inbox,
   KeyRound,
   KeySquare,
@@ -123,7 +124,12 @@ export const baseMainNav: NavEntry[] = [
 // IPAM-family children (all route under /ipam/*). Alphabetised, matching the
 // Network/Administration sub-group convention.
 export const coreIpamNav: NavEntry[] = [
-  { label: "NAT Mappings", icon: Shuffle, to: "/ipam/nat" },
+  {
+    label: "NAT Mappings",
+    icon: Shuffle,
+    to: "/ipam/nat",
+    module: "ipam.nat",
+  },
   { label: "Stale IPs", icon: History, to: "/ipam/stale" },
   { label: "Subnet Planner", icon: Workflow, to: "/ipam/plans" },
 ];
@@ -143,8 +149,14 @@ export const dnsSectionNav: NavEntry[] = [
   // Domains is deliberately NOT gated on core.dns (#1068): a Domain is the
   // registrar / expiry / RDAP record for a name, which exists whether or not
   // SpatiumDDI serves a zone for it — an operator tracking renewals on names
-  // hosted elsewhere still wants this with DNS off.
-  { label: "Domains", icon: Earth, to: "/admin/domains" },
+  // hosted elsewhere still wants this with DNS off. It has its own module
+  // (#2325) because it is the one that makes off-prem RDAP lookups.
+  {
+    label: "Domains",
+    icon: Earth,
+    to: "/admin/domains",
+    module: "network.domains",
+  },
 ];
 
 // Operations — cross-cutting live telemetry.
@@ -487,6 +499,9 @@ export const footerNav: NavEntry[] = [
   { label: "Appliance", icon: Wrench, to: "/appliance" },
   { label: "Features & Integrations", icon: ToggleLeft, to: "/admin/features" },
   { label: "Settings", icon: Settings, to: "/settings" },
+  // #2895 — About: version, licence, NOTICE, third-party lists. The sidebar
+  // shows it as an icon in the footer's utility row; the palette lists it here.
+  { label: "About", icon: Info, to: "/about" },
 ];
 
 /**

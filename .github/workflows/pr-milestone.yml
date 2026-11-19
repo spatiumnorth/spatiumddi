@@ -1,0 +1,151 @@
+name: PR — Milestone
+
+# Every PR carries the milestone of the release it ships in, so the milestone
+# is a complete list of what a release contains. Nothing set it before this
+# workflow: only PRs someone milestoned by hand had one, and every PR merged
+# 15–24 October 2026 had none.
+#
+# - Opened / edited / reopened / ready: when the PR has no milestone and every
+#   issue it closes shares one, the PR takes it.
+# - Merged with still none (no closing issue, issues that disagree, or a PR
+#   stacked on another branch, whose "Fixes #N" GitHub does not link): the PR
+#   takes the next drop's milestone, the lowest-versioned open one, a beta or
+#   RC included (1.0.0-beta.4 < 1.0.0-rc.1 < 1.0.0), so the fallback moves on
+#   by itself when a milestone is closed.
+# - A PR into a ``release/X.Y.Z`` branch (#3948) ships in X.Y.Z whatever its
+#   issues say, so it takes the open milestone titled ``X.Y.Z`` when there is
+#   one, before anything above is consulted.
+# - A milestone already on the PR is never changed.
+#
+# pull_request_target so fork PRs get a token that can write the milestone.
+# Safe because nothing here checks out or runs the PR's code: the script reads
+# the PR and its issues through the API and sets one field.
+
+on:
+  pull_request_target:
+    types: [opened, edited, reopened, ready_for_review, closed]
+
+permissions:
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: pr-milestone-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  milestone:
+    name: Set the PR's milestone
+    runs-on: ubuntu-latest
+    if: >-
+      github.event.pull_request.milestone == null &&
+      (github.event.action != 'closed' || github.event.pull_request.merged == true)
+    steps:
+      - uses: actions/github-script@v9
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const number = context.payload.pull_request.number;
+
+            // Re-read: an earlier run, or a person, may have set it since the event fired.
+            const pr = await github.rest.pulls.get({ owner, repo, pull_number: number });
+            if (pr.data.milestone) {
+              core.info(`#${number} already has milestone ${pr.data.milestone.title}`);
+              return;
+            }
+
+            // #3948 — a release branch decides the release, not the issues.
+            const branch = /^release\/(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/.exec(pr.data.base.ref);
+            if (branch) {
+              const open = await github.paginate(github.rest.issues.listMilestones, {
+                owner,
+                repo,
+                state: "open",
+                per_page: 100,
+              });
+              const m = open.find((x) => x.title === branch[1]);
+              if (m) {
+                await github.rest.issues.update({ owner, repo, issue_number: number, milestone: m.number });
+                core.info(`#${number} -> ${m.title}: its base branch ${pr.data.base.ref}`);
+                return;
+              }
+              core.info(`#${number}: no open milestone titled ${branch[1]} for ${pr.data.base.ref}; falling back`);
+            }
+
+            const q = await github.graphql(
+              `query($owner: String!, $repo: String!, $number: Int!) {
+                 repository(owner: $owner, name: $repo) {
+                   pullRequest(number: $number) {
+                     closingIssuesReferences(first: 20) {
+                       nodes { number milestone { number title } }
+                     }
+                   }
+                 }
+               }`,
+              { owner, repo, number },
+            );
+            const issues = q.repository.pullRequest.closingIssuesReferences.nodes;
+            const fromIssues = [
+              ...new Map(
+                issues.filter((i) => i.milestone).map((i) => [i.milestone.number, i.milestone]),
+              ).values(),
+            ];
+
+            let target = null;
+            let why = "";
+            if (fromIssues.length === 1) {
+              target = fromIssues[0];
+              why = `the milestone of ${issues.map((i) => "#" + i.number).join(", ")}`;
+            } else if (context.payload.action === "closed") {
+              // Merged with no single answer from its issues: the next release.
+              const open = await github.paginate(github.rest.issues.listMilestones, {
+                owner,
+                repo,
+                state: "open",
+                per_page: 100,
+              });
+              // SemVer 2.0 precedence; reference ordering is backend/app/core/versions.py.
+              // A pre-release sorts before its release; titles that are not versions are ignored.
+              const version = (t) => {
+                const m = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/.exec(t);
+                return m ? { core: m.slice(1, 4).map(Number), pre: m[4] ? m[4].split(".") : [] } : null;
+              };
+              const cmpId = (a, b) => {
+                const an = /^\d+$/.test(a);
+                const bn = /^\d+$/.test(b);
+                if (an && bn) return Number(a) - Number(b);
+                if (an !== bn) return an ? -1 : 1; // numeric identifiers sort below alphanumeric
+                return a < b ? -1 : a > b ? 1 : 0;
+              };
+              const cmp = (a, b) => {
+                for (let i = 0; i < 3; i++) if (a.core[i] !== b.core[i]) return a.core[i] - b.core[i];
+                if (!a.pre.length || !b.pre.length) return b.pre.length - a.pre.length; // release > pre-release
+                for (let i = 0; i < Math.min(a.pre.length, b.pre.length); i++) {
+                  const c = cmpId(a.pre[i], b.pre[i]);
+                  if (c) return c;
+                }
+                return a.pre.length - b.pre.length; // a longer set wins when the rest is equal
+              };
+              const releases = open
+                .map((m) => ({ m, v: version(m.title) }))
+                .filter((x) => x.v)
+                .sort((a, b) => cmp(a.v, b.v));
+              if (releases.length) {
+                target = { number: releases[0].m.number, title: releases[0].m.title };
+                why = fromIssues.length > 1
+                  ? `the next release (its issues disagree: ${fromIssues.map((m) => m.title).join(", ")})`
+                  : "the next release (no closing issue has a milestone)";
+              }
+            }
+
+            if (!target) {
+              core.info(`#${number}: no milestone to set yet (${issues.length} closing issue(s))`);
+              return;
+            }
+            await github.rest.issues.update({
+              owner,
+              repo,
+              issue_number: number,
+              milestone: target.number,
+            });
+            core.info(`#${number} -> ${target.title}: ${why}`);

@@ -43,6 +43,7 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser
 from app.core.agent_wake import HOSTCONFIG_ALL, publish_wake
+from app.core.config_text import has_control_chars
 from app.core.permissions import user_has_permission
 from app.core.request_meta import get_trusted_client_ip
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
@@ -55,6 +56,7 @@ from app.models.firewall import (
     FirewallRule,
 )
 from app.models.settings import PlatformSettings
+from app.services.api_token_scopes import read_only_post
 from app.services.appliance.access import (
     SSH_REACHABILITY_CAVEAT,
     console_only_detail,
@@ -164,6 +166,22 @@ class RuleIn(BaseModel):
             raise ValueError(f"family must be one of {sorted(_FAMILIES)}")
         return v
 
+    @field_validator("comment")
+    @classmethod
+    def _v_comment(cls, v: str | None) -> str | None:
+        # Rendered inside ``comment "..."`` on an nftables rule line. A
+        # double quote or backslash would end or escape that string, and a
+        # newline would end the rule, so the rest would be read as rules of
+        # its own.
+        if v is None:
+            return None
+        if '"' in v or "\\" in v or has_control_chars(v):
+            raise ValueError(
+                "comment must not contain double quotes, backslashes or control "
+                "characters (newline, carriage return, NUL, tab, ...)"
+            )
+        return v
+
     @field_validator("ports")
     @classmethod
     def _v_ports(cls, v: list[int]) -> list[int]:
@@ -197,6 +215,13 @@ class RuleResponse(RuleIn):
     policy_id: uuid.UUID
 
     model_config = {"from_attributes": True}
+
+    @field_validator("comment")
+    @classmethod
+    def _v_comment(cls, v: str | None) -> str | None:
+        # Reading a rule back must not fail on a comment stored before the
+        # write-side check existed; the renderer cleans those on output.
+        return v
 
 
 class PolicyCreate(BaseModel):
@@ -379,6 +404,7 @@ async def create_policy(body: PolicyCreate, db: DB, current_user: CurrentUser) -
         )
     p = FirewallPolicy(**body.model_dump(), is_builtin=False, updated_by_id=current_user.id)
     db.add(p)
+    await db.flush()  # column-default id must exist before the audit row reads it (#2006)
     db.add(
         AuditLog(
             action="create",
@@ -611,6 +637,7 @@ async def create_alias(body: AliasCreate, db: DB, current_user: CurrentUser) -> 
     _require_admin(current_user)
     a = FirewallAlias(**body.model_dump(), is_builtin=False)
     db.add(a)
+    await db.flush()  # column-default id must exist before the audit row reads it (#2006)
     db.add(
         AuditLog(
             action="create",
@@ -915,6 +942,11 @@ async def effective(
     ap = await load_appliance_policy(db, row.id)
     body = _render_for(inputs, ps, ap)
     state = await db.get(FirewallApplyState, row.id)
+    enforced = bool(inputs["firewall_enabled"])
+    # #2794 — drift is "the server render is enforced and the node hasn't
+    # applied it". With enforcement off nothing is expected of the node, so
+    # drift is False whatever hash an earlier enforced render left behind.
+    rendered_hash = getattr(state, "rendered_hash", None) if enforced else None
     return EffectiveResponse(
         appliance_id=row.id,
         hostname=row.hostname,
@@ -922,15 +954,16 @@ async def effective(
         config_hash=hashlib.sha256(body.encode("utf-8")).hexdigest(),
         firewall_conf=body,
         layers=_layer_breakdown(body),
-        rendered_hash=getattr(state, "rendered_hash", None),
+        rendered_hash=rendered_hash,
         applied_hash=getattr(state, "applied_hash", None),
         applied_status=getattr(state, "applied_status", None),
         base_conf_marker=getattr(state, "base_conf_marker", None),
-        drift=bool(state and state.rendered_hash and state.rendered_hash != state.applied_hash),
+        drift=bool(state and rendered_hash and rendered_hash != state.applied_hash),
     )
 
 
 @router.post("/preview", response_model=PreviewResponse)
+@read_only_post
 async def preview(body: PreviewRequest, db: DB, current_user: CurrentUser) -> PreviewResponse:
     _require_read(current_user)
     row = await db.get(Appliance, body.appliance_id)

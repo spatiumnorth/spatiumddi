@@ -15,13 +15,14 @@ that the importer consumes.
 
 from __future__ import annotations
 
-import csv
 import io
 import json
 from dataclasses import dataclass, field
 from typing import Any
 
 from fastapi import HTTPException, status
+
+from app.services.csv_text import CSVReadError, read_csv_table
 
 
 @dataclass
@@ -183,10 +184,20 @@ def _csv_is_address_payload(headers: list[str]) -> bool:
 
 def parse_csv(data: bytes) -> ParsedPayload:
     text = data.decode("utf-8-sig", errors="replace")
-    reader = csv.DictReader(io.StringIO(text))
+    # The shared reader handles \n, \r\n and a bare \r alike; a file saved
+    # with classic Mac line endings answered 500 here (#1637). Anything else
+    # the csv module refuses is the file's problem: a 422 with its reason,
+    # as parse_json answers for JSON it cannot read.
+    try:
+        table = read_csv_table(text)
+    except CSVReadError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
     payload = ParsedPayload()
-    is_addresses = _csv_is_address_payload(list(reader.fieldnames or []))
-    for row in reader:
+    is_addresses = _csv_is_address_payload(table.fieldnames)
+    for row in table.rows:
         if not any((v or "").strip() for v in row.values() if isinstance(v, str)):
             continue
         if is_addresses:
@@ -258,6 +269,22 @@ def parse_xlsx(data: bytes) -> ParsedPayload:
             detail="openpyxl is required for XLSX import but is not installed",
         ) from exc
 
+    # Same limits as the DNS spreadsheet import: the upload cap bounds the
+    # compressed size only. Imported lazily (dns_io imports ipam_io.export).
+    from app.services.dns_io.spreadsheet import (
+        MAX_SHEET_ROWS,
+        SpreadsheetError,
+        check_xlsx_size,
+    )
+
+    try:
+        check_xlsx_size(data)
+    except SpreadsheetError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid XLSX file: {exc}",
+        ) from exc
+
     try:
         wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     except Exception as exc:
@@ -279,7 +306,14 @@ def parse_xlsx(data: bytes) -> ParsedPayload:
             return []
         headers = [str(h).strip() if h is not None else "" for h in header]
         out: list[dict[str, Any]] = []
-        for raw in rows:
+        for n, raw in enumerate(rows, 1):
+            if n > MAX_SHEET_ROWS:
+                wb.close()
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"Invalid XLSX file: sheet {sheet_name!r} has more than "
+                    f"{MAX_SHEET_ROWS} rows; split it or use CSV",
+                )
             if raw is None or all(c is None or c == "" for c in raw):
                 continue
             row = {headers[i]: raw[i] for i in range(min(len(headers), len(raw))) if headers[i]}

@@ -80,6 +80,56 @@ def test_clean_apply_writes_done_and_renames_trigger(tmp_path: Path) -> None:
     assert len(list(tmp_path.glob("slot-upgrade-pending.done.*"))) == 1
 
 
+def test_reboot_pending_records_the_staged_boot_and_slot(tmp_path: Path) -> None:
+    """#2007 — the supervisor settles reboot-pending off these two fields:
+    a different boot_id later is the reboot, a different slot a rollback."""
+    import json
+
+    stub = _write_stub(tmp_path, "exit 0")
+    _seed_trigger(tmp_path)
+    grubenv = tmp_path / "grubenv"
+    grubenv.write_text(
+        "# GRUB Environment Block\nsaved_entry=slot_a\nnext_entry=slot_b\n" + "#" * 64,
+        encoding="utf-8",
+    )
+    boot_id = tmp_path / "boot_id"
+    boot_id.write_text("0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0\n", encoding="utf-8")
+    subprocess.run(
+        ["bash", str(RUNNER)],
+        env=_env(
+            tmp_path, stub, SPATIUM_GRUBENV=str(grubenv), SPATIUM_BOOT_ID_FILE=str(boot_id)
+        ),
+        capture_output=True,
+        timeout=30,
+    )
+    prog = json.loads((tmp_path / "slot-upgrade.progress").read_text(encoding="utf-8"))
+    assert prog["step"] == "reboot-pending"
+    assert prog["staged_slot"] == "slot_b"
+    assert prog["staged_boot_id"] == "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+
+
+def test_reboot_pending_omits_an_unreadable_identity(tmp_path: Path) -> None:
+    import json
+
+    stub = _write_stub(tmp_path, "exit 0")
+    _seed_trigger(tmp_path)
+    subprocess.run(
+        ["bash", str(RUNNER)],
+        env=_env(
+            tmp_path,
+            stub,
+            SPATIUM_GRUBENV=str(tmp_path / "absent"),
+            SPATIUM_BOOT_ID_FILE=str(tmp_path / "absent-too"),
+        ),
+        capture_output=True,
+        timeout=30,
+    )
+    assert _state(tmp_path).startswith("done ")
+    prog = json.loads((tmp_path / "slot-upgrade.progress").read_text(encoding="utf-8"))
+    assert prog["step"] == "reboot-pending"
+    assert "staged_slot" not in prog and "staged_boot_id" not in prog
+
+
 def test_apply_failure_writes_failed(tmp_path: Path) -> None:
     stub = _write_stub(tmp_path, "exit 1")
     trigger = _seed_trigger(tmp_path)
@@ -131,7 +181,7 @@ def test_ticker_keeps_stamp_fresh_then_cleans_up(tmp_path: Path) -> None:
     marker (so the supervisor never falsely reaps a live apply), then the
     ticker is reaped and the terminal state is done."""
     stub = _write_stub(
-        tmp_path, '[ "$1" = "set-next-boot" ] && exit 0; sleep 3; exit 0'
+        tmp_path, '[ "$1" = "set-next-boot" ] && exit 0; sleep 6; exit 0'
     )
     _seed_trigger(tmp_path)
     proc = subprocess.Popen(
@@ -144,9 +194,16 @@ def test_ticker_keeps_stamp_fresh_then_cleans_up(tmp_path: Path) -> None:
     while time.time() < deadline and not _state(tmp_path).startswith("in-flight"):
         time.sleep(0.1)
     s1 = _state(tmp_path)
-    time.sleep(1.3)
-    s2 = _state(tmp_path)
-    proc.wait(timeout=15)
+    # Poll rather than sleep a fixed interval (#3668): the ticker re-stamps
+    # once a second at second resolution, so a loaded runner can leave a
+    # single fixed-gap sample in the same second. The stub apply runs 6 s,
+    # so a live ticker must advance the stamp well inside this deadline.
+    s2 = s1
+    deadline = time.time() + 4.5
+    while time.time() < deadline and s2 == s1:
+        time.sleep(0.2)
+        s2 = _state(tmp_path)
+    proc.wait(timeout=20)
     # The stamp advanced while the apply ran → ticker alive.
     assert s1.startswith("in-flight") and s2.startswith("in-flight")
     assert s1 != s2
@@ -163,3 +220,105 @@ def test_no_trigger_is_noop(tmp_path: Path) -> None:
     )
     assert proc.returncode == 0
     assert _state(tmp_path) == ""
+
+
+# --- #1747: durable sidecar writes -------------------------------------------
+
+_HOST_RUNNERS = [
+    "spatiumddi-slot-upgrade",
+    "spatiumddi-slot-set-next-boot",
+    "spatiumddi-slot-set-default",
+    "spatiumddi-slot-rollback",
+]
+
+
+def _extract_atomic_write(script: str) -> str:
+    import re
+
+    text = (RUNNER.parent / script).read_text(encoding="utf-8")
+    m = re.search(r"^fsync_path\(\).*?^atomic_write\(\) \{.*?^\}\n", text, re.S | re.M)
+    assert m, f"{script} has no fsync_path/atomic_write helpers"
+    return m.group(0)
+
+
+def test_every_slot_runner_writes_state_durably() -> None:
+    """No runner may redirect straight into a ``.state`` file any more: a
+    power loss then leaves it NUL-filled and the node's heartbeats 422."""
+    for script in _HOST_RUNNERS:
+        text = (RUNNER.parent / script).read_text(encoding="utf-8")
+        assert '> "${TRIGGER}.state"' not in text, script
+        assert 'atomic_write "${TRIGGER}.state"' in text, script
+
+
+def test_atomic_write_replaces_via_temp_and_fsyncs(tmp_path: Path) -> None:
+    """Run the shipped helper under bash with a ``sync`` shim recording
+    which paths were fsynced and what the temp file held at that moment."""
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    trace = tmp_path / "trace"
+    (shim / "sync").write_text(
+        '#!/bin/bash\nfor p in "$@"; do\n'
+        f'  if [ -f "$p" ]; then echo "file:$p:$(cat "$p")" >> {trace}; '
+        f'else echo "dir:$p" >> {trace}; fi\ndone\n',
+        encoding="utf-8",
+    )
+    (shim / "sync").chmod(0o755)
+    for script in _HOST_RUNNERS:
+        trace.write_text("")
+        target = tmp_path / f"{script}.state"
+        target.write_text("old\n")
+        target.chmod(0o640)
+        src = _extract_atomic_write(script) + f'\natomic_write "{target}" "done X"\n'
+        r = subprocess.run(
+            ["bash", "-c", src],
+            env={**os.environ, "PATH": f"{shim}:{os.environ['PATH']}"},
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 0, r.stderr
+        assert target.read_text() == "done X\n"
+        assert (target.stat().st_mode & 0o777) == 0o640  # mode preserved
+        lines = trace.read_text().splitlines()
+        # temp file fsynced WITH its full content before the rename ...
+        assert any(
+            ln.startswith("file:")
+            and ln.endswith(":done X")
+            and str(target) + "." in ln
+            for ln in lines
+        ), lines
+        # ... then the directory.
+        assert lines[-1] == f"dir:{tmp_path}", lines
+        assert not [
+            p for p in tmp_path.iterdir() if p.name.startswith(target.name + ".")
+        ]
+
+
+def test_atomic_write_creates_a_missing_target_readable(tmp_path: Path) -> None:
+    """First write of a sidecar: mktemp's 0600 must not leak through, or the
+    supervisor (a different user) could never read the state."""
+    for script in _HOST_RUNNERS:
+        target = tmp_path / f"{script}.new.state"
+        src = _extract_atomic_write(script) + f'\natomic_write "{target}" "in-flight X"\n'
+        r = subprocess.run(["bash", "-c", src], capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        assert target.read_text() == "in-flight X\n"
+        assert (target.stat().st_mode & 0o777) == 0o644
+
+
+def test_atomic_write_failure_leaves_the_target_and_no_temp(tmp_path: Path) -> None:
+    """A write that cannot complete returns non-zero and never replaces the
+    target with a partial file."""
+    for script in _HOST_RUNNERS:
+        target = tmp_path / "missing-dir" / "x.state"
+        src = _extract_atomic_write(script) + f'\natomic_write "{target}" "done"\n'
+        r = subprocess.run(["bash", "-c", src], capture_output=True, text=True)
+        assert r.returncode != 0
+        assert not target.exists()
+
+
+def test_exit_trap_is_armed_before_the_in_flight_stamp() -> None:
+    """#2424: a SIGTERM landing between the in-flight stamp and the trap
+    left the state at in-flight. The trap must come first."""
+    text = RUNNER.read_text(encoding="utf-8")
+    body = text[text.index('if [ ! -f "$TRIGGER" ]; then') :]
+    assert body.index("trap on_exit EXIT") < body.index("\nmark_inflight")

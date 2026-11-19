@@ -38,6 +38,7 @@ from app.models.dns import DNSServer, DNSServerGroup
 from app.models.ipam import IPBlock, IPSpace, Subnet
 from app.models.logs import DHCPLogEntry, DNSQueryLogEntry
 from app.models.metrics import DHCPMetricSample, DNSMetricSample
+from app.models.settings import PlatformSettings
 from app.services.agents.ingest_receipt import RECEIPT_RETENTION_DAYS, prune_receipts
 from app.services.agents.spool_status import apply_reported_spool
 from app.services.alerts import _matching_agent_spool_trimmed_subjects
@@ -277,6 +278,55 @@ async def test_query_log_drops_lines_past_retention_but_not_undated_ones(
         .all()
     )
     assert names == {"fresh.example", "undated.example"}
+
+
+async def _set_log_retention(db: AsyncSession, hours: int) -> None:
+    row = await db.get(PlatformSettings, 1)
+    if row is None:
+        row = PlatformSettings(id=1)
+        db.add(row)
+    row.log_retention_hours = hours
+    await db.commit()
+
+
+async def test_ingest_expiry_follows_the_configured_log_retention(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#2273 — a backlog older than 24 h but inside a raised window is kept."""
+    await _set_log_retention(db_session, 72)
+    dns = await _dns_server(db_session)
+    dhcp = await _dhcp_server(db_session)
+    now = datetime.now(UTC)
+    r = await _post(
+        client,
+        "dns",
+        dns,
+        "query-log-entries",
+        {
+            "lines": [
+                _bind_line(now - timedelta(hours=30), "inside.example"),
+                _bind_line(now - timedelta(hours=80), "outside.example"),
+            ],
+            "batch_id": _bid(),
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert (r.json()["inserted"], r.json()["expired"]) == (1, 1)
+    r = await _post(
+        client,
+        "dhcp",
+        dhcp,
+        "log-entries",
+        {
+            "lines": [
+                _kea_line(now - timedelta(hours=30), "aa:bb:cc:dd:ee:03"),
+                _kea_line(now - timedelta(hours=80), "aa:bb:cc:dd:ee:04"),
+            ],
+            "batch_id": _bid(),
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert (r.json()["inserted"], r.json()["expired"]) == (1, 1)
 
 
 # ── DHCP activity log: same two properties ────────────────────────────────
@@ -570,6 +620,45 @@ async def test_malformed_spool_report_does_not_fail_the_heartbeat(
         await db_session.execute(select(DNSServer.spool_status).where(DNSServer.id == srv.id))
     ).scalar_one()
     assert row is None
+
+
+async def test_dhcp_heartbeat_persists_in_memory_lease_backlog_3782(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """An agent behind on lease events has an EMPTY on-disk spool; what it has
+    read but not delivered must be stored, and an agent that does not report it
+    must read as unknown (None), never as 0."""
+    srv = await _dhcp_server(db_session)
+    oldest = "2026-11-08T10:00:00+00:00"
+    spool = _spool(bytes_=0, stream="lease_events")
+    spool["pending_events"] = 2400
+    spool["pending_oldest_at"] = oldest
+    spool["unread_bytes"] = 4096
+    spool["unread_events_estimated"] = 2000
+    spool["streams"]["lease_events"].update(
+        pending_events=2400, pending_oldest_at=oldest, unread_bytes=4096
+    )
+    r = await _post(client, "dhcp", srv, "heartbeat", {"spool": spool})
+    assert r.status_code == 200, r.text
+    row = (
+        await db_session.execute(select(DHCPServer.spool_status).where(DHCPServer.id == srv.id))
+    ).scalar_one()
+    assert row is not None and row["entries"] == 0
+    assert row["pending_events"] == 2400
+    assert row["unread_bytes"] == 4096
+    assert row["unread_events_estimated"] == 2000
+    assert row["streams"]["lease_events"]["pending_events"] == 2400
+    assert row["streams"]["lease_events"]["pending_oldest_at"].startswith("2026-11-08T10:00:00")
+
+    # A pre-#3782 agent: the fields are absent -> stored as null (unknown).
+    srv2 = await _dhcp_server(db_session)
+    r = await _post(client, "dhcp", srv2, "heartbeat", {"spool": _spool(bytes_=0)})
+    assert r.status_code == 200, r.text
+    row2 = (
+        await db_session.execute(select(DHCPServer.spool_status).where(DHCPServer.id == srv2.id))
+    ).scalar_one()
+    assert row2 is not None and row2["pending_events"] is None
+    assert row2["unread_bytes"] is None
 
 
 def test_apply_reported_spool_none_is_a_no_op() -> None:

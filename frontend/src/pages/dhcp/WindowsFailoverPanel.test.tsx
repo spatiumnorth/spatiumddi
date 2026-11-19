@@ -26,6 +26,16 @@ vi.mock("./windowsFailover", () => ({
   useGroupFailover: () => ({ data: report(), isLoading: false }),
 }));
 vi.mock("@/lib/api", () => ({ dhcpApi: {} }));
+// Relationship management takes a superadmin (#1339); the cases below run
+// as one unless they say otherwise.
+const isSuperadmin = vi.fn(() => true);
+vi.mock("@/hooks/usePermissions", () => ({
+  usePermissions: () => ({
+    isSuperadmin: isSuperadmin(),
+    can: () => isSuperadmin(),
+    isLoading: false,
+  }),
+}));
 
 function withClient(ui: ReactElement) {
   return render(
@@ -213,6 +223,17 @@ describe("WindowsFailoverPanel management (#1110 Phase 2)", () => {
     report.mockReturnValue(group());
     render(<WindowsFailoverPanel groupId="g-1" />);
     expect(screen.getByText("+ New relationship")).toBeTruthy();
+  });
+
+  it("offers a user who is not a superadmin no relationship action (#1339)", () => {
+    isSuperadmin.mockReturnValue(false);
+    report.mockReturnValue(group({ relationships: [pair()] }));
+    render(<WindowsFailoverPanel groupId="g-1" />);
+    expect(screen.queryByText("+ New relationship")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Replicate" })).toBeNull();
+    isSuperadmin.mockReturnValue(true);
   });
 
   it("warns loudly about Kea members in the same group", () => {

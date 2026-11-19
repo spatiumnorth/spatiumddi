@@ -32,6 +32,23 @@
 
 set -euo pipefail
 
+# Writes stdin to $1, a file in the release-state directory. The api and the
+# supervisor can create names in that directory and this runs as root, so a
+# redirect onto the name would follow a symlink planted there. Instead a temp
+# file is created exclusively (mktemp) next to it and renamed over the name:
+# whatever was at the name, a symlink included, is replaced, never written
+# through. -T: a directory at the name fails the rename instead of receiving
+# the file. $2 = mode, default 0644.
+state_write() {
+    local _dst="$1" _tmp
+    _tmp=$(mktemp "$(dirname -- "$_dst")/.$(basename -- "$_dst").XXXXXX") || return 1
+    if cat > "$_tmp" && chmod "${2:-0644}" "$_tmp" && mv -fT -- "$_tmp" "$_dst"; then
+        return 0
+    fi
+    rm -f -- "$_tmp"
+    return 1
+}
+
 TRIGGER=/var/lib/spatiumddi/release-state/tz-pending
 HASH_SIDECAR=/var/lib/spatiumddi/release-state/tz-hash
 STATUS_SIDECAR=/var/lib/spatiumddi/release-state/tz-status
@@ -78,8 +95,8 @@ if ! timedatectl list-timezones 2>/dev/null | grep -Fxq "$tz"; then
     # (#550). Renaming it lets the next (corrected) heartbeat re-write
     # the trigger; the ``.failed.<ts>`` copy stays for forensics.
     printf 'state=failed\nreason=unknown_timezone\nrequested=%s\napplied_at=%s\n' \
-        "$tz" "$(date -u +%FT%TZ)" > "$STATUS_SIDECAR"
-    mv -f "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" 2>/dev/null || rm -f "$TRIGGER"
+        "$tz" "$(date -u +%FT%TZ)" | state_write "$STATUS_SIDECAR"
+    mv -fT "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" 2>/dev/null || rm -f "$TRIGGER"
     exit 1
 fi
 
@@ -94,9 +111,9 @@ else
     if ! timedatectl set-timezone "$tz" 2>&1 | tee -a "$LOG"; then
         log "ERROR: timedatectl set-timezone failed"
         printf 'state=failed\nreason=set_timezone_failed\nrequested=%s\napplied_at=%s\n' \
-            "$tz" "$(date -u +%FT%TZ)" > "$STATUS_SIDECAR"
+            "$tz" "$(date -u +%FT%TZ)" | state_write "$STATUS_SIDECAR"
         # Move the trigger aside so a retry isn't wedged (see #550).
-        mv -f "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" 2>/dev/null || rm -f "$TRIGGER"
+        mv -fT "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" 2>/dev/null || rm -f "$TRIGGER"
         exit 1
     fi
 fi
@@ -104,9 +121,9 @@ fi
 # Apply landed. Write the hash sidecar (the IANA name itself — for
 # tz it's small enough to use verbatim instead of sha256) so the
 # supervisor short-circuits the next heartbeat's trigger write.
-printf '%s\n' "$tz" > "$HASH_SIDECAR"
+printf '%s\n' "$tz" | state_write "$HASH_SIDECAR"
 printf 'state=ok\nrequested=%s\napplied=%s\napplied_at=%s\n' \
-    "$tz" "$tz" "$(date -u +%FT%TZ)" > "$STATUS_SIDECAR"
+    "$tz" "$tz" "$(date -u +%FT%TZ)" | state_write "$STATUS_SIDECAR"
 
 # Drop the trigger so the .path unit doesn't re-fire (the trigger's
 # absence is the marker; presence means "operator wants a change").

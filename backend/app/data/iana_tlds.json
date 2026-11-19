@@ -1,8 +1,8 @@
 {
   "source": "https://data.iana.org/TLD/tlds-alpha-by-domain.txt",
   "note": "Two tables. `tlds` is IANA's root-zone list, regenerated wholesale by `scripts/refresh_iana_tlds.py` at release-prep — entries are published as uppercase A-labels and stored lowercased here so an `xn--` TLD matches a validate_fqdn-normalised zone name with a plain set lookup. `special_use` is HAND-CURATED and must survive every regeneration: it changes by RFC and by ICANN action, not by download. Consumed by `app/services/dns/name_scope.py`; an operator can supersede `tlds` at runtime with a newer snapshot via POST /api/v1/dns/tld-registry/refresh, but never `special_use`.",
-  "version": "2026090500",
-  "fetched_at": "2026-09-06T00:42:39Z",
+  "version": "2026102700",
+  "fetched_at": "2026-10-28T01:06:54Z",
   "tlds": [
     "aaa",
     "aarp",
@@ -624,7 +624,6 @@
     "jpmorgan",
     "jprs",
     "juegos",
-    "juniper",
     "kaufen",
     "kddi",
     "ke",

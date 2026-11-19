@@ -33,6 +33,7 @@ from dataclasses import dataclass
 import httpx
 import structlog
 
+from .cert_auth import register_proof_fields
 from .identity import Identity
 
 log = structlog.get_logger()
@@ -98,6 +99,7 @@ def register(
     supervisor_version: str,
     client: httpx.Client,
     appliance_variant: str | None = None,
+    restore_roles: dict[str, object] | None = None,
     max_attempts: int = 60,
     backoff_seconds: float = 2.0,
 ) -> RegisterResult:
@@ -117,12 +119,20 @@ def register(
         # + auto-assigns the variant's fixed role set at register time
         # instead of waiting for the first heartbeat.
         payload["appliance_variant"] = appliance_variant
+    if restore_roles:
+        # #2801 — the roles this node was serving before its Fleet row went
+        # away (``role_orchestrator.last_assigned_roles``). The control plane
+        # restores them only on a self-bootstrap registration, and audits it;
+        # an older control plane ignores the field.
+        payload["restore_roles"] = restore_roles
     url = control_plane_url.rstrip("/") + "/api/v1/appliance/supervisor/register"
 
     last_error: str | None = None
     for attempt in range(1, max_attempts + 1):
         try:
-            resp = client.post(url, json=payload, timeout=10.0)
+            # Signed afresh per attempt: the control plane accepts each once.
+            signed = {**payload, **register_proof_fields(identity.private_key, identity.fingerprint)}
+            resp = client.post(url, json=signed, timeout=10.0)
         except httpx.HTTPError as exc:
             last_error = f"network: {exc}"
             log.warning(

@@ -27,12 +27,14 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.celery_app import celery_app
 from app.config import settings
+from app.db import task_connect_args
 from app.models.bgp_looking_glass import BGPLGRoute, LookingGlassCollector
 from app.services.looking_glass.ipam_link import (
     build_resolution_cache,
     resolve_route_links,
 )
 from app.services.looking_glass.vrf_match import build_vrf_rt_index, match_vrf_for_route
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -47,7 +49,9 @@ async def _collector_stale_sweep_async() -> dict[str, int]:
     Idempotent — only touches rows currently ``active`` whose ``last_seen_at``
     is beyond the cutoff.
     """
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
@@ -72,6 +76,7 @@ async def _collector_stale_sweep_async() -> dict[str, int]:
 
 
 @celery_app.task(name="app.tasks.looking_glass.collector_stale_sweep")
+@module_gated("network.looking_glass")
 def collector_stale_sweep() -> dict[str, int]:
     """Celery beat task — flips stale Looking Glass collectors to 'unreachable'."""
     return asyncio.run(_collector_stale_sweep_async())
@@ -87,7 +92,9 @@ async def _reresolve_route_links_async() -> dict[str, int]:
     push to trigger a fresh resolve. Idempotent — a no-op recompute
     changes nothing.
     """
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
@@ -141,6 +148,7 @@ async def _reresolve_route_links_async() -> dict[str, int]:
 
 
 @celery_app.task(name="app.tasks.looking_glass.reresolve_route_links")
+@module_gated("network.looking_glass")
 def reresolve_route_links() -> dict[str, int]:
     """Celery beat task — re-resolves matched_*_id for every active route."""
     return asyncio.run(_reresolve_route_links_async())

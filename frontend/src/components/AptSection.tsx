@@ -391,6 +391,8 @@ export function AptSection({
                   Enabled
                 </label>
                 <button
+                  aria-label="Remove source"
+                  title="Remove source"
                   type="button"
                   disabled={ro}
                   onClick={() => {
@@ -462,6 +464,8 @@ export function AptSection({
                   }}
                 />
                 <button
+                  aria-label="Remove GPG key"
+                  title="Remove GPG key"
                   type="button"
                   disabled={ro}
                   onClick={() => {
@@ -529,6 +533,10 @@ export function AptSection({
             mark();
           }}
         />
+        <p className="text-xs text-muted-foreground">
+          A credential in a proxy URL shows as <code>***@</code>. Leave it as-is
+          to keep the stored one.
+        </p>
       </div>
 
       {/* ── Private-mirror auth ── */}
@@ -594,6 +602,8 @@ export function AptSection({
                 }}
               />
               <button
+                aria-label="Remove credential"
+                title="Remove credential"
                 type="button"
                 disabled={ro}
                 onClick={() => {

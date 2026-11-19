@@ -14,9 +14,15 @@ Default-enabled state follows non-negotiable #13:
   WHOIS queries to public registries, so air-gapped / strict-egress
   operators opt in explicitly (mirrors ``tools/whois.py``).
 
-These are reads, not writes — they don't mutate state. Touching the
-network is read-only here (a ping is observation, not a change), so no
-``propose_*`` preview/apply contract is needed.
+Each tool declares the budget bucket of its ``/api/v1/tools/*`` route
+(``rate_limit=``), so a copilot or MCP call spends the same per-user
+budget a Tools-page call does (see ``app.services.nettools.budgets``).
+
+These are reads, not writes — they don't mutate state, so no
+``propose_*`` preview/apply contract is needed. They do send traffic
+outward, so each (bar ``lookup_mac_vendor``, a database lookup) is
+``outbound=True``: a ``read``-scoped API token never makes SpatiumDDI send
+traffic outward, and MCP hides these from one (#3302).
 """
 
 from __future__ import annotations
@@ -84,6 +90,9 @@ class NetworkPingArgs(BaseModel):
 
 @register_tool(
     name="network_ping",
+    outbound=True,
+    rate_limit="default",
+    permission=("read", "use_network_tools"),
     module=_MODULE,
     category="tools",
     description=(
@@ -124,6 +133,9 @@ class NetworkTracerouteArgs(BaseModel):
 
 @register_tool(
     name="network_traceroute",
+    outbound=True,
+    rate_limit="default",
+    permission=("read", "use_network_tools"),
     module=_MODULE,
     category="tools",
     description=(
@@ -185,6 +197,9 @@ class NetworkDigArgs(BaseModel):
 
 @register_tool(
     name="network_dig",
+    outbound=True,
+    rate_limit="default",
+    permission=("read", "use_network_tools"),
     module=_MODULE,
     category="tools",
     description=(
@@ -225,6 +240,9 @@ class NetworkPortTestArgs(BaseModel):
 
 @register_tool(
     name="network_port_test",
+    outbound=True,
+    rate_limit="default",
+    permission=("read", "use_network_tools"),
     module=_MODULE,
     category="tools",
     description=(
@@ -267,6 +285,9 @@ class NetworkTlsCertArgs(BaseModel):
 
 @register_tool(
     name="network_tls_cert",
+    outbound=True,
+    rate_limit="default",
+    permission=("read", "use_network_tools"),
     module=_MODULE,
     category="tools",
     description=(
@@ -317,6 +338,8 @@ class LookupMacVendorArgs(BaseModel):
 
 @register_tool(
     name="lookup_mac_vendor",
+    rate_limit="default",
+    permission=("read", "use_network_tools"),
     module=_MODULE,
     category="tools",
     description=(
@@ -352,13 +375,17 @@ class NetworkWhoisArgs(BaseModel):
 
 @register_tool(
     name="network_whois",
+    outbound=True,
+    rate_limit="offprem",
+    permission=("read", "use_network_tools"),
     module=_MODULE,
     category="tools",
     description=(
         "Run a WHOIS query from the SpatiumDDI server against public "
         "registries — answers 'who owns this IP / domain / ASN?'. Makes "
         "an OUTBOUND connection to a WHOIS server, so it's disabled by "
-        "default; enable it in Settings → AI → Tool Catalog."
+        "default; an administrator enables it in Administration → AI Tool "
+        "Catalog."
     ),
     args_model=NetworkWhoisArgs,
     default_enabled=False,

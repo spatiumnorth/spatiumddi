@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Search, X } from "lucide-react";
 import { searchApi } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { closePopupOnEscape } from "@/components/ui/use-draggable-modal";
 
 /**
  * Debounced IP address picker. Used by the multicast Memberships
@@ -70,7 +71,23 @@ export function IPAddressPicker({
   );
 
   return (
-    <div ref={containerRef} className={cn("relative", className)}>
+    <div
+      ref={containerRef}
+      className={cn("relative", className)}
+      // An Esc on a result reached with Tab is the list's too (#3157).
+      onKeyDown={(e) =>
+        closePopupOnEscape(e, open && debouncedQuery.length >= 2, () =>
+          setOpen(false),
+        )
+      }
+      // Focus leaving the picker (Tab / Shift+Tab past it) closes the list,
+      // or the next Esc, now outside the picker, closes the dialog with the
+      // list still showing (#3486). A move onto a result keeps it open.
+      onBlur={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null))
+          setOpen(false);
+      }}
+    >
       <div className="relative">
         <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
         <input
@@ -81,6 +98,11 @@ export function IPAddressPicker({
             setOpen(true);
           }}
           onFocus={() => setOpen(true)}
+          onKeyDown={(e) =>
+            closePopupOnEscape(e, open && debouncedQuery.length >= 2, () =>
+              setOpen(false),
+            )
+          }
           placeholder={placeholder}
           disabled={disabled}
           className="w-full rounded-md border bg-background py-1.5 pl-7 pr-7 text-sm focus:outline-none focus:ring-2 focus:ring-ring disabled:opacity-50"
@@ -102,7 +124,14 @@ export function IPAddressPicker({
       </div>
 
       {open && debouncedQuery.length >= 2 && (
-        <div className="absolute left-0 right-0 z-30 mt-1 max-h-72 overflow-auto rounded-md border bg-background shadow-md">
+        <div
+          className="absolute left-0 right-0 z-30 mt-1 max-h-72 overflow-auto rounded-md border bg-background shadow-md"
+          // A press in the list keeps focus where it is, so the blur above
+          // cannot close the list before a click on a result lands (a
+          // browser that does not focus a pressed button would otherwise
+          // blur the search with no related target).
+          onMouseDown={(e) => e.preventDefault()}
+        >
           {q.isFetching && results.length === 0 && (
             <p className="px-3 py-2 text-xs text-muted-foreground">
               Searching…

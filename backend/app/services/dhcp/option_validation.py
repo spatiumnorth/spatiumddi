@@ -237,6 +237,9 @@ _V6_CHECKS: dict[str, Callable[[Any], None]] = {
 }
 
 
+_TABLES = {"ipv4": _V4_CHECKS, "ipv6": _V6_CHECKS}
+
+
 def renderer_vocabularies() -> tuple[set[str], set[str], set[str], set[str], set[str]]:
     """The checked names beside the renderer's own tables, for the test that
     pins them equal — adding an option to the Kea driver without a value check
@@ -265,13 +268,114 @@ def _describe_code(code: int) -> str:
     return f"option {code} ({known.name})" if known else f"option {code}"
 
 
-def normalize_options(raw: Any) -> dict[str, Any]:
+# Every stored spelling of options 15 and 119 that reaches a server (#1347):
+# the canonical names, and the Windows raw spelling ``opt-NN``, which the
+# Windows driver writes as option 15 / 119 just the same. ``code:15`` /
+# ``code:119`` are refused on write (no option-def), and a list-form entry
+# carrying code 15 / 119 is keyed by its canonical name before this runs.
+# Each maps to the rule the write check applies, which gates the rewrite.
+_FQDN_OPTION_RULES: dict[str, Callable[[Any], None]] = {
+    "domain-name": _fqdn,
+    "domain-search": _fqdn_list,
+    "opt-15": _fqdn,
+    "opt-119": _fqdn_list,
+}
+
+
+def _canonical_str(value: str) -> str | None:
+    """The DNS form of one string (comma-separated entries allowed), or
+    ``None`` when any entry is refused by ``validate_fqdn``."""
+    out: list[str] = []
+    for part in (p.strip() for p in value.split(",")):
+        if not part:
+            continue
+        try:
+            out.append(validate_fqdn(part, field="value"))
+        except ValueError:
+            return None
+    return ", ".join(out) if out else None
+
+
+def _canonical_fqdn(value: Any) -> Any:
+    """``validate_fqdn``'s DNS form of one value, or the value untouched.
+
+    All or nothing: when any entry is refused by ``validate_fqdn`` (a value
+    stored before the write check existed, #597) the WHOLE value is returned
+    as it is. Rewriting only the valid entries would make the stored value
+    compare unequal to the round-tripped one, and the scope update path
+    validates every option that changed (#1228) — so an unrelated edit of a
+    scope carrying a grandfathered list would start answering 422.
+    A list stays a list; a comma-separated string stays one string.
+    """
+    if isinstance(value, str):
+        canon = _canonical_str(value)
+        return value if canon is None else canon
+    if isinstance(value, list):
+        out: list[str] = []
+        for item in value:
+            canon = _canonical_str(item) if isinstance(item, str) else None
+            if canon is None:
+                return value
+            out.append(canon)
+        return out
+    return value
+
+
+def canonical_domain_options(options: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Copy of ``options`` with ``domain-name`` / ``domain-search`` in the DNS
+    form ``validate_fqdn`` returns (IDNA A-labels, lower case, no root dot, #2924).
+
+    Kea and Windows serve these strings to clients verbatim, and the zones the
+    product stores for the same name are A-labels, so the two must agree. Used
+    at write time (``normalize_options``) and again at render time, so rows
+    stored before the fix are served in the same form without a migration.
+
+    Deterministic and idempotent, so the config-bundle ETag moves once for a
+    row stored in another form and is stable after that. A value is rewritten
+    only when the rewritten form passes the same check the write path runs:
+    otherwise a grandfathered value the check would refuse (a two-entry
+    ``domain-name``, say) would read as changed and block an unrelated edit.
+    """
+    out = dict(options or {})
+    for key, rule in _FQDN_OPTION_RULES.items():
+        if key not in out or _is_unset(out[key]):
+            continue
+        canon = _canonical_fqdn(out[key])
+        if canon == out[key]:
+            continue
+        try:
+            rule(canon)
+        except ValueError:
+            continue
+        out[key] = canon
+    return out
+
+
+def normalize_options(raw: Any, *, raw_codes: str = "code") -> dict[str, Any]:
+    """Accept ``{name: value}`` or ``[{code, name, value}, …]``; return a mapping.
+
+    The domain options come back in their DNS form (see
+    ``canonical_domain_options``).
+    """
+    return canonical_domain_options(_normalize_options_raw(raw, raw_codes=raw_codes))
+
+
+def _normalize_options_raw(raw: Any, *, raw_codes: str = "code") -> dict[str, Any]:
     """Accept ``{name: value}`` or ``[{code, name, value}, …]``; return a mapping.
 
     Does not validate. A list entry is keyed by its name when that name is one
     SpatiumDDI renders, else by its code: the custom-options editor sends the
     IANA catalogue name (``vendor-encapsulated-options``), which the renderer
     does not know, alongside a code (43) it can deliver as ``code:43``.
+
+    ``raw_codes`` is the spelling the group's servers read (#1347): a
+    catalogue pick on a Windows group is keyed ``opt-43``, which Windows
+    serves, rather than ``code:43``, which the write check would refuse.
+
+    Raises ``ValueError`` when two list entries resolve to the same key (by
+    name, by code, or one of each): keeping either would silently store a
+    value other than the one the client sent (#3614). A dict cannot repeat a
+    key, so it never raises.
     """
     if raw is None:
         return {}
@@ -280,6 +384,7 @@ def normalize_options(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, list):
         return {}
     out: dict[str, Any] = {}
+    seen: dict[str, dict[str, Any]] = {}
     for entry in raw:
         if not isinstance(entry, dict):
             continue
@@ -308,13 +413,28 @@ def normalize_options(raw: Any) -> dict[str, Any]:
         if known:
             key = str(name)
         elif code_int is not None:
-            key = CODE_TO_NAME.get(code_int) or f"code:{code_int}"
+            raw_key = f"opt-{code_int}" if raw_codes == "opt" else f"code:{code_int}"
+            key = CODE_TO_NAME.get(code_int) or raw_key
         elif name:
             key = name  # unknown, and validation will say so
         else:
             continue
+        if key in seen:
+            raise ValueError(
+                f"Option {key!r} is given more than once: "
+                f"{_describe_entry(seen[key])} and {_describe_entry(entry)}. "
+                "Send each option once."
+            )
+        seen[key] = entry
         out[key] = entry.get("value")
     return out
+
+
+def _describe_entry(entry: Mapping[str, Any]) -> str:
+    parts = [
+        f"{k}={entry[k]!r}" for k in ("name", "code", "value") if entry.get(k) not in (None, "")
+    ]
+    return "{" + ", ".join(parts) + "}"
 
 
 def _is_code_key(key: str) -> bool:
@@ -322,8 +442,13 @@ def _is_code_key(key: str) -> bool:
 
 
 def _supported(address_family: str) -> str:
-    names = sorted(_V6_CHECKS if address_family == "ipv6" else _V4_CHECKS)
-    return ", ".join(names)
+    if address_family == "ipv6":
+        names = set(_V6_CHECKS)
+    elif address_family == "dual":
+        names = set(_V4_CHECKS) | set(_V6_CHECKS)
+    else:
+        names = set(_V4_CHECKS)
+    return ", ".join(sorted(names))
 
 
 RAW_CODES_KEA = "code"
@@ -364,6 +489,7 @@ def _check_one(key: str, value: Any, address_family: str, raw_codes: str = RAW_C
         # would send the operator to a key that is refused too.
         if address_family == "ipv6":
             raise ValueError(f"option '{key}': raw option codes are DHCPv4 only")
+        # (``dual`` accepts one: it renders into Dhcp4 only.)
         _refuse_raw_spelling(key, raw.group(1), raw_codes)
         if code not in _KEA_VENDOR_OPTION_DEFS:
             supported = ", ".join(f"code:{c}" for c in sorted(_KEA_VENDOR_OPTION_DEFS))
@@ -381,37 +507,101 @@ def _check_one(key: str, value: Any, address_family: str, raw_codes: str = RAW_C
 
     win = _WINDOWS_CODE.fullmatch(key)
     if win:
-        if address_family == "ipv6" and raw_codes != RAW_CODES_WINDOWS:
-            # The ``code:NN`` the spelling check would suggest is v4-only.
+        if address_family == "ipv6":
+            # Every raw spelling is v4-only: ``code:NN`` above, and Windows
+            # writes options with ``Set-DhcpServerv4OptionValue`` alone, so an
+            # ``opt-NN`` on a v6 scope reaches no server either (#1347).
             raise ValueError(f"option '{key}': raw option codes are DHCPv4 only")
         _refuse_raw_spelling(key, win.group(1), raw_codes)
         if not 1 <= int(win.group(1)) <= 254:
             raise ValueError(f"option '{key}': option codes run 1..254")
         return
 
-    # A client class ("any") renders into Dhcp4 unconditionally, and into
-    # Dhcp6 only when the group has v6 scopes, so a key Dhcp4 knows must be
-    # valid there: an IPv6 ``dns-servers`` would reach Dhcp4 as
-    # ``domain-name-servers`` and take the whole config down. Dhcp4's table
-    # is therefore consulted first for "any", and v6 only for a v6-only key.
-    tables = {"ipv4": (_V4_CHECKS,), "ipv6": (_V6_CHECKS,)}.get(
-        address_family, (_V4_CHECKS, _V6_CHECKS)
-    )
-    check = next((t[key] for t in tables if key in t), None)
-    if check is None:
+    families = ("ipv4", "ipv6") if address_family == "dual" else (address_family,)
+    known_in = [f for f in families if key in _TABLES[f]]
+    if not known_in:
         if address_family == "ipv6" and key in _V4_CHECKS:
             raise ValueError(f"option '{key}': has no DHCPv6 equivalent")
         raise ValueError(
             f"unknown DHCP option '{key}'; supported names are "
-            f"{_supported(address_family if address_family != 'any' else 'ipv4')}, "
-            f"or code:NN for a raw code"
+            f"{_supported(address_family)}, or code:NN for a raw code"
         )
     if _is_unset(value):
         return
+    # A ``dual`` client class sends each option to whichever family it is
+    # valid in (``options_for_family``), so one family accepting it is enough.
+    # The error reported is the first family's: DHCPv4 when the name is in both.
+    first: ValueError | None = None
+    for fam in known_in:
+        try:
+            _TABLES[fam][key](value)
+            return
+        except ValueError as exc:
+            first = first or exc
+    raise ValueError(f"option '{key}': {first}") from None
+
+
+def _fits(key: str, value: Any, family: str) -> bool:
+    """Would this one option render validly into ``family``'s daemon?"""
     try:
-        check(value)
-    except ValueError as exc:
-        raise ValueError(f"option '{key}': {exc}") from None
+        _check_one(key, value, family)
+    except ValueError:
+        return False
+    return True
+
+
+def options_for_family(options: Mapping[str, Any], family: str) -> dict[str, Any]:
+    """The part of a ``dual`` client class's options that belongs in ``family``.
+
+    ``dns-servers`` exists in both daemons with a different address type, so
+    one map cannot be rendered into both (#1295): an IPv4 list reaches Dhcp6
+    as an IPv6 option and Kea rejects the whole config. Each option goes to
+    the families it is valid in, and a v4-only one (``routers``) stays out of
+    Dhcp6 as it always has.
+
+    Keys are checked under their canonical name, so a class stored before
+    #583 normalised ``domain-name-servers`` keeps it. And Dhcp4 still gets an
+    option neither family accepts — a grandfathered value, stored before the
+    write check existed — because before #1229 Dhcp4 received the class's
+    whole map; only an option that fits Dhcp6 and not Dhcp4 is withheld from
+    it. Dhcp6 gets strictly what it accepts, which is the #1295 fix.
+    """
+    other = "ipv6" if family == "ipv4" else "ipv4"
+    out: dict[str, Any] = {}
+    for k, v in options.items():
+        key = OPTION_NAME_ALIASES.get(str(k), str(k))
+        if _fits(key, v, family) or (family == "ipv4" and not _fits(key, v, other)):
+            out[k] = v
+    return out
+
+
+# Kea tokens only one daemon parses (measured with ``kea-dhcp4 -t`` /
+# ``kea-dhcp6 -t`` 3.0.3: "pkt4 can only be used in DHCPv4", and the mirror
+# image). Named ``option[...]`` lookups are family-specific too, but by option
+# name, which no short list covers; Kea's own check (#882) is the backstop.
+_FAMILY_TOKENS = {
+    "ipv4": re.compile(r"\b(pkt4|relay4)\b"),
+    "ipv6": re.compile(r"\b(pkt6|relay6)\b"),
+}
+# A Kea string literal — ``option[60].text == 'pkt4'`` compares against the
+# text, it does not use the token, so literals are blanked before the search.
+_KEA_STRING = re.compile(r"'[^']*'")
+
+
+def validate_class_test(expression: str, address_family: str) -> None:
+    """Raise ``ValueError`` when a client-class test uses a token the class's
+    family (or one of them, for ``dual``) cannot parse (#1229)."""
+    for family, other in (("ipv4", "ipv6"), ("ipv6", "ipv4")):
+        if address_family not in (family, "dual"):
+            continue
+        hit = _FAMILY_TOKENS[other].search(_KEA_STRING.sub("''", expression or ""))
+        if hit:
+            label = "IPv4" if family == "ipv4" else "IPv6"
+            raise ValueError(
+                f"match expression uses '{hit.group(1)}', which only "
+                f"kea-dhcp{other[-1]} understands; a class rendered for {label} "
+                f"cannot use it — set the class's address family to {other}"
+            )
 
 
 def validate_options(
@@ -423,10 +613,10 @@ def validate_options(
 ) -> None:
     """Raise ``ValueError`` naming the first option that cannot be rendered.
 
-    ``address_family`` is ``ipv4``, ``ipv6``, or ``any`` for a client class,
-    which always renders into Dhcp4 and so is checked against Dhcp4 first.
-    ``raw_codes`` is the raw-code spelling the group's servers read; see the
-    module docstring.
+    ``address_family`` is ``ipv4``, ``ipv6``, or ``dual`` for a client class
+    rendered into both daemons, where an option valid in either is accepted
+    and ``options_for_family`` routes it. ``raw_codes`` is the raw-code
+    spelling the group's servers read; see the module docstring.
 
     A key whose value is unchanged from ``previous`` is skipped, so an edit
     that round-trips a grandfathered option — stored before this check existed,
@@ -449,6 +639,64 @@ def _changed_options(
         for key, value in options.items()
         if not (str(key) in prev and prev[str(key)] == value)
     ]
+
+
+def raw_code_keys(options: Mapping[str, Any]) -> list[str]:
+    """The raw-code keys (``code:NN`` / ``opt-NN``) in ``options``."""
+    return [str(k) for k in options if _is_code_key(str(k))]
+
+
+def raw_keys_dropped_by(options: Mapping[str, Any], raw_codes: str) -> list[str]:
+    """Raw-code keys a group with spelling ``raw_codes`` would drop (#1347)."""
+    out = []
+    for key in raw_code_keys(options):
+        if raw_codes == RAW_CODES_NONE:
+            out.append(key)
+        elif key.startswith("opt-") and raw_codes != RAW_CODES_WINDOWS:
+            out.append(key)
+        elif key.startswith("code:") and raw_codes == RAW_CODES_WINDOWS:
+            out.append(key)
+    return out
+
+
+def rekey_raw_options(
+    options: Mapping[str, Any], *, raw_codes: str, address_family: str = "ipv4"
+) -> tuple[dict[str, Any], list[str]]:
+    """Re-spell raw-code keys for a group whose servers read ``raw_codes``.
+
+    For an importer (#1347), which brings options across in the SOURCE
+    server's spelling (Windows' ``opt-NN``) whatever the target group's
+    servers read. Returns the re-keyed options and the keys that could not
+    be carried: raw codes are DHCPv4-only, a mixed group (``none``) serves no
+    raw code, and Kea can deliver only the codes it ships a definition for.
+    Named options pass through unchanged.
+    """
+    out: dict[str, Any] = {}
+    dropped: list[str] = []
+    for key, value in options.items():
+        key = str(key)
+        match = _RAW_CODE.fullmatch(key) or _WINDOWS_CODE.fullmatch(key)
+        if not match:
+            out[key] = value
+            continue
+        code = int(match.group(1))
+        if address_family != "ipv4" or raw_codes == RAW_CODES_NONE:
+            dropped.append(key)
+            continue
+        if raw_codes == RAW_CODES_WINDOWS:
+            if 1 <= code <= 254:
+                out[f"opt-{code}"] = value
+            else:
+                dropped.append(key)
+            continue
+        target = f"code:{code}"
+        try:
+            _check_one(target, value, address_family, raw_codes)
+        except ValueError:
+            dropped.append(key)
+            continue
+        out[target] = value
+    return out, dropped
 
 
 def changes_raw_code(options: Mapping[str, Any], previous: Mapping[str, Any] | None = None) -> bool:

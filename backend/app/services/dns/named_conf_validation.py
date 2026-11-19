@@ -47,6 +47,7 @@ __all__ = [
     "RESERVED_VIEW_NAMES",
     "AclCycleError",
     "ViewValidationError",
+    "bind9_refused_prefix",
     "is_name_reference",
     "UPDATE_POLICY_NAMED_SCOPES",
     "UPDATE_POLICY_RR_TYPES",
@@ -140,12 +141,48 @@ def validate_view_name(name: str, *, field: str = "name") -> str:
     return candidate
 
 
+def bind9_refused_prefix(element: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
+    """The network a prefix BIND 9 refuses stands for, or ``None`` (#2695).
+
+    BIND reads a prefix as an address, ``/`` and a decimal length, with no
+    host bits set. ``ipaddress`` also reads two forms ``named-checkconf``
+    refuses, and each gives its network here:
+
+    * host bits set: ``10.0.0.5/24`` gives ``10.0.0.0/24``
+      ("'10.0.0.5/24': address/prefix length mismatch '24'");
+    * a mask where the length goes: ``10.0.0.0/255.255.255.0`` gives
+      ``10.0.0.0/24`` ("expected prefix length near '255.255.255.0'").
+
+    One element BIND refuses fails the whole group's config. An address, a
+    name, a prefix BIND reads and anything malformed give ``None``; a
+    leading ``!`` is ignored.
+    """
+    body = (element or "").strip()
+    if body.startswith("!"):
+        body = body[1:].strip()
+    if "/" not in body:
+        return None
+    try:
+        network = ipaddress.ip_network(body, strict=False)
+    except ValueError:
+        return None
+    length = body.partition("/")[2]
+    if not (length.isascii() and length.isdigit()):
+        return network
+    try:
+        ipaddress.ip_network(body)
+    except ValueError:
+        return network
+    return None
+
+
 def _validate_element(
     element: str,
     field: str,
     known_acls: frozenset[str],
     known_keys: frozenset[str],
     allow_unknown_names: bool = False,
+    allow_bind9_refused_prefixes: bool = False,
 ) -> None:
     raw = (element or "").strip()
     if not raw:
@@ -186,8 +223,13 @@ def _validate_element(
             )
         return
 
-    # An address or prefix. ``strict=False`` so 10.0.0.5/24 is accepted the
-    # way BIND accepts it, rather than rejected for having host bits set.
+    # An address or prefix. BIND 9 refuses a prefix with host bits set
+    # (10.0.0.5/24, "address/prefix length mismatch") and one with a mask
+    # where the length goes (10.0.0.0/255.255.255.0, "expected prefix
+    # length"), though ``ipaddress`` reads both. Accepting either would stop
+    # every BIND9 server in the group loading new config (#2695). Each is
+    # refused rather than rewritten: 10.0.0.5/24 may mean the network or the
+    # one host.
     if "/" in body:
         try:
             ipaddress.ip_network(body, strict=False)
@@ -197,6 +239,20 @@ def _validate_element(
                 field=field,
                 value=element,
             ) from exc
+        network = None if allow_bind9_refused_prefixes else bind9_refused_prefix(body)
+        if network is not None:
+            address = body.partition("/")[0].strip()
+            if ipaddress.ip_address(address) != network.network_address:
+                message = (
+                    f"'{body}' has host bits set, which BIND refuses: use {network} for "
+                    f"the network, or {address} for the one address."
+                )
+            else:
+                message = (
+                    f"'{body}' gives its mask as an address, which BIND refuses: "
+                    f"write it as {network}."
+                )
+            raise ViewValidationError(message, field=field, value=element)
         return
     try:
         ipaddress.ip_address(body)
@@ -240,6 +296,7 @@ def validate_address_match_list(
     known_acls: frozenset[str] = frozenset(),
     known_keys: frozenset[str] = frozenset(),
     allow_unknown_names: bool = False,
+    allow_bind9_refused_prefixes: bool = False,
 ) -> list[str]:
     """Validate every element of a BIND address-match-list.
 
@@ -247,6 +304,14 @@ def validate_address_match_list(
     without asking whether it resolves. The bundle builder uses it to
     decide whether a legacy row is *renderable*; resolution is a separate
     question it answers with its own known-set.
+
+    ``allow_bind9_refused_prefixes`` accepts a prefix BIND 9 refuses, one
+    with host bits set (10.0.0.5/24) or a mask where the length goes
+    (10.0.0.0/255.255.255.0), which is otherwise refused (#2695). The bundle
+    builder passes it too: it ships such a prefix to a BIND 9 server as the
+    network it stands for, and as stored to the Technitium and PowerDNS
+    agents, which apply that network themselves, so how one renders is a
+    per-server question it answers itself.
 
     ``known_keys`` is the set of TSIG key names the group ships to its
     agents; a ``key <name>`` element naming one that doesn't exist renders a
@@ -264,7 +329,14 @@ def validate_address_match_list(
         return []
     cleaned: list[str] = []
     for element in elements:
-        _validate_element(element, field, known_acls, known_keys, allow_unknown_names)
+        _validate_element(
+            element,
+            field,
+            known_acls,
+            known_keys,
+            allow_unknown_names,
+            allow_bind9_refused_prefixes,
+        )
         cleaned.append((element or "").strip())
     return cleaned
 
@@ -450,19 +522,27 @@ _OPTION_CHOICES: dict[str, frozenset[str]] = {
     "forward_policy": frozenset({"first", "only"}),
     "dnssec_validation": frozenset({"auto", "yes", "no"}),
     "notify_enabled": frozenset({"yes", "no", "explicit", "master-only", "primary-only"}),
-    "query_log_channel": frozenset({"file", "syslog", "stderr"}),
+    # Only ``file`` (#2265): the agent's QueryLogShipper tails the file
+    # channel, so syslog / stderr would silently empty the DNS Queries tab.
+    "query_log_channel": frozenset({"file"}),
 }
 
-#: ``severity`` in a logging channel. ``debug`` may carry a level.
-_SEVERITIES = frozenset({"critical", "error", "warning", "notice", "info", "dynamic", "debug"})
+#: Severities that still let a query line through the channel (#2265).
+#: named logs queries at ``info``, so a channel threshold of ``notice`` or
+#: above drops every line and the DNS Queries tab goes quiet.
+_QUERY_LOG_SEVERITIES = frozenset({"info", "dynamic", "debug"})
+
+#: The one path the shipper tails (#2265); ``query_log_file`` may not move.
+QUERY_LOG_FIXED_FILE = "/var/log/named/queries.log"
+
+#: ``debug`` may carry a level.
 _DEBUG_LEVEL_RE = re.compile(r"^debug\s+\d{1,3}$")
 
 #: Where each path option may point. The query log has to land in the
 #: directory the agent's entrypoint chowns to the unprivileged user (and
-#: that its shipper tails); a keytab is read-only host material.
+#: that its shipper tails).
 PATH_OPTION_PREFIXES: dict[str, tuple[str, ...]] = {
     "query_log_file": ("/var/log/named/",),
-    "gss_tsig_keytab_path": ("/etc/", "/var/lib/"),
 }
 
 # Deliberately narrow: the value sits inside ``"…"`` in named.conf, so a
@@ -500,9 +580,9 @@ def _validate_path(value: str, *, field: str) -> str:
 def _validate_choice(value: str, *, field: str) -> str:
     candidate = (value or "").strip().lower()
     if field == "query_log_severity":
-        if candidate in _SEVERITIES or _DEBUG_LEVEL_RE.match(candidate):
+        if candidate in _QUERY_LOG_SEVERITIES or _DEBUG_LEVEL_RE.match(candidate):
             return candidate
-        allowed = ", ".join(sorted(_SEVERITIES)) + ", debug <level>"
+        allowed = ", ".join(sorted(_QUERY_LOG_SEVERITIES)) + ", debug <level>"
     else:
         if candidate in _OPTION_CHOICES[field]:
             return candidate
@@ -515,7 +595,8 @@ def _validate_choice(value: str, *, field: str) -> str:
 
 
 def _validate_port(port: str, *, field: str, element: str) -> None:
-    if not port.isdigit() or not 1 <= int(port) <= 65535:
+    # ASCII digits only: ``str.isdigit()`` is true for ``²`` and ``int()`` then raises.
+    if not (port.isascii() and port.isdigit()) or not 1 <= int(port) <= 65535:
         raise ViewValidationError(
             f"'{port}' is not a port number (1-65535).", field=field, value=element
         )
@@ -586,6 +667,30 @@ def _validate_also_notify(
     return cleaned
 
 
+def _refuse_mixed_none(elements: list[str], *, field: str) -> None:
+    """Refuse an ``allow_transfer`` list that puts ``none`` beside other entries.
+
+    BIND reads ``none`` as ``!any``: wherever it sits, it denies everyone
+    from that point on, so ``["none", "10.0.0.0/8"]`` admits nobody while
+    reading like "10/8 only", and ``["10.0.0.0/8", "none"]`` is just
+    ``["10.0.0.0/8"]``. One list, two plausible readings — so neither is
+    accepted. ``["none"]`` alone, or the entries without it, say one thing.
+    """
+    if len(elements) < 2:
+        return
+    for element in elements:
+        body = element[1:].strip() if element.startswith("!") else element
+        if body.lower() == "none":
+            raise ViewValidationError(
+                "'none' cannot be combined with other entries: BIND reads it as "
+                "'deny everyone from here on'. Use ['none'] on its own to allow "
+                "transfers to no one but the group's TSIG keys, or list only the "
+                "addresses, prefixes, ACLs or keys that may transfer.",
+                field=field,
+                value=element,
+            )
+
+
 def validate_server_option(
     field: str,
     value: Any,
@@ -605,20 +710,39 @@ def validate_server_option(
     if value is None:
         return None
     if field in ADDRESS_MATCH_LIST_OPTIONS:
-        return validate_address_match_list(
+        cleaned = validate_address_match_list(
             list(value),
             field=field,
             known_acls=known_acls,
             known_keys=known_keys,
         )
+        if field == "allow_transfer":
+            _refuse_mixed_none(cleaned, field=field)
+        return cleaned
     if field == "forwarders":
         return _validate_forwarders(list(value), field=field)
     if field == "also_notify":
         return _validate_also_notify(list(value), field=field, known_keys=known_keys)
     if field in _OPTION_CHOICES or field == "query_log_severity":
         return _validate_choice(str(value), field=field)
-    if field in PATH_OPTION_PREFIXES:
-        return _validate_path(str(value), field=field)
+    if field == "query_log_file":
+        candidate = _validate_path(str(value), field=field)
+        if candidate != QUERY_LOG_FIXED_FILE:
+            raise ViewValidationError(
+                f"The query log is always written to {QUERY_LOG_FIXED_FILE}, the file "
+                "the agent's query-log shipper tails; a different path would leave "
+                "the DNS Queries tab empty.",
+                field=field,
+                value=value,
+            )
+        return candidate
+    if field == "query_log_print_time" and value is False:
+        raise ViewValidationError(
+            "query_log_print_time must stay on: the query-log shipper reads each "
+            "line's timestamp.",
+            field=field,
+            value="false",
+        )
     return value
 
 
@@ -897,3 +1021,108 @@ def validate_update_acl_entry(
             if t is not None and str(t).strip()
         ] or None
     return pattern, types
+
+
+#: BIND 9.20 accepts exactly one NSEC3 iteration count. ``named-checkconf``
+#: answers ``dnssec-policy: nsec3 iterations value N not allowed, must be
+#: zero`` (verified against 9.20.29), and RFC 9276 §3.1 says the same. A
+#: refused ``dnssec-policy`` rejects the WHOLE ``named.conf``, so one such
+#: policy stops every structural change on the group converging (#3153, the
+#: #876 / #899 class). The salt length is NOT restricted (0-255 loads).
+BIND_NSEC3_ITERATIONS = 0
+BIND_NSEC3_SALT_MAX = 255
+
+
+def validate_nsec3_iterations(value: int) -> int:
+    """Raise ``ValueError`` (a 422 inside a pydantic validator) unless 0."""
+    if value != BIND_NSEC3_ITERATIONS:
+        raise ValueError(
+            f"nsec3_iterations must be {BIND_NSEC3_ITERATIONS}: BIND 9.20 refuses "
+            "any other value (RFC 9276 recommends 0), and a policy it refuses "
+            "stops the whole server group's config from applying"
+        )
+    return value
+
+
+def validate_nsec3_salt_length(value: int) -> int:
+    if not 0 <= value <= BIND_NSEC3_SALT_MAX:
+        raise ValueError(f"nsec3_salt_length must be between 0 and {BIND_NSEC3_SALT_MAX}")
+    return value
+
+
+def effective_nsec3_iterations(policy_name: str, value: int | None, log: Any = None) -> int:
+    """What a stored policy renders as. Rows saved before the API refused a
+    non-zero count still exist; rendering them as stored would make BIND
+    reject the whole config, so they render as 0 with a warning."""
+    v = int(value or 0)
+    if v != BIND_NSEC3_ITERATIONS:
+        if log is not None:
+            log.warning(
+                "dnssec_policy_nsec3_iterations_clamped",
+                policy=policy_name,
+                stored=v,
+                rendered=BIND_NSEC3_ITERATIONS,
+            )
+        return BIND_NSEC3_ITERATIONS
+    return v
+
+
+#: What BIND 9.20 takes as a ``dnssec-policy`` key ``lifetime``, in days, for a
+#: policy as the agents render it (``keys`` only, so BIND's default timings),
+#: each bound verified against ``named-checkconf`` 9.20.30 (#3411). 0 renders
+#: as ``unlimited``. A negative count is not a duration ("expected ISO 8601
+#: duration or TTL value"), past 49710 days it no longer fits BIND's 32-bit
+#: seconds ("duration or TTL out of range"), and a KSK under 2 days or a ZSK
+#: under 11 is "shorter than the time it takes to do a rollover". Like an NSEC3
+#: iteration count, any of them rejects the WHOLE ``named.conf``, so once a
+#: zone is signed with the policy no later change on the group applies.
+BIND_KEY_LIFETIME_MAX_DAYS = 49710
+BIND_KEY_LIFETIME_MIN_DAYS = {"ksk": 2, "zsk": 11}
+
+
+def validate_key_lifetime_days(value: int, *, key: str) -> int:
+    """Raise ``ValueError`` (a 422 inside a pydantic validator) unless BIND
+    takes ``value`` as the lifetime of ``key`` (``ksk`` or ``zsk``)."""
+    low = BIND_KEY_LIFETIME_MIN_DAYS[key]
+    if value == 0 or low <= value <= BIND_KEY_LIFETIME_MAX_DAYS:
+        return value
+    if value < 0:
+        why = "a negative lifetime"
+    elif value > BIND_KEY_LIFETIME_MAX_DAYS:
+        why = f"a lifetime past {BIND_KEY_LIFETIME_MAX_DAYS} days"
+    else:
+        why = f"a {key.upper()} lifetime shorter than the time a rollover takes"
+    raise ValueError(
+        f"{key}_lifetime_days must be 0 (unlimited) or {low} to "
+        f"{BIND_KEY_LIFETIME_MAX_DAYS} days: BIND 9.20 refuses {why}, and a "
+        "policy it refuses stops the whole server group's config from applying"
+    )
+
+
+def effective_key_lifetime_days(
+    policy_name: str, key: str, value: int | None, log: Any = None
+) -> int:
+    """What a stored lifetime renders as. Rows saved before the API refused a
+    lifetime BIND cannot take still exist (#3411); rendering one as stored
+    would make BIND reject the whole config, so it renders as the nearest one
+    BIND takes, with a warning: a negative lifetime as 0 (unlimited), a short
+    one at the key's floor, a long one at the ceiling."""
+    v = int(value or 0)
+    low = BIND_KEY_LIFETIME_MIN_DAYS[key]
+    if v < 0:
+        rendered = 0
+    elif 0 < v < low:
+        rendered = low
+    elif v > BIND_KEY_LIFETIME_MAX_DAYS:
+        rendered = BIND_KEY_LIFETIME_MAX_DAYS
+    else:
+        return v
+    if log is not None:
+        log.warning(
+            "dnssec_policy_key_lifetime_clamped",
+            policy=policy_name,
+            key=key,
+            stored=v,
+            rendered=rendered,
+        )
+    return rendered

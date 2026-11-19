@@ -56,6 +56,8 @@ from typing import Any
 import httpx
 import structlog
 
+from app.core.exc_text import describe_http_exc
+
 logger = structlog.get_logger(__name__)
 
 
@@ -547,7 +549,7 @@ class OPNsenseClient:
             # Transport-level failure (timeout / connection refused) — no
             # HTTP status, so status_code stays None and the caller treats
             # it as transient (abort, don't diff against empty).
-            raise OPNsenseClientError(f"{path}: {exc}") from exc
+            raise OPNsenseClientError(f"{path}: {describe_http_exc(exc)}") from exc
         if resp.status_code == 401:
             raise OPNsenseClientError(f"{path}: HTTP 401 — API key/secret invalid", status_code=401)
         if resp.status_code == 403:
@@ -892,12 +894,15 @@ class OPNsenseClient:
             if not addr or mac is None:
                 continue
             host = str(r.get("host") or "").strip()
-            domain = str(r.get("domain") or "").strip()
+            # The row's ``domain`` is deliberately NOT appended (#1557).
             out.append(
                 _OPNReservation(
                     address=addr,
                     mac=mac,
-                    hostname=f"{host}.{domain}" if host and domain else host,
+                    # Host label only (#1557): ``host`` + ``domain`` is
+                    # an FQDN, and IPAM publishing appends the zone to
+                    # hostname, which doubled the suffix.
+                    hostname=host,
                     description=str(r.get("descr") or "").strip(),
                 )
             )

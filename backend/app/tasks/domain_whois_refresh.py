@@ -42,6 +42,7 @@ from app.services.domain_refresh import (
     build_refresh_audit_payload,
     refresh_one_domain,
 )
+from app.services.feature_modules import is_module_enabled
 
 logger = structlog.get_logger(__name__)
 
@@ -71,6 +72,12 @@ async def _refresh_due_async() -> dict[str, Any]:
     ``refresh_one_domain``'s caller below for rows whose state moved.
     """
     async with task_session() as db:
+        # #2325 — the module is the operator's off switch for the RDAP
+        # egress. Checked before any row is read so an off module makes no
+        # lookup at all, not even one whose result would be discarded.
+        if not await is_module_enabled(db, "network.domains"):
+            return {"status": "skipped", "reason": "module_disabled"}
+
         ps = await db.get(PlatformSettings, _SINGLETON_ID)
         interval_hours = _clamp_interval(ps.domain_whois_interval_hours if ps is not None else None)
 
@@ -242,6 +249,10 @@ async def _refresh_one_by_id_async(domain_id: str) -> dict[str, Any]:
     add a noise row on top of the ``create`` audit already written.
     """
     async with task_session() as db:
+        # #2325 — a lookup queued just before the module was switched off.
+        if not await is_module_enabled(db, "network.domains"):
+            return {"status": "skipped", "reason": "module_disabled", "domain_id": domain_id}
+
         d = await db.get(Domain, uuid.UUID(domain_id))
         if d is None:
             # Created then deleted before the task ran — nothing to do.

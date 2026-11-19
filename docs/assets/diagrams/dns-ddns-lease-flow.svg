@@ -39,7 +39,7 @@
   <path d="M 66 122 H 360" stroke="#fed7aa" stroke-width="1" opacity="0.6"/>
   <rect x="66" y="145" width="8" height="2" rx="1" fill="#fed7aa"/>
   <text x="80" y="150" font-size="13" font-weight="600" fill="#ffffff">agentless pull</text>
-  <text x="193" y="150" font-size="11" fill="#fed7aa">(Windows DHCP)</text>
+  <text x="193" y="150" font-size="11" fill="#fed7aa">(Windows DHCP, FortiGate)</text>
   <rect x="66" y="181" width="8" height="2" rx="1" fill="#fed7aa"/>
   <text x="80" y="186" font-size="13" font-weight="600" fill="#ffffff">agent lease event</text>
   <text x="222" y="186" font-size="11" fill="#fed7aa">(Kea)</text>
@@ -79,14 +79,14 @@
   <text x="66" y="436" font-size="12" fill="#ddd6fe">(IPAM router)</text>
 
   <path d="M 386 424 H 426" stroke="#64748b" stroke-width="1.5" fill="none" marker-end="url(#ddns-arrow)"/>
-  <text x="436" y="408" font-size="12" fill="#475569">unchanged — drives A/AAAA + PTR via</text>
-  <text x="436" y="426" font-size="12" fill="#475569">RFC 2136 for BIND9 / Windows Path A,</text>
-  <text x="436" y="444" font-size="12" fill="#475569">or WinRM for Windows Path B</text>
+  <text x="436" y="408" font-size="12" fill="#475569">unchanged — queues a DNSRecordOp per</text>
+  <text x="436" y="426" font-size="12" fill="#475569">server: BIND9 agent applies via nsupdate,</text>
+  <text x="436" y="444" font-size="12" fill="#475569">other drivers via their own API</text>
 
   <!-- expiry footnote -->
   <rect x="48" y="496" width="824" height="70" rx="12" fill="#ffffff" stroke="#cbd5e1"
         stroke-width="1.5" stroke-dasharray="4 4"/>
   <text x="66" y="522" font-size="12" font-weight="600" fill="#0f172a">On lease expiry</text>
-  <text x="66" y="542" font-size="11" fill="#475569">dhcp_lease_cleanup sweeps the DHCPLease row past its grace period; before deleting the mirrored</text>
-  <text x="66" y="558" font-size="11" fill="#475569">auto_from_lease IPAM row it calls revoke_ddns_for_lease, which fires _sync_dns_record(..., action="delete").</text>
+  <text x="66" y="542" font-size="11" fill="#475569">dhcp_lease_cleanup sweeps the DHCPLease row past its grace period (the pull's absence-delete and release events do the same);</text>
+  <text x="66" y="558" font-size="11" fill="#475569">before deleting the mirrored auto_from_lease IPAM row it calls revoke_ddns_for_lease -> _sync_dns_record(..., action="delete").</text>
 </svg>

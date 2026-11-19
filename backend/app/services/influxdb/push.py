@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.exc_text import describe_exc
 from app.models.influxdb import InfluxDBTarget
 from app.services.influxdb import collect
 from app.services.influxdb.client import config_from_row, write_lines
@@ -89,6 +90,15 @@ async def push_target(db: AsyncSession, row: InfluxDBTarget, *, now: datetime) -
             points.extend(await collect.collect_dhcp_scope_lease_points(db, now))
 
         body = render_batch(_prefixed(points, row.measurement_prefix or ""))
+        if not body:
+            # Nothing to send, so nobody was contacted: this is not a push
+            # the destination accepted (#2749). ``last_push_at`` still moves
+            # so interval gating holds; ``last_success_at`` and any recorded
+            # failure are left exactly as the last real attempt left them.
+            row.last_push_at = now
+            row.last_push_points = 0
+            logger.info("influxdb_push_empty", target=row.name)
+            return PushResult(str(row.id), row.name, 0, ok=True)
         await write_lines(config_from_row(row), body)
     # Broad on purpose: this is the per-target failure-isolation boundary.
     # The caller pushes every due target inside one transaction, so an
@@ -97,7 +107,7 @@ async def push_target(db: AsyncSession, row: InfluxDBTarget, *, now: datetime) -
     # leaving this one with no ``last_push_error`` to explain itself, so
     # nothing anywhere would say what went wrong.
     except Exception as exc:  # noqa: BLE001
-        row.last_push_error = str(exc)[:1000] or type(exc).__name__
+        row.last_push_error = describe_exc(exc)[:1000]
         # ``last_push_at`` still advances on failure — otherwise a target
         # that errors fast would be retried on every 30 s beat tick
         # instead of on its own interval.
@@ -116,6 +126,7 @@ async def push_target(db: AsyncSession, row: InfluxDBTarget, *, now: datetime) -
     if dhcp_watermark is not None:
         row.last_dhcp_bucket_at = dhcp_watermark
     row.last_push_at = now
+    row.last_success_at = now
     row.last_push_points = len(points)
     row.last_push_error = None
     logger.info("influxdb_push_ok", target=row.name, points=len(points))

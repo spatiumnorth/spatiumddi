@@ -41,8 +41,8 @@ level all three blocks can render side-by-side if values.yaml says so.
 ## Air-gap defaults
 
 - `global.imagePullPolicy: Never` everywhere. All container images
-  preload from `/usr/lib/spatiumddi/images/*.tar.zst` into
-  containerd at firstboot. No registry lookups at runtime.
+  are imported by k3s from `/var/lib/rancher/k3s/agent/images/*.tar.zst`
+  into containerd when it starts. No registry lookups at runtime.
 - `global.imageTag` defaults to the slot's `SPATIUMDDI_VERSION`
   stamp; the supervisor rewrites it on apply.
 
@@ -60,10 +60,11 @@ bursts the data plane exists to serve, so none is set.
 
 | Values key | Default request |
 |---|---|
-| `dhcpKea.resources` | `500m` CPU / `64Mi` |
-| `dnsBind9.resources` / `dnsPowerdns.resources` / `dnsTechnitium.resources` | `250m` CPU / `64Mi` |
+| `dhcpKea.resources` | `500m` CPU / `128Mi` |
+| `dnsBind9.resources` / `dnsTechnitium.resources` | `250m` CPU / `256Mi` (BIND's memory limit + request come from `dnsBind9.memory`, which the supervisor sizes from node RAM: a quarter of the smallest DNS node, 2Gi to 8Gi, request an eighth of it, #1725 / #2223; a memory value in `dnsBind9.resources` overrides it) |
+| `dnsPowerdns.resources` | `250m` CPU / `128Mi` |
 | `supervisor.resources` | `50m` CPU / `128Mi` |
-| `lookingGlass.resources` | `50m` CPU / `64Mi` |
+| `lookingGlass.resources` | `50m` CPU / `128Mi` |
 | `agentLanding.resources` | `10m` CPU / `16Mi` |
 
 The supervisor's values map does not touch these keys, so the chart

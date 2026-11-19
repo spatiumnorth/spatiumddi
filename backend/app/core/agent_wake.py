@@ -45,6 +45,7 @@ from typing import Any
 import structlog
 
 from app.config import settings
+from app.core import shutdown as _shutdown
 from app.core.redis_client import make_async_redis
 
 logger = structlog.get_logger(__name__)
@@ -119,6 +120,13 @@ def appliance_channel(appliance_id: uuid.UUID | str) -> str:
 # the DHCP agent long-poll folds those into its ETag today, so only it
 # subscribes here.
 HOSTCONFIG_ALL = _ch("hostconfig", "all")
+
+
+# Web UI certificate changed in the DB (#1895). Published by the Celery
+# worker after an ACME issue / renewal commits; the api (the only process
+# whose ServiceAccount may patch the ``spatium-appliance-tls`` Secret)
+# subscribes in its lifespan and deploys the active cert.
+APPLIANCE_CERT_DEPLOY = _ch("appliance", "cert-deploy")
 
 
 def dns_wake_channels(server: Any) -> list[str]:
@@ -224,6 +232,25 @@ def collect_wake(*channels: str) -> None:
             bucket.add(ch)
 
 
+async def flush_collected_wakes() -> None:
+    """Publish and clear what ``collect_wake`` has stashed so far, now.
+
+    For a handler that commits in several steps and must wake the agents
+    once, after the last commit it made, on every way out of it: the
+    collector's own flush runs only on a clean exit, so a handler that
+    commits and then raises (a 503 after some of its chunks committed) would
+    leave those commits to the ``WAKE_TICK_SECONDS`` tick. Emptying the
+    bucket makes the collector's flush a no-op, so the wake is one publish
+    per request, not one per commit. No-op without a collector.
+    """
+    bucket = _wake_collector.get()
+    if not bucket:
+        return
+    channels = list(bucket)
+    bucket.clear()
+    await publish_wake(*channels)
+
+
 async def wake_publishing() -> AsyncIterator[None]:
     """FastAPI dependency: open a request-scoped wake collector so any
     ``collect_wake`` calls made while handling the request publish once,
@@ -256,6 +283,7 @@ class WakeResult(StrEnum):
     WAKE = "wake"  # a real wake message arrived → re-check now
     TIMEOUT = "timeout"  # tick elapsed with no wake → re-check anyway
     UNAVAILABLE = "unavailable"  # Redis error → degraded to poll fallback
+    SHUTDOWN = "shutdown"  # this api process is stopping (#3015) → answer now
 
 
 class WakeSubscription:
@@ -276,8 +304,11 @@ class WakeSubscription:
         message, TIMEOUT when the tick elapses, UNAVAILABLE (after a
         fallback sleep) on any Redis error so the caller keeps looping
         at the old cadence."""
+        if _shutdown.shutdown_requested():
+            return WakeResult.SHUTDOWN
         if self.degraded or self._pubsub is None:
-            await asyncio.sleep(min(timeout, LONGPOLL_POLL_INTERVAL_FALLBACK))
+            if await _shutdown.sleep_or_shutdown(min(timeout, LONGPOLL_POLL_INTERVAL_FALLBACK)):
+                return WakeResult.SHUTDOWN
             return WakeResult.UNAVAILABLE
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
@@ -286,16 +317,47 @@ class WakeSubscription:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
                     return WakeResult.TIMEOUT
-                msg = await self._pubsub.get_message(
-                    ignore_subscribe_messages=True, timeout=remaining
-                )
+                msg, ended = await self._read_or_shutdown(remaining)
+                if ended:
+                    return WakeResult.SHUTDOWN
                 if msg is not None and msg.get("type") == "message":
                     return WakeResult.WAKE
         except Exception as exc:  # noqa: BLE001 — degrade to poll, never fail the poll
             logger.warning("agent_wake_wait_failed", error=str(exc))
             self.degraded = True
-            await asyncio.sleep(LONGPOLL_POLL_INTERVAL_FALLBACK)
+            if await _shutdown.sleep_or_shutdown(LONGPOLL_POLL_INTERVAL_FALLBACK):
+                return WakeResult.SHUTDOWN
             return WakeResult.UNAVAILABLE
+
+    async def _read_or_shutdown(self, timeout: float) -> tuple[Any, bool]:
+        """One pub/sub read of up to ``timeout``, raced against api shutdown
+        (#3015). Returns ``(message_or_None, shutdown_won)``.
+
+        A race rather than a short read in a loop: a parked poll then costs
+        one timer per wake tick instead of several wakeups a second, which
+        matters with a whole fleet parked on one pod. When shutdown wins the
+        read is cancelled, possibly mid-frame, so the subscription is marked
+        degraded and never read again — it is torn down with the request
+        anyway (``wake_subscription`` owns a dedicated connection).
+        """
+        read = asyncio.ensure_future(
+            self._pubsub.get_message(ignore_subscribe_messages=True, timeout=timeout)
+        )
+        stop = _shutdown.shutdown_future()
+        try:
+            await asyncio.wait({read, stop}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            _shutdown.discard(stop)
+            if not read.done():
+                read.cancel()
+                self.degraded = True
+                try:
+                    await read
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001 — abandoned read
+                    pass
+        if read.cancelled():
+            return None, True
+        return read.result(), False
 
 
 @asynccontextmanager
@@ -305,9 +367,12 @@ async def wake_subscription(channels: Iterable[str]) -> AsyncIterator[WakeSubscr
     If Redis is unreachable the context still yields a (degraded)
     subscription whose ``wait`` sleeps — so the long-poll loop is
     identical to write either way. Always tears the pub/sub connection
-    down in ``finally`` (FastAPI cancels the handler when the agent
-    disconnects mid-poll; without teardown a flapping fleet would
-    exhaust Redis connections).
+    down in ``finally``: a poll that ends early (an exception, a
+    cancellation) must not leave it open, or a flapping fleet would exhaust
+    Redis connections. An agent disconnecting mid-poll does NOT cancel the
+    handler, which runs on to its deadline (#2042); that is why the DNS
+    long-poll checks ``request.is_disconnected()`` before committing a page
+    of ops.
     """
     chans = [c for c in channels if c]
     client = None

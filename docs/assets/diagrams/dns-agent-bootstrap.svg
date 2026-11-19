@@ -46,7 +46,7 @@
     <rect x="48" y="146" width="330" height="76" rx="8" fill="url(#dnsb-surface)" stroke="#94a3b8" stroke-width="1.5"/>
     <text x="66" y="170" font-size="12" font-weight="600" fill="#0f172a">1 · Read env</text>
     <text x="66" y="190" font-size="11" fill="#475569">CONTROL_PLANE_URL · DNS_AGENT_KEY</text>
-    <text x="66" y="208" font-size="11" fill="#475569">AGENT_ID — persisted in /var/lib</text>
+    <text x="66" y="208" font-size="11" fill="#475569">agent-id file kept in the state dir</text>
   </g>
 
   <!-- 2. Bootstrap register -->
@@ -54,15 +54,15 @@
   <text x="460" y="266" text-anchor="middle" font-size="11" fill="#475569">header  X-DNS-Agent-Key: &lt;bootstrap PSK&gt;</text>
   <text x="460" y="284" text-anchor="middle" font-size="11" fill="#475569">body  {hostname, driver, roles, version, group_name, fingerprint}</text>
   <path d="M 212 298 H 708" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#dnsb-arrow)"/>
-  <text x="460" y="316" text-anchor="middle" font-size="11" font-style="italic" fill="#64748b">sent only when no cached agent_token.jwt exists</text>
+  <text x="460" y="316" text-anchor="middle" font-size="11" font-style="italic" fill="#64748b">sent when no cached token exists, or on 401 / 404 (re-register from the PSK)</text>
 
   <!-- 3. Validate + mint -->
   <g>
     <rect x="560" y="336" width="330" height="114" rx="8" fill="url(#dnsb-surface)" stroke="#94a3b8" stroke-width="1.5"/>
     <text x="578" y="360" font-size="12" font-weight="600" fill="#0f172a">3 · Validate PSK</text>
     <text x="578" y="380" font-size="11" fill="#475569">create / update DNSServer row</text>
-    <text x="578" y="398" font-size="11" fill="#475569">pending_approval = true if</text>
-    <text x="578" y="416" font-size="11" fill="#475569">settings.require_agent_approval</text>
+    <text x="578" y="398" font-size="11" fill="#475569">pending_approval = true if env</text>
+    <text x="578" y="416" font-size="11" fill="#475569">DNS_REQUIRE_AGENT_APPROVAL (new or changed)</text>
     <text x="578" y="434" font-size="11" fill="#475569">mint agent_token (JWT, 24 h)</text>
   </g>
 

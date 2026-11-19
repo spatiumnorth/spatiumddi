@@ -140,6 +140,6 @@ def test_an_unreadable_chart_does_not_break_the_key(slot) -> None:
 def test_the_heartbeat_takes_its_skip_decision_from_the_full_key() -> None:
     """The heartbeat must decide through ``_role_apply_due``, never by hashing
     the rendered env on its own again."""
-    src = inspect.getsource(heartbeat.heartbeat_once)
+    src = inspect.getsource(heartbeat._run_role_lifecycle)
     assert "_role_apply_due(" in src
     assert "hashlib.sha256(rendered" not in src

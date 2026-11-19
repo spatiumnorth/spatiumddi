@@ -1,5 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { ipamApi, type IPSpace } from "@/lib/api";
+import { ipamApi, formatDialogError, type IPSpace } from "@/lib/api";
 import { zebraBodyCls } from "@/lib/utils";
 import { Trash2 } from "lucide-react";
 
@@ -22,6 +22,11 @@ export function IPSpacesPage() {
       <h1 className="text-2xl font-bold tracking-tight">IP Spaces</h1>
       {spaces?.length === 0 && (
         <p className="text-sm text-muted-foreground">No IP spaces yet.</p>
+      )}
+      {deleteMutation.isError && (
+        <p role="alert" className="text-sm text-destructive">
+          {formatDialogError(deleteMutation.error, "Failed to delete IP space")}
+        </p>
       )}
       <div className="rounded-lg border">
         <table className="w-full text-sm">
@@ -46,6 +51,8 @@ export function IPSpacesPage() {
                 <td className="px-4 py-3">{space.is_default ? "Yes" : "—"}</td>
                 <td className="px-4 py-3 text-right">
                   <button
+                    aria-label="Delete IP space"
+                    title="Delete IP space"
                     onClick={() => deleteMutation.mutate(space.id)}
                     disabled={deleteMutation.isPending}
                     className="rounded p-1 text-muted-foreground hover:text-destructive"

@@ -1168,6 +1168,14 @@ ask_role() {
 # "is that MY control plane". A typo landing on some other host's web
 # server fails the JSON check rather than passing a reachability ping.
 #
+# #2935 — an anonymous caller (this probe has no credential) now gets only
+# ``"product": "SpatiumDDI"`` and ``api_level``; the version itself is for
+# signed-in users, and ``version`` carries the placeholder ``restricted``.
+# So the product name is the match, and a real version string is shown only
+# when an older control plane, which still sends one, does. (The placeholder
+# is what keeps an OLDER installer, which matches on ``version`` alone,
+# reporting this control plane as reachable.)
+#
 # The pairing code deliberately is NOT probed. It can only be validated
 # by claiming it, and an unauthenticated "is this code valid" endpoint
 # would be an oracle for guessing eight digits. A reachable control plane
@@ -1209,15 +1217,21 @@ _probe_control_plane() {
         printf '%s' "${body:-curl exited $rc}"
         return 1
     fi
-    # One pass: an empty result IS the "not a version document" verdict,
-    # so the two matchers cannot disagree about what one is.
-    local ver
+    # A current control plane names itself; an older one only sends a
+    # version string. Either is a SpatiumDDI version document, and anything
+    # else (an empty result from both) is the "not one" verdict.
+    local ver product
+    product=$(printf '%s' "$body" | sed -n 's/.*"product"[[:space:]]*:[[:space:]]*"\(SpatiumDDI\)".*/\1/p')
     ver=$(printf '%s' "$body" | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-    if [ -z "$ver" ]; then
+    if [ -z "$product" ] && [ -z "$ver" ]; then
         printf '%s' "Reachable, but the reply carries no version string. Is this the right host?"
         return 1
     fi
-    printf 'SpatiumDDI %s%s' "$ver" "$insecure"
+    if [ -n "$ver" ] && [ "$ver" != "restricted" ]; then
+        printf 'SpatiumDDI %s%s' "$ver" "$insecure"
+    else
+        printf 'SpatiumDDI control plane%s' "$insecure"
+    fi
     return 0
 }
 
@@ -3892,6 +3906,12 @@ _assert_admin_user_available() {
     local why=""
     if [ -z "$ADMIN_USER" ]; then
         why="No admin username was chosen."
+    elif [ "$ADMIN_USER" = "user" ] || [ "$ADMIN_USER" = "debian" ]; then
+        # Same set as spatium-preseed-parse's _LIVE_INSTALLER_USERS:
+        # the names Debian's live tooling uses for its live-session
+        # account. Checked here as well because this pre-flight is the
+        # one both install paths are guaranteed to reach.
+        why="The name '$ADMIN_USER' is reserved by the live installer. Pick a different name."
     elif getent passwd "$ADMIN_USER" >/dev/null 2>&1; then
         why="The account '$ADMIN_USER' already exists in the appliance image, so useradd would fail after the disk had been wiped. Pick a different name."
     fi
@@ -4069,12 +4089,133 @@ _save_install_logs() {
     # Say what happened. An unconditional success line is the last thing
     # written to the log that is then (not) copied, so on a full or
     # read-only /var it ends with a claim the three WARNs above disprove.
+    _INSTALL_LOGS_SAVED=$saved
     if [ "$saved" -gt 0 ]; then
         log "Installer logs preserved under /var/log/spatiumddi/install/ ($saved file(s), $failed failed)"
     else
         log "WARN: no installer logs could be preserved ($failed failed)"
     fi
     return 0
+}
+
+# #2256 — copy the live root onto the target.
+#
+# Two halves, both needed:
+#
+# 1. The excludes. /var/lib/rancher/k3s/data/ is k3s's own self-extraction
+#    area: the binary unpacks its bundled tools into <hash>-tmp/ on ANY
+#    invocation (even `k3s kubectl`) and renames it to <hash> when done.
+#    It is runtime state the installed system regenerates on its first
+#    k3s start, and nothing is baked there (the image bakes only
+#    agent/images/, which stays copied) — so copying it can only ever
+#    carry a half-extracted tree k3s then trusts, or race the extraction.
+# 2. Exit 24. rsync says "some files vanished before they could be
+#    transferred" for anything deleted between the file-list scan and the
+#    read; on a live root that is by definition transient churn, so it is
+#    logged and accepted — for THIS copy only. Every other non-zero exit
+#    (23 partial transfer, 11 disk full, ...) still fails, and the caller's
+#    pipefail + set -e aborts the install. Not a blanket ignore.
+#
+# The live session's own state stays behind too: the SSH drop-in, banner
+# and host keys spatium-live-bootstrap writes, and anything live-config
+# leaves in /etc/sudoers.d/live or its /var/lib/live/config run markers.
+# mkosi.postinst removes live-config's account components from the image,
+# so nothing should be at those two paths; the excludes keep that true for
+# an image built without that step.
+#
+# SRC / DEST default to the real thing; they are parameters so the tests
+# can run this against a stub rsync.
+_copy_live_root() {
+    local _rc=0
+    rsync -aAXH --info=progress2 \
+        --exclude="/dev/*" \
+        --exclude="/proc/*" \
+        --exclude="/sys/*" \
+        --exclude="/tmp/*" \
+        --exclude="/run/*" \
+        --exclude="/mnt/*" \
+        --exclude="/media/*" \
+        --exclude="/lib/live" \
+        --exclude="/var/log/*" \
+        --exclude="/var/cache/apt/archives/*" \
+        --exclude="/var/lib/rancher/k3s/data/*" \
+        --exclude="/var/lib/spatiumddi/firstboot.done" \
+        --exclude="/var/lib/spatiumddi/swapfile" \
+        --exclude="/etc/spatiumddi/.env" \
+        --exclude="/etc/ssh/sshd_config.d/00-spatium-live.conf" \
+        --exclude="/etc/ssh/ssh_host_*" \
+        --exclude="/etc/issue.d/zz-spatium-live.issue" \
+        --exclude="/etc/sudoers.d/live" \
+        --exclude="/var/lib/live/config" \
+        "${LIVE_ROOT_SRC:-/}" "${MOUNT}/" 2>> "$INSTALL_LOG" || _rc=$?
+    if [ "$_rc" -eq 24 ]; then
+        log "rsync exit 24 (some files vanished during the live-root copy) - treated as success"
+        return 0
+    fi
+    return "$_rc"
+}
+
+# #3169 — keep the baked image tarballs on root_A's OWN filesystem too.
+#
+# do_install mounts /var at $MOUNT/var BEFORE _copy_live_root, so rsync
+# lands the live root's var/lib/rancher/k3s/agent/images on the /var
+# partition and root_A's own copy of that directory stays an empty
+# mountpoint subdir. A slot written by `spatium-upgrade-slot` carries the
+# set in its filesystem (build-slot-image.sh excludes nothing there), and a
+# later rollback re-copies it from there; without this, the node's ORIGINAL
+# slot has nothing to re-copy from and rolls back to a set-less slot.
+#
+# The raw root is reached through a NON-recursive bind mount of $MOUNT
+# (plain --bind does not carry the /var submount along), so the files land
+# on root_A underneath the mountpoint. They stay hidden at runtime, exactly
+# like a slot image's. The source is the live root itself, not $MOUNT/var,
+# so the KEEP_VAR reinstall (whose /var holds an older set) is covered.
+#
+# Fails the install loudly rather than leave a truncated set: a half-set on
+# the slot is worse than none, because a rollback would trust it.
+#
+# LIVE_ROOT_SRC / MOUNT are parameters so the tests can run this against stubs.
+_keep_images_in_root_slot() {
+    local _rel="var/lib/rancher/k3s/agent/images"
+    local _src="${LIVE_ROOT_SRC:-/}"
+    _src="${_src%/}/$_rel"
+    if [ ! -d "$_src" ] || ! ls "$_src"/*.tar.zst >/dev/null 2>&1; then
+        log "No baked image tarballs in the live root ($_src) - root_A keeps none of its own (#3169)"
+        return 0
+    fi
+    local _raw _need _avail _n=0 _f
+    _raw=$(mktemp -d /tmp/spatium-rootA-raw.XXXXXX)
+    if ! mount --bind "$MOUNT" "$_raw" >> "$INSTALL_LOG" 2>&1; then
+        rmdir "$_raw" 2>/dev/null || true
+        log "FATAL: could not bind-mount root_A to place its baked images (#3169)"
+        return 1
+    fi
+    local _dest="$_raw/$_rel" _rc=0
+    _need=$(du -sb "$_src" | cut -f1)
+    _avail=$(df -B1 --output=avail "$_raw" | tail -n 1 | tr -d ' ')
+    if [ "${_avail:-0}" -lt $(( _need + 134217728 )) ]; then
+        log "FATAL: root_A has $((_avail / 1048576)) MiB free; its baked images need $((_need / 1048576)) MiB plus headroom (#3169)"
+        _rc=1
+    else
+        mkdir -p "$_dest" && cp -a "$_src"/. "$_dest"/ >> "$INSTALL_LOG" 2>&1 || _rc=1
+        if [ "$_rc" -eq 0 ]; then
+            for _f in "$_src"/*.tar.zst; do
+                _n=$((_n + 1))
+                if [ "$(stat -c %s "$_f")" != "$(stat -c %s "$_dest/${_f##*/}" 2>/dev/null)" ]; then
+                    log "FATAL: ${_f##*/} on root_A does not match the live root's copy (#3169)"
+                    _rc=1
+                fi
+            done
+        fi
+        if [ "$_rc" -ne 0 ]; then
+            # Never leave a partial set where a rollback would trust it.
+            rm -rf "$_dest"
+        fi
+    fi
+    umount "$_raw" >> "$INSTALL_LOG" 2>&1 || log "WARN: could not unmount $_raw"
+    rmdir "$_raw" 2>/dev/null || true
+    [ "$_rc" -eq 0 ] && log "Kept $_n baked image tarballs on root_A's own filesystem (#3169)"
+    return "$_rc"
 }
 
 do_install() {
@@ -4504,23 +4645,7 @@ EOF
         # whiptail --gauge — so the blocks go straight out and rsync's own
         # stderr goes to the log. Only emit on a CHANGE, or the protocol
         # is flooded with thousands of identical blocks.
-        rsync -aAXH --info=progress2 \
-            --exclude="/dev/*" \
-            --exclude="/proc/*" \
-            --exclude="/sys/*" \
-            --exclude="/tmp/*" \
-            --exclude="/run/*" \
-            --exclude="/mnt/*" \
-            --exclude="/media/*" \
-            --exclude="/lib/live" \
-            --exclude="/var/log/*" \
-            --exclude="/var/cache/apt/archives/*" \
-            --exclude="/var/lib/spatiumddi/firstboot.done" \
-            --exclude="/var/lib/spatiumddi/swapfile" \
-            --exclude="/etc/spatiumddi/.env" \
-            --exclude="/etc/ssh/sshd_config.d/00-spatium-live.conf" \
-            --exclude="/etc/issue.d/zz-spatium-live.issue" \
-            / "$MOUNT/" 2>> "$INSTALL_LOG" \
+        _copy_live_root \
             | { _last=-1
                 while IFS= read -r -d $'\r' _line || [ -n "$_line" ]; do
                     case "$_line" in
@@ -4535,6 +4660,9 @@ EOF
                     printf 'XXX\n%d\nCopying root filesystem... %d%%\nXXX\n' "$_g" "$_pct"
                 done
               }
+
+        echo "XXX"; echo "60"; echo "Keeping the container images on the first slot..."; echo "XXX"
+        _keep_images_in_root_slot || exit 1
 
         echo "XXX"; echo "60"; echo "Writing boot-critical config to root baseline..."; echo "XXX"
         # IMPORTANT: fstab + /etc/hostname need to land on the
@@ -4629,6 +4757,13 @@ EOF
         # Use cp -a to preserve perms / xattrs / symlinks. /etc is
         # only ~10 MiB so the copy is fast (<2 s on any disk worth
         # running an appliance on).
+        # The live session's sudoers rule (see _copy_live_root) must not
+        # become part of the slot's /etc baseline. The rsync excludes it;
+        # this removes any copy that reached the target another way,
+        # before the snapshot below makes it the lower layer of BOTH
+        # slots. A fresh target has no operator content to keep here.
+        rm -f "$MOUNT/etc/sudoers.d/live"
+        rm -rf "$MOUNT/var/lib/live/config"
         mkdir -p "$MOUNT/usr/lib/etc.image"
         cp -a "$MOUNT/etc/." "$MOUNT/usr/lib/etc.image/" >> "$INSTALL_LOG" 2>&1
 
@@ -4637,33 +4772,26 @@ EOF
         #   /var/persist/etc-work  workdir   (overlay scratch space)
         mkdir -p "$MOUNT/var/persist/etc" "$MOUNT/var/persist/etc-work"
 
-        # Issue #276 — SSH host keys + machine config are seeded into
-        # the STATE partition, which spatium-etc-render copies into
-        # /etc on every boot BEFORE sshd / k3s start. STATE survives
-        # both an OS slot swap AND a /var factory reset, so the host
-        # key + hostname stay stable forever. Strip the keys out of
-        # /etc.image (the overlay LOWER) so a future slot image's
-        # mkosi-built keys can never shadow the operator's. (Supersedes
-        # the #272 Phase 1 bandaid that parked keys in
-        # /var/persist/etc/ssh — STATE is the authoritative home now.)
+        # Issue #276 — machine config is seeded into the STATE partition,
+        # which spatium-etc-render copies into /etc on every boot BEFORE
+        # sshd / k3s start. STATE survives both an OS slot swap AND a /var
+        # factory reset, so the host key + hostname stay stable forever.
+        #
+        # GHSA-vvh9-6gfw-wphp — SSH host keys are NOT seeded from the
+        # image any more. They used to be copied from /etc.image, i.e. the
+        # keys generated once in the build container, so every install of
+        # a release shared them. The image ships none now (mkosi.finalize)
+        # and the rsync above excludes the live session's throwaway set;
+        # spatium-etc-render generates this appliance's own on first boot
+        # and persists them here. Keys STATE already holds from a previous
+        # install are left untouched (#995 item 25 — STATE is not
+        # reformatted on a reinstall, and replacing them would give every
+        # client that knew this appliance a host-key-changed warning).
+        # The rm is belt and braces: nothing key-shaped may sit in the
+        # overlay lower, where it would shadow STATE's.
         STATE_MNT="$MOUNT/var/lib/spatium-state"
         mkdir -p "$STATE_MNT/ssh"
-        for k in "$MOUNT/usr/lib/etc.image/ssh/"ssh_host_*_key \
-                 "$MOUNT/usr/lib/etc.image/ssh/"ssh_host_*_key.pub; do
-            [ -f "$k" ] || continue
-            # #995 item 25 — never overwrite a key STATE already holds.
-            # STATE is not reformatted on a reinstall, so this loop would
-            # otherwise copy the NEW image's freshly-generated host keys
-            # over the preserved ones and every client that knew this
-            # appliance would get REMOTE HOST IDENTIFICATION HAS CHANGED —
-            # the one thing keeping STATE is for.
-            if [ -e "$STATE_MNT/ssh/$(basename "$k")" ]; then
-                rm -f "$k"
-                continue
-            fi
-            cp -a "$k" "$STATE_MNT/ssh/" >> "$INSTALL_LOG" 2>&1
-            rm -f "$k"
-        done
+        rm -f "$MOUNT/usr/lib/etc.image/ssh/"ssh_host_* "$MOUNT/etc/ssh/"ssh_host_*
 
         # spatium-config.yaml — the operator-authoritative machine
         # config the render service reads. Flat ``key: value`` shape
@@ -5187,11 +5315,26 @@ EOF
             log "SSH: password authentication disabled (key-only)"
         fi
 
-        # Disable cloud-init on the installed system (we configured
-        # everything ourselves; cloud-init would just sit waiting for a
-        # datasource that isn't there).
+        # Disable cloud-init on the installed system: the network, the
+        # admin account and every other answer come from STATE, which we
+        # wrote ourselves.
+        #
+        # #1511 — the masks alone never worked. They land in the /etc
+        # overlay (/var/persist/etc), which etc.mount brings up after
+        # systemd has loaded its units, so at boot every cloud-init unit
+        # was still loadable, and cloud-init 25.1 (trixie) also renamed
+        # them (cloud-init-main, cloud-init-network). With the CIDATA
+        # drive still attached after a preseed install, init-local wrote
+        # a DHCP profile (cloud-init-<iface>.nmconnection) beside the
+        # static one. Every cloud-init unit carries
+        # ConditionPathExists=!/etc/cloud/cloud-init.disabled and starts
+        # after etc.mount, so the marker is what keeps it off. The masks
+        # stay, with the 25.1 names, for anything that reloads units later.
+        install -d -m 0755 "$MOUNT/etc/cloud"
+        : > "$MOUNT/etc/cloud/cloud-init.disabled"
         chroot "$MOUNT" systemctl mask \
-            cloud-init.service cloud-init-local.service \
+            cloud-init.service cloud-init-main.service \
+            cloud-init-local.service cloud-init-network.service \
             cloud-config.service cloud-final.service \
             >> "$INSTALL_LOG" 2>&1 || true
 
@@ -6599,11 +6742,28 @@ on_failure() {
     # are exactly the ones that leave none, and the operator's natural
     # next move re-runs the installer, whose startup TRUNCATES both logs.
     # The target is still mounted here: the unmount block is at 95%.
-    if [ -d "$MOUNT/var/log" ]; then
+    #
+    # #2405 — "$MOUNT/var/log exists" was the wrong gate: a root copy that
+    # fails early (rsync exit 11 in /usr/lib/modules) stops before /var is
+    # populated, so /var/log is absent and nothing was saved OR said. The
+    # question is whether the target is MOUNTED; _save_install_logs
+    # creates the directory itself. Before anything is mounted (the
+    # wizard prompts) there is no target to write to, and creating
+    # $MOUNT/... would only litter the live tmpfs, so that case skips.
+    # The gate is /var, not the root: /var is its own partition, so a
+    # failure between mounting the root and mounting /var would write the
+    # logs into the root's /var directory, hidden under the real /var
+    # mount on every boot after.
+    local _logs_kept=0
+    if mountpoint -q "$MOUNT/var" 2>/dev/null \
+        || [ -d "$MOUNT/var/log" ]; then
+        _INSTALL_LOGS_SAVED=0
         _save_install_logs || true
+        if [ "${_INSTALL_LOGS_SAVED:-0}" -gt 0 ]; then
+            _logs_kept=1
+        fi
     fi
     clear
-    echo
     echo "Installer exited with status $exit_code"
     echo
     echo "-- Last 20 lines of $INSTALL_LOG --"
@@ -6629,6 +6789,18 @@ on_failure() {
     echo "Also useful from the shell:"
     echo "  journalctl -u spatium-install.service --no-pager"
     echo "  systemctl cat spatium-install.service"
+    echo
+    # #2405 — the verdict on the logs goes LAST, just above the prompt: the
+    # tails above run to ~90 rows, so printed first it scrolled off a
+    # 50-row console before anyone could read it.
+    if [ "${_logs_kept:-0}" -eq 1 ]; then
+        echo "Installer logs were saved to the target: /var/log/spatiumddi/install/"
+    else
+        echo "WARN: the installer logs could NOT be saved to the target."
+        echo "      They remain on the live system only: $INSTALL_LOG, $TRACE_LOG,"
+        echo "      /var/log/spatium-install-launch.log. Copy them off before rebooting"
+        echo "      or re-running the installer (a re-run starts them afresh)."
+    fi
     echo
     echo "Press Enter to drop to a root shell."
     echo "(From the shell you can re-run 'spatium-install' or 'reboot'.)"

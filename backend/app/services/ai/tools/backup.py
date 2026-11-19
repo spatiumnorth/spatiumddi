@@ -1,7 +1,7 @@
 """Backup + factory-reset read tools for the Operator Copilot
 (issues #117 + #116 + #702).
 
-Five read-only tools, all superadmin-only because the surface
+Six read-only tools, all superadmin-only because the surface
 exposes destination configs (even with secrets redacted, the
 target name + kind + path/bucket/host is sensitive metadata):
 
@@ -24,6 +24,9 @@ target name + kind + path/bucket/host is sensitive metadata):
 * ``get_restore_drill_readiness`` — the rollup that answers "can
   I restore this install right now, and how do I know?" per
   target, without reading the whole history.
+* ``get_backup_health`` — per target: is the schedule actually
+  producing backups? Failed / stale / stuck, decided by the same
+  function as the ``backup_failed`` / ``backup_stale`` alerts (#1262).
 
 Deliberately NO ``propose_*`` write tools. The factory-reset and
 restore paths are password-gated + confirm-phrase-gated by design;
@@ -49,6 +52,7 @@ from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.backup import BackupTarget, RestoreDrill
 from app.services.ai.tools.base import register_tool
+from app.services.audit_redact import redact_audit_value
 
 
 def _superadmin_gate(user: User) -> dict[str, Any] | None:
@@ -125,11 +129,13 @@ class ListBackupTargetsArgs(BaseModel):
 
 @register_tool(
     name="list_backup_targets",
+    permission="superadmin",
     description=(
         "List all configured backup targets (superadmin only). "
         "Each row carries id / name / kind / enabled / "
         "schedule_cron / retention / last_run_status / last_run_at "
-        "/ last_run_filename / last_run_bytes / last_run_error / "
+        "/ last_run_filename / last_run_node / last_run_bytes / "
+        "last_run_error / "
         "next_run_at. Use for 'did all my backups succeed last "
         "night?', 'which targets are scheduled?', or 'list failed "
         "backup runs'. Destination credentials are NOT returned; "
@@ -164,6 +170,10 @@ async def list_backup_targets(
             "last_run_status": t.last_run_status,
             "last_run_at": (t.last_run_at.isoformat() if t.last_run_at else None),
             "last_run_filename": t.last_run_filename,
+            # #1838 — the node that wrote that archive. A local_volume
+            # target is per node on a multi-node appliance, so this is the
+            # only node that can list, download or restore it.
+            "last_run_node": t.last_run_node,
             "last_run_bytes": t.last_run_bytes,
             "last_run_duration_ms": t.last_run_duration_ms,
             "last_run_error": t.last_run_error,
@@ -194,6 +204,8 @@ class ListBackupArchivesArgs(BaseModel):
 
 @register_tool(
     name="list_backup_archives_at_target",
+    outbound=True,
+    permission="superadmin",
     description=(
         "List archives currently stored at a specific backup target "
         "(superadmin only). Calls the driver's ``list_archives`` so "
@@ -306,6 +318,7 @@ _DEFAULT_BACKUP_ACTIONS = (
 
 @register_tool(
     name="find_backup_audit_history",
+    permission="superadmin",
     description=(
         "Return the recent backup + factory-reset audit history "
         "(superadmin only). Each row carries timestamp / action / "
@@ -341,8 +354,9 @@ async def find_backup_audit_history(
             "resource_type": r.resource_type,
             "resource_display": r.resource_display,
             "result": r.result,
-            "error_detail": r.error_detail,
-            "new_value": r.new_value,
+            # Redacted as the audit API redacts them (#2009 / #2015).
+            "error_detail": redact_audit_value(r.error_detail),
+            "new_value": redact_audit_value(r.new_value),
         }
         for r in rows
     ]
@@ -377,6 +391,7 @@ class FindRestoreDrillsArgs(BaseModel):
 
 @register_tool(
     name="find_restore_drills",
+    permission="superadmin",
     description=(
         "Return restore-verification drill history (superadmin only). "
         "A drill replays a backup target's newest archive into a "
@@ -445,6 +460,7 @@ class RestoreDrillReadinessArgs(BaseModel):
 
 @register_tool(
     name="get_restore_drill_readiness",
+    permission="superadmin",
     description=(
         "One-shot recovery-readiness rollup across every backup target "
         "(superadmin only). Per target: whether drills are scheduled, "
@@ -478,4 +494,62 @@ async def get_restore_drill_readiness(
         "total_targets": len(out),
         "verified_targets": verified,
         "unverified_targets": len(out) - verified,
+    }
+
+
+# ── get_backup_health ─────────────────────────────────────────────────
+
+
+class BackupHealthArgs(BaseModel):
+    problems_only: bool = Field(
+        default=False,
+        description="When True, return only targets that are failed, stale or stuck.",
+    )
+
+
+@register_tool(
+    name="get_backup_health",
+    permission="superadmin",
+    description=(
+        "Per backup target: is its schedule actually producing backups? "
+        "(superadmin only). Each row carries state (ok / failed / stale / "
+        "stuck / running / awaiting_first_run / manual_only / disabled), "
+        "last_run_status, last_run_at, last_success_at, next_run_at and "
+        "stale_after (when it goes stale without a success). Decided by "
+        "the same function as the backup_failed and backup_stale alerts, "
+        "so the answer matches what they fire on. 'stuck' means a run has "
+        "been in progress so long its process is presumed dead. Use for "
+        "'are my backups healthy?', 'when did the corp-vault target last "
+        "succeed?' or 'why is the backup_stale alert firing?'. No "
+        "destination config or credentials are returned."
+    ),
+    args_model=BackupHealthArgs,
+    category="admin",
+)
+async def get_backup_health(db: AsyncSession, user: User, args: BackupHealthArgs) -> dict[str, Any]:
+    gate = _superadmin_gate(user)
+    if gate:
+        return gate
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+    from app.services.alerts import RULE_TYPE_BACKUP_STALE  # noqa: PLC0415
+    from app.services.backup.health import (  # noqa: PLC0415
+        STALE_AFTER_RUNS_DEFAULT,
+        evaluate_backup_health,
+    )
+
+    # Use the stale threshold the alert rule is configured with, so the
+    # tool and the alert agree on what "stale" means on this install.
+    rule = await db.scalar(
+        select(AlertRule).where(AlertRule.rule_type == RULE_TYPE_BACKUP_STALE).limit(1)
+    )
+    runs = (rule.threshold_percent if rule is not None else None) or STALE_AFTER_RUNS_DEFAULT
+    rows = await evaluate_backup_health(db, now=datetime.now(UTC), stale_after_runs=runs)
+    targets = [h.as_dict() for h in rows]
+    if args.problems_only:
+        targets = [t for t in targets if t["state"] in ("failed", "stale", "stuck")]
+    return {
+        "stale_after_runs": runs,
+        "targets": targets,
+        "failed": sum(1 for h in rows if h.failed),
+        "stale": sum(1 for h in rows if h.stale),
     }

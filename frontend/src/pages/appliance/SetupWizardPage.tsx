@@ -17,6 +17,7 @@ import {
   versionApi,
   formatApiError,
 } from "@/lib/api";
+import { useApplianceAdminGate } from "@/hooks/useApplianceAdmin";
 
 /**
  * Phase 4g — Web first-boot setup wizard.
@@ -36,6 +37,8 @@ import {
  * banner stops showing + the redirect-on-first-hit logic stops firing.
  */
 export function SetupWizardPage() {
+  // #1342 — every appliance action takes `admin` on `appliance`.
+  const applianceGate = useApplianceAdminGate();
   const qc = useQueryClient();
   const navigate = useNavigate();
 
@@ -105,7 +108,11 @@ export function SetupWizardPage() {
             sys.data
               ? `${sys.data.hostname} · ${
                   sys.data.host_ips.join(", ") || "no public IPs"
-                } · v${sys.data.appliance_version}`
+                }${
+                  sys.data.appliance_version
+                    ? ` · v${sys.data.appliance_version}`
+                    : ""
+                }`
               : "Loading…"
           }
           icon={ShieldCheck}
@@ -125,7 +132,7 @@ export function SetupWizardPage() {
         <Step
           done={false}
           title="SSH access"
-          subtitle="Manage SSH keys via the OS account you created in the installer (~/.ssh/authorized_keys). A web-side SSH key manager is on the roadmap."
+          subtitle="Manage SSH keys from the web under Appliance → Fleet → SSH (Authorized keys). Until you do, edit ~/.ssh/authorized_keys on the OS account you created in the installer by hand; once managed there, the web list replaces that file."
           icon={ContainerIcon}
         />
         <Step
@@ -170,6 +177,7 @@ export function SetupWizardPage() {
             onClick={() => finish.mutate()}
             disabled={finish.isPending || setup.data?.complete}
             className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+            {...applianceGate}
           >
             <CheckCircle2 className="h-3.5 w-3.5" />
             {setup.data?.complete

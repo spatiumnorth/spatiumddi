@@ -15,10 +15,42 @@ lifetimes), and ``render_radvd_conf`` renders the final config text.
 from __future__ import annotations
 
 import ipaddress
+import re
 from collections.abc import Sequence
 from typing import Any
 
+import structlog
+
+from app.core.dns_names import validate_fqdn
 from app.drivers.dhcp.base import RAConfigDef
+
+logger = structlog.get_logger(__name__)
+
+# Linux IFNAMSIZ - 1 = 15 chars; no whitespace, braces, semicolons, quotes or
+# newlines can match. These values are interpolated verbatim into radvd.conf,
+# so this is the injection boundary (GHSA-6235-5gh6-4hr2).
+_IFACE_RE = re.compile(r"^[A-Za-z0-9._-]{1,15}$")
+
+
+def validate_ra_interface(name: str) -> str:
+    """Return *name* if it is a safe Linux interface name, else raise ValueError."""
+    if not _IFACE_RE.fullmatch(name) or name in (".", ".."):
+        raise ValueError(
+            "ra_interface must be a Linux interface name: 1-15 characters of "
+            "letters, digits, '.', '_' or '-'"
+        )
+    return name
+
+
+def validate_dnssl_name(name: str) -> str:
+    """Return the normalized DNSSL domain, or raise ValueError.
+
+    RFC 2181 labels, as every other domain field takes them (an underscore is
+    not radvd syntax): no whitespace, quote, brace, semicolon or newline can
+    pass, so nothing can break out of the ``DNSSL … {};`` statement.
+    """
+    return validate_fqdn(name, field="domain")
+
 
 # M/O flags derived from the DHCPv6 operating mode when the operator hasn't
 # set an explicit override. Mirrors the mapping documented on
@@ -92,18 +124,23 @@ def resolve_dnssl(scope_options: dict[str, Any] | None, subnet_domain: str | Non
     """DNSSL search-domain list (RFC 8106).
 
     Prefers the scope's ``domain-search`` option, then its ``domain-name``,
-    then the subnet's ``domain_name``.
+    then the subnet's ``domain_name``. Entries that are not valid hostnames
+    are dropped (logged) — the subnet field in particular is writable by
+    non-superadmins and is interpolated into ``radvd.conf``.
     """
     opts = scope_options or {}
-    search = _as_list(opts.get("domain-search"))
-    if search:
-        return search
-    single = _as_list(opts.get("domain-name"))
-    if single:
-        return single
-    if subnet_domain:
-        return _as_list(subnet_domain)
-    return []
+    candidates = _as_list(opts.get("domain-search"))
+    if not candidates:
+        candidates = _as_list(opts.get("domain-name"))
+    if not candidates and subnet_domain:
+        candidates = _as_list(subnet_domain)
+    out: list[str] = []
+    for c in candidates:
+        try:
+            out.append(validate_dnssl_name(c))
+        except ValueError:
+            logger.warning("radvd_dnssl_dropped", value=c[:80])
+    return out
 
 
 def build_ra_config(scope: Any, subnet: Any) -> RAConfigDef | None:
@@ -168,7 +205,16 @@ def render_radvd_conf(ra_configs: Sequence[RAConfigDef], *, default_iface: str =
     by_iface: dict[str, list[RAConfigDef]] = {}
     for cfg in ra_configs:
         iface = (cfg.interface or default_iface).strip() or default_iface
+        # Defence in depth: the API validates, but a legacy row or a caller
+        # that built the dataclass by hand must still not reach the file.
+        try:
+            validate_ra_interface(iface)
+        except ValueError:
+            logger.warning("radvd_interface_dropped", subnet=cfg.subnet_cidr, value=iface[:80])
+            continue
         by_iface.setdefault(iface, []).append(cfg)
+    if not by_iface:
+        return ""
 
     lines: list[str] = [
         "# Managed by SpatiumDDI — IPv6 Router Advertisements (issue #524).",
@@ -187,20 +233,26 @@ def render_radvd_conf(ra_configs: Sequence[RAConfigDef], *, default_iface: str =
         lines.append(f"    AdvManagedFlag {_bool(head.managed_flag)};")
         lines.append(f"    AdvOtherConfigFlag {_bool(head.other_flag)};")
         lines.append(f"    AdvDefaultLifetime {head.router_lifetime};")
-        lines.append(f"    AdvMaxInterval {head.max_interval};")
+        lines.append(f"    MaxRtrAdvInterval {int(head.max_interval)};")
         seen_rdnss: list[str] = []
         seen_dnssl: list[str] = []
         for cfg in entries:
-            lines.append(f"    prefix {cfg.subnet_cidr} {{")
+            prefix = str(ipaddress.ip_network(cfg.subnet_cidr, strict=False))
+            lines.append(f"    prefix {prefix} {{")
             lines.append(f"        AdvOnLink {_bool(cfg.prefix_on_link)};")
             lines.append(f"        AdvAutonomous {_bool(cfg.prefix_autonomous)};")
             lines.append(f"        AdvValidLifetime {cfg.prefix_valid_lifetime};")
             lines.append(f"        AdvPreferredLifetime {cfg.prefix_preferred_lifetime};")
             lines.append("    };")
-            for r in cfg.rdnss:
+            for r in _ipv6_only(cfg.rdnss):
                 if r not in seen_rdnss:
                     seen_rdnss.append(r)
             for d in cfg.dnssl:
+                try:
+                    d = validate_dnssl_name(d)
+                except ValueError:
+                    logger.warning("radvd_dnssl_dropped", value=d[:80])
+                    continue
                 if d not in seen_dnssl:
                     seen_dnssl.append(d)
         if seen_rdnss:
@@ -219,4 +271,6 @@ __all__ = [
     "render_radvd_conf",
     "resolve_dnssl",
     "resolve_rdnss",
+    "validate_dnssl_name",
+    "validate_ra_interface",
 ]

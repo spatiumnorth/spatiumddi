@@ -2,11 +2,13 @@
 Description=Clear wedged k3s HelmChart releases so helm-controller retries (#183 Phase 9)
 Documentation=https://github.com/spatiumnorth/spatiumddi/issues/183
 After=k3s.service
-# Wants, not Requires: with Requires= every k3s restart (a member join, a
-# slot upgrade, an etcd exit on a wedged cluster) took a running recovery
-# tick down with it — the exact moment the recovery is needed. The runner
-# already bails when the k3s API is not ready.
-Wants=k3s.service
+# Neither Requires= nor Wants= k3s.service. With Requires= every k3s
+# restart (a member join, a slot upgrade, an etcd exit on a wedged
+# cluster) took a running recovery tick down with it — the exact moment
+# the recovery is needed. With Wants= a tick that landed while the
+# cluster join runner held k3s stopped started k3s in the middle of the
+# join (#1723). The runner already bails when the k3s API is not ready,
+# so it has no use for a k3s it would start.
 
 [Service]
 Type=oneshot

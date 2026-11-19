@@ -22,10 +22,12 @@ class, generated rather than hand-written. Reads follow that resource
 permission, so the builtin DHCP Editor role gains them with no role
 migration.
 
-**Writes are superadmin**, matching the hand-authored client-class
-surface next door rather than quietly widening it — the two produce the
-same Kea object, and a policy that can move devices into a quarantine
-pool is not a smaller privilege than typing that class by hand.
+Writes follow the same resource permission (``write`` / ``delete`` on
+``dhcp_client_class``), matching the hand-authored client-class surface next
+door — the two produce the same Kea object, and a policy that can move
+devices into a quarantine pool is not a smaller privilege than typing that
+class by hand. Both were superadmin-only until #1861, which made the
+built-in DHCP Editor's grants mean what its description says.
 """
 
 from __future__ import annotations
@@ -38,11 +40,13 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
 
-from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
+from app.api.v1.dhcp.client_classes import refuse_if_name_referenced
 from app.api.v1.dhcp.scopes import validate_dhcp_options
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
+from app.core.update_nulls import changed_keys, snapshot
 from app.models.dhcp import DHCPServerGroup
 from app.models.dhcp_device_policy import DHCPDevicePolicy
 from app.models.dhcp_fingerprint import DHCPFingerprint
@@ -351,7 +355,7 @@ async def list_device_policies(
     status_code=status.HTTP_201_CREATED,
 )
 async def create_device_policy(
-    group_id: uuid.UUID, body: DevicePolicyCreate, db: DB, user: SuperAdmin
+    group_id: uuid.UUID, body: DevicePolicyCreate, db: DB, user: CurrentUser
 ) -> DHCPDevicePolicy:
     await _get_group(db, group_id)
     dupe = await db.execute(
@@ -400,7 +404,7 @@ async def get_device_policy(policy_id: uuid.UUID, db: DB, _: CurrentUser) -> DHC
 
 @router.put("/device-policies/{policy_id}", response_model=DevicePolicyResponse)
 async def update_device_policy(
-    policy_id: uuid.UUID, body: DevicePolicyUpdate, db: DB, user: SuperAdmin
+    policy_id: uuid.UUID, body: DevicePolicyUpdate, db: DB, user: CurrentUser
 ) -> DHCPDevicePolicy:
     row = await _get_policy(db, policy_id)
     changes = body.model_dump(exclude_unset=True)
@@ -464,6 +468,7 @@ async def update_device_policy(
     # a class by name, so regenerating it here would leave every pool with
     # a ``client-class`` naming a class that no longer exists — which Kea
     # accepts and which silently stops the pool serving anyone.
+    before = snapshot(row, changes)
     for k, v in changes.items():
         setattr(row, k, v)
 
@@ -474,7 +479,7 @@ async def update_device_policy(
         resource_type="dhcp_device_policy",
         resource_id=str(row.id),
         resource_display=row.name,
-        changed_fields=list(changes.keys()),
+        changed_fields=changed_keys(before, changes),
         new_value=body.model_dump(mode="json", exclude_unset=True),
     )
     collect_wake(dhcp_group_channel(row.group_id))
@@ -484,8 +489,9 @@ async def update_device_policy(
 
 
 @router.delete("/device-policies/{policy_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_device_policy(policy_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
+async def delete_device_policy(policy_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
     row = await _get_policy(db, policy_id)
+    await refuse_if_name_referenced(db, row.group_id, row.class_name, "delete device policy")
     write_audit(
         db,
         user=user,

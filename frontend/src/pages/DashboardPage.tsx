@@ -1,4 +1,12 @@
-import { Children, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Children,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { useDismissableMenu } from "@/hooks/useDismissableMenu";
 import { useQuery, useQueries, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import {
@@ -102,10 +110,29 @@ import {
 import { cn } from "@/lib/utils";
 import { includeInUtilization } from "@/lib/utilization";
 import { useSessionState } from "@/lib/useSessionState";
+import { safeLocalStorage } from "@/lib/safeStorage";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { usePermissions } from "@/hooks/usePermissions";
+import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
+import { isRefused, pollUnlessRefused } from "@/lib/refusal";
+import { poolOccupancyTone } from "@/lib/pool-occupancy-tone";
+import { useModuleOn } from "@/hooks/useModuleOn";
+import {
+  type UtilizationThresholds,
+  useUtilizationThresholds,
+  utilizationBand,
+} from "@/hooks/useUtilizationThresholds";
 import { DHCPTrafficCard, DNSQueryRateCard } from "@/components/MetricsCharts";
 import { HA_V4_ONLY_NOTE } from "@/lib/dhcpHa";
+import { activityTone } from "@/lib/activity-tone";
+import {
+  isPartialApply,
+  PARTIAL_APPLY_EXPLAIN,
+  partialApplyDetail,
+} from "@/lib/configApply";
 import { WidgetErrorBoundary } from "@/components/WidgetErrorBoundary";
+import { CredentialChip } from "@/components/CredentialChip";
+import { cardTargets } from "@/lib/credential-chip";
 
 /**
  * Dashboard — the home page.
@@ -183,14 +210,65 @@ function KpiCard({
   return to ? <Link to={to}>{inner}</Link> : inner;
 }
 
-function UtilColor(percent: number): string {
-  if (percent >= 95) return "bg-red-500";
-  if (percent >= 85) return "bg-red-400";
-  if (percent >= 70) return "bg-amber-400";
+/**
+ * The one definition of "needs attention" for a DNS / DHCP agent (#2755).
+ * The KPI tile, the panel of the same name and the header all count from
+ * this, so they cannot disagree about which agents are in the set.
+ *
+ * Unreachable or error; any config-apply verdict other than ok (a partial
+ * apply, zones refused, included); or a daemon the agent reports as not
+ * serving. NULL verdicts are UNKNOWN and are not failures.
+ */
+function agentNeedsAttention(s: {
+  status?: string | null;
+  config_apply_status?: string | null;
+  daemon_not_serving?: boolean | null;
+}): boolean {
+  return (
+    s.status === "unreachable" ||
+    s.status === "error" ||
+    (s.config_apply_status != null && s.config_apply_status !== "ok") ||
+    s.daemon_not_serving === true
+  );
+}
+
+function UtilColor(percent: number, t: UtilizationThresholds): string {
+  // Amber and red sit at Settings' Warning / Critical Threshold (#3539), the
+  // same lines the IPAM tree and the page's counts use; below the warning
+  // line only the green shade steps with fill.
+  if (percent >= t.critical) return "bg-red-500";
+  if (percent >= t.warn) return "bg-amber-400";
   if (percent >= 50) return "bg-emerald-500";
   if (percent >= 25) return "bg-emerald-400";
   if (percent > 0) return "bg-emerald-300";
   return "bg-muted/60 dark:bg-muted/40";
+}
+
+/** The heatmap legend: each swatch labelled with the percentage its colour
+ *  starts at, matching ``UtilColor``. A green step at or above the warning
+ *  line, and an amber step when warning is not below critical, are never
+ *  drawn, so they are left out rather than listed out of order (#3539). */
+function heatmapLegend(
+  t: UtilizationThresholds,
+): { cls: string; label: string }[] {
+  const entries: { cls: string; label: string }[] = [];
+  if (t.warn > 0 && t.critical > 0) {
+    entries.push({ cls: "bg-muted/60", label: "0%" });
+    entries.push({ cls: "bg-emerald-300", label: ">0" });
+  }
+  for (const [start, cls] of [
+    [25, "bg-emerald-400"],
+    [50, "bg-emerald-500"],
+  ] as const) {
+    if (start < t.warn && start < t.critical) {
+      entries.push({ cls, label: String(start) });
+    }
+  }
+  if (t.warn < t.critical) {
+    entries.push({ cls: "bg-amber-400", label: String(t.warn) });
+  }
+  entries.push({ cls: "bg-red-500", label: String(t.critical) });
+  return entries;
 }
 
 /** One entry in the Overview inventory strip (#942) — a value, its unit,
@@ -259,15 +337,20 @@ function capacityLabel(subnet: {
   return `${subnet.allocated_ips.toLocaleString()} / ${subnet.total_ips.toLocaleString()}`;
 }
 
-function UtilizationBar({
+export function UtilizationBar({
   percent,
   network,
+  tone,
 }: {
   percent: number;
   /** When this is a v6 prefix the bar renders n/a: "0%" of a /64 is
    *  true, useless, and indistinguishable from an empty v4 subnet. */
   network?: string;
+  /** Fill class for a bar that is not subnet utilization (a DHCP pool's
+   *  occupancy), which Settings' IPAM thresholds do not govern. */
+  tone?: string;
 }) {
+  const thresholds = useUtilizationThresholds();
   if (network && isV6(network)) {
     return (
       <div className="flex items-center gap-2">
@@ -287,7 +370,7 @@ function UtilizationBar({
         <div
           className={cn(
             "h-full rounded-full transition-all",
-            UtilColor(percent),
+            tone ?? UtilColor(percent, thresholds),
           )}
           style={{ width: `${Math.min(percent, 100)}%` }}
         />
@@ -307,7 +390,26 @@ function UtilizationBar({
  * end. Cells stay square at every breakpoint via aspect-square +
  * grid-cols-autofill.
  */
-function SubnetHeatmap({ subnets }: { subnets: Subnet[] }) {
+export function SubnetHeatmap({
+  subnets,
+  unreadable = null,
+}: {
+  subnets: Subnet[];
+  /** Set when the subnet read failed or was refused (#2754): the heatmap
+   *  says so rather than "No subnets yet". */
+  unreadable?: string | null;
+}) {
+  const thresholds = useUtilizationThresholds();
+  if (unreadable) {
+    return (
+      <div className="rounded-lg border border-dashed p-8 text-center">
+        <Network className="mx-auto mb-2 h-8 w-8 text-muted-foreground/30" />
+        <p className="text-xs text-muted-foreground">
+          Subnet utilization is not shown: {unreadable}.
+        </p>
+      </div>
+    );
+  }
   if (subnets.length === 0) {
     return (
       <div className="rounded-lg border border-dashed p-8 text-center">
@@ -328,7 +430,9 @@ function SubnetHeatmap({ subnets }: { subnets: Subnet[] }) {
     .sort((a, b) => a - b);
   const p95Index = Math.max(0, Math.floor(sorted.length * 0.95) - 1);
   const p95 = sorted.length > 0 ? sorted[p95Index] : 0;
-  const hot = active.filter((s) => s.utilization_percent >= 85).length;
+  const hot = active.filter(
+    (s) => s.utilization_percent >= thresholds.critical,
+  ).length;
 
   return (
     <div className="rounded-lg border bg-card">
@@ -343,30 +447,14 @@ function SubnetHeatmap({ subnets }: { subnets: Subnet[] }) {
           </span>
         </div>
         <div className="flex flex-wrap items-center gap-3 text-[11px]">
-          <div className="flex items-center gap-1">
-            <span className="inline-block h-2.5 w-2.5 rounded-sm bg-muted/60" />
-            <span className="text-muted-foreground">0%</span>
-          </div>
-          <div className="flex items-center gap-1">
-            <span className="inline-block h-2.5 w-2.5 rounded-sm bg-emerald-300" />
-            <span className="text-muted-foreground">25</span>
-          </div>
-          <div className="flex items-center gap-1">
-            <span className="inline-block h-2.5 w-2.5 rounded-sm bg-emerald-500" />
-            <span className="text-muted-foreground">50</span>
-          </div>
-          <div className="flex items-center gap-1">
-            <span className="inline-block h-2.5 w-2.5 rounded-sm bg-amber-400" />
-            <span className="text-muted-foreground">70</span>
-          </div>
-          <div className="flex items-center gap-1">
-            <span className="inline-block h-2.5 w-2.5 rounded-sm bg-red-400" />
-            <span className="text-muted-foreground">85</span>
-          </div>
-          <div className="flex items-center gap-1">
-            <span className="inline-block h-2.5 w-2.5 rounded-sm bg-red-500" />
-            <span className="text-muted-foreground">100%</span>
-          </div>
+          {heatmapLegend(thresholds).map((e) => (
+            <div key={e.cls} className="flex items-center gap-1">
+              <span
+                className={cn("inline-block h-2.5 w-2.5 rounded-sm", e.cls)}
+              />
+              <span className="text-muted-foreground">{e.label}</span>
+            </div>
+          ))}
         </div>
       </div>
       <div className="p-4">
@@ -387,7 +475,7 @@ function SubnetHeatmap({ subnets }: { subnets: Subnet[] }) {
               }`}
               className={cn(
                 "aspect-square rounded transition-all hover:scale-110 hover:ring-2 hover:ring-primary/40",
-                UtilColor(s.utilization_percent),
+                UtilColor(s.utilization_percent, thresholds),
               )}
             />
           ))}
@@ -435,18 +523,7 @@ function SubnetHeatmap({ subnets }: { subnets: Subnet[] }) {
  */
 function ActionBadge({ action, result }: { action: string; result: string }) {
   // Map both action and result to one of a few colour families.
-  let tone: Tone = "info";
-  let label = action.toUpperCase();
-  if (result === "failed") {
-    tone = "bad";
-    label = "FAIL";
-  } else if (result === "denied") {
-    tone = "warn";
-    label = "DENY";
-  } else if (action === "create") tone = "good";
-  else if (action === "delete") tone = "bad";
-  else if (action === "update") tone = "info";
-  else if (action === "login" || action === "logout") tone = "info";
+  const { tone, label } = activityTone(action, result);
 
   const cls = TONE_CLASS[tone];
   return (
@@ -655,11 +732,15 @@ function AttentionAgentsPanel({
 function OpenAlertsPanel({
   events,
   failed = false,
+  error,
   truncated = false,
 }: {
   events: AlertEvent[];
   /** The fetch failed. Distinct from "no open alerts" — see below. */
   failed?: boolean;
+  /** The fetch's error, so a refusal reads as one rather than as an outage
+   *  (#3456): the IPAM / DNS / DHCP Editor roles hold no `read alert`. */
+  error?: unknown;
   /** The response came back at the fetch cap, so the count is a floor. */
   truncated?: boolean;
 }) {
@@ -672,6 +753,14 @@ function OpenAlertsPanel({
   // A failed fetch renders as unknown, never as an all-clear. React Query
   // hands back the `[]` default on error, which would otherwise paint the
   // exact green "No open alerts" this panel exists to disprove.
+  if (failed && isRefused(error)) {
+    return (
+      <div className="flex items-center gap-2 rounded-lg border bg-card px-4 py-2.5 text-xs">
+        <span className="font-medium">Open alerts</span>
+        <ListReadError error={error} what="alert events" />
+      </div>
+    );
+  }
   if (failed) {
     return (
       <div className="flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-4 py-2.5 text-xs text-amber-700 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-400">
@@ -791,7 +880,7 @@ function AsnSummaryCard() {
   // Gate on ``ready`` so the query waits for the real module state (``enabled``
   // is optimistically true while loading → a one-shot 404 on hard load).
   const moduleOn = ready && enabled("network.asn");
-  const { data, isLoading, isError } = useQuery({
+  const { data, isLoading, isError, error } = useQuery({
     queryKey: ["asns-summary"],
     queryFn: () => asnsApi.list({ limit: 200 }),
     staleTime: 30_000,
@@ -818,8 +907,8 @@ function AsnSummaryCard() {
     }
     if (isError) {
       return (
-        <p className="mt-3 text-xs text-red-600 dark:text-red-400">
-          Failed to load ASN data.
+        <p className="mt-3 text-xs">
+          <ListReadError error={error} what="ASNs" />
         </p>
       );
     }
@@ -933,6 +1022,7 @@ function VrfSummaryCard() {
     data: vrfs = [],
     isLoading,
     isError,
+    error,
   } = useQuery<VRF[]>({
     queryKey: ["vrfs-summary"],
     queryFn: () => vrfsApi.list(),
@@ -960,8 +1050,8 @@ function VrfSummaryCard() {
     }
     if (isError) {
       return (
-        <p className="mt-3 text-xs text-red-600 dark:text-red-400">
-          Failed to load VRF data.
+        <p className="mt-3 text-xs">
+          <ListReadError error={error} what="VRFs" />
         </p>
       );
     }
@@ -1025,11 +1115,17 @@ function VrfSummaryCard() {
 // ── Domains Summary card ──────────────────────────────────────────────────────
 
 function DomainsSummaryCard() {
-  const { data, isLoading, isError } = useQuery({
+  const { enabled, ready } = useFeatureModules();
+  // Wait for the real module state: ``enabled`` is optimistically true while
+  // loading, which would fire one 404 on a hard load with the module off.
+  const moduleOn = ready && enabled("network.domains");
+  const { data, isLoading, isError, error } = useQuery({
     queryKey: ["domains-summary"],
     queryFn: () => domainsApi.list({ page_size: 200 }),
     staleTime: 30_000,
+    enabled: moduleOn,
   });
+  if (!moduleOn) return null;
 
   const inner = (() => {
     if (isLoading) {
@@ -1047,8 +1143,8 @@ function DomainsSummaryCard() {
     }
     if (isError) {
       return (
-        <p className="mt-3 text-xs text-red-600 dark:text-red-400">
-          Failed to load domain data.
+        <p className="mt-3 text-xs">
+          <ListReadError error={error} what="domains" />
         </p>
       );
     }
@@ -1253,11 +1349,13 @@ function SubnetDecomCard() {
 function LookingGlassHealthCard() {
   const { enabled, ready } = useFeatureModules();
   const moduleOn = ready && enabled("network.looking_glass");
-  const { data, isLoading, isError } = useQuery({
+  // Add Peer on the Looking Glass page is a write on bgp_lg_peer (#4116).
+  const canConfigure = usePermissions().can("write", "bgp_lg_peer");
+  const { data, isLoading, isError, error } = useQuery({
     queryKey: ["lg-dashboard-summary"],
     queryFn: () => lookingGlassApi.getDashboardSummary(),
     staleTime: 30_000,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
     enabled: moduleOn,
   });
 
@@ -1281,9 +1379,10 @@ function LookingGlassHealthCard() {
       );
     }
     if (isError) {
+      // A refusal is said to be one, not "Failed to load" (#3149).
       return (
-        <p className="mt-3 text-xs text-red-600 dark:text-red-400">
-          Failed to load Looking Glass data.
+        <p className="mt-3 text-xs">
+          <ListReadError error={error} what="Looking Glass data" />
         </p>
       );
     }
@@ -1293,12 +1392,14 @@ function LookingGlassHealthCard() {
           <p className="text-xs text-muted-foreground">
             No Looking Glass peers configured.
           </p>
-          <Link
-            to="/network/looking-glass"
-            className="mt-2 text-[11px] text-primary hover:underline"
-          >
-            Configure a peer →
-          </Link>
+          {canConfigure && (
+            <Link
+              to="/network/looking-glass"
+              className="mt-2 text-[11px] text-primary hover:underline"
+            >
+              Configure a peer →
+            </Link>
+          )}
         </div>
       );
     }
@@ -1412,7 +1513,7 @@ export function DashboardPage() {
   };
 
   const [tab, setTab] = useState<DashboardTab>(() => {
-    const saved = localStorage.getItem("dashboard-tab");
+    const saved = safeLocalStorage.getItem("dashboard-tab");
     if (saved && _PERSISTED_TABS.has(saved as DashboardTab)) {
       return saved as DashboardTab;
     }
@@ -1420,35 +1521,42 @@ export function DashboardPage() {
   });
   function selectTab(next: DashboardTab) {
     setTab(next);
-    localStorage.setItem("dashboard-tab", next);
+    safeLocalStorage.setItem("dashboard-tab", next);
   }
 
   // If the persisted tab points at a now-hidden (module-disabled) tab,
   // fall back to Overview so we don't render a panel against a 404'd
   // endpoint.
   useEffect(() => {
-    if (!tabVisible(tab)) {
+    // ``ready``: before the module set loads ``enabled`` answers true, so
+    // a persisted ``dhcp`` tab is neither reset nor — see the panel guards
+    // below — mounted against a module that may turn out to be off (#2130).
+    if (ready && !tabVisible(tab)) {
       setTab("overview");
-      localStorage.setItem("dashboard-tab", "overview");
+      safeLocalStorage.setItem("dashboard-tab", "overview");
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab, enabled]);
+  }, [tab, enabled, ready]);
 
   // IPAM
-  const { data: spaces } = useQuery({
+  const { data: spaces, error: spacesError } = useQuery({
     queryKey: ["spaces"],
     queryFn: ipamApi.listSpaces,
   });
-  const { data: subnets } = useQuery({
+  const { data: subnets, error: subnetsError } = useQuery({
     queryKey: ["subnets"],
     queryFn: () => ipamApi.listSubnets(),
   });
 
   // NAT mapping count — cheap (single page=1, per_page=1 just for total).
+  // Behind the ``ipam.nat`` module (#2100): the route 404s while it is off,
+  // and the card below goes with it.
+  const natOn = useModuleOn("ipam.nat");
   const { data: natTotal } = useQuery({
     queryKey: ["nat-mappings", "count"],
     queryFn: () => natApi.list({ page: 1, per_page: 1 }).then((r) => r.total),
     staleTime: 60_000,
+    enabled: natOn,
   });
 
   // Platform settings drive the utilization filter (excludes /30, /31,
@@ -1462,6 +1570,9 @@ export function DashboardPage() {
   const reportSubnets = subnets?.filter((s) =>
     includeInUtilization(s, settings),
   );
+  // Settings' Warning / Critical Thresholds (#3327) band the capacity
+  // figures below, as they do the IPAM tree's bars and dots.
+  const utilThresholds = useUtilizationThresholds();
 
   // DNS
   //
@@ -1473,7 +1584,7 @@ export function DashboardPage() {
   // their list comes from a query that stays empty.
   const dnsOn = ready && enabled("core.dns");
   const dhcpOn = ready && enabled("core.dhcp");
-  const { data: dnsGroups = [] } = useQuery({
+  const { data: dnsGroups = [], error: dnsGroupsError } = useQuery({
     queryKey: ["dns-groups"],
     queryFn: dnsApi.listGroups,
     staleTime: 30_000,
@@ -1494,16 +1605,18 @@ export function DashboardPage() {
     queries: dnsGroups.map((g) => ({
       queryKey: ["dns-servers", g.id],
       queryFn: () => dnsApi.listServers(g.id),
-      refetchInterval: 30_000,
+      refetchInterval: pollUnlessRefused(30_000),
     })),
   });
   const allDnsServers: DNSServer[] = serverQueries.flatMap((q) => q.data ?? []);
 
   // DHCP
-  const { data: dhcpServers = [] } = useQuery<DHCPServer[]>({
+  const { data: dhcpServers = [], error: dhcpServersError } = useQuery<
+    DHCPServer[]
+  >({
     queryKey: ["dhcp-servers"],
     queryFn: () => dhcpApi.listServers(),
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
     enabled: dhcpOn,
   });
   // Single groups fetch — drives both the DHCP server-row group-name
@@ -1511,17 +1624,27 @@ export function DashboardPage() {
   const { data: dhcpGroups = [] } = useQuery({
     queryKey: ["dhcp-groups"],
     queryFn: dhcpApi.listGroups,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
     enabled: dhcpOn,
   });
   const haGroups = dhcpGroups.filter((g) => g.kea_member_count >= 2);
 
   // Audit
-  const { data: recent } = useQuery({
+  // The route takes read on `audit_log`: a user without it is not asked at
+  // all (each refusal writes a `denied` audit row), and the card says so
+  // rather than "No recent activity" (#2702). A refusal also ends the poll.
+  const {
+    can: canRead,
+    isLoading: permsLoading,
+    isError: permsFailed,
+  } = usePermissions();
+  const canReadAudit = canRead("read", "audit_log");
+  const { data: recent, error: recentError } = useQuery({
     queryKey: ["audit", "recent"],
     queryFn: () => auditApi.list({ limit: 15, offset: 0 }),
     staleTime: 10_000,
-    refetchInterval: 15_000,
+    refetchInterval: pollUnlessRefused(15_000),
+    enabled: canReadAudit,
   });
 
   // Integrations — only fetched when the corresponding toggle is on,
@@ -1541,13 +1664,13 @@ export function DashboardPage() {
     queryKey: ["kubernetes-clusters"],
     queryFn: kubernetesApi.listClusters,
     enabled: kubernetesEnabled,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
   const { data: dockerHosts = [] } = useQuery<DockerHost[]>({
     queryKey: ["docker-hosts"],
     queryFn: dockerApi.listHosts,
     enabled: dockerEnabled,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
   const { data: tailscaleTenants = [] } = useQuery<TailscaleTenant[]>({
     queryKey: ["tailscale-tenants"],
@@ -1564,49 +1687,49 @@ export function DashboardPage() {
     queryKey: ["proxmox-nodes"],
     queryFn: proxmoxApi.listNodes,
     enabled: proxmoxEnabled,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
 
   const { data: opnsenseRouters = [] } = useQuery<OPNsenseRouter[]>({
     queryKey: ["opnsense-routers"],
     queryFn: opnsenseApi.listRouters,
     enabled: opnsenseEnabled,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
 
   const { data: panosFirewalls = [] } = useQuery<PANOSFirewall[]>({
     queryKey: ["panos-firewalls"],
     queryFn: panosApi.list,
     enabled: panosEnabled,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
 
   const { data: fortinetFirewalls = [] } = useQuery<FortinetFirewall[]>({
     queryKey: ["fortinet-firewalls"],
     queryFn: fortinetApi.list,
     enabled: fortinetEnabled,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
 
   const { data: merakiOrgs = [] } = useQuery<MerakiOrg[]>({
     queryKey: ["meraki-orgs"],
     queryFn: merakiApi.list,
     enabled: merakiEnabled,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
 
   const { data: cloudEndpoints = [] } = useQuery<CloudEndpoint[]>({
     queryKey: ["cloud-endpoints"],
     queryFn: cloudApi.listEndpoints,
     enabled: cloudEnabled,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
 
   const { data: unifiControllers = [] } = useQuery<UnifiController[]>({
     queryKey: ["unifi-controllers"],
     queryFn: unifiApi.listControllers,
     enabled: unifiEnabled,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
 
   // Platform health — covers api / postgres / redis / celery workers /
@@ -1616,7 +1739,7 @@ export function DashboardPage() {
   const { data: platformHealth } = useQuery<PlatformHealthResponse>({
     queryKey: ["platform-health"],
     queryFn: platformHealthApi.get,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
 
   // Open alert events (#942). Drives BOTH the header pill and the
@@ -1632,14 +1755,18 @@ export function DashboardPage() {
   // practice. When the response comes back exactly full the total is
   // rendered as "N+" rather than as a number we know is wrong.
   const OPEN_ALERT_FETCH_LIMIT = 1000;
-  const { data: openAlerts = [], isError: openAlertsFailed } = useQuery({
+  const {
+    data: openAlerts = [],
+    isError: openAlertsFailed,
+    error: openAlertsError,
+  } = useQuery({
     queryKey: ["alert-events", { open: true }],
     queryFn: () =>
       alertsApi.listEvents({
         open_only: true,
         limit: OPEN_ALERT_FETCH_LIMIT,
       }),
-    refetchInterval: 60_000,
+    refetchInterval: pollUnlessRefused(60_000),
   });
   const openAlertsTruncated = openAlerts.length >= OPEN_ALERT_FETCH_LIMIT;
 
@@ -1657,10 +1784,9 @@ export function DashboardPage() {
       ? (rows ?? []).filter((s) => ipamSpaceFilter.includes(s.space_id))
       : (rows ?? []);
 
-  // Derived stats — every utilization-driven counter reads from
-  // `reportSubnets` so small PTP / loopback subnets don't skew the
-  // dashboard. `subnets` (the unfiltered list) is still used for
-  // inventory counts like "N subnets". Both feed through `filterSpaces`
+  // Derived stats — the heatmap, Top Subnets and threshold counters read
+  // from `reportSubnets` so small PTP / loopback subnets don't skew them;
+  // the address totals and inventory counts read the unfiltered list. Both feed through `filterSpaces`
   // so the IPAM-tab filter, when active, scopes every downstream number.
   const reporting = filterSpaces(reportSubnets);
   const subnetsScoped = filterSpaces(subnets);
@@ -1669,8 +1795,12 @@ export function DashboardPage() {
   // meaningless (a single /64 swamps every IPv4 subnet combined). Restrict
   // the top-line counters to IPv4. The heatmap + per-subnet stats keep
   // IPv6 since per-subnet utilization_percent is still meaningful.
-  const reportingV4 = reporting.filter((s) => !s.network.includes(":"));
-  const reportingV6 = reporting.filter((s) => s.network.includes(":"));
+  // The totals count EVERY subnet's addresses (#3785): the
+  // utilization_max_prefix_* cut is for the heatmap, Top Subnets and alerts,
+  // and a total that left a /30's addresses out beside a Subnets card that
+  // counts the /30 told two stories.
+  const reportingV4 = subnetsScoped.filter((s) => !s.network.includes(":"));
+  const reportingV6 = subnetsScoped.filter((s) => s.network.includes(":"));
   const totalIPs = reportingV4.reduce((s, n) => s + n.total_ips, 0);
   const allocatedIPs = reportingV4.reduce((s, n) => s + n.allocated_ips, 0);
   const freeIPs = totalIPs - allocatedIPs;
@@ -1686,9 +1816,12 @@ export function DashboardPage() {
     .sort((a, b) => b.utilization_percent - a.utilization_percent);
   const topSubnets = sortedSubnets.slice(0, 6);
   const ipamTopSubnets = sortedSubnets.slice(0, 20);
-  const critical = reporting.filter((s) => s.utilization_percent >= 95).length;
+  const critical = reporting.filter(
+    (s) =>
+      utilizationBand(s.utilization_percent, utilThresholds) === "critical",
+  ).length;
   const warning = reporting.filter(
-    (s) => s.utilization_percent >= 80 && s.utilization_percent < 95,
+    (s) => utilizationBand(s.utilization_percent, utilThresholds) === "warn",
   ).length;
 
   const allServers = [
@@ -1721,7 +1854,15 @@ export function DashboardPage() {
   // agent too old to report is where a silent revert would hide, so it
   // is deliberately not counted as a failure either.
   const configFailedServers = supervisedServers.filter(
-    (s) => s.config_apply_status != null && s.config_apply_status !== "ok",
+    (s) =>
+      s.config_apply_status != null &&
+      s.config_apply_status !== "ok" &&
+      !isPartialApply(s.config_apply_status, s.config_apply_error),
+  ).length;
+  // A partial apply (#1280) still needs attention, but nothing failed to
+  // apply as a whole, so it is counted apart from "config failed".
+  const zonesRefusedServers = supervisedServers.filter((s) =>
+    isPartialApply(s.config_apply_status, s.config_apply_error),
   ).length;
   // #1067 — an agent whose daemon is not serving keeps heartbeating too, so
   // ``status`` and the last-seen stamp read normal while it answers nothing
@@ -1739,25 +1880,48 @@ export function DashboardPage() {
   // honest, because the set spans DNS and DHCP servers across different
   // groups. So the Overview names them and each row deep-links to the
   // group whose server list contains it.
-  const attentionServers = supervisedServers.filter(
-    (s) =>
-      s.status === "unreachable" ||
-      s.status === "error" ||
-      (s.config_apply_status != null && s.config_apply_status !== "ok") ||
-      s.daemon_not_serving === true,
-  );
+  const attentionServers = supervisedServers.filter(agentNeedsAttention);
+  // The tile's "healthy" line is everything the panel does NOT list, not
+  // everything whose status reads "active" (#2755).
+  const healthyServers = supervisedServers.length - attentionServers.length;
+
+  // A read the server refused (or that failed) is not an empty estate
+  // (#2754): the header, tiles, strip and heatmap say they cannot be read
+  // instead of counting zero and calling it healthy.
+  const ipamUnreadable = !!spacesError || !!subnetsError;
+  const fleetUnreadable = !!dnsGroupsError || !!dhcpServersError;
+  const unreadableWhy = (err: unknown) =>
+    isRefused(err) ? "you may not read this" : "couldn't load this";
+  // The same for the faces that count one read's rows (#3234): the value is
+  // a dash and the sub-line says why, never a zero.
+  const subnetsWhy = subnetsError ? unreadableWhy(subnetsError) : undefined;
+  const zonesWhy = dnsGroupsError ? unreadableWhy(dnsGroupsError) : undefined;
+  const serversWhy =
+    dnsGroupsError || dhcpServersError
+      ? unreadableWhy(dnsGroupsError ?? dhcpServersError)
+      : undefined;
 
   const degraded =
     unhealthyServers > 0 ||
     configFailedServers > 0 ||
+    zonesRefusedServers > 0 ||
     daemonDegradedServers > 0 ||
     critical > 0;
-  const healthTone: Tone = degraded ? "bad" : warning > 0 ? "warn" : "good";
+  const healthUnknown = ipamUnreadable || fleetUnreadable;
+  const healthTone: Tone = degraded
+    ? "bad"
+    : warning > 0
+      ? "warn"
+      : healthUnknown
+        ? "default"
+        : "good";
   const healthLabel = degraded
     ? "degraded"
     : warning > 0
       ? "near capacity"
-      : "healthy";
+      : healthUnknown
+        ? "status unknown"
+        : "healthy";
   // The label is a rollup of five unrelated things; without this the
   // operator sees "degraded" and has no idea which one to chase. Every
   // input to ``degraded`` above needs its line here, or the header can read
@@ -1765,10 +1929,10 @@ export function DashboardPage() {
   const healthDetail =
     [
       critical > 0
-        ? `${critical} subnet${critical === 1 ? "" : "s"} ≥95% full`
+        ? `${critical} subnet${critical === 1 ? "" : "s"} ≥${utilThresholds.critical}% full`
         : null,
       warning > 0
-        ? `${warning} subnet${warning === 1 ? "" : "s"} ≥80% full`
+        ? `${warning} subnet${warning === 1 ? "" : "s"} ≥${utilThresholds.warn}% full`
         : null,
       unhealthyServers > 0
         ? `${unhealthyServers} server${unhealthyServers === 1 ? "" : "s"} unreachable`
@@ -1776,8 +1940,14 @@ export function DashboardPage() {
       configFailedServers > 0
         ? `${configFailedServers} agent${configFailedServers === 1 ? "" : "s"} failed to apply config`
         : null,
+      zonesRefusedServers > 0
+        ? `${zonesRefusedServers} agent${zonesRefusedServers === 1 ? "" : "s"} with zones refused`
+        : null,
       daemonDegradedServers > 0
         ? `${daemonDegradedServers} daemon${daemonDegradedServers === 1 ? "" : "s"} not serving`
+        : null,
+      healthUnknown
+        ? `${[ipamUnreadable ? "subnets" : null, fleetUnreadable ? "servers" : null].filter(Boolean).join(" and ")} could not be read (${unreadableWhy(subnetsError ?? spacesError ?? dnsGroupsError ?? dhcpServersError)}), so health is unknown`
         : null,
     ]
       .filter(Boolean)
@@ -1792,12 +1962,18 @@ export function DashboardPage() {
             <h1 className="text-2xl font-bold tracking-tight">Dashboard</h1>
             <p className="mt-1 flex items-center gap-3 text-xs text-muted-foreground">
               <span className="font-mono">//</span>
-              <span>
-                {spaces?.length ?? 0} space{spaces?.length === 1 ? "" : "s"}
+              <span
+                title={spacesError ? unreadableWhy(spacesError) : undefined}
+              >
+                {spacesError ? "—" : (spaces?.length ?? 0)} space
+                {!spacesError && spaces?.length === 1 ? "" : "s"}
               </span>
               <span>·</span>
-              <span>
-                {subnets?.length ?? 0} subnet{subnets?.length === 1 ? "" : "s"}
+              <span
+                title={subnetsError ? unreadableWhy(subnetsError) : undefined}
+              >
+                {subnetsError ? "—" : (subnets?.length ?? 0)} subnet
+                {!subnetsError && subnets?.length === 1 ? "" : "s"}
               </span>
               <span>·</span>
               <span
@@ -1932,26 +2108,44 @@ export function DashboardPage() {
           <div className="grid gap-3 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3">
             <KpiCard
               label="Agents needing attention"
-              value={unhealthyServers + configFailedServers}
+              value={
+                fleetUnreadable && attentionServers.length === 0
+                  ? "—"
+                  : attentionServers.length
+              }
               sub={
-                unhealthyServers + configFailedServers > 0 ? (
+                attentionServers.length > 0 ? (
                   <span className="text-red-600 dark:text-red-400">
                     {unhealthyServers} unreachable
                     {configFailedServers > 0 &&
                       ` · ${configFailedServers} config failed`}
+                    {zonesRefusedServers > 0 &&
+                      ` · ${zonesRefusedServers} with zones refused`}
+                    {daemonDegradedServers > 0 &&
+                      ` · ${daemonDegradedServers} daemon not serving`}
                   </span>
+                ) : fleetUnreadable ? (
+                  `${unreadableWhy(dnsGroupsError ?? dhcpServersError)} (servers)`
                 ) : (
-                  `${activeServers} healthy · paused and maintenance excluded`
+                  `${healthyServers} healthy · paused and maintenance excluded`
                 )
               }
               icon={Cpu}
-              tone={unhealthyServers + configFailedServers > 0 ? "bad" : "good"}
+              tone={
+                attentionServers.length > 0
+                  ? "bad"
+                  : fleetUnreadable
+                    ? "default"
+                    : "good"
+              }
             />
             <KpiCard
               label="Capacity pressure"
-              value={critical + warning}
+              value={ipamUnreadable ? "—" : critical + warning}
               sub={
-                critical + warning > 0 ? (
+                ipamUnreadable ? (
+                  `${unreadableWhy(subnetsError ?? spacesError)} (subnets)`
+                ) : critical + warning > 0 ? (
                   <span
                     className={
                       critical > 0
@@ -1959,14 +2153,23 @@ export function DashboardPage() {
                         : "text-amber-600 dark:text-amber-400"
                     }
                   >
-                    {critical} at ≥95% · {warning} at ≥80%
+                    {critical} at ≥{utilThresholds.critical}% · {warning} at ≥
+                    {utilThresholds.warn}%
                   </span>
                 ) : (
-                  "no subnet above 80%"
+                  `no subnet above ${utilThresholds.warn}%`
                 )
               }
               icon={Network}
-              tone={critical > 0 ? "bad" : warning > 0 ? "warn" : "good"}
+              tone={
+                ipamUnreadable
+                  ? "default"
+                  : critical > 0
+                    ? "bad"
+                    : warning > 0
+                      ? "warn"
+                      : "good"
+              }
               to="/ipam"
             />
             <WidgetErrorBoundary title="Certificates expiring">
@@ -1989,55 +2192,74 @@ export function DashboardPage() {
             />
             <KpiCard
               label="Subnets"
-              value={subnetsScoped.length}
+              value={subnetsWhy ? "—" : subnetsScoped.length}
               sub={
-                <>
-                  <span className="text-emerald-600 dark:text-emerald-400">
-                    {subnetsScoped.length - critical - warning} healthy
-                  </span>
-                  {(critical > 0 || warning > 0) && (
-                    <>
-                      {" · "}
-                      <span className="text-red-600 dark:text-red-400">
-                        {critical + warning} alert
-                        {critical + warning === 1 ? "" : "s"}
-                      </span>
-                    </>
-                  )}
-                </>
+                subnetsWhy ? (
+                  subnetsWhy
+                ) : (
+                  <>
+                    <span className="text-emerald-600 dark:text-emerald-400">
+                      {subnetsScoped.length - critical - warning} healthy
+                    </span>
+                    {(critical > 0 || warning > 0) && (
+                      <>
+                        {" · "}
+                        <span className="text-red-600 dark:text-red-400">
+                          {critical + warning} alert
+                          {critical + warning === 1 ? "" : "s"}
+                        </span>
+                      </>
+                    )}
+                  </>
+                )
               }
               icon={Network}
-              tone={critical > 0 ? "bad" : warning > 0 ? "warn" : "good"}
+              tone={
+                subnetsWhy
+                  ? "default"
+                  : critical > 0
+                    ? "bad"
+                    : warning > 0
+                      ? "warn"
+                      : "good"
+              }
               to="/ipam"
             />
             <KpiCard
               label="Allocated IPs (IPv4)"
-              value={allocatedIPs.toLocaleString()}
-              sub={`${freeIPs.toLocaleString()} free`}
+              value={subnetsWhy ? "—" : allocatedIPs.toLocaleString()}
+              sub={subnetsWhy ?? `${freeIPs.toLocaleString()} free`}
               icon={Activity}
               to="/ipam"
             />
             <KpiCard
               label="Utilization (IPv4)"
-              value={`${overallUtil.toFixed(1)}%`}
-              sub={`${allocatedIPs.toLocaleString()} / ${totalIPs.toLocaleString()}`}
+              value={subnetsWhy ? "—" : `${overallUtil.toFixed(1)}%`}
+              sub={
+                subnetsWhy ??
+                `${allocatedIPs.toLocaleString()} / ${totalIPs.toLocaleString()}`
+              }
               icon={Server}
               tone={
-                overallUtil >= 95
-                  ? "bad"
-                  : overallUtil >= 80
-                    ? "warn"
-                    : "default"
+                subnetsWhy
+                  ? "default"
+                  : overallUtil >= utilThresholds.critical
+                    ? "bad"
+                    : overallUtil >= utilThresholds.warn
+                      ? "warn"
+                      : "default"
               }
             />
             {dnsOn && (
               <KpiCard
                 label="DNS Zones"
-                value={totalZones}
+                value={zonesWhy ? "—" : totalZones}
                 sub={
-                  dnsGroups.length > 0
-                    ? `${dnsGroups.length} group${dnsGroups.length === 1 ? "" : "s"}`
-                    : "no groups"
+                  zonesWhy
+                    ? zonesWhy
+                    : dnsGroups.length > 0
+                      ? `${dnsGroups.length} group${dnsGroups.length === 1 ? "" : "s"}`
+                      : "no groups"
                 }
                 icon={Globe2}
                 to="/dns"
@@ -2045,9 +2267,11 @@ export function DashboardPage() {
             )}
             <KpiCard
               label="Servers"
-              value={allServers.length}
+              value={serversWhy ? "—" : allServers.length}
               sub={
-                unhealthyServers > 0 ? (
+                serversWhy ? (
+                  serversWhy
+                ) : unhealthyServers > 0 ? (
                   <span className="text-red-600 dark:text-red-400">
                     {activeServers} active · {unhealthyServers} unhealthy
                   </span>
@@ -2058,7 +2282,7 @@ export function DashboardPage() {
                 )
               }
               icon={Cpu}
-              tone={unhealthyServers > 0 ? "bad" : "default"}
+              tone={!serversWhy && unhealthyServers > 0 ? "bad" : "default"}
             />
           </div>
         )}
@@ -2078,6 +2302,7 @@ export function DashboardPage() {
             <OpenAlertsPanel
               events={openAlerts}
               failed={openAlertsFailed}
+              error={openAlertsError}
               truncated={openAlertsTruncated}
             />
           </WidgetErrorBoundary>
@@ -2096,47 +2321,59 @@ export function DashboardPage() {
               a reference lookup rather than a thing to monitor. ─────── */}
         {tab === "overview" && (
           <div className="flex flex-wrap items-center gap-x-1 gap-y-2 rounded-lg border bg-card px-4 py-2.5 text-xs">
-            <InventoryStat
-              value={spaces?.length ?? 0}
-              label="spaces"
-              to="/ipam"
-            />
-            <InventoryStat
-              value={subnetsScoped.length}
-              label="subnets"
-              to="/ipam"
-            />
-            <InventoryStat
-              value={allocatedIPs.toLocaleString()}
-              label="allocated IPv4"
-              title={`${freeIPs.toLocaleString()} free of ${totalIPs.toLocaleString()}`}
-              to="/ipam"
-            />
-            <InventoryStat
-              value={`${overallUtil.toFixed(1)}%`}
-              label="utilization"
-              tone={
-                overallUtil >= 95
-                  ? "bad"
-                  : overallUtil >= 80
-                    ? "warn"
-                    : undefined
-              }
-              title={`${allocatedIPs.toLocaleString()} / ${totalIPs.toLocaleString()} IPv4 addresses`}
-              to="/ipam"
-            />
-            <InventoryStat
-              value={totalZones}
-              label="DNS zones"
-              title={`across ${dnsGroups.length} group${dnsGroups.length === 1 ? "" : "s"}`}
-              to="/dns"
-            />
-            <InventoryStat
-              value={allServers.length}
-              label="servers"
-              title={`${activeServers} active`}
-              to="/dns"
-            />
+            {!spacesError && (
+              <InventoryStat
+                value={spaces?.length ?? 0}
+                label="spaces"
+                to="/ipam"
+              />
+            )}
+            {!subnetsError && (
+              <InventoryStat
+                value={subnetsScoped.length}
+                label="subnets"
+                to="/ipam"
+              />
+            )}
+            {!ipamUnreadable && (
+              <InventoryStat
+                value={allocatedIPs.toLocaleString()}
+                label="allocated IPv4"
+                title={`${freeIPs.toLocaleString()} free of ${totalIPs.toLocaleString()}`}
+                to="/ipam"
+              />
+            )}
+            {!ipamUnreadable && (
+              <InventoryStat
+                value={`${overallUtil.toFixed(1)}%`}
+                label="utilization"
+                tone={
+                  overallUtil >= utilThresholds.critical
+                    ? "bad"
+                    : overallUtil >= utilThresholds.warn
+                      ? "warn"
+                      : undefined
+                }
+                title={`${allocatedIPs.toLocaleString()} / ${totalIPs.toLocaleString()} IPv4 addresses`}
+                to="/ipam"
+              />
+            )}
+            {!dnsGroupsError && (
+              <InventoryStat
+                value={totalZones}
+                label="DNS zones"
+                title={`across ${dnsGroups.length} group${dnsGroups.length === 1 ? "" : "s"}`}
+                to="/dns"
+              />
+            )}
+            {!fleetUnreadable && (
+              <InventoryStat
+                value={allServers.length}
+                label="servers"
+                title={`${activeServers} active`}
+                to="/dns"
+              />
+            )}
           </div>
         )}
 
@@ -2169,19 +2406,19 @@ export function DashboardPage() {
         )}
 
         {/* ── DNS query rate (DNS tab only) ──────────────────────────── */}
-        {tab === "dns" && (
+        {tab === "dns" && dnsOn && (
           <WidgetErrorBoundary title="DNS query rate">
             <DNSQueryRateCard dnsServers={allDnsServers} />
           </WidgetErrorBoundary>
         )}
 
         {/* ── DHCP pools + traffic (DHCP tab only) ───────────────────── */}
-        {tab === "dhcp" && (
+        {tab === "dhcp" && dhcpOn && (
           <WidgetErrorBoundary title="DHCP pools">
-            <DhcpPoolPressure />
+            <DhcpPoolPressure dhcpOn={dhcpOn} />
           </WidgetErrorBoundary>
         )}
-        {tab === "dhcp" && (
+        {tab === "dhcp" && dhcpOn && (
           <WidgetErrorBoundary title="DHCP traffic">
             <DHCPTrafficCard dhcpServers={dhcpServers} />
           </WidgetErrorBoundary>
@@ -2190,7 +2427,14 @@ export function DashboardPage() {
         {/* ── Heatmap (Overview + IPAM) ──────────────────────────────── */}
         {(tab === "overview" || tab === "ipam") && (
           <WidgetErrorBoundary title="Subnet heatmap">
-            <SubnetHeatmap subnets={reporting} />
+            <SubnetHeatmap
+              subnets={reporting}
+              unreadable={
+                ipamUnreadable
+                  ? unreadableWhy(subnetsError ?? spacesError)
+                  : null
+              }
+            />
           </WidgetErrorBoundary>
         )}
 
@@ -2211,9 +2455,9 @@ export function DashboardPage() {
                   <div className="flex items-center justify-between text-xs">
                     <span className="font-mono">IPv4</span>
                     <span className="text-muted-foreground">
-                      {v4SubnetCount} subnet
-                      {v4SubnetCount === 1 ? "" : "s"} ·{" "}
-                      {allocatedIPs.toLocaleString()} alloc
+                      {subnetsWhy
+                        ? subnetsWhy
+                        : `${v4SubnetCount} subnet${v4SubnetCount === 1 ? "" : "s"} · ${allocatedIPs.toLocaleString()} alloc`}
                     </span>
                   </div>
                   <div className="mt-1 h-2 overflow-hidden rounded-full bg-muted">
@@ -2235,9 +2479,9 @@ export function DashboardPage() {
                   <div className="flex items-center justify-between text-xs">
                     <span className="font-mono">IPv6</span>
                     <span className="text-muted-foreground">
-                      {v6SubnetCount} subnet
-                      {v6SubnetCount === 1 ? "" : "s"} ·{" "}
-                      {v6AllocCount.toLocaleString()} alloc
+                      {subnetsWhy
+                        ? subnetsWhy
+                        : `${v6SubnetCount} subnet${v6SubnetCount === 1 ? "" : "s"} · ${v6AllocCount.toLocaleString()} alloc`}
                     </span>
                   </div>
                   <div className="mt-1 h-2 overflow-hidden rounded-full bg-muted">
@@ -2258,21 +2502,29 @@ export function DashboardPage() {
               </div>
             </div>
 
-            <KpiCard
-              label="NAT mappings"
-              value={natTotal ?? "—"}
-              sub={natTotal === 0 ? "none configured" : "operator-curated"}
-              icon={Plug}
-              to="/ipam/nat"
-            />
+            {natOn && (
+              <KpiCard
+                label="NAT mappings"
+                value={natTotal ?? "—"}
+                sub={natTotal === 0 ? "none configured" : "operator-curated"}
+                icon={Plug}
+                to="/ipam/nat"
+              />
+            )}
 
             <KpiCard
               label="Capacity headroom"
-              value={`${(100 - overallUtil).toFixed(1)}%`}
-              sub={`${freeIPs.toLocaleString()} IPv4 free`}
+              value={subnetsWhy ? "—" : `${(100 - overallUtil).toFixed(1)}%`}
+              sub={subnetsWhy ?? `${freeIPs.toLocaleString()} IPv4 free`}
               icon={HardDrive}
               tone={
-                overallUtil >= 95 ? "bad" : overallUtil >= 80 ? "warn" : "good"
+                subnetsWhy
+                  ? "default"
+                  : overallUtil >= utilThresholds.critical
+                    ? "bad"
+                    : overallUtil >= utilThresholds.warn
+                      ? "warn"
+                      : "good"
               }
             />
 
@@ -2295,14 +2547,18 @@ export function DashboardPage() {
                   </h3>
                 </div>
                 <span className="text-[11px] text-muted-foreground">
-                  Showing {topSubnets.length} of {subnets?.length ?? 0}
+                  {subnetsError
+                    ? "—"
+                    : `Showing ${topSubnets.length} of ${subnets?.length ?? 0}`}
                 </span>
               </div>
               <div className="overflow-x-auto">
                 <div className="min-w-[480px] divide-y">
                   {topSubnets.length === 0 ? (
                     <div className="px-4 py-8 text-center text-xs text-muted-foreground">
-                      No subnets have allocated IPs yet.
+                      <ListEmpty error={subnetsError} what="subnets">
+                        No subnets have allocated IPs yet.
+                      </ListEmpty>
                     </div>
                   ) : (
                     topSubnets.map((subnet) => (
@@ -2356,9 +2612,27 @@ export function DashboardPage() {
               </div>
               <div className="overflow-x-auto">
                 <div className="min-w-[440px] divide-y">
-                  {!recent || recent.items.length === 0 ? (
+                  {recentError || (!canReadAudit && !permsLoading) ? (
                     <div className="px-4 py-8 text-center text-xs text-muted-foreground">
-                      No recent activity. Try creating a subnet or a DNS record.
+                      {recentError ? (
+                        <ListReadError
+                          error={recentError}
+                          what="the audit log"
+                        />
+                      ) : permsFailed ? (
+                        // A failed permissions read is not a missing grant
+                        // (#3541): ``can`` is false for everyone then.
+                        "Your permissions could not be read, so the audit log was not requested. Reload to try again."
+                      ) : (
+                        "You don't have permission to see the audit log."
+                      )}
+                    </div>
+                  ) : !recent || recent.items.length === 0 ? (
+                    <div className="px-4 py-8 text-center text-xs text-muted-foreground">
+                      No recent activity.
+                      {(canRead("write", "subnet") ||
+                        canRead("write", "dns_record")) &&
+                        " Try creating a subnet or a DNS record."}
                     </div>
                   ) : (
                     recent.items.slice(0, 12).map((entry) => (
@@ -2417,13 +2691,17 @@ export function DashboardPage() {
                 </h3>
               </div>
               <span className="text-[11px] text-muted-foreground">
-                Showing {ipamTopSubnets.length} of {subnetsScoped.length}
+                {subnetsError
+                  ? "—"
+                  : `Showing ${ipamTopSubnets.length} of ${subnetsScoped.length}`}
               </span>
             </div>
             <div className="divide-y">
               {ipamTopSubnets.length === 0 ? (
                 <div className="px-4 py-8 text-center text-xs text-muted-foreground">
-                  No subnets have allocated IPs yet.
+                  <ListEmpty error={subnetsError} what="subnets">
+                    No subnets have allocated IPs yet.
+                  </ListEmpty>
                 </div>
               ) : (
                 ipamTopSubnets.map((subnet) => (
@@ -2457,7 +2735,7 @@ export function DashboardPage() {
         )}
 
         {/* ── DNS tab: Server list ──────────────────────────────────── */}
-        {tab === "dns" && allDnsServers.length > 0 && (
+        {tab === "dns" && dnsOn && allDnsServers.length > 0 && (
           <div className="rounded-lg border bg-card">
             <div className="flex items-center justify-between border-b px-4 py-2.5">
               <div className="flex items-center gap-2">
@@ -2498,13 +2776,22 @@ export function DashboardPage() {
             </div>
           </div>
         )}
-        {tab === "dns" && allDnsServers.length === 0 && (
+        {tab === "dns" && dnsOn && allDnsServers.length === 0 && (
           <div className="rounded-lg border border-dashed p-10 text-center">
             <Globe2 className="mx-auto mb-3 h-10 w-10 text-muted-foreground/30" />
-            <p className="text-sm font-medium">No DNS servers registered</p>
-            <p className="mt-1 text-xs text-muted-foreground">
-              Register a DNS server to see query rates, zones, and health here.
-            </p>
+            {dnsGroupsError ? (
+              <p className="text-sm text-muted-foreground">
+                <ListReadError error={dnsGroupsError} what="DNS servers" />
+              </p>
+            ) : (
+              <>
+                <p className="text-sm font-medium">No DNS servers registered</p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Register a DNS server to see query rates, zones, and health
+                  here.
+                </p>
+              </>
+            )}
           </div>
         )}
 
@@ -2571,14 +2858,24 @@ export function DashboardPage() {
             )}
           </div>
         )}
-        {tab === "dhcp" && dhcpServers.length === 0 && (
+        {tab === "dhcp" && dhcpOn && dhcpServers.length === 0 && (
           <div className="rounded-lg border border-dashed p-10 text-center">
             <Server className="mx-auto mb-3 h-10 w-10 text-muted-foreground/30" />
-            <p className="text-sm font-medium">No DHCP servers registered</p>
-            <p className="mt-1 text-xs text-muted-foreground">
-              Register a DHCP server to see lease activity, scopes, and HA state
-              here.
-            </p>
+            {dhcpServersError ? (
+              <p className="text-sm text-muted-foreground">
+                <ListReadError error={dhcpServersError} what="DHCP servers" />
+              </p>
+            ) : (
+              <>
+                <p className="text-sm font-medium">
+                  No DHCP servers registered
+                </p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Register a DHCP server to see lease activity, scopes, and HA
+                  state here.
+                </p>
+              </>
+            )}
           </div>
         )}
 
@@ -2636,7 +2933,12 @@ export function DashboardPage() {
 
         {tab === "security" && <SecurityPanel />}
 
-        {tab === "compliance" && <CompliancePanel subnets={subnets ?? []} />}
+        {tab === "compliance" && (
+          <CompliancePanel
+            subnets={subnets ?? []}
+            subnetsError={subnetsError}
+          />
+        )}
 
         {/* ── Conformity tab ────────────────────────────────────────── */}
         {tab === "conformity" && <ConformityPanel />}
@@ -2670,7 +2972,7 @@ export function DashboardPage() {
  * selecting a subset narrows every IPAM-tab card. Renders nothing when
  * fewer than two spaces exist — there's nothing to filter against.
  */
-function IpamSpaceFilter({
+export function IpamSpaceFilter({
   spaces,
   selected,
   onChange,
@@ -2681,20 +2983,16 @@ function IpamSpaceFilter({
 }) {
   const [open, setOpen] = useState(false);
   const wrapperRef = useRef<HTMLDivElement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
 
-  useEffect(() => {
-    if (!open) return;
-    function onDoc(e: MouseEvent) {
-      if (
-        wrapperRef.current &&
-        !wrapperRef.current.contains(e.target as Node)
-      ) {
-        setOpen(false);
-      }
-    }
-    document.addEventListener("mousedown", onDoc);
-    return () => document.removeEventListener("mousedown", onDoc);
-  }, [open]);
+  // Esc / outside press / focus leaving close the picker (#3159).
+  const closePicker = useCallback(() => setOpen(false), []);
+  const { onBlur } = useDismissableMenu({
+    open,
+    onClose: closePicker,
+    containerRef: wrapperRef,
+    triggerRef,
+  });
 
   const sortedSpaces = useMemo(
     () => [...spaces].sort((a, b) => a.name.localeCompare(b.name)),
@@ -2717,9 +3015,12 @@ function IpamSpaceFilter({
   }
 
   return (
-    <div className="relative" ref={wrapperRef}>
+    <div className="relative" ref={wrapperRef} onBlur={onBlur}>
       <button
+        ref={triggerRef}
         type="button"
+        aria-haspopup="true"
+        aria-expanded={open}
         onClick={() => setOpen(!open)}
         title="Scope IPAM-tab cards to one or more IP spaces"
         className={cn(
@@ -2787,7 +3088,14 @@ function IpamSpaceFilter({
             <div className="border-t px-3 py-2">
               <button
                 type="button"
-                onClick={() => onChange([])}
+                onClick={() => {
+                  onChange([]);
+                  // The button is drawn only while a filter is set, so it
+                  // removes itself: close the list and hand focus to the
+                  // trigger, as Esc does, rather than the page body (#4222).
+                  setOpen(false);
+                  triggerRef.current?.focus();
+                }}
                 className="inline-flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
               >
                 <X className="h-3 w-3" />
@@ -2822,6 +3130,16 @@ function ConfigApplyChip({
   error?: string | null;
 }) {
   if (status == null || status === "ok") return null;
+  // A partial apply reports `reverted`, but nothing rolled back (#1280).
+  if (isPartialApply(status, error)) {
+    return (
+      <StatusChip
+        tone="amber"
+        label="zones held back"
+        title={`${PARTIAL_APPLY_EXPLAIN}\n\n${partialApplyDetail(error)}`}
+      />
+    );
+  }
   // `reverted` means a known-good config is still serving; the other two
   // mean the running state is wrong or unknown.
   const tone = status === "reverted" ? "amber" : "red";
@@ -2983,16 +3301,26 @@ function ServerRow({
  * offered to a client and a reserved one is *supposed* to fill up, so
  * either would render as a red exhaustion bar for behaving correctly.
  */
-function DhcpPoolPressure() {
-  const { data, isLoading, isError } = useQuery({
+export function DhcpPoolPressure({ dhcpOn }: { dhcpOn: boolean }) {
+  const { data, isLoading, isError, error } = useQuery({
     queryKey: ["dhcp-pool-occupancy", "fleet"],
     queryFn: () => dhcpApi.fleetPoolOccupancy(8),
-    refetchInterval: 60_000,
+    refetchInterval: pollUnlessRefused(60_000),
+    // Belt and braces with the caller's ``dhcpOn`` guard (#2130).
+    enabled: dhcpOn,
   });
 
   // A failed fetch must not render as "no pools configured" — that is the
   // same false-calm this panel exists to prevent, and an error boundary
-  // does not catch a rejected query.
+  // does not catch a rejected query. A refusal is neither: the role may
+  // not read pools, so say that rather than "could not load" (#3456).
+  if (isError && isRefused(error)) {
+    return (
+      <div className="rounded-lg border bg-card px-4 py-3 text-xs">
+        <ListReadError error={error} what="DHCP pool occupancy" />
+      </div>
+    );
+  }
   if (isError) {
     return (
       <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-xs text-red-700 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-400">
@@ -3109,7 +3437,10 @@ function DhcpPoolPressure() {
                   />
                 )}
                 <div className="flex-1">
-                  <UtilizationBar percent={p.percent} />
+                  <UtilizationBar
+                    percent={p.percent}
+                    tone={poolOccupancyTone(p.percent)}
+                  />
                 </div>
                 <span className="w-28 shrink-0 whitespace-nowrap text-right text-[11px] tabular-nums text-muted-foreground">
                   {p.assigned.toLocaleString()} / {p.total.toLocaleString()}
@@ -3755,7 +4086,9 @@ function IntegrationsPanel({
             ) : (
               <div className="overflow-x-auto">
                 <div className="min-w-[520px] divide-y">
-                  {tailscaleTenants.map((t) => (
+                  {cardTargets(tailscaleTenants, tailscaleTenants.length, {
+                    maxProblems: tailscaleTenants.length,
+                  }).shown.map((t) => (
                     <IntegrationRow
                       key={t.id}
                       to={`/tailscale`}
@@ -3770,6 +4103,15 @@ function IntegrationsPanel({
                       lastSyncError={t.last_sync_error}
                       intervalSeconds={t.sync_interval_seconds}
                       enabled={t.enabled}
+                      badge={
+                        t.enabled ? (
+                          <CredentialChip
+                            state={t.credential_state}
+                            daysLeft={t.credential_days_left}
+                            expiresAt={t.api_key_expires_at}
+                          />
+                        ) : null
+                      }
                     />
                   ))}
                 </div>
@@ -3881,11 +4223,14 @@ function IntegrationRow({
   lastSyncWarning,
   intervalSeconds,
   enabled,
+  badge,
 }: {
   to: string;
   name: string;
   subtitle: string;
   meta: string;
+  // #2138 — e.g. a credential-expiry chip; rendered after the name.
+  badge?: React.ReactNode;
   lastSyncedAt: string | null;
   lastSyncError: string | null;
   // Optional — only integrations that compute non-fatal findings pass it.
@@ -3911,6 +4256,7 @@ function IntegrationRow({
       <span className="w-28 truncate font-semibold" title={name}>
         {name}
       </span>
+      {badge}
       <span
         className="w-48 truncate font-mono text-muted-foreground"
         title={subtitle}
@@ -3946,12 +4292,21 @@ function IntegrationRow({
 // this one — different audience question. This tab answers "is
 // anything *changing* in scope?", the conformity tab answers "is
 // scope still in policy *right now*?".
-function CompliancePanel({ subnets }: { subnets: Subnet[] }) {
+function CompliancePanel({
+  subnets,
+  subnetsError,
+}: {
+  subnets: Subnet[];
+  subnetsError?: unknown;
+}) {
   const pciCount = subnets.filter((s) => s.pci_scope).length;
   const hipaaCount = subnets.filter((s) => s.hipaa_scope).length;
   const internetCount = subnets.filter((s) => s.internet_facing).length;
 
-  const { data: rules = [] } = useQuery<AlertRule[]>({
+  // Both reads need `read alert`, which the IPAM / DNS / DHCP Editor roles
+  // lack: a refusal is shown as one, not as an empty list, and is asked once
+  // (#3456).
+  const { data: rules = [], error: rulesError } = useQuery<AlertRule[]>({
     queryKey: ["alert-rules"],
     queryFn: () => alertsApi.listRules(),
     staleTime: 30_000,
@@ -3962,10 +4317,10 @@ function CompliancePanel({ subnets }: { subnets: Subnet[] }) {
 
   // Open + recently-resolved compliance-change events. ``subject_type``
   // for these is ``audit:<resource_type>`` (see services/alerts.py).
-  const { data: events = [] } = useQuery<AlertEvent[]>({
+  const { data: events = [], error: eventsError } = useQuery<AlertEvent[]>({
     queryKey: ["alert-events", { compliance: true }],
     queryFn: () => alertsApi.listEvents({ limit: 200 }),
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
   const complianceEvents = events
     .filter((e) => e.subject_type.startsWith("audit:"))
@@ -3979,6 +4334,7 @@ function CompliancePanel({ subnets }: { subnets: Subnet[] }) {
           label="PCI scope"
           count={pciCount}
           total={subnets.length}
+          error={subnetsError}
           to="/admin/compliance"
           tone="bad"
         />
@@ -3986,6 +4342,7 @@ function CompliancePanel({ subnets }: { subnets: Subnet[] }) {
           label="HIPAA scope"
           count={hipaaCount}
           total={subnets.length}
+          error={subnetsError}
           to="/admin/compliance"
           tone="warn"
         />
@@ -3993,6 +4350,7 @@ function CompliancePanel({ subnets }: { subnets: Subnet[] }) {
           label="Internet-facing"
           count={internetCount}
           total={subnets.length}
+          error={subnetsError}
           to="/admin/compliance"
           tone="warn"
         />
@@ -4013,7 +4371,11 @@ function CompliancePanel({ subnets }: { subnets: Subnet[] }) {
               Manage rules →
             </Link>
           </div>
-          {complianceRules.length === 0 ? (
+          {rulesError ? (
+            <div className="px-4 py-6 text-center text-xs">
+              <ListReadError error={rulesError} what="alert rules" />
+            </div>
+          ) : complianceRules.length === 0 ? (
             <div className="px-4 py-6 text-center text-xs text-muted-foreground">
               No <code>compliance_change</code> rules yet. Three disabled seed
               rules ship at first boot — toggle one on in{" "}
@@ -4077,7 +4439,11 @@ function CompliancePanel({ subnets }: { subnets: Subnet[] }) {
               View all →
             </Link>
           </div>
-          {complianceEvents.length === 0 ? (
+          {eventsError ? (
+            <div className="px-4 py-6 text-center text-xs">
+              <ListReadError error={eventsError} what="alert events" />
+            </div>
+          ) : complianceEvents.length === 0 ? (
             <div className="px-4 py-6 text-center text-xs text-muted-foreground">
               No compliance-change events. Either no rules are enabled or
               nothing scoped has been mutated yet.
@@ -4094,7 +4460,10 @@ function CompliancePanel({ subnets }: { subnets: Subnet[] }) {
                       {humanTime(e.fired_at)}
                     </span>
                   </div>
-                  <p className="mt-0.5 truncate text-[11px] text-muted-foreground">
+                  <p
+                    className="mt-0.5 truncate text-[11px] text-muted-foreground"
+                    title={e.message}
+                  >
                     {e.message}
                   </p>
                 </li>
@@ -4121,14 +4490,23 @@ function CertsExpiringKpi() {
   const { enabled, ready } = useFeatureModules();
   const moduleOn = enabled("security.tls_certs");
 
-  const { data } = useQuery({
+  // The route takes read on `tls_cert`; a user without it is not asked, and
+  // the card says it is withheld rather than "0 of 0 monitored" (#2702).
+  const {
+    can,
+    isLoading: permsLoading,
+    isError: permsFailed,
+  } = usePermissions();
+  const canReadCerts = can("read", "tls_cert");
+  const { data, error } = useQuery({
     queryKey: ["tls-certs", "kpi"],
     queryFn: () => tlsCertsApi.list({ limit: 500 }),
-    enabled: ready && moduleOn,
+    enabled: ready && moduleOn && canReadCerts,
     staleTime: 60_000,
   });
 
   if (ready && !moduleOn) return null;
+  const withheld = (!canReadCerts && !permsLoading) || !!error;
 
   const items = data?.items ?? [];
   const expiring = items.filter(
@@ -4144,11 +4522,22 @@ function CertsExpiringKpi() {
       <p className="text-[11px] uppercase tracking-wider text-muted-foreground">
         Certs expiring ≤30d
       </p>
-      <p className={cn("mt-2 text-3xl font-bold tabular-nums", cls.value)}>
-        {expiring}
+      <p
+        className={cn(
+          "mt-2 text-3xl font-bold tabular-nums",
+          withheld ? "text-muted-foreground" : cls.value,
+        )}
+      >
+        {withheld ? "—" : expiring}
       </p>
       <p className="text-[11px] text-muted-foreground">
-        of {items.length} monitored · click to review
+        {withheld
+          ? error && !isRefused(error)
+            ? "couldn't load certificates"
+            : !error && permsFailed
+              ? "couldn't read your permissions"
+              : "you may not read certificates"
+          : `of ${items.length} monitored · click to review`}
       </p>
     </Link>
   );
@@ -4197,12 +4586,15 @@ function ComplianceKpi({
   total,
   to,
   tone,
+  error,
 }: {
   label: string;
   count: number;
   total: number;
   to: string;
   tone: Tone;
+  /** The subnets read's error: the counts are of a list never read (#3234). */
+  error?: unknown;
 }) {
   const cls = TONE_CLASS[tone];
   const pct = total > 0 ? Math.round((count / total) * 100) : 0;
@@ -4214,11 +4606,20 @@ function ComplianceKpi({
       <p className="text-[11px] uppercase tracking-wider text-muted-foreground">
         {label}
       </p>
-      <p className={cn("mt-2 text-3xl font-bold tabular-nums", cls.value)}>
-        {count}
+      <p
+        className={cn(
+          "mt-2 text-3xl font-bold tabular-nums",
+          error ? "text-muted-foreground" : cls.value,
+        )}
+      >
+        {error ? "—" : count}
       </p>
       <p className="text-[11px] text-muted-foreground">
-        {pct}% of {total} subnets · click to filter
+        {error
+          ? isRefused(error)
+            ? "you may not read subnets"
+            : "couldn't load subnets"
+          : `${pct}% of ${total} subnets · click to filter`}
       </p>
     </Link>
   );
@@ -4235,7 +4636,7 @@ function ComplianceKpi({
 //
 // The companion Compliance tab covers the static + reactive picture
 // (classification roll-up + audit-log change events).
-function ConformityPanel() {
+export function ConformityPanel() {
   const { enabled, ready } = useFeatureModules();
   const moduleEnabled = enabled("compliance.conformity");
   // Gate queries on ``ready`` so they wait for the real module state; show the
@@ -4246,13 +4647,13 @@ function ConformityPanel() {
   const summaryQ = useQuery<ConformitySummary>({
     queryKey: ["conformity-summary"],
     queryFn: () => conformityApi.summary(),
-    refetchInterval: 60_000,
+    refetchInterval: pollUnlessRefused(60_000),
     enabled: moduleOn,
   });
   const failingQ = useQuery<ConformityResult[]>({
     queryKey: ["conformity-results", "fail-recent"],
     queryFn: () => conformityApi.listResults({ status: "fail", limit: 20 }),
-    refetchInterval: 60_000,
+    refetchInterval: pollUnlessRefused(60_000),
     enabled: moduleOn,
   });
 
@@ -4276,7 +4677,20 @@ function ConformityPanel() {
   if (ready && !moduleEnabled) {
     return (
       <div className="rounded-lg border bg-card p-8 text-center text-sm text-muted-foreground">
-        Conformity module is disabled — enable it in Settings → Features.
+        Conformity module is disabled — enable it under Features & Integrations.
+      </div>
+    );
+  }
+
+  // A refused or failed conformity read is not "0 frameworks, nothing
+  // failing" (#3148): say so instead of drawing zeros over it.
+  if (summaryQ.isError && !summaryQ.data) {
+    return (
+      <div
+        role="alert"
+        className="rounded-lg border bg-card p-8 text-center text-sm text-muted-foreground"
+      >
+        <ListReadError error={summaryQ.error} what="conformity results" />
       </div>
     );
   }
@@ -4457,6 +4871,10 @@ function ConformityPanel() {
           <div className="px-4 py-6 text-center text-xs text-muted-foreground">
             Loading…
           </div>
+        ) : failingQ.isError ? (
+          <div className="px-4 py-6 text-center text-xs">
+            <ListReadError error={failingQ.error} what="failing results" />
+          </div>
         ) : (failingQ.data ?? []).length === 0 ? (
           <div className="px-4 py-6 text-center text-xs text-muted-foreground">
             <Check className="mx-auto mb-2 h-4 w-4 text-emerald-500" />
@@ -4503,11 +4921,24 @@ function ConformityPanel() {
 //     soon (left), circuit alerts + orphan services + overlay
 //     impact (right).
 function NetworkPanel() {
-  const { data, isLoading } = useQuery<NetworkDashboardSummary>({
-    queryKey: ["dashboards", "network"],
-    queryFn: () => dashboardsApi.networkSummary(),
-    refetchInterval: 60_000,
-  });
+  const { data, isLoading, isError, error } = useQuery<NetworkDashboardSummary>(
+    {
+      queryKey: ["dashboards", "network"],
+      queryFn: () => dashboardsApi.networkSummary(),
+      // A refusal ends the poll (#3149).
+      refetchInterval: pollUnlessRefused(60_000),
+    },
+  );
+
+  // A refusal says so; any other failure says the read failed, never that
+  // the role may lack access (#3149).
+  if (isError) {
+    return (
+      <div className="rounded-lg border bg-card p-8 text-center text-xs text-muted-foreground">
+        <ListReadError error={error} what="network signals" />
+      </div>
+    );
+  }
 
   if (isLoading || !data) {
     return (
@@ -4517,48 +4948,113 @@ function NetworkPanel() {
     );
   }
 
+  const w = data.withheld ?? {};
+  const NV = "not visible to your role";
+
+  // Nothing pulled: a zero here is not an all-clear (#3540). A withheld
+  // grant zeroes the total too, so it is excluded: that tile says "not
+  // visible to your role", never "nothing pulled". A missing total (an
+  // older API) is unknown, not zero, and keeps the plain count.
+  const rpkiUntracked = !w.asn && data.rpki_total_count === 0;
   return (
     <div className="space-y-5">
       {/* KPI ribbon */}
       <div className="grid gap-3 grid-cols-2 md:grid-cols-3 xl:grid-cols-6">
         <NetworkKpi
           label="ASN drift"
-          value={data.asn_drift_count}
-          tone={data.asn_drift_count > 0 ? "warn" : "good"}
+          value={w.asn ? "—" : data.asn_drift_count}
+          tone={w.asn ? "default" : data.asn_drift_count > 0 ? "warn" : "good"}
+          hint={w.asn ? NV : undefined}
           to="/network/asns"
         />
-        <RpkiExpiringKpi data={data} />
-        <NetworkKpi
-          label="RPKI expired"
-          value={data.rpki_expired_count}
-          tone={data.rpki_expired_count > 0 ? "bad" : "good"}
-          to="/network/asns"
-        />
+        {w.asn ? (
+          <NetworkKpi
+            label="RPKI expiring"
+            value="—"
+            tone="default"
+            to="/network/asns"
+            hint={NV}
+          />
+        ) : (
+          <RpkiExpiringKpi data={data} />
+        )}
+        {!w.asn && !rpkiUntracked && rpkiExpiryUnmeasured(data) ? (
+          <NetworkKpi
+            label="RPKI expired"
+            value="n/a"
+            tone="default"
+            to="/network/asns"
+            hint={RPKI_NO_LIFETIME_HINT}
+            title={RPKI_NO_LIFETIME_TITLE}
+          />
+        ) : (
+          <NetworkKpi
+            label="RPKI expired"
+            value={w.asn || rpkiUntracked ? "—" : data.rpki_expired_count}
+            tone={
+              w.asn || rpkiUntracked
+                ? "default"
+                : data.rpki_expired_count > 0
+                  ? "bad"
+                  : "good"
+            }
+            hint={w.asn ? NV : rpkiUntracked ? "no ROAs tracked" : undefined}
+            title={
+              rpkiUntracked
+                ? "No RPKI ROAs have been pulled yet. Add a public ASN and the hourly refresh will populate them."
+                : undefined
+            }
+            to="/network/asns"
+          />
+        )}
         <NetworkKpi
           label="Circuit alerts"
           value={
-            data.circuit_term_expiring_count + data.circuit_status_changed_count
+            w.circuit
+              ? "—"
+              : data.circuit_term_expiring_count +
+                data.circuit_status_changed_count
           }
           tone={
-            data.circuit_term_expiring_count +
-              data.circuit_status_changed_count >
-            0
-              ? "warn"
-              : "good"
+            w.circuit
+              ? "default"
+              : data.circuit_term_expiring_count +
+                    data.circuit_status_changed_count >
+                  0
+                ? "warn"
+                : "good"
           }
           to="/network/circuits"
-          hint={`${data.circuit_term_expiring_count} term · ${data.circuit_status_changed_count} status`}
+          hint={
+            w.circuit
+              ? NV
+              : `${data.circuit_term_expiring_count} term · ${data.circuit_status_changed_count} status`
+          }
         />
         <NetworkKpi
           label="Orphan services"
-          value={data.service_orphan_count}
-          tone={data.service_orphan_count > 0 ? "bad" : "good"}
+          value={w.service ? "—" : data.service_orphan_count}
+          tone={
+            w.service
+              ? "default"
+              : data.service_orphan_count > 0
+                ? "bad"
+                : "good"
+          }
+          hint={w.service ? NV : undefined}
           to="/network/services"
         />
         <NetworkKpi
           label="Overlays impacted"
-          value={data.overlay_impacted_count}
-          tone={data.overlay_impacted_count > 0 ? "warn" : "good"}
+          value={w.overlay ? "—" : data.overlay_impacted_count}
+          tone={
+            w.overlay
+              ? "default"
+              : data.overlay_impacted_count > 0
+                ? "warn"
+                : "good"
+          }
+          hint={w.overlay ? NV : undefined}
           to="/network/overlays"
         />
       </div>
@@ -4566,6 +5062,8 @@ function NetworkPanel() {
       <div className="grid gap-5 lg:grid-cols-2">
         <DashboardListCard
           title="ASN holder drift"
+          withheld={w.asn}
+          withheldHint="Not visible to your role."
           emptyHint="No ASNs in drift state right now."
         >
           {data.asn_drift.map((row) => (
@@ -4590,7 +5088,15 @@ function NetworkPanel() {
         </DashboardListCard>
         <DashboardListCard
           title="RPKI ROAs expiring soon"
-          emptyHint="No ROAs are expiring in the next 30 days."
+          withheld={w.asn}
+          withheldHint="Not visible to your role."
+          emptyHint={
+            rpkiUntracked
+              ? "No RPKI ROAs are tracked yet."
+              : rpkiExpiryUnmeasured(data)
+                ? "Not measured: the ROA source ships no per-ROA lifetime."
+                : "No ROAs are expiring in the next 30 days."
+          }
         >
           {data.rpki_expiring.map((row) => (
             <Link
@@ -4615,6 +5121,8 @@ function NetworkPanel() {
         </DashboardListCard>
         <DashboardListCard
           title="Circuit alerts"
+          withheld={w.circuit}
+          withheldHint="Not visible to your role."
           emptyHint="No circuits past term or in suspended/decom status."
         >
           {data.circuit_alerts.map((row) => (
@@ -4647,7 +5155,25 @@ function NetworkPanel() {
         </DashboardListCard>
         <DashboardListCard
           title="Orphan services + overlay impact"
-          emptyHint="Service catalog clean and no overlays touching down circuits."
+          withheld={w.service && w.overlay}
+          withheldHint="Not visible to your role."
+          // With one half withheld, the card names that half whether or not
+          // the other half has rows: a list of orphan services alone must not
+          // read as "and no overlay impact" (#3449).
+          emptyHint={
+            w.service
+              ? "No overlays touching down circuits."
+              : w.overlay
+                ? "Service catalog clean."
+                : "Service catalog clean and no overlays touching down circuits."
+          }
+          note={
+            w.service && !w.overlay
+              ? "Orphan services are not visible to your role."
+              : w.overlay && !w.service
+                ? "Overlay impact is not visible to your role."
+                : undefined
+          }
         >
           {data.orphan_services.map((row) => (
             <Link
@@ -4708,6 +5234,20 @@ function NetworkPanel() {
  * ticks hourly) — six missed cycles, generous enough not to flap on a
  * slow sweep and short enough to notice a dead task the same day.
  */
+/**
+ * True when ROAs are tracked but none carries a known certificate lifetime
+ * (#3557). Neither Cloudflare's dump nor RIPE's export ships one, so the
+ * expiring / expired counts are then always 0 by construction, and a green
+ * 0 would read as an all-clear that nothing measured.
+ */
+function rpkiExpiryUnmeasured(data: NetworkDashboardSummary): boolean {
+  return data.rpki_total_count > 0 && data.rpki_expiry_known_count === 0;
+}
+
+const RPKI_NO_LIFETIME_HINT = "source has no ROA lifetimes";
+const RPKI_NO_LIFETIME_TITLE =
+  "The configured ROA source does not publish each ROA's certificate lifetime, so expiry is not measured. This is not an all-clear.";
+
 function RpkiExpiringKpi({ data }: { data: NetworkDashboardSummary }) {
   const STALE_AFTER_MS = 24 * 60 * 60 * 1000;
   const checkedAt = data.rpki_last_checked_at;
@@ -4735,6 +5275,18 @@ function RpkiExpiringKpi({ data }: { data: NetworkDashboardSummary }) {
         to="/network/asns"
         hint={checkedAt ? `checked ${humanTime(checkedAt)}` : "never checked"}
         title={`The ROA refresh has not run recently, so any count here would be fiction. ${data.rpki_total_count} ROAs tracked.`}
+      />
+    );
+  }
+  if (rpkiExpiryUnmeasured(data)) {
+    return (
+      <NetworkKpi
+        label="RPKI expiring"
+        value="n/a"
+        tone="default"
+        to="/network/asns"
+        hint={`${RPKI_NO_LIFETIME_HINT} · ${data.rpki_total_count.toLocaleString()} tracked`}
+        title={RPKI_NO_LIFETIME_TITLE}
       />
     );
   }
@@ -4795,11 +5347,22 @@ function NetworkKpi({
 // Overview tab (the legacy one is per-target chips, this one is the
 // rollup-driven tab body).
 function IntegrationsDashboardTabPanel() {
-  const { data, isLoading } = useQuery<IntegrationsDashboardSummary>({
-    queryKey: ["dashboards", "integrations"],
-    queryFn: () => dashboardsApi.integrationsSummary(),
-    refetchInterval: 30_000,
-  });
+  const { data, isLoading, isError, error } =
+    useQuery<IntegrationsDashboardSummary>({
+      queryKey: ["dashboards", "integrations"],
+      queryFn: () => dashboardsApi.integrationsSummary(),
+      refetchInterval: pollUnlessRefused(30_000),
+    });
+
+  // A refusal says so; any other failure says the read failed, never that
+  // the role may lack access (#3149).
+  if (isError) {
+    return (
+      <div className="rounded-lg border bg-card p-8 text-center text-xs text-muted-foreground">
+        <ListReadError error={error} what="integration health" />
+      </div>
+    );
+  }
 
   if (isLoading || !data) {
     return (
@@ -4810,27 +5373,50 @@ function IntegrationsDashboardTabPanel() {
   }
 
   const enabledPanels = data.panels.filter((p) => p.enabled);
+  const withheld = data.withheld ?? [];
+  const withheldNote =
+    withheld.length > 0
+      ? `Not visible to your role: ${withheld.map((w) => w.label).join(", ")}.`
+      : undefined;
   if (enabledPanels.length === 0) {
     return (
       <div className="rounded-lg border border-dashed p-10 text-center">
         <Plug className="mx-auto mb-3 h-10 w-10 text-muted-foreground/30" />
-        <p className="text-sm font-medium">No integrations are enabled yet</p>
-        <p className="mt-1 text-xs text-muted-foreground">
-          Head to{" "}
-          <Link
-            to="/admin/features"
-            className="text-primary underline underline-offset-2"
-          >
-            Features → Integrations
-          </Link>{" "}
-          to enable read-only infrastructure mirrors.
-        </p>
+        {withheld.length > 0 ? (
+          <>
+            <p className="text-sm font-medium">
+              No integrations your role can read are enabled
+            </p>
+            <p className="mt-1 text-xs text-muted-foreground">{withheldNote}</p>
+          </>
+        ) : (
+          <>
+            <p className="text-sm font-medium">
+              No integrations are enabled yet
+            </p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Head to{" "}
+              <Link
+                to="/admin/features"
+                className="text-primary underline underline-offset-2"
+              >
+                Features → Integrations
+              </Link>{" "}
+              to enable read-only infrastructure mirrors.
+            </p>
+          </>
+        )}
       </div>
     );
   }
 
   return (
     <div className="space-y-5">
+      {withheldNote && (
+        <p className="rounded-lg border border-dashed px-4 py-2 text-center text-xs text-muted-foreground">
+          {withheldNote} The error and warning lists below leave them out too.
+        </p>
+      )}
       <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
         {enabledPanels.map((p) => (
           <IntegrationCard key={p.kind} panel={p} />
@@ -4839,7 +5425,11 @@ function IntegrationsDashboardTabPanel() {
 
       <DashboardListCard
         title="Recent reconciler errors"
-        emptyHint="No reconciler errors in recent history."
+        emptyHint={
+          withheld.length > 0
+            ? "No reconciler errors in the integrations you can read."
+            : "No reconciler errors in recent history."
+        }
       >
         {data.recent_errors.map((e) => (
           <div key={e.id} className="px-4 py-2 text-xs">
@@ -4854,6 +5444,36 @@ function IntegrationsDashboardTabPanel() {
             {e.error_detail && (
               <p className="mt-0.5 truncate font-mono text-[10px] text-red-600 dark:text-red-400">
                 {e.error_detail}
+              </p>
+            )}
+          </div>
+        ))}
+      </DashboardListCard>
+
+      <DashboardListCard
+        title="Recent reconciler warnings"
+        emptyHint={
+          withheld.length > 0
+            ? "No reconciler warnings in the integrations you can read."
+            : "No reconciler warnings in recent history."
+        }
+      >
+        {(data.recent_warnings ?? []).map((w) => (
+          <div key={w.id} className="px-4 py-2 text-xs">
+            <div className="flex items-baseline justify-between gap-2">
+              <span className="min-w-0 truncate font-medium">
+                {w.integration} · {w.target_display || w.target_id}
+              </span>
+              <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">
+                {humanTime(w.timestamp)}
+              </span>
+            </div>
+            {w.error_detail && (
+              <p
+                className="mt-0.5 break-words font-mono text-[10px] text-amber-600 dark:text-amber-400"
+                title={w.error_detail}
+              >
+                {w.error_detail}
               </p>
             )}
           </div>
@@ -4876,13 +5496,32 @@ function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
   // #797 — a warned target syncs on time and without error but isn't
   // producing what it was configured to produce, so it must not read as
   // green here while the IPAM-tab panel shows it amber.
+  // #2138 — a credential about to lapse is a warning even while every sync
+  // is still green; an expired / rejected one is as bad as an error.
+  // #2192 — prefer the server's counts: `panel.targets` is a capped list.
+  const credentialDead =
+    panel.credential_dead_count ??
+    panel.targets.filter(
+      (t) =>
+        t.credential_state === "expired" || t.credential_state === "rejected",
+    ).length;
+  const credentialExpiring =
+    panel.credential_expiring_count ??
+    panel.targets.filter((t) => t.credential_state === "expiring").length;
   const tone: Tone =
-    panel.error_count > 0
+    panel.error_count > 0 || credentialDead > 0
       ? "bad"
-      : panel.stale_count > 0 || panel.warning_count > 0
+      : panel.stale_count > 0 ||
+          panel.warning_count > 0 ||
+          credentialExpiring > 0
         ? "warn"
         : "good";
   const cls = TONE_CLASS[tone];
+  // #2192 — problem targets are always named, ahead of healthy ones.
+  const cardRows = cardTargets(panel.targets, 3, {
+    total: panel.target_count,
+    problemTotal: panel.problem_count,
+  });
   return (
     <div className="rounded-lg border bg-card p-3">
       <div className="flex items-center justify-between">
@@ -4922,28 +5561,53 @@ function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
             </span>
           </>
         )}
+        {credentialDead > 0 && (
+          <>
+            {" · "}
+            <span className="text-red-600 dark:text-red-400">
+              {credentialDead} token expired
+            </span>
+          </>
+        )}
+        {credentialExpiring > 0 && (
+          <>
+            {" · "}
+            <span className="text-amber-600 dark:text-amber-400">
+              {credentialExpiring} token expiring
+            </span>
+          </>
+        )}
       </p>
       {panel.targets.length > 0 && (
         <ul className="mt-2 space-y-1 text-[11px]">
-          {panel.targets.slice(0, 3).map((t) => (
+          {cardRows.shown.map((t) => (
             <li
               key={t.id}
               className="flex items-baseline justify-between gap-2"
             >
-              <span
-                className="truncate"
-                title={t.last_sync_warning ?? t.display}
-              >
-                {t.display}
+              <span className="flex min-w-0 items-baseline gap-1.5">
+                <span
+                  className="truncate"
+                  title={t.last_sync_warning ?? t.display}
+                >
+                  {t.display}
+                </span>
+                <CredentialChip
+                  state={t.credential_state}
+                  daysLeft={t.credential_days_left}
+                  expiresAt={t.credential_expires_at}
+                />
               </span>
               <span
                 className={cn(
                   "shrink-0 tabular-nums",
-                  t.last_sync_error
-                    ? "text-red-600 dark:text-red-400"
-                    : t.is_stale || t.last_sync_warning
-                      ? "text-amber-600 dark:text-amber-400"
-                      : "text-muted-foreground",
+                  t.enabled === false
+                    ? "text-muted-foreground"
+                    : t.last_sync_error
+                      ? "text-red-600 dark:text-red-400"
+                      : t.is_stale || t.last_sync_warning
+                        ? "text-amber-600 dark:text-amber-400"
+                        : "text-muted-foreground",
                 )}
                 title={t.last_sync_error ?? t.last_sync_warning ?? undefined}
               >
@@ -4951,9 +5615,14 @@ function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
               </span>
             </li>
           ))}
-          {panel.targets.length > 3 && (
+          {cardRows.hiddenProblems > 0 && (
+            <li className="text-[10px] text-red-600 dark:text-red-400">
+              + {cardRows.hiddenProblems} more with problems
+            </li>
+          )}
+          {cardRows.hidden > 0 && (
             <li className="text-[10px] text-muted-foreground">
-              + {panel.targets.length - 3} more
+              + {cardRows.hidden} more
             </li>
           )}
         </ul>
@@ -4972,7 +5641,7 @@ function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
  * "no data" and "no threats" look identical on a dashboard unless you
  * say which one you mean, and only one of them is reassuring.
  */
-function DNSThreatCard() {
+export function DNSThreatCard() {
   // Gate the QUERY on the module, not just the render (#942). Hiding
   // the card on a 404 still fired the request — and with a 60 s
   // refetch, that is a console error every minute forever on every
@@ -4984,18 +5653,43 @@ function DNSThreatCard() {
   // the hook's own docstring.
   const { enabled, ready } = useFeatureModules();
   const moduleEnabled = ready && enabled("security.dns_threat");
+  // The route needs read on servers (#3450): a user without it was refused
+  // every 60 s, each a 403 and a denied audit row. ``can`` is false while
+  // the grants load, so the query waits for them as well.
+  const {
+    can,
+    isLoading: permsLoading,
+    isError: permsFailed,
+  } = usePermissions();
+  const mayRead = can("read", "server");
   const { data, isLoading, error } = useQuery({
     queryKey: ["dashboards", "dns-threat"],
     queryFn: () => dnsThreatApi.summary({ hours: 24 }),
-    refetchInterval: 60_000,
+    // A grant revoked while the tab is open (or a time-bound grant that
+    // lapsed) still leaves a stale ``can`` for up to the permission cache's
+    // lifetime; stop on the first refusal rather than ask every minute.
+    refetchInterval: pollUnlessRefused(60_000),
     retry: false,
-    enabled: moduleEnabled,
+    enabled: moduleEnabled && mayRead,
   });
 
   const moduleOff =
     (error as { response?: { status?: number } } | null)?.response?.status ===
     404;
-  if (!moduleEnabled || moduleOff || isLoading) return null;
+  if (!moduleEnabled || permsLoading) return null;
+  if (!mayRead) {
+    return (
+      <div className="rounded-lg border bg-card p-4">
+        <h3 className="text-sm font-semibold">DNS tunneling (24 h)</h3>
+        <p className="mt-1 text-xs text-muted-foreground">
+          {permsFailed
+            ? "Not shown: your permissions could not be read, so the DNS tunneling rollup was not requested. Reload to try again."
+            : "Not shown: the DNS tunneling rollup needs read on servers (the server logs permission), which your role does not have."}
+        </p>
+      </div>
+    );
+  }
+  if (moduleOff || isLoading) return null;
   if (!data) return null;
 
   const tone: Tone = !data.has_data
@@ -5067,11 +5761,21 @@ function DNSThreatCard() {
 // query. MFA coverage uses local-auth users only — external-auth
 // users authenticate against the upstream provider.
 function SecurityPanel() {
-  const { data, isLoading } = useQuery<SecurityDashboardSummary>({
-    queryKey: ["dashboards", "security"],
-    queryFn: () => dashboardsApi.securitySummary(),
-    refetchInterval: 60_000,
-  });
+  const { data, isLoading, isError, error } =
+    useQuery<SecurityDashboardSummary>({
+      queryKey: ["dashboards", "security"],
+      queryFn: () => dashboardsApi.securitySummary(),
+      refetchInterval: pollUnlessRefused(60_000),
+    });
+
+  // A failed read used to leave "Loading security signals…" up for good.
+  if (isError) {
+    return (
+      <div className="rounded-lg border bg-card p-8 text-center text-xs text-muted-foreground">
+        <ListReadError error={error} what="security signals" />
+      </div>
+    );
+  }
 
   if (isLoading || !data) {
     return (
@@ -5081,6 +5785,7 @@ function SecurityPanel() {
     );
   }
 
+  const withheld = data.detail_withheld === true;
   const mfaTone: Tone =
     data.mfa_coverage_pct >= 90
       ? "good"
@@ -5185,7 +5890,12 @@ function SecurityPanel() {
 
       <div className="grid gap-5 lg:grid-cols-2">
         <DashboardListCard
-          title={`Local users without MFA (${data.mfa_unenrolled.length})`}
+          title={
+            withheld
+              ? "Local users without MFA"
+              : `Local users without MFA (${data.mfa_unenrolled.length})`
+          }
+          withheld={withheld}
           emptyHint="Every local user has TOTP enrolled."
         >
           {data.mfa_unenrolled.map((u) => (
@@ -5210,6 +5920,7 @@ function SecurityPanel() {
         </DashboardListCard>
         <DashboardListCard
           title="API tokens expiring < 30 d"
+          withheld={withheld}
           emptyHint="No tokens are expiring in the next 30 days."
         >
           {data.api_tokens_expiring.map((t) => (
@@ -5235,6 +5946,7 @@ function SecurityPanel() {
         </DashboardListCard>
         <DashboardListCard
           title={`Failed logins past ${data.failed_login_window_hours} h`}
+          withheld={withheld}
           emptyHint={`No failed logins in the last ${data.failed_login_window_hours} h.`}
         >
           {data.failed_login_top_sources.map((row, i) => (
@@ -5264,6 +5976,7 @@ function SecurityPanel() {
         </DashboardListCard>
         <DashboardListCard
           title={`Permission changes past ${data.permission_change_window_days} d`}
+          withheld={withheld}
           emptyHint="No role / group / token / auth-provider changes recorded."
         >
           {data.permission_changes.map((row) => (
@@ -5299,10 +6012,22 @@ function SecurityPanel() {
 function DashboardListCard({
   title,
   emptyHint,
+  withheld = false,
+  withheldHint,
+  note,
   children,
 }: {
   title: string;
   emptyHint: string;
+  /** A line under the list or the empty sentence, shown either way: for a
+   *  card part of which the server withheld (#3449). */
+  note?: string;
+  /** Replaces the default withheld sentence where there is no count above
+   *  the card to lean on (#3449). */
+  withheldHint?: string;
+  /** The server stripped this list for the caller (#400): say so in place of
+   *  the all-clear sentence (#3235). */
+  withheld?: boolean;
   children: React.ReactNode;
 }) {
   // ``React.Children.toArray`` flattens nested arrays (a card fed two
@@ -5319,7 +6044,10 @@ function DashboardListCard({
       </div>
       {childArray.length === 0 ? (
         <div className="px-4 py-6 text-center text-xs text-muted-foreground">
-          {emptyHint}
+          {withheld
+            ? (withheldHint ??
+              "The detail is not shown to your role. The count above is the whole headline.")
+            : emptyHint}
         </div>
       ) : (
         <ul className="divide-y max-h-96 overflow-auto">
@@ -5327,6 +6055,11 @@ function DashboardListCard({
             <li key={i}>{child}</li>
           ))}
         </ul>
+      )}
+      {note && (
+        <p className="border-t px-4 py-2 text-center text-[11px] text-muted-foreground">
+          {note}
+        </p>
       )}
     </div>
   );

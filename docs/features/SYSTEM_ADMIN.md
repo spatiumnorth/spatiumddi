@@ -22,9 +22,23 @@ brings the scope back whole — #617). See
 the full data model + cascade-batch semantics. The admin page
 lists deleted rows newest-first with type / since / `q` filters,
 per-row Restore (with conflict-detail rendering when a live row
-would clash) and Delete-permanently buttons. Nightly purge sweep
+would clash) and Delete-permanently buttons. Soft-deleting a DNS zone
+does not touch agentless servers (Windows DNS, cloud, Technitium API);
+Delete-permanently and the purge sweep do, and a failing provider keeps
+the zone in the Trash. A row is only restored under a live parent: a
+subnet whose block is still in the Trash (and likewise a block, scope or
+record) is refused with a 409 naming the parent, which the page offers to
+restore first; a subnet or block that would overlap a live one is refused
+by the create path's own overlap rules. Delete-permanently on a
+block or IP space also purges the trashed subnets and blocks under it, and
+refuses while a live row (block, subnet, DHCP scope, pool or reservation)
+sits under it; the nightly sweep holds such a row back and counts it in its
+`held_back_live_children` summary. The list is paged (100 per page,
+`limit` / `offset` / `total`, `sort=oldest` for the rows the purge removes
+first). Nightly purge sweep
 is operator-configurable via
-`PlatformSettings.soft_delete_purge_days`.
+`PlatformSettings.soft_delete_purge_days` (Settings → Data Retention,
+see [§2.7](#27-audit-log-and-data-retention)).
 
 ### Platform Insights (`/admin/platform-insights`) — landed in `2026.04.26-1`
 
@@ -40,7 +54,19 @@ control plane is doing without standing up a separate Prometheus
   `pg_stat_statements` if the extension is installed.
 - **Redis** — overview, keyspace breakdown, and the agent-wake
   pub/sub bus state.
-- **Containers** — per-container CPU% (computed the same way
+- **Containers** — detects what the deployment can see and reports each
+  backend (Docker socket, Kubernetes ServiceAccount, appliance) with the
+  toggle that enables the missing ones (`GET /admin/containers/backends`).
+  On Kubernetes (`api.serviceAccount.enabled`; manifests:
+  `k8s/pod-logs/rbac.yaml`) it lists the release's pods in the api pod's
+  namespace — only pods labelled as ours, narrowed to the api pod's own
+  `app.kubernetes.io/instance` (it refuses, rather than widening, when it
+  cannot find its own pod) — and tails or follows their logs through the
+  support-bundle redactor. A log request's pod name is checked against a fresh
+  listing; anything else is a 404. Superadmin only; each log read is audited
+  (`container_logs_read`). The appliance still sends you to Cluster → Pods.
+  No MCP tool: log text is a secrets surface, so it stays UI/REST only.
+  Docker view: per-container CPU% (computed the same way
   `docker stats` does), memory used / limit / %, network rx /
   tx, block-IO read / write. Default-filtered to the
   `spatiumddi-*` prefix; set the filter to empty to see every
@@ -48,7 +74,14 @@ control plane is doing without standing up a separate Prometheus
   one-line setup hint when `/var/run/docker.sock` isn't mounted
   into the api container.
 - **Conformity** — promoted from the Compliance surface; shows
-  the latest conformity-evaluation rollup.
+  the latest conformity-evaluation rollup. "Latest" is each
+  **enabled** policy's most recent evaluation pass: a target deleted
+  or moved out of a policy's scope drops out at that policy's next
+  pass, a disabled policy counts towards `policies_total` but reports
+  no results, and editing what a policy checks (`target_kind`,
+  `target_filter`, `check_kind`, `check_args`) clears its last pass
+  until it runs again. The conformity PDF reports the same set and
+  prints each policy's as-of time (#2278).
 - **Copilot Usage** — Operator Copilot token / cost observability.
 
 Backend at `app/api/v1/admin/postgres.py` (5 endpoints) +
@@ -60,44 +93,21 @@ superadmin-gated.
 
 ## 1. System Health Dashboard
 
-The main **Health Overview** page gives a single-pane-of-glass view of the entire platform.
-
-### Component Health Grid
-
-Each managed component shows a status card:
+The dashboard's **Platform Health** card reports whether the platform's own moving parts are up. It is fed by `GET /health/platform` and shows five cells, each a status dot (green ok, amber warn, red error) and a one-line detail:
 
 <p align="center">
-  <img src="../assets/diagrams/system-health-grid.svg" alt="System health — component status grid" width="900"/>
+  <img src="../assets/diagrams/system-health-grid.svg" alt="Platform Health strip — API, PostgreSQL, Redis, Workers and Beat" width="900"/>
 </p>
 
-### Per-Component Detail
+| Cell | What it checks | Detail shown |
+|---|---|---|
+| API | The request was served | `responding` |
+| PostgreSQL | A `SELECT 1` round trip | `SELECT 1 in N ms` |
+| Redis | A `PING` round trip | `ping in N ms` |
+| Workers | A Celery `inspect` ping | `N alive`, or `no workers responding` / `inspect timed out` |
+| Beat | The beat heartbeat key a worker refreshes each tick | `last tick Ns ago`, `(stalled)`, or clock skew |
 
-Clicking any component opens a detail panel:
-
-**Database:**
-- Primary/replica status
-- Replication lag (ms)
-- Active connections / max connections
-- Longest running query
-- WAL archive status
-- Last backup timestamp
-
-**DHCP/DNS Servers:**
-- Online/offline status per server
-- Last successful sync timestamp
-- Config version: IPAM DB version vs. pushed version
-- Query rate (DNS), lease count (DHCP)
-- Agent connectivity status
-
-**Celery Workers:**
-- Worker list with hostname, status, active tasks
-- Queue depths per queue
-- Failed task count in last hour
-
-**Redis:**
-- Sentinel / Cluster topology
-- Memory usage
-- Hit/miss ratio
+The card's headline reads `all good` when the rollup status is ok and `degraded` otherwise. Hovering a Workers cell lists the worker names for a signed-in user. A failing check reports a generic detail (`postgres error`, `redis error`) rather than the exception text. Replication lag, WAL archive state, queue depths and per-server DNS / DHCP status are not part of this card; DNS and DHCP server state is on their own pages and in the alert rules.
 
 ### Service Start / Stop / Restart (issue #890)
 
@@ -272,13 +282,9 @@ Default ruleset (enforced, cannot be deleted):
 ### 2.4 Users and Groups (Platform-Level)
 
 Separate from IP-range-scoped permissions — this section manages:
-- Local user accounts (create, edit, enable/disable, reset password, force MFA)
+- Local user accounts (create, edit, enable/disable, reset password). Users enrol their own MFA from the Account page; there is no per-user "require MFA" switch
 - Local groups (create, manage membership)
-- LDAP / OIDC sync configuration:
-  - Which LDAP OUs to sync groups from
-  - Group attribute mapping
-  - Sync interval
-  - Manual "Sync Now" trigger
+- External auth provider group mapping (LDAP, OIDC, SAML, RADIUS, TACACS+): each provider carries group mappings (external group → SpatiumDDI group). There is no directory sync job, interval or "Sync Now": a user's groups are replaced from the mappings at each sign-in (see [AUTH.md](AUTH.md))
 - Last login per user
 - Active sessions (with revoke capability)
 
@@ -287,20 +293,22 @@ Separate from IP-range-scoped permissions — this section manages:
 ```
 APIToken
   id, name, description
-  token_hash: str        -- only hash stored; token shown once on creation
-  scope: enum(global, user)
-  user_id (FK, nullable) -- if user-scoped
-  permissions: JSONB     -- optional restriction (e.g., read-only, specific resource types)
+  token_hash: str        -- only the sha256 hash is stored; token shown once on creation
+  prefix: str            -- short identifier shown in the UI
+  scope: str            -- always "user" today (see below)
+  user_id (FK)           -- the owning user; the token acts as that user
+  scopes: list[str]      -- coarse scopes (below); empty = no scope restriction
+  resource_grants: list  -- optional binding to specific subnets / DNS zones
+  allowed_paths, permissions: JSONB -- reserved columns, not set or read today
   expires_at: timestamp (nullable)
   last_used_at: timestamp
   created_by_user_id, created_at
   is_active: bool
 ```
 
-- **Global tokens**: used for automation, CI/CD, Terraform providers — permissions are explicit
-- **User tokens**: scoped to the creating user's permission set — cannot exceed user's own rights
-- Tokens are displayed once on creation (PBKDF2 hash stored)
-- Tokens can be scoped to specific API paths (e.g., `/api/v1/ipam/*` only)
+- **User tokens** are the only kind the build issues: a token acts as its owning user and cannot exceed that user's rights. A token with no owner (a "global" token) is refused with 401 "Global-scope API tokens are not yet supported"; use a dedicated service user for automation, CI/CD and Terraform instead
+- Tokens are displayed once on creation (sha256 hash stored)
+- Instead of typing API paths, the create dialog offers four fixed scopes, each a family of routes: `read` (read-only), `ipam:write` (`/ipam/*`, `/vlans/*`, `/vrfs/*`, `/network-devices/*`), `dns:write` and `dhcp:write`. There is no scope for the agent routes, which never accept an API token. A token may also be bound to specific subnets or DNS zones (`resource_grants`; the create dialog binds one)
 
 ### 2.6 Syslog / Log Forwarding
 
@@ -319,13 +327,47 @@ SyslogTarget
 
 Multiple syslog targets can be configured simultaneously (e.g., local Loki + remote SIEM).
 
-### 2.7 Audit Log Settings
+### 2.7 Audit Log and Data Retention
 
-- Retention period (default: 365 days)
-- Export audit log: date range → CSV or JSON download
-- Archive to S3-compatible storage (optional)
-- Audit log is append-only — no delete capability, even for superadmin
+- Audit log is append-only — no update or delete capability, even for superadmin; DB triggers refuse both, and the `audit_log_immutable` conformity check fails if either trigger is dropped or disabled (tamper-evident, not tamper-proof — the DB owner can still remove them)
 - Fields logged on every mutation: user, timestamp, source IP, action, resource, old value, new value
+- **Tamper evidence (#73, #2286).** Every row is hash-chained to the one before it. The `audit_chain_verify` task runs nightly at 02:00 UTC and opens a critical `audit-chain-broken` alert on a break. It walks the chain in pages of 5,000 rows and records how far it verified in `audit_chain_checkpoint`, so a nightly run checks only the rows added since the last one. **Trade-off:** a nightly run trusts every row at or below that checkpoint, so an edit to an older row is found at the next *full* pass, which starts on the first nightly run after the last full pass is more than 7 days old (so roughly every eighth night, and later if nightly runs fail), and also whenever the checkpointed row is missing or no longer carries the recorded hash (a restore, a rewritten row) or the recorded full-pass time lies in the future. So expect up to about eight days between an edit to an old row and its alert, plus however long the full pass takes. `GET /api/v1/audit/integrity` walks the whole chain on demand (`max_rows` caps it; a capped check answers `partial: true` with `rows_checked` and the `first_seq` / `last_seq` it walked). The chain is not keyed: it detects edits made without recomputing the hashes, not a writer with database access who recomputes them. Forward the audit log off-box (audit forwarding) for evidence such a writer cannot reach.
+**Audit log.** The audit log is append-only: nothing deletes from it,
+not even a superadmin, and no task prunes it, so it has no retention
+setting. Every mutation records the user, timestamp, source IP, action,
+resource, old value and new value. Export a date range as an
+auditor-facing PDF (`GET /api/v1/audit/export.pdf`), or forward events
+as they happen to syslog or a webhook (Settings → Audit Event
+Forwarding). A configurable audit retention period and archive to
+S3-compatible storage are **not implemented**; size visibility and the
+tables nothing prunes are tracked in
+[#2274](https://github.com/spatiumnorth/spatiumddi/issues/2274).
+
+**Data retention** (Settings → Application → Data Retention, #2273).
+Each window below is read by a nightly prune task, which deletes
+anything older. All are superadmin-only to change, and every change is
+written to the audit log (`resource_type=platform_settings`,
+`resource_id=retention`) with the old and new values. Shortening a
+window deletes the older data on the next nightly run.
+
+| Setting | Data | Default | Range |
+|---|---|---|---|
+| `log_retention_hours` | DNS query log and DHCP activity log rows | 24 hours | 1–168 hours |
+| `metric_retention_days` | DNS / DHCP metric samples (dashboard charts, InfluxDB backfill) | 7 days | 1–365 days |
+| `dhcp_lease_history_retention_days` | Expired / released DHCP lease history | 90 days | 0–3650 days (0 = keep forever) |
+| `soft_delete_purge_days` | Trash (soft-deleted IPAM / DNS / DHCP rows) | 30 days | 0–365 days (0 = never purge) |
+| `pcap_retention_days` | Finished packet captures and their `.pcap` files | 7 days | 1–90 days |
+| `appliance_revoked_retention_days` | Deleted (revoked) Fleet appliance rows | 30 days | 0–365 days (0 = keep until permanently deleted) |
+| `e911_resolution_log_retention_days` | The E911 location-lookup trail (`e911_resolution_log`, #3514) | 90 days | 7–3650 days |
+
+`log_retention_hours` is capped at a week because the prune is a single
+`DELETE`, and a longer window makes that one transaction larger;
+[#2185](https://github.com/spatiumnorth/spatiumddi/issues/2185) replaces
+it with partition drops and raises the cap. The agent ingest endpoints
+skip a replayed log line already older than this window rather than
+inserting a row the next prune would delete. For longer log history,
+forward to Loki or a SIEM. Backups have their own retention per
+destination (§2.9).
 
 ### 2.8 Statistics / Reporting
 
@@ -346,6 +388,10 @@ Dashboard tiles showing platform-wide stats:
 
 The Backup admin page (`/admin/backup`) ships four tabs: **Manual** (build-and-download / restore-from-file), **Destinations** (configured remote targets, scheduling, restore-from-destination), **Restore Drills** (scheduled proof that an archive is actually restorable), and **Factory Reset** (per-section wipe back to defaults). Everything described here is reachable from the UI; the same surface is exposed via REST under `/api/v1/backup`, `/api/v1/backup/targets`, and `/api/v1/backup/drills` so operators can drive it from automation.
 
+On Edit, an empty secret field keeps the stored secret (it is what the console sends for a field left blank). A secret is taken away by sending `null` for that field through the API, or by moving the destination to its other auth mode: setting an Azure `account_key` drops a stored `connection_string` (and the reverse), an SCP `password` drops a stored key and its passphrase (and the reverse), and `https_put` auth `none` drops the stored credential. Setting both modes of Azure or SCP in one request is refused with a 422, on Add as well as Edit, and Add with `https_put` auth `none` stores no credential. A destination saved with two modes before this rule stays editable: an edit that sets no new secret keeps what is stored. The audit row names any secret field an edit cleared (`config_fields_cleared`), never its value. Name (1 to 120 characters), description (500) and the other text fields hold the same bounds as Add.
+
+**Factory Reset removes only what a section names.** A section never uses `TRUNCATE … CASCADE` (which would empty every table with a foreign key into the wiped one, whatever its `ON DELETE` rule — #1835). Tables nothing else references are truncated; the rest are deleted so `ON DELETE SET NULL` references are cleared and the referencing rows kept: a Tools reset leaves every IP address, DNS record and DHCP static in place. The one exception is a row that cannot exist without its parent (`ON DELETE CASCADE` — a DHCP scope without its subnet, a zone's DNSSEC keys): each section declares those, and the preview lists them as `<table> (cascade)` with the exact number of rows that go (an Integrations reset counts the records of integration-owned zones, not every record). The whole reset is one transaction, and a reset that a `RESTRICT` reference from a surviving row would break (IPAM while an integration, network device or multicast group still points at an IP space; Integrations while an operator's subnet sits under an integration-owned block) is refused with a 409 that names the referencing table and row count, and nothing is deleted.
+
 #### What's in the archive
 
 A single `.zip` per backup, named `spatiumddi-backup-{hostname}-{YYYYMMDD-HHMMSS}.zip`:
@@ -361,12 +407,20 @@ The archive is the unit operators move around — single-file, easy to ship over
 
 #### What an archive exposes
 
-**Only `secrets.enc` is encrypted. The database dump next to it is not.** Anyone who can read an archive can read the whole database: users and their emails, password and API-token hashes, every IPAM / DNS / DHCP row, and the audit log. The credentials SpatiumDDI stores (auth-provider secrets, agent keys, integration and destination credentials, operator TSIG keys, each DNS server group's internal TSIG key, and audit-forward webhook URLs and `Authorization` headers) stay Fernet-encrypted inside the dump, so reading those also takes the source install's key, which is inside `secrets.enc` behind the passphrase. **Leftovers until the next release:** two of those were stored in clear until this release, and their old columns are kept, unread, for one release so a rolling upgrade's old pods keep working. They still hold the pre-upgrade values:
+**Only `secrets.enc` is encrypted. The database dump next to it is not.** Anyone who can read an archive can read the whole database: users and their emails, password and API-token hashes, every IPAM / DNS / DHCP row, and the audit log. The credentials SpatiumDDI stores (auth-provider secrets, agent keys, integration and destination credentials, operator TSIG keys, each DNS server group's internal TSIG key, and audit-forward webhook URLs and `Authorization` headers) stay Fernet-encrypted inside the dump, so reading those also takes the source install's key, which is inside `secrets.enc` behind the passphrase. **Leftover until the next release:** one of those was stored in clear until a recent release, and its old column is kept, unread, for one release so a rolling upgrade's old pods keep working. It still holds the pre-upgrade value:
 
 - The group TSIG key (#1364, `dns_server_group.tsig_key_secret`). That key matters: the group's BIND9 servers grant zone transfers and dynamic updates to it from any address. Rotate each group's key once the upgrade has finished (**DNS → server group → Rotate group TSIG key**, or `POST /dns/groups/{id}/group-tsig-key/rotate`) and the leftover copy is a dead secret.
-- Webhook forward targets (#1502, `audit_forward_target.url` / `auth_header`, and the legacy `platform_settings.audit_forward_webhook_url` / `audit_forward_webhook_auth_header`). A Slack, Discord or Teams incoming-webhook URL lets anyone who has it post into that channel. Re-issue the URL in the chat platform (and any collector token) once the upgrade has finished, paste the new one into the target, and the leftover copy is dead.
 
-An "exclude secrets" diagnostic archive blanks those leftover columns along with the encrypted ones.
+Webhook forward targets (#1502) had the same arrangement: `audit_forward_target.url` / `auth_header` and the legacy `platform_settings.audit_forward_webhook_url` / `audit_forward_webhook_auth_header` were kept in clear for one release and are now dropped (migration `c2b203844c95`); any value still left in one is encrypted into its `*_encrypted` column first. An archive taken before that still carries them, so a Slack, Discord or Teams incoming-webhook URL in such an archive is readable by anyone who has it: re-issue the URL in the chat platform (and any collector token) to retire it. Restoring such an archive works either way — a full restore runs the migration over it, and a selective restore loads the old columns, encrypts what they hold, and drops them again. A target (or the Settings webhook) whose URL or header is filled from one of those old columns, on upgrade or on restore, is left **disabled**, since the value may be one an admin had cleared: an audit-log row per target records it (filter the audit log on the target), and a restore's warnings name each one. Re-enable it once the endpoint is confirmed.
+
+An "exclude secrets" diagnostic archive blanks the leftover column along with the encrypted ones. Restoring an "exclude secrets" archive leaves the encrypted webhook columns as an empty bytea rather than NULL; the application treats an empty bytea as unset everywhere (`url_set`, the audit snapshot, and the check that a webhook target has a URL), so a restored target with no re-entered URL is reported as unconfigured instead of silently failing to deliver — re-enter the URL and header after such a restore.
+
+An "exclude secrets" archive removes every secret, not only the credentials an operator types in: the appliance CA private key, the k3s join tokens and the cluster kubeconfig, persistent pairing-code reveals, the ACME account key, and the stored digests of credentials (local password hashes, API-token, session, pairing-code and agent-token digests). Its `secrets.enc` carries no `SECRET_KEY` or `CREDENTIAL_ENCRYPTION_KEY`, only the archive metadata the passphrase check needs. Restoring one succeeds and leaves an install that regenerates what it can:
+
+- **Local sign-in.** Every local password is cleared, so sign in through an external provider or reset a password with the recipe in [Troubleshooting](../TROUBLESHOOTING.md#resetting-the-admin-password). API tokens and sessions no longer match anything; issue new tokens.
+- **Appliances.** The appliance CA is regenerated on the next approval, so appliances approved against the old one must be re-keyed. The supervisor re-reports the kubeconfig and the join token on its next heartbeat. Pairing codes cannot be claimed or revealed; create new ones.
+- **Agents** are refused on their next request and re-bootstrap from their pre-shared key.
+- **ACME.** The next certificate order mints a new account key and registers it with the CA.
 
 So treat an archive as the install itself. Keep it at a destination that restricts who can read it and, if the medium could leave your control, encrypts it at rest (S3 / Azure / GCS server-side encryption, an encrypted share). A removable disk on the appliance cannot be encrypted — see [Removable (USB) disks](#removable-usb-disks-on-the-appliance).
 
@@ -486,6 +540,35 @@ where it is reachable — `s3` (a key without `DeleteObject`) and `https_put`
 destination that grants write but not unlink is not a configuration those
 protocols really produce.
 
+#### `local_volume` on a multi-node appliance (#1838)
+
+The default `/var/lib/spatiumddi/backups` is a hostPath, so it is **per node**:
+an archive stays on the disk of the node whose pod wrote it, and only the api on
+that node can list, download, restore or drill it. Scheduled runs land on
+whichever node's worker picked up the job, so the archives spread across nodes,
+and retention prunes each node's directory separately. Losing a node loses its
+archives. On a cluster, use a network destination (S3, SCP, SMB, NFS).
+
+SpatiumDDI does not move the archives, but it says where they are:
+
+- Each successful run records the node that wrote it, `last_run_node`, shown
+  next to the last run on the Backup page and returned by the targets API and
+  `list_backup_targets`.
+- With two or more control-plane nodes, Test connection warns that the target
+  is per node.
+- The archive list carries `node_name` per archive and an
+  `X-Archive-Listing-Note` header, shown above the list, saying whose disk it
+  is and, when the last run's archive is absent, which node holds it.
+- A download or restore that misses answers 502 naming the node that answered
+  and, when the run recorded it, the node holding the archive. Nothing is
+  restored. Copy the archive off that node and use **Restore from file**, or
+  retry until the request reaches that node's api.
+- A drill on a node that cannot see the newest archive reports `error` (no
+  verdict) instead of `failed` when it sees no archive at all, and notes it in
+  the `archive_available` check when it drilled an older one.
+
+A single-node appliance and Compose never see this wording.
+
 #### Removable (USB) disks on the appliance
 
 The single-appliance operator with no NAS and no cloud account backs up to a USB
@@ -604,11 +687,14 @@ curl -sS -f -o backup.zip -D headers.txt \
 grep -i '^etag:' headers.txt | cut -d' ' -f2- > etag.txt
 ```
 
-Three things make this a least-privilege pull rather than a full API key:
+Three things to know about this pull:
 
-* **Mint the token with `allowed_paths`** restricted to that one route. A token
-  so restricted gets 403 on `GET /backup/targets` — it can fetch the archive and
-  nothing else.
+* **The token must be unrestricted** (no scopes), and its owner a superadmin,
+  which the route requires. A `read` token is refused: reading the destination
+  is outbound, which `read` never does, and no write scope covers `/backup`.
+  There is no way to limit a token to this one route (`allowed_paths` is
+  reserved and enforced nowhere), so keep the credential in the backup tool's
+  secret store and revoke it when the job is retired.
 * **The response is conditional.** Archive filenames carry a UTC timestamp and
   the bytes under a name are never rewritten, so the filename is a legitimate
   strong `ETag`. A poller that already has the newest archive gets a `304` and
@@ -619,6 +705,13 @@ Three things make this a least-privilege pull rather than a full API key:
   the database dump is readable (see
   [What an archive exposes](#what-an-archive-exposes)), so protect the token and
   wherever the puller writes the archive as you would the install itself.
+
+**The token cannot be `read`-scoped.** Listing, downloading or previewing an
+archive reads it from the backup destination, and a `read` token never makes
+SpatiumDDI contact another host (#3302), so a `read`-only token gets `403` on
+every `/backup/targets/{id}/archives…` route. No write scope covers `/backup`
+either, so the puller needs an **unrestricted** token (empty scopes) belonging
+to a superadmin, which these routes require anyway.
 
 Two limits: a **destination must exist** — for a pull-only deployment make a
 `local_volume` target the staging destination, because a `GET` that triggers a
@@ -637,7 +730,11 @@ Each target carries:
 | `retention_keep_days` | Drop archives whose mtime is older than N days. |
 | `last_run_status` / `last_run_at` / `last_run_filename` / `last_run_bytes` / `last_run_duration_ms` / `last_run_error` | Surfaced inline on the target row. `last_run_status=in_progress` acts as a per-target mutex so a slow run can't double up on the next tick. |
 
-Set exactly one of `retention_keep_last_n` / `retention_keep_days`, or neither for no auto-prune. A single Celery beat task (every 60 s) walks all enabled targets, checks each one against its `next_run_at`, and dispatches a one-off backup task per target that's due.
+Both must be at least 1 (0 is rejected), and retention never deletes the newest archive or the one a run has just written, whatever the setting; a stored 0 from an older release behaves as 1. A retention failure after a successful write leaves the run `success` and shows the problem on the target's last-run error line. Set exactly one of `retention_keep_last_n` / `retention_keep_days`, or neither for no auto-prune. A single Celery beat task (every 60 s) walks all enabled targets, checks each one against its `next_run_at`, and dispatches a one-off backup task per target that's due.
+
+Two alert rules, both seeded **enabled**, watch every enabled target that has a schedule (#1262). `backup_failed` (warning) fires when the last finished run failed and resolves on the next success. `backup_stale` (critical) fires when there has been no successful run for N scheduled runs plus one hour (N = the rule's `threshold_percent`, default 2). It counts from the last success, but never from before the schedule was set, so a new schedule gets its first run first. It also catches the case where nothing runs at all: worker or beat down, or a run left `in_progress` by a process that died, which the sweep then skips for good. Clicking **Run now** clears that. Manual-only targets are not watched. The `get_backup_health` copilot tool shows the same per-target state (ok / failed / stale / stuck / running).
+
+A failed run also writes a `backup_target_run_failed` audit row, which audit forwarding and the `system.backup_failed` event send on. It carries a fixed `failure_category` (`unreachable`, `timeout`, `permission_denied`, `auth_failed`, `no_space`, `not_found`, `config_invalid`, …) rather than the driver's error text, which often names the destination (#1617). The full text is still shown under the target in the backup targets list (`last_run_error`, superadmin-only).
 
 #### Manual triggers
 
@@ -658,20 +755,30 @@ The proxy-download endpoint streams `driver.download(filename)` straight back to
 Same code path is hit whether the archive comes from an upload or a destination download.
 
 1. **Pre-flight.** Validates archive shape, manifest `format_version` (1 or 2 currently), passphrase. The passphrase verify happens **before** any destructive step so a wrong passphrase is rejected up front.
-2. **Pre-restore safety dump.** The current state of the database is snapshotted to `/var/lib/spatiumddi/backups/pre-restore-{ts}.zip` (passphrase `pre-restore-safety`). If the apply fails for any reason, the operator can roll back from this dump.
+2. **Pre-restore safety dump.** The current state of the database is snapshotted to `/var/lib/spatiumddi/backups/pre-restore-{ts}.zip` (passphrase `pre-restore-safety`). If the apply fails for any reason, the operator can roll back from this dump. Only the newest three safety dumps are kept in that directory; older ones are deleted when a new one is written, because each carries the install's `SECRET_KEY` under that public passphrase.
 3. **Connection pool teardown.** SQLAlchemy's engine is disposed and `pg_terminate_backend` kicks every other connection so the replay's drops don't deadlock against the worker / beat / agents.
 4. **Data replay.**
    - Full restore: the schema is **cleared, then the archive replayed, in one transaction** (#1363). `psql --single-transaction --set=ON_ERROR_STOP=1` reads one script on stdin: first a block that drops every table, view, sequence, standalone type and routine in `public` (extension members excepted), then the archive's SQL. For a Phase 2+ archive (`dump_format: custom`) that SQL is `pg_restore --no-owner --no-acl --file=-`'s output, streamed rather than staged on disk. For a Phase 1 archive (plain SQL) it is the dump itself. If `pg_restore` fails part way, psql is killed before it reaches end of input, so it never commits. A replay counts as complete only when psql acknowledges the end of the script: a per-run token is `\echo`-ed after the archive's last statement, so a psql that left early with exit 0 is reported as a partial restore, not a success. Any failure before psql is given end of input (a bad statement, a `pg_restore` error, a timeout) rolls back and leaves the database exactly as it was. The one exception is a timeout after end of input, while psql may be committing. It is reported as an unknown outcome, not as a rollback, so check the database (or restore the pre-restore safety dump) before relying on it.
 
      The clearing is what makes an archive **older than this install** restorable. The replay used to be `pg_restore --clean --if-exists`, and `--clean` drops only the objects the archive contains. Every table a later migration had added survived with its constraints. An archive from before `dns_agent_bundle` (every 2026.09.04-1 archive) then failed with a 400: `--clean` could not drop `dns_server_pkey` while `dns_agent_bundle_server_id_fkey` depended on it. A surviving table with no such dependency failed later instead, stopping the upgrade below on "already exists". Backups dump the whole database with no exclusions, so clearing loses nothing the archive does not recreate.
-   - Selective restore (operator ticked specific sections) → `TRUNCATE … RESTART IDENTITY CASCADE` followed by `pg_restore --data-only --disable-triggers --table=…`, over the **FK-cascade closure** of the selected sections' tables rather than the selection alone. `platform_internal` (alembic_version + oui_vendor) always rides along.
+   - Selective restore (operator ticked specific sections) → `TRUNCATE … RESTART IDENTITY CASCADE` followed by `pg_restore --data-only --table=…`, over the **FK-cascade closure** of the selected sections' tables rather than the selection alone. `platform_internal` (alembic_version + oui_vendor) always rides along.
+
+     The emptying and the load run in **one transaction**, through the same streamed `psql --single-transaction` replay the full restore uses (#1693): `pg_restore --data-only --file=-` writes the closure's rows as a script, and psql runs it between a prelude and a postlude. Any failure rolls the emptying back with it and leaves the database as it was. They used to be two transactions, and the TRUNCATE committed first, so a load that failed left every table in the closure empty, `alembic_version` among them, which leaves the api not ready and the restore page out of reach.
+
+     It needs **no superuser**. The load used `--disable-triggers`, which emits `ALTER TABLE … DISABLE TRIGGER ALL`, and PostgreSQL refuses that to a non-superuser on any table with a foreign key. An appliance connects as the app role, which owns the tables but is not a superuser, so every selective restore there failed. Instead, the prelude drops the closure's foreign keys after the TRUNCATE, and the postlude adds them back from their own catalog definitions, which only ownership requires. No load order would do without that, since `ip_address` / `dns_record` / `nmap_scan` and `asn` / `provider` reference each other. Adding a key back checks every row it covers, which the disabled triggers never did: an archive whose rows point at something deleted since the backup, outside the restored sections, is **refused** with the constraint named, and nothing changes. Restore the missing section too, or do a full restore.
+
+     The postlude then sets each sequence a reloaded table owns past the largest value its column holds (#1720). `RESTART IDENTITY` sends those sequences back to their start and `pg_restore --table` reloads rows, not sequences, so `audit_log.seq` used to hand out values the restored rows held, and every audited write after a restore of `audit` (a login is one) answered 409. Values that rows written after the backup had held can be handed out again, as after a full restore.
+
+     Before anything is emptied, the prelude works the closure out again from the database's own foreign keys, and refuses the restore if the `CASCADE` would reach a table outside it (a key a migration created and no model declares). That table would otherwise be emptied and never reloaded.
+
+     The emptying holds its locks until the load commits, so a selective restore takes every table's lock up front, as the full restore does (#1648).
 
      The closure matters because `CASCADE` empties every table holding a foreign key into a truncated one, transitively — catalogued or not, ticked or not. Restoring only the ticked tables therefore *deleted* the difference: measured against the shipped catalog, selecting `auth` cascaded into 130 tables and refilled 11 (#781). `cascade_closure()` in `app/services/backup/sections.py` derives that reach from mapped metadata (the FK graph is what Postgres actually walks; a hand-maintained copy is one migration away from being wrong), and everything it reaches is restored from the same archive so the operation ends consistent. This is deliberately *wider* than what the operator ticked — the alternative was never "narrower", it was "emptied". The response's `cascade_widened_tables` lists exactly which tables were pulled in, and a warning repeats it in prose.
 
      Worth knowing for anyone revisiting this: classifying the unclassified tables — the fix originally sketched on #781 — would **not** have solved it, because `CASCADE` reaches them regardless of whether a section claims them. Classification only decides what an operator can *tick*.
 5. **Alembic upgrade-on-restore.** If the archive's `schema_version` is older than this install's expected head, `alembic upgrade head` runs against the freshly-restored database. Same head → no-op. An archive whose head is **not in this install's chain** — i.e. taken on a newer build — is **refused up front, before any data is replayed**, so a database this build cannot migrate is never written (#781); the operator is told to upgrade SpatiumDDI here first.
 
-   That refusal is overridable with `allow_newer_schema=true`. It exists for the A/B-rollback case: an operator who rolled back *because* the newer build broke would otherwise be told to upgrade into the build they just escaped. The override also covers a subtler trap — `_is_ancestor` returns False on **any** exception, so a forked, squashed or renamed revision is indistinguishable from a genuinely newer one. It is superadmin-only (like every restore), recorded on the audit row, and the response leads with a warning that `alembic_version` may now be ahead of the running code, which the api's strict schema-head readiness gate rejects. The head is taken from the manifest, falling back to the copy inside `secrets.enc`, so an archive that never recorded one in its manifest is still checked. The restore returns a `migration` block with `state` (`up_to_date` / `upgraded` / `auto_recovered` / `incompatible_newer` / `unknown` / `failed`), `source_head`, `local_head`, `migrations_applied`.
+   That refusal is overridable with `allow_newer_schema=true`. It exists for the A/B-rollback case: an operator who rolled back *because* the newer build broke would otherwise be told to upgrade into the build they just escaped. The override also covers a subtler trap — `_is_ancestor` returns False on **any** exception, so a forked, squashed or renamed revision is indistinguishable from a genuinely newer one. It is superadmin-only (like every restore), recorded on the audit row, and the response leads with a warning that `alembic_version` may now be ahead of the running code: an api pod that starts or restarts on it stays unready, and one already serving keeps serving only while every table and column the build uses is still in the database (#2777). The head is taken from the manifest, falling back to the copy inside `secrets.enc`, so an archive that never recorded one in its manifest is still checked. The restore returns a `migration` block with `state` (`up_to_date` / `upgraded` / `auto_recovered` / `incompatible_newer` / `unknown` / `failed`), `source_head`, `local_head`, `migrations_applied`.
 
    **Drift recovery.** An upgrade that stops on an object that *already exists* is the signature of a stale `alembic_version`: the archive was taken while that row lagged the schema, so the dump carries a schema already at head beneath a version that says otherwise. The restore then runs `alembic stamp head` and reports `auto_recovered` — but only after checking that every table and column this build's models declare is present in the restored database. The signature alone is not proof (#1233): any revision that meets one object it would create fails the same way, and since migrations commit one revision at a time (#1204), the revisions before it stay applied and those after it never ran. Stamping head on the signature would record that partially migrated schema as current, and it would fail later somewhere unrelated to the restore. When anything is missing, or the check cannot run, the restore reports `failed`, names the missing tables and columns, and leaves `alembic_version` at the last revision that committed, so a manual `alembic upgrade head` resumes from there. The check is deliberately one-directional and covers tables and columns only; a revision after the failing one that changes only data, indexes, constraints or types is not visible to it.
 
@@ -746,7 +853,7 @@ A backup you have never restored is a hypothesis. The **Restore Drills** tab tur
 | `dump_replays_cleanly` | `pg_restore` / `psql` aborted — the dump is truncated or corrupt. |
 | `alembic_version_present` | No single schema revision, or one this build has never heard of (the archive came from a newer SpatiumDDI). An archive *behind* the bundled head passes: a real restore migrates it forward. |
 | `core_tables_populated` | The archive restored but came back with no users — an install restored from it would have no way in. |
-| `audit_chain_intact` | The restored audit log's tamper-evident hash chain does not verify. Skipped when the restored schema isn't at the bundled head, because the ORM-based verifier would misread schema skew as tampering. Capped at 250k rows — a break inside that window is plenty to prove damage, and the nightly `audit_chain_verify` task walks the live table exhaustively. |
+| `audit_chain_intact` | The restored audit log's tamper-evident hash chain does not verify. Skipped when the restored schema isn't at the bundled head, because the ORM-based verifier would misread schema skew as tampering. Capped at 250k rows — a break inside that window is plenty to prove damage, and the `audit_chain_verify` task walks the whole live table at least weekly (see §2.7). |
 
 #### Requirements and costs
 
@@ -830,6 +937,53 @@ SMTPConfig
   from_address, from_name
   reply_to: str (nullable)
 ```
+
+### About page: licence, NOTICE and third-party lists
+
+`/about` (sidebar footer —
+[#2895](https://github.com/spatiumnorth/spatiumddi/issues/2895)) shows the
+product name and version, the Apache-2.0 licence and its text, Spatium North,
+links to the source, docs and [privacy statement](../PRIVACY.md), the full
+`NOTICE` text, a section on the GPL / LGPL components of the OS appliance
+image, and the two generated third-party lists.
+
+**It is for signed-in users only**, and so is every file it shows. Someone
+probing the server from outside must not learn which version, libraries or
+third-party tools it runs, so the page is routed inside the authenticated
+console, the sign-in page does not link to it, and each data source refuses a
+caller without a session (401, or 403 for a disabled account or a pending
+password change). Any signed-in user may read it; no role is needed.
+
+| Source | Generated by | Served from |
+|---|---|---|
+| `NOTICE`, `LICENSE` | copied from the repo root by the Vite build | `/legal/NOTICE.txt`, `/legal/LICENSE.txt` (frontend image) |
+| Web UI libraries (npm) | `rollup-plugin-license` during `vite build`, so it covers exactly what is in the bundle | `/legal/third-party-npm.txt` (frontend image) |
+| Backend libraries (Python) | `pip-licenses` in the backend image's builder stage, over the packages the runtime stage receives; the tool itself never reaches the runtime image | `GET /api/v1/about/third-party/python` (plain text) |
+
+How the `/legal/` files are protected: the Vite build writes them to
+`dist-legal/`, a sibling of the public `dist/`, and the frontend image copies
+them to `/usr/share/spatiumddi/legal`, outside the nginx web root, so neither
+the SPA fallback nor the static-asset location can serve them. nginx serves
+`/legal/` only after an `auth_request` to `GET /api/v1/about/session`, which
+answers 204 for a signed-in caller and 401 / 403 otherwise; an api that cannot
+answer is a 503, never the file. Both nginx configs carry this: the image's own
+`default.conf.template` (Docker Compose, and the Helm chart without TLS) and
+the chart's `frontend-tls-config.yaml` (the Helm chart with TLS, and the
+appliance). The SPA's session is a Bearer token held in memory, which a plain
+link would not send, so the page fetches each file through its API client and
+shows it inline rather than linking it for a new tab. Nothing is inlined into
+the JS bundle.
+
+That is about the **content**. The version number is a separate decision,
+made on its own route: `GET /api/v1/version`, which the installer probe and
+the mobile client use, answers everyone, but since #2935 an anonymous caller
+gets `version: "restricted"` and only a signed-in caller sees the release (see
+[API.md](../API.md) §7.2).
+
+A `make dev` or `npm run dev` session has none of these files, and the page
+says "not available in this build" rather than show an empty list. Agent images
+and the appliance's OS packages are not in the generated lists yet; `NOTICE`
+covers them.
 
 ---
 
@@ -918,12 +1072,28 @@ env_banner_fg: str (default "#ffffff")      -- 6-digit hex, validated
 env_banner_position: str (default "top")    -- top | bottom | both
 ```
 
-Branding writes (`app_title`, either banner) are **superadmin-only**, a
-stronger gate than the `write:settings` the rest of the PUT takes: these
-fields render to anonymous visitors on the login page, so a delegated
-settings editor must not be able to put arbitrary text in front of
-everyone. Every branding change writes an audit row
+Branding writes (`app_title`, either banner) are **superadmin-only**:
+these fields render to anonymous visitors on the login page, so a
+delegated settings editor must not be able to put arbitrary text in front
+of everyone. Every branding change writes an audit row
 (`resource_type="platform_settings"`, `resource_id="branding"`).
+
+The same holds for **most of `PUT /settings`**. A delegate holding
+`write` on `settings` may change only the fields in
+`SETTINGS_DELEGATE_WRITABLE` (`backend/app/api/v1/settings/router.py`):
+IPAM / DNS / DHCP working preferences such as utilization thresholds,
+DNS defaults, the DNS auto-sync and pull schedules, and DHCP lease and
+domain defaults. Every other field is superadmin-only, including
+`app_base_url` (it builds the URLs handed to identity providers),
+session and password policy, appliance host configuration (SSH, APT,
+syslog, SNMP, NTP, LLDP, resolver, timezone), and anything that makes an
+outbound connection. A new field is superadmin-only until it is added to
+that set. A delegate's request naming any superadmin-only field is
+refused whole with `403` and an audited denial, so nothing is written.
+`PUT /settings/resolver` is superadmin-only for the same reason.
+`GET /settings` returns the set as `delegate_writable_fields`, and the
+Settings page reads it: a delegate gets Save and those fields, and every
+other field stays disabled for anyone but a superadmin (#3429).
 
 ### 6.1 Public branding endpoint
 
@@ -992,9 +1162,22 @@ ip_allocation_strategy: str (default "sequential")  -- sequential | random
 **Session / security**
 
 ```
-session_timeout_minutes: int (default 60)
-auto_logout_minutes: int (default 0)  -- idle session timeout; 0 = disabled
+session_timeout_minutes: int (default 60)  -- idle session timeout; 0 = disabled
+auto_logout_minutes: int (default 0)       -- console warning before it; 0 = disabled
 ```
+
+`session_timeout_minutes` is enforced by the API: a browser session
+(`user_session`) whose last activity is older than the timeout is refused
+on its next request and on `/auth/refresh`, and is left out of the
+Sessions list. Activity is `user_session.last_seen_at`. A refresh carries
+it forward rather than counting as activity, and the console sends
+`X-Spatium-Idle-Seconds` (time since the operator last used the page) on
+every request, so background polling does not keep a session alive. The
+check allows up to a minute (a quarter of the timeout, if shorter) past
+the configured value, never less. API tokens are not sessions and are not
+affected. The console shows the warning `auto_logout_minutes` before
+expiry, capped at half the timeout, and returns to the login page when
+the timeout passes.
 
 **Password policy** (issue #70 — flat columns, not a JSONB blob; validator + history in `app.services.password_policy`)
 
@@ -1056,7 +1239,18 @@ dns_auto_sync_enabled / dns_auto_sync_interval_minutes / dns_auto_sync_delete_st
 reverse_dns_enabled / reverse_dns_interval_minutes        -- PTR auto-population (issue #41)
 dhcp_pull_leases_enabled / dhcp_pull_leases_interval_seconds
 oui_lookup_enabled / oui_update_interval_hours
+```
+
+**Data retention** — see [§2.7](#27-audit-log-and-data-retention) for
+ranges and what each prunes
+
+```
+log_retention_hours (default 24)                          -- DNS query + DHCP activity logs
+metric_retention_days (default 7)                         -- DNS / DHCP metric samples
+dhcp_lease_history_retention_days (default 90)
 soft_delete_purge_days (default 30)                       -- trash purge sweep
+pcap_retention_days (default 7)
+appliance_revoked_retention_days (default 30)
 ```
 
 **Maintenance mode** (issue #57 — see [§5](#5-maintenance-mode))
@@ -1067,7 +1261,7 @@ maintenance_message: str (default "")
 maintenance_started_at: timestamp | null  -- server-stamped on enable, never operator-set directly
 ```
 
-Other notable areas on the model (each a small cluster of columns): integration toggles (`integration_kubernetes_enabled`, `integration_docker_enabled`, …), Operator Copilot caps (`ai_per_user_daily_token_cap`, `ai_per_user_daily_cost_cap_usd`, `ai_tools_enabled`, …), audit-event forwarding (`audit_forward_syslog_*`, `audit_forward_webhook_*`), and the per-appliance host-config plane (`snmp_*`, `ntp_*`, `apt_*`, `syslog_*`, `ssh_*`, `resolver_*`, `lldp_*`, `timezone`, `console_mode`).
+Other notable areas on the model (each a small cluster of columns): a derived copy of each integration's on/off state (`integration_kubernetes_enabled`, `integration_docker_enabled`, …; the `integrations.*` feature module is the switch, #2196), Operator Copilot caps (`ai_per_user_daily_token_cap`, `ai_per_user_daily_cost_cap_usd`, `ai_tools_enabled` — changes via the Tool Catalog are audited as an enabled/disabled diff, …), audit-event forwarding (`audit_forward_syslog_*`, `audit_forward_webhook_*`), and the per-appliance host-config plane (`snmp_*`, `ntp_*`, `apt_*`, `syslog_*`, `ssh_*`, `resolver_*`, `lldp_*`, `timezone`, `console_mode`).
 
 ---
 
@@ -1075,7 +1269,7 @@ Other notable areas on the model (each a small cluster of columns): integration 
 
 ### Current Version Display
 
-The current application version is displayed in the UI header bar and on the System Admin → About page. Releases up to the bridge are **CalVer**, `YYYY.MM.DD-N`, where N is the release number for that date (starting at 1). From 1.0.0 they are **SemVer**, `MAJOR.MINOR.PATCH`, with release candidates tagged `1.0.0-rc.N` (#1182).
+The current application version is displayed in the sidebar footer and on the [About page](#about-page-licence-notice-and-third-party-lists). Releases up to the bridge are **CalVer**, `YYYY.MM.DD-N`, where N is the release number for that date (starting at 1). From 1.0.0 they are **SemVer**, `MAJOR.MINOR.PATCH`, with release candidates tagged `1.0.0-rc.N` (#1182).
 
 Examples: `2026.04.13-1`, `2026.04.13-2` (hotfix same day), `1.0.0-rc.1`, `1.0.0`, `1.0.1`
 
@@ -1085,7 +1279,17 @@ Every SemVer release is newer than every CalVer one, and versions are never comp
 
 The version is injected at build time and exposed via:
 - UI header (e.g., `v2026.04.13-1`)
-- `GET /api/v1/version` — returns `{ "version": "...", "update_available": ..., "latest_version": ... }`
+- `GET /api/v1/version` — returns `{ "version": "...", "update_available": ..., "latest_version": ... }` to a signed-in caller
+
+**What an anonymous caller sees (#2935).** Version and stack details are for signed-in users only, because the exact release tells a scanner which advisories apply. Without a session or API token:
+
+- `GET /api/v1/version` returns only `product`, `api_level` and `restricted: true`; the version and release-check fields are null / false.
+- `GET /health/platform` returns the rollup `status` only, with no component list (which named every Celery worker by container id or pod name).
+- `/api/openapi.json` answers 401. `/api/docs` and `/api/redoc` load, then ask the reader to sign in.
+- The web tier sends `Server: nginx` with no version (`server_tokens off`), on the console and on the appliance's agent landing page.
+- DNS servers answer `version.bind CH TXT` with `"none"`. BIND9 also stops answering `hostname.bind`, and PowerDNS answers `id.server` (and NSID) with `"none"` instead of the container hostname. Technitium already refuses CHAOS queries.
+
+The public JavaScript bundle still carries the libraries it is built from; that cannot be hidden while the console loads before sign-in.
 
 ### GitHub Release Check
 
@@ -1146,18 +1350,22 @@ InfluxDBTarget                    -- backend/app/models/influxdb.py
   -- v1 fields:
   database: str
   username: str
-  password_encrypted: bytes       -- Fernet at rest; API returns password_set only
+  password_encrypted: bytes       -- Fernet at rest; API returns password_set only;
+                                  -- blank on save keeps it, clear_password removes it (#1989)
   -- v2 / v3 fields:
   org: str                        -- required on v2; optional on v3
   bucket: str                     -- on v3 this is the database name
-  token_encrypted: bytes          -- Fernet at rest; API returns token_set only
+  token_encrypted: bytes          -- Fernet at rest; API returns token_set only;
+                                  -- blank on save keeps it, clear_token removes it (#1989)
   measurement_prefix: str (default "spatiumddi_")
   push_interval_seconds: int (default 60, min 30)
   push_dns_metrics / push_dhcp_metrics /
   push_subnet_utilization / push_dhcp_scope_leases: bool (all default true)
   -- push state (written by the task, read-only to the operator):
   last_dns_bucket_at, last_dhcp_bucket_at    -- per-source high-water marks
-  last_push_at, last_push_points, last_push_error
+  last_push_at                    -- last ATTEMPT (moves on failure)
+  last_success_at                 -- last push accepted; NULL = never (#1990)
+  last_push_points, last_push_error
 ```
 
 #### "All versions" — v1, v2 and v3
@@ -1254,7 +1462,10 @@ means a delayed export, never a hole — the samples stay in Postgres until
 
 `last_push_at` moves on failure as well as success — otherwise a
 fast-failing target would be retried on every 30 s beat tick instead of
-on its own interval. A failure is always recorded against the target
+on its own interval. So `last_push_at` is the last *attempt*; the
+`last_success_at` column is the last push the destination accepted
+(NULL = never), and the table's **Last push** column shows that one,
+with a "last attempt failed" line beside it. A failure is always recorded against the target
 that caused it: the push is wrapped in a broad per-target boundary,
 because the beat task pushes every due target in one transaction and an
 escaping exception would discard the state updates of the ones that
@@ -1313,6 +1524,15 @@ PEM private keys, JWTs, PSKs, API tokens, TSIG keys. Matched both by field
 name and by value shape, and removed in **every** mode including the
 unscrubbed one. There is no version of "let me read my own logs" that is
 improved by including the key that decrypts the database.
+
+The process environment (`system/env.txt`) is the exception to matching by
+name: a variable's **value** appears only when its name is on an allowlist
+of known non-secret settings (log level, timeouts, feature flags, versions,
+Kubernetes service links). Every other variable is listed with its value
+replaced, so the dump still shows what is set. Connection URLs such as
+`DATABASE_URL` and `REDIS_URL` are on the replaced side. The appliance
+diagnostic bundle applies the same rule to its env dumps and runs every
+file it contains, logs included, through the same secret-shape sweep.
 
 **Pseudonymise — identifiers.** IPs, hostnames, domains, MACs, usernames
 become stable synthetic values, so the archive stays *readable*:
@@ -1404,3 +1624,103 @@ cannot abort the transaction and take every later section with it.
 
 **MCP:** `get_support_bundle_preview` (default **off** — a broad read of
 logs and configuration). It returns the preview, never the archive.
+
+---
+
+## 10. Factory reset
+
+_Moved here from the README feature tour (#3410), so the detail stays in the documentation._
+
+### Per-section wipe back to defaults
+
+per-section "wipe back to defaults" surface for superadmins.
+
+- 14 sections mapped from the operator's mental model: IPAM · DNS · DHCP · Migration · Network modeling · Integrations · AI/Copilot · Compliance · Verticals · Tools · Observability logs · Auth+RBAC · Settings+branding · Everything. Per-section confirm phrase (`DESTROY-IPAM` / `DESTROY-DNS` / … / `FACTORY-RESET-ALL`) typed exactly to commit
+- Three dispatch kinds: `truncate` (11 sections — `TRUNCATE TABLE … RESTART IDENTITY` on the tables the section names that nothing outside the wipe references, `DELETE` children-first for the rest, never `CASCADE`, #1835), `auth_rbac` (partial wipe preserving the calling user, every other superadmin, and built-in roles), `settings_reset` (DELETE platform_settings; recreated with model defaults). Tables intentionally untouchable: `alembic_version`, `oui_vendor`, `backup_target`, `feature_module`, `event_outbox`, `internal_error`, `audit_forward_target` — the schema head, OUI cache, recovery path, module toggles, and audit-forward shipping channels survive every reset
+- Hard guardrails server-side: superadmin gate · fresh bcrypt password re-check (NOT bearer-token check) · exact-match per-section confirm phrase · refuses 409 when any backup target is mid-run · Redis lock against concurrent resets · 6-hour cooldown · audit anchor written via fresh AsyncSessionLocal post-truncate so the trail of evidence survives an `audit_log` wipe · `system.factory_reset` typed event fans through the existing webhook outbox
+- **Pre-flight backup as warn-only with override** — if no enabled backup target exists, `POST /system/factory-reset/execute` returns 412 unless the operator passes `acknowledge_no_backup=true`. The Backup admin tab surfaces the warning + checkbox up front
+- UI lives as the fourth tab on the Backup admin page (after Manual, Destinations and Restore Drills) — backup snapshots state, factory reset wipes it, two ends of the same lifecycle. Per-section cards in a 2-col grid + red-bordered "Reset everything" card. Modal gates the password field on a green-border phrase match
+
+---
+
+## 11. Reference summaries — audit chain, conformity, trash, backup
+
+_Moved here from the README feature tour (#3410), so the detail stays in the documentation._
+
+### Audit log + tamper-evident hash chain
+
+append-only, SHA-256 chained, machine-verifiable.
+
+- Every mutation across IPAM / DNS / DHCP / Network / auth / ownership / integrations writes an `AuditLog` row before the response is returned. Filterable in the UI by user / action / resource type / time range; full row diff (`old_value` / `new_value` / `changed_fields` JSONB) so an audit shows you exactly what changed
+- **Hash chain** — each row carries `seq` (monotonically-increasing position), `prev_hash` (the previous row's hash), and `row_hash = sha256(prev_hash || canonical_json(row))`. A `before_flush` SQLAlchemy listener takes a Postgres transaction-scoped advisory lock so concurrent transactions can't interleave their "fetch previous hash, hash my row, write it" sequence — you can't fork the chain by racing
+- **Verifier** — `verify_chain` walks the table in `seq` order, recomputes the hash for each row, and returns the first break with `reason=row_hash_mismatch` (someone edited the row's content) or `reason=prev_hash_mismatch` (someone deleted or inserted a row mid-stream). One verification pass shows the offending row + the position in the chain
+- **Conformity hookup** — the `audit_log_immutable` conformity check kind runs the verifier on its scheduled tick and emits a `pass` / `fail` result, so the auditor's PDF export carries a positive-presence signal that nothing has been tampered with since the last evaluation
+- **Backfill migration** — `d92f4a18c763_audit_chain_hash` populates `seq`, `prev_hash`, and `row_hash` for every existing row in chronological order on upgrade, so the chain is unbroken from day one
+
+### Conformity evaluations
+
+proactive: prove steady state and produce the auditor PDF.
+
+- Declarative `ConformityPolicy` rows pin a `check_kind` against a target set (subnet / IP address / DNS zone / DHCP scope / platform). Beat-driven engine ticks every 60 s and runs every enabled policy on its `eval_interval_hours` cadence (default 24 h). On-demand re-eval via `POST /conformity/policies/{id}/evaluate`
+- 24 check kinds:
+  - `has_field` — non-empty value on a named target column (e.g. PCI subnet must have `customer_id`)
+  - `in_separate_vrf` — subnet's effective VRF holds only classification-matched siblings (no PCI ↔ non-PCI mixing)
+  - `no_open_ports` — latest nmap scan within N days didn't expose forbidden ports (`warn` when no recent scan; never silent-pass)
+  - `alert_rule_covers` — at least one enabled alert rule of the named type covers this scope (positive coverage signal — confirms the reactive #105 channel is wired)
+  - `last_seen_within` — IP / subnet recency check (catches rows that should be decommissioned)
+  - `audit_log_immutable` — platform-level positive-presence signal for the auditor checkbox
+  - `voice_segment_not_internet_facing` — a voice / VoIP-classified subnet must not also carry the `internet_facing` flag
+  - `no_multicast_collision` — no two multicast group registrations in an IPSpace claim the same address
+  - `no_lanwide_control_plane_ports` — no appliance exposes k3s control-plane ports (etcd / kubelet / apiserver) to the LAN
+  - `av_flow_outside_reserved_range` — an AV-over-IP flow sits outside every multicast range declared for its protocol (not applicable when no range is declared — absence of policy isn't a violation)
+  - `av_flow_no_ptp_domain` — advisory; an AV flow with no PTP clock domain recorded (PTP misconfig is the top AoIP failure mode)
+  - `bbmd_one_per_subnet` — a BACnet-bearing subnet has exactly one BBMD; fails on 0 (devices unreachable across routers) and on >1 (duplicated broadcasts)
+  - `bacnet_duplicate_device_instance` — no two BACnet devices share an internetwork-unique device instance number
+  - `bacnet_vendor_id_unknown` — advisory; BACnet devices reporting vendor id 0 or none (usually a cloned or misconfigured controller)
+  - `ot_device_crosses_purdue_boundary` — an OT device's Purdue level differs from the level its subnet is zoned for
+  - `ot_zone_missing_purdue_level` — advisory; a subnet carrying OT devices but declaring no OT zone
+  - `fragile_subnet_probed` — works *backwards* from the OT / DICOM / `bmc`-role registries: a subnet holding devices known to be probe-fragile that nobody marked do-not-probe
+  - `dicom_ae_default_title` — no DICOM AE is still on a vendor default title (`AE_TITLE`, `DICOM_SCP`, …)
+  - `dicom_ae_title_convention` — AE Titles match an operator-supplied regex, so the estate's naming scheme is enforceable
+  - `dicom_ae_outside_hipaa_scope` — AEs sit in subnets actually flagged `hipaa_scope`
+  - `dicom_ae_no_tls` — AEs are recorded as TLS-enabled
+  - `e911_voice_subnet_unbound` — a voice subnet can reach an Emergency Response Location
+  - `e911_erl_validated` — every in-use ERL carries a provider validation verdict, and not an old one
+  - `e911_port_binding_evidence_fresh` — switch-port ERL bindings sit on devices that are still polled
+- 22 disabled seed policies covering PCI-DSS / HIPAA / SOC2 + the vertical registries: PCI dedicated VRF, PCI owner_assigned, PCI no admin ports, PCI alert coverage, PCI no stale IPs, HIPAA dedicated VRF, internet-facing alert coverage, voice-not-internet-facing, voice subnets reach an ERL, in-use ERLs provider-validated, switch-port ERL bindings on polled devices, multicast-collision-free, audit log immutable, no LAN-wide control-plane ports, AV flows in declared range, AV flows record PTP domain, one BBMD per subnet, unique BACnet device instances, plausible BACnet vendor ids, OT devices match subnet Purdue level, OT subnets declare a zone, fragile subnets marked do-not-probe
+- `pass→fail` transitions emit `AlertEvent` rows against the policy's wired alert rule when set, so conformity drift surfaces in the existing alerts dashboard
+- Append-only `ConformityResult` history indexed twice (by policy and by resource) so both natural drilldowns hit an index — answers "every result for this policy" + "every policy that touched this resource" in O(log n)
+- Auditor-facing **PDF export** via `reportlab` — per-framework summary table, per-policy section with pass / warn / fail counts, enumerated failing rows with diagnostic JSON pretty-printed beneath, trailer with a SHA-256 hash over `(result_id, status)` tuples so the auditor can verify post-generation tampering. `GET /conformity/export.pdf` with optional `?framework=` filter
+- New `conformity` permission resource type plus two new built-in roles: **Auditor** (read-only) suitable for an external auditor account, **Compliance Editor** (admin) for the team that authors and tunes policies
+- Frontend `/admin/conformity` page with per-framework summary cards, policies table (toggle / re-eval / edit / delete inline), filterable results panel with diagnostic JSON drill-in. Platform Insights gains a Conformity card with deep-link
+
+### Soft-delete + 30-day Trash
+
+accidental deletes are recoverable; the `Delete` button moves rows to a holding area, not the void.
+
+- Scope: `IPSpace`, `IPBlock`, `Subnet`, `DNSZone`, `DNSRecord`, `DHCPScope`, customer, overlay and network-service rows inherit a `SoftDeleteMixin` (`deleted_at`, `deleted_by_user_id`, `deletion_batch_id`). IP addresses are intentionally NOT soft-deletable — they cascade-delete with their parent subnet, and the parent subnet is the recoverable unit
+- **Global ORM filter** — a `do_orm_execute` event listener injects `Model.deleted_at IS NULL` into every SELECT touching one of these models, so the rest of the codebase doesn't need to remember. Callers that need to see the trash opt in via `execution_options(include_deleted=True)`
+- **Cascade-aware restore** — when you delete a subnet its DHCP scopes are stamped under the same `deletion_batch_id`; one click on Restore brings the whole batch back atomically, with a pre-flight conflict check (rejects 409 when a live row would clash on a uniqueness key)
+- Admin page at `/admin/trash` lists soft-deleted rows newest-first with type / since / substring filters and "Restore" / "Delete permanently" per row. Sidebar entry under Admin
+- **Nightly purge** — `trash_purge` Celery beat task hard-deletes rows older than `PlatformSettings.soft_delete_purge_days` (default 30; set 0 to disable forever). The retention window is operator-tunable in Settings → Security
+- Endpoints: `GET /admin/trash` · `POST /admin/trash/{type}/{id}/restore` · `DELETE /admin/trash/{type}/{id}` (hard-delete a soft-deleted row before the purge sweep)
+
+### Backup + restore
+
+full-system snapshot with passphrase-wrapped secrets and 10 destination kinds.
+
+- **Format** — single `.zip` archive carrying `manifest.json` (app version, schema head, hostname, dump format), `database.dump` (custom-format `pg_dump`), `secrets.enc` (PBKDF2-HMAC-SHA256 + AES-256-GCM envelope wrapping the install's `SECRET_KEY`), and `README.txt`. The operator passphrase NEVER lands on disk or in the API logs
+- **Ten destination kinds** — `local_volume` (filesystem path mounted as a docker / k8s volume), `s3` (AWS + S3-compatible: MinIO, Wasabi, Backblaze B2, Cloudflare R2 — via `endpoint_url`), `scp` (SFTP with password OR PEM private key, three host-key check modes), `azure_blob` (shared-key OR connection-string), `smb` (NTLM with optional domain + SMB3 encryption), `ftp` (plain ftp / ftps_explicit / ftps_implicit + passive/active + verify_tls toggle), `gcs` (service-account JSON key), `webdav` (Nextcloud / ownCloud / mod_dav / IIS WebDAV via PUT/GET/PROPFIND/DELETE — no SDK dep), `nfs` (an NFSv4 or v3 export, spoken in userspace — no kernel mount, so it works on the appliance too), `https_put` (PUT or POST to an HTTPS receiver — Artifactory / Nexus generic repositories, a presigned URL — with none / bearer / basic / header auth; write-only, so no listing, restore-from-destination or drill). Same `BackupDestination` ABC + module registry; the kind picker reflects on `GET /backup/targets/kinds` so adding a new driver requires no frontend changes
+- **Scheduled cron + retention** — 5-field UTC cron with friendly presets (hourly / 6h / 12h / daily 02:00 / 04:00 / weekly Sun 03:00 / monthly 1st 03:00) + custom; retention as `keep_last_n` OR `keep_for_days`; per-target last-run state surfaced inline; 60s beat sweep with `last_run_status='in_progress'` per-target mutex
+- **Selective restore** — operators tick which sections to restore (IPAM only / DNS only / etc.) on both upload-restore and restore-from-destination flows. 21-section catalog mapping all 142 schema tables; volatile sections (DHCP leases, DNS query log, DHCP activity log, nmap scan history, metric samples) skipped by default. TRUNCATE … RESTART IDENTITY CASCADE + `pg_restore --data-only --table=…` in one transaction, with the closure's foreign keys set aside and checked on the way back, so it needs no superuser (#1693); `platform_internal` (alembic_version + oui_vendor) always rides along
+- **Cross-install secret rewrap** — restoring onto an install with a different `SECRET_KEY` rewraps every Fernet-encrypted column (22 columns across 16 tables + the `backup_target.config` JSONB blob). Same-install restores short-circuit. Closes the manual `SECRET_KEY` copy step that Phase 1 needed
+- **Alembic upgrade-on-restore + drift recovery** — restore detects schema-version skew and runs `alembic upgrade head` automatically when the source is on an older head. Drift-recovery branch handles the case where the dump's alembic_version row is stale relative to the dump's own schema (operator stamped head later, then restored an older backup): canonical "table already exists" error pattern is detected and recovered via `alembic stamp head`
+- **Exclude-secrets diagnostic mode** — checkbox on the build form switches to plain-format dump and post-processes the SQL text in memory to scrub every Fernet-encrypted column + `__enc__:`-prefixed JSONB field. Live database is never touched. For sharing snapshots with support / consultants without leaking integration credentials
+- **Restore from any archive at any destination** — pick destination → expand drawer → click Restore icon. Driver fetches the bytes via `download(filename)`; standard restore path takes over. Plus `GET /backup/targets/{id}/archives/{filename}/download` for proxy-download (operator pulls a remote archive without ever holding the destination's credentials) and `…/archives/latest/download` for one-shot "give me the newest" automation
+- **Audit + observability** — every backup creates / fails / restore-performed lands an audit row; `system.backup_completed` / `system.backup_failed` / `system.restore_performed` typed events fire via the existing webhook event-outbox + HMAC-signed POST + retry pipeline
+- **Restore drills** — scheduled proof that the archives are actually restorable, which is the failure nobody discovers until recovery day. A drill downloads a target's newest archive, replays it into a throwaway scratch database, runs a fixed assertion set (archive readable and a supported format version · the stored passphrase opens `secrets.enc` · the dump replays · the alembic head is one this build knows · core tables are populated · the audit chain verifies), then drops the scratch database. **The live database is never written to** — the scratch name is generated from a fixed prefix plus random hex, never from operator input, and is checked against the live database name before anything runs. Deliberately not built on the operator restore path, which takes a pre-restore safety dump and disposes the live engine's pool: correct for a deliberate restore, wrong for an unattended background check
+  - Cadence is **separate from the backup schedule**, because replaying a full dump costs far more than taking a backup — weekly drills against nightly backups is the expected shape
+  - Bounded and self-cleaning: a size ceiling (`SPATIUM_DRILL_MAX_DB_BYTES`, 20 GiB default) so a verification job can never fill the production volume, a stale-mutex escape so a killed worker can't stop a target drilling forever, and a reaper that drops orphaned scratch databases with no backend attached
+  - `restore_drill_failed` alert fires only on a verdict *about the archive* — never on "the drill couldn't run at all", which would train operators to ignore the rule. A target with drills switched off reports as **unverified**, not healthy
+  - Restore Drills tab on the Backup admin page, `GET/POST /backup/drills` (list · get · run-now · readiness), 2 Copilot tools
+- Endpoints: `POST /backup/create-and-download` · `POST /backup/restore` · `POST /backup/targets` (CRUD + run-now + test) · `POST /backup/targets/{id}/archives/restore` · `GET /backup/targets/{id}/archives/{filename}/download` · `GET /backup/targets/{id}/archives/latest/download` · `GET /backup/drills`. UI lives at **Administration → Backup**

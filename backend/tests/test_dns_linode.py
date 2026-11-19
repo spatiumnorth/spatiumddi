@@ -509,6 +509,69 @@ async def test_apply_zone_delete_resolves_then_deletes(monkeypatch: pytest.Monke
     assert fake.calls[1]["path"] == "/domains/77"
 
 
+# ── #1889 — deleting a zone already absent at the provider is done ──────
+async def test_apply_zone_delete_absent_from_list_is_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeClient({"get": [_FakeResponse(200, _env([]))]})
+    driver = _patch_client(monkeypatch, fake)
+    zone = type("Z", (), {"name": "gone.example."})()
+
+    await driver._apply_zone(_Server(), _CREDS, zone, "delete")
+
+    assert [c["method"] for c in fake.calls] == ["get"]
+
+
+async def test_apply_zone_delete_404_at_delete_is_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeClient(
+        {
+            "get": [_FakeResponse(200, _env([{"id": 77, "domain": "gone.example"}]))],
+            "delete": [_FakeResponse(404, {"errors": [{"reason": "Not found"}]})],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+    zone = type("Z", (), {"name": "gone.example."})()
+
+    await driver._apply_zone(_Server(), _CREDS, zone, "delete")
+
+    assert [c["method"] for c in fake.calls] == ["get", "delete"]
+
+
+async def test_apply_zone_delete_other_errors_still_raise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for status in (401, 429, 500):
+        fake = _FakeClient(
+            {
+                "get": [_FakeResponse(200, _env([{"id": 77, "domain": "gone.example"}]))],
+                "delete": [_FakeResponse(status, {"errors": [{"reason": "nope"}]})],
+            }
+        )
+        driver = _patch_client(monkeypatch, fake)
+        zone = type("Z", (), {"name": "gone.example."})()
+        with pytest.raises(CloudDNSError):
+            await driver._apply_zone(_Server(), _CREDS, zone, "delete")
+
+
+async def test_apply_zone_delete_404_without_linode_envelope_still_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 404 without Linode's ``errors`` envelope is not its verdict on the
+    domain, so the zone is not dropped as already gone."""
+    fake = _FakeClient(
+        {
+            "get": [_FakeResponse(200, _env([{"id": 77, "domain": "gone.example"}]))],
+            "delete": [_FakeResponse(404, {})],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+    zone = type("Z", (), {"name": "gone.example."})()
+    with pytest.raises(CloudDNSError):
+        await driver._apply_zone(_Server(), _CREDS, zone, "delete")
+
+
 # ── Error surfacing ─────────────────────────────────────────────────────
 async def test_error_envelope_raises_clouddnserror(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = {"errors": [{"reason": "Invalid Token", "field": None}]}
@@ -581,3 +644,74 @@ def test_capabilities_shape() -> None:
     assert "CAA" in caps["record_types"]
     assert "SVCB" not in caps["record_types"]
     assert "HTTPS" not in caps["record_types"]
+
+
+# ── SRV split-form contract (#1526) ─────────────────────────────────────────
+
+
+async def test_apply_record_create_srv_sends_weight_and_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeClient(
+        {
+            "get": [_FakeResponse(200, _env([{"id": 42, "domain": "example.com"}]))],
+            "post": [_FakeResponse(200, {"id": 501})],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+    change = RecordChange(
+        op="create",
+        zone_name="example.com.",
+        record=RecordData(
+            name="_sip._tcp",
+            record_type="SRV",
+            value="sip.example.com",
+            ttl=3600,
+            priority=10,
+            weight=20,
+            port=5060,
+        ),
+        target_serial=1,
+    )
+
+    await driver._apply_record(_Server(), _CREDS, change)
+
+    post = next(c for c in fake.calls if c["method"] == "post")
+    assert post["json"]["priority"] == 10
+    assert post["json"]["weight"] == 20
+    assert post["json"]["port"] == 5060
+    assert post["json"]["target"] == "sip.example.com"
+
+
+async def test_list_zone_records_srv_weight_and_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    domain_lookup = _env([{"id": 42, "domain": "example.com"}])
+    records = _env(
+        [
+            {
+                "id": 103,
+                "name": "_sip._tcp",
+                "type": "SRV",
+                "target": "sip.example.com",
+                "ttl_sec": 3600,
+                "priority": 10,
+                "weight": 20,
+                "port": 5060,
+            }
+        ]
+    )
+    fake = _FakeClient({"get": [_FakeResponse(200, domain_lookup), _FakeResponse(200, records)]})
+    driver = _patch_client(monkeypatch, fake)
+
+    recs = await driver._list_zone_records(_Server(), _CREDS, "example.com.")
+
+    assert recs == [
+        RecordData(
+            name="_sip._tcp",
+            record_type="SRV",
+            value="sip.example.com",
+            ttl=3600,
+            priority=10,
+            weight=20,
+            port=5060,
+        )
+    ]

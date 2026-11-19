@@ -9,6 +9,7 @@ import { EnvironmentBanner } from "./EnvironmentBanner";
 import { MaintenanceBanner } from "./MaintenanceBanner";
 import { MaintenanceModeBanner } from "./MaintenanceModeBanner";
 import { SetupBanner } from "./SetupBanner";
+import { IdleLogout } from "./IdleLogout";
 import { CopilotButton } from "@/components/copilot/CopilotButton";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 
@@ -44,7 +45,10 @@ export function AppLayout() {
         <SetupBanner />
         <MaintenanceBanner />
         <MaintenanceModeBanner />
-        <Header onMobileMenu={() => setMobileOpen(true)} />
+        <Header
+          onMobileMenu={() => setMobileOpen(true)}
+          mobileNavOpen={mobileOpen}
+        />
         <main className="flex-1 overflow-auto">
           <ErrorBoundary
             key={pathname}
@@ -74,6 +78,8 @@ export function AppLayout() {
       {/* Issue #90 — Operator Copilot floating button. Hidden when no
           AI provider is enabled, opens the chat drawer otherwise. */}
       {copilotEnabled && <CopilotButton />}
+      {/* Settings → Sessions: Auto-Logout Warning + Session Timeout. */}
+      <IdleLogout />
     </div>
   );
 }

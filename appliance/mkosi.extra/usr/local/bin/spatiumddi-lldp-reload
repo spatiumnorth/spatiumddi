@@ -30,9 +30,31 @@
 # Persistence across A/B slot swaps (Phase 8a, issue #138): /etc/lldpd.d/ +
 # /etc/default/lldpd live on the /etc overlay upper (/var/persist/etc) and
 # the sidecars on /var directly, so operator LLDP config + lldpd's enable
-# state survive a slot swap with no reapply.
+# link survive a slot swap ON DISK. At boot that is not enough (#2376): the
+# image ships lldpd disabled, the operator's enable link lives only in the
+# overlay upper, and etc.mount puts that up after systemd has loaded its
+# units, so nothing wants lldpd. ``--boot`` (run by
+# spatiumddi-optin-services-boot.service after etc.mount) starts it when
+# the operator has LLDP on — see spatiumddi-snmp-reload for the details.
 
 set -euo pipefail
+
+# Writes stdin to $1, a file in the release-state directory. The api and the
+# supervisor can create names in that directory and this runs as root, so a
+# redirect onto the name would follow a symlink planted there. Instead a temp
+# file is created exclusively (mktemp) next to it and renamed over the name:
+# whatever was at the name, a symlink included, is replaced, never written
+# through. -T: a directory at the name fails the rename instead of receiving
+# the file. $2 = mode, default 0644.
+state_write() {
+    local _dst="$1" _tmp
+    _tmp=$(mktemp "$(dirname -- "$_dst")/.$(basename -- "$_dst").XXXXXX") || return 1
+    if cat > "$_tmp" && chmod "${2:-0644}" "$_tmp" && mv -fT -- "$_tmp" "$_dst"; then
+        return 0
+    fi
+    rm -f -- "$_tmp"
+    return 1
+}
 
 TRIGGER=/var/lib/spatiumddi/release-state/lldp-config-pending
 HASH_SIDECAR=/var/lib/spatiumddi/release-state/lldp-config-hash
@@ -45,6 +67,45 @@ LOCK=/run/spatiumddi-lldp-reload.lock
 
 mkdir -p "$LOG_DIR" "$(dirname "$HASH_SIDECAR")" "$(dirname "$ETC_CONF")"
 exec >> "$LOG" 2>&1
+
+# ── --boot: start lldpd when the operator has LLDP on (#2376) ───────
+# The hash sidecar is the plane's record of "on" (non-empty only after a
+# successful enabled apply, truncated by a disabled one).
+if [ "${1:-}" = "--boot" ]; then
+    echo
+    echo "[$(date -Iseconds)] === lldp boot re-arm ==="
+    exec 9>"$LOCK"
+    if ! flock -n 9; then
+        echo "  an apply is in progress; it owns lldpd's state"
+        exit 0
+    fi
+    want=""
+    [ -f "$HASH_SIDECAR" ] && want=$(tr -d '[:space:]' < "$HASH_SIDECAR")
+    if [ -z "$want" ]; then
+        echo "  LLDP is not configured on; nothing to start"
+        if [ -f "$STATUS_SIDECAR" ] && ! systemctl is-active --quiet lldpd; then
+            echo "stopped" | state_write "$STATUS_SIDECAR"
+        fi
+        exit 0
+    fi
+    if ! systemctl is-enabled --quiet lldpd 2>/dev/null; then
+        echo "  LLDP is on but lldpd is not enabled; re-enabling"
+        systemctl enable lldpd >/dev/null 2>&1 || echo "  ! systemctl enable lldpd failed"
+    fi
+    if ! systemctl is-active --quiet lldpd; then
+        systemctl start lldpd >/dev/null 2>&1 || echo "  ! systemctl start lldpd failed"
+        sleep 2
+    fi
+    if systemctl is-active --quiet lldpd; then
+        echo "  ✓ lldpd is active"
+        echo "running" | state_write "$STATUS_SIDECAR"
+    else
+        echo "  ✗ lldpd is not running"
+        systemctl status lldpd --no-pager 2>&1 | sed 's/^/      /' | head -10 || true
+        echo "stopped" | state_write "$STATUS_SIDECAR"
+    fi
+    exit 0
+fi
 
 echo
 echo "[$(date -Iseconds)] === spatiumddi-lldp-reload fired ==="
@@ -71,8 +132,8 @@ DAEMON_ARGS=$(sed -n '3p' "$TRIGGER" | tr -d '\r\n')
 # anything outside it rather than trying to escape.
 if printf '%s' "$DAEMON_ARGS" | LC_ALL=C grep -q '[^A-Za-z0-9 _=./:,-]'; then
     echo "  ✗ DAEMON_ARGS contains disallowed characters — refusing"
-    echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
-    mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+    echo "failed $(date -Iseconds)" | state_write "${TRIGGER}.state"
+    mv -T "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
     exit 1
 fi
 TMP_BODY=$(mktemp /tmp/spatium-lldpd.conf.XXXXXX)
@@ -100,8 +161,8 @@ case "$MARKER" in
     enabled)
         if ! command -v lldpd >/dev/null 2>&1; then
             echo "  ✗ lldpd binary not found — is lldpd installed?"
-            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
-            mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+            echo "failed $(date -Iseconds)" | state_write "${TRIGGER}.state"
+            mv -T "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
             exit 1
         fi
         # Atomic swap of the lldpcli-directive config + the daemon args.
@@ -112,9 +173,9 @@ case "$MARKER" in
         # wouldn't re-read /etc/default). enable --now covers first apply.
         if ! systemctl enable --now lldpd; then
             echo "  ✗ systemctl enable --now lldpd failed"
-            echo "stopped" > "$STATUS_SIDECAR"
-            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
-            mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+            echo "stopped" | state_write "$STATUS_SIDECAR"
+            echo "failed $(date -Iseconds)" | state_write "${TRIGGER}.state"
+            mv -T "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
             exit 1
         fi
         systemctl restart lldpd >/dev/null 2>&1 || true
@@ -124,16 +185,16 @@ case "$MARKER" in
             # Push the running config through lldpcli too so a live daemon
             # (that didn't restart cleanly) still converges. Best-effort.
             lldpcli -c "$ETC_CONF" >/dev/null 2>&1 || true
-            echo "running" > "$STATUS_SIDECAR"
-            echo "$HASH" > "$HASH_SIDECAR"
-            echo "done $(date -Iseconds)" > "${TRIGGER}.state"
-            mv "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
+            echo "running" | state_write "$STATUS_SIDECAR"
+            echo "$HASH" | state_write "$HASH_SIDECAR"
+            echo "done $(date -Iseconds)" | state_write "${TRIGGER}.state"
+            mv -T "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
         else
             echo "  ✗ lldpd not active after start"
             systemctl status lldpd --no-pager | sed 's/^/      /' || true
-            echo "stopped" > "$STATUS_SIDECAR"
-            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
-            mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+            echo "stopped" | state_write "$STATUS_SIDECAR"
+            echo "failed $(date -Iseconds)" | state_write "${TRIGGER}.state"
+            mv -T "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
             exit 1
         fi
         ;;
@@ -145,16 +206,16 @@ case "$MARKER" in
 EOF
         chmod 0644 "$ETC_CONF"
         write_default ""
-        echo "stopped" > "$STATUS_SIDECAR"
-        : > "$HASH_SIDECAR"
+        echo "stopped" | state_write "$STATUS_SIDECAR"
+        state_write "$HASH_SIDECAR" </dev/null
         echo "  ✓ lldpd stopped + disabled, config stubbed (no firewall change needed)"
-        echo "done $(date -Iseconds)" > "${TRIGGER}.state"
-        mv "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
+        echo "done $(date -Iseconds)" | state_write "${TRIGGER}.state"
+        mv -T "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
         ;;
     *)
         echo "  ✗ unknown marker line: ${MARKER:-<empty>}"
-        echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
-        mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+        echo "failed $(date -Iseconds)" | state_write "${TRIGGER}.state"
+        mv -T "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
         exit 1
         ;;
 esac

@@ -614,6 +614,12 @@ class Appliance(Base):
     reboot_requested_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # #1446 — the boot (``/proc/sys/kernel/random/boot_id``) the reboot
+    # request applies to, recorded from the first heartbeat after the stamp.
+    # The request is retired when a heartbeat arrives from a DIFFERENT boot,
+    # which is the proof it landed. NULL until that first heartbeat, and
+    # always NULL for a supervisor too old to report a boot id.
+    reboot_requested_boot_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # #786 — operator asked to clear a failed upgrade. The visible failure
     # state (the ``last_upgrade_*`` columns above) is re-published from
     # host sidecar files on every heartbeat, so clearing the DB alone does
@@ -880,6 +886,21 @@ class Appliance(Base):
     # NULL (idle).
     cluster_join_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
     cluster_join_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # #1903 — id of the promote in flight, stamped fresh by every promote. The
+    # supervisor echoes the id of the join it fired; a terminal join verdict is
+    # applied only when it matches, so a stale ``ready`` from a previous
+    # membership (a Replace-evicted box that is still up) cannot settle a
+    # re-promote. NULL = no promote has stamped one.
+    cluster_transition_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # #1903 — when that promote was stamped. Never compared with a node's clock:
+    # the heartbeat hands the node its AGE (control-plane now minus this), and the
+    # node compares that with the age of its sidecar verdict (node now minus the
+    # file's mtime). A verdict younger than the promote was written after it, so a
+    # node whose join a pre-#1903 supervisor fired is not re-fired over its fresh
+    # ``ready`` just because it holds no fire record for the id.
+    cluster_transition_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # #590 — when ``cluster_join_state`` last CHANGED. No cluster transition
     # has a timeout (each converges only on a supervisor report), so this is
     # the only way to tell a healthy multi-minute k3s join from one that will
@@ -940,9 +961,21 @@ class Appliance(Base):
     # dead). The SEED supervisor reads the eviction list off its
     # heartbeat response and deletes the k8s Node (k3s removes the etcd
     # member with it), then reports the hostname back so the backend
-    # clears this flag + settles the row to ``left``. Distinct from a
-    # graceful demote, which the leaving node drives itself.
+    # clears this flag + settles the row to ``left``. A graceful demote's
+    # node drives its own leave, and (#1541) its ``left`` report sets this
+    # too, with ``evict_after_demote``, so the seed deletes the stale Node.
     evict_requested: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa.text("false")
+    )
+    # #1541 — True when the eviction above is the seed's cleanup after a
+    # graceful DEMOTE (the node left etcd itself and reported ``left``; the
+    # seed only deletes its stale Node and confirms etcd agrees), False for a
+    # dead-node Replace. The seed treats the two differently: a Replace arms
+    # #1059's CloudNativePG size hold until the replacement is promoted, and
+    # a demote must never arm it — the slot is given up on purpose, so the
+    # control plane scales down to the committed count. Cleared with
+    # ``evict_requested``.
+    evict_after_demote: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=sa.text("false")
     )
 

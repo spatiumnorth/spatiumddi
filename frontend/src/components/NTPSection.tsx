@@ -3,6 +3,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, Plus, Trash2 } from "lucide-react";
 
 import {
+  formatDialogError,
   settingsApi,
   type NtpCustomServer,
   type NtpSourceMode,
@@ -90,8 +91,11 @@ export function NTPSection({
       setSavedAt(Date.now());
       setTimeout(() => setSavedAt(null), 2500);
     },
+    // formatDialogError, not err.message: on an AxiosError the latter is only
+    // "Request failed with status code N", which hides the server's reason,
+    // the validator's sentence naming the refused value (#3424).
     onError: (err: unknown) => {
-      setSaveErr(err instanceof Error ? err.message : String(err));
+      setSaveErr(formatDialogError(err));
     },
   });
 
@@ -167,7 +171,7 @@ export function NTPSection({
       {(sourceMode === "pool" || sourceMode === "mixed") && (
         <Field
           label="Pool servers"
-          description="Comma- or space-separated list of NTP pool hostnames (e.g. ``pool.ntp.org``, ``2.debian.pool.ntp.org``). Each name expands to multiple servers via DNS. ``iburst`` is implied so initial sync is fast."
+          description="Comma- or space-separated list of NTP pool hostnames (e.g. ‘pool.ntp.org’, ‘2.debian.pool.ntp.org’). Each name expands to multiple servers via DNS. ‘iburst’ is implied so initial sync is fast."
         >
           <input
             type="text"
@@ -186,9 +190,11 @@ export function NTPSection({
             <div>
               <div className="text-sm font-medium">Unicast servers</div>
               <div className="text-xs text-muted-foreground">
-                Explicit NTP servers (host or IP). ``iburst`` speeds initial
-                sync; ``prefer`` tags a canonical source — chrony biases toward
-                it during selection when multiple servers are healthy.
+                Explicit NTP servers (host or IP).{" "}
+                <code className="font-mono">iburst</code> speeds initial sync;{" "}
+                <code className="font-mono">prefer</code> tags a canonical
+                source — chrony biases toward it during selection when multiple
+                servers are healthy.
               </div>
             </div>
             <button
@@ -289,7 +295,7 @@ export function NTPSection({
       {allowClients && (
         <Field
           label="Allowed client CIDRs"
-          description="Comma- or space-separated list of CIDRs allowed to query this appliance for time. Empty = nothing allowed (chrony refuses every query). Use ``0.0.0.0/0`` to allow everything (rare; rely on the host firewall + perimeter instead)."
+          description="Comma- or space-separated list of CIDRs allowed to query this appliance for time. Empty = nothing allowed (chrony refuses every query). Use ‘0.0.0.0/0’ to allow everything (rare; rely on the host firewall + perimeter instead)."
         >
           <input
             type="text"

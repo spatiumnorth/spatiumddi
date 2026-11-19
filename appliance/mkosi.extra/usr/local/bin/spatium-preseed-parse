@@ -78,6 +78,14 @@ _RESERVED_USERS = {
     "news", "uucp", "proxy", "www-data", "backup", "list", "irc", "nobody",
     "systemd-network", "systemd-resolve", "messagebus", "sshd",
 }
+# Names Debian's live tooling gives the live-session account: live-config
+# creates ``user`` and grants it /etc/sudoers.d/live, and ``debian`` is the
+# live-build default. Neither exists in the image (mkosi.postinst removes
+# live-config's account components), so they would pass the passwd check
+# below — but an admin account must never share a name a live-session
+# sudo rule or a later image could hand privileges to without a password.
+# Kept apart from _RESERVED_USERS so the refusal says why.
+_LIVE_INSTALLER_USERS = {"user", "debian"}
 
 ZONEINFO_DIR = "/usr/share/zoneinfo"
 # IANA zone names are ASCII letters / digits / '+' / '-' / '_' joined by
@@ -107,6 +115,11 @@ def validate_admin_user(name: str) -> str:
             f"admin_user {name!r} is a reserved system account that "
             "already exists in the image — pick a different name (the root "
             "password is set from admin_password separately)"
+        )
+    if name in _LIVE_INSTALLER_USERS:
+        return (
+            f"admin_user {name!r} is reserved by the live installer — "
+            "pick a different name"
         )
     return ""
 

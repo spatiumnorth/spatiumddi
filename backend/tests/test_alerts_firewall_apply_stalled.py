@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
 from app.models.firewall import FirewallApplyState
+from app.models.settings import PlatformSettings
 from app.services.alerts import (
     _FIREWALL_STALE_GRACE,
     _matching_firewall_apply_stalled_subjects,
@@ -27,6 +28,12 @@ _RULE = SimpleNamespace(severity="warning")
 
 
 async def _appliance(db: AsyncSession, **st_kw: object) -> Appliance:
+    # #2794 — the matcher only runs while fleet enforcement is on.
+    cfg = await db.get(PlatformSettings, 1)
+    if cfg is None:
+        cfg = PlatformSettings(id=1)
+        db.add(cfg)
+    cfg.firewall_enabled = True
     der = os.urandom(32)
     a = Appliance(
         id=uuid.uuid4(),

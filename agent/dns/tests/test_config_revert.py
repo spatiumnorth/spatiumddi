@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
+import httpx
 import pytest
 
 from spatium_dns_agent.cache import (
@@ -32,13 +33,14 @@ from spatium_dns_agent.config_apply import (
     STATUS_OK,
     STATUS_REVERT_FAILED,
     STATUS_REVERTED,
+    MAX_ERROR_LEN,
     ApplyStatus,
     ConfigApplyError,
     Quarantine,
     truncate_error,
 )
-from spatium_dns_agent.drivers.base import DriverBase
-from spatium_dns_agent.sync import SyncLoop
+from spatium_dns_agent.drivers.base import DriverBase, HeldZone
+from spatium_dns_agent.sync import PARTIAL_APPLY_PREFIX, SyncLoop, _partial_apply_error
 
 
 # ── cache: previous == last GOOD, not last fetched ────────────────────────
@@ -187,14 +189,21 @@ class _Driver(DriverBase):
         super().__init__(state_dir)
         self.fail_on: str | None = None
         self.applied: list[str] = []
+        # What the next validate holds back (#1403), as the BIND9 zone check does.
+        self.hold: tuple[HeldZone, ...] = ()
+        self.ops: list[str] = []
+        self.validations = 0
 
     def render(self, bundle: dict[str, Any]) -> None:
         if self.fail_on == "render":
             raise RuntimeError("render boom")
 
     def validate(self) -> None:
+        self.validations += 1
+        self.held_back = ()
         if self.fail_on == "validate":
             raise RuntimeError("named-checkconf failed: bad acl")
+        self.held_back = self.hold
 
     def swap_and_reload(self) -> None:
         if self.fail_on == "reload":
@@ -205,6 +214,7 @@ class _Driver(DriverBase):
         self.applied.append(str(bundle.get("etag")))
 
     def apply_record_op(self, op: dict[str, Any]) -> dict[str, Any] | None:
+        self.ops.append(str(op["op_id"]))
         return None
 
     def start_daemon(self) -> None:
@@ -400,6 +410,225 @@ def test_bootstrap_falls_back_when_cached_bundle_fails(tmp_path: Path) -> None:
     assert loop._quarantine.blocks("bad")
 
 
+# ── #1403: a zone the zone check refuses holds back only itself ───────────
+
+HELD = HeldZone(
+    "bad.test",
+    "internal",
+    "zone bad.test/IN: NS 'ns9.bad.test' has no address records (A or AAAA)",
+    True,
+)
+
+
+def test_a_held_zone_is_reported_not_quarantined(tmp_path: Path) -> None:
+    """The rest of the bundle is live, so it is committed and nothing is
+    quarantined; the server says which zone is not, the way #882 reports any
+    divergence."""
+    ensure_layout(tmp_path)
+    driver = _Driver(tmp_path)
+    loop = _loop(tmp_path, driver)
+    driver.hold = (HELD,)
+
+    save_config(tmp_path, _bundle("b1"), "b1")
+    assert loop._apply_with_revert(_bundle("b1"), "b1") is True
+
+    assert loop._quarantine.etag is None
+    assert load_previous_config(tmp_path) == (_bundle("b1"), "b1")
+    status = loop.apply_status
+    assert (status.status, status.etag, status.failed_etag, status.phase) == (
+        STATUS_REVERTED,
+        "b1",
+        "b1",
+        PHASE_VALIDATE,
+    )
+    assert "bad.test (view internal): zone bad.test/IN: NS" in (status.error or "")
+    assert "still served from its last good copy" in (status.error or "")
+    assert loop.heartbeat.config_apply is status
+    _assert_echoed(loop, STATUS_REVERTED)
+
+
+def test_held_back_error_names_every_zone_and_stays_bounded() -> None:
+    gone = HeldZone("new.test", None, "zone new.test/IN: bad dotted quad", False)
+    text = _partial_apply_error((HELD, gone), ())
+    assert text.startswith(
+        PARTIAL_APPLY_PREFIX + "named-checkzone refused 2 zone files, held back until"
+    )
+    assert "bad.test (view internal): zone bad.test/IN" in text
+    assert "new.test: zone new.test/IN: bad dotted quad (not served)" in text
+    long = HeldZone("x.test", None, "y" * 5000, True)
+    assert len(_partial_apply_error((long,), ())) <= MAX_ERROR_LEN
+
+
+def test_name_hold_is_not_worded_as_a_zone_file_named_checkzone_refused() -> None:
+    """#3843: a zone held for its name was never seen by named-checkzone."""
+    longz = HeldZone("l" * 249 + ".test", None, "the zone name is 253 characters", False, True)
+    text = _partial_apply_error((longz,), ())
+    assert "whose name is too long for its files" in text
+    assert "named-checkzone" not in text
+    assert "until the data loads" not in text
+    assert "the zone name is 253 characters" in text
+    # Alongside a zone the checker refused, each keeps its own lead-in.
+    both = _partial_apply_error((HELD, longz), ())
+    assert "named-checkzone refused a zone file, held back until the data loads" in both
+    assert "holds back a zone whose name is too long" in both
+
+
+def test_both_kinds_of_unserved_zone_are_named_in_one_verdict() -> None:
+    """No driver both holds back and refuses today; if one did, the verdict
+    names both rather than dropping one."""
+    text = _partial_apply_error((HELD,), ["other.test: HTTP 422 bad rrset"])
+    assert text.startswith(PARTIAL_APPLY_PREFIX + "named-checkzone refused a zone file")
+    assert "the daemon refused 1 item(s); everything else is served: other.test" in text
+
+
+class _Http:
+    """The control plane: one long-poll answer per ``get``, posts recorded."""
+
+    def __init__(self, bundles: list[dict[str, Any]]):
+        self.bundles = bundles
+        self.posts: list[tuple[str, dict[str, Any]]] = []
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def get(self, url: str, headers: dict[str, str]) -> httpx.Response:
+        return httpx.Response(200, json=self.bundles.pop(0), request=httpx.Request("GET", url))
+
+    def post(self, url: str, headers: dict[str, str], json: dict[str, Any]) -> httpx.Response:
+        self.posts.append((url, json))
+        return httpx.Response(200, json={}, request=httpx.Request("POST", url))
+
+
+def _flat(tag: str, structural: str, ops: list[str]) -> dict[str, Any]:
+    """A bundle of a group without views: two zones, and a page of record ops."""
+    return {
+        "etag": tag,
+        "structural_etag": structural,
+        "zones": [{"name": "bad.test.", "serial": 7}, {"name": "lab.test.", "serial": 9}],
+        "pending_record_ops": [{"op_id": op, "op": "create", "zone_name": "lab.test."}
+                               for op in ops],
+    }
+
+
+def test_a_poll_applies_the_rest_while_a_zone_is_held(tmp_path: Path, monkeypatch) -> None:
+    """Before #1403 a refused zone returned before the ops page: every record
+    change on the server stalled behind it. Now the page drains, and the held
+    zone is left out of the zone-state report (it is not serving that serial)."""
+    ensure_layout(tmp_path)
+    monkeypatch.setattr("spatium_dns_agent.sync.push_rendered_config", lambda *a: None)
+    driver = _Driver(tmp_path)
+    loop = _loop(tmp_path, driver)
+    http = _Http([_flat("e1", "s1", ["op-1"]), _flat("e2", "s1", [])])
+    loop._client = lambda: http  # type: ignore[method-assign]
+
+    driver.hold = (HELD,)
+    loop._poll_once()
+
+    assert driver.applied == ["e1"]
+    assert driver.ops == ["op-1"]
+    assert loop.heartbeat.pending_acks == [{"op_id": "op-1", "result": "ok"}]
+    assert loop.apply_status.status == STATUS_REVERTED, "the recovery check must not clear it"
+    assert loop._quarantine.etag is None
+    assert loop._current_structural_etag is None
+    reports = [body for url, body in http.posts if url.endswith("/zone-state")]
+    assert reports == [{"zones": [{"zone_name": "lab.test.", "serial": 9}]}]
+
+    # The bad record is deleted: on a group without views a record-only change,
+    # so the structural etag does not move. It must still re-render, load the
+    # zone, and clear the verdict.
+    driver.hold = ()
+    loop._poll_once()
+
+    assert driver.applied == ["e1", "e2"]
+    assert loop.apply_status.status == STATUS_OK
+    assert loop._current_structural_etag == "s1"
+    assert loop.heartbeat.daemon_status == {"status": "ok"}
+
+
+def test_a_change_made_while_a_zone_is_held_still_applies(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """#1403's own scenario: the zone is already held when another zone's
+    record changes. The next bundle re-renders, holds the zone again, applies
+    the rest, and keeps reporting the hold; nothing is quarantined."""
+    ensure_layout(tmp_path)
+    monkeypatch.setattr("spatium_dns_agent.sync.push_rendered_config", lambda *a: None)
+    driver = _Driver(tmp_path)
+    loop = _loop(tmp_path, driver)
+    http = _Http([_flat("e1", "s1", []), _flat("e2", "s1", ["op-2"])])
+    loop._client = lambda: http  # type: ignore[method-assign]
+    driver.hold = (HELD,)
+
+    loop._poll_once()
+    loop._poll_once()
+
+    assert driver.applied == ["e1", "e2"], "the second bundle re-rendered"
+    assert driver.ops == ["op-2"]
+    assert loop.apply_status.status == STATUS_REVERTED
+    assert loop.apply_status.etag == "e2"
+    assert loop._quarantine.etag is None
+    assert loop._current_structural_etag is None
+    _assert_echoed(loop, STATUS_REVERTED)
+
+
+def test_a_held_zone_reads_as_a_partial_apply_and_survives_a_record_only_poll(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A BIND9 hold is reported with :data:`PARTIAL_APPLY_PREFIX`, so the UI and
+    the ``agent_config_rejected`` alert say "nothing rolled back" instead of
+    #882's rollback wording (#1280). And a poll that re-renders nothing must
+    not read that verdict as stale: the zone is still held."""
+    ensure_layout(tmp_path)
+    monkeypatch.setattr("spatium_dns_agent.sync.push_rendered_config", lambda *a: None)
+    driver = _Driver(tmp_path)
+    loop = _loop(tmp_path, driver)
+    http = _Http([_flat("e1", "s1", []), _flat("e2", "s1", ["op-3"])])
+    loop._client = lambda: http  # type: ignore[method-assign]
+    driver.hold = (HELD,)
+
+    loop._poll_once()
+    error = loop.apply_status.error or ""
+    assert loop.apply_status.status == STATUS_REVERTED
+    assert error.startswith(PARTIAL_APPLY_PREFIX + "named-checkzone refused a zone file")
+    assert "bad.test (view internal)" in error
+
+    # Force the record-only path: the structural etag matches, so nothing
+    # re-renders and only the stale-verdict clear stands between the poll and
+    # an ``ok`` that would hide the held zone.
+    loop._current_structural_etag = "s1"
+    loop._poll_once()
+
+    assert driver.applied == ["e1"], "a record-only poll re-renders nothing"
+    assert driver.ops == ["op-3"]
+    assert loop.apply_status.status == STATUS_REVERTED
+    assert (loop.apply_status.error or "").startswith(PARTIAL_APPLY_PREFIX)
+    _assert_echoed(loop, STATUS_REVERTED)
+
+
+def test_bootstrap_reports_zones_held_back(tmp_path: Path) -> None:
+    """A restart re-applies the cache; a zone it holds back is reported too,
+    and the first bundle after it re-renders."""
+    ensure_layout(tmp_path)
+    save_config(tmp_path, _bundle("cached"), "cached")
+    commit_config(tmp_path, "cached")
+
+    class _Holding(_Driver):
+        def __init__(self, state_dir: Path):
+            super().__init__(state_dir)
+            self.hold = (HELD,)
+
+    driver = _Holding(tmp_path)
+    loop = _loop(tmp_path, driver)
+
+    assert driver.applied == ["cached"]
+    assert loop.apply_status.status == STATUS_REVERTED
+    assert "bad.test (view internal)" in (loop.apply_status.error or "")
+    assert loop._current_structural_etag is None
+
+
 # ── named-checkconf diagnostics land on stdout ────────────────────────────
 
 
@@ -436,6 +665,26 @@ def test_bind9_validate_reads_checkconf_stdout(tmp_path: Path, monkeypatch) -> N
     assert "named.conf:20" in str(ei.value)
 
 
+def test_bind9_validate_empty_output_names_exit_status(tmp_path: Path, monkeypatch) -> None:
+    """No text on either stream must not read as a bare "no output" (#3153)."""
+    import subprocess
+
+    from spatium_dns_agent.drivers.bind9 import Bind9Driver
+
+    (tmp_path / "rendered.new").mkdir(parents=True)
+    (tmp_path / "rendered.new" / "named.conf").write_text("options {};\n")
+    monkeypatch.setattr("spatium_dns_agent.drivers.bind9.shutil.which", lambda _: "/x")
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *a, **kw: subprocess.CompletedProcess(a[0], -9, stdout="", stderr=""),
+    )
+    with pytest.raises(RuntimeError) as ei:
+        Bind9Driver(tmp_path).validate()
+    assert "exit status -9" in str(ei.value)
+    assert "named-checkconf" in str(ei.value)
+
+
 def test_commit_is_skipped_when_previous_already_matches(tmp_path: Path) -> None:
     """``commit_config`` is called from two points in a successful poll; the
     second must not re-copy a bundle that can be tens of kilobytes."""
@@ -458,3 +707,59 @@ def test_commit_refuses_when_current_is_not_what_applied(tmp_path: Path) -> None
     # must not promote ``current``.
     commit_config(tmp_path, "good")
     assert load_previous_config(tmp_path) == (_bundle("good"), "good")
+
+
+# ── quarantine is keyed on the structure, not the full etag (#2647) ───────
+
+
+def test_quarantine_record_only_change_keeps_the_ladder(tmp_path: Path, monkeypatch) -> None:
+    ensure_layout(tmp_path)
+    now = [0.0]
+    monkeypatch.setattr("spatium_dns_agent.config_apply.time.time", lambda: now[0])
+    q = Quarantine(tmp_path)
+    q.record("e1", "x", structural="s1")
+    assert q.blocks("e2", "s1"), "same structure, new full etag: still blocked"
+    q.record("e2", "x", structural="s1")
+    assert q.failures == 2, "a record-only change must not restart the backoff"
+    assert not q.blocks("e3", "s2")
+    q.record("e3", "y", structural="s2")
+    assert q.failures == 1
+
+
+def test_quarantine_from_an_older_agent_file_matches_on_full_etag(tmp_path: Path) -> None:
+    ensure_layout(tmp_path)
+    path = tmp_path / "config" / "quarantine.json"
+    path.write_text(
+        json.dumps({"etag": "old", "reason": "r", "failures": 2, "retry_at": 9e12})
+    )
+    q = Quarantine(tmp_path)
+    assert q.structural is None
+    assert q.blocks("old", "s-whatever")
+    assert not q.blocks("other", "s-whatever")
+    assert q.same_structure("old", None)
+
+
+def test_record_only_changes_do_not_reapply_a_quarantined_structure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    ensure_layout(tmp_path)
+    monkeypatch.setattr("spatium_dns_agent.sync.push_rendered_config", lambda *a: None)
+    driver = _Driver(tmp_path)
+    loop = _loop(tmp_path, driver)
+    http = _Http(
+        [_flat("e1", "sBAD", []), _flat("e2", "sBAD", ["op-1"]), _flat("e3", "sBAD", ["op-2"])]
+    )
+    loop._client = lambda: http  # type: ignore[method-assign]
+    driver.fail_on = "validate"
+
+    loop._poll_once()
+    assert driver.validations == 1
+    assert loop._quarantine.failures == 1
+
+    loop._poll_once()
+    loop._poll_once()
+
+    assert driver.validations == 1, "record-only bundles must not re-render/validate"
+    assert loop._quarantine.failures == 1
+    assert loop._quarantine.etag == "e1"
+    assert driver.ops == []

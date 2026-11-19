@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.core.crypto import encrypt_str
 from app.core.security import create_access_token, hash_password
 from app.models.appliance import ApplianceCertificate
@@ -86,9 +88,14 @@ async def test_defaults_are_off(client: AsyncClient, db_session: AsyncSession) -
     assert body["tls_certificate_id"] is None
 
 
+@pytest.mark.parametrize("appliance_mode", [True, False])
 async def test_enabling_listener_without_cert_is_422(
-    client: AsyncClient, db_session: AsyncSession
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    appliance_mode: bool,
 ) -> None:
+    monkeypatch.setattr(settings, "appliance_mode", appliance_mode)
     headers = await _superadmin(db_session)
     group = await _group(db_session)
     await db_session.commit()
@@ -100,6 +107,15 @@ async def test_enabling_listener_without_cert_is_422(
     )
     assert r.status_code == 422
     assert "certificate" in r.json()["detail"].lower()
+    # #3045: Web UI Certificate is an entry under Appliance -> Fleet, not an
+    # Appliance tab, and Fleet shows it only on an appliance-hosted control
+    # plane; Docker / Kubernetes are sent to the API that holds the store.
+    detail = r.json()["detail"]
+    if appliance_mode:
+        assert "Appliance → Fleet → Web UI Certificate" in detail
+    else:
+        assert "Web UI Certificate" not in detail
+        assert "POST /api/v1/appliance/tls/upload" in detail
 
 
 async def test_enabling_listener_with_csr_pending_cert_is_422(
@@ -437,3 +453,180 @@ async def test_delete_cert_linked_but_listeners_off_succeeds(
 
     r = await client.delete(f"/api/v1/appliance/tls/{cert.id}", headers=headers)
     assert r.status_code == 204, r.text
+
+
+async def test_delete_active_cert_off_appliance_succeeds(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch
+) -> None:
+    """#3061 — ``is_active`` means "the cert nginx serves" and only an
+    appliance has one, yet an ACME issue sets it anywhere. Refusing the
+    delete would leave an issued cert undeletable on compose / k8s."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "appliance_mode", False)
+    headers = await _superadmin(db_session)
+    cert = await _cert(db_session)
+    cert.is_active = True
+    await db_session.commit()
+
+    r = await client.delete(f"/api/v1/appliance/tls/{cert.id}", headers=headers)
+    assert r.status_code == 204, r.text
+
+
+async def test_delete_active_cert_on_appliance_is_409(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch
+) -> None:
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "appliance_mode", True)
+    headers = await _superadmin(db_session)
+    cert = await _cert(db_session)
+    cert.is_active = True
+    await db_session.commit()
+
+    r = await client.delete(f"/api/v1/appliance/tls/{cert.id}", headers=headers)
+    assert r.status_code == 409, r.text
+
+
+@pytest.mark.parametrize("appliance_mode", [True, False])
+async def test_delete_active_cert_in_use_by_listener_is_409_on_every_install(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch, appliance_mode: bool
+) -> None:
+    """#3061 relaxed the ``is_active`` refusal off an appliance; the DoT/DoH
+    in-use guard is the one that protects encrypted-DNS clients, and it must
+    still refuse on both install shapes, whatever ``is_active`` says."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "appliance_mode", appliance_mode)
+    headers = await _superadmin(db_session)
+    group = await _group(db_session)
+    cert = await _cert(db_session)
+    cert.is_active = not appliance_mode  # off-appliance: the ACME-issued shape
+    db_session.add(
+        DNSServerOptions(group_id=group.id, dot_enabled=True, tls_certificate_id=cert.id)
+    )
+    await db_session.commit()
+
+    r = await client.delete(f"/api/v1/appliance/tls/{cert.id}", headers=headers)
+    assert r.status_code == 409, r.text
+    assert group.name in r.json()["detail"]
+
+
+async def test_delete_cert_serving_doq_only_is_409(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#3061 — DoQ (Technitium, #741) serves the same certificate, but the
+    in-use guard only looked at DoT and DoH, so a DoQ-only group's cert could
+    be deleted out from under it with nothing said."""
+    headers = await _superadmin(db_session)
+    group = await _group(db_session)
+    cert = await _cert(db_session)
+    db_session.add(
+        DNSServerOptions(group_id=group.id, doq_enabled=True, tls_certificate_id=cert.id)
+    )
+    await db_session.commit()
+
+    r = await client.delete(f"/api/v1/appliance/tls/{cert.id}", headers=headers)
+    assert r.status_code == 409, r.text
+    assert group.name in r.json()["detail"]
+
+
+# ── MCP read tool (#2887) ───────────────────────────────────────────────
+
+
+async def test_find_dns_encrypted_transports_reports_doq(db_session: AsyncSession) -> None:
+    """The copilot read must carry the DoQ toggle + port, like dot_* / doh_*."""
+    from app.services.ai.tools.dns import (  # noqa: PLC0415
+        FindDNSEncryptedTransportsArgs,
+        find_dns_encrypted_transports,
+    )
+
+    user = User(
+        username=f"sa-{uuid.uuid4().hex[:6]}",
+        email=f"{uuid.uuid4().hex[:6]}@t.io",
+        display_name="sa",
+        hashed_password=hash_password("password123"),
+        is_superadmin=True,
+    )
+    db_session.add(user)
+    group = await _group(db_session)
+    db_session.add(DNSServerOptions(group_id=group.id, doq_enabled=True, doq_port=8853))
+    await db_session.flush()
+
+    out = await find_dns_encrypted_transports(
+        db_session, user, FindDNSEncryptedTransportsArgs(group_id=str(group.id))
+    )
+    assert out["count"] == 1
+    row = out["groups"][0]
+    assert row["doq_enabled"] is True
+    assert row["doq_port"] == 8853
+
+
+async def _tool_row(db: AsyncSession, group_id: uuid.UUID) -> tuple[dict, dict]:
+    from app.services.ai.tools.dns import (  # noqa: PLC0415
+        FindDNSEncryptedTransportsArgs,
+        find_dns_encrypted_transports,
+    )
+
+    user = User(
+        username=f"sa-{uuid.uuid4().hex[:6]}",
+        email=f"{uuid.uuid4().hex[:6]}@t.io",
+        display_name="sa",
+        hashed_password=hash_password("password123"),
+        is_superadmin=True,
+    )
+    db.add(user)
+    await db.flush()
+    out = await find_dns_encrypted_transports(
+        db, user, FindDNSEncryptedTransportsArgs(group_id=str(group_id))
+    )
+    return out["groups"][0], out["summary"]
+
+
+async def _technitium_group(db: AsyncSession) -> DNSServerGroup:
+    group = DNSServerGroup(name=f"g-{uuid.uuid4().hex[:6]}")
+    db.add(group)
+    await db.flush()
+    db.add(DNSServer(group_id=group.id, name="t1", driver="technitium", host="10.0.0.54", port=53))
+    await db.flush()
+    return group
+
+
+async def test_tool_doq_only_technitium_group_is_effective(db_session: AsyncSession) -> None:
+    group = await _technitium_group(db_session)
+    cert = await _cert(db_session)
+    db_session.add(
+        DNSServerOptions(group_id=group.id, doq_enabled=True, tls_certificate_id=cert.id)
+    )
+    await db_session.flush()
+
+    row, summary = await _tool_row(db_session, group.id)
+    assert row["listeners_effective"] is True
+    assert summary["groups_serving_encrypted"] == 1
+    assert summary["groups_with_broken_listener"] == 0
+
+
+async def test_tool_doq_only_without_cert_is_broken_listener(db_session: AsyncSession) -> None:
+    group = await _technitium_group(db_session)
+    db_session.add(DNSServerOptions(group_id=group.id, doq_enabled=True))
+    await db_session.flush()
+
+    row, summary = await _tool_row(db_session, group.id)
+    assert row["listeners_effective"] is False
+    assert summary["groups_with_broken_listener"] == 1
+
+
+async def test_tool_stale_doq_on_bind9_is_not_effective(db_session: AsyncSession) -> None:
+    """A row stored before the driver gate must not read as a serving DoQ listener."""
+    group = await _group(db_session)  # bind9
+    cert = await _cert(db_session)
+    db_session.add(
+        DNSServerOptions(group_id=group.id, doq_enabled=True, tls_certificate_id=cert.id)
+    )
+    await db_session.flush()
+
+    row, summary = await _tool_row(db_session, group.id)
+    assert row["doq_enabled"] is True
+    assert row["listeners_effective"] is False
+    assert summary["groups_serving_encrypted"] == 0
+    assert summary["groups_with_broken_listener"] == 0

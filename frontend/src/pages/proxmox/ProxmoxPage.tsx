@@ -1,5 +1,8 @@
+import { useCredentialReask } from "@/hooks/useCredentialReask";
+import { useModuleOn } from "@/hooks/useModuleOn";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import {
   AlertTriangle,
   Check,
@@ -31,6 +34,13 @@ import { copyToClipboard } from "@/lib/clipboard";
 import { HeaderButton } from "@/components/ui/header-button";
 import { Modal } from "@/components/ui/modal";
 import { IPSpacePicker } from "@/components/ipam/space-picker";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
+import { secondsFieldError, SYNC_INTERVAL_BOUNDS } from "@/lib/seconds";
+import { FormError } from "@/components/ui/form-error";
 
 // ── Setup guide ─────────────────────────────────────────────────────
 // One-shot snippet operators can paste into a root shell on any PVE
@@ -65,8 +75,19 @@ pveum user token add spatiumddi@pve spatiumddi --privsep=0
 // ── Page ─────────────────────────────────────────────────────────────
 
 export function ProxmoxPage() {
+  // #1340 — every write on this integration takes a superadmin (its
+  // router's create / update / delete / sync / test handlers take
+  // SuperAdmin), so a read-only user is offered none of them.
+  const superadminGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const qc = useQueryClient();
-  const { data: nodes = [], isFetching } = useQuery({
+  const {
+    data: nodes = [],
+    isFetching,
+    error: listError,
+  } = useQuery({
     queryKey: ["proxmox-nodes"],
     queryFn: proxmoxApi.listNodes,
   });
@@ -143,6 +164,7 @@ export function ProxmoxPage() {
               variant="primary"
               icon={Plus}
               onClick={() => setShowCreate(true)}
+              {...superadminGate}
             >
               Add Endpoint
             </HeaderButton>
@@ -155,11 +177,14 @@ export function ProxmoxPage() {
           {nodes.length === 0 ? (
             <div className="p-8 text-center">
               <p className="text-sm text-muted-foreground">
-                No Proxmox endpoints configured yet.
+                <ListEmpty error={listError} what="Proxmox endpoints">
+                  No Proxmox endpoints configured yet.
+                </ListEmpty>
               </p>
               <button
                 onClick={() => setShowCreate(true)}
-                className="mt-3 inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
+                className="mt-3 inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                {...superadminGate}
               >
                 <Plus className="h-3 w-3" /> Add Endpoint
               </button>
@@ -257,6 +282,7 @@ export function ProxmoxPage() {
                             onClick={() => testMut.mutate(n.id)}
                             disabled={testMut.isPending}
                             className="inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] hover:bg-accent disabled:opacity-50"
+                            {...superadminGate}
                           >
                             <TestTube2 className="h-3 w-3" />
                             Test
@@ -282,6 +308,8 @@ export function ProxmoxPage() {
                             }
                             className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-50"
                             title="Sync Now"
+                            aria-label="Sync Now"
+                            {...superadminGate}
                           >
                             <RotateCw
                               className={`h-3.5 w-3.5 ${
@@ -300,20 +328,25 @@ export function ProxmoxPage() {
                                 ? "Discovery — see which guests aren't reporting IPs"
                                 : "Sync at least once to populate discovery"
                             }
+                            aria-label="Discovery"
                           >
                             <Search className="h-3.5 w-3.5" />
                           </button>
                           <button
                             onClick={() => setEdit(n)}
-                            className="rounded p-1 text-muted-foreground hover:text-foreground"
+                            className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                             title="Edit"
+                            aria-label="Edit"
+                            {...superadminGate}
                           >
                             <Pencil className="h-3.5 w-3.5" />
                           </button>
                           <button
                             onClick={() => setDel(n)}
-                            className="rounded p-1 text-muted-foreground hover:text-destructive"
+                            className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                             title="Delete"
+                            aria-label="Delete"
+                            {...superadminGate}
                           >
                             <Trash2 className="h-3.5 w-3.5" />
                           </button>
@@ -700,9 +733,13 @@ function NodeModal({
   const qc = useQueryClient();
   const editing = !!node;
 
+  // DNS off (#2135): no /dns/groups read and no picker. The stored
+  // dns_group_id is sent back untouched, so saving here cannot clear it.
+  const dnsOn = useModuleOn("core.dns");
   const { data: dnsGroups = [] } = useQuery<DNSServerGroup[]>({
     queryKey: ["dns-groups"],
     queryFn: () => dnsApi.listGroups(),
+    enabled: dnsOn,
   });
 
   const [name, setName] = useState(node?.name ?? "");
@@ -714,6 +751,13 @@ function NodeModal({
   const [caBundlePem, setCaBundlePem] = useState("");
   const [tokenId, setTokenId] = useState(node?.token_id ?? "");
   const [tokenSecret, setTokenSecret] = useState("");
+  // #4135 — a moved address needs the stored secret entered again.
+  const reask = useCredentialReask(
+    { host, port },
+    node && { host: node.host, port: node.port },
+    () => setTokenSecret(""),
+  );
+  const mustEnter = reask.asks(node?.token_secret_present);
   const [spaceId, setSpaceId] = useState(node?.ipam_space_id ?? "");
   const [dnsGroupId, setDnsGroupId] = useState(node?.dns_group_id ?? "");
   const [mirrorVms, setMirrorVms] = useState(node?.mirror_vms ?? true);
@@ -725,7 +769,7 @@ function NodeModal({
     node?.infer_vnet_subnets ?? false,
   );
   const [syncInterval, setSyncInterval] = useState(
-    node?.sync_interval_seconds ?? 120,
+    String(node?.sync_interval_seconds ?? 120),
   );
   const [showGuide, setShowGuide] = useState(!editing);
   const [error, setError] = useState("");
@@ -771,7 +815,7 @@ function NodeModal({
           mirror_lxc: mirrorLxc,
           include_stopped: includeStopped,
           infer_vnet_subnets: inferVnetSubnets,
-          sync_interval_seconds: syncInterval,
+          sync_interval_seconds: Number(syncInterval.trim()),
         };
         if (caBundlePem) update.ca_bundle_pem = caBundlePem;
         if (tokenSecret) update.token_secret = tokenSecret;
@@ -793,7 +837,7 @@ function NodeModal({
         mirror_lxc: mirrorLxc,
         include_stopped: includeStopped,
         infer_vnet_subnets: inferVnetSubnets,
-        sync_interval_seconds: syncInterval,
+        sync_interval_seconds: Number(syncInterval.trim()),
       };
       return proxmoxApi.createNode(create);
     },
@@ -813,6 +857,17 @@ function NodeModal({
       <form
         onSubmit={(e) => {
           e.preventDefault();
+          // #2110 — "1h" and an empty field are refused, not read as 1 / the default.
+          const intervalError = secondsFieldError(
+            "Sync interval",
+            syncInterval,
+            SYNC_INTERVAL_BOUNDS,
+          );
+          if (intervalError) {
+            setError(intervalError);
+            return;
+          }
+          setError("");
           saveMut.mutate();
         }}
         className="space-y-3"
@@ -907,18 +962,20 @@ function NodeModal({
               required
             />
           </Field>
-          <Field label="Token Secret">
+          <Field label="Token Secret" hint={mustEnter ? reask.hint : undefined}>
             <input
               type="password"
               className={`${inputCls} font-mono text-[11px]`}
               value={tokenSecret}
               onChange={(e) => setTokenSecret(e.target.value)}
               placeholder={
-                editing && node?.token_secret_present
-                  ? "••• stored — enter to replace"
-                  : "UUID printed by pveum"
+                mustEnter
+                  ? reask.placeholder
+                  : editing && node?.token_secret_present
+                    ? "••• stored — enter to replace"
+                    : "UUID printed by pveum"
               }
-              required={!editing}
+              required={!editing || mustEnter}
             />
           </Field>
         </div>
@@ -984,20 +1041,22 @@ function NodeModal({
           <Field label="IPAM space">
             <IPSpacePicker value={spaceId} onChange={setSpaceId} required />
           </Field>
-          <Field label="DNS server group (optional)">
-            <select
-              className={inputCls}
-              value={dnsGroupId ?? ""}
-              onChange={(e) => setDnsGroupId(e.target.value)}
-            >
-              <option value="">— none —</option>
-              {dnsGroups.map((g) => (
-                <option key={g.id} value={g.id}>
-                  {g.name}
-                </option>
-              ))}
-            </select>
-          </Field>
+          {dnsOn && (
+            <Field label="DNS server group (optional)">
+              <select
+                className={inputCls}
+                value={dnsGroupId ?? ""}
+                onChange={(e) => setDnsGroupId(e.target.value)}
+              >
+                <option value="">— none —</option>
+                {dnsGroups.map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.name}
+                  </option>
+                ))}
+              </select>
+            </Field>
+          )}
         </div>
 
         <Field label="Sync interval (seconds)" hint="Minimum 30 s.">
@@ -1006,7 +1065,7 @@ function NodeModal({
             className={inputCls}
             value={syncInterval}
             min={30}
-            onChange={(e) => setSyncInterval(parseInt(e.target.value) || 120)}
+            onChange={(e) => setSyncInterval(e.target.value)}
           />
         </Field>
 
@@ -1083,7 +1142,9 @@ function NodeModal({
           </label>
         </div>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -1095,7 +1156,7 @@ function NodeModal({
           </button>
           <button
             type="submit"
-            disabled={saveMut.isPending}
+            disabled={saveMut.isPending || (mustEnter && !tokenSecret.trim())}
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {saveMut.isPending ? "Saving…" : editing ? "Save" : "Create"}
@@ -1124,9 +1185,10 @@ function DeleteNodeModal({
         <p className="text-sm text-muted-foreground">
           Remove the Proxmox endpoint{" "}
           <span className="font-semibold">{node.name}</span>? This only affects
-          SpatiumDDI — nothing on the Proxmox side changes. All IPAM rows
-          mirrored from this endpoint (subnets + addresses) will be removed via
-          the FK cascade.
+          SpatiumDDI — nothing on the Proxmox side changes. Only rows that were
+          purely mirrored are removed. Anything you added yourself (addresses,
+          DHCP scopes, reservations, edited rows, custom fields) is kept and
+          detached from this integration.
         </p>
         <label className="flex cursor-pointer items-start gap-2 text-sm">
           <input

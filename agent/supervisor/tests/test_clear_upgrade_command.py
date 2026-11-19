@@ -140,3 +140,58 @@ def test_clear_reports_failure_when_the_trigger_survives(
 
     assert appliance_state.apply_clear_upgrade_command() is False
     assert paths["trigger"].exists()
+
+
+# --- #2021: a clear that lost the race must not blind the running apply ----
+
+
+def _set_mtime(path: Path, seconds: float) -> None:
+    import os
+
+    os.utime(path, (seconds, seconds))
+
+
+def test_clear_keeps_the_progress_of_an_apply_the_runner_has_claimed(
+    paths: dict[str, Path],
+) -> None:
+    """The cancel arrived after the runner took the trigger. The apply keeps
+    going, so its progress is the only thing showing what it is doing; the
+    runner rewrites it only at its next step, minutes away during a dd."""
+    paths["trigger"].write_text("https://cp.local/x.raw.xz\n", encoding="utf-8")
+    paths["state"].write_text("in-flight 2026-10-17T04:03:08+00:00\n", encoding="utf-8")
+    live = {"step": "writing", "pct": None, "detail": "writing image to root-b"}
+    paths["progress"].write_text(json.dumps(live), encoding="utf-8")
+    _set_mtime(paths["trigger"], 1_000)
+    _set_mtime(paths["state"], 1_001)  # claimed: the runner stamped after the trigger
+
+    appliance_state.apply_clear_upgrade_command()
+
+    assert json.loads(paths["progress"].read_text(encoding="utf-8")) == live
+    assert paths["state"].read_text(encoding="utf-8").startswith("in-flight")
+
+
+def test_clear_still_resets_an_unclaimed_trigger(paths: dict[str, Path]) -> None:
+    """Before the runner claims it, the clear wins: trigger gone, and the
+    previous run's leftover progress is reset as before (#786)."""
+    paths["state"].write_text("ready 2026-10-01T00:00:00+00:00\n", encoding="utf-8")
+    paths["progress"].write_text(json.dumps({"step": "reboot-pending"}), encoding="utf-8")
+    paths["trigger"].write_text("https://cp.local/x.raw.xz\n", encoding="utf-8")
+    _set_mtime(paths["state"], 1_000)
+    _set_mtime(paths["trigger"], 1_001)  # newer than .state: not claimed
+
+    appliance_state.apply_clear_upgrade_command()
+
+    assert not paths["trigger"].exists()
+    assert paths["progress"].read_text(encoding="utf-8").strip() == "{}"
+
+
+def test_clear_keeps_a_staged_slots_breadcrumb(paths: dict[str, Path]) -> None:
+    """A clear does not disarm next-boot, and the #2007 settle keys on the
+    ``reboot-pending`` progress: wiping it left the node at ``done`` forever."""
+    paths["state"].write_text("done 2026-10-17T04:05:00+00:00\n", encoding="utf-8")
+    staged = {"step": "reboot-pending", "staged_slot": "slot_b", "staged_boot_id": "abc"}
+    paths["progress"].write_text(json.dumps(staged), encoding="utf-8")
+
+    appliance_state.apply_clear_upgrade_command()
+
+    assert json.loads(paths["progress"].read_text(encoding="utf-8")) == staged

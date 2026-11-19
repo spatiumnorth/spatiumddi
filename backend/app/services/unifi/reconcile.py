@@ -35,7 +35,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import structlog
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import decrypt_str
@@ -43,7 +43,26 @@ from app.models.audit import AuditLog
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.unifi import UnifiController
 from app.models.vlans import VLAN, Router
-from app.services.integration_ownership import owned_by_other_integration, owning_integration
+from app.services._mirror_hostname import normalize_desired_hostname
+from app.services.dns.record_ops import retract_address_dns
+from app.services.integration_ownership import (
+    SpaceRelease,
+    addresses_in_space,
+    drop_wrapper_block,
+    gateway_changed,
+    move_stays_in_space,
+    owned_addresses_in_space,
+    owned_by_other_integration,
+    owned_subnets_in_space,
+    owning_integration,
+    refuse_sync_into_trashed_space,
+    retire_vanished_subnet,
+    subnet_for_address,
+    unowned_subnets_at,
+)
+from app.services.ipam.subnet_placeholders import sync_mirror_gateway_row
+from app.services.ipam.utilization import recount_subnets_and_blocks
+from app.services.router_naming import pick_unique_router_name
 from app.services.unifi.client import (
     UnifiClient,
     UnifiClientConfig,
@@ -97,6 +116,9 @@ class _DesiredAddress:
     mac: str | None
     network_id: str | None  # to find the matching subnet on insert
 
+    def __post_init__(self) -> None:
+        normalize_desired_hostname(self)
+
 
 @dataclass
 class ReconcileSummary:
@@ -111,6 +133,8 @@ class ReconcileSummary:
     subnets_created: int = 0
     subnets_updated: int = 0
     subnets_deleted: int = 0
+    # #2790: un-owned subnets reused at a desired CIDR instead of twinned.
+    subnets_matched: int = 0
     addresses_created: int = 0
     addresses_updated: int = 0
     addresses_deleted: int = 0
@@ -120,7 +144,13 @@ class ReconcileSummary:
     vlans_updated: int = 0
     vlans_deleted: int = 0
     routers_created: int = 0
+    # The controller's Router name — differs from the controller name when
+    # an operator Router already held that name (#2140).
+    router_name: str | None = None
     warnings: list[str] = field(default_factory=list)
+    # #2577 — what this sync released outside the target's IP space
+    # (``integration_ownership.release_outside_space``).
+    released: SpaceRelease = field(default_factory=SpaceRelease)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -225,42 +255,6 @@ def _find_enclosing_operator_block(
             best = b
             best_prefix = bnet.prefixlen
     return best
-
-
-def _find_subnet_for_ip(subnets: list[Subnet], ip: str) -> Subnet | None:
-    try:
-        addr = ipaddress.ip_address(ip)
-    except ValueError:
-        return None
-    best: Subnet | None = None
-    best_prefix: int = -1
-    for s in subnets:
-        net = _parse_net(str(s.network))
-        if net is None:
-            continue
-        if addr in net and net.prefixlen > best_prefix:
-            best = s
-            best_prefix = net.prefixlen
-    return best
-
-
-async def _recompute_subnet_utilization(db: AsyncSession, subnet_id: Any) -> None:
-    allocated = (
-        await db.scalar(
-            select(func.count())
-            .select_from(IPAddress)
-            .where(IPAddress.subnet_id == subnet_id)
-            .where(IPAddress.status != "available")
-        )
-        or 0
-    )
-    subnet = await db.get(Subnet, subnet_id)
-    if subnet is None:
-        return
-    subnet.allocated_ips = allocated
-    subnet.utilization_percent = (
-        round(allocated / subnet.total_ips * 100, 2) if subnet.total_ips > 0 else 0.0
-    )
 
 
 # ── Desired state computation ────────────────────────────────────────
@@ -385,6 +379,25 @@ def _compute_desired(
 # linked to a VLAN entry.
 
 
+def _management_ip_for(controller: UnifiController) -> str | None:
+    """The address to record as the Router's ``management_ip``, or None.
+
+    ``Router.management_ip`` is an INET column. A local controller added by
+    host NAME must not have the name written there: the insert fails and
+    the whole reconcile rolls back on every pass (#2797). Only an IP
+    literal (v4 or v6, optionally bracketed) is recorded; a name leaves it
+    NULL (the name stays on the controller row), because resolving it here
+    would add a DNS lookup to every sync for a cosmetic field.
+    """
+    if controller.mode != "local" or not controller.host:
+        return None
+    host = controller.host.strip().strip("[]")
+    try:
+        return str(ipaddress.ip_address(host))
+    except ValueError:
+        return None
+
+
 async def _apply_router_and_vlans(
     db: AsyncSession,
     controller: UnifiController,
@@ -405,15 +418,31 @@ async def _apply_router_and_vlans(
     ).scalar_one_or_none()
 
     desired_router_name = controller.name
-    desired_management_ip = (
-        controller.host if controller.mode == "local" and controller.host else None
-    )
+    desired_management_ip = _management_ip_for(controller)
     desired_description = f"Auto-created from UniFi controller {controller.name}" + (
         f" ({controller.controller_version})" if controller.controller_version else ""
     )
     if router is None:
+        # Ownership is ``unifi_controller_id`` only: never adopt an
+        # operator Router that merely shares the name — the VLAN pass below
+        # renames and deletes VLANs on the Router it owns (#2140).
+        #
+        # Check-then-insert can still race a concurrent pass that picks the
+        # same free name. That is left to fail on ``uq_router_name``, not
+        # retried under a new name: ``unifi_controller_id`` is not unique,
+        # so when the racer is a second pass for THIS controller (beat sweep
+        # vs Sync Now) a retry would give one controller two Routers. The
+        # task records the crash and the next pass finds or names the Router.
+        router_name = await pick_unique_router_name(db, desired_router_name, tag="UniFi")
+        if router_name != desired_router_name:
+            logger.info(
+                "unifi_router_name_disambiguated",
+                controller=str(controller.id),
+                wanted=desired_router_name,
+                chosen=router_name,
+            )
         router = Router(
-            name=_pick_unique_router_name(db, desired_router_name),
+            name=router_name,
             description=desired_description,
             vendor="Ubiquiti",
             model="UniFi Network Controller",
@@ -425,7 +454,9 @@ async def _apply_router_and_vlans(
         summary.routers_created += 1
     else:
         # Refresh the pieces that can drift across syncs. Leave
-        # ``location`` / ``notes`` alone — those are operator fields
+        # ``name`` alone — it is chosen once at create (possibly
+        # disambiguated, #2140) and an operator may have renamed it — and
+        # ``location`` / ``notes`` — those are operator fields
         # the integration shouldn't clobber.
         if router.description != desired_description:
             router.description = desired_description
@@ -435,6 +466,7 @@ async def _apply_router_and_vlans(
             router.model = "UniFi Network Controller"
         if router.management_ip != desired_management_ip:
             router.management_ip = desired_management_ip
+    summary.router_name = router.name
 
     # Compute the desired VLAN set. Tag → friendly name, picking the
     # last-seen name when two networks share a tag (rare; unique
@@ -486,22 +518,6 @@ async def _apply_router_and_vlans(
                 summary.vlans_updated += 1
 
     return by_tag
-
-
-def _pick_unique_router_name(db: AsyncSession, base: str) -> str:
-    """Router.name has a ``unique`` constraint. If the controller's
-    name collides with an existing operator-managed Router, fall back
-    to a suffixed form so the integration never 500s on an idempotent
-    sync. Synchronous lookup is fine — the caller is already inside
-    an async session and we only hit this once per pass.
-
-    ``db`` is the async session; we use ``run_sync`` only as a marker
-    here — actually we just return ``base`` since the caller catches
-    the unique violation on flush. Keep it simple: prefer the base
-    name and let Postgres yell if there's a real collision (operator
-    is then expected to rename one or the other).
-    """
-    return base
 
 
 def _unique_vlan_name(
@@ -559,19 +575,49 @@ async def _apply_blocks_and_subnets(
         existing_networks[supernet] = parent
         summary.blocks_created += 1
 
-    res = await db.execute(select(Subnet).where(Subnet.unifi_controller_id == controller.id))
-    current_subnets = {str(s.network): s for s in res.scalars().all()}
+    # #2577 — only subnets in the controller's own space; anything it owns
+    # in another (its old space, after a space change) is released first.
+    current_subnets = {
+        str(s.network): s
+        for s in await owned_subnets_in_space(
+            db,
+            "unifi_controller_id",
+            controller.id,
+            controller.ipam_space_id,
+            summary=summary,
+        )
+    }
 
     desired_map = {d.network: d for d in desired_subnets}
     used_wrapper_cidrs: set[str] = set()
+    gw_subnets: list[Subnet] = []  # #3347 — subnets whose gateway row was synced
 
     for net_str, row in current_subnets.items():
         if net_str in desired_map:
             continue
-        await db.delete(row)
-        summary.subnets_deleted += 1
+        # #1558 / #3532: a blind delete cascades to every address and DHCP
+        # scope (live or in Trash) on the subnet. Hand it back (un-claim)
+        # when it carries operator content; either way it is audited.
+        if await retire_vanished_subnet(db, row, "unifi_controller_id", warnings=summary.warnings):
+            summary.subnets_updated += 1
+        else:
+            summary.subnets_deleted += 1
+
+    # #2790: an un-owned subnet at exactly a desired CIDR is reused as it
+    # stands, never twinned, as the Docker reconciler does (#2601). It is one
+    # the loop above un-claimed when its network left (#1558), one a
+    # controller delete kept for its operator content (#2287), or one an
+    # operator made. It is neither claimed nor rewritten, and the address
+    # pass still mirrors into it.
+    kept = await unowned_subnets_at(
+        db, controller.ipam_space_id, [n for n in desired_map if n not in current_subnets]
+    )
 
     for net_str, d in desired_map.items():
+        if net_str in kept:
+            summary.subnets_matched += 1
+            continue
+
         parent_block = _find_enclosing_operator_block(blocks, d.network, controller.id)
 
         if parent_block is None:
@@ -601,23 +647,33 @@ async def _apply_blocks_and_subnets(
 
         existing = current_subnets.get(net_str)
         if existing is None:
-            db.add(
-                Subnet(
-                    space_id=controller.ipam_space_id,
-                    block_id=parent_block.id,
-                    network=d.network,
-                    name=d.name,
-                    description=d.description,
-                    gateway=d.gateway,
-                    unifi_controller_id=controller.id,
-                    total_ips=expected_total,
-                    vlan_ref_id=vlan_ref_id,
-                    vlan_id=d.vlan_tag,
-                )
+            existing = Subnet(
+                space_id=controller.ipam_space_id,
+                block_id=parent_block.id,
+                network=d.network,
+                name=d.name,
+                description=d.description,
+                gateway=d.gateway,
+                unifi_controller_id=controller.id,
+                total_ips=expected_total,
+                vlan_ref_id=vlan_ref_id,
+                vlan_id=d.vlan_tag,
             )
+            db.add(existing)
+            await db.flush()
             summary.subnets_created += 1
+            gw_subnets.append(existing)
+            if d.gateway:
+                gw_problem = await sync_mirror_gateway_row(db, existing, d.gateway)
+                if gw_problem:
+                    summary.warnings.append(gw_problem)
         else:
             changed = False
+            gw_subnets.append(existing)
+            if d.gateway:
+                gw_problem = await sync_mirror_gateway_row(db, existing, d.gateway)
+                if gw_problem:
+                    summary.warnings.append(gw_problem)
             if existing.block_id != parent_block.id:
                 existing.block_id = parent_block.id
                 changed = True
@@ -627,7 +683,7 @@ async def _apply_blocks_and_subnets(
             if existing.description != d.description:
                 existing.description = d.description
                 changed = True
-            if d.gateway and existing.gateway != d.gateway:
+            if gateway_changed(existing.gateway, d.gateway):
                 existing.gateway = d.gateway
                 changed = True
             # VLAN linkage is integration-derived. We refresh it on
@@ -648,13 +704,12 @@ async def _apply_blocks_and_subnets(
                 summary.subnets_updated += 1
 
     await db.flush()
+    await recount_subnets_and_blocks(db, [s.id for s in gw_subnets])
 
     for net_str, wrapper in controller_owned_wrappers.items():
         if net_str in used_wrapper_cidrs:
             continue
-        refs = await db.execute(select(Subnet).where(Subnet.block_id == wrapper.id))
-        if refs.scalar_one_or_none() is None:
-            await db.delete(wrapper)
+        if await drop_wrapper_block(db, wrapper, "unifi_controller_id", warnings=summary.warnings):
             summary.blocks_deleted += 1
 
 
@@ -673,6 +728,7 @@ async def _apply_addresses(
         .all()
     )
     subnets = list(subnet_rows)
+    space_subnet_ids = {s.id for s in subnets}
 
     desired_map: dict[str, _DesiredAddress] = {}
     for d in desired:
@@ -690,10 +746,15 @@ async def _apply_addresses(
     #     hits the (subnet_id, address) unique violation.
     # Keep the most-recently-modified row, soft-delete the rest. Done
     # before adoption so the adopted set is already deduped.
-    pre_owned = (
-        (await db.execute(select(IPAddress).where(IPAddress.unifi_controller_id == controller.id)))
-        .scalars()
-        .all()
+    # #2577 — only rows inside the controller's space; a unifi-owned row in
+    # another space is released (never moved or deduped across spaces) by
+    # ``owned_addresses_in_space`` before this sees anything.
+    pre_owned = await owned_addresses_in_space(
+        db,
+        "unifi_controller_id",
+        controller.id,
+        controller.ipam_space_id,
+        summary=summary,
     )
     pre_groups: dict[str, list[IPAddress]] = {}
     for row in pre_owned:
@@ -703,6 +764,7 @@ async def _apply_addresses(
         if len(rows) > 1:
             rows.sort(key=lambda r: r.modified_at or datetime.min, reverse=True)
             for stale in rows[1:]:
+                await retract_address_dns(db, [stale.id])
                 await db.delete(stale)
                 summary.addresses_deleted += 1
                 pre_dedup_dirty = True
@@ -711,11 +773,9 @@ async def _apply_addresses(
 
     desired_addrs = list(desired_map.keys())
     if desired_addrs:
-        existing = (
-            (await db.execute(select(IPAddress).where(IPAddress.address.in_(desired_addrs))))
-            .scalars()
-            .all()
-        )
+        # #2577 — adoption candidates come from the controller's own space
+        # only. The same address in another space is a different host.
+        existing = await addresses_in_space(db, controller.ipam_space_id, desired_addrs)
         # Group by address so we can detect "multiple operator-owned
         # rows at this address" before adopting any of them. Adopting
         # both would re-create the duplicate we just cleaned up.
@@ -755,11 +815,20 @@ async def _apply_addresses(
                 winner.user_modified_at = datetime.now(UTC)
         await db.flush()
 
-    res = await db.execute(select(IPAddress).where(IPAddress.unifi_controller_id == controller.id))
-    current = {str(a.address): a for a in res.scalars().all()}
+    current = {
+        str(a.address): a
+        for a in await owned_addresses_in_space(
+            db,
+            "unifi_controller_id",
+            controller.id,
+            controller.ipam_space_id,
+            summary=summary,
+        )
+    }
 
     dirty_subnets: set[Any] = {s.id for s in subnets if s.unifi_controller_id == controller.id}
 
+    gone: list[IPAddress] = []
     for addr, row in current.items():
         if addr not in desired_map:
             dirty_subnets.add(row.subnet_id)
@@ -767,11 +836,21 @@ async def _apply_addresses(
                 row.unifi_controller_id = None
                 summary.addresses_updated += 1
             else:
-                await db.delete(row)
+                gone.append(row)
                 summary.addresses_deleted += 1
+    # #3200 — one retraction for the whole sweep, before the deletes flush.
+    await retract_address_dns(db, [r.id for r in gone])
+    for row in gone:
+        await db.delete(row)
 
     for addr, d in desired_map.items():
-        subnet = _find_subnet_for_ip(subnets, d.address)
+        # #2790: the controller's own subnet first, then the longest prefix,
+        # with a fixed tie-break (never the order the rows came back in);
+        # an operator-edited row stays in its subnet, so it is neither moved
+        # nor dropped as a duplicate below.
+        subnet = subnet_for_address(
+            subnets, d.address, "unifi_controller_id", controller.id, held=current.get(addr)
+        )
         if subnet is None:
             summary.skipped_no_subnet += 1
             continue
@@ -779,6 +858,13 @@ async def _apply_addresses(
             row = current[addr]
             changed = False
             if row.subnet_id != subnet.id:
+                # #2577 — never re-parent a row across IP spaces.
+                if not move_stays_in_space(row.subnet_id, space_subnet_ids):
+                    summary.warnings.append(
+                        f"address {addr}: current subnet is outside this target's "
+                        f"IP space; not moving"
+                    )
+                    continue
                 # Before moving the row, check whether the target
                 # (subnet_id, address) tuple is already occupied by a
                 # different row — typically one written by SNMP
@@ -801,6 +887,7 @@ async def _apply_addresses(
                 if conflict is not None:
                     dirty_subnets.add(row.subnet_id)
                     dirty_subnets.add(subnet.id)
+                    await retract_address_dns(db, [row.id])
                     await db.delete(row)
                     summary.addresses_deleted += 1
                     summary.warnings.append(
@@ -859,9 +946,7 @@ async def _apply_addresses(
             summary.addresses_created += 1
 
     if dirty_subnets:
-        await db.flush()
-        for subnet_id in dirty_subnets:
-            await _recompute_subnet_utilization(db, subnet_id)
+        await recount_subnets_and_blocks(db, dirty_subnets)
 
 
 # ── Discovery payload ───────────────────────────────────────────────
@@ -963,6 +1048,10 @@ def _decrypt_or_empty(blob: bytes) -> str:
 
 async def reconcile_controller(db: AsyncSession, controller: UnifiController) -> ReconcileSummary:
     summary = ReconcileSummary(ok=False)
+    # #2577 — a target whose IP space is in Trash syncs nothing: it would
+    # rebuild its rows as live rows inside the trashed space.
+    if await refuse_sync_into_trashed_space(db, controller, summary):
+        return summary
 
     try:
         api_key = _decrypt_or_empty(controller.api_key_encrypted)
@@ -1090,6 +1179,8 @@ async def reconcile_controller(db: AsyncSession, controller: UnifiController) ->
             resource_id=str(controller.id),
             resource_display=controller.name,
             new_value={
+                # #2577 — what the sync released outside the target's IP space.
+                "released": summary.released.as_dict(),
                 "blocks": {
                     "created": summary.blocks_created,
                     "deleted": summary.blocks_deleted,
@@ -1098,6 +1189,7 @@ async def reconcile_controller(db: AsyncSession, controller: UnifiController) ->
                     "created": summary.subnets_created,
                     "updated": summary.subnets_updated,
                     "deleted": summary.subnets_deleted,
+                    "matched": summary.subnets_matched,
                 },
                 "addresses": {
                     "created": summary.addresses_created,
@@ -1111,6 +1203,7 @@ async def reconcile_controller(db: AsyncSession, controller: UnifiController) ->
                     "deleted": summary.vlans_deleted,
                 },
                 "routers_created": summary.routers_created,
+                "router_name": summary.router_name,
                 "sites_skipped": summary.sites_skipped,
             },
         )
@@ -1119,12 +1212,14 @@ async def reconcile_controller(db: AsyncSession, controller: UnifiController) ->
     summary.ok = True
     logger.info(
         "unifi_reconcile_ok",
+        **summary.released.log_fields(),
         controller=str(controller.id),
         version=summary.controller_version,
         sites=summary.site_count,
         networks=summary.network_count,
         clients=summary.client_count,
         subnets_created=summary.subnets_created,
+        subnets_matched=summary.subnets_matched,
         addresses_created=summary.addresses_created,
         addresses_deleted=summary.addresses_deleted,
     )

@@ -96,6 +96,10 @@ _K3S_APISERVER_TCP = 6443
 # this renderer must stay byte-identical to it.
 _K3S_KUBELET_TCP = 10250
 _METALLB_MEMBERLIST = 7946
+# #1827 — frr-k8s's validating webhook, peer-scoped under the memberlist gate.
+# See the long note on the same constant in the supervisor's
+# ``firewall_renderer``; this renderer must stay byte-identical to it.
+_FRR_K8S_WEBHOOK = 19443
 
 
 def _profile_name(roles: list[str]) -> str:
@@ -184,7 +188,8 @@ def compile_firewall_body(
     lines.append("# for the operator-override surface that lands at the end of this file.")
     lines.append(f"# profile: {profile}")
     lines.append(f"# roles: {','.join(roles) if roles else '(idle)'}")
-    bootstrap_action = "retire" if cp_member_count >= 2 else "keep"
+    # #1508 — retire only on a control-plane member; an agent keeps it.
+    bootstrap_action = "retire" if cp_member_count >= 2 and is_cp else "keep"
     lines.append(f"# spatium-bootstrap: {bootstrap_action}")
     # #769 — host-runner directive for the baked Web-UI sentinel
     # (00-spatium-webui.nft), which opens 80/443 from first boot so the
@@ -325,6 +330,13 @@ def compile_firewall_body(
                 peer_v6,
                 f"udp dport {_METALLB_MEMBERLIST} accept",
                 "metallb-memberlist-udp",
+            )
+            _emit_family_rule(
+                lines,
+                peer_v4,
+                peer_v6,
+                f"tcp dport {_FRR_K8S_WEBHOOK} accept",
+                "frr-k8s-webhook",
             )
 
     if firewall_extra.strip():

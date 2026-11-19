@@ -12,8 +12,9 @@ Drives one :class:`~app.models.acme_client.ACMEOrder` from ``pending`` to
 5. generate a fresh cert key + CSR, finalize the order, poll to
    ``valid``, download the full PEM chain;
 6. land the chain in an :class:`~app.models.appliance.ApplianceCertificate`
-   row (``source="letsencrypt"``), make it the sole active cert, deploy
-   it to nginx (tolerating deploy failure);
+   row (``source="letsencrypt"``), make it the sole active cert, and wake
+   the api to deploy it to nginx (#1895 — the worker cannot patch the
+   TLS Secret);
 7. ALWAYS clean up every challenge TXT in a ``finally`` block.
 
 The whole thing is idempotent + re-runnable: a re-run from any state
@@ -23,7 +24,6 @@ re-derives what it needs. Called from the Celery task
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 from datetime import UTC, datetime
 
@@ -34,8 +34,9 @@ from cryptography.x509 import load_pem_x509_csr
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.agent_wake import APPLIANCE_CERT_DEPLOY, publish_wake
 from app.core.crypto import decrypt_str, encrypt_str
-from app.db import AsyncSessionLocal
+from app.db import task_session
 from app.models.acme_client import (
     ACME_CHALLENGE_HTTP01,
     ACME_ORDER_INVALID,
@@ -50,8 +51,11 @@ from app.models.appliance import (
 )
 from app.models.audit import AuditLog
 from app.services.acme_client import dns01, http01
-from app.services.acme_client.engine import ACMEClient, ACMEProtocolError
-from app.services.appliance.deployment import deploy_and_reload
+from app.services.acme_client.engine import (
+    ACMEClient,
+    ACMEProtocolError,
+    generate_account_key_pem,
+)
 from app.services.appliance.tls import (
     CSRSubject,
     generate_csr_and_key,
@@ -67,7 +71,9 @@ logger = structlog.get_logger(__name__)
 _CERT_KEY_TYPE = "ec-p256"
 
 
-async def run_order(db: AsyncSession, order_id: uuid.UUID | str) -> str:
+async def run_order(
+    db: AsyncSession, order_id: uuid.UUID | str, *, final_attempt: bool = False
+) -> str:
     """Drive a single ACME order to completion.
 
     Returns the terminal order status (``"valid"`` / ``"invalid"``).
@@ -75,6 +81,14 @@ async def run_order(db: AsyncSession, order_id: uuid.UUID | str) -> str:
     protocol/DNS failure — those are recorded on the order row so the
     UI can surface them; only genuinely unexpected errors propagate
     (so Celery can log + retry).
+
+    A network error (``httpx.TransportError``: the CA refused, timed out,
+    reset) is retried by the Celery task, so it propagates with the order
+    left ``processing`` and a ``retrying: …`` note in ``last_error``.
+    ``final_attempt`` is the task's word that no retry follows: the order
+    then ends ``invalid`` like any other failure. Left ``processing``, it
+    would never finish and would block the renewal of every certificate
+    with its domains for good (#1686).
 
     The passed ``db`` session is used for the cert + order bookkeeping;
     the DNS-01 solver opens / commits through the same session so the
@@ -97,8 +111,18 @@ async def run_order(db: AsyncSession, order_id: uuid.UUID | str) -> str:
     if account is None:
         return await _fail(db, oid, "ACME account row not found")
 
+    # A retry after a network error (below) finds the order already
+    # ``processing`` with its "retrying: …" note. Keep the note until this
+    # attempt settles the order, so the UI can say why it is still waiting.
+    if order.status != ACME_ORDER_PROCESSING:
+        order.last_error = None
     order.status = ACME_ORDER_PROCESSING
-    order.last_error = None
+    if not account.account_key_encrypted:
+        # Scrubbed by an exclude-secrets backup that was then restored: mint
+        # a new account key and register it afresh, since the CA-side
+        # account belongs to the key that is gone.
+        account.account_key_encrypted = encrypt_str(generate_account_key_pem())
+        account.account_url = None
     await db.commit()
 
     handles: list[dns01.DNS01Handle] = []
@@ -258,6 +282,7 @@ async def run_order(db: AsyncSession, order_id: uuid.UUID | str) -> str:
         order.status = ACME_ORDER_VALID
         order.certificate_id = cert_row.id
         order.last_error = None
+        await _record_issuance_shape(db, order)
         await db.commit()
         logger.info(
             "acme_client_order_valid",
@@ -273,10 +298,17 @@ async def run_order(db: AsyncSession, order_id: uuid.UUID | str) -> str:
         return await _fail(db, oid, str(exc))
     except httpx.TransportError as exc:
         # Transient network blip talking to the CA. Do NOT mark the order
-        # terminally ``invalid`` — leave it ``processing`` and re-raise so
-        # the Celery task autoretries (httpx.TransportError is in its
-        # autoretry_for); the retry reuses the persisted order (above).
+        # terminally ``invalid`` — leave it ``processing``, say why on it,
+        # and re-raise so the Celery task autoretries (httpx.TransportError
+        # is in its autoretry_for); the retry reuses the persisted order
+        # (above). On the task's last attempt no retry follows: end the
+        # order like any other failure, or it stays ``processing`` for good
+        # and blocks the renewal of every cert with its domains (#1686).
         logger.warning("acme_client_transient_ca_error", order_id=str(oid), error=str(exc))
+        detail = _network_error_detail(exc)
+        if final_attempt:
+            return await _fail(db, oid, f"{detail} (no retries left)")
+        await _note_retrying(db, oid, f"retrying: {detail}")
         raise
     except Exception as exc:  # noqa: BLE001 — record + re-raise for Celery retry
         await _fail(db, oid, f"unexpected: {exc}")
@@ -285,10 +317,15 @@ async def run_order(db: AsyncSession, order_id: uuid.UUID | str) -> str:
         # Always tear down challenge TXT records — they're useless after
         # validation and would accumulate as zone noise otherwise. Each
         # cleanup opens its own fresh session so a failed primary session
-        # (rolled back) doesn't block the teardown.
+        # (rolled back) doesn't block the teardown. They use
+        # ``task_session()``, not the shared ``AsyncSessionLocal``: this
+        # runs inside a Celery task's ``asyncio.run`` loop, and the shared
+        # engine's pooled connections stay bound to an earlier task's
+        # (closed) loop - "Event loop is closed", teardown skipped
+        # (#1687, #1726).
         for handle in handles:
             try:
-                async with AsyncSessionLocal() as cleanup_db:
+                async with task_session() as cleanup_db:
                     await dns01.cleanup(cleanup_db, handle)
             except Exception as exc:  # noqa: BLE001 — best-effort teardown
                 logger.warning(
@@ -298,11 +335,33 @@ async def run_order(db: AsyncSession, order_id: uuid.UUID | str) -> str:
                 )
         # http-01 token rows are useless after validation — sweep them too.
         try:
-            async with AsyncSessionLocal() as cleanup_db:
+            async with task_session() as cleanup_db:
                 await http01.cleanup(cleanup_db, oid)
                 await cleanup_db.commit()
         except Exception as exc:  # noqa: BLE001 — best-effort teardown
             logger.warning("acme_client_http01_cleanup_failed", order_id=str(oid), error=str(exc))
+
+
+async def _record_issuance_shape(db: AsyncSession, order: ACMEOrder) -> None:
+    """Copy a SUCCESSFUL order's issuance shape onto ``platform_settings``.
+
+    #1529: these settings used to be written by ``POST /issue`` at order
+    creation, so a later — even failed — issue attempt for different
+    domains changed what the active cert would be renewed for. Writing
+    them only here, on success, keeps them describing the last order
+    that actually produced a cert. The renewal sweep primarily reads
+    the per-certificate shape from the successful order itself
+    (``ACMEOrder.certificate_id``); these settings remain as the
+    legacy fallback for certs with no linked order.
+    """
+    from app.models.settings import PlatformSettings  # noqa: PLC0415
+
+    settings = await db.get(PlatformSettings, 1)
+    if settings is None:
+        return
+    settings.acme_challenge_type = order.challenge_type
+    settings.acme_dns_provider = order.dns_provider
+    settings.acme_domains = list(order.domains)
 
 
 async def _fail(db: AsyncSession, order_id: uuid.UUID, message: str) -> str:
@@ -330,6 +389,44 @@ async def _fail(db: AsyncSession, order_id: uuid.UUID, message: str) -> str:
     return ACME_ORDER_INVALID
 
 
+async def _note_retrying(db: AsyncSession, order_id: uuid.UUID, message: str) -> None:
+    """Persist why a ``processing`` order waits on a retry (#1686).
+
+    ``last_error`` only; the status stays ``processing``. Rolls back and
+    re-reads the row by id, as ``_fail`` does, so nothing the failed attempt
+    left uncommitted is persisted with the note. A row that is no longer
+    ``processing`` (cancelled meanwhile) is left as it is. Best-effort: a DB
+    error here must not mask the network error the caller re-raises.
+    """
+    try:
+        await db.rollback()
+    except Exception:  # noqa: BLE001 — already-clean session
+        pass
+    try:
+        fresh = await db.get(ACMEOrder, order_id)
+        if fresh is not None and fresh.status == ACME_ORDER_PROCESSING:
+            fresh.last_error = message[:2000]
+            await db.commit()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("acme_client_retry_note_failed", order_id=str(order_id), error=str(exc))
+
+
+def _network_error_detail(exc: httpx.TransportError) -> str:
+    """``network error talking to <scheme>://<host>[:<port>]: <ExceptionType>: <message>``.
+
+    Names the exception type (a ``ReadTimeout`` can carry no message) and
+    the origin the request went to, which tells a wrong or blocked
+    directory URL apart from a DNS provider the solve could not reach.
+    Scheme, host and port only: never a path or a query string.
+    """
+    kind = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+    try:
+        url = exc.request.url
+    except RuntimeError:  # raised without a request attached
+        return f"network error: {kind}"
+    return f"network error talking to {url.scheme}://{url.netloc.decode('ascii')}: {kind}"
+
+
 async def _store_certificate(
     db: AsyncSession,
     order: ACMEOrder,
@@ -340,15 +437,24 @@ async def _store_certificate(
 
     Idempotent on the order's stable name: a re-run for the same order
     updates the existing row in place rather than colliding on the
-    unique ``name``. The row is made the sole active cert and deployed
-    to nginx (deploy failure logged, never raised).
+    unique ``name``. A fresh issue makes the row the sole active cert; the
+    api deploys it to nginx on the wake published here (#1895) — unless the
+    order was placed with ``activate_on_issue`` false (#3067), which stores
+    the cert for DoT / DoH / DoQ and leaves the Web UI cert alone.
+
+    A renewal (the beat task points ``order.certificate_id`` at the cert it
+    renews, #3061) rewrites that row in place and leaves ``is_active`` as it
+    was: a DNS group's ``tls_certificate_id`` keeps naming the live material,
+    and renewing a DoT-only cert does not make it the Web UI cert.
     """
     info = parse_pem_certificate(chain_pem)
     name = f"letsencrypt-{order.id}"
 
     row = None
+    renewing = False
     if order.certificate_id is not None:
         row = await db.get(ApplianceCertificate, order.certificate_id)
+        renewing = row is not None
     if row is None:
         # Re-run with no prior cert pointer — look up by our stable name.
         row = (
@@ -383,7 +489,8 @@ async def _store_certificate(
         row.valid_to = info.valid_to
     await db.flush()
 
-    await _make_sole_active(db, row)
+    if not renewing and order.activate_on_issue:
+        await _make_sole_active(db, row)
     # Audit the serving-cert swap (non-negotiable #4). This runs off the
     # request thread in the Celery worker, so there is no operator actor —
     # record it as a system action (mirrors the scheduled-task audit
@@ -393,7 +500,7 @@ async def _store_certificate(
             user_id=None,
             user_display_name="system",
             auth_source="system",
-            action="activate",
+            action="renew" if renewing else "activate",
             resource_type="appliance_certificate",
             resource_id=str(row.id),
             resource_display=row.name,
@@ -410,16 +517,13 @@ async def _store_certificate(
     await db.commit()
     await db.refresh(row)
 
-    # Deploy + reload — tolerate failure (DB is the source of truth; the
-    # api boot's ensure_self_signed_cert re-deploys the active row). Run
-    # the blocking kubeapi PATCH/roll off the event loop (non-negotiable
-    # #2 — deploy_and_reload makes synchronous http.client round-trips).
-    try:
-        await asyncio.to_thread(
-            deploy_and_reload, row.cert_pem or chain_pem, key_pem, name=row.name
-        )
-    except Exception as exc:  # noqa: BLE001 — never let a deploy hiccup fail issuance
-        logger.warning("acme_client_cert_deploy_failed", cert_id=str(row.id), error=str(exc))
+    # The Secret patch is NOT made here (#1895): this runs in the Celery
+    # worker, whose ServiceAccount deliberately cannot patch
+    # ``spatium-appliance-tls`` (#983 / #1445). Hand the deploy to the api —
+    # it reconciles the active row into the Secret on this wake, and on a
+    # periodic tick if the wake is missed. The DB commit above is the source
+    # of truth; publish_wake never raises.
+    await publish_wake(APPLIANCE_CERT_DEPLOY)
 
     # #50 — a renewal rewrites cert_pem in place, so any DoT/DoH listener
     # serving this row needs to pick up the new material.

@@ -25,8 +25,13 @@ import {
 import type { PasswordPolicy } from "@/lib/api";
 
 const navigate = vi.fn();
+let locationState: unknown = null;
 vi.mock("react-router-dom", () => ({
   useNavigate: () => navigate,
+  useLocation: () => ({ state: locationState }),
+  Link: ({ to, children }: { to: string; children: React.ReactNode }) => (
+    <a href={to}>{children}</a>
+  ),
 }));
 
 const changePassword = vi.fn();
@@ -63,6 +68,12 @@ afterEach(() => {
 // `null` — not `undefined` — for "the policy has not loaded": a default
 // parameter is applied when the argument IS undefined, so `setup(undefined)`
 // would silently get POLICY and the test would assert nothing.
+function setupVoluntary() {
+  locationState = { voluntary: true };
+  passwordPolicy.mockReturnValue(POLICY);
+  render(<ChangePasswordPage />);
+}
+
 function setup(policy: PasswordPolicy | null = POLICY) {
   passwordPolicy.mockReturnValue(policy ?? undefined);
   render(<ChangePasswordPage />);
@@ -195,5 +206,24 @@ describe("server errors", () => {
     fill(type, "wrong", "Abcdefghij12");
     fireEvent.click(submit);
     await screen.findByText("Current password is incorrect");
+  });
+});
+
+describe("opened from Account (#2441)", () => {
+  afterEach(() => {
+    locationState = null;
+  });
+
+  it("does not claim the change is required, and offers a way back", () => {
+    setupVoluntary();
+    expect(screen.queryByText(/you must set a new password/i)).toBeNull();
+    const cancel = screen.getByRole("link", { name: /cancel/i });
+    expect(cancel.getAttribute("href")).toBe("/account");
+  });
+
+  it("keeps the required wording, and no way out, for a forced change", () => {
+    setup();
+    expect(screen.getByText(/you must set a new password/i)).toBeTruthy();
+    expect(screen.queryByRole("link", { name: /cancel/i })).toBeNull();
   });
 });

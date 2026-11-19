@@ -4,14 +4,19 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Activity, Download, Loader2, Trash2 } from "lucide-react";
 import {
   applianceApprovalApi,
+  formatApiError,
   type PcapCaptureCreate,
   type PcapCaptureRead,
   pcapApi,
 } from "@/lib/api";
 import { useModalDialog } from "@/components/ui/use-draggable-modal";
 import { cn } from "@/lib/utils";
+import { ListReadError } from "@/components/ui/list-read-error";
+import { pollUnlessRefused } from "@/lib/refusal";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { humanTime } from "@/pages/network/_shared";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 type RightTab = "live" | "history" | "result";
 
@@ -237,6 +242,13 @@ function CaptureForm({
   onStarted: (c: PcapCaptureRead) => void;
   initialVantage?: string;
 }) {
+  // #1341 — a read-only user is offered no write it would be refused:
+  // the router asks write on 'manage_packet_capture'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "manage_packet_capture"),
+    "Requires write permission on packet captures",
+  );
   // vantage select value: "server" or an appliance UUID.
   const [vantage, setVantage] = useState<string>(initialVantage);
   const [iface, setIface] = useState<string>("any");
@@ -462,16 +474,16 @@ function CaptureForm({
         </p>
       )}
       {start.isError && (
-        <p className="text-[11px] text-destructive">
-          {(start.error as { response?: { data?: { detail?: string } } })
-            ?.response?.data?.detail ?? "Failed to start capture."}
-        </p>
+        <FormError className="text-[11px] text-destructive">
+          {formatApiError(start.error, "Failed to start capture.")}
+        </FormError>
       )}
 
       <button
         type="submit"
         disabled={!hasStop || start.isPending}
         className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+        {...writeGate}
       >
         {start.isPending ? (
           <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -540,6 +552,13 @@ function LiveTab({
   onComplete: (id: string) => void;
 }) {
   const qc = useQueryClient();
+  // Stop and delete take delete on 'manage_packet_capture' (pcap/router.py).
+  // Start capture asks write (#4116): the empty-state "start one" hint follows it.
+  const canStart = usePermissions().can("write", "manage_packet_capture");
+  const deleteGate = permissionGate(
+    usePermissions().can("delete", "manage_packet_capture"),
+    "Requires delete permission on packet captures",
+  );
   const { data } = useQuery({
     enabled: !!captureId,
     queryKey: ["pcap-capture", captureId],
@@ -569,7 +588,8 @@ function LiveTab({
   if (!captureId || !data) {
     return (
       <p className="text-xs text-muted-foreground">
-        No capture running — start one on the left. Live progress shows here.
+        No capture running
+        {canStart ? " — start one on the left. Live progress shows here." : "."}
       </p>
     );
   }
@@ -597,6 +617,7 @@ function LiveTab({
           onClick={() => cancel.mutate(data.id)}
           disabled={cancel.isPending}
           className="inline-flex items-center gap-1 rounded border border-destructive/40 px-2 py-1 text-xs text-destructive hover:bg-destructive/10 disabled:opacity-50"
+          {...deleteGate}
         >
           <Trash2 className="h-3 w-3" /> Stop capture
         </button>
@@ -672,6 +693,9 @@ function ResultTab({ captureId }: { captureId: string | null }) {
       <div className="grid grid-cols-2 gap-2">
         <Stat label="Packets" value={String(data.packets_captured)} />
         <Stat label="Size" value={fmtBytes(data.pcap_size_bytes)} />
+        {data.artifact_node && (
+          <Stat label="Stored on node" value={data.artifact_node} />
+        )}
       </div>
       {meta?.stop_reason && (
         <p className="text-[11px] text-muted-foreground">
@@ -699,21 +723,33 @@ function ResultTab({ captureId }: { captureId: string | null }) {
           before Stop.
         </p>
       )}
+      {download.isError && (
+        <p className="text-[11px] text-rose-600">
+          {formatApiError(download.error, "Download failed")}
+        </p>
+      )}
     </div>
   );
 }
 
 function HistoryTab({ onSelect }: { onSelect: (c: PcapCaptureRead) => void }) {
   const qc = useQueryClient();
+  // Stop and delete take delete on 'manage_packet_capture' (pcap/router.py).
+  // Start capture asks write (#4116): the empty-state "start one" hint follows it.
+  const canStart = usePermissions().can("write", "manage_packet_capture");
+  const deleteGate = permissionGate(
+    usePermissions().can("delete", "manage_packet_capture"),
+    "Requires delete permission on packet captures",
+  );
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [pendingBulk, setPendingBulk] = useState<PcapCaptureRead[] | null>(
     null,
   );
 
-  const { data, isLoading, isError } = useQuery({
+  const { data, isLoading, isError, error } = useQuery({
     queryKey: ["pcap-captures", "recent"],
     queryFn: () => pcapApi.listCaptures({ page_size: 50 }),
-    refetchInterval: 5000,
+    refetchInterval: pollUnlessRefused(5000),
   });
   const items = data?.items ?? [];
 
@@ -759,12 +795,17 @@ function HistoryTab({ onSelect }: { onSelect: (c: PcapCaptureRead) => void }) {
     );
   }
   if (isError) {
-    return <p className="text-xs text-destructive">Failed to load captures.</p>;
+    // A refused read is said to be refused, not "Failed to load" (#3149).
+    return (
+      <p className="text-xs">
+        <ListReadError error={error} what="packet captures" />
+      </p>
+    );
   }
   if (items.length === 0) {
     return (
       <p className="text-xs text-muted-foreground">
-        No captures yet — start one on the left.
+        No captures yet{canStart ? " — start one on the left." : "."}
       </p>
     );
   }
@@ -781,10 +822,16 @@ function HistoryTab({ onSelect }: { onSelect: (c: PcapCaptureRead) => void }) {
             }
             disabled={bulkDelete.isPending}
             className="inline-flex items-center gap-1 rounded border border-destructive/40 px-2 py-0.5 text-[11px] text-destructive hover:bg-destructive/10 disabled:opacity-60"
+            {...deleteGate}
           >
             <Trash2 className="h-3 w-3" /> Delete {selected.size}
           </button>
         </div>
+      )}
+      {download.isError && (
+        <p className="text-xs text-rose-600">
+          {formatApiError(download.error, "Download failed")}
+        </p>
       )}
       <div className="overflow-x-auto rounded-md border">
         <table className="w-full min-w-[560px] text-xs">
@@ -851,7 +898,11 @@ function HistoryTab({ onSelect }: { onSelect: (c: PcapCaptureRead) => void }) {
                   {s.has_artifact && (
                     <button
                       type="button"
-                      title="Download .pcap"
+                      title={
+                        s.artifact_node
+                          ? `Download .pcap (stored on node ${s.artifact_node})`
+                          : "Download .pcap"
+                      }
                       onClick={() => download.mutate(s.id)}
                       className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
                     >

@@ -18,18 +18,39 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import func, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ownership._audit import write_audit
-from app.core.permissions import require_resource_permission
+from app.core.permissions import (
+    require_resource_permission,
+    scoped_grant_refusal,
+    user_has_permission,
+)
 from app.models.asn import ASN
+from app.models.circuit import Circuit
 from app.models.ownership import PROVIDER_KINDS, Provider
 
 router = APIRouter(
     tags=["providers"],
-    dependencies=[Depends(require_resource_permission("provider"))],
+    dependencies=[
+        Depends(
+            require_resource_permission(
+                "provider",
+                # A grant scoped to one provider (#3039) reaches that row's detail
+                # and edit and the list, which narrows to the granted rows.
+                instance_routes=(
+                    "provider",
+                    "GET /",
+                    frozenset({"GET /{provider_id}"}),
+                    frozenset({"PUT /{provider_id}"}),
+                ),
+                instance_param="provider_id",
+                prefix="/providers",
+            )
+        )
+    ],
 )
 
 
@@ -95,7 +116,7 @@ class ProviderBulkDelete(BaseModel):
 @router.get("", response_model=ProviderListResponse)
 async def list_providers(
     db: DB,
-    _: CurrentUser,
+    user: CurrentUser,
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     kind: ProviderKind | None = Query(default=None),
@@ -116,8 +137,17 @@ async def list_providers(
                 Provider.contact_email.ilike(needle),
             )
         )
+    # A caller admitted only by grants scoped to individual rows (#3039) sees
+    # those rows and no others.
+    if not user_has_permission(user, "read", "provider"):
+        ids = (await db.execute(select(Provider.id))).scalars().all()
+        stmt = stmt.where(
+            Provider.id.in_(
+                [i for i in ids if user_has_permission(user, "read", "provider", str(i))]
+            )
+        )
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
-    stmt = stmt.order_by(Provider.name.asc()).limit(limit).offset(offset)
+    stmt = stmt.order_by(Provider.name.asc(), Provider.id).limit(limit).offset(offset)
     rows = (await db.execute(stmt)).scalars().all()
     return ProviderListResponse(
         items=[ProviderRead.model_validate(r) for r in rows],
@@ -193,6 +223,16 @@ async def update_provider(
             raise HTTPException(
                 status_code=409, detail=f"Provider named {changes['name']!r} already exists"
             )
+    # A grant scoped to this provider (#3039) does not reach the ASN it points at.
+    if (
+        "default_asn_id" in changes
+        and changes["default_asn_id"] != row.default_asn_id
+        and not user_has_permission(user, "write", "provider")
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail=scoped_grant_refusal("default_asn_id", "provider", inherited=False),
+        )
     if "default_asn_id" in changes:
         await _check_default_asn(db, changes["default_asn_id"])
 
@@ -214,12 +254,43 @@ async def update_provider(
     return ProviderRead.model_validate(row)
 
 
+_LIVE_CIRCUITS_409 = (
+    "Cannot delete provider while circuits reference it. " "Delete or re-attach the circuits first."
+)
+
+
+async def _release_provider_circuits(db: DB, provider_ids: list[uuid.UUID]) -> None:
+    """#2707 — drop the soft-deleted circuits that still pin a provider.
+
+    ``circuit.provider_id`` is ``ON DELETE RESTRICT`` and counts soft-deleted
+    rows, but nothing purges a deleted circuit (they are not in Trash and every
+    circuit route 404s for one), so a provider whose circuits were all deleted
+    could never be deleted. Live circuits still refuse (409); deleted ones are
+    removed for good with the provider.
+    """
+    live = (
+        await db.execute(
+            select(func.count())
+            .select_from(Circuit)
+            .where(Circuit.provider_id.in_(provider_ids), Circuit.deleted_at.is_(None))
+        )
+    ).scalar_one()
+    if live:
+        raise HTTPException(status_code=409, detail=_LIVE_CIRCUITS_409)
+    await db.execute(
+        delete(Circuit).where(
+            Circuit.provider_id.in_(provider_ids), Circuit.deleted_at.is_not(None)
+        )
+    )
+
+
 @router.delete("/{provider_id:uuid}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_provider(provider_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
     row = await db.get(Provider, provider_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Provider not found")
 
+    await _release_provider_circuits(db, [row.id])
     write_audit(
         db,
         user=user,
@@ -239,10 +310,7 @@ async def delete_provider(provider_id: uuid.UUID, db: DB, user: CurrentUser) -> 
         await db.rollback()
         raise HTTPException(
             status_code=409,
-            detail=(
-                "Cannot delete provider while circuits reference it. "
-                "Delete or re-attach the circuits first."
-            ),
+            detail=_LIVE_CIRCUITS_409,
         ) from exc
 
 
@@ -257,6 +325,8 @@ async def bulk_delete_providers(
     found_ids = {r.id for r in rows}
     not_found = [str(i) for i in body.ids if i not in found_ids]
 
+    if rows:
+        await _release_provider_circuits(db, [r.id for r in rows])
     for r in rows:
         write_audit(
             db,

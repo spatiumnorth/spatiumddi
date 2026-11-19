@@ -33,6 +33,26 @@ For the per-platform install steps, see:
 | **DHCP agents** (Kea + sidecar) | Per DHCP server | One agent per DHCP server. Group-centric Kea HA across 2+ peers |
 | **Backup destinations** | External (S3/SCP/Azure/SMB/FTP/GCS/WebDAV) | Out-of-band — operator's responsibility. SpatiumDDI just writes archives there |
 
+**DNS serving pod memory.** Each DNS server's container (agent and daemon
+under one limit, 2Gi by default) grows with the records its group holds:
+measured at 20,000 zones and 1,000,000 records, named held 868 MB and the
+agent peaked at 480 MB while taking a bundle, so a group that size fits
+the default only while its resolver cache stays small, and wants 3Gi if it
+also recurses for clients. A cold start at that size spends tens of minutes
+checking zones before named listens, which the containers' 60-minute
+startup probe allows for. **Views multiply blocklist memory, not zone
+memory:** an authoritative zone identical across views loads once (#3551),
+but each view that applies a blocklist loads its own copy of it, at about
+1.4 kB per entry, so a 190,000-entry list on two views costs about 520 MiB
+of named's memory rather than 260 MiB. Size the limit for one copy of every
+list per view. The control plane warns at 80 % of the limit the agents
+report (a banner on the group's Views and Blocking Lists tabs, and the
+`dns_memory_pressure` alert); see
+[`DNS.md` §2](../features/DNS.md#what-a-view-costs-in-memory-3551) for what
+shares and what does not, and
+[`DNS.md` §8.0](../features/DNS.md#80-memory-sizing-for-large-blocklists-issue-1725)
+for the measurements and where to raise each limit.
+
 The control plane's blast radius is roughly **the API container's writable
 layer** (which is empty when scheduled targets push to a remote
 destination). The agents survive control-plane outages because they
@@ -117,7 +137,7 @@ its PSK for a rotating JWT, then long-polls forever. See
 ## Topology 3 — DNS + DHCP HA pairs
 
 Production-grade availability. Multiple DNS servers in a server group
-(primary + secondary, or split-horizon views), Kea DHCP HA across
+(independent authoritative copies, or split-horizon views), Kea DHCP HA across
 two peers. Each DNS or DHCP host is its own VM.
 
 <p align="center">
@@ -127,10 +147,12 @@ two peers. Each DNS or DHCP host is its own VM.
 Configured via the UI:
 
 - **DNS Server Group** — list `vm-dns-01` and `vm-dns-02` as members of one
-  group. Records render to both. SpatiumDDI watches per-server zone
-  serials so you can spot a slave that hasn't transferred (zone-state pill
+  group. Every member is an independent authoritative copy of the group's
+  zones (`type master`): SpatiumDDI fans each record change out to every
+  server, with no zone transfer between them. It watches per-server zone
+  serials so you can spot a server that hasn't converged (zone-state pill
   on the zone page).
-- **DHCP Server Group** with HA mode = `hot-standby` (or `load-balancing`
+- **DHCP Server Group** with HA `mode` = `hot-standby` (or `load-balancing`
   for higher throughput). Set `ha_peer_url` on each Kea server to **its
   own** HA listener URL, `http://<that server's address>:8000/`; each
   server's URL is rendered into every peer's `peers` list, which is how
@@ -215,7 +237,7 @@ domain as its clients.
    keep serving from cache.
 3. Backup destinations don't have to be in the same region. A cloud
    control plane can write nightly archives to an on-prem SCP target
-   (or vice versa). See the SCP / S3 / Azure / SMB / FTP / GCS / WebDAV
+   (or vice versa). See the SCP / S3 / Azure / SMB / FTP / GCS / WebDAV / NFS / HTTPS PUT
    driver matrix in `docs/features/SYSTEM_ADMIN.md` §2.9.
 
 **Caveats:**
@@ -247,8 +269,11 @@ domain as its clients.
 
 The Kubernetes flavour of Topology 4. The umbrella Helm chart
 (`charts/spatiumddi`) ships every component — api / worker / beat /
-frontend / migrate / Postgres + Redis subcharts (or external
-endpoints) / optional DNS+DHCP agent StatefulSets.
+frontend / migrate / Postgres + Redis (in-chart StatefulSets, or
+CloudNativePG, or external endpoints) / optional DNS+DHCP agent StatefulSets.
+The same chart installs on Red Hat OpenShift under its default security
+context constraints, with a Route for the UI; see
+[KUBERNETES.md → OpenShift](KUBERNETES.md#openshift).
 
 <p align="center">
   <img src="../assets/topologies/topology-6-kubernetes.svg" alt="Topology 6 — Kubernetes via the umbrella Helm chart" width="900"/>
@@ -259,9 +284,8 @@ The chart's relevant values:
 ```yaml
 postgresql.kind: cnpg           # HA Postgres via the CloudNativePG operator
 redis.kind: sentinel            # HA Redis via the in-chart sentinel shape
-api.replicas: 3
+api.autoscaling.minReplicas: 3  # the HPA sets the api's count (api.replicas only with it off)
 worker.replicas: 4
-worker.netRawCapability: true   # for passive DHCP fingerprinting
 dnsAgents.enabled: true         # spawns the bind9 StatefulSet
 dhcpAgents.enabled: true        # spawns the kea StatefulSet (group-centric HA)
 ```
@@ -351,9 +375,9 @@ the appliance internals are in [`APPLIANCE.md`](APPLIANCE.md#control-plane-high-
 
 ## PowerDNS-primary + BIND-secondary hybrid (driver crossover)
 
-SpatiumDDI ships three agent-managed authoritative DNS drivers: BIND9 (default), PowerDNS and Technitium. Each `DNSServerGroup` is single-driver — but **multiple groups, each on a different driver, can serve overlapping namespaces** via plain AXFR or RFC 9432 catalog zones. The two shapes below use PowerDNS + BIND9 as the worked example; a Technitium group substitutes for either side, since it does catalog zones as both producer and consumer and transfers over TSIG the same way.
+SpatiumDDI ships three agent-managed authoritative DNS drivers: BIND9 (default), PowerDNS and Technitium. Each `DNSServerGroup` is single-driver — but **multiple groups, each on a different driver, can serve overlapping namespaces** via plain per-zone AXFR. RFC 9432 catalog zones are a different tool: the producer and its consumers are resolved inside one group and one driver, so they never span the crossover. The two shapes below use PowerDNS + BIND9 as the worked example; a Technitium group substitutes for either side over plain AXFR, which it transfers over TSIG the same way. It does not do catalog zones: both roles are broken and refused until [#1766](https://github.com/spatiumnorth/spatiumddi/issues/1766) ([#1782](https://github.com/spatiumnorth/spatiumddi/issues/1782)), so a catalog-zone shape needs BIND9 on every member of the group.
 
-**Shape A — PowerDNS-primary + BIND-secondary on the same zones.** PowerDNS handles writes (online DNSSEC signing, ALIAS records, LUA records); BIND fans the zones out to a battle-tested edge. Catalog-zone-driven AXFR keeps both drivers in sync because the producer-side catalog renderer emits identical wire bytes from either driver (issue #127 Phase 3d).
+**Shape A — PowerDNS-authoritative + BIND-secondary on the same zones.** PowerDNS handles writes (online DNSSEC signing, ALIAS records, LUA records); BIND fans the zones out to a battle-tested edge. The BIND servers are ordinary per-zone secondaries of the PowerDNS server, pulling by AXFR from the per-zone `masters` list. A group holding signed zones takes one agent server only (the single-signer rule, #1762), so `internal-pdns` is a single PowerDNS server.
 
 <p align="center">
   <img src="../assets/diagrams/topology-powerdns-group.svg" alt="PowerDNS and BIND9 server groups under one control plane" width="900"/>
@@ -361,9 +385,9 @@ SpatiumDDI ships three agent-managed authoritative DNS drivers: BIND9 (default),
 
 Wire it up:
 
-1. In `internal-pdns` set `catalog_zones_enabled=true` + `catalog_zone_name=catalog.example.com.`. The PowerDNS primary publishes the catalog zone alongside member zones via the agent's REST patch path.
-2. In `edge-bind`, create each fanned-out zone as `zone_type=secondary` (or `stub`) with its per-zone `masters` list pointing at the PowerDNS primary (an `ip` or `ip@port` string, issue #336). BIND loads each as `type slave;` and AXFRs from the master; a `catalog_zones_enabled=true` + `catalog_zone_name=catalog.example.com.` setting on the `edge-bind` group additionally distributes the member list across every BIND member of the group via one RFC 9432 catalog (BIND 9.18+).
-3. Operator changes land via the SpatiumDDI UI → write-through to PowerDNS REST → PowerDNS bumps zone serial → BIND notices via NOTIFY-then-IXFR.
+1. In `internal-pdns`, create the zones as primaries on the single PowerDNS server. Do not enable catalog zones for the crossover: a group's catalog is published for secondaries SpatiumDDI does not manage, and no agent-managed server consumes one (#3764), so it cannot carry zones from `internal-pdns` to `edge-bind`.
+2. In `edge-bind`, create each fanned-out zone as `zone_type=secondary` (or `stub`) with its per-zone `masters` list pointing at the PowerDNS primary (an `ip` or `ip@port` string, issue #336). BIND loads each as `type slave;` and AXFRs from the master; every BIND member of `edge-bind` is its own secondary and AXFRs each zone independently.
+3. Operator changes land via the SpatiumDDI UI → write-through to the PowerDNS HTTP API → PowerDNS bumps zone serial → BIND notices via NOTIFY-then-IXFR.
 
 **Shape B — Per-zone driver placement (not crossover).** Some zones live on PowerDNS (those needing ALIAS / LUA), some on BIND9 (those needing first-class views or RPZ blocklists), some on Technitium (those serving or forwarding encrypted DNS, especially DoQ or DoH-upstream, which neither of the others can do). Each zone is owned by exactly one group; the operator picks the right group at zone-create time. The Operator Copilot's `propose_create_dns_zone` tool accepts a `driver_hint` arg that picks a matching group automatically.
 
@@ -464,8 +488,8 @@ the fleet → role → appliance policy layers:
   (2379/2380) + kubelet (10250) never open on a non-CP worker. The control
   node(s) open the control-plane ports scoped to the cluster-peer CIDR set.
 - **Appliance multi-node CP HA (7)** — every CP member opens etcd/kubelet +
-  MetalLB memberlist (7946) scoped to the *peer* CIDRs (never LAN-wide; the
-  #285 fix), and 6443 to peers ∪ pod ∪ service ∪ kubeapi-expose. The
+  MetalLB memberlist (7946) + frr-k8s's webhook (19443, #1827) scoped to the
+  *peer* CIDRs (never LAN-wide; the #285 fix), and 6443 to peers ∪ pod ∪ service ∪ kubeapi-expose. The
   peer-drift cross-check (warn-only) flags a member whose peer entry hasn't
   propagated, or a left member's stale /32.
 

@@ -83,16 +83,14 @@ def _reset_module_cache() -> None:
 
 def _no_limit_redis() -> AsyncMock:
     r = AsyncMock()
-    r.incr = AsyncMock(return_value=1)
-    r.expire = AsyncMock()
+    r.eval = AsyncMock(return_value=1)
     r.aclose = AsyncMock()
     return r
 
 
 def _over_limit_redis() -> AsyncMock:
     r = AsyncMock()
-    r.incr = AsyncMock(return_value=999)  # way over any budget
-    r.expire = AsyncMock()
+    r.eval = AsyncMock(return_value=999)  # way over any budget
     r.aclose = AsyncMock()
     return r
 

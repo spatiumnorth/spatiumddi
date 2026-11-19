@@ -93,8 +93,10 @@ def is_unhealthy(status: str | None) -> bool:
 # ``config_apply_<reverted|revert_failed|no_previous>: <error>``). The DHCP
 # agent writes ``config_apply_reverted: <error>`` after a rollback, and
 # otherwise leaves Kea's own refusal in place (``_reload_socket``:
-# ``dhcp4_config_rejected: <error>`` / ``dhcp6_…``) — which is what survives
-# a failed apply with nothing, or nothing that works, to roll back to. Both
+# ``dhcp4_config_rejected: <error>`` / ``dhcp6_…``, or
+# ``config_apply_unvalidated: <daemon>: <error>`` when its ``kea-dhcpX -t``
+# preflight could not run) — which is what survives a failed apply with
+# nothing, or nothing that works, to roll back to. Both
 # halves of that contract are pinned: each agent's own suite asserts the exact
 # prefixes it emits (``test_config_revert.py``, and the DHCP agent's
 # ``test_config_test_preflight.py``), and ``tests/test_agent_daemon_state.py``
@@ -124,6 +126,28 @@ def is_not_serving(status: str | None, reason: str | None) -> bool | None:
     if status == STATUS_OK:
         return False
     return not is_config_apply_verdict(reason)
+
+
+def forget_stale_ok(server: _HasDaemonStateColumns) -> bool:
+    """An agent that cannot report no longer vouches for ``ok`` (#2961).
+
+    ``ok`` is the agent's own word, and the only thing that retires it is the
+    agent's next heartbeat. Once the health sweep reads the server
+    ``unreachable`` that heartbeat is not coming, so a row left at ``ok``
+    asserts a daemon is serving on the strength of a report the control plane
+    has stopped receiving: measured, a Kea killed six times in four minutes read
+    ``unreachable`` beside a stale ``daemon_status=ok``. The convention for
+    "nothing current to say" is NULL (unknown), which no alert or chip reads as
+    healthy or as failing. Only ``ok`` is retired: a ``degraded`` is a report
+    of a failure that is still unresolved, and the supervisor's own verdicts
+    (``container_oom``) live in the same columns. Returns whether it wrote.
+    """
+    if server.daemon_status != STATUS_OK:
+        return False
+    server.daemon_status = None
+    server.daemon_reason = None
+    server.daemon_status_since = None
+    return True
 
 
 def apply_reported_daemon_state(

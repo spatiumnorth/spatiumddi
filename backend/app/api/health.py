@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import Awaitable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from time import monotonic
 from typing import Any, cast
@@ -12,8 +13,9 @@ from sqlalchemy import text
 from starlette import status
 from starlette.responses import JSONResponse
 
-from app.core.schema_check import schema_at_head
-from app.db import AsyncSessionLocal
+from app.api.deps import OptionalUser
+from app.core.schema_check import SchemaCheck, missing_from_database, schema_at_head
+from app.db import AsyncSessionLocal, ProbeSessionLocal
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(tags=["health"])
@@ -34,16 +36,155 @@ router = APIRouter(tags=["health"])
 # The comparison itself lives in the framework-agnostic
 # ``app.core.schema_check`` module (extracted in #565 so the Celery
 # worker/beat startup + periodic checks share one implementation);
-# this wrapper keeps the ``("ok"|"error", detail)`` shape the
-# readiness verdict folds in alongside DB + Redis.
+# this wrapper keeps the ``(verdict, detail)`` shape the readiness
+# verdict folds in alongside DB + Redis.
+#
+# #2777 — a DB *ahead* of the image is the mixed-version window of a
+# rolling upgrade: the new release's migration commits while the old
+# release's pods still serve (expand/contract keeps the old code safe on
+# the new schema, docs/DEVELOPMENT.md). Refusing it took EVERY old api
+# pod out of the Service at once, before any new pod was ready: ~80 s of
+# 502 on a three-node roll. So a process that has been Ready at its own
+# head (a whole probe answered 200 there) keeps serving there. One that
+# never was (a new pod, a restarted container, an older release rolled
+# back onto a newer database) still refuses it, as wait-for-migrate and
+# #1227's guard do. Behind, unstamped and failed checks stay 503 whatever
+# the history.
+#
+# ``ahead`` only says the image's tree lacks the revision, which is also
+# true of a forked or squashed head, a mistyped ``alembic stamp`` and a
+# restore made with ``allow_newer_schema``. So a Ready pod keeps serving on
+# a newer schema only while every table and column its models map is in
+# the database: read once per revision, and a read that fails or times
+# out answers 503 and is not kept.
+@dataclass(slots=True)
+class _SchemaReadiness:
+    """This process's schema history across probes (#2777).
+
+    ``seen_head`` latches the first time a whole readiness probe answers
+    200 with the DB exactly at this image's own head: the pod has been
+    Ready at its own head (one uvicorn worker per api container, so the
+    process is the pod). A probe that found the schema at head but failed
+    on Redis answered 503 and does not set it. ``logged`` is the last
+    (verdict, detail) logged, so a mismatch logs once per change, not
+    once per probe. ``checked`` is the last newer revision whose tables
+    and columns were read, with what it lacks of them (empty: nothing);
+    only a read that finished is kept.
+    """
+
+    seen_head: bool = False
+    logged: tuple[str, str] | None = None
+    checked: tuple[str, tuple[str, ...]] | None = None
+
+
+_schema_readiness = _SchemaReadiness()
+
+# How many missing tables and columns a refusal names, and its warning logs.
+_MISSING_SHOWN = 5
+_MISSING_LOGGED = 20
+
+
+def reset_schema_readiness() -> None:
+    """Forget this process's schema history, as if it had just started:
+    the latch, the last state logged and the newer revision whose tables
+    and columns were read (tests)."""
+    global _schema_readiness
+    _schema_readiness = _SchemaReadiness()
+
+
+def _log_schema_change(
+    verdict: str, detail: str, result: SchemaCheck, missing: tuple[str, ...] = ()
+) -> None:
+    """Log a schema mismatch at warning once per change of what readiness
+    answers (#2777), with what a newer schema lacks when it lacks something."""
+    key = (verdict, detail)
+    previous = _schema_readiness.logged
+    if key == previous:
+        return
+    _schema_readiness.logged = key
+    if verdict == "ok":
+        if previous is not None:
+            logger.info("readiness_schema_at_head", expected=result.expected, previous=previous[1])
+        return
+    lacks: dict[str, Any] = {}
+    if missing:
+        lacks = {"missing": list(missing[:_MISSING_LOGGED]), "missing_count": len(missing)}
+    logger.warning(
+        "readiness_schema_mismatch",
+        expected=result.expected,
+        actual=result.actual,
+        ahead=result.ahead,
+        serving=verdict == "newer",
+        detail=detail,
+        **lacks,
+    )
+
+
+async def _judge_newer_schema(
+    actual: str, expected: str | None
+) -> tuple[str, str, tuple[str, ...]]:
+    """Keep a Ready pod serving on a newer schema only while every table and
+    column its image uses is there (#2777).
+
+    Returns ``(verdict, detail, missing)``. The schema is read once per
+    revision: a revision's DDL and its ``alembic_version`` commit together
+    (one transaction per revision). A read that raises answers 503 and is
+    not kept, so the next probe reads again; one cut off by readiness's
+    timeout keeps nothing either.
+    """
+    newer = f"schema at {actual} is newer than this image's head {expected}"
+    checked = _schema_readiness.checked
+    if checked is not None and checked[0] == actual:
+        missing = checked[1]
+    else:
+        try:
+            tables, columns = await missing_from_database(session_factory=ProbeSessionLocal)
+        except Exception as exc:  # noqa: BLE001
+            # A read that could not run proves nothing: fail closed, keep nothing.
+            first = (str(exc).splitlines() or [""])[0][:160]
+            reason = f"{type(exc).__name__}: {first}"
+            return (
+                "error",
+                f"{newer}, and its tables and columns could not be checked: {reason}",
+                (),
+            )
+        missing = (*tables, *columns)
+        _schema_readiness.checked = (actual, missing)
+    if missing:
+        count = len(missing)
+        names = ", ".join(missing[:_MISSING_SHOWN])
+        if count > _MISSING_SHOWN:
+            names += f" and {count - _MISSING_SHOWN} more"
+        what = "table or column" if count == 1 else "tables and columns"
+        return "error", f"{newer} and lacks {count} {what} this image uses: {names}", missing
+    return (
+        "newer",
+        f"{newer}: a newer release migrated the database, and this pod keeps serving "
+        "until it is replaced",
+        (),
+    )
+
+
 async def _check_schema_ready() -> tuple[str, str]:
     """Verify the DB schema is at the head this api image expects.
 
-    Returns ``("ok", "<detail>")`` if the schema matches, else
-    ``("error", "<detail>")`` with an operator-actionable message.
+    Returns ``("ok", "<detail>")`` if the schema matches;
+    ``("newer", "<detail>")`` when a newer release migrated the DB, this
+    process has been Ready at its own head, and every table and column its
+    image uses is in the database, so it keeps serving (#2777); else
+    ``("error", "<detail>")`` with an operator-actionable message. It reads
+    the latch; only ``readiness`` sets it.
     """
-    result = await schema_at_head()
-    return ("ok" if result.ok else "error"), result.detail
+    result = await schema_at_head(session_factory=ProbeSessionLocal)
+    missing: tuple[str, ...] = ()
+    if result.ok:
+        verdict, detail = "ok", result.detail
+    elif result.ahead and result.actual is not None and _schema_readiness.seen_head:
+        verdict, detail, missing = await _judge_newer_schema(result.actual, result.expected)
+    else:
+        verdict, detail = "error", result.detail
+    _log_schema_change(verdict, detail, result, missing)
+    return verdict, detail
 
 
 @router.get("/health/live", status_code=status.HTTP_200_OK)
@@ -67,6 +208,11 @@ async def readiness() -> JSONResponse:
     the Service endpoint set, and serves 500s on every actual route
     handler until migrations finish — which the operator sees as
     bare nginx 502s through the frontend proxy (issue #299).
+
+    A schema AHEAD of this image (a newer release migrated it) keeps a
+    process that has been Ready at its own head (this probe answered 200
+    there) in service: ``checks.schema`` reads ``ok: …`` naming both
+    revisions (#2777).
     """
     checks: dict[str, str] = {}
     healthy = True
@@ -87,7 +233,7 @@ async def readiness() -> JSONResponse:
     # probe response itself honest-and-fast while that happens.
     try:
         async with asyncio.timeout(4):
-            async with AsyncSessionLocal() as session:
+            async with ProbeSessionLocal() as session:
                 await session.execute(text("SELECT 1"))
         checks["database"] = "ok"
     except TimeoutError:
@@ -114,14 +260,19 @@ async def readiness() -> JSONResponse:
                 verdict, detail = await _check_schema_ready()
         except TimeoutError:
             verdict, detail = "error", "timed out after 4s"
-        checks["schema"] = "ok" if verdict == "ok" else f"error: {detail}"
-        if verdict != "ok":
+            _log_schema_change(verdict, detail, SchemaCheck(False, None, None, detail))
+        if verdict == "ok":
+            checks["schema"] = "ok"
+        elif verdict == "newer":
+            checks["schema"] = f"ok: {detail}"
+        else:
+            checks["schema"] = f"error: {detail}"
             healthy = False
 
     # Redis check
     try:
         from app.config import settings
-        from app.core.redis_client import make_async_redis
+        from app.core.redis_client import shared_async_redis
 
         # #590 — socket_timeout too, and both knobs now reach the SENTINEL
         # hops as well (redis_client._sentinel_kwargs): an unbounded
@@ -129,14 +280,21 @@ async def readiness() -> JSONResponse:
         # for minutes, which the kubelet's 1 s probe timeout reads as
         # NotReady — on every api pod at once, during exactly the
         # node-loss window readiness exists to survive.
-        r = make_async_redis(settings.redis_url, socket_connect_timeout=2, socket_timeout=2)
+        # #3693 — the pooled client, not a fresh one per probe: building
+        # and closing a client here paid a TCP connect plus the connect
+        # handshake on every call, which was most of this endpoint's CPU.
+        r = shared_async_redis(settings.redis_url, socket_connect_timeout=2, socket_timeout=2)
         await cast(Awaitable[bool], r.ping())
-        await r.aclose()
         checks["redis"] = "ok"
     except Exception as exc:
         logger.warning("readiness_check_failed", check="redis", error=str(exc))
         checks["redis"] = f"error: {exc}"
         healthy = False
+
+    if healthy and checks.get("schema") == "ok":
+        # #2777: the latch means "has been Ready at its own head", so only a
+        # probe that answers 200 with the schema exactly at head sets it.
+        _schema_readiness.seen_head = True
 
     body = {"status": "ok" if healthy else "degraded", "checks": checks}
     code = status.HTTP_200_OK if healthy else status.HTTP_503_SERVICE_UNAVAILABLE
@@ -149,8 +307,78 @@ async def startup() -> JSONResponse:
     return await readiness()
 
 
+# ── Celery worker ping: single-flight + short cache (GHSA-c58p-8cq9-g3gm) ──
+#
+# ``/health/platform`` is unauthenticated, and ``inspect().ping()`` is a
+# broadcast that holds one pooled broker connection while it acquires a
+# second for its producer. Run once per request, a burst of anonymous
+# callers filled kombu's connection pool with these hold-and-wait pings —
+# and ``asyncio.wait_for`` abandons the *request* at the timeout but not the
+# thread, so stuck pings accumulated. The next inline ``.delay()`` on the
+# event loop then blocked forever on the pool, hanging the whole api.
+#
+# So at most ONE ping is in flight per process: concurrent callers await the
+# same task, a caller arriving while a ping is still hung past its timeout
+# joins it rather than starting another, and a finished result (or error)
+# answers every caller for ``WORKER_PING_CACHE_TTL_S``.
+WORKER_PING_TIMEOUT_S = 3.0
+WORKER_PING_CACHE_TTL_S = 5.0
+
+_ping_task: asyncio.Future[dict[str, Any] | None] | None = None
+# (completed_at, result, exception) — exactly one of result/exception is meaningful.
+_ping_cached: tuple[float, dict[str, Any] | None, BaseException | None] | None = None
+
+
+def _inspect_ping() -> dict[str, Any] | None:
+    from app.celery_app import celery_app  # noqa: PLC0415
+
+    return celery_app.control.inspect(timeout=2).ping()
+
+
+def invalidate_worker_ping_cache() -> None:
+    """Forget the cached / in-flight ping (tests; the next call re-pings)."""
+    global _ping_task, _ping_cached
+    _ping_task = None
+    _ping_cached = None
+
+
+def _store_ping(fut: asyncio.Future[dict[str, Any] | None]) -> None:
+    global _ping_cached
+    if fut.cancelled():
+        return
+    exc = fut.exception()
+    _ping_cached = (monotonic(), None if exc else fut.result(), exc)
+
+
+async def _worker_ping() -> dict[str, Any] | None:
+    """Return the worker ping, issuing at most one broadcast at a time.
+
+    Raises ``TimeoutError`` when the ping has not answered within
+    ``WORKER_PING_TIMEOUT_S`` (the ping keeps running and later callers join
+    it), or whatever the ping itself raised.
+    """
+    global _ping_task
+    cached = _ping_cached
+    if cached is not None and monotonic() - cached[0] < WORKER_PING_CACHE_TTL_S:
+        if cached[2] is not None:
+            # Fresh traceback each time, or every re-raise appends to it.
+            raise cached[2].with_traceback(None)
+        return cached[1]
+
+    loop = asyncio.get_running_loop()
+    # No await between the check and the assignment, so two coroutines on
+    # this loop cannot both start a ping. A task from another (closed) loop
+    # can never complete here, so it is replaced rather than awaited.
+    if _ping_task is None or _ping_task.done() or _ping_task.get_loop() is not loop:
+        _ping_task = asyncio.ensure_future(asyncio.to_thread(_inspect_ping))
+        _ping_task.add_done_callback(_store_ping)
+    # shield: one caller timing out must not cancel the ping the others await
+    # (cancelling would not stop the thread anyway, only orphan it).
+    return await asyncio.wait_for(asyncio.shield(_ping_task), timeout=WORKER_PING_TIMEOUT_S)
+
+
 @router.get("/health/platform")
-async def platform_health() -> JSONResponse:
+async def platform_health(current_user: OptionalUser) -> JSONResponse:
     """Dashboard-oriented rollup of every control-plane component.
 
     Distinct from ``/health/ready`` in that this one is dashboard-
@@ -163,15 +391,25 @@ async def platform_health() -> JSONResponse:
     components into a single ``ok`` / ``degraded`` verdict for headline
     display.
 
-    SECURITY (#400 / M5): this endpoint is mounted UNAUTHENTICATED
-    (the AppLayout polls it before login for the demo-mode /
-    maintenance banner), so component ``detail`` fields must never echo
+    SECURITY (#400 / M5): this endpoint is mounted UNAUTHENTICATED (an
+    uptime monitor or a client probe needs no credential), and even a
+    signed-in caller is not entitled to backend internals, so component
+    ``detail`` fields must never echo
     raw backend exception strings — those can leak DSNs, internal
     hostnames, driver versions, and stack-frame paths to an anonymous
     caller. On error we log the full ``str(exc)`` server-side (where
     operators can see it) and return only a fixed, generic detail
     string. The ``ok`` / ``error`` / ``warn`` status semantics are
     unchanged, so the per-component dots still render correctly.
+
+    #2935 — the component list is for signed-in callers only. It names
+    every Celery worker (``celery@<hostname>``, a container id on Compose
+    and a pod name on Kubernetes) and describes the stack, which is
+    fingerprinting material. An anonymous caller gets the rollup
+    ``status`` and nothing else: enough for an uptime monitor or a client
+    asking "is this a working control plane", and nothing about what it is
+    built from. The banners that read ``demo_mode`` / ``maintenance_*``
+    render inside the signed-in console, which sends its Bearer.
     """
     components: list[dict[str, Any]] = [{"name": "api", "status": "ok", "detail": "responding"}]
 
@@ -197,7 +435,7 @@ async def platform_health() -> JSONResponse:
     t0 = monotonic()
     try:
         from app.config import settings
-        from app.core.redis_client import make_async_redis
+        from app.core.redis_client import shared_async_redis
 
         # #590 — socket_timeout too, and both knobs now reach the SENTINEL
         # hops as well (redis_client._sentinel_kwargs): an unbounded
@@ -205,9 +443,11 @@ async def platform_health() -> JSONResponse:
         # for minutes, which the kubelet's 1 s probe timeout reads as
         # NotReady — on every api pod at once, during exactly the
         # node-loss window readiness exists to survive.
-        r = make_async_redis(settings.redis_url, socket_connect_timeout=2, socket_timeout=2)
+        # #3693 — the pooled client, not a fresh one per probe: building
+        # and closing a client here paid a TCP connect plus the connect
+        # handshake on every call, which was most of this endpoint's CPU.
+        r = shared_async_redis(settings.redis_url, socket_connect_timeout=2, socket_timeout=2)
         await cast(Awaitable[bool], r.ping())
-        await r.aclose()
         components.append(
             {
                 "name": "redis",
@@ -238,13 +478,10 @@ async def platform_health() -> JSONResponse:
     # is amplification an anonymous caller controls. The celery-beat
     # component BELOW is the signal that does surface a wedged pool —
     # which is why its detail must not blame beat for it.
-    def _inspect_ping() -> dict[str, Any] | None:
-        from app.celery_app import celery_app  # noqa: PLC0415
-
-        return celery_app.control.inspect(timeout=2).ping()
-
+    #
+    # The ping itself is single-flight + cached — see ``_worker_ping``.
     try:
-        ping = await asyncio.wait_for(asyncio.to_thread(_inspect_ping), timeout=3)
+        ping = await _worker_ping()
     except TimeoutError:
         ping = None
         workers_detail = "inspect timed out"
@@ -293,7 +530,7 @@ async def platform_health() -> JSONResponse:
     # it without involving the pool at all.
     try:
         from app.config import settings
-        from app.core.redis_client import make_async_redis
+        from app.core.redis_client import shared_async_redis
         from app.tasks.heartbeat import BEAT_HEARTBEAT_KEY  # noqa: PLC0415
 
         # Sentinel-aware (HA Redis uses ``sentinel://``, which raw
@@ -305,9 +542,8 @@ async def platform_health() -> JSONResponse:
         # for minutes, which the kubelet's 1 s probe timeout reads as
         # NotReady — on every api pod at once, during exactly the
         # node-loss window readiness exists to survive.
-        r = make_async_redis(settings.redis_url, socket_connect_timeout=2, socket_timeout=2)
+        r = shared_async_redis(settings.redis_url, socket_connect_timeout=2, socket_timeout=2)
         raw = await r.get(BEAT_HEARTBEAT_KEY)
-        await r.aclose()
         if raw is None:
             components.append(
                 {
@@ -363,6 +599,11 @@ async def platform_health() -> JSONResponse:
             break
         if c["status"] == "warn" and rollup == "ok":
             rollup = "degraded"
+
+    if current_user is None:
+        # #2935 — status only. Returned before the maintenance read, which an
+        # anonymous caller has no use for.
+        return JSONResponse(status_code=status.HTTP_200_OK, content={"status": rollup})
 
     # Surface demo-mode to the frontend so AppLayout can render a
     # persistent banner. Cheap to bundle here — every authenticated

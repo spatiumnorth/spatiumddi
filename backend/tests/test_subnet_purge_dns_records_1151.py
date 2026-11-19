@@ -28,7 +28,6 @@ from httpx import AsyncClient
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.agent_wake import dns_group_channel
 from app.core.security import create_access_token, hash_password
 from app.models.auth import User
 from app.models.dns import DNSRecord, DNSRecordOp, DNSServer, DNSServerGroup, DNSZone
@@ -213,10 +212,10 @@ async def test_purging_a_subnet_from_trash_withdraws_its_records_and_only_its_re
 
     resp = await client.delete(f"/api/v1/ipam/subnets/{doomed}", headers=headers)
     assert resp.status_code == 204, resp.text
-    # While the subnet sits in Trash nothing is withdrawn (#1152's copy says
-    # so): its A record and its PTRs in the shared zone still answer.
-    assert ("host50", "A", "10.92.22.50") in await _live_records(db_session, zone.id)
-    assert ("50", "PTR", f"host50.{zone.name}") in await _live_records(db_session, rev.id)
+    # spatiumddi#1906: trashing already withdrew the subnet's own records (they
+    # ride its batch); the purge has nothing live left to retract.
+    assert ("host50", "A", "10.92.22.50") not in await _live_records(db_session, zone.id)
+    assert ("50", "PTR", f"host50.{zone.name}") not in await _live_records(db_session, rev.id)
     await _clear_ops(db_session)
 
     resp = await client.delete(f"/api/v1/admin/trash/subnet/{doomed}", headers=headers)
@@ -238,14 +237,8 @@ async def test_purging_a_subnet_from_trash_withdraws_its_records_and_only_its_re
         )
     ).scalar_one()
     assert manual.ip_address_id is None  # the FK's SET NULL, as before
-    assert await _ops(db_session, server) == [
-        ("22.92.10.in-addr.arpa.", "delete", "1", "PTR", []),
-        ("22.92.10.in-addr.arpa.", "delete", "50", "PTR", []),
-        ("22.92.10.in-addr.arpa.", "delete", "60", "PTR", []),
-        (zone.name, "delete", "host50", "A", []),
-        (zone.name, "delete", "rr", "A", ["10.92.22.160"]),
-    ]
-    assert woken == [dns_group_channel(grp.id)]
+    assert await _ops(db_session, server) == []
+    assert woken == []
 
 
 @pytest.mark.asyncio
@@ -289,18 +282,20 @@ async def test_the_scheduled_purge_withdraws_records_only_for_subnets_past_reten
     assert result["per_type"]["subnet"] == 1
     live = await _live_records(db_session, zone.id)
     assert ("old50", "A", "10.94.40.50") not in live
-    assert ("recent50", "A", "10.94.41.50") in live  # inside the window: untouched
-    assert result["address_records_retracted"] == 1
+    # Inside the window: withdrawn when it was trashed (#1906), but still in the
+    # Trash bound to its address, so a restore brings it back.
+    assert ("recent50", "A", "10.94.41.50") not in live
+    assert result["address_records_retracted"] == 0  # withdrawn when it was trashed (#1906)
     recent_rec = (
         await db_session.execute(
             select(DNSRecord)
             .where(DNSRecord.name == "recent50")
-            .execution_options(populate_existing=True)
+            .execution_options(include_deleted=True, populate_existing=True)
         )
     ).scalar_one()
-    assert str(recent_rec.ip_address_id) == recent_ip
-    assert await _ops(db_session, server) == [(zone.name, "delete", "old50", "A", [])]
-    assert woken == [dns_group_channel(grp.id)]
+    assert str(recent_rec.ip_address_id) == recent_ip and recent_rec.deleted_at is not None
+    assert await _ops(db_session, server) == []
+    assert woken == []
 
 
 @pytest.mark.asyncio
@@ -394,14 +389,18 @@ async def test_purge_from_trash_pushes_the_delete_to_an_agentless_primary(
     monkeypatch.setattr("app.services.dns.record_ops.get_driver", lambda _name: rec)
     sid = await _bound_subnet(client, headers, space, block, "10.96.50.0/24", grp, zone)
     await _address(client, headers, sid, "10.96.50.50", "win50")
+    rec.changes.clear()
     resp = await client.delete(f"/api/v1/ipam/subnets/{sid}", headers=headers)
     assert resp.status_code == 204, resp.text
+    # #1906: the retraction goes to the agentless primary when the subnet is
+    # trashed; the purge has nothing left to push.
+    assert rec.changes == [("delete", "win50", "A")]
     rec.changes.clear()
 
     resp = await client.delete(f"/api/v1/admin/trash/subnet/{sid}", headers=headers)
     assert resp.status_code == 204, resp.text
 
-    assert rec.changes == [("delete", "win50", "A")]
+    assert rec.changes == []
     assert await _live_records(db_session, zone.id) == []
 
 
@@ -409,8 +408,9 @@ async def test_purge_from_trash_pushes_the_delete_to_an_agentless_primary(
 async def test_a_subnet_restored_from_trash_keeps_every_record(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    """Only a hard delete withdraws anything: an address that comes back with
-    its subnet is not "really gone"."""
+    """An address that comes back with its subnet is not "really gone": its
+    records (withdrawn while it sat in Trash, #1906) are live again and
+    re-asserted."""
     headers = await _admin_headers(db_session)
     grp, server, zone = await _dns(db_session)
     space, block = await _space_block(db_session, "10.97.0.0/16")
@@ -421,11 +421,14 @@ async def test_a_subnet_restored_from_trash_keeps_every_record(
 
     resp = await client.delete(f"/api/v1/ipam/subnets/{sid}", headers=headers)
     assert resp.status_code == 204, resp.text
+    await _clear_ops(db_session)
     resp = await client.post(f"/api/v1/admin/trash/subnet/{sid}/restore", headers=headers)
     assert resp.status_code == 200, resp.text
 
     assert ("back50", "A", "10.97.60.50") in await _live_records(db_session, zone.id)
-    assert [op for op in await _ops(db_session, server) if op[1] == "delete"] == []
+    assert [op[1:4] for op in await _ops(db_session, server) if op[3] == "A"] == [
+        ("create", "back50", "A")
+    ]
     ip = (
         await db_session.execute(
             select(IPAddress)

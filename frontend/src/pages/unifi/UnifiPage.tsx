@@ -1,6 +1,9 @@
+import { useCredentialReask } from "@/hooks/useCredentialReask";
+import { useModuleOn } from "@/hooks/useModuleOn";
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import {
   Check,
   Clipboard,
@@ -26,6 +29,13 @@ import { copyToClipboard } from "@/lib/clipboard";
 import { HeaderButton } from "@/components/ui/header-button";
 import { Modal } from "@/components/ui/modal";
 import { IPSpacePicker } from "@/components/ipam/space-picker";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
+import { secondsFieldError, SYNC_INTERVAL_BOUNDS } from "@/lib/seconds";
+import { FormError } from "@/components/ui/form-error";
 
 // One-shot snippet operators can paste into Settings → Control
 // Plane → Integrations on UniFi OS to mint an API key with the
@@ -37,8 +47,10 @@ const SETUP_KEY = `# Generate a UniFi Network API key:
 # 2. Click "Create API Key"
 # 3. Name it "spatiumddi" with an expiry that matches your rotation
 #    window. The key inherits your admin's permissions on the
-#    controller; SpatiumDDI never writes back, so a read-only role
-#    is the correct choice when your UniFi version supports it.
+#    controller. The mirror only reads, so a read-only role is the
+#    correct choice for this key when your UniFi version supports
+#    it. Active block sync, if you arm it for this controller,
+#    writes with its own credentials, entered on the Block Sync page.
 # 4. Copy the printed value. The key only displays once.
 #
 # Cloud-hosted controllers (UniFi Site Manager): generate at
@@ -50,8 +62,19 @@ const SETUP_KEY = `# Generate a UniFi Network API key:
 // ── Page ─────────────────────────────────────────────────────────────
 
 export function UnifiPage() {
+  // #1340 — every write on this integration takes a superadmin (its
+  // router's create / update / delete / sync / test handlers take
+  // SuperAdmin), so a read-only user is offered none of them.
+  const superadminGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const qc = useQueryClient();
-  const { data: controllers = [], isFetching } = useQuery({
+  const {
+    data: controllers = [],
+    isFetching,
+    error: listError,
+  } = useQuery({
     queryKey: ["unifi-controllers"],
     queryFn: unifiApi.listControllers,
   });
@@ -106,12 +129,14 @@ export function UnifiPage() {
               </span>
             </div>
             <p className="mt-1 max-w-3xl text-xs text-muted-foreground">
-              Read-only integration. Each controller is polled via the UniFi
-              REST API; networks, VLANs, active clients, and DHCP fixed-IP
-              reservations are mirrored into IPAM. Local controllers connect
-              directly; cloud controllers proxy through{" "}
-              <code className="font-mono">api.ui.com</code>. SpatiumDDI never
-              writes to UniFi.
+              Each controller is polled via the UniFi REST API; networks, VLANs,
+              active clients, and DHCP fixed-IP reservations are mirrored into
+              IPAM. Local controllers connect directly; cloud controllers proxy
+              through <code className="font-mono">api.ui.com</code>. The mirror
+              only reads. SpatiumDDI writes to a controller only when Active
+              block sync is armed on it (Tools → Block Sync): it then pushes
+              client blocks (L2 quarantine) with the separate write credentials
+              entered there.
             </p>
           </div>
           <div className="flex flex-shrink-0 items-center gap-2">
@@ -128,6 +153,7 @@ export function UnifiPage() {
               variant="primary"
               icon={Plus}
               onClick={() => setShowCreate(true)}
+              {...superadminGate}
             >
               Add Controller
             </HeaderButton>
@@ -140,11 +166,14 @@ export function UnifiPage() {
           {controllers.length === 0 ? (
             <div className="p-8 text-center">
               <p className="text-sm text-muted-foreground">
-                No UniFi controllers configured yet.
+                <ListEmpty error={listError} what="UniFi controllers">
+                  No UniFi controllers configured yet.
+                </ListEmpty>
               </p>
               <button
                 onClick={() => setShowCreate(true)}
-                className="mt-3 inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
+                className="mt-3 inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                {...superadminGate}
               >
                 <Plus className="h-3 w-3" /> Add Controller
               </button>
@@ -250,6 +279,7 @@ export function UnifiPage() {
                             onClick={() => testMut.mutate(c.id)}
                             disabled={testMut.isPending}
                             className="inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] hover:bg-accent disabled:opacity-50"
+                            {...superadminGate}
                           >
                             <TestTube2 className="h-3 w-3" />
                             Test
@@ -275,6 +305,8 @@ export function UnifiPage() {
                             }
                             className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-50"
                             title="Sync Now"
+                            aria-label="Sync Now"
+                            {...superadminGate}
                           >
                             <RotateCw
                               className={`h-3.5 w-3.5 ${
@@ -286,15 +318,19 @@ export function UnifiPage() {
                           </button>
                           <button
                             onClick={() => setEdit(c)}
-                            className="rounded p-1 text-muted-foreground hover:text-foreground"
+                            className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                             title="Edit"
+                            aria-label="Edit"
+                            {...superadminGate}
                           >
                             <Pencil className="h-3.5 w-3.5" />
                           </button>
                           <button
                             onClick={() => setDel(c)}
-                            className="rounded p-1 text-muted-foreground hover:text-destructive"
+                            className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                             title="Delete"
+                            aria-label="Delete"
+                            {...superadminGate}
                           >
                             <Trash2 className="h-3.5 w-3.5" />
                           </button>
@@ -316,9 +352,13 @@ export function UnifiPage() {
       {del && (
         <DeleteControllerModal
           controller={del}
-          onClose={() => setDel(null)}
+          onClose={() => {
+            delMut.reset();
+            setDel(null);
+          }}
           onConfirm={() => delMut.mutate(del.id)}
           isPending={delMut.isPending}
+          error={delMut.isError ? errMsg(delMut.error, "Delete failed") : null}
         />
       )}
     </div>
@@ -327,7 +367,7 @@ export function UnifiPage() {
 
 // ── Create / Edit modal ─────────────────────────────────────────────
 
-function ControllerModal({
+export function ControllerModal({
   controller,
   onClose,
 }: {
@@ -337,9 +377,13 @@ function ControllerModal({
   const qc = useQueryClient();
   const editing = !!controller;
 
+  // DNS off (#2135): no /dns/groups read and no picker. The stored
+  // dns_group_id is sent back untouched, so saving here cannot clear it.
+  const dnsOn = useModuleOn("core.dns");
   const { data: dnsGroups = [] } = useQuery<DNSServerGroup[]>({
     queryKey: ["dns-groups"],
     queryFn: () => dnsApi.listGroups(),
+    enabled: dnsOn,
   });
 
   const [name, setName] = useState(controller?.name ?? "");
@@ -389,7 +433,7 @@ function ControllerModal({
     controller?.include_vpn ?? false,
   );
   const [syncInterval, setSyncInterval] = useState(
-    controller?.sync_interval_seconds ?? 60,
+    String(controller?.sync_interval_seconds ?? 60),
   );
   const [showGuide, setShowGuide] = useState(!editing);
   const [error, setError] = useState("");
@@ -403,6 +447,24 @@ function ControllerModal({
   const hasStoredUsername = !!controller?.username_present;
   const hasStoredPassword = !!controller?.password_present;
   const hasStoredCaBundle = !!controller?.ca_bundle_present;
+
+  // #4135 — a moved address needs the stored credential entered again.
+  const reask = useCredentialReask(
+    { mode, host, port, cloudHostId },
+    controller && {
+      mode: controller.mode,
+      host: controller.host,
+      port: controller.port,
+      cloudHostId: controller.cloud_host_id,
+    },
+    () => {
+      setApiKey("");
+      setPassword("");
+    },
+  );
+  const mustEnterKey = authKind === "api_key" && reask.asks(hasStoredApiKey);
+  const mustEnterPassword =
+    authKind === "user_password" && reask.asks(hasStoredPassword);
 
   // Cloud + user_password is illegal — flip to api_key when mode
   // switches to cloud so the form doesn't carry an invalid combo.
@@ -465,7 +527,7 @@ function ControllerModal({
           include_wired: includeWired,
           include_wireless: includeWireless,
           include_vpn: includeVpn,
-          sync_interval_seconds: syncInterval,
+          sync_interval_seconds: Number(syncInterval.trim()),
         };
         if (caBundle) update.ca_bundle_pem = caBundle;
         if (apiKey) update.api_key = apiKey;
@@ -496,7 +558,7 @@ function ControllerModal({
         include_wired: includeWired,
         include_wireless: includeWireless,
         include_vpn: includeVpn,
-        sync_interval_seconds: syncInterval,
+        sync_interval_seconds: Number(syncInterval.trim()),
       };
       return unifiApi.createController(create);
     },
@@ -516,6 +578,17 @@ function ControllerModal({
       <form
         onSubmit={(e) => {
           e.preventDefault();
+          // #2110 — "1h" and an empty field are refused, not read as 1 / the default.
+          const intervalError = secondsFieldError(
+            "Sync interval",
+            syncInterval,
+            SYNC_INTERVAL_BOUNDS,
+          );
+          if (intervalError) {
+            setError(intervalError);
+            return;
+          }
+          setError("");
           saveMut.mutate();
         }}
         className="space-y-3"
@@ -675,18 +748,24 @@ function ControllerModal({
             </select>
           </Field>
           {authKind === "api_key" ? (
-            <Field label="API key" className="col-span-2">
+            <Field
+              label="API key"
+              className="col-span-2"
+              hint={mustEnterKey ? reask.hint : undefined}
+            >
               <input
                 type="password"
                 className={`${inputCls} font-mono text-[11px]`}
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
                 placeholder={
-                  editing && hasStoredApiKey
-                    ? "••• stored — enter to replace"
-                    : "<api key>"
+                  mustEnterKey
+                    ? reask.placeholder
+                    : editing && hasStoredApiKey
+                      ? "••• stored — enter to replace"
+                      : "<api key>"
                 }
-                required={!editing && !hasStoredApiKey}
+                required={(!editing && !hasStoredApiKey) || mustEnterKey}
               />
             </Field>
           ) : (
@@ -704,18 +783,25 @@ function ControllerModal({
                   required={!editing && !hasStoredUsername}
                 />
               </Field>
-              <Field label="Password">
+              <Field
+                label="Password"
+                hint={mustEnterPassword ? reask.hint : undefined}
+              >
                 <input
                   type="password"
                   className={inputCls}
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   placeholder={
-                    editing && hasStoredPassword
-                      ? "••• stored — enter to replace"
-                      : ""
+                    mustEnterPassword
+                      ? reask.placeholder
+                      : editing && hasStoredPassword
+                        ? "••• stored — enter to replace"
+                        : ""
                   }
-                  required={!editing && !hasStoredPassword}
+                  required={
+                    (!editing && !hasStoredPassword) || mustEnterPassword
+                  }
                 />
               </Field>
             </>
@@ -750,20 +836,22 @@ function ControllerModal({
           <Field label="IPAM space">
             <IPSpacePicker value={spaceId} onChange={setSpaceId} required />
           </Field>
-          <Field label="DNS server group (optional)">
-            <select
-              className={inputCls}
-              value={dnsGroupId ?? ""}
-              onChange={(e) => setDnsGroupId(e.target.value)}
-            >
-              <option value="">— none —</option>
-              {dnsGroups.map((g) => (
-                <option key={g.id} value={g.id}>
-                  {g.name}
-                </option>
-              ))}
-            </select>
-          </Field>
+          {dnsOn && (
+            <Field label="DNS server group (optional)">
+              <select
+                className={inputCls}
+                value={dnsGroupId ?? ""}
+                onChange={(e) => setDnsGroupId(e.target.value)}
+              >
+                <option value="">— none —</option>
+                {dnsGroups.map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.name}
+                  </option>
+                ))}
+              </select>
+            </Field>
+          )}
         </div>
 
         <Field
@@ -820,11 +908,13 @@ function ControllerModal({
             className={inputCls}
             value={syncInterval}
             min={30}
-            onChange={(e) => setSyncInterval(parseInt(e.target.value) || 60)}
+            onChange={(e) => setSyncInterval(e.target.value)}
           />
         </Field>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -836,7 +926,11 @@ function ControllerModal({
           </button>
           <button
             type="submit"
-            disabled={saveMut.isPending}
+            disabled={
+              saveMut.isPending ||
+              (mustEnterKey && !apiKey.trim()) ||
+              (mustEnterPassword && !password.trim())
+            }
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {saveMut.isPending ? "Saving…" : editing ? "Save" : "Create"}
@@ -852,11 +946,13 @@ function DeleteControllerModal({
   onConfirm,
   onClose,
   isPending,
+  error,
 }: {
   controller: UnifiController;
   onConfirm: () => void;
   onClose: () => void;
   isPending: boolean;
+  error?: string | null;
 }) {
   const [checked, setChecked] = useState(false);
   return (
@@ -865,9 +961,12 @@ function DeleteControllerModal({
         <p className="text-sm text-muted-foreground">
           Remove the UniFi controller{" "}
           <span className="font-semibold">{controller.name}</span>? This only
-          affects SpatiumDDI — nothing on the controller side changes. All IPAM
-          rows mirrored from this controller (subnets, blocks, IP addresses)
-          will be removed via the FK cascade.
+          affects SpatiumDDI — nothing on the controller side changes. If active
+          block sync is armed, disarm it first (that lifts the pushed blocks
+          from the device); delete is refused while it is armed. Only rows that
+          were purely mirrored are removed. Anything you added yourself
+          (addresses, DHCP scopes, reservations, edited rows, custom fields) is
+          kept and detached from this integration.
         </p>
         <label className="flex cursor-pointer items-start gap-2 text-sm">
           <input
@@ -878,6 +977,11 @@ function DeleteControllerModal({
           />
           <span>I understand.</span>
         </label>
+        {error && (
+          <FormError className="break-words rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            {error}
+          </FormError>
+        )}
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}

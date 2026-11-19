@@ -19,6 +19,8 @@ from __future__ import annotations
 import asyncio
 import uuid
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import structlog
 from sqlalchemy import select
@@ -26,17 +28,60 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.drivers.dns import get_driver
 from app.drivers.dns.base import RecordData, TsigKey
-from app.models.dns import DNSRecord, DNSServer, DNSZone
-from app.services.dns.pull_from_server import _key, without_agent_ns_glue
+from app.models.dns import DNSRecord, DNSServer, DNSServerZoneState, DNSZone
+from app.services.dns.pull_from_server import (
+    _key,
+    non_authoritative_reason,
+    targets_are_relative,
+    without_agent_ns_glue,
+    without_server_apex_ns,
+)
+from app.services.dns.pull_from_server import (
+    is_apex_ns as _is_apex_ns,
+)
 from app.services.dns.tsig import (
     is_view_transfer_key,
     pull_zone_records_signed,
     resolve_group_transfer_key,
+    resolve_transfer_vip,
     resolve_view_transfer_key,
+    transfer_fallback_kwargs,
     transfer_needs_tsig,
 )
 
 logger = structlog.get_logger(__name__)
+
+# #3198 — how long after a change to the zone a server may sit below its
+# serial, or lack a record that change saved, before the report calls it
+# behind. A save bumps the serial and wakes the agents at once (Redis wake,
+# 12 s safety tick), and an apply is a render + validate + reload, so a server
+# catching up is normally done well inside this. 120 s is ten safety ticks:
+# past it the server has had many chances to converge and has not, which is a
+# fact about the server rather than a change still in flight.
+SERIAL_GRACE = timedelta(seconds=120)
+
+
+def zone_state_in_sync(zone: DNSZone, current: int, target: int, driver: str) -> bool:
+    """Whether a server's reported serial says it serves the zone's saved state.
+
+    A primary zone is in sync when the server serves our serial
+    (``last_serial``). A secondary / stub zone's serial is its primary's, not
+    ours to number, so it is never compared with ``last_serial`` (0 for a
+    secondary): a server that holds the zone is in sync. PowerDNS and BIND9
+    report the serial they serve, so a secondary there is in sync once it has
+    transferred (a transferred zone never serves 0) and not before: at 0 it
+    holds no data and answers REFUSED / SERVFAIL (#1967, #3940). A BIND9 agent
+    that cannot read the zone back reports nothing, which is not in sync
+    either. A BIND9 agent from before #3940 reports 0 for a secondary it never
+    read back, but its start-up report reads every zone from named, so a
+    secondary at a non-zero serial is served at it whichever agent says so;
+    a 0 from such an agent is "not reported", never synced. Other drivers
+    compare with the target."""
+    if (zone.zone_type or "primary") in ("secondary", "stub"):
+        if driver in ("powerdns", "bind9"):
+            return current != 0
+        return current == target
+    return current == target
 
 
 @dataclass
@@ -45,6 +90,11 @@ class DriftRecord:
     record_type: str
     value: str
     ttl: int | None = None
+    # Structured MX / SRV fields (#1525) — carried so a priority-only
+    # difference is visible in the report, not just counted.
+    priority: int | None = None
+    weight: int | None = None
+    port: int | None = None
 
 
 @dataclass
@@ -52,11 +102,35 @@ class ServerDrift:
     server_id: str
     server_name: str
     driver: str
-    status: str  # "ok" | "error" | "unsupported"
+    # "ok" — transferred, nothing missing or extra, not below the target
+    # serial (a server AHEAD of it — an inline-signed zone re-signing — is
+    # serving every saved change).
+    # "syncing" — transferred, the server has not caught up yet, and the zone
+    # changed within ``SERIAL_GRACE``: a change still in flight, not a fault.
+    # "behind" — transferred, but the server is not serving the zone as saved
+    # (a saved record is missing, or it sits below the target serial) and has
+    # had time to catch up.
+    # "drift" — transferred and not behind, but the record sets differ in a
+    # way that is not shown to be the server's fault: records SpatiumDDI does
+    # not hold (a manual change on the host), or differences a split-horizon
+    # transfer cannot attribute to this server's copy.
+    # "error" / "unsupported" — the transfer failed / cannot be done; the
+    # counts mean nothing. Anything else must be read as NOT ok (#3198).
+    status: str
     error: str | None = None
+    # What put the server in "behind" / "drift", operator-readable.
+    reason: str | None = None
+    # The server's reported serial (None = it has not reported) and the
+    # zone's target.
+    current_serial: int | None = None
+    target_serial: int = 0
     in_sync: int = 0
     extra_on_server: list[DriftRecord] = field(default_factory=list)
     missing_on_server: list[DriftRecord] = field(default_factory=list)
+    # How many of ``missing_on_server`` are view-scoped records of an
+    # unviewed zone, which a transfer may legitimately not return. Internal:
+    # read by the classifier, not part of the API.
+    missing_view_scoped: int = 0
 
     @property
     def drift_count(self) -> int:
@@ -74,13 +148,176 @@ class ZoneDriftReport:
     warnings: list[str] = field(default_factory=list)
 
 
+def _renders_apex_ns(srv: DNSServer, driver: object) -> bool:
+    """Whether ``srv`` serves the zone's own apex NS rows as its NS set, and
+    the read can return them (#1857).
+
+    True for an agent-managed BIND9 or Technitium: both agents write a
+    zone's apex NS records as the whole NS set (#1153), and both drivers read
+    over AXFR, which keeps the apex NS when asked. Elsewhere the NS set is the
+    server's or the provider's, not rendered from the rows.
+    """
+    return srv.agent_id is not None and bool(getattr(driver, "pull_can_include_apex_ns", False))
+
+
+def _compare_apex_ns(
+    db_rows: list[DNSRecord], on_wire: list[RecordData], zone_name: str
+) -> tuple[list[DNSRecord], list[RecordData]]:
+    """The two sides of a drift diff with apex NS kept only where it means
+    something (#1857).
+
+    * The zone declares no apex NS: whatever NS set the server answers with
+      is its own (an agent's ``primary_ns`` or placeholder, a provider's name
+      servers), not a difference from the zone. Drop it from the wire.
+    * The read carried no apex NS: an AXFR of a server that does not render
+      the zone's NS rows (an operator's BIND9, Windows). Every zone has an apex
+      NS set, so its absence means the read could not see it, and the stored
+      rows would read "missing on server" forever. Drop them from the DB side.
+    * Both sides have one: compare them like any record, so an NS set changed
+      on the server, or an NS change the agent failed to apply, shows.
+    """
+    db_has = any(_is_apex_ns(r, zone_name) for r in db_rows)
+    wire_has = any(_is_apex_ns(r, zone_name) for r in on_wire)
+    if not db_has:
+        on_wire = [r for r in on_wire if not _is_apex_ns(r, zone_name)]
+    elif not wire_has:
+        db_rows = [r for r in db_rows if not _is_apex_ns(r, zone_name)]
+    return db_rows, on_wire
+
+
 def _to_drift_record(r: RecordData | DNSRecord) -> DriftRecord:
     return DriftRecord(
         name=r.name or "@",
         record_type=r.record_type,
         value=r.value,
         ttl=r.ttl,
+        priority=getattr(r, "priority", None),
+        weight=getattr(r, "weight", None),
+        port=getattr(r, "port", None),
     )
+
+
+# Statuses of a server whose zone was actually read: the diff is meaningful.
+TRANSFERRED = frozenset({"ok", "syncing", "behind", "drift"})
+
+
+def _serial_behind(zone: DNSZone, current: int, target: int, driver: str) -> bool:
+    """Whether a reported serial says the server has not reached the zone's.
+
+    A secondary / stub zone's serial is its primary's, so the in-sync rule
+    (``zone_state_in_sync``) is the only reading. A primary zone's server is
+    behind only when its serial is BELOW ours in RFC 1982 serial arithmetic:
+    an inline-signed BIND9 zone serves the signed copy's serial, which
+    signing and re-signing move past ours on their own (#2835), and a third
+    party's RFC 2136 update does the same. Those servers serve every saved
+    change; calling them behind would flag every signed zone, permanently.
+    """
+    if (zone.zone_type or "primary") in ("secondary", "stub"):
+        return not zone_state_in_sync(zone, current, target, driver)
+    return current != target and (target - current) % 2**32 < 2**31
+
+
+def _plural(n: int, one: str, many: str) -> str:
+    return f"{n} {one if n == 1 else many}"
+
+
+async def _classify_transferred(
+    db: AsyncSession,
+    zone: DNSZone,
+    servers: list[DNSServer],
+    entries: list[ServerDrift],
+    view_addressed: dict[str, bool],
+) -> None:
+    """Turn "the transfer worked" into "and the server is serving the zone"
+    (#3198). The per-server status used to mean only the former, so a server
+    that had stopped applying the zone read ``ok``.
+    """
+    # Re-read what this uses: the report is read-only, and a commit between
+    # loading the zone and here must not leave these lazy-loading (async IO).
+    await db.refresh(zone, ["last_serial", "modified_at", "zone_type", "view_id"])
+    target = int(zone.last_serial or 0)
+    states = {
+        st.server_id: st
+        for st in (
+            await db.execute(
+                select(DNSServerZoneState).where(DNSServerZoneState.zone_id == zone.id)
+            )
+        )
+        .scalars()
+        .all()
+    }
+    modified = zone.modified_at
+    age = datetime.now(UTC) - modified if modified is not None else None
+    # Every save that changes what the zone serves bumps its serial, and so
+    # its ``modified_at``: inside the grace a difference may be that save
+    # still on its way to the server.
+    in_flight_window = age is not None and age <= SERIAL_GRACE
+    by_id = {str(s.id): s for s in servers}
+    for e in entries:
+        if e.status != "ok":
+            continue
+        e.target_serial = target
+        st = states.get(uuid.UUID(e.server_id))
+        if st is not None:
+            e.current_serial = int(st.current_serial)
+        behind_serial = e.current_serial is not None and _serial_behind(
+            zone,
+            e.current_serial,
+            target,
+            by_id[e.server_id].driver,
+        )
+        # Under split-horizon a transfer not addressed to the zone's view was
+        # answered by some view, maybe another one; an unviewed zone's
+        # view-scoped records are served to their view only. Neither kind of
+        # difference is evidence that THIS server is behind (see the warnings
+        # ``compute_zone_drift`` adds).
+        unattributable = zone.view_id is not None and not view_addressed.get(e.server_id, False)
+        missing = 0 if unattributable else len(e.missing_on_server) - e.missing_view_scoped
+        serving = (
+            f"serving serial {e.current_serial}, below the zone's {target}"
+            if behind_serial
+            else None
+        )
+        # A change still in flight: the server has not reached the serial
+        # that carries it (or has not reported one), and the zone changed a
+        # moment ago. A server AT the serial and still missing a record has
+        # applied the change without it — that is behind at once.
+        if (
+            in_flight_window
+            and (missing or behind_serial)
+            and (behind_serial or e.current_serial is None)
+        ):
+            e.status = "syncing"
+            secs = int(age.total_seconds()) if age is not None else 0
+            e.reason = (
+                f"the zone changed {secs}s ago and this server has not caught up yet"
+                + (f" ({serving})" if serving else "")
+                + "; re-run the report in a minute"
+            )
+            continue
+        reasons: list[str] = []
+        if missing:
+            reasons.append(f"{_plural(missing, 'saved record', 'saved records')} not being served")
+        if serving:
+            reasons.append(serving)
+        if reasons:
+            e.status = "behind"
+            e.reason = "; ".join(reasons)
+        elif e.drift_count:
+            e.status = "drift"
+            parts: list[str] = []
+            if e.extra_on_server:
+                n = len(e.extra_on_server)
+                parts.append(
+                    f"{n} record{' is' if n == 1 else 's are'} served that SpatiumDDI "
+                    "does not hold"
+                )
+            if e.missing_on_server:
+                parts.append(
+                    f"{_plural(len(e.missing_on_server), 'saved record', 'saved records')} "
+                    "not returned, which DNS views can explain (see the report's warnings)"
+                )
+            e.reason = "; ".join(parts)
 
 
 async def compute_zone_drift(
@@ -93,7 +330,6 @@ async def compute_zone_drift(
     db_rows = list(
         (await db.execute(select(DNSRecord).where(DNSRecord.zone_id == zone.id))).scalars().all()
     )
-    db_by_key = {_key(r, zone.name): r for r in db_rows}
 
     servers = list(
         (
@@ -128,10 +364,15 @@ async def compute_zone_drift(
     # one derived key per view into that view alone; sign with the key of the
     # view holding this zone's copy, and keep the group key as the fallback
     # for an agent that predates the view keys.
+    # #1470 — behind the appliance's DNS VIP the node address refuses :53;
+    # each member is then retried at its own pod address, never the VIP.
+    transfer_vip = await resolve_transfer_vip(db) if needs_tsig else ""
     view_transfer = await resolve_view_transfer_key(db, zone) if needs_tsig else None
     view_key, view_name = view_transfer if view_transfer is not None else (None, None)
     # server_id -> the transfer was addressed to the zone's own view.
     view_addressed: dict[str, bool] = {}
+
+    is_secondary = (zone.zone_type or "primary") == "secondary"
 
     async def _drift_for_server(srv: DNSServer) -> ServerDrift:
         entry = ServerDrift(
@@ -140,6 +381,12 @@ async def compute_zone_drift(
             driver=srv.driver,
             status="ok",
         )
+        # #3758 — a forward / stub zone is not held authoritatively, so the
+        # transfer is refused by design: not applicable, not a failed pull.
+        if (na_reason := non_authoritative_reason(zone)) is not None:
+            entry.status = "unsupported"
+            entry.error = na_reason
+            return entry
         driver = get_driver(srv.driver)
         if not hasattr(driver, "pull_zone_records"):
             entry.status = "unsupported"
@@ -174,9 +421,13 @@ async def compute_zone_drift(
             # authorised by address; handing either a key it never granted
             # turns a working pull into NOTAUTH.
             keys = [None]
+        pull_kwargs: dict[str, Any] = (
+            {"include_apex_ns": True} if _renders_apex_ns(srv, driver) else {}
+        )
+        pull_kwargs.update(transfer_fallback_kwargs(srv, transfer_vip))
         try:
             on_wire, used = await pull_zone_records_signed(
-                driver, srv, zone.name, keys, view_name=view_name
+                driver, srv, zone.name, keys, view_name=view_name, **pull_kwargs
             )
         except Exception as exc:  # noqa: BLE001 — per-server, never fail the whole report
             entry.status = "error"
@@ -191,14 +442,34 @@ async def compute_zone_drift(
             return entry
 
         view_addressed[entry.server_id] = is_view_transfer_key(used)
+        # #4057 — a secondary's records come from its primary by transfer;
+        # SpatiumDDI holds none of them, so a diff against the zone's own rows
+        # would list every transferred record as "extra on the server". The
+        # transfer proves the zone is served; the serial check in
+        # ``_classify_transferred`` speaks for convergence.
+        if is_secondary:
+            entry.in_sync = len(on_wire)
+            return entry
+        # #1794 — a dot-less name target is relative on a zone-file driver and
+        # absolute on a cloud one, so the DB side is keyed per server.
+        rel = targets_are_relative(srv)
+        # #1857 — a stored apex NS row (an importer's copy of the source's, or
+        # one an operator wrote) read "missing on server" forever, because the
+        # transfer dropped the apex NS. See ``_compare_apex_ns``.
+        db_rows_cmp, on_wire = _compare_apex_ns(db_rows, on_wire, zone.name)
+        db_by_key = {_key(r, zone.name, relative_targets=rel): r for r in db_rows_cmp}
         on_wire = without_agent_ns_glue(on_wire, srv, zone.name, set(db_by_key))
-        wire_by_key = {_key(r, zone.name): r for r in on_wire}
+        on_wire = without_server_apex_ns(on_wire, srv, zone.name, set(db_by_key))
+        wire_by_key = {_key(r, zone.name, relative_targets=rel): r for r in on_wire}
         entry.extra_on_server = [
             _to_drift_record(r) for k, r in wire_by_key.items() if k not in db_by_key
         ]
         entry.missing_on_server = [
             _to_drift_record(r) for k, r in db_by_key.items() if k not in wire_by_key
         ]
+        entry.missing_view_scoped = sum(
+            1 for k, r in db_by_key.items() if k not in wire_by_key and r.view_id is not None
+        )
         entry.in_sync = len(set(db_by_key) & set(wire_by_key))
         return entry
 
@@ -207,6 +478,14 @@ async def compute_zone_drift(
     # only touches the driver (network), never the shared AsyncSession, and
     # isolates its own failures, so gather() is safe. Order is preserved.
     report.servers = list(await asyncio.gather(*(_drift_for_server(s) for s in servers)))
+    await _classify_transferred(db, zone, servers, report.servers, view_addressed)
+    if is_secondary:
+        report.warnings.append(
+            "This is a secondary zone: its records come from the primary by zone "
+            "transfer and SpatiumDDI does not hold them, so they are not compared "
+            "record by record. Only whether each server is serving the zone, and "
+            "at which serial, is checked."
+        )
 
     # Split-horizon caveats. A zone that belongs to a view has one copy per
     # view it lives in, and an AXFR names only the zone. A transfer addressed
@@ -220,7 +499,7 @@ async def compute_zone_drift(
         unaddressed = [
             s.server_name
             for s in report.servers
-            if s.status == "ok" and not view_addressed.get(s.server_id, False)
+            if s.status in TRANSFERRED and not view_addressed.get(s.server_id, False)
         ]
         if unaddressed:
             report.warnings.append(

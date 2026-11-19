@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 import {
   AlertCircle,
   CheckCircle2,
@@ -24,7 +25,9 @@ import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { IPSpacePicker } from "@/components/ipam/space-picker";
 
+import { DEVICE_SECONDS_BOUNDS, secondsFieldError } from "@/lib/seconds";
 import { DEVICE_TYPE_OPTIONS, Field, errMsg, inputCls } from "./_shared";
+import { FormError } from "@/components/ui/form-error";
 
 // ── Static option lists ──────────────────────────────────────────────
 
@@ -82,7 +85,7 @@ export function DeviceFormModal({
   );
   const [snmpPort, setSnmpPort] = useState(device?.snmp_port ?? 161);
   const [snmpTimeout, setSnmpTimeout] = useState(
-    device?.snmp_timeout_seconds ?? 5,
+    String(device?.snmp_timeout_seconds ?? 5),
   );
   const [snmpRetries, setSnmpRetries] = useState(device?.snmp_retries ?? 1);
 
@@ -106,13 +109,41 @@ export function DeviceFormModal({
     device?.v3_priv_protocol ?? "AES128",
   );
   const [v3PrivKey, setV3PrivKey] = useState("");
+  // #4135 — a moved address / SNMP port needs the stored community or v3 keys
+  // entered again.
+  const reask = useCredentialReask(
+    { ip_address: ipAddress.trim(), snmp_port: snmpPort },
+    device && { ip_address: device.ip_address, snmp_port: device.snmp_port },
+    () => {
+      setCommunity("");
+      setV3AuthKey("");
+      setV3PrivKey("");
+    },
+  );
+  const isV2 = snmpVersion === "v1" || snmpVersion === "v2c";
+  const mustEnterCommunity =
+    isV2 && reask.asks(device?.has_community) && !community.trim();
+  const needsAuth =
+    v3SecurityLevel === "authNoPriv" || v3SecurityLevel === "authPriv";
+  const mustEnterAuthKey =
+    snmpVersion === "v3" &&
+    needsAuth &&
+    reask.asks(device?.has_auth_key) &&
+    !v3AuthKey.trim();
+  const mustEnterPrivKey =
+    snmpVersion === "v3" &&
+    v3SecurityLevel === "authPriv" &&
+    reask.asks(device?.has_priv_key) &&
+    !v3PrivKey.trim();
+  const mustEnterAny =
+    mustEnterCommunity || mustEnterAuthKey || mustEnterPrivKey;
   const [v3ContextName, setV3ContextName] = useState(
     device?.v3_context_name ?? "",
   );
 
   // Polling
   const [pollInterval, setPollInterval] = useState(
-    device?.poll_interval_seconds ?? 300,
+    String(device?.poll_interval_seconds ?? 300),
   );
   const [pollArp, setPollArp] = useState(device?.poll_arp ?? true);
   const [pollFdb, setPollFdb] = useState(device?.poll_fdb ?? true);
@@ -164,7 +195,11 @@ export function DeviceFormModal({
           return "Privacy key is required for authPriv";
       }
     }
-    return null;
+    // #2110 — "1h" and an empty field are refused, never read as 1 / the default.
+    return (
+      secondsFieldError("SNMP timeout", snmpTimeout, DEVICE_SECONDS_BOUNDS) ??
+      secondsFieldError("Poll interval", pollInterval, DEVICE_SECONDS_BOUNDS)
+    );
   }
 
   // ── Build payload ──
@@ -178,9 +213,9 @@ export function DeviceFormModal({
       description: description || null,
       snmp_version: snmpVersion,
       snmp_port: snmpPort,
-      snmp_timeout_seconds: snmpTimeout,
+      snmp_timeout_seconds: Number(snmpTimeout.trim()),
       snmp_retries: snmpRetries,
-      poll_interval_seconds: pollInterval,
+      poll_interval_seconds: Number(pollInterval.trim()),
       poll_arp: pollArp,
       poll_fdb: pollFdb,
       poll_interfaces: pollInterfaces,
@@ -219,9 +254,9 @@ export function DeviceFormModal({
       description: description || null,
       snmp_version: snmpVersion,
       snmp_port: snmpPort,
-      snmp_timeout_seconds: snmpTimeout,
+      snmp_timeout_seconds: Number(snmpTimeout.trim()),
       snmp_retries: snmpRetries,
-      poll_interval_seconds: pollInterval,
+      poll_interval_seconds: Number(pollInterval.trim()),
       poll_arp: pollArp,
       poll_fdb: pollFdb,
       poll_interfaces: pollInterfaces,
@@ -425,9 +460,7 @@ export function DeviceFormModal({
                   value={snmpTimeout}
                   min={1}
                   max={60}
-                  onChange={(e) =>
-                    setSnmpTimeout(parseInt(e.target.value) || 5)
-                  }
+                  onChange={(e) => setSnmpTimeout(e.target.value)}
                 />
               </Field>
               <Field label="Retries">
@@ -454,17 +487,24 @@ export function DeviceFormModal({
           {(snmpVersion === "v1" || snmpVersion === "v2c") && (
             <Field
               label="Community string"
-              hint="SNMP v1/v2c community. ``public`` is the most common default."
+              hint={
+                reask.asks(device?.has_community)
+                  ? reask.hint
+                  : "SNMP v1/v2c community. ‘public’ is the most common default."
+              }
             >
               <input
                 type="text"
                 className={inputCls}
                 value={community}
                 onChange={(e) => setCommunity(e.target.value)}
+                required={mustEnterCommunity}
                 placeholder={
-                  editing && device?.has_community
-                    ? "(unchanged — leave blank to keep existing)"
-                    : "public"
+                  reask.asks(device?.has_community)
+                    ? reask.placeholder
+                    : editing && device?.has_community
+                      ? "(unchanged — leave blank to keep existing)"
+                      : "public"
                 }
                 autoComplete="off"
                 spellCheck={false}
@@ -519,16 +559,24 @@ export function DeviceFormModal({
                       ))}
                     </select>
                   </Field>
-                  <Field label="Auth key">
+                  <Field
+                    label="Auth key"
+                    hint={
+                      reask.asks(device?.has_auth_key) ? reask.hint : undefined
+                    }
+                  >
                     <input
                       type="password"
                       className={inputCls}
                       value={v3AuthKey}
                       onChange={(e) => setV3AuthKey(e.target.value)}
+                      required={mustEnterAuthKey}
                       placeholder={
-                        editing && device?.has_auth_key
-                          ? "(unchanged — leave blank to keep existing)"
-                          : ""
+                        reask.asks(device?.has_auth_key)
+                          ? reask.placeholder
+                          : editing && device?.has_auth_key
+                            ? "(unchanged — leave blank to keep existing)"
+                            : ""
                       }
                       autoComplete="new-password"
                     />
@@ -554,16 +602,24 @@ export function DeviceFormModal({
                       ))}
                     </select>
                   </Field>
-                  <Field label="Privacy key">
+                  <Field
+                    label="Privacy key"
+                    hint={
+                      reask.asks(device?.has_priv_key) ? reask.hint : undefined
+                    }
+                  >
                     <input
                       type="password"
                       className={inputCls}
                       value={v3PrivKey}
                       onChange={(e) => setV3PrivKey(e.target.value)}
+                      required={mustEnterPrivKey}
                       placeholder={
-                        editing && device?.has_priv_key
-                          ? "(unchanged — leave blank to keep existing)"
-                          : ""
+                        reask.asks(device?.has_priv_key)
+                          ? reask.placeholder
+                          : editing && device?.has_priv_key
+                            ? "(unchanged — leave blank to keep existing)"
+                            : ""
                       }
                       autoComplete="new-password"
                     />
@@ -597,7 +653,7 @@ export function DeviceFormModal({
               value={pollInterval}
               min={30}
               max={86400}
-              onChange={(e) => setPollInterval(parseInt(e.target.value) || 300)}
+              onChange={(e) => setPollInterval(e.target.value)}
             />
           </Field>
           <div className="flex flex-wrap gap-4">
@@ -665,10 +721,10 @@ export function DeviceFormModal({
         {testResult && <TestResultBanner result={testResult} />}
 
         {error && (
-          <div className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+          <FormError className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
             <AlertCircle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0" />
             <span>{error}</span>
-          </div>
+          </FormError>
         )}
 
         {/* Footer buttons */}
@@ -708,7 +764,7 @@ export function DeviceFormModal({
             </button>
             <button
               type="submit"
-              disabled={saveMut.isPending}
+              disabled={saveMut.isPending || mustEnterAny}
               className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
             >
               {saveMut.isPending ? "Saving…" : editing ? "Save" : "Add Device"}

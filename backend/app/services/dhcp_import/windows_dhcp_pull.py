@@ -38,6 +38,7 @@ def _scope_from_dict(raw: dict[str, Any]) -> ImportedScope | None:
     if not cidr:
         return None
     pools: list[ImportedPool] = []
+    parse_warnings: list[str] = []
     for p in raw.get("pools") or []:
         if p.get("start_ip") and p.get("end_ip"):
             pools.append(
@@ -46,6 +47,12 @@ def _scope_from_dict(raw: dict[str, Any]) -> ImportedScope | None:
                     end_ip=str(p["end_ip"]),
                     pool_type=str(p.get("pool_type") or "dynamic"),
                 )
+            )
+        else:
+            # Name a dropped range rather than leave it silently missing (#3097).
+            parse_warnings.append(
+                f"Range {p.get('start_ip')!r}-{p.get('end_ip')!r} not imported: "
+                "the server reported no start or end address."
             )
     reservations: list[ImportedReservation] = []
     for s in raw.get("statics") or []:
@@ -70,6 +77,7 @@ def _scope_from_dict(raw: dict[str, Any]) -> ImportedScope | None:
         options=dict(raw.get("options") or {}),
         pools=pools,
         reservations=reservations,
+        parse_warnings=parse_warnings,
     )
 
 

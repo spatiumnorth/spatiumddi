@@ -55,6 +55,8 @@ from urllib.parse import urlparse, urlunparse
 
 import structlog
 
+from .ha_tls import credential_from_failover, tls_paths
+
 _log = structlog.get_logger(__name__)
 
 # Well-known DHCPv4 option codes we emit by name when present in the bundle.
@@ -384,6 +386,28 @@ def _options_from_mapping_v6(options: dict[str, Any] | None) -> list[dict[str, A
     return out
 
 
+def _class_in_family(c: dict[str, Any], family: str) -> bool:
+    """Does an operator client class belong in ``family``'s daemon (#1229)?
+
+    A class whose test uses ``pkt4`` / ``relay4`` makes kea-dhcp6 reject the
+    WHOLE config (and ``pkt6`` / ``relay6`` does the same to kea-dhcp4), which
+    reverts the bundle for both daemons. The control plane says which family a
+    class is for; a bundle from a control plane older than #1229 carries no
+    ``address_family``, and the class goes into both, as it always did.
+    """
+    return c.get("address_family", "dual") in (family, "dual")
+
+
+def _class_options(c: dict[str, Any], family: str) -> dict[str, Any] | None:
+    """The options a class delivers in ``family`` (#1295). ``dns-servers`` is
+    an IPv4 list in Dhcp4 and an IPv6 one in Dhcp6, so one map cannot serve
+    both; the control plane splits it. An older control plane sends only
+    ``options``, used for both as before."""
+    if "address_family" not in c:
+        return c.get("options")
+    return c.get("options_v6" if family == "ipv6" else "options_v4")
+
+
 def _reservation_v6(res: dict[str, Any]) -> dict[str, Any]:
     """Render a single Dhcp6 host reservation.
 
@@ -418,15 +442,21 @@ def _reservation_v6(res: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _pxe_class(p: dict[str, Any]) -> dict[str, Any]:
+def _pxe_class(p: dict[str, Any], *, additional: bool = False) -> dict[str, Any]:
     """Render a PXE / iPXE client class (#51) — Dhcp4 only.
 
-    Mirrors ``_render_pxe_class`` in ``backend/app/drivers/dhcp/kea.py``.
+    The class that carries the boot fields; ``_pxe_classes`` adds its selector.
     ``next-server`` + ``boot-file-name`` on the class win over scope-level
     defaults when Kea matches the packet, which is what lets one scope serve
     a different boot binary per architecture. An empty ``match_expression``
     means "always match" — a low-priority fallthrough — so the key is omitted
     rather than emitted empty, which Kea would reject.
+
+    #2731: ``additional`` renders the class ``only-in-additional-list``, so
+    Kea evaluates it only for the subnets that list it, which are the scopes
+    bound to its profile (``_scope_to_subnet``). Its boot fields still reach
+    the OFFER, and with no ``test`` it is added for every client of those
+    subnets (both measured on kea-dhcp4 3.0.3).
     """
     out: dict[str, Any] = {
         "name": p["name"],
@@ -448,7 +478,62 @@ def _pxe_class(p: dict[str, Any]) -> dict[str, Any]:
             out["next-server"] = next_server
     if p.get("match_expression"):
         out["test"] = p["match_expression"]
+    if additional:
+        out["only-in-additional-list"] = True
     return out
+
+
+# #3404: the suffix of the class that carries a PXE rule's boot fields once the
+# classes are scoped. Mirrors ``PXE_BOOT_CLASS_SUFFIX`` in
+# ``backend/app/drivers/dhcp/kea.py``.
+PXE_BOOT_CLASS_SUFFIX = "-boot"
+
+
+def pxe_boot_class_name(name: str) -> str:
+    """The name of the class that carries PXE rule ``name``'s boot fields (#3404)."""
+    return f"{name}{PXE_BOOT_CLASS_SUFFIX}"
+
+
+def _pxe_classes(p: dict[str, Any], *, additional: bool = False) -> list[dict[str, Any]]:
+    """Render one PXE / iPXE rule as its Kea client classes (Dhcp4 only).
+
+    Mirrors ``_render_pxe_classes`` in ``backend/app/drivers/dhcp/kea.py``.
+    Without ``additional`` (a control plane older than #2731) the rule is one
+    global class carrying its test and its boot fields, as it always was.
+
+    With ``additional``, two classes (#3404):
+
+    - The selector keeps the rule's name and its test, and carries no boot
+      fields. It is an ordinary class, which Kea evaluates for every packet
+      before it picks a pool, so a pool restricted to it (``class_restriction``,
+      the pool's ``client-class``) serves the clients the rule matches. Kea
+      evaluates an ``only-in-additional-list`` class only after it has picked
+      the pool and the lease, so a pool restricted to such a class served
+      nobody. Evaluated everywhere, the selector still boots no one.
+    - The boot class (``pxe_boot_class_name``) carries the boot fields, tests
+      ``member('<selector>')`` and is ``only-in-additional-list``. Only the
+      subnets of the scopes bound to the rule's profile list it
+      (``_scope_to_subnet``), so the boot fields reach those scopes' clients
+      and no other (#2731). It is declared after its selector, because Kea
+      refuses a ``member()`` of a class not yet defined.
+
+    A rule with no test matches every client. Kea never assigns an ordinary
+    class that has no test, so that rule's selector tests ``member('ALL')``
+    (every packet is in Kea's built-in ``ALL``), and its boot class keeps no
+    test, which Kea adds for every client of a subnet that lists it.
+    """
+    boot = _pxe_class(p, additional=additional)
+    if not additional:
+        return [boot]
+    name = p["name"]
+    selector: dict[str, Any] = {
+        "name": name,
+        "test": p.get("match_expression") or "member('ALL')",
+    }
+    boot["name"] = pxe_boot_class_name(name)
+    if p.get("match_expression"):
+        boot["test"] = f"member('{name}')"
+    return [selector, boot]
 
 
 def _phone_class(c: dict[str, Any]) -> dict[str, Any]:
@@ -687,6 +772,33 @@ def _normalize_mac_for_kea(raw: str) -> str | None:
     return ":".join(cleaned[i : i + 2] for i in range(0, 12, 2))
 
 
+def _add_mac_blocklist_class(
+    rendered_classes: list[dict[str, Any]], drop_expr: str, *, family: str
+) -> None:
+    """Add the MAC blocklist to ``rendered_classes`` as Kea's ``DROP`` class.
+
+    Kea drops any packet in a class named ``DROP``, and only that name does
+    it, so the blocklist cannot be rendered under another name. An operator
+    class already called ``DROP`` (stored before the API refused the name,
+    #2296) is not skipped and not renamed: renaming it would stop it
+    dropping the packets it drops today, and skipping the blocklist would
+    leave every blocked MAC served. Instead the one ``DROP`` class matches
+    either: the operator's test OR the blocklist. A ``DROP`` with no test
+    (assigned only by reservations) takes the blocklist as its test, which
+    keeps those assignments working. Two classes of one name would make Kea
+    reject the whole config, so this is the only shape that keeps both.
+    """
+    if not drop_expr:
+        return
+    existing = next((c for c in rendered_classes if c.get("name") == "DROP"), None)
+    if existing is None:
+        rendered_classes.append({"name": "DROP", "test": drop_expr})
+        return
+    own = existing.get("test")
+    existing["test"] = f"({own}) or ({drop_expr})" if own else drop_expr
+    _log.warning("mac_blocklist_merged_into_operator_drop_class", family=family)
+
+
 def _build_drop_expression(mac_blocks: list[dict[str, Any]]) -> str:
     """Build a Kea client-class ``test`` expression for the DROP list.
 
@@ -707,6 +819,35 @@ def _build_drop_expression(mac_blocks: list[dict[str, Any]]) -> str:
     if not norms:
         return ""
     return " or ".join(f"hexstring(pkt4.mac, ':') == '{m}'" for m in norms)
+
+
+def _build_drop_expression_v6(mac_blocks: list[dict[str, Any]]) -> str:
+    """Best-effort Kea Dhcp6 ``test`` expression for the MAC blocklist (#2268).
+
+    Kea has no ``pkt6.mac``: a DHCPv6 packet carries no hardware address at
+    all. A MAC can only be recovered from (a) the client DUID when it is
+    DUID-LLT (type 1) or DUID-LL (type 3) over Ethernet (hwtype 1), or
+    (b) the RFC 6939 client link-layer address option (79) a first-hop relay
+    appends. Both are matched here, per MAC. A client using DUID-EN /
+    DUID-UUID, a randomised DUID, or an unrelayed packet from a relay that
+    doesn't add option 79, carries no MAC and cannot be matched.
+    """
+    clauses: list[str] = []
+    for entry in mac_blocks:
+        mac = entry.get("mac_address") if isinstance(entry, dict) else None
+        if not mac:
+            continue
+        n = _normalize_mac_for_kea(str(mac))
+        if n is None:
+            continue
+        h = "0x" + n.replace(":", "")
+        clauses.append(
+            f"(substring(option[1].hex, 0, 4) == 0x00030001 and substring(option[1].hex, 4, 6) == {h})"
+            f" or (substring(option[1].hex, 0, 4) == 0x00010001 and substring(option[1].hex, 8, 6) == {h})"
+            f" or (substring(relay6[-1].option[79].hex, 0, 2) == 0x0001 and substring(relay6[-1].option[79].hex, 2, 6) == {h})"
+            f" or (substring(relay6[0].option[79].hex, 0, 2) == 0x0001 and substring(relay6[0].option[79].hex, 2, 6) == {h})"
+        )
+    return " or ".join(clauses)
 
 
 def _reservation(res: dict[str, Any]) -> dict[str, Any]:
@@ -845,6 +986,15 @@ def _scope_to_subnet(scope: dict[str, Any]) -> dict[str, Any]:
     relay = scope.get("relay_addresses")
     if relay:
         out["relay"] = {"ip-addresses": list(relay)}
+    # #2731: the classes of the scope's own PXE profile, in the order the
+    # control plane sent them. Rendered ``only-in-additional-list`` (see
+    # ``render``), they are evaluated for the subnets that list them and no
+    # other, so one scope's profile no longer boots every scope's clients.
+    # #3404: the subnet lists each rule's boot class; the rule's own name is
+    # its selector, an ordinary class that pools can be restricted to.
+    pxe = scope.get("pxe_class_names")
+    if pxe:
+        out["evaluate-additional-classes"] = [pxe_boot_class_name(n) for n in pxe]
     return out
 
 
@@ -885,12 +1035,33 @@ def _resolve_peer_url(url: str) -> str:
         return url
 
 
+# Where ``sync`` writes the HA peer credential (``<state_dir>/ha-tls``) when
+# the caller does not say otherwise.
+DEFAULT_HA_TLS_DIR = "/var/lib/spatium-dhcp-agent/ha-tls"
+
+
 # #980 — see the ``multi-threading`` block in _ha_hook for why the HA hook's
 # HTTP pools are pinned rather than left to follow the packet-worker pool.
 _HA_HTTP_THREADS = 4
 
 
-def _ha_hook(failover: dict[str, Any]) -> dict[str, Any]:
+def _https(url: str) -> str:
+    """``url`` with an ``https`` scheme (the peer listener speaks TLS).
+
+    The port is kept: a URL with none meant 80 under ``http``, and Kea would
+    read the same URL under ``https`` as 443 — moving the listener off the
+    port the appliance firewall opened from the stored ``ha_peer_url``.
+    """
+    p = urlparse(url)
+    if p.scheme.lower() != "http":
+        return url
+    netloc = p.netloc
+    if p.port is None:
+        netloc = f"{netloc}:80"
+    return urlunparse(("https", netloc, p.path or "/", p.params, p.query, p.fragment))
+
+
+def _ha_hook(failover: dict[str, Any], ha_tls_dir: str = DEFAULT_HA_TLS_DIR) -> dict[str, Any]:
     """Render the ``libdhcp_ha.so`` hook entry from a failover payload.
 
     Shape mirrors Kea's HA hook reference (ARM §14.3): the hook takes
@@ -898,16 +1069,31 @@ def _ha_hook(failover: dict[str, Any]) -> dict[str, Any]:
     list with one entry per relationship. Each entry has
     ``this-server-name``, ``mode``, a ``peers`` array, and heartbeat
     tuning.
+
+    When the payload carries the group's peer credential (``failover.tls``),
+    the relationship is rendered with ``trust-anchor`` / ``cert-file`` /
+    ``key-file`` (written to ``ha_tls_dir`` by ``ha_tls.materialise``) and
+    ``require-client-certs``. Kea then runs its dedicated listener as a TLS
+    server that refuses any client without a certificate issued by the
+    group's CA, and verifies its partner the same way when it is the client.
+    That — not ``basic-auth-user`` — is what the listener enforces: in Kea
+    3.0 the HA hook only ever SENDS basic-auth, it never checks it on its own
+    listener (``CmdResponseCreator::http_auth_config_`` is left unset).
     """
-    peers = [
-        {
-            "name": p["name"],
-            "url": _resolve_peer_url(p["url"]),
-            "role": p["role"],
-            "auto-failover": bool(p.get("auto-failover", True)),
-        }
-        for p in failover["peers"]
-    ]
+    use_tls = credential_from_failover(failover) is not None
+    peers = []
+    for p in failover["peers"]:
+        url = _resolve_peer_url(p["url"])
+        peers.append(
+            {
+                "name": p["name"],
+                # Kea refuses an ``https`` URL without TLS and the listener
+                # speaks only TLS once it is configured, so the scheme follows.
+                "url": _https(url) if use_tls else url,
+                "role": p["role"],
+                "auto-failover": bool(p.get("auto-failover", True)),
+            }
+        )
     relationship = {
         # #980 — pin the HA hook's OWN thread pools.
         #
@@ -936,12 +1122,18 @@ def _ha_hook(failover: dict[str, Any]) -> dict[str, Any]:
         },
         "this-server-name": failover["this_server_name"],
         "mode": failover["mode"],
-        "heartbeat-delay": int(failover.get("heartbeat_delay_ms", 10000)),
+        "heartbeat-delay": int(failover.get("heartbeat_delay_ms", 2000)),
         "max-response-delay": int(failover.get("max_response_delay_ms", 60000)),
         "max-ack-delay": int(failover.get("max_ack_delay_ms", 10000)),
         "max-unacked-clients": int(failover.get("max_unacked_clients", 5)),
+        # Kea 3.0's default, stated explicitly: the dedicated listener accepts
+        # only the commands the HA hook itself sends.
+        "restrict-commands": True,
         "peers": peers,
     }
+    if use_tls:
+        relationship.update(tls_paths(ha_tls_dir))
+        relationship["require-client-certs"] = True
     return {
         "library": "/usr/lib/kea/hooks/libdhcp_ha.so",
         "parameters": {"high-availability": [relationship]},
@@ -1011,6 +1203,71 @@ def _quiet_packet_logger(daemon: str, server: dict[str, Any]) -> list[dict[str, 
     return [{"name": f"{daemon}.packets", "severity": "WARN"}]
 
 
+# #1259 — renewal (T1) and rebind (T2) times, derived from each lease's own
+# lifetime instead of pinned. The roots used to carry ``renew-timer: 900`` /
+# ``rebind-timer: 1800``, so a 1-day lease renewed every 15 minutes (~48x the
+# RFC load), a v4 lease of 15 minutes or less got no T1/T2 at all (Kea omits
+# a T1 that is not below T2 / the lease), and a short v6 lease got a T1 past
+# its own expiry.
+#
+# The percentages are the RFC ones: RFC 2131 §4.4.5 for v4 (0.5 / 0.875 of
+# the lease) and RFC 8415 for v6 (0.5 / 0.8), which are also Kea's own
+# defaults. kea-dhcp6 applies them to the PREFERRED lifetime, which defaults to
+# 62.5% of the valid one, so a 1-day v6 lease renews after 7.5 h (measured on
+# kea-dhcp6 3.0.3). v4 needs ``calculate-tee-times`` turned on (Kea defaults
+# it off and then sends no T1/T2 options); v6 already defaults it on, and is
+# rendered explicitly anyway so the file says what the server does.
+#
+# Never put ``renew-timer`` / ``rebind-timer`` back on the roots: Kea prefers
+# explicit timers over calculated ones and subnets inherit them, so a global
+# value silently disables the calculation everywhere. A per-subnet value (the
+# legacy ``_subnet`` path below) still wins for that subnet only.
+_TEE_TIMES_V4: dict[str, Any] = {
+    "calculate-tee-times": True,
+    "t1-percent": 0.5,
+    "t2-percent": 0.875,
+}
+_TEE_TIMES_V6: dict[str, Any] = {
+    "calculate-tee-times": True,
+    "t1-percent": 0.5,
+    "t2-percent": 0.8,
+}
+
+
+# #1283 — Kea's multi-threading packet queue, between the thread that reads
+# the sockets and the worker pool. Left unset it holds 64 packets, and when a
+# burst outruns the workers Kea evicts the OLDEST queued packet to make room
+# for the newest. Nothing counts that: ``pkt4-received`` is incremented by the
+# worker that processes a packet, so an evicted packet reaches no statistic,
+# and the only trace is a debug-level log line. The server reports answering
+# everything it received while clients wait out a retransmit (4 s) each.
+#
+# The size bounds how long a request can sit in the queue: size divided by the
+# rate the pool serves at. It must hold an arrival burst, and a full queue must
+# still drain inside the client's first retransmit, or Kea spends the burst
+# answering requests their clients have already re-sent (#952 measured that
+# shape as a 34 s DORA). Measured on a three-node cluster's relayed load ramp
+# (kea-dhcp4 3.0.3, one worker), with only this value changed between runs:
+#
+#   size   evicted, counted nowhere   handshakes re-sent   answer latency p99 / max
+#   64     2,286                      35.1 %               0.14 s / 0.33 s
+#   1024   0                          15.1 %               1.17 s / 1.21 s
+#   4096   0                           7.8 %               1.37 s / 1.39 s
+#
+# At 1024 the queue's deepest point was about 570 by Kea's own 10-packet
+# average, so the bursts fit with room to spare. At the roughly 470 packets/s
+# one worker served there, a full queue drains in about 2 s. At 4096 it would
+# take over 8 s, past the first retransmit. The re-sends left at 1024 and at
+# 4096 match the kernel's drops on Kea's raw socket (1,042 and 505), which
+# ``socket_drop`` counts (``socket_drops.py``).
+#
+# Not scaled by ``thread-pool-size``: more workers drain the same queue
+# faster, so one size is only ever safer as the pool grows. The backend's
+# config preview renders the same value
+# (``app.drivers.dhcp.kea.KEA_PACKET_QUEUE_SIZE``).
+KEA_PACKET_QUEUE_SIZE = 1024
+
+
 def _multi_threading(server: dict[str, Any]) -> dict[str, Any]:
     """Render Kea's ``multi-threading`` block from the bundle (#980).
 
@@ -1041,11 +1298,15 @@ def _multi_threading(server: dict[str, Any]) -> dict[str, Any]:
     operator asked for auto-sizing" must not render the same way — the whole
     point is that auto is the wrong answer here. An explicit 0 IS honoured
     and hands sizing back to Kea.
+
+    ``packet-queue-size`` is rendered too (#1283); see
+    :data:`KEA_PACKET_QUEUE_SIZE` for why and why this number.
     """
     size = server.get("kea_thread_pool_size")
     return {
         "enable-multi-threading": True,
         "thread-pool-size": 1 if size is None else int(size),
+        "packet-queue-size": KEA_PACKET_QUEUE_SIZE,
     }
 
 
@@ -1078,6 +1339,7 @@ def render(
     control_socket_v6: str | None = None,
     lease_file_v6: str | None = None,
     v6_unicast: list[tuple[str, str]] | None = None,
+    ha_tls_dir: str = DEFAULT_HA_TLS_DIR,
 ) -> dict[str, Any]:
     """Render a ConfigBundle into a Kea config document.
 
@@ -1151,8 +1413,8 @@ def render(
         # #980 — see _multi_threading. Rendered on every bundle, so the ETag
         # already covers it via the "server" block it reads from.
         "multi-threading": _multi_threading(server),
-        "renew-timer": 900,
-        "rebind-timer": 1800,
+        # #1259 — T1/T2 from the lease lifetime; see _TEE_TIMES_V4.
+        **_TEE_TIMES_V4,
         "hooks-libraries": [
             {"library": "/usr/lib/kea/hooks/libdhcp_lease_cmds.so"},
         ],
@@ -1181,7 +1443,7 @@ def render(
     # the lease_cmds hook above is load-bearing here too.
     failover = bundle.get("failover")
     if isinstance(failover, dict) and failover.get("peers"):
-        dhcp4["hooks-libraries"].append(_ha_hook(failover))
+        dhcp4["hooks-libraries"].append(_ha_hook(failover, ha_tls_dir))
 
     opts = _options_from_mapping(bundle.get("global_options"))
     if opts:
@@ -1195,6 +1457,7 @@ def render(
     # into ``subnet4`` here, v6 scopes into a ``Dhcp6`` block below. The
     # legacy ``subnets`` shape is v4-only by construction.
     scopes = bundle.get("scopes")
+    v4_scopes: list[dict[str, Any]] = []
     v6_scopes: list[dict[str, Any]] = []
     if scopes is not None:
         v4_scopes = [s for s in scopes if (s.get("address_family") or "ipv4") != "ipv6"]
@@ -1215,12 +1478,13 @@ def render(
                 else {}
             ),
             **(
-                {"option-data": _options_from_mapping(c.get("options"))}
-                if c.get("options")
+                {"option-data": _options_from_mapping(_class_options(c, "ipv4"))}
+                if _class_options(c, "ipv4")
                 else {}
             ),
         }
         for c in classes
+        if _class_in_family(c, "ipv4")
     ]
 
     # #858 — PXE + phone classes. Both were folded into the bundle ETag and
@@ -1229,7 +1493,20 @@ def render(
     # how both the appliance and the Compose stack run DHCP. Order matches the
     # backend driver: operator classes, then PXE, then phone. Kea evaluates
     # client-classes in declaration order, so this is behaviour, not style.
-    rendered_classes += [_pxe_class(p) for p in (bundle.get("pxe_classes") or [])]
+    #
+    # #2731: a PXE class belongs to the scopes bound to its profile. Each of
+    # those subnets lists it (``_scope_to_subnet``) and Kea evaluates it there
+    # and nowhere else. A bundle from a control plane older than #2731 lists
+    # no scope's classes, and they stay global, as they always were.
+    # #3404: scoped, each rule renders as a selector (an ordinary class, which
+    # pools can be restricted to) and a boot class that the subnets list; see
+    # ``_pxe_classes``.
+    pxe_scoped = any("pxe_class_names" in s for s in v4_scopes)
+    rendered_classes += [
+        cls
+        for p in (bundle.get("pxe_classes") or [])
+        for cls in _pxe_classes(p, additional=pxe_scoped)
+    ]
     rendered_classes += [_phone_class(c) for c in (bundle.get("phone_classes") or [])]
     # #700 — device policies last, matching the backend driver's order, so an
     # operator's own class of the same shape is evaluated first. Kea stops at
@@ -1246,12 +1523,12 @@ def render(
     # MAC blocklist — render as Kea's reserved ``DROP`` class. Any packet
     # whose hardware address matches the OR-ed expression is silently
     # dropped before allocation. ``DROP`` is a Kea built-in name, not
-    # something the operator can reuse — so if a user-defined class is
-    # already named ``DROP`` we skip blocklist rendering to avoid
-    # clobbering it (defensive; the API already reserves the name).
+    # something the operator can reuse. The API refuses the name since #2296,
+    # but a class stored before that may still carry it: see
+    # ``_add_mac_blocklist_class``, which keeps that class dropping what it
+    # dropped and enforces the blocklist too.
     drop_expr = _build_drop_expression(bundle.get("mac_blocks") or [])
-    if drop_expr and not any(c.get("name") == "DROP" for c in rendered_classes):
-        rendered_classes.append({"name": "DROP", "test": drop_expr})
+    _add_mac_blocklist_class(rendered_classes, drop_expr, family="ipv4")
 
     if rendered_classes:
         dhcp4["client-classes"] = rendered_classes
@@ -1275,7 +1552,7 @@ def render(
     # A raw-code option is only safe to emit once a definition for it exists:
     # Kea types an undefined code as BINARY and REJECTS THE WHOLE CONFIG when
     # the value isn't hex. Dropping one option is survivable; a rejected config
-    # is not, and `sync.py` writes the file before `config-test`, so a bad
+    # is not, and `sync.py` writes the file before `kea-dhcp4 -t`, so a bad
     # render outlives the process that made it.
     #
     # This also covers the two cases where no definitions arrive at all: the
@@ -1344,8 +1621,8 @@ def render(
         # leaving it on auto would put back most of the threads Dhcp4 just
         # dropped.
         "multi-threading": _multi_threading(server),
-        "renew-timer": 900,
-        "rebind-timer": 1800,
+        # #1259 — see _TEE_TIMES_V6.
+        **_TEE_TIMES_V6,
         "hooks-libraries": [
             {"library": "/usr/lib/kea/hooks/libdhcp_lease_cmds.so"},
         ],
@@ -1372,8 +1649,8 @@ def render(
         if opts6:
             dhcp6["option-data"] = opts6
         # Client classes render through the v6 name map. The MAC blocklist
-        # DROP class is v4-only (Kea v6 has no ``pkt4.mac``) so it is not
-        # carried into Dhcp6 — matching the backend driver.
+        # DROP class is rendered best-effort from the DUID / relay option 79
+        # (#2268) — Kea v6 has no ``pkt6.mac``.
         rendered_classes_v6: list[dict[str, Any]] = [
             {
                 "name": c["name"],
@@ -1383,13 +1660,16 @@ def render(
                     else {}
                 ),
                 **(
-                    {"option-data": _options_from_mapping_v6(c.get("options"))}
-                    if c.get("options")
+                    {"option-data": _options_from_mapping_v6(_class_options(c, "ipv6"))}
+                    if _class_options(c, "ipv6")
                     else {}
                 ),
             }
             for c in classes
+            if _class_in_family(c, "ipv6")
         ]
+        drop_expr_v6 = _build_drop_expression_v6(bundle.get("mac_blocks") or [])
+        _add_mac_blocklist_class(rendered_classes_v6, drop_expr_v6, family="ipv6")
         if rendered_classes_v6:
             dhcp6["client-classes"] = rendered_classes_v6
     out["Dhcp6"] = dhcp6

@@ -20,6 +20,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -34,12 +35,22 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
+API_KEY_EXPIRY_SOURCE_API = "api"
+API_KEY_EXPIRY_SOURCE_OPERATOR = "operator"
+API_KEY_EXPIRY_SOURCES = (API_KEY_EXPIRY_SOURCE_API, API_KEY_EXPIRY_SOURCE_OPERATOR)
+
 
 class TailscaleTenant(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """A Tailscale tenant (tailnet) SpatiumDDI polls for device state."""
 
     __tablename__ = "tailscale_tenant"
-    __table_args__ = (Index("ix_tailscale_tenant_name", "name", unique=True),)
+    __table_args__ = (
+        Index("ix_tailscale_tenant_name", "name", unique=True),
+        CheckConstraint(
+            "api_key_expiry_source IS NULL OR api_key_expiry_source IN ('api', 'operator')",
+            name="ck_tailscale_tenant_api_key_expiry_source",
+        ),
+    )
 
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
@@ -54,6 +65,16 @@ class TailscaleTenant(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     api_key_encrypted: Mapped[bytes] = mapped_column(
         LargeBinary, nullable=False, default=b"", server_default=sa_text("''::bytea")
     )
+    # When the access token stops working (#2138). Tailscale caps an API
+    # access token at 90 days, and an expired one turns every sync into an
+    # HTTP 401. NULL means UNKNOWN — never "does not expire".
+    api_key_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Where ``api_key_expires_at`` came from: ``"api"`` (read from
+    # Tailscale's keys endpoint, which wins whenever it can be read) or
+    # ``"operator"`` (typed into the tenant form). NULL with a NULL expiry.
+    api_key_expiry_source: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
     # ── Binding ─────────────────────────────────────────────────────
     ipam_space_id: Mapped[uuid.UUID] = mapped_column(
@@ -101,4 +122,9 @@ class TailscaleTenant(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     device_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
-__all__ = ["TailscaleTenant"]
+__all__ = [
+    "API_KEY_EXPIRY_SOURCES",
+    "API_KEY_EXPIRY_SOURCE_API",
+    "API_KEY_EXPIRY_SOURCE_OPERATOR",
+    "TailscaleTenant",
+]

@@ -23,7 +23,9 @@ import {
   MODAL_BACKDROP_CLS,
   useModalDialog,
 } from "@/components/ui/use-draggable-modal";
+import { summarizeZoneNames } from "@/lib/dnsNames";
 import { cn } from "@/lib/utils";
+import { formatCount } from "@/lib/format-count";
 import {
   formatApiError,
   ipamApi,
@@ -35,6 +37,7 @@ import {
   type SubnetResizeCommitResponse,
   type SubnetResizePreviewResponse,
 } from "@/lib/api";
+import { FormError } from "@/components/ui/form-error";
 
 // ── Shared UI bits ────────────────────────────────────────────────────────
 
@@ -75,29 +78,45 @@ function WarningList({ warnings }: { warnings: string[] }) {
   );
 }
 
-function BigYellowBanner({ newCidr }: { newCidr: string }) {
+export function BigYellowBanner({
+  newCidr,
+  kind,
+}: {
+  newCidr: string;
+  kind: "subnet" | "block";
+}) {
+  const isBlock = kind === "block";
   return (
     <div className="rounded border-2 border-yellow-400 bg-yellow-50 p-3 text-xs text-yellow-900 dark:border-yellow-700 dark:bg-yellow-900/20 dark:text-yellow-100">
       <div className="flex items-start gap-2">
         <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0" />
         <div className="space-y-1">
           <p className="font-semibold">
-            This operation rewrites the authoritative network definition.
+            {isBlock
+              ? "This operation rewrites the block's container CIDR."
+              : "This operation rewrites the authoritative network definition."}
           </p>
           <ul className="list-disc pl-4 space-y-0.5">
-            <li>
-              Every client on this network must be reconfigured with the new
-              netmask (<span className="font-mono">{newCidr}</span>).
-            </li>
+            {isBlock ? (
+              <li>
+                Child subnets are unchanged; only the block&apos;s container
+                CIDR moves to <span className="font-mono">{newCidr}</span>. No
+                client needs reconfiguring.
+              </li>
+            ) : (
+              <li>
+                Every client on this network must be reconfigured with the new
+                netmask (<span className="font-mono">{newCidr}</span>).
+              </li>
+            )}
             <li>
               Routers, firewalls, and any hard-coded references to the old CIDR
               must be updated manually.
             </li>
             <li>
-              This cannot be automatically undone. To revert, you must run the
-              resize again with the original CIDR — which is only legal if the
-              new smaller subnet is still a valid grow-target of whatever is
-              there now.
+              Resize is grow-only, so this cannot be undone by resizing back to
+              the original CIDR. To return to a smaller size, delete the {kind}{" "}
+              and recreate it at the smaller size.
             </li>
           </ul>
         </div>
@@ -383,16 +402,18 @@ export function ResizeSubnetModal({
       </div>
 
       {error && (
-        <div className="flex items-start gap-2 rounded border border-red-300 bg-red-50 p-2 text-xs text-red-800 dark:border-red-900 dark:bg-red-900/20 dark:text-red-300">
+        <FormError className="flex items-start gap-2 rounded border border-red-300 bg-red-50 p-2 text-xs text-red-800 dark:border-red-900 dark:bg-red-900/20 dark:text-red-300">
           <AlertCircle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0" />
           <span>{error}</span>
-        </div>
+        </FormError>
       )}
 
       {preview && (
         <div className="space-y-3">
           <ConflictList conflicts={preview.conflicts} />
-          {!hasConflicts && <BigYellowBanner newCidr={preview.new_cidr} />}
+          {!hasConflicts && (
+            <BigYellowBanner newCidr={preview.new_cidr} kind="subnet" />
+          )}
 
           <div className="rounded border bg-muted/30 p-3 text-xs space-y-2">
             <div className="font-semibold">Blast radius</div>
@@ -409,8 +430,14 @@ export function ResizeSubnetModal({
               />
               <RangeRow
                 label="Total usable IPs"
-                before={preview.total_ips_before.toLocaleString()}
-                after={preview.total_ips_after.toLocaleString()}
+                before={formatCount(
+                  preview.total_ips_before_exact,
+                  preview.total_ips_before,
+                )}
+                after={formatCount(
+                  preview.total_ips_after_exact,
+                  preview.total_ips_after,
+                )}
               />
               <RangeRow
                 label="Gateway (current)"
@@ -454,14 +481,17 @@ export function ResizeSubnetModal({
                   <span className="text-muted-foreground">Reverse zones:</span>{" "}
                   {preview.reverse_zones_existing.length > 0 && (
                     <span className="font-mono text-[10px]">
-                      existing {preview.reverse_zones_existing.join(", ")}
+                      existing{" "}
+                      {summarizeZoneNames(preview.reverse_zones_existing)}
                     </span>
                   )}
                   {preview.reverse_zones_will_be_created.length > 0 && (
                     <span className="font-mono text-[10px]">
                       {" "}
                       + create{" "}
-                      {preview.reverse_zones_will_be_created.join(", ")}
+                      {summarizeZoneNames(
+                        preview.reverse_zones_will_be_created,
+                      )}
                     </span>
                   )}
                 </div>
@@ -677,16 +707,18 @@ export function ResizeBlockModal({
       </div>
 
       {error && (
-        <div className="flex items-start gap-2 rounded border border-red-300 bg-red-50 p-2 text-xs text-red-800 dark:border-red-900 dark:bg-red-900/20 dark:text-red-300">
+        <FormError className="flex items-start gap-2 rounded border border-red-300 bg-red-50 p-2 text-xs text-red-800 dark:border-red-900 dark:bg-red-900/20 dark:text-red-300">
           <AlertCircle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0" />
           <span>{error}</span>
-        </div>
+        </FormError>
       )}
 
       {preview && (
         <div className="space-y-3">
           <ConflictList conflicts={preview.conflicts} />
-          {!hasConflicts && <BigYellowBanner newCidr={preview.new_cidr} />}
+          {!hasConflicts && (
+            <BigYellowBanner newCidr={preview.new_cidr} kind="block" />
+          )}
 
           <div className="rounded border bg-muted/30 p-3 text-xs space-y-2">
             <div className="font-semibold">Blast radius</div>
@@ -698,8 +730,14 @@ export function ResizeBlockModal({
               />
               <RangeRow
                 label="Total addresses"
-                before={preview.total_ips_before.toLocaleString()}
-                after={preview.total_ips_after.toLocaleString()}
+                before={formatCount(
+                  preview.total_ips_before_exact,
+                  preview.total_ips_before,
+                )}
+                after={formatCount(
+                  preview.total_ips_after_exact,
+                  preview.total_ips_after,
+                )}
               />
             </div>
             <div className="pt-2 space-y-0.5">

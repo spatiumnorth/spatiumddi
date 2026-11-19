@@ -25,20 +25,41 @@ CLAUDE.md non-negotiables that apply here:
 from __future__ import annotations
 
 import ipaddress
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.dns_names import bind_check_names_error
+from app.core.dns_names import (
+    HOSTNAME_TARGET_RECORD_TYPES,
+    bind_check_names_error,
+    contains_control_chars,
+    primary_ns_error,
+    record_value_error,
+    validate_fqdn,
+    validate_optional_hostname,
+    validate_record_owner,
+)
+from app.core.mac import canonicalize_mac
 from app.models.address_set import AddressSet, validate_address_set_shape
 from app.models.auth import User
-from app.models.ipam import IPAddress, IPBlock, Subnet
+from app.models.ipam import IP_STATUSES_CREATE_SETTABLE, IPAddress, IPBlock, Subnet
+from app.services.dns.name_targets import absolute_target_error
+from app.services.dns.new_object_defaults import default_zone_ttl
+from app.services.dns.sync_check import ipam_authors_zone
+from app.services.dns.zone_synthesis import unauthored_zone_error
+from app.services.ipam.address_create_rules import (
+    boundary_address_refusal,
+    holds_address,
+    take_address_row,
+)
 from app.services.ipam.probe_policy import check_probe_target
 from app.services.nmap import NmapArgError, build_argv
 from app.services.pcap import (
@@ -48,6 +69,7 @@ from app.services.pcap import (
     validate_bpf_filter,
     validate_interface,
 )
+from app.services.refusal import HTTPRefusal, ValueRefusal
 
 # Per-proposal TTL. 30 minutes is a generous window for a thoughtful
 # review without keeping yesterday's proposals lying around — the
@@ -91,6 +113,29 @@ class Operation:
     # (e.g. archiving your own chat session) that gate on ownership
     # inside their own apply rather than on a coarse RBAC permission.
     required_permission: tuple[str, str] | None = None
+    # Types on which a grant of ``required_permission``'s action ALSO passes
+    # ``enforce_operation_permission`` when it is scoped to one instance, the
+    # way the REST twin's router gate admits a subnet-scoped writer or an
+    # address-set delegate (#3058, #103). Only for an operation whose own
+    # apply then enforces the per-resource gate on the instance it acts on
+    # (``create_ip_address`` → ``_require_address_writable``): without that
+    # gate, a grant on one subnet would reach every subnet.
+    scoped_grant_types: tuple[str, ...] = ()
+    # The gate for operations whose REST equivalent is superadmin-only
+    # (webhooks, DNSSEC sign/unsign, zone update ACL, SNMP/NTP/syslog
+    # settings, the importers, alert rules, temporary access, service
+    # restart). There is no RBAC permission to name for those, so instead of
+    # ``required_permission`` they set this, and ``enforce_operation_permission``
+    # refuses a non-superadmin at apply time. Their ``_apply_*`` still checks
+    # inline too. ``tests/test_operation_permission_declared.py`` fails for any
+    # operation that sets neither.
+    requires_superadmin: bool = False
+    # Optional submit-time refusal, run ONLY by the request portal
+    # (``submit_request``) after ``preview`` passes. It raises a 4xx
+    # ``HTTPException`` for what the REST create would refuse (#2903). Kept
+    # off ``preview`` because the copilot shares that and deliberately only
+    # hints at conflicts; apply re-enforces regardless.
+    validate_submit: Callable[[AsyncSession, User, Any], Awaitable[None]] | None = None
 
 
 @dataclass(frozen=True)
@@ -112,12 +157,21 @@ class PreviewResult:
     already landed resolves cleanly instead of stranding ``pending`` / failing
     (#62 concurrent break-glass). Defaults False so no existing op changes
     behaviour.
+
+    ``forbidden_detail`` (only with ``ok=False``) marks a refusal that is
+    about the CALLER, not the target: the resource exists, but this caller
+    can neither read nor act on it, so ``detail`` answers it like an unknown
+    id. ``forbidden_detail`` is the permission refusal the operation's REST
+    twin gives that caller. The approve spine raises it as a 403 and leaves
+    the request pending for an approver who can reach the target, instead of
+    failing the request as if the target were gone (#2934).
     """
 
     ok: bool
     detail: str
     preview_text: str = ""
     idempotent: bool = False
+    forbidden_detail: str | None = None
 
 
 _OPERATIONS: dict[str, Operation] = {}
@@ -148,8 +202,8 @@ class OperationPermissionError(PermissionError):
     alert rows the equivalent REST route would 403.
     """
 
-    def __init__(self, action: str, resource_type: str) -> None:
-        super().__init__(f"Permission denied: need '{action}' on '{resource_type}'")
+    def __init__(self, action: str, resource_type: str, message: str | None = None) -> None:
+        super().__init__(message or f"Permission denied: need '{action}' on '{resource_type}'")
         self.action = action
         self.resource_type = resource_type
 
@@ -159,16 +213,177 @@ def enforce_operation_permission(user: User, op: Operation) -> None:
 
     Called both by ``apply_proposal`` (the authoritative gate) and by
     each ``_apply_*`` (defense in depth, so the gate holds even if the
-    op is ever dispatched outside the apply endpoint). No-op when the
-    operation declares ``required_permission=None`` (self-scoped ops).
+    op is ever dispatched outside the apply endpoint). Refuses a
+    non-superadmin for ``requires_superadmin`` operations. No-op when the
+    operation declares neither gate (self-scoped ops such as
+    ``archive_session``, which check ownership inside their own apply).
     """
-    from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
+    from app.core.permissions import (  # noqa: PLC0415 — avoid cycle
+        has_any_grant_for,
+        is_effective_superadmin,
+        user_has_permission,
+    )
 
+    if op.requires_superadmin and not is_effective_superadmin(user):
+        raise OperationPermissionError(
+            "superadmin",
+            op.name,
+            f"Permission denied: operation '{op.name}' is restricted to superadmin users",
+        )
     if op.required_permission is None:
         return
     action, resource_type = op.required_permission
-    if not user_has_permission(user, action, resource_type):
-        raise OperationPermissionError(action, resource_type)
+    if user_has_permission(user, action, resource_type):
+        return
+    # An instance-scoped grant on a ``scoped_grant_types`` type passes here as
+    # it passes the REST twin's router gate; the apply's per-resource gate
+    # decides whether it reaches the instance named.
+    if any(has_any_grant_for(user, action, rt) for rt in op.scoped_grant_types):
+        return
+    raise OperationPermissionError(action, resource_type)
+
+
+# ── Target resources: read visibility + per-resource apply gates ───────────
+#
+# ``enforce_operation_permission`` checks the operation's type-wide grant.
+# Some REST twins additionally gate on the specific resource the request names
+# (an address needs write on its subnet or on an address set covering it), so
+# the operations that create into such a resource repeat that gate inside
+# their own apply, under the APPLYING user: the approver of a portal request
+# or the owner of a Copilot proposal.
+#
+# Previews name the resource they act on (subnet CIDR, zone name, scope name),
+# so they answer for a resource the caller can neither read nor act on exactly
+# as they answer for an unknown id. ``TARGET_NOT_FOUND`` holds those answers,
+# one per ``x-resource`` type, so a preview and the request portal's submit
+# check cannot word them differently.
+
+TARGET_NOT_FOUND: dict[str, str] = {
+    "subnet": "Subnet {id} not found",
+    "ip_block": "Block {id} not found",
+    "dns_zone": "Zone {id} not found.",
+    "dhcp_scope": "DHCP scope {id} not found.",
+}
+
+
+def target_not_found_detail(resource_type: str, resource_id: object) -> str:
+    """The unknown-id answer for an ``x-resource`` reference."""
+    template = TARGET_NOT_FOUND.get(resource_type, "{type} {id} not found")
+    return template.format(type=resource_type, id=resource_id)
+
+
+def hidden_target_preview(
+    resource_type: str, resource_id: object, refusal: OperationPermissionError
+) -> PreviewResult:
+    """A preview's answer for a target the caller can neither read nor act on.
+
+    ``detail`` is the unknown-id answer, so a preview names nothing the caller
+    could not read. ``forbidden_detail`` carries ``refusal``, the REST twin's
+    permission answer, so an approve re-preview refuses THIS approver (403,
+    request still pending) rather than failing the request as if the target
+    were gone. A target that does not exist is a plain not-found preview.
+    """
+    return PreviewResult(
+        ok=False,
+        detail=target_not_found_detail(resource_type, resource_id),
+        forbidden_detail=str(refusal),
+    )
+
+
+# Whose permissions a preview judges. A preview normally runs under the user
+# who will apply (the Copilot proposal's owner, a portal request's approver at
+# its re-preview), so a per-resource refusal the apply would raise belongs in
+# the preview. At portal SUBMIT it runs under the requester, who by definition
+# lacks the permission (#696): the approver must hold it, and the approve
+# spine re-previews under the approver. ``submit_request`` sets this so such a
+# check is skipped there and only there (#3425).
+_PREVIEW_FOR_REQUESTER: ContextVar[bool] = ContextVar("preview_for_requester", default=False)
+
+
+@contextmanager
+def previewing_for_requester() -> Iterator[None]:
+    """Run a preview for a portal requester (see ``_PREVIEW_FOR_REQUESTER``)."""
+    token = _PREVIEW_FOR_REQUESTER.set(True)
+    try:
+        yield
+    finally:
+        _PREVIEW_FOR_REQUESTER.reset(token)
+
+
+def preview_is_for_requester() -> bool:
+    return _PREVIEW_FOR_REQUESTER.get()
+
+
+def resource_reference_fields(args_model: type[BaseModel]) -> list[tuple[str, str]]:
+    """``(field name, resource_type)`` for every ``x-resource`` field (#759)."""
+    out: list[tuple[str, str]] = []
+    for name, info in args_model.model_fields.items():
+        extra = info.json_schema_extra
+        if isinstance(extra, dict):
+            rtype = extra.get("x-resource")
+            if isinstance(rtype, str):
+                out.append((name, rtype))
+    return out
+
+
+def _can_read_target(user: User, resource_type: str, resource_id: object) -> bool:
+    from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
+
+    return user_has_permission(user, "read", resource_type, str(resource_id))
+
+
+def unreadable_target_detail(user: User, op: Operation, args: BaseModel) -> str | None:
+    """The unknown-id answer for the first referenced resource ``user`` cannot
+    read, or ``None`` when every one is readable. Superadmin reads everything."""
+    for field_name, rtype in resource_reference_fields(op.args_model):
+        value = getattr(args, field_name, None)
+        if value is None:
+            continue
+        if not _can_read_target(user, rtype, value):
+            return target_not_found_detail(rtype, value)
+    return None
+
+
+async def _user_can_write_address(
+    db: AsyncSession,
+    user: User,
+    subnet: Subnet,
+    addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> bool:
+    """The REST address create's gate (``POST /subnets/{id}/addresses``): an
+    API token bound to another resource is refused; otherwise write on the
+    subnet, or write on an address set of that subnet covering ``addr``
+    (#103)."""
+    from app.core.permissions import (  # noqa: PLC0415 — avoid cycle
+        token_scope_allows,
+        user_has_permission,
+    )
+    from app.services.ipam.address_set_gate import (  # noqa: PLC0415
+        load_writable_set_ranges,
+        user_can_write_ip,
+    )
+
+    if not token_scope_allows(user, "subnet", subnet.id):
+        return False
+    subnet_writable = user_has_permission(user, "write", "subnet", subnet.id)
+    if subnet_writable:
+        return True
+    set_ranges = await load_writable_set_ranges(db, user, subnet.id)
+    return user_can_write_ip(user, int(addr), subnet_writable, set_ranges)
+
+
+async def _require_address_writable(
+    db: AsyncSession,
+    user: User,
+    subnet: Subnet,
+    addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> None:
+    if not await _user_can_write_address(db, user, subnet, addr):
+        raise OperationPermissionError(
+            "write",
+            "subnet",
+            f"No write permission on subnet or any address set covering {addr}",
+        )
 
 
 def expires_at_default() -> datetime:
@@ -198,25 +413,118 @@ class CreateIPAddressArgs(BaseModel):
             "'static_dhcp'. Static_dhcp requires mac_address."
         ),
     )
-    hostname: str | None = Field(default=None, description="Hostname (e.g. web01)")
+    hostname: str | None = Field(default=None, max_length=255, description="Hostname (e.g. web01)")
     fqdn: str | None = Field(
-        default=None, description="Fully-qualified domain name (e.g. web01.prod.example.com)"
+        default=None,
+        max_length=512,  # ``ip_address.fqdn`` column width
+        description=(
+            "Fully-qualified domain name in the subnet's DNS zone (e.g. "
+            "web01.prod.example.com); the hostname is the part before the zone"
+        ),
     )
     mac_address: str | None = Field(default=None, description="MAC address in any standard format")
     description: str = Field(default="", description="Free-form description")
+
+    # The same field rules as the REST create (``IPAddressCreate``): the
+    # requests portal validates a submission against this model, and an
+    # approved request provisions it, so a value REST refuses must be refused
+    # here too, at submit, where the requester can still correct it.
+    @field_validator("status")
+    @classmethod
+    def _status(cls, v: str) -> str:
+        if v not in IP_STATUSES_CREATE_SETTABLE:
+            raise ValueError(
+                f"status must be one of: {', '.join(sorted(IP_STATUSES_CREATE_SETTABLE))}"
+            )
+        return v
+
+    @field_validator("hostname")
+    @classmethod
+    def _hostname(cls, v: str | None) -> str | None:
+        return validate_optional_hostname(v) or None
+
+    @field_validator("fqdn")
+    @classmethod
+    def _fqdn(cls, v: str | None) -> str | None:
+        if v is None or v.strip() == "":
+            return None
+        return validate_fqdn(v, field="fqdn", allow_underscore=False)
+
+    @field_validator("mac_address")
+    @classmethod
+    def _mac(cls, v: str | None) -> str | None:
+        if v is None or v.strip() == "":
+            return None
+        return canonicalize_mac(v)
+
+
+async def _hostname_from_fqdn(
+    db: AsyncSession, subnet: Subnet, args: CreateIPAddressArgs
+) -> tuple[CreateIPAddressArgs, str | None]:
+    """The args with the hostname an ``fqdn`` names, or why it names none (#3348).
+
+    The REST create takes only a hostname and publishes ``<hostname>.<zone>``
+    in the subnet's effective forward zone, which is also the ``fqdn`` it
+    stores. An address's ``fqdn`` reads as current only with a hostname
+    (#3297), so an ``fqdn`` is turned into the hostname that publishes exactly
+    that name: the part before the zone, which may be more than one label. An
+    ``fqdn`` outside the zone, or in a subnet with no zone, would be replaced
+    by a different name (or by none), so it is refused, as is a hostname that
+    names a different host than the ``fqdn``.
+    """
+    if not args.fqdn:
+        return args, None
+    from app.api.v1.ipam.router import _resolve_effective_zone  # noqa: PLC0415 — avoid cycle
+    from app.models.dns import DNSZone  # noqa: PLC0415
+
+    zone_id = await _resolve_effective_zone(db, subnet)
+    zone = await db.get(DNSZone, zone_id) if zone_id else None
+    if zone is None:
+        return args, (
+            f"fqdn {args.fqdn} cannot be published: subnet {subnet.network} has no "
+            "DNS zone. Give a hostname without an fqdn."
+        )
+    zone_name = zone.name.rstrip(".").lower()
+    if not args.fqdn.endswith("." + zone_name):
+        return args, (
+            f"fqdn {args.fqdn} is not a name in {zone_name}, the DNS zone bound to "
+            f"this subnet. Give a hostname, or an fqdn ending in .{zone_name}."
+        )
+    hostname = args.fqdn[: -len(zone_name) - 1]
+    if args.hostname and args.hostname != hostname:
+        return args, (
+            f"hostname {args.hostname} and fqdn {args.fqdn} name different hosts: "
+            f"the hostname gives {args.hostname}.{zone_name}. Give one of them."
+        )
+    return args.model_copy(update={"hostname": hostname}), None
 
 
 async def _preview_create_ip_address(
     db: AsyncSession, user: User, args: CreateIPAddressArgs
 ) -> PreviewResult:
-    # Resolve the subnet so the preview can name it.
+    # Resolve the subnet so the preview can name it. A subnet the caller can
+    # neither read nor create this address in is answered as an unknown one.
     subnet = await db.get(Subnet, args.subnet_id)
     if subnet is None:
-        return PreviewResult(ok=False, detail=f"Subnet {args.subnet_id} not found")
+        return PreviewResult(ok=False, detail=target_not_found_detail("subnet", args.subnet_id))
 
     try:
         addr_obj = ipaddress.ip_address(args.address)
     except ValueError:
+        addr_obj = None
+    if not _can_read_target(user, "subnet", subnet.id) and (
+        addr_obj is None or not await _user_can_write_address(db, user, subnet, addr_obj)
+    ):
+        return hidden_target_preview(
+            "subnet",
+            args.subnet_id,
+            OperationPermissionError(
+                "write",
+                "subnet",
+                f"No write permission on subnet or any address set covering {args.address}",
+            ),
+        )
+    if addr_obj is None:
         return PreviewResult(ok=False, detail=f"Invalid IP address: {args.address!r}")
 
     try:
@@ -232,6 +540,16 @@ async def _preview_create_ip_address(
             ),
         )
 
+    # #3321 — a host on an IPv4 network / broadcast address is refused at
+    # apply (and by the REST create), so say so here rather than propose it.
+    boundary = boundary_address_refusal(subnet, args.address)
+    if boundary is not None:
+        return PreviewResult(ok=False, detail=boundary)
+
+    args, fqdn_err = await _hostname_from_fqdn(db, subnet, args)
+    if fqdn_err is not None:
+        return PreviewResult(ok=False, detail=fqdn_err)
+
     # Check for existing allocation — a non-blocking cue that apply
     # will likely 409. The preview deliberately doesn't reject; the
     # operator might be replacing a stale row.
@@ -240,6 +558,7 @@ async def _preview_create_ip_address(
             select(IPAddress).where(
                 IPAddress.subnet_id == subnet.id,
                 IPAddress.address == args.address,
+                holds_address(),  # an ``available`` row is a free slot (#2980, #3249)
             )
         )
     ).scalar_one_or_none()
@@ -265,7 +584,172 @@ async def _preview_create_ip_address(
         # Truncate to keep the preview readable.
         d = args.description if len(args.description) < 80 else args.description[:77] + "..."
         parts.append(f"desc={d!r}")
+    if args.hostname:
+        # #2900 — say what apply will publish, the way the REST create does:
+        # the A / AAAA record lands in the subnet's effective forward zone.
+        from app.api.v1.ipam.router import _resolve_effective_zone  # local import — avoid cycle
+        from app.models.dns import DNSZone
+
+        zone_id = await _resolve_effective_zone(db, subnet)
+        zone = await db.get(DNSZone, zone_id) if zone_id else None
+        rtype = "AAAA" if addr_obj.version == 6 else "A"
+        if zone is not None and not ipam_authors_zone(zone):
+            # #3833 — IPAM writes records only into a primary zone it serves
+            # (#1633), so the address is created with its fqdn but no record.
+            # Say so rather than promise one the approval will not write.
+            why = unauthored_zone_error(zone, "creat")
+            parts.append(f"no {rtype} record is published ({why})")
+        elif zone is not None:
+            # #3647 — the address sync skips a forward record beside a CNAME
+            # (#1441), so promising one would be false. Refuse, as the DNS
+            # record kind does; the approve re-preview re-runs this, so a
+            # CNAME added since submit is refused the same way.
+            from app.services.dns.cname_conflict import (
+                describe_cname_conflict,
+                find_cname_conflict,
+            )
+
+            clash = await find_cname_conflict(
+                db, zone.id, view_id=None, name=args.hostname, record_type=rtype
+            )
+            if clash is not None:
+                owner = f"{args.hostname}.{zone.name.rstrip('.')}"
+                return PreviewResult(
+                    ok=False,
+                    detail=describe_cname_conflict(
+                        rtype, owner, clash, requester_safe=preview_is_for_requester()
+                    ),
+                )
+            parts.append(f"publishes {rtype} {args.hostname}.{zone.name.rstrip('.')}")
     return PreviewResult(ok=True, detail="ready", preview_text=", ".join(parts) + suffix)
+
+
+def _describe_address_warnings(warnings: list[dict[str, Any]], subnet: Subnet) -> str:
+    """The create's confirm-or-force warnings as words for a request.
+
+    The portal has no ``force`` (an approver does not override a collision), so
+    each is a refusal. Another address is never named: the requester may not
+    hold read on it.
+    """
+    parts: list[str] = []
+    for w in warnings:
+        kind = w.get("kind") or w.get("type")
+        if kind == "fqdn_collision":
+            parts.append(f"the name {w.get('fqdn')} is already in use in that DNS zone")
+        elif kind == "mac_collision":
+            parts.append(
+                f"MAC {w.get('mac_address')} is already recorded on another address in this IP space"
+            )
+        elif kind == "ptr_collision":
+            # Not the reverse zone's name: the requester may not read it.
+            parts.append("the reverse DNS name for this address already holds a PTR record")
+        elif kind == "dynamic_pool":
+            # Not the pool's bounds: the requester may hold no read on the scope.
+            parts.append(f"{w.get('address')} is inside a DHCP dynamic pool")
+        elif kind == "public_facing_private_ip":
+            parts.append(
+                f"{w.get('address') or 'a private address'} would be published into zone "
+                f"'{w.get('zone')}', which is in a public-facing DNS server group"
+            )
+        else:
+            parts.append(str(w.get("message") or kind))
+    return (
+        f"Cannot allocate in subnet {subnet.network}: " + "; ".join(parts) + ". "
+        "Choose another address, name or MAC."
+    )
+
+
+async def _static_dhcp_scope_error(
+    db: AsyncSession, subnet: Subnet, args: CreateIPAddressArgs, *, user: User | None = None
+) -> str | None:
+    """Why a ``static_dhcp`` request would get no DHCP reservation, else None (#3250).
+
+    The reservation is made by the same sync a manual create calls, which makes
+    none (and only warns) when no scope, or more than one, serves the subnet,
+    when the reservation conflicts, or when the acting user may not write
+    reservations. A request must not end provisioned with no reservation, so
+    submit (``user=None``: the requester is not the one who provisions) and
+    apply (``user`` = the approver) refuse up front.
+    """
+    if args.status != "static_dhcp":
+        return None
+    from app.services.dhcp.static_ipam import new_reservation_refusal  # noqa: PLC0415
+
+    probe = IPAddress(
+        subnet_id=subnet.id,
+        address=args.address,
+        status=args.status,
+        mac_address=args.mac_address,
+    )
+    return await new_reservation_refusal(db, probe, user=user)
+
+
+async def _address_request_refusal(
+    db: AsyncSession, subnet: Subnet, args: CreateIPAddressArgs
+) -> Exception | None:
+    """The REST create's collision / pool / name-length refusals, for a request.
+
+    Shared by submit (#3243) and the no-hostname apply (#3248), which does not
+    go through ``create_address`` and so never ran them.
+    """
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    from app.api.v1.ipam.router import (  # noqa: PLC0415 — avoid cycle
+        _resolve_effective_zone,
+        address_create_warnings,
+    )
+    from app.core.dns_names import host_in_zone_error  # noqa: PLC0415
+    from app.models.dns import DNSZone  # noqa: PLC0415
+
+    zone_id = await _resolve_effective_zone(db, subnet) if args.hostname else None
+    zone = await db.get(DNSZone, zone_id) if zone_id else None
+    if args.hostname and zone is not None:
+        err = host_in_zone_error(args.hostname, zone.name.rstrip("."), field="hostname")
+        if err is not None:
+            return HTTPException(status_code=422, detail=err)
+    warnings = await address_create_warnings(
+        db,
+        subnet,
+        address=args.address,
+        hostname=args.hostname,
+        mac_address=args.mac_address,
+        role=None,
+        forward_zone_id=zone.id if zone is not None else None,
+    )
+    if warnings:
+        return HTTPException(status_code=409, detail=_describe_address_warnings(warnings, subnet))
+    return None
+
+
+async def _validate_submit_create_ip_address(
+    db: AsyncSession, user: User, args: CreateIPAddressArgs
+) -> None:
+    """Request-portal submit check: what the REST create would refuse (#2903/#2905)."""
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    from app.services.ipam.address_create_rules import (  # noqa: PLC0415
+        assert_address_unallocated,
+        assert_not_boundary_address,
+        assert_static_dhcp_has_mac,
+        assert_subnet_takes_addresses,
+    )
+
+    subnet = await db.get(Subnet, args.subnet_id)
+    if subnet is None:  # preview already refused; defensive
+        return
+    args, fqdn_err = await _hostname_from_fqdn(db, subnet, args)
+    if fqdn_err is not None:  # preview already refused; defensive
+        raise HTTPException(status_code=422, detail=fqdn_err)
+    assert_subnet_takes_addresses(subnet)
+    assert_static_dhcp_has_mac(args.status, args.mac_address)
+    assert_not_boundary_address(subnet, args.address)
+    await assert_address_unallocated(db, subnet.id, args.address)
+    reason = await _static_dhcp_scope_error(db, subnet, args)
+    if reason is not None:
+        raise HTTPException(status_code=422, detail=reason)
+    refusal = await _address_request_refusal(db, subnet, args)
+    if refusal is not None:
+        raise refusal
 
 
 async def _apply_create_ip_address(
@@ -273,10 +757,10 @@ async def _apply_create_ip_address(
 ) -> dict[str, Any]:
     """Re-validate at apply time + insert the row.
 
-    Mirrors the conflict checks from the IPAM router's create_address
-    handler. We don't import that handler directly (it's bound to a
-    FastAPI request shape) — duplicating the few-line conflict check
-    is the simpler alternative until the apply set grows.
+    A hostname-bearing address delegates to the IPAM router's
+    ``create_address`` (DNS sync + every other side effect of a manual
+    allocation, #2900). One without a hostname publishes nothing and is
+    inserted directly after the same few-line conflict checks.
     """
     from app.api.v1.dhcp._audit import write_audit  # local import to avoid cycle
 
@@ -293,9 +777,37 @@ async def _apply_create_ip_address(
     except ValueError as exc:
         raise ValueError(f"Invalid IP address: {args.address!r}") from exc
 
+    # The REST create's per-resource gate, for every address (named or not):
+    # write on this subnet, or on an address set covering the address. The
+    # check above admits a grant scoped to ANY subnet or address set
+    # (``scoped_grant_types``), so this is the gate that holds it to this one.
+    await _require_address_writable(db, user, subnet, addr_obj)
+
     net = ipaddress.ip_network(str(subnet.network), strict=False)
     if addr_obj not in net:
         raise ValueError(f"Address {args.address} is not within subnet {subnet.network}")
+
+    # #2905 — the REST create's multicast refusal. A hostname-bearing apply
+    # reaches it through ``create_address``; this one inserts directly, so a
+    # request queued before submit learned the rule must still not land.
+    if subnet.kind == "multicast":
+        raise ValueError(
+            f"Subnet {subnet.network} is a multicast subnet — addresses are stream "
+            "identities. Create a multicast group under /multicast/groups instead."
+        )
+
+    # #3321 — the REST create's network / broadcast refusal. A named apply
+    # meets it in ``create_address``; this one inserts directly, and a request
+    # queued before the rule must still not land there.
+    boundary = boundary_address_refusal(subnet, args.address)
+    if boundary is not None:
+        raise ValueError(boundary)
+
+    # #3348 — an fqdn becomes the hostname that publishes it, re-resolved
+    # against the zone as it is now, not as it was when the request was made.
+    args, fqdn_err = await _hostname_from_fqdn(db, subnet, args)
+    if fqdn_err is not None:
+        raise ValueError(fqdn_err)
 
     # Re-check for existing allocation under the apply transaction.
     existing = (
@@ -303,6 +815,7 @@ async def _apply_create_ip_address(
             select(IPAddress).where(
                 IPAddress.subnet_id == subnet.id,
                 IPAddress.address == args.address,
+                holds_address(),  # an ``available`` row is a free slot (#2980)
             )
         )
     ).scalar_one_or_none()
@@ -315,17 +828,112 @@ async def _apply_create_ip_address(
     if args.status == "static_dhcp" and not args.mac_address:
         raise ValueError("mac_address is required when status is 'static_dhcp'")
 
-    row = IPAddress(
-        subnet_id=subnet.id,
-        address=args.address,
+    # #3646 — an approver who may not write reservations is refused as a
+    # permission error, which leaves the request pending for one who may. A
+    # plain ValueError would end it ``failed`` for good over a refusal that is
+    # about THIS approver, not the request.
+    if args.status == "static_dhcp" and args.mac_address:
+        from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
+
+        if not user_has_permission(user, "write", "dhcp_static"):
+            raise OperationPermissionError(
+                "write",
+                "dhcp_static",
+                "The approver has no 'write' permission on DHCP reservations "
+                f"(dhcp_static), so no reservation can be made for {args.address}. "
+                "Another approver who holds it can approve this request.",
+            )
+
+    # #3250 — a static_dhcp request that can get no reservation fails here,
+    # before anything is written, rather than ending provisioned without one.
+    reason = await _static_dhcp_scope_error(db, subnet, args, user=user)
+    if reason is not None:
+        raise ValueError(reason)
+
+    if not args.hostname:
+        # #3248 — the create's collision / pool checks. A named address meets
+        # them inside ``create_address``; this path inserts directly, and the
+        # approver cannot force past them.
+        refusal = await _address_request_refusal(db, subnet, args)
+        if refusal is not None:
+            raise ValueError(str(refusal.detail))  # type: ignore[attr-defined]
+
+    if args.hostname:
+        # #2900 — a named address goes through the REST create, so an
+        # approved request / applied proposal does everything a manual
+        # allocation does: the A (+ PTR) record in the subnet's effective
+        # zone under ``strict`` (a name DNS refuses fails the apply and
+        # rolls the address back with it), the collision + dynamic-pool
+        # checks (409 — ``force`` is the operator's call, not an approver's,
+        # so the apply refuses rather than overriding), MAC history, the
+        # static-DHCP reservation for ``static_dhcp`` and utilisation. The
+        # handler commits and writes its own audit row; the DNS wake rides
+        # the caller's ``collecting_wakes()``.
+        from app.api.v1.ipam.router import (  # local import — avoid cycle
+            IPAddressCreate,
+            create_address,
+        )
+
+        created = await create_address(
+            subnet.id,
+            IPAddressCreate(
+                address=args.address,
+                status=args.status,
+                hostname=args.hostname,
+                mac_address=args.mac_address,
+                description=args.description or "",
+            ),
+            user,
+            db,
+        )
+        named: dict[str, Any] = {
+            "id": str(created.id),
+            "address": args.address,
+            "subnet_id": str(subnet.id),
+            "status": args.status,
+            "hostname": args.hostname,
+        }
+        # The pre-flight above refuses every case the sync would decline
+        # (#3250), but ``create_address`` commits, so a reservation lost to a
+        # DHCP-side change in between cannot be rolled back here: keep the
+        # sync's reason on the executed request / proposal instead.
+        warning = getattr(created, "dhcp_static_warning", None)
+        if warning:
+            named["dhcp_static_warning"] = warning
+        return named
+
+    from app.api.v1.ipam.router import (  # local import — avoid cycle
+        _record_mac_history,
+        _update_block_utilization,
+        _update_utilization,
+    )
+    from app.services.dhcp.static_ipam import sync_static_for_ipam_row
+
+    # An ``available`` row is a free slot, taken over in place (#2980).
+    row = await take_address_row(
+        db,
+        subnet,
+        args.address,
+        user,
         status=args.status,
         hostname=args.hostname,
         fqdn=args.fqdn,
         mac_address=args.mac_address,
         description=args.description or "",
+        created_by_user_id=user.id,
     )
-    db.add(row)
-    await db.flush()
+
+    # #2900 — the downstream work the REST create runs that needs no
+    # hostname: MAC history, the DHCP reservation a ``static_dhcp`` row owns
+    # (#1628; gated on the acting user's ``dhcp_static`` write, warning
+    # otherwise), and the subnet / block utilisation counters.
+    await _record_mac_history(db, row.id, args.mac_address)
+    dhcp_sync = await sync_static_for_ipam_row(db, row, user=user)
+    if args.status == "static_dhcp" and dhcp_sync.warning:
+        # #3250 — the pre-flight passed but the sync still made no
+        # reservation (a DHCP-side change in between). Nothing is committed
+        # yet, so fail: the caller rolls the address back with it.
+        raise ValueError(dhcp_sync.warning)
 
     # Audit the apply path so the audit log captures the outcome (the
     # propose step doesn't audit — proposals can be discarded). The
@@ -335,7 +943,9 @@ async def _apply_create_ip_address(
         db,
         user=user,
         action="create",
-        resource_type="ipam.ip_address",
+        # Bare RBAC type: event_publisher + the compliance change alert key
+        # on "ip_address"; a namespaced string silences both (#3936).
+        resource_type="ip_address",
         resource_id=str(row.id),
         resource_display=str(args.address),
         new_value={
@@ -347,15 +957,21 @@ async def _apply_create_ip_address(
             "via": "ai_proposal",
         },
     )
+    await db.flush()
+    await _update_utilization(db, subnet.id)
+    await _update_block_utilization(db, subnet.block_id)
     await db.commit()
     await db.refresh(row)
-    return {
+    result: dict[str, Any] = {
         "id": str(row.id),
         "address": args.address,
         "subnet_id": str(subnet.id),
         "status": args.status,
         "hostname": args.hostname,
     }
+    if dhcp_sync.warning:
+        result["dhcp_static_warning"] = dhcp_sync.warning
+    return result
 
 
 # ── run_nmap_scan operation ────────────────────────────────────────────
@@ -573,7 +1189,23 @@ async def _load_wake_target(db: AsyncSession, args: WakeHostArgs) -> tuple[Any, 
     return await wol.resolve_wake_params(db, aid)
 
 
+def _wake_host_refusal(user: User) -> OperationPermissionError | None:
+    """The REST wake route's second gate: the IPAM router needs type-level
+    ``write`` on ``subnet`` for ``POST /addresses/{id}/wake`` on top of the
+    route's own ``read`` on ``use_network_tools`` (#3461). ``None`` when held."""
+    from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
+
+    if user_has_permission(user, "write", "subnet"):
+        return None
+    return OperationPermissionError("write", "subnet")
+
+
 async def _preview_wake_host(db: AsyncSession, user: User, args: WakeHostArgs) -> PreviewResult:
+    # wake_host is in neither the request-portal catalog nor the risky-op
+    # set, so the previewing user is always the one who applies.
+    refusal = _wake_host_refusal(user)
+    if refusal is not None:
+        return PreviewResult(ok=False, detail=str(refusal), forbidden_detail=str(refusal))
     try:
         ip, mac, broadcast = await _load_wake_target(db, args)
     except ValueError as exc:
@@ -594,6 +1226,9 @@ async def _apply_wake_host(db: AsyncSession, user: User, args: WakeHostArgs) -> 
     from app.services import wol  # noqa: PLC0415
 
     enforce_operation_permission(user, _OPERATIONS["wake_host"])
+    refusal = _wake_host_refusal(user)
+    if refusal is not None:
+        raise refusal
     ip, mac, broadcast = await _load_wake_target(db, args)
     # AI proposals always send from the control-plane (server) vantage.
     try:
@@ -637,7 +1272,8 @@ register(
         preview=_preview_wake_host,
         apply=_apply_wake_host,
         category="network",
-        # ``read`` matches the rest of the network-tools surface.
+        # ``read`` matches the rest of the network-tools surface; the REST
+        # route also needs write on ``subnet`` (#3461), checked beside it.
         required_permission=("read", "use_network_tools"),
     )
 )
@@ -1549,7 +2185,9 @@ class AllocateSubnetArgs(BaseModel):
         le=128,
         description="Prefix length of the subnet to carve (e.g. 24 for a /24, 64 for a v6 /64)",
     )
-    name: str = Field(default="", description="Optional name for the new subnet")
+    # 255 is the ``subnet.name`` column width: past it the INSERT fails with a
+    # raw database error at approve time instead of a refusal at submit.
+    name: str = Field(default="", max_length=255, description="Optional name for the new subnet")
     description: str = Field(default="", description="Optional free-form description")
     template_id: str | None = Field(
         default=None, description="Optional IPAM template UUID to stamp onto the new subnet"
@@ -1577,12 +2215,41 @@ def _carve_candidate(
     return chosen
 
 
+def _target_block_refusal(user: User, block: IPBlock) -> OperationPermissionError | None:
+    """The REST allocate's target-block gate (#3425) as an operation refusal,
+    or ``None`` when ``user`` may write ``block``."""
+    from app.api.v1.ipam.router import target_block_write_refusal  # noqa: PLC0415 — cycle
+    from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
+
+    if user_has_permission(user, "write", "ip_block", block.id):
+        return None
+    return OperationPermissionError("write", "ip_block", target_block_write_refusal(user, block))
+
+
 async def _preview_allocate_subnet(
     db: AsyncSession, user: User, args: AllocateSubnetArgs
 ) -> PreviewResult:
+    from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
+
     block = await db.get(IPBlock, args.block_id)
+    # A block the caller can neither read nor carve from (the REST allocate's
+    # type-wide ``write subnet``) is answered as an unknown one.
     if block is None:
-        return PreviewResult(ok=False, detail=f"Block {args.block_id} not found")
+        return PreviewResult(ok=False, detail=target_not_found_detail("ip_block", args.block_id))
+    if not (
+        _can_read_target(user, "ip_block", block.id) or user_has_permission(user, "write", "subnet")
+    ):
+        return hidden_target_preview(
+            "ip_block", args.block_id, OperationPermissionError("write", "subnet")
+        )
+    # The REST allocate also needs write on THIS block (#3425), so a caller who
+    # will apply without it is told here, not by a failed apply. Not judged for
+    # a portal requester: the approver must hold it, and is re-previewed.
+    refusal = _target_block_refusal(user, block)
+    if refusal is not None and not preview_is_for_requester():
+        if not _can_read_target(user, "ip_block", block.id):
+            return hidden_target_preview("ip_block", args.block_id, refusal)
+        return PreviewResult(ok=False, detail=str(refusal), forbidden_detail=str(refusal))
 
     block_net = ipaddress.ip_network(str(block.network), strict=False)
     family_max = 32 if block_net.version == 4 else 128
@@ -1629,6 +2296,61 @@ async def _preview_allocate_subnet(
     return PreviewResult(ok=True, detail="ready", preview_text=", ".join(parts))
 
 
+async def _validate_submit_allocate_subnet(
+    db: AsyncSession, user: User, args: AllocateSubnetArgs
+) -> None:
+    """Request-portal submit check: what the REST allocate would refuse (#3244).
+
+    A malformed / unknown / non-subnet template, and a subnet the estate's
+    Required custom fields would refuse (counting what the template and the
+    block chain supply), answered in the allocate's own words.
+    """
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    from app.api.v1.ipam.router import SubnetAllocate  # noqa: PLC0415 — avoid cycle
+    from app.models.ipam import IPAMTemplate  # noqa: PLC0415
+    from app.services.ipam.custom_field_rules import (  # noqa: PLC0415
+        enforce_required_custom_fields,
+        inherited_block_custom_fields,
+    )
+    from app.services.ipam.templates import (  # noqa: PLC0415
+        TemplateError,
+        apply_template_on_create_subnet,
+    )
+
+    try:
+        template_id = UUID(args.template_id) if args.template_id else None
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"The IPAM template must be given by its id; {args.template_id!r} is not one.",
+        ) from exc
+    body = SubnetAllocate(
+        prefix_len=args.prefix_len,
+        name=args.name or "",
+        description=args.description or "",
+        template_id=template_id,
+    )
+    if template_id is not None:
+        template = await db.get(IPAMTemplate, template_id)
+        if template is None:
+            raise HTTPException(status_code=404, detail="No IPAM template has that id.")
+        try:
+            apply_template_on_create_subnet(template, body)
+        except TemplateError as exc:
+            # The allocate's words name the template, and a template of the
+            # wrong kind must not read differently from an unknown id: the
+            # requester may hold no read on templates.
+            raise HTTPException(status_code=404, detail="No IPAM template has that id.") from exc
+    await enforce_required_custom_fields(
+        db,
+        "subnet",
+        body.custom_fields,
+        inherited=await inherited_block_custom_fields(db, UUID(args.block_id)),
+        creating=True,
+    )
+
+
 async def _apply_allocate_subnet(
     db: AsyncSession, user: User, args: AllocateSubnetArgs
 ) -> dict[str, Any]:
@@ -1645,6 +2367,29 @@ async def _apply_allocate_subnet(
     # SECURITY (#400, C2): RBAC backstop — matches the IPAM router's
     # require_any_resource_permission("subnet", ...) write gate.
     enforce_operation_permission(user, _OPERATIONS["allocate_subnet"])
+    # The target-block gate (#3425) as an OperationPermissionError, not the
+    # REST handler's 403: it is about THIS applier, so an approve leaves the
+    # portal request pending for one who may write the block instead of
+    # failing it.
+    block = await db.get(IPBlock, UUID(args.block_id))
+    if block is not None:
+        refusal = _target_block_refusal(user, block)
+        if refusal is not None:
+            raise refusal
+
+    if args.template_id:
+        from app.models.ipam import IPAMTemplate  # noqa: PLC0415
+
+        tmpl = await db.get(IPAMTemplate, UUID(args.template_id))
+        unknown = "No IPAM template has that id."
+        if tmpl is None:
+            raise HTTPRefusal(404, "Template not found", requester_text=unknown)
+        if tmpl.applies_to != "subnet":
+            raise HTTPRefusal(
+                422,
+                f"Template {tmpl.name!r} applies to {tmpl.applies_to!r}, not 'subnet'.",
+                requester_text=unknown,
+            )
 
     alloc = SubnetAllocate(
         prefix_len=args.prefix_len,
@@ -1674,6 +2419,7 @@ register(
         args_model=AllocateSubnetArgs,
         preview=_preview_allocate_subnet,
         apply=_apply_allocate_subnet,
+        validate_submit=_validate_submit_allocate_subnet,
         category="ipam",
         required_permission=("write", "subnet"),
     )
@@ -1694,8 +2440,15 @@ register(
         args_model=CreateIPAddressArgs,
         preview=_preview_create_ip_address,
         apply=_apply_create_ip_address,
+        validate_submit=_validate_submit_create_ip_address,
         category="ipam",
-        required_permission=("write", "ip_address"),
+        # The REST address write needs ``write`` on the subnet that owns the
+        # address (#3058); the apply path delegates to that handler. Its router
+        # gate also admits a writer scoped to one subnet or an address-set
+        # delegate (#103), so this does too, and the apply's
+        # ``_require_address_writable`` holds either to its own subnet / set.
+        required_permission=("write", "subnet"),
+        scoped_grant_types=("subnet", "address_set"),
     )
 )
 
@@ -1925,11 +2678,12 @@ class CreateDNSRecordArgs(BaseModel):
         json_schema_extra={"x-resource": "dns_zone"},
     )
     name: str = Field(
+        max_length=255,  # ``dns_record.name`` column width
         description=(
             "Relative record name. Use ``@`` for the zone apex. Do NOT "
             "include the trailing zone (use ``host1`` not "
             "``host1.example.com``)."
-        )
+        ),
     )
     record_type: str = Field(
         description=(
@@ -1973,16 +2727,80 @@ class CreateDNSRecordArgs(BaseModel):
         le=65_535,
     )
 
+    # The REST record create's rules (``RecordCreate`` +
+    # ``_validate_address_record_value``), applied when the payload is parsed
+    # so a requests-portal submission is refused at submit. The checks that
+    # need the zone (relative rdata names) run again in preview / apply.
+    @field_validator("name")
+    @classmethod
+    def _name(cls, v: str) -> str:
+        return validate_record_owner(v, field="record name")
+
+    # A field validator, not a model one, so the refusal names ``value`` the
+    # way the other field refusals name theirs. ``record_type`` is declared
+    # first, so it is in ``info.data`` here unless it failed its own check.
+    @field_validator("value")
+    @classmethod
+    def _value(cls, v: str, info: ValidationInfo) -> str:
+        rtype = str(info.data.get("record_type") or "").strip().upper()
+        if contains_control_chars(v) or rtype in ({"A", "AAAA"} | HOSTNAME_TARGET_RECORD_TYPES):
+            err = record_value_error(rtype, v)
+            if err is not None:
+                raise ValueError(err)
+        return v
+
+
+def _user_can_write_zone_records(user: User, zone_id: object) -> bool:
+    """The REST record create's gate: type-wide ``write dns_record`` (the
+    operation's declared permission), and an API token, if any, bound to this
+    zone."""
+    from app.core.permissions import (  # noqa: PLC0415 — avoid cycle
+        token_scope_allows,
+        user_has_permission,
+    )
+
+    return user_has_permission(user, "write", "dns_record") and token_scope_allows(
+        user, "dns_zone", str(zone_id)
+    )
+
+
+def _zone_records_refusal(user: User, zone_id: object) -> OperationPermissionError:
+    """Why :func:`_user_can_write_zone_records` refused ``user`` this zone."""
+    from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
+
+    if not user_has_permission(user, "write", "dns_record"):
+        return OperationPermissionError("write", "dns_record")
+    return OperationPermissionError("write", "dns_zone", "API token is not scoped to this DNS zone")
+
+
+def _record_struct_fields(
+    args: CreateDNSRecordArgs, rtype: str
+) -> tuple[int | None, int | None, int | None]:
+    """The record create's per-type priority / weight / port rules (#3245).
+
+    Returns what the create would store; raises its own 422 (HTTPException) for
+    a field the type does not take, so submit, preview and apply agree with it.
+    """
+    from app.api.v1.dns.router import _normalize_record_struct_fields  # noqa: PLC0415
+
+    return _normalize_record_struct_fields(rtype, args.priority, args.weight, args.port)
+
 
 async def _preview_create_dns_record(
     db: AsyncSession, user: User, args: CreateDNSRecordArgs
 ) -> PreviewResult:
+    from fastapi import HTTPException  # noqa: PLC0415
+
     from app.models.dns import DNSRecord, DNSZone  # local import — avoid cycle
     from app.services.dns.cname_conflict import (
         APEX_CNAME_DETAIL,
         describe_cname_conflict,
         find_cname_conflict,
         is_apex,
+    )
+    from app.services.dns.zone_synthesis import (
+        synthesised_zone_error,
+        unauthored_zone_error,
     )
 
     rtype = args.record_type.strip().upper()
@@ -2005,12 +2823,27 @@ async def _preview_create_dns_record(
                 ok=False,
                 detail="SRV records require " + ", ".join(missing) + ".",
             )
+    try:
+        priority, weight, port = _record_struct_fields(args, rtype)
+    except HTTPException as exc:
+        return PreviewResult(ok=False, detail=str(exc.detail))
 
     zone = await db.get(DNSZone, args.zone_id)
+    # A zone the caller can neither read nor create records in (the REST
+    # create's type-wide record write, narrowed by a zone-bound API token) is
+    # answered as an unknown one.
     if zone is None:
-        return PreviewResult(ok=False, detail=f"Zone {args.zone_id} not found.")
+        return PreviewResult(ok=False, detail=target_not_found_detail("dns_zone", args.zone_id))
+    if not (
+        _can_read_target(user, "dns_zone", zone.id) or _user_can_write_zone_records(user, zone.id)
+    ):
+        return hidden_target_preview("dns_zone", args.zone_id, _zone_records_refusal(user, zone.id))
     if getattr(zone, "deleted_at", None) is not None:
         return PreviewResult(ok=False, detail=f"Zone {args.zone_id} is deleted.")
+    # #2653 — the REST create's refusal; the reconciler would revert the row.
+    synth_err = synthesised_zone_error(zone, "edit") or unauthored_zone_error(zone, "add")
+    if synth_err is not None:
+        return PreviewResult(ok=False, detail=synth_err)
 
     name = args.name.strip()
     if not name:
@@ -2022,12 +2855,32 @@ async def _preview_create_dns_record(
     names_err = bind_check_names_error(rtype, owner, args.value, origin=zone.name)
     if names_err is not None:
         return PreviewResult(ok=False, detail=names_err)
+    # #2502 — nor rdata dnspython cannot read, nor a value REST refuses.
+    rdata_err = record_value_error(
+        rtype,
+        args.value,
+        priority=priority,
+        weight=weight,
+        port=port,
+        origin=zone.name,
+    )
+    if rdata_err is not None:
+        return PreviewResult(ok=False, detail=rdata_err)
+    # #2060 — nor a dot-less target the group's PowerDNS would refuse.
+    target_err = await absolute_target_error(db, zone.group_id, rtype, args.value, zone.name)
+    if target_err is not None:
+        return PreviewResult(ok=False, detail=target_err)
     # #1381 — nor a CNAME beside other data; apply refuses it too.
     if rtype == "CNAME" and is_apex(name):
         return PreviewResult(ok=False, detail=APEX_CNAME_DETAIL)
     clash = await find_cname_conflict(db, zone.id, view_id=None, name=name, record_type=rtype)
     if clash is not None:
-        return PreviewResult(ok=False, detail=describe_cname_conflict(rtype, owner, clash))
+        return PreviewResult(
+            ok=False,
+            detail=describe_cname_conflict(
+                rtype, owner, clash, requester_safe=preview_is_for_requester()
+            ),
+        )
 
     # Surface a heads-up if a row with the same (zone, name, type, value)
     # already exists; preview doesn't reject — operator may want a parallel
@@ -2042,7 +2895,7 @@ async def _preview_create_dns_record(
                 DNSRecord.deleted_at.is_(None),
             )
         )
-    ).scalar_one_or_none()
+    ).first()
     suffix = " — note: an identical record already exists" if existing else ""
 
     parts = [
@@ -2051,18 +2904,65 @@ async def _preview_create_dns_record(
     ]
     if args.ttl is not None:
         parts.append(f"ttl={args.ttl}")
-    if args.priority is not None:
-        parts.append(f"priority={args.priority}")
-    if args.weight is not None:
-        parts.append(f"weight={args.weight}")
-    if args.port is not None:
-        parts.append(f"port={args.port}")
+    if priority is not None:
+        parts.append(f"priority={priority}")
+    if weight is not None:
+        parts.append(f"weight={weight}")
+    if port is not None:
+        parts.append(f"port={port}")
     return PreviewResult(ok=True, detail="ready", preview_text=", ".join(parts) + suffix)
+
+
+async def _validate_submit_create_dns_record(
+    db: AsyncSession, user: User, args: CreateDNSRecordArgs
+) -> None:
+    """Request-portal submit check: the identical-record 409 the REST create
+    and this operation's apply both make (#1230), refused while the requester
+    is still present rather than at approve (#2903)."""
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    from app.models.dns import DNSZone  # noqa: PLC0415
+    from app.services.dns.record_identity import find_identical_record  # noqa: PLC0415
+    from app.services.dns.zone_synthesis import unauthored_zone_error  # noqa: PLC0415
+
+    zone = await db.get(DNSZone, UUID(args.zone_id))
+    if zone is not None:
+        # #3838 — a secondary / stub / forward zone serves none of our records.
+        err = unauthored_zone_error(zone, "add")
+        if err is not None:
+            raise HTTPException(status_code=422, detail=err)
+    rtype = args.record_type.strip().upper()
+    # The create's per-type priority / weight / port rules (#3245): 422 in its
+    # words for a field the type does not take.
+    priority, weight, port = _record_struct_fields(args, rtype)
+    existing = await find_identical_record(
+        db,
+        UUID(args.zone_id),
+        view_id=None,
+        name=args.name.strip(),
+        record_type=rtype,
+        value=args.value,
+        priority=priority,
+        weight=weight,
+        port=port,
+    )
+    if existing is not None:
+        # The REST wording minus the existing row's id (``describe_identical``
+        # names it): the requester need not hold read on the zone's records.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"An identical {existing.record_type} record {existing.fqdn} -> "
+                f"{existing.value} already exists."
+            ),
+        )
 
 
 async def _apply_create_dns_record(
     db: AsyncSession, user: User, args: CreateDNSRecordArgs
 ) -> dict[str, Any]:
+    from fastapi import HTTPException
+
     from app.api.v1.dhcp._audit import write_audit  # local import to avoid cycle
     from app.core.agent_wake import dns_group_channel, publish_wake
     from app.models.dns import DNSRecord, DNSZone
@@ -2075,6 +2975,10 @@ async def _apply_create_dns_record(
     from app.services.dns.record_identity import describe_identical, find_identical_record
     from app.services.dns.record_ops import enqueue_record_op
     from app.services.dns.serial import bump_zone_serial
+    from app.services.dns.zone_synthesis import (
+        synthesised_zone_error,
+        unauthored_zone_error,
+    )
 
     # SECURITY (#400, C2): RBAC backstop — matches the DNS router's
     # require_any_resource_permission("dns_record", ...) write gate.
@@ -2087,10 +2991,26 @@ async def _apply_create_dns_record(
         raise ValueError("MX records require a priority.")
     if rtype == "SRV" and (args.priority is None or args.weight is None or args.port is None):
         raise ValueError("SRV records require priority, weight, and port.")
+    # The REST create's per-type field rules (#3245), so no record is stored
+    # with a field its own update refuses.
+    try:
+        priority, weight, port = _record_struct_fields(args, rtype)
+    except HTTPException as exc:
+        raise ValueError(str(exc.detail)) from exc
 
     zone = await db.get(DNSZone, args.zone_id)
     if zone is None:
         raise ValueError(f"Zone {args.zone_id} not found.")
+    # The REST create refuses an API token bound to another zone.
+    if not _user_can_write_zone_records(user, zone.id):
+        raise _zone_records_refusal(user, zone.id)
+    # #2653 — a zone trashed (or taken over by an integration) between
+    # propose and apply must not receive records.
+    if getattr(zone, "deleted_at", None) is not None:
+        raise ValueError(f"Zone {args.zone_id} is deleted.")
+    synth_err = synthesised_zone_error(zone, "edit") or unauthored_zone_error(zone, "add")
+    if synth_err is not None:
+        raise ValueError(synth_err)
 
     name = args.name.strip()
     fqdn = (
@@ -2103,6 +3023,21 @@ async def _apply_create_dns_record(
     names_err = bind_check_names_error(rtype, fqdn, args.value, origin=zone.name)
     if names_err is not None:
         raise ValueError(names_err)
+    # #2502 — the same record-value refusal as the REST create path.
+    rdata_err = record_value_error(
+        rtype,
+        args.value,
+        priority=priority,
+        weight=weight,
+        port=port,
+        origin=zone.name,
+    )
+    if rdata_err is not None:
+        raise ValueError(rdata_err)
+    # #2060 — the same dot-less-target refusal as the REST create path.
+    target_err = await absolute_target_error(db, zone.group_id, rtype, args.value, zone.name)
+    if target_err is not None:
+        raise ValueError(target_err)
 
     # #1230 — never store the same RR twice; see app.services.dns.record_identity.
     existing = await find_identical_record(
@@ -2112,18 +3047,27 @@ async def _apply_create_dns_record(
         name=name,
         record_type=rtype,
         value=args.value,
-        priority=args.priority,
-        weight=args.weight if rtype == "SRV" else None,
-        port=args.port if rtype == "SRV" else None,
+        priority=priority,
+        weight=weight,
+        port=port,
     )
     if existing is not None:
-        raise ValueError(describe_identical(existing))
+        raise ValueRefusal(
+            describe_identical(existing),
+            requester_text=(
+                f"An identical {existing.record_type} record {existing.fqdn} -> "
+                f"{existing.value} already exists."
+            ),
+        )
     # #1381 — a CNAME stands alone at its name, as on the REST path.
     if rtype == "CNAME" and is_apex(name):
         raise ValueError(APEX_CNAME_DETAIL)
     clash = await find_cname_conflict(db, zone.id, view_id=None, name=name, record_type=rtype)
     if clash is not None:
-        raise ValueError(describe_cname_conflict(rtype, fqdn, clash))
+        raise ValueRefusal(
+            describe_cname_conflict(rtype, fqdn, clash),
+            requester_text=describe_cname_conflict(rtype, fqdn, clash, requester_safe=True),
+        )
 
     row = DNSRecord(
         zone_id=zone.id,
@@ -2132,9 +3076,9 @@ async def _apply_create_dns_record(
         record_type=rtype,
         value=args.value,
         ttl=args.ttl,
-        priority=args.priority,
-        weight=args.weight if rtype == "SRV" else None,
-        port=args.port if rtype == "SRV" else None,
+        priority=priority,
+        weight=weight,
+        port=port,
         created_by_user_id=user.id,
     )
     db.add(row)
@@ -2166,7 +3110,8 @@ async def _apply_create_dns_record(
         db,
         user=user,
         action="create",
-        resource_type="dns.record",
+        # Bare type, as the REST create audits — keys ``dns.record.created`` (#3936).
+        resource_type="dns_record",
         resource_id=str(row.id),
         resource_display=f"{name} {rtype} {args.value}",
         new_value={
@@ -2176,9 +3121,9 @@ async def _apply_create_dns_record(
             "type": rtype,
             "value": args.value,
             "ttl": args.ttl,
-            "priority": args.priority,
-            "weight": args.weight if rtype == "SRV" else None,
-            "port": args.port if rtype == "SRV" else None,
+            "priority": priority,
+            "weight": weight,
+            "port": port,
             "via": "ai_proposal",
         },
     )
@@ -2207,6 +3152,7 @@ register(
         args_model=CreateDNSRecordArgs,
         preview=_preview_create_dns_record,
         apply=_apply_create_dns_record,
+        validate_submit=_validate_submit_create_dns_record,
         category="dns",
         required_permission=("write", "dns_record"),
     )
@@ -2331,8 +3277,8 @@ class CreateDNSZoneArgs(BaseModel):
             "``technitium_api`` (agentless, an install the operator "
             "already runs), or ``windows_dns``. Pair it with "
             "``dnssec_enabled=true`` to auto-select a group whose driver "
-            "can sign online (``bind9``, ``powerdns`` and ``technitium`` "
-            "all can; ``windows_dns`` and ``technitium_api`` cannot). "
+            "can sign (``bind9`` and ``powerdns``; ``technitium``, "
+            "``technitium_api`` and ``windows_dns`` cannot, #1783). "
             "When ``group_id`` is set, this is validated against the "
             "group's actual driver mix."
         ),
@@ -2350,13 +3296,39 @@ class CreateDNSZoneArgs(BaseModel):
             "defaults to ``forward``."
         ),
     )
+
+    @field_validator("name")
+    @classmethod
+    def _name_is_fqdn(cls, v: str) -> str:
+        # Same rule as the REST zone create (#597): validated, IDNA-normalised,
+        # lower-cased, with the trailing root dot the storage convention uses.
+        if not v.strip():
+            return v  # the preview reports a missing name in its own words
+        return validate_fqdn(v, field="zone name") + "."
+
     primary_ns: str = Field(
         default="",
         description="Primary nameserver FQDN (e.g. ``ns1.example.com.``). Recommended.",
     )
+
+    @field_validator("primary_ns")
+    @classmethod
+    def _primary_ns_is_host_name(cls, v: str) -> str:
+        # #2075 — same rule as the REST zone create: BIND refuses a zone
+        # whose SOA primary name is not a host name. A host name carries no
+        # zone-file syntax, so this also covers the #597 injection guard.
+        err = primary_ns_error(v)
+        if err is not None:
+            raise ValueError(f"Primary NS (primary_ns) {err}")
+        return v
+
     admin_email: str = Field(
         default="",
-        description="Zone admin email rendered into SOA RNAME (e.g. ``hostmaster@example.com``).",
+        description=(
+            "Zone admin mailbox, the SOA RNAME, in domain-name form: "
+            "``hostmaster.example.com.`` for hostmaster@example.com. An "
+            "address with ``@`` is refused."
+        ),
     )
     dnssec_enabled: bool = Field(
         default=False,
@@ -2368,12 +3340,47 @@ class CreateDNSZoneArgs(BaseModel):
             "matching ``driver_hint`` to auto-select a compatible group."
         ),
     )
-    ttl: int = Field(
-        default=3600,
-        description="Default record TTL in seconds.",
+    ttl: int | None = Field(
+        default=None,
+        description=(
+            "Default record TTL in seconds. Omit to use the platform's "
+            "Default Zone TTL from Settings."
+        ),
         ge=60,
         le=604_800,
     )
+
+
+async def _effective_zone_ttl(db: AsyncSession, args: CreateDNSZoneArgs, group_id: UUID) -> int:
+    """The TTL the zone will carry: the caller's, else the group's default
+    (Settings' Default Zone TTL; the stock value on ``technitium_api``) (#3087)."""
+    if args.ttl is not None:
+        return args.ttl
+    return await default_zone_ttl(db, group_id)
+
+
+def _technitium_api_zone_arg_conflict(
+    args: CreateDNSZoneArgs, drivers: set[str], ttl: int
+) -> str | None:
+    """#1784 — the REST zone-create scope gate for an experimental
+    ``technitium_api`` group, applied to the Copilot's create too: the
+    Copilot fronts the REST API and must not be a way around its 422s.
+    Shared by preview and apply, like the DNSSEC gate above."""
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    from app.services.dns import technitium_api_scope  # noqa: PLC0415
+
+    if technitium_api_scope.DRIVER not in drivers:
+        return None
+    try:
+        technitium_api_scope.refuse_non_primary(args.zone_type)
+        technitium_api_scope.refuse_unapplied_zone_changes(
+            {"ttl": ttl, "primary_ns": args.primary_ns, "admin_email": args.admin_email},
+            None,
+        )
+    except HTTPException as exc:
+        return str(exc.detail)
+    return None
 
 
 def _normalize_zone_name(raw: str) -> str:
@@ -2464,7 +3471,7 @@ async def _preview_create_dns_zone(
     db: AsyncSession, user: User, args: CreateDNSZoneArgs
 ) -> PreviewResult:
     from app.api.v1.dns.router import VALID_ZONE_TYPES, resolved_zone_kind  # noqa: PLC0415
-    from app.models.dns import DNSZone  # noqa: PLC0415
+    from app.services.dns.zone_guards import soa_field_error, zone_name_taken  # noqa: PLC0415
 
     name = _normalize_zone_name(args.name)
     if not name:
@@ -2498,18 +3505,32 @@ async def _preview_create_dns_zone(
     conflict = _gated_zone_arg_conflict(args, drivers, grp.name)
     if conflict is not None:
         return PreviewResult(ok=False, detail=conflict)
+    conflict = _technitium_api_zone_arg_conflict(
+        args, drivers, await _effective_zone_ttl(db, args, grp.id)
+    )
+    if conflict is not None:
+        return PreviewResult(ok=False, detail=conflict)
+    if args.dnssec_enabled:
+        # #1762 — single-signer rule; read-only here, re-checked under lock
+        # at apply.
+        from app.services.dns.dnssec_signers import sign_refusal  # noqa: PLC0415
 
-    existing = (
-        await db.execute(
-            select(DNSZone).where(
-                DNSZone.group_id == grp.id,
-                DNSZone.view_id.is_(None),
-                DNSZone.name == name,
-                DNSZone.deleted_at.is_(None),
-            )
-        )
-    ).scalar_one_or_none()
-    if existing is not None:
+        refusal = await sign_refusal(db, grp.id, lock=False)
+        if refusal is not None:
+            return PreviewResult(ok=False, detail=refusal)
+
+    for soa_field in ("primary_ns", "admin_email"):
+        soa_err = soa_field_error(getattr(args, soa_field), soa_field)
+        if soa_err is not None:
+            return PreviewResult(ok=False, detail=f"{soa_field} {soa_err}")
+    if args.zone_type == "primary":
+        # #3672 — the REST create's apex-name rule.
+        from app.services.dns.zone_apex import apex_name_length_error  # noqa: PLC0415
+
+        apex_err = apex_name_length_error(name, args.primary_ns, args.admin_email)
+        if apex_err is not None:
+            return PreviewResult(ok=False, detail=apex_err)
+    if await zone_name_taken(db, grp.id, None, name):
         return PreviewResult(
             ok=False,
             detail=f"A zone named {name!r} already exists in group {grp.name!r}.",
@@ -2543,6 +3564,7 @@ async def _apply_create_dns_zone(
     from app.api.v1.dns.router import resolved_zone_kind  # noqa: PLC0415
     from app.models.audit import AuditLog  # noqa: PLC0415
     from app.models.dns import DNSZone  # noqa: PLC0415
+    from app.services.dns.zone_guards import soa_field_error, zone_name_taken  # noqa: PLC0415
 
     # SECURITY (#400, C2): RBAC backstop — matches the DNS router's
     # require_any_resource_permission("dns_zone", ...) write gate.
@@ -2563,19 +3585,62 @@ async def _apply_create_dns_zone(
     conflict = _gated_zone_arg_conflict(args, drivers, grp.name)
     if conflict is not None:
         raise ValueError(conflict)
+    conflict = _technitium_api_zone_arg_conflict(
+        args, drivers, await _effective_zone_ttl(db, args, grp.id)
+    )
+    if conflict is not None:
+        raise ValueError(conflict)
+    # #1762 — the single-signer rule the REST create applies, re-checked at
+    # apply (a server can join between proposal and approval).
+    if args.dnssec_enabled:
+        from app.services.dns.dnssec_signers import sign_refusal  # noqa: PLC0415
+
+        refusal = await sign_refusal(db, grp.id)
+        if refusal is not None:
+            raise ValueError(refusal)
+
+    # #2652 — the REST create's checks, re-run at apply. The unique
+    # constraint cannot catch a twin when view_id is NULL.
+    for soa_field in ("primary_ns", "admin_email"):
+        soa_err = soa_field_error(getattr(args, soa_field), soa_field)
+        if soa_err is not None:
+            raise ValueError(f"{soa_field} {soa_err}")
+    if args.zone_type == "primary":
+        from app.services.dns.zone_apex import apex_name_length_error  # noqa: PLC0415
+
+        apex_err = apex_name_length_error(name, args.primary_ns, args.admin_email)
+        if apex_err is not None:
+            raise ValueError(apex_err)
+    if await zone_name_taken(db, grp.id, None, name):
+        raise ValueError(f"A zone named {name!r} already exists in group {grp.name!r}.")
+
+    from app.services.dns.view_collisions import RenderGuard  # noqa: PLC0415
+
+    # #2275 — a zone with no view renders into every view of the group, so it
+    # must not land beside a same-name zone pinned to one of them.
+    render_guard = await RenderGuard.capture(db, grp.id, [name])
 
     zone = DNSZone(
         group_id=grp.id,
         name=name,
         zone_type=args.zone_type,
         kind=kind,
-        ttl=args.ttl,
+        ttl=await _effective_zone_ttl(db, args, grp.id),
         primary_ns=args.primary_ns,
         admin_email=args.admin_email,
         dnssec_enabled=args.dnssec_enabled,
     )
     db.add(zone)
     await db.flush()
+    await render_guard.check(db, f"create zone {name!r}", error=ValueError)
+
+    # #1932 — push the create to the group's agentless servers before the
+    # commit, exactly as the REST create does (#798 lockstep): a provider
+    # refusal fails the apply and the row rolls back, and a zone found
+    # already there is adopted and recorded in the audit row.
+    from app.api.v1.dns.router import _push_zone_to_agentless_servers  # noqa: PLC0415
+
+    adopted_on = await _push_zone_to_agentless_servers(db, zone, "create")
 
     # #811: enqueue the sign op the same way the REST create does — the
     # Copilot fronts the REST API and the two must stay in lockstep (#798).
@@ -2604,6 +3669,7 @@ async def _apply_create_dns_zone(
                 "dnssec_enabled": args.dnssec_enabled,
                 "driver_hint": args.driver_hint,
                 "via": "ai_proposal",
+                **({"adopted_existing_on": adopted_on} if adopted_on else {}),
             },
         )
     )
@@ -2657,19 +3723,41 @@ class CreateDHCPStaticArgs(BaseModel):
     )
     ip_address: str = Field(description="IP to reserve (must fall inside the scope).")
     mac_address: str = Field(description="MAC address (any standard format).")
-    hostname: str | None = Field(default=None, description="Optional hostname.")
+    hostname: str | None = Field(default=None, max_length=255, description="Optional hostname.")
     description: str = Field(default="", description="Free-form description.")
+
+    # The REST reservation create's rules (``StaticCreate``): a blank hostname
+    # is no hostname, anything else a legal host name; the MAC is canonical.
+    @field_validator("hostname")
+    @classmethod
+    def _hostname(cls, v: str | None) -> str | None:
+        return validate_optional_hostname(v)
+
+    @field_validator("mac_address")
+    @classmethod
+    def _mac(cls, v: str) -> str:
+        return canonicalize_mac(v)
 
 
 async def _preview_create_dhcp_static(
     db: AsyncSession, user: User, args: CreateDHCPStaticArgs
 ) -> PreviewResult:
+    from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
     from app.models.dhcp import DHCPScope, DHCPStaticAssignment
     from app.models.ipam import Subnet
 
     scope = await db.get(DHCPScope, args.scope_id)
+    # A scope the caller can neither read nor add reservations to (the REST
+    # create's type-wide ``write dhcp_static``) is answered as an unknown one.
     if scope is None:
-        return PreviewResult(ok=False, detail=f"DHCP scope {args.scope_id} not found.")
+        return PreviewResult(ok=False, detail=target_not_found_detail("dhcp_scope", args.scope_id))
+    if not (
+        _can_read_target(user, "dhcp_scope", scope.id)
+        or user_has_permission(user, "write", "dhcp_static")
+    ):
+        return hidden_target_preview(
+            "dhcp_scope", args.scope_id, OperationPermissionError("write", "dhcp_static")
+        )
 
     # #923: the CIDR is on the related Subnet, not on DHCPScope — the scope
     # carries only ``subnet_id``. Reading ``scope.subnet`` raised
@@ -2708,7 +3796,7 @@ async def _preview_create_dhcp_static(
                 ),
             )
         )
-    ).scalar_one_or_none()
+    ).first()
     suffix = ""
     if existing is not None:
         suffix = " — note: a static for this IP or MAC already exists; apply will fail"
@@ -2723,15 +3811,37 @@ async def _preview_create_dhcp_static(
     if args.description:
         d = args.description if len(args.description) < 80 else args.description[:77] + "..."
         parts.append(f"desc={d!r}")
+    # #2901 — apply mirrors the reservation into IPAM, as the REST create does.
+    parts.append("mirrors into IPAM as a static_dhcp address")
     return PreviewResult(ok=True, detail="ready", preview_text=", ".join(parts) + suffix)
+
+
+async def _validate_submit_create_dhcp_static(
+    db: AsyncSession, user: User, args: CreateDHCPStaticArgs
+) -> None:
+    """Request-portal submit check: the REST create's reservation conflicts (#2903)."""
+    from app.models.dhcp import DHCPScope  # noqa: PLC0415
+    from app.services.dhcp.static_conflicts import check_static_conflicts  # noqa: PLC0415
+
+    scope = await db.get(DHCPScope, args.scope_id)
+    if scope is None:  # preview already refused; defensive
+        return
+    await check_static_conflicts(
+        db, scope, args.ip_address, args.mac_address.lower(), name_other_scope=False
+    )
 
 
 async def _apply_create_dhcp_static(
     db: AsyncSession, user: User, args: CreateDHCPStaticArgs
 ) -> dict[str, Any]:
     from app.api.v1.dhcp._audit import write_audit
+    from app.api.v1.dhcp.statics import _recount_subnet  # noqa: PLC0415
+    from app.core.agent_wake import collect_wake, dhcp_group_channel  # noqa: PLC0415
     from app.models.dhcp import DHCPScope, DHCPStaticAssignment
     from app.models.ipam import Subnet
+    from app.services.dhcp.static_conflicts import check_static_conflicts  # noqa: PLC0415
+    from app.services.dhcp.static_ipam import upsert_ipam_for_static  # noqa: PLC0415
+    from app.services.dhcp.windows_writethrough import push_static_change  # noqa: PLC0415
 
     # SECURITY (#400, C2): RBAC backstop — matches the DHCP statics
     # router's require_resource_permission("dhcp_static") write gate.
@@ -2751,6 +3861,12 @@ async def _apply_create_dhcp_static(
     if addr_obj not in net:
         raise ValueError(f"IP {args.ip_address} is outside scope subnet {subnet.network}.")
 
+    # #2901 — the REST create's conflict check (a MAC already reserved in the
+    # group, a malformed IP). Raises a 4xx HTTPException; both callers roll
+    # back on it. An approve records the request ``failed`` with the detail
+    # (#2911); a proposal apply reports it as the proposal's error.
+    await check_static_conflicts(db, scope, args.ip_address, args.mac_address.lower())
+
     row = DHCPStaticAssignment(
         scope_id=scope.id,
         ip_address=args.ip_address,
@@ -2761,12 +3877,21 @@ async def _apply_create_dhcp_static(
     )
     db.add(row)
     await db.flush()
+    # #2901 — the same downstream work the REST create runs, in its order:
+    # Windows / cloud write-through (raises before anything commits), agent
+    # wake, the IPAM ``static_dhcp`` mirror, then the cached subnet / block
+    # counts. All in this one transaction, committed below.
+    await push_static_change(db, row, action="create")
+    collect_wake(dhcp_group_channel(scope.group_id))
+    await upsert_ipam_for_static(db, scope, row)
+    await _recount_subnet(db, scope.subnet_id)
 
     write_audit(
         db,
         user=user,
         action="create",
-        resource_type="dhcp.static_assignment",
+        # Bare type, as the REST create audits — keys ``dhcp.static.created`` (#3936).
+        resource_type="dhcp_static_assignment",
         resource_id=str(row.id),
         resource_display=f"{args.ip_address} ({args.mac_address})",
         new_value={
@@ -2799,6 +3924,7 @@ register(
         args_model=CreateDHCPStaticArgs,
         preview=_preview_create_dhcp_static,
         apply=_apply_create_dhcp_static,
+        validate_submit=_validate_submit_create_dhcp_static,
         category="dhcp",
         required_permission=("write", "dhcp_static"),
     )
@@ -2908,6 +4034,7 @@ register(
         preview=_preview_create_alert_rule,
         apply=_apply_create_alert_rule,
         category="ops",
+        requires_superadmin=True,
     )
 )
 
@@ -3580,6 +4707,7 @@ class AssignApplianceRoleArgs(BaseModel):
             "observer / custom. The three dns-* roles are mutually exclusive."
         )
     )
+    # #1562 — present-but-null unassigns the group; omitted leaves it.
     dns_group_id: str | None = None
     dhcp_group_id: str | None = None
 
@@ -3633,6 +4761,7 @@ async def _preview_assign_appliance_role(
         cap_key = {
             "dns-bind9": "can_run_dns_bind9",
             "dns-powerdns": "can_run_dns_powerdns",
+            "dns-technitium": "can_run_dns_technitium",
             "dhcp": "can_run_dhcp",
             "observer": "can_run_observer",
         }.get(r)
@@ -3644,6 +4773,36 @@ async def _preview_assign_appliance_role(
                     f"{cap_key}=true; cannot assign role {r!r}."
                 ),
             )
+    group_problem = await _assign_role_group_problem(db, args)
+    if group_problem is not None:
+        return PreviewResult(ok=False, detail=group_problem)
+    dhcp_module_problem = await _assign_role_dhcp_module_problem(db, row, args)
+    if dhcp_module_problem is not None:
+        return PreviewResult(ok=False, detail=dhcp_module_problem)
+    dns_module_problem = await _assign_role_dns_module_problem(db, row, args)
+    if dns_module_problem is not None:
+        return PreviewResult(ok=False, detail=dns_module_problem)
+    catalog_problem = await _assign_role_catalog_problem(db, row, args)
+    if catalog_problem is not None:
+        return PreviewResult(ok=False, detail=catalog_problem)
+    cluster_dns_problem = await _assign_role_cluster_dns_problem(db, row, args)
+    if cluster_dns_problem is not None:
+        return PreviewResult(ok=False, detail=cluster_dns_problem)
+    signer_problem = await _assign_role_signer_problem(db, row, args, lock=False)
+    if signer_problem is not None:
+        return PreviewResult(ok=False, detail=signer_problem)
+    # #1856 / #1902 — both server moves' refusals, so an operator changing
+    # the DNS and DHCP groups in one proposal sees every reason it won't apply.
+    move_problems = [
+        problem
+        for problem in (
+            await _assign_role_dns_move_problem(db, row, args),
+            await _assign_role_dhcp_move_problem(db, user, row, args),
+        )
+        if problem is not None
+    ]
+    if move_problems:
+        return PreviewResult(ok=False, detail=" ".join(move_problems))
 
     preview_lines = [
         f"Assign roles to **{row.hostname}** ({appliance_uuid})",
@@ -3651,8 +4810,12 @@ async def _preview_assign_appliance_role(
     ]
     if args.dns_group_id:
         preview_lines.append(f"dns_group_id: {args.dns_group_id}")
+    elif "dns_group_id" in args.model_fields_set:
+        preview_lines.append("dns_group_id: (unassigned — clears the current group)")
     if args.dhcp_group_id:
         preview_lines.append(f"dhcp_group_id: {args.dhcp_group_id}")
+    elif "dhcp_group_id" in args.model_fields_set:
+        preview_lines.append("dhcp_group_id: (unassigned — clears the current group)")
     preview_lines.append(
         "The supervisor's next heartbeat reads the new role set + "
         "starts / stops service containers accordingly."
@@ -3660,33 +4823,358 @@ async def _preview_assign_appliance_role(
     return PreviewResult(ok=True, detail="ready", preview_text="\n".join(preview_lines))
 
 
+async def _assign_role_group_problem(db: AsyncSession, args: AssignApplianceRoleArgs) -> str | None:
+    """Why a group in ``args`` can't be assigned, or None (#1468).
+
+    Same rule as the REST role-assign route: the supervisor drops a group
+    name it won't put in the role env, so refuse it here instead.
+    """
+    from app.models.dhcp import DHCPServerGroup  # noqa: PLC0415
+    from app.models.dns import DNSServerGroup  # noqa: PLC0415
+    from app.services.appliance.group_names import group_name_problem  # noqa: PLC0415
+
+    if args.dns_group_id:
+        try:
+            dns_group = await db.get(DNSServerGroup, UUID(args.dns_group_id))
+        except ValueError:
+            return f"dns_group_id must be a UUID, got {args.dns_group_id!r}"
+        if dns_group is None:
+            return f"DNS group {args.dns_group_id} not found."
+        problem = group_name_problem("dns", dns_group.name)
+        if problem is not None:
+            return problem
+    if args.dhcp_group_id:
+        try:
+            dhcp_group = await db.get(DHCPServerGroup, UUID(args.dhcp_group_id))
+        except ValueError:
+            return f"dhcp_group_id must be a UUID, got {args.dhcp_group_id!r}"
+        if dhcp_group is None:
+            return f"DHCP group {args.dhcp_group_id} not found."
+        return group_name_problem("dhcp", dhcp_group.name)
+    return None
+
+
+async def _assign_role_signer_problem(
+    db: AsyncSession, row: Any, args: AssignApplianceRoleArgs, *, lock: bool
+) -> str | None:
+    """#1762 — the single-signer refusal the REST role-assign route applies.
+
+    Pointing a DNS appliance at a group that already has a DNS server and
+    holds signed zones makes it a second independent signer (its agent
+    registers into the group). Refused on a pointer change only, like REST,
+    so re-proposing an unchanged assignment is never refused. When the
+    appliance's own DNS server already sits in the target group it adds no
+    signer.
+    """
+    from app.models.dns import DNSServer, DNSServerGroup  # noqa: PLC0415
+    from app.services.dns.dnssec_signers import second_signer_refusal  # noqa: PLC0415
+
+    if not args.dns_group_id or "dns_group_id" not in args.model_fields_set:
+        return None
+    engines = _APPL_DNS_ROLES.intersection(args.roles)
+    if not engines:
+        return None
+    try:
+        target_id = UUID(args.dns_group_id)
+    except ValueError:
+        return None  # _assign_role_group_problem reports it
+    if row.assigned_dns_group_id == target_id:
+        return None
+    group = await db.get(DNSServerGroup, target_id)
+    if group is None:
+        return None
+    driver = next(iter(engines)).removeprefix("dns-")
+    own = (
+        await db.execute(
+            select(DNSServer.id).where(
+                DNSServer.group_id == target_id,
+                func.lower(DNSServer.name) == (row.hostname or "").lower(),
+                DNSServer.driver == driver,
+            )
+        )
+    ).first()
+    if own is not None:
+        return None
+    return await second_signer_refusal(db, group, driver=driver, lock=lock)
+
+
+async def _assign_role_dhcp_module_problem(
+    db: AsyncSession, row: Any, args: AssignApplianceRoleArgs
+) -> str | None:
+    """#2130 — same refusal as the REST role-assign route: the DHCP role
+    needs ``core.dhcp``. Only when the role is newly ADDED, so an appliance
+    already holding it can still re-save (e.g. to change its DNS group)."""
+    from app.services.feature_modules import is_module_enabled  # noqa: PLC0415
+
+    if "dhcp" not in args.roles or "dhcp" in (row.assigned_roles or []):
+        return None
+    if await is_module_enabled(db, "core.dhcp"):
+        return None
+    return (
+        "Cannot assign the 'dhcp' role: the DHCP module (core.dhcp) is "
+        "disabled. Enable it under Administration > Features & "
+        "Integrations, or remove the role."
+    )
+
+
+async def _assign_role_dns_module_problem(
+    db: AsyncSession, row: Any, args: AssignApplianceRoleArgs
+) -> str | None:
+    """#2135 — same refusal as the REST role-assign route: a DNS role needs
+    ``core.dns``. Only a newly ADDED engine, so an appliance already holding
+    one can still re-save (e.g. to change its DHCP group)."""
+    from app.services.feature_modules import is_module_enabled  # noqa: PLC0415
+
+    held = set(row.assigned_roles or [])
+    added = sorted(r for r in _APPL_DNS_ROLES.intersection(args.roles) if r not in held)
+    if not added or await is_module_enabled(db, "core.dns"):
+        return None
+    return (
+        f"Cannot assign the {added[0]!r} role: the DNS module (core.dns) is "
+        "disabled. Enable it under Administration > Features & "
+        "Integrations, or remove the role."
+    )
+
+
+async def _assign_role_cluster_dns_problem(
+    db: AsyncSession, row: Any, args: AssignApplianceRoleArgs
+) -> str | None:
+    """#1427 — same refusal as the REST role-assign route: a control-plane
+    cluster serves one DNS server group, so a member may not run DNS in
+    another. Only on a change, so an unchanged assignment re-saves."""
+    from app.services.appliance.cluster_dns_group import (  # noqa: PLC0415
+        cluster_dns_group_refusal,
+    )
+
+    if "dns_group_id" in args.model_fields_set:
+        try:
+            group_id = UUID(args.dns_group_id) if args.dns_group_id else None
+        except ValueError:
+            return None  # _assign_role_group_problem reports the bad UUID
+    else:
+        group_id = row.assigned_dns_group_id
+    return await cluster_dns_group_refusal(
+        db,
+        row,
+        roles=list(args.roles),
+        group_id=group_id,
+        prev_roles=set(row.assigned_roles or []),
+        prev_group_id=row.assigned_dns_group_id,
+    )
+
+
+async def _assign_role_catalog_problem(
+    db: AsyncSession, row: Any, args: AssignApplianceRoleArgs
+) -> str | None:
+    """#1782 / #1858 — same refusals as the REST role-assign route: a
+    Technitium appliance must not be pointed at a catalog-enabled DNS group
+    (#1766), nor at one holding a TSIG key Technitium cannot use
+    (hmac-sha224). Only on a change, so a pre-existing assignment can still
+    be re-saved."""
+    from app.models.dns import DNSServerGroup  # noqa: PLC0415
+    from app.services.dns.server_move import catalog_unsupported_message  # noqa: PLC0415
+
+    if "dns-technitium" not in args.roles:
+        return None
+    if "dns_group_id" in args.model_fields_set:
+        try:
+            group_id = UUID(args.dns_group_id) if args.dns_group_id else None
+        except ValueError:
+            return None  # _assign_role_group_problem reports the bad UUID
+    else:
+        group_id = row.assigned_dns_group_id
+    if group_id is None:
+        return None
+    if "dns-technitium" in (row.assigned_roles or []) and group_id == row.assigned_dns_group_id:
+        return None
+    group = await db.get(DNSServerGroup, group_id)
+    if group is None:
+        return None
+    if not group.catalog_zones_enabled:
+        # #1858 — same refusal as the REST route: a key Technitium cannot use.
+        from app.services.dns.tsig_algorithms import group_key_refusal  # noqa: PLC0415
+
+        key_problem = await group_key_refusal(db, group.id, {"technitium"})
+        return f"DNS server group {group.name!r}: {key_problem}" if key_problem else None
+    return f"DNS server group {group.name!r} has catalog zones enabled. " + (
+        catalog_unsupported_message({"technitium"})
+    )
+
+
+async def _assign_role_dns_move_problem(
+    db: AsyncSession, row: Any, args: AssignApplianceRoleArgs
+) -> str | None:
+    """#1856 — the ambiguous-row refusal the apply's server move makes,
+    reported at preview. Read-only: the move's other refusals (name clash,
+    mixed driver, catalog, second signer) need the move itself and are
+    re-checked at apply, which refuses the whole proposal before it commits.
+    """
+    from app.models.dns import DNSServer, DNSServerGroup  # noqa: PLC0415
+    from app.services.appliance.dns_group_move import (  # noqa: PLC0415
+        appliance_adoptable_dns_server,
+    )
+    from app.services.appliance.ownership import (  # noqa: PLC0415
+        DNS_ROLE_DRIVER,
+        own_server_condition,
+    )
+    from app.services.dns.server_move import ServerMoveError  # noqa: PLC0415
+
+    if not args.dns_group_id or "dns_group_id" not in args.model_fields_set:
+        return None
+    drivers = {DNS_ROLE_DRIVER[r] for r in args.roles if r in DNS_ROLE_DRIVER}
+    if not drivers:
+        return None
+    try:
+        group = await db.get(DNSServerGroup, UUID(args.dns_group_id))
+    except ValueError:
+        return None  # _assign_role_group_problem reports it
+    if group is None:
+        return None
+    own = await own_server_condition(db, row, DNSServer)
+    has_current = (
+        await db.execute(select(DNSServer.id).where(own, DNSServer.driver.in_(sorted(drivers))))
+    ).first()
+    if has_current is not None:
+        return None
+    try:
+        await appliance_adoptable_dns_server(db, row, group)
+    except ServerMoveError as exc:
+        return exc.detail
+    return None
+
+
+async def _assign_role_dhcp_move_problem(
+    db: AsyncSession, user: User, row: Any, args: AssignApplianceRoleArgs
+) -> str | None:
+    """#1902 — the refusals the apply's Kea server move makes (a mixed
+    Kea / Windows group, v6 scopes for Windows), reported at preview. Read-only."""
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    from app.models.dhcp import DHCPServerGroup  # noqa: PLC0415
+    from app.services.appliance.dhcp_group_move import (  # noqa: PLC0415
+        move_appliance_dhcp_servers,
+    )
+
+    if not args.dhcp_group_id or "dhcp_group_id" not in args.model_fields_set:
+        return None
+    try:
+        group = await db.get(DHCPServerGroup, UUID(args.dhcp_group_id))
+    except ValueError:
+        return None  # _assign_role_group_problem reports it
+    if group is None:
+        return None
+    try:
+        await move_appliance_dhcp_servers(
+            db, row, group, user, dry_run=True, roles=list(args.roles)
+        )
+    except HTTPException as exc:
+        return str(exc.detail)
+    return None
+
+
 async def _apply_assign_appliance_role(
     db: AsyncSession, user: User, args: AssignApplianceRoleArgs
 ) -> dict[str, Any]:
+    from app.core.agent_wake import collecting_wakes  # noqa: PLC0415
     from app.models.appliance import Appliance  # noqa: PLC0415
-    from app.models.audit import AuditLog  # noqa: PLC0415
-    from app.models.dhcp import DHCPServerGroup  # noqa: PLC0415
-    from app.models.dns import DNSServerGroup  # noqa: PLC0415
 
     # SECURITY (#400, C2): RBAC backstop — matches the REST role-assign
     # route's require_permission("admin", "appliance").
     enforce_operation_permission(user, _OPERATIONS["assign_appliance_role"])
 
     appliance_uuid = UUID(args.appliance_id)
-    row = await db.get(Appliance, appliance_uuid)
+    # #1856 — FOR UPDATE, like the REST route (#1715): two saves on one
+    # appliance must not race the server move below on stale reads.
+    row = await db.get(Appliance, appliance_uuid, with_for_update=True)
     if row is None:
         raise ValueError(f"Appliance {args.appliance_id} not found.")
+    # The /ai router mounts without ``wake_publishing``; open the collector
+    # here so the move's wakes publish after the commit below (and are
+    # dropped if it raises).
+    async with collecting_wakes():
+        return await _apply_assign_appliance_role_locked(db, user, args, row)
+
+
+async def _apply_assign_appliance_role_locked(
+    db: AsyncSession, user: User, args: AssignApplianceRoleArgs, row: Any
+) -> dict[str, Any]:
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    from app.core.agent_wake import appliance_channel, collect_wake  # noqa: PLC0415
+    from app.models.audit import AuditLog  # noqa: PLC0415
+    from app.models.dhcp import DHCPServerGroup  # noqa: PLC0415
+    from app.models.dns import DNSServerGroup  # noqa: PLC0415
+    from app.services.appliance.dhcp_group_move import (  # noqa: PLC0415
+        move_appliance_dhcp_servers,
+    )
+    from app.services.appliance.dns_group_move import (  # noqa: PLC0415
+        move_appliance_dns_servers,
+    )
+    from app.services.dns.server_move import ServerMoveError  # noqa: PLC0415
+
+    # Re-checked at apply: a group can be renamed between preview and apply.
+    group_problem = await _assign_role_group_problem(db, args)
+    if group_problem is not None:
+        raise ValueError(group_problem)
+    dhcp_module_problem = await _assign_role_dhcp_module_problem(db, row, args)
+    if dhcp_module_problem is not None:
+        raise ValueError(dhcp_module_problem)
+    dns_module_problem = await _assign_role_dns_module_problem(db, row, args)
+    if dns_module_problem is not None:
+        raise ValueError(dns_module_problem)
+    catalog_problem = await _assign_role_catalog_problem(db, row, args)
+    if catalog_problem is not None:
+        raise ValueError(catalog_problem)
+    cluster_dns_problem = await _assign_role_cluster_dns_problem(db, row, args)
+    if cluster_dns_problem is not None:
+        raise ValueError(cluster_dns_problem)
+    signer_problem = await _assign_role_signer_problem(db, row, args, lock=True)
+    if signer_problem is not None:
+        raise ValueError(signer_problem)
+    prev_roles = list(row.assigned_roles or [])
     row.assigned_roles = list(args.roles)
-    if args.dns_group_id:
-        dns_group = await db.get(DNSServerGroup, UUID(args.dns_group_id))
-        if dns_group is None:
-            raise ValueError(f"DNS group {args.dns_group_id} not found.")
-        row.assigned_dns_group_id = dns_group.id
-    if args.dhcp_group_id:
-        dhcp_group = await db.get(DHCPServerGroup, UUID(args.dhcp_group_id))
-        if dhcp_group is None:
-            raise ValueError(f"DHCP group {args.dhcp_group_id} not found.")
-        row.assigned_dhcp_group_id = dhcp_group.id
+    # #1562 — same contract as the REST roles endpoint: a group field
+    # present in the payload with a null value unassigns the group; an
+    # omitted field leaves the current assignment alone. (Proposals
+    # persist args with exclude_unset=True so the distinction survives
+    # the store/re-validate round-trip.)
+    moved_servers: list[dict[str, Any]] = []
+    retired_servers: list[str] = []
+    if "dns_group_id" in args.model_fields_set:
+        if args.dns_group_id:
+            dns_group = await db.get(DNSServerGroup, UUID(args.dns_group_id))
+            if dns_group is None:
+                raise ValueError(f"DNS group {args.dns_group_id} not found.")
+            # #1565 / #1856 — the same server move the REST route makes: the
+            # pointer alone would leave the appliance's server serving the old
+            # group. A refusal raises, and the proposal applies nothing.
+            try:
+                dns_move = await move_appliance_dns_servers(db, row, dns_group, user)
+            except ServerMoveError as exc:
+                raise ValueError(exc.detail) from exc
+            moved_servers = dns_move.moved
+            retired_servers = dns_move.retired
+            row.assigned_dns_group_id = dns_group.id
+        else:
+            row.assigned_dns_group_id = None
+    if "dhcp_group_id" in args.model_fields_set:
+        if args.dhcp_group_id:
+            dhcp_group = await db.get(DHCPServerGroup, UUID(args.dhcp_group_id))
+            if dhcp_group is None:
+                raise ValueError(f"DHCP group {args.dhcp_group_id} not found.")
+            # #1565 / #1902 — the same Kea server move the REST route makes: the
+            # pointer alone would leave the appliance's server in the old group.
+            # A refusal raises, and the proposal applies nothing.
+            try:
+                dhcp_move = await move_appliance_dhcp_servers(
+                    db, row, dhcp_group, user, prev_roles=prev_roles
+                )
+            except HTTPException as exc:
+                raise ValueError(str(exc.detail)) from exc
+            moved_servers.extend(dhcp_move.moved)
+            row.assigned_dhcp_group_id = dhcp_group.id
+        else:
+            row.assigned_dhcp_group_id = None
     db.add(
         AuditLog(
             user_id=user.id,
@@ -3702,14 +5190,21 @@ async def _apply_assign_appliance_role(
                 "dns_group_id": args.dns_group_id,
                 "dhcp_group_id": args.dhcp_group_id,
                 "via": "ai_proposal",
+                **({"moved_servers": moved_servers} if moved_servers else {}),
+                **({"retired_servers": retired_servers} if retired_servers else {}),
             },
         )
     )
+    # #358 Phase 1 — wake the supervisor heartbeat, as the Fleet roles PUT
+    # does, so the new roles and groups apply without waiting a heartbeat.
+    # Collected, so it publishes after the commit (and not on a refusal).
+    collect_wake(appliance_channel(row.id))
     await db.commit()
     return {
         "appliance_id": str(row.id),
         "hostname": row.hostname,
         "roles": list(args.roles),
+        **({"moved_servers": moved_servers} if moved_servers else {}),
     }
 
 
@@ -3859,6 +5354,34 @@ class GrantTemporaryAccessArgs(BaseModel):
     )
 
 
+_GRANT_MAKES_SUPERADMIN = (
+    "This grant would make {n} member(s) of the group superadmins, and that needs "
+    "your password or authenticator code, which a chat Apply cannot ask for "
+    "(#1412). Grant it from Groups → Time-bound grants instead."
+)
+
+
+async def _grant_makes_superadmins(
+    db: AsyncSession, group_id: UUID, args: GrantTemporaryAccessArgs
+) -> int:
+    """How many users a ``*`` / ``*`` grant would make superadmins (#1412)."""
+    from app.services.superadmin_grant import (  # noqa: PLC0415
+        newly_superadmin,
+        permissions_grant_superadmin,
+    )
+
+    requested = [
+        {
+            "action": args.action,
+            "resource_type": args.resource_type,
+            "resource_id": (args.resource_id or "").strip() or None,
+        }
+    ]
+    if not permissions_grant_superadmin(requested):
+        return 0
+    return len(await newly_superadmin(db, lambda m: m.granted_groups.add(group_id)))
+
+
 async def _preview_grant_temporary_access(
     db: AsyncSession, user: User, args: GrantTemporaryAccessArgs
 ) -> PreviewResult:
@@ -3880,6 +5403,9 @@ async def _preview_grant_temporary_access(
     group = await db.get(Group, gid)
     if group is None:
         return PreviewResult(ok=False, detail=f"No group with id {args.group_id}.")
+    granted = await _grant_makes_superadmins(db, gid, args)
+    if granted:
+        return PreviewResult(ok=False, detail=_GRANT_MAKES_SUPERADMIN.format(n=granted))
     expires = datetime.now(UTC) + timedelta(hours=args.expires_in_hours)
     scope = f"/{args.resource_id}" if args.resource_id else " (any instance)"
     preview_text = (
@@ -3903,6 +5429,10 @@ async def _apply_grant_temporary_access(
     group = await db.get(Group, UUID(args.group_id))
     if group is None:
         raise ValueError(f"No group with id {args.group_id}.")
+    # Re-checked at apply: membership can change between preview and Apply.
+    granted = await _grant_makes_superadmins(db, group.id, args)
+    if granted:
+        raise ValueError(_GRANT_MAKES_SUPERADMIN.format(n=granted))
     resource_id = (args.resource_id or "").strip() or None
     expires = datetime.now(UTC) + timedelta(hours=args.expires_in_hours)
     grant = TimeBoundGrant(
@@ -3961,6 +5491,7 @@ register(
         preview=_preview_grant_temporary_access,
         apply=_apply_grant_temporary_access,
         category="admin",
+        requires_superadmin=True,
     )
 )
 
@@ -4062,6 +5593,10 @@ async def _preview_approve_change_request(
     except Exception as exc:  # noqa: BLE001
         return PreviewResult(ok=False, detail=f"Stored args no longer validate: {exc}")
     inner = await op.preview(db, user, inner_args)
+    if not inner.ok and inner.forbidden_detail is not None:
+        # The target exists but this approver cannot reach it: the approval
+        # would be refused (403) and the request left pending, not stale.
+        return PreviewResult(ok=False, detail=inner.forbidden_detail)
     if not inner.ok:
         return PreviewResult(ok=False, detail=f"Stale change request: {inner.detail}")
     preview_text = (
@@ -4093,9 +5628,10 @@ async def _apply_approve_change_request(
     try:
         cr = await approve_change_request(db, cr_id, approver=user, request=None, note=args.note)
     except DecisionForbidden as exc:
-        # Map the self-approval / missing-permission case to the op's RBAC
-        # error so the apply endpoint returns a clean 403.
-        raise OperationPermissionError("approve", "change_request") from exc
+        # Still a 403 from the apply endpoint, but carry the orchestrator's
+        # own reason (self-approval, missing write on the target, ...): the
+        # approver usually DOES hold 'approve' on 'change_request' (#3152).
+        raise OperationPermissionError("approve", "change_request", str(exc)) from exc
     except DecisionError as exc:
         raise ValueError(str(exc)) from exc
     return {
@@ -4161,7 +5697,7 @@ async def _apply_reject_change_request(
     try:
         cr = await reject_change_request(db, cr_id, approver=user, request=None, note=args.note)
     except DecisionForbidden as exc:
-        raise OperationPermissionError("approve", "change_request") from exc
+        raise OperationPermissionError("approve", "change_request", str(exc)) from exc
     except DecisionError as exc:
         raise ValueError(str(exc)) from exc
     return {"id": str(cr.id), "operation": cr.operation, "state": cr.state}
@@ -4223,8 +5759,13 @@ async def _preview_acknowledge_device(
     row = await db.get(IpMacHistory, args.sighting_id)
     if row is None:
         return PreviewResult(ok=False, detail=f"Sighting {args.sighting_id} not found")
-    ip = await db.get(IPAddress, row.ip_address_id)
-    where = str(ip.address) if ip else "an IP"
+    from app.services.ipam.live_address import get_live_address  # noqa: PLC0415
+
+    ip = await get_live_address(db, row.ip_address_id)
+    if ip is None:
+        # #3537: the apply refuses a sighting under a trashed subnet; say so here.
+        return PreviewResult(ok=False, detail=f"Sighting {args.sighting_id} not found")
+    where = str(ip.address)
     return PreviewResult(
         ok=True,
         detail="ready",
@@ -4280,6 +5821,14 @@ class AllowlistMacArgs(BaseModel):
         default=None, description="OUI prefix (e.g. '00:50:56' or '005056') to trust a whole vendor"
     )
     note: str = Field(default="", description="Why this MAC/vendor is trusted")
+
+    @field_validator("mac_address")
+    @classmethod
+    def _norm_mac(cls, v: str | None) -> str | None:
+        # Same canonical form (and refusal of a malformed one) as the REST route.
+        from app.api.v1.dhcp._mac import canonicalize_mac  # noqa: PLC0415
+
+        return None if v is None else canonicalize_mac(v)
 
 
 async def _preview_allowlist_mac(
@@ -4361,6 +5910,13 @@ class BlockMacArgs(BaseModel):
     )
     reason: str = Field(default="other", description="Block reason code")
     description: str = Field(default="", description="Free-form note")
+
+    @field_validator("mac_address")
+    @classmethod
+    def _norm_mac(cls, v: str) -> str:
+        from app.api.v1.dhcp._mac import canonicalize_mac  # noqa: PLC0415
+
+        return canonicalize_mac(v)
 
 
 async def _block_target_groups(db: AsyncSession, args: BlockMacArgs) -> list[UUID]:
@@ -4948,5 +6504,6 @@ register(
         preview=_preview_restart_service,
         apply=_apply_restart_service,
         category="admin",
+        requires_superadmin=True,
     )
 )

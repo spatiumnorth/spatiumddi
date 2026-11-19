@@ -7,7 +7,7 @@ title: Windows Server Setup
 
 SpatiumDDI can manage Windows Server DNS and DHCP agentlessly — no software installed on the Windows side. DNS has two tiers (RFC 2136 always-on, WinRM unlocks more); DHCP runs entirely over WinRM — lease and scope mirroring into IPAM, plus per-object scope / reservation / exclusion writes.
 
-This page is the **Windows-side checklist**. The SpatiumDDI-side config is covered in [features/DNS.md §13](../features/DNS.md#13-windows-dns--path-a--b) and [features/DHCP.md §15](../features/DHCP.md#15-windows-dhcp--path-a-read-only).
+This page is the **Windows-side checklist**. The SpatiumDDI-side config is covered in [features/DNS.md §13](../features/DNS.md#13-windows-dns--path-a--b) and [features/DHCP.md §15](../features/DHCP.md#15-windows-dhcp-agentless-winrm).
 
 > **You do not install anything on the Windows server.** Everything runs remotely over WinRM (DNS zone management + DHCP reads) or RFC 2136 / dnspython over UDP/TCP 53 (DNS record writes + AXFR).
 

@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-# SpatiumDDI Kea DHCP container — kea-dhcp4 + kea-dhcp6 + kea-ctrl-agent + spatium-dhcp-agent
+# SpatiumDDI Kea DHCP container — kea-dhcp4 + kea-dhcp6 + spatium-dhcp-agent
 # Multi-arch: linux/amd64, linux/arm64 (non-negotiable #11)
 ARG PYTHON_VERSION=3.14
 
@@ -70,7 +70,7 @@ FROM alpine:3.24 AS runtime
 # ``kea-ctrl-agent`` is deliberately NOT installed (#637). Kea 3.0 deprecates
 # it, and nothing in SpatiumDDI ever spoke to it: the agent drives kea-dhcp4 /
 # kea-dhcp6 over their unix control sockets (spatium_dhcp_agent/kea_ctrl.py —
-# config-test, config-reload, status-get, statistic-get-all) and the backend
+# config-reload, status-get, statistic-get-all) and the backend
 # KeaDriver.apply_config is a no-op. It was dead weight whose supervise loop
 # could take the whole container down via the entrypoint's ``wait -n``.
 #
@@ -115,6 +115,18 @@ RUN echo "apk snapshot ${APK_SNAPSHOT}" >/dev/null \
       /etc/radvd /run/radvd \
  && chown -R spatium:spatium /var/lib/spatium-dhcp-agent /var/lib/kea /run/kea /etc/kea /var/log/kea \
       /etc/radvd /run/radvd \
+ # #3852 — OpenShift's restricted SCC starts the container as a random uid in
+ # group 0 and no other, so every path written at run time is group-0 owned and
+ # group-writable. NOT /run/kea: Kea 3.0 refuses a control-socket directory more
+ # permissive than 0750 (measured: a 0770 /run/kea fails with "more relaxed
+ # permissions than 750"), and a 0750 directory is writable only by its owner —
+ # so the entrypoint recreates it owned by the uid it runs as, and /run itself
+ # is group-writable to allow that. All a no-op when started as root.
+ && chgrp -R 0 /var/lib/spatium-dhcp-agent /var/lib/kea /etc/kea /var/log/kea \
+      /etc/radvd /run/radvd \
+ && chmod -R g=u /var/lib/spatium-dhcp-agent /var/lib/kea /etc/kea /var/log/kea \
+      /etc/radvd /run/radvd \
+ && chmod g+w /run \
  && { \
       echo "alpine_release=$(cat /etc/alpine-release)"; \
       apk info -v 2>/dev/null \
@@ -129,7 +141,9 @@ COPY agent/dhcp/images/kea/kea-dhcp6.conf /etc/kea/kea-dhcp6.conf
 COPY agent/dhcp/images/kea/entrypoint.sh /usr/local/bin/spatium-dhcp-entrypoint
 RUN chmod +x /usr/local/bin/spatium-dhcp-entrypoint \
  && chown spatium:spatium \
-      /etc/kea/kea-dhcp4.conf /etc/kea/kea-dhcp6.conf
+      /etc/kea/kea-dhcp4.conf /etc/kea/kea-dhcp6.conf \
+ && chgrp 0 /etc/kea/kea-dhcp4.conf /etc/kea/kea-dhcp6.conf \
+ && chmod g=u /etc/kea/kea-dhcp4.conf /etc/kea/kea-dhcp6.conf
 
 ARG PYTHON_VERSION
 ENV CACHE_DIR=/var/lib/spatium-dhcp-agent \
@@ -181,3 +195,23 @@ ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/spatium-dhcp-entrypoint"]
 # "dev". Last, so a new version only rebuilds this layer.
 ARG APP_VERSION=dev
 ENV SPATIUM_AGENT_VERSION=${APP_VERSION}
+
+# #3913 — image metadata the OCI spec and Red Hat's preflight expect, plus the
+# project licence texts at /licenses. ``release`` is the image build number,
+# not the product version; ``version`` follows APP_VERSION from release.yml.
+ARG IMAGE_RELEASE=1
+COPY LICENSE NOTICE /licenses/
+LABEL name="dhcp-kea" \
+      vendor="Spatium North Inc." \
+      version="${APP_VERSION:-dev}" \
+      release="${IMAGE_RELEASE}" \
+      summary="SpatiumDDI managed Kea DHCP server" \
+      description="ISC Kea DHCPv4 and DHCPv6 server with the SpatiumDDI agent, configured by the SpatiumDDI control plane." \
+      maintainer="Spatium North Inc. <https://www.spatiumddi.com/>" \
+      url="https://www.spatiumddi.com/" \
+      org.opencontainers.image.title="dhcp-kea" \
+      org.opencontainers.image.vendor="Spatium North Inc." \
+      org.opencontainers.image.url="https://www.spatiumddi.com/" \
+      org.opencontainers.image.source="https://github.com/spatiumnorth/spatiumddi" \
+      org.opencontainers.image.documentation="https://www.spatiumddi.com/" \
+      org.opencontainers.image.licenses="Apache-2.0"

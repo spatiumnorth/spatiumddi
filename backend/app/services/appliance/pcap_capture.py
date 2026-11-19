@@ -2,13 +2,13 @@
 
 The appliance vantage runs tcpdump on the appliance **host** (real NICs),
 not in a container — so the capture rides the supervisor channel. Unlike
-:mod:`app.services.appliance.agent_cmd` (an in-memory per-replica queue
+:mod:`app.services.appliance.agent_cmd` (a Redis-backed queue
 for short request/response nettools), the authority here is the
 ``packet_capture`` **DB row**: a minutes-long job that outlives any single
 poll and is replica-agnostic — *any* api replica can serve the
 supervisor's poll because the claim is a guarded UPDATE against the shared
-Postgres, not an in-memory queue (which would strand a capture enqueued on
-a different replica — the #430-class delivery gap we explicitly avoid).
+Postgres, not a transient queue (a minutes-long job must survive a Redis flush
+and a replica restart).
 
 Flow:
   * supervisor long-polls ``/supervisor/pcap/poll`` → :func:`claim_next`
@@ -33,6 +33,7 @@ from typing import Any
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.models.pcap import PacketCapture
 
 
@@ -162,6 +163,8 @@ async def finalize_capture(
         row.pcap_path = pcap_path
         row.pcap_size_bytes = pcap_size_bytes
         row.pcap_sha256 = pcap_sha256
+        # #2866 — the file is on THIS pod's node disk; record which.
+        row.artifact_node = (settings.node_name or "").strip() or None
         if packet_count is not None:
             row.packets_captured = packet_count
         row.bytes_captured = pcap_size_bytes

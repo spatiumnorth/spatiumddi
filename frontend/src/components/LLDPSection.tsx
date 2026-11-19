@@ -3,6 +3,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AlertCircle } from "lucide-react";
 
 import {
+  formatDialogError,
   settingsApi,
   type LldpProtocol,
   type PlatformSettings,
@@ -113,8 +114,11 @@ export function LLDPSection({
       setSavedAt(Date.now());
       setTimeout(() => setSavedAt(null), 2500);
     },
+    // formatDialogError, not err.message: on an AxiosError the latter is only
+    // "Request failed with status code N", which hides the server's reason,
+    // the validator's sentence naming the refused value (#3424).
     onError: (err: unknown) => {
-      setSaveErr(err instanceof Error ? err.message : String(err));
+      setSaveErr(formatDialogError(err));
     },
   });
 
@@ -278,7 +282,7 @@ export function LLDPSection({
 
       <Field
         label="SNMP AgentX (LLDP-MIB)"
-        description="Register lldpd as an AgentX subagent of the host snmpd so LLDP-MIB (lldpRemTable) is queryable over SNMP. Only meaningful when SNMP is also enabled. Loopback only — no firewall change."
+        description="Register lldpd as an AgentX subagent of the host snmpd so LLDP-MIB (lldpRemTable) is queryable over SNMP. Only meaningful when SNMP is also enabled. Local socket only — no firewall change."
       >
         <Toggle
           checked={agentx}

@@ -26,6 +26,9 @@ import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { ReauthFields } from "@/components/ReauthFields";
 import { cn } from "@/lib/utils";
+import { copyToClipboard } from "@/lib/clipboard";
+import { useSecretCloseGuard } from "@/hooks/useSecretCloseGuard";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Appliance → Pairing codes tab (#169 + #170 Wave A3 reshape).
@@ -185,7 +188,9 @@ export function PairingTab() {
       {/* #407 — registration gate. Surfaces + toggles
           ``supervisor_registration_enabled`` so an operator can enable
           appliance pairing from the UI instead of hand-editing the DB.
-          Generic Kubernetes/Helm control planes ship with it OFF. */}
+          Generic Kubernetes/Helm control planes ship with it OFF. It
+          gates new registrations only, never the heartbeat of an
+          appliance that is already registered (#2798). */}
       <div
         className={cn(
           "mb-4 rounded-md border p-3",
@@ -211,8 +216,8 @@ export function PairingTab() {
             </p>
             <p className="mt-1 text-xs text-muted-foreground">
               {registrationEnabled === false
-                ? "New supervisors cannot pair while this is off — the register endpoint returns 404. Enable it before pairing an appliance."
-                : "Remote supervisors may register with a valid pairing code. Turn this off to refuse all new pairings."}
+                ? "New supervisors cannot pair while this is off — the register endpoint returns 404. Appliances already registered keep heartbeating and serving. Enable it before pairing an appliance."
+                : "Remote supervisors may register with a valid pairing code. Turn this off to refuse all new pairings; appliances already registered are not affected."}
             </p>
           </div>
           <button
@@ -455,7 +460,7 @@ function RelativeTime({ iso }: { iso: string }) {
 
 // ── Generate modal ──────────────────────────────────────────────────
 
-function GenerateCodeModal({
+export function GenerateCodeModal({
   onClose,
   onCreated,
 }: {
@@ -467,6 +472,19 @@ function GenerateCodeModal({
   const [maxClaims, setMaxClaims] = useState<number | "">("");
   const [note, setNote] = useState("");
   const [generated, setGenerated] = useState<PairingCodeCreated | null>(null);
+  // #3222 — an ephemeral code's cleartext is shown once and is not
+  // recoverable, so closing before copying it asks first. A persistent
+  // code can be re-revealed later and closes as before.
+  const generatedValues = useMemo(
+    () => (generated ? [formatPairingCode(generated.code)] : []),
+    [generated],
+  );
+  const guard = useSecretCloseGuard({
+    onClose,
+    secrets: generatedValues,
+    noun: "pairing code",
+    active: !!generated && !generated.persistent,
+  });
 
   // Reset expiry default when toggling persistent: ephemeral defaults
   // to 15 min, persistent to 30 days (#1356). 0 = never, persistent only.
@@ -490,154 +508,165 @@ function GenerateCodeModal({
   });
 
   return (
-    <Modal onClose={onClose} title="New pairing code">
-      {generated ? (
-        <GeneratedView code={generated} onClose={onClose} />
-      ) : (
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            mutation.mutate();
-          }}
-          className="flex flex-col gap-4"
-        >
-          {/* Persistent toggle — two card-style radios */}
-          <fieldset className="flex flex-col gap-2">
-            <legend className="text-sm font-medium">Flavour</legend>
-            <div className="grid grid-cols-2 gap-2">
-              {[
-                {
-                  value: false,
-                  title: "Ephemeral",
-                  subtitle: "Single-use, short expiry",
-                },
-                {
-                  value: true,
-                  title: "Persistent",
-                  subtitle: "Multi-claim, re-revealable",
-                },
-              ].map((opt) => (
-                <label
-                  key={String(opt.value)}
-                  className={cn(
-                    "cursor-pointer rounded-md border p-2",
-                    persistent === opt.value
-                      ? "border-primary bg-primary/5"
-                      : "hover:bg-muted",
-                  )}
-                >
-                  <input
-                    type="radio"
-                    className="sr-only"
-                    checked={persistent === opt.value}
-                    onChange={() => setPersistent(opt.value)}
-                  />
-                  <div className="text-sm font-medium">{opt.title}</div>
-                  <div className="text-xs text-muted-foreground">
-                    {opt.subtitle}
-                  </div>
-                </label>
-              ))}
-            </div>
-          </fieldset>
-
-          <label className="flex flex-col gap-1 text-sm">
-            <span className="text-xs font-medium">
-              Expiry{" "}
-              <span className="text-muted-foreground">
-                {persistent
-                  ? "(minutes — default 30 days, 0 for no expiry)"
-                  : "(minutes)"}
-              </span>
-            </span>
-            <input
-              type="number"
-              className={inputCls}
-              min={persistent ? 0 : 5}
-              max={persistent ? undefined : 60}
-              value={expiresInMinutes ?? 0}
-              onChange={(e) => setExpiresInMinutes(Number(e.target.value))}
+    <>
+      <Modal onClose={guard.requestClose} title="New pairing code">
+        {generated ? (
+          <div {...guard.copyProps}>
+            <GeneratedView
+              code={generated}
+              onClose={guard.requestClose}
+              onCopied={guard.markTaken}
             />
-          </label>
-          {persistent && expiresInMinutes === 0 && (
-            <p className="rounded-md border border-amber-500/40 bg-amber-500/10 p-2 text-xs text-amber-700 dark:text-amber-300">
-              A code that never expires lets any appliance that learns its 8
-              digits ask to join, for as long as the code exists. Prefer an
-              expiry, and revoke the code when the rollout is done.
-            </p>
-          )}
+          </div>
+        ) : (
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              mutation.mutate();
+            }}
+            className="flex flex-col gap-4"
+          >
+            {/* Persistent toggle — two card-style radios */}
+            <fieldset className="flex flex-col gap-2">
+              <legend className="text-sm font-medium">Flavour</legend>
+              <div className="grid grid-cols-2 gap-2">
+                {[
+                  {
+                    value: false,
+                    title: "Ephemeral",
+                    subtitle: "Single-use, short expiry",
+                  },
+                  {
+                    value: true,
+                    title: "Persistent",
+                    subtitle: "Multi-claim, re-revealable",
+                  },
+                ].map((opt) => (
+                  <label
+                    key={String(opt.value)}
+                    className={cn(
+                      "cursor-pointer rounded-md border p-2",
+                      persistent === opt.value
+                        ? "border-primary bg-primary/5"
+                        : "hover:bg-muted",
+                    )}
+                  >
+                    <input
+                      type="radio"
+                      className="sr-only"
+                      checked={persistent === opt.value}
+                      onChange={() => setPersistent(opt.value)}
+                    />
+                    <div className="text-sm font-medium">{opt.title}</div>
+                    <div className="text-xs text-muted-foreground">
+                      {opt.subtitle}
+                    </div>
+                  </label>
+                ))}
+              </div>
+            </fieldset>
 
-          {persistent && (
             <label className="flex flex-col gap-1 text-sm">
               <span className="text-xs font-medium">
-                Max claims{" "}
+                Expiry{" "}
                 <span className="text-muted-foreground">
-                  (blank = unlimited)
+                  {persistent
+                    ? "(minutes — default 30 days, 0 for no expiry)"
+                    : "(minutes)"}
                 </span>
               </span>
               <input
                 type="number"
                 className={inputCls}
-                min={1}
-                value={maxClaims}
-                onChange={(e) =>
-                  setMaxClaims(e.target.value ? Number(e.target.value) : "")
-                }
+                min={persistent ? 0 : 5}
+                max={persistent ? undefined : 60}
+                value={expiresInMinutes ?? 0}
+                onChange={(e) => setExpiresInMinutes(Number(e.target.value))}
               />
             </label>
-          )}
+            {persistent && expiresInMinutes === 0 && (
+              <p className="rounded-md border border-amber-500/40 bg-amber-500/10 p-2 text-xs text-amber-700 dark:text-amber-300">
+                A code that never expires lets any appliance that learns its 8
+                digits ask to join, for as long as the code exists. Prefer an
+                expiry, and revoke the code when the rollout is done.
+              </p>
+            )}
 
-          <label className="flex flex-col gap-1 text-sm">
-            <span className="text-xs font-medium">
-              Note <span className="text-muted-foreground">(optional)</span>
-            </span>
-            <input
-              type="text"
-              className={inputCls}
-              maxLength={255}
-              value={note}
-              onChange={(e) => setNote(e.target.value)}
-              placeholder="e.g. staging fleet"
-            />
-          </label>
+            {persistent && (
+              <label className="flex flex-col gap-1 text-sm">
+                <span className="text-xs font-medium">
+                  Max claims{" "}
+                  <span className="text-muted-foreground">
+                    (blank = unlimited)
+                  </span>
+                </span>
+                <input
+                  type="number"
+                  className={inputCls}
+                  min={1}
+                  value={maxClaims}
+                  onChange={(e) =>
+                    setMaxClaims(e.target.value ? Number(e.target.value) : "")
+                  }
+                />
+              </label>
+            )}
 
-          {mutation.error && (
-            <div className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-xs text-destructive">
-              {formatApiError(mutation.error)}
+            <label className="flex flex-col gap-1 text-sm">
+              <span className="text-xs font-medium">
+                Note <span className="text-muted-foreground">(optional)</span>
+              </span>
+              <input
+                type="text"
+                className={inputCls}
+                maxLength={255}
+                value={note}
+                onChange={(e) => setNote(e.target.value)}
+                placeholder="e.g. staging fleet"
+              />
+            </label>
+
+            {mutation.error && (
+              <FormError className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-xs text-destructive">
+                {formatApiError(mutation.error)}
+              </FormError>
+            )}
+
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={onClose}
+                className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={mutation.isPending}
+                className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-60"
+              >
+                {mutation.isPending && (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                )}
+                Generate
+              </button>
             </div>
-          )}
-
-          <div className="flex justify-end gap-2">
-            <button
-              type="button"
-              onClick={onClose}
-              className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
-            >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              disabled={mutation.isPending}
-              className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-60"
-            >
-              {mutation.isPending && (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              )}
-              Generate
-            </button>
-          </div>
-        </form>
-      )}
-    </Modal>
+          </form>
+        )}
+      </Modal>
+      {guard.confirm}
+    </>
   );
 }
 
 function GeneratedView({
   code,
   onClose,
+  onCopied,
 }: {
   code: PairingCodeCreated;
   onClose: () => void;
+  onCopied?: () => void;
 }) {
   const [copied, setCopied] = useState(false);
   const copyRef = useRef<number | null>(null);
@@ -648,7 +677,8 @@ function GeneratedView({
     // operator sees on screen. The backend + installer + supervisor
     // all strip non-digits before validating, so the dashes are
     // cosmetic only.
-    await navigator.clipboard.writeText(formatted);
+    if (!(await copyToClipboard(formatted))) return;
+    onCopied?.();
     setCopied(true);
     if (copyRef.current !== null) window.clearTimeout(copyRef.current);
     copyRef.current = window.setTimeout(() => setCopied(false), 1500);
@@ -793,9 +823,9 @@ function RevealModal({
             autoFocus
           />
           {mutation.error && (
-            <div className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-xs text-destructive">
+            <FormError className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-xs text-destructive">
               {formatApiError(mutation.error)}
-            </div>
+            </FormError>
           )}
           <div className="flex justify-end gap-2">
             <button

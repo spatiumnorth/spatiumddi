@@ -1,3 +1,4 @@
+import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AudioLines, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
@@ -20,7 +21,8 @@ import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { Pager } from "@/components/ui/pager";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
-import { usePermissions } from "@/hooks/usePermissions";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 // AV over IP (issue #540, part of #543). Two operator surfaces on one
 // page because they only make sense together: the flows are the AV
@@ -106,6 +108,8 @@ export function AVFlowsPage() {
       qc.invalidateQueries({ queryKey: ["av-flows"] });
       setDeleteFlow(null);
     },
+    // A 404 means the row is already gone: re-read so it leaves the list.
+    onError: () => qc.invalidateQueries({ queryKey: ["av-flows"] }),
   });
 
   const deleteRangeMut = useMutation({
@@ -114,6 +118,7 @@ export function AVFlowsPage() {
       qc.invalidateQueries({ queryKey: ["av-reserved-ranges"] });
       setDeleteRange(null);
     },
+    onError: () => qc.invalidateQueries({ queryKey: ["av-reserved-ranges"] }),
   });
 
   function protocolLabel(id: string): string {
@@ -129,8 +134,17 @@ export function AVFlowsPage() {
               <AudioLines className="h-5 w-5 text-muted-foreground" />
               <h1 className="text-lg font-semibold">AV over IP</h1>
               <span className="text-xs text-muted-foreground">
-                {total} flow{total === 1 ? "" : "s"} · {ranges.length} reserved
-                range{ranges.length === 1 ? "" : "s"}
+                {flowsQ.error ? (
+                  <ListReadError error={flowsQ.error} what="AV flows" />
+                ) : (
+                  `${total} flow${total === 1 ? "" : "s"}`
+                )}{" "}
+                ·{" "}
+                {rangesQ.error ? (
+                  <ListReadError error={rangesQ.error} what="reserved ranges" />
+                ) : (
+                  `${ranges.length} reserved range${ranges.length === 1 ? "" : "s"}`
+                )}
               </span>
             </div>
             <p className="mt-1 max-w-3xl text-xs text-muted-foreground">
@@ -160,7 +174,10 @@ export function AVFlowsPage() {
               icon={Plus}
               disabled={!canWrite}
               title={
-                canWrite ? undefined : "Requires write permission on AV flows"
+                permissionGate(
+                  canWrite,
+                  "Requires write permission on AV flows",
+                ).title
               }
               onClick={() => setFlowModal({ mode: "create" })}
             >
@@ -227,9 +244,28 @@ export function AVFlowsPage() {
           <div className="rounded-lg border">
             {flows.length === 0 ? (
               <div className="p-8 text-center text-sm text-muted-foreground">
-                {flowsQ.isLoading
-                  ? "Loading AV flows…"
-                  : "No AV flows recorded. Stamp a multicast group as an AV flow to start documenting the plant."}
+                {flowsQ.isLoading ? (
+                  "Loading AV flows…"
+                ) : (
+                  <ListEmpty
+                    error={flowsQ.error}
+                    what="AV flows"
+                    filtered={
+                      search.trim() !== "" ||
+                      protocolFilter !== "" ||
+                      ptpFilter.trim() !== ""
+                    }
+                    onClearFilters={() => {
+                      setSearch("");
+                      setProtocolFilter("");
+                      setPtpFilter("");
+                      setPage(1);
+                    }}
+                  >
+                    No AV flows recorded. Stamp a multicast group as an AV flow
+                    to start documenting the plant.
+                  </ListEmpty>
+                )}
               </div>
             ) : (
               <div className="overflow-x-auto">
@@ -333,7 +369,10 @@ export function AVFlowsPage() {
               icon={Plus}
               disabled={!canWrite}
               title={
-                canWrite ? undefined : "Requires write permission on AV flows"
+                permissionGate(
+                  canWrite,
+                  "Requires write permission on AV flows",
+                ).title
               }
               onClick={() => setRangeModal({ mode: "create" })}
             >
@@ -464,9 +503,20 @@ export function AVFlowsPage() {
         title="Remove AV flow"
         message={
           <>
-            Remove the AV identity from{" "}
-            <span className="font-mono">{deleteFlow?.group_address}</span>? The
-            multicast group itself is kept — it simply stops being an AV flow.
+            <>
+              Remove the AV identity from{" "}
+              <span className="font-mono">{deleteFlow?.group_address}</span>?
+              The multicast group itself is kept — it simply stops being an AV
+              flow.
+            </>
+            {deleteFlowMut.isError && (
+              <p role="alert" className="mt-2 text-destructive">
+                {formatApiError(
+                  deleteFlowMut.error,
+                  "Failed to delete AV flow",
+                )}
+              </p>
+            )}
           </>
         }
         tone="destructive"
@@ -475,23 +525,39 @@ export function AVFlowsPage() {
         onConfirm={() =>
           deleteFlow && deleteFlowMut.mutate(deleteFlow.group_id)
         }
-        onClose={() => setDeleteFlow(null)}
+        onClose={() => {
+          setDeleteFlow(null);
+          deleteFlowMut.reset();
+        }}
       />
       <ConfirmModal
         open={deleteRange !== null}
         title="Delete reserved range"
         message={
           <>
-            Undeclare <span className="font-mono">{deleteRange?.cidr}</span>?
-            Nothing cascades — groups and flows inside the range are untouched,
-            they just stop being checkable against it.
+            <>
+              Undeclare <span className="font-mono">{deleteRange?.cidr}</span>?
+              Nothing cascades — groups and flows inside the range are
+              untouched, they just stop being checkable against it.
+            </>
+            {deleteRangeMut.isError && (
+              <p role="alert" className="mt-2 text-destructive">
+                {formatApiError(
+                  deleteRangeMut.error,
+                  "Failed to delete reserved range",
+                )}
+              </p>
+            )}
           </>
         }
         tone="destructive"
         confirmLabel="Delete"
         loading={deleteRangeMut.isPending}
         onConfirm={() => deleteRange && deleteRangeMut.mutate(deleteRange.id)}
-        onClose={() => setDeleteRange(null)}
+        onClose={() => {
+          setDeleteRange(null);
+          deleteRangeMut.reset();
+        }}
       />
     </div>
   );
@@ -593,7 +659,7 @@ function FlowModal({
             {ready && !multicastEnabled ? (
               <p className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
                 The Multicast feature module is disabled, so there are no groups
-                to stamp. Enable it under Settings → Features first.
+                to stamp. Enable it under Features & Integrations first.
               </p>
             ) : (
               <>
@@ -698,7 +764,9 @@ function FlowModal({
           />
         </Field>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -900,7 +968,9 @@ function RangeModal({
           </span>
         </label>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 pt-2">
           <button

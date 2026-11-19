@@ -7,6 +7,21 @@ Documentation=https://github.com/spatiumnorth/spatiumddi/issues/138
 
 [Service]
 Type=oneshot
+# GHSA-h2j9-qrg7-grfw — act only on a trigger written by root, the
+# supervisor or the api; anything else is renamed aside and the unit
+# skips cleanly. See spatiumddi-trigger-guard.
+ExecCondition=/usr/local/bin/spatiumddi-trigger-guard /var/lib/spatiumddi/release-state/reboot-pending-fleet
+# #3008 — the agent runs spatium-power-action, which can wait minutes on the
+# primary's handoff. No start timeout (a oneshot's default, stated so nobody
+# adds one): a timeout stops the wrapper, which takes it as a cancel.
+TimeoutStartSec=infinity
 ExecStart=/usr/local/bin/spatiumddi-reboot-agent
+# #3162 — F9 (systemctl stop) is a cancel, not a failure: the agent ends by
+# the stop's own signal. For Type=oneshot systemd counts death by SIGTERM /
+# SIGINT / SIGHUP as a FAILURE (result 'signal') unless listed here, so
+# without this line the unit is left 'failed' exactly as with the old exit 1
+# (verified on systemd 257). Exit 1 (a failed systemctl reboot) stays a
+# failure.
+SuccessExitStatus=TERM INT HUP
 # No Install section — only invoked by the matching .path unit, never
 # directly enabled at boot.

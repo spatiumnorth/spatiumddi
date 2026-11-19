@@ -23,6 +23,19 @@ from typing import Any, Literal
 # ── Neutral record / zone data shapes ──────────────────────────────────────
 
 
+def first_ttl(*candidates: int | None, default: int) -> int:
+    """First candidate that is not ``None``, else ``default``.
+
+    A TTL of ``0`` is a real, publishable value (the record API accepts
+    ``ge=0``), so ``ttl or default`` is wrong: it reads 0 as missing and
+    publishes the default instead (#2942). Only ``None`` falls through.
+    """
+    for c in candidates:
+        if c is not None:
+            return int(c)
+    return default
+
+
 @dataclass(frozen=True)
 class RecordData:
     """A single DNS resource record, relative to its zone."""
@@ -61,6 +74,12 @@ class ZoneData:
     # (false — the resolver may fall back to recursion if all forwarders fail).
     forwarders: tuple[str, ...] = ()
     forward_only: bool = True
+    # The forward zone's own upstream transport (#2121) — NOT the group's
+    # ``ServerOptions.forward_transport``, which applies to the group's
+    # resolver forwarders only. ``forward_tls_hostname`` is the upstream
+    # certificate name, required for every encrypted transport.
+    forward_transport: str = "do53"
+    forward_tls_hostname: str | None = None
     # Secondary / stub primaries (issue #336). The master server IPs this
     # zone transfers FROM, as ``ip`` or ``ip@port`` strings. Required +
     # non-empty for ``zone_type`` in {secondary, stub} — the BIND9 renderer
@@ -170,7 +189,16 @@ class ServerOptions:
     forwarders: tuple[str, ...] = ()
     forward_policy: str = "first"
     recursion_enabled: bool = True
-    allow_recursion: tuple[str, ...] = ("any",)
+    # #1817: local + private networks. Mirrors models.dns.DEFAULT_ALLOW_RECURSION.
+    allow_recursion: tuple[str, ...] = (
+        "localhost",
+        "localnets",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "fc00::/7",
+        "fe80::/10",
+    )
     dnssec_validation: str = "auto"
     notify_enabled: str = "yes"
     also_notify: tuple[str, ...] = ()
@@ -235,7 +263,7 @@ class TsigKey:
 class BlocklistEntry:
     domain: str
     action: str  # block | redirect | nxdomain
-    block_mode: str  # nxdomain | sinkhole | refused
+    block_mode: str  # nxdomain | sinkhole (``refused`` retired in #2124)
     sinkhole_ip: str | None
     target: str | None
     is_wildcard: bool
@@ -436,6 +464,20 @@ class DNSDriver(ABC):
     """
 
     name: str = "abstract"
+
+    def provider_identity(self, server: Any) -> str | None:
+        """Identify the external system an AGENTLESS server drives (#3805).
+
+        Two server rows can reach the same provider zone store (two
+        Technitium rows with one API URL, two cloud rows with one account).
+        A zone move pushes a create to the target group and a delete to the
+        source group; when both reach one provider the delete removes the
+        only copy. Equal identities mean "same provider". ``None`` means
+        unknown, and callers must treat unknown as "might be the same":
+        delete is the destructive direction. Agent-managed drivers have no
+        provider to share, so the default is ``None``.
+        """
+        return None
 
     # ── Rendering ─────────────────────────────────────────────────────────
 

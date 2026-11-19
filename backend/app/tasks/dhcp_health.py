@@ -32,9 +32,12 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.celery_app import celery_app
 from app.config import settings
+from app.db import task_connect_args
 from app.drivers.dhcp import get_driver, is_agentless
 from app.models.dhcp import DHCPServer
+from app.services.agents.daemon_state import forget_stale_ok
 from app.services.feature_modules import is_module_enabled
+from app.tasks.module_gate import module_gated
 
 # If agent hasn't heartbeat'd in this long, mark unreachable.
 AGENT_STALE_AFTER = timedelta(seconds=120)
@@ -43,7 +46,9 @@ logger = structlog.get_logger(__name__)
 
 
 async def _check_health(server_id: uuid.UUID) -> None:
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
@@ -96,6 +101,9 @@ async def _check_health(server_id: uuid.UUID) -> None:
                     server.status = "active"
                 else:
                     server.status = "unreachable"
+                    # #2961 — no heartbeat, so no current daemon state: the
+                    # last ``ok`` is not evidence of anything any more.
+                    forget_stale_ok(server)
 
             server.last_health_check_at = now
             await db.commit()
@@ -128,7 +136,9 @@ def check_dhcp_server_health(self: object, server_id: str) -> None:  # type: ign
 
 
 async def _enqueue_all() -> None:
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
@@ -145,6 +155,7 @@ async def _enqueue_all() -> None:
 
 
 @celery_app.task(name="app.tasks.dhcp_health.check_all_dhcp_servers_health", bind=True)
+@module_gated("core.dhcp")
 def check_all_dhcp_servers_health(self: object) -> None:  # type: ignore[type-arg]
     """Fan-out task — enqueues one health check per registered DHCP server.
 

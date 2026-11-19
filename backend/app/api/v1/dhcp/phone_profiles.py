@@ -23,16 +23,25 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import delete, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
+from app.core.update_nulls import changed_keys, resolve_update_changes, snapshot
 from app.models.dhcp import (
     DHCPPhoneProfile,
     DHCPPhoneProfileScope,
     DHCPScope,
     DHCPServerGroup,
+)
+from app.services.dhcp.class_refs import (
+    describe_pools,
+    phone_class_name,
+    phone_profile_rendered,
+    pools_restricted_to,
+    trash_hint,
 )
 from app.services.dhcp.option_validation import (
     check_vendor_class_match,
@@ -150,8 +159,15 @@ def _to_option_response(rows: list[dict]) -> list[PhoneOptionResponse]:
 
 
 async def _scope_ids_for(db: DB, profile_id: uuid.UUID) -> list[uuid.UUID]:
+    """The profile's live scopes (#3448). Selected through ``DHCPScope``, so
+    the soft-delete filter leaves out a scope in the Trash: the profile reads
+    what it can be saved with (``_validate_scope_ids`` cannot see that scope
+    either), as the bundle renders it. The attachment row itself stays, so a
+    restored scope comes back attached."""
     res = await db.execute(
-        select(DHCPPhoneProfileScope.scope_id).where(DHCPPhoneProfileScope.profile_id == profile_id)
+        select(DHCPScope.id)
+        .join(DHCPPhoneProfileScope, DHCPPhoneProfileScope.scope_id == DHCPScope.id)
+        .where(DHCPPhoneProfileScope.profile_id == profile_id)
     )
     return [row[0] for row in res.all()]
 
@@ -194,6 +210,77 @@ async def _validate_scope_ids(db: DB, group_id: uuid.UUID, scope_ids: list[uuid.
         )
 
 
+async def refuse_if_phone_class_stops_rendering(
+    db: AsyncSession,
+    p: DHCPPhoneProfile,
+    verb: str,
+    *,
+    enabled: bool | None = None,
+    scope_ids: list[uuid.UUID] | None = None,
+    exclude_scope_id: uuid.UUID | None = None,
+    always: bool = False,
+) -> None:
+    """409 when a change would stop the bundle defining the profile's class
+    (disabled, deleted, or left attached to no active scope) while a pool's
+    ``class_restriction`` names it (#3388). Kea accepts the reference and the
+    pool silently matches no client. The arguments describe the pending change
+    (``phone_profile_rendered``); ``always`` is the delete, which takes the
+    class away whatever the profile's state. Only the transition is refused
+    otherwise: a profile that renders nothing today can still be tidied up.
+    ``exclude_scope_id``'s own pools leave with that scope, so they don't
+    count."""
+    if not always:
+        if not await phone_profile_rendered(db, p):
+            return
+        if await phone_profile_rendered(
+            db, p, enabled=enabled, scope_ids=scope_ids, exclude_scope_id=exclude_scope_id
+        ):
+            return
+    name = phone_class_name(p.id)
+    pools = await pools_restricted_to(
+        db, p.group_id, name, exclude_scope_id=exclude_scope_id, include_trashed=always
+    )
+    if pools:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cannot {verb}: phone profile '{p.name}' generates class '{name}', which is "
+                f"still referenced by {len(pools)} pool(s) ({describe_pools(pools)}). Kea "
+                "accepts a reference to an undefined class and the pool would silently "
+                "match no client. Clear or change those references first." + trash_hint(pools)
+            ),
+        )
+
+
+async def refuse_scope_removal_orphaning_classes(
+    db: AsyncSession, scope: DHCPScope, verb: str
+) -> None:
+    """409 when deleting or deactivating ``scope`` would drop a phone class a
+    pool in ANOTHER scope still names (#3388): the class renders only while
+    an enabled profile is attached to an active scope. PXE classes need no
+    check here: one is evaluated only in the scopes bound to its profile
+    (#2731), so the pools that use it are this scope's own and leave with it."""
+    if not scope.is_active:
+        return
+    profiles = (
+        (
+            await db.execute(
+                select(DHCPPhoneProfile)
+                .join(
+                    DHCPPhoneProfileScope,
+                    DHCPPhoneProfileScope.profile_id == DHCPPhoneProfile.id,
+                )
+                .where(DHCPPhoneProfileScope.scope_id == scope.id)
+                .order_by(DHCPPhoneProfile.name)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for p in profiles:
+        await refuse_if_phone_class_stops_rendering(db, p, verb, exclude_scope_id=scope.id)
+
+
 # ── Endpoints ───────────────────────────────────────────────────────────────
 
 
@@ -220,7 +307,7 @@ async def create_profile(
     group_id: uuid.UUID,
     body: PhoneProfileCreate,
     db: DB,
-    user: SuperAdmin,
+    user: CurrentUser,
 ) -> PhoneProfileResponse:
     grp = await db.get(DHCPServerGroup, group_id)
     if grp is None:
@@ -289,13 +376,19 @@ async def update_profile(
     profile_id: uuid.UUID,
     body: PhoneProfileUpdate,
     db: DB,
-    user: SuperAdmin,
+    user: CurrentUser,
 ) -> PhoneProfileResponse:
     prof = await db.get(DHCPPhoneProfile, profile_id)
     if prof is None:
         raise HTTPException(status_code=404, detail="Phone profile not found")
 
-    payload = body.model_dump(exclude_none=True)
+    # #1563 — explicit null clears vendor / vendor_class_match; null for
+    # a NOT NULL column is a 422.
+    payload = resolve_update_changes(
+        body,
+        clearable={"vendor", "vendor_class_match"},
+        non_nullable={"name", "description", "enabled", "option_set", "tags"},
+    )
     if "name" in payload and payload["name"] != prof.name:
         clash = await db.execute(
             select(DHCPPhoneProfile).where(
@@ -321,6 +414,12 @@ async def update_profile(
     if "tags" in payload:
         payload["tags"] = dict(payload["tags"] or {})
 
+    if payload.get("enabled") is False:
+        await refuse_if_phone_class_stops_rendering(
+            db, prof, f"disable phone profile '{prof.name}'", enabled=False
+        )
+
+    before = snapshot(prof, payload)
     for k, v in payload.items():
         setattr(prof, k, v)
 
@@ -331,8 +430,8 @@ async def update_profile(
         resource_type="dhcp_phone_profile",
         resource_id=str(prof.id),
         resource_display=prof.name,
-        changed_fields=list(payload.keys()),
-        new_value=body.model_dump(mode="json", exclude_none=True),
+        changed_fields=changed_keys(before, payload),
+        new_value=body.model_dump(mode="json", exclude_unset=True),
     )
     collect_wake(dhcp_group_channel(prof.group_id))
     await db.commit()
@@ -341,10 +440,13 @@ async def update_profile(
 
 
 @router.delete("/phone-profiles/{profile_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_profile(profile_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
+async def delete_profile(profile_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
     prof = await db.get(DHCPPhoneProfile, profile_id)
     if prof is None:
         raise HTTPException(status_code=404, detail="Phone profile not found")
+    await refuse_if_phone_class_stops_rendering(
+        db, prof, f"delete phone profile '{prof.name}'", always=True
+    )
 
     write_audit(
         db,
@@ -367,13 +469,14 @@ async def replace_scope_attachments(
     profile_id: uuid.UUID,
     body: PhoneProfileScopeAttach,
     db: DB,
-    user: SuperAdmin,
+    user: CurrentUser,
 ) -> PhoneProfileResponse:
     """Replace the profile's scope attachments with the provided list.
 
     Atomic — passes through validation that every scope id belongs to
-    the same group as the profile, then deletes existing rows and
-    inserts the new set in one transaction.
+    the same group as the profile, then detaches the live scopes left out
+    and attaches the new ones in one transaction. A scope in the Trash is
+    neither listed nor accepted, so its attachment is left as it is (#3448).
     """
     prof = await db.get(DHCPPhoneProfile, profile_id)
     if prof is None:
@@ -381,11 +484,31 @@ async def replace_scope_attachments(
 
     await _validate_scope_ids(db, prof.group_id, body.scope_ids)
 
-    await db.execute(
-        delete(DHCPPhoneProfileScope).where(DHCPPhoneProfileScope.profile_id == profile_id)
+    # #3367 — an untouched Save re-sends the same list. Nothing to rewrite,
+    # audit or wake agents for.
+    current = set(await _scope_ids_for(db, profile_id))
+    if current == set(body.scope_ids):
+        return await _to_response(db, prof)
+    await refuse_if_phone_class_stops_rendering(
+        db,
+        prof,
+        f"detach phone profile '{prof.name}' from its last active scope",
+        scope_ids=list(body.scope_ids),
     )
-    for sid in body.scope_ids:
-        db.add(DHCPPhoneProfileScope(profile_id=profile_id, scope_id=sid))
+
+    # #3448: only the live attachments are replaced. A Trash scope's row
+    # stays, so a save made meanwhile does not detach it from its restore.
+    dropped = current - set(body.scope_ids)
+    if dropped:
+        await db.execute(
+            delete(DHCPPhoneProfileScope).where(
+                DHCPPhoneProfileScope.profile_id == profile_id,
+                DHCPPhoneProfileScope.scope_id.in_(list(dropped)),
+            )
+        )
+    for sid in dict.fromkeys(body.scope_ids):
+        if sid not in current:
+            db.add(DHCPPhoneProfileScope(profile_id=profile_id, scope_id=sid))
 
     write_audit(
         db,
@@ -395,7 +518,7 @@ async def replace_scope_attachments(
         resource_id=str(prof.id),
         resource_display=prof.name,
         changed_fields=["scope_attachments"],
-        new_value={"scope_count": len(body.scope_ids)},
+        new_value={"scope_count": len(set(body.scope_ids))},
     )
     collect_wake(dhcp_group_channel(prof.group_id))
     await db.commit()
@@ -413,7 +536,7 @@ async def replace_scope_attachments(
 async def seed_starter_pack(
     group_id: uuid.UUID,
     db: DB,
-    user: SuperAdmin,
+    user: CurrentUser,
 ) -> list[PhoneProfileResponse]:
     """Seed the curated 9-vendor starter pack into this group.
 

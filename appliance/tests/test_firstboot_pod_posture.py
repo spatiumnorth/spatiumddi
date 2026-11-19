@@ -185,8 +185,12 @@ def test_control_manifest_parses_when_memtotal_is_unreadable(tmp_path: Path) -> 
     body = _extract_function("_render_control_helmchart")
     # Neutralise the MemTotal read the same way a missing /proc/meminfo would.
     body = body.replace("/proc/meminfo", str(tmp_path / "no-such-meminfo"))
+    # #2240 — and the CPU count, which sizes the CPU limits on its own: with
+    # neither readable, nothing is sized at all.
+    nproc = "nproc 2>/dev/null || true"
+    assert nproc in body, "firstboot's CPU count read moved"
     proc = subprocess.run(
-        ["bash", "-c", f"{body}\n_render_control_helmchart\n"],
+        ["bash", "-c", f"{body.replace(nproc, 'true')}\n_render_control_helmchart\n"],
         env={**os.environ, "CHART_TGZ": "/nonexistent/appliance.tgz"},
         capture_output=True,
         text=True,
@@ -199,6 +203,22 @@ def test_control_manifest_parses_when_memtotal_is_unreadable(tmp_path: Path) -> 
     assert "resources" not in (values.get("api") or {}), (
         "with MemTotal unreadable the chart's own defaults must stand"
     )
+
+    # With only the CPU count readable the document is still valid, and the
+    # api carries the CPU limit alone.
+    proc = subprocess.run(
+        ["bash", "-c", f"{body.replace(nproc, 'echo 8')}\n_render_control_helmchart\n"],
+        env={**os.environ, "CHART_TGZ": "/nonexistent/appliance.tgz"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    doc = yaml.safe_load(proc.stdout)
+    assert set(doc) == {"apiVersion", "kind", "metadata", "spec"}
+    values = yaml.safe_load(doc["spec"]["valuesContent"])
+    assert values["api"]["resources"] == {"limits": {"cpu": "2000m"}}
+    assert values["postgresql"]["resources"] == {"limits": {"cpu": "4000m"}}
 
 
 def test_control_manifest_carries_the_sizing_when_memtotal_is_readable() -> None:

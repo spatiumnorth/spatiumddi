@@ -5,7 +5,7 @@
 # subset to ``true`` based on the SpatiumApplianceRole spec.
 #
 # All container images come from the slot's containerd content store
-# (preloaded at firstboot from /usr/lib/spatiumddi/images/*.tar.zst).
+# (imported by k3s from /var/lib/rancher/k3s/agent/images/*.tar.zst).
 # imagePullPolicy is ``Never`` everywhere — air-gap means no registry
 # lookup at runtime, ever.
 
@@ -113,15 +113,42 @@ dnsBind9:
   priorityClassName: spatium-service  # #983 — see ``priorityClasses`` above
   image:
     repository: ghcr.io/spatiumnorth/dns-bind9
-  # Scheduling weight for the serving pod. Requests only, no limits: a
-  # request lifts the pod out of BestEffort QoS (cgroup cpu.weight 1, the
-  # lowest on the node) so the control plane's bursts cannot starve the
-  # data plane; a CPU limit would throttle the bursts the data plane
-  # exists to serve. Sized as a floor, not a measurement of need.
+  # CPU: a request only, no limit. A request lifts the pod out of
+  # BestEffort QoS (cgroup cpu.weight 1, the lowest on the node) so the
+  # control plane's bursts cannot starve the data plane; a CPU limit would
+  # throttle the bursts the data plane exists to serve.
+  #
+  # Memory (#1725): a request AND a limit. With no limit, loading one ~580k
+  # entry catalog blocklist into a group with a view took the pod to
+  # 2.8-3.6 GB on a 6 GiB node, which pushed the node under the kubelet's
+  # eviction threshold: the worker, Postgres and the api were evicted and
+  # then named was OOM-killed. The limit makes the overload this pod's own
+  # (the kernel kills named inside its cgroup) instead of the node's. It is
+  # ONE value for the whole cluster, not sized per node: the role chart is
+  # shared and must render the same on every node (#1137), and a DaemonSet
+  # takes one limit for all its pods. The memory limit and request are
+  # ``memory`` below, NOT ``resources``: the supervisor sizes them from node
+  # RAM (#2223) — a quarter of the SMALLEST node labelled for dns-bind9,
+  # rounded to whole GiB, floor 2Gi, cap 8Gi, with the request an eighth of
+  # the limit — because a fixed 2Gi was OOM-killed at about 2M records in
+  # ddi-pg's scale lab. The values here are the floor, which a render with no
+  # supervisor (``helm template``, a node whose RAM could not be read) gets.
+  # Zone data (#2223), measured at 20,000 zones and 1,000,000 records: named
+  # 868 MB resident, the agent at most 480 MB while it takes a bundle (~110
+  # MB between polls). A catalog blocklist in the hundreds of thousands of
+  # entries needs more, see the sizing table in docs/features/DNS.md (8.x).
+  # To pin a value, set ``resources.limits.memory`` (and/or
+  # ``resources.requests.memory``) with a HelmChartConfig on this chart
+  # (docs/deployment/APPLIANCE.md): an explicit ``resources`` memory always
+  # wins over ``memory``. The agent also derives named's ``max-cache-size``
+  # from the limit (a quarter of it) so the resolver cache cannot eat the
+  # RPZ's share.
   resources:
     requests:
       cpu: 250m
-      memory: 64Mi
+  memory:
+    limit: 2Gi
+    request: 256Mi
   # Pass-through to the agent via env. The supervisor fills these in
   # when assigning the DNS role.
   # controlPlaneUrl is the EXTERNAL operator-facing URL. #409 — the
@@ -174,12 +201,18 @@ dnsPowerdns:
     repository: ghcr.io/spatiumnorth/dns-powerdns
   # Scheduling weight for the serving pod — see dnsBind9.resources. The
   # three DNS drivers are interchangeable roles on the same node, so they
-  # carry the same floor: whichever one the operator assigns must not be
+  # carry the same weight: whichever one the operator assigns must not be
   # the BestEffort pod the control plane starves.
+  #
+  # Memory (#1828): 128Mi, above the pod's idle working set. The kubelet
+  # ranks evictions by "is usage over the memory REQUEST" BEFORE it looks at
+  # priority, so a serving pod running above its request is evicted ahead of
+  # every pod within its own request, whatever the PriorityClasses say. A
+  # request is therefore only a floor if the pod stays under it.
   resources:
     requests:
       cpu: 250m
-      memory: 64Mi
+      memory: 128Mi
   controlPlaneUrl: ""
   inClusterApiUrl: ""  # #292 — see dnsBind9.inClusterApiUrl
   agentKey: ""
@@ -210,13 +243,14 @@ dnsTechnitium:
   image:
     repository: ghcr.io/spatiumnorth/dns-technitium
   # Scheduling weight for the serving pod — see dnsBind9.resources. The
-  # memory request is the same 64Mi floor the other DNS roles carry; it is
-  # a scheduling and eviction-ranking floor, not a sizing estimate, and
-  # Technitium's .NET runtime idles well above it. Requests only.
+  # memory request is 256Mi like BIND's (#1828): the .NET runtime idles well
+  # above the 64Mi floor this used to carry, and a serving pod over its
+  # request is ranked for eviction ahead of pods within theirs, regardless of
+  # PriorityClass. Requests only.
   resources:
     requests:
       cpu: 250m
-      memory: 64Mi
+      memory: 256Mi
   controlPlaneUrl: ""
   inClusterApiUrl: ""  # #292 — see dnsBind9.inClusterApiUrl
   agentKey: ""
@@ -255,6 +289,11 @@ dhcpKea:
   # api ran at 110 %, its socket queue overflowed and only 37 % of the
   # DISCOVERs on the wire were answered. Requests only, no limits.
   #
+  # Memory (#1828): 128Mi. Kea's working set is 66-72 Mi at idle on the
+  # measured appliances, which sat ABOVE the 64Mi this carried, and the
+  # kubelet evicts a pod over its memory request ahead of pods within theirs
+  # before it ever looks at the PriorityClass.
+  #
   # 500m is the value every measured cell used (#967): what does the work
   # under contention is the cgroup weight the request derives to, and
   # 500m (weight 20) holds ~48 % of the CPU against the api + worker where
@@ -265,10 +304,14 @@ dhcpKea:
   resources:
     requests:
       cpu: 500m
-      memory: 64Mi
+      memory: 128Mi
   controlPlaneUrl: ""
   inClusterApiUrl: ""  # #292 — see dnsBind9.inClusterApiUrl
   agentKey: ""
+  # #3202: rendered nowhere. The dhcp-kea pod template is one for every node
+  # of a cluster and carries no node's DHCP group: the control plane places
+  # each Kea agent in the group its appliance is assigned. The key stays so a
+  # values file that still sets it renders unchanged.
   serverGroupName: ""
   # ``host`` = listen on the host's NIC (the default + only mode
   # that lets DHCP broadcasts reach Kea). ``bridged`` would require
@@ -281,7 +324,8 @@ dhcpKea:
   # MetalLB pool so a DHCP relay's ``forward-to`` target can outlive a
   # single Kea node. Kea KEEPS hostNetwork:67 — this VIP does NOT replace
   # client-facing broadcast reach (operators still run a relay per VLAN);
-  # it only stabilises the relay→server unicast forward. Must fall inside
+  # it only stabilises the relay→server unicast forward. Every DHCP group
+  # behind it must use dhcp_socket_mode=relay (#2899). Must fall inside
   # the MetalLB pool. Requires ``metallb.enabled: true``.
   relayVIP: ""
   # MetalLB pool the relay VIP draws from. Empty → falls back to the
@@ -305,10 +349,12 @@ lookingGlass:
   # weight on the node, and a starved collector misses keepalives until
   # the peer's hold timer expires and the session flaps — louder than a
   # dropped query. Requests only, no limits, same shape as dnsBind9.
+  # Memory is 128Mi (#1828) so the pod stays within its request, which is
+  # what keeps it behind the control plane in the kubelet's eviction order.
   resources:
     requests:
       cpu: 50m
-      memory: 64Mi
+      memory: 128Mi
   # Same precedence + rationale as dnsBind9.controlPlaneUrl /
   # inClusterApiUrl above: external operator-facing URL (Application
   # appliance, self-signed) takes priority over the in-cluster Service
@@ -335,6 +381,17 @@ dns:
   useMetalLBVIP: false
   vip: ""
   vipPool: spatium-control-plane
+  # #2223 — how long a DNS serving container (bind9 / powerdns / technitium)
+  # may take to start listening on :53 before it is restarted. The liveness
+  # probe (:53, 3 x 30 s) only starts once this has passed. A cold start
+  # renders and checks every zone before the daemon starts: measured with
+  # BIND 9.20, named-checkzone costs ~70 ms a zone, so 20,000 zones take
+  # ~23 minutes on a release without #2180's batched checks, and the agent
+  # first waits up to a long-poll for its bundle. 10 s x 360 = 60 minutes.
+  # Raise failureThreshold for a group much larger than that.
+  startupProbe:
+    periodSeconds: 10
+    failureThreshold: 360
 
 # Observer — placeholder for future metrics / log shipper role. No
 # service container in Phase 2; this just lets the supervisor pre-
@@ -460,7 +517,7 @@ agentLanding:
   priorityClassName: ""
   image:
     repository: nginx
-    tag: 1.31.6-alpine
+    tag: 1.31.8-alpine
   # #965 — token request so no pod in this chart is BestEffort (the CI
   # render check refuses one). A static nginx page needs nothing more.
   resources:
@@ -551,6 +608,12 @@ cnpg:
   #  * fast-evict tolerations: even a co-located replica leaves a dead
   #    node in ~20 s instead of 300 s (suppresses DefaultTolerationSeconds,
   #    exactly like api/frontend/worker/postgresql/redis).
+  #
+  # #2240: preferred alone never moves the replicas once both run on the
+  # seed, which is where firstboot starts them. From three nodes the seed
+  # supervisor adds the REQUIRED form of this term to the Deployment itself
+  # (k8s_api.ensure_cnpg_operator_spread) and removes it below three; keep
+  # this term's selector in step with it.
   replicaCount: 2
   affinity:
     podAntiAffinity:

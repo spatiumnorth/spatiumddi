@@ -1,5 +1,8 @@
+import { useModuleOn } from "@/hooks/useModuleOn";
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import {
   Check,
   Clipboard,
@@ -25,6 +28,13 @@ import { copyToClipboard } from "@/lib/clipboard";
 import { HeaderButton } from "@/components/ui/header-button";
 import { Modal } from "@/components/ui/modal";
 import { IPSpacePicker } from "@/components/ipam/space-picker";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
+import { secondsFieldError, SYNC_INTERVAL_BOUNDS } from "@/lib/seconds";
+import { FormError } from "@/components/ui/form-error";
 
 // ── Setup guide ─────────────────────────────────────────────────────
 // Steps an operator follows in the OPNsense web UI to mint a read-only
@@ -47,13 +57,27 @@ const SETUP_GUIDE = `# In the OPNsense web UI:
 #
 # Paste 'key' into "API Key" and 'secret' into "API Secret" below.
 # SpatiumDDI authenticates over HTTPS with HTTP Basic auth
-# (key as username, secret as password) and never writes to OPNsense.`;
+# (key as username, secret as password). The mirror only reads, so the
+# read-only key above is the correct choice for it. Active block sync, if
+# you arm it for this firewall, writes with its own key/secret, entered on
+# the Block Sync page.`;
 
 // ── Page ─────────────────────────────────────────────────────────────
 
 export function OpnsensePage() {
+  // #1340 — every write on this integration takes a superadmin (its
+  // router's create / update / delete / sync / test handlers take
+  // SuperAdmin), so a read-only user is offered none of them.
+  const superadminGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const qc = useQueryClient();
-  const { data: routers = [], isFetching } = useQuery({
+  const {
+    data: routers = [],
+    isFetching,
+    error: listError,
+  } = useQuery({
     queryKey: ["opnsense-routers"],
     queryFn: opnsenseApi.listRouters,
   });
@@ -108,11 +132,14 @@ export function OpnsensePage() {
               </span>
             </div>
             <p className="mt-1 text-xs text-muted-foreground max-w-3xl">
-              Read-only integration. Each firewall is polled via the OPNsense
-              REST API. Interfaces with a CIDR (LAN / OPT* / VLANs) land in the
-              bound IPAM space as subnets; DHCPv4 leases land as IP addresses,
-              static reservations as reserved entries, and (optionally) the ARP
-              table as discovered hosts. SpatiumDDI never writes to OPNsense.
+              Each firewall is polled via the OPNsense REST API. Interfaces with
+              a CIDR (LAN / OPT* / VLANs) land in the bound IPAM space as
+              subnets; DHCPv4 leases land as IP addresses, static reservations
+              as reserved entries, and (optionally) the ARP table as discovered
+              hosts. The mirror only reads. SpatiumDDI writes to a firewall only
+              when Active block sync is armed on it (Tools → Block Sync): it
+              then adds blocked IPs to a firewall alias with the separate write
+              credentials entered there.
             </p>
           </div>
           <div className="flex items-center gap-2 flex-shrink-0">
@@ -129,6 +156,7 @@ export function OpnsensePage() {
               variant="primary"
               icon={Plus}
               onClick={() => setShowCreate(true)}
+              {...superadminGate}
             >
               Add Firewall
             </HeaderButton>
@@ -141,11 +169,14 @@ export function OpnsensePage() {
           {routers.length === 0 ? (
             <div className="p-8 text-center">
               <p className="text-sm text-muted-foreground">
-                No OPNsense firewalls configured yet.
+                <ListEmpty error={listError} what="OPNsense firewalls">
+                  No OPNsense firewalls configured yet.
+                </ListEmpty>
               </p>
               <button
                 onClick={() => setShowCreate(true)}
-                className="mt-3 inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
+                className="mt-3 inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                {...superadminGate}
               >
                 <Plus className="h-3 w-3" /> Add Firewall
               </button>
@@ -269,6 +300,7 @@ export function OpnsensePage() {
                             onClick={() => testMut.mutate(r.id)}
                             disabled={testMut.isPending}
                             className="inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] hover:bg-accent disabled:opacity-50"
+                            {...superadminGate}
                           >
                             <TestTube2 className="h-3 w-3" />
                             Test
@@ -294,6 +326,8 @@ export function OpnsensePage() {
                             }
                             className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-50"
                             title="Sync Now"
+                            aria-label="Sync Now"
+                            {...superadminGate}
                           >
                             <RotateCw
                               className={`h-3.5 w-3.5 ${
@@ -305,15 +339,19 @@ export function OpnsensePage() {
                           </button>
                           <button
                             onClick={() => setEdit(r)}
-                            className="rounded p-1 text-muted-foreground hover:text-foreground"
+                            className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                             title="Edit"
+                            aria-label="Edit"
+                            {...superadminGate}
                           >
                             <Pencil className="h-3.5 w-3.5" />
                           </button>
                           <button
                             onClick={() => setDel(r)}
-                            className="rounded p-1 text-muted-foreground hover:text-destructive"
+                            className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                             title="Delete"
+                            aria-label="Delete"
+                            {...superadminGate}
                           >
                             <Trash2 className="h-3.5 w-3.5" />
                           </button>
@@ -333,9 +371,13 @@ export function OpnsensePage() {
       {del && (
         <DeleteRouterModal
           router={del}
-          onClose={() => setDel(null)}
+          onClose={() => {
+            delMut.reset();
+            setDel(null);
+          }}
           onConfirm={() => delMut.mutate(del.id)}
           isPending={delMut.isPending}
+          error={delMut.isError ? errMsg(delMut.error, "Delete failed") : null}
         />
       )}
     </div>
@@ -362,9 +404,13 @@ function RouterModal({
   const qc = useQueryClient();
   const editing = !!router;
 
+  // DNS off (#2135): no /dns/groups read and no picker. The stored
+  // dns_group_id is sent back untouched, so saving here cannot clear it.
+  const dnsOn = useModuleOn("core.dns");
   const { data: dnsGroups = [] } = useQuery<DNSServerGroup[]>({
     queryKey: ["dns-groups"],
     queryFn: () => dnsApi.listGroups(),
+    enabled: dnsOn,
   });
 
   const [name, setName] = useState(router?.name ?? "");
@@ -376,6 +422,13 @@ function RouterModal({
   const [caBundlePem, setCaBundlePem] = useState("");
   const [apiKey, setApiKey] = useState(router?.api_key ?? "");
   const [apiSecret, setApiSecret] = useState("");
+  // #4135 — a moved address needs the stored secret entered again.
+  const reask = useCredentialReask(
+    { host, port },
+    router && { host: router.host, port: router.port },
+    () => setApiSecret(""),
+  );
+  const mustEnter = reask.asks(router?.api_secret_present);
   const [spaceId, setSpaceId] = useState(router?.ipam_space_id ?? "");
   const [dnsGroupId, setDnsGroupId] = useState(router?.dns_group_id ?? "");
   const [mirrorDhcpLeases, setMirrorDhcpLeases] = useState(
@@ -386,7 +439,7 @@ function RouterModal({
   );
   const [mirrorArp, setMirrorArp] = useState(router?.mirror_arp ?? false);
   const [syncInterval, setSyncInterval] = useState(
-    router?.sync_interval_seconds ?? 60,
+    String(router?.sync_interval_seconds ?? 60),
   );
   const [showGuide, setShowGuide] = useState(!editing);
   const [error, setError] = useState("");
@@ -429,7 +482,7 @@ function RouterModal({
           mirror_dhcp_leases: mirrorDhcpLeases,
           mirror_static_mappings: mirrorStaticMappings,
           mirror_arp: mirrorArp,
-          sync_interval_seconds: syncInterval,
+          sync_interval_seconds: Number(syncInterval.trim()),
         };
         if (caBundlePem) update.ca_bundle_pem = caBundlePem;
         if (apiSecret) update.api_secret = apiSecret;
@@ -450,7 +503,7 @@ function RouterModal({
         mirror_dhcp_leases: mirrorDhcpLeases,
         mirror_static_mappings: mirrorStaticMappings,
         mirror_arp: mirrorArp,
-        sync_interval_seconds: syncInterval,
+        sync_interval_seconds: Number(syncInterval.trim()),
       };
       return opnsenseApi.createRouter(create);
     },
@@ -470,6 +523,17 @@ function RouterModal({
       <form
         onSubmit={(e) => {
           e.preventDefault();
+          // #2110 — "1h" and an empty field are refused, not read as 1 / the default.
+          const intervalError = secondsFieldError(
+            "Sync interval",
+            syncInterval,
+            SYNC_INTERVAL_BOUNDS,
+          );
+          if (intervalError) {
+            setError(intervalError);
+            return;
+          }
+          setError("");
           saveMut.mutate();
         }}
         className="space-y-3"
@@ -561,18 +625,23 @@ function RouterModal({
               required
             />
           </Field>
-          <Field label="API Secret" hint="The 'secret' line from apikey.txt.">
+          <Field
+            label="API Secret"
+            hint={mustEnter ? reask.hint : "The 'secret' line from apikey.txt."}
+          >
             <input
               type="password"
               className={`${inputCls} font-mono text-[11px]`}
               value={apiSecret}
               onChange={(e) => setApiSecret(e.target.value)}
               placeholder={
-                editing && router?.api_secret_present
-                  ? "••• stored — enter to replace"
-                  : "API secret"
+                mustEnter
+                  ? reask.placeholder
+                  : editing && router?.api_secret_present
+                    ? "••• stored — enter to replace"
+                    : "API secret"
               }
-              required={!editing}
+              required={!editing || mustEnter}
             />
           </Field>
         </div>
@@ -638,20 +707,22 @@ function RouterModal({
           <Field label="IPAM space">
             <IPSpacePicker value={spaceId} onChange={setSpaceId} required />
           </Field>
-          <Field label="DNS server group (optional)">
-            <select
-              className={inputCls}
-              value={dnsGroupId ?? ""}
-              onChange={(e) => setDnsGroupId(e.target.value)}
-            >
-              <option value="">— none —</option>
-              {dnsGroups.map((g) => (
-                <option key={g.id} value={g.id}>
-                  {g.name}
-                </option>
-              ))}
-            </select>
-          </Field>
+          {dnsOn && (
+            <Field label="DNS server group (optional)">
+              <select
+                className={inputCls}
+                value={dnsGroupId ?? ""}
+                onChange={(e) => setDnsGroupId(e.target.value)}
+              >
+                <option value="">— none —</option>
+                {dnsGroups.map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.name}
+                  </option>
+                ))}
+              </select>
+            </Field>
+          )}
         </div>
 
         <Field label="Sync interval (seconds)" hint="Minimum 30 s.">
@@ -660,7 +731,7 @@ function RouterModal({
             className={inputCls}
             value={syncInterval}
             min={30}
-            onChange={(e) => setSyncInterval(parseInt(e.target.value) || 60)}
+            onChange={(e) => setSyncInterval(e.target.value)}
           />
         </Field>
 
@@ -712,7 +783,9 @@ function RouterModal({
           </label>
         </div>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -724,7 +797,7 @@ function RouterModal({
           </button>
           <button
             type="submit"
-            disabled={saveMut.isPending}
+            disabled={saveMut.isPending || (mustEnter && !apiSecret.trim())}
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {saveMut.isPending ? "Saving…" : editing ? "Save" : "Create"}
@@ -740,11 +813,13 @@ function DeleteRouterModal({
   onConfirm,
   onClose,
   isPending,
+  error,
 }: {
   router: OPNsenseRouter;
   onConfirm: () => void;
   onClose: () => void;
   isPending: boolean;
+  error?: string | null;
 }) {
   const [checked, setChecked] = useState(false);
   return (
@@ -753,9 +828,12 @@ function DeleteRouterModal({
         <p className="text-sm text-muted-foreground">
           Remove the OPNsense firewall{" "}
           <span className="font-semibold">{router.name}</span>? This only
-          affects SpatiumDDI — nothing on the OPNsense side changes. All IPAM
-          rows mirrored from this firewall (subnets + addresses) will be removed
-          via the FK cascade.
+          affects SpatiumDDI — nothing on the OPNsense side changes. If active
+          block sync is armed, disarm it first (that lifts the pushed blocks
+          from the device); delete is refused while it is armed. Only rows that
+          were purely mirrored are removed. Anything you added yourself
+          (addresses, DHCP scopes, reservations, edited rows, custom fields) is
+          kept and detached from this integration.
         </p>
         <label className="flex cursor-pointer items-start gap-2 text-sm">
           <input
@@ -766,6 +844,11 @@ function DeleteRouterModal({
           />
           <span>I understand.</span>
         </label>
+        {error && (
+          <FormError className="break-words rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            {error}
+          </FormError>
+        )}
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}

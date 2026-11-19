@@ -43,6 +43,8 @@ from typing import Any
 import structlog
 
 from app.core.dns_names import strip_control_chars
+from app.drivers.dns._caa import caa_presentation
+from app.drivers.dns._txt import quote_txt as _quote_txt
 from app.drivers.dns.base import (
     ConfigBundle,
     DNSDriver,
@@ -89,21 +91,6 @@ _SUPPORTED_RECORD_TYPES = frozenset(
 )
 
 
-def _quote_txt(value: str) -> str:
-    """Quote a TXT record value per RFC 1035 (split into ≤255 chunks).
-
-    PowerDNS's REST API accepts the same wire-format quoted-string
-    representation BIND9 zone files use, so we re-derive the format
-    here rather than depending on the BIND driver module.
-    """
-    s = value
-    if s.startswith('"') and s.endswith('"') and len(s) >= 2:
-        s = s[1:-1]
-    s = s.replace("\\", "\\\\").replace('"', '\\"')
-    chunks = [s[i : i + 255] for i in range(0, len(s), 255)] or [""]
-    return " ".join(f'"{c}"' for c in chunks)
-
-
 def _record_content(rr: RecordData) -> str:
     """Compose the wire-format ``content`` field for the PowerDNS API.
 
@@ -118,6 +105,10 @@ def _record_content(rr: RecordData) -> str:
     value = strip_control_chars(rr.value)
     if rtype == "TXT":
         return _quote_txt(value)
+    if rtype == "CAA":
+        # A bare value is quoted and escaped (#2943); a zone-file reader takes
+        # the ``;`` in ``ca.org; account=1`` as a comment.
+        return caa_presentation(value)
     if rtype == "MX":
         prio = rr.priority if rr.priority is not None else 10
         return f"{prio} {value}"
@@ -207,10 +198,21 @@ def render_pdns_conf(
             # with the version, an outbound connection nobody configured
             # (non-negotiable #17, #1353). Mirrors the agent's renderer.
             "security-poll-suffix=",
+            # #2935 — nothing about the daemon over CHAOS queries: the
+            # version and the container hostname answer "none". Mirrors the
+            # agent's renderer.
+            "version-string=none",
+            "server-id=none",
             # RFC 2136 dynamic updates (issue #641). Enabled globally; per-zone
             # ``ALLOW-DNSUPDATE-FROM`` / ``TSIG-ALLOW-DNSUPDATE`` metadata gates
             # actual acceptance, so this is a no-op for zones without an ACL.
             "dnsupdate=yes",
+            "",
+            # Declare the server's roles: PowerDNS sends no NOTIFY while
+            # ``primary`` is ``no`` and never transfers a secondary zone while
+            # ``secondary`` is ``no`` (#1967). Mirrors the agent's renderer.
+            "primary=yes",
+            "secondary=yes",
             "",
         ]
     )
@@ -287,7 +289,7 @@ class PowerDNSDriver(DNSDriver):
             {
                 "name": qname,
                 "type": rtype,
-                "ttl": records[0].ttl or zone.ttl,
+                "ttl": records[0].ttl if records[0].ttl is not None else zone.ttl,
                 "records": rrs,
             }
             for (qname, rtype), rrs in sorted(rrsets.items())
