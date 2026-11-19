@@ -301,17 +301,110 @@ def validate_mtu(
         )
     return ""
 
+#: Characters a control-plane URL may carry. The value is written into a
+#: double-quoted YAML string in spatium-config.yaml and as a bare
+#: ``KEY=value`` line in role-config, so a quote, a backslash, a space or a
+#: shell metacharacter changes the meaning of one file or the other. A real
+#: URL for this field never needs any of them.
+_CP_URL_RE = re.compile(r"^https?://[A-Za-z0-9._~:/?#\[\]@%+=&,-]*$")
+
+
+def validate_control_plane_url(url: str) -> str:
+    """#4546 — the ONE control-plane URL rule. Returns a reason, or "".
+
+    Scheme (http / https), a host, and a character set that cannot break
+    out of the quoted YAML string or the role-config line the value is
+    written to. Registered for ``--check-field`` so the interactive wizard
+    and the preseed parser share it rather than each keeping a copy.
+    """
+    if not url:
+        return "The control-plane URL is empty."
+    if re.search(r"\s", url) or any(c in url for c in "\"'\\`$;()*!<>|{}^"):
+        return (
+            "The control-plane URL contains a space, a quote or another "
+            "character that cannot be part of a URL."
+        )
+    if not url.lower().startswith(("http://", "https://")):
+        return "The control-plane URL must start with https:// (or http:// for a lab)."
+    if not _CP_URL_RE.match(url):
+        return "The control-plane URL contains characters that cannot be part of a URL."
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname
+        parts.port  # noqa: B018 - raises ValueError on a bad port
+    except ValueError:
+        return "The control-plane URL is not valid (check the host and port)."
+    if not host:
+        return "The control-plane URL has no host (e.g. https://control.example.com/)."
+    if parts.username is not None or parts.password is not None:
+        return "The control-plane URL must not carry credentials."
+    return ""
+
+
+def warn_control_plane_url(url: str) -> str:
+    """Advisory for a URL that is usable but sends the pairing code in clear."""
+    if url.lower().startswith("http://"):
+        return (
+            "This URL is plain http://. The pairing code and the node's "
+            "registration would cross the network unencrypted. Use https:// "
+            "unless this is an isolated lab."
+        )
+    return ""
+
+
+def validate_static_v4(ip: str, prefix: str = "", gateway: str = "") -> str:
+    """#4546 — host-address rules for a static IPv4 config. "" when fine.
+
+    Only the rules the plain parse checks do not cover: an address that
+    parses but cannot be a host's own (loopback, multicast, unspecified,
+    reserved, the network or broadcast address of its subnet) and a
+    gateway that is the host itself. Unparseable input is left to the
+    callers' own messages, so each problem is reported once.
+    """
+    errs = []
+    try:
+        ip_a = ipaddress.IPv4Address(ip.strip())
+    except ValueError:
+        return ""
+    if ip_a.is_unspecified or ip_a.is_loopback or ip_a.is_multicast or ip_a.is_reserved:
+        errs.append(
+            f"{ip_a} is not usable as a host address "
+            "(unspecified, loopback, multicast or reserved)."
+        )
+    elif prefix.strip().isdigit() and 0 < int(prefix) < 31:
+        net = ipaddress.ip_network(f"{ip_a}/{int(prefix)}", strict=False)
+        if ip_a == net.network_address:
+            errs.append(f"{ip_a} is the network address of {net}, not a host address.")
+        elif ip_a == net.broadcast_address:
+            errs.append(f"{ip_a} is the broadcast address of {net}, not a host address.")
+    if gateway.strip():
+        try:
+            gw_a = ipaddress.IPv4Address(gateway.strip())
+        except ValueError:
+            gw_a = None
+        if gw_a is not None:
+            if gw_a == ip_a:
+                errs.append(f"The gateway {gw_a} is the appliance's own address.")
+            elif gw_a.is_unspecified or gw_a.is_loopback or gw_a.is_multicast:
+                errs.append(f"The gateway {gw_a} is not a usable router address.")
+    return "\n".join(errs)
+
 
 _FIELD_VALIDATORS = {
     "admin_user": validate_admin_user,
     "timezone": validate_timezone,
     "admin_password": validate_admin_password,
     "mtu": validate_mtu,
+    "control_plane_url": validate_control_plane_url,
+    "static_v4": validate_static_v4,
 }
 #: Fields whose ACCEPT path can still carry advice, keyed the same way so
 #: a caller cannot ask for a warning on a field that has none.
 _FIELD_WARNERS = {
     "admin_password": warn_admin_password,
+    "control_plane_url": warn_control_plane_url,
 }
 #: Fields whose value must never travel in argv — argv is readable
 #: through /proc and lands in shell history. The caller passes ``-`` and
@@ -1027,6 +1120,12 @@ if net is not None:
                 except ValueError:
                     fail(f"network.gateway {gateway!r} is not a valid address")
                     static_ok = False
+                if static_ok:
+                    # #4546 — network / broadcast / loopback / multicast
+                    # addresses and a gateway equal to the host itself.
+                    for _v4_err in validate_static_v4(ip, prefix, gateway).splitlines():
+                        fail(f"network: {_v4_err}")
+                        static_ok = False
             # ── Optional static IPv6 (#995 item 21) ───────────────
             # Same rules the wizard's _validate_static_net applies, with
             # the two differences that matter for v6: any prefix 1..128 is
@@ -1203,11 +1302,21 @@ if k3s is not None:
 
 # ── Control-plane URL + pairing code (appliance role) ─────────────────
 cp_url = as_str(ps.get("control_plane_url"))
-if cp_url and cp_url != "https://":
-    env["CONTROL_PLANE_URL"] = cp_url
-    env["PRESEED_HAS_CONTROL_URL"] = "1"
-elif cp_url == "https://":
+if cp_url == "https://":
     fail("control_plane_url is a bare scheme with no host")
+elif cp_url:
+    # #4546 — the same rule the wizard applies. Only "not empty" was
+    # checked, so a value with a space or a quote reached a quoted YAML
+    # string in spatium-config.yaml.
+    _cp_reason = validate_control_plane_url(cp_url)
+    if _cp_reason:
+        fail(f"control_plane_url {cp_url!r}: {_cp_reason}")
+    else:
+        env["CONTROL_PLANE_URL"] = cp_url
+        env["PRESEED_HAS_CONTROL_URL"] = "1"
+        _cp_advice = warn_control_plane_url(cp_url)
+        if _cp_advice:
+            note(f"control_plane_url: {_cp_advice}")
 
 code = as_str(ps.get("pairing_code"))
 if code:
