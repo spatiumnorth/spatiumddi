@@ -74,6 +74,13 @@ const view: DNSView = {
   forward_policy: null,
   forward_transport: "do53",
   forward_tls_hostname: null,
+  dnssec_validation: null,
+  allow_recursion: null,
+  rrl_enabled: null,
+  rrl_responses_per_second: null,
+  rrl_window: null,
+  rrl_slip: null,
+  minimal_responses: null,
   created_at: "2026-01-01T00:00:00Z",
   modified_at: "2026-01-01T00:00:00Z",
 };

@@ -307,6 +307,14 @@ def build_view_descriptors(ordered_views: list, geo: GeoSteering) -> list[dict[s
                 "forward_policy": getattr(v, "forward_policy", None),
                 "forward_transport": getattr(v, "forward_transport", None) or "do53",
                 "forward_tls_hostname": getattr(v, "forward_tls_hostname", None),
+                # #3569 — per-view resolver overrides (None = the group's).
+                "dnssec_validation": getattr(v, "dnssec_validation", None),
+                "allow_recursion": getattr(v, "allow_recursion", None),
+                "rrl_enabled": getattr(v, "rrl_enabled", None),
+                "rrl_responses_per_second": getattr(v, "rrl_responses_per_second", None),
+                "rrl_window": getattr(v, "rrl_window", None),
+                "rrl_slip": getattr(v, "rrl_slip", None),
+                "minimal_responses": getattr(v, "minimal_responses", None),
             }
         )
         order += 1
