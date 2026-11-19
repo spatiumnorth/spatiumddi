@@ -33,10 +33,12 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from typing import Any
 
 from sqlalchemy import Text, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.metrics import AGENT_BUNDLE_RENDERS
 from app.models.dns import DNSAgentBundle, DNSServer
 from app.services.dns import agent_bundle_store as bundle_store
 from app.services.dns.agent_config import encode_bundle_body, retire_queued_ops
@@ -61,6 +63,20 @@ class RenderOutcome:
         return self.bundle is not None
 
 
+def _render_reason(previous: Any, rendered: Any) -> str:
+    """Why this render happened, from the bundle it replaces (#2242): a closed
+    set, so the counter's label cardinality is five."""
+    if previous is None:
+        return "initial"
+    if previous.renderer_revision != bundle_store.RENDERER_REVISION:
+        return "revision"
+    if previous.structural_etag != rendered.structural_etag:
+        return "structural"
+    if previous.etag != rendered.etag:
+        return "records"
+    return "unchanged"
+
+
 async def render_and_store(
     db: AsyncSession, server: DNSServer, *, rendered_by: str
 ) -> RenderOutcome:
@@ -79,7 +95,20 @@ async def render_and_store(
     snapshot_at, visible_xacts = (
         await db.execute(select(func.clock_timestamp(), cast(func.pg_current_snapshot(), Text)))
     ).one()
+    previous = (
+        await db.execute(
+            select(
+                DNSAgentBundle.etag,
+                DNSAgentBundle.structural_etag,
+                DNSAgentBundle.renderer_revision,
+            )
+            .where(DNSAgentBundle.server_id == server.id)
+            .order_by(DNSAgentBundle.dirty_watermark.desc())
+            .limit(1)
+        )
+    ).first()
     rendered = await encode_bundle_body(db, server)
+    AGENT_BUNDLE_RENDERS.labels(reason=_render_reason(previous, rendered)).inc()
     render_ms = int((time.monotonic() - started) * 1000)
     # Exactly the inline build's rule: under split-horizon the queued ops the
     # render folded in are retired — unless the server is in maintenance,

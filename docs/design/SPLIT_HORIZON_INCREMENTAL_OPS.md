@@ -63,7 +63,7 @@ The agent advertises `per_view_ops` in its poll. The control plane ships view-sc
 ## 4. Slices
 
 1. **This note** (docs only).
-2. Measurement: a render counter (`dns_agent_bundle_renders_total{reason}`) and a test pinning "one record change in a split-horizon group = N renders" today, so slice 4's effect is demonstrable and a regression is visible.
+2. Measurement: a render counter (`dns_agent_bundle_renders_total{reason}`) and a test pinning "one record change in a split-horizon group = N renders" today, so slice 4's effect is demonstrable and a regression is visible. **Done in this PR** (`tests/test_dns_agent_bundle_render_counter_2242.py`; slice 4 flips its assertions).
 3. Op `view_name` column + enqueue fan-out + exact sweep; still `ships_ops = False` under views (no behaviour change; ops queued under views are retired as before).
 4. Structural payload carries placement not records; agent `per_view_ops` capability and per-view keyed nsupdate; `ships_ops` turned on for capable agents; `retire_queued_ops` limited to placement changes.
 5. Geo steering (`records_for_view` with member filtering) enabled last; until then a geo-active group stays on the re-render path.

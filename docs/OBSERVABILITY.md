@@ -727,7 +727,15 @@ The DNS agent config long-poll (#1111) adds three counters, labelled
 spatiumddi_agent_bundle_served_total{family, outcome}   # full / not_modified / client_gone
 spatiumddi_agent_bundle_inline_renders_total{family}
 spatiumddi_agent_bundle_inline_failures_total{family}
+dns_agent_bundle_renders_total{reason}   # #2242 — initial / revision / structural / records / unchanged
 ```
+
+`dns_agent_bundle_renders_total` counts every full bundle render and why it
+was needed, so the cost of a record change is measurable: in a group with
+views one change is one `structural` render per server, in a flat group it
+is `records` renders and the ops ship. A Celery worker counts into its own
+registry, which nothing scrapes (the api's `/metrics` carries the inline
+fallback renders); the per-server total is `dns_server.bundle_render_count`.
 
 Plus two counters declared but not yet wired to a call site (no samples):
 
@@ -1262,6 +1270,7 @@ see `family="dns"`:
 | `spatiumddi_agent_bundle_served_total` | counter | `family`, `outcome` |
 | `spatiumddi_agent_bundle_inline_renders_total` | counter | `family` |
 | `spatiumddi_agent_bundle_inline_failures_total` | counter | `family` |
+| `dns_agent_bundle_renders_total` | counter | `reason` |
 
 For example, an API error-rate alert is
 `sum(rate(spatiumddi_api_requests_total{status_code=~"5.."}[5m])) / sum(rate(spatiumddi_api_requests_total[5m])) > 0.05`

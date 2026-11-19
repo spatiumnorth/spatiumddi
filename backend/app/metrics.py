@@ -62,6 +62,21 @@ AGENT_BUNDLE_INLINE_FAILURES = Counter(
     ["family"],
 )
 
+# #2242 — every full DNS agent bundle render, by why it was needed. Measures
+# the cost of a record change in a split-horizon group (one render per server)
+# against the flat-group path. ``reason`` is a closed set decided in
+# ``agent_bundle_render``: initial (no earlier bundle) / revision (renderer
+# upgrade) / structural (the structural ETag moved) / records (only the body
+# ETag moved) / unchanged (a render that produced the same bytes). A worker
+# process counts into its own registry, which nothing scrapes; the api's
+# ``/metrics`` carries its inline-fallback renders. The per-server total is
+# ``dns_server.bundle_render_count``.
+AGENT_BUNDLE_RENDERS = Counter(
+    "dns_agent_bundle_renders_total",
+    "DNS agent bundles rendered, by reason",
+    ["reason"],
+)
+
 # #1051 — the ``path_template`` value for a request no route claimed (a 404,
 # or a path the router never saw). ONE constant bucket, never the raw path:
 # the label set must stay bounded by the route table, not by what clients
