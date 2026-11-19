@@ -184,11 +184,10 @@ updates:
         update-types: ["version-update:semver-major"]
       # The lint/format toolchain reformats or re-lints the WHOLE codebase on a
       # bump — pure CI churn, not a code change (prettier 3.4→3.9 reflowed every
-      # file; an eslint-plugin-react-refresh bump added new warnings). Bump these
+      # file; an eslint-plugin-react-refresh bump added new warnings). The ESLint
+      # family itself moved to 10 in #2233 and is no longer held. Bump these
       # deliberately together with the matching reformat/lint pass, never via a
       # weekly auto-PR. (These are dev-only tools; security isn't a concern.)
       - dependency-name: "prettier"
-      - dependency-name: "eslint*"
-      - dependency-name: "@eslint/*"
       - dependency-name: "typescript-eslint"
       - dependency-name: "@typescript-eslint/*"
