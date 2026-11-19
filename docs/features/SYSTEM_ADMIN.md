@@ -376,8 +376,20 @@ decided or expired), never open or in-flight ones, and it deletes in
 batches of 10,000 rows, each batch its own transaction, so no prune
 becomes one long transaction. `audit_log` is never pruned. Still tracked
 in [#2274](https://github.com/spatiumnorth/spatiumddi/issues/2274):
-settings for the windows that are still fixed in code, a database-size /
-disk-fill alert, and archiving before an audit-log prune.
+settings for the windows that are still fixed in code, and archiving
+before an audit-log prune.
+
+**Where the space went.** Platform Insights → Postgres → *Data retention*
+lists, per table with a retention policy, its size, row estimate
+(`pg_class.reltuples`, never `count(*)`), the setting and window that govern
+it (or "Never pruned", as for `audit_log`) and its oldest row. The oldest
+row is one `MIN()` and is read only where its timestamp column leads an
+index; for the rest the page says it is not indexed rather than scan a large
+table. The same list is `GET /admin/postgres/retention` and the Copilot's
+`find_data_retention` tool (superadmin only, like the page). The
+`database_size_high` alert (see
+[OBSERVABILITY.md](../OBSERVABILITY.md)) warns when the database itself
+outgrows a size you choose.
 
 `log_retention_hours` is capped at a week because the prune is a single
 `DELETE`, and a longer window makes that one transaction larger;

@@ -16563,7 +16563,25 @@ export interface PostgresSlowQueriesResponse {
   rows: PostgresSlowQuery[];
 }
 
+export interface PostgresRetentionRow {
+  table: string;
+  total_bytes: number;
+  estimated_rows: number;
+  retention_setting: string | null;
+  retention_window: number | null;
+  retention_unit: "days" | "hours" | null;
+  keeps_forever: boolean;
+  oldest_row_column: string;
+  oldest_row: string | null;
+  oldest_row_note: string | null;
+  note: string | null;
+}
+
 export const postgresApi = {
+  retention: () =>
+    api
+      .get<{ rows: PostgresRetentionRow[] }>("/admin/postgres/retention")
+      .then((r) => r.data.rows),
   overview: () =>
     api.get<PostgresOverview>("/admin/postgres/overview").then((r) => r.data),
   tables: (limit = 50) =>

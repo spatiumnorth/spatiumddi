@@ -477,6 +477,22 @@ _SPECS: list[tuple[str, str, str, list[ParamSpec]]] = [
         "Infrastructure",
         [],
     ),
+    (
+        a.RULE_TYPE_DATABASE_SIZE_HIGH,
+        "Database size high",
+        "Infrastructure",
+        [
+            _count(
+                "Size threshold (GiB)",
+                a._DATABASE_SIZE_DEFAULT_GIB,
+                "Warns when the control-plane database is at least this many GiB "
+                f"(pg_database_size); critical at {a._DATABASE_SIZE_CRITICAL_FACTOR:g} "
+                "times it. Volume fill on an appliance is the separate "
+                "'Appliance data partition (/var) filling' rule.",
+                min_=1,
+            )
+        ],
+    ),
     (a.RULE_TYPE_FIREWALL_APPLY_STALLED, "Firewall apply stalled", "Infrastructure", []),
     (a.RULE_TYPE_AGENT_CONFIG_REJECTED, "Agent rejected its configuration", "Infrastructure", []),
     (a.RULE_TYPE_AGENT_SPOOL_TRIMMED, "Agent spool trimmed", "Infrastructure", []),
