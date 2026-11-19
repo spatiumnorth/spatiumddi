@@ -1870,9 +1870,10 @@ async def resolve_op_views(
     reaches that view's copy alone, a shared one every copy. An op that
     names no ``record_id`` (a DNSSEC signal, a payload the caller built by
     hand) or whose row is gone goes to every view rendering the zone, unless it
-    names a pool member (``_pool_stand_in``). Never
-    an empty list: an op no view claims is queued with NULL rather than
-    dropped, so a caller gating on "was an op queued" still sees one.
+    names a pool member (``_pool_stand_in``). In a group with views an op no
+    view claims (an unreachable geo member's record) answers ``[]``: no copy
+    holds the record, so a per-view agent has nothing to apply and must not be
+    handed an op it can only ack as failed (``unclaimed_row``).
 
     The record's own row is read with ``include_deleted``: a soft-deleted
     record is no longer in the zone's render, but its op still has to name
@@ -1939,8 +1940,24 @@ async def resolve_op_views(
         names: list[str | None] = [
             vd["name"] for vd in rendering if row is None or records_for_view([row], vd, geo)
         ]
-        out.append(names or [None])
+        out.append(names)
     return out
+
+
+def unclaimed_row(srv: DNSServer, now: datetime) -> dict[str, Any]:
+    """Row fields for an op no view carries (``resolve_op_views`` gave ``[]``).
+
+    A server that applies ops per view (``agent_per_view_ops``) has no copy to
+    apply it to, and the body, which omits the record, is the source of truth:
+    the row is born ``applied`` so it still exists for a caller gating on "was
+    an op queued" but never ships, retries, ends ``failed`` or raises the
+    ``dns_record_op_failed`` alert for what is a normal condition (#2242). Any
+    other server keeps the NULL-view ``pending`` row, which its next render
+    retires.
+    """
+    if srv.agent_per_view_ops:
+        return {"view_name": None, "attempts": 0, **_applied_values(now)}
+    return {"view_name": None, "state": "pending"}
 
 
 async def view_record_filters(
@@ -2128,19 +2145,25 @@ async def enqueue_record_op(
         )[0]
     else:
         view_records = [record] * len(view_names)
+    view_records = view_records or [record]  # no view carries it: one unclaimed row
     primary_op: DNSRecordOp | None = None
     first_op: DNSRecordOp | None = None
+    now = datetime.now(UTC)
     for srv in agent_servers:
-        for view_name, view_record in zip(view_names, view_records, strict=True):
+        targets: list[dict[str, Any]] = (
+            [{"view_name": v, "state": "pending"} for v in view_names]
+            if view_names
+            else [unclaimed_row(srv, now)]
+        )
+        for fields, view_record in zip(targets, view_records, strict=True):
             row = DNSRecordOp(
                 server_id=srv.id,
                 zone_id=zone.id,
                 zone_name=zone.name,
-                view_name=view_name,
                 op=op,
                 record=view_record,
                 target_serial=target_serial,
-                state="pending",
+                **fields,
             )
             db.add(row)
             if first_op is None:
@@ -2298,18 +2321,23 @@ async def _fanout_agent_ops(
     returned = next((s for s in agent_servers if s.id == primary.id), agent_servers[0])
     result: list[DNSRecordOp | None] = []
     rows: list[DNSRecordOp] = []
+    now = datetime.now(UTC)
     for srv in agent_servers:
         for o, view_names, view_records in zip(ops, op_views, op_records, strict=True):
-            for i, view_name in enumerate(view_names):
+            targets: list[dict[str, Any]] = (
+                [{"view_name": v, "state": "pending"} for v in view_names]
+                if view_names
+                else [unclaimed_row(srv, now)]
+            )
+            for i, fields in enumerate(targets):
                 row = DNSRecordOp(
                     server_id=srv.id,
                     zone_id=zone.id,
                     zone_name=zone.name,
-                    view_name=view_name,
                     op=o["op"],
-                    record=view_records[i],
+                    record=view_records[i] if view_records else o["record"],
                     target_serial=o.get("target_serial"),
-                    state="pending",
+                    **fields,
                 )
                 rows.append(row)
                 if srv.id == returned.id and i == 0:

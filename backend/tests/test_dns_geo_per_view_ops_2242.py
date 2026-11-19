@@ -294,3 +294,136 @@ async def test_a_change_of_the_geo_plan_moves_the_structural_etag(
     await db_session.flush()
     moved = await render_bundle_body(db_session, srv)
     assert moved.structural_etag != same.structural_etag
+
+
+async def _converge(
+    db: AsyncSession, servers: list[DNSServer], prev: dict[uuid.UUID, Sets]
+) -> None:
+    """Ship the pending changes and assert each server, applying its queued ops
+    to ``prev``, ends where a fresh render does; ``prev`` then advances."""
+    await db.commit()
+    after = await _ship(db, servers)
+    for s in servers:
+        bundle = after[s.id].bundle
+        assert bundle is not None and bundle.ships_ops is True, "a health flip must not re-render"
+        fresh = _sets((await render_bundle_body(db, s)).body)
+        assert await _apply_ops(db, s, prev[s.id]) == fresh
+        prev[s.id] = fresh
+        for op in (
+            (await db.execute(select(DNSRecordOp).where(DNSRecordOp.server_id == s.id)))
+            .scalars()
+            .all()
+        ):
+            op.state = "applied"
+    await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_health_flips_down_view_down_and_back_equal_a_fresh_render(
+    db_session: AsyncSession,
+) -> None:
+    """Health is not part of the geo plan, so a flip ships as ops and never
+    re-renders: a member down, every member of a geo view down (an all-geo
+    pool's fallback copies in the non-geo views follow), and back up."""
+    grp, servers = await _group(db_session, operator_view=True)
+    zone = await _zone(db_session, grp)
+    www = await _pool(
+        db_session,
+        grp,
+        zone,
+        "www",
+        [
+            {"address": "10.1.0.1"},
+            {"address": "10.1.0.2", "cidrs": GEO_A},
+            {"address": "10.1.0.3", "cidrs": GEO_B},
+        ],
+    )
+    api = await _pool(
+        db_session,
+        grp,
+        zone,
+        "api",
+        [{"address": "10.2.0.1", "cidrs": GEO_A}, {"address": "10.2.0.2", "cidrs": GEO_B}],
+    )
+    await db_session.commit()
+    await _ship(db_session, servers)
+    prev = {s.id: _sets((await render_bundle_body(db_session, s)).body) for s in servers}
+
+    async def flip(pool: DNSPool, down: set[str]) -> None:
+        for m in pool.members:
+            m.last_check_state = "unhealthy" if m.address in down else "healthy"
+        await db_session.flush()
+        await apply_pool_state(db_session, pool)
+
+    await flip(www, {"10.1.0.2"})  # one geo member down
+    await _converge(db_session, servers, prev)
+    await flip(api, {"10.2.0.1", "10.2.0.2"})  # every member of an all-geo pool down
+    await _converge(db_session, servers, prev)
+    await flip(www, {"10.1.0.2", "10.1.0.3"})  # every geo member of www down
+    await _converge(db_session, servers, prev)
+    await flip(api, set())  # back
+    await flip(www, set())
+    await _converge(db_session, servers, prev)
+
+
+@pytest.mark.asyncio
+async def test_a_record_no_view_carries_is_not_shipped_to_a_per_view_agent(
+    db_session: AsyncSession,
+) -> None:
+    """An unreachable member's record (its Site has no subnets) is in no view's
+    copy. A per-view agent can only ack that op as failed, which after the
+    retry budget is a ``failed`` op and a ``dns_record_op_failed`` alert for a
+    normal condition; it is queued already applied. A server that re-renders
+    keeps the pending NULL-view op."""
+    from app.models.ownership import Site
+
+    grp, (capable, legacy) = await _group(db_session, operator_view=False)
+    legacy.agent_per_view_ops = False
+    zone = await _zone(db_session, grp)
+    site = Site(name=f"s-{uuid.uuid4().hex[:6]}", code=uuid.uuid4().hex[:6], kind="datacenter")
+    db_session.add(site)
+    await db_session.flush()
+    pool = DNSPool(
+        group_id=grp.id,
+        zone_id=zone.id,
+        name="www",
+        record_name="www",
+        record_type="A",
+        ttl=30,
+        hc_type="none",
+        enabled=True,
+    )
+    db_session.add(pool)
+    await db_session.flush()
+    db_session.add_all(
+        [
+            DNSPoolMember(
+                pool_id=pool.id,
+                address="10.9.0.1",
+                enabled=True,
+                last_check_state="healthy",
+                site_id=site.id,
+            ),
+            DNSPoolMember(
+                pool_id=pool.id,
+                address="10.9.0.2",
+                enabled=True,
+                last_check_state="healthy",
+                serving_cidrs=GEO_A,
+            ),
+        ]
+    )
+    await db_session.flush()
+    await db_session.refresh(pool)
+    await apply_pool_state(db_session, pool)
+    await db_session.commit()
+
+    rows = (
+        (await db_session.execute(select(DNSRecordOp).where(DNSRecordOp.view_name.is_(None))))
+        .scalars()
+        .all()
+    )
+    by_server = {r.server_id: r for r in rows if r.record.get("value") == "10.9.0.1"}
+    assert by_server[capable.id].state == "applied"
+    assert by_server[legacy.id].state == "pending"
+    assert not [r for r in rows if r.server_id == capable.id and r.state != "applied"]

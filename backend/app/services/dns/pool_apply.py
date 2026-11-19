@@ -102,13 +102,7 @@ async def apply_pool_state(
             # carries the old IP. Delete-then-recreate on the same
             # serial so the live daemon moves to the new value
             # atomically (same shape as the rename branch below).
-            old_snapshot = {
-                "name": rec.name,
-                "type": rec.record_type,
-                "value": rec.value,
-                "ttl": rec.ttl,
-                "rrset_action": "delete_value",
-            }
+            old_snapshot = _delete_snapshot(rec)
             target_serial = bump_zone_serial(zone)
             await enqueue_record_op(db, zone, "delete", old_snapshot, target_serial=target_serial)
             rec.value = member.address
@@ -132,13 +126,7 @@ async def apply_pool_state(
             # actually moves to the new identity. Done as two ops on
             # the same serial so the replay is atomic from the
             # operator's perspective.
-            old_snapshot = {
-                "name": rec.name,
-                "type": rec.record_type,
-                "value": rec.value,
-                "ttl": rec.ttl,
-                "rrset_action": "delete_value",
-            }
+            old_snapshot = _delete_snapshot(rec)
             target_serial = bump_zone_serial(zone)
             await enqueue_record_op(db, zone, "delete", old_snapshot, target_serial=target_serial)
             fqdn = zone.name if pool.record_name == "@" else f"{pool.record_name}.{zone.name}"
