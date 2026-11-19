@@ -28,8 +28,12 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit, urlunsplit
 
 from app.models.dhcp import HA_MODES, DHCPServer
+
+# Advertised by an agent that renders the HA hook into Dhcp6 too (#1258).
+HA_V6_CAPABILITY = "ha_v6"
 
 
 @dataclass
@@ -56,3 +60,39 @@ def kea_ha_members(mode: str | None, servers: Iterable[DHCPServer]) -> KeaHAMemb
         participants=with_url,
         sidelined=[s for s in kea if not s.ha_peer_url],
     )
+
+
+def v6_peer_url(url: str) -> str | None:
+    """The DHCPv6 HA listener URL derived from a member's ``ha_peer_url`` (#1258).
+
+    Kea runs one HTTP listener per daemon, so kea-dhcp6's HA hook cannot share
+    the port kea-dhcp4's already holds. The v6 listener is the v4 one's port
+    plus one, on the same host: nothing new for the operator to configure, and
+    every consumer (the config bundle, the appliance firewall, the agent's
+    published container ports) derives it from the same URL. A URL with no
+    port means the scheme default (80 / 443), as ``ha_firewall.listener_port``
+    reads it. None when the URL has no usable port or the next one is out of
+    range, in which case the group simply has no v6 HA.
+    """
+    try:
+        parts = urlsplit(url.strip())
+        port = parts.port
+        host = parts.hostname
+    except ValueError:
+        return None
+    if port is None:
+        port = {"http": 80, "https": 443}.get(parts.scheme.lower())
+    if port is None or not host or not 1 <= port < 65535:
+        return None
+    host = f"[{host}]" if ":" in host else host
+    return urlunsplit((parts.scheme, f"{host}:{port + 1}", parts.path, parts.query, parts.fragment))
+
+
+def v6_peer_port(url: str) -> int | None:
+    """The port of :func:`v6_peer_url`, or None when the group has no v6 HA."""
+    derived = v6_peer_url(url)
+    return urlsplit(derived).port if derived else None
+
+
+def supports_ha_v6(capabilities: object) -> bool:
+    return isinstance(capabilities, list) and HA_V6_CAPABILITY in capabilities

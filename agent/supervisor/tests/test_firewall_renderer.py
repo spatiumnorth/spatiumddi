@@ -69,6 +69,40 @@ def test_kea_ha_listener_opens_to_the_pair_only() -> None:
     assert "8000" not in q.body
 
 
+def test_kea_ha_opens_the_dhcp6_listener_to_the_same_pair() -> None:
+    """#1258 — kea-dhcp6's own listener, beside kea-dhcp4's, same peers."""
+    p = render_drop_in(
+        {
+            "roles": ["dhcp"],
+            "dhcp_ha_port": 8000,
+            "dhcp_ha_v6_port": 8001,
+            "dhcp_ha_peer_cidrs": ["192.168.0.12/32", "2001:db8::12/128"],
+        }
+    )
+    assert (
+        'ip saddr { 192.168.0.12/32 } tcp dport { 8000, 8001 } accept comment "role:dhcp-ha-v4"'
+        in p.body
+    )
+    assert {8000, 8001} <= set(p.expected_tcp_ports)
+    assert all("saddr" in line for line in p.body.splitlines() if "8001" in line)
+    # Junk or absent v6 port leaves the v4-only rule untouched.
+    for junk in (None, 0, "x", 8000, 70000):
+        q = render_drop_in(
+            {
+                "roles": ["dhcp"],
+                "dhcp_ha_port": 8000,
+                "dhcp_ha_v6_port": junk,
+                "dhcp_ha_peer_cidrs": ["192.168.0.12/32"],
+            }
+        )
+        assert "tcp dport 8000 accept" in q.body and "{ 8000" not in q.body
+    # No v4 listener, no v6 one either.
+    r = render_drop_in(
+        {"roles": ["dhcp"], "dhcp_ha_v6_port": 8001, "dhcp_ha_peer_cidrs": ["10.0.0.1/32"]}
+    )
+    assert "8001" not in r.body
+
+
 # ── Control-plane peer scoping (the #285 hardening) ──────────────────
 
 

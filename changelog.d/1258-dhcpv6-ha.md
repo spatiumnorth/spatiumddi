@@ -1,0 +1,3 @@
+### Fixed
+
+- DHCPv6 now gets high availability. The Kea HA hook is rendered into the `Dhcp6` config as well as `Dhcp4`, on its own listener (the member's `ha_peer_url` port + 1, since the two daemons cannot share one port), whenever an HA pair serves an IPv6 scope and every member's agent supports it. The agent reports the DHCPv4 and DHCPv6 HA states separately (`HA v4` / `HA v6` in the UI, `ha_state_v6` in the API), the appliance firewall, Helm chart, Kubernetes manifests and Compose files open the new port, and the "HA covers DHCPv4 only" notes from #1238 are gone. Older agents and control planes keep working: DHCPv6 stays uncoordinated until every member upgrades. Adds migration `d3a9c5e71b42`.

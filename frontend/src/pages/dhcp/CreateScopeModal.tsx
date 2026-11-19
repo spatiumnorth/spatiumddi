@@ -306,7 +306,8 @@ function ScopeModalForm({
     setRaOther(m !== "slaac");
   }
 
-  // #1238 — HA is DHCPv4 only. Say so while the scope is being set up,
+  // #1238 / #1258 — say so while the scope is being set up, when the group's
+  // DHCPv6 HA is not active,
   // not only as a tag after it has been created on a multi-Kea group.
   const selectedGroup = dhcpGroups.find((g) => g.id === groupId);
   const v6NoHa =

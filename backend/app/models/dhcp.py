@@ -448,6 +448,10 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # follow Kea's own state names (``hot-standby`` / ``normal`` /
     # ``partner-down`` / etc). Treat as opaque reporting.
     ha_state: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    # #1258 — the same, read from kea-dhcp6's own HA hook. ``ha_state`` is the
+    # DHCPv4 daemon's; the two daemons are separate processes with separate
+    # state machines. Null while no DHCPv6 HA is rendered for this server.
+    ha_state_v6: Mapped[str | None] = mapped_column(String(50), nullable=True)
     ha_last_heartbeat_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

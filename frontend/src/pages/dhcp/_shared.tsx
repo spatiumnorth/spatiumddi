@@ -246,8 +246,8 @@ export function StatusDot({
   );
 }
 
-/** #1238 — marks a DHCPv6 scope on a group with two or more Kea members,
- * which HA does not coordinate. Callers decide with `v6ScopeLacksHa`. */
+/** #1238 / #1258 — marks a DHCPv6 scope on a group with two or more Kea
+ * members whose DHCPv6 HA is not active, so each serves it on its own. Callers decide with `v6ScopeLacksHa`. */
 export function V6NoHaTag({ keaMemberCount }: { keaMemberCount: number }) {
   return (
     <span

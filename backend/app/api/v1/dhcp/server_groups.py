@@ -27,7 +27,7 @@ from app.api.v1.dhcp._failover_schemas import (
     FailoverScopesChange,
     GroupFailoverResponse,
 )
-from app.api.v1.dhcp.servers import HA_STATE_DESCRIPTION
+from app.api.v1.dhcp.servers import HA_STATE_DESCRIPTION, HA_STATE_V6_DESCRIPTION
 from app.core.agent_wake import appliance_channel, collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
 from app.core.update_nulls import changed_keys, snapshot
@@ -41,7 +41,7 @@ from app.services.appliance.group_names import (
 )
 from app.services.approvals.gate import gate_or_execute
 from app.services.dhcp import windows_failover_manage as fo_manage
-from app.services.dhcp.ha_members import kea_ha_members
+from app.services.dhcp.ha_members import kea_ha_members, supports_ha_v6, v6_peer_url
 from app.services.dhcp.ha_peer_auth import peer_auth_ready, rotate_credential
 from app.services.dhcp.ha_peer_autofill import HA_GROUP_MODES, autofill_skipped_reason
 from app.services.dhcp.relay_vip import (
@@ -148,6 +148,7 @@ class ServerSummary(BaseModel):
     host: str
     status: str
     ha_state: str | None = Field(description=HA_STATE_DESCRIPTION)
+    ha_state_v6: str | None = Field(default=None, description=HA_STATE_V6_DESCRIPTION)
     ha_peer_url: str
     agent_approved: bool
 
@@ -198,6 +199,12 @@ class GroupResponse(BaseModel):
     # ``active`` on an HA group means a member still runs an older agent.
     ha_peer_credential_set: bool = False
     ha_peer_auth_active: bool = False
+    # #1258 - whether this group's DHCPv6 scopes are covered by HA: it is an HA
+    # group and every participant's agent renders the HA hook into Dhcp6 (the
+    # control plane then ships the v6 listener URLs). False on an HA group
+    # means a member's agent predates DHCPv6 HA, so its DHCPv6 scopes are
+    # still served by each member on its own.
+    ha_v6_ready: bool = False
     created_at: datetime
     modified_at: datetime
 
@@ -234,6 +241,11 @@ def _group_to_response(g: DHCPServerGroup) -> GroupResponse:
         ),
         ha_peer_credential_set=bool(g.ha_peer_credential_encrypted),
         ha_peer_auth_active=ha.renders_ha and peer_auth_ready(g, ha.participants),
+        ha_v6_ready=ha.renders_ha
+        and all(
+            supports_ha_v6(s.agent_capabilities) and v6_peer_url(s.ha_peer_url)
+            for s in ha.participants
+        ),
         servers=[
             ServerSummary(
                 id=s.id,
@@ -242,6 +254,7 @@ def _group_to_response(g: DHCPServerGroup) -> GroupResponse:
                 host=s.host,
                 status=s.status,
                 ha_state=s.ha_state,
+                ha_state_v6=s.ha_state_v6,
                 ha_peer_url=s.ha_peer_url or "",
                 agent_approved=s.agent_approved,
             )

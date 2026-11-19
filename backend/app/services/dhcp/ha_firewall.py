@@ -45,9 +45,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
-from app.models.dhcp import DHCPServer, DHCPServerGroup
+from app.models.dhcp import DHCPScope, DHCPServer, DHCPServerGroup
 from app.services.appliance.ownership import hostname_is_unambiguous, hostname_sql, norm_host
-from app.services.dhcp.ha_members import kea_ha_members
+from app.services.dhcp.ha_members import kea_ha_members, supports_ha_v6, v6_peer_port
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
@@ -181,4 +181,49 @@ async def dhcp_ha_firewall_inputs(
     return port, sorted(cidrs)
 
 
-__all__ = ["dhcp_ha_firewall_inputs", "listener_port"]
+async def dhcp_ha_v6_port(
+    db: AsyncSession, appliance: Appliance, v4_port: int | None
+) -> int | None:
+    """The DHCPv6 HA listener port to open beside ``v4_port`` (#1258), or None.
+
+    Kea needs one HTTP listener per daemon, so kea-dhcp6's is the v4 port plus
+    one (``ha_members.v6_peer_url``). It exists only while the bundle carries
+    ``url_v6`` (every participant's agent renders it) AND the group has an
+    enabled IPv6 scope — the agent renders the v6 hook only then. The source
+    set is the one :func:`dhcp_ha_firewall_inputs` already computed.
+    """
+    if v4_port is None or appliance.assigned_dhcp_group_id is None:
+        return None
+    group = (
+        await db.execute(
+            select(DHCPServerGroup)
+            .where(DHCPServerGroup.id == appliance.assigned_dhcp_group_id)
+            .options(selectinload(DHCPServerGroup.servers))
+        )
+    ).scalar_one_or_none()
+    if group is None:
+        return None
+    kea = kea_ha_members(group.mode, group.servers).participants
+    if not kea or not all(supports_ha_v6(s.agent_capabilities) for s in kea):
+        return None
+    ports = {v6_peer_port(s.ha_peer_url) for s in kea}
+    if None in ports:
+        return None
+    has_v6 = (
+        await db.execute(
+            select(DHCPScope.id)
+            .where(
+                DHCPScope.group_id == group.id,
+                DHCPScope.address_family == "ipv6",
+                DHCPScope.is_active.is_(True),
+            )
+            .limit(1)
+        )
+    ).first()
+    if has_v6 is None:
+        return None
+    # The firewall rule belongs to THIS node: its own member's port.
+    return v4_port + 1 if v4_port < 65535 else None
+
+
+__all__ = ["dhcp_ha_firewall_inputs", "dhcp_ha_v6_port", "listener_port"]

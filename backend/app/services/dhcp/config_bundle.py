@@ -56,7 +56,7 @@ from app.services.dhcp.device_policy import (
     compile_device_policy,
     load_fingerprint_snapshot,
 )
-from app.services.dhcp.ha_members import kea_ha_members
+from app.services.dhcp.ha_members import kea_ha_members, supports_ha_v6, v6_peer_url
 from app.services.dhcp.ha_peer_auth import current_peer_credential
 from app.services.dhcp.option_validation import (
     canonical_domain_options,
@@ -143,6 +143,14 @@ async def _resolve_failover(
     # agent long-poll expires its session on every pass since #2040, so this is
     # now belt-and-braces for any other caller.
     tls = await current_peer_credential(db, group, kea_peers)
+    # #1258 — the DHCPv6 listener URL per peer, only once EVERY participant's
+    # agent renders the HA hook into Dhcp6: one that does not would never bind
+    # the port its partner then polls. Same fresh-column read as the
+    # credential above, for the same long-poll identity-map reason.
+    if await _all_support_ha_v6(db, kea_peers):
+        v6_urls = {p.id: v6_peer_url(p.ha_peer_url) for p in kea_peers}
+        if all(v6_urls.values()):
+            peers = [{**entry, "url_v6": v6_urls[p.id]} for entry, p in zip(peers, kea_peers)]
     return FailoverConfig(
         tls_ca_pem=tls["ca_pem"] if tls else None,
         tls_cert_pem=tls["cert_pem"] if tls else None,
@@ -157,6 +165,17 @@ async def _resolve_failover(
         max_ack_delay_ms=group.max_ack_delay_ms,
         max_unacked_clients=group.max_unacked_clients,
     )
+
+
+async def _all_support_ha_v6(db: AsyncSession, kea_peers: list[DHCPServer]) -> bool:
+    ids = [s.id for s in kea_peers]
+    rows = (
+        await db.execute(
+            select(DHCPServer.id, DHCPServer.agent_capabilities).where(DHCPServer.id.in_(ids))
+        )
+    ).all()
+    caps = {row.id: row.agent_capabilities for row in rows}
+    return bool(ids) and all(supports_ha_v6(caps.get(i)) for i in ids)
 
 
 async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBundle:

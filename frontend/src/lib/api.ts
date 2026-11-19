@@ -8757,6 +8757,9 @@ export interface DHCPServerGroupMember {
   host: string;
   status: string;
   ha_state: string | null;
+  /** #1258 — the DHCPv6 daemon's own HA state; null while no DHCPv6 HA runs.
+   *  Optional so fixtures and older API replies still type-check. */
+  ha_state_v6?: string | null;
   ha_peer_url: string;
   agent_approved: boolean;
 }
@@ -8803,6 +8806,11 @@ export interface DHCPServerGroup {
   // Number of Kea servers currently in the group. ≥ 2 means HA is
   // rendered into every peer's Kea config via libdhcp_ha.so.
   kea_member_count: number;
+  /** #1258 — DHCPv6 scopes on this group are covered by HA: an HA group whose
+   *  every participant's agent renders the HA hook into Dhcp6. False on an HA
+   *  group means a member's agent predates it. Optional like the fields
+   *  below. */
+  ha_v6_ready?: boolean;
   /** #2963 — names of Kea members with no `ha_peer_url` in an HA-mode group
    *  of two or more. Empty for a standalone group. HA does not render while
    *  fewer than two members have a URL; otherwise the URL-less ones are
@@ -8898,6 +8906,8 @@ export interface DHCPServer {
   // partner-down / hot-standby / load-balancing / backup /
   // passive-backup / terminated.
   ha_state?: string | null;
+  /** #1258 — kea-dhcp6's HA state (null while no DHCPv6 HA runs). */
+  ha_state_v6?: string | null;
   ha_last_heartbeat_at?: string | null;
   // True once Windows admin credentials have been stored on this server.
   // The password itself is never returned — set via `windows_credentials`

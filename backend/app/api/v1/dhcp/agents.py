@@ -265,6 +265,11 @@ class HAStatusReport(BaseModel):
 
     state: str
     raw: dict[str, Any] | None = None
+    # #1258 — kea-dhcp6's HA state, polled from its own control socket. Absent
+    # from an agent that predates DHCPv6 HA, and None from one whose Dhcp6 has
+    # no HA hook (no v6 scopes, or a partner that cannot yet run it).
+    state_v6: str | None = None
+    raw_v6: dict[str, Any] | None = None
 
 
 class LeaseEvent(BaseModel):
@@ -788,6 +793,14 @@ async def agent_config_longpoll(
             if bundle.failover is None and _forget_ha_state(server):
                 await db.commit()
                 logger.info("dhcp_ha_state_cleared", server_id=str(server.id), why="no_ha_hook")
+            # #1258: the v6 state goes the same way, and also when the bundle
+            # keeps HA but no longer carries the v6 listener (a member's agent
+            # lost the capability, or the group lost its last v6 scope's
+            # peers): the v6 hook is gone from the Dhcp6 config.
+            elif not _bundle_has_v6_ha(bundle.failover) and server.ha_state_v6 is not None:
+                server.ha_state_v6 = None
+                await db.commit()
+                logger.info("dhcp_ha_state_cleared", server_id=str(server.id), why="no_v6_ha_hook")
             # Issue #153 — fold the rendered snmpd.conf hash into the ETag
             # mix below so a Settings → Appliance → SNMP change wakes the
             # agent's long-poll even when nothing in the DHCP driver
@@ -2589,11 +2602,23 @@ async def agent_mac_sightings(
     return {"recorded": recorded, "new": new_count}
 
 
+def _bundle_has_v6_ha(failover: Any) -> bool:
+    """Whether the failover block carries the DHCPv6 HA listener URLs (#1258)."""
+    return (
+        failover is not None and bool(failover.peers) and all("url_v6" in p for p in failover.peers)
+    )
+
+
 def _forget_ha_state(server: DHCPServer) -> bool:
     """#3241: clear the HA state ``server`` last reported. True if it held one."""
-    if server.ha_state is None and server.ha_last_heartbeat_at is None:
+    if (
+        server.ha_state is None
+        and server.ha_state_v6 is None
+        and server.ha_last_heartbeat_at is None
+    ):
         return False
     server.ha_state = None
+    server.ha_state_v6 = None
     server.ha_last_heartbeat_at = None
     return True
 
@@ -2641,6 +2666,7 @@ async def agent_ha_status(
             await db.commit()
         return {"status": "not_in_ha"}
     server.ha_state = body.state
+    server.ha_state_v6 = body.state_v6
     server.ha_last_heartbeat_at = datetime.now(UTC)
     await db.commit()
     return {"status": "ok"}

@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from app.services.appliance.firewall import (
+    _dhcp_ha_ports,
     _dhcp_ha_rule,
     _emit_family_rule,
     _profile_name,
@@ -679,7 +680,13 @@ def compile_firewall_from_policies(
         if not (role_udp or role_tcp):
             lines.append("")
             lines.append("# ── Per-role service ports ─────────────────────────────")
-        _emit_family_rule(lines, ha_v4, ha_v6, f"tcp dport {ha_port} accept", "role:dhcp-ha")
+        _emit_family_rule(
+            lines,
+            ha_v4,
+            ha_v6,
+            f"tcp dport {_dhcp_ha_ports(ra, ha_port)} accept",
+            "role:dhcp-ha",
+        )
 
     # ── Control-plane derived (STRUCTURAL emit, byte-identical). ──
     if ctx.is_cp:

@@ -127,7 +127,7 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
     queryKey: ["dhcp-statics", scope.id],
     queryFn: () => dhcpApi.listStatics(scope.id),
   });
-  // #1238 — HA is DHCPv4 only; flag a v6 scope on a multi-Kea group.
+  // #1238 / #1258 — flag a v6 scope on a multi-Kea group without v6 HA.
   const { data: groups = [] } = useQuery({
     queryKey: ["dhcp-groups"],
     queryFn: dhcpApi.listGroups,
