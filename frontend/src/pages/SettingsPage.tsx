@@ -619,7 +619,7 @@ const RETENTION_ROWS: {
     key: "alert_event_retention_days",
     label: "Alert events",
     description:
-      "Resolved alert events; open ones are never deleted. 0–3650 days; 0 keeps them forever.",
+      "Resolved alert events; open ones and the newest per rule and subject are kept. 0–3650 days; 0 keeps them forever.",
     unit: "days",
     min: 0,
     max: 3650,

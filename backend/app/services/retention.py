@@ -124,14 +124,35 @@ def _ai_chat(cutoff: datetime) -> ColumnElement[bool]:
     )
 
 
+def _alert_event(cutoff: datetime) -> ColumnElement[bool]:
+    # Resolved events are state, not just history. Transition-once rules
+    # (tls_cert_changed, domain_registrar_changed, ...) read the newest event
+    # per subject as the baseline to compare against, and the conformity
+    # engine reads it to decide whether a re-fail is a new incident, so the
+    # newest event per (rule, subject) is kept whatever its age. A manually
+    # resolved event that still suppresses its subject (#2498: resolved_by
+    # manual, not yet manual_cleared) and one whose delivery is still pending
+    # are kept too.
+    newer = aliased(AlertEvent)
+    manual_suppressing = and_(
+        func.coalesce(AlertEvent.last_observed_value["resolved_by"].astext, "") == "manual",
+        AlertEvent.last_observed_value["manual_cleared"].astext.is_(None),
+    )
+    return and_(
+        AlertEvent.resolved_at.is_not(None),
+        AlertEvent.resolved_at < cutoff,
+        AlertEvent.delivery_pending_since.is_(None),
+        not_(manual_suppressing),
+        exists().where(
+            newer.rule_id == AlertEvent.rule_id,
+            newer.subject_id == AlertEvent.subject_id,
+            newer.fired_at > AlertEvent.fired_at,
+        ),
+    )
+
+
 RULES: tuple[RetentionRule, ...] = (
-    RetentionRule(
-        "alert_event",
-        "alert_event_retention_days",
-        180,
-        AlertEvent,
-        lambda c: and_(AlertEvent.resolved_at.is_not(None), AlertEvent.resolved_at < c),
-    ),
+    RetentionRule("alert_event", "alert_event_retention_days", 180, AlertEvent, _alert_event),
     RetentionRule(
         "ip_mac_history",
         "ip_mac_history_retention_days",

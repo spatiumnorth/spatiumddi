@@ -359,7 +359,7 @@ window deletes the older data on the next nightly run.
 | `pcap_retention_days` | Finished packet captures and their `.pcap` files | 7 days | 1–90 days |
 | `appliance_revoked_retention_days` | Deleted (revoked) Fleet appliance rows | 30 days | 0–365 days (0 = keep until permanently deleted) |
 | `e911_resolution_log_retention_days` | The E911 location-lookup trail (`e911_resolution_log`, #3514) | 90 days | 7–3650 days |
-| `alert_event_retention_days` | Resolved alert events; open ones are never deleted. | 180 days | 0–3650 days (0 = keep forever) |
+| `alert_event_retention_days` | Resolved alert events; open ones are never deleted, and the newest event per rule and subject is kept (rules compare against it). | 180 days | 0–3650 days (0 = keep forever) |
 | `ip_mac_history_retention_days` | MAC sightings not seen for this long. Acknowledged and known MACs are kept. | 365 days | 0–3650 days (0 = keep forever) |
 | `nmap_scan_retention_days` | Finished nmap scans, with their raw output. | 90 days | 0–3650 days (0 = keep forever) |
 | `conformity_result_retention_days` | Older results; the newest per policy and resource is always kept. | 365 days | 0–3650 days (0 = keep forever) |

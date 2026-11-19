@@ -138,26 +138,66 @@ async def test_alert_events_only_resolved_and_old(db_session: AsyncSession) -> N
     db_session.add(rule)
     await db_session.flush()
 
-    def ev(fired: datetime, resolved: datetime | None) -> AlertEvent:
+    shared = str(uuid.uuid4())
+
+    def ev(fired: datetime, resolved: datetime | None, subject: str | None = None) -> AlertEvent:
         return AlertEvent(
             rule_id=rule.id,
             subject_type="subnet",
-            subject_id=str(uuid.uuid4()),
+            subject_id=subject or str(uuid.uuid4()),
             fired_at=fired,
             resolved_at=resolved,
         )
 
     db_session.add_all(
         [
-            ev(old(), old(3999)),  # resolved long ago: pruned
+            ev(old(), old(3999), shared),  # resolved long ago, superseded: pruned
+            ev(old(3000), old(2999), shared),  # newest for its subject: kept
             ev(old(), None),  # still open, however old: kept
             ev(old(), NOW - timedelta(days=10)),  # resolved recently: kept
         ]
     )
     await db_session.commit()
     assert (await prune_unbounded_tables())["alert_event"] == 1
-    assert await count(db_session, AlertEvent) == 2
+    assert await count(db_session, AlertEvent) == 3
     assert (await prune_unbounded_tables())["alert_event"] == 0
+
+
+async def test_alert_events_keep_state_the_evaluators_read(db_session: AsyncSession) -> None:
+    """The newest event per (rule, subject) is a baseline (transition-once
+    rules, conformity) and a manual resolve still suppresses its subject
+    (#2498): neither may be pruned, only the older history behind them."""
+    rule = AlertRule(name="r2", rule_type="tls_cert_changed", severity="info")
+    db_session.add(rule)
+    await db_session.flush()
+
+    def ev(subject: str, age: int, **kw: Any) -> AlertEvent:
+        return AlertEvent(
+            rule_id=rule.id,
+            subject_type="tls_cert",
+            subject_id=subject,
+            fired_at=old(age),
+            resolved_at=old(age - 1),
+            **kw,
+        )
+
+    manual = ev("manual", 4000, last_observed_value={"resolved_by": "manual"})
+    cleared = ev(
+        "manual", 3999, last_observed_value={"resolved_by": "manual", "manual_cleared": True}
+    )
+    db_session.add_all(
+        [
+            ev("base", 4000),  # older history behind a newer event: pruned
+            ev("base", 3999, last_observed_value={"to": "fp"}),  # newest: the baseline, kept
+            manual,  # still suppressing: kept although a newer event exists
+            cleared,  # newest of its subject: kept
+            ev("pending", 4000, delivery_pending_since=old(4000)),  # undelivered: kept
+            ev("pending", 3999),  # newest: kept
+        ]
+    )
+    await db_session.commit()
+    assert (await prune_unbounded_tables())["alert_event"] == 1
+    assert await count(db_session, AlertEvent) == 5
 
 
 async def test_user_sessions_expired_or_old_revoked(db_session: AsyncSession) -> None:
