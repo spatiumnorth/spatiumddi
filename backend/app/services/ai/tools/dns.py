@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import uuid
+from dataclasses import asdict
 from typing import Any
 
 import dns.exception
@@ -29,6 +30,7 @@ from app.models.dns import (
     DNSZone,
     DNSZoneUpdateAcl,
 )
+from app.services.agents.memory_status import fresh_memory_status
 from app.services.ai.operations_writes import SetZoneUpdateAclArgs
 from app.services.ai.tools.base import register_tool
 from app.services.ai.tools.scope import token_allows_zone, token_zone_ids
@@ -297,7 +299,9 @@ class ListServerGroupsArgs(BaseModel):
         "List DNS server groups (logical groupings of authoritative "
         "DNS servers). Each summary includes name, group type, "
         "default view, recursive flag, and whether subnet reverse zones "
-        "are auto-created in it when it runs a cloud DNS driver."
+        "are auto-created in it when it runs a cloud DNS driver. "
+        "max_cache_size is the BIND9 resolver cache ceiling per recursive view "
+        "(null = the agent's default)."
     ),
     args_model=ListServerGroupsArgs,
     category="dns",
@@ -319,6 +323,7 @@ async def list_dns_server_groups(
             "default_view": g.default_view,
             "is_recursive": g.is_recursive,
             "auto_reverse_zones_at_provider": g.auto_reverse_zones_at_provider,
+            "max_cache_size": g.max_cache_size,
         }
         for g in rows
     ]
@@ -357,7 +362,9 @@ class FindDnsServersArgs(BaseModel):
         "primary for that group?' and "
         "'which groups have no primary?' (one is re-elected automatically "
         "within a minute; until then writes go to the server it will "
-        "pick). Read-only: "
+        "pick). Each row's ``memory`` is the agent's reported container used / "
+        "peak / limit and daemon / agent RSS in bytes (null = not reported). "
+        "Read-only: "
         "moving a server between groups is done over the REST API or the "
         "DNS → Server Groups UI, not from here."
     ),
@@ -415,6 +422,10 @@ async def find_dns_servers(
             # #3551 — the agent container's memory limit; NULL = never
             # reported (an older agent, an agentless driver) or no limit.
             "memory_limit_bytes": s.memory_limit_bytes,
+            # #4193 — what the agent actually reports using (container used /
+            # peak / limit, daemon and agent RSS, reported_at); NULL = never
+            # reported, which is unknown, not zero.
+            "memory": fresh_memory_status(s.memory_status),
         }
         for s, group_name in rows
     ]
@@ -434,8 +445,9 @@ class GetDnsGroupMemoryEstimateArgs(BaseModel):
         "share a response-policy zone between views); identical zones load "
         "once. Returns the estimate, the limit and where it came from "
         "(``agent`` or the 2 GiB ``default``), the percentage, whether it "
-        "warns (80 % and over), and each blocklist zone with the views that "
-        "load it and its entry count. Answers 'will adding a view OOM this "
+        "warns (80 % and over), each blocklist zone with the views that "
+        "load it and its entry count, and each server's ACTUAL reported "
+        "memory (named's RSS, container used / peak / limit). Answers 'will adding a view OOM this "
         "group?' and 'why are the DNS agents being OOM-killed?'. Null for a "
         "group with no BIND9 server. Read-only."
     ),
@@ -471,6 +483,9 @@ async def get_dns_group_memory_estimate(
             {"zone": r.zone, "views": list(r.views), "entries": r.entries, "bytes": r.bytes}
             for r in est.rpz
         ],
+        # #4193 — what each BIND9 server actually reports using, to set beside
+        # the estimate. Null figures are unreported, not zero.
+        "servers": [asdict(s) for s in est.servers],
     }
 
 
@@ -554,6 +569,7 @@ async def preview_dns_zone_move(
         "tsig_algorithm_refusal": plan.tsig_algorithm_refusal,
         "forward_transport_refusal": plan.forward_transport_refusal,
         "technitium_acl_refusal": plan.technitium_acl_refusal,
+        "classless_refusal": plan.classless_refusal,
         "warnings": plan.warnings,
         "required_acknowledgements": plan.required_acknowledgements,
     }
@@ -1199,8 +1215,8 @@ async def find_zone_dnssec_info(
         # keys: the DS shown is one server's, and the others' do not match it.
         "dnssec_multi_signer": bool(zone.dnssec_enabled) and signers > 1,
         "signing_servers": signers,
-        # #1783 — the group runs Technitium: SpatiumDDI will not sign or
-        # re-sign here (#1767), so do not propose it. With dnssec_enabled,
+        # The group runs the agentless Technitium API driver: SpatiumDDI will
+        # not sign or re-sign here, so do not propose it. With dnssec_enabled,
         # the zone was signed before that and is not kept signed.
         "signing_unmanaged": unmanaged,
         "dnssec_unmanaged_warning": bool(zone.dnssec_enabled) and unmanaged,
@@ -1575,6 +1591,8 @@ async def find_dns_queries(
     from app.services.logs.agent_logs import (  # noqa: PLC0415
         InvalidLogFilter,
         LogScopeError,
+        include_orphaned_logs,
+        log_row_server_name,
         resolve_dns_log_servers,
         search_dns_queries,
     )
@@ -1609,14 +1627,15 @@ async def find_dns_queries(
             qtype=args.qtype,
             rcode=args.rcode,
             limit=args.limit,
+            include_orphans=include_orphaned_logs(user, **scope),
         )
     except InvalidLogFilter as exc:
         return [{"result": exc.detail}]
     return [
         {
             "ts": r.ts.isoformat(),
-            "server_id": str(r.server_id),
-            "server_name": names.get(r.server_id),
+            "server_id": str(r.server_id) if r.server_id else None,
+            "server_name": log_row_server_name(r.server_id, r.server_name, names),
             "client_ip": str(r.client_ip) if r.client_ip is not None else None,
             "qname": r.qname,
             "qtype": r.qtype,

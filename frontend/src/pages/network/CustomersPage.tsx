@@ -1,3 +1,5 @@
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { ListEmpty } from "@/components/ui/list-read-error";
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -76,7 +78,11 @@ function CustomerEditorModal({
           status,
           notes,
         };
-        return customersApi.update(existing.id, body);
+        // Only what changed against the row read when the dialog opened
+        // (#4379), so a field another client set since is not put back.
+        const changed = changedFields(existing, body);
+        if (Object.keys(changed).length === 0) return existing;
+        return customersApi.update(existing.id, changed);
       }
       const body: CustomerCreate = {
         name,
@@ -502,10 +508,19 @@ export function CustomersPage() {
           />
         )}
         {editing && (
-          <CustomerEditorModal
-            existing={editing}
+          <FreshEdit
+            row={editing}
+            load={() => customersApi.get(editing.id)}
+            title="Edit customer"
             onClose={() => setEditing(null)}
-          />
+          >
+            {(fresh) => (
+              <CustomerEditorModal
+                existing={fresh}
+                onClose={() => setEditing(null)}
+              />
+            )}
+          </FreshEdit>
         )}
         <ConfirmModal
           open={confirm !== null}

@@ -275,12 +275,17 @@ async def test_scoped_grant_reads_only_the_subnets_own_routes(
     """Reads are an allow-list of the subnet's own routes: a GET that carries
     ``subnet_id`` but reports another resource type (NAT mappings) or records
     outside the subnet (the DNS drift report) is not on it."""
-    x, _y, _o = await _two_subnets(db_session)
+    x, y, _o = await _two_subnets(db_session)
     h = await _user(db_session, _rw(x))
     await db_session.commit()
+    # #4348: the grant reaches X's effective DDNS, not Y's.
+    r = await client.get(f"/api/v1/ipam/subnets/{y.id}/effective-ddns", headers=h)
+    assert r.status_code in (403, 404), r.text
     for path in (
         f"/api/v1/ipam/subnets/{x.id}/effective-fields",
         f"/api/v1/ipam/subnets/{x.id}/effective-dns",
+        # #4348: the DDNS tab of Edit Subnet reads it, beside DNS and DHCP.
+        f"/api/v1/ipam/subnets/{x.id}/effective-ddns",
         f"/api/v1/ipam/subnets/{x.id}/next-ip-preview",
         f"/api/v1/ipam/subnets/{x.id}/aliases",
         f"/api/v1/ipam/subnets/{x.id}/domains",

@@ -1360,6 +1360,7 @@ function RPZPanel({
                 <thead className="sticky top-0 border-b bg-card text-left text-xs text-muted-foreground">
                   <tr>
                     <th className="py-1.5 pr-3 font-medium">Time</th>
+                    <th className="py-1.5 pr-3 font-medium">Server</th>
                     <th className="py-1.5 pr-3 font-medium">Client</th>
                     <th className="py-1.5 pr-3 font-medium">Name</th>
                     <th className="py-1.5 pr-3 font-medium">Policy</th>
@@ -1371,6 +1372,20 @@ function RPZPanel({
                     <tr key={h.id} className="border-b last:border-0">
                       <td className="py-1.5 pr-3 text-xs text-muted-foreground whitespace-nowrap">
                         {new Date(h.ts).toLocaleString()}
+                      </td>
+                      <td className="py-1.5 pr-3 font-mono text-xs">
+                        {h.server_name ? (
+                          <span title={h.server_name}>
+                            {h.server_name}
+                            {h.server_id == null && (
+                              <span className="ml-1 font-sans text-muted-foreground">
+                                (deleted)
+                              </span>
+                            )}
+                          </span>
+                        ) : (
+                          "—"
+                        )}
                       </td>
                       <td className="py-1.5 pr-3 font-mono text-xs">
                         {h.client_ip ?? "—"}

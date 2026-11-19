@@ -178,6 +178,9 @@ def note_local_api_result(url: str, ok: bool) -> None:
     if ok:
         if _local_api["failures"] >= _LOCAL_API_FAIL_THRESHOLD:
             log.info("supervisor.control_plane.node_local_restored")
+            # #4223: a pin refresh that failed while this path was down is
+            # owed now, not after its backoff.
+            cp_tls.request_pin_refresh()
         _local_api["failures"] = 0
         _local_api["fallback_logged"] = False
         return
