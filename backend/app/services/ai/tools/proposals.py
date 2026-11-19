@@ -36,6 +36,7 @@ from app.services.ai.operations import (
     CreateDNSZoneArgs,
     CreateIPAddressArgs,
     CreateMulticastGroupArgs,
+    CreateSubnetHoldArgs,
     RunNmapScanArgs,
     WakeHostArgs,
 )
@@ -337,6 +338,30 @@ async def propose_create_address_set(
     db: AsyncSession, user: User, args: CreateAddressSetArgs
 ) -> dict[str, Any]:
     return await _propose_via(db=db, user=user, operation_name="create_address_set", args=args)
+
+
+# ── propose_subnet_hold (issue #4492) ─────────────────────────────────
+
+
+@register_tool(
+    name="propose_subnet_hold",
+    permission=("write", "subnet"),
+    description=(
+        "Prepare a proposal to hold a CIDR for a future project (reason + "
+        "optional expiry). Operator must click Approve in the chat drawer. "
+        "Creates no subnet, placeholder addresses, reverse zone or DHCP; "
+        "subnet creation refuses the space until the hold is released. "
+        "Returns a kind='proposal' card; never call twice for the same change."
+    ),
+    args_model=CreateSubnetHoldArgs,
+    writes=False,
+    category="ipam",
+    default_enabled=True,
+)
+async def propose_subnet_hold(
+    db: AsyncSession, user: User, args: CreateSubnetHoldArgs
+) -> dict[str, Any]:
+    return await _propose_via(db=db, user=user, operation_name="create_subnet_hold", args=args)
 
 
 # ── propose_create_dns_record ─────────────────────────────────────────

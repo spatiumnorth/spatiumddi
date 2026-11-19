@@ -2640,6 +2640,81 @@ register(
 )
 
 
+# ── create_subnet_hold operation (issue #4492) ──────────────────────────────
+
+
+class CreateSubnetHoldArgs(BaseModel):
+    """Args for the ``create_subnet_hold`` operation."""
+
+    space_id: UUID = Field(description="UUID of the IP space the CIDR is in")
+    network: str = Field(description="CIDR to hold, e.g. 10.20.0.0/22")
+    reason: str = Field(description="Why the space is held (project, ticket, owner)")
+    expires_at: datetime | None = Field(
+        default=None, description="ISO-8601 date the hold lapses; omit for no expiry"
+    )
+
+
+async def _preview_create_subnet_hold(
+    db: AsyncSession, user: User, args: CreateSubnetHoldArgs
+) -> PreviewResult:
+    from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
+
+    if not user_has_permission(user, "write", "subnet"):
+        return PreviewResult(ok=False, detail="You need write on subnet to hold a CIDR.")
+    try:
+        ipaddress.ip_network(args.network, strict=False)
+    except ValueError as exc:
+        return PreviewResult(ok=False, detail=f"Invalid CIDR: {exc}")
+    when = args.expires_at.date().isoformat() if args.expires_at else "no expiry"
+    return PreviewResult(
+        ok=True,
+        detail="ready",
+        preview_text=f"Hold {args.network} ({args.reason}), expires: {when}",
+    )
+
+
+async def _apply_create_subnet_hold(
+    db: AsyncSession, user: User, args: CreateSubnetHoldArgs
+) -> dict[str, Any]:
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    from app.api.v1.subnet_holds.router import HoldCreate, create_hold  # noqa: PLC0415
+
+    enforce_operation_permission(user, _OPERATIONS["create_subnet_hold"])
+    try:
+        out = await create_hold(
+            HoldCreate(
+                space_id=args.space_id,
+                network=args.network,
+                reason=args.reason,
+                expires_at=args.expires_at,
+            ),
+            user,
+            db,
+        )
+    except HTTPException as exc:
+        raise ValueError(str(exc.detail)) from exc
+    return {"id": str(out.id), "network": out.network, "status": out.status}
+
+
+register(
+    Operation(
+        name="create_subnet_hold",
+        description=(
+            "Hold a CIDR for a future project with a reason and optional expiry. "
+            "No subnet, placeholder addresses, reverse zone or DHCP is created; "
+            "subnet creation refuses the space until the hold is released. "
+            "Always go through propose_subnet_hold."
+        ),
+        args_model=CreateSubnetHoldArgs,
+        preview=_preview_create_subnet_hold,
+        apply=_apply_create_subnet_hold,
+        category="ipam",
+        required_permission=("write", "subnet"),
+    )
+)
+
+
 # ── Tier 5 (issue #101) — DNS record / DHCP static / alert rule / chat archive ──
 #
 # Each operation follows the same preview / apply / register pattern

@@ -638,6 +638,10 @@ async def _assert_no_overlap(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Network {network} overlaps with existing subnet {row[0]}",
         )
+    # A CIDR held for a future project (#4492) is not allocatable either.
+    from app.services.ipam.holds import assert_not_held  # noqa: PLC0415
+
+    await assert_not_held(db, space_id, network)
 
 
 async def _assert_no_block_overlap(

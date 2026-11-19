@@ -1243,6 +1243,92 @@ async def find_address_sets(
     ]
 
 
+class FindSubnetHoldsArgs(BaseModel):
+    expired: bool | None = Field(
+        default=None, description="True: only active holds past their expiry date."
+    )
+    expiring_within_days: int | None = Field(
+        default=None, ge=0, le=3650, description="Only holds expiring within N days."
+    )
+    include_closed: bool = Field(default=False, description="Also list converted / released holds.")
+    limit: int = Field(default=200, ge=1, le=1000)
+
+
+@register_tool(
+    name="find_subnet_holds",
+    permission=("read", "subnet"),
+    description=(
+        "List CIDRs held for a future project (#4492): network, reason, owner, "
+        "expiry and whether the hold has expired. An expired hold still blocks "
+        "allocation until released or converted."
+    ),
+    args_model=FindSubnetHoldsArgs,
+    category="ipam",
+)
+async def find_subnet_holds(
+    db: AsyncSession, user: User, args: FindSubnetHoldsArgs
+) -> list[dict[str, Any]]:
+    from datetime import UTC, datetime, timedelta  # noqa: PLC0415
+
+    from app.models.subnet_hold import SubnetHold  # noqa: PLC0415
+
+    now = datetime.now(UTC)
+    stmt = select(SubnetHold)
+    if not args.include_closed:
+        stmt = stmt.where(SubnetHold.status == "active")
+    if args.expired:
+        stmt = stmt.where(SubnetHold.expires_at.is_not(None), SubnetHold.expires_at <= now)
+    if args.expiring_within_days is not None:
+        stmt = stmt.where(
+            SubnetHold.expires_at.is_not(None),
+            SubnetHold.expires_at <= now + timedelta(days=args.expiring_within_days),
+        )
+    stmt = stmt.order_by(SubnetHold.network, SubnetHold.id).limit(args.limit)
+    rows = (await db.execute(stmt)).scalars().all()
+    return [
+        {
+            "id": str(h.id),
+            "network": str(h.network),
+            "space_id": str(h.space_id),
+            "reason": h.reason,
+            "status": h.status,
+            "expires_at": h.expires_at.isoformat() if h.expires_at else None,
+            "expired": h.status == "active" and h.expires_at is not None and h.expires_at <= now,
+            "owner_user_id": str(h.owner_user_id) if h.owner_user_id else None,
+            "owner_group_id": str(h.owner_group_id) if h.owner_group_id else None,
+        }
+        for h in rows
+    ]
+
+
+class CountSubnetHoldsArgs(BaseModel):
+    pass
+
+
+@register_tool(
+    name="count_subnet_holds",
+    permission=("read", "subnet"),
+    description="Count of active subnet holds and how many are past their expiry date.",
+    args_model=CountSubnetHoldsArgs,
+    category="ipam",
+)
+async def count_subnet_holds(
+    db: AsyncSession, user: User, args: CountSubnetHoldsArgs
+) -> dict[str, Any]:
+    from datetime import UTC, datetime  # noqa: PLC0415
+
+    from app.models.subnet_hold import SubnetHold  # noqa: PLC0415
+
+    now = datetime.now(UTC)
+    rows = (
+        await db.execute(select(SubnetHold.expires_at).where(SubnetHold.status == "active"))
+    ).all()
+    return {
+        "active": len(rows),
+        "expired": sum(1 for (e,) in rows if e is not None and e <= now),
+    }
+
+
 class CountAddressSetsArgs(BaseModel):
     pass
 
