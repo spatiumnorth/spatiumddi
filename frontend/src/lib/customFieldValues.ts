@@ -14,11 +14,39 @@ export function customFieldChecked(value: unknown): boolean {
     : Boolean(value);
 }
 
+/** Field types whose definition carries an options list (#4288). */
+export function hasOptions(fieldType: string): boolean {
+  return fieldType === "select" || fieldType === "multi_select";
+}
+
+/** A multi_select value as a list: what is stored, or [] for anything else. */
+export function multiSelectValue(value: unknown): string[] {
+  return Array.isArray(value) ? value.map(String) : [];
+}
+
+/**
+ * A custom field's value as table / detail text. The API stores any JSON, so:
+ * a list reads comma-joined (a multi_select), an object as compact JSON (the
+ * text the address detail, the CSV / XLSX and PDF exports and the search
+ * label use), anything else as typed. Never "[object Object]" (#4421).
+ */
+export function customFieldDisplay(value: unknown): string {
+  if (Array.isArray(value)) return value.map(customFieldDisplay).join(", ");
+  if (value !== null && typeof value === "object") {
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value ?? "");
+}
+
 /**
  * The value a create dialog starts a custom field at: its definition's
  * Default Value, typed the way the field's control sends it. Undefined when
  * the definition has none, or one its control cannot show: a boolean default
- * that is neither true nor false, a select default outside its options, a
+ * that is neither true nor false, a select default outside its options, a multi_select default naming none of them, a
  * number default that is not a number.
  */
 export function customFieldDefault(def: CustomField): unknown {
@@ -31,6 +59,16 @@ export function customFieldDefault(def: CustomField): unknown {
       return undefined;
     case "select":
       return def.options?.includes(raw) ? raw : undefined;
+    case "multi_select": {
+      // A comma-separated default, kept to the options the field offers.
+      const picked = raw
+        .split(",")
+        .map((x) => x.trim())
+        .filter((x) => def.options?.includes(x));
+      return picked.length > 0 ? picked : undefined;
+    }
+    case "date":
+      return /^\d{4}-\d{2}-\d{2}$/.test(raw.trim()) ? raw.trim() : undefined;
     case "number":
       return Number.isFinite(Number(raw)) ? raw : undefined;
     default:
@@ -60,7 +98,10 @@ export function withCustomFieldDefaults(
 }
 
 const isBlank = (v: unknown): boolean =>
-  v === undefined || v === null || (typeof v === "string" && v.trim() === "");
+  v === undefined ||
+  v === null ||
+  (typeof v === "string" && v.trim() === "") ||
+  (Array.isArray(v) && v.length === 0);
 
 /**
  * Labels of the Required custom fields a save would leave empty (#2478), the

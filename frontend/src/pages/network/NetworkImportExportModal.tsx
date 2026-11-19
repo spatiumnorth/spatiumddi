@@ -410,7 +410,9 @@ export function NetworkImportModal({ onClose }: { onClose: () => void }) {
                               </span>
                             )
                           ) : r.error ? (
-                            <span className="text-red-600">{r.error}</span>
+                            <span role="alert" className="text-red-600">
+                              {r.error}
+                            </span>
                           ) : (
                             <span className="text-emerald-600">ready</span>
                           )}

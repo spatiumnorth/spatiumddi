@@ -359,13 +359,21 @@ async def update_role(
             resource_id=str(r.id),
             resource_display=f"update role {r.name}",
         )
+    unchanged = (
+        (body.name is None or body.name == r.name)
+        and (body.description is None or body.description == r.description)
+        and (new_permissions is None or new_permissions == r.permissions)
+    )
     if body.name is not None:
         r.name = body.name
     if body.description is not None:
         r.description = body.description
     if new_permissions is not None:
         r.permissions = new_permissions
-    db.add(_audit(current_user, "update", r, f"Updated role {r.name}", method, granted))
+    # An edit that changes nothing writes no audit row (#4452); a step-up
+    # that was verified is still recorded.
+    if not unchanged or method is not None:
+        db.add(_audit(current_user, "update", r, f"Updated role {r.name}", method, granted))
     await db.commit()
     await db.refresh(r)
     return _to_response(r)

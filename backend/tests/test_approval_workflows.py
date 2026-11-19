@@ -564,3 +564,25 @@ async def test_router_404_when_module_off(client: AsyncClient, db_session: Async
     )
     r = await client.get("/api/v1/change-requests", headers=_auth(token))
     assert r.status_code == 404, r.text
+
+
+@pytest.mark.asyncio
+async def test_missing_policy_and_request_404_name_the_object(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#4359 — a bare 404 rendered as "Not Found" in the console's refused-delete line."""
+    await _enable_module(db_session)
+    _, token = await _user(db_session, name="root", superadmin=True)
+    await db_session.commit()
+    missing = uuid.uuid4()
+    r = await client.delete(f"/api/v1/change-requests/policies/{missing}", headers=_auth(token))
+    assert r.status_code == 404
+    assert r.json()["detail"] == "Approval policy not found"
+    r = await client.put(
+        f"/api/v1/change-requests/policies/{missing}", json={}, headers=_auth(token)
+    )
+    assert r.status_code == 404
+    assert r.json()["detail"] == "Approval policy not found"
+    r = await client.get(f"/api/v1/change-requests/{missing}", headers=_auth(token))
+    assert r.status_code == 404
+    assert r.json()["detail"] == "Change request not found"

@@ -502,9 +502,10 @@ export function NetworkPage() {
                     setActiveFilter("all");
                     setTagFilters([]);
                   }}
+                  gate={writeGate}
+                  hint="Add a router or switch to start discovering IPs."
                 >
-                  No network devices yet — add a router or switch to start
-                  discovering IPs.
+                  No network devices yet.
                 </ListEmpty>
               </p>
               <button

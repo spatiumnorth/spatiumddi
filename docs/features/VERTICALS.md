@@ -266,21 +266,22 @@ An unbound AE is therefore a normal, first-class state: the list has a
 "Reservations only" filter, the API a `?unbound=true` query, and the UI a
 `reservation` badge.
 
-### AE Title validation — 16 bytes, and spaces are legal
+### AE Title validation — 16 printable ASCII characters, and spaces are legal
 
 The `AE` value representation is easy to get wrong in the strict direction, and
 strict is the worse failure: a registry that rejects a title real devices use
 records a plan that fails at commissioning. `services/dicom/titles.py` implements
 PS3.5 verbatim:
 
-- maximum **16 bytes** — bytes, not characters, so a non-ASCII title can be over
-  the limit at 15 characters;
+- maximum **16 characters**, from the default character repertoire (printable
+  ASCII `0x20`-`0x7E`) — anything else, including C1 control characters,
+  no-break spaces and look-alike letters (a Cyrillic А), is refused with the
+  offending code point named;
 - **spaces are legal** but non-significant (they are padding), so leading and
-  trailing space is trimmed and internal spaces are kept;
+  trailing ASCII space is trimmed and internal spaces are kept;
 - an **all-space value is forbidden**, which after trimming is the same
   statement as "must not be empty";
-- backslash (`0x5C`, the multi-value delimiter) and all control characters are
-  excluded.
+- backslash (`0x5C`, the multi-value delimiter) is excluded.
 
 There is no alphanumeric-only rule and no case rule. Case *is* significant to
 peers, so titles are stored as given and matched exactly; only the

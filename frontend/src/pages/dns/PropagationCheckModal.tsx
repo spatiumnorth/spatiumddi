@@ -181,7 +181,9 @@ function ResultsTable({
                     ))}
                   </div>
                 ) : r.error ? (
-                  <span className="text-destructive/80">{r.error}</span>
+                  <span role="alert" className="text-destructive/80">
+                    {r.error}
+                  </span>
                 ) : (
                   <span className="text-muted-foreground">—</span>
                 )}
