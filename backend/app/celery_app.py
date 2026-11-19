@@ -193,6 +193,7 @@ celery_app = SpatiumCelery(
         "app.tasks.prune_multicast_memberships",
         "app.tasks.prune_pairing_codes",
         "app.tasks.prune_e911_resolution_log",
+        "app.tasks.prune_unbounded_tables",
         "app.tasks.firewall_lint_scan",
         "app.tasks.prune_revoked_appliances",
         "app.tasks.upgrade_image_reclaim",
@@ -275,6 +276,7 @@ celery_app.conf.update(
         "app.tasks.prune_multicast_memberships.*": {"queue": "default"},
         "app.tasks.prune_pairing_codes.*": {"queue": "default"},
         "app.tasks.prune_e911_resolution_log.*": {"queue": "default"},
+        "app.tasks.prune_unbounded_tables.*": {"queue": "default"},
         "app.tasks.firewall_lint_scan.*": {"queue": "default"},
         "app.tasks.trash_purge.*": {"queue": "default"},
         "app.tasks.ipam_reservation_sweep.*": {"queue": "ipam"},
@@ -817,6 +819,14 @@ celery_app.conf.update(
         "e911-resolution-log-prune": {
             "task": "app.tasks.prune_e911_resolution_log.prune_e911_resolution_log",
             "schedule": crontab(hour=4, minute=10),
+        },
+        # Daily at 04:30 UTC, batched prune of the tables that used to grow
+        # forever (alert events, ip_mac_history, nmap scans, conformity
+        # results, delivered outbox rows, sessions, AI chats, change requests,
+        # run logs); windows are platform settings, 0 = keep (#2274).
+        "unbounded-tables-prune": {
+            "task": "app.tasks.prune_unbounded_tables.prune_unbounded_tables",
+            "schedule": crontab(hour=4, minute=30),
         },
         "pairing-codes-prune": {
             "task": "app.tasks.prune_pairing_codes.prune_pairing_codes",

@@ -19,7 +19,7 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 
 import structlog
-from sqlalchemy import delete, select
+from sqlalchemy import select
 
 from app.celery_app import celery_app
 from app.config import settings as app_config
@@ -27,6 +27,7 @@ from app.db import task_session
 from app.models.dhcp import DHCPLeaseHistory
 from app.models.settings import PlatformSettings
 from app.services.feature_modules import is_module_enabled
+from app.services.retention import batched_delete
 from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
@@ -45,13 +46,8 @@ async def _prune() -> int:
         if retention_days <= 0:
             logger.info("dhcp_lease_history_prune_disabled", retention_days=retention_days)
             return 0
-        cutoff = datetime.now(UTC) - timedelta(days=retention_days)
-        result = await db.execute(
-            delete(DHCPLeaseHistory).where(DHCPLeaseHistory.expired_at < cutoff)
-        )
-        await db.commit()
-        # ``rowcount`` may be -1 on some drivers; guard for that.
-        return max(int(result.rowcount or 0), 0)
+    cutoff = datetime.now(UTC) - timedelta(days=retention_days)
+    return await batched_delete(DHCPLeaseHistory, DHCPLeaseHistory.expired_at < cutoff)
 
 
 @celery_app.task(name="app.tasks.dhcp_lease_history_prune.prune_lease_history")

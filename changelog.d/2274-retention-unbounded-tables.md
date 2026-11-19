@@ -1,0 +1,3 @@
+### Fixed
+
+- Tables that grew forever are now pruned daily, each with a window under Settings → Data Retention (0 keeps forever): resolved alert events (180 days), IP-MAC history (365), nmap scans (90), conformity results (365), delivered event-outbox rows (7), expired / revoked login sessions (30), idle Copilot chats (90), decided change requests (365) and finished Wake-on-LAN / system-upgrade runs (90). Only terminal rows are removed, and deletes run in batches of 10,000 rows per transaction (the DHCP lease history and E911 trail prunes now batch too), so a large table no longer means one long delete (#2274).

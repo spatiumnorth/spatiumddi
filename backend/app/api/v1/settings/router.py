@@ -315,6 +315,16 @@ class SettingsResponse(BaseModel):
     # E911 lookup trail bounds (#3514), superadmin-only.
     e911_resolution_log_retention_days: int = 90
     e911_lookup_log_budget_per_minute: int = 120
+    # Unbounded-table retention (#2274); 0 keeps forever. Superadmin-only.
+    alert_event_retention_days: int = 180
+    ip_mac_history_retention_days: int = 365
+    nmap_scan_retention_days: int = 90
+    conformity_result_retention_days: int = 365
+    event_outbox_retention_days: int = 7
+    user_session_retention_days: int = 30
+    ai_chat_retention_days: int = 90
+    change_request_retention_days: int = 365
+    run_log_retention_days: int = 90
     # ── Appliance DNS resolver (issue #158) ───────────────────────
     # No secrets — resolver IPs / search domains are not sensitive, so
     # the read shape mirrors the stored shape directly (like NTP / SSH
@@ -1082,6 +1092,15 @@ RETENTION_FIELDS: tuple[str, ...] = (
     # Not a retention window, but a limit on what the E911 trail records and
     # answers (#3633); it rides this audited group so a change is never silent.
     "e911_lookup_log_budget_per_minute",
+    "alert_event_retention_days",
+    "ip_mac_history_retention_days",
+    "nmap_scan_retention_days",
+    "conformity_result_retention_days",
+    "event_outbox_retention_days",
+    "user_session_retention_days",
+    "ai_chat_retention_days",
+    "change_request_retention_days",
+    "run_log_retention_days",
 )
 
 
@@ -1267,6 +1286,16 @@ class SettingsUpdate(BaseModel):
     # bound. The retention floor keeps a week for an after-action review.
     e911_resolution_log_retention_days: int | None = Field(default=None, ge=7, le=3650)
     e911_lookup_log_budget_per_minute: int | None = Field(default=None, ge=1, le=6000)
+    # Unbounded-table windows (#2274). 0 = keep forever.
+    alert_event_retention_days: int | None = Field(default=None, ge=0, le=3650)
+    ip_mac_history_retention_days: int | None = Field(default=None, ge=0, le=3650)
+    nmap_scan_retention_days: int | None = Field(default=None, ge=0, le=3650)
+    conformity_result_retention_days: int | None = Field(default=None, ge=0, le=3650)
+    event_outbox_retention_days: int | None = Field(default=None, ge=0, le=3650)
+    user_session_retention_days: int | None = Field(default=None, ge=0, le=3650)
+    ai_chat_retention_days: int | None = Field(default=None, ge=0, le=3650)
+    change_request_retention_days: int | None = Field(default=None, ge=0, le=3650)
+    run_log_retention_days: int | None = Field(default=None, ge=0, le=3650)
     # ── Appliance DNS resolver (issue #158) ───────────────────────
     resolver_mode: str | None = None
     resolver_servers: list[str] | None = None

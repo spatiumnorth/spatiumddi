@@ -479,6 +479,45 @@ class PlatformSettings(Base):
         Integer, nullable=False, default=90, server_default=sa_text("90")
     )
 
+    # Retention for tables that used to grow forever (#2274), read by the daily
+    # ``prune_unbounded_tables`` sweep. 0 keeps the data forever.
+    # Resolved alert events (open ones are never pruned).
+    alert_event_retention_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=180, server_default=sa_text("180")
+    )
+    # IP-MAC sightings not seen for this long (acknowledged / known MACs are kept).
+    ip_mac_history_retention_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=365, server_default=sa_text("365")
+    )
+    # Finished nmap scans.
+    nmap_scan_retention_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=90, server_default=sa_text("90")
+    )
+    # Conformity results (the newest per policy + resource is kept).
+    conformity_result_retention_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=365, server_default=sa_text("365")
+    )
+    # Delivered event-outbox rows.
+    event_outbox_retention_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=7, server_default=sa_text("7")
+    )
+    # Expired / revoked login sessions.
+    user_session_retention_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=30, server_default=sa_text("30")
+    )
+    # Operator Copilot chats idle for this long.
+    ai_chat_retention_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=90, server_default=sa_text("90")
+    )
+    # Decided / expired change requests.
+    change_request_retention_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=365, server_default=sa_text("365")
+    )
+    # Finished Wake-on-LAN runs and system-upgrade runs.
+    run_log_retention_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=90, server_default=sa_text("90")
+    )
+
     # Fingerbank API key for passive DHCP device fingerprinting (Phase 2 of
     # the device profiling feature). Fernet-encrypted at rest; null when the
     # operator hasn't configured a key. When unset, the agent still ships
