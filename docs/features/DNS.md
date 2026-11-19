@@ -3508,3 +3508,25 @@ health-checked DNS round-robin.
   - Manual enable / disable per member, like a load-balancer pool
 - **Driver-agnostic** — members render as regular A/AAAA records via the normal record pipeline, so BIND9 + Windows DNS serve them unchanged
 - **Tradeoff (UI-warned)** — TTL races. DNS is cached client-side; a member dropping out doesn't take effect until TTL expires. This is not a real L4/L7 load balancer. Default TTL is 30 s with an inline pointer to the LB-mapping roadmap item.
+
+## 22. Exporting the query log (issue #4171)
+
+Logs → DNS Queries has **Export CSV** and **Export JSON Lines** buttons that
+download exactly the rows the current filters (server / group, search, qtype,
+client IP, view, rcode, since) select; Logs → DHCP Activity has the same. The
+REST equivalents are `GET /api/v1/logs/dns-queries/export` and
+`GET /api/v1/logs/dhcp-activity/export` with `format=csv|jsonl` and the list
+endpoint's filters as query parameters. The permission and per-server scope
+are those of reading the log.
+
+- Streamed, never built in memory, and capped at 100,000 rows. A capped
+  download says so in the `X-Export-Capped: true` header (and in the UI);
+  narrow the filter to get the rest. `X-Export-Row-Count` reports the rows sent.
+- Columns: `ts` (UTC, ISO 8601), `server`, `client_ip`, `client_port`, `qname`,
+  `qclass`, `qtype`, `flags`, `view`, `rcode`, `answer_count`, `raw`. An empty
+  `rcode` means the outcome was not recorded, not that the query succeeded.
+- CSV cells that begin like a spreadsheet formula (`=`, `+`, `-`, `@`) are
+  prefixed with a single quote.
+- File name: `dns-queries-<server|group-xxxxxxxx|all>-YYYYMMDDTHHMMZ.csv|jsonl`
+  (UTC). Every export writes an `export` audit row with the format, filters,
+  row count and whether it was capped, before the download starts.

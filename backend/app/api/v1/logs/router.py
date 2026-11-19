@@ -26,11 +26,14 @@ from datetime import datetime
 from typing import Any, Literal
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.api.deps import DB, CurrentUser
 from app.api.token_binding import honours_token_binding
+from app.api.v1.ownership._audit import write_audit
+from app.core.content_disposition import content_disposition
 from app.core.permissions import require_permission, require_permission_or_scoped
 from app.drivers.dhcp import AGENTLESS_DRIVERS as DHCP_AGENTLESS
 from app.drivers.dhcp import get_driver as get_dhcp_driver
@@ -43,11 +46,24 @@ from app.services.feature_modules import get_enabled_modules, require_module
 from app.services.logs.agent_logs import (
     InvalidLogFilter,
     LogScopeError,
+    dhcp_activity_stmt,
+    dns_queries_stmt,
     dns_query_analytics,
     resolve_dhcp_log_servers,
     resolve_dns_log_servers,
     search_dhcp_activity,
     search_dns_queries,
+)
+from app.services.logs.export import (
+    DHCP_COLUMNS,
+    DNS_COLUMNS,
+    EXPORT_ROW_CAP,
+    ExportFormat,
+    count_capped,
+    dhcp_record,
+    dns_record,
+    export_filename,
+    stream_export,
 )
 
 logger = structlog.get_logger(__name__)
@@ -826,4 +842,187 @@ async def query_dhcp_activity(
         server_ids=list(names),
         events=events,
         truncated=len(events) >= body.max_events,
+    )
+
+
+# ── Export (#4171) ───────────────────────────────────────────────────────────
+
+_EXPORT_MEDIA = {"csv": "text/csv", "jsonl": "application/x-ndjson"}
+
+
+class _ExportBody(StreamingResponse):
+    """Documents the export routes' wire type; the handler builds the real one."""
+
+    media_type = "text/csv"
+
+
+async def _export_response(
+    db: DB,
+    current_user: CurrentUser,
+    *,
+    kind: Literal["dns", "dhcp"],
+    servers: list[Any],
+    stmt: Any,
+    fmt: ExportFormat,
+    columns: tuple[str, ...],
+    to_record: Any,
+    scope: dict[str, Any],
+    filters: dict[str, Any],
+) -> StreamingResponse:
+    """Audit the export, then stream it. The audit row commits before the
+    first byte, so an export that dies midway is still on record."""
+    count = await count_capped(db, stmt)
+    capped = count > EXPORT_ROW_CAP
+    rows = min(count, EXPORT_ROW_CAP)
+    if len(servers) == 1 and scope.get("server_id"):
+        label = servers[0].name
+    elif scope.get("group_id"):
+        label = f"group-{str(scope['group_id'])[:8]}"
+    else:
+        label = "all"
+    filename = export_filename(f"{kind}-{'queries' if kind == 'dns' else 'activity'}-{label}", fmt)
+    write_audit(
+        db,
+        user=current_user,
+        action="export",
+        resource_type=f"{kind}_query_log" if kind == "dns" else "dhcp_activity_log",
+        resource_id=filename,
+        resource_display=f"{rows} row(s){' (capped)' if capped else ''}",
+        new_value={
+            "format": fmt,
+            "rows": rows,
+            "capped": capped,
+            "row_cap": EXPORT_ROW_CAP,
+            "scope": {k: str(v) for k, v in scope.items() if v is not None},
+            "server_count": len(servers),
+            "filters": {k: str(v) for k, v in filters.items() if v is not None},
+        },
+    )
+    await db.commit()
+    names = {s.id: s.name for s in servers}
+    body = stream_export(
+        db, stmt, fmt=fmt, columns=columns, to_record=lambda r: to_record(r, names)
+    )
+    return StreamingResponse(
+        body,
+        media_type=_EXPORT_MEDIA[fmt],
+        headers={
+            "Content-Disposition": content_disposition(filename),
+            "X-Export-Row-Count": str(rows),
+            "X-Export-Capped": "true" if capped else "false",
+            "X-Export-Row-Cap": str(EXPORT_ROW_CAP),
+            "Access-Control-Expose-Headers": "X-Export-Row-Count, X-Export-Capped, X-Export-Row-Cap, Content-Disposition",
+        },
+    )
+
+
+@router.get(
+    "/dns-queries/export",
+    response_class=_ExportBody,
+    dependencies=[_AGENT_READ, Depends(require_module("core.dns"))],
+)
+@honours_token_binding
+async def export_dns_queries(
+    db: DB,
+    current_user: CurrentUser,
+    format: ExportFormat = Query(default="csv"),
+    server_id: uuid.UUID | None = None,
+    group_id: uuid.UUID | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    q: str | None = None,
+    qtype: str | None = None,
+    client_ip: str | None = None,
+    view: str | None = None,
+    rcode: str | None = None,
+) -> StreamingResponse:
+    """Download the DNS query log the given filters select, as CSV or JSON
+    Lines. Same filters, scope rules and permission as ``POST
+    /logs/dns-queries``; streamed, at most ``EXPORT_ROW_CAP`` rows (see the
+    ``X-Export-Capped`` response header)."""
+    try:
+        servers = await resolve_dns_log_servers(
+            db, current_user, server_id=server_id, group_id=group_id
+        )
+    except LogScopeError as exc:
+        raise _scope_http_error(exc) from exc
+    filters: dict[str, Any] = {
+        "since": since,
+        "until": until,
+        "q": q,
+        "qtype": qtype,
+        "client_ip": client_ip,
+        "view": view,
+        "rcode": rcode,
+    }
+    try:
+        stmt = dns_queries_stmt([s.id for s in servers], **filters)
+    except InvalidLogFilter as exc:
+        raise HTTPException(status_code=422, detail=exc.detail) from exc
+    return await _export_response(
+        db,
+        current_user,
+        kind="dns",
+        servers=servers,
+        stmt=stmt,
+        fmt=format,
+        columns=DNS_COLUMNS,
+        to_record=dns_record,
+        scope={"server_id": server_id, "group_id": group_id},
+        filters=filters,
+    )
+
+
+@router.get(
+    "/dhcp-activity/export",
+    response_class=_ExportBody,
+    dependencies=[_AGENT_READ, Depends(require_module("core.dhcp"))],
+)
+@honours_token_binding
+async def export_dhcp_activity(
+    db: DB,
+    current_user: CurrentUser,
+    format: ExportFormat = Query(default="csv"),
+    server_id: uuid.UUID | None = None,
+    group_id: uuid.UUID | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    q: str | None = None,
+    severity: str | None = None,
+    code: str | None = None,
+    mac_address: str | None = None,
+    ip_address: str | None = None,
+) -> StreamingResponse:
+    """Download the DHCP activity log the given filters select (see
+    ``export_dns_queries``)."""
+    try:
+        servers = await resolve_dhcp_log_servers(
+            db, current_user, server_id=server_id, group_id=group_id
+        )
+    except LogScopeError as exc:
+        raise _scope_http_error(exc) from exc
+    filters: dict[str, Any] = {
+        "since": since,
+        "until": until,
+        "q": q,
+        "severity": severity,
+        "code": code,
+        "mac_address": mac_address,
+        "ip_address": ip_address,
+    }
+    try:
+        stmt = dhcp_activity_stmt([s.id for s in servers], **filters)
+    except InvalidLogFilter as exc:
+        raise HTTPException(status_code=422, detail=exc.detail) from exc
+    return await _export_response(
+        db,
+        current_user,
+        kind="dhcp",
+        servers=servers,
+        stmt=stmt,
+        fmt=format,
+        columns=DHCP_COLUMNS,
+        to_record=dhcp_record,
+        scope={"server_id": server_id, "group_id": group_id},
+        filters=filters,
     )

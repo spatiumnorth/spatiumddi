@@ -124,6 +124,10 @@ def _csv_safe(value: object) -> str:
     return text
 
 
+#: Public name for the other CSV exports (#4171 reuses it for the query log).
+csv_safe = _csv_safe
+
+
 def _ios_safe(value: object) -> str | None:
     """An IOS command argument, or None when the value cannot be made safe.
 

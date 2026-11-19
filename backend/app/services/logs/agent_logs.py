@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.auth import User
@@ -202,8 +202,7 @@ def _rcode_clause(rcode: str) -> Any:
     return DNSQueryLogEntry.rcode == wanted
 
 
-async def search_dns_queries(
-    db: AsyncSession,
+def dns_queries_stmt(
     server_ids: Sequence[uuid.UUID],
     *,
     since: datetime | None = None,
@@ -214,16 +213,18 @@ async def search_dns_queries(
     client_ip: str | None = None,
     view: str | None = None,
     rcode: str | None = None,
-    limit: int = 200,
-) -> list[DNSQueryLogEntry]:
-    """Query-log rows for ``server_ids``, newest first, at most ``limit``.
+) -> Select[tuple[DNSQueryLogEntry]]:
+    """The filtered, newest-first query-log SELECT for ``server_ids``.
+
+    The one place the filters are built: the list endpoint
+    (:func:`search_dns_queries`) and the CSV / JSON export (#4171) both run
+    it, so an export is exactly what the page shows. ``server_ids`` empty
+    yields a statement that matches nothing.
 
     ``q`` matches the qname or the raw line (the UI search box);
     ``qname_contains`` matches the qname only (the copilot's argument).
     Both are substring matches with LIKE metacharacters neutralised.
     """
-    if not server_ids:
-        return []
     stmt = select(DNSQueryLogEntry).where(DNSQueryLogEntry.server_id.in_(list(server_ids)))
     if since is not None:
         stmt = stmt.where(DNSQueryLogEntry.ts >= since)
@@ -251,7 +252,23 @@ async def search_dns_queries(
             DNSQueryLogEntry.qname.ilike(like, escape="\\")
             | DNSQueryLogEntry.raw.ilike(like, escape="\\")
         )
-    stmt = stmt.order_by(DNSQueryLogEntry.ts.desc(), DNSQueryLogEntry.id.desc()).limit(limit)
+    return stmt.order_by(DNSQueryLogEntry.ts.desc(), DNSQueryLogEntry.id.desc())
+
+
+async def search_dns_queries(
+    db: AsyncSession,
+    server_ids: Sequence[uuid.UUID],
+    *,
+    limit: int = 200,
+    **filters: Any,
+) -> list[DNSQueryLogEntry]:
+    """Query-log rows for ``server_ids``, newest first, at most ``limit``.
+
+    ``filters`` are those of :func:`dns_queries_stmt`.
+    """
+    if not server_ids:
+        return []
+    stmt = dns_queries_stmt(server_ids, **filters).limit(limit)
     return list((await db.execute(stmt)).scalars().all())
 
 
@@ -323,8 +340,7 @@ async def dns_query_analytics(
     )
 
 
-async def search_dhcp_activity(
-    db: AsyncSession,
+def dhcp_activity_stmt(
     server_ids: Sequence[uuid.UUID],
     *,
     since: datetime | None = None,
@@ -334,11 +350,11 @@ async def search_dhcp_activity(
     code: str | None = None,
     mac_address: str | None = None,
     ip_address: str | None = None,
-    limit: int = 200,
-) -> list[DHCPLogEntry]:
-    """Kea activity rows for ``server_ids``, newest first, at most ``limit``."""
-    if not server_ids:
-        return []
+) -> Select[tuple[DHCPLogEntry]]:
+    """The filtered, newest-first Kea activity SELECT for ``server_ids``.
+
+    Shared by the list endpoint and the export (#4171).
+    """
     stmt = select(DHCPLogEntry).where(DHCPLogEntry.server_id.in_(list(server_ids)))
     if since is not None:
         stmt = stmt.where(DHCPLogEntry.ts >= since)
@@ -354,7 +370,20 @@ async def search_dhcp_activity(
         stmt = stmt.where(ip_filter_clause(DHCPLogEntry.ip_address, ip_address, field="ip_address"))
     if q:
         stmt = stmt.where(DHCPLogEntry.raw.ilike(like_pattern(q.strip()), escape="\\"))
-    stmt = stmt.order_by(DHCPLogEntry.ts.desc(), DHCPLogEntry.id.desc()).limit(limit)
+    return stmt.order_by(DHCPLogEntry.ts.desc(), DHCPLogEntry.id.desc())
+
+
+async def search_dhcp_activity(
+    db: AsyncSession,
+    server_ids: Sequence[uuid.UUID],
+    *,
+    limit: int = 200,
+    **filters: Any,
+) -> list[DHCPLogEntry]:
+    """Kea activity rows for ``server_ids``, newest first, at most ``limit``."""
+    if not server_ids:
+        return []
+    stmt = dhcp_activity_stmt(server_ids, **filters).limit(limit)
     return list((await db.execute(stmt)).scalars().all())
 
 
@@ -367,6 +396,8 @@ __all__ = [
     "LogScopeError",
     "LogServer",
     "can_read_log_server",
+    "dhcp_activity_stmt",
+    "dns_queries_stmt",
     "dns_query_analytics",
     "resolve_dhcp_log_servers",
     "resolve_dns_log_servers",

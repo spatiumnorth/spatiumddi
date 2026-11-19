@@ -10973,7 +10973,71 @@ export const dnsThreatApi = {
       .then((r) => r.data),
 };
 
+export type LogExportFormat = "csv" | "jsonl";
+
+/** What a finished export download says about itself (#4171). */
+export interface LogExportResult {
+  filename: string;
+  rows: number;
+  /** True when the server stopped at its row cap — narrow the filter. */
+  capped: boolean;
+  rowCap: number;
+}
+
+/** GET a log export as a blob, save it, and report the cap headers. */
+async function downloadLogExport(
+  path: string,
+  params: Record<string, string | null | undefined>,
+  format: LogExportFormat,
+): Promise<LogExportResult> {
+  const clean: Record<string, string> = { format };
+  for (const [k, v] of Object.entries(params)) if (v) clean[k] = v;
+  const res = await api
+    .get(path, { params: clean, responseType: "blob" })
+    .catch(rethrowBlobError);
+  const disp = (res.headers["content-disposition"] as string) || "";
+  const match = disp.match(/filename="?([^";]+)"?/i);
+  const stamp = new Date()
+    .toISOString()
+    .slice(0, 16)
+    .replace(/[-:]/g, "")
+    .concat("Z");
+  const filename = match ? match[1] : `log-export-${stamp}.${format}`;
+  const blob = new Blob([res.data as BlobPart]);
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  return {
+    filename,
+    rows: Number(res.headers["x-export-row-count"] ?? 0),
+    capped: res.headers["x-export-capped"] === "true",
+    rowCap: Number(res.headers["x-export-row-cap"] ?? 0),
+  };
+}
+
+const exportFilters = (
+  b: DNSQueryLogRequest | DHCPActivityLogRequest,
+): Record<string, string | null | undefined> => {
+  // max_events is the on-screen page size; an export takes every match.
+  const { max_events: _max, ...rest } = b as Record<string, unknown>;
+  return rest as Record<string, string | null | undefined>;
+};
+
 export const logsApi = {
+  /** Export the DNS query log the same filters select (#4171). */
+  exportDnsQueries: (body: DNSQueryLogRequest, format: LogExportFormat) =>
+    downloadLogExport("/logs/dns-queries/export", exportFilters(body), format),
+  exportDhcpActivity: (body: DHCPActivityLogRequest, format: LogExportFormat) =>
+    downloadLogExport(
+      "/logs/dhcp-activity/export",
+      exportFilters(body),
+      format,
+    ),
   listSources: () => api.get<LogSource[]>("/logs/sources").then((r) => r.data),
   listAgentSources: () =>
     api.get<AgentLogSource[]>("/logs/agent-sources").then((r) => r.data),
