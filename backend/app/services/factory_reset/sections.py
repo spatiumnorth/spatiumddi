@@ -85,6 +85,7 @@ AUTH_RBAC_CASCADE_DEPENDENTS: tuple[str, ...] = (
     "ai_chat_message",
     "ai_chat_session",
     "ai_operation_proposal",
+    "api_token_usage_daily",
     "saved_view",
     "time_bound_grant",
 )
