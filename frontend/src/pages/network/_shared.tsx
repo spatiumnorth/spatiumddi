@@ -1,4 +1,4 @@
-import { type ReactNode } from "react";
+import { Field } from "@/components/ui/field";
 import { cn } from "@/lib/utils";
 import type {
   NetworkArpEntryRead,
@@ -14,29 +14,9 @@ import type {
 export const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
 
-// Standard form-field wrapper. Mirrors the same helper in
-// ProxmoxPage.tsx — a tiny shared component to keep the modal markup
-// readable.
+// Standard form-field wrapper: the shared labelled Field (#4371).
 // eslint-disable-next-line react-refresh/only-export-components
-export function Field({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  children: ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="block text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-      {hint && <p className="text-[11px] text-muted-foreground/70">{hint}</p>}
-    </div>
-  );
-}
+export { Field };
 
 // Lift detail off the FastAPI 422 envelope so users don't see the raw
 // pydantic error array.

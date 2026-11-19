@@ -1,4 +1,7 @@
 import { useModuleOn } from "@/hooks/useModuleOn";
+import { Field } from "@/components/ui/field";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -367,7 +370,18 @@ export function OpnsensePage() {
       </div>
 
       {showCreate && <RouterModal onClose={() => setShowCreate(false)} />}
-      {edit && <RouterModal router={edit} onClose={() => setEdit(null)} />}
+      {edit && (
+        <FreshEdit
+          row={edit}
+          queryKeys={[["opnsense-routers"]]}
+          title="Edit OPNsense Firewall"
+          onClose={() => setEdit(null)}
+        >
+          {(fresh) => (
+            <RouterModal router={fresh} onClose={() => setEdit(null)} />
+          )}
+        </FreshEdit>
+      )}
       {del && (
         <DeleteRouterModal
           router={del}
@@ -486,7 +500,12 @@ function RouterModal({
         };
         if (caBundlePem) update.ca_bundle_pem = caBundlePem;
         if (apiSecret) update.api_secret = apiSecret;
-        return opnsenseApi.updateRouter(router!.id, update);
+        // Send only what the operator changed against the row read when the
+        // dialog opened (#4370), so a field another client set since is not
+        // put back. A secret left blank is never in `update`, so it is kept.
+        const body = changedFields(router!, update);
+        if (Object.keys(body).length === 0) return Promise.resolve(router!);
+        return opnsenseApi.updateRouter(router!.id, body);
       }
       const create: OPNsenseRouterCreate = {
         name,
@@ -910,26 +929,6 @@ function CopyablePre({ text, label }: { text: string; label: string }) {
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
-
-function Field({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="block text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-      {hint && <p className="text-[11px] text-muted-foreground/70">{hint}</p>}
-    </div>
-  );
-}
 
 function errMsg(e: unknown, fallback: string): string {
   const ae = e as {
