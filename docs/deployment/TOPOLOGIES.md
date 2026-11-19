@@ -222,7 +222,7 @@ Control plane runs in your cloud account (AWS / Azure / GCP / Hetzner /
 DigitalOcean / Vultr — any provider). DNS and DHCP agents stay
 on-prem because they're network-path dependencies — DNS recursion has
 to terminate close to the queriers, DHCP has to be on the same broadcast
-domain as its clients.
+domain as its clients or one relay hop from them.
 
 <p align="center">
   <img src="../assets/topologies/topology-5-hybrid-cloud.svg" alt="Topology 5 — Hybrid cloud control plane + on-prem agents" width="900"/>
