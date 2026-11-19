@@ -4026,6 +4026,118 @@ _assert_safe_wipe_target() {
     on_cancel "pre-wipe safety check ($disk)"
 }
 
+# #4547 — SpatiumDDI filesystem labels on a disk the installer is NOT
+# about to wipe.
+#
+# The installed system mounts /var, STATE and the ESP by filesystem LABEL
+# (the image-baseline fstab), and ``spatium-etc-render`` / the ESP sync
+# resolve ``state`` / ``ESP2`` with ``blkid -L``. A second attached disk
+# carrying the same labels — an old system disk left in place, a former
+# mirror member, another test install — makes two filesystems answer to
+# one label, and the installed system can mount the OTHER disk's /var.
+# This lists such partitions; ``_assert_no_foreign_labels`` decides what
+# to do about them.
+#
+# Prints one ``<partition> <label> <disk>`` line per hit. Every disk in
+# the arguments is excluded (target, and the mirror member when there is
+# one). Labels are the filesystem ones, which is what fstab matches; the
+# set is the one ``_md_array_is_ours`` already treats as ours, plus the
+# two ESP spellings.
+_foreign_labelled_partitions() {
+    local skip=" " d real node label
+    for d in "$@"; do
+        [ -n "$d" ] || continue
+        skip+="$(readlink -f "$d" 2>/dev/null || echo "$d") "
+    done
+    while read -r d _; do
+        [ -n "$d" ] || continue
+        real=$(readlink -f "$d" 2>/dev/null || echo "$d")
+        case "$skip" in *" $real "*) continue ;; esac
+        while read -r node label; do
+            case "$label" in
+                var|state|ESP|ESP2|root_a|root_b)
+                    printf '%s %s %s\n' "$node" "$label" "$d" ;;
+            esac
+        done < <(lsblk -nrpo NAME,LABEL "$d" 2>/dev/null)
+    done < <(lsblk -dnrpo NAME,TYPE 2>/dev/null | awk '$2 == "disk"')
+}
+
+# Blank the filesystem label of one partition: the signature stays, the
+# name that fstab matches on does not. Returns non-zero for a filesystem
+# type it cannot relabel in place, or when the label is still there after.
+_clear_fs_label() {
+    local node="$1" fstype
+    fstype=$(lsblk -nro FSTYPE "$node" 2>/dev/null | head -1)
+    case "$fstype" in
+        ext2|ext3|ext4) e2label "$node" "" >> "$INSTALL_LOG" 2>&1 || return 1 ;;
+        vfat)           fatlabel "$node" "NOLABEL" >> "$INSTALL_LOG" 2>&1 || return 1 ;;
+        *)              return 1 ;;
+    esac
+    udevadm settle >> "$INSTALL_LOG" 2>&1 || true
+    case "$(lsblk -nro LABEL "$node" 2>/dev/null | head -1)" in
+        var|state|ESP|ESP2|root_a|root_b) return 1 ;;
+    esac
+    return 0
+}
+
+# Pre-wipe guard for the above (#4547). Refuses by default; the operator
+# can clear the labels on the OTHER disk(s) after typing CLEAR, and a
+# headless run needs ``clear_foreign_labels: true`` in the preseed.
+# Only the labels change — nothing else on the other disk is touched.
+_assert_no_foreign_labels() {
+    local hits disks listing node label disk
+    hits=$(_foreign_labelled_partitions "$@")
+    [ -z "$hits" ] && return 0
+    disks=$(printf '%s\n' "$hits" | awk '{print $3}' | sort -u | tr '\n' ' ')
+    listing=$(printf '%s\n' "$hits" | awk '{printf "  %s  (label %s, on %s)\n", $1, $2, $3}')
+    log "Pre-wipe guard: other disk(s) carry SpatiumDDI labels: $disks"
+
+    if [ "$FULLY_UNATTENDED" = "1" ]; then
+        if [ "${PRESEED_CLEAR_FOREIGN_LABELS:-}" != "1" ]; then
+            preseed_halt "Another attached disk carries SpatiumDDI filesystem labels (var / state / ESP / root_a / root_b):"$'\n\n'"$listing"$'\n\n'"The installed system mounts by label and could mount that disk's /var instead. Detach it, or set clear_foreign_labels: true in the preseed to blank those labels."
+        fi
+    else
+        set +x
+        whiptail --backtitle "$BACKTITLE" --title "Another disk has SpatiumDDI labels" \
+            --msgbox "Besides the install target, these partitions carry the same filesystem labels the installed system mounts by:"$'\n\n'"$listing"$'\n\n'"The installed system could mount that disk's /var, STATE or ESP instead of its own. Detach the disk (recommended), or clear its labels on the next screen." 20 76 || true
+        local pick
+        pick=$(whiptail --backtitle "$BACKTITLE" --title "Other disk labels" \
+            --cancel-button "Cancel" \
+            --menu "What now?" 12 76 2 \
+            "stop"  "Cancel the install (nothing has been written)" \
+            "clear" "Clear the labels on the other disk(s)" \
+            3>&1 1>&2 2>&3) || pick="stop"
+        if [ "$pick" != "clear" ]; then
+            on_cancel "other disk carries SpatiumDDI labels ($disks)"
+        fi
+        local typed
+        typed=$(whiptail --backtitle "$BACKTITLE" --title "Confirm" \
+            --inputbox "Only the filesystem labels are blanked on: $disks"$'\n\n'"Type CLEAR to continue." 12 76 "" \
+            3>&1 1>&2 2>&3) || typed=""
+        if [ "$typed" != "CLEAR" ]; then
+            on_cancel "other disk labels not cleared ($disks)"
+        fi
+    fi
+
+    local failed=""
+    while read -r node label disk; do
+        if _clear_fs_label "$node"; then
+            log "Cleared filesystem label '$label' on $node ($disk)"
+        else
+            log "Could not clear filesystem label '$label' on $node"
+            failed+=" $node"
+        fi
+    done <<<"$hits"
+    if [ -n "$failed" ]; then
+        if [ "$FULLY_UNATTENDED" = "1" ]; then
+            preseed_halt "Could not clear the SpatiumDDI labels on:$failed"
+        fi
+        whiptail --backtitle "$BACKTITLE" --title "Could not clear labels" \
+            --msgbox "Could not clear the labels on:$failed"$'\n\n'"Detach that disk and run the installer again. Nothing has been written to the target." 12 72 || true
+        on_cancel "could not clear other disk labels"
+    fi
+}
+
 # #995 item 1 — carry the installer's own logs onto the installed
 # system, immediately before the unmount block.
 #
@@ -4259,6 +4371,9 @@ do_install() {
             on_cancel "pre-wipe safety check (mirror too small)"
         fi
     fi
+    # #4547 — no OTHER disk may answer to the labels the installed system
+    # mounts by.
+    _assert_no_foreign_labels "$TARGET_DISK" "${TARGET_DISK2:-}"
     # ...and the account that will be the only way into the installed
     # system, for the same reason and in the same place (#995 item 4).
     _assert_admin_user_available
