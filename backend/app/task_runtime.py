@@ -39,11 +39,19 @@ from app.config import settings
 
 logger = structlog.get_logger(__name__)
 
-# Pool sizing for the shared engine. A task is one coroutine on one loop, so a
-# couple of connections cover the sessions it holds at once (a poll loop opens
-# its sessions in turn); the overflow absorbs ``gather`` fan-out.
-_POOL_SIZE = 2
-_MAX_OVERFLOW = 8
+# Pool sizing for the shared engine. A task is one coroutine on one loop and
+# opens its sessions in turn, so ONE connection stays pooled (idle between
+# tasks); the overflow, closed again at check-in, absorbs a task that holds a
+# couple of sessions at once. The deployment's ``max_connections`` budget
+# (chart helper ``postgresMaxConnections``, appliance
+# ``postgres_connection_budget``) allows 3 per prefork child, and a child holds
+# at most one engine per command-timeout bound, but a task uses one at a time:
+# 1 idle per engine, 3 live at most while a task runs.
+_POOL_SIZE = 1
+_MAX_OVERFLOW = 2
+# Recycle so a connection never lives across a long idle stretch (a NAT or
+# load balancer dropping it); pre-ping covers the rest.
+_POOL_RECYCLE_S = 1800
 
 
 class _ChildState:
@@ -145,6 +153,7 @@ def _make_engine(command_timeout: float | None) -> AsyncEngine:
         # A connection outlives a failover or a database restart between tasks
         # now; replace a dead one at checkout (#1445).
         pool_pre_ping=True,
+        pool_recycle=_POOL_RECYCLE_S,
         connect_args=task_connect_args(command_timeout),
     )
 

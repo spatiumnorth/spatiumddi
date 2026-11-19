@@ -158,3 +158,17 @@ def test_task_session_frees_session_advisory_locks(child):
 
     task_runtime.run_task(take())
     assert task_runtime.run_task(probe()) is True
+
+
+def test_shared_engine_pool_fits_the_per_child_connection_budget(child):
+    """The chart and appliance budget 3 Postgres connections per prefork child;
+    the shared engine keeps one pooled and may overflow by two, and recycles."""
+
+    async def body():
+        return task_runtime.task_engine().sync_engine.pool
+
+    pool = task_runtime.run_task(body())
+    assert pool.size() == 1
+    assert pool._max_overflow == 2
+    assert pool._recycle == 1800
+    assert pool._pre_ping is True
