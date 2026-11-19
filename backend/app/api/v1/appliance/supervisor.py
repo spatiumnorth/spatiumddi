@@ -2146,6 +2146,11 @@ class SupervisorHeartbeatResponse(BaseModel):
     desired_metallb_bgp_enabled: bool = False
     desired_metallb_bgp_peers: list[dict] = Field(default_factory=list)
     desired_metallb_bgp_advertisements: list[dict] = Field(default_factory=list)
+    # #1261 — opt-in synchronous Postgres replication. Acted on only by the
+    # seed: it renders ``postgresql.cnpg.synchronous`` on the spatium-control
+    # HelmChartConfig. ``{}`` / ``enabled: false`` = asynchronous. A
+    # supervisor that predates the field ignores it (the key is just unread).
+    desired_postgres_synchronous: dict[str, Any] = Field(default_factory=dict)
     # #272 Phase 9 — dead-node replacement. Hostnames of k8s Nodes the
     # SEED should evict (delete the Node → k3s removes the etcd member).
     # Populated from rows flagged ``evict_requested``; only the
@@ -3724,6 +3729,7 @@ async def _supervisor_heartbeat(
         desired_metallb_bgp_enabled=metallb_bgp_enabled,
         desired_metallb_bgp_peers=metallb_bgp_peers,
         desired_metallb_bgp_advertisements=metallb_bgp_advertisements,
+        desired_postgres_synchronous=(dict(cfg_row.postgres_synchronous or {}) if cfg_row else {}),
         evict_node_names=evict_names,
         replace_node_names=replace_names,
         demote_evict_node_names=demote_names,
@@ -7179,6 +7185,130 @@ async def put_metallb_config(
         user=current_user.username,
     )
     return await _metallb_response(db, row)
+
+
+# ── Postgres synchronous replication (#1261) ─────────────────────
+
+
+class PostgresSynchronousConfig(BaseModel):
+    """Opt-in synchronous replication for the appliance's CloudNativePG
+    cluster. ``required`` blocks writes while fewer than ``number`` sync
+    replicas are available (no data loss, less availability); ``preferred``
+    degrades to asynchronous instead (availability over durability)."""
+
+    enabled: bool = False
+    method: Literal["any", "first"] = "any"
+    number: int = Field(default=1, ge=1, le=6)
+    data_durability: Literal["required", "preferred"] = "required"
+
+
+class PostgresSynchronousResponse(PostgresSynchronousConfig):
+    # Settled control-plane members = CNPG instances; read-only context for
+    # the form (``number`` must stay between 1 and instances - 1).
+    instances: int = 1
+
+
+def _postgres_sync_of(row: PlatformSettings | None) -> PostgresSynchronousConfig:
+    raw = dict(row.postgres_synchronous or {}) if row else {}
+    try:
+        return PostgresSynchronousConfig(**raw)
+    except ValueError:
+        return PostgresSynchronousConfig()
+
+
+@router.get(
+    "/fleet/control-plane/postgres-synchronous",
+    response_model=PostgresSynchronousResponse,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Read the cluster synchronous-replication setting (superadmin)",
+)
+async def get_postgres_synchronous(
+    current_user: SuperAdmin,
+    db: DB,
+) -> PostgresSynchronousResponse:
+    row = await _get_or_create_settings(db)
+    cfg = _postgres_sync_of(row)
+    return PostgresSynchronousResponse(**cfg.model_dump(), instances=await _committed_cp_count(db))
+
+
+@router.put(
+    "/fleet/control-plane/postgres-synchronous",
+    response_model=PostgresSynchronousResponse,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Set the cluster synchronous-replication setting (superadmin)",
+)
+async def put_postgres_synchronous(
+    body: PostgresSynchronousConfig,
+    current_user: SuperAdmin,
+    db: DB,
+) -> PostgresSynchronousResponse:
+    """Persist the opt-in synchronous replication setting (#1261).
+
+    Enabling needs at least two control-plane members (a single instance has
+    no replica to confirm a commit) and ``number`` between 1 and instances-1.
+    The seed supervisor picks it up on its next heartbeat and renders
+    ``postgresql.cnpg.synchronous``; CloudNativePG applies it without a
+    restart. If the cluster later shrinks below ``number + 1`` the supervisor
+    clamps ``number`` (and renders nothing under two instances) rather than
+    let the chart refuse to render. Idempotent.
+    """
+    instances = await _committed_cp_count(db)
+    if body.enabled:
+        if instances < 2:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "Synchronous replication needs at least 2 control-plane members: "
+                f"this cluster has {instances}, so there is no replica to confirm a commit.",
+            )
+        if body.number >= instances:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"Synchronous replicas must be between 1 and {instances - 1} "
+                f"(the cluster has {instances} members), got {body.number}.",
+            )
+    row = await _get_or_create_settings(db)
+    old = _postgres_sync_of(row).model_dump()
+    new = body.model_dump()
+    row.postgres_synchronous = new
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="appliance.postgres_synchronous_updated",
+            resource_type="platform_settings",
+            resource_id="1",
+            resource_display="Postgres synchronous replication",
+            result="success",
+            old_value=old,
+            new_value=new,
+        )
+    )
+    members = (
+        (
+            await db.execute(
+                select(Appliance.id).where(
+                    Appliance.state == APPLIANCE_STATE_APPROVED,
+                    Appliance.cluster_role.in_((CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    await db.commit()
+    logger.info(
+        "postgres_synchronous_updated",
+        enabled=body.enabled,
+        number=body.number,
+        method=body.method,
+        durability=body.data_durability,
+        user=current_user.username,
+    )
+    # #358 — wake the control-plane supervisors' heartbeat long-poll so the
+    # new desired state applies now; advisory, the heartbeat tick is the fallback.
+    await publish_wake(*[appliance_channel(m) for m in members])
+    return PostgresSynchronousResponse(**body.model_dump(), instances=instances)
 
 
 # ── Admin: OS upgrade + reboot (#170 Wave D1) ────────────────────

@@ -13022,6 +13022,16 @@ export interface MetalLBBgpAdvertisement {
   aggregation_length?: number | null;
 }
 
+// #1261 — opt-in synchronous Postgres replication. `instances` is the
+// settled control-plane member count (read-only; not sent on PUT).
+export interface PostgresSynchronousConfig {
+  enabled: boolean;
+  method: "any" | "first";
+  number: number;
+  data_durability: "required" | "preferred";
+  instances?: number;
+}
+
 // #272 Phase 7c — cluster-wide MetalLB / control-plane-VIP config.
 export interface MetalLBConfig {
   enabled: boolean;
@@ -13888,6 +13898,19 @@ export const applianceApprovalApi = {
   getMetalLBConfig: () =>
     api
       .get<MetalLBConfig>("/appliance/fleet/control-plane/metallb")
+      .then((r) => r.data),
+  getPostgresSynchronous: () =>
+    api
+      .get<PostgresSynchronousConfig>(
+        "/appliance/fleet/control-plane/postgres-synchronous",
+      )
+      .then((r) => r.data),
+  setPostgresSynchronous: (body: PostgresSynchronousConfig) =>
+    api
+      .put<PostgresSynchronousConfig>(
+        "/appliance/fleet/control-plane/postgres-synchronous",
+        body,
+      )
       .then((r) => r.data),
   setMetalLBConfig: (body: MetalLBConfig) =>
     api

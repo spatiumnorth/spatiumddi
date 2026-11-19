@@ -357,8 +357,8 @@ node, the UI stays up on the same address. CNPG replicates
 asynchronously by default, so a failover can lose the last few commits (RPO > 0). On a
 Kubernetes install of the umbrella chart, `postgresql.cnpg.synchronous` opts in to synchronous
 replication (RPO 0; with `dataDurability: required` writes block while no sync replica is
-available, see [Kubernetes](KUBERNETES.md#postgresql--cloudnativepg)); the appliance has no
-setting for it yet. Bring the node back, or
+available, see [Kubernetes](KUBERNETES.md#postgresql--cloudnativepg)); on the appliance it is
+**Appliance → Cluster → Database**, with the same trade-off. Bring the node back, or
 replace it — operator-driven dead-node replacement is the Phase 9
 follow-up tracked on [#272](https://github.com/spatiumnorth/spatiumddi/issues/272).
 

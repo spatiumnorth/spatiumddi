@@ -1072,6 +1072,16 @@ class PlatformSettings(Base):
         String(64), nullable=False, default="", server_default=sa_text("''")
     )
 
+    # ── Postgres synchronous replication (issue #1261) ──────────────
+    # Opt-in, cluster-wide. ``{}`` = unset = asynchronous replication (RPO > 0,
+    # the shipped behaviour). Otherwise ``{"enabled": bool, "method": "any" |
+    # "first", "number": int, "data_durability": "required" | "preferred"}``;
+    # the seed supervisor renders it into ``postgresql.cnpg.synchronous`` on
+    # the spatium-control HelmChartConfig, clamped to the live instance count.
+    postgres_synchronous: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=sa_text("'{}'::jsonb")
+    )
+
     # ── Data-plane resolver VIPs (issue #272 Phase 10) ──────────────
     # Same cluster-wide singleton + same MetalLB pool as the control-
     # plane VIP. Both default empty = the single-node hostNetwork data
