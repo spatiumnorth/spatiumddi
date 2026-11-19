@@ -990,7 +990,7 @@ function TargetFormModal({
         } as BackupTargetCreate;
         return backupTargetsApi.create(body);
       }
-      // The eight top-level fields go only when changed against what the
+      // The nine top-level fields go only when changed against what the
       // dialog read (#4236), so one another client set since is not put back.
       const { config: _cfg, ...topLevel } = sharedFields;
       void _cfg;
@@ -1004,6 +1004,7 @@ function TargetFormModal({
           retention_keep_last_n: existing!.retention_keep_last_n,
           retention_keep_days: existing!.retention_keep_days,
           write_only: existing!.write_only,
+          encrypt_archive: existing!.encrypt_archive ?? false,
         },
         topLevel,
       );
