@@ -319,7 +319,15 @@ export function PairingTab() {
         confirmLabel="Revoke"
         tone="destructive"
         loading={revokeMutation.isPending}
-        onClose={() => setRevokeTarget(null)}
+        error={
+          revokeMutation.error
+            ? formatApiError(revokeMutation.error, "Revoke failed")
+            : null
+        }
+        onClose={() => {
+          setRevokeTarget(null);
+          revokeMutation.reset();
+        }}
         onConfirm={() => revokeTarget && revokeMutation.mutate(revokeTarget.id)}
       />
 

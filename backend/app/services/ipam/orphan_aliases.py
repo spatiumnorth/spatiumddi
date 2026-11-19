@@ -128,3 +128,90 @@ def refusal_reason(address: str) -> str:
         f"it is an alias withdrawn when IP address {address} was marked as orphan. "
         "Restore the address (or delete it permanently) and the alias follows it"
     )
+
+
+async def superseded_record_owners(
+    db: Any,
+    *,
+    record_ids: list[uuid.UUID] | None = None,
+    batch_id: uuid.UUID | None = None,
+) -> dict[uuid.UUID, tuple[str, str, str]]:
+    """``{record id: (fqdn, record type, address)}`` for trashed IPAM host / PTR
+    records whose address has moved on since they were trashed (#4361).
+
+    The record API's delete trashes an IPAM-generated record on its own. While
+    it sits there a rename publishes a fresh record under the new name and
+    never sees the trashed copy (only a retract purges one, #3186), so a
+    restore would bring back a name IPAM gave up, beside the new one. A record
+    is superseded when its address (live, not an orphan; those are
+    :func:`orphan_record_owners`) now holds a record of the same type and none
+    of them is this one, or when the address has no name any more. Aliases are
+    operator-authored and follow no rename; a record riding its zone's own
+    batch is reconciled by the zone's restore (#3924). ``record_ids`` or
+    ``batch_id`` narrows the read.
+    """
+    zone = aliased(DNSZone)
+    stmt: Any = (
+        select(
+            DNSRecord.id,
+            DNSRecord.fqdn,
+            DNSRecord.record_type,
+            DNSRecord.name,
+            DNSRecord.value,
+            DNSRecord.ip_address_id,
+            IPAddress.address,
+            IPAddress.hostname,
+        )
+        .join(IPAddress, IPAddress.id == DNSRecord.ip_address_id)
+        .join(zone, zone.id == DNSRecord.zone_id)
+        .where(
+            DNSRecord.auto_generated.is_(True),
+            DNSRecord.ip_alias.is_(False),
+            DNSRecord.record_type.in_(("A", "AAAA", "PTR")),
+            DNSRecord.deleted_at.is_not(None),
+            IPAddress.status != "orphan",
+            zone.deletion_batch_id.is_distinct_from(DNSRecord.deletion_batch_id),
+        )
+        .execution_options(include_deleted=True)
+    )
+    if record_ids is not None:
+        stmt = stmt.where(DNSRecord.id.in_(record_ids))
+    if batch_id is not None:
+        stmt = stmt.where(DNSRecord.deletion_batch_id == batch_id)
+    candidates = (await db.execute(stmt)).all()
+    if not candidates:
+        return {}
+    # One read of every live record of these addresses, however many there are.
+    # The soft-delete filter hides trashed rows, so these are the live ones.
+    live: dict[tuple[uuid.UUID, str], set[tuple[str, str]]] = {}
+    for ip_id, rtype, name, value in (
+        await db.execute(
+            select(
+                DNSRecord.ip_address_id,
+                DNSRecord.record_type,
+                DNSRecord.name,
+                DNSRecord.value,
+            ).where(
+                DNSRecord.ip_address_id.in_({c[5] for c in candidates}),
+                DNSRecord.auto_generated.is_(True),
+                DNSRecord.ip_alias.is_(False),
+            )
+        )
+    ).all():
+        live.setdefault((ip_id, rtype), set()).add((name.lower(), value.lower()))
+    out: dict[uuid.UUID, tuple[str, str, str]] = {}
+    for rid, fqdn, rtype, name, value, ip_id, address, hostname in candidates:
+        held = live.get((ip_id, rtype), set())
+        if (held and (name.lower(), value.lower()) not in held) or (
+            not held and not (hostname or "").strip()
+        ):
+            out[rid] = (fqdn, rtype, str(address))
+    return out
+
+
+def superseded_record_reason(address: str) -> str:
+    return (
+        f"its IP address {address} no longer holds this name, so it would publish a "
+        "name IPAM gave up. Delete it from the Trash; IPAM publishes the address "
+        "under its current name"
+    )

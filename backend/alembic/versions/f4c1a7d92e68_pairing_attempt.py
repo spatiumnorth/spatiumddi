@@ -7,7 +7,7 @@ superadmin pairing tab. ``pairing_code_id`` is NULL when the submitted code
 matched nothing; it cascades with the code.
 
 Revision ID: f4c1a7d92e68
-Revises: b6d2e9f41a07
+Revises: d8b3f6a1c274
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from sqlalchemy.dialects.postgresql import UUID
 from alembic import op
 
 revision: str = "f4c1a7d92e68"
-down_revision: str | None = "b6d2e9f41a07"
+down_revision: str | None = "d8b3f6a1c274"
 branch_labels: str | None = None
 depends_on: str | None = None
 

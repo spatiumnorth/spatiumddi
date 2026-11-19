@@ -45,7 +45,7 @@ the database. A handful of tables deviate deliberately:
 - `dns_metric_sample` / `dhcp_metric_sample` use a composite PK
   `(server_id, bucket_at)` — they are time-series buckets, not entities.
 - `audit_log` keeps its UUID `id` but also carries a monotonic
-  `BigInteger seq` for chain ordering (see §11).
+  `BigInteger seq` for chain ordering (see §10).
 
 ### Timestamps
 
@@ -115,7 +115,7 @@ Rows that can be created by an importer or a read-only integration
 reconciler carry provenance columns so re-runs are idempotent and
 operators can tell hand-authored rows from mirrored ones. Common shapes:
 `import_source` + `imported_at` (NetBox / DNS / DHCP importers), and the
-integration FKs described in §5. `IPAddress.status` distinguishes
+integration FKs described in §7. `IPAddress.status` distinguishes
 operator-settable lifecycle values
 (`IP_STATUSES_OPERATOR_SETTABLE`) from integration-owned ones
 (`IP_STATUSES_INTEGRATION_OWNED`); an operator override stamps
