@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import socket
 import uuid
 from collections.abc import Iterator, Sequence
@@ -12,19 +11,19 @@ import httpx
 import structlog
 from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from app.celery_app import celery_app
 from app.config import settings
 from app.core.agent_wake import dns_group_channel, publish_wake
 from app.core.safe_fetch import FetchRefusedError, describe_fetch_error, safe_get_text
-from app.db import task_connect_args
 from app.models.dns import DNSBlockList, DNSBlockListEntry, DNSBlockListException, DNSServer
 from app.services.agents.daemon_state import forget_stale_ok
 from app.services.dns_blocklist import looks_like_html, parse_feed_detailed
 from app.services.feature_modules import is_module_enabled
 from app.services.forward_secrets import redact, secret_url_in_flight, url_display
+from app.task_runtime import release_task_engine, run_task, session_locks_released, task_engine
 from app.tasks.module_gate import module_gated
 
 # If an agent hasn't heartbeat'd in this long, the server is unreachable.
@@ -74,8 +73,8 @@ async def _unlock_list(db: AsyncSession, list_id: str) -> None:
         )
         await db.commit()
     except Exception as exc:  # noqa: BLE001
-        # The engine is disposed right after, which closes the connection and
-        # with it the lock; log, never mask the refresh's own outcome.
+        # session_locks_released() frees the lock as the session ends (the engine
+        # is shared now, #4515); log, never mask the refresh's own outcome.
         logger.warning("blocklist_feed_unlock_failed", list_id=list_id, error=str(exc))
 
 
@@ -118,17 +117,13 @@ async def _refuse_feed_refresh(
 
 async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
     """Core async logic for refresh_blocklist_feed, reusable from tests."""
-    engine = create_async_engine(
-        settings.database_url,
-        future=True,
-        # The apply is a handful of set statements over the whole feed, not
-        # row-at-a-time writes (#4062).
-        connect_args=task_connect_args(settings.task_db_long_command_timeout),
-    )
+    # The apply is a handful of set statements over the whole feed, not
+    # row-at-a-time writes (#4062).
+    engine = task_engine(settings.task_db_long_command_timeout)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
     try:
-        async with session_factory() as db:
+        async with session_factory() as db, session_locks_released(db):
             # One refresh per list at a time (#4059): a second one, queued by
             # a subscribe followed by Refresh, would hold a second copy of the
             # feed beside the first and could OOM the worker.
@@ -162,7 +157,7 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
             finally:
                 await _unlock_list(db, list_id)
     finally:
-        await engine.dispose()
+        await release_task_engine(engine)
 
 
 async def _refresh_locked(db: AsyncSession, list_id: str) -> dict[str, int | str]:
@@ -570,7 +565,7 @@ def refresh_blocklist_feed(self: object, list_id: str) -> dict[str, int | str]: 
     parse-shape failures don't get fixed by retrying).
     """
     logger.info("refresh_blocklist_feed_started", list_id=list_id)
-    return asyncio.run(_refresh_blocklist_feed_async(list_id))
+    return run_task(_refresh_blocklist_feed_async(list_id))
 
 
 # ── Agent stale-sweep ──────────────────────────────────────────────────────────
@@ -589,9 +584,7 @@ async def _dns_agent_stale_sweep_async() -> dict[str, int]:
 
     from app.models.dns import DNSServer
 
-    engine = create_async_engine(
-        settings.database_url, future=True, connect_args=task_connect_args()
-    )
+    engine = task_engine()
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
@@ -661,14 +654,14 @@ async def _dns_agent_stale_sweep_async() -> dict[str, int]:
                 logger.info("dns_agent_stale_sweep", marked_unreachable=changed)
             return {"marked_unreachable": changed, "primaries_healed": healed}
     finally:
-        await engine.dispose()
+        await release_task_engine(engine)
 
 
 @celery_app.task(name="app.tasks.dns.agent_stale_sweep")
 @module_gated("core.dns")
 def agent_stale_sweep() -> dict[str, int]:
     """Celery beat task — runs every 60s, flips stale agents to 'unreachable'."""
-    return asyncio.run(_dns_agent_stale_sweep_async())
+    return run_task(_dns_agent_stale_sweep_async())
 
 
 # ── Agentless record-op retry sweep (#1538) ────────────────────────────────
@@ -681,9 +674,7 @@ async def _agentless_op_retry_sweep_async() -> dict[str, int]:
     for them."""
     from app.services.dns.record_ops import apply_pending_agentless_ops
 
-    engine = create_async_engine(
-        settings.database_url, future=True, connect_args=task_connect_args()
-    )
+    engine = task_engine()
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
@@ -693,14 +684,14 @@ async def _agentless_op_retry_sweep_async() -> dict[str, int]:
             await db.commit()
             return counts
     finally:
-        await engine.dispose()
+        await release_task_engine(engine)
 
 
 @celery_app.task(name="app.tasks.dns.agentless_op_retry_sweep")
 @module_gated("core.dns")
 def agentless_op_retry_sweep() -> dict[str, int]:
     """Celery beat task — runs every 60s, replays due agentless record ops."""
-    return asyncio.run(_agentless_op_retry_sweep_async())
+    return run_task(_agentless_op_retry_sweep_async())
 
 
 async def _probe_server_soa(host: str, port: int) -> bool:
@@ -737,9 +728,7 @@ async def _check_health(server_id: uuid.UUID) -> None:
     # loop that touches it, which turns into "Future attached to a different
     # loop" errors when multiple Celery tasks share a worker. See the matching
     # pattern in ``app.tasks.dns_pull`` / ``app.tasks.dhcp_pull_leases``.
-    engine = create_async_engine(
-        settings.database_url, future=True, connect_args=task_connect_args()
-    )
+    engine = task_engine()
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
@@ -836,7 +825,7 @@ async def _check_health(server_id: uuid.UUID) -> None:
                 detail=health_detail,
             )
     finally:
-        await engine.dispose()
+        await release_task_engine(engine)
 
 
 @celery_app.task(
@@ -848,16 +837,14 @@ async def _check_health(server_id: uuid.UUID) -> None:
 def check_dns_server_health(self: object, server_id: str) -> None:  # type: ignore[type-arg]
     """Celery entry point for a single-server health check. Idempotent."""
     try:
-        asyncio.run(_check_health(uuid.UUID(server_id)))
+        run_task(_check_health(uuid.UUID(server_id)))
     except Exception as exc:  # noqa: BLE001
         logger.warning("dns_health_check_error", server_id=server_id, error=str(exc))
         raise self.retry(exc=exc, countdown=30) from exc  # type: ignore[attr-defined]
 
 
 async def _enqueue_all() -> None:
-    engine = create_async_engine(
-        settings.database_url, future=True, connect_args=task_connect_args()
-    )
+    engine = task_engine()
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
@@ -868,7 +855,7 @@ async def _enqueue_all() -> None:
             result = await db.execute(select(DNSServer.id))
             ids = [str(row[0]) for row in result.all()]
     finally:
-        await engine.dispose()
+        await release_task_engine(engine)
     for sid in ids:
         check_dns_server_health.delay(sid)
 
@@ -880,4 +867,4 @@ def check_all_dns_servers_health(self: object) -> None:  # type: ignore[type-arg
 
     Scheduled every 60s by Celery Beat — see ``app.celery_app.beat_schedule``.
     """
-    asyncio.run(_enqueue_all())
+    run_task(_enqueue_all())

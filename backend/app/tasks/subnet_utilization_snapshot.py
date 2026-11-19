@@ -10,7 +10,6 @@ sample); the chart tolerates multiple same-day points.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime, timedelta
 
 import structlog
@@ -19,6 +18,7 @@ from sqlalchemy import delete, select
 from app.celery_app import celery_app
 from app.db import task_session
 from app.models.ipam import Subnet, SubnetUtilizationHistory
+from app.task_runtime import run_task
 
 logger = structlog.get_logger(__name__)
 
@@ -50,6 +50,6 @@ async def _snapshot() -> dict[str, int]:
 
 @celery_app.task(name="app.tasks.subnet_utilization_snapshot.snapshot_subnet_utilization")
 def snapshot_subnet_utilization() -> dict[str, int]:
-    result = asyncio.run(_snapshot())
+    result = run_task(_snapshot())
     logger.info("subnet_utilization_snapshot", **result)
     return result

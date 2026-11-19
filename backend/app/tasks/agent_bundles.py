@@ -81,7 +81,6 @@ belt and braces for a lost broker message.
 
 from __future__ import annotations
 
-import asyncio
 import math
 import threading
 import time
@@ -111,6 +110,7 @@ from app.services.dns.agent_bundle_store import (
     is_current,
     record_failure,
 )
+from app.task_runtime import run_task
 
 logger = structlog.get_logger(__name__)
 
@@ -711,7 +711,7 @@ def render_dns_bundle(  # type: ignore[type-arg]
     — the server's lock still holds it.
     """
     limits = _message_limits(self)
-    result = asyncio.run(
+    result = run_task(
         _run_bounded(
             server_id,
             lock_token,
@@ -795,7 +795,7 @@ def render_missing_sweep() -> dict[str, int]:
     """Every 30 s: enqueue a render for any enabled agent-based server whose
     newest stored bundle is behind its dirty sequence, came from an older
     renderer revision, or is absent."""
-    return asyncio.run(_sweep())
+    return run_task(_sweep())
 
 
 __all__ = [

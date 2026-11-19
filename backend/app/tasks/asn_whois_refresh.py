@@ -31,7 +31,6 @@ Idempotent — re-running before any row is due is a no-op.
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -44,6 +43,7 @@ from app.db import task_session
 from app.models.asn import ASN
 from app.models.audit import AuditLog
 from app.models.settings import PlatformSettings
+from app.task_runtime import run_task
 from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
@@ -257,7 +257,7 @@ def refresh_due_asns(self: object) -> dict[str, Any]:  # type: ignore[type-arg]
     pace; ``PlatformSettings.asn_whois_interval_hours`` controls the
     cadence operator-side without restarting beat."""
     try:
-        return asyncio.run(_run_refresh())
+        return run_task(_run_refresh())
     except Exception as exc:  # noqa: BLE001
         logger.exception("asn_whois_refresh_failed", error=str(exc))
         raise
@@ -355,7 +355,7 @@ def refresh_one_asn_by_id(self: object, asn_id: str) -> dict[str, Any]:  # type:
     after create_asn (#278 follow-up) so a public AS is populated within
     seconds instead of sitting at ``n/a`` until the next beat tick."""
     try:
-        return asyncio.run(_refresh_one_by_id_async(asn_id))
+        return run_task(_refresh_one_by_id_async(asn_id))
     except Exception as exc:  # noqa: BLE001
         logger.exception("asn_whois_refresh_one_failed", asn_id=asn_id, error=str(exc))
         raise

@@ -14,7 +14,6 @@ predictable window without flooding the beat schedule.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime, timedelta
 
 import structlog
@@ -24,6 +23,7 @@ from app.celery_app import celery_app
 from app.db import task_session
 from app.models.appliance import APPLIANCE_STATE_REVOKED, Appliance
 from app.models.settings import PlatformSettings
+from app.task_runtime import run_task
 
 logger = structlog.get_logger(__name__)
 
@@ -54,6 +54,6 @@ async def _sweep() -> dict[str, int]:
 
 @celery_app.task(name="app.tasks.prune_revoked_appliances.prune_revoked_appliances")
 def prune_revoked_appliances() -> dict[str, int]:
-    result = asyncio.run(_sweep())
+    result = run_task(_sweep())
     logger.info("revoked_appliances_pruned", **result)
     return result

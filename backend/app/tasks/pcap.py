@@ -16,7 +16,6 @@ Two tasks:
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -33,6 +32,7 @@ from app.db import task_session
 from app.models.pcap import PacketCapture
 from app.models.settings import PlatformSettings
 from app.services.pcap.runner import HARD_MAX_DURATION_S, run_pcap
+from app.task_runtime import run_task
 
 logger = structlog.get_logger(__name__)
 
@@ -50,7 +50,7 @@ def run_capture_task(self: Any, capture_id_str: str) -> dict[str, str]:  # noqa:
     """Drive one server-vantage packet capture from start to finish."""
     capture_id = uuid.UUID(capture_id_str)
     logger.info("pcap_run_task_started", capture_id=capture_id_str)
-    asyncio.run(run_pcap(capture_id))
+    run_task(run_pcap(capture_id))
     return {"capture_id": capture_id_str}
 
 
@@ -137,6 +137,6 @@ async def _prune() -> dict[str, int]:
     retry_kwargs={"max_retries": 3},
 )
 def prune_captures(self: Any) -> dict[str, int]:  # noqa: ARG001
-    result = asyncio.run(_prune())
+    result = run_task(_prune())
     logger.info("pcap_captures_pruned", **result)
     return result

@@ -21,12 +21,11 @@ appliance host mounts; compose: the shared named volume).
 
 from __future__ import annotations
 
-import asyncio
-
 import structlog
 
 from app.celery_app import celery_app
 from app.db import task_session
+from app.task_runtime import run_task
 
 logger = structlog.get_logger(__name__)
 
@@ -42,7 +41,7 @@ async def _sweep() -> list[str]:
 
 @celery_app.task(name="app.tasks.upgrade_image_reclaim.reclaim_upgrade_images")
 def reclaim_upgrade_images() -> dict[str, int]:
-    reclaimed = asyncio.run(_sweep())
+    reclaimed = run_task(_sweep())
     if reclaimed:
         logger.info("upgrade_images_reclaimed", images=reclaimed)
     return {"reclaimed": len(reclaimed)}

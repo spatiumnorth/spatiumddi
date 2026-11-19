@@ -26,6 +26,7 @@ import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import db as app_db
+from app import task_runtime
 from app.config import settings
 from app.core.redis_client import make_async_redis
 from app.core.task_attempts import DELIVERY_KEY_PREFIX
@@ -332,13 +333,13 @@ async def test_the_render_session_statement_bound_follows_the_soft_limit(
     monkeypatch: pytest.MonkeyPatch, db_session: AsyncSession  # noqa: ARG001
 ) -> None:
     seen: list[float] = []
-    real = app_db.create_async_engine
+    real = task_runtime.create_async_engine
 
     def spy(*a, **kw):  # noqa: ANN002, ANN003
         seen.append(kw["connect_args"]["command_timeout"])
         return real(*a, **kw)
 
-    monkeypatch.setattr(app_db, "create_async_engine", spy)
+    monkeypatch.setattr(task_runtime, "create_async_engine", spy)
     assert (await agent_bundles._render_once(uuid.uuid4()))["status"] == "gone"
     assert (await agent_bundles._render_once(uuid.uuid4(), 3120))["status"] == "gone"
     assert seen == [settings.task_db_long_command_timeout, 3120]

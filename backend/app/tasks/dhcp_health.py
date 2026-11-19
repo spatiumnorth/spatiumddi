@@ -22,21 +22,19 @@ different loop" errors across concurrent Celery tasks.
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
 
 import structlog
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.celery_app import celery_app
-from app.config import settings
-from app.db import task_connect_args
 from app.drivers.dhcp import get_driver, is_agentless
 from app.models.dhcp import DHCPServer
 from app.services.agents.daemon_state import forget_stale_ok
 from app.services.feature_modules import is_module_enabled
+from app.task_runtime import release_task_engine, run_task, task_engine
 from app.tasks.module_gate import module_gated
 
 # If agent hasn't heartbeat'd in this long, mark unreachable.
@@ -46,9 +44,7 @@ logger = structlog.get_logger(__name__)
 
 
 async def _check_health(server_id: uuid.UUID) -> None:
-    engine = create_async_engine(
-        settings.database_url, future=True, connect_args=task_connect_args()
-    )
+    engine = task_engine()
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
@@ -117,7 +113,7 @@ async def _check_health(server_id: uuid.UUID) -> None:
                 host=server.host,
             )
     finally:
-        await engine.dispose()
+        await release_task_engine(engine)
 
 
 @celery_app.task(
@@ -129,16 +125,14 @@ async def _check_health(server_id: uuid.UUID) -> None:
 def check_dhcp_server_health(self: object, server_id: str) -> None:  # type: ignore[type-arg]
     """Idempotent single-server health check."""
     try:
-        asyncio.run(_check_health(uuid.UUID(server_id)))
+        run_task(_check_health(uuid.UUID(server_id)))
     except Exception as exc:  # noqa: BLE001
         logger.warning("dhcp_health_check_error", server_id=server_id, error=str(exc))
         raise self.retry(exc=exc, countdown=30) from exc  # type: ignore[attr-defined]
 
 
 async def _enqueue_all() -> None:
-    engine = create_async_engine(
-        settings.database_url, future=True, connect_args=task_connect_args()
-    )
+    engine = task_engine()
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
@@ -149,7 +143,7 @@ async def _enqueue_all() -> None:
             result = await db.execute(select(DHCPServer.id))
             ids = [str(row[0]) for row in result.all()]
     finally:
-        await engine.dispose()
+        await release_task_engine(engine)
     for sid in ids:
         check_dhcp_server_health.delay(sid)
 
@@ -161,4 +155,4 @@ def check_all_dhcp_servers_health(self: object) -> None:  # type: ignore[type-ar
 
     Scheduled every 60s by Celery beat (see app.celery_app).
     """
-    asyncio.run(_enqueue_all())
+    run_task(_enqueue_all())

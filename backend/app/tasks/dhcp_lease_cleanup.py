@@ -13,7 +13,6 @@ expired and its IPAM row (if auto_from_lease) removed.
 
 from __future__ import annotations
 
-import asyncio
 import ipaddress
 import time
 import uuid
@@ -48,6 +47,7 @@ from app.services.lock_order import (
     lock_mirror_rows,
     lock_zones_for_addresses,
 )
+from app.task_runtime import run_task
 from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
@@ -368,7 +368,7 @@ async def _tear_down_trashed_scopes(
 def tear_down_trashed_scope_leases(scope_id: str | None = None) -> dict[str, int]:
     """The rest of a scope delete's lease teardown, past its request's deadline
     (#3733)."""
-    removed, mirrors, done = asyncio.run(_tear_down_trashed_scopes(scope_id))
+    removed, mirrors, done = run_task(_tear_down_trashed_scopes(scope_id))
     logger.info(
         "dhcp_trashed_scope_lease_teardown",
         scope=scope_id,
@@ -394,7 +394,7 @@ async def _run_both() -> tuple[tuple[int, int], int, int]:
 @celery_app.task(name="app.tasks.dhcp_lease_cleanup.sweep_expired_leases")
 @module_gated("core.dhcp")
 def sweep_expired_leases() -> dict[str, int]:
-    (cleaned, deleted), remirrored, left_behind = asyncio.run(_run_both())
+    (cleaned, deleted), remirrored, left_behind = run_task(_run_both())
     if remirrored:
         # Warning, not info: since the row locks of #2580 only a lease batch
         # the agent dropped should leave an address here, which wants finding.

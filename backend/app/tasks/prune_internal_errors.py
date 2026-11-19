@@ -18,7 +18,6 @@ volume we can add one later.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime, timedelta
 
 import structlog
@@ -28,6 +27,7 @@ from app.celery_app import celery_app
 from app.config import settings
 from app.db import task_session
 from app.models.diagnostics import InternalError
+from app.task_runtime import run_task
 
 logger = structlog.get_logger(__name__)
 
@@ -62,6 +62,6 @@ async def _sweep() -> dict[str, int]:
 
 @celery_app.task(name="app.tasks.prune_internal_errors.prune_internal_errors")
 def prune_internal_errors() -> dict[str, int]:
-    result = asyncio.run(_sweep())
+    result = run_task(_sweep())
     logger.info("internal_errors_pruned", **result)
     return result

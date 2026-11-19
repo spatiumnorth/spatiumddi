@@ -182,17 +182,17 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 # ── Per-task DB session for Celery ────────────────────────────────────────
 #
-# Celery's ``asyncio.run(...)`` pattern spins up a fresh event loop per
-# task invocation. The shared ``engine`` / ``AsyncSessionLocal`` above
-# bind their asyncpg connections to whichever loop first checked them
-# out — re-using them from a later task surfaces as
+# A Celery task runs its coroutine through ``app.task_runtime.run_task``: on
+# the prefork child's one long-lived loop, or on a fresh ``asyncio.run`` loop
+# outside a child. The shared ``engine`` / ``AsyncSessionLocal`` above bind
+# their asyncpg connections to whichever loop first checked them out —
+# re-using them from a task surfaces as
 # ``RuntimeError: Future attached to a different loop``.
 #
-# Tasks should call this helper instead of importing ``AsyncSessionLocal``
-# directly. It builds a throwaway engine + session factory scoped to the
-# current call so the connection lifecycle matches the loop lifecycle.
-# Cost is one extra TCP handshake per task — acceptable for our task
-# cadence (seconds, not milliseconds).
+# Tasks should call these helpers instead of importing ``AsyncSessionLocal``
+# directly. They hand out the child's shared task engine (one per child, bound
+# to its loop, #4515), or a throwaway engine scoped to the call when no child
+# loop is installed.
 
 
 def task_connect_args(command_timeout: float | None = None) -> dict[str, float]:
@@ -216,54 +216,43 @@ async def task_sessionmaker(
 ) -> AsyncGenerator[async_sessionmaker[AsyncSession], None]:
     """Per-Celery-task session factory, for task code that opens several
     sessions in turn (a poll loop) and must not reach for the shared
-    ``AsyncSessionLocal``. One throwaway engine bound to the current loop,
-    disposed at exit — so N sessions cost one engine, not N (#1687).
+    ``AsyncSessionLocal``. One engine for all N sessions, not one each (#1687):
+    the child's shared task engine, or outside a child a throwaway one bound to
+    the current loop and disposed at exit (#4515).
 
     ``command_timeout`` overrides the per-statement bound
     (``settings.task_db_command_timeout``); tasks whose single statements are
     legitimately slow pass ``settings.task_db_long_command_timeout`` (#1719).
     """
 
-    # A task needs exactly one connection; bound the pool to 1 (no
-    # overflow) so a burst of N concurrent scheduled tasks opens N
-    # connections, not N×(pool_size+max_overflow). The engine is disposed
-    # in the finally below, releasing that connection at task end (#15).
-    task_engine = create_async_engine(
-        settings.database_url,
-        future=True,
-        json_serializer=_json_serializer,
-        pool_size=1,
-        max_overflow=0,
-        # A long task outlives its connection: the rolling upgrade holds one
-        # session across the CNPG switchover it waits for, and the next query
-        # after it met "connection is closed" (#1445). Pinging on checkout
-        # replaces a dead connection between transactions, as the module
-        # engine above already does.
-        pool_pre_ping=True,
-        # #1719 — the same black-hole bound the module engine carries (#590).
-        # Without it a task holding a connection to a primary whose node died
-        # sat in epoll_wait for ~15 min (the kernel's TCP retransmit timeout)
-        # while its worker completed nothing and the liveness probe passed.
-        # The pre-ping is a command too, so this bounds it as well.
-        connect_args=task_connect_args(command_timeout),
-    )
+    # In a prefork child this is the child's shared engine (#4515); elsewhere
+    # a throwaway one, disposed at exit. Either way N sessions cost one engine.
+    from app.task_runtime import release_task_engine, task_engine  # noqa: PLC0415
+
+    engine_ = task_engine(command_timeout)
     try:
-        yield async_sessionmaker(task_engine, class_=AsyncSession, expire_on_commit=False)
+        yield async_sessionmaker(engine_, class_=AsyncSession, expire_on_commit=False)
     finally:
-        await task_engine.dispose()
+        await release_task_engine(engine_)
 
 
 @asynccontextmanager
 async def task_session(
     *, command_timeout: float | None = None
 ) -> AsyncGenerator[AsyncSession, None]:
-    """Per-Celery-task DB session — fresh engine, fresh loop binding.
+    """Per-Celery-task DB session on the task engine (see :func:`task_sessionmaker`).
 
     ``command_timeout`` is passed to :func:`task_sessionmaker`.
     """
+    from app.task_runtime import release_session_locks  # noqa: PLC0415
+
     async with task_sessionmaker(command_timeout=command_timeout) as factory:
         async with factory() as session:
-            yield session
+            try:
+                yield session
+            finally:
+                # The shared engine's connection outlives the task (#4515).
+                await release_session_locks(session)
 
 
 # ── Global soft-delete filter ──────────────────────────────────────────────

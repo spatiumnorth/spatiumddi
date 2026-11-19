@@ -22,23 +22,21 @@ refreshes ``last_seen_at``.
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
 from sqlalchemy import select, text
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.celery_app import celery_app
-from app.config import settings
 from app.core.task_lock import single_flight
-from app.db import task_connect_args
 from app.models.audit import AuditLog
 from app.models.ipam import Subnet
 from app.services.ipam.discovery import reconcile_subnet, sweep_subnet
 from app.services.ipam.probe_policy import resolve_probe_policy
+from app.task_runtime import release_task_engine, run_task, session_locks_released, task_engine
 
 logger = structlog.get_logger(__name__)
 
@@ -49,23 +47,21 @@ _DISCOVERY_LOCK_NS = 0x1DA_D15C  # "IPAM DISC"
 
 
 async def _run_subnet_discovery_async(subnet_id_str: str) -> dict[str, Any]:
-    engine = create_async_engine(
-        settings.database_url, future=True, connect_args=task_connect_args()
-    )
+    engine = task_engine()
     factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         subnet_id = uuid.UUID(subnet_id_str)
     except (ValueError, TypeError):
         return {"status": "skipped", "reason": "bad_subnet_id"}
     try:
-        async with factory() as db:
+        async with factory() as db, session_locks_released(db):
             # Per-subnet session advisory lock: the dispatcher gates on
             # last_discovery_at, which is only stamped at completion, so a sweep
             # slower than the 60s beat tick gets re-dispatched while still
             # running — two runs then race to insert the same discovered IP and
             # collide on uq_ip_address_subnet_address, aborting one whole commit.
             # try-lock and bow out if another run holds it (#515). Released when
-            # engine.dispose() closes the connection in the finally below.
+            # session_locks_released() frees it when this block exits.
             locked = await db.scalar(
                 text("SELECT pg_try_advisory_lock(:ns, hashtext(:sid))"),
                 {"ns": _DISCOVERY_LOCK_NS, "sid": subnet_id_str},
@@ -163,7 +159,7 @@ async def _run_subnet_discovery_async(subnet_id_str: str) -> dict[str, Any]:
             )
             return {"status": "ok", "alive": len(sweep.alive), **counts}
     finally:
-        await engine.dispose()
+        await release_task_engine(engine)
 
 
 @celery_app.task(
@@ -177,13 +173,11 @@ async def _run_subnet_discovery_async(subnet_id_str: str) -> dict[str, Any]:
 def run_subnet_discovery(self: Any, subnet_id_str: str) -> dict[str, Any]:  # noqa: ARG001
     """Sweep one subnet + reconcile. Invoked on-demand and by the beat
     dispatcher."""
-    return asyncio.run(_run_subnet_discovery_async(subnet_id_str))
+    return run_task(_run_subnet_discovery_async(subnet_id_str))
 
 
 async def _dispatch_due_async() -> int:
-    engine = create_async_engine(
-        settings.database_url, future=True, connect_args=task_connect_args()
-    )
+    engine = task_engine()
     factory = async_sessionmaker(engine, expire_on_commit=False)
     queued = 0
     skipped_do_not_probe = 0
@@ -230,13 +224,13 @@ async def _dispatch_due_async() -> int:
             )
         return queued
     finally:
-        await engine.dispose()
+        await release_task_engine(engine)
 
 
 @celery_app.task(name="app.tasks.ipam_discovery.dispatch_due_subnets", bind=True)
 def dispatch_due_subnets(self: Any) -> int:  # noqa: ARG001
     """Beat-fired sweep — queues ``run_subnet_discovery`` per due subnet."""
-    return asyncio.run(_dispatch_due_async())
+    return run_task(_dispatch_due_async())
 
 
 __all__ = ["run_subnet_discovery", "dispatch_due_subnets"]

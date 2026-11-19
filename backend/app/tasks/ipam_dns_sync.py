@@ -25,23 +25,21 @@ Scope per run:
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
 from sqlalchemy import select, text
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.celery_app import celery_app
-from app.config import settings
 from app.core.agent_wake import dns_group_channel, publish_wake
-from app.db import task_connect_args
 from app.models.audit import AuditLog
 from app.models.ipam import IPAddress, Subnet
 from app.models.settings import PlatformSettings
 from app.services.feature_modules import is_module_enabled
+from app.task_runtime import release_task_engine, run_task, task_engine
 from app.tasks._interval_gate import interval_skip
 from app.tasks.module_gate import module_gated
 
@@ -354,9 +352,7 @@ async def _run_auto_sync() -> dict[str, Any]:
     # time — the router has its own side-effectful imports.
     from app.api.v1.ipam.router import _resolve_effective_dns  # noqa: PLC0415
 
-    engine = create_async_engine(
-        settings.database_url, future=True, connect_args=task_connect_args()
-    )
+    engine = task_engine()
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
     try:
@@ -494,7 +490,7 @@ async def _run_auto_sync() -> dict[str, Any]:
                 "errors": len(errors),
             }
     finally:
-        await engine.dispose()
+        await release_task_engine(engine)
 
 
 @celery_app.task(name="app.tasks.ipam_dns_sync.auto_sync_ipam_dns", bind=True)
@@ -503,7 +499,7 @@ def auto_sync_ipam_dns(self: object) -> dict[str, Any]:  # type: ignore[type-arg
     """Celery beat entrypoint — fires every 60 s; the task itself checks
     the platform-settings gate and the per-run interval."""
     try:
-        return asyncio.run(_run_auto_sync())
+        return run_task(_run_auto_sync())
     except Exception as exc:  # noqa: BLE001
         logger.exception("ipam_dns_auto_sync_failed", error=str(exc))
         raise
@@ -607,9 +603,7 @@ async def republish_restored_lease_ddns(db: Any, subnet_ids: list[Any]) -> tuple
 async def _run_republish_restored(subnet_ids: list[str]) -> dict[str, Any]:
     import uuid  # noqa: PLC0415
 
-    engine = create_async_engine(
-        settings.database_url, future=True, connect_args=task_connect_args()
-    )
+    engine = task_engine()
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
@@ -620,7 +614,7 @@ async def _run_republish_restored(subnet_ids: list[str]) -> dict[str, Any]:
             await publish_wake(dns_group_channel(gid))
         return {"status": "ok", "records_fired": fired}
     finally:
-        await engine.dispose()
+        await release_task_engine(engine)
 
 
 @celery_app.task(name="app.tasks.ipam_dns_sync.republish_restored_lease_ddns", bind=True)
@@ -631,7 +625,7 @@ def republish_restored_lease_ddns_task(  # type: ignore[type-arg]
     """#3787 — post-commit follow-up of a Trash restore of a subnet, block,
     space or scope: re-publish the A / PTR of the lease mirrors it brought back."""
     try:
-        return asyncio.run(_run_republish_restored(subnet_ids))
+        return run_task(_run_republish_restored(subnet_ids))
     except Exception as exc:  # noqa: BLE001
         logger.exception("restore_ddns_republish_failed", error=str(exc))
         raise
@@ -746,9 +740,7 @@ async def reconcile_restored_zone_records(db: Any, zone_ids: list[Any]) -> tuple
 async def _run_reconcile_restored_zones(zone_ids: list[str]) -> dict[str, Any]:
     import uuid  # noqa: PLC0415
 
-    engine = create_async_engine(
-        settings.database_url, future=True, connect_args=task_connect_args()
-    )
+    engine = task_engine()
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
@@ -759,7 +751,7 @@ async def _run_reconcile_restored_zones(zone_ids: list[str]) -> dict[str, Any]:
             await publish_wake(dns_group_channel(gid))
         return {"status": "ok", "records_changed": changed}
     finally:
-        await engine.dispose()
+        await release_task_engine(engine)
 
 
 @celery_app.task(name="app.tasks.ipam_dns_sync.reconcile_restored_zone_records", bind=True)
@@ -770,7 +762,7 @@ def reconcile_restored_zone_records_task(  # type: ignore[type-arg]
     """#3924 — post-commit follow-up of a Trash restore of a DNS zone: bring its
     IPAM-generated records up to what IPAM holds now."""
     try:
-        return asyncio.run(_run_reconcile_restored_zones(zone_ids))
+        return run_task(_run_reconcile_restored_zones(zone_ids))
     except Exception as exc:  # noqa: BLE001
         logger.exception("restore_zone_reconcile_failed", error=str(exc))
         raise

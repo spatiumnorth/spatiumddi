@@ -16,8 +16,6 @@ beat entry fires every 30 min but the scan body runs exactly once per install.
 
 from __future__ import annotations
 
-import asyncio
-
 import structlog
 from sqlalchemy import exists, select
 
@@ -26,6 +24,7 @@ from app.db import task_session
 from app.models.appliance import Appliance
 from app.models.audit import AuditLog
 from app.services.appliance.firewall_lint import lint_firewall_extra
+from app.task_runtime import run_task
 
 logger = structlog.get_logger(__name__)
 
@@ -85,7 +84,7 @@ async def scan_firewall_extra(db) -> dict[str, int | bool]:  # type: ignore[no-u
 
 @celery_app.task(name="app.tasks.firewall_lint_scan.scan_firewall_extra")
 def scan_firewall_extra_task() -> dict[str, int | bool]:
-    result = asyncio.run(_run())
+    result = run_task(_run())
     logger.info("firewall_extra_lint_scan", **result)
     return result
 
