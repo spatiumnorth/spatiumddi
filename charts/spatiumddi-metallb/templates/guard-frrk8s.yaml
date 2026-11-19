@@ -1,0 +1,14 @@
+{{- /* #2245 — the frr-k8s vendored inside metallb 0.15.3 is frr-k8s 0.0.21,
+       which cannot run the >= v0.0.23 image this chart pins (plain-HTTP
+       probes against a TLS listener, a colliding health-probe port, no RBAC
+       for FRRK8sConfiguration). BGP mode goes through this chart's own
+       ``frr-k8s`` dependency, switched on by ``metallb.frrk8s.external``.
+       A values document that still sets ``metallb.frrk8s.enabled`` (an old
+       supervisor writing a stale HelmChartConfig) would otherwise render a
+       second, broken frr-k8s next to the real one: refuse it by name. */}}
+{{- /* ``index`` rather than ``.enabled``: this is a refusal, not a toggle, so
+       it is deliberately not a render-matrix gate (chart-toggle-coverage.py
+       greps for ``.Values.<path>.enabled``). */}}
+{{- if index .Values.metallb.frrk8s "enabled" }}
+{{- fail "metallb.frrk8s.enabled deploys the vendored frr-k8s 0.0.21 and is not supported (#2245): set metallb.frrk8s.external=true instead; the frr-k8s dependency of this chart is the BGP backend" }}
+{{- end }}

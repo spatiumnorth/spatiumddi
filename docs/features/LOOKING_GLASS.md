@@ -289,7 +289,7 @@ advertised — each origin ASN and community clickable back into SpatiumDDI.
   actually contains. They share no code — the hijack monitor never opens a BGP
   session; the Looking Glass never talks to RIPEstat.
 - **The MetalLB VIP advertiser (BGP mode)** is a *separate* piece of work
-  (issue #566 decision D1): lighting up `frrk8s.enabled=true` on
+  (issue #566 decision D1): lighting up `metallb.frrk8s.external=true` on
   `charts/spatiumddi-metallb/` so MetalLB can *advertise* the control-plane VIP
   (and optionally data-plane VIPs) to upstream routers via FRRouting (GPL v2).
   That is an **export** path (SpatiumDDI → router); the Looking Glass is an
@@ -300,9 +300,12 @@ advertised — each origin ASN and community clickable back into SpatiumDDI.
   more). Configured from Fleet → Network & Host (`MetalLBConfigCard`'s
   "BGP mode" disclosure) — see `backend/app/models/settings.py`'s
   `metallb_bgp_enabled` / `metallb_bgp_peers` / `metallb_bgp_advertisements`
-  columns and `charts/spatiumddi-metallb/values.yaml`'s `bgp:` + `frr-k8s:`
-  blocks for the chart-level wiring. Stays opt-in — both `frrk8s.enabled` and
-  `bgp.enabled` default `false` until an operator configures a peer.
+  columns and `charts/spatiumddi-metallb/values.yaml`'s `bgp:` block and its top-level
+  `frr-k8s:` block for the chart-level wiring. frr-k8s (v0.0.27) is that chart's
+  own dependency rather than the 0.0.21 subchart inside MetalLB 0.15.3
+  (#2245); it serves its metrics over native TLS, with no kube-rbac-proxy
+  sidecar. Stays opt-in — both `frrk8s.external` and `bgp.enabled` default
+  `false` until an operator configures a peer.
 
 ## Scope (Phase 1 + 2, this cut)
 

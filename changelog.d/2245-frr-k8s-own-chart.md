@@ -1,0 +1,2 @@
+### Fixed
+- Appliance BGP-mode MetalLB now runs frr-k8s v0.0.27 (with FRR 10.6.2) as its own chart dependency instead of the older frr-k8s 0.0.21 subchart bundled inside the held MetalLB 0.15.3 chart, which clears the scanner findings on that image. The kube-rbac-proxy sidecars and image are gone (frr-k8s serves its metrics over TLS itself), the frr-k8s CRD set now includes `FRRK8sConfiguration`, and BGP mode is switched on through `metallb.frrk8s.external` rather than `metallb.frrk8s.enabled`. BGP mode stays off by default; MetalLB itself stays on 0.15.3.

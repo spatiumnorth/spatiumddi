@@ -598,7 +598,7 @@ the reference topologies are in
   sidecar; app / worker / beat resolve the master via a `sentinel://`
   URL. `sentinel.replicas` scales with the member count.
 - **MetalLB, v0.15.3, L2 mode** (air-gap baked: controller + speaker
-  only, `frrk8s.enabled=false`; pinned to the full v0.15.3 release —
+  only, `frrk8s.external=false`; pinned to the full v0.15.3 release —
   chart + images + CRDs — because v0.16.0 regressed the speaker's
   ServiceL2Status reconciler into an apiserver-flooding loop, metallb#3063).
   Provides the control-plane VIP; BGP templates render spec-only for the
@@ -697,7 +697,7 @@ state on its heartbeat:
   | HelmChartConfig | Supervisor-owned keys (source) |
   |---|---|
   | `spatium-control` | `api` / `frontend` / `worker`: `replicas`, `podAntiAffinity`, `tolerations` (committed control-plane size); `api.service.trafficDistribution` (`PreferSameNode` at every size, #1805); `api.service.nodeLocal` (`true` at every size, #3645); `api.resources.limits.memory`, `worker.resources.limits.memory`, `worker.concurrency` (node RAM); `api.resources.limits.cpu`, `postgresql.resources.limits.cpu` (node CPU count, #2240); `frontend.controlPlaneVIP`, `frontend.loadBalancerSourceRanges` (MetalLB settings, Web UI source CIDRs); `slotImageMirror.enabled`; `postgresql.cnpg.instances`, `postgresql.cnpg.parameters.shared_buffers`, `postgresql.cnpg.parameters.max_connections` (connection budget, #2156), `postgresql.resources.requests.memory` + `.limits.memory` (size, node RAM, and the connection budget of the control-plane size, #2156); `api.databasePool.size` / `.maxOverflow` (control-plane size, #2156); `redis.kind`, `redis.sentinel.replicas` |
-  | `spatium-metallb` | `metallb.enabled`, `metallb.ipPool.addresses`, `metallb.frrk8s.enabled`, `metallb.bgp.enabled` / `.peers` / `.advertisements` (Network & Host → MetalLB) |
+  | `spatium-metallb` | `metallb.enabled`, `metallb.ipPool.addresses`, `metallb.frrk8s.external`, `metallb.bgp.enabled` / `.peers` / `.advertisements` (Network & Host → MetalLB) |
   | `spatiumddi-appliance` | `dns.useMetalLBVIP`, `dns.vip`, `dhcpKea.relayVIP` (MetalLB → Advanced) |
 
   `image.tag` on `spatium-control` is written by the backend's chart bump,
@@ -1086,8 +1086,8 @@ Kubernetes 1.36 adds an alpha `SeccompDefault` kubelet gate that would do
 this cluster-wide; it is alpha, so the charts do it instead.
 
 One workload cannot have it at all: **frr-k8s**, the BGP-mode routing
-daemon, comes from a vendored subchart (`frr-k8s` 0.0.21) that exposes no
-pod-`securityContext` knob, so no values override can supply a profile. It is
+daemon, comes from the chart's own `frr-k8s` dependency (0.0.27), whose chart
+exposes no pod-`securityContext` knob, so no values override can supply a profile. It is
 exempted by name in the render check rather than the chart being skipped —
 which is how its missing PriorityClass and BestEffort QoS survived #965
 unnoticed. Revisit on a chart bump.

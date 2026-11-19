@@ -1522,21 +1522,23 @@ render metallb-all-on "$METALLB" "${METALLB_ALL_ON[@]}"
 # purpose (see the script's docstring).
 python3 "$ROOT/.github/scripts/chart-webhooks-fail-open.py" "$OUT/metallb-all-on.yaml" --require \
     || failures=$((failures + 1))
-# BGP mode (#566 D1) — the supervisor flips ``frrk8s.enabled`` on together
+# BGP mode (#566 D1) — the supervisor flips ``frrk8s.external`` on together
 # with ``bgp.enabled`` the moment a peer is configured, so this shape reaches
 # real appliances and has to be rendered. The two frr-k8s workloads are
-# exempted from the seccomp check ONLY: the frr-k8s 0.0.21 subchart exposes no
-# pod-securityContext knob, so no values override can supply a profile.
+# exempted from the seccomp check ONLY: the frr-k8s chart (its own dependency
+# since #2245) exposes no pod-securityContext knob, so no values override can
+# supply a profile.
 # Exempting them by name is strictly better than not rendering the chart,
 # which is how their missing priority class and BestEffort QoS survived #965.
-# The same subchart gives its four ``cp-*`` init containers no resources knob
-# either (#3208), so the init-resources check exempts frr-k8s by name too.
-POSTURE_ARGS="--require-priority --allow-no-seccomp frr-k8s,frr-k8s-statuscleaner --allow-no-init-resources frr-k8s"
+# frr-k8s >= 0.0.23 does carry a resources knob for its four ``cp-*`` init
+# containers (#3208 exempted the 0.0.21 chart, which had none), so no
+# init-resources exemption is needed here any more.
+POSTURE_ARGS="--require-priority --allow-no-seccomp frr-k8s,frr-k8s-statuscleaner"
 # One peer, because the API refuses BGP mode without one: without it this
 # render held no BGPPeer at all, so the CR every BGP appliance carries was
 # never schema-checked.
 METALLB_BGP=(
-    --set metallb.frrk8s.enabled=true
+    --set metallb.frrk8s.external=true
     --set metallb.bgp.peers[0].myASN=64512
     --set metallb.bgp.peers[0].peerASN=64513
     --set metallb.bgp.peers[0].peerAddress=10.0.0.1
