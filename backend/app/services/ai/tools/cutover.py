@@ -25,7 +25,7 @@ without opting in. ``find_cutover_parity_check`` runs a **live pull from the
 Windows source over WinRM using stored credentials**, exactly like
 ``find_dns_import_preview``, so it ships disabled per non-negotiable #13's
 "off-prem calls default to disabled" rule and the operator opts in via
-Settings → AI → Tool Catalog.
+Administration → AI Tool Catalog.
 
 All four are reads. The parity tool deliberately does *not* persist its report
 onto the item — that is a mutation, and it belongs to

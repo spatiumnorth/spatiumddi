@@ -1713,11 +1713,9 @@ export function ClusterOverview({
             The host will power-cycle in ~10 seconds. Existing DHCP leases keep
             their state (DB-backed); DNS zones reload from the served config;
             the web UI will be unreachable for ~1 minute.
-            {rebootError && (
-              <span className="mt-2 block text-destructive">{rebootError}</span>
-            )}
           </span>
         }
+        error={rebootError}
         confirmLabel="Reboot now"
         tone="destructive"
         requireCheckboxLabel="I understand the appliance will go offline for ~1 minute."

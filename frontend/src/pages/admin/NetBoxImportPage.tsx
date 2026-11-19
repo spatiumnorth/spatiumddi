@@ -299,7 +299,10 @@ export function NetBoxImportPage() {
 
         <div className="space-y-4">
           {state.error && (
-            <div className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive">
+            <div
+              role="alert"
+              className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive"
+            >
               <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0" />
               <div className="break-all">{state.error}</div>
             </div>

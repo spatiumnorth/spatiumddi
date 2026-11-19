@@ -14,6 +14,8 @@ import {
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { CustomerPicker, ProviderPicker } from "@/components/ownership/pickers";
 import { ZoneScopePill } from "@/components/ZoneScopePill";
@@ -170,7 +172,11 @@ function DomainEditorModal({
           customer_id: customerId,
           registrar_provider_id: registrarProviderId,
         };
-        return domainsApi.update(existing.id, body);
+        // Only what the operator changed against the row read when the dialog
+        // opened (#4379), so a field another client set since is kept.
+        const changed = changedFields(existing, body);
+        if (Object.keys(changed).length === 0) return existing;
+        return domainsApi.update(existing.id, changed);
       }
       const body: DomainCreate = {
         name,
@@ -629,10 +635,19 @@ export function DomainsPage() {
         />
       )}
       {editing && (
-        <DomainEditorModal
-          existing={editing}
+        <FreshEdit
+          row={editing}
+          load={() => domainsApi.get(editing.id)}
+          title="Edit Domain"
           onClose={() => setEditing(null)}
-        />
+        >
+          {(fresh) => (
+            <DomainEditorModal
+              existing={fresh}
+              onClose={() => setEditing(null)}
+            />
+          )}
+        </FreshEdit>
       )}
     </div>
   );

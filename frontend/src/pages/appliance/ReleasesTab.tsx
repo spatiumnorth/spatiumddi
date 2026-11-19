@@ -325,7 +325,7 @@ function ReleaseCard({
 // Shown on docker / k8s control planes (no host-side update mechanism,
 // and no A/B slot flow either). The operator copies a command + runs it
 // against the deployment they manage.
-function ManualApplyModal({
+export function ManualApplyModal({
   tag,
   onClose,
 }: {
@@ -343,8 +343,10 @@ function ManualApplyModal({
   const chartVersion = helmChartVersion(tag);
   const k8sCmd = [
     "# On a workstation with kubectl + helm pointed at the cluster:",
-    "helm upgrade spatiumddi \\",
+    "# Use your own release name and namespace (`helm list -A` shows both):",
+    "helm upgrade <release> \\",
     "  oci://ghcr.io/spatiumnorth/charts/spatiumddi \\",
+    "  -n <namespace> \\",
     ...(chartVersion ? [`  --version ${chartVersion} \\`] : []),
     `  --set image.tag=${tag} \\`,
     "  --reuse-values",

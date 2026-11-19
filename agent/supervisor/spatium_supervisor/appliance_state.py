@@ -637,6 +637,9 @@ _SLOT_VERSIONS_FILE = Path("/var/lib/spatiumddi-host/release-state/slot-versions
 # supervisor short-circuits the next heartbeat's trigger write.
 _TZ_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/tz-pending")
 _TZ_APPLIED_HASH_FILE = Path("/var/lib/spatiumddi-host/release-state/tz-hash")
+#: The runner's verdict (``state=failed`` / ``reason=unknown_timezone`` ...),
+#: read so a failing timezone plane carries its reason to the Fleet UI (#4416).
+_TZ_STATUS_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/tz-status")
 # Verbose-boot console toggle. The runner flips a grubenv variable
 # (spatium_verbose) the grub.cfg menuentries read; trigger body is a single
 # "0" (quiet boot + dashboard), "1" (verbose boot + plain getty, no dashboard)
@@ -1472,6 +1475,22 @@ def _fire_host_config(
     return True
 
 
+def _read_tz_failure_reason() -> dict[str, str]:
+    """``{"reason": ..., "requested": ...}`` when the tz runner's last
+    verdict is ``failed``; ``{}`` otherwise (#4416)."""
+    try:
+        text = _TZ_STATUS_SIDECAR.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    kv = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+    if kv.get("state") != "failed" or not kv.get("reason"):
+        return {}
+    out = {"reason": kv["reason"][:200]}
+    if kv.get("requested"):
+        out["requested"] = kv["requested"][:100]
+    return out
+
+
 def read_host_config_health() -> dict[str, dict[str, object]]:
     """(#387) Per-plane apply health for the hash-keyed host-config
     runners, surfaced on the heartbeat so the Fleet UI shows a stuck
@@ -1510,6 +1529,9 @@ def read_host_config_health() -> dict[str, dict[str, object]]:
             "attempts": attempts,
             "at": when.isoformat() if when else None,
         }
+        if name == "timezone":
+            # The runner's own verdict (#4416), e.g. unknown_timezone.
+            out[name].update(_read_tz_failure_reason())
     return out
 
 
