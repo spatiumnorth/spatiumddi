@@ -32,6 +32,7 @@ from sqlalchemy import delete, func, select
 
 from app.api.deps import DB, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
+from app.core.celery_dispatch import dispatch
 from app.core.permissions import require_permission
 from app.models.ai import AIProvider
 from app.models.ai_watch import (
@@ -60,6 +61,7 @@ from app.services.ai.watch.principal import (
 )
 from app.services.ai.watch.providers import provider_eligible, resolve_provider_chain
 from app.services.ai.watch.tools import DEFAULT_WATCH_TOOLS, allowable_tools, validate_allowlist
+from app.services.api_token_scopes import token_write
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -454,6 +456,7 @@ async def update_watch_config(
 
 
 @router.post("/pause", response_model=WatchConfigResponse)
+@token_write("Pauses or resumes Copilot Watch and writes an audit row")
 async def pause_watch(body: PauseRequest, current_user: SuperAdmin, db: DB) -> WatchConfigResponse:
     """Pause or resume. Resuming also clears an automatic pause (budget
     reached, repeated failures)."""
@@ -485,6 +488,7 @@ async def pause_watch(body: PauseRequest, current_user: SuperAdmin, db: DB) -> W
 
 
 @router.post("/run-now", response_model=RunNowResponse, status_code=status.HTTP_202_ACCEPTED)
+@token_write("Queues a Copilot Watch run, which spends AI provider tokens")
 async def run_watch_now(current_user: SuperAdmin, db: DB) -> RunNowResponse:
     """Ask for a run. It starts on the worker within a minute; the guards
     (budget, provider, maintenance mode) still apply, and a refused run
@@ -515,7 +519,7 @@ async def run_watch_now(current_user: SuperAdmin, db: DB) -> RunNowResponse:
     try:
         from app.tasks.ai_watch import tick  # noqa: PLC0415
 
-        tick.delay()
+        await dispatch(tick)
     except Exception as exc:  # noqa: BLE001
         # The request is stored; the 60 s beat tick picks it up.
         logger.warning("ai_watch_run_now_enqueue_failed", error=str(exc))
@@ -538,7 +542,13 @@ async def list_watch_runs(
         stmt = stmt.where(AIWatchRun.state == state)
         count = count.where(AIWatchRun.state == state)
     rows = (
-        (await db.execute(stmt.order_by(AIWatchRun.started_at.desc()).limit(limit).offset(offset)))
+        (
+            await db.execute(
+                stmt.order_by(AIWatchRun.started_at.desc(), AIWatchRun.id)
+                .limit(limit)
+                .offset(offset)
+            )
+        )
         .scalars()
         .all()
     )
@@ -782,6 +792,7 @@ def _set_state(finding: AIFinding, state: str, user: User, note: str) -> dict[st
 
 
 @router.post("/findings/{finding_id}/acknowledge", response_model=FindingResponse)
+@token_write("Changes a finding's state and writes an audit row")
 async def acknowledge_finding(
     finding_id: uuid.UUID,
     body: AcknowledgeRequest,
@@ -813,6 +824,7 @@ async def acknowledge_finding(
 
 
 @router.post("/findings/{finding_id}/dismiss", response_model=FindingResponse)
+@token_write("Dismisses a finding, optionally muting it, and writes an audit row")
 async def dismiss_finding(
     finding_id: uuid.UUID,
     body: DismissRequest,
@@ -863,6 +875,7 @@ async def dismiss_finding(
 
 
 @router.post("/findings/{finding_id}/reopen", response_model=FindingResponse)
+@token_write("Reopens a finding and writes an audit row")
 async def reopen_finding(
     finding_id: uuid.UUID, db: DB, current_user: User = _FindingWriter
 ) -> FindingResponse:
@@ -906,6 +919,7 @@ async def reopen_finding(
 
 
 @router.post("/findings/{finding_id}/feedback", response_model=FindingResponse)
+@token_write("Records operator feedback on a finding and writes an audit row")
 async def leave_feedback(
     finding_id: uuid.UUID,
     body: FeedbackRequest,

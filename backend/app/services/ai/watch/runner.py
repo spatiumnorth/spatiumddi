@@ -27,6 +27,7 @@ import structlog
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.denial_audit import note_denial_audited
 from app.drivers.llm.base import ChatMessage, ToolDefinition
 from app.models.ai_watch import (
     FINDING_ACTIVE_STATES,
@@ -155,6 +156,9 @@ async def _record_skip(
     )
     db.add(run)
     await db.flush()
+    # A skipped run is a refusal, not an HTTP 403; mark it audited so a
+    # run-now request that also 403s never gets a second row (#3644).
+    note_denial_audited()
     db.add(
         AuditLog(
             user_id=None,
