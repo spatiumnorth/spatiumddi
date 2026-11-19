@@ -183,7 +183,12 @@ describe("Edit Zone (#3509)", () => {
       );
     }
     expect(screen.getByLabelText("Kind").tagName).toBe("SELECT");
-    expect(screen.getByLabelText("Customer (optional)").tagName).toBe("SELECT");
+    // The customer picker names both its group wrapper and the select inside
+    // it, so the label can resolve to two nodes once the picker has loaded.
+    const customer = screen
+      .getAllByLabelText("Customer (optional)")
+      .map((el) => (el.tagName === "SELECT" ? el : el.querySelector("select")));
+    expect(customer.some(Boolean)).toBe(true);
     expect(boxesNamedByNothing()).toEqual([]);
     expectLabelsSound();
   });
