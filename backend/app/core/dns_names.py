@@ -326,7 +326,7 @@ def classless_owner_error(record_type: str, owner: str, origin: str) -> str | No
     )
 
 
-_ZONE_STORAGE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./*-]*\.?$")
+_ZONE_STORAGE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./*-]*\.?\Z")
 
 
 def zone_name_storage_error(name: str) -> str | None:
