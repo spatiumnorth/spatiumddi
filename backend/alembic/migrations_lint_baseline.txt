@@ -288,6 +288,7 @@ backend/alembic/versions/b7c2f1a9d4e6_block_allocated_total_ips.py:drop_column:7
 backend/alembic/versions/b7d21c9e4f06_agent_daemon_state.py:drop_column:63
 backend/alembic/versions/b7d21c9e4f06_agent_daemon_state.py:drop_column:64
 backend/alembic/versions/b7d21c9e4f06_agent_daemon_state.py:drop_column:65
+backend/alembic/versions/b7d2e4f81c59_dns_group_max_cache_size.py:drop_column:32
 backend/alembic/versions/b7d2e4f91a08_dhcp_queue_evicted_metric.py:drop_column:43
 backend/alembic/versions/b7e29c4f5d18_dns_dhcp_tags.py:drop_column:63
 backend/alembic/versions/b7e2a4f91d35_vrf_phase2.py:drop_column:60
@@ -396,6 +397,8 @@ backend/alembic/versions/c4e1a87b3920_tailscale_integration.py:drop_column:115
 backend/alembic/versions/c4e1a87b3920_tailscale_integration.py:drop_column:118
 backend/alembic/versions/c4e1a87b3920_tailscale_integration.py:drop_table:120
 backend/alembic/versions/c4e2b7f81a39_appliance_role_health.py:drop_column:40
+backend/alembic/versions/c4e7a1d93b52_dns_server_delete_keeps_history.py:drop_column:80
+backend/alembic/versions/c4e7a1d93b52_dns_server_delete_keeps_history.py:drop_column:81
 backend/alembic/versions/c4e7a2f813b9_network_devices.py:drop_table:298
 backend/alembic/versions/c4e7a2f813b9_network_devices.py:drop_table:303
 backend/alembic/versions/c4e7a2f813b9_network_devices.py:drop_table:306
@@ -615,6 +618,7 @@ backend/alembic/versions/d7e5b8c91a3f_dhcp_failover_channel.py:drop_table:148
 backend/alembic/versions/d7f2a91c4b58_server_maintenance_mode.py:drop_column:67
 backend/alembic/versions/d7f2a91c4b58_server_maintenance_mode.py:drop_column:68
 backend/alembic/versions/d7f2a91c4b58_server_maintenance_mode.py:drop_column:69
+backend/alembic/versions/d8b3f6a1c274_dns_zone_agentless_created_server_ids.py:drop_column:34
 backend/alembic/versions/d8c5f12a47b9_query_log_entries.py:drop_table:82
 backend/alembic/versions/d8c5f12a47b9_query_log_entries.py:drop_table:85
 backend/alembic/versions/d8e1b5a26c47_dns_record_op_backoff.py:drop_column:54
@@ -725,6 +729,8 @@ backend/alembic/versions/e5a3f17b2d8c_device_profiling_phase2.py:drop_column:110
 backend/alembic/versions/e5a3f17b2d8c_device_profiling_phase2.py:drop_column:111
 backend/alembic/versions/e5a3f17b2d8c_device_profiling_phase2.py:drop_table:113
 backend/alembic/versions/e5a72f14c890_proxmox_infer_vnet_subnets.py:drop_column:38
+backend/alembic/versions/e5b1c7a94d20_agent_memory_status.py:drop_column:39
+backend/alembic/versions/e5b1c7a94d20_agent_memory_status.py:drop_column:41
 backend/alembic/versions/e5b1d47a9c62_ssh_lockdown.py:drop_column:41
 backend/alembic/versions/e5b21a8f0d94_release_check_state.py:drop_column:56
 backend/alembic/versions/e5b21a8f0d94_release_check_state.py:drop_column:57

@@ -6,7 +6,7 @@ resolver. Both are nullable with no backfill: NULL means the server's log did
 not say, and existing rows never reported anything.
 
 Revision ID: c7e3a91d5b24
-Revises: b6d2e9f41a07
+Revises: d8b3f6a1c274
 Create Date: 2026-11-18 10:00:00.000000
 """
 
@@ -15,7 +15,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "c7e3a91d5b24"
-down_revision = "b6d2e9f41a07"
+down_revision = "d8b3f6a1c274"
 branch_labels = None
 depends_on = None
 

@@ -1,9 +1,12 @@
-import { useEffect, useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { isAxiosError } from "axios";
 import { ListEmpty } from "@/components/ui/list-read-error";
 import { useSearchParams } from "react-router-dom";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { usePermissions } from "@/hooks/usePermissions";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
+import { useSessionState } from "@/lib/useSessionState";
 import {
   Activity,
   AlertTriangle,
@@ -32,9 +35,11 @@ import {
   type LogSource,
   formatApiError,
 } from "@/lib/api";
+import { formatClientEndpoint } from "@/lib/clientEndpoint";
 import { Modal } from "@/components/ui/modal";
 import { AgentLogScopePicker } from "@/components/AgentLogScopePicker";
 import {
+  ALL_SERVERS,
   type AgentLogSelection,
   defaultSelection,
   selectionHost,
@@ -156,6 +161,7 @@ export function LogsPage() {
     queryKey: ["logs-sources"],
     queryFn: logsApi.listSources,
     staleTime: 60_000,
+    refetchOnMount: "always",
   });
 
   const {
@@ -167,6 +173,9 @@ export function LogsPage() {
     queryKey: ["logs-agent-sources"],
     queryFn: logsApi.listAgentSources,
     staleTime: 60_000,
+    // A server deleted or lost since the last visit must not still be
+    // offered, or picked, from the cache (#4234).
+    refetchOnMount: "always",
   });
 
   // Filter by tab — audit tab is DHCP-only. The agent tabs filter
@@ -584,7 +593,9 @@ const WEEKDAYS: DhcpAuditDay[] = [
   "Sun",
 ];
 
-function DhcpAuditTab({ sources }: { sources: LogSource[] }) {
+export function DhcpAuditTab({ sources }: { sources: LogSource[] }) {
+  // Add Server on a DHCP server group is a superadmin's (#4314).
+  const { isSuperadmin } = usePermissions();
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [day, setDay] = useState<DhcpAuditDay | "today">("today");
   const [maxEvents, setMaxEvents] = useState(500);
@@ -658,10 +669,15 @@ function DhcpAuditTab({ sources }: { sources: LogSource[] }) {
       <div className="flex flex-1 items-center justify-center p-10">
         <div className="max-w-md rounded-lg border border-dashed p-10 text-center">
           <FileClock className="mx-auto mb-3 h-10 w-10 text-muted-foreground/30" />
-          <p className="text-sm font-medium">No DHCP servers configured</p>
+          <p className="text-sm font-medium">
+            No Windows DHCP servers configured
+          </p>
           <p className="mt-2 text-xs text-muted-foreground">
-            DHCP audit logs require a Windows DHCP server with WinRM
-            credentials. Register one under DHCP → Server Groups first.
+            DHCP Audit reads the audit logs of Windows DHCP servers that have
+            WinRM credentials.
+            {isSuperadmin &&
+              " Register one under DHCP → Server Groups first."}{" "}
+            Kea servers&apos; lease events are on the DHCP Activity tab.
           </p>
         </div>
       </div>
@@ -1116,6 +1132,68 @@ const DHCP_COLS = "grid-cols-[20px_160px_70px_180px_140px_120px_1fr]";
 const DHCP_COLS_SERVER =
   "grid-cols-[20px_160px_130px_70px_180px_140px_120px_1fr]";
 
+/**
+ * The server pick a tab acts on. The pick is kept in sessionStorage so it
+ * survives a switch to another Logs tab and back (only the active tab is
+ * mounted, #4234); a stored pick that no longer names a readable server falls
+ * back to the default, and nothing is read with no sources.
+ */
+function effectiveSelection(
+  picked: AgentLogSelection | null,
+  sources: AgentLogSource[],
+): AgentLogSelection | null {
+  if (sources.length === 0) return null;
+  return selectionIsValid(picked, sources) ? picked : defaultSelection(sources);
+}
+
+/**
+ * Refetch the agent sources each time an agent tab mounts, and report whether
+ * a fetch that STARTED after this mount has settled. The Logs page stays
+ * mounted across a tab switch, so its own read happened once; a server deleted
+ * since would still validate a stored pick from the cache and cost one query
+ * (#4234). The tab reads nothing until this is true.
+ */
+function useFreshAgentSources(): boolean {
+  const [mountedAt] = useState(() => Date.now());
+  const q = useQuery({
+    queryKey: ["logs-agent-sources"],
+    queryFn: logsApi.listAgentSources,
+    staleTime: 60_000,
+    refetchOnMount: "always",
+  });
+  return (
+    !q.isFetching &&
+    (q.dataUpdatedAt >= mountedAt || q.errorUpdatedAt >= mountedAt)
+  );
+}
+
+/** Whether a failed read answered 404: the picked server no longer exists. */
+function isNotFound(err: unknown): boolean {
+  return isAxiosError(err) && err.response?.status === 404;
+}
+
+/**
+ * A read that 404s for a picked server or group means the pick is gone (the
+ * server was deleted or lost its registration after the sources list was
+ * fetched). Clear the stored pick so the tab falls back to the default, and
+ * refresh the list, instead of showing a banner for it (#4234).
+ */
+function useDropGonePick(
+  error: unknown,
+  selection: AgentLogSelection | null,
+  clearPick: () => void,
+) {
+  const qc = useQueryClient();
+  const gone = isNotFound(error) && !!selection && selection !== ALL_SERVERS;
+  useEffect(() => {
+    if (!gone) return;
+    clearPick();
+    void qc.invalidateQueries({ queryKey: ["logs-agent-sources"] });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- clearPick is a fresh closure each render; `gone` is the trigger
+  }, [gone, selection]);
+  return gone;
+}
+
 /** Whether a response merged more than one server. */
 function coversManyServers(data: { server_ids?: string[] } | undefined) {
   return (data?.server_ids?.length ?? 0) > 1;
@@ -1130,9 +1208,10 @@ function ServerCell({ name }: { name: string }) {
 }
 
 function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
-  const [selection, setSelection] = useState<AgentLogSelection | null>(() =>
-    defaultSelection(sources),
-  );
+  const ready = useFreshAgentSources();
+  const [pickedSelection, setSelection] =
+    useSessionState<AgentLogSelection | null>("logs-dns-queries-server", null);
+  const selection = effectiveSelection(pickedSelection, sources);
   const [maxEvents, setMaxEvents] = useState(200);
   const [since, setSince] = useState<string>("");
   const [q, setQ] = useState("");
@@ -1142,19 +1221,10 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
   const [rcode, setRcode] = useState<string>("");
   const [answerSource, setAnswerSource] = useState<string>("");
 
-  useEffect(() => {
-    if (sources.length === 0) {
-      setSelection(null);
-      return;
-    }
-    if (!selectionIsValid(selection, sources)) {
-      setSelection(defaultSelection(sources));
-    }
-  }, [sources, selection]);
   const scope = selection ? selectionToScope(selection) : {};
 
   const sinceIso = since ? new Date(since).toISOString() : null;
-  const enabled = !!selection;
+  const enabled = !!selection && ready;
   // A partial address filters as you type; wait for a pause so each
   // keystroke is not its own request (#3171).
   const debouncedClientIp = useDebouncedValue(clientIp);
@@ -1206,6 +1276,9 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
     retry: false,
   });
 
+  const pickGone = useDropGonePick(dnsQueriesQuery.error, selection, () =>
+    setSelection(null),
+  );
   const events = dnsQueriesQuery.data?.events ?? [];
   const showServer = coversManyServers(dnsQueriesQuery.data);
   const selectedHost = useMemo(
@@ -1348,7 +1421,9 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
         onPickRcode={(r) => setRcode(r)}
       />
 
-      {dnsQueriesQuery.isError && <QueryErrorBanner query={dnsQueriesQuery} />}
+      {dnsQueriesQuery.isError && !pickGone && (
+        <QueryErrorBanner query={dnsQueriesQuery} />
+      )}
       {dnsQueriesQuery.isFetching && events.length === 0 && (
         <QueryingIndicator host={selectedHost} />
       )}
@@ -1606,19 +1681,19 @@ export function DNSQueryRow({
   onFilterClient?: (ip: string) => void;
   onFilterQname?: (qname: string) => void;
 }) {
-  const [open, setOpen] = useState(false);
+  const { open, setOpen, closeDetails, rowProps } = useRowDetails(
+    `Details for ${row.qname ?? "query"} ${row.qtype ?? ""} from ${row.client_ip ?? "unknown client"}`,
+  );
   return (
     <div
-      className={cn(
-        "grid items-baseline gap-x-3 px-6 py-1 hover:bg-muted/40",
-        showServer ? DNS_COLS_SERVER : DNS_COLS,
-      )}
+      {...rowProps}
+      className={cn(ROW_CLICKABLE_CLS, showServer ? DNS_COLS_SERVER : DNS_COLS)}
     >
       <RowDetailsButton onClick={() => setOpen(true)} />
       {open && (
         <DNSQueryDetailModal
           row={row}
-          onClose={() => setOpen(false)}
+          onClose={closeDetails}
           onFilterClient={onFilterClient}
           onFilterQname={onFilterQname}
         />
@@ -1634,7 +1709,7 @@ export function DNSQueryRow({
         className="truncate font-mono text-[11px]"
         title={
           row.client_ip
-            ? `${row.client_ip}${row.client_port ? `#${row.client_port}` : ""}`
+            ? formatClientEndpoint(row.client_ip, row.client_port)
             : ""
         }
       >
@@ -1666,9 +1741,13 @@ export function DNSQueryRow({
 // ── DHCP Activity tab (Kea log) ───────────────────────────────────
 
 function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
-  const [selection, setSelection] = useState<AgentLogSelection | null>(() =>
-    defaultSelection(sources),
-  );
+  const ready = useFreshAgentSources();
+  const [pickedSelection, setSelection] =
+    useSessionState<AgentLogSelection | null>(
+      "logs-dhcp-activity-server",
+      null,
+    );
+  const selection = effectiveSelection(pickedSelection, sources);
   const [maxEvents, setMaxEvents] = useState(200);
   const [since, setSince] = useState<string>("");
   const [q, setQ] = useState("");
@@ -1677,19 +1756,10 @@ function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
   const [mac, setMac] = useState<string>("");
   const [ip, setIp] = useState<string>("");
 
-  useEffect(() => {
-    if (sources.length === 0) {
-      setSelection(null);
-      return;
-    }
-    if (!selectionIsValid(selection, sources)) {
-      setSelection(defaultSelection(sources));
-    }
-  }, [sources, selection]);
   const scope = selection ? selectionToScope(selection) : {};
 
   const sinceIso = since ? new Date(since).toISOString() : null;
-  const enabled = !!selection;
+  const enabled = !!selection && ready;
   const debouncedMac = useDebouncedValue(mac);
   const debouncedIp = useDebouncedValue(ip);
 
@@ -1722,6 +1792,9 @@ function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
     retry: false,
   });
 
+  const pickGone = useDropGonePick(activityQuery.error, selection, () =>
+    setSelection(null),
+  );
   const events = activityQuery.data?.events ?? [];
   const showServer = coversManyServers(activityQuery.data);
   const selectedHost = useMemo(
@@ -1812,7 +1885,9 @@ function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
         </div>
       </div>
 
-      {activityQuery.isError && <QueryErrorBanner query={activityQuery} />}
+      {activityQuery.isError && !pickGone && (
+        <QueryErrorBanner query={activityQuery} />
+      )}
       {activityQuery.isFetching && events.length === 0 && (
         <QueryingIndicator host={selectedHost} />
       )}
@@ -1864,7 +1939,12 @@ export function DHCPActivityRow({
   /** Render the Server column (#2120) — the read merged several servers. */
   showServer?: boolean;
 }) {
-  const [open, setOpen] = useState(false);
+  const { open, setOpen, closeDetails, rowProps } = useRowDetails(
+    `Details for ${row.code ?? "activity"} ${row.mac_address ?? ""} ${row.ip_address ?? ""}`.replace(
+      /\s+/g,
+      " ",
+    ),
+  );
   const sevCls =
     row.severity === "ERROR" || row.severity === "FATAL"
       ? "text-destructive"
@@ -1875,15 +1955,14 @@ export function DHCPActivityRow({
           : "text-foreground";
   return (
     <div
+      {...rowProps}
       className={cn(
-        "grid items-baseline gap-x-3 px-6 py-1 hover:bg-muted/40",
+        ROW_CLICKABLE_CLS,
         showServer ? DHCP_COLS_SERVER : DHCP_COLS,
       )}
     >
       <RowDetailsButton onClick={() => setOpen(true)} />
-      {open && (
-        <DHCPActivityDetailModal row={row} onClose={() => setOpen(false)} />
-      )}
+      {open && <DHCPActivityDetailModal row={row} onClose={closeDetails} />}
       <span
         className="font-mono tabular-nums text-muted-foreground"
         title={row.ts}
@@ -1925,6 +2004,46 @@ export function DHCPActivityRow({
 // event, and a hover ``title`` is not selectable, not usable on touch
 // and clipped by the browser for long lines. The details button opens
 // every field of the row untruncated, with the raw line copyable.
+
+// Whole-row activation (#4248). A click anywhere on the row opens the
+// details modal, except on a control inside it (the arrow has its own
+// handler) and except when the click ended a text selection. The row is a
+// focusable group (no role=button: it holds the arrow button); Enter / Space open it, and focus returns to it
+// when the modal closes (the shared Modal does not restore focus itself).
+const ROW_CLICKABLE_CLS =
+  "grid cursor-pointer items-baseline gap-x-3 px-6 py-1 hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring";
+
+function useRowDetails(label: string) {
+  const [open, setOpen] = useState(false);
+  const rowRef = useRef<HTMLDivElement>(null);
+  const closeDetails = () => {
+    setOpen(false);
+    rowRef.current?.focus();
+  };
+  const rowProps = {
+    ref: rowRef,
+    role: "group" as const,
+    tabIndex: 0,
+    "aria-label": `${label} (press Enter to open details)`,
+    onClick: (e: React.MouseEvent<HTMLDivElement>) => {
+      if (
+        (e.target as HTMLElement).closest("button, a, input, select, textarea")
+      )
+        return;
+      if (window.getSelection()?.toString()) return;
+      setOpen(true);
+    },
+    onKeyDown: (e: React.KeyboardEvent<HTMLDivElement>) => {
+      // Only the row itself: Enter / Space on an inner control is its own.
+      if (e.target !== e.currentTarget) return;
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        setOpen(true);
+      }
+    },
+  };
+  return { open, setOpen, closeDetails, rowProps };
+}
 
 function RowDetailsButton({ onClick }: { onClick: () => void }) {
   return (
@@ -2048,7 +2167,7 @@ function DNSQueryDetailModal({
   const answers = row.answer_count ?? null;
   const result = describeRcode(rcode, answers);
   const client = row.client_ip
-    ? `${row.client_ip}${row.client_port ? `#${row.client_port}` : ""}`
+    ? formatClientEndpoint(row.client_ip, row.client_port)
     : null;
   return (
     <Modal title="DNS query details" onClose={onClose} wide>

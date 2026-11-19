@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.auth import User
@@ -52,6 +52,9 @@ DHCP_AGENT_DRIVERS: frozenset[str] = frozenset({"kea"})
 #: Sentinel for "the outcome was never recorded" (#914). Not a real RCODE,
 #: and deliberately not spelled like one.
 RCODE_UNKNOWN = "UNKNOWN"
+
+#: Shown for a log row whose server was deleted before rows carried its name.
+DELETED_SERVER_NAME = "deleted server"
 
 
 class LogScopeError(Exception):
@@ -195,6 +198,43 @@ async def resolve_dhcp_log_servers(
     )
 
 
+def include_orphaned_logs(
+    user: User, *, server_id: uuid.UUID | None, group_id: uuid.UUID | None
+) -> bool:
+    """Whether a read also covers rows whose server was deleted (#4173).
+
+    Those rows have ``server_id`` NULL, so no server grant can name them.
+    They are what the "all servers" read returns to a caller who holds an
+    UNSCOPED ``read`` on ``server`` (the same caller who could have read them
+    before the server went), never to a read narrowed to one server or group
+    and never to a caller whose grants are scoped.
+    """
+    from app.core.permissions import user_has_permission  # noqa: PLC0415
+
+    if server_id is not None or group_id is not None:
+        return False
+    return user_has_permission(user, "read", "server")
+
+
+def _server_scope(column: Any, server_ids: Sequence[uuid.UUID], include_orphans: bool) -> Any:
+    if include_orphans:
+        return or_(column.in_(list(server_ids)), column.is_(None))
+    return column.in_(list(server_ids))
+
+
+def log_row_server_name(
+    row_server_id: uuid.UUID | None, stored_name: str | None, names: dict[uuid.UUID, str]
+) -> str:
+    """The server name a merged log read shows for one row.
+
+    The live name while the server exists, else the name stored at ingest,
+    else a plain ``deleted server`` (rows older than the column).
+    """
+    if row_server_id is not None and row_server_id in names:
+        return names[row_server_id]
+    return stored_name or DELETED_SERVER_NAME
+
+
 def _rcode_clause(rcode: str) -> Any:
     wanted = rcode.strip().upper()
     if wanted == RCODE_UNKNOWN:
@@ -223,6 +263,7 @@ async def search_dns_queries(
     rcode: str | None = None,
     answer_source: str | None = None,
     limit: int = 200,
+    include_orphans: bool = False,
 ) -> list[DNSQueryLogEntry]:
     """Query-log rows for ``server_ids``, newest first, at most ``limit``.
 
@@ -230,9 +271,11 @@ async def search_dns_queries(
     ``qname_contains`` matches the qname only (the copilot's argument).
     Both are substring matches with LIKE metacharacters neutralised.
     """
-    if not server_ids:
+    if not server_ids and not include_orphans:
         return []
-    stmt = select(DNSQueryLogEntry).where(DNSQueryLogEntry.server_id.in_(list(server_ids)))
+    stmt = select(DNSQueryLogEntry).where(
+        _server_scope(DNSQueryLogEntry.server_id, server_ids, include_orphans)
+    )
     if since is not None:
         stmt = stmt.where(DNSQueryLogEntry.ts >= since)
     if until is not None:
@@ -282,11 +325,14 @@ async def dns_query_analytics(
     since: datetime | None = None,
     until: datetime | None = None,
     limit: int = 10,
+    include_orphans: bool = False,
 ) -> DNSQueryAnalytics:
     """Top-N rollups over every row the selected servers logged."""
-    if not server_ids:
+    if not server_ids and not include_orphans:
         return DNSQueryAnalytics(0, [], [], [], [], [])
-    base_filter: list[Any] = [DNSQueryLogEntry.server_id.in_(list(server_ids))]
+    base_filter: list[Any] = [
+        _server_scope(DNSQueryLogEntry.server_id, server_ids, include_orphans)
+    ]
     if since is not None:
         base_filter.append(DNSQueryLogEntry.ts >= since)
     if until is not None:
@@ -345,11 +391,14 @@ async def search_dhcp_activity(
     mac_address: str | None = None,
     ip_address: str | None = None,
     limit: int = 200,
+    include_orphans: bool = False,
 ) -> list[DHCPLogEntry]:
     """Kea activity rows for ``server_ids``, newest first, at most ``limit``."""
-    if not server_ids:
+    if not server_ids and not include_orphans:
         return []
-    stmt = select(DHCPLogEntry).where(DHCPLogEntry.server_id.in_(list(server_ids)))
+    stmt = select(DHCPLogEntry).where(
+        _server_scope(DHCPLogEntry.server_id, server_ids, include_orphans)
+    )
     if since is not None:
         stmt = stmt.where(DHCPLogEntry.ts >= since)
     if until is not None:
@@ -376,7 +425,10 @@ __all__ = [
     "InvalidLogFilter",
     "LogScopeError",
     "LogServer",
+    "DELETED_SERVER_NAME",
     "can_read_log_server",
+    "include_orphaned_logs",
+    "log_row_server_name",
     "dns_query_analytics",
     "resolve_dhcp_log_servers",
     "resolve_dns_log_servers",
