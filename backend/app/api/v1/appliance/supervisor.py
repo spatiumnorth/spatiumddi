@@ -138,6 +138,7 @@ from app.services.appliance.ca import (
     verify_session_token,
 )
 from app.services.appliance.cert_auth import (
+    RegisterProofRefused,
     RegisterProofUnavailable,
     verify_register_proof,
 )
@@ -1064,6 +1065,18 @@ _UNSIGNED_REGISTER_REFUSED = (
     "administrator change APPLIANCE_UNSIGNED_REGISTER_ALLOWED."
 )
 
+# #4433 — why a registration proof was refused. The header carries the reason
+# for a supervisor that reads headers; the 403 body carries it too.
+REGISTER_REFUSAL_HEADER = "X-Register-Refusal"
+_REGISTER_PROOF_MESSAGES = {
+    "clock_skew": (
+        "Registration refused: the appliance's clock differs from this server's "
+        "by more than the allowed skew. Correct its clock; the pairing code is kept."
+    ),
+    "bad_signature": "Registration refused: the registration proof was not valid. Retrying.",
+    "replayed": "Registration refused: the registration proof was already used. Retrying.",
+}
+
 # First release whose supervisor signs its registration.
 _FIRST_SIGNING_RELEASE = "1.0.1"
 
@@ -1131,6 +1144,20 @@ async def supervisor_register(
                 body.proof_nonce or "",
                 body.proof_signature,
             )
+        except RegisterProofRefused as exc:
+            # Still a 403 (an older supervisor reads that as "code rejected"),
+            # but with the reason in a header and the body so a current one
+            # keeps its pairing code and retries (#4433). Nothing here depends
+            # on the code, so there is no oracle to protect.
+            await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                {
+                    "reason": exc.reason,
+                    "message": _REGISTER_PROOF_MESSAGES.get(exc.reason, "Registration refused."),
+                },
+                headers={REGISTER_REFUSAL_HEADER: exc.reason},
+            ) from None
         except RegisterProofUnavailable:
             await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
             raise HTTPException(
@@ -1138,9 +1165,6 @@ async def supervisor_register(
                 "Registration is paused: the nonce store is unavailable. Retrying shortly.",
                 headers={"Retry-After": "30"},
             ) from None
-        if not key_proven:
-            await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "Registration refused.")
 
     submitted_hash = _hash_code(body.pairing_code)
     client_ip = _client_ip(request)

@@ -153,6 +153,8 @@ async def test_registration_signed_by_another_key_is_refused(
     before = await _token_hash(db_session, aid)
     r = await client.post(URL, json=k.body("00000000", **k.proof(key=Ed25519PrivateKey.generate())))
     assert r.status_code == 403
+    assert r.headers["X-Register-Refusal"] == "bad_signature"
+    assert r.json()["detail"]["reason"] == "bad_signature"
     assert await _token_hash(db_session, aid) == before
 
 
@@ -164,7 +166,9 @@ async def test_a_registration_signature_is_accepted_once(
     body = k.body("00000000", **k.proof())
     assert (await client.post(URL, json=body)).status_code == 200
     before = await _token_hash(db_session, aid)
-    assert (await client.post(URL, json=body)).status_code == 403
+    again = await client.post(URL, json=body)
+    assert again.status_code == 403
+    assert again.headers["X-Register-Refusal"] == "replayed"
     assert await _token_hash(db_session, aid) == before
 
 
@@ -174,7 +178,21 @@ async def test_stale_registration_signature_is_refused(
 ) -> None:
     k, _, _ = await _registered(db_session, client, signed=True)
     r = await client.post(URL, json=k.body("00000000", **k.proof(age_s=3600)))
+    # Still a 403 (older supervisors read it as before), now with the reason.
     assert r.status_code == 403
+    assert r.headers["X-Register-Refusal"] == "clock_skew"
+    assert r.json()["detail"]["reason"] == "clock_skew"
+    assert "clock" in r.json()["detail"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_future_dated_proof_is_clock_skew_too(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    k, _, _ = await _registered(db_session, client, signed=True)
+    r = await client.post(URL, json=k.body("00000000", **k.proof(age_s=-3600)))
+    assert r.status_code == 403
+    assert r.headers["X-Register-Refusal"] == "clock_skew"
 
 
 @pytest.mark.asyncio
