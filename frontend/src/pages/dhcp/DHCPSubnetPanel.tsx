@@ -17,6 +17,7 @@ import {
   type DHCPScope,
 } from "@/lib/api";
 import { zebraBodyCls } from "@/lib/utils";
+import { FormError } from "@/components/ui/form-error";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import {
   APPROVAL_QUEUED_MESSAGE,
@@ -82,9 +83,9 @@ function SuggestRangeModal({
       <div className="space-y-2 text-sm">
         {isLoading && <p className="text-muted-foreground">Looking…</p>}
         {error && (
-          <p className="text-destructive">
+          <FormError className="text-sm">
             {formatApiError(error, "Could not compute suggestions")}
-          </p>
+          </FormError>
         )}
         {data && data.suggestions.length === 0 && (
           <p className="text-muted-foreground">
