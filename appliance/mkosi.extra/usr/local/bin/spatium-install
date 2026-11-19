@@ -237,6 +237,10 @@ ADMIN_PASSWORD_HASH=""
 # the previous behaviour, where root always got it.
 SET_ROOT_PASSWORD="no"
 NET_MODE="dhcp"
+# #4546 - set once the Network screen has been answered, so Keep /var's
+# previous-answer defaults never replace a DHCP answer (whose NET_IP is
+# empty, like an unanswered screen's).
+NET_ANSWERED=""
 NET_INTERFACE=""
 NET_IP=""
 NET_PREFIX="24"
@@ -2068,7 +2072,8 @@ _apply_kept_answers() {
     if [ "$ROLE" = "appliance" ] && [ -z "${PRESEED_HAS_CONTROL_URL:-}" ] && [ -z "$CONTROL_PLANE_URL" ]; then
         CONTROL_PLANE_URL="$KEPT_CONTROL_URL"
     fi
-    if [ -z "${PRESEED_HAS_NETWORK:-}" ] && [ -n "$KEPT_NET_MODE" ] && [ -z "$NET_IP" ]; then
+    if [ -z "${PRESEED_HAS_NETWORK:-}" ] && [ -n "$KEPT_NET_MODE" ] && [ -z "$NET_IP" ] \
+       && [ -z "${NET_ANSWERED:-}" ]; then
         NET_MODE="$KEPT_NET_MODE"
         NET_INTERFACE="$KEPT_NET_INTERFACE"
         if [ "$KEPT_NET_MODE" = "static" ]; then
@@ -3089,6 +3094,7 @@ ask_network() {
         "static" "Static IP" \
         3>&1 1>&2 2>&3) \
         || return 1
+    NET_ANSWERED=1
 
     # A re-answer must not carry the previous one's IPv6 forward. These
     # were only ever reset inside the static branch, so static -> Back ->

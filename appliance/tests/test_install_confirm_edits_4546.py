@@ -879,6 +879,23 @@ echo "HOST=$HOSTNAME USER=$ADMIN_USER IP=$NET_IP TZ=$TIMEZONE"
     assert "HOST=typed-already USER=bob IP=10.1.1.1 TZ=UTC" in p.stdout
 
 
+def test_kept_network_never_replaces_an_answered_dhcp_screen(tmp_path):
+    # A DHCP answer has an empty NET_IP, exactly like a screen not yet shown:
+    # Confirm -> Target disk -> Keep /var used to swap it for the kept static IP.
+    d = _state_dir(tmp_path)
+    p, _, _ = run(
+        tmp_path,
+        KEPT_FNS,
+        f"""
+KEEP_VAR=yes; NET_MODE=dhcp; NET_ANSWERED=1
+_set_kept_answers "$(_read_kept_answers {str(d)!r})"
+_apply_kept_answers
+echo "NET=$NET_MODE/$NET_IP"
+""",
+    )
+    assert "NET=dhcp/" in p.stdout
+
+
 def test_a_role_different_from_the_kept_data_is_switched_or_refused(tmp_path):
     d = _state_dir(tmp_path)
     script = f"""
