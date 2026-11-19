@@ -432,13 +432,12 @@ export function StaleIPReportPage() {
                 reversible — edit any row back from the IPAM page.
               </>
             )}
-            {deprecate.isError && (
-              <span role="alert" className="mt-2 block text-destructive">
-                Could not deprecate:{" "}
-                {formatApiError(deprecate.error, "the request failed")}
-              </span>
-            )}
           </>
+        }
+        error={
+          deprecate.isError
+            ? `Could not deprecate: ${formatApiError(deprecate.error, "the request failed")}`
+            : null
         }
         onConfirm={confirmDeprecate}
         onClose={() => {

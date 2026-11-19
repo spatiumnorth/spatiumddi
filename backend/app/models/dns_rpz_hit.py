@@ -53,12 +53,17 @@ class DNSRPZHit(Base):
         Index("ix_dns_rpz_hit_ts", "ts"),
         # "Which feed is doing the work" rollup.
         Index("ix_dns_rpz_hit_zone_ts", "rpz_zone", "ts"),
+        # The server delete's SET NULL looks rows up by server (#4173).
+        Index("ix_dns_rpz_hit_server_id", "server_id"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    server_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("dns_server.id", ondelete="CASCADE"), nullable=False
+    # SET NULL (#4173): a hit is evidence about a client, not the server, so
+    # it outlives the server's deletion; ``server_name`` keeps it attributable.
+    server_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("dns_server.id", ondelete="SET NULL"), nullable=True
     )
+    server_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     # Nullable because a hit whose log head didn't parse is still worth

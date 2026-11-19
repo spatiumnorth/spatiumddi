@@ -648,8 +648,10 @@ export function ReapplyConfirmModal({
         <p>
           This will stamp the template across every recorded instance with
           <code className="mx-1">force=True</code>, overwriting any operator
-          overrides. Capped at 200 instances per call. An instance whose child
-          layout cannot be carved is skipped and left as it was.
+          overrides of the template&apos;s fields. Tags and custom fields are
+          merged: the template&apos;s keys are set, and keys the template does
+          not hold are kept. Capped at 200 instances per call. An instance whose
+          child layout cannot be carved is skipped and left as it was.
         </p>
         <p>
           Type the template name to confirm:{" "}
@@ -869,6 +871,12 @@ export function IPAMTemplatesPage() {
           />
         </div>
 
+        <FormError className="text-sm">
+          {deleteMut.error
+            ? formatApiError(deleteMut.error, "Delete failed")
+            : null}
+        </FormError>
+
         <div className="overflow-x-auto rounded-lg border">
           <table className="w-full text-sm">
             <thead className="border-b bg-muted/30 text-left text-xs uppercase text-muted-foreground">
@@ -968,6 +976,7 @@ export function IPAMTemplatesPage() {
                     </button>
                     <button
                       onClick={() => {
+                        deleteMut.reset();
                         if (
                           confirm(
                             `Delete template "${t.name}"? Applied instances are not removed; their applied_template_id is cleared.`,
