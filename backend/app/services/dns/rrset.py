@@ -66,6 +66,7 @@ The agentless drivers receive the set too (#783), as ``RecordChange.rrset``.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from sqlalchemy import func, select
@@ -148,6 +149,8 @@ async def resolve_rrsets(
     db: AsyncSession,
     zone: DNSZone,
     keys: set[tuple[str, str]],
+    *,
+    include: Callable[[DNSRecord], bool] | None = None,
 ) -> dict[tuple[str, str], list[dict[str, Any]]]:
     """Load the live members of every requested ``(name, type)``.
 
@@ -163,10 +166,11 @@ async def resolve_rrsets(
     the whole commit, which for an import means losing the entire zone rather
     than one record.
 
-    View-scoped records (``view_id``) are not filtered: a server whose group has
-    views never receives incremental ops at all — ``agent_config`` retires them
-    and re-renders the whole zone per view instead — so an op that reaches a
-    driver is always from a group where every record lands in one namespace.
+    ``include`` keeps only the rows it accepts. Under views an op is for one
+    view's copy of the zone (#2242), whose RRset is made of the records that
+    copy carries (``pool_geo.records_for_view``), not of every row of the zone
+    — a record scoped to the other view is not a member. Without it every row
+    counts: a group without views has one namespace.
     """
     if not keys:
         return {}
@@ -186,6 +190,8 @@ async def resolve_rrsets(
             .all()
         )
         for row in rows:
+            if include is not None and not include(row):
+                continue
             key = ((row.name or "@").lower(), (row.record_type or "").upper())
             if key in out:
                 out[key].append(_member(row.value, row.ttl, row))
@@ -260,6 +266,7 @@ async def stamp_rrsets_for_ops(
     ops: list[dict[str, Any]],
     *,
     agentless: bool = False,
+    row_filter: Callable[[DNSRecord], bool] | None = None,
 ) -> None:
     """Stamp every op in a batch with the RRset that should exist once the
     WHOLE batch has been applied. Payloads are mutated in place.
@@ -299,6 +306,9 @@ async def stamp_rrsets_for_ops(
     old-agent reason for opting out does not apply to drivers that live in
     this codebase. A pool's ``create`` (``add``) and ``delete_value`` ops are
     still left alone, for the order-dependence reason above.
+
+    ``row_filter`` (#2242) stamps the RRset of one view's copy of the zone: the
+    rows that copy carries, nothing scoped to a sibling view.
     """
     stampable = [
         o
@@ -309,7 +319,10 @@ async def stamp_rrsets_for_ops(
     keys = {k for o in stampable if (k := rrset_target(o["op"], o["record"])) is not None}
     if not keys:
         return
-    final = {key: list(members) for key, members in (await resolve_rrsets(db, zone, keys)).items()}
+    final = {
+        key: list(members)
+        for key, members in (await resolve_rrsets(db, zone, keys, include=row_filter)).items()
+    }
     for o in stampable:
         key = rrset_target(o["op"], o["record"])
         if key is not None:

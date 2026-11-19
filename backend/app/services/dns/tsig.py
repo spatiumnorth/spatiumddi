@@ -60,6 +60,8 @@ logger = structlog.get_logger(__name__)
 #: ``key`` statements with one name, which fails ``named-checkconf`` — and with
 #: it the whole group's config.
 VIEW_TRANSFER_KEY_PREFIX = "spatium_xfr_"
+# #2242 — the per-view key record ops are signed with (``view_update_key``).
+VIEW_UPDATE_KEY_PREFIX = "spatium_upd_"
 
 
 def transfer_needs_tsig(server: DNSServer) -> bool:
@@ -298,6 +300,35 @@ def view_transfer_key(group_key: TsigKey, view_name: str) -> TsigKey:
     ).digest()
     return TsigKey(
         name=VIEW_TRANSFER_KEY_PREFIX + hashlib.sha256(view_name.encode()).hexdigest()[:16],
+        algorithm="hmac-sha256",
+        secret=base64.b64encode(digest).decode(),
+    )
+
+
+def view_update_key(group_key: TsigKey, view_name: str) -> TsigKey:
+    """The key an agent signs a view's record ops with (#2242).
+
+    Under split-horizon an RFC 2136 update to loopback lands in whichever
+    view matches ``127.0.0.1``, so a record op cannot be aimed by address.
+    Like the transfer key (:func:`view_transfer_key`) this one selects its own
+    view through ``match-clients`` (the agent admits it there and refuses it
+    in every other), so named routes the update into that view's copy of the
+    zone. It is a SEPARATE derived key, under its own label: the transfer
+    key reads (AXFR) and this one writes, and a holder of either cannot use it
+    for the other (``allow-transfer`` grants only the transfer keys,
+    ``allow-update`` only this one). Derived from the legacy group key like
+    the transfer key, with the same properties: nothing stored, nothing to
+    migrate, rotated with the group key.
+    """
+    try:
+        material = base64.b64decode(group_key.secret, validate=True)
+    except (binascii.Error, ValueError):
+        material = group_key.secret.encode()
+    digest = hmac.new(
+        material, b"spatium-view-update\x00" + view_name.encode(), hashlib.sha256
+    ).digest()
+    return TsigKey(
+        name=VIEW_UPDATE_KEY_PREFIX + hashlib.sha256(view_name.encode()).hexdigest()[:16],
         algorithm="hmac-sha256",
         secret=base64.b64encode(digest).decode(),
     )

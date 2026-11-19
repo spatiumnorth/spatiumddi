@@ -203,6 +203,18 @@ Three channels:
 **Why not WebSocket / SSE?**
 - We considered it. Long-poll is simpler, survives hostile proxies, does not need sticky-session affinity on a multi-replica API. We can upgrade to SSE in a later phase without changing the agent contract (long-poll remains a compatible fallback).
 
+### Capability header: `per-view-ops` (#2242)
+
+A BIND9 agent also sends `per-view-ops` in `X-Spatium-Agent-Features` (register,
+every heartbeat and every poll, recorded as `dns_server.agent_per_view_ops`;
+no other driver says it). It means the agent applies a record op into the view
+the op names, signed with that view's `update_key` from the bundle's `views`.
+Only for such a server does a group with views ship record ops and keep records
+out of its structural fingerprint; every other server keeps the re-render, so
+an upgrade of the control plane ahead of its agents changes nothing until each
+agent reports in. See [DNS drivers](../drivers/DNS_DRIVERS.md) and
+[DNS](../features/DNS.md) for what changes on both sides.
+
 ### Blocklist entries in the bundle — packed runs (#4040)
 
 A blocklist's `entries` list used to hold one JSON object per entry (~108

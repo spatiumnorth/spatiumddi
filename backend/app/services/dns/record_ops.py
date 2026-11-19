@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import ipaddress
 import uuid
-from collections.abc import Collection, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -111,9 +111,37 @@ def retry_delay(attempts: int) -> timedelta:
     return timedelta(seconds=min(OP_RETRY_BASE_SECONDS * (2 ** min(exp, 16)), OP_RETRY_MAX_SECONDS))
 
 
+#: Joins an op's zone and view into the first component of its RRset key.
+#: Not valid in a zone or view name, so two different pairs never collide.
+_SCOPE_SEP = "\x1f"
+
+
+def op_scope(zone_name: str, view_name: str | None) -> str:
+    """The first component of an op's RRset key: its zone and its view (#2242).
+
+    Two views of one group each hold a copy of a zone, and an op carries the
+    whole RRset of the view it is for, so an op for the same name and type in a
+    SIBLING view neither supersedes it nor is superseded by it. An op with no
+    view (a flat group, or queued before the column) is its own scope.
+    """
+    return f"{zone_name}{_SCOPE_SEP}{view_name or ''}"
+
+
+def _op_scope_sql() -> Any:
+    """``op_scope`` of the op row, in SQL."""
+    # Literals, not bind parameters: the statement keeps a fixed parameter count
+    # whatever the key count (#2289), and these two never vary.
+    return func.concat(
+        DNSRecordOp.zone_name,
+        literal_column("chr(31)"),
+        func.coalesce(DNSRecordOp.view_name, literal_column("''")),
+    )
+
+
 def op_rrset_key(op: DNSRecordOp) -> tuple[str, str, str] | None:
-    """``(zone, name, type)`` of the RRset an op rewrites, or None when the op
-    carries no whole-RRset state.
+    """``(scope, name, type)`` of the RRset an op rewrites, or None when the op
+    carries no whole-RRset state. ``scope`` is the zone and the view the op is
+    for (``op_scope``).
 
     Only an op with an ``rrset`` (#773) is a complete statement of what the
     RRset should be; one that opted out via ``rrset_action`` (DNS pools) or
@@ -125,7 +153,7 @@ def op_rrset_key(op: DNSRecordOp) -> tuple[str, str, str] | None:
     if "rrset" not in record:
         return None
     key = record_rrset_key(record)
-    return None if key is None else (op.zone_name, key[0], key[1])
+    return None if key is None else (op_scope(op.zone_name, op.view_name), key[0], key[1])
 
 
 def _op_name_sql() -> Any:
@@ -165,16 +193,17 @@ def rrset_match_where(keys: Collection[tuple[str, str, str]]) -> Any:
     """WHERE clause matching ops whose RRset is one of ``keys``."""
     return and_(
         DNSRecordOp.record.has_key("rrset"),
-        _keys_in((DNSRecordOp.zone_name, _op_name_sql(), _op_type_sql()), keys),
+        _keys_in((_op_scope_sql(), _op_name_sql(), _op_type_sql()), keys),
     )
 
 
 def _rrset_candidates(*where: Any) -> Select[Any]:
     """The ops matching ``where`` as ``(id, zone_name, name, type)`` rows, for
-    ``candidates_with_keys``. Only ops that carry an RRset have a key."""
+    ``candidates_with_keys`` (``zone_name`` is the op's scope, zone and view).
+    Only ops that carry an RRset have a key."""
     return select(
         DNSRecordOp.id.label("id"),
-        DNSRecordOp.zone_name.label("zone_name"),
+        _op_scope_sql().label("zone_name"),
         _op_name_sql().label("name"),
         _op_type_sql().label("type"),
     ).where(*where, DNSRecordOp.record.has_key("rrset"))
@@ -281,8 +310,10 @@ def queued_after(
 
 
 async def _successors(db: AsyncSession, ops: Collection[DNSRecordOp]) -> dict[uuid.UUID, uuid.UUID]:
-    """For each op, the newest op queued STRICTLY after it for the same server
-    and RRset, if any (#1232). One query per server per key chunk.
+    """For each op, the newest op queued STRICTLY after it for the same server,
+    view and RRset, if any (#1232, #2242). The view is part of the RRset's
+    identity: two views' ops for one name each carry their own view's set, so
+    neither delivers the other's change. One query per server per key chunk.
 
     That newer op carries the whole desired RRset as of a later moment, so it
     already delivers the older op's change; retrying the older one after it
@@ -306,7 +337,7 @@ async def _successors(db: AsyncSession, ops: Collection[DNSRecordOp]) -> dict[uu
                 await db.execute(
                     select(
                         DNSRecordOp.id,
-                        DNSRecordOp.zone_name,
+                        _op_scope_sql(),
                         _op_name_sql(),
                         _op_type_sql(),
                         DNSRecordOp.created_at,
@@ -515,10 +546,12 @@ def queued_zone_ops_where(zone: DNSZone, group_id: uuid.UUID) -> list[Any]:
 
     Ops with ``view_name`` NULL — queued in a flat group, or before the column
     existed — cannot be attributed to a view and keep the name-scoped sweep.
-    Under views that is the documented over-sweep, and it is harmless while
-    ``ships_ops`` is false there: the bundle build retires every queued op for
-    the server as ``applied`` (``agent_config.retire_queued_ops``), so an op
-    the sweep discards was never going to reach ``nsupdate``. In a flat group
+    Under views that is the documented over-sweep. It is harmless for a server
+    whose agent cannot apply per view (``ships_ops`` false there: the bundle
+    build retires every queued op as ``applied``,
+    ``agent_config.retire_queued_ops``) and, for one that can, only reaches ops
+    queued before the column existed, which the structural re-render of the
+    upgrade retires anyway. In a flat group
     the same name cannot exist twice (the create route 409s it), so the
     predicate is exact there.
 
@@ -1668,7 +1701,7 @@ async def _ptr_delete_queued_last(db: AsyncSession, zone_name: str, ptr_name: st
     transaction (an agentless op is already ``applied`` when we look). A caller
     that queued the PTR's delete before the A's has deliberately removed it; a
     re-assert queued after would bring it back."""
-    key = (zone_name, ptr_name.lower() or "@", "PTR")
+    key = (op_scope(zone_name, None), ptr_name.lower() or "@", "PTR")
     rows = (
         await db.execute(
             select(DNSRecordOp.op, DNSRecordOp.created_at, DNSRecordOp.seq)
@@ -1890,6 +1923,65 @@ async def resolve_op_views(
     return out
 
 
+async def view_record_filters(
+    db: AsyncSession, zone: DNSZone
+) -> dict[str, Callable[[DNSRecord], bool]]:
+    """``{view name: does that view's copy of the zone carry this record}`` for
+    every view descriptor of the zone's group (#2242); empty in a flat group.
+
+    The predicate is ``records_for_view``, the one the bundle's copies and the
+    op fan-out (``resolve_op_views``) use, so the RRset an op carries is made of
+    exactly what its view's copy serves.
+    """
+    views = (
+        (await db.execute(select(DNSView).where(DNSView.group_id == zone.group_id))).scalars().all()
+    )
+    geo = await build_geo_steering(db, zone.group_id)
+    if not views and not geo.active:
+        return {}
+    descs = build_view_descriptors(sorted(views, key=lambda v: (v.order, v.name)), geo)
+    return {
+        vd["name"]: (lambda r, vd=vd: bool(records_for_view([r], vd, geo)))  # type: ignore[misc]
+        for vd in descs
+    }
+
+
+async def stamp_ops_for_views(
+    db: AsyncSession,
+    zone: DNSZone,
+    ops: list[dict[str, Any]],
+    op_views: Sequence[Sequence[str | None]],
+) -> list[list[dict[str, Any]]]:
+    """Stamp each op's whole desired RRset (#773) from the copy of the zone its
+    view serves, and return, per op, one record payload per view it is queued
+    for (parallel to ``op_views``) (#2242).
+
+    In a flat group every op is for ``[None]``: one stamp over the zone, the
+    same payload object for every row, exactly as before. Under views the
+    RRset an op ships is the one in ITS view's copy: two views may serve the
+    same name with different data, and an op written with the other view's
+    members would put them into the wrong view. Each view stamps its own copies
+    of the op payloads (a batch is folded per view, since the final set of a
+    name differs per view), so the rows never share a payload. ``ops`` payloads
+    are left as they are in that case.
+    """
+    if all(v is None for names in op_views for v in names):
+        await stamp_rrsets_for_ops(db, zone, ops)
+        return [[o["record"]] * len(names) for o, names in zip(ops, op_views, strict=True)]
+    filters = await view_record_filters(db, zone)
+    slots: dict[str | None, list[tuple[int, int]]] = {}
+    for i, names in enumerate(op_views):
+        for j, view in enumerate(names):
+            slots.setdefault(view, []).append((i, j))
+    out: list[list[dict[str, Any]]] = [[{}] * len(names) for names in op_views]
+    for view, where in slots.items():
+        copies = [{**ops[i], "record": dict(ops[i]["record"])} for i, _ in where]
+        await stamp_rrsets_for_ops(db, zone, copies, row_filter=filters.get(view) if view else None)
+        for (i, j), copy in zip(where, copies, strict=True):
+            out[i][j] = copy["record"]
+    return out
+
+
 async def enqueue_record_op(
     db: AsyncSession,
     zone: DNSZone,
@@ -1999,6 +2091,9 @@ async def enqueue_record_op(
         )
         return None
 
+    # #2242 — one op per view that renders the zone (one, view_name NULL, in
+    # a flat group).
+    view_names = (await resolve_op_views(db, zone, [{"op": op, "record": record}]))[0]
     # #773 — ship the complete desired RRset alongside the op. Every agent
     # driver has to apply a record change as a whole-RRset write, so without
     # this a second value at an existing (name, type) silently retired the
@@ -2006,24 +2101,24 @@ async def enqueue_record_op(
     # path folds and stamps its whole list in a single query before delegating
     # here — restamping per op would undo the fold. (An op carrying an explicit
     # ``rrset_action`` opts out entirely; ``stamp_rrsets_for_ops`` handles it.)
+    # Under views each view's op carries the RRset of its own view's copy.
     if "rrset" not in record:
-        record = dict(record)
-        await stamp_rrsets_for_ops(db, zone, [{"op": op, "record": record}])
-
-    # #2242 — one op per view that renders the zone (one, view_name NULL, in
-    # a flat group).
-    view_names = (await resolve_op_views(db, zone, [{"op": op, "record": record}]))[0]
+        view_records = (
+            await stamp_ops_for_views(db, zone, [{"op": op, "record": dict(record)}], [view_names])
+        )[0]
+    else:
+        view_records = [record] * len(view_names)
     primary_op: DNSRecordOp | None = None
     first_op: DNSRecordOp | None = None
     for srv in agent_servers:
-        for view_name in view_names:
+        for view_name, view_record in zip(view_names, view_records, strict=True):
             row = DNSRecordOp(
                 server_id=srv.id,
                 zone_id=zone.id,
                 zone_name=zone.name,
                 view_name=view_name,
                 op=op,
-                record=record,
+                record=view_record,
                 target_serial=target_serial,
                 state="pending",
             )
@@ -2038,7 +2133,7 @@ async def enqueue_record_op(
     # tick. Collected here (no commit yet); the request's
     # ``wake_publishing`` dependency flushes it after the outer commit.
     collect_wake(dns_group_channel(zone.group_id))
-    await reassert_ptrs_after_a_deletes(db, zone, primary, [{"op": op, "record": record}])
+    await reassert_ptrs_after_a_deletes(db, zone, primary, [{"op": op, "record": view_records[0]}])
     # Return the primary's op when the primary is among the enabled servers,
     # else the first enabled agent's op. The return must be truthy whenever we
     # actually enqueued something — a disabled primary + enabled secondary still
@@ -2173,17 +2268,18 @@ async def _fanout_agent_ops(
         )
         return [None] * len(ops)
     ops = [{**o, "record": dict(o["record"])} for o in ops]
-    await stamp_rrsets_for_ops(db, zone, ops)
-    # The row we hand back per op: the primary's if enabled, else the first
-    # enabled agent's (``agent_servers`` is ordered is_primary DESC).
-    returned = next((s for s in agent_servers if s.id == primary.id), agent_servers[0])
     # #2242 — one row per view that renders the zone, per op (one, NULL view,
     # in a flat group). The row returned for an op is its first view's.
     op_views = await resolve_op_views(db, zone, ops)
+    # Each row carries the RRset of its own view's copy of the zone.
+    op_records = await stamp_ops_for_views(db, zone, ops, op_views)
+    # The row we hand back per op: the primary's if enabled, else the first
+    # enabled agent's (``agent_servers`` is ordered is_primary DESC).
+    returned = next((s for s in agent_servers if s.id == primary.id), agent_servers[0])
     result: list[DNSRecordOp | None] = []
     rows: list[DNSRecordOp] = []
     for srv in agent_servers:
-        for o, view_names in zip(ops, op_views, strict=True):
+        for o, view_names, view_records in zip(ops, op_views, op_records, strict=True):
             for i, view_name in enumerate(view_names):
                 row = DNSRecordOp(
                     server_id=srv.id,
@@ -2191,7 +2287,7 @@ async def _fanout_agent_ops(
                     zone_name=zone.name,
                     view_name=view_name,
                     op=o["op"],
-                    record=o["record"],
+                    record=view_records[i],
                     target_serial=o.get("target_serial"),
                     state="pending",
                 )

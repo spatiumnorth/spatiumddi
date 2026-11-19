@@ -2,14 +2,15 @@
 
 Without views a record change is an op: the structural ETag does not move,
 the stored bundle ships its ops, and no server needs more than an ETag-only
-re-render. With views the record is part of the structural fingerprint, the
-op path is off (``ships_ops`` False) and the queued ops are retired, so every
-server in the group renders the whole record set again: N servers, N renders
-of reason ``structural``.
+re-render. With views and an agent that cannot apply per view the record is
+part of the structural fingerprint, the op path is off (``ships_ops`` False)
+and the queued ops are retired, so every server in the group renders the whole
+record set again: N servers, N renders of reason ``structural``. With views and
+agents that apply per view (slice 4 of
+docs/design/SPLIT_HORIZON_INCREMENTAL_OPS.md) the record leaves the structural
+payload and the change is N ops: no structural render, ops shipped.
 
-These tests pin that cost as it is today so the change that ships view-scoped
-ops (slice 4 of docs/design/SPLIT_HORIZON_INCREMENTAL_OPS.md) flips the
-assertions on purpose, and so a regression in the flat path is visible.
+Both costs are pinned, so a regression in either is visible.
 """
 
 from __future__ import annotations
@@ -17,13 +18,15 @@ from __future__ import annotations
 import uuid
 
 import pytest
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.metrics import AGENT_BUNDLE_RENDERS
-from app.models.dns import DNSRecord, DNSServer, DNSServerGroup, DNSView, DNSZone
+from app.models.dns import DNSRecord, DNSRecordOp, DNSServer, DNSServerGroup, DNSView, DNSZone
 from app.services.dns import agent_bundle_store as store
 from app.services.dns.agent_bundle_render import RenderOutcome, render_and_store
 from app.services.dns.record_ops import enqueue_record_op
+from app.services.dns.tsig import ensure_group_tsig_key
 
 N_SERVERS = 3
 REASONS = ("initial", "revision", "structural", "records", "unchanged")
@@ -38,8 +41,11 @@ def _delta(before: dict[str, float]) -> dict[str, int]:
     return {r: int(now[r] - before[r]) for r in REASONS if now[r] != before[r]}
 
 
-async def _group(db: AsyncSession, *, views: bool) -> tuple[list[DNSServer], DNSZone]:
+async def _group(
+    db: AsyncSession, *, views: bool, per_view_ops: bool = False
+) -> tuple[list[DNSServer], DNSZone]:
     grp = DNSServerGroup(name=f"g-{uuid.uuid4().hex[:6]}")
+    ensure_group_tsig_key(grp)
     db.add(grp)
     await db.flush()
     servers = []
@@ -52,6 +58,7 @@ async def _group(db: AsyncSession, *, views: bool) -> tuple[list[DNSServer], DNS
             is_primary=i == 0,
             is_enabled=True,
             agent_id=uuid.uuid4(),
+            agent_per_view_ops=per_view_ops,
         )
         db.add(s)
         servers.append(s)
@@ -105,7 +112,7 @@ async def _one_record_change(db: AsyncSession, zone: DNSZone) -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_record_change_with_views_renders_every_server_in_full(
+async def test_a_record_change_with_views_and_old_agents_renders_every_server_in_full(
     db_session: AsyncSession,
 ) -> None:
     servers, zone = await _group(db_session, views=True)
@@ -118,11 +125,37 @@ async def test_a_record_change_with_views_renders_every_server_in_full(
     before = _counts()
     outcomes = await _render_all(db_session, servers)
 
-    # Today: the record is structural under views, so each of the N servers
-    # re-renders the group's whole record set for one record.
+    # An agent that cannot apply per view: the record is structural under
+    # views, so each of the N servers re-renders the group's whole record set.
     assert _delta(before) == {"structural": N_SERVERS}
     # ...and none of those bundles ships ops: the op path is off under views.
     assert all(o.bundle is not None and o.bundle.ships_ops is False for o in outcomes)
+
+
+@pytest.mark.asyncio
+async def test_a_record_change_with_views_and_per_view_agents_is_ops_not_renders(
+    db_session: AsyncSession,
+) -> None:
+    servers, zone = await _group(db_session, views=True, per_view_ops=True)
+    await db_session.commit()
+    await _render_all(db_session, servers)
+
+    await _one_record_change(db_session, zone)
+    before = _counts()
+    outcomes = await _render_all(db_session, servers)
+
+    # No structural render at all: only the stored body is refreshed, as in a
+    # flat group; the bundles ship ops, and the queued ops were not retired.
+    assert _delta(before) == {"records": N_SERVERS}
+    assert all(o.bundle is not None and o.bundle.ships_ops is True for o in outcomes)
+    queued = (
+        await db_session.execute(
+            select(func.count())
+            .select_from(DNSRecordOp)
+            .where(DNSRecordOp.state == "pending", DNSRecordOp.zone_id == zone.id)
+        )
+    ).scalar_one()
+    assert queued == N_SERVERS  # one view ("internal") renders the zone
 
 
 @pytest.mark.asyncio

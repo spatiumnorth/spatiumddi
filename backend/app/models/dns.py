@@ -346,6 +346,13 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     agent_renders_packed_blocklists: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    # #2242 — this server's BIND9 agent applies a record op into the view the
+    # op names (``per-view-ops`` in ``X-Spatium-Agent-Features``). Only then is
+    # a group with views sent record ops and a structural payload without
+    # records; False for an older agent, which re-renders on every change.
+    agent_per_view_ops: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
 
     # ── #882 last config-apply verdict ────────────────────────────────────
     #

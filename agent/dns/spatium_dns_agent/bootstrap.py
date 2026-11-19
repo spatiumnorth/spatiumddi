@@ -54,7 +54,7 @@ def _client(cfg: AgentConfig) -> httpx.Client:
         base_url=cfg.control_plane_url,
         verify=verify,
         timeout=30.0,
-        headers=features.headers(),
+        headers=features.headers(cfg.driver),
     )
 
 

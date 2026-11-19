@@ -114,6 +114,7 @@ from app.services.dns.row_locks import (
 from app.services.dns.server_move import CATALOG_UNSUPPORTED_DRIVERS
 from app.services.dns.soa_timers import (
     AGENT_FEATURES_HEADER,
+    applies_per_view_ops,
     reconcile_soa_timers,
     renders_soa_timers,
     reports_served_serials,
@@ -402,6 +403,19 @@ async def _set_packed_blocklists(db: AsyncSession, server: DNSServer, features: 
     if server.agent_renders_packed_blocklists == packed:
         return
     server.agent_renders_packed_blocklists = packed
+    await mark_bundles_dirty(db, server_ids=[server.id])
+
+
+async def _set_per_view_ops(db: AsyncSession, server: DNSServer, features: str | None) -> None:
+    """Record whether the agent applies a record op into the view it names
+    (#2242), and re-render the server's stored bundle when that changes: what
+    a split-horizon bundle ships (records in the structural payload or not,
+    the view update keys, whether ops ship at all) depends on it. Only a
+    BIND9 agent can say so; the flag stays false for any other driver."""
+    capable = server.driver == "bind9" and applies_per_view_ops(features)
+    if bool(server.agent_per_view_ops) == capable:
+        return
+    server.agent_per_view_ops = capable
     await mark_bundles_dirty(db, server_ids=[server.id])
 
 
@@ -727,6 +741,7 @@ async def agent_register(
     server.agent_renders_soa_timers = renders_soa_timers(agent_features)
     server.agent_reports_served_serials = reports_served_serials(agent_features)
     await _set_packed_blocklists(db, server, agent_features)
+    await _set_per_view_ops(db, server, agent_features)
 
     db.add(
         AuditLog(
@@ -1111,6 +1126,13 @@ async def agent_config_longpoll(
     if req_packed != bool(server.agent_renders_packed_blocklists):
         await _set_packed_blocklists(db, server, request.headers.get(AGENT_FEATURES_HEADER))
         await db.commit()
+    # #2242 — the same for what a split-horizon bundle ships: the stored flag is
+    # as fresh as the last heartbeat, the request header is this agent now.
+    if applies_per_view_ops(request.headers.get(AGENT_FEATURES_HEADER)) != bool(
+        server.agent_per_view_ops
+    ):
+        await _set_per_view_ops(db, server, request.headers.get(AGENT_FEATURES_HEADER))
+        await db.commit()
 
     deadline = asyncio.get_running_loop().time() + LONGPOLL_TIMEOUT_SECONDS
     enqueued = False
@@ -1308,6 +1330,7 @@ async def agent_heartbeat(
             request.headers.get(AGENT_FEATURES_HEADER)
         )
         await _set_packed_blocklists(db, server, request.headers.get(AGENT_FEATURES_HEADER))
+        await _set_per_view_ops(db, server, request.headers.get(AGENT_FEATURES_HEADER))
 
         # Phase 8f-2 — persist whatever slot state the agent reported. Only
         # overwrite when the agent actually sent a value (older agents

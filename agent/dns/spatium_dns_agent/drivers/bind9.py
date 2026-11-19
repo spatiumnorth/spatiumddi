@@ -232,7 +232,11 @@ def _render_response_log_option(opts: dict[str, Any]) -> str:
     return ""
 
 
-def _render_allow_update(zone: dict[str, Any], group_key_name: str | None) -> str:
+def _render_allow_update(
+    zone: dict[str, Any],
+    group_key_name: str | None,
+    view_update_key_name: str | None = None,
+) -> str:
     """Build the ``allow-update { ... };`` clause for a primary zone (issue #641).
 
     The internal agent loopback grant (the group TSIG key) is ALWAYS
@@ -246,12 +250,19 @@ def _render_allow_update(zone: dict[str, Any], group_key_name: str | None) -> st
 
     Returns "" (no clause) only when there's no group key AND no operator
     grants — i.e. a zone with dynamic updates off and no loopback key.
+
+    ``view_update_key_name`` (#2242) is the key of the view this copy lives in:
+    the control plane signs its record ops with it, and named admits it
+    into exactly that view, so it is granted here and nowhere else.
     """
     items: list[str] = []
     seen_keys: set[str] = set()
     if group_key_name:
         items.append(f'key "{group_key_name}";')
         seen_keys.add(group_key_name)
+    if view_update_key_name and view_update_key_name not in seen_keys:
+        items.append(f'key "{view_update_key_name}";')
+        seen_keys.add(view_update_key_name)
     if zone.get("dynamic_update_enabled"):
         for e in zone.get("update_acl") or []:
             if e.get("action") != "grant":
@@ -395,8 +406,30 @@ def _view_transfer_keys(views: list[dict[str, Any]]) -> dict[str, dict[str, Any]
     return out
 
 
+def _view_update_keys(views: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """``{view name: key}`` for every view the bundle gives an update key (#2242).
+
+    The key a record op for that view is signed with. Like the transfer key it
+    is admitted into its own view's ``match-clients`` and refused in every
+    other, so named routes the RFC 2136 update into that view's copy of the
+    zone instead of the one a loopback source address happens to match. A
+    separate key from the transfer one: that reads, this writes, and each
+    is granted only what it is for. A bundle from a control plane that does not
+    ship them (or an agent it does not ship them to) renders as before.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for view in views or []:
+        name = view.get("name") or ""
+        key = view.get("update_key")
+        if name and isinstance(key, dict) and key.get("name") and key.get("secret"):
+            out[name] = key
+    return out
+
+
 def _render_match_clients(
-    view: dict[str, Any], view_keys: dict[str, dict[str, Any]]
+    view: dict[str, Any],
+    view_keys: dict[str, dict[str, Any]],
+    update_keys: dict[str, dict[str, Any]] | None = None,
 ) -> str:
     """The body of one view's ``match-clients { … }`` (#920).
 
@@ -414,7 +447,11 @@ def _render_match_clients(
     own = view_keys.get(vname)
     if own is not None:
         items.append(f'key "{own["name"]}"')
+    own_update = (update_keys or {}).get(vname)
+    if own_update is not None:
+        items.append(f'key "{own_update["name"]}"')
     items += [f'!key "{k["name"]}"' for name, k in view_keys.items() if name != vname]
+    items += [f'!key "{k["name"]}"' for name, k in (update_keys or {}).items() if name != vname]
     items += [str(c) for c in (view.get("match_clients") or ["any"])]
     return "; ".join(items)
 
@@ -564,7 +601,11 @@ def _zone_needs_update_policy(zone: dict[str, Any]) -> bool:
 
 
 def _render_update_policy(
-    zone: dict[str, Any], group_key_name: str | None, *, grant_soa: bool = False
+    zone: dict[str, Any],
+    group_key_name: str | None,
+    *,
+    grant_soa: bool = False,
+    view_update_key_name: str | None = None,
 ) -> str:
     """Build the ``update-policy { ... };`` clause for a fine-grained zone.
 
@@ -585,6 +626,10 @@ def _render_update_policy(
         # key external clients hold, and it keeps exactly the grant it had.
         types = " ANY" if grant_soa else ""
         lines.append(f"grant {group_key_name} zonesub{types};")
+    if view_update_key_name:
+        # #2242 — the view's own update key is the product's, like the group
+        # key: it writes the SOA a record op carries.
+        lines.append(f"grant {view_update_key_name} zonesub ANY;")
     for e in zone.get("update_acl") or []:
         if e.get("match_kind") != "tsig_key" or not e.get("tsig_key_name"):
             continue
@@ -2100,7 +2145,11 @@ def _zone_accepts_updates(zone: dict[str, Any], *, foreign_loopback: bool = Fals
 
 
 def _view_share_key(
-    zone: dict[str, Any], view: dict[str, Any], *, foreign_loopback: bool = False
+    zone: dict[str, Any],
+    view: dict[str, Any],
+    *,
+    foreign_loopback: bool = False,
+    per_view_updates: bool = False,
 ) -> str | None:
     """What a view's copy of ``zone`` must match to share an earlier view's
     copy through ``in-view`` (#3551), or None when it can never share.
@@ -2126,10 +2175,17 @@ def _view_share_key(
     an update sent through any view and answers every view with it, which
     split-horizon exists to keep apart. Each view keeps its own copy
     (``_zone_accepts_updates``).
+
+    The same holds for every primary zone once the control plane ships record
+    ops per view (``per_view_updates``, #2242): an op for one view is an update
+    through that view's key, and a copy another view references would take it
+    for all of them, or refuse it (the update grant is the defining view's).
     """
     if not zone.get("name") or zone.get("type", "primary") == "forward":
         return None
     if _zone_accepts_updates(zone, foreign_loopback=foreign_loopback):
+        return None
+    if per_view_updates and zone.get("type", "primary") in {"primary", "master"}:
         return None
     body = {k: v for k, v in zone.items() if k != "view_name"}
     return hashlib.sha256(
@@ -2139,6 +2195,13 @@ def _view_share_key(
             default=str,
         ).encode("utf-8")
     ).hexdigest()
+
+
+def _apex_scope(key: str, view: str | None) -> str:
+    """What the per-zone op state is keyed by: the zone, and under views (#2242)
+    the view too, since each view holds its own copy. ``\x01`` is in no zone
+    or view name."""
+    return f"{view}\x01{key}" if view else key
 
 
 def _zone_label(zname: str, view: str | None) -> str:
@@ -3393,6 +3456,9 @@ class Bind9Driver(DriverBase):
         self._learned_rrsets = {}
         # The RPZ zones this render makes dynamic, by file (#4191).
         self._rpz_update_keys = {}
+        # ``{view: (name, secret, algorithm)}`` of the keys this render admits
+        # record ops through (#2242); empty without views or per-view ops.
+        self._view_update_keys: dict[str, tuple[str, str, str]] = {}
         # A new render may grant the SOA where the last one did not (#2835).
         self._soa_refused_zones: set[str] = set()
         # What each zone's apex is computed from, re-filled by this render
@@ -3531,6 +3597,25 @@ class Bind9Driver(DriverBase):
         )
         if view_keys:
             tsig_include += f'include "{self.state_dir / self.rendered_dir_name / "tsig" / "view-transfer.key"}";\n'
+        # The keys a view's record ops are signed with (#2242): their own file
+        # and include, like the transfer keys, defined above every view that
+        # names them. Present only for an agent the control plane ships
+        # per-view ops to.
+        update_keys = (
+            {
+                vname: k
+                for vname, k in _view_update_keys(views).items()
+                if _renderable_tsig_keys([k])
+            }
+            if has_views
+            else {}
+        )
+        self._view_update_keys = {
+            vname: (k["name"], k["secret"], k.get("algorithm", "hmac-sha256"))
+            for vname, k in update_keys.items()
+        }
+        if update_keys:
+            tsig_include += f'include "{self.state_dir / self.rendered_dir_name / "tsig" / "view-update.key"}";\n'
         # Server-wide transfer policy (issue #734). Rendered once here so it
         # covers every zone type — primary, secondary, stub, RPZ — and so the
         # control plane can read any zone this server serves. A zone with its
@@ -3708,12 +3793,21 @@ class Bind9Driver(DriverBase):
             abs_zfile = self.state_dir / self.rendered_dir_name / rel_zfile
             # Coarse allow-update (IP + TSIG) unless the ACL needs the
             # fine-grained update-policy path (name-scope / per-type / deny).
+            # #2242 — the copy in a view is also writable with that view's
+            # own update key (``file_prefix`` is ``<view>/`` under views).
+            own_update = update_keys.get(file_prefix.rstrip("/"))
+            own_update_name = own_update["name"] if own_update else None
             if _zone_needs_update_policy(zone):
                 update_clause = _render_update_policy(
-                    zone, tsig_key_name, grant_soa=loopback_owned
+                    zone,
+                    tsig_key_name,
+                    grant_soa=loopback_owned,
+                    view_update_key_name=own_update_name,
                 )
             else:
-                update_clause = _render_allow_update(zone, tsig_key_name)
+                update_clause = _render_allow_update(
+                    zone, tsig_key_name, own_update_name
+                )
             # Transfer policy (issues #641 + #734). The key grant that makes
             # ingest-back and the drift report work now lives in the options
             # block above, so it covers every zone rather than only dynamic
@@ -3843,7 +3937,7 @@ class Bind9Driver(DriverBase):
                 vname = view.get("name") or ""
                 if not vname:
                     continue
-                match_clients = _render_match_clients(view, view_keys)
+                match_clients = _render_match_clients(view, view_keys, update_keys)
                 recursion_v = "yes" if view.get("recursion", True) else "no"
                 own_bls = [bl for bl in blocklists if bl.get("view_name") == vname]
                 # #1706 — a view's own zone already folds in the group's
@@ -3862,7 +3956,10 @@ class Bind9Driver(DriverBase):
                     if zone.get("view_name") != vname:
                         continue
                     share = _view_share_key(
-                        zone, view, foreign_loopback=bool(tsig_keys) and not loopback_owned
+                        zone,
+                        view,
+                        foreign_loopback=bool(tsig_keys) and not loopback_owned,
+                        per_view_updates=bool(update_keys),
                     )
                     zname = zone.get("name") or ""
                     if share is not None:
@@ -3911,6 +4008,8 @@ class Bind9Driver(DriverBase):
                 # the server row names) is refused by the destination half.
                 if md and vname in view_keys:
                     md = [f'key "{view_keys[vname]["name"]}"', *md]
+                if md and vname in update_keys:
+                    md = [f'key "{update_keys[vname]["name"]}"', *md]
                 md_line = (
                     f"    match-destinations {{ {'; '.join(md)}; }};\n" if md else ""
                 )
@@ -4010,6 +4109,8 @@ class Bind9Driver(DriverBase):
         # views), so no secret outlives the config that needed it.
         if view_keys:
             self._write_key_file("view-transfer.key", list(view_keys.values()))
+        if update_keys:
+            self._write_key_file("view-update.key", list(update_keys.values()))
 
         # DoT / DoH listener cert (issue #50) — written to the stable
         # tls/ paths the ``tls`` statement above points at. Same atomic
@@ -6366,13 +6467,33 @@ class Bind9Driver(DriverBase):
         ttl_value = rec.get("ttl")
         ttl = ttl_value if ttl_value is not None else 3600
 
+        # #2242 — in a group with views the update goes into the view the op
+        # names, signed with that view's update key: named routes it there by
+        # ``match-clients``, where a loopback source address would reach
+        # whichever view matches 127.0.0.1. An op that names no view, or one
+        # this render has no key for, is not applied (never aimed at a guess):
+        # it is acked as failed, and the structural render that moves the
+        # view's placement carries it.
+        view: str | None = None
+        view_key: tuple[str, str, str] | None = None
+        if getattr(self, "_rendered_has_views", False):
+            view = str(op.get("view_name") or "") or None
+            if view is None:
+                raise RuntimeError(
+                    f"record op for {zone} names no view, and this server serves views"
+                )
+            view_key = (getattr(self, "_view_update_keys", None) or {}).get(view)
+            if view_key is None:
+                raise RuntimeError(f"no update key for view {view!r} (zone {zone})")
         tsig_path = self.state_dir / self.rendered_dir_name / "tsig" / "ddns.key"
         if not tsig_path.exists():
             # Upgrade: the live named.conf still includes the pre-#2648 path
             # until the next apply swaps a new tree in.
             tsig_path = self.state_dir / "tsig" / "ddns.key"
         keyring = None
-        if tsig_path.exists():
+        if view_key is not None:
+            keyring = dns.tsigkeyring.from_text({view_key[0]: view_key[1]})
+        elif tsig_path.exists():
             # Very small parser — supports the one-line key we render above.
             content = tsig_path.read_text()
             import re
@@ -6397,7 +6518,15 @@ class Bind9Driver(DriverBase):
         rrset = rec.get("rrset") if isinstance(rec.get("rrset"), dict) else None
         members = rrset.get("members") if rrset is not None else None
 
-        upd = dns.update.Update(zone, keyring=keyring)
+        if view_key is not None:
+            upd = dns.update.Update(
+                zone,
+                keyring=keyring,
+                keyname=dns.name.from_text(view_key[0]),
+                keyalgorithm=dns.name.from_text(view_key[2]),
+            )
+        else:
+            upd = dns.update.Update(zone, keyring=keyring)
         if rrset is not None and members is not None and op["op"] in RRSET_OP_KINDS:
             # ``or ttl`` would swallow a legitimate TTL of 0 (RFC 2181 allows
             # it and it is how "never cache this" is expressed), so test for
@@ -6473,14 +6602,18 @@ class Bind9Driver(DriverBase):
         # named increments as usual — so it is only sent when it is later, and
         # never moves the served serial backwards.
         if rrset is not None and members is not None and op["op"] in RRSET_OP_KINDS:
-            self._reconcile_apex(upd, zone, name, rtype.upper(), wire_members)
+            self._reconcile_apex(upd, zone, name, rtype.upper(), wire_members, view)
         apex_after = None
-        state = self._apex_state(zone.rstrip(".").lower())
+        state = self._apex_state(zone.rstrip(".").lower(), view)
         if state is not None:
             apex_after = _zone_apex(_apex_zone(state))
         target = op.get("target_serial")
         has_target = isinstance(target, int) and not isinstance(target, bool)
         key = zone.rstrip(".").lower()
+        # The apex state, the refused-SOA set and the signing key are per
+        # (view, zone) under views (#2242); the served-serial map stays by zone.
+        scope = _apex_scope(key, view)
+        sel = () if view is None else (view,)
         refused = getattr(self, "_soa_refused_zones", None)
         if refused is None:
             refused = self._soa_refused_zones = set()
@@ -6491,13 +6624,13 @@ class Bind9Driver(DriverBase):
         soa = None
         soa_ttl = 3600
         if has_target:
-            soa, soa_ttl, serving, signed = self._served_soa(zone)
+            soa, soa_ttl, serving, signed = self._served_soa(zone, *sel)
             signed = signed or bool(state and state.get("signed"))
             if signed:
-                raw_before = self._zonestatus_serials(zone)[0]
+                raw_before = self._zonestatus_serials(zone, *sel)[0]
         if (
             has_target
-            and key not in refused
+            and scope not in refused
             and soa is not None
             and serving is not None
             and _serial_later(target, serving)
@@ -6522,8 +6655,8 @@ class Bind9Driver(DriverBase):
             # or the key is an operator's (no group key, so no ``ANY``). The
             # records still land; named numbers them itself, as before #2835.
             # Not tried again for this zone until the next render.
-            log.info("bind9_record_op_soa_refused", zone=zone)
-            refused.add(key)
+            log.info("bind9_record_op_soa_refused", zone=zone, view=view)
+            refused.add(scope)
             upd.update.remove(soa_rrset)
             resp = dns.query.tcp(upd, "127.0.0.1", timeout=10)
             rcode = resp.rcode()
@@ -6538,9 +6671,9 @@ class Bind9Driver(DriverBase):
             # our SOA "not later" and named numbers it itself. What it
             # serves is what is reported; unread is reported as nothing.
             if signed:
-                served = self._settled_signed_serial(zone, raw_before, serving)
+                served = self._settled_signed_serial(zone, raw_before, serving, *sel)
             else:
-                served = self._served_soa(zone)[2]
+                served = self._served_soa(zone, *sel)[2]
             self._op_reached_map()[key] = served if served is not None else SERIAL_UNREAD
         # Explicit None so the record-op path matches the dict|None return
         # type the DNSSEC branches use (no implicit fall-through).
@@ -6581,7 +6714,10 @@ class Bind9Driver(DriverBase):
             "addressed": sorted(addressed),
             "signed": bool(zone.get("dnssec_enabled")),
         }
-        lines.append(f"{key}\t{json.dumps(state, separators=(',', ':'))}")
+        lines.append(
+            f"{_apex_scope(key, zone.get('view_name'))}\t"
+            f"{json.dumps(state, separators=(',', ':'))}"
+        )
 
     def periodic_served_serials(self) -> dict[str, int]:
         """Zone name (lowercase, no trailing dot) → the serial named serves,
@@ -6609,9 +6745,10 @@ class Bind9Driver(DriverBase):
         served = _parallel_map(lambda k: self._served_soa(k + ".")[2], keys)
         return {k: v for k, v in zip(keys, served) if v is not None}
 
-    def _apex_state(self, key: str) -> dict[str, Any] | None:
-        """The apex inputs noted for zone ``key``: as the last op left them,
-        else as the last render noted them, else None."""
+    def _apex_state(self, key: str, view: str | None = None) -> dict[str, Any] | None:
+        """The apex inputs noted for zone ``key`` (in ``view``, #2242): as the
+        last op left them, else as the last render noted them, else None."""
+        key = _apex_scope(key, view)
         overlay = getattr(self, "_apex_overlay", None) or {}
         if key in overlay:
             return overlay[key]
@@ -6635,6 +6772,7 @@ class Bind9Driver(DriverBase):
         name: str,
         rtype: str,
         members: list[str] | None,
+        view: str | None = None,
     ) -> None:
         """Make an op leave named with the apex the next render writes (D5).
 
@@ -6648,7 +6786,7 @@ class Bind9Driver(DriverBase):
         with its glue). Glue the render stops or starts writing follows.
         """
         key = zone.rstrip(".").lower()
-        state = self._apex_state(key)
+        state = self._apex_state(key, view)
         if state is None or members is None:
             return
         origin = zone if zone.endswith(".") else zone + "."
@@ -6669,7 +6807,7 @@ class Bind9Driver(DriverBase):
         overlay = getattr(self, "_apex_overlay", None)
         if overlay is None:
             overlay = self._apex_overlay = {}
-        overlay[key] = new
+        overlay[_apex_scope(key, view)] = new
         before = _zone_apex(_apex_zone(state))
         after = _zone_apex(_apex_zone(new))
         _state_ttl = state.get("ttl")
@@ -6683,7 +6821,7 @@ class Bind9Driver(DriverBase):
         desired = list(new["ns"]) or list(after.ns)
         if not members:
             upd.add("@", ttl, "NS", *desired)
-        served = self._served_apex_ns(zone)
+        served = self._served_apex_ns(zone) if view is None else self._served_apex_ns(zone, view)
         if served is not None:
             want = {d.lower() for d in desired}
             for ns in served:
@@ -6751,9 +6889,24 @@ class Bind9Driver(DriverBase):
                 out[name.lower()] = serial
         return out
 
-    def _served_soa(self, zone: str) -> tuple[Any | None, int, int | None, bool]:
+    def _sign_for_view(self, q: Any, view: str) -> None:
+        """Sign query ``q`` with ``view``'s update key, so named answers it from
+        that view's copy of the zone (#2242)."""
+        key = (getattr(self, "_view_update_keys", None) or {}).get(view)
+        if key is None:
+            raise RuntimeError(f"no update key for view {view!r}")
+        q.use_tsig(
+            dns.tsigkeyring.from_text({key[0]: key[1]}),
+            keyname=dns.name.from_text(key[0]),
+            algorithm=dns.name.from_text(key[2]),
+        )
+
+    def _served_soa(
+        self, zone: str, view: str | None = None
+    ) -> tuple[Any | None, int, int | None, bool]:
         """``(soa_rdata, soa_ttl, serial, signed)`` for ``zone`` as named
-        serves it.
+        serves it (in ``view``, when the group has views: the query is signed
+        with the view's key, #2242).
 
         The serial is the one on the wire: an authoritative loopback answer's.
         For an inline-signed zone that is the SIGNED serial, which BIND keeps
@@ -6776,6 +6929,8 @@ class Bind9Driver(DriverBase):
             # resolver-enabled named whose zone failed to load would
             # otherwise answer with someone else's SOA.
             q.flags &= ~dns.flags.RD
+            if view is not None:
+                self._sign_for_view(q, view)
             r = dns.query.tcp(q, "127.0.0.1", timeout=_SOA_READ_TIMEOUT_S)
             if r.rcode() == 0 and r.flags & dns.flags.AA:
                 origin = dns.name.from_text(zone)
@@ -6793,22 +6948,33 @@ class Bind9Driver(DriverBase):
             log.info("bind9_soa_read_failed", zone=zone, error=str(e)[:200])
         if soa is not None:
             return soa, ttl, int(soa.serial), signed
-        raw, signed_serial = self._zonestatus_serials(zone)
+        raw, signed_serial = (
+            self._zonestatus_serials(zone)
+            if view is None
+            else self._zonestatus_serials(zone, view)
+        )
         return None, ttl, signed_serial if signed_serial is not None else raw, False
 
-    def _zonestatus_serials(self, zone: str) -> tuple[int | None, int | None]:
-        """``(raw, signed)`` serials from ``rndc zonestatus``; ``signed`` is
-        None for an unsigned zone, both None when it cannot be read."""
+    def _zonestatus_serials(
+        self, zone: str, view: str | None = None
+    ) -> tuple[int | None, int | None]:
+        """``(raw, signed)`` serials from ``rndc zonestatus`` (of ``view``'s copy
+        when given, #2242); ``signed`` is None for an unsigned zone, both None
+        when it cannot be read."""
         if not shutil.which("rndc"):
             return None, None
-        scopes = self._zone_rndc_scopes(zone)
+        scopes = [[zone, "IN", view]] if view else self._zone_rndc_scopes(zone)
         rc, out, _err = _rndc_run(self._rndc_base(), "zonestatus", *scopes[0])
         if rc != 0:
             return None, None
         return _zonestatus_serial(out), _zonestatus_signed_serial(out)
 
     def _settled_signed_serial(
-        self, zone: str, raw_before: int | None, signed_before: int | None
+        self,
+        zone: str,
+        raw_before: int | None,
+        signed_before: int | None,
+        view: str | None = None,
     ) -> int | None:
         """The signed serial an inline-signed zone serves once BIND's signer
         has taken the update just applied, or None if it did not in time.
@@ -6820,11 +6986,12 @@ class Bind9Driver(DriverBase):
         if that is later, else one past its own), so this waits for it to
         move; one that changed nothing (a replay) moves neither.
         """
+        sel = () if view is None else (view,)
         if not shutil.which("rndc"):
-            return self._served_soa(zone)[2]
+            return self._served_soa(zone, *sel)[2]
         deadline = time.monotonic() + _SIGNED_SETTLE_TIMEOUT_S
         while True:
-            raw, signed = self._zonestatus_serials(zone)
+            raw, signed = self._zonestatus_serials(zone, *sel)
             if signed is not None and (
                 signed_before is None or raw == raw_before or signed != signed_before
             ):
@@ -6840,12 +7007,15 @@ class Bind9Driver(DriverBase):
                 return None
             time.sleep(_SIGNED_SETTLE_POLL_S)
 
-    def _served_apex_ns(self, zone: str) -> list[str] | None:
+    def _served_apex_ns(self, zone: str, view: str | None = None) -> list[str] | None:
         """The apex NS targets named serves for ``zone`` (absolute, as text),
-        or None when they could not be read authoritatively (#2835, D5)."""
+        or None when they could not be read authoritatively (#2835, D5). Read
+        from ``view``'s copy when given (#2242)."""
         try:
             q = dns.message.make_query(zone, "NS")
             q.flags &= ~dns.flags.RD
+            if view is not None:
+                self._sign_for_view(q, view)
             r = dns.query.tcp(q, "127.0.0.1", timeout=_SOA_READ_TIMEOUT_S)
         except Exception as e:  # noqa: BLE001 — a failed read means "unknown"
             log.info("bind9_ns_read_failed", zone=zone, error=str(e)[:200])

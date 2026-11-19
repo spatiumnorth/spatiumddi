@@ -968,7 +968,7 @@ class SyncLoop:
             base_url=self.cfg.control_plane_url,
             verify=verify,
             timeout=timeout,
-            headers=features.headers(),
+            headers=features.headers(self.cfg.driver),
         )
 
     def _on_reregistered(self) -> None:
