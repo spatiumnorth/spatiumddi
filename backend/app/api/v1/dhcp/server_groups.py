@@ -41,7 +41,7 @@ from app.services.appliance.group_names import (
 )
 from app.services.approvals.gate import gate_or_execute
 from app.services.dhcp import windows_failover_manage as fo_manage
-from app.services.dhcp.ha_members import kea_ha_members, supports_ha_v6, v6_peer_url
+from app.services.dhcp.ha_members import kea_ha_members, supports_ha_v6, v6_peer_urls
 from app.services.dhcp.ha_peer_auth import peer_auth_ready, rotate_credential
 from app.services.dhcp.ha_peer_autofill import HA_GROUP_MODES, autofill_skipped_reason
 from app.services.dhcp.relay_vip import (
@@ -242,10 +242,8 @@ def _group_to_response(g: DHCPServerGroup) -> GroupResponse:
         ha_peer_credential_set=bool(g.ha_peer_credential_encrypted),
         ha_peer_auth_active=ha.renders_ha and peer_auth_ready(g, ha.participants),
         ha_v6_ready=ha.renders_ha
-        and all(
-            supports_ha_v6(s.agent_capabilities) and v6_peer_url(s.ha_peer_url)
-            for s in ha.participants
-        ),
+        and all(supports_ha_v6(s.agent_capabilities) for s in ha.participants)
+        and v6_peer_urls(ha.participants) is not None,
         servers=[
             ServerSummary(
                 id=s.id,

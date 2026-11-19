@@ -47,7 +47,7 @@ from sqlalchemy.orm import selectinload
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
 from app.models.dhcp import DHCPScope, DHCPServer, DHCPServerGroup
 from app.services.appliance.ownership import hostname_is_unambiguous, hostname_sql, norm_host
-from app.services.dhcp.ha_members import kea_ha_members, supports_ha_v6, v6_peer_port
+from app.services.dhcp.ha_members import kea_ha_members, supports_ha_v6, v6_peer_urls
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
@@ -206,8 +206,7 @@ async def dhcp_ha_v6_port(
     kea = kea_ha_members(group.mode, group.servers).participants
     if not kea or not all(supports_ha_v6(s.agent_capabilities) for s in kea):
         return None
-    ports = {v6_peer_port(s.ha_peer_url) for s in kea}
-    if None in ports:
+    if v6_peer_urls(kea) is None:
         return None
     has_v6 = (
         await db.execute(

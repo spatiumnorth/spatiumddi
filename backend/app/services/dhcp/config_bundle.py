@@ -56,7 +56,7 @@ from app.services.dhcp.device_policy import (
     compile_device_policy,
     load_fingerprint_snapshot,
 )
-from app.services.dhcp.ha_members import kea_ha_members, supports_ha_v6, v6_peer_url
+from app.services.dhcp.ha_members import kea_ha_members, supports_ha_v6, v6_peer_urls
 from app.services.dhcp.ha_peer_auth import current_peer_credential
 from app.services.dhcp.option_validation import (
     canonical_domain_options,
@@ -148,8 +148,8 @@ async def _resolve_failover(
     # the port its partner then polls. Same fresh-column read as the
     # credential above, for the same long-poll identity-map reason.
     if await _all_support_ha_v6(db, kea_peers):
-        v6_urls = {p.id: v6_peer_url(p.ha_peer_url) for p in kea_peers}
-        if all(v6_urls.values()):
+        v6_urls = v6_peer_urls(kea_peers)
+        if v6_urls:
             peers = [{**entry, "url_v6": v6_urls[p.id]} for entry, p in zip(peers, kea_peers)]
     return FailoverConfig(
         tls_ca_pem=tls["ca_pem"] if tls else None,

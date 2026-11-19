@@ -94,5 +94,35 @@ def v6_peer_port(url: str) -> int | None:
     return urlsplit(derived).port if derived else None
 
 
+def v6_peer_urls(servers: Iterable[DHCPServer]) -> dict[object, str] | None:
+    """Every member's DHCPv6 listener URL by server id, or None when v6 HA cannot run.
+
+    None when any member's URL has no derivable v6 port, or when a derived
+    listener lands on a host:port another member's DHCPv4 listener (or another
+    derived one) already holds, e.g. two Kea members on one host with v4 ports
+    8000 and 8001: kea-dhcp6 on the first would try to bind the second's
+    kea-dhcp4 port and never come up (#1258).
+    """
+    members = list(servers)
+    derived: dict[object, str] = {}
+    for s in members:
+        url = v6_peer_url(s.ha_peer_url)
+        if not url:
+            return None
+        derived[s.id] = url
+
+    def _key(u: str) -> tuple[str, int | None]:
+        parts = urlsplit(u.strip())
+        port = parts.port
+        if port is None:
+            port = {"http": 80, "https": 443}.get(parts.scheme.lower())
+        return ((parts.hostname or "").lower(), port)
+
+    taken = [_key(s.ha_peer_url) for s in members] + [_key(u) for u in derived.values()]
+    if len(set(taken)) != len(taken):
+        return None
+    return derived
+
+
 def supports_ha_v6(capabilities: object) -> bool:
     return isinstance(capabilities, list) and HA_V6_CAPABILITY in capabilities

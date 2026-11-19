@@ -131,6 +131,20 @@ async def test_one_older_member_keeps_v6_ha_out_of_the_bundle(
 
 
 @pytest.mark.asyncio
+async def test_a_v6_listener_landing_on_the_partners_v4_port_keeps_v6_ha_out(
+    db_session: AsyncSession,
+) -> None:
+    # Two members on one host with v4 ports 8000 and 8001: member a's kea-dhcp6
+    # (8001) would try to bind member b's kea-dhcp4 port.
+    _grp, a, b = await _pair(db_session, CAPS, CAPS)
+    b.ha_peer_url = "http://10.0.0.1:8001/"
+    await db_session.flush()
+    failover = (await build_config_bundle(db_session, a)).failover
+    assert failover is not None and failover.peers
+    assert all("url_v6" not in p for p in failover.peers)
+
+
+@pytest.mark.asyncio
 async def test_a_peer_url_with_no_room_for_a_v6_port_keeps_v6_ha_out(
     db_session: AsyncSession,
 ) -> None:
