@@ -573,6 +573,14 @@ On restart the agent checks the quarantine before re-applying `current.json`:
 a container that crash-loops must not re-break itself with the bundle that
 broke it.
 
+**Resolver cache ceiling (#4185).** The agent writes `max-cache-size` into
+`options {}`, which BIND applies to each recursive view's own cache. Precedence:
+the server group's `max_cache_size` (carried in the bundle's `options`), then
+the `NAMED_MAX_CACHE_SIZE` env var, then a quarter of the container's memory
+limit split across the recursive views. `unlimited` and `0` are refused by the
+API and ignored by the agent (`bind9_max_cache_size_ignored`). See
+`docs/features/DNS.md` section 8.0 for sizing guidance.
+
 **A bundle the daemon dies on is not re-applied blindly either (#2019).**
 The quarantine only hears of failures the agent survives. A bundle too big
 for the container's memory limit (a large RPZ blocklist set; on the appliance
@@ -1064,9 +1072,10 @@ Both must survive restarts → named volumes in Compose / PVCs in K8s.
 
 **One `StatefulSet` per `DNSServer` row** (umbrella chart,
 `charts/spatiumddi/templates/dns-agent.yaml`), not per group. Headless
-`Service` per StatefulSet (ClusterIP=None) plus an externally-exposed
-`Service` of type `LoadBalancer` or `NodePort` for DNS traffic (UDP/TCP
-53). On the appliance chart
+`Service` per StatefulSet (ClusterIP=None) plus a per-server `Service` for
+DNS traffic (UDP/TCP 53), `ClusterIP` by default (#3229) and `LoadBalancer`
+or `NodePort` when you opt in (see
+[Exposing DNS to clients](KUBERNETES.md#exposing-dns-to-clients)). On the appliance chart
 (`charts/spatiumddi-appliance/templates/dns-bind9.yaml`) the same
 service-container runs as a per-role-labelled `DaemonSet` instead.
 

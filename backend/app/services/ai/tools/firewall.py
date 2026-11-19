@@ -9,7 +9,7 @@ Read tools (default-enabled — discovery):
 * ``find_firewall_effective`` — server-render any node's MERGED drop-in (the
   same merge the heartbeat ships), with the layer breakdown + drift + the
   enforcement-on flag. Answers "what does node X's firewall actually look
-  like?" without the operator opening the Fleet → Firewall tab.
+  like?" without the operator opening the Appliance → Firewall tab.
 
 Write proposal (default-DISABLED — a firewall change can sever a node's
 reachability, so it's opt-in per non-negotiable #13's broad-blast-radius
@@ -97,7 +97,7 @@ class FindFirewallPoliciesArgs(BaseModel):
         "source). Filter by scope_kind or scope_role. Use to answer 'what does "
         "the dhcp role open?', 'is the control-plane policy enabled?', or 'which "
         "policies has someone customised?'. Read-only — toggles go through "
-        "propose_toggle_firewall_policy; rule edits through the Fleet → Firewall "
+        "propose_toggle_firewall_policy; rule edits through the Appliance → Firewall "
         "tab."
     ),
     args_model=FindFirewallPoliciesArgs,
@@ -372,7 +372,7 @@ class ProposeToggleFirewallPolicyArgs(BaseModel):
         "reachability, so the operator opts this tool in. The model proposes the "
         "toggle; the operator clicks Apply for it to take effect on the next "
         "supervisor heartbeat (only if the firewall_enabled master switch is on). "
-        "Rule edits + new policies go through the Fleet → Firewall tab, not the "
+        "Rule edits + new policies go through the Appliance → Firewall tab, not the "
         "Copilot."
     ),
     args_model=ProposeToggleFirewallPolicyArgs,
