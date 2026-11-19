@@ -66,7 +66,7 @@ jobs:
       prev_tag: ${{ steps.ver.outputs.prev_tag }}
       images: ${{ steps.ver.outputs.images }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -204,10 +204,10 @@ jobs:
       REF: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
       IMAGE: ${{ matrix.image }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: docker/setup-qemu-action@v4
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -215,7 +215,7 @@ jobs:
 
       - id: build
         name: Build and push by digest
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.file }}
@@ -267,7 +267,7 @@ jobs:
       # anything a rebuild would cure fails). ``exit-code: 0`` because the
       # verdict belongs to the gate step.
       - name: Trivy (amd64)
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           skip-setup-trivy: true
           image-ref: scan-target:${{ matrix.image }}-amd64
@@ -280,7 +280,7 @@ jobs:
         run: .github/scripts/trivy-gate.sh trivy-amd64.json "scan-target:${IMAGE}-amd64"
 
       - name: Trivy (arm64)
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           skip-setup-trivy: true
           image-ref: scan-target:${{ matrix.image }}-arm64
@@ -293,7 +293,7 @@ jobs:
         run: .github/scripts/trivy-gate.sh trivy-arm64.json "scan-target:${IMAGE}-arm64"
 
       # Only a digest that passed both gates reaches the tagging job.
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: digest-${{ matrix.image }}
           path: digests/${{ matrix.image }}
@@ -312,13 +312,13 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: digest-*
           merge-multiple: true
@@ -376,8 +376,8 @@ jobs:
     outputs:
       chart_version: ${{ steps.pkg.outputs.chart_version }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: azure/setup-helm@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v4.3.1
       - name: Log in to GHCR
@@ -469,8 +469,8 @@ jobs:
       contents: read
       packages: read
     steps:
-      - uses: actions/checkout@v7
-      - uses: docker/login-action@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -513,7 +513,7 @@ jobs:
           print(f"ok: {len(doc['paths'])} paths, version {got}")
           EOF
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: openapi-contract
           path: openapi.json
@@ -529,7 +529,7 @@ jobs:
     outputs:
       make_latest: ${{ steps.latest.outputs.make_latest }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -650,7 +650,7 @@ jobs:
           echo "→ ${VERSION} becomes GitHub's latest release: ${MAKE_LATEST}"
 
       - name: Download appliance artifacts (ISO + slot image, per arch)
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           # #1026 — the appliance job is a matrix now, so it uploads
           # ``appliance-artifacts-<arch>`` per leg. A bare ``name:`` of
@@ -666,12 +666,12 @@ jobs:
       # appliance globs in the ``files:`` list below cannot accidentally
       # widen onto it.
       - name: Download the OpenAPI contract
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: openapi-contract
           path: contract/
 
-      - uses: softprops/action-gh-release@v3
+      - uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           name: "SpatiumDDI ${{ needs.meta.outputs.version }}"
           # A SemVer pre-release (1.0.0-rc.1) is published as a GitHub
@@ -828,11 +828,11 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -908,7 +908,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Prune old appliance release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

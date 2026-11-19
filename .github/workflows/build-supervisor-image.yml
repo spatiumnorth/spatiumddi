@@ -42,9 +42,9 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       # Rotates weekly so the Dockerfile's apk layer cannot be served
       # from the GHA layer cache indefinitely — see APK_SNAPSHOT in
@@ -61,7 +61,7 @@ jobs:
       # step was reachable solely by hand and pushed ``:<branch>`` / ``:sha-*``
       # tags nothing consumes. release.yml and nightly.yml own publishing.
       - name: Build (single-arch, load locally for Trivy)
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: agent/supervisor/images/supervisor/Dockerfile
@@ -80,7 +80,7 @@ jobs:
         uses: ./.github/actions/install-trivy
 
       - name: Trivy scan
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           skip-setup-trivy: true
           image-ref: ghcr.io/spatiumnorth/spatium-supervisor:pr-scan

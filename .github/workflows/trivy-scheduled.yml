@@ -57,7 +57,7 @@ jobs:
     if: github.repository_owner == 'spatiumnorth'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Build and scan every image
         id: scan
@@ -301,7 +301,7 @@ jobs:
 
       - name: Open, update or close the tracking issue
         if: always()
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           HAS_FINDINGS: ${{ steps.scan.outputs.has_findings }}
           HAS_ADVISORY: ${{ steps.scan.outputs.has_advisory }}
@@ -432,9 +432,9 @@ jobs:
     if: github.repository_owner == 'spatiumnorth'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
 
@@ -519,7 +519,7 @@ jobs:
 
       - name: Open, update or close the drift tracking issue
         if: always()
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           DRIFT_STATUS: ${{ steps.drift.outputs.status }}
         with:
