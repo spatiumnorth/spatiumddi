@@ -11067,6 +11067,10 @@ export interface ApiToken {
   blocked_reason?: string | null;
   expires_at: string | null;
   last_used_at: string | null;
+  /** Address of the most recent call, and calls in the last 30 days (#4491);
+   * older servers omit both. Both lag the call by a few minutes. */
+  last_client_ip?: string | null;
+  calls_30d?: number;
   is_active: boolean;
   created_at: string;
 }
