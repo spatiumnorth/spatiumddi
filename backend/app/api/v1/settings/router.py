@@ -3886,7 +3886,11 @@ def _apply_body(t: AuditForwardTarget, body: AuditTargetBody) -> None:
         setattr(t, field, value)
     # ``url`` / ``auth_header`` / ``smtp_password``: ``None`` or omitted
     # keeps the stored value, ``""`` clears it, anything else is encrypted.
-    url = body.url.strip() if body.url and t.kind == "webhook" and t.webhook_flavor == "apprise" else body.url
+    url = (
+        body.url.strip()
+        if body.url and t.kind == "webhook" and t.webhook_flavor == "apprise"
+        else body.url
+    )
     t.url_encrypted = apply_write_only(t.url_encrypted, url)
     t.auth_header_encrypted = apply_write_only(t.auth_header_encrypted, body.auth_header)
     if body.smtp_password is not None:

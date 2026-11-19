@@ -795,7 +795,7 @@ function TargetModal({
                     ? "Sends a title and a short text through Apprise, which formats it for the service. One Apprise URL per target."
                     : form.webhook_flavor === "teams"
                       ? "Create the URL with the Workflows app in the Teams channel → “Send webhook alerts to a channel”. Teams accepts the request before the flow runs, so a successful Test doesn't prove the card was posted; check the flow's run history."
-                    : "Wraps the payload in the platform's incoming-webhook block format. Paste the URL the platform issued."}
+                      : "Wraps the payload in the platform's incoming-webhook block format. Paste the URL the platform issued."}
               </div>
             </label>
             <label className="block">

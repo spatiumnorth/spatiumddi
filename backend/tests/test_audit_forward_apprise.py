@@ -342,19 +342,22 @@ async def test_deliver_hands_title_body_and_severity_to_apprise() -> None:
     )
 
 
-async def test_deliver_logs_redacted_and_raises_only_when_asked() -> None:
+async def test_deliver_logs_redacted_and_reports_the_reason() -> None:
+    # Delivery never raises (#1577); a failure is a FAILED outcome carrying
+    # the service's own, already-redacted reason for the Test button (#3931).
+    reasons: list[str] = []
     with (
         patch("requests.post", return_value=_telegram_reply(400, "Bad Request: chat not found")),
         capture_logs() as logs,
     ):
-        await svc._deliver_to_target(_apprise_target(), {"action": "x"})  # noqa: SLF001
-        with pytest.raises(ad.AppriseDeliveryError):
-            await svc._deliver_to_target(  # noqa: SLF001
-                _apprise_target(), {"action": "x"}, raise_errors=True
-            )
+        outcome = await svc._deliver_to_target(  # noqa: SLF001
+            _apprise_target(), {"action": "x"}, reasons
+        )
+    assert outcome == svc.FAILED
     failed = [e for e in logs if e["event"] == "audit_forward_target_failed"]
-    assert len(failed) == 2 and "chat not found" in failed[0]["error"]
-    _assert_no_secret(str(logs), _BOT_SECRET, _BOT_ID)
+    assert len(failed) == 1 and "chat not found" in failed[0]["error"]
+    assert len(reasons) == 1 and "chat not found" in reasons[0]
+    _assert_no_secret(str(logs) + " ".join(reasons), _BOT_SECRET, _BOT_ID)
 
 
 async def test_an_alert_rule_without_the_webhook_channel_skips_apprise() -> None:
