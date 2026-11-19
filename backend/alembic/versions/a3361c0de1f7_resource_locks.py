@@ -15,7 +15,7 @@ Adds the lock columns of ``app.models.base.LockMixin`` to every lockable table:
 All five columns are nullable with no default, so the ALTERs are metadata-only.
 
 Revision ID: a3361c0de1f7
-Revises: b6d2e9f41a07
+Revises: d8b3f6a1c274
 Create Date: 2026-11-14
 """
 
