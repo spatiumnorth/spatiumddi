@@ -50,9 +50,25 @@ from app.core.agent_wake import collect_wake, dns_group_channel
 from app.drivers.dns import AGENTLESS_DRIVERS, get_driver, is_agentless
 from app.drivers.dns.base import RecordChange, RecordData, RRsetData, RRsetMember
 from app.models.audit import AuditLog
-from app.models.dns import DNSKey, DNSRecord, DNSRecordOp, DNSServer, DNSZone, servable_ttl
+from app.models.dns import (
+    DNSKey,
+    DNSRecord,
+    DNSRecordOp,
+    DNSServer,
+    DNSView,
+    DNSZone,
+    servable_ttl,
+)
 from app.models.ipam import IPAddress, Subnet
 from app.services.dns.bundle_dirty import mark_bundles_dirty
+from app.services.dns.pool_geo import (
+    build_geo_steering,
+    build_view_descriptors,
+    places_zone,
+    places_zone_clause,
+    records_for_view,
+    views_rendering_zone,
+)
 from app.services.dns.row_locks import ids_in, lock_op_ids, lock_ops
 from app.services.dns.rrset import rrset_key as record_rrset_key
 from app.services.dns.rrset import stamp_rrsets_for_ops
@@ -487,39 +503,38 @@ def queued_zone_ops_where(zone: DNSZone, group_id: uuid.UUID) -> list[Any]:
     reaches only the primary leaves secondaries' queues behind, the fan-out
     bug #934 fixed).
 
-    **This predicate is name-scoped, and that is a decision, not an accident
-    of the schema (#964).** ``DNSRecordOp`` carries ``server_id`` +
-    ``zone_name`` and no view discriminator, while ``DNSZone`` is unique on
+    **Name-scoped, narrowed by view (#964, #2242).** ``DNSRecordOp`` carries
+    ``server_id`` + ``zone_name``, while ``DNSZone`` is unique on
     ``(group_id, view_id, name)`` — so under split-horizon (#24) the same name
-    legitimately exists twice in one group, and a sweep for ``internal``'s
-    ``example.com.`` also discards ``external``'s queued ops on the same
-    servers.
+    legitimately exists twice in one group. Ops queued in a group with views
+    carry the ``view_name`` they were fanned out to (``resolve_op_views``), so
+    for a zone pinned to a view the sweep takes only the ops of that view and
+    leaves a sibling view's alone. An unpinned zone renders into every view
+    that names it, so its sweep stays name-wide (the collision guard, #2275,
+    keeps a pinned sibling of the same name out of the group).
 
-    Why that is accepted rather than fixed with a view column: under
-    split-horizon the incremental op path does not run at all. When a group
-    has views (or geo steering) ``agent_config.build_config_bundle`` folds
-    records INTO the structural fingerprint, so every record change is a full
-    view-correct re-render from the database — and it ships no
-    ``pending_record_ops``, retiring every queued op for the server as
-    ``applied`` on each bundle build instead. A sibling view's op the sweep
-    discards was therefore never going to reach ``nsupdate``: the over-sweep
-    costs nothing. In a flat group the same name cannot exist twice (the
-    create route 409s it), so the predicate is exact there. Ops now carry
-    ``zone_id`` too (set on every enqueue path, used where per-view
-    attribution matters: the pending-ops list narrowed to a token's zones),
-    but rows queued before that column existed have it NULL, so keying this
-    predicate on it would need this name-scoped fallback anyway, to guard a
-    path the incremental op flow never takes under split-horizon.
+    Ops with ``view_name`` NULL — queued in a flat group, or before the column
+    existed — cannot be attributed to a view and keep the name-scoped sweep.
+    Under views that is the documented over-sweep, and it is harmless while
+    ``ships_ops`` is false there: the bundle build retires every queued op for
+    the server as ``applied`` (``agent_config.retire_queued_ops``), so an op
+    the sweep discards was never going to reach ``nsupdate``. In a flat group
+    the same name cannot exist twice (the create route 409s it), so the
+    predicate is exact there.
 
     Every zone-scoped sweep and count goes through here so the decision lives
     in one place; ``tests/test_dns_record_ops_sweep.py`` pins both the
     behaviour and that no other module carries its own copy.
     """
-    return [
+    conds: list[Any] = [
         DNSRecordOp.server_id.in_(select(DNSServer.id).where(DNSServer.group_id == group_id)),
         DNSRecordOp.zone_name == zone.name,
         DNSRecordOp.state.in_(QUEUED_OP_STATES),
     ]
+    if zone.view_id is not None:
+        pin = select(DNSView.name).where(DNSView.id == zone.view_id).scalar_subquery()
+        conds.append(or_(DNSRecordOp.view_name.is_(None), DNSRecordOp.view_name == pin))
+    return conds
 
 
 async def queued_op_counts(
@@ -1791,6 +1806,90 @@ async def clear_dnssec_key_state(db: AsyncSession, zone: DNSZone) -> None:
     await db.execute(sa_delete(DNSKey).where(DNSKey.zone_id == zone.id))
 
 
+async def resolve_op_views(
+    db: AsyncSession, zone: DNSZone, ops: Sequence[dict[str, Any]]
+) -> list[list[str | None]]:
+    """The view name(s) each of ``ops`` is queued for, one list per op (#2242).
+
+    A flat group (no operator views, no geo steering) answers ``[None]`` for
+    every op: one op, ``view_name`` NULL, exactly as before. In a group with
+    views the zone has one copy per view that renders it
+    (``views_rendering_zone``, the call the bundle builder makes), and an op
+    is queued once per view whose copy carries the record
+    (``records_for_view``, the same predicate): a record scoped to one view
+    reaches that view's copy alone, a shared one every copy. An op that
+    names no ``record_id`` (a DNSSEC signal, a payload the caller built by
+    hand) or whose row is gone goes to every view rendering the zone. Never
+    an empty list: an op no view claims is queued with NULL rather than
+    dropped, so a caller gating on "was an op queued" still sees one.
+
+    The record's own row is read with ``include_deleted``: a soft-deleted
+    record is no longer in the zone's render, but its op still has to name
+    the view that held it. A learned record is left out of the placement set
+    like everywhere else (``places_zone``).
+    """
+    flat: list[list[str | None]] = [[None] for _ in ops]
+    if not ops:
+        return flat
+    views = (
+        (await db.execute(select(DNSView).where(DNSView.group_id == zone.group_id))).scalars().all()
+    )
+    geo = await build_geo_steering(db, zone.group_id)
+    if not views and not geo.active:
+        return flat
+    view_descs = build_view_descriptors(sorted(views, key=lambda v: (v.order, v.name)), geo)
+
+    def _record_id(o: dict[str, Any]) -> uuid.UUID | None:
+        rid = (o.get("record") or {}).get("record_id")
+        try:
+            return uuid.UUID(str(rid)) if rid else None
+        except ValueError:
+            return None  # not a row id: treated as "no record_id"
+
+    wanted = {rid for o in ops if (rid := _record_id(o)) is not None}
+    own: dict[uuid.UUID, DNSRecord] = {}
+    if wanted:
+        own = {
+            r.id: r
+            for r in (
+                await db.execute(
+                    select(DNSRecord)
+                    .where(DNSRecord.id.in_(wanted))
+                    .execution_options(include_deleted=True)
+                )
+            )
+            .scalars()
+            .all()
+        }
+    placing = set(
+        (
+            await db.execute(
+                select(DNSRecord.view_id)
+                .where(
+                    DNSRecord.zone_id == zone.id,
+                    DNSRecord.view_id.is_not(None),
+                    places_zone_clause(),
+                )
+                .distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    placing.update(r.view_id for r in own.values() if places_zone(r))
+    rendering = views_rendering_zone(view_descs, zone.view_id, placing)
+
+    out: list[list[str | None]] = []
+    for o in ops:
+        rid = _record_id(o)
+        row = own.get(rid) if rid is not None else None
+        names: list[str | None] = [
+            vd["name"] for vd in rendering if row is None or records_for_view([row], vd, geo)
+        ]
+        out.append(names or [None])
+    return out
+
+
 async def enqueue_record_op(
     db: AsyncSession,
     zone: DNSZone,
@@ -1911,23 +2010,28 @@ async def enqueue_record_op(
         record = dict(record)
         await stamp_rrsets_for_ops(db, zone, [{"op": op, "record": record}])
 
+    # #2242 — one op per view that renders the zone (one, view_name NULL, in
+    # a flat group).
+    view_names = (await resolve_op_views(db, zone, [{"op": op, "record": record}]))[0]
     primary_op: DNSRecordOp | None = None
     first_op: DNSRecordOp | None = None
     for srv in agent_servers:
-        row = DNSRecordOp(
-            server_id=srv.id,
-            zone_id=zone.id,
-            zone_name=zone.name,
-            op=op,
-            record=record,
-            target_serial=target_serial,
-            state="pending",
-        )
-        db.add(row)
-        if first_op is None:
-            first_op = row
-        if srv.id == primary.id:
-            primary_op = row
+        for view_name in view_names:
+            row = DNSRecordOp(
+                server_id=srv.id,
+                zone_id=zone.id,
+                zone_name=zone.name,
+                view_name=view_name,
+                op=op,
+                record=record,
+                target_serial=target_serial,
+                state="pending",
+            )
+            db.add(row)
+            if first_op is None:
+                first_op = row
+            if srv.id == primary.id and primary_op is None:
+                primary_op = row
     await db.flush()
     # #358 — wake every agent in this group so they re-poll + apply the
     # queued op immediately instead of waiting for the belt-and-braces
@@ -2073,22 +2177,27 @@ async def _fanout_agent_ops(
     # The row we hand back per op: the primary's if enabled, else the first
     # enabled agent's (``agent_servers`` is ordered is_primary DESC).
     returned = next((s for s in agent_servers if s.id == primary.id), agent_servers[0])
+    # #2242 — one row per view that renders the zone, per op (one, NULL view,
+    # in a flat group). The row returned for an op is its first view's.
+    op_views = await resolve_op_views(db, zone, ops)
     result: list[DNSRecordOp | None] = []
     rows: list[DNSRecordOp] = []
     for srv in agent_servers:
-        for o in ops:
-            row = DNSRecordOp(
-                server_id=srv.id,
-                zone_id=zone.id,
-                zone_name=zone.name,
-                op=o["op"],
-                record=o["record"],
-                target_serial=o.get("target_serial"),
-                state="pending",
-            )
-            rows.append(row)
-            if srv.id == returned.id:
-                result.append(row)
+        for o, view_names in zip(ops, op_views, strict=True):
+            for i, view_name in enumerate(view_names):
+                row = DNSRecordOp(
+                    server_id=srv.id,
+                    zone_id=zone.id,
+                    zone_name=zone.name,
+                    view_name=view_name,
+                    op=o["op"],
+                    record=o["record"],
+                    target_serial=o.get("target_serial"),
+                    state="pending",
+                )
+                rows.append(row)
+                if srv.id == returned.id and i == 0:
+                    result.append(row)
     db.add_all(rows)
     await db.flush()
     # #358 — wake every agent in the group so they drain the queued ops on the

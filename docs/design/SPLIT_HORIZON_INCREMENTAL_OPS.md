@@ -38,7 +38,7 @@ The hard part is which writes are *record-only*. Under views a record write can 
 
 - written by the enqueue chokepoint (`enqueue_record_op`) from the record's zone (`zone.view_id`), one op per view that serves the record (`records_for_view` is the single predicate; a record in a global zone fans out to every view that renders the zone, which is the same set the render writes today);
 - `NULL` on rows queued before the column and in flat groups, meaning "the only copy";
-- `sweep_zone_ops` can then become exact under views; the over-sweep it documents stops being an accepted cost.
+- `sweep_zone_ops` can then become exact under views (for ops that carry a view; `NULL` rows keep the name match); the over-sweep it documents stops being an accepted cost.
 
 This needs a migration (backup-catalogue registration, per the `new-migration` recipe).
 
@@ -64,7 +64,7 @@ The agent advertises `per_view_ops` in its poll. The control plane ships view-sc
 
 1. **This note** (docs only).
 2. Measurement: a render counter (`dns_agent_bundle_renders_total{reason}`) and a test pinning "one record change in a split-horizon group = N renders" today, so slice 4's effect is demonstrable and a regression is visible. **Done in this PR** (`tests/test_dns_agent_bundle_render_counter_2242.py`; slice 4 flips its assertions).
-3. Op `view_name` column + enqueue fan-out + exact sweep; still `ships_ops = False` under views (no behaviour change; ops queued under views are retired as before).
+3. Op `view_name` column + enqueue fan-out + exact sweep; still `ships_ops = False` under views (no behaviour change; ops queued under views are retired as before). **Done in this PR** (migration `c4e8a1d7f253`, `record_ops.resolve_op_views`, `tests/test_dns_record_op_view_fanout_2242.py`). The fan-out is one op per view whose copy carries the record: `views_rendering_zone` for the zone, then `records_for_view` for the record's own row, so a view-scoped record reaches its view alone and an op with no readable record row goes to every rendering view. The sweep narrows to the view for a zone pinned to one; `view_name` NULL ops keep the name-scoped match. Two things slice 4 must still do, because nothing ships these ops yet: make `_successors` (the supersede key) view-aware, since two views' ops for one RRset now share a key, and stamp each op's `rrset` from its own view's copy (`stamp_rrsets_for_ops` reads the whole zone).
 4. Structural payload carries placement not records; agent `per_view_ops` capability and per-view keyed nsupdate; `ships_ops` turned on for capable agents; `retire_queued_ops` limited to placement changes.
 5. Geo steering (`records_for_view` with member filtering) enabled last; until then a geo-active group stays on the re-render path.
 
@@ -80,6 +80,6 @@ The agent advertises `per_view_ops` in its poll. The control plane ships view-sc
 
 ## 6. Open questions
 
-- One op per view versus one op naming a list of views. One-per-view keeps the existing per-op ack and retry; the cost is fan-out in a global zone with many views.
+- ~~One op per view versus one op naming a list of views.~~ Decided in slice 3: one op per view. It keeps the existing per-op ack and retry and a plain nullable column; the cost is fan-out in a global zone with many views.
 - Whether the per-view key should be a distinct `update` key from the transfer key, so an update grant cannot be used to transfer and the reverse. Cheap to separate; costs one more derived secret per view.
 - DNSSEC-signed zones under views: the agent's signed-zone serial handling (`raw_before` in the op path) is per zone name today and would need to be per `(view, zone)`.

@@ -137,7 +137,8 @@ async def test_sweep_discards_queued_keeps_history_and_other_groups(
 async def test_sweep_is_name_scoped_across_sibling_views_by_decision(
     db_session: AsyncSession,
 ) -> None:
-    """The documented over-sweep (#964). Under split-horizon the same name
+    """The documented over-sweep (#964), for ops that name no view (NULL: queued
+    before #2242 or in a flat group). Under split-horizon the same name
     exists once per view and the op queue cannot tell them apart — and does
     not need to, because a group with views ships no ops (next test). If this
     starts failing because the sweep became view-exact, update the decision in

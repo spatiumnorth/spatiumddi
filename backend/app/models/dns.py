@@ -656,6 +656,10 @@ class DNSRecordOp(UUIDPrimaryKeyMixin, Base):
         nullable=True,
         index=True,
     )
+    # #2242 — the view whose copy of the zone this op is for. A group with
+    # views queues one op per view that renders the zone; NULL in a flat
+    # group and on ops queued before the column existed ("the only copy").
+    view_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     op: Mapped[str] = mapped_column(String(20), nullable=False)  # create | update | delete
     record: Mapped[dict] = mapped_column(JSONB, nullable=False)
     target_serial: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
