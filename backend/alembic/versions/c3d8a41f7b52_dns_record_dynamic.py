@@ -11,7 +11,7 @@ record read over AXFR (Path A, BIND9, Technitium), which carries no
 timestamp. Nothing is backfilled.
 
 Revision ID: c3d8a41f7b52
-Revises: b6d2e9f41a07
+Revises: d8b3f6a1c274
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "c3d8a41f7b52"
-down_revision: str | None = "b6d2e9f41a07"
+down_revision: str | None = "d8b3f6a1c274"
 branch_labels = None
 depends_on = None
 

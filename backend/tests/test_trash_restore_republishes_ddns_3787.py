@@ -174,9 +174,12 @@ async def test_a_restore_brings_back_the_a_and_ptr_of_its_lease_mirrors(
         )
     ).scalar_one()
     assert leases == len(ips)
-    # ... and the task the restore queued for the subnet gives them their names.
+    # ... and their names are back already: since #4227 the restore itself
+    # reconciles the restored subnet (its DDNS re-apply publishes the mirrors),
+    # so the queued task is the retry and finds nothing left to write.
     assert queued == [[str(sid)]]
-    assert await _run_queued(db_session, queued) == len(ips)
+    assert await _records_by_ip(db_session, sid) == _published(ips)
+    assert await _run_queued(db_session, queued) == 0
     assert await _records_by_ip(db_session, sid) == _published(ips)
 
     # A retried task, and a renewal of each lease, write nothing more and
@@ -220,7 +223,10 @@ async def test_expired_and_released_leases_are_not_published(
         client, "subnet", await _subnet(db_session, sid), headers, between=_age
     )
 
-    assert await _run_queued(db_session, queued) == 1
+    # The restore's own reconcile (#4227) already published the one live
+    # mirror; the queued task finds nothing to add and nothing for the others.
+    assert await _records_by_ip(db_session, sid) == _published([live])
+    assert await _run_queued(db_session, queued) == 0
     assert await _records_by_ip(db_session, sid) == _published([live])
 
 
@@ -239,6 +245,13 @@ async def test_a_mirror_the_teardown_removed_after_the_enqueue_is_skipped(
     ips = await _publish_leases(client, db_session, server, octet)
     _no_inline_teardown(monkeypatch)
     queued = _capture_republish(monkeypatch)
+
+    async def _no_reconcile(*_a: Any, **_k: Any) -> tuple[int, set[Any]]:
+        return 0, set()
+
+    # The restore's own reconcile (#4227) would publish the mirrors in the
+    # request; this test is about the task, so leave them to it.
+    monkeypatch.setattr(ipam_dns_sync, "reconcile_restored_subnet_records", _no_reconcile)
     await _delete_and_restore(client, "subnet", await _subnet(db_session, sid), headers)
 
     stale = await ipam_dns_sync.active_lease_mirror_ids(db_session, sid)

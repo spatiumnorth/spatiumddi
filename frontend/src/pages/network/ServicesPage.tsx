@@ -1,4 +1,6 @@
 import { ListEmpty } from "@/components/ui/list-read-error";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -384,6 +386,7 @@ export function ResourcesTab({
       qc.invalidateQueries({ queryKey: ["service", service.id] });
       qc.invalidateQueries({ queryKey: ["service-summary", service.id] });
       onChange();
+      setConfirm(null);
     },
   });
 
@@ -587,11 +590,15 @@ export function ResourcesTab({
         message={confirm?.message ?? ""}
         confirmLabel="Detach"
         tone="destructive"
-        onConfirm={() => {
-          confirm?.onConfirm();
+        loading={detach.isPending}
+        error={
+          detach.error ? formatApiError(detach.error, "Detach failed") : null
+        }
+        onConfirm={() => confirm?.onConfirm()}
+        onClose={() => {
           setConfirm(null);
+          detach.reset();
         }}
-        onClose={() => setConfirm(null)}
       />
     </div>
   );
@@ -850,7 +857,13 @@ export function ServiceEditorModal({
         sla_tier: slaTier || null,
         notes,
       };
-      if (existing) return servicesApi.update(existing.id, body);
+      if (existing) {
+        // Send only what changed from the row read when the dialog opened
+        // (#4379), so a field another client set since is not put back.
+        const update = changedFields(existing, body as ServiceUpdate);
+        if (Object.keys(update).length === 0) return Promise.resolve(existing);
+        return servicesApi.update(existing.id, update);
+      }
       return servicesApi.create(body as ServiceCreate);
     },
     onSuccess: () => {
@@ -1537,10 +1550,19 @@ export function ServicesPage() {
           />
         )}
         {editing && (
-          <ServiceEditorModal
-            existing={editing}
+          <FreshEdit
+            row={editing}
+            load={() => servicesApi.get(editing.id)}
+            title="Edit Service"
             onClose={() => setEditing(null)}
-          />
+          >
+            {(fresh) => (
+              <ServiceEditorModal
+                existing={fresh}
+                onClose={() => setEditing(null)}
+              />
+            )}
+          </FreshEdit>
         )}
         <ConfirmModal
           open={confirm !== null}

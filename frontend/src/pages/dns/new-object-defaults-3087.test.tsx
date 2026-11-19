@@ -159,14 +159,25 @@ describe("New Server Group", () => {
   const recursion = () =>
     screen.getByLabelText("Allow recursion") as HTMLInputElement;
 
-  it("pre-fills Allow recursion from Settings and sends it", async () => {
+  it("pre-fills Allow recursion from Settings and leaves it to the server while untouched (#4309)", async () => {
     stored = { dns_recursive_by_default: false };
     wrap(<GroupModal onClose={() => {}} />);
     await waitFor(() => expect(recursion().checked).toBe(false));
     fireEvent.change(control("Name"), { target: { value: "g" } });
     fireEvent.submit(control("Name").form!);
     await waitFor(() => expect(createGroup).toHaveBeenCalledTimes(1));
-    expect(createGroup.mock.calls[0][0]).toMatchObject({ is_recursive: false });
+    expect(createGroup.mock.calls[0][0]).not.toHaveProperty("is_recursive");
+  });
+
+  it("sends Allow recursion once the operator changed it", async () => {
+    stored = { dns_recursive_by_default: false };
+    wrap(<GroupModal onClose={() => {}} />);
+    await waitFor(() => expect(recursion().checked).toBe(false));
+    fireEvent.click(recursion());
+    fireEvent.change(control("Name"), { target: { value: "g" } });
+    fireEvent.submit(control("Name").form!);
+    await waitFor(() => expect(createGroup).toHaveBeenCalledTimes(1));
+    expect(createGroup.mock.calls[0][0]).toMatchObject({ is_recursive: true });
   });
 
   it("keeps a tick the operator made", async () => {

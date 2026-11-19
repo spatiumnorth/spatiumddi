@@ -987,6 +987,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 wake_subscription,
             )
             from app.services.appliance.bootstrap import (  # noqa: PLC0415
+                retry_bootstrap_if_no_active_cert,
                 sync_active_cert_to_secret,
             )
 
@@ -997,7 +998,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                     if result is WakeResult.UNAVAILABLE:
                         await asyncio.sleep(30)  # Redis down: tick-only
                     out = await sync_active_cert_to_secret()
-                    if out.get("status") not in ("in-sync", "locked", "no-active-cert"):
+                    if out.get("status") == "no-active-cert":
+                        # The startup bootstrap lost the reconcile lock to a
+                        # sibling and nothing else issues the first cert (#4442).
+                        await retry_bootstrap_if_no_active_cert()
+                    elif out.get("status") not in ("in-sync", "locked", "no-active-cert"):
                         logger.info("appliance_cert_deploy_sync", **out)
                 except asyncio.CancelledError:
                     raise
