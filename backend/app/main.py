@@ -665,6 +665,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_dns_pool_health_stale_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("dns_pool_health_stale_alert_rule_seed_skipped", reason=str(exc))
+    # Log-stream forwarding dropped-entries alert rule — singleton, ENABLED by
+    # default (issue #4545). Silent unless a target dropped entries. Idempotent.
+    try:
+        from app.services.alerts import (  # noqa: PLC0415
+            seed_log_forward_dropping_alert_rule,
+        )
+
+        await seed_log_forward_dropping_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("log_forward_dropping_alert_rule_seed_skipped", reason=str(exc))
     # The ``secret_expiring`` rule (#2138) is NOT seeded here: it is inserted
     # once by migration c8e2a5f71d39, so an operator who deletes it keeps it
     # deleted. A startup seed would re-create it on every restart.

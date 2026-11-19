@@ -581,6 +581,11 @@ RULE_TYPE_DNS_BLOCKLIST_FEED_STALE = "dns_blocklist_feed_stale"
 # leaves a dead member in the answer set with nothing else saying so.
 RULE_TYPE_DNS_POOL_HEALTH_STALE = "dns_pool_health_stale"
 
+# Issue #4545 — a syslog forward target that opted into the DNS query log or
+# the DHCP activity log dropped entries because its collector could not keep up
+# (queue cap reached, or delivery kept failing). Subject = audit_forward_target.
+RULE_TYPE_LOG_FORWARD_DROPPING = "log_forward_dropping"
+
 # Issue #1762 — a DNSSEC-signed zone on a group with more than one agent DNS
 # server (BIND9 / PowerDNS / Technitium; disabled servers count — they still
 # serve the bundle). Each server signs with keys it generated, so the zone is
@@ -794,6 +799,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_DHCP_RELAY_VIP_DIRECT_SOCKET,
         RULE_TYPE_DNS_BLOCKLIST_FEED_STALE,
         RULE_TYPE_DNS_POOL_HEALTH_STALE,
+        RULE_TYPE_LOG_FORWARD_DROPPING,
         RULE_TYPE_DNSSEC_MULTI_SIGNER,
         RULE_TYPE_NODE_PRESSURE,
         RULE_TYPE_CLUSTER_DNS_DEGRADED,
@@ -4232,6 +4238,50 @@ async def _matching_agent_spool_trimmed_subjects(
     return matches
 
 
+async def _matching_log_forward_dropping_subjects(
+    db: AsyncSession,
+    rule: AlertRule,  # noqa: ARG001
+    now: datetime | None = None,
+) -> list[tuple[str, str, str, str | None]]:
+    """``log_forward_dropping`` — every forward target that dropped log-stream
+    entries within :data:`log_stream_forward.ALERT_WINDOW_S` (#4545).
+
+    Reads the drop counter the api process flushed onto the target row; no
+    probing. A target that never dropped has a NULL timestamp and never
+    matches; one whose collector recovered stops matching after the window.
+    """
+    from app.models.audit_forward import AuditForwardTarget  # noqa: PLC0415
+    from app.services.log_stream_forward import ALERT_WINDOW_S  # noqa: PLC0415
+
+    now = now or datetime.now(UTC)
+    cutoff = now - timedelta(seconds=ALERT_WINDOW_S)
+    rows = (
+        (
+            await db.execute(
+                select(AuditForwardTarget)
+                .where(AuditForwardTarget.log_stream_last_drop_at.is_not(None))
+                .where(AuditForwardTarget.log_stream_last_drop_at >= cutoff)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [
+        (
+            str(t.id),
+            t.name,
+            f"Forward target '{t.name}' ({t.host}:{t.port} {t.protocol.upper()}) dropped DNS "
+            "query log / DHCP activity log entries because its collector could not keep up: "
+            f"{t.log_stream_dropped_total} dropped in total, the latest at "
+            f"{t.log_stream_last_drop_at:%Y-%m-%d %H:%M} UTC. Entries stay in the Logs page "
+            "for their retention window; check that the collector is reachable and fast "
+            "enough, or narrow the target's stream filters or lower its query sampling.",
+            "warning",
+        )
+        for t in rows
+    ]
+
+
 async def _matching_dns_memory_pressure_subjects(
     db: AsyncSession,
     rule: AlertRule,  # noqa: ARG001
@@ -6785,6 +6835,47 @@ async def seed_dns_blocklist_feed_stale_alert_rule() -> None:
         await session.commit()
 
 
+_LOG_FORWARD_DROPPING_RULE_NAME = "Log stream forwarding dropping entries"
+
+
+async def seed_log_forward_dropping_alert_rule() -> None:
+    """Seed the #4545 rule, ENABLED by default.
+
+    Silent on every install that does not forward the DNS query log or DHCP
+    activity log (no target has the streams on, so no drop is ever recorded).
+    When it speaks, entries the operator asked to have in their SIEM are
+    missing from it. Keyed on ``name``; an operator who disables or renames it
+    is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _LOG_FORWARD_DROPPING_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_LOG_FORWARD_DROPPING_RULE_NAME,
+                description=(
+                    "Fires for each syslog forward target that dropped DNS query log or "
+                    "DHCP activity log entries in the last 15 minutes because its "
+                    "collector was slow or unreachable and the target's queue filled. "
+                    "Auto-resolves 15 minutes after the last drop."
+                ),
+                rule_type=RULE_TYPE_LOG_FORWARD_DROPPING,
+                severity="warning",
+                enabled=True,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
 _DNS_POOL_HEALTH_STALE_RULE_NAME = "DNS pool health checks stale"
 
 
@@ -8654,6 +8745,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 multi = await _matching_dnssec_multi_signer_subjects(db, rule)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in multi]
                 subject_type = "dns_zone"
+            elif rule.rule_type == RULE_TYPE_LOG_FORWARD_DROPPING:
+                dropping = await _matching_log_forward_dropping_subjects(db, rule, now)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in dropping]
+                subject_type = "audit_forward_target"
             elif rule.rule_type == RULE_TYPE_AGENT_SPOOL_TRIMMED:
                 trimmed_hits = await _matching_agent_spool_trimmed_subjects(db, rule, now)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in trimmed_hits]
