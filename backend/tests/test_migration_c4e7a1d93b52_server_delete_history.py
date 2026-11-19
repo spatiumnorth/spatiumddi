@@ -37,6 +37,24 @@ _PATH = (
 )
 _TABLES = ("dns_query_log_entry", "dns_rpz_hit", "dhcp_log_entry")
 
+#: The revisions after this one that reshape the same tables (#2185), newest
+#: first. The suite's schema comes from the models, so it is already
+#: partitioned and key-less; this revision's constraints can only be added to
+#: the plain tables it ran against, so the fixture walks those back first.
+_LATER = (
+    "e5a93c1b7d24_partition_log_tables.py",
+    "b6e1c94f3a02_drop_dhcp_log_table_fk.py",
+    "a8d2f6c04b71_drop_dns_log_table_fks.py",
+)
+
+
+def _later(name: str) -> ModuleType:
+    spec = importlib.util.spec_from_file_location(name.split("_")[0], _PATH.parent / name)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
 
 def _migration() -> ModuleType:
     spec = importlib.util.spec_from_file_location("c4e7a1d93b52", _PATH)
@@ -90,6 +108,8 @@ async def conn() -> AsyncIterator[AsyncConnection]:
         async with engine.connect() as c:
             trans = await c.begin()
             try:
+                for name in _LATER:
+                    await c.run_sync(_run, _later(name).downgrade)
                 yield c
             finally:
                 await trans.rollback()
