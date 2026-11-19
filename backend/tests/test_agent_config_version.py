@@ -575,3 +575,87 @@ def test_every_model_the_dhcp_bundle_module_imports_is_probed() -> None:
     assert tables, "the module's models were not found"
     missing = tables - {p.name for p in DHCP_CONFIG_PROBES}
     assert not missing, f"config_bundle names {sorted(missing)} but the version key does not"
+
+
+# ── the fingerprint is not an xmin sum ────────────────────────────────────────
+
+
+async def test_two_writes_whose_xmin_changes_cancel_still_move_the_key(
+    db_session: AsyncSession,
+) -> None:
+    """xids are not commit-ordered: a low-xid transaction that commits late
+    LOWERS one row's xmin while a later one RAISES another's by the same
+    amount, so ``count(*), sum(xmin)`` is unchanged though two rows changed."""
+    from sqlalchemy import text
+
+    from app.services.agents.config_version import config_version, xmin_probe
+
+    engine = db_session.bind
+    assert engine is not None
+    tbl = f"xmin_cancel_{uuid.uuid4().hex[:8]}"
+    probe = xmin_probe(tbl)
+    plain = f"SELECT count(*), coalesce(sum(xmin::text::bigint), 0) FROM {tbl}"
+    async with engine.connect() as admin, engine.connect() as low:
+        await admin.execute(text(f"CREATE TABLE {tbl} (id int PRIMARY KEY, v int)"))
+        await admin.commit()
+        try:
+            # ``low`` takes the lowest xid and holds it open.
+            a = (await low.execute(text("SELECT txid_current()"))).scalar_one()
+            await admin.execute(text(f"INSERT INTO {tbl} VALUES (1, 0)"))  # xid a+1
+            await admin.commit()
+            await admin.execute(text(f"INSERT INTO {tbl} VALUES (2, 0)"))  # xid a+2
+            await admin.commit()
+            async with db_session.bind.connect() as probe_conn:  # type: ignore[union-attr]
+                s = AsyncSession(bind=probe_conn)
+                before = await config_version(s, [probe])
+                before_plain = (await probe_conn.execute(text(plain))).one()
+                await probe_conn.commit()
+                await admin.execute(text(f"UPDATE {tbl} SET v = 1 WHERE id = 2"))  # xid a+3
+                await admin.commit()
+                await low.execute(text(f"UPDATE {tbl} SET v = 1 WHERE id = 1"))  # xmin a
+                await low.commit()
+                after_plain = (await probe_conn.execute(text(plain))).one()
+                await probe_conn.commit()
+                if before_plain != after_plain:
+                    pytest.skip("xid allocation interleaved with other work; no cancellation")
+                after = await config_version(s, [probe])
+                await s.close()
+            assert a is not None
+            assert before != after, "two real writes left the key unmoved"
+        finally:
+            await admin.execute(text(f"DROP TABLE IF EXISTS {tbl}"))
+            await admin.commit()
+
+
+def test_a_rebuild_drops_the_process_local_module_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The DHCP build reads feature modules through a TTL cache; a rebuild
+    must not pin a stale read to the new key (see the long-poll comment)."""
+    import inspect
+
+    src = inspect.getsource(dhcp_agents.agent_config_longpoll)
+    assert src.index("invalidate_module_cache()") < src.index("await build_config_bundle(")
+    assert src.index("invalidate_module_cache()") > src.index("_BUNDLE_VERSIONS.hit(")
+
+
+@pytest.mark.parametrize(
+    "col,val",
+    [
+        ("option_55", "9"),
+        ("option_60", "other"),
+        ("fingerbank_device_class", "Phone"),
+        ("fingerbank_score", 77),
+        ("mac_address", "aa:bb:cc:00:00:0a"),
+    ],
+)
+async def test_each_fingerprint_column_the_compiler_reads_moves_the_key(
+    db_session: AsyncSession, col: str, val: Any
+) -> None:
+    ids = await _rich_dhcp_estate(db_session)
+    before = await _key(db_session, ids)
+    await db_session.execute(
+        update(DHCPFingerprint)
+        .where(DHCPFingerprint.mac_address == "aa:bb:cc:00:00:09")
+        .values(**{col: val})
+    )
+    await db_session.commit()
+    assert await _key(db_session, ids) != before

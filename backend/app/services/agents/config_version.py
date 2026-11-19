@@ -12,7 +12,7 @@ that moves without the content moving costs one wasted rebuild. A key that
 fails to move when the content moves would freeze an agent's config while
 every surface reports converged, so everything here errs towards moving:
 
-* a table is fingerprinted by ``count(*)`` plus ``sum(xmin)``. ``xmin`` is the
+* a table is fingerprinted by ``count(*)`` plus a sum of per-row ``hash(ctid, xmin)``. ``xmin`` is the
   transaction that wrote the row version, so ANY write moves it -- no
   ``modified_at`` has to be maintained, and a column added tomorrow is covered
   without anyone remembering to list it. A delete moves the count; a
@@ -62,12 +62,21 @@ class Probe:
 
 
 def xmin_probe(table: str, where: str | None = None) -> Probe:
-    """Fingerprint ``table`` (optionally filtered) by row count + sum of ``xmin``."""
+    """Fingerprint ``table`` (optionally filtered) by row count + a hash sum of ``(ctid, xmin)``.
+
+    NOT ``sum(xmin)``: xids are not commit-ordered (a long transaction holds a
+    low xid and commits late), so one write that lowers a row's xmin and
+    another that raises a different row's by the same amount cancel in a plain
+    sum and the key stays put. Hashing each row's ``(ctid, xmin)`` first makes
+    a cancellation a 64-bit collision, and ``ctid`` also covers a wrapped xid
+    reusing a frozen row's raw xmin: an update always lands on a new ctid.
+    """
     assert _IDENT.match(table), table
     clause = f" WHERE {where}" if where else ""
     return Probe(
         table,
-        f"SELECT count(*)::text || ':' || coalesce(sum(xmin::text::bigint), 0)::text "
+        f"SELECT count(*)::text || ':' || "
+        f"coalesce(sum(hashtextextended(ctid::text || ':' || xmin::text, 0)::numeric), 0)::text "
         f"FROM {table}{clause}",
     )
 

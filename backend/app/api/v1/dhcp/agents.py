@@ -103,6 +103,7 @@ from app.services.dhcp.lease_cleanup import address_still_held
 from app.services.dhcp.normalize import canonical_duid, norm_duid, norm_ip, norm_mac
 from app.services.dns.record_ops import purge_trashed_address_records
 from app.services.e911.address_bindings import keep_row_if_bound
+from app.services.feature_modules import invalidate_cache as invalidate_module_cache
 from app.services.ipam.utilization import recount_subnets_and_blocks
 from app.services.lock_order import (
     claim_mirror_inserts,
@@ -818,6 +819,11 @@ async def agent_config_longpoll(
                     if await wake.wait(min(WAKE_TICK_SECONDS, remaining)) == WakeResult.SHUTDOWN:
                         deadline = asyncio.get_running_loop().time()
                     continue
+            # The build reads feature modules through a per-process TTL cache.
+            # The key just moved because a ``feature_module`` row may have, and a
+            # build that read the stale cache would be pinned to the new key
+            # with the old content for the whole safety interval.
+            invalidate_module_cache()
             bundle = await build_config_bundle(db, server)
             # #3241: a bundle with no failover block tells the agent to run no
             # HA hook, so it stops reporting an HA state. Whatever state it

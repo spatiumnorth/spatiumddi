@@ -59,16 +59,6 @@ DHCP_SERVER_VOLATILE = (
     "modified_at",
 )
 
-#: dhcp_fingerprint columns every observation / enrichment rewrites; the
-#: device-policy compiler reads the option strings, class and score only.
-DHCP_FINGERPRINT_VOLATILE = (
-    "first_seen_at",
-    "last_seen_at",
-    "fingerbank_last_lookup_at",
-    "fingerbank_last_error",
-    "modified_at",
-)
-
 DHCP_CONFIG_PROBES: list[Probe] = [
     xmin_probe("dhcp_server_group", f"id = {_G}"),
     # The group's members (HA peers) and this server's own fleet columns.
@@ -102,11 +92,15 @@ DHCP_CONFIG_PROBES: list[Probe] = [
     # without an operator edit), but only while an enabled policy exists, and
     # every observation rewrites ``last_seen_at``: fingerprinted by what the
     # compiler reads, and only then.
-    row_probe(
+    # An order-independent hash of exactly the five columns
+    # ``load_fingerprint_snapshot`` selects (keep the two in step: a test moves
+    # each). A row-JSON fingerprint cost ~0.5 s per tick at 100k devices.
+    raw_probe(
         "dhcp_fingerprint",
-        exclude=DHCP_FINGERPRINT_VOLATILE,
-        order_by="mac_address",
-        where=f"EXISTS (SELECT 1 FROM dhcp_device_policy WHERE group_id = {_G} AND enabled)",
+        "SELECT count(*)::text || ':' || coalesce(sum(hashtextextended(row(mac_address, "
+        "option_55, option_60, fingerbank_device_class, fingerbank_score)::text, 0)::numeric), "
+        "0)::text FROM dhcp_fingerprint "
+        f"WHERE EXISTS (SELECT 1 FROM dhcp_device_policy WHERE group_id = {_G} AND enabled)",
     ),
     xmin_probe("vlan"),
     xmin_probe("router"),
