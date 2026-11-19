@@ -69,6 +69,7 @@ EXPECTED_DEFAULTS: dict[str, bool] = {
     "ipv6.router_advertisements": False,
     # ── AI ──────────────────────────────────────────────────────────
     "ai.copilot": True,
+    "ai.watch": False,
     # ── Compliance ──────────────────────────────────────────────────
     "compliance.conformity": False,
     "reports.top_n": True,

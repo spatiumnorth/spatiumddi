@@ -83,6 +83,7 @@ import { CustomFieldsPage } from "@/pages/admin/CustomFieldsPage";
 import { IPAMTemplatesPage } from "@/pages/admin/IPAMTemplatesPage";
 import { ApiTokensPage } from "@/pages/admin/ApiTokensPage";
 import { SessionsPage } from "@/pages/admin/SessionsPage";
+import { AIWatchPage } from "@/pages/admin/AIWatchPage";
 import { AlertsPage } from "@/pages/admin/AlertsPage";
 import { DNSBLPage } from "@/pages/admin/DNSBLPage";
 import { AuthProvidersPage } from "@/pages/admin/AuthProvidersPage";
@@ -274,6 +275,7 @@ export default function App() {
         <Route path="admin/ai/providers" element={<AIProvidersPage />} />
         <Route path="admin/ai/prompts" element={<AIPromptsPage />} />
         <Route path="admin/ai/tools" element={<AIToolCatalogPage />} />
+        <Route path="admin/ai/watch" element={<AIWatchPage />} />
         <Route path="admin/features" element={<FeaturesPage />} />
         <Route path="admin/custom-fields" element={<CustomFieldsPage />} />
         <Route path="admin/ipam/templates" element={<IPAMTemplatesPage />} />

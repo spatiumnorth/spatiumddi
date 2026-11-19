@@ -292,6 +292,18 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         group="AI",
         description="Multi-vendor LLM chat + MCP tool surface. Disabling hides the chat drawer and 404s /ai endpoints.",
     ),
+    # Copilot Watch (#4405). Default-OFF (#1069): once armed it sends
+    # install data to an LLM provider with nobody watching. It is a child
+    # of the Copilot (it uses its providers and tool registry), so turning
+    # the Copilot off turns this off with it (#1068).
+    ModuleSpec(
+        id="ai.watch",
+        label="Copilot Watch",
+        group="AI",
+        description="Background agent that reviews what the alert, conformity and health checks found and files explained findings in an inbox. Observes and advises only; it never changes anything. Sends data to an AI provider unattended once enabled, so it is off by default and uses on-prem providers unless you allow a hosted one.",
+        default_enabled=False,
+        requires=("ai.copilot",),
+    ),
     # Compliance / observability extras. Conformity is default-OFF (#1069):
     # it is a rules engine an operator opts into, and its builtin policies
     # seed ``enabled=False``, so the 60 s evaluator finds nothing due and the

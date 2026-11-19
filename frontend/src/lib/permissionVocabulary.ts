@@ -37,6 +37,7 @@ export const GRANT_RESOURCE_TYPES = [
   "server",
   "audit_log",
   "alert",
+  "ai_finding",
   "user",
   "group",
   "role",

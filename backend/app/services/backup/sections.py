@@ -365,7 +365,8 @@ SECTIONS: tuple[Section, ...] = (
         key="ai",
         label="Operator Copilot (providers / sessions / prompts)",
         description=(
-            "AI providers, chat sessions + messages, saved " "prompts, write-operation proposals."
+            "AI providers, chat sessions + messages, saved prompts, write-operation "
+            "proposals, and Copilot Watch settings, runs, findings, feedback and mutes."
         ),
         tables=(
             "ai_provider",
@@ -373,6 +374,11 @@ SECTIONS: tuple[Section, ...] = (
             "ai_chat_message",
             "ai_prompt",
             "ai_operation_proposal",
+            "ai_watch_config",
+            "ai_watch_run",
+            "ai_finding",
+            "ai_finding_feedback",
+            "ai_finding_mute",
         ),
     ),
     Section(

@@ -106,6 +106,7 @@ import {
   type IntegrationsDashboardSummary,
   type IntegrationsDashboardPanel,
   type SecurityDashboardSummary,
+  aiWatchApi,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { includeInUtilization } from "@/lib/utilization";
@@ -5631,6 +5632,58 @@ function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
   );
 }
 
+/**
+ * Copilot Watch rollup on the Security tab (#4405): open findings by
+ * severity. Silent when the module is off or the viewer cannot read
+ * findings; the query is gated on both so a refused install does not poll.
+ */
+export function AIWatchCard() {
+  const { enabled, ready } = useFeatureModules();
+  const moduleEnabled = ready && enabled("ai.watch");
+  const { can, isLoading: permsLoading } = usePermissions();
+  const mayRead = can("read", "ai_finding");
+  const { data } = useQuery({
+    queryKey: ["dashboards", "ai-watch"],
+    queryFn: aiWatchApi.summary,
+    refetchInterval: pollUnlessRefused(60_000),
+    retry: false,
+    enabled: moduleEnabled && mayRead,
+  });
+  if (!moduleEnabled || permsLoading || !mayRead || !data || !data.enabled)
+    return null;
+  const bySev = data.open_by_severity;
+  return (
+    <div className="rounded-lg border bg-card p-4" data-testid="ai-watch-card">
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <h3 className="text-sm font-semibold">Copilot Watch</h3>
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            {data.paused
+              ? "Paused: findings are not being refreshed"
+              : "Open findings from the unattended Copilot sweep"}
+          </p>
+        </div>
+        <Link
+          to="/admin/ai/watch"
+          className="shrink-0 text-xs text-primary hover:underline"
+        >
+          View →
+        </Link>
+      </div>
+      <div className="mt-3 flex items-baseline gap-3">
+        <span className="text-2xl font-semibold">{data.open_total}</span>
+        <span className="text-xs text-muted-foreground">
+          open
+          {(["critical", "warning", "info"] as const)
+            .filter((k) => (bySev[k] ?? 0) > 0)
+            .map((k) => ` · ${bySev[k]} ${k}`)
+            .join("")}
+        </span>
+      </div>
+    </div>
+  );
+}
+
 // ── Security dashboard tab (issue #109) ─────────────────────────────
 //
 /**
@@ -5796,6 +5849,7 @@ function SecurityPanel() {
   return (
     <div className="space-y-5">
       <DNSThreatCard />
+      <AIWatchCard />
       <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
         <Link
           to="/admin/users"

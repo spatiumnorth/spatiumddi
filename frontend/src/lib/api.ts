@@ -2848,6 +2848,259 @@ export const aiToolCatalogApi = {
       .then((r) => r.data),
 };
 
+// ── Copilot Watch (#4405) ────────────────────────────────────────────
+//
+// An opt-in background agent that reviews what the detectors found and
+// files findings. It observes and advises; nothing here changes the DDI
+// configuration. Settings are superadmin-only; findings need read (and
+// write, to triage) on `ai_finding`.
+export type AIFindingState = "open" | "acknowledged" | "dismissed" | "resolved";
+export type AIFindingSeverity = "info" | "warning" | "critical";
+export type AIFindingVerdict = "useful" | "not_useful" | "wrong";
+
+export interface AIFindingEvidence {
+  ref: string;
+  /** alert | conformity | server | agent | audit */
+  type: string;
+  subject: string;
+  display: string;
+  severity: string;
+  detail: string;
+  at: string | null;
+  cleared: boolean;
+}
+
+export interface AIFindingFeedbackEntry {
+  user_id: string;
+  username: string;
+  verdict: AIFindingVerdict;
+  note: string;
+  modified_at: string;
+}
+
+export interface AIFinding {
+  id: string;
+  fingerprint: string;
+  kind: string;
+  severity: AIFindingSeverity;
+  title: string;
+  explanation: string;
+  evidence: AIFindingEvidence[];
+  recommendations: string[];
+  confidence: string;
+  state: AIFindingState;
+  first_seen_at: string;
+  last_seen_at: string;
+  resolved_at: string | null;
+  run_id: string | null;
+  model: string;
+  state_changed_at: string | null;
+  state_changed_by: string | null;
+  state_note: string;
+  my_verdict: AIFindingVerdict | null;
+  feedback: AIFindingFeedbackEntry[];
+}
+
+export interface AIWatchRun {
+  id: string;
+  /** manual | event | sweep */
+  trigger: string;
+  /** running | ok | failed | skipped */
+  state: string;
+  skip_reason: string | null;
+  error: string | null;
+  provider_name: string;
+  model: string;
+  tokens_in: number;
+  tokens_out: number;
+  /** null = the model is not on the rate sheet: unknown, not zero. */
+  cost_usd: string | null;
+  rounds: number;
+  tool_calls: number;
+  evidence_count: number;
+  findings_opened: number;
+  findings_updated: number;
+  findings_resolved: number;
+  findings_dropped: number;
+  findings_muted: number;
+  started_at: string;
+  finished_at: string | null;
+}
+
+export interface AIWatchRunDetail extends AIWatchRun {
+  transcript: Array<Record<string, unknown>> | null;
+}
+
+export interface AIWatchSummary {
+  enabled: boolean;
+  paused: boolean;
+  paused_reason: string | null;
+  paused_detail: string;
+  paused_until: string | null;
+  open_total: number;
+  open_by_severity: Record<string, number>;
+  acknowledged_total: number;
+  last_run: AIWatchRun | null;
+}
+
+export interface AIWatchProviderOption {
+  id: string;
+  name: string;
+  kind: string;
+  default_model: string;
+  is_enabled: boolean;
+  is_on_prem: boolean;
+  eligible: boolean;
+}
+
+export interface AIWatchToolOption {
+  name: string;
+  category: string;
+  description: string;
+  default: boolean;
+}
+
+export interface AIWatchConfig {
+  enabled: boolean;
+  paused: boolean;
+  paused_reason: string | null;
+  paused_detail: string;
+  paused_at: string | null;
+  paused_until: string | null;
+  provider_id: string | null;
+  allow_hosted_provider: boolean;
+  sweep_interval_hours: number;
+  event_trigger_enabled: boolean;
+  event_debounce_seconds: number;
+  /** null = the built-in default list. */
+  enabled_tools: string[] | null;
+  daily_token_budget: number;
+  daily_cost_budget_usd: string;
+  max_runs_per_hour: number;
+  max_rounds: number;
+  max_tokens_per_run: number;
+  last_sweep_at: string | null;
+  run_requested_at: string | null;
+  consecutive_failures: number;
+  blocked_reason: string | null;
+  usage_today: {
+    runs: number;
+    tokens: number;
+    cost_usd: string;
+    token_budget: number;
+    cost_budget_usd: string;
+  };
+  principal: {
+    id: string;
+    username: string;
+    is_active: boolean;
+    group: string;
+    roles: string[];
+    problem: string | null;
+  };
+  providers: AIWatchProviderOption[];
+  tools: AIWatchToolOption[];
+}
+
+export type AIWatchConfigUpdate = Partial<
+  Pick<
+    AIWatchConfig,
+    | "enabled"
+    | "provider_id"
+    | "allow_hosted_provider"
+    | "sweep_interval_hours"
+    | "event_trigger_enabled"
+    | "event_debounce_seconds"
+    | "enabled_tools"
+    | "daily_token_budget"
+    | "daily_cost_budget_usd"
+    | "max_runs_per_hour"
+    | "max_rounds"
+    | "max_tokens_per_run"
+  >
+>;
+
+export interface AIFindingMute {
+  id: string;
+  fingerprint: string;
+  title: string;
+  reason: string;
+  until: string | null;
+  finding_id: string | null;
+  created_at: string;
+}
+
+export interface AIFeedbackStat {
+  dimension: "kind" | "model";
+  value: string;
+  useful: number;
+  not_useful: number;
+  wrong: number;
+}
+
+export const aiWatchApi = {
+  getConfig: () =>
+    api.get<AIWatchConfig>("/ai/watch/config").then((r) => r.data),
+  updateConfig: (body: AIWatchConfigUpdate) =>
+    api.put<AIWatchConfig>("/ai/watch/config", body).then((r) => r.data),
+  setPaused: (paused: boolean, reason = "") =>
+    api
+      .post<AIWatchConfig>("/ai/watch/pause", { paused, reason })
+      .then((r) => r.data),
+  runNow: () =>
+    api
+      .post<{ requested_at: string }>("/ai/watch/run-now", {})
+      .then((r) => r.data),
+  summary: () =>
+    api.get<AIWatchSummary>("/ai/watch/summary").then((r) => r.data),
+  listFindings: (params?: {
+    state?: string;
+    severity?: string;
+    kind?: string;
+    limit?: number;
+    offset?: number;
+  }) =>
+    api
+      .get<{ items: AIFinding[]; total: number }>("/ai/watch/findings", {
+        params,
+      })
+      .then((r) => r.data),
+  getFinding: (id: string) =>
+    api.get<AIFinding>(`/ai/watch/findings/${id}`).then((r) => r.data),
+  acknowledge: (id: string, note = "") =>
+    api
+      .post<AIFinding>(`/ai/watch/findings/${id}/acknowledge`, { note })
+      .then((r) => r.data),
+  /** `muteDays`: 0 = do not mute, null = until unmuted. */
+  dismiss: (id: string, note: string, muteDays: number | null) =>
+    api
+      .post<AIFinding>(`/ai/watch/findings/${id}/dismiss`, {
+        note,
+        mute_days: muteDays,
+      })
+      .then((r) => r.data),
+  reopen: (id: string) =>
+    api
+      .post<AIFinding>(`/ai/watch/findings/${id}/reopen`, {})
+      .then((r) => r.data),
+  feedback: (id: string, verdict: AIFindingVerdict, note = "") =>
+    api
+      .post<AIFinding>(`/ai/watch/findings/${id}/feedback`, { verdict, note })
+      .then((r) => r.data),
+  listRuns: (params?: { state?: string; limit?: number; offset?: number }) =>
+    api
+      .get<{ items: AIWatchRun[]; total: number }>("/ai/watch/runs", { params })
+      .then((r) => r.data),
+  getRun: (id: string) =>
+    api.get<AIWatchRunDetail>(`/ai/watch/runs/${id}`).then((r) => r.data),
+  listMutes: () =>
+    api.get<AIFindingMute[]>("/ai/watch/mutes").then((r) => r.data),
+  deleteMute: (id: string) =>
+    api.delete<void>(`/ai/watch/mutes/${id}`).then((r) => r.data),
+  feedbackStats: () =>
+    api.get<AIFeedbackStat[]>("/ai/watch/feedback-stats").then((r) => r.data),
+};
+
 // ── Feature modules ──────────────────────────────────────────────────
 //
 // Operator-controlled visibility for whole sidebar / REST / MCP
@@ -4852,6 +5105,10 @@ export interface AIProvider {
   /** null = all registered tools enabled (default). [] = no tools.
    *  list = exactly those tool names (unknown names skipped at runtime). */
   enabled_tools: string[] | null;
+  /** The operator's statement that this endpoint runs on infrastructure
+   *  they control. Copilot Watch uses only such providers unless hosted
+   *  use is allowed (#4405). Only an openai_compat provider can carry it. */
+  is_on_prem: boolean;
   created_at: string;
   modified_at: string;
 }
@@ -4867,6 +5124,7 @@ export interface AIProviderCreate {
   options?: Record<string, unknown>;
   system_prompt_override?: string | null;
   enabled_tools?: string[] | null;
+  is_on_prem?: boolean;
 }
 
 export interface AIProviderUpdate {
@@ -4881,6 +5139,7 @@ export interface AIProviderUpdate {
   system_prompt_override?: string | null;
   /** null sentinel = revert to "all enabled". Field omitted = no change. */
   enabled_tools?: string[] | null;
+  is_on_prem?: boolean;
 }
 
 export interface AIToolCatalogEntry {

@@ -33,6 +33,7 @@ from app.drivers.llm.registry import known_kinds
 from app.models.ai import AI_PROVIDER_KINDS, AIProvider
 from app.services.ai.chat import _STATIC_SYSTEM_PROMPT
 from app.services.ai.tools import REGISTRY
+from app.services.ai.watch.providers import can_be_on_prem
 from app.services.api_token_scopes import token_outbound
 
 logger = structlog.get_logger(__name__)
@@ -61,6 +62,9 @@ class ProviderCreate(BaseModel):
     # NULL = all tools enabled (default). Empty list = no tools.
     # Non-empty list = exactly those tool names.
     enabled_tools: list[str] | None = None
+    # The endpoint runs on infrastructure the operator controls. Copilot
+    # Watch uses only such providers unless hosted use is allowed (#4405).
+    is_on_prem: bool = False
 
     @field_validator("kind")
     @classmethod
@@ -95,6 +99,7 @@ class ProviderUpdate(BaseModel):
     # ``exclude_unset`` distinguishes "absent → leave unchanged" from
     # "explicit null → clear column".
     enabled_tools: list[str] | None = None
+    is_on_prem: bool | None = None
 
 
 class ProviderResponse(BaseModel):
@@ -109,6 +114,7 @@ class ProviderResponse(BaseModel):
     options: dict[str, Any]
     system_prompt_override: str | None
     enabled_tools: list[str] | None
+    is_on_prem: bool
     created_at: datetime
     modified_at: datetime
 
@@ -154,6 +160,17 @@ class ListModelsResponse(BaseModel):
 # ── Helpers ──────────────────────────────────────────────────────────────
 
 
+def _refuse_on_prem_for_hosted_kind(kind: str, is_on_prem: bool) -> None:
+    if is_on_prem and not can_be_on_prem(kind):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"A {kind} provider is a hosted service and cannot be marked on-prem. "
+                "Only an OpenAI-compatible provider pointed at a host you run can be."
+            ),
+        )
+
+
 def _to_response(p: AIProvider) -> ProviderResponse:
     return ProviderResponse(
         id=p.id,
@@ -167,6 +184,7 @@ def _to_response(p: AIProvider) -> ProviderResponse:
         options=p.options or {},
         system_prompt_override=p.system_prompt_override,
         enabled_tools=p.enabled_tools,
+        is_on_prem=p.is_on_prem,
         created_at=p.created_at,
         modified_at=p.modified_at,
     )
@@ -219,6 +237,7 @@ async def create_provider(
     body: ProviderCreate, current_user: SuperAdmin, db: DB
 ) -> ProviderResponse:
     forbid_in_demo_mode("AI provider creation is disabled")
+    _refuse_on_prem_for_hosted_kind(body.kind, body.is_on_prem)
     row = AIProvider(
         name=body.name,
         kind=body.kind,
@@ -234,6 +253,7 @@ async def create_provider(
             body.system_prompt_override if body.system_prompt_override else None
         ),
         enabled_tools=body.enabled_tools,
+        is_on_prem=body.is_on_prem,
     )
     db.add(row)
     try:
@@ -331,6 +351,18 @@ async def update_provider(
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
     changes = body.model_dump(exclude_unset=True)
+    if changes.get("is_on_prem") is None:
+        changes.pop("is_on_prem", None)
+    _refuse_on_prem_for_hosted_kind(row.kind, changes.get("is_on_prem", False))
+    if (
+        "base_url" in changes
+        and changes["base_url"] != row.base_url
+        and "is_on_prem" not in changes
+        and row.is_on_prem
+    ):
+        # The mark was a statement about the old endpoint. Moving the
+        # provider somewhere else must not carry it along silently.
+        changes["is_on_prem"] = False
     require_secret_with_destination_change(
         row,
         changes,

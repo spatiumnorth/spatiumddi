@@ -25,6 +25,7 @@ from app.services.account_lockout import (
 from app.services.account_lockout import (
     unlock as unlock_user,
 )
+from app.services.ai.watch.principal import is_service_account
 from app.services.mfa import clear_pending_enrolment
 from app.services.password_policy import (
     PasswordPolicy,
@@ -42,6 +43,15 @@ from app.services.superadmin_grant import (
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
+
+# A built-in service identity (the Copilot Watch principal, #4405) is not a
+# person's account: it must stay unable to sign in and must never be a
+# superadmin. Disabling it is allowed and is a way to stop what runs as it.
+_SERVICE_ACCOUNT_REFUSAL = (
+    "'{username}' is a built-in service identity. It cannot be deleted, linked to an "
+    "identity provider, given a password or made a superadmin. Disable it to stop "
+    "what runs as it."
+)
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -422,6 +432,12 @@ async def update_user(
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
+    if is_service_account(user) and (body.is_superadmin or body.force_password_change):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=_SERVICE_ACCOUNT_REFUSAL.format(username=user.username),
+        )
+
     # Prevent removing superadmin from own account
     if user.id == current_user.id and body.is_superadmin is False:
         raise HTTPException(
@@ -695,6 +711,11 @@ async def link_provider(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Auth provider not found"
         )
+    if is_service_account(user):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=_SERVICE_ACCOUNT_REFUSAL.format(username=user.username),
+        )
     if user.auth_source == "local":
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -757,6 +778,11 @@ async def delete_user(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot delete your own account",
+        )
+    if is_service_account(user):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=_SERVICE_ACCOUNT_REFUSAL.format(username=user.username),
         )
 
     target_id = user.id

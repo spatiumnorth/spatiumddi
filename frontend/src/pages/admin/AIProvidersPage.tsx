@@ -55,6 +55,9 @@ interface ProviderForm {
   system_prompt_override: string | null;
   // null sentinel = "all enabled" (default). Set = exactly these tools.
   enabled_tools: string[] | null;
+  // The operator's statement that this endpoint runs on their own
+  // infrastructure. Copilot Watch uses only such providers by default.
+  is_on_prem: boolean;
 }
 
 const EMPTY: ProviderForm = {
@@ -70,6 +73,8 @@ const EMPTY: ProviderForm = {
   system_prompt_override: "",
   // Default = all tools enabled (null sentinel = "no allowlist").
   enabled_tools: null,
+  // Never assumed: the default URL is local, but only the operator knows.
+  is_on_prem: false,
 };
 
 function formFromProvider(p: AIProvider): ProviderForm {
@@ -92,6 +97,7 @@ function formFromProvider(p: AIProvider): ProviderForm {
     // "no override" on the wire.
     system_prompt_override: p.system_prompt_override ?? "",
     enabled_tools: p.enabled_tools,
+    is_on_prem: p.is_on_prem,
   };
 }
 
@@ -120,6 +126,7 @@ function toCreatePayload(form: ProviderForm): AIProviderCreate {
         ? form.system_prompt_override
         : null,
     enabled_tools: form.enabled_tools,
+    is_on_prem: form.kind === "openai_compat" && form.is_on_prem,
   };
 }
 
@@ -155,6 +162,7 @@ function fullUpdatePayload(form: ProviderForm): AIProviderUpdate {
   // allowlist (revert to "all enabled"). Pydantic's exclude_unset
   // distinguishes that from absent on the backend.
   update.enabled_tools = form.enabled_tools;
+  update.is_on_prem = form.kind === "openai_compat" && form.is_on_prem;
   return update;
 }
 
@@ -281,7 +289,13 @@ function ProviderEditor({
               </label>
               <input
                 value={form.base_url}
-                onChange={(e) => set("base_url", e.target.value)}
+                onChange={(e) => {
+                  set("base_url", e.target.value);
+                  // The on-prem mark is a statement about one endpoint.
+                  // Pointing the provider somewhere else clears it, so it
+                  // has to be stated again for the new place.
+                  if (form.is_on_prem) set("is_on_prem", false);
+                }}
                 placeholder="http://host.docker.internal:11434/v1"
                 className={`${inputCls} font-mono text-xs`}
               />
@@ -409,6 +423,26 @@ function ProviderEditor({
                 Enabled
               </label>
             </div>
+            {form.kind === "openai_compat" && (
+              <div className="col-span-2">
+                <label className="flex items-start gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    className="mt-1"
+                    checked={form.is_on_prem}
+                    onChange={(e) => set("is_on_prem", e.target.checked)}
+                  />
+                  <span>
+                    This endpoint runs on infrastructure I control (on-prem)
+                    <span className="block text-xs text-muted-foreground">
+                      Copilot Watch sends data with nobody watching, and by
+                      default uses only providers marked this way. The chat
+                      ignores the mark. Changing the base URL clears it.
+                    </span>
+                  </span>
+                </label>
+              </div>
+            )}
             <div className="col-span-2">
               <label className="mb-1 block text-xs font-medium text-muted-foreground">
                 Options (JSON){" "}

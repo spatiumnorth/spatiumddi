@@ -155,6 +155,7 @@ backend/alembic/versions/a3f7b2c8d419_add_name_description_to_dhcp_scope.py:drop
 backend/alembic/versions/a3f7c1e84d59_appliance_lldpd_running.py:drop_column:35
 backend/alembic/versions/a3f7c1e92b48_decom_date_awareness.py:drop_column:38
 backend/alembic/versions/a3f7c1e92b48_decom_date_awareness.py:drop_column:41
+backend/alembic/versions/a4040c7e91d3_dns_server_packed_blocklists.py:drop_column:52
 backend/alembic/versions/a4040c7e91d3_dns_server_packed_blocklists.py:drop_column:53
 backend/alembic/versions/a4b8c2d619e7_ai_provider.py:drop_table:92
 backend/alembic/versions/a4d92f61c08b_drop_discovery_scan_settings.py:drop_column:31
@@ -481,6 +482,12 @@ backend/alembic/versions/c8e3a7f10b54_ai_usage_observability.py:drop_column:77
 backend/alembic/versions/c8e3a7f10b54_ai_usage_observability.py:drop_column:78
 backend/alembic/versions/c8e4f7a91d36_session_viewer.py:drop_column:65
 backend/alembic/versions/c8e4f7a91d36_session_viewer.py:drop_column:66
+backend/alembic/versions/c8f4a1d27e53_copilot_watch.py:drop_column:229
+backend/alembic/versions/c8f4a1d27e53_copilot_watch.py:drop_table:221
+backend/alembic/versions/c8f4a1d27e53_copilot_watch.py:drop_table:222
+backend/alembic/versions/c8f4a1d27e53_copilot_watch.py:drop_table:225
+backend/alembic/versions/c8f4a1d27e53_copilot_watch.py:drop_table:227
+backend/alembic/versions/c8f4a1d27e53_copilot_watch.py:drop_table:228
 backend/alembic/versions/c93f1a72e408_dhcp_drop_metrics_and_thread_pool.py:drop_column:84
 backend/alembic/versions/c93f1a72e408_dhcp_drop_metrics_and_thread_pool.py:drop_column:85
 backend/alembic/versions/c93f1a72e408_dhcp_drop_metrics_and_thread_pool.py:drop_column:86

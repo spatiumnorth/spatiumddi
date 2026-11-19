@@ -1,4 +1,5 @@
 import {
+  Eye,
   Activity,
   AlertTriangle,
   AudioLines,
@@ -448,6 +449,12 @@ export const adminConfigurationNav: NavEntry[] = [
 
 export const adminNotificationsNav: NavEntry[] = [
   { label: "Alerts", icon: BellRing, to: "/admin/alerts" },
+  {
+    label: "Copilot Watch",
+    icon: Eye,
+    to: "/admin/ai/watch",
+    module: "ai.watch",
+  },
   {
     label: "DNS Blocklists",
     icon: ShieldAlert,
