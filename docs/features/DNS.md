@@ -32,8 +32,8 @@ SpatiumDDI ships five authoritative DNS drivers (Technitium in two shapes — se
 | Online DNSSEC signing | ✅ inline-signing (#49) | ✅ one-toggle | ✅ one-toggle (#740) | manual |
 | Native DoT / DoH (no sidecar) | ✅ (issue #50) | — (needs dnsdist sidecar) | ✅ + DoQ (issue #741) | — |
 | Encrypted *upstream* forwarding | DoT only (no client-side HTTP) | — | DoT / DoH / DoQ (#741) | — |
-| Catalog zones (RFC 9432) — producer | ✅ | ✅ | ❌ (broken, refused — #1782, fix #1766) | — |
-| Catalog zones (RFC 9432) — consumer | — (producer-only in a group, #3764; external BIND secondaries consume, §1) | — | ❌ (refused — #1782) | — |
+| Catalog zones (RFC 9432) — producer | ✅ | ✅ | ✅ (agent-managed `technitium` only, #1766; `technitium_api` refused) | — |
+| Catalog zones (RFC 9432) — consumer | — (producer-only in a group, #3764; external BIND secondaries consume, §1) | — | — (producer-only, #3764) | — |
 | First-class views / split-horizon | ✅ | tag-based, not surfaced as views in UI | — | — (replication scope) |
 | RPZ blocklists | ✅ | — (recursor feature only) | native blocking, not RPZ (#744) | — |
 | AD-integrated zones | — | — | — | ✅ |
@@ -43,7 +43,7 @@ SpatiumDDI ships five authoritative DNS drivers (Technitium in two shapes — se
 
 **Pick PowerDNS when** you need ALIAS records (CNAME-at-apex without the BIND-side workaround), LUA records (geo-routing / weighted answers / `pickrandom` / `ifportup`), or the simpler one-toggle online DNSSEC story. The shipped image (`ghcr.io/spatiumnorth/dns-powerdns`) bundles `pdns 5.0 + pdns-backend-lmdb` for an agent-isolated zone store with no external Postgres dependency. See [issue #127](https://github.com/spatiumnorth/spatiumddi/issues/127) for the full driver rationale.
 
-**Pick Technitium when** you want a minimal-footprint REST-driven authoritative host and don't need ALIAS/LUA. It covers primary / secondary / stub / forward zones, TSIG-authenticated zone transfer, and the standard record types (A/AAAA/CNAME/MX/TXT/NS/PTR/SRV/CAA/TLSA/SSHFP/NAPTR/URI/SVCB/HTTPS/DNAME). **Catalog zones are not supported on Technitium** ([#1782](https://github.com/spatiumnorth/spatiumddi/issues/1782)): both roles are broken, so enabling them on a Technitium group is refused with a 422 and a group that already has them on shows a warning; the fix is [#1766](https://github.com/spatiumnorth/spatiumddi/issues/1766) (1.1.0) — see [`docs/drivers/DNS_DRIVERS.md` §4B.3a](../drivers/DNS_DRIVERS.md). Its real differentiator is native DNS-over-TLS/HTTPS/QUIC with no dnsdist-style sidecar (PowerDNS's approach), *and* encrypted upstream forwarding over all three — BIND9 forwards over DoT only, and PowerDNS does not forward at all. That wiring shipped in [#741](https://github.com/spatiumnorth/spatiumddi/issues/741); see §20 below. The live-pull importer ([#744](https://github.com/spatiumnorth/spatiumddi/issues/744)) shipped too (DNSSEC is not supported on Technitium in 1.0, agent-managed or agentless: signing was withdrawn in #1783 and is tracked in #1767). The one thing still outstanding is query-log shipping — [#742](https://github.com/spatiumnorth/spatiumddi/issues/742) — so a Technitium group's queries don't reach the Logs page's DNS Queries tab yet.
+**Pick Technitium when** you want a minimal-footprint REST-driven authoritative host and don't need ALIAS/LUA. It covers primary / secondary / stub / forward zones, TSIG-authenticated zone transfer, and the standard record types (A/AAAA/CNAME/MX/TXT/NS/PTR/SRV/CAA/TLSA/SSHFP/NAPTR/URI/SVCB/HTTPS/DNAME). Catalog zones work as a **producer** on the agent-managed driver ([#1766](https://github.com/spatiumnorth/spatiumddi/issues/1766)): the agent configures the catalog zone's transfer and notify and has every member zone override the catalog's own settings, so enabling the catalog no longer undoes the #734 transfer grant — see [`docs/drivers/DNS_DRIVERS.md` §4B.3a](../drivers/DNS_DRIVERS.md). Its real differentiator is native DNS-over-TLS/HTTPS/QUIC with no dnsdist-style sidecar (PowerDNS's approach), *and* encrypted upstream forwarding over all three — BIND9 forwards over DoT only, and PowerDNS does not forward at all. That wiring shipped in [#741](https://github.com/spatiumnorth/spatiumddi/issues/741); see §20 below. The live-pull importer ([#744](https://github.com/spatiumnorth/spatiumddi/issues/744)) shipped too (DNSSEC signing is supported on agent-managed Technitium since #1767, not on the agentless `technitium_api` driver). The one thing still outstanding is query-log shipping — [#742](https://github.com/spatiumnorth/spatiumddi/issues/742) — so a Technitium group's queries don't reach the Logs page's DNS Queries tab yet.
 
 **Pick `technitium_api` when the Technitium server already exists** and should stay where it is. It is the same daemon and a different *ownership* model: agentless, nothing deployed, and the control plane drives Technitium's HTTP API directly with an operator-supplied bearer token — the same shape as Windows DNS Path B. Zones and records only; DNSSEC, encrypted transports, forwarders and blocklists stay managed in Technitium's own console, because those are the agent-managed driver's surface. **Experimental in 1.0.** Supported: one server per group, Primary zones SpatiumDDI creates (an existing zone of the same name is adopted only if it is an empty Primary), and records on them. Not supported, and refused with a 422 rather than accepted and ignored: DNS pools, SOA fields beyond the defaults, zone ACLs / transfer / notify, group options, catalog zones, and blocklists. An existing group that already breaks these limits keeps serving and shows a warning ([#1784](https://github.com/spatiumnorth/spatiumddi/issues/1784); full support is tracked for 1.1.0). Add it under **Add DNS server → Technitium (agentless, remote API)** with the API URL (`https://host:53443`, or `:5380` for plain HTTP) and a permanent token from Administration → Sessions → Create Token. Technitium **15.0 or later** is required (earlier versions have no Bearer auth). Create that token against a dedicated user that is a member of the **DNS Administrators** group rather than the admin account — it inherits that user's permissions, including per-zone ACLs. "Zones: Modify" alone is not enough: it cannot delete zones and sees no zone created before the user existed, so the connection test reports 0 zones. Shipped in [#810](https://github.com/spatiumnorth/spatiumddi/issues/810); internals in [`DNS_DRIVERS.md` §4C](../drivers/DNS_DRIVERS.md).
 
@@ -57,19 +57,19 @@ Driver-gated features are enforced server-side by the API's `_DRIVER_GATED_RECOR
 |---|---|
 | `ALIAS`, `LUA` records | `powerdns` |
 | `SVCB`, `HTTPS`, `DNAME` records | `bind9`, `powerdns`, `technitium` |
-| `dnssec_sign` | `bind9`, `powerdns` (`technitium` and `technitium_api` refused with a 422, #1783 / #1767 / #3806) |
+| `dnssec_sign` | `bind9`, `powerdns`, `technitium` (`technitium_api` refused with a 422, #3806) |
 | `dnssec_unsign` | `bind9`, `powerdns`, `technitium` |
-| `dnssec_rollover` (manual key rollover) | `bind9` |
+| `dnssec_rollover` (manual key rollover) | `bind9`, `technitium` |
 
-Manual rollover stays BIND9-only on purpose: PowerDNS and Technitium each roll on their own schedule (Technitium carries `rolloverDays` per key), so exposing a manual rollover against them would fight the daemon.
+Manual rollover is BIND9 and Technitium only: PowerDNS rolls on its own schedule. Technitium's ZSK rolls automatically (`zskRolloverDays`, from the policy's ZSK lifetime) but its KSK `rolloverDays` defaults to 0 (never), so a KSK rolls only through the manual rollover (`rolloverDnsKey`, #1767).
 
 The Operator Copilot's `propose_create_dns_zone` tool accepts an explicit `driver_hint` argument (`bind9` / `powerdns` / `technitium` / `windows_dns`) so the LLM can route a zone to a matching group without operators having to specify the group UUID by hand. See `app.services.ai.operations.CreateDNSZoneArgs`.
 
 Its `dnssec_enabled=true` path reads the same `dnssec_sign` row of the table above rather than restating it, with the same subset rule — *every* server in the group must run a signing driver, and an empty group passes — so the tool accepts exactly the groups the REST API accepts (issue #798; a test asserts the two agree for every driver, because they had drifted once).
 
-Creating a zone with `dnssec_enabled=true` signs it in the same request ([#811](https://github.com/spatiumnorth/spatiumddi/issues/811)): both `POST /api/v1/dns/groups/{id}/zones` and the Copilot tool enqueue the same `dnssec_sign` op the zone's **Sign** action does. BIND9 ignores the op and converges from the rendered config alone (inline-signing); PowerDNS signs in response to it. Technitium is refused (422): its signing is one-shot, so SpatiumDDI cannot keep a zone signed (#1783; full support is #1767). A zone already signed on Technitium keeps serving, shows a "DNSSEC not managed" warning, and can still be unsigned. Flipping `dnssec_enabled` through the generic zone-update endpoint behaves identically. The one caveat is a group with no servers yet: the create succeeds (nobody to disagree) but there is no agent to queue against, so signing starts from a manual **Sign** once servers join. Turning the flag **off** is allowed on any group — a zone flagged on a group that could never have signed has nothing to unsign, and clearing the stale flag must stay possible.
+Creating a zone with `dnssec_enabled=true` signs it in the same request ([#811](https://github.com/spatiumnorth/spatiumddi/issues/811)): both `POST /api/v1/dns/groups/{id}/zones` and the Copilot tool enqueue the same `dnssec_sign` op the zone's **Sign** action does. BIND9 ignores the op and converges from the rendered config alone (inline-signing); PowerDNS signs in response to it. Technitium signs structurally too (#1767): the agent compares each signed-flagged zone with the daemon on every apply and signs it if unsigned (a new server, a re-created zone or a lost volume), maps the zone's policy onto Technitium's sign parameters, and reports key state back on every apply and periodic refresh. The agentless `technitium_api` driver is refused (422); a zone already signed there keeps serving, shows a "DNSSEC not managed" warning, and can still be unsigned. Flipping `dnssec_enabled` through the generic zone-update endpoint behaves identically. The one caveat is a group with no servers yet: the create succeeds (nobody to disagree) but there is no agent to queue against, so signing starts from a manual **Sign** once servers join. Turning the flag **off** is allowed on any group — a zone flagged on a group that could never have signed has nothing to unsign, and clearing the stale flag must stay possible.
 
-**One signing server per group ([#1762](https://github.com/spatiumnorth/spatiumddi/issues/1762)).** Every agent engine signs per server with keys that server generated (BIND9 inline-signing, PowerDNS LMDB cryptokeys, Technitium), and there is no shared key custody, so a signed zone on a group with two agent servers is served with two different DNSKEY sets against one published DS (SERVFAIL on whichever server the DS does not match). **Disabled servers count:** `is_enabled` only pauses record-op delivery — a disabled agent still receives the bundle, so a disabled BIND9 server still renders `inline-signing` with its own keys, and a disabled PowerDNS / Technitium server serves the zone unsigned under the parent's DS. Agentless drivers are outside the rule (cloud providers hold one key set per zone; the others cannot sign). Therefore `dnssec_sign`, `dnssec_enabled` on zone create/update, and both Copilot paths (`create_dns_zone`, `sign_zone_dnssec`) 422 when the group has more than one agent server; adding or moving a server into a group that holds signed zones — server create, move, a Fleet group change, the Copilot `assign_appliance_role` — is a 422, as is moving a signed zone into a multi-server group. These checks lock the group row, so two concurrent requests cannot both pass. An agent that auto-registers into a signed group (`AGENT_GROUP`) is **not** refused — that would leave it re-bootstrapping forever, and there is no safe "don't sign" mode (unsigned under a DS is equally bogus) — but it is logged, audited (`dns.agent.register.dnssec_multi_signer`) and surfaced. Zones already signed on a multi-server group are not touched; they are flagged `dnssec_multi_signer: true` on the zone and on `GET …/dnssec/info` (with `signing_servers`), shown as a red **DNSSEC: multiple signers** badge on the zone header and a warning on the DNSSEC card, and raise the default-on, critical `dnssec_multi_signer` alert. Re-signing them is refused until the group is back to one server. The agent's DS/key report is matched within the reporting server's group (a same-named zone in another group is never touched), and on a multi-server group only one server's report is stored — the primary's, or the oldest signer's when no signer is primary — so the DS no longer flaps. After the group drops to one server, PowerDNS reports again only on its next sign op, so **re-sign** the zone and re-publish the DS; BIND9 re-reports after its next reload. A Technitium zone cannot be re-signed (#1783), so unsign it instead. Technitium servers still count towards the rule, because a zone signed there before #1783 is held with per-server keys too. Shared keys are future work.
+**One signing server per group ([#1762](https://github.com/spatiumnorth/spatiumddi/issues/1762)).** Every agent engine signs per server with keys that server generated (BIND9 inline-signing, PowerDNS LMDB cryptokeys, Technitium), and there is no shared key custody, so a signed zone on a group with two agent servers is served with two different DNSKEY sets against one published DS (SERVFAIL on whichever server the DS does not match). **Disabled servers count:** `is_enabled` only pauses record-op delivery — a disabled agent still receives the bundle, so a disabled BIND9 server still renders `inline-signing` with its own keys, and a disabled PowerDNS / Technitium server serves the zone unsigned under the parent's DS. Agentless drivers are outside the rule (cloud providers hold one key set per zone; the others cannot sign). Therefore `dnssec_sign`, `dnssec_enabled` on zone create/update, and both Copilot paths (`create_dns_zone`, `sign_zone_dnssec`) 422 when the group has more than one agent server; adding or moving a server into a group that holds signed zones — server create, move, a Fleet group change, the Copilot `assign_appliance_role` — is a 422, as is moving a signed zone into a multi-server group. These checks lock the group row, so two concurrent requests cannot both pass. An agent that auto-registers into a signed group (`AGENT_GROUP`) is **not** refused — that would leave it re-bootstrapping forever, and there is no safe "don't sign" mode (unsigned under a DS is equally bogus) — but it is logged, audited (`dns.agent.register.dnssec_multi_signer`) and surfaced. Zones already signed on a multi-server group are not touched; they are flagged `dnssec_multi_signer: true` on the zone and on `GET …/dnssec/info` (with `signing_servers`), shown as a red **DNSSEC: multiple signers** badge on the zone header and a warning on the DNSSEC card, and raise the default-on, critical `dnssec_multi_signer` alert. Re-signing them is refused until the group is back to one server. The agent's DS/key report is matched within the reporting server's group (a same-named zone in another group is never touched), and on a multi-server group only one server's report is stored — the primary's, or the oldest signer's when no signer is primary — so the DS no longer flaps. After the group drops to one server, PowerDNS reports again only on its next sign op, so **re-sign** the zone and re-publish the DS; BIND9 re-reports after its next reload. Technitium servers count towards the rule like BIND9 and PowerDNS: each holds its own keys. Shared keys are future work.
 
 ### 0a. Cloud DNS providers — Cloudflare / Route 53 / Azure DNS / Google Cloud DNS (issue #37)
 
@@ -554,9 +554,9 @@ BIND 9.20.29:
 | Data | Resident, per copy |
 |---|---|
 | Authoritative zone, 200,000 A records | about 86 MiB (about 0.45 kB per record) |
-| RPZ zone, 100,000 entries (200,000 policy records) | about 135 MiB (about 1.4 kB per entry) |
+| RPZ zone, 100,000 entries (200,000 policy records) | about 135 MiB (about 1.4 kB per entry) on 9.20.29; about 1.0 kB per owner on 9.20.30 with jemalloc (see §8.0) |
 
-So a view adds roughly **1.4 kB × entries** for each list it applies, and
+So a view adds roughly **1.1 kB × entries** (the estimate; measured 0.93 - 1.04 kB, see §8.0) for each list it applies, and
 nothing for the authoritative zones it shares. A 190,000-entry list costs
 about 260 MiB per view that applies it. If a view exists only to give some
 clients a different blocklist, size the DNS pod for one copy of every list
@@ -569,7 +569,7 @@ agents run under. It warns; it never refuses a change.
 
 - *The estimate*: 400 MiB for named and the agent at idle, plus about
   0.45 kB per record of each zone copy named loads (a copy shared through
-  `in-view` counts once), plus about 1.4 kB per RPZ owner name per view that
+  `in-view` counts once), plus about 1.1 kB per RPZ owner name per view that
   loads it. RPZ owners are counted as the bundle builds each view's zone:
   every domain once across the lists it draws on (the §8 first-writer dedup),
   plus exception domains, which render as passthru owners. Records of a
@@ -592,6 +592,27 @@ agents run under. It warns; it never refuses a change.
 
   The fix is one of two things: fewer views drawing on the same lists, or a
   larger memory limit for the DNS pod (§8.0 says where to raise it).
+
+**Actual memory (#4193).** The estimate is a model; the agents also report
+what they really use. Each heartbeat carries an optional `memory` block:
+the container's cgroup usage, peak and limit (`memory.current` /
+`memory.peak` on cgroup v2, `memory.usage_in_bytes` /
+`memory.max_usage_in_bytes` on v1) and the resident set (`VmRSS`) of the
+daemon (`named`, `pdns_server`, Technitium) and of the agent itself. Usage is
+the cgroup's own counter, page cache included, so it can read higher than
+`kubectl top`'s working set. Every field is best effort: an unreadable one is
+left out, and an older agent sends no block at all, which reads as "not
+reported" (`null` / "—"), never 0. The latest report is
+`dns_server.memory_status` (exposed as `memory_status` on the server read
+endpoints and in the Copilot's `find_dns_servers`), and a per-minute sample
+goes into `dns_metric_sample` (`mem_*` columns, same retention as the
+counters; `GET /dns/servers/{id}/memory-history`). The DNS server list shows
+used / limit (amber above 80 %), the server modal shows the breakdown and a
+sparkline, and the Blocking Lists tab sets each server's real `named` RSS
+beside the estimate (`servers` on `GET /dns/groups/{id}/memory-estimate`).
+The DHCP side is the same: `dhcp_server.memory_status`,
+`GET /dhcp/servers/{id}/memory-history`, Kea's RSS summed over `kea-dhcp4`
+and `kea-dhcp6`.
 
 ---
 
@@ -1336,7 +1357,7 @@ RPZ zones:
 
 | | Measured |
 |---|---|
-| named, resident | 1.6 - 2.2 GB (about 1.4 kB per entry per zone) |
+| named, resident | 1.6 - 2.2 GB (about 1.4 kB per entry per zone; about 1.0 kB on 9.20.30, see below) |
 | agent while it renders | about 1.0 - 1.2 GB, plus short-lived children |
 | the pod's peak | 2.8 GB on the first apply, 3.6 GB on the next |
 
@@ -1371,6 +1392,63 @@ list beside its own); BIND cannot share an RPZ zone between views, so that
 factor stays (see §2, "What a view costs in memory"). So 582k entries x 2 zones is about 3.9 GB and
 needs a node with 8 GiB or more; one list on a group with no views is about
 half that.
+
+### Blocklist memory: measured on BIND 9.20.30 (#4183)
+
+These figures come from a before/after run on a dev host: BIND 9.20.30 on
+Alpine 3.24, one group, the AdGuard DNS filter, HaGeZi TIF mini and
+StevenBlack unified lists plus 300 manual entries (454,421 entries, 416,344
+distinct owners). "Before" is `release/1.0.1` as of the run; "after" adds the
+fixes listed below. Resident figures are `named` VmRSS read from the
+container's cgroup, in MiB. **Measured** means read off that run;
+**estimated** means derived or extrapolated.
+
+| Measured | Before | After |
+|---|---|---|
+| Steady, 1 view, whole RPZ loaded (cold restart) | 622 | 578 |
+| Steady, same record count (639,994 records) in both | 619 - 626 | 536 - 541 |
+| Full reload, peak / settled | 1,008 / 681 | 940 / 584 |
+| Small list edit (+2 / -3 domains), peak | 1,010 | 596 |
+| Second view applying the same lists, steady | 1,002 | 887 |
+| Second view removed again | 619 | 477 |
+
+- **Per-view cost** (measured): the second view added about 385 MiB before
+  and about 414 MiB after, for 416k owners, so roughly 1.0 kB per owner name
+  per view. That is the figure to plan with; the 1.4 kB this page gave before was
+  measured on an older build and a smaller list.
+- **Reload peak** (measured): a full reload of the RPZ peaks about 400 MiB
+  above steady state, because named holds the old and the new zone at once.
+  Size the limit for the peak, not the steady figure.
+- **What changed it** (measured, in this run): jemalloc in the BIND9 image
+  (#4192) lowers steady RSS by about 80 MiB at the same record count;
+  syntax-aware wildcards (#4190) stop wildcarding hosts-format entries,
+  which halved the records for a hosts-only list (135,293 to 67,652);
+  incremental RPZ updates (#4191) remove the reload for a small edit, so the
+  peak is steady state plus about 10 MiB instead of plus about 330 MiB, as
+  long as the change stays under the incremental budget (a larger change
+  falls back to a reload); the group `max-cache-size` setting (#4185) is
+  applied and honoured by named, but this run's query load never filled even
+  a 64 MiB cache, so its effect on RSS is **not measured**.
+- **After a reload** (measured): on the build with #4191, `rndc reload`
+  no longer re-reads the RPZ, because the zone is dynamic; use
+  `rndc freeze`, then `rndc thaw`.
+- **Not measured**: a cache-bound RSS difference, the server-list memory
+  column in the UI, arm64, and anything above about 640k records. Figures
+  for other list sizes are **estimated** by scaling the per-owner cost.
+
+The control plane's estimate and the measurement agree within about 30 %.
+The memory warning (§2) uses 1.1 kB per owner per view, taken from this run
+(measured 0.93 - 1.04 kB) with a margin for the reload peak the estimate
+leaves out. It does not account for
+the reload peak, which is why the warning threshold is 80 % of the limit.
+
+**DNSRPS is not supported (#4183).** `dnsrps-enable` hands RPZ lookups to
+`librpz`, a proprietary provider (Farsight / DomainTools) that cannot be
+redistributed. ISC deprecated DNSRPS in BIND 9.20 and removed it in 9.21
+([announcement](https://lists.isc.org/pipermail/bind-users/2024-August/108841.html),
+[9.21.3 notes](https://mirrorservice.org/sites/ftp.isc.org/isc/bind/9.21.3/doc/arm/html/notes.html)),
+and our image is built without it. The supported route is native RPZ with
+incremental updates (#4191).
 
 **That peak is paid only when a list changed (#2157).** The control plane
 ships a content hash with each RPZ zone, and the agent records it beside the
@@ -1517,8 +1595,17 @@ writes an explicit `max-cache-size` into `options {}`: a quarter of the
 container's memory limit, split across the views that recurse (at least
 32m each). So a 2Gi limit gives `512m` with no views and `256m` with two
 recursive views. With no limit it writes nothing and BIND keeps its default.
-Set `NAMED_MAX_CACHE_SIZE` (a BIND size such as `256m`, applied per view, as
-BIND does) on the agent to override it. `unlimited` and `0` are not accepted:
+Set **Resolver cache size per view** on the server group (`max_cache_size` on
+the group's API, a BIND size such as `64m`, `512m` or `1g`; #4185) to choose it
+per group: it goes in the bundle, so every BIND9 agent of the group re-renders,
+and it applies to each recursive view's own cache. The precedence is the group
+setting, then the `NAMED_MAX_CACHE_SIZE` env on the agent, then the derived
+quarter of the limit. Total cache memory is the per-view figure times the
+number of recursive views. As a guide, a home or small office at about 10
+queries/s needs only 64-128m per view, against the roughly 320m the quarter
+rule gives on a 1.25 GiB limit; a view added for kids or guests costs another
+cache of that size. `NAMED_MAX_CACHE_SIZE` (applied per view, as BIND does)
+stays as the agent-wide override for groups that set nothing. `unlimited` and `0` are not accepted:
 BIND 9.21.21+ stops honouring them and falls back to 90 % of physical memory,
 so the agent ignores them (logging `bind9_max_cache_size_ignored`) and keeps
 the derived ceiling. Use an explicit size.

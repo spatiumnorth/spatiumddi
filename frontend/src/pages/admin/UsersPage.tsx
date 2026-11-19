@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Field } from "@/components/ui/field";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { ListReadError } from "@/components/ui/list-read-error";
 import {
@@ -30,6 +31,8 @@ import { StepUpSection } from "@/components/StepUpSection";
 import { stepUpBody } from "@/lib/stepup";
 import { parsePasswordError } from "@/lib/password-policy";
 import { FormError } from "@/components/ui/form-error";
+import { FreshRowError } from "@/components/FreshRowError";
+import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
 
 /** A refused user dialog says what is wrong in words (#2435, #3040). */
 const userDialogError = formatDialogError;
@@ -63,23 +66,6 @@ function PolicyErrorList({ errors }: { errors: string[] }) {
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
-
-function Field({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-    </div>
-  );
-}
 
 // ── Create User Modal ─────────────────────────────────────────────────────────
 
@@ -249,7 +235,35 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
 
 // ── Edit User Modal ───────────────────────────────────────────────────────────
 
+// Edit reads the user when it opens: the row the list holds can be stale, and
+// `is_active` / `is_superadmin` are access decisions another administrator may
+// have changed since. The Save then sends only what was changed against the
+// row read here, so an untouched field is never put back.
 function EditUserModal({
+  user: listed,
+  onClose,
+}: {
+  user: AppUser;
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const fresh = useFreshRow<AppUser>(listed, () =>
+    refetchRow<AppUser>(qc, [["users"]], listed.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title={`Edit ${listed.username}`}
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={onClose}
+      />
+    );
+  if (!fresh.ready || !fresh.row) return null;
+  return <EditUserForm user={fresh.row} onClose={onClose} />;
+}
+
+function EditUserForm({
   user,
   onClose,
 }: {
@@ -267,14 +281,27 @@ function EditUserModal({
   const promoting = isSuperadmin && !user.is_superadmin;
 
   const mutation = useMutation({
-    mutationFn: () =>
-      usersApi.update(user.id, {
-        display_name: displayName,
-        email,
-        is_superadmin: isSuperadmin,
-        is_active: isActive,
+    mutationFn: async () => {
+      const body = changedFields(
+        {
+          display_name: user.display_name,
+          email: user.email,
+          is_superadmin: user.is_superadmin,
+          is_active: user.is_active,
+        },
+        {
+          display_name: displayName,
+          email,
+          is_superadmin: isSuperadmin,
+          is_active: isActive,
+        },
+      );
+      if (Object.keys(body).length === 0) return null;
+      return usersApi.update(user.id, {
+        ...body,
         ...(promoting ? stepUpBody(stepPassword, stepTotp) : {}),
-      }),
+      });
+    },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["users"] });
       onClose();

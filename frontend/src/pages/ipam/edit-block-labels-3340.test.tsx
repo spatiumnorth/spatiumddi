@@ -135,14 +135,13 @@ describe("Edit Block labels (#3340)", () => {
     expect(pci.type).toBe("checkbox");
   });
 
-  it("a picker component is named as a group, and no label points at a missing id", async () => {
+  it("a picker component's select is named by the label (#4387), and no label points at a missing id", async () => {
     answer("ipamApi", "getBlock", () => Promise.resolve(stored));
     open(<EditBlockModal block={stored} onClose={() => {}} />);
     await screen.findByLabelText("Name");
     fireEvent.click(screen.getByRole("button", { name: "Networking" }));
     for (const name of ["VRF", "Origin ASN (BGP)", "Customer", "Site"]) {
-      const group = screen.getByRole("group", { name });
-      expect(group.querySelector("select")).not.toBeNull();
+      expect(screen.getByLabelText(name).tagName, name).toBe("SELECT");
     }
     const labels = Array.from(document.querySelectorAll("label[for]"));
     for (const l of labels) {
