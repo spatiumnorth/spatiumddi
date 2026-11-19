@@ -60,9 +60,10 @@ def test_an_rpz_costs_once_per_view_that_loads_it() -> None:
 
 
 def test_the_reported_group_warns_with_two_views_and_not_with_one() -> None:
-    """The reported install: one ~187,500-entry list, 1 GiB agent limit. One
-    view fits; adding the second loads the list twice and OOM-looped it."""
-    limit = 1024 * MIB
+    """The reported install: one ~187,500-entry list. One view fits; adding the
+    second loads the list twice and OOM-looped it. The limit is 900 MiB since
+    #4183 lowered the per-entry cost (at 1 GiB two views are ~78 %)."""
+    limit = 900 * MIB
     entries = 187_544
     one = assess(estimate_bytes(0, [RpzLoad("r.", ("default",), entries)]), limit)
     two = assess(estimate_bytes(0, [RpzLoad("r.", ("restricted", "default"), entries)]), limit)
@@ -444,3 +445,10 @@ async def test_the_heartbeat_stores_the_limit_and_omission_keeps_it(
         assert await stored() is None  # no limit any more
     finally:
         app.dependency_overrides.pop(_auth_agent, None)
+
+
+def test_the_rpz_entry_cost_is_the_measured_figure() -> None:
+    """Measured on BIND 9.20.30 (#4183): 0.93 - 1.04 kB per owner per view.
+    1,100 keeps a margin for the reload peak the estimate ignores; the old
+    1,430 came from 9.20.29 on a smaller list."""
+    assert BYTES_PER_RPZ_ENTRY == 1100

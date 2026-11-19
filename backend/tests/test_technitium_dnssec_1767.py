@@ -1,8 +1,11 @@
-"""#1783 — SpatiumDDI no longer claims DNSSEC signing on Technitium.
+"""#1767 — DNSSEC signing is back on agent-managed Technitium.
 
-Signing is one-shot there (never re-signed on a new server, a re-created
-zone or a lost volume), so the sign surfaces refuse with a 422 naming #1767,
-while unsign keeps working and a zone already flagged signed gets a warning.
+The agent now reconciles signing state from every bundle (a new server, a
+re-created zone or a lost volume is signed again), maps the zone's policy onto
+the sign call and reports key state back, so the control plane no longer
+withdraws it (#1783). The agentless ``technitium_api`` driver has no agent to
+do that and keeps the explicit 422. Manual rollover is wired to Technitium's
+``rolloverDnsKey``.
 """
 
 from __future__ import annotations
@@ -79,7 +82,7 @@ async def _signed_zone(db: AsyncSession, grp: DNSServerGroup) -> DNSZone:
 
 
 @pytest.mark.asyncio
-async def test_sign_endpoint_422_on_technitium(
+async def test_sign_endpoint_allowed_on_technitium_and_enqueues_op(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     h = await _headers(db_session)
@@ -88,16 +91,23 @@ async def test_sign_endpoint_422_on_technitium(
     z.dnssec_enabled = False
     await db_session.commit()
     r = await client.post(f"/api/v1/dns/groups/{grp.id}/zones/{z.id}/dnssec/sign", headers=h)
-    assert r.status_code == 422, r.text
-    assert "1767" in r.json()["detail"]
+    assert r.status_code == 200, r.text
+    assert r.json()["dnssec_enabled"] is True
+    assert r.json()["dnssec_unmanaged_warning"] is False
+    ops = await db_session.execute(
+        select(DNSRecordOp.op).where(
+            DNSRecordOp.zone_name == z.name, DNSRecordOp.op == "dnssec_sign"
+        )
+    )
+    assert len(ops.scalars().all()) == 1
 
 
 @pytest.mark.asyncio
 async def test_sign_endpoint_422_explains_on_technitium_api(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    """#3806: the agentless driver gets the same explicit refusal, not the
-    generic "requires one of [bind9, powerdns]" text."""
+    """The agentless driver keeps an explicit refusal, not the generic
+    "requires one of [...]" text."""
     h = await _headers(db_session)
     grp = await _group(db_session, "technitium_api")
     z = await _signed_zone(db_session, grp)
@@ -105,30 +115,29 @@ async def test_sign_endpoint_422_explains_on_technitium_api(
     await db_session.commit()
     r = await client.post(f"/api/v1/dns/groups/{grp.id}/zones/{z.id}/dnssec/sign", headers=h)
     assert r.status_code == 422, r.text
-    assert "not supported on Technitium" in r.json()["detail"]
-    assert "1767" in r.json()["detail"]
+    assert "agentless Technitium" in r.json()["detail"]
     await db_session.refresh(z)
     assert z.dnssec_enabled is False
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("driver", ["technitium", "technitium_api"])
-async def test_dnssec_info_flags_signing_unsupported(
-    client: AsyncClient, db_session: AsyncSession, driver: str
+async def test_dnssec_info_flags_signing_unsupported_only_for_api_driver(
+    client: AsyncClient, db_session: AsyncSession
 ) -> None:
     """The flag the UI reads to disable the Sign button."""
     h = await _headers(db_session)
-    grp = await _group(db_session, driver)
-    z = await _signed_zone(db_session, grp)
-    z.dnssec_enabled = False
-    await db_session.commit()
-    r = await client.get(f"/api/v1/dns/groups/{grp.id}/zones/{z.id}/dnssec/info", headers=h)
-    assert r.status_code == 200, r.text
-    assert r.json()["signing_unmanaged"] is True
+    for driver, expected in (("technitium", False), ("technitium_api", True)):
+        grp = await _group(db_session, driver)
+        z = await _signed_zone(db_session, grp)
+        z.dnssec_enabled = False
+        await db_session.commit()
+        r = await client.get(f"/api/v1/dns/groups/{grp.id}/zones/{z.id}/dnssec/info", headers=h)
+        assert r.status_code == 200, r.text
+        assert r.json()["signing_unmanaged"] is expected, driver
 
 
 @pytest.mark.asyncio
-async def test_create_and_update_with_dnssec_422_on_technitium(
+async def test_create_with_dnssec_allowed_on_technitium(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     h = await _headers(db_session)
@@ -136,33 +145,17 @@ async def test_create_and_update_with_dnssec_422_on_technitium(
     r = await client.post(
         f"/api/v1/dns/groups/{grp.id}/zones", json=_body(dnssec_enabled=True), headers=h
     )
-    assert r.status_code == 422, r.text
-    r = await client.post(f"/api/v1/dns/groups/{grp.id}/zones", json=_body(), headers=h)
-    assert r.status_code == 201, r.text
-    r = await client.put(
-        f"/api/v1/dns/groups/{grp.id}/zones/{r.json()['id']}",
-        json={"dnssec_enabled": True},
-        headers=h,
-    )
-    assert r.status_code == 422, r.text
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("driver", ["bind9", "powerdns"])
-async def test_sign_still_allowed_single_server(
-    client: AsyncClient, db_session: AsyncSession, driver: str
-) -> None:
-    h = await _headers(db_session)
-    grp = await _group(db_session, driver)
-    r = await client.post(
-        f"/api/v1/dns/groups/{grp.id}/zones", json=_body(dnssec_enabled=True), headers=h
-    )
     assert r.status_code == 201, r.text
     assert r.json()["dnssec_unmanaged_warning"] is False
+    api = await _group(db_session, "technitium_api")
+    r = await client.post(
+        f"/api/v1/dns/groups/{api.id}/zones", json=_body(dnssec_enabled=True), headers=h
+    )
+    assert r.status_code == 422, r.text
 
 
 @pytest.mark.asyncio
-async def test_unsign_still_works_and_enqueues_op_on_technitium(
+async def test_unsign_enqueues_op_on_technitium(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     h = await _headers(db_session)
@@ -181,48 +174,67 @@ async def test_unsign_still_works_and_enqueues_op_on_technitium(
         )
     )
     assert len(ops.scalars().all()) == 1
-    r = await client.post(f"/api/v1/dns/groups/{grp.id}/zones/{z.id}/dnssec/unsign", headers=h)
-    assert r.status_code == 200, r.text
 
 
 @pytest.mark.asyncio
-async def test_already_signed_technitium_zone_carries_warning(
+async def test_rollover_enqueues_op_on_technitium(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     h = await _headers(db_session)
-    tn = await _group(db_session, "technitium")
-    bd = await _group(db_session, "bind9")
-    zt = await _signed_zone(db_session, tn)
-    zb = await _signed_zone(db_session, bd)
-    r = await client.get(f"/api/v1/dns/groups/{tn.id}/zones/{zt.id}", headers=h)
+    grp = await _group(db_session, "technitium")
+    z = await _signed_zone(db_session, grp)
+    r = await client.post(
+        f"/api/v1/dns/groups/{grp.id}/zones/{z.id}/dnssec/rollover",
+        json={"key_tag": 4242},
+        headers=h,
+    )
     assert r.status_code == 200, r.text
-    assert r.json()["dnssec_enabled"] is True
-    assert r.json()["dnssec_unmanaged_warning"] is True
-    r = await client.get(f"/api/v1/dns/groups/{bd.id}/zones/{zb.id}", headers=h)
-    assert r.json()["dnssec_unmanaged_warning"] is False
+    op = (
+        await db_session.execute(
+            select(DNSRecordOp).where(
+                DNSRecordOp.zone_name == z.name, DNSRecordOp.op == "dnssec_rollover"
+            )
+        )
+    ).scalar_one()
+    assert op.record["key_tag"] == 4242
 
 
-# ── Stacked on #1762: one signer list, Technitium still counted ──────────
+@pytest.mark.asyncio
+async def test_rollover_still_refused_on_powerdns(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h = await _headers(db_session)
+    grp = await _group(db_session, "powerdns")
+    z = await _signed_zone(db_session, grp)
+    r = await client.post(
+        f"/api/v1/dns/groups/{grp.id}/zones/{z.id}/dnssec/rollover",
+        json={"key_tag": 1},
+        headers=h,
+    )
+    assert r.status_code == 422, r.text
 
 
-def test_one_signer_list_without_technitium() -> None:
+# ── One signer list; the single-signer rule counts Technitium ────────────
+
+
+def test_one_signer_list_includes_technitium_agent_only() -> None:
     from app.api.v1.dns.router import _DRIVER_GATED_OPERATIONS
     from app.services.dns import dnssec_signers
     from app.services.dns.zone_move import DNSSEC_SIGN_DRIVERS
 
     assert _DRIVER_GATED_OPERATIONS["dnssec_sign"] is dnssec_signers.SIGNING_DRIVERS
     assert DNSSEC_SIGN_DRIVERS is dnssec_signers.SIGNING_DRIVERS
-    assert "technitium" not in dnssec_signers.SIGNING_DRIVERS
-    # A zone signed before #1783 is still held with per-server keys.
+    assert "technitium" in dnssec_signers.SIGNING_DRIVERS
+    assert "technitium_api" not in dnssec_signers.SIGNING_DRIVERS
     assert "technitium" in dnssec_signers.PER_SERVER_SIGNING_DRIVERS
 
 
 @pytest.mark.asyncio
-async def test_signed_technitium_group_still_refuses_a_second_server(
+async def test_signed_technitium_group_refuses_a_second_server(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    """A second Technitium server would serve the already-signed zone
-    unsigned under the parent's DS, so #1762's refusal must still apply."""
+    """Each Technitium server signs with its own keys, so #1762's refusal
+    applies."""
     h = await _headers(db_session)
     grp = await _group(db_session, "technitium")
     await _signed_zone(db_session, grp)
@@ -236,54 +248,24 @@ async def test_signed_technitium_group_still_refuses_a_second_server(
 
 
 @pytest.mark.asyncio
-async def test_zone_list_flags_each_signed_technitium_zone(
+async def test_signing_a_zone_on_a_two_server_technitium_group_is_refused(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     h = await _headers(db_session)
     grp = await _group(db_session, "technitium")
-    signed = [await _signed_zone(db_session, grp) for _ in range(3)]
-    plain = DNSZone(
-        group_id=grp.id,
-        name=f"p{uuid.uuid4().hex[:6]}.example.",
-        zone_type="primary",
-        kind="forward",
-        primary_ns="ns1.example.",
-        admin_email="admin.example.",
+    db_session.add(
+        DNSServer(
+            group_id=grp.id,
+            driver="technitium",
+            host="10.0.0.9",
+            name="tn-second",
+            is_primary=False,
+            is_enabled=True,
+        )
     )
-    db_session.add(plain)
-    await db_session.commit()
-    r = await client.get(f"/api/v1/dns/groups/{grp.id}/zones", headers=h)
-    assert r.status_code == 200, r.text
-    body = r.json()
-    rows = body["items"] if isinstance(body, dict) else body
-    flags = {row["id"]: row["dnssec_unmanaged_warning"] for row in rows}
-    for z in signed:
-        assert flags[str(z.id)] is True
-    assert flags[str(plain.id)] is False
-
-
-@pytest.mark.asyncio
-async def test_dnssec_info_and_copilot_report_unmanaged(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
-    h = await _headers(db_session)
-    grp = await _group(db_session, "technitium")
-    z = await _signed_zone(db_session, grp)
-    r = await client.get(f"/api/v1/dns/groups/{grp.id}/zones/{z.id}/dnssec/info", headers=h)
-    assert r.status_code == 200, r.text
-    assert r.json()["signing_unmanaged"] is True
-    assert r.json()["dnssec_unmanaged_warning"] is True
-
-    from app.services.ai.operations_writes import (
-        SignZoneDNSSECArgs,
-        _preview_sign_zone_dnssec,
+    await db_session.flush()
+    r = await client.post(
+        f"/api/v1/dns/groups/{grp.id}/zones", json=_body(dnssec_enabled=True), headers=h
     )
-
-    user = (await db_session.execute(select(User).where(User.username.like("tn-%")))).scalar_one()
-    z.dnssec_enabled = False
-    await db_session.commit()
-    preview = await _preview_sign_zone_dnssec(
-        db_session, user, SignZoneDNSSECArgs(group_id=grp.id, zone_id=z.id)
-    )
-    assert preview.ok is False
-    assert "1767" in (preview.detail or "")
+    assert r.status_code == 422, r.text
+    assert "own keys" in r.json()["detail"]

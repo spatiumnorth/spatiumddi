@@ -21,6 +21,7 @@ auto-created as a parent (because subnets require ``block_id``).
 from __future__ import annotations
 
 import ipaddress
+import json
 import re
 import uuid
 from collections.abc import Callable
@@ -34,7 +35,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dns_names import validate_hostname
 from app.models.audit import AuditLog
-from app.models.ipam import IP_STATUSES, IPAddress, IPBlock, IPSpace, Subnet
+from app.models.ipam import (
+    IP_STATUSES,
+    CustomFieldDefinition,
+    IPAddress,
+    IPBlock,
+    IPSpace,
+    Subnet,
+)
 from app.services.ipam.address_create_rules import boundary_address_refusal
 from app.services.ipam.resize import _total_ips
 from app.services.ipam.subnet_placeholders import (
@@ -75,10 +83,13 @@ class ImportPreview:
     updates: list[DiffRow] = field(default_factory=list)
     conflicts: list[DiffRow] = field(default_factory=list)
     errors: list[DiffRow] = field(default_factory=list)
+    # Exporter-computed columns present in the upload and ignored (#4289).
+    skipped_columns: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "space_id": self.space_id,
+            "skipped_columns": self.skipped_columns,
             "space_name": self.space_name,
             "summary": {
                 "creates": len(self.creates),
@@ -239,6 +250,48 @@ async def _overwrite_gateway_problem(
 # ── Preview ────────────────────────────────────────────────────────────────────
 
 
+async def _coerce_multi_select_cells(db: AsyncSession, payload: ParsedPayload) -> None:
+    """Read a ``multi_select`` custom field's cell back into a list (#4282).
+
+    The exporter writes a list custom field to CSV / XLSX as compact JSON text.
+    The importer does not otherwise validate custom fields against their
+    definitions (an undefined key is stored as given, text stays text), so only
+    a field whose definition is ``multi_select`` has a text cell starting with
+    ``[`` parsed back; a ``text`` field holding ``[1,2]`` stays that string.
+    JSON input rows already carry structured values and are untouched.
+    """
+    for resource_type, rows in (("subnet", payload.subnets), ("ip_address", payload.addresses)):
+        if not rows:
+            continue
+        names = set(
+            (
+                await db.execute(
+                    select(CustomFieldDefinition.name).where(
+                        CustomFieldDefinition.resource_type == resource_type,
+                        CustomFieldDefinition.field_type == "multi_select",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not names:
+            continue
+        for row in rows:
+            cf = row.get("custom_fields")
+            if not isinstance(cf, dict):
+                continue
+            for k in names & cf.keys():
+                v = cf[k]
+                if isinstance(v, str) and v.startswith("["):
+                    try:
+                        parsed = json.loads(v)
+                    except ValueError:
+                        continue
+                    if isinstance(parsed, list):
+                        cf[k] = parsed
+
+
 async def preview_import(
     db: AsyncSession,
     payload: ParsedPayload,
@@ -247,8 +300,10 @@ async def preview_import(
     space_name: str | None = None,
     strategy: Strategy = "fail",
 ) -> ImportPreview:
+    await _coerce_multi_select_cells(db, payload)
     space = await _resolve_space(db, space_id, space_name)
     preview = ImportPreview(space_id=str(space.id), space_name=space.name)
+    preview.skipped_columns = sorted(payload.skipped_columns)
 
     existing_subnets = await _load_existing_subnets(db, space.id)
     existing_blocks = await _load_existing_blocks(db, space.id)
@@ -450,6 +505,7 @@ async def commit_import(
     """Apply the import. All changes happen inside the caller's transaction —
     the caller (the route handler) owns the commit.
     """
+    await _coerce_multi_select_cells(db, payload)
     space = await _resolve_space(db, space_id, space_name)
     result_obj = ImportResult(space_id=str(space.id))
 
@@ -867,8 +923,10 @@ async def preview_address_import(
     it refuses is reported as an error (the commit skips it as
     ``skipped_no_perm``) and the existing row at that address is not shown.
     """
+    await _coerce_multi_select_cells(db, payload)
     subnet = await _load_subnet(db, subnet_id)
     preview = ImportPreview(space_id=str(subnet.id), space_name=str(subnet.network))
+    preview.skipped_columns = sorted(payload.skipped_columns)
 
     subnet_net = ipaddress.ip_network(str(subnet.network), strict=False)
     existing = await _load_existing_addresses(db, subnet.id)
@@ -1123,6 +1181,7 @@ async def commit_address_import(
     from app.services.dhcp.static_ipam import sync_static_for_ipam_row
     from app.services.dns.sync_check import address_own_forward_zone_id
 
+    await _coerce_multi_select_cells(db, payload)
     subnet = await _load_subnet(db, subnet_id)
     result_obj = AddressImportResult(subnet_id=str(subnet.id))
 
