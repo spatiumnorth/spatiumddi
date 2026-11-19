@@ -1082,6 +1082,36 @@ else
     echo "   FAIL: a one-instance Cluster did not render smartShutdownTimeout: 15" >&2
     failures=$((failures + 1))
 fi
+# #1261: opt-in synchronous replication. Off renders no ``synchronous`` block
+# (asynchronous, unchanged); on renders it; with one instance, or a number the
+# instances cannot satisfy, the render is refused.
+echo "── CNPG synchronous replication is off by default (#1261)"
+if helm template sync "$UMBRELLA" --kube-version "$K8S_VERSION" "${UMBRELLA_HA[@]}" \
+    | grep -q '^    synchronous:'; then
+    echo "   FAIL: the default render carries a synchronous block" >&2
+    failures=$((failures + 1))
+else
+    echo "   ok: default render is asynchronous"
+fi
+echo "── CNPG synchronous replication renders when enabled (#1261)"
+if helm template sync "$UMBRELLA" --kube-version "$K8S_VERSION" "${UMBRELLA_HA[@]}" \
+    --set postgresql.cnpg.synchronous.enabled=true --set postgresql.cnpg.synchronous.dataDurability=preferred \
+    | grep -A4 '^    synchronous:' | grep -q 'dataDurability: preferred'; then
+    echo "   ok: synchronous block rendered"
+else
+    echo "   FAIL: enabled synchronous replication did not render" >&2
+    failures=$((failures + 1))
+fi
+for bad in "postgresql.cnpg.instances=1" "postgresql.cnpg.synchronous.number=3" "postgresql.cnpg.synchronous.method=bogus"; do
+    echo "── negative control: synchronous with $bad must fail to render (#1261)"
+    if helm template neg "$UMBRELLA" --kube-version "$K8S_VERSION" "${UMBRELLA_HA[@]}" \
+        --set postgresql.cnpg.synchronous.enabled=true --set "$bad" >/dev/null 2>&1; then
+        echo "   FAIL: $bad rendered with synchronous replication on" >&2
+        failures=$((failures + 1))
+    else
+        echo "   ok: refused"
+    fi
+done
 POSTURE_ARGS=""
 coverage "$UMBRELLA" "${UMBRELLA_ALL_ON[@]}" "${UMBRELLA_HA[@]}" "${UMBRELLA_EXTERNAL[@]}" \
     "${UMBRELLA_APPLIANCE_CNPG[@]}"

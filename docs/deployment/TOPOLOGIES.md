@@ -354,7 +354,11 @@ recommended HA path for operators who installed from the ISO.
 **Failure behaviour:** lose one of three nodes → etcd keeps quorum (2/3),
 CNPG fails over to a replica, the MetalLB VIP re-homes to a surviving
 node, the UI stays up on the same address. CNPG replicates
-asynchronously, so a failover can lose the last few commits (RPO > 0). Bring the node back, or
+asynchronously by default, so a failover can lose the last few commits (RPO > 0). On a
+Kubernetes install of the umbrella chart, `postgresql.cnpg.synchronous` opts in to synchronous
+replication (RPO 0; with `dataDurability: required` writes block while no sync replica is
+available, see [Kubernetes](KUBERNETES.md#postgresql--cloudnativepg)); the appliance has no
+setting for it yet. Bring the node back, or
 replace it — operator-driven dead-node replacement is the Phase 9
 follow-up tracked on [#272](https://github.com/spatiumnorth/spatiumddi/issues/272).
 
