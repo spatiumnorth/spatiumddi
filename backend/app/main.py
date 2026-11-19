@@ -148,6 +148,13 @@ async def _seed_default_admin() -> None:
                 # appliance installer) starts on it, with no forced change.
                 # The hash is never logged.
                 preset = _initial_admin_hash(settings.initial_admin_password_hash)
+                if settings.initial_admin_password_hash.strip() and not preset:
+                    # Never the value itself.
+                    logger.warning(
+                        "initial_admin_password_hash_ignored",
+                        message="INITIAL_ADMIN_PASSWORD_HASH is not a bcrypt hash; "
+                        "using the default admin account",
+                    )
                 admin = User(
                     username="admin",
                     email="admin@localhost",

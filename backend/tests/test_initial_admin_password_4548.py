@@ -82,3 +82,18 @@ def test_the_hash_env_var_is_redacted_in_a_support_bundle() -> None:
     value = hash_password("whatever-pw")
     out = render_env({"INITIAL_ADMIN_PASSWORD_HASH": value}, lambda v: v)
     assert value not in out
+
+
+async def test_a_malformed_hash_is_warned_about_without_the_value(db_session, monkeypatch) -> None:
+    import app.main as main_mod
+
+    events: list[tuple[str, dict]] = []
+
+    class _Log:
+        def __getattr__(self, _name):
+            return lambda event, **kw: events.append((event, kw))
+
+    monkeypatch.setattr(main_mod, "logger", _Log())
+    await _seed(db_session, monkeypatch, "$6$salt$sha512crypt")
+    ignored = [kw for ev, kw in events if ev == "initial_admin_password_hash_ignored"]
+    assert ignored and "sha512crypt" not in str(ignored)
