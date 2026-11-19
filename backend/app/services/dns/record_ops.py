@@ -1839,6 +1839,23 @@ async def clear_dnssec_key_state(db: AsyncSession, zone: DNSZone) -> None:
     await db.execute(sa_delete(DNSKey).where(DNSKey.zone_id == zone.id))
 
 
+def _pool_stand_in(op: dict[str, Any]) -> DNSRecord | None:
+    """A transient row for a pool op that names its member but no record row.
+
+    A pool op is built from the member (a create's row is not yet known to the
+    payload, a delete's row is already gone), and which view serves the record
+    depends on the member alone (``records_for_view`` reads ``pool_member_id``
+    and ``view_id``), so a row carrying just those answers the same as the real
+    one. Without it such an op would fan out to every view, putting a geo
+    member's address into views that do not serve it (#2242).
+    """
+    raw = (op.get("record") or {}).get("pool_member_id")
+    try:
+        return DNSRecord(pool_member_id=uuid.UUID(str(raw)), view_id=None) if raw else None
+    except ValueError:
+        return None
+
+
 async def resolve_op_views(
     db: AsyncSession, zone: DNSZone, ops: Sequence[dict[str, Any]]
 ) -> list[list[str | None]]:
@@ -1852,7 +1869,8 @@ async def resolve_op_views(
     (``records_for_view``, the same predicate): a record scoped to one view
     reaches that view's copy alone, a shared one every copy. An op that
     names no ``record_id`` (a DNSSEC signal, a payload the caller built by
-    hand) or whose row is gone goes to every view rendering the zone. Never
+    hand) or whose row is gone goes to every view rendering the zone, unless it
+    names a pool member (``_pool_stand_in``). Never
     an empty list: an op no view claims is queued with NULL rather than
     dropped, so a caller gating on "was an op queued" still sees one.
 
@@ -1916,6 +1934,8 @@ async def resolve_op_views(
     for o in ops:
         rid = _record_id(o)
         row = own.get(rid) if rid is not None else None
+        if row is None:
+            row = _pool_stand_in(o)
         names: list[str | None] = [
             vd["name"] for vd in rendering if row is None or records_for_view([row], vd, geo)
         ]

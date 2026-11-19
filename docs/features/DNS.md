@@ -475,14 +475,23 @@ changes for such a server, and only such a server:
   change, the server's first render, or a renderer revision. Otherwise the ops
   stay queued and ship.
 
-What stays on the re-render path, whatever the agent says: a group with geo
-steering (which view a pool member answers in depends on the record set), a
-group holding a DNSSEC-signed zone (the agent's signed-serial handling is per
-zone name, not per view), a group without the product's own TSIG key (the
-view keys are derived from it), and any server whose agent does not say
-`per-view-ops`. A mixed group is fine: each server follows its own agent, so
-a control plane upgraded before its agents keeps today's behaviour until each
-agent reports in.
+**Geo steering rides the same path** (#2242 slice 5). Which view a pool
+member's record is served in is decided by `records_for_view`, the one
+predicate the bundle's zone copies, the op fan-out and the op's RRset stamp all
+use, so an op for a geo view carries exactly what a full render would put in
+that view (an all-geo pool's no-blackhole fallback and unreachable members
+included). The geo plan itself (which member is in which geo view, the
+all-geo fallback set, unreachable members) is part of the structural
+fingerprint, because a change to it re-files records without writing one: it
+re-renders and retires the queued ops it covers.
+
+What stays on the re-render path, whatever the agent says: a group holding a
+DNSSEC-signed zone (the agent's signed-serial handling is per zone name, not
+per view), a group without the product's own TSIG key (the view keys are
+derived from it), and any server whose agent does not say `per-view-ops`. A
+mixed group is fine: each server follows its own agent, so a control plane
+upgraded before its agents keeps today's behaviour until each agent reports
+in.
 
 This is the control plane's side. The agent and its daemon have their own
 memory to size for the same group (#2223), and

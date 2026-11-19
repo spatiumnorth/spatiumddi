@@ -5,8 +5,9 @@ per view (``per-view-ops``): the structural payload then carries the zones'
 placement (which views hold a copy) but not their records, each op names its
 view and carries the RRset of that view's copy, and the queued ops are retired
 only by a render that moved something the agent re-applies from the body.
-Everything else keeps today's path: an agent that does not say so, geo
-steering, a signed zone, a group without the product's own key.
+Everything else keeps today's path: an agent that does not say so, a signed
+zone, a group without the product's own key. Geo steering is on the per-view
+path since slice 5 (``test_dns_geo_per_view_ops_2242.py``).
 """
 
 from __future__ import annotations
@@ -319,28 +320,6 @@ async def test_what_keeps_a_group_on_the_re_render_path(db_session: AsyncSession
     await _zone(db_session, grp3)
     body3 = await render_bundle_body(db_session, srv3)
     assert body3.per_view_ops is False and body3.has_views is False
-
-
-@pytest.mark.asyncio
-async def test_geo_steering_stays_on_the_re_render_path(
-    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from app.services.dns import agent_config
-    from app.services.dns.pool_geo import GeoSteering, GeoView
-
-    grp, (srv,), _ = await _group(db_session)
-    await _zone(db_session, grp)
-    off = await render_bundle_body(db_session, srv)
-    assert off.per_view_ops is True
-
-    async def geo_on(db: AsyncSession, group_id: Any) -> GeoSteering:
-        return GeoSteering(views=[GeoView(name="geo-a", match_clients=("192.0.2.0/24",))])
-
-    monkeypatch.setattr(agent_config, "build_geo_steering", geo_on)
-    body = await render_bundle_body(db_session, srv)
-    # Geo views need member filtering per view (slice 5): records stay
-    # structural and the ops are not shipped.
-    assert body.per_view_ops is False and body.has_views is True
 
 
 @pytest.mark.asyncio

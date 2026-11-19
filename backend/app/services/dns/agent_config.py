@@ -1604,15 +1604,16 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         )
 
     # #2242 — does this server take its record changes as ops, per view?
-    # Only a BIND9 agent that said so (``per-view-ops``), in a group whose views
-    # are the operator's alone: geo steering changes which members a view
-    # answers with (slice 5) and a signed zone needs its serial read per
-    # (view, zone), so either keeps the group on the re-render path, where
-    # records are structural and the queued ops are retired. And the product's
-    # own group key, from which each view's update key is derived, must exist.
+    # Only a BIND9 agent that said so (``per-view-ops``), in a group with views
+    # (operator views or geo steering, #2242 slice 5: ``records_for_view``
+    # decides each view's records for both, and the op fan-out and stamp use
+    # it, so an op's RRset is what the re-render would put in that view). A
+    # signed zone needs its serial read per (view, zone), so it keeps the group
+    # on the re-render path, where records are structural and the queued ops
+    # are retired. And the product's own group key, from which each view's
+    # update key is derived, must exist.
     per_view_ops = (
-        bool(views)
-        and not geo.active
+        has_views
         and server.driver == "bind9"
         and bool(server.agent_per_view_ops)
         and group_key is not None
@@ -2327,6 +2328,20 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         # be structural (issue #50).
         "tls_cert": tls_cert_block,
     }
+    if per_view_ops and geo.active:
+        # #2242 slice 5 — which view a pool member's record is served in is
+        # decided by the geo plan, not by the record, and a change to the plan
+        # (a member's scope moved to another geo view, a pool gained or lost
+        # its unscoped member so the all-geo fallback toggled, a member went
+        # unreachable) re-files records without writing one, so no op would
+        # carry it. Making the plan structural moves the etag, and the render
+        # then re-applies from the body and retires the ops it covers. Left out
+        # without geo so a plain split-horizon group keeps its etag.
+        structural["geo_plan"] = {
+            "member_view": sorted(geo.member_view.items()),
+            "default_fallback": sorted(geo.default_fallback_members),
+            "unreachable": sorted(geo.unreachable_members),
+        }
     if server.zone_resync_seq:
         # #2281 — this server was re-enabled. While it was disabled it got no
         # record ops, so its daemon still serves the records it had then; the

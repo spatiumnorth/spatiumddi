@@ -320,6 +320,9 @@ def _delete_snapshot(rec: DNSRecord) -> dict[str, object]:
         "value": rec.value,
         "ttl": rec.ttl,
         "rrset_action": "delete_value",
+        # The row is gone by the time the op is queued; the member names the
+        # views that served it (``record_ops.resolve_op_views``, #2242).
+        "pool_member_id": str(rec.pool_member_id) if rec.pool_member_id else None,
     }
 
 
@@ -350,4 +353,6 @@ def _record_payload(pool: DNSPool, member: DNSPoolMember, ttl: int | None) -> di
         "value": member.address,
         "ttl": ttl,
         "rrset_action": "add",
+        # Which geo view serves the record follows its member (#2242).
+        "pool_member_id": str(member.id),
     }
