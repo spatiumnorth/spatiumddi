@@ -126,6 +126,7 @@ listed in §3.3 for that reason.)
 | `stat.ripe.net`, `www.peeringdb.com`, `ris-live.ripe.net`, `rpki.cloudflare.com`, `rpki-validator.ripe.net` | BGP Looking Glass enrichment and prefix-hijack monitoring (`bgp_monitoring_enabled`); the two RPKI hosts are also reached by the scheduled ROA refresh above | off — the `network.asn` feature module; its scheduled ROA refresh and hijack poll do nothing while it is off (#2279), and the hijack poll also needs `bgp_monitoring_enabled`; the RIS Live stream is a separate process behind `BGP_RIS_LIVE_ENABLED` (default false) | The ASN or prefix being enriched. |
 | Your alert / notification endpoints (Slack webhook, generic webhook, SMTP relay) | Alerting | off until a channel is configured | The alert payload, to the URL or relay you entered. |
 | Your audit-forward endpoint | Audit forwarding | off | Audit rows, to the URL you entered. |
+| Your Apprise destinations — whichever service an Apprise URL names: Telegram, ntfy (`ntfy.sh` or your own server), Pushover, Matrix, Gotify, Teams Workflows, … | Audit forwarding and alerting, webhook targets with the `apprise` flavor (#1503) | off; nothing is sent until you add a target with an Apprise URL. Saving a target only checks that Apprise can read the URL, it sends nothing | A title and a short text for each event the target accepts (rule name, severity, subject and message for an alert; action, resource, user and result for an audit row), to the service and account in the URL you entered. The hostnames are not in our source: Apprise's plugins hold them, so the guard in §8 cannot list them, and this row is the only record. Apprise's default notification icons, which some services would fetch from `github.com`, are switched off. |
 | Your backup destination (S3, Azure Blob, GCS, WebDAV, SMB, FTP, SCP, NFS, or any HTTPS receiver you name) | Backup targets | off; local volume by default | The encrypted backup archive, to the destination you configured. The `https_put` kind sends it to a URL you type — an Artifactory or Nexus repository, a presigned S3 URL, an internal receiver — so it goes exactly where you point it and nowhere else; the URL is checked against the SSRF guard and redirects are not followed, so the archive cannot be re-sent to a third address. The `nfs` kind connects to the server and export you name, over AUTH_SYS, which is unauthenticated (see SYSTEM_ADMIN.md). |
 
 ### 3.4 Appliance host (OS-level, not the application)
@@ -307,7 +308,9 @@ call (`gethostbyname`, `getaddrinfo`, `create_connection`, `connect`, a
 dnspython `resolve` / `query`), directly or through a variable assigned a
 literal; a hostname written bare anywhere else (a resolver name in a
 config template, a `tls://` endpoint) is not seen. The things it cannot see, and which therefore need a
-human: hostname literals in the appliance's **shell** scripts under
+human: the hostnames inside the Apprise library that an `apprise`
+webhook target reaches (§3.3), since the guard scans our code and not
+third-party packages; hostname literals in the appliance's **shell** scripts under
 `appliance/mkosi.extra/usr/local/bin/` — the guard reads Python only, so
 §3.4's rows were written by hand and the next `curl` added to the
 installer will pass CI with nothing to catch it; the same for the
@@ -335,6 +338,8 @@ the installer's SSH-key fetch in §3.4 is a separate use),
 `www.spatiumddi.com` (the ACME
 client's User-Agent string, as RFC 8555 asks for), `fingerbank.org`,
 `aistudio.google.com` (the "get an API key" link in an error message),
+`appriseit.com` (the Apprise URL documentation, linked from the
+audit-forward target form),
 `bacnet.org`, `kea.readthedocs.io`, `adaptivecards.io` (the `$schema`
 identifier in a Teams-format webhook payload — a schema URI, not a
 URL that is dereferenced), `www.opengis.net` (the GML namespace in the

@@ -4355,7 +4355,9 @@ export type AuditForwardWebhookFlavor =
   | "generic"
   | "slack"
   | "teams"
-  | "discord";
+  | "discord"
+  // One Apprise service URL (``tgram://…``, ``ntfys://…``) in ``url`` (#1503).
+  | "apprise";
 export type AuditForwardSmtpSecurity = "none" | "starttls" | "ssl";
 export type AuditForwardFormat =
   | "rfc5424_json"
@@ -4379,7 +4381,8 @@ export interface AuditForwardTarget {
   ca_cert_pem: string | null;
   // The webhook URL and Authorization header are Fernet-encrypted at rest
   // and never returned (#1502). ``url_display`` is scheme + host only, e.g.
-  // ``https://hooks.slack.com/…``.
+  // ``https://hooks.slack.com/…``; for an Apprise target the scheme only
+  // (``tgram://…``), since there the host can be the token.
   url_set: boolean;
   url_display: string;
   auth_header_set: boolean;

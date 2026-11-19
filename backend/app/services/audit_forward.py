@@ -18,7 +18,10 @@ Supported output formats (syslog kind):
   For raw TCP/UDP inputs on Logstash / Fluentd / Vector.
 
 Webhook targets always deliver compact JSON (the HTTP body); the
-``format`` column is ignored for ``kind="webhook"``.
+``format`` column is ignored for ``kind="webhook"``. The one exception is
+``webhook_flavor="apprise"`` (#1503): the URL is an Apprise service URL
+and ``app.services.apprise_delivery`` sends a title + text body through
+Apprise instead.
 
 Design notes:
 
@@ -62,7 +65,7 @@ from app.db import task_connect_args
 from app.models.audit import AuditLog
 from app.models.audit_forward import AuditForwardTarget
 from app.models.settings import PlatformSettings
-from app.services import dispatch_db
+from app.services import apprise_delivery, dispatch_db
 from app.services.after_commit_dispatch import dispatch
 from app.services.audit_redact import redact_audit_payload
 from app.services.forward_secrets import redact, reveal, secret_url_in_flight, url_display
@@ -985,6 +988,17 @@ async def _deliver_to_target(
             )
         elif kind == "webhook":
             flavor = (target.get("webhook_flavor") or "generic").lower()
+            if flavor == "apprise":
+                # One Apprise service URL (#1503). Apprise formats for the
+                # service, so it gets plain text and our severity.
+                title, text_body = _payload_summary_lines(payload)
+                await apprise_delivery.send(
+                    target["url"],
+                    title=title,
+                    body=text_body,
+                    severity=_payload_severity(payload),
+                )
+                return DELIVERED
             body = _shape_webhook_body(flavor, payload)
             # Slack / Teams / Discord incoming-webhook URLs accept
             # unauthenticated POSTs by design; forwarding the
@@ -1162,7 +1176,14 @@ async def _forward_config_from(
                 "protocol": t.protocol or "udp",
                 "facility": int(t.facility or 16),
             }
-        elif webhook_cfg is None and t.kind == "webhook" and t.url_encrypted:
+        elif (
+            webhook_cfg is None
+            and t.kind == "webhook"
+            and t.webhook_flavor != "apprise"
+            and t.url_encrypted
+        ):
+            # The legacy shape is a plain JSON POST; an Apprise URL is not
+            # something httpx can post to.
             url = reveal(t.url_encrypted, field="url", target=t.name)
             if url:
                 webhook_cfg = {

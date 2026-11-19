@@ -59,6 +59,7 @@ from app.models.settings import (
     BrandingAsset,
     PlatformSettings,
 )
+from app.services import apprise_delivery
 from app.services import audit_forward as audit_forward_svc
 from app.services import feature_modules as fm_svc
 from app.services.api_token_scopes import token_write
@@ -3536,7 +3537,7 @@ async def get_oui_refresh_status(task_id: str, current_user: CurrentUser) -> OUI
 # ── Audit forward targets (multi-target + multi-format) ───────────────────
 
 _VALID_KINDS = {"syslog", "webhook", "smtp"}
-_VALID_WEBHOOK_FLAVORS = {"generic", "slack", "teams", "discord"}
+_VALID_WEBHOOK_FLAVORS = {"generic", "slack", "teams", "discord", "apprise"}
 _VALID_SMTP_SECURITY = {"none", "starttls", "ssl"}
 _VALID_FORMATS = {
     "rfc5424_json",
@@ -3569,7 +3570,10 @@ class AuditTargetBody(BaseModel):
     # webhook. Both are write-only and Fernet-encrypted at rest (#1502):
     # for a Slack / Discord / Teams target the URL IS the credential. Same
     # three-way contract as ``smtp_password``: ``None`` (or omitted) keeps
-    # the stored value, ``""`` clears it, anything else replaces it.
+    # the stored value, ``""`` clears it, anything else replaces it. For
+    # ``webhook_flavor="apprise"`` (#1503) it is an Apprise service URL,
+    # checked in ``_check_apprise_target`` rather than by a validator here,
+    # because a pydantic 422 echoes the rejected input back.
     url: str | None = None
     auth_header: str | None = None
     webhook_flavor: str = "generic"
@@ -3726,7 +3730,8 @@ class AuditTargetResponse(BaseModel):
     ca_cert_pem: str | None
     # The URL and header are never returned (#1502). ``url_display`` is the
     # scheme and host only (``https://hooks.slack.com/…``), so targets can
-    # still be told apart.
+    # still be told apart; for an Apprise target only the scheme
+    # (``tgram://…``), since there the host can be the token.
     url_set: bool
     url_display: str
     auth_header_set: bool
@@ -3759,7 +3764,7 @@ def _target_to_response(t: AuditForwardTarget) -> AuditTargetResponse:
         facility=t.facility,
         ca_cert_pem=t.ca_cert_pem,
         url_set=bool(t.url_encrypted),
-        url_display=url_display(reveal(t.url_encrypted, field="url", target=t.name)),
+        url_display=_target_url_display(t),
         auth_header_set=bool(t.auth_header_encrypted),
         webhook_flavor=t.webhook_flavor or "generic",
         smtp_host=t.smtp_host or "",
@@ -3802,6 +3807,67 @@ _AUDIT_PLAIN_FIELDS = (
 _AUDIT_NULLABLE_FIELDS = {"ca_cert_pem", "smtp_to_addresses", "min_severity", "resource_types"}
 
 
+def _target_url_display(t: AuditForwardTarget) -> str:
+    url = reveal(t.url_encrypted, field="url", target=t.name)
+    if t.kind == "webhook" and t.webhook_flavor == "apprise":
+        return apprise_delivery.url_display(url)
+    return url_display(url)
+
+
+async def _check_apprise_target(body: AuditTargetBody, existing: AuditForwardTarget | None) -> None:
+    """422 unless an Apprise target ends up with a URL Apprise can load.
+
+    Judged on the target as it will be stored (#3926): an update body that
+    omits ``kind`` or ``webhook_flavor`` keeps the row's. The detail never
+    contains the URL. A target switched to or from the Apprise flavor needs
+    its URL re-entered: the stored value is the other kind of URL, and a
+    blank field means "keep it".
+    """
+    sent = body.model_fields_set if body.partial else None
+
+    def merged(field: str) -> Any:
+        if existing is None or sent is None or field in sent:
+            return getattr(body, field)
+        return getattr(existing, field)
+
+    if merged("kind") != "webhook":
+        return
+    flavor = merged("webhook_flavor") or "generic"
+    was_apprise = (
+        existing is not None
+        and existing.kind == "webhook"
+        and existing.webhook_flavor == "apprise"
+        and bool(existing.url_encrypted)
+    )
+    if flavor != "apprise":
+        if was_apprise and body.url is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Enter the webhook URL again when switching a target away from Apprise.",
+            )
+        return
+    if body.url == "":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="An Apprise target needs its Apprise URL; it cannot be cleared.",
+        )
+    if body.url is None:
+        if existing is not None and existing.url_encrypted and not was_apprise:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Enter the Apprise URL when switching a target to the Apprise flavor.",
+            )
+        if existing is None or not existing.url_encrypted:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="An Apprise target needs an Apprise URL.",
+            )
+        return
+    problem = await apprise_delivery.check_url(body.url.strip())
+    if problem:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=problem)
+
+
 def _apply_body(t: AuditForwardTarget, body: AuditTargetBody) -> None:
     """Apply ``body`` to ``t``.
 
@@ -3820,7 +3886,12 @@ def _apply_body(t: AuditForwardTarget, body: AuditTargetBody) -> None:
         setattr(t, field, value)
     # ``url`` / ``auth_header`` / ``smtp_password``: ``None`` or omitted
     # keeps the stored value, ``""`` clears it, anything else is encrypted.
-    t.url_encrypted = apply_write_only(t.url_encrypted, body.url)
+    url = (
+        body.url.strip()
+        if body.url and t.kind == "webhook" and t.webhook_flavor == "apprise"
+        else body.url
+    )
+    t.url_encrypted = apply_write_only(t.url_encrypted, url)
     t.auth_header_encrypted = apply_write_only(t.auth_header_encrypted, body.auth_header)
     if body.smtp_password is not None:
         t.smtp_password_encrypted = encrypt_str(body.smtp_password) if body.smtp_password else None
@@ -3985,6 +4056,7 @@ async def create_audit_target(
 ) -> AuditTargetResponse:
     forbid_in_demo_mode("Audit-forward target creation is disabled")
     _require_webhook_url(body, None)
+    await _check_apprise_target(body, None)
     row = AuditForwardTarget()
     _apply_body(row, body)
     db.add(row)
@@ -4017,6 +4089,7 @@ async def update_audit_target(
         raise HTTPException(status_code=404, detail="Target not found")
     old_value = _forward_snapshot(row)
     _check_merged_target(row, body)
+    await _check_apprise_target(body, row)
     _apply_body(row, body)
     _audit_forward_target(db, current_user, "update", row, old_value=old_value)
     try:
