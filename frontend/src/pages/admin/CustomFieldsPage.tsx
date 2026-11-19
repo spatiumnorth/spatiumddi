@@ -13,9 +13,19 @@ import { useFreshRow, changedFields } from "@/hooks/useFreshRow";
 import { FreshRowError } from "@/components/FreshRowError";
 import { useModalDialog } from "@/components/ui/use-draggable-modal";
 import { FormError } from "@/components/ui/form-error";
+import { hasOptions } from "@/lib/customFieldValues";
 
 const RESOURCE_TYPES = ["ip_space", "ip_block", "subnet", "ip_address"];
-const FIELD_TYPES = ["text", "number", "boolean", "select", "url", "email"];
+const FIELD_TYPES = [
+  "text",
+  "number",
+  "boolean",
+  "date",
+  "select",
+  "multi_select",
+  "url",
+  "email",
+];
 
 const RESOURCE_LABELS: Record<string, string> = {
   ip_space: "IP Space",
@@ -28,7 +38,9 @@ const FIELD_TYPE_LABELS: Record<string, string> = {
   text: "Text",
   number: "Number",
   boolean: "Boolean",
+  date: "Date",
   select: "Select (dropdown)",
+  multi_select: "Multi-select (several options)",
   url: "URL",
   email: "Email",
 };
@@ -221,7 +233,7 @@ function FieldModal({
             />
           </div>
 
-          {form.field_type === "select" && (
+          {hasOptions(form.field_type) && (
             <div>
               <label className="mb-1 block text-xs font-medium text-muted-foreground">
                 Options{" "}
@@ -325,11 +337,13 @@ function fieldToForm(field: CustomField): FieldForm {
 function DeleteFieldDialog({
   field,
   pending,
+  error,
   onConfirm,
   onClose,
 }: {
   field: CustomField;
   pending: boolean;
+  error?: string | null;
   onConfirm: () => void;
   onClose: () => void;
 }) {
@@ -349,6 +363,7 @@ function DeleteFieldDialog({
           from {RESOURCE_LABELS[field.resource_type]}? Existing data stored in
           this field will be lost.
         </p>
+        <FormError className="mt-2 text-sm">{error}</FormError>
         <div className="mt-4 flex justify-end gap-2">
           <button
             onClick={onClose}
@@ -633,8 +648,16 @@ export function CustomFieldsPage() {
         <DeleteFieldDialog
           field={deleteConfirm}
           pending={deleteMutation.isPending}
+          error={
+            deleteMutation.error
+              ? formatApiError(deleteMutation.error, "Delete failed")
+              : null
+          }
           onConfirm={() => deleteMutation.mutate(deleteConfirm.id)}
-          onClose={() => setDeleteConfirm(null)}
+          onClose={() => {
+            setDeleteConfirm(null);
+            deleteMutation.reset();
+          }}
         />
       )}
     </div>

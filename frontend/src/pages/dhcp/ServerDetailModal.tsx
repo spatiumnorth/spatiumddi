@@ -39,6 +39,7 @@ import { formatBucket } from "@/lib/chart-time";
 import { ConfigApplyBanner } from "@/components/ConfigApplyChip";
 import { DaemonStateBanner } from "@/components/DaemonStateChip";
 import { DuplicateAgentChip } from "@/components/DuplicateAgentChip";
+import { AgentMemoryPanel } from "@/components/AgentMemoryPanel";
 import { SpoolChip } from "@/components/SpoolChip";
 import { syncCard } from "@/lib/dhcp-sync-label";
 import { haPillTitle } from "@/lib/dhcpHa";
@@ -298,6 +299,13 @@ function OverviewTab({ server }: { server: DHCPServer }) {
         <SpoolChip server={server} />
         <DuplicateAgentChip server={server} kind="DHCP" />
       </div>
+      <AgentMemoryPanel
+        serverId={server.id}
+        status={server.memory_status}
+        daemonLabel="Kea"
+        fetchHistory={(id) => dhcpApi.getMemoryHistory(id)}
+        queryKeyPrefix="dhcp-server"
+      />
       <div className="grid grid-cols-2 gap-3">
         <InfoCard label="Status" value={server.status}>
           <StatusDot status={server.status} />

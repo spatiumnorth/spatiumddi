@@ -2,7 +2,8 @@
 {{- $root := . -}}
 {{- /* #3209 — fail on two servers rendering one object name. */ -}}
 {{- include "spatiumddi.agentNamesUnique" . -}}
-{{- $tag := .Values.dhcpAgents.image.tag | default .Chart.AppVersion -}}
+{{- /* #3913 — image.tagSuffix ("-ubi") picks the UBI build of the Kea image. */ -}}
+{{- $tag := printf "%s%s" (.Values.dhcpAgents.image.tag | default .Chart.AppVersion) (.Values.image.tagSuffix | default "") -}}
 {{- $secretName := .Values.dhcpAgents.agentKey.existingSecret | default (printf "%s-dhcp-agent-key" (include "spatiumddi.fullname" .)) -}}
 {{- if and (not .Values.dhcpAgents.agentKey.existingSecret) .Values.dhcpAgents.agentKey.value }}
 apiVersion: v1
@@ -15,7 +16,7 @@ metadata:
 type: Opaque
 stringData:
   SPATIUM_AGENT_KEY: {{ .Values.dhcpAgents.agentKey.value | quote }}
----
+{{- "\n---\n" }}
 {{- end }}
 {{- range $server := .Values.dhcpAgents.servers }}
 {{- $flavor := $server.flavor | default "kea" -}}
@@ -162,7 +163,7 @@ spec:
         resources:
           requests:
             storage: {{ (get ($server.storage | default dict) "keaState") | default "2Gi" }}
----
+{{- "\n---\n" }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -197,7 +198,7 @@ spec:
       {{- with (get ($server.service | default dict) "nodePort") }}
       nodePort: {{ . }}
       {{- end }}
----
+{{- "\n---\n" }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -215,6 +216,6 @@ spec:
     - { name: dhcp-udp,  port: 67,   protocol: UDP }
     - { name: ctrl-http, port: 8000, protocol: TCP }
     - { name: ctrl-http-v6, port: 8001, protocol: TCP }
----
+{{- "\n---\n" }}
 {{- end }}
 {{- end }}

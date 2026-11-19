@@ -31,6 +31,7 @@ from app.models.dhcp_fingerprint import DHCPFingerprint
 from app.models.ipam import Subnet
 from app.models.metrics import DHCPMetricSample
 from app.services.agents.instance_ownership import duplicate_active as duplicate_agent_active
+from app.services.agents.memory_status import fresh_memory_status
 from app.services.ai.tools.base import register_tool
 from app.services.dhcp.device_policy import compile_device_policy
 from app.services.dhcp.normalize import canonical_duid
@@ -52,7 +53,9 @@ class ListDHCPServersArgs(BaseModel):
         "(``duplicate_agent``, a cloned VM or copied agent state dir). "
         "ha_state is the DHCPv4 daemon's HA state and ha_state_v6 the DHCPv6 "
         "daemon's (null while the group runs no DHCPv6 HA, in which case its "
-        "DHCPv6 scopes are served by each member independently)."
+        "DHCPv6 scopes are served by each member independently). ``memory`` is "
+        "the agent's reported container used / peak / limit and Kea / agent RSS "
+        "in bytes (null when the agent has not reported it)."
     ),
     args_model=ListDHCPServersArgs,
     category="dhcp",
@@ -88,6 +91,10 @@ async def list_dhcp_servers(
             # being refused (the one the row's alert and chip read).
             "duplicate_agent": duplicate_agent_active(s),
             "duplicate_agent_ip": s.duplicate_agent_ip if duplicate_agent_active(s) else None,
+            # #4193 — what the agent actually reports using (container used /
+            # peak / limit, Kea and agent RSS, reported_at); NULL = never
+            # reported, which is unknown, not zero.
+            "memory": fresh_memory_status(s.memory_status),
         }
         for s in rows
     ]
