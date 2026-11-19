@@ -1310,6 +1310,7 @@ function MappingsSection({ providerId }: { providerId: string }) {
         queryKey: ["auth-providers", providerId, "mappings"],
       });
       qc.invalidateQueries({ queryKey: ["auth-providers"] });
+      setConfirmDeleteId(null);
     },
   });
 
@@ -1519,11 +1520,19 @@ function MappingsSection({ providerId }: { providerId: string }) {
         message="Delete this mapping?"
         confirmLabel="Delete"
         tone="destructive"
+        loading={deleteMut.isPending}
+        error={
+          deleteMut.error
+            ? formatApiError(deleteMut.error, "Delete failed")
+            : null
+        }
         onConfirm={() => {
           if (confirmDeleteId) deleteMut.mutate(confirmDeleteId);
-          setConfirmDeleteId(null);
         }}
-        onClose={() => setConfirmDeleteId(null)}
+        onClose={() => {
+          setConfirmDeleteId(null);
+          deleteMut.reset();
+        }}
       />
     </div>
   );
@@ -2001,7 +2010,10 @@ export function AuthProvidersPage() {
   });
   const deleteMut = useMutation({
     mutationFn: authProvidersApi.delete,
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["auth-providers"] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["auth-providers"] });
+      setConfirmDelete(null);
+    },
   });
 
   function initialFormFromProvider(p: AuthProvider): ProviderForm {
@@ -2302,11 +2314,19 @@ export function AuthProvidersPage() {
         message={`Delete auth provider "${confirmDelete?.name ?? ""}"? Mappings will be deleted too; already-provisioned users remain.`}
         confirmLabel="Delete"
         tone="destructive"
+        loading={deleteMut.isPending}
+        error={
+          deleteMut.error
+            ? formatApiError(deleteMut.error, "Delete failed")
+            : null
+        }
         onConfirm={() => {
           if (confirmDelete) deleteMut.mutate(confirmDelete.id);
-          setConfirmDelete(null);
         }}
-        onClose={() => setConfirmDelete(null)}
+        onClose={() => {
+          setConfirmDelete(null);
+          deleteMut.reset();
+        }}
       />
     </div>
   );

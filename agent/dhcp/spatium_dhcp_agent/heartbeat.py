@@ -19,7 +19,8 @@ from .config import AgentConfig
 from .config_apply import ApplyStatus
 from .ha_tls import AGENT_CAPABILITIES
 from .instance import AGENT_INSTANCE, AGENT_INSTANCE_HEADER
-from .oom_watch import OomWatch
+from .memory_stats import memory_report
+from .oom_watch import OomWatch, read_kea_pids
 from .spool import SpoolManager
 
 log = structlog.get_logger(__name__)
@@ -62,6 +63,9 @@ class HeartbeatClient:
         # model is ``extra="forbid"`` and predates #1077. Dropping the field
         # keeps the agent's liveness signal alive across the version skew.
         self._spool_field_unsupported = False
+        # #4193 — same skew handling for the ``memory`` block (container
+        # usage + RSS); dropped for the life of the process once refused.
+        self._memory_block_unsupported = False
         # #3782 — what the spool cannot count: events read from Kea but not
         # yet delivered or spooled. Set by the supervisor to the lease
         # watcher's ``pending_status``; merged into the ``lease_events``
@@ -180,6 +184,13 @@ class HeartbeatClient:
                 body["spool"] = self._spool_with_pending(self.spool_manager.status())
             except Exception as exc:  # noqa: BLE001 — telemetry must never cost liveness
                 log.warning("heartbeat_spool_status_failed", error=str(exc))
+        # #4193 — what the container, Kea and this agent actually use. Best
+        # effort: an unreadable field is left out, and with nothing readable
+        # the block is not sent at all.
+        if not self._memory_block_unsupported:
+            mem = memory_report(read_kea_pids())
+            if mem is not None:
+                body["memory"] = mem
         # #170 Wave C1 — slot / deployment / upgrade-state telemetry
         # used to ship here per Phase 8f-2; now lives on the
         # supervisor's heartbeat (one producer instead of three).
@@ -212,6 +223,15 @@ class HeartbeatClient:
                     log.warning("heartbeat_spool_field_unsupported")
                     self._spool_field_unsupported = True
                     body.pop("spool")
+                    resp = c.post(
+                        "/api/v1/dhcp/agents/heartbeat",
+                        json=body,
+                        headers=self._auth_headers(),
+                    )
+                if resp.status_code == 422 and "memory" in body and '"memory"' in resp.text:
+                    log.warning("heartbeat_memory_block_unsupported")
+                    self._memory_block_unsupported = True
+                    body.pop("memory")
                     resp = c.post(
                         "/api/v1/dhcp/agents/heartbeat",
                         json=body,

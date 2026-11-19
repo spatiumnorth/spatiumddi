@@ -1,3 +1,5 @@
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { ListEmpty } from "@/components/ui/list-read-error";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -95,7 +97,12 @@ function MulticastDomainModal({
         ssm_range: ssmRange.trim() || null,
         notes,
       };
-      if (existing) return multicastApi.updateDomain(existing.id, body);
+      if (existing) {
+        // Only what changed against the row read when the dialog opened (#4379).
+        const changed = changedFields(existing, body);
+        if (Object.keys(changed).length === 0) return existing;
+        return multicastApi.updateDomain(existing.id, changed);
+      }
       return multicastApi.createDomain(body as MulticastDomainCreate);
     },
     onSuccess: () => {
@@ -402,14 +409,26 @@ export function MulticastDomainsTab() {
         </div>
       </div>
 
-      {(showNew || editing) && (
+      {showNew && (
         <MulticastDomainModal
-          existing={editing}
-          onClose={() => {
-            setShowNew(false);
-            setEditing(null);
-          }}
+          existing={null}
+          onClose={() => setShowNew(false)}
         />
+      )}
+      {editing && (
+        <FreshEdit
+          row={editing}
+          load={() => multicastApi.getDomain(editing.id)}
+          title="Edit multicast domain"
+          onClose={() => setEditing(null)}
+        >
+          {(fresh) => (
+            <MulticastDomainModal
+              existing={fresh}
+              onClose={() => setEditing(null)}
+            />
+          )}
+        </FreshEdit>
       )}
       <ConfirmModal
         open={confirm !== null}

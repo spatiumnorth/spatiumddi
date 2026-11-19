@@ -1,7 +1,7 @@
 """dns zone master_options + group allow_transfer_tls_only (#3568)
 
 Revision ID: d3568a7f1c42
-Revises: b6d2e9f41a07
+Revises: d8b3f6a1c274
 Create Date: 2026-11-18 00:00:00.000000
 
 Adds ``dns_zone.master_options`` — per-primary TSIG key name and TLS
@@ -19,7 +19,7 @@ from sqlalchemy.dialects import postgresql
 from alembic import op
 
 revision: str = "d3568a7f1c42"
-down_revision: str | None = "b6d2e9f41a07"
+down_revision: str | None = "d8b3f6a1c274"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

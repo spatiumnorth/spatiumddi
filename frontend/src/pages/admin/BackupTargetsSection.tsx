@@ -69,6 +69,53 @@ const BACKUP_DESTINATION_KEYS = [
   "endpoint_url",
 ];
 
+const TRANSPORT_REASK_HINT =
+  "Re-enter the credential: the connection settings changed to a less protected transport.";
+const TRANSPORT_REASK_PLACEHOLDER = "re-enter for the changed transport";
+
+const cfgText = (
+  c: Record<string, unknown> | undefined,
+  key: string,
+  dflt: string,
+) => {
+  const v = c?.[key];
+  return (typeof v === "string" && v.trim() ? v : dflt).trim().toLowerCase();
+};
+
+// How well a destination protects a credential in transit (higher is better);
+// the same ranking the API applies, defaults included.
+function transportLevel(
+  kind: string,
+  c: Record<string, unknown> | undefined,
+): number {
+  if (kind === "ftp") {
+    if (!["ftps_explicit", "ftps_implicit"].includes(cfgText(c, "mode", "ftp")))
+      return 0;
+    return cfgText(c, "verify_tls", "true") !== "false" ? 2 : 1;
+  }
+  if (kind === "https_put" || kind === "webdav")
+    return cfgText(c, "verify_tls", "true") !== "false" ? 1 : 0;
+  if (kind === "scp")
+    return cfgText(c, "host_key_check", "known_hosts") === "insecure_skip"
+      ? 0
+      : 1;
+  return 1;
+}
+
+// A weaker transport, or other trusted host keys, ask for the stored
+// credential again exactly as a new host does (the API refuses otherwise).
+function transportReask(
+  kind: string,
+  edited: Record<string, unknown>,
+  stored: Record<string, unknown> | undefined,
+): string {
+  const weaker = transportLevel(kind, edited) < transportLevel(kind, stored);
+  const keys =
+    kind === "scp" &&
+    String(edited.known_hosts ?? "") !== String(stored?.known_hosts ?? "");
+  return weaker || keys ? "changed" : "";
+}
+
 // Settings the API reads as numbers (#3946). The form holds every value as
 // text; a whole number in one of these goes out as a number, anything else
 // as typed so the API refuses it by name.
@@ -326,7 +373,7 @@ function TargetRow({
         </div>
       </div>
       {/* A refused request (403, 404, 409 …) never reaches the ``data``
-          panels below; show the API's reason (#2203). */}
+          panels below; show the API's reason (#2203), announced (#4404). */}
       {(
         [
           [runMut, "run failed"],
@@ -335,13 +382,13 @@ function TargetRow({
         ] as const
       ).map(([m, fallback]) =>
         m.isError ? (
-          <div
+          <FormError
             key={fallback}
-            className="border-t bg-destructive/5 px-3 py-1.5 text-xs text-destructive"
+            className="border-t bg-destructive/5 px-3 py-1.5"
           >
             <ServerCrash className="mr-1 inline h-3.5 w-3.5" />
             {formatApiError(m.error, fallback)}
-          </div>
+          </FormError>
         ) : null,
       )}
       {testMut.data && (
@@ -474,9 +521,9 @@ function ArchiveList({
           Loading…
         </div>
       ) : q.isError ? (
-        <div className="break-words text-destructive">
+        <FormError className="break-words text-destructive">
           {formatApiError(q.error, "failed to list")}
-        </div>
+        </FormError>
       ) : (
         <>
           {q.data?.note && (
@@ -576,9 +623,11 @@ function ArchiveList({
           targetId={targetId}
           filename={restoring}
           onClose={() => setRestoring(null)}
-          onSuccess={() => {
-            setRestoring(null);
+          onSuccess={(warnings) => {
             onAfterChange();
+            // A restore that carries advisories stays open so the operator
+            // reads them (#4333); a clean one closes as before.
+            if (warnings.length === 0) setRestoring(null);
           }}
         />
       )}
@@ -595,7 +644,7 @@ function RestoreFromArchiveModal({
   targetId: string;
   filename: string;
   onClose: () => void;
-  onSuccess: () => void;
+  onSuccess: (warnings: string[]) => void;
 }) {
   const [passphrase, setPassphrase] = useState("");
   const [confirm, setConfirm] = useState("");
@@ -629,8 +678,9 @@ function RestoreFromArchiveModal({
         confirmation_phrase: confirm,
         sections: mode === "selective" ? sections : null,
       }),
-    onSuccess,
+    onSuccess: (data) => onSuccess(data.warnings ?? []),
   });
+  const restoreWarnings = restoreMut.data?.warnings ?? [];
 
   // The restore's own refusals (missing member, unsupported format_version,
   // a schema this install cannot place), read from the preview (#3287).
@@ -643,6 +693,7 @@ function RestoreFromArchiveModal({
     passphrase.length >= 8 &&
     confirm === "RESTORE-FROM-BACKUP" &&
     !restoreMut.isPending &&
+    !restoreMut.isSuccess &&
     !restoreRefused &&
     (mode !== "selective" || (!selectiveDisabledReason && sections.length > 0));
 
@@ -681,9 +732,9 @@ function RestoreFromArchiveModal({
             <>
               <strong>Selective restore.</strong> The selected sections will be
               wiped + re-loaded from{" "}
-              <code className="font-mono">{filename}</code>. The rest of the
-              install is left untouched (with the FK-cascade caveat in the
-              section picker below).
+              <code className="font-mono">{filename}</code>. Tables in other
+              sections that reference them are replaced from the archive too
+              (listed in the section picker below); nothing else is touched.
             </>
           )}
         </div>
@@ -764,13 +815,30 @@ function RestoreFromArchiveModal({
               {restoreMut.data.duration_ms} ms.
             </div>
           )}
+          {restoreWarnings.length > 0 && (
+            <div
+              role="alert"
+              className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-800 dark:text-amber-300"
+            >
+              <div className="mb-1 font-medium">
+                Post-restore action required
+              </div>
+              <ul className="ml-4 list-disc space-y-1.5">
+                {restoreWarnings.map((w, i) => (
+                  <li key={i} className="whitespace-pre-wrap">
+                    {w}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
           <div className="flex items-center justify-end gap-2">
             <button
               type="button"
               onClick={onClose}
               className="rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
             >
-              Cancel
+              {restoreMut.isSuccess ? "Close" : "Cancel"}
             </button>
             <button
               type="submit"
@@ -919,8 +987,8 @@ function TargetFormModal({
     () => kindsQ.data?.find((k) => k.kind === kind),
     [kindsQ.data, kind],
   );
-  // #4135 — a moved host / port / server / URL needs every stored secret of
-  // this destination entered again (the same keys the API compares).
+  // #4135 — a moved host / port / server / URL, or a weaker transport, needs
+  // every stored secret of this destination entered again (what the API compares).
   const secretFieldNames = (kindMeta?.config_fields ?? [])
     .filter((f) => f.secret)
     .map((f) => f.name);
@@ -928,9 +996,17 @@ function TargetFormModal({
     BACKUP_DESTINATION_KEYS.includes(k),
   );
   const reask = useCredentialReask(
-    Object.fromEntries(destKeys.map((k) => [k, config[k]])),
+    {
+      ...Object.fromEntries(destKeys.map((k) => [k, config[k]])),
+      transport: transportReask(kind, config, existing?.config),
+    },
     mode === "edit" && existing
-      ? Object.fromEntries(destKeys.map((k) => [k, existing.config?.[k] ?? ""]))
+      ? {
+          ...Object.fromEntries(
+            destKeys.map((k) => [k, existing.config?.[k] ?? ""]),
+          ),
+          transport: "",
+        }
       : null,
     () =>
       setConfig((prev) => {
@@ -939,6 +1015,18 @@ function TargetFormModal({
         return next;
       }),
   );
+  // Say why the credential is asked for: a transport-only change is not a
+  // new address. Both changed: the shared address text is still true.
+  const transportOnly =
+    mode === "edit" &&
+    transportReask(kind, config, existing?.config) !== "" &&
+    !destKeys.some(
+      (k) => String(config[k] ?? "") !== String(existing?.config?.[k] ?? ""),
+    );
+  const askHint = transportOnly ? TRANSPORT_REASK_HINT : reask.hint;
+  const askPlaceholder = transportOnly
+    ? TRANSPORT_REASK_PLACEHOLDER
+    : reask.placeholder;
   const mustEnter = (name: string) =>
     mode === "edit" &&
     reask.asks(Boolean(existing?.config?.[name])) &&
@@ -1132,7 +1220,7 @@ function TargetFormModal({
                 key={f.name}
                 label={f.label}
                 required={(f.required && !isSecretInEdit) || askAgain}
-                help={askAgain ? reask.hint : f.description}
+                help={askAgain ? askHint : f.description}
               >
                 {f.multiline ? (
                   // A PEM key, a known_hosts file or one header per line:
@@ -1157,7 +1245,7 @@ function TargetFormModal({
                     required={askAgain}
                     placeholder={
                       askAgain
-                        ? reask.placeholder
+                        ? askPlaceholder
                         : isSecretStored
                           ? "(set — leave empty to keep, type to replace)"
                           : undefined
