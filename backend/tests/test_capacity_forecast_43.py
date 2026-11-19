@@ -192,3 +192,89 @@ async def test_mcp_tool(db_session: AsyncSession) -> None:
         await REGISTRY.call("find_subnet_forecasts", {"within_days": 5}, db=db_session, user=user)
         == []
     )
+
+
+async def _plain_user(db: AsyncSession, permissions: list[dict]) -> str:
+    from app.models.auth import Group, Role
+
+    u = User(
+        username=f"cfs-{uuid.uuid4().hex[:8]}",
+        email=f"{uuid.uuid4().hex[:8]}@example.test",
+        display_name="CFS",
+        hashed_password=hash_password("x"),
+    )
+    role = Role(name=f"role-{uuid.uuid4().hex[:8]}", permissions=permissions)
+    group = Group(name=f"grp-{uuid.uuid4().hex[:8]}")
+    group.roles = [role]
+    u.groups = [group]
+    db.add_all([role, group, u])
+    await db.flush()
+    return create_access_token(str(u.id))
+
+
+async def test_api_scoped_grant_is_refused_not_leaked(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A grant scoped to one subnet does not open the all-subnet forecast."""
+    mine = await _growing(db_session, "10.11.0.0/24")
+    await _growing(db_session, "10.12.0.0/24")
+    tok = await _plain_user(
+        db_session, [{"action": "read", "resource_type": "subnet", "resource_id": str(mine.id)}]
+    )
+    await db_session.commit()
+    r = await client.get(
+        "/api/v1/ipam/subnets/capacity-forecast", headers={"Authorization": f"Bearer {tok}"}
+    )
+    assert r.status_code == 403
+
+
+async def test_api_without_subnet_read_is_refused(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    await _growing(db_session, "10.13.0.0/24")
+    tok = await _plain_user(db_session, [{"action": "read", "resource_type": "dns_zone"}])
+    await db_session.commit()
+    r = await client.get(
+        "/api/v1/ipam/subnets/capacity-forecast", headers={"Authorization": f"Bearer {tok}"}
+    )
+    assert r.status_code == 403
+
+
+async def test_resized_subnet_uses_percent_at_each_sample(db_session: AsyncSession) -> None:
+    """A subnet resized mid-window must not show a phantom jump: 100/1000 then
+    200/2000 is a flat 10 %, not growth."""
+    s = await _subnet(db_session, "10.14.0.0/24", allocated=200)
+    now = datetime.now(UTC)
+    for i in range(20):
+        big = i >= 10
+        db_session.add(
+            SubnetUtilizationHistory(
+                subnet_id=s.id,
+                sampled_at=now - timedelta(days=19 - i, minutes=1),
+                allocated_ips=200 if big else 100,
+                total_ips=2000 if big else 1000,
+            )
+        )
+    await db_session.commit()
+    assert s.id not in {f.subnet_id for f in await compute_capacity_forecasts(db_session)}
+
+
+async def test_alert_evaluation_is_idempotent(db_session: AsyncSession) -> None:
+    await _growing(db_session, "10.15.0.0/24")
+    rule = AlertRule(
+        name="fc-idem",
+        rule_type="subnet_capacity_forecast",
+        severity="warning",
+        threshold_days=90,
+        enabled=True,
+    )
+    db_session.add(rule)
+    await db_session.commit()
+    await evaluate_all(db_session)
+    await evaluate_all(db_session)
+    events = (
+        (await db_session.execute(select(AlertEvent).where(AlertEvent.rule_id == rule.id)))
+        .scalars()
+        .all()
+    )
+    assert len(events) == 1
