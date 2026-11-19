@@ -34,6 +34,7 @@ from app.core.http_etag import etag_matches, format_etag
 from app.core.jwt_compat import JWTError
 from app.models.bgp_looking_glass import BGPLGPeer, LookingGlassCollector
 from app.services.agents.config_apply import apply_reported_status
+from app.services.agents.config_version import VersionCache
 from app.services.agents.server_gone import refresh_agent_server
 from app.services.looking_glass.agent_token import (
     hash_token,
@@ -42,6 +43,7 @@ from app.services.looking_glass.agent_token import (
     verify_agent_token,
 )
 from app.services.looking_glass.config_bundle import build_lg_config_bundle
+from app.services.looking_glass.config_version import lg_config_version
 from app.services.looking_glass.routes_ingest import ingest_routes
 
 logger = structlog.get_logger(__name__)
@@ -289,6 +291,10 @@ async def agent_register(
     )
 
 
+#: Per-collector ``(version key, etag)`` of the last full build in this process (#1109).
+_BUNDLE_VERSIONS = VersionCache()
+
+
 @router.get("/config")
 async def agent_config_longpoll(
     db: DB,
@@ -317,8 +323,22 @@ async def agent_config_longpoll(
             # committed state, as the DHCP long-poll does.
             db.expire_all()
             await refresh_agent_server(db, collector)
+            # #1109 — version key before the build (see the DHCP long-poll):
+            # unmoved since the build that produced the agent's etag means
+            # nothing to rebuild; the ETag still decides what ships.
+            version_key = await lg_config_version(db, collector)
+            idle = _BUNDLE_VERSIONS.hit(str(collector.id), version_key, if_none_match)
+            if idle is not None:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    return Response(status_code=304, headers={"ETag": format_etag(idle.etag)})
+                await db.commit()
+                if await wake.wait(min(WAKE_TICK_SECONDS, remaining)) == WakeResult.SHUTDOWN:
+                    deadline = asyncio.get_running_loop().time()
+                continue
             bundle = await build_lg_config_bundle(db, collector)
             etag = bundle.etag
+            _BUNDLE_VERSIONS.store(str(collector.id), version_key, etag)
             if not etag_matches(if_none_match, etag):
                 logger.info(
                     "lg_agent_config_200",

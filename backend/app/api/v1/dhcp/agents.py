@@ -56,6 +56,7 @@ from app.models.logs import DHCPLogEntry
 from app.models.metrics import DHCPMetricSample
 from app.models.settings import PlatformSettings
 from app.services.agents.config_apply import apply_reported_status
+from app.services.agents.config_version import VersionCache
 from app.services.agents.container_oom import effective_daemon_report, fresh_role_health
 from app.services.agents.daemon_state import apply_reported_daemon_state
 from app.services.agents.ingest_receipt import (
@@ -92,6 +93,7 @@ from app.services.dhcp.agent_token import (
     verify_agent_token,
 )
 from app.services.dhcp.config_bundle import build_config_bundle
+from app.services.dhcp.config_version import dhcp_config_version
 from app.services.dhcp.ha_members import kea_ha_members
 from app.services.dhcp.ipam_mirror import (
     insert_ipam_mirror_row,
@@ -716,6 +718,23 @@ async def agent_register(
     )
 
 
+#: Per-server ``(version key, etag)`` of the last full build in this process (#1109).
+_BUNDLE_VERSIONS = VersionCache()
+
+
+async def _pending_ops_exist(db: AsyncSession, server: DHCPServer) -> bool:
+    """Whether a pending op would be shipped to this server right now."""
+    if server.maintenance_mode:
+        return False
+    return (
+        await db.scalar(
+            select(DHCPConfigOp.id)
+            .where(DHCPConfigOp.server_id == server.id, DHCPConfigOp.status == "pending")
+            .limit(1)
+        )
+    ) is not None
+
+
 @router.get("/config")
 async def agent_config_longpoll(
     request: Request,
@@ -778,6 +797,27 @@ async def agent_config_longpoll(
                 # agent's leftover) or a second live agent. Either way it must
                 # not ship ops; the new owner's polls do.
                 return duplicate_instance_response("DHCP", server.name)
+            # #1109 — the version key first (before the build: a change landing
+            # between the two then costs one extra rebuild, never a stale pin).
+            # While it has not moved since the build that produced the etag the
+            # agent already holds, there is nothing to rebuild; only the ops
+            # queue can still need an answer. The ETag stays the source of
+            # truth for what ships, and ``VersionCache`` re-trusts nothing for
+            # longer than its safety interval.
+            version_key = await dhcp_config_version(db, server)
+            idle = _BUNDLE_VERSIONS.hit(str(server.id), version_key, if_none_match)
+            if idle is not None:
+                if idle.meta and _forget_ha_state(server):
+                    await db.commit()
+                    logger.info("dhcp_ha_state_cleared", server_id=str(server.id), why="no_ha_hook")
+                if not await _pending_ops_exist(db, server):
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        return Response(status_code=304, headers={"ETag": format_etag(idle.etag)})
+                    await db.commit()
+                    if await wake.wait(min(WAKE_TICK_SECONDS, remaining)) == WakeResult.SHUTDOWN:
+                        deadline = asyncio.get_running_loop().time()
+                    continue
             bundle = await build_config_bundle(db, server)
             # #3241: a bundle with no failover block tells the agent to run no
             # HA hook, so it stops reporting an HA state. Whatever state it
@@ -878,6 +918,7 @@ async def agent_config_longpoll(
                 f":{resolver_block.get('config_hash', '')}"
             )
             etag = "sha256:" + hashlib.sha256(f"{bundle.etag}|{fleet_marker}".encode()).hexdigest()
+            _BUNDLE_VERSIONS.store(str(server.id), version_key, etag, meta=bundle.failover is None)
 
             # Pending ops fast-path. Issue #182: paused servers don't ship
             # ops — they accumulate as ``pending`` and dispatch as soon as
