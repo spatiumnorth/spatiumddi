@@ -107,13 +107,15 @@ export function selectionIsValid(
 }
 
 /**
- * The selection a tab opens on. Kept as it always was — the first server —
- * so the tab opens on the same narrow, fast read as before; `All servers`
- * and the group entries are one click away.
+ * The selection a tab opens on (#4206). `sources` is already what the server
+ * lets the caller read, and the picker always offers `All servers` over it, so
+ * with more than one source the default is `All servers`; with one, that
+ * server. A selection the user made is kept by the tabs' validity check.
  */
 export function defaultSelection(
   sources: AgentLogSource[],
 ): AgentLogSelection | null {
+  if (sources.length > 1) return ALL_SERVERS;
   return sources[0] ? serverSelection(sources[0].server_id) : null;
 }
 

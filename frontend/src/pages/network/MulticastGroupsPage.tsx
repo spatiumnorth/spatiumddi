@@ -1,3 +1,4 @@
+import { useOwnershipModules } from "@/hooks/useOwnershipModules";
 import { useEffect, useMemo, useState } from "react";
 import { MissingCustomerOption } from "@/components/ownership/pickers";
 import {
@@ -30,12 +31,14 @@ import {
   type MulticastPortTransport,
   formatApiError,
 } from "@/lib/api";
+import { cascadeList } from "@/lib/delete-cascade";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal, ModalTabs } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { IPAddressPicker } from "@/components/IPAddressPicker";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -80,6 +83,7 @@ export function MulticastGroupModal({
   spaces: IPSpace[];
   onClose: () => void;
 }) {
+  const own = useOwnershipModules();
   const qc = useQueryClient();
   const [tab, setTab] = useState<EditorTab>("general");
 
@@ -108,6 +112,7 @@ export function MulticastGroupModal({
     queryKey: ["customers", "all"],
     queryFn: () => customersApi.list({ limit: 500 }),
     staleTime: 60_000,
+    enabled: own.customer,
   });
   const customers = customersQ.data?.items ?? [];
 
@@ -226,27 +231,29 @@ export function MulticastGroupModal({
               </p>
             )}
           </div>
-          <div>
-            <label className="text-xs font-medium text-muted-foreground">
-              Customer (optional)
-            </label>
-            <select
-              className={inputCls}
-              value={customerId ?? ""}
-              onChange={(e) => setCustomerId(e.target.value || null)}
-            >
-              <option value="">— None —</option>
-              <MissingCustomerOption
-                customerId={customerId}
-                list={customersQ}
-              />
-              {customers.map((c) => (
-                <option key={c.id} value={c.id}>
-                  {c.name}
-                </option>
-              ))}
-            </select>
-          </div>
+          {own.customer && (
+            <div>
+              <label className="text-xs font-medium text-muted-foreground">
+                Customer (optional)
+              </label>
+              <select
+                className={inputCls}
+                value={customerId ?? ""}
+                onChange={(e) => setCustomerId(e.target.value || null)}
+              >
+                <option value="">— None —</option>
+                <MissingCustomerOption
+                  customerId={customerId}
+                  list={customersQ}
+                />
+                {customers.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
           <div className="sm:col-span-2">
             <label className="text-xs font-medium text-muted-foreground">
               PIM domain (optional)
@@ -321,7 +328,9 @@ export function MulticastGroupModal({
         <MembershipsTab groupId={existing.id} />
       )}
 
-      {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
+      {error && (
+        <FormError className="mt-3 text-sm text-destructive">{error}</FormError>
+      )}
 
       <div className="mt-6 flex justify-end gap-2 border-t pt-3">
         <button
@@ -378,7 +387,12 @@ export function PortsTab({ groupId }: { groupId: string }) {
 
   const remove = useMutation({
     mutationFn: (id: string) => multicastApi.deletePort(id),
+    onMutate: () => setError(null),
     onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["multicast-ports", groupId] });
+    },
+    onError: (e: unknown) => {
+      setError(formatApiError(e, "Delete failed"));
       qc.invalidateQueries({ queryKey: ["multicast-ports", groupId] });
     },
   });
@@ -441,7 +455,11 @@ export function PortsTab({ groupId }: { groupId: string }) {
             Add
           </button>
         </div>
-        {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="mt-2 text-xs text-destructive">
+            {error}
+          </FormError>
+        )}
       </div>
 
       {ports.length === 0 ? (
@@ -537,7 +555,14 @@ function MembershipsTab({ groupId }: { groupId: string }) {
 
   const remove = useMutation({
     mutationFn: (id: string) => multicastApi.deleteMembership(id),
+    onMutate: () => setError(null),
     onSuccess: () => {
+      qc.invalidateQueries({
+        queryKey: ["multicast-memberships", groupId],
+      });
+    },
+    onError: (e: unknown) => {
+      setError(formatApiError(e, "Delete failed"));
       qc.invalidateQueries({
         queryKey: ["multicast-memberships", groupId],
       });
@@ -593,7 +618,11 @@ function MembershipsTab({ groupId }: { groupId: string }) {
             Add
           </button>
         </div>
-        {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="mt-2 text-xs text-destructive">
+            {error}
+          </FormError>
+        )}
       </div>
 
       {memberships.length === 0 ? (
@@ -910,7 +939,9 @@ function BulkAllocateModal({
           </div>
         )}
 
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-sm text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 border-t pt-3">
           <button
@@ -1025,15 +1056,29 @@ export function MulticastGroupsPage() {
 
   const items = query.data?.items ?? [];
 
+  // A refused delete says why in an announced line and re-reads the list, so
+  // a group that is already gone leaves it (#4220).
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
   const removeOne = useMutation({
     mutationFn: (id: string) => multicastApi.remove(id),
+    onMutate: () => setDeleteError(null),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["multicast-groups"] }),
+    onError: (e: unknown) => {
+      setDeleteError(formatApiError(e, "Failed to delete multicast group"));
+      qc.invalidateQueries({ queryKey: ["multicast-groups"] });
+    },
   });
 
   const bulkDelete = useMutation({
     mutationFn: (ids: string[]) => multicastApi.bulkDelete(ids),
+    onMutate: () => setDeleteError(null),
     onSuccess: () => {
       setSelectedIds(new Set());
+      qc.invalidateQueries({ queryKey: ["multicast-groups"] });
+    },
+    onError: (e: unknown) => {
+      setDeleteError(formatApiError(e, "Failed to delete multicast groups"));
       qc.invalidateQueries({ queryKey: ["multicast-groups"] });
     },
   });
@@ -1152,6 +1197,7 @@ export function MulticastGroupsPage() {
             toggleOne={toggleOne}
             removeOne={removeOne}
             bulkDelete={bulkDelete}
+            deleteError={deleteError}
             setEditing={setEditing}
             setShowNew={setShowNew}
             setShowBulk={setShowBulk}
@@ -1233,6 +1279,7 @@ type GroupsTabBodyProps = {
   toggleOne: (id: string) => void;
   removeOne: { mutate: (id: string) => void };
   bulkDelete: { mutate: (ids: string[]) => void; isPending: boolean };
+  deleteError: string | null;
   setEditing: (g: MulticastGroupRead | null) => void;
   setShowNew: (v: boolean) => void;
   setShowBulk: (v: boolean) => void;
@@ -1258,6 +1305,7 @@ function GroupsTabBody({
   toggleOne,
   removeOne,
   bulkDelete,
+  deleteError,
   setEditing,
   setShowNew,
   setShowBulk,
@@ -1281,6 +1329,7 @@ function GroupsTabBody({
   } | null>(null);
   return (
     <>
+      <FormError className="text-sm text-destructive">{deleteError}</FormError>
       <div className="flex justify-end gap-2">
         <HeaderButton
           icon={RefreshCw}
@@ -1350,7 +1399,7 @@ function GroupsTabBody({
               const ids = Array.from(selectedIds);
               setConfirm({
                 title: "Delete multicast groups",
-                message: `Delete ${ids.length} multicast group${ids.length === 1 ? "" : "s"}? Ports + memberships cascade.`,
+                message: `Delete ${ids.length} multicast group${ids.length === 1 ? "" : "s"}? ${ids.length === 1 ? "Its" : "Their"} ${cascadeList("multicast_group")} are deleted with ${ids.length === 1 ? "it" : "them"}.`,
                 confirmLabel: "Delete",
                 onConfirm: () => bulkDelete.mutate(ids),
               });
@@ -1393,6 +1442,12 @@ function GroupsTabBody({
                   <ListEmpty
                     error={query.error}
                     what="multicast groups"
+                    gate={writeGate}
+                    hint={
+                      <>
+                        Click <strong>New group</strong> to add the first.
+                      </>
+                    }
                     filtered={
                       search !== "" ||
                       spaceFilter !== "" ||
@@ -1404,8 +1459,7 @@ function GroupsTabBody({
                       setCustomerFilter("");
                     }}
                   >
-                    No multicast groups yet. Click <strong>New group</strong> to
-                    add the first.
+                    No multicast groups yet.
                   </ListEmpty>
                 </td>
               </tr>

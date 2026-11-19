@@ -5,7 +5,7 @@ Adds ``dns_view.forwarders`` / ``forward_policy`` / ``forward_transport`` /
 is what every existing row does, so every rendered config is unchanged.
 
 Revision ID: c4d8a1f6b329
-Revises: ede3bcd2aff4
+Revises: b6d2e9f41a07
 Create Date: 2026-11-13
 """
 
@@ -17,7 +17,7 @@ from sqlalchemy.dialects import postgresql
 from alembic import op
 
 revision = "c4d8a1f6b329"
-down_revision = "ede3bcd2aff4"
+down_revision = "b6d2e9f41a07"
 branch_labels = None
 depends_on = None
 

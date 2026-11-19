@@ -33,3 +33,40 @@ async def test_existing_ips_listed_only_for_dynamic_pool(
         assert [i["address"] for i in existing] == ["10.71.0.12"]
     else:
         assert not existing
+
+
+@pytest.mark.asyncio
+async def test_update_widening_dynamic_pool_lists_existing_ips_4027(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#4027 — Edit Pool gets the same notice as New Pool."""
+    headers, scope = await _setup(db_session)
+    db_session.add(IPAddress(subnet_id=scope.subnet_id, address="10.71.0.60", status="reserved"))
+    await db_session.commit()
+    r = await client.post(
+        f"/api/v1/dhcp/scopes/{scope.id}/pools",
+        json={"start_ip": "10.71.0.10", "end_ip": "10.71.0.50", "pool_type": "dynamic"},
+        headers=headers,
+    )
+    assert r.status_code in (200, 201), r.text
+    pid = r.json()["id"]
+    assert not r.json().get("existing_ips_in_range")
+    # A rename leaves the range alone: no notice.
+    r = await client.put(f"/api/v1/dhcp/pools/{pid}", json={"name": "x"}, headers=headers)
+    assert r.status_code == 200, r.text
+    assert not r.json().get("existing_ips_in_range")
+    # Widening over the reserved address names it.
+    r = await client.put(
+        f"/api/v1/dhcp/pools/{pid}", json={"end_ip": "10.71.0.70"}, headers=headers
+    )
+    assert r.status_code == 200, r.text
+    assert [i["address"] for i in r.json()["existing_ips_in_range"]] == ["10.71.0.60"]
+    # Excluded -> dynamic over it names it too; dynamic -> excluded does not.
+    r = await client.put(
+        f"/api/v1/dhcp/pools/{pid}", json={"pool_type": "excluded"}, headers=headers
+    )
+    assert not r.json().get("existing_ips_in_range")
+    r = await client.put(
+        f"/api/v1/dhcp/pools/{pid}", json={"pool_type": "dynamic"}, headers=headers
+    )
+    assert [i["address"] for i in r.json()["existing_ips_in_range"]] == ["10.71.0.60"]
