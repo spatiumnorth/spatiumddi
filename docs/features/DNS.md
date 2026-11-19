@@ -1148,12 +1148,24 @@ DNSBlockListException
     `$dnstype=`, `$denyallow=`, …) **skips the rule**. Most of them narrow
     a rule, and DNS cannot express that, so keeping the bare name would
     block more than the feed asked for.
+  - Two non-`||` shapes that name a complete DNS name **are** enforced
+    (#4037), and neither follows the list's "Block subdomains" setting:
+    a dot-led `.name^` blocks the name's subdomains only (stored as
+    `*.name`; the apex keeps resolving), and `|name^` blocks exactly that
+    name (no subdomains). Both need the closing `^` (without it adblock
+    reads a substring), and a name with an all-digit label or a file
+    extension as its last label (`.n.2.1.js^`) is a filename fragment and
+    stays skipped. `@@|name^` becomes an exception for the name, which
+    every renderer applies to its subdomains too; `@@.name^` has no
+    exception to map to and stays skipped.
   - Regex rules (`/…/`), paths (`||host/ads`), a `*` inside a name and
     other non-`||name^` rules are skipped.
 
   Skipped rules are counted by category (regex / modifier / badfilter /
   malformed), stored on the list as `feed_parse_skipped`, and shown on the
-  list as "N rules not enforced". Every `||name^` rule means "this name and
+  list as "N rules skipped", with the list's entry count first and the
+  reasons in plain words on hover and on the list's detail page: they are
+  rules only a browser ad blocker can apply, not a fault. Every `||name^` rule means "this name and
   its subdomains", so an adblock feed on a list set to apex-only logs the
   same override warning a `*.`-prefixed feed does (#894).
 
@@ -1183,7 +1195,7 @@ lists to `nxdomain`, which changes nothing they answer.
 ### BIND9 Implementation
 - Uses a `Response Policy Zone (RPZ)` — an industry-standard BIND9 feature
 - Block list entries are written as RPZ zone records
-- Updating the RPZ zone uses `rndc reload <rpz-zone>` (no full restart)
+- Updating the RPZ zone is an incremental RFC 2136 update when only a few names changed, else `rndc reload <rpz-zone>` (no full restart). The zone is dynamic, so a manual `rndc reload` alone does not re-read it: use `rndc freeze <rpz-zone>`, `rndc reload <rpz-zone>`, `rndc thaw <rpz-zone>`. See [DNS drivers](../drivers/DNS_DRIVERS.md)
 - Every list a scope draws on is folded into ONE RPZ zone per view (plus one group zone), so BIND's limit of 64 zones per `response-policy` statement can never be reached by assigning lists; there is deliberately no assignment-time cap (#3564)
 
 ### UI Features
@@ -1655,23 +1667,34 @@ still contains `***` in a credential position is refused (422).
 
 #### Do feed entries block subdomains?
 
-Yes by default, and it is a **per-list** setting — *Block subdomains of
-feed entries* on the list's edit form (`feed_entries_are_wildcard`,
-issue #894).
+It depends on the entry's own syntax, and it is a **per-list** setting —
+*Block subdomains of feed entries* on the list's edit form
+(`feed_wildcard_mode`, issues #894 and #4190). Three values:
 
-Leave it on for anything in the curated catalog. Every one of those 19
-sources is a "block this domain and everything under it" list, and off
-would mean a feed naming `tracker.example` leaves
-`cdn.tracker.example` resolving — which is what these lists exist to
-stop.
+| Mode | What it does |
+|---|---|
+| **By syntax** (default) | Each entry follows its own line. An adblock `\|\|name^` rule, or a `*.name` line, blocks `name` and every subdomain (`name` plus `*.name` in the RPZ). A hosts line (`0.0.0.0 name`) or a bare domain blocks only `name` (one RPZ record), the way AdGuard Home and hosts-file resolvers read it. |
+| **Always** | Every feed entry also blocks its subdomains, whatever its syntax. For a plain-domain feed whose publisher means "this domain and everything under it". |
+| **Never** | Exact names only. For a feed of specific hosts (a threat-intel drop of individual C2 FQDNs) where blocking the parent would be too broad. |
 
-Turn it off only for a feed that lists **specific hosts** rather than
-domains: a threat-intel drop of individual C2 FQDNs, say, where
-blocking the parent domain would take out everything else hosted under
-it. Toggling it restamps the entries already imported, so the change
-takes effect immediately rather than waiting for the feed's contents to
-churn — the save takes a few seconds on a large list (measured ~7 s on
-a 464k-entry feed) because it rewrites every row in one transaction.
+The curated catalog sets **Always** on the HaGeZi `wildcard/` and OISD
+`domainswild` sources (plain-domain feeds that mean "and everything under
+it") and leaves the hosts-format (StevenBlack, 1Hosts) and adblock-format
+(AdGuard DNS filter, EasyPrivacy, URLhaus) sources and Phishing Army on
+**By syntax**. Before #4190 every list was "Always"; on upgrade a list
+that had the box unticked becomes **Never**, one subscribed to a HaGeZi /
+OISD wildcard feed becomes **Always**, and every other list becomes
+**By syntax**, with its stored entries restamped by the next refresh. A
+hosts-format list therefore drops to one RPZ record per entry.
+
+Changing the mode restamps the entries already imported: to **Always** or
+**Never** immediately (the save takes a few seconds on a large list,
+measured ~7 s on a 464k-entry feed, because it rewrites every row in one
+transaction); to **By syntax** by refreshing the feed, since stored rows
+do not remember which syntax they came from. The old boolean
+`feed_entries_are_wildcard` is still read in responses (false only for
+**Never**) and still accepted on write (true = **Always**, false =
+**Never**); send `feed_wildcard_mode` instead.
 
 Two related behaviours worth knowing:
 
@@ -1682,7 +1705,7 @@ Two related behaviours worth knowing:
   the feed means. The prefix is instead read as the feed declaring
   "and every subdomain", which is exactly what this setting expresses.
 - If such a feed is imported into an apex-only list, the refresh logs
-  `blocklist_feed_wildcard_intent_overridden` naming the count. That is
+  `blocklist_feed_wildcard_intent_overridden` (mode *Never* only) naming the count. That is
   a legitimate configuration, not an error — but it overrides something
   the feed stated, so it says so.
 
@@ -1691,11 +1714,12 @@ and is never rewritten by this list-level switch.
 
 #### Sizing
 
-Feed-sourced entries block the named domain *and* its subdomains, which
-takes two RPZ records each (`example.com` and `*.example.com`) — an RPZ
-wildcard matches subdomains only, so the bare name is not redundant.
-Budget roughly **two records per feed entry** (halve it for a list with
-*Block subdomains* off):
+A feed entry that blocks the named domain *and* its subdomains takes two
+RPZ records (`example.com` and `*.example.com`) — an RPZ wildcard matches
+subdomains only, so the bare name is not redundant. An exact entry (a hosts
+line under *By syntax*, or a list set to *Never*) takes one. The table
+below is for lists that block subdomains, so budget roughly **two records
+per feed entry** for those and **one** for a hosts-format list:
 
 | Profile feed | Entries | RPZ records |
 |---|---|---|
@@ -2194,7 +2218,9 @@ most of these feed the IPAM / DNS / DHCP UI error banners directly.
   bundle applies. An RPZ zone with no room for its hash sidecar (246 to
   248 characters) is still served, just rendered on every apply. The
   control plane does not refuse these names: PowerDNS and the agentless
-  drivers serve them.
+  drivers serve them. A DNSSEC-signed zone is held back from 215 characters
+  (issue #3750): BIND cannot write the key files it names after the zone, so
+  it would serve the zone unsigned with no key.
 
 ### Servers & server groups
 

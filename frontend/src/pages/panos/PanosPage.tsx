@@ -1,3 +1,4 @@
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -36,6 +37,7 @@ import {
   usePermissions,
 } from "@/hooks/usePermissions";
 import { secondsFieldError, SYNC_INTERVAL_BOUNDS } from "@/lib/seconds";
+import { FormError } from "@/components/ui/form-error";
 
 // ── Setup guide ─────────────────────────────────────────────────────
 // Steps an operator follows in the PAN-OS / Panorama web UI to mint a
@@ -587,6 +589,13 @@ export function FirewallModal({
   // Auth — either paste an API key, or username + password to keygen via Test.
   const [authMode, setAuthMode] = useState<"api_key" | "keygen">("api_key");
   const [apiKey, setApiKey] = useState("");
+  // #4135 — a moved address needs the stored key entered (or minted) again.
+  const reask = useCredentialReask(
+    { host, port },
+    firewall && { host: firewall.host, port: firewall.port },
+    () => setApiKey(""),
+  );
+  const mustEnter = reask.asks(firewall?.api_key_present);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [spaceId, setSpaceId] = useState(firewall?.ipam_space_id ?? "");
@@ -879,7 +888,11 @@ export function FirewallModal({
           {authMode === "api_key" ? (
             <Field
               label="API Key"
-              hint="The XML API key. On edit, leave blank to keep the stored key."
+              hint={
+                mustEnter
+                  ? reask.hint
+                  : "The XML API key. On edit, leave blank to keep the stored key."
+              }
             >
               <input
                 className={`${inputCls} font-mono text-[11px]`}
@@ -887,11 +900,13 @@ export function FirewallModal({
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
                 placeholder={
-                  editing && firewall?.api_key_present
-                    ? "••• stored — enter to replace"
-                    : "API key"
+                  mustEnter
+                    ? reask.placeholder
+                    : editing && firewall?.api_key_present
+                      ? "••• stored — enter to replace"
+                      : "API key"
                 }
-                required={!editing && authMode === "api_key"}
+                required={(!editing || mustEnter) && authMode === "api_key"}
               />
             </Field>
           ) : (
@@ -1084,7 +1099,9 @@ export function FirewallModal({
           </label>
         </div>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -1101,7 +1118,7 @@ export function FirewallModal({
             // authMode back to "api_key"), so this also forces a successful
             // Test before Create. Editing leaves the key blank to keep the
             // stored one, so no gate there.
-            disabled={saveMut.isPending || (!editing && !apiKey)}
+            disabled={saveMut.isPending || ((!editing || mustEnter) && !apiKey)}
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {saveMut.isPending ? "Saving…" : editing ? "Save" : "Create"}
@@ -1149,9 +1166,9 @@ function DeleteFirewallModal({
           <span>I understand.</span>
         </label>
         {error && (
-          <p className="break-words rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          <FormError className="break-words rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
             {error}
-          </p>
+          </FormError>
         )}
         <div className="flex justify-end gap-2">
           <button

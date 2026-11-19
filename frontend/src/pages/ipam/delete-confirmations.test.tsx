@@ -226,8 +226,8 @@ describe("IPAM delete confirmations", () => {
         ", greyed out in the list, and excluded from next-free allocation. DNS and DHCP cascades still run: its DNS records and aliases leave the zone. You can restore or permanently delete it later from the orphans view; restoring it publishes its DNS records and aliases again.",
         "the orphan option: a purge is possible later",
       ],
-      ["Delete Permanently (irreversible)", "the address purge option"],
-      ["Delete Permanently", "the address purge's button"],
+      // The address purge's heading and button are the shared
+      // DeleteChoiceModal's defaults (#4078), no longer literals here.
     ]);
     // jsdom gives this module an http: URL, so the file is found from here.
     const file = join(__dirname, "IPAMPage.tsx");
