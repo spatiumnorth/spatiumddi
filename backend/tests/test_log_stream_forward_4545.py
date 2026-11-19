@@ -588,3 +588,79 @@ async def test_dns_filters_apply_at_ingest(
     await _settle()
     # Only the third target's filters match this query.
     assert len(wire.lines) == 1
+
+
+# ── the alert rule is seeded once, by the migration (not at startup) ───────
+
+
+async def test_migration_seeds_the_drop_alert_once_and_startup_does_not(
+    db_session: AsyncSession,
+) -> None:
+    import importlib.util
+    from pathlib import Path
+
+    from sqlalchemy import func
+
+    from app.models.alerts import AlertRule
+    from app.services import alerts
+
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "e5a2c8d4f7b1_audit_forward_target_log_streams.py"
+    )
+    spec = importlib.util.spec_from_file_location("_mig_e5a2c8d4f7b1", path)
+    assert spec is not None and spec.loader is not None
+    mig = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mig)
+
+    # A startup seed would re-create the rule after an operator deletes it.
+    assert not hasattr(alerts, "seed_log_forward_dropping_alert_rule")
+    for _ in range(2):
+        await db_session.execute(mig.SEED_LOG_FORWARD_DROPPING_RULE_SQL, mig.seed_params())
+        await db_session.commit()
+    n = await db_session.scalar(
+        select(func.count())
+        .select_from(AlertRule)
+        .where(AlertRule.rule_type == alerts.RULE_TYPE_LOG_FORWARD_DROPPING)
+    )
+    assert n == 1
+    rule = await db_session.scalar(
+        select(AlertRule).where(AlertRule.rule_type == alerts.RULE_TYPE_LOG_FORWARD_DROPPING)
+    )
+    assert rule is not None and rule.enabled and rule.severity == "warning"
+
+
+async def test_shutdown_flushes_drops_and_stops_every_task(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate = asyncio.Event()
+
+    async def stuck(*a: Any, **k: Any) -> None:
+        await gate.wait()
+
+    monkeypatch.setattr(audit_forward, "_send_syslog_batch", stuck)
+    monkeypatch.setattr(log_stream_forward, "SEND_TIMEOUT_S", 60.0)
+    monkeypatch.setattr(log_stream_forward, "DROP_FLUSH_S", 3600.0)
+    target = await _add_target(db_session, stream_dns_query_log=True)
+    tid = target.id
+    await log_stream_forward.refresh_targets()
+    st = log_stream_forward._state  # noqa: SLF001
+    tq = st.targets[str(tid)]
+    tq.events.append({"stream": "dns_query_log"})
+    tq.task = asyncio.get_running_loop().create_task(
+        log_stream_forward._send_loop(tq)
+    )  # noqa: SLF001
+    await asyncio.sleep(0.05)
+    log_stream_forward._record_drop(tq, "dns_query_log", 3)  # noqa: SLF001
+    task = tq.task
+
+    await log_stream_forward.shutdown()
+
+    assert task.done()
+    db_session.expire_all()
+    row = (
+        await db_session.execute(select(AuditForwardTarget).where(AuditForwardTarget.id == tid))
+    ).scalar_one()
+    assert row.log_stream_dropped_total == 3

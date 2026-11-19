@@ -473,3 +473,18 @@ async def flush_drops() -> None:
         except Exception:  # noqa: BLE001
             tq.unflushed["retry"] = tq.unflushed.get("retry", 0) + total
             logger.warning("log_stream_drop_flush_failed", exc_info=True)
+
+
+async def shutdown() -> None:
+    """Api shutdown: persist the pending drop counts, then stop every task
+    (queued events are best-effort and are not replayed)."""
+    try:
+        await asyncio.wait_for(flush_drops(), timeout=5.0)
+    except Exception:  # noqa: BLE001
+        logger.warning("log_stream_shutdown_flush_failed", exc_info=True)
+    tasks = [tq.task for tq in _state.targets.values()]
+    tasks += [_state.pump, _state.refresh, _state.flusher]
+    live = [t for t in tasks if t is not None and not t.done()]
+    for t in live:
+        t.cancel()
+    await asyncio.gather(*live, return_exceptions=True)

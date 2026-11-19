@@ -6835,47 +6835,6 @@ async def seed_dns_blocklist_feed_stale_alert_rule() -> None:
         await session.commit()
 
 
-_LOG_FORWARD_DROPPING_RULE_NAME = "Log stream forwarding dropping entries"
-
-
-async def seed_log_forward_dropping_alert_rule() -> None:
-    """Seed the #4545 rule, ENABLED by default.
-
-    Silent on every install that does not forward the DNS query log or DHCP
-    activity log (no target has the streams on, so no drop is ever recorded).
-    When it speaks, entries the operator asked to have in their SIEM are
-    missing from it. Keyed on ``name``; an operator who disables or renames it
-    is never overridden.
-    """
-    from app.db import AsyncSessionLocal  # noqa: PLC0415
-    from app.models.alerts import AlertRule  # noqa: PLC0415
-
-    async with AsyncSessionLocal() as session:
-        existing = await session.scalar(
-            select(AlertRule).where(AlertRule.name == _LOG_FORWARD_DROPPING_RULE_NAME)
-        )
-        if existing is not None:
-            return
-        session.add(
-            AlertRule(
-                name=_LOG_FORWARD_DROPPING_RULE_NAME,
-                description=(
-                    "Fires for each syslog forward target that dropped DNS query log or "
-                    "DHCP activity log entries in the last 15 minutes because its "
-                    "collector was slow or unreachable and the target's queue filled. "
-                    "Auto-resolves 15 minutes after the last drop."
-                ),
-                rule_type=RULE_TYPE_LOG_FORWARD_DROPPING,
-                severity="warning",
-                enabled=True,
-                notify_syslog=True,
-                notify_webhook=True,
-                notify_smtp=False,
-            )
-        )
-        await session.commit()
-
-
 _DNS_POOL_HEALTH_STALE_RULE_NAME = "DNS pool health checks stale"
 
 
