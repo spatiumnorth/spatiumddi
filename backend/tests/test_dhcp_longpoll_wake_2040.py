@@ -100,7 +100,7 @@ def fresh_session_per_request() -> Any:
     the edit share an identity map and hide the bug.
     """
 
-    async def _get_db() -> AsyncGenerator[AsyncSession, None]:
+    async def _get_db() -> AsyncGenerator[AsyncSession]:
         async with _TestSessionLocal() as session:
             yield session
 

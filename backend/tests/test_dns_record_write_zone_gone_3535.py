@@ -107,11 +107,11 @@ def _request(case: str, z: _Zone) -> tuple[str, str, dict[str, Any] | None, dict
 
 
 @pytest.fixture
-async def concurrent_client() -> AsyncGenerator[AsyncClient, None]:
+async def concurrent_client() -> AsyncGenerator[AsyncClient]:
     """A client whose every request runs on its own session, and which answers
     an unhandled error with the 500 a client sees instead of raising it."""
 
-    async def own_session() -> AsyncGenerator[AsyncSession, None]:
+    async def own_session() -> AsyncGenerator[AsyncSession]:
         async with _TestSessionLocal() as session:
             yield session
 

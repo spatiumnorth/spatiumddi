@@ -1,5 +1,5 @@
 # ── Stage 1: build dependencies ───────────────────────────────────────────────
-FROM python:3.12-slim AS builder
+FROM python:3.14-slim AS builder
 
 WORKDIR /build
 
@@ -43,7 +43,7 @@ RUN mkdir -p app && touch app/__init__.py && \
 ARG PIP_LICENSES_VERSION=5.5.5
 RUN python -m venv /opt/pip-licenses \
     && /opt/pip-licenses/bin/pip install --no-cache-dir "pip-licenses==${PIP_LICENSES_VERSION}" \
-    && printf '#!/bin/sh\nPYTHONPATH=/install/lib/python3.12/site-packages exec /usr/local/bin/python "$@"\n' > /opt/py-install \
+    && printf '#!/bin/sh\nPYTHONPATH=/install/lib/python3.14/site-packages exec /usr/local/bin/python "$@"\n' > /opt/py-install \
     && chmod +x /opt/py-install \
     && mkdir -p /install/share/spatiumddi \
     && /opt/pip-licenses/bin/pip-licenses --python=/opt/py-install \
@@ -52,11 +52,11 @@ RUN python -m venv /opt/pip-licenses \
          --ignore-packages pip setuptools wheel spatiumddi \
          --output-file=/install/share/spatiumddi/third-party-python.txt \
     && python -c "import importlib.metadata as m, re, sys; n = lambda s: re.sub(r'[-_.]+', '-', s).lower(); listed = {n(l.strip()) for l in open(sys.argv[1], encoding='utf-8')}; want = {n(d.metadata['Name']) for d in m.distributions(path=[sys.argv[2]])} - {'pip', 'setuptools', 'wheel', 'spatiumddi'}; miss = sorted(want - listed); assert len(want) > 50 and not miss, f'third-party-python.txt is missing {miss} ({len(want)} installed)'" \
-         /install/share/spatiumddi/third-party-python.txt /install/lib/python3.12/site-packages
+         /install/share/spatiumddi/third-party-python.txt /install/lib/python3.14/site-packages
 
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
-FROM python:3.12-slim AS runtime
+FROM python:3.14-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -101,10 +101,10 @@ WORKDIR /app
 #
 # ``apt-get upgrade`` runs BEFORE the installs so the base image's own
 # packages — perl-base, gzip, libpcre2, libsqlite3, libssh2, everything
-# ``python:3.12-slim`` brought with it — are patched against the current
+# ``python:3.14-slim`` brought with it — are patched against the current
 # Debian index rather than frozen at whatever the base image was baked
 # with. Without it those packages can only ever be fixed by upstream
-# rebuilding python:3.12-slim, which is not a schedule we control: the
+# rebuilding python:3.14-slim, which is not a schedule we control: the
 # nightly of 2026-09-14 refused to publish the api image on 34 HIGH /
 # CRITICAL findings (7 CVEs across perl, 2 libpcre2, 2 libsqlite3, 1
 # gzip, 1 libssh2) whose fixes had been sitting on deb.debian.org the

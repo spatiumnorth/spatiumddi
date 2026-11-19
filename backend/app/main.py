@@ -463,7 +463,7 @@ def _log_backup_section_catalog_gap() -> None:
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     configure_logging()
     # #3015 — startup runs inside uvicorn's Server.capture_signals, so its
     # SIGTERM handler is installed by now: wrap it so long-polls end the

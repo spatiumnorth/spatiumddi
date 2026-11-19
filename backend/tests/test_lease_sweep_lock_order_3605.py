@@ -176,7 +176,7 @@ async def test_sweep_and_lease_events_on_the_same_addresses_do_not_deadlock(
 
 
 @pytest.fixture
-async def other_conn() -> AsyncGenerator[AsyncConnection, None]:
+async def other_conn() -> AsyncGenerator[AsyncConnection]:
     """A connection of its own, standing in for a concurrent writer."""
     engine = create_async_engine(os.environ["DATABASE_URL"], poolclass=NullPool)
     try:

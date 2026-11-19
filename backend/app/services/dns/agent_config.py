@@ -868,7 +868,7 @@ async def _stream_zone_entries(
 
 async def _zone_record_batches(
     db: AsyncSession, zones: list[Any]
-) -> AsyncGenerator[tuple[int, Any, list[Any] | None], None]:
+) -> AsyncGenerator[tuple[int, Any, list[Any] | None]]:
     """``(index, zone, its records)`` for every zone, in ``zones``' order,
     reading the records of a batch of zones per query (#2227).
 
@@ -928,7 +928,7 @@ async def _zone_record_batches(
             yield item
 
 
-async def _zone_record_chunks(db: AsyncSession, zone: Any) -> AsyncGenerator[list[Any], None]:
+async def _zone_record_chunks(db: AsyncSession, zone: Any) -> AsyncGenerator[list[Any]]:
     """One zone's records in ``_records_query`` order, ``RECORD_RENDER_BATCH``
     rows at a time, over a server-side cursor (#2227)."""
     result = await db.stream(

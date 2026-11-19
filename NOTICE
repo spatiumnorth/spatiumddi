@@ -79,7 +79,7 @@ Where the two disagree about a license, THIS file is authoritative.
 - GoBGP (BGP Looking Glass collector, issue #566) — Apache 2.0 — https://github.com/osrg/gobgp
 
 ── Container base images & init ────────────────────────────────────────────
-- python:3.12-slim — PSF + Debian — https://python.org
+- python:3.14-slim — PSF + Debian — https://python.org
 - node (frontend build stage) — MIT — https://nodejs.org
 - ASP.NET Core runtime (Technitium agent image) — MIT — https://dotnet.microsoft.com
 - tini — MIT — https://github.com/krallin/tini
@@ -186,7 +186,7 @@ system — for example:
   /usr/share/doc/<package>/copyright        (Debian appliance packages)
   /usr/share/licenses/<package>/            (Alpine agent images)
   /usr/share/doc/k3s/LICENSE                (k3s, fetched at image build)
-  /usr/local/lib/python3.12/site-packages/<name>-*.dist-info/
+  /usr/local/lib/python3.14/site-packages/<name>-*.dist-info/
                                             (Python packages, API image)
 
 docs/THIRD_PARTY.md documents this in more detail, including the copyleft

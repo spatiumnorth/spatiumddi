@@ -384,7 +384,7 @@ def get_container_logs(
 
 async def stream_container_logs(
     name: str, tail: int = 100, container: str | None = None
-) -> AsyncGenerator[str, None]:
+) -> AsyncGenerator[str]:
     """Yield log lines from the named pod as they arrive.
 
     Wraps ``k8s.stream_pod_logs`` (a sync generator) with

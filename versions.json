@@ -486,6 +486,21 @@
       "note": "Not a choice -- it MUST equal the python3 that `alpine` above ships, because it is interpolated into PYTHONPATH and the agent lives at that exact path. Declared here so the pair is visibly coupled; the load-bearing check is the `RUN python3 -c \"import <agent>\"` in each image, which turns a mismatch into a build failure instead of the ModuleNotFoundError CrashLoopBackOff of #672. Until #1037 this arg was declared and referenced by NOTHING in four of the five images -- bumping it changed the image not at all, while the real pin sat hardcoded in PYTHONPATH."
     },
 
+    "backend-python": {
+      "version": "3.14",
+      "pinned_in": [
+        { "path": "backend/Dockerfile", "match": "FROM python:{version}-slim", "count": 2 },
+        { "path": "backend/Dockerfile", "match": "lib/python{version}/site-packages", "count": 2 },
+        { "path": "backend/Dockerfile.dev", "match": "FROM python:{version}-slim", "count": 1 },
+        { "path": "backend/pyproject.toml", "match": "requires-python = \">={version}\"", "count": 1 },
+        { "path": "backend/pyproject.toml", "match": "target-version = \"py314\"", "count": 1 },
+        { "path": "backend/pyproject.toml", "match": "python_version = \"{version}\"", "count": 1 },
+        { "path": ".devcontainer/devcontainer.json", "match": "\"version\": \"{version}\"", "count": 1 }
+      ],
+      "upstream": { "kind": "none" },
+      "note": "Backend runtime, builder, CI and lint interpreter, moved 3.12 -> 3.14 in #2229 to match `agent-python`. The `python` Dependabot ignore stays: a minor of the base image is a deliberate move. The `setup-python` `python-version` inputs in .github/workflows are not counted here (an exact count would fail whenever a job is added); they move with this entry. `technitium-agent-python` below is a separate pin."
+    },
+
     "technitium-agent-python": {
       "version": "3.12",
       "pinned_in": [
@@ -595,12 +610,6 @@
   },
 
   "holds": [
-    {
-      "name": "Python (backend runtime + CI)",
-      "version": "3.12",
-      "reason": "3.14.7 is current. A deliberate, coordinated interpreter upgrade -- backend/Dockerfile, every setup-python step and the agents move together or not at all.",
-      "why_not_enforced": "The literal is `python-version: \"3.12\"` repeated across CI jobs, and an exact count there would fail every time a job is added -- a guard that fires for unrelated reasons is one people learn to weaken."
-    },
     {
       "name": "Node (frontend builder)",
       "version": "22",

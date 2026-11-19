@@ -37,7 +37,7 @@ _degraded: dict[str, bool] = {}
 
 
 @asynccontextmanager
-async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
+async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     shutdown.reset()
     shutdown.install_signal_hook()
     yield

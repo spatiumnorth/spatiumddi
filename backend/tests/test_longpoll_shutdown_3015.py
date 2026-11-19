@@ -50,7 +50,7 @@ def _clean_flag() -> Any:
 
 @pytest.fixture
 def fresh_session_per_request() -> Any:
-    async def _get_db() -> AsyncGenerator[AsyncSession, None]:
+    async def _get_db() -> AsyncGenerator[AsyncSession]:
         async with _TestSessionLocal() as session:
             yield session
 

@@ -1009,7 +1009,7 @@ CONSUMER_RECONNECT_INTERVAL_MAX_S = 2.0
 # Name resolution is not bounded by any socket timeout (#1754). The worker
 # pods run with ``dnsConfig`` options ``timeout:2 attempts:2``
 # (charts/spatiumddi/templates/worker.yaml, k8s/base/worker.yaml; glibc, the
-# image is python:3.12-slim). The pod has one nameserver, the cluster DNS
+# image is python:3.14-slim). The pod has one nameserver, the cluster DNS
 # Service, and glibc retries a query on the SAME socket, so kube-proxy's
 # conntrack sends both attempts to the same CoreDNS endpoint: a dead one
 # costs timeout x attempts = 4 s per query. A name that times out is tried

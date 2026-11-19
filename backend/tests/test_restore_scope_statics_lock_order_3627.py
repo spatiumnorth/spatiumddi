@@ -35,7 +35,7 @@ from tests.test_lock_order_3617 import _hold_first_call, _no_deadlock, _race
 
 
 @pytest.fixture
-async def engine() -> AsyncGenerator[AsyncEngine, None]:
+async def engine() -> AsyncGenerator[AsyncEngine]:
     """Sessions of their own, each on its own connection."""
     eng = create_async_engine(os.environ["DATABASE_URL"], poolclass=NullPool)
     try:
