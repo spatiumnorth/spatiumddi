@@ -673,11 +673,15 @@ function CertDetailModal({
                 <p role="alert" className="px-3 py-2 text-xs text-destructive">
                   CT-log lookup failed.
                 </p>
+              ) : ctQuery.data?.error ? (
+                // The API answers a crt.sh failure with 200 + `error`, so the
+                // isError branch above never sees it: announce it here (#4480).
+                <p role="alert" className="px-3 py-2 text-xs text-destructive">
+                  crt.sh: {ctQuery.data.error}
+                </p>
               ) : (ctQuery.data?.entries.length ?? 0) === 0 ? (
                 <p className="px-3 py-2 text-xs text-muted-foreground">
-                  {ctQuery.data?.error
-                    ? `crt.sh: ${ctQuery.data.error}`
-                    : "No CT-log entries found for this host."}
+                  No CT-log entries found for this host.
                 </p>
               ) : (
                 <table className="w-full text-[11px]">
