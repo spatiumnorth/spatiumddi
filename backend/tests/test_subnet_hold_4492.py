@@ -158,3 +158,118 @@ async def test_hold_validation_and_permissions(
 def test_mcp_tools_registered() -> None:
     for name in ("find_subnet_holds", "count_subnet_holds", "propose_subnet_hold"):
         assert REGISTRY.get(name) is not None
+
+
+# ── Slice 2: the other subnet-creating paths (#4492) ─────────────────────────
+
+
+async def _hold(db: AsyncSession, space: IPSpace, block: IPBlock, network: str) -> SubnetHold:
+    row = SubnetHold(space_id=space.id, block_id=block.id, network=network, reason="falcon")
+    db.add(row)
+    await db.commit()
+    return row
+
+
+async def _subnet(db: AsyncSession, space: IPSpace, block: IPBlock, network: str) -> Subnet:
+    s = Subnet(space_id=space.id, block_id=block.id, network=network, name="s", total_ips=254)
+    db.add(s)
+    await db.commit()
+    return s
+
+
+async def test_resize_refuses_a_held_cidr(
+    client: AsyncClient, db_session: AsyncSession, auth_headers: dict
+) -> None:
+    space, block = await _space_block(db_session)
+    sn = await _subnet(db_session, space, block, "10.0.0.0/25")
+    await _hold(db_session, space, block, "10.0.0.128/25")
+
+    r = await client.post(
+        f"/api/v1/ipam/subnets/{sn.id}/resize/preview",
+        json={"new_cidr": "10.0.0.0/24"},
+        headers=auth_headers,
+    )
+    assert r.status_code == 200, r.text
+    assert any(c["type"] == "subnet_hold" for c in r.json()["conflicts"])
+
+    r = await client.post(
+        f"/api/v1/ipam/subnets/{sn.id}/resize",
+        json={"new_cidr": "10.0.0.0/24"},
+        headers=auth_headers,
+    )
+    assert r.status_code == 409 and "hold" in r.json()["detail"]
+
+
+async def test_split_refuses_a_held_cidr(
+    client: AsyncClient, db_session: AsyncSession, auth_headers: dict
+) -> None:
+    space, block = await _space_block(db_session)
+    sn = await _subnet(db_session, space, block, "10.0.0.0/24")
+    # Legacy state: a hold written before the guard existed sits on the parent.
+    await _hold(db_session, space, block, "10.0.0.0/25")
+
+    r = await client.post(
+        f"/api/v1/ipam/subnets/{sn.id}/split/preview",
+        json={"new_prefix_length": 25},
+        headers=auth_headers,
+    )
+    assert r.status_code == 200, r.text
+    assert any(c["type"] == "subnet_hold" for c in r.json()["conflicts"])
+    r = await client.post(
+        f"/api/v1/ipam/subnets/{sn.id}/split/commit",
+        json={"new_prefix_length": 25, "confirm_cidr": "10.0.0.0/24"},
+        headers=auth_headers,
+    )
+    assert r.status_code == 409 and "hold" in r.json()["detail"]
+
+
+async def test_merge_refuses_a_held_cidr(
+    client: AsyncClient, db_session: AsyncSession, auth_headers: dict
+) -> None:
+    space, block = await _space_block(db_session)
+    a = await _subnet(db_session, space, block, "10.0.0.0/25")
+    b = await _subnet(db_session, space, block, "10.0.0.128/25")
+    await _hold(db_session, space, block, "10.0.0.64/26")  # legacy overlap
+
+    r = await client.post(
+        f"/api/v1/ipam/subnets/{a.id}/merge/preview",
+        json={"sibling_subnet_ids": [str(b.id)]},
+        headers=auth_headers,
+    )
+    assert r.status_code == 200, r.text
+    assert any(c["type"] == "subnet_hold" for c in r.json()["conflicts"])
+    r = await client.post(
+        f"/api/v1/ipam/subnets/{a.id}/merge/commit",
+        json={"sibling_subnet_ids": [str(b.id)], "confirm_cidr": "10.0.0.0/24"},
+        headers=auth_headers,
+    )
+    assert r.status_code == 409 and "hold" in r.json()["detail"]
+
+
+async def test_allocate_subnet_skips_and_refuses_held_cidr(
+    client: AsyncClient, db_session: AsyncSession, auth_headers: dict
+) -> None:
+    space = IPSpace(name=f"sp-{uuid.uuid4().hex[:6]}")
+    db_session.add(space)
+    await db_session.flush()
+    block = IPBlock(space_id=space.id, network="10.9.0.0/22", name="b")
+    db_session.add(block)
+    await db_session.commit()
+    await _hold(db_session, space, block, "10.9.0.0/24")
+
+    # No network: the lowest free /24 is the one after the hold.
+    r = await client.post(
+        f"/api/v1/ipam/blocks/{block.id}/allocate-subnet",
+        json={"prefix_len": 24},
+        headers=auth_headers,
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["network"] == "10.9.1.0/24"
+
+    # A specific held pick is refused.
+    r = await client.post(
+        f"/api/v1/ipam/blocks/{block.id}/allocate-subnet",
+        json={"prefix_len": 24, "network": "10.9.0.0/24"},
+        headers=auth_headers,
+    )
+    assert r.status_code == 409

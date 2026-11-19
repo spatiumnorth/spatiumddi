@@ -200,6 +200,7 @@ _SPECS: list[tuple[str, str, str, list[ParamSpec]]] = [
         ],
     ),
     (a.RULE_TYPE_DECOM_EXPIRING, "Subnet decommission approaching", "IPAM", [_expiry()]),
+    (a.RULE_TYPE_SUBNET_HOLD_EXPIRING, "Subnet hold expiring", "IPAM", [_expiry()]),
     (
         a.RULE_TYPE_IP_FREE_BUT_RESPONDING,
         "IP marked free but responding",

@@ -7073,6 +7073,16 @@ async def allocate_subnet(
     )
     child_subnets = await db.execute(select(Subnet.network).where(Subnet.block_id == block.id))
     occupied = [str(n) for (n,) in child_blocks.all()] + [str(n) for (n,) in child_subnets.all()]
+    # A CIDR held for a future project (#4492) is not free either: the carve
+    # skips it instead of picking it and then failing create_subnet's 409.
+    held = await db.execute(
+        text(
+            "SELECT network FROM subnet_hold WHERE space_id = CAST(:space_id AS uuid) "
+            "AND status = 'active' AND network && CAST(:block AS cidr)"
+        ),
+        {"space_id": str(block.space_id), "block": str(block.network)},
+    )
+    occupied += [str(n) for (n,) in held.all()]
     occupied_nets = [ipaddress.ip_network(o, strict=False) for o in occupied]
 
     chosen: ipaddress.IPv4Network | ipaddress.IPv6Network | None = None
@@ -7101,7 +7111,7 @@ async def allocate_subnet(
         if any(picked.overlaps(o) for o in occupied_nets):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=f"{picked} is already allocated or overlaps an existing block/subnet",
+                detail=f"{picked} is already allocated or overlaps an existing block, subnet or hold",
             )
         chosen = picked
     else:

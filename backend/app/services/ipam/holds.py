@@ -1,7 +1,8 @@
 """Subnet hold overlap rule (#4492).
 
-Shared by the subnet create / restore path (``_assert_no_overlap``) so a CIDR
-claimed by an active hold cannot be allocated out from under its owner.
+Shared by every path that gives a subnet a CIDR: create / restore / allocate
+(``_assert_no_overlap``), resize, split and merge, so a CIDR claimed by an
+active hold cannot be taken out from under its owner.
 """
 
 from __future__ import annotations
@@ -41,3 +42,31 @@ async def assert_not_held(
             + (f" ({row[1]})" if row[1] else "")
             + "; release or convert the hold first",
         )
+
+
+async def hold_conflicts(
+    db: AsyncSession,
+    space_id: uuid.UUID,
+    network: str,
+) -> list[str]:
+    """Details of the active holds a subnet at ``network`` would overlap.
+
+    The non-raising form of :func:`assert_not_held`, for the resize / split /
+    merge previews, which collect every conflict instead of stopping at one.
+    """
+    rows = (
+        await db.execute(
+            text(
+                "SELECT network, reason FROM subnet_hold "
+                "WHERE space_id = CAST(:space_id AS uuid) AND status = 'active' "
+                "AND network && CAST(:network AS cidr) ORDER BY network"
+            ),
+            {"space_id": str(space_id), "network": network},
+        )
+    ).all()
+    return [
+        f"New CIDR {network} overlaps a hold on {r[0]}"
+        + (f" ({r[1]})" if r[1] else "")
+        + "; release or convert the hold first"
+        for r in rows
+    ]

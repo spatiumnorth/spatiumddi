@@ -22045,3 +22045,54 @@ export const otApi = {
       .post<OTDeviceImportCommitResponse>("/ot/devices/import/commit", data)
       .then((r) => r.data),
 };
+
+// ── Subnet holds (#4492) ───────────────────────────────────────────────────
+
+export interface SubnetHold {
+  id: string;
+  space_id: string;
+  block_id: string | null;
+  network: string;
+  reason: string;
+  status: "active" | "converted" | "released";
+  expires_at: string | null;
+  /** Active and past ``expires_at``: still holding until released. */
+  expired: boolean;
+  owner_user_id: string | null;
+  owner_group_id: string | null;
+  customer_id: string | null;
+  converted_subnet_id: string | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface SubnetHoldCreate {
+  space_id: string;
+  network: string;
+  reason: string;
+  expires_at?: string | null;
+  customer_id?: string | null;
+}
+
+export interface SubnetHoldUpdate {
+  reason?: string;
+  expires_at?: string | null;
+  clear_expiry?: boolean;
+}
+
+export const subnetHoldsApi = {
+  list: (params?: {
+    space_id?: string;
+    status?: string;
+    expired?: boolean;
+    expiring_within_days?: number;
+  }) => api.get<SubnetHold[]>("/ipam/holds", { params }).then((r) => r.data),
+  create: (data: SubnetHoldCreate) =>
+    api.post<SubnetHold>("/ipam/holds", data).then((r) => r.data),
+  update: (id: string, data: SubnetHoldUpdate) =>
+    api.put<SubnetHold>(`/ipam/holds/${id}`, data).then((r) => r.data),
+  release: (id: string) =>
+    api.post<SubnetHold>(`/ipam/holds/${id}/release`).then((r) => r.data),
+  convert: (id: string, data: { name?: string; description?: string }) =>
+    api.post<SubnetHold>(`/ipam/holds/${id}/convert`, data).then((r) => r.data),
+};

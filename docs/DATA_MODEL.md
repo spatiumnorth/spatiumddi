@@ -171,6 +171,25 @@ Supporting IPAM tables:
 | `IpMacHistory` | `ip_mac_history` | observed IP ↔ MAC sightings (arpwatch-style) |
 | `MACAllowlist` | `mac_allowlist` | known-MAC allowlist for new-device detection |
 
+### Subnet holds (#4492)
+
+`subnet_hold` (`models/subnet_hold.py`) is a claim on address space, not a
+subnet: it carries no gateway row, placeholder addresses, reverse zone or DHCP
+scope.
+
+| Column | Notes |
+|---|---|
+| `space_id` | `ip_space` (`CASCADE`) |
+| `block_id` | the block the CIDR sat in at creation (`SET NULL`); informational |
+| `network` | `CIDR`; no two active holds, and no hold and subnet, overlap in a space |
+| `reason` | free text, required on create |
+| `status` | `active` (blocks allocation) / `converted` / `released` |
+| `expires_at` | optional; an expired active hold keeps holding and is flagged `expired` |
+| `owner_user_id`, `owner_group_id`, `customer_id` | optional owners (`SET NULL`) |
+| `converted_subnet_id` | the subnet a `convert` created; no FK, so deleting the subnet leaves the history row |
+
+Registered in the backup IPAM section and the factory-reset IPAM section.
+
 ### VLAN / VXLAN
 
 VLANs live under a `Router` (the L3 device that owns them), distinct
