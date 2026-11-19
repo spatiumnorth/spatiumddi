@@ -4494,6 +4494,13 @@ async def update_influxdb_target(
         sent_fields,
         destination=("url",),
         secrets={"password": row.password_encrypted, "token": row.token_encrypted},
+        # A blank never clears here (only the flag does), so it keeps the stored
+        # value and is not a re-entry.
+        blank_keeps=[
+            name
+            for name, cleared in (("password", body.clear_password), ("token", body.clear_token))
+            if not cleared
+        ],
     )
     secret_changes = _apply_influx_body(row, body)
     _assert_influx_writable(row)

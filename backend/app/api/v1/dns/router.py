@@ -13,6 +13,7 @@ import zlib
 from collections.abc import Iterable, Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any, Literal, Self
 
 import structlog
@@ -3067,6 +3068,19 @@ async def update_server(
                     # rewrap): treat the submitted set as the whole truth
                     # rather than refusing the edit that would fix it.
                     merged = {}
+            # The stored API token goes with the API URL it was entered for: a
+            # new URL needs the token sent again in the same request.
+            if "api_url" in body.cloud_credentials:
+                require_secret_with_destination_change(
+                    SimpleNamespace(api_url=_url_key(merged.get("api_url"))),
+                    {
+                        "api_url": _url_key(body.cloud_credentials.get("api_url")),
+                        "api_token": body.cloud_credentials.get("api_token"),
+                    },
+                    destination=("api_url",),
+                    secrets={"api_token": merged.get("api_token")},
+                    blank_keeps=("api_token",),
+                )
             merged.update(body.cloud_credentials)
             await _validate_driver_credentials(server.driver, merged)
             server.credentials_encrypted = encrypt_dict(merged)
@@ -12446,6 +12460,12 @@ async def import_zone_spreadsheet_commit(
 
 
 # ── Helper functions ────────────────────────────────────────────────────────
+
+
+def _url_key(value: Any) -> str:
+    """An API URL as compared for "did the destination change": case and a
+    trailing slash do not move it."""
+    return str(value or "").strip().rstrip("/").lower()
 
 
 async def _require_group(group_id: uuid.UUID, db: DB) -> DNSServerGroup:
