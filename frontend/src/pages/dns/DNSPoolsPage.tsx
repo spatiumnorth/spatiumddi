@@ -14,10 +14,12 @@ import {
 } from "lucide-react";
 import {
   dnsApi,
+  formatApiError,
   type DNSPoolListEntry,
   type DNSServerGroup,
   type DNSZone,
 } from "@/lib/api";
+import { FormError } from "@/components/ui/form-error";
 import { Modal } from "@/components/ui/modal";
 import { ListReadError } from "@/components/ui/list-read-error";
 import {
@@ -199,8 +201,12 @@ export function DNSPoolsPage() {
         <ConfirmDeleteModal
           pool={confirmDelete}
           onConfirm={() => del.mutate(confirmDelete.id)}
-          onClose={() => setConfirmDelete(null)}
+          onClose={() => {
+            setConfirmDelete(null);
+            del.reset();
+          }}
           pending={del.isPending}
+          error={del.error ? formatApiError(del.error, "Delete failed") : null}
         />
       )}
     </div>
@@ -438,11 +444,13 @@ export function ConfirmDeleteModal({
   onConfirm,
   onClose,
   pending,
+  error,
 }: {
   pool: DNSPoolListEntry;
   onConfirm: () => void;
   onClose: () => void;
   pending: boolean;
+  error?: string | null;
 }) {
   const fqdn =
     pool.record_name === "@"
@@ -460,6 +468,7 @@ export function ConfirmDeleteModal({
           publishedCount: pool.enabled ? pool.live_count : 0,
         })}
       </p>
+      <FormError className="mt-2 text-sm">{error}</FormError>
       <div className="mt-4 flex justify-end gap-2">
         <button
           type="button"

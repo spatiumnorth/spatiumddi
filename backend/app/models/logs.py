@@ -19,9 +19,10 @@ tells ingest what is covered.
 a partition locks the referenced server table and dropping a retired one takes
 ``ACCESS EXCLUSIVE`` there, and every connected agent's long poll holds that
 table in a transaction most of the time, so neither would get through on a
-live install. The rows of a deleted server stay until the retention window
-removes them: the Logs page looks rows up by the servers that exist, and the
-threat rollup only counts distinct servers.
+live install. Deleting a server keeps its entries (#4173) all the same: the
+delete detaches them itself (``server_id`` NULL, ``server_name`` stamped)
+instead of leaving it to ``ON DELETE SET NULL``, and the retention drop ages
+them out as usual.
 """
 
 from __future__ import annotations
@@ -67,7 +68,12 @@ class DNSQueryLogEntry(Base):
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    server_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    # No foreign key (#2185), but the same contract as #4173: the row records what
+    # a client asked, not anything about the server, so a server delete detaches
+    # it (NULL ``server_id``, ``server_name`` stamped) rather than erasing it.
+    # NULL ``server_id`` means "the server was deleted", never "unknown server".
+    server_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    server_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
     client_ip: Mapped[str | None] = mapped_column(INET, nullable=True)
     client_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -122,7 +128,12 @@ class DHCPLogEntry(Base):
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    server_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    # No foreign key (#2185), but the same contract as #4173: the row records what
+    # a client asked, not anything about the server, so a server delete detaches
+    # it (NULL ``server_id``, ``server_name`` stamped) rather than erasing it.
+    # NULL ``server_id`` means "the server was deleted", never "unknown server".
+    server_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    server_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
     severity: Mapped[str | None] = mapped_column(String(16), nullable=True)
     code: Mapped[str | None] = mapped_column(String(64), nullable=True)

@@ -9,7 +9,7 @@ from typing import Any, Literal
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE, MAX_PAGE_SIZE, Page, paginate
@@ -42,10 +42,18 @@ from app.drivers.dhcp.windows import test_winrm_credentials
 from app.models.audit import AuditLog
 from app.models.dhcp import DHCPConfigOp, DHCPLease, DHCPMACBlock, DHCPScope, DHCPServer
 from app.models.ipam import Subnet
+from app.models.logs import DHCPLogEntry
 from app.models.metrics import DHCPMetricSample
 from app.services.agents.container_oom import daemon_reported_by
 from app.services.agents.daemon_state import is_not_serving
 from app.services.agents.instance_ownership import duplicate_active as duplicate_agent_active
+from app.services.agents.memory_status import (
+    MAX_HISTORY_HOURS,
+    MemoryHistory,
+    MemoryStatus,
+    fresh_memory_status,
+    memory_history,
+)
 from app.services.agents.spool_status import SpoolStatus
 from app.services.api_token_scopes import token_outbound
 from app.services.appliance.ownership import owning_appliance_for_dhcp_server
@@ -267,6 +275,10 @@ class ServerResponse(BaseModel):
     # NULL when never reported (a pre-#1077 agent, or an agentless driver):
     # UNKNOWN, never "empty".
     spool_status: SpoolStatus | None = None
+    # #4193 — the agent's actual memory use as last reported on its heartbeat
+    # (container used / peak / limit, daemon and agent RSS). NULL when never
+    # reported (an older agent, an agentless driver): UNKNOWN, never 0.
+    memory_status: MemoryStatus | None = None
     # #1067 — the daemon state the agent reports on its heartbeat. ``ok`` or
     # ``degraded`` (the agent's own word); NULL when the agent has never
     # reported one — UNKNOWN, never "fine". ``daemon_status_since`` is when
@@ -371,6 +383,7 @@ class ServerResponse(BaseModel):
             config_failed_etag=s.config_failed_etag,
             config_apply_at=s.config_apply_at,
             spool_status=s.spool_status,
+            memory_status=fresh_memory_status(s.memory_status),
             daemon_status=s.daemon_status,
             daemon_reason=s.daemon_reason,
             daemon_status_since=s.daemon_status_since,
@@ -911,6 +924,13 @@ async def delete_server(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
         resource_type="dhcp_server",
         resource_id=str(s.id),
         resource_display=s.name,
+    )
+    # ``dhcp_log_entry.server_id`` is not a foreign key (#2185), so nothing detaches
+    # the server's log entries for us (#4173): keep them, attributable by name.
+    await db.execute(
+        update(DHCPLogEntry)
+        .where(DHCPLogEntry.server_id == s.id)
+        .values(server_id=None, server_name=func.coalesce(DHCPLogEntry.server_name, s.name))
     )
     await db.delete(s)
     if gid is not None:
@@ -1829,6 +1849,21 @@ class DHCPServerStatsResponse(BaseModel):
     range: str
     bucket_seconds: int
     rate_buckets: list[DHCPRateBucket]
+
+
+@router.get("/{server_id}/memory-history", response_model=MemoryHistory)
+async def get_server_memory_history(
+    server_id: uuid.UUID,
+    db: DB,
+    _: CurrentUser,
+    hours: int = Query(6, ge=1, le=MAX_HISTORY_HOURS),
+) -> MemoryHistory:
+    """#4193 — the agent's memory samples (container used / peak, Kea and agent
+    RSS), one per minute, for the Server modal's sparkline. Empty for an agent
+    that does not report memory."""
+    if await db.get(DHCPServer, server_id) is None:
+        raise HTTPException(status_code=404, detail="Server not found")
+    return await memory_history(db, DHCPMetricSample, server_id, hours)
 
 
 @router.get("/{server_id}/stats", response_model=DHCPServerStatsResponse)

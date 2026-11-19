@@ -98,6 +98,7 @@ _TABLES = (
         "dns_rpz_hit",
         (
             ("ix_dns_rpz_hit_client_ts", "client_ip, ts"),
+            ("ix_dns_rpz_hit_server_id", "server_id"),
             ("ix_dns_rpz_hit_ts", "ts"),
             ("ix_dns_rpz_hit_zone_ts", "rpz_zone, ts"),
         ),

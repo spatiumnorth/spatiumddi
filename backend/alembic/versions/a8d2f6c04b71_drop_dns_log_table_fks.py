@@ -31,7 +31,7 @@ Downgrade puts the keys back, after removing the rows of servers that are
 gone, which the keys would refuse.
 
 Revision ID: a8d2f6c04b71
-Revises: b6d2e9f41a07
+Revises: d8b3f6a1c274
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ from __future__ import annotations
 from alembic import op
 
 revision: str = "a8d2f6c04b71"
-down_revision: str | None = "b6d2e9f41a07"
+down_revision: str | None = "d8b3f6a1c274"
 branch_labels: str | None = None
 depends_on: str | None = None
 
