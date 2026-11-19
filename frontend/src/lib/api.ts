@@ -12181,7 +12181,7 @@ export const changeRequestsApi = {
   // inline. Return the FULL axios response so callers can route it through
   // ``handleApprovalQueued``; strengthening edits + lock-off return the
   // 200/204 inline path. (See featureModulesApi.toggle for the same shape.)
-  updatePolicy: (id: string, body: ApprovalPolicyWrite) =>
+  updatePolicy: (id: string, body: Partial<ApprovalPolicyWrite>) =>
     api.put<ApprovalPolicy | ChangeRequestQueued>(
       `/change-requests/policies/${id}`,
       body,

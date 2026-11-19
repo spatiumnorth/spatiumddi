@@ -18,6 +18,8 @@ import {
   type AVReservedRangeUpdate,
 } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { Pager } from "@/components/ui/pager";
@@ -478,28 +480,60 @@ export function AVFlowsPage() {
         </section>
       </div>
 
-      {flowModal && (
-        <FlowModal
-          mode={flowModal.mode}
-          flow={flowModal.mode === "edit" ? flowModal.flow : null}
-          protocols={protocols.map((p) => ({
-            id: p.av_protocol,
-            label: p.label,
-          }))}
-          flowSources={presetsQ.data?.flow_sources ?? []}
-          ptpMin={presetsQ.data?.ptp_domain_min ?? 0}
-          ptpMax={presetsQ.data?.ptp_domain_max ?? 255}
-          onClose={() => setFlowModal(null)}
-        />
-      )}
-      {rangeModal && (
-        <RangeModal
-          mode={rangeModal.mode}
-          range={rangeModal.mode === "edit" ? rangeModal.range : null}
-          protocols={protocols}
-          onClose={() => setRangeModal(null)}
-        />
-      )}
+      {flowModal &&
+        (() => {
+          const flowDialog = (flow: AVFlow | null) => (
+            <FlowModal
+              mode={flowModal.mode}
+              flow={flow}
+              protocols={protocols.map((p) => ({
+                id: p.av_protocol,
+                label: p.label,
+              }))}
+              flowSources={presetsQ.data?.flow_sources ?? []}
+              ptpMin={presetsQ.data?.ptp_domain_min ?? 0}
+              ptpMax={presetsQ.data?.ptp_domain_max ?? 255}
+              onClose={() => setFlowModal(null)}
+            />
+          );
+          return flowModal.mode === "edit" ? (
+            <FreshEdit
+              row={flowModal.flow}
+              queryKeys={[["av-flows"]]}
+              title="Edit AV flow"
+              onClose={() => setFlowModal(null)}
+            >
+              {(fresh) => flowDialog(fresh)}
+            </FreshEdit>
+          ) : (
+            flowDialog(null)
+          );
+        })()}
+      {rangeModal &&
+        (rangeModal.mode === "edit" ? (
+          <FreshEdit
+            row={rangeModal.range}
+            queryKeys={[["av-reserved-ranges"]]}
+            title="Edit reserved range"
+            onClose={() => setRangeModal(null)}
+          >
+            {(fresh) => (
+              <RangeModal
+                mode="edit"
+                range={fresh}
+                protocols={protocols}
+                onClose={() => setRangeModal(null)}
+              />
+            )}
+          </FreshEdit>
+        ) : (
+          <RangeModal
+            mode="create"
+            range={null}
+            protocols={protocols}
+            onClose={() => setRangeModal(null)}
+          />
+        ))}
       <ConfirmModal
         open={deleteFlow !== null}
         title="Remove AV flow"
@@ -625,6 +659,15 @@ function FlowModal({
         seen_via: seenVia as AVFlowSource,
         notes,
       };
+      // The PUT carries the whole document, so a save with nothing changed
+      // against the row read when the dialog opened sends nothing (#4379),
+      // and any other save restates the fresh row's custom fields rather than
+      // clearing them.
+      if (mode === "edit" && flow) {
+        if (Object.keys(changedFields(flow, body)).length === 0)
+          return Promise.resolve(flow);
+        body.custom_fields = flow.custom_fields;
+      }
       return avApi.upsertFlow(groupId, body);
     },
     onSuccess: () => {
@@ -846,7 +889,9 @@ function RangeModal({
           description,
           exclusive,
         };
-        return avApi.updateReservedRange(range.id, body);
+        const diff = changedFields(range, body);
+        if (Object.keys(diff).length === 0) return Promise.resolve(range);
+        return avApi.updateReservedRange(range.id, diff);
       }
       const body: AVReservedRangeCreate = {
         space_id: spaceId,
