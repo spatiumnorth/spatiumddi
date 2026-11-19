@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useId, useState } from "react";
+import { Field } from "@/components/ui/field";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Copy, Pencil, Plus, Trash2 } from "lucide-react";
 import {
@@ -7,7 +8,6 @@ import {
   rolesApi,
   type AppRole,
   type PermissionEntry,
-  type RoleCreate,
   type RoleUpdate,
 } from "@/lib/api";
 import { zebraBodyCls } from "@/lib/utils";
@@ -21,6 +21,8 @@ import {
   GRANT_RESOURCE_TYPES,
 } from "@/lib/permissionVocabulary";
 import { FormError } from "@/components/ui/form-error";
+import { FreshRowError } from "@/components/FreshRowError";
+import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
 
 // What a new grant row offers: the shared vocabulary (lib/permissionVocabulary).
 // A role can hold more than these lists name — the built-in roles do
@@ -40,23 +42,6 @@ function withHeld(list: readonly string[], held: string): string[] {
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
 
-function Field({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-    </div>
-  );
-}
-
 function PermissionEditor({
   value,
   onChange,
@@ -64,6 +49,7 @@ function PermissionEditor({
   value: PermissionEntry[];
   onChange: (next: PermissionEntry[]) => void;
 }) {
+  const headingId = useId();
   function update(idx: number, patch: Partial<PermissionEntry>) {
     const next = value.slice();
     next[idx] = { ...next[idx], ...patch };
@@ -77,11 +63,14 @@ function PermissionEditor({
   }
 
   return (
-    <div className="space-y-2">
+    <div role="group" aria-labelledby={headingId} className="space-y-2">
       <div className="flex items-center justify-between">
-        <label className="text-xs font-medium text-muted-foreground">
+        <h3
+          id={headingId}
+          className="text-xs font-medium text-muted-foreground"
+        >
           Permissions
-        </label>
+        </h3>
         <button
           onClick={add}
           type="button"
@@ -101,6 +90,7 @@ function PermissionEditor({
           className="grid grid-cols-[110px_1fr_1fr_32px] gap-2 items-center"
         >
           <select
+            aria-label={`Action, row ${idx + 1}`}
             className={inputCls}
             value={p.action}
             onChange={(e) => update(idx, { action: e.target.value })}
@@ -110,6 +100,7 @@ function PermissionEditor({
             ))}
           </select>
           <select
+            aria-label={`Resource type, row ${idx + 1}`}
             className={inputCls}
             value={p.resource_type}
             onChange={(e) => update(idx, { resource_type: e.target.value })}
@@ -138,8 +129,12 @@ function PermissionEditor({
   );
 }
 
+// Edit reads the role when it opens: the row the list holds can be stale, and
+// the Save used to send the whole `permissions` list back, re-granting what
+// another administrator revoked since. It now sends only what was changed
+// against the row read here.
 function RoleModal({
-  role,
+  role: listed,
   onClose,
   canEdit = true,
 }: {
@@ -148,6 +143,34 @@ function RoleModal({
   /** #1341 — false for a caller without `admin` on `role`: the modal
    *  shows the role read-only, as it does a built-in one. */
   canEdit?: boolean;
+}) {
+  const qc = useQueryClient();
+  const fresh = useFreshRow<AppRole>(listed ?? undefined, () =>
+    refetchRow<AppRole>(qc, [["roles"]], (listed as AppRole).id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title={`Edit role — ${listed?.name ?? ""}`}
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return (
+    <RoleForm role={fresh.row ?? null} onClose={onClose} canEdit={canEdit} />
+  );
+}
+
+function RoleForm({
+  role,
+  onClose,
+  canEdit,
+}: {
+  role: AppRole | null;
+  onClose: () => void;
+  canEdit: boolean;
 }) {
   const qc = useQueryClient();
   const [name, setName] = useState(role?.name ?? "");
@@ -163,18 +186,22 @@ function RoleModal({
   const [stepTotp, setStepTotp] = useState("");
 
   const mutation = useMutation({
-    mutationFn: () => {
-      const payload: RoleCreate | RoleUpdate = {
-        name,
-        description,
-        permissions,
-      };
-      return role
-        ? rolesApi.update(role.id, {
-            ...(payload as RoleUpdate),
-            ...(needsStepUp ? stepUpBody(stepPassword, stepTotp) : {}),
-          })
-        : rolesApi.create(payload as RoleCreate);
+    mutationFn: async () => {
+      if (!role) return rolesApi.create({ name, description, permissions });
+      // Only what changed; an untouched Save sends nothing (#4452).
+      const diff = changedFields(
+        {
+          name: role.name,
+          description: role.description,
+          permissions: role.permissions,
+        },
+        { name, description, permissions },
+      ) as RoleUpdate;
+      if (Object.keys(diff).length === 0 && !needsStepUp) return null;
+      return rolesApi.update(role.id, {
+        ...diff,
+        ...(needsStepUp ? stepUpBody(stepPassword, stepTotp) : {}),
+      });
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["roles"] });

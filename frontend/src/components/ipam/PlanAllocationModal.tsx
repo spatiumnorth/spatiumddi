@@ -11,6 +11,7 @@ import {
   formatApiError,
 } from "@/lib/api";
 import { FormError } from "@/components/ui/form-error";
+import { defaultPlanPrefix } from "@/lib/plan-allocation";
 
 interface RowDraft {
   count: string;
@@ -24,7 +25,8 @@ function isV6(block: IPBlock): boolean {
 /**
  * Address planner — operator enters one or more sized requests
  * (e.g. "4 × /24, 2 × /26") and the backend returns a packed
- * allocation preview using the smallest-fitting-free heuristic.
+ * allocation preview (largest first, each in the lowest-addressed free range
+ * that fits).
  *
  * No writes happen here; this is purely a visualisation tool. The
  * operator copies the suggested CIDRs back into the existing
@@ -45,7 +47,7 @@ export function PlanAllocationModal({
   const [rows, setRows] = useState<RowDraft[]>([
     {
       count: "4",
-      prefix_len: String(Math.min(blockPrefix + 8, maxPrefix)),
+      prefix_len: defaultPlanPrefix(v6, blockPrefix),
     },
   ]);
   const [result, setResult] = useState<PlanAllocationResponse | null>(null);
@@ -90,7 +92,7 @@ export function PlanAllocationModal({
   function addRow() {
     setRows((prev) => [
       ...prev,
-      { count: "1", prefix_len: String(Math.min(blockPrefix + 8, maxPrefix)) },
+      { count: "1", prefix_len: defaultPlanPrefix(v6, blockPrefix) },
     ]);
   }
 
@@ -103,7 +105,9 @@ export function PlanAllocationModal({
       <div className="space-y-4">
         <p className="text-xs text-muted-foreground">
           Pack requested subnet sizes into this block's free space using a
-          largest-first best-fit heuristic. Preview only — nothing is written.
+          largest-first first-fit heuristic: each subnet goes in the
+          lowest-addressed free range that holds it. Preview only — nothing is
+          written.
         </p>
 
         <div className="rounded-md border">

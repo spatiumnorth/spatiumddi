@@ -5,7 +5,7 @@ subnet, placeholder addresses, reverse zone or DHCP scope is created; subnet
 creation refuses overlapping space while the hold is active.
 
 Revision ID: c4e8a1d7b392
-Revises: b6d2e9f41a07
+Revises: d8b3f6a1c274
 Create Date: 2026-11-19
 """
 
@@ -17,7 +17,7 @@ from sqlalchemy.dialects import postgresql
 from alembic import op
 
 revision: str = "c4e8a1d7b392"
-down_revision: str | None = "b6d2e9f41a07"
+down_revision: str | None = "d8b3f6a1c274"
 branch_labels: str | None = None
 depends_on: str | None = None
 

@@ -15,10 +15,11 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.dns import DNSRecord, DNSZone
+from app.models.dns import DNSRecord, DNSView, DNSZone
+from app.services.dns.cname_conflict import describe_cname_conflict, find_cname_conflict
 
 
 def _norm(name: str) -> str:
@@ -30,17 +31,32 @@ def _norm(name: str) -> str:
 
 
 async def find_parent_zone(
-    db: AsyncSession, group_id: uuid.UUID, child_name: str
+    db: AsyncSession,
+    group_id: uuid.UUID,
+    child_name: str,
+    child_view_id: uuid.UUID | None,
 ) -> DNSZone | None:
-    """Return the longest-suffix-matching zone in the same group.
+    """Return the longest-suffix-matching zone in the same group and view.
 
     Compares against every zone whose name is a strict suffix of ``child_name``
     (excluding the child itself). Returns the zone with the longest name when
     multiple suffixes match — that's the immediate parent. Forward zones are
     not eligible parents (they don't carry records).
+
+    A group may hold one zone of a name per view (#4389), and a zone pinned to
+    a view renders into that view alone, so the parent is looked up in the
+    child's own view: a child pinned to a view takes a parent pinned to that
+    view (or, failing that, one pinned to none, which renders in every view);
+    a child pinned to none takes only a parent pinned to none. A zone of
+    another view is never a parent, however its name matches.
     """
     child = _norm(child_name)
-    res = await db.execute(select(DNSZone).where(DNSZone.group_id == group_id))
+    stmt = select(DNSZone).where(DNSZone.group_id == group_id)
+    if child_view_id is None:
+        stmt = stmt.where(DNSZone.view_id.is_(None))
+    else:
+        stmt = stmt.where(or_(DNSZone.view_id.is_(None), DNSZone.view_id == child_view_id))
+    res = await db.execute(stmt)
     candidates: list[DNSZone] = []
     for z in res.scalars().all():
         if z.zone_type == "forward":
@@ -54,8 +70,29 @@ async def find_parent_zone(
             candidates.append(z)
     if not candidates:
         return None
-    candidates.sort(key=lambda z: len(z.name), reverse=True)
+    # Longest name first; at one name the zone pinned to the child's own view
+    # beats an unpinned one.
+    candidates.sort(
+        key=lambda z: (len(z.name), child_view_id is not None and z.view_id == child_view_id),
+        reverse=True,
+    )
     return candidates[0]
+
+
+def unauthored_parent_reason(parent: DNSZone) -> str | None:
+    """Why ``parent`` cannot take the delegation's NS + glue records, or None (#4258).
+
+    The records are written into the parent, and only a primary zone is one
+    SpatiumDDI serves records from (#3838): a secondary's or stub's data is its
+    masters', so a record written there would be served by nobody.
+    """
+    zone_type = parent.zone_type or "primary"
+    if zone_type == "primary":
+        return None
+    return (
+        f"The parent zone {parent.name.rstrip('.')} is a {zone_type} zone, served from "
+        "its masters: add the delegation on the primary server."
+    )
 
 
 def child_label_in_parent(parent: DNSZone, child: DNSZone) -> str:
@@ -103,11 +140,39 @@ class DelegationPreview:
     # Operator-facing diagnostics surfaced even though apply still works.
     warnings: list[str] = field(default_factory=list)
     child_apex_ns_count: int = 0
+    # The view the parent is pinned to (None: it renders in every view) (#4389).
+    parent_view_name: str | None = None
+    # Rows that would sit beside a CNAME in the parent (#4388): left out of the
+    # lists above, and the apply refuses while any is here.
+    cname_conflicts: list[str] = field(default_factory=list)
 
 
 async def _load_records(db: AsyncSession, zone_id: uuid.UUID) -> list[DNSRecord]:
     res = await db.execute(select(DNSRecord).where(DNSRecord.zone_id == zone_id))
     return list(res.scalars().all())
+
+
+async def _blocked_by_cname(
+    db: AsyncSession, parent: DNSZone, preview: DelegationPreview, rec: _PendingRecord
+) -> bool:
+    """Whether ``rec`` meets a CNAME at its name in the parent (#4388).
+
+    The record API refuses a row beside a CNAME (409) because BIND refuses the
+    whole zone file ("CNAME and other data"); a delegation holds its rows to
+    the same rule. The row is written with no view of its own, so it meets a
+    CNAME of any view. The reason lands in ``preview.cname_conflicts``.
+    """
+    fqdn = f"{rec.name}.{parent.name}" if rec.name != "@" else parent.name
+    conflict = await find_cname_conflict(
+        db, parent.id, view_id=None, name=rec.name, record_type=rec.record_type
+    )
+    if conflict is None:
+        return False
+    preview.cname_conflicts.append(
+        describe_cname_conflict(rec.record_type, fqdn, conflict)
+        + " Delete or rename that CNAME first, then delegate."
+    )
+    return True
 
 
 async def compute_delegation(
@@ -127,6 +192,10 @@ async def compute_delegation(
         child_zone_name=child.name,
         child_label=label,
     )
+
+    if parent.view_id is not None:
+        view = await db.get(DNSView, parent.view_id)
+        preview.parent_view_name = view.name if view is not None else None
 
     child_records = await _load_records(db, child.id)
     parent_records = await _load_records(db, parent.id)
@@ -155,7 +224,7 @@ async def compute_delegation(
         )
         if ns_value.rstrip(".").lower() in parent_ns_at_label:
             preview.existing_ns_records.append(rec)
-        else:
+        elif not await _blocked_by_cname(db, parent, preview, rec):
             preview.ns_records_to_create.append(rec)
 
     glue_seen: set[tuple[str, str, str]] = set()
@@ -197,7 +266,7 @@ async def compute_delegation(
             )
             if existing:
                 preview.existing_glue_records.append(rec)
-            else:
+            elif not await _blocked_by_cname(db, parent, preview, rec):
                 preview.glue_records_to_create.append(rec)
 
     return preview
@@ -224,4 +293,6 @@ def preview_to_dict(p: DelegationPreview) -> dict[str, Any]:
         "existing_glue_records": _list(p.existing_glue_records),
         "warnings": p.warnings,
         "child_apex_ns_count": p.child_apex_ns_count,
+        "parent_view_name": p.parent_view_name,
+        "cname_conflicts": p.cname_conflicts,
     }
