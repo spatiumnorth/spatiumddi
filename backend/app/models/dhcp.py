@@ -353,6 +353,10 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # carries the field. Read by the server-list chip and the
     # ``agent_spool_trimmed`` alert.
     spool_status: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # #4193 — the agent's actual memory use as last reported on the heartbeat
+    # (container used / peak / limit, Kea's and the agent's RSS, reported_at).
+    # NULL = never reported: UNKNOWN, never 0.
+    memory_status: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     # #1067 — the agent's own word about the Kea daemon, reported on every
     # heartbeat (``daemon: {status, reason}``; sync.py sets ``degraded`` when a
     # control socket is unreachable or a config was rejected, ``ok`` after a

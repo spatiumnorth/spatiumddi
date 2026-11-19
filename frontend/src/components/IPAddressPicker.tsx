@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Search, X } from "lucide-react";
 import { searchApi } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { useFieldControl } from "@/components/ui/field";
 import { closePopupOnEscape } from "@/components/ui/use-draggable-modal";
 
 /**
@@ -34,6 +35,7 @@ export function IPAddressPicker({
   disabled?: boolean;
   className?: string;
 }) {
+  const fieldControl = useFieldControl();
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [open, setOpen] = useState(false);
@@ -91,6 +93,7 @@ export function IPAddressPicker({
       <div className="relative">
         <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
         <input
+          {...fieldControl}
           type="text"
           value={query}
           onChange={(e) => {

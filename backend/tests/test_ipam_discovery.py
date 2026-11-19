@@ -260,3 +260,38 @@ async def test_reconcile_recounts_subnet_and_block_on_insert(db_session: AsyncSe
     await db_session.refresh(block)
     # A block counts its subnets' network + broadcast too (#2982).
     assert block.allocated_ips == 4
+
+
+async def test_duplicate_queued_during_sweep_skips_repeat_sweep(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#4432: the dispatcher re-queues a due subnet every tick while its sweep
+    runs; the deferred copy must not run a full repeat sweep once the first
+    has stamped ``last_discovery_at``. An on-demand run (no stamp) still does."""
+    from app.tasks import ipam_discovery as task
+
+    subnet = await _make_subnet(db_session)
+    await db_session.commit()
+    sid = str(subnet.id)
+
+    sweeps: list[str] = []
+
+    async def fake_sweep(network: str) -> SweepResult:
+        sweeps.append(network)
+        return SweepResult(ping_alive={"192.0.2.9"}, arp={})
+
+    monkeypatch.setattr(task, "sweep_subnet", fake_sweep)
+
+    # Both copies were dispatched while the subnet had never been swept.
+    dispatched_at = datetime.now(UTC).isoformat()
+    first = await task._run_subnet_discovery_async(sid, dispatched_at)
+    assert first["status"] == "ok"
+    second = await task._run_subnet_discovery_async(sid, dispatched_at)
+    assert second == {"status": "skipped", "reason": "no_longer_due"}
+    assert len(sweeps) == 1
+
+    # A later dispatch (new tick after the interval) and an on-demand run both sweep.
+    later = (datetime.now(UTC) + timedelta(minutes=10)).isoformat()
+    assert (await task._run_subnet_discovery_async(sid, later))["status"] == "ok"
+    assert (await task._run_subnet_discovery_async(sid))["status"] == "ok"
+    assert len(sweeps) == 3

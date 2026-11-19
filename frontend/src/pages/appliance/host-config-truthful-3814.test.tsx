@@ -52,3 +52,24 @@ describe("host-config apply health", () => {
     expect(screen.queryByText(/retrying/)).toBeNull();
   });
 });
+
+describe("host-config apply health reason (#4416)", () => {
+  it("shows the host runner's refusal", { timeout: 30000 }, () => {
+    render(
+      <ApplianceHostConfigHealthSection
+        row={row({
+          timezone: {
+            state: "failing",
+            attempts: 3,
+            at: null,
+            reason: "unknown_timezone",
+            requested: "US/Pacific",
+          },
+        })}
+      />,
+    );
+    const text = document.body.textContent ?? "";
+    expect(text).toContain('Host refused "US/Pacific"');
+    expect(text).toContain("unknown timezone");
+  });
+});

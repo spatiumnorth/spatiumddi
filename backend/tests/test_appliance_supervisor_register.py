@@ -364,10 +364,12 @@ async def test_register_is_idempotent_for_same_pubkey(
     )
     assert second_claims == []
 
-    # Version was updated on the existing row.
+    # An unsigned re-register leaves the stored version alone.
+    await db_session.rollback()
     appliance = await db_session.get(Appliance, uuid.UUID(first_id))
     assert appliance is not None
-    assert appliance.supervisor_version == "2026.05.14-2"
+    await db_session.refresh(appliance)
+    assert appliance.supervisor_version == "2026.05.14-1"
 
 
 @pytest.mark.asyncio
