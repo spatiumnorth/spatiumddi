@@ -1,3 +1,5 @@
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -501,26 +503,30 @@ function SitesTab({ overlayId }: { overlayId: string }) {
         />
       )}
       {editing && (
-        <SiteEditorModal
-          overlayId={overlayId}
-          existing={editing}
+        <FreshEdit
+          row={editing}
+          queryKeys={[["overlay-sites", overlayId]]}
+          title="Edit overlay site"
           onClose={() => setEditing(null)}
-        />
+        >
+          {(fresh) => (
+            <SiteEditorModal
+              overlayId={overlayId}
+              existing={fresh}
+              onClose={() => setEditing(null)}
+            />
+          )}
+        </FreshEdit>
       )}
       <ConfirmModal
         open={confirmDetachId !== null}
         title="Detach site"
         loading={detach.isPending}
-        message={
-          <>
-            Detach this site from the overlay?
-            {detach.isError && (
-              <span role="alert" className="mt-2 block text-destructive">
-                Could not detach the site:{" "}
-                {formatApiError(detach.error, "the request failed")}
-              </span>
-            )}
-          </>
+        message={<>Detach this site from the overlay?</>}
+        error={
+          detach.isError
+            ? `Could not detach the site: ${formatApiError(detach.error, "the request failed")}`
+            : null
         }
         confirmLabel="Detach"
         tone="destructive"
@@ -732,7 +738,10 @@ function SiteEditorModal({
         notes,
       };
       if (existing) {
-        return overlaysApi.updateSite(overlayId, existing.id, body);
+        // Only what changed against the row read when the dialog opened (#4379).
+        const changed = changedFields(existing, body);
+        if (Object.keys(changed).length === 0) return existing;
+        return overlaysApi.updateSite(overlayId, existing.id, changed);
       }
       return overlaysApi.attachSite(overlayId, { site_id: siteId, ...body });
     },
@@ -979,6 +988,7 @@ function PoliciesTab({ overlayId }: { overlayId: string }) {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["overlay-policies", overlayId] });
       qc.invalidateQueries({ queryKey: ["overlay", overlayId] });
+      setConfirm(null);
     },
     // A 404 means the policy is already gone: re-read so it leaves the list.
     onError: () =>
@@ -1151,11 +1161,20 @@ function PoliciesTab({ overlayId }: { overlayId: string }) {
         />
       )}
       {editing && (
-        <PolicyEditorModal
-          overlayId={overlayId}
-          existing={editing}
+        <FreshEdit
+          row={editing}
+          queryKeys={[["overlay-policies", overlayId]]}
+          title="Edit routing policy"
           onClose={() => setEditing(null)}
-        />
+        >
+          {(fresh) => (
+            <PolicyEditorModal
+              overlayId={overlayId}
+              existing={fresh}
+              onClose={() => setEditing(null)}
+            />
+          )}
+        </FreshEdit>
       )}
       <ConfirmModal
         open={confirm !== null}
@@ -1163,11 +1182,15 @@ function PoliciesTab({ overlayId }: { overlayId: string }) {
         message={`Delete policy "${confirm?.name ?? ""}"?`}
         confirmLabel="Delete"
         tone="destructive"
-        onConfirm={() => {
-          confirm?.onConfirm();
+        loading={remove.isPending}
+        error={
+          remove.error ? formatApiError(remove.error, "Delete failed") : null
+        }
+        onConfirm={() => confirm?.onConfirm()}
+        onClose={() => {
           setConfirm(null);
+          remove.reset();
         }}
-        onClose={() => setConfirm(null)}
       />
     </div>
   );
@@ -1227,7 +1250,10 @@ function PolicyEditorModal({
         notes,
       };
       if (existing) {
-        return overlaysApi.updatePolicy(overlayId, existing.id, body);
+        // Only what changed against the row read when the dialog opened (#4379).
+        const changed = changedFields(existing, body);
+        if (Object.keys(changed).length === 0) return existing;
+        return overlaysApi.updatePolicy(overlayId, existing.id, changed);
       }
       return overlaysApi.createPolicy(overlayId, body as RoutingPolicyCreate);
     },

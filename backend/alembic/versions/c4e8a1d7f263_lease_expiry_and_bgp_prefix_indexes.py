@@ -8,7 +8,7 @@
   reachability, the route list's prefix filter), which a btree cannot serve.
 
 Revision ID: c4e8a1d7f263
-Revises: b6d2e9f41a07
+Revises: d8b3f6a1c274
 Create Date: 2026-11-18 10:00:00.000000
 """
 
@@ -17,7 +17,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "c4e8a1d7f263"
-down_revision = "b6d2e9f41a07"
+down_revision = "d8b3f6a1c274"
 branch_labels = None
 depends_on = None
 

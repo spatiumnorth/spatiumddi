@@ -517,6 +517,44 @@ async def test_revoke_account_kills_credentials(
     assert resp.status_code == 401
 
 
+# ── Zone in the Trash (#4335) ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_list_and_revoke_with_zone_in_trash(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, token = await _make_user(db_session)
+    hdr = {"Authorization": f"Bearer {token}"}
+    _live_zone, live_creds = await _register_account(client, db_session, token)
+    trashed_zone, creds = await _register_account(client, db_session, token)
+    trashed_zone.deleted_at = datetime.now(UTC)
+    await db_session.commit()
+
+    resp = await client.get("/api/v1/acme/accounts", headers=hdr)
+    assert resp.status_code == 200
+    by_user = {a["username"]: a for a in resp.json()}
+    assert by_user[creds["username"]]["zone_in_trash"] is True
+    assert by_user[creds["username"]]["fulldomain"] == creds["fulldomain"]
+    assert by_user[live_creds["username"]]["zone_in_trash"] is False
+
+    # /update must not write into a zone in the Trash.
+    resp = await client.post(
+        "/api/v1/acme/update",
+        json={"subdomain": creds["subdomain"], "txt": "whatever"},
+        headers={"X-Api-User": creds["username"], "X-Api-Key": creds["password"]},
+    )
+    assert resp.status_code == 409
+
+    resp = await client.delete(
+        f"/api/v1/acme/accounts/{by_user[creds['username']]['id']}", headers=hdr
+    )
+    assert resp.status_code == 204
+    resp = await client.get("/api/v1/acme/accounts", headers=hdr)
+    assert resp.status_code == 200
+    assert [a["username"] for a in resp.json()] == [live_creds["username"]]
+
+
 # ── HTTP: DELETE /update (cleanup) ─────────────────────────────────
 
 
