@@ -7,7 +7,7 @@ spatium-control HelmChartConfig. ``{}`` (the default) means unset, which is
 asynchronous replication exactly as before, so this is purely additive.
 
 Revision ID: d4a8c27e91f3
-Revises: b6d2e9f41a07
+Revises: d8b3f6a1c274
 Create Date: 2026-11-19
 """
 
@@ -19,7 +19,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from alembic import op
 
 revision: str = "d4a8c27e91f3"
-down_revision: str | None = "b6d2e9f41a07"
+down_revision: str | None = "d8b3f6a1c274"
 branch_labels: str | None = None
 depends_on: str | None = None
 

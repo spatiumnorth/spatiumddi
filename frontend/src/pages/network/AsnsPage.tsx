@@ -508,7 +508,9 @@ export function AsnsPage() {
               Clear
             </button>
             {bulkError && (
-              <span className="ml-2 text-xs text-red-600">{bulkError}</span>
+              <span role="alert" className="ml-2 text-xs text-red-600">
+                {bulkError}
+              </span>
             )}
           </div>
         )}
@@ -537,8 +539,10 @@ export function AsnsPage() {
                     setSearch("");
                     setTagFilters([]);
                   }}
+                  gate={writeGate}
+                  hint="Add one to start the registry."
                 >
-                  No ASNs tracked yet — add one to start the registry.
+                  No ASNs tracked yet.
                 </ListEmpty>
               </p>
               <button

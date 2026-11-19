@@ -36,7 +36,10 @@ from app.core.exc_text import describe_exc
 from app.core.header_credentials import header_credential_problem, header_secret
 from app.core.permissions import require_resource_permission
 from app.core.ssrf import assert_safe_target
-from app.core.stored_secret_guard import require_secret_with_destination_change
+from app.core.stored_secret_guard import (
+    require_secret_for_changed_connection,
+    require_secret_with_destination_change,
+)
 from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace
@@ -612,6 +615,7 @@ async def update_cluster(
         changes,
         destination=["api_server_url"],
         secrets={"token": c.token_encrypted},
+        blank_keeps=("token",),
     )
     new_ipam = changes.get("ipam_space_id", c.ipam_space_id)
     new_dns = changes.get("dns_group_id", c.dns_group_id)
@@ -721,6 +725,12 @@ async def test_connection(
         stored = await db.get(KubernetesCluster, body.cluster_id)
         if stored is None:
             raise HTTPException(status_code=404, detail="Cluster not found")
+        require_secret_for_changed_connection(
+            stored,
+            {"api_server_url": body.api_server_url, "token": body.token},
+            destination=("api_server_url",),
+            secrets={"token": stored.token_encrypted},
+        )
         api_server_url = api_server_url or stored.api_server_url
         ca_bundle_pem = ca_bundle_pem if ca_bundle_pem is not None else stored.ca_bundle_pem
         if not token:
@@ -781,6 +791,12 @@ async def detect_cidrs(body: DetectCIDRsRequest, db: DB, _: SuperAdmin) -> Detec
         stored = await db.get(KubernetesCluster, body.cluster_id)
         if stored is None:
             raise HTTPException(status_code=404, detail="Cluster not found")
+        require_secret_for_changed_connection(
+            stored,
+            {"api_server_url": body.api_server_url, "token": body.token},
+            destination=("api_server_url",),
+            secrets={"token": stored.token_encrypted},
+        )
         api_server_url = api_server_url or stored.api_server_url
         ca_bundle_pem = ca_bundle_pem if ca_bundle_pem is not None else stored.ca_bundle_pem
         if not token:

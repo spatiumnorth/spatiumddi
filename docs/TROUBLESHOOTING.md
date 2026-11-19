@@ -35,20 +35,51 @@ that no longer exists it responds with **404**; the agent treats 401 *or*
 (`DNS_AGENT_KEY` / `DHCP_AGENT_KEY`). A fresh server row appears in the
 GUI within a heartbeat cycle (~30 s by default).
 
-**When the auto-recovery is enough** — just wait. No manual steps.
+**When the auto-recovery is enough** — just wait. No manual steps. This
+holds only while agent approval is off (the default); see the approval
+bullet below.
 
 **When you need to intervene**
 
-- *The pre-shared key was rotated on the server.* The agent's bootstrap
-  request will be rejected. Update the `DNS_AGENT_KEY` or
-  `DHCP_AGENT_KEY` env var on the agent container (matching the value in
-  SpatiumDDI settings) and restart:
+- *Agent approval is on* (`DNS_REQUIRE_AGENT_APPROVAL=true` /
+  `DHCP_REQUIRE_AGENT_APPROVAL=true` on the control plane). The agent
+  re-registers, but the new row comes back **pending approval** and
+  the agent gets no config (its config poll answers
+  `pending_approval`) until an operator approves it. For DHCP use
+  **Approve** on the server in the DHCP page (or
+  `POST /api/v1/dhcp/servers/{id}/approve`). The DNS console has no Approve
+  button, so approve a DNS server through the API:
+  `POST /api/v1/dns/groups/{group_id}/servers/{server_id}/approve`.
 
-  ```bash
-  docker compose restart dns-bind9
-  # or
-  docker compose restart dhcp-kea
-  ```
+- *The pre-shared key was rotated on the server.* The agent's bootstrap
+  request will be rejected. The agent needs the new key in its
+  environment, and how that gets there depends on the deployment:
+
+  - **Docker Compose.** Set the new value in `.env` (`DNS_AGENT_KEY` /
+    `DHCP_AGENT_KEY`, the same values the api container has) and
+    **recreate** the agent. `docker compose restart` reuses the
+    environment the container was created with, so it would keep the old
+    key:
+
+    ```bash
+    docker compose up -d dns-bind9
+    # or
+    docker compose up -d dhcp-kea
+    ```
+
+    On the DHCP container the variable is `SPATIUM_AGENT_KEY`; the
+    compose file fills it from the host's `DHCP_AGENT_KEY`.
+  - **Standalone agent files** (`docker-compose.agent-dhcp.yml`): the host
+    variable is `SPATIUM_AGENT_KEY` itself; set it and run
+    `docker compose -f docker-compose.agent-dhcp.yml up -d`.
+  - **Appliance.** The supervisor delivers the agent keys with the role
+    assignment; there is no key to edit on the host. The control plane's
+    keys are the source; after changing them, the supervisor hands the
+    new values to the service containers on its next role assignment.
+  - **Kubernetes (Helm).** Update `dnsAgents.agentKey` /
+    `dhcpAgents.agentKey` (the `value`, or the Secret named by
+    `existingSecret`, keys `DNS_AGENT_KEY` / `SPATIUM_AGENT_KEY`), then
+    `helm upgrade` the release and restart the agent pods so they read it.
 
 - *Auto-recovery appears stuck.* Force a clean re-bootstrap by wiping
   the cached credentials and restarting the container. The config cache
@@ -79,7 +110,8 @@ GUI within a heartbeat cycle (~30 s by default).
 **What doesn't come back automatically**
 
 The re-bootstrapped server row inherits the agent's environment
-variables (`SERVER_NAME`, `AGENT_GROUP`, `AGENT_ROLES`), **not** any
+variables (`SERVER_NAME`, `AGENT_GROUP`, `AGENT_ROLES` for the DNS
+agent; `SPATIUM_SERVER_NAME` and its siblings for the DHCP agent), **not** any
 settings that had been edited in the GUI. Notes, credentials for Path B
 drivers, per-server overrides, or TSIG keys that were rotated via the
 UI all need to be re-applied on the new row.
@@ -87,7 +119,8 @@ UI all need to be re-applied on the new row.
 Zones and records attached to a DNS server group, and DHCP scopes /
 pools attached via `subnet_id`, are *not* lost — they live on the group
 and subnet rows, not on the individual server. Deleting + recreating the
-server just re-attaches the running agent to the same group config.
+server just re-attaches the running agent to the same group config
+(once approved, if agent approval is on).
 
 ---
 
@@ -301,6 +334,15 @@ permanent (hard) delete path, which refuses unless you either:
   same pre-delete cleanup still runs — agentless Windows DHCP gets a
   WinRM remove-scope, agent-based Kea gets its bundle ETag bumped — so
   no lease is orphaned on a running server.
+
+Two refusals are not cleared by either of those:
+
+- **Only a superadmin can delete permanently.** Anyone else gets `403`,
+  whatever the subnet holds.
+- **An E911 location binding blocks the delete, `force` or not.** If a
+  binding points at the subnet, or at any address in it, the delete is
+  refused with its own `409` that `?force=true` never skips. Remove the
+  binding first (Network, E911, Bindings), then retry.
 
 System placeholder rows (the `.0` network and `.255` broadcast, and the reserved
 "Gateway" row while it is still untouched) and
@@ -559,17 +601,35 @@ health).
 
 Split them in about a minute:
 
+Deployment and namespace names depend on how the chart was installed. The
+Helm chart names them `FULLNAME-beat` / `FULLNAME-worker`, where `FULLNAME` is
+the release name if it contains `spatiumddi`, else `RELEASE-spatiumddi`.
+
+| Deployment | Beat | Worker | Namespace |
+|---|---|---|---|
+| Appliance (release `spatium-control`) | `spatium-control-spatiumddi-beat` | `spatium-control-spatiumddi-worker` | `spatium` |
+| Helm, as in `docs/deployment/KUBERNETES.md` (release `ddi`) | `ddi-spatiumddi-beat` | `ddi-spatiumddi-worker` | `spatiumddi` |
+| Helm, any other release `R` in namespace `N` | `R-spatiumddi-beat` | `R-spatiumddi-worker` | `N` |
+| Raw manifests (`k8s/base/`) | `beat` | `worker` | `spatiumddi` |
+| Docker Compose | service `beat` | service `worker` | n/a |
+
+The commands below use the appliance's names; substitute yours. On the
+appliance host run them as `sudo k3s kubectl ...`.
+
 ```bash
 # 1. Is beat scheduling? Look for the send line, once per 30 s.
-kubectl -n spatiumddi logs deploy/spatiumddi-beat --tail=20 | grep 'Sending due task'
+kubectl -n spatium logs deploy/spatium-control-spatiumddi-beat --tail=20 | grep 'Sending due task'
 docker compose logs --tail=20 beat | grep 'Sending due task'      # compose
 
 # 2. Is a worker executing it? Look for the matching succeeded line.
-kubectl -n spatiumddi logs deploy/spatiumddi-worker --tail=50 | grep beat_tick
+kubectl -n spatium logs deploy/spatium-control-spatiumddi-worker --tail=50 | grep beat_tick
+docker compose logs --tail=50 worker | grep beat_tick             # compose
 
 # 3. Can the pool run anything at all? active == concurrency means it can't.
-kubectl -n spatiumddi exec deploy/spatiumddi-worker -- \
+kubectl -n spatium exec deploy/spatium-control-spatiumddi-worker -- \
   celery -A app.celery_app inspect active --timeout 5
+docker compose exec worker \
+  celery -A app.celery_app inspect active --timeout 5             # compose
 ```
 
 | What you see | Where the fault is |

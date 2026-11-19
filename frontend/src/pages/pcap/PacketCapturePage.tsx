@@ -649,7 +649,8 @@ function Stat({ label, value }: { label: string; value: string }) {
   );
 }
 
-function ResultTab({ captureId }: { captureId: string | null }) {
+export function ResultTab({ captureId }: { captureId: string | null }) {
+  const canCapture = usePermissions().can("write", "manage_packet_capture");
   const { data } = useQuery({
     enabled: !!captureId,
     queryKey: ["pcap-capture", captureId],
@@ -666,7 +667,8 @@ function ResultTab({ captureId }: { captureId: string | null }) {
   if (!data) {
     return (
       <p className="text-xs text-muted-foreground">
-        Nothing to show yet. Click a row in History or run a capture.
+        Nothing to show yet. Click a row in History
+        {canCapture && " or run a capture"}.
       </p>
     );
   }

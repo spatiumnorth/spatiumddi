@@ -13,7 +13,8 @@
  * custom role's Edit dialog showed the same wrong values.
  *
  * The contract: every grant row shows the action and the resource type the
- * role stores, built-in or custom, and an untouched row is saved as stored.
+ * role stores, built-in or custom, and an untouched grant list is not sent
+ * back (#4236).
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -131,7 +132,8 @@ async function openDialog(role: { name: string; is_builtin: boolean }) {
   fireEvent.click(
     within(row).getByTitle(role.is_builtin ? "View" : "Edit", { exact: true }),
   );
-  const dialogs = screen.getAllByRole("dialog");
+  // The dialog reads the role first, then shows it.
+  const dialogs = await screen.findAllByRole("dialog");
   return dialogs[dialogs.length - 1];
 }
 
@@ -169,7 +171,23 @@ describe("Roles: a role's dialog shows the grants it holds", () => {
     },
   );
 
-  it("saves a custom role's untouched grants as stored", async () => {
+  it("does not send a custom role's untouched grants", async () => {
+    const update = vi.fn(async () => ({}));
+    answers.rolesApi = { list: async () => [CUSTOM], update };
+    show(<RolesPage />);
+
+    const dialog = await openDialog(CUSTOM);
+    // Only what was changed is sent (#4236): an untouched grant list is not.
+    fireEvent.change(within(dialog).getByDisplayValue("NAT desk"), {
+      target: { value: "NAT desk 2" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: /^Save$/ }));
+
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
+    expect(update).toHaveBeenCalledWith(CUSTOM.id, { name: "NAT desk 2" });
+  });
+
+  it("an untouched Save sends nothing and closes (#4452)", async () => {
     const update = vi.fn(async () => ({}));
     answers.rolesApi = { list: async () => [CUSTOM], update };
     show(<RolesPage />);
@@ -177,10 +195,9 @@ describe("Roles: a role's dialog shows the grants it holds", () => {
     const dialog = await openDialog(CUSTOM);
     fireEvent.click(within(dialog).getByRole("button", { name: /^Save$/ }));
 
-    await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
-    expect(update).toHaveBeenCalledWith(
-      CUSTOM.id,
-      expect.objectContaining({ permissions: CUSTOM.permissions }),
+    await waitFor(() =>
+      expect(screen.queryAllByRole("dialog")).toHaveLength(0),
     );
+    expect(update).not.toHaveBeenCalled();
   });
 });
