@@ -232,6 +232,11 @@ ADMIN_PASSWORD=""
 # When set, do_install feeds it through `chpasswd -e` instead of the
 # plaintext ADMIN_PASSWORD. Mutually exclusive with ADMIN_PASSWORD.
 ADMIN_PASSWORD_HASH=""
+# #4548 — bcrypt hash of the web UI's `admin` password, in the backend's own
+# format. Empty means the web UI keeps its built-in admin / admin account with
+# a forced change at first login. Only ever a HASH: it is written to STATE
+# (0600) and handed to the control plane by firstboot, never logged.
+WEB_ADMIN_PASSWORD_HASH=""
 # #995 item 12 — whether root gets the admin password as well. Default no:
 # root is locked (`passwd -l`) and the operator uses sudo. This CHANGES
 # the previous behaviour, where root always got it.
@@ -2305,6 +2310,74 @@ _check_field_stdin() {
     esac
 }
 
+# #4548 — bcrypt-hash a web UI password read from stdin. The backend verifies
+# with bcrypt (app/core/security.py), so the hash has to be one; python3-bcrypt
+# is in the image for this. Prints the hash only; the caller must have tracing
+# off, because `VAR=$(...)` is traced WITH its value. Fails (rc 1, no output)
+# when bcrypt is unavailable, and the caller then leaves the web UI on its
+# default account rather than inventing a weaker hash format.
+_hash_web_password() {
+    python3 -c '
+import sys
+import bcrypt
+pw = sys.stdin.buffer.read()[:72]
+sys.stdout.write(bcrypt.hashpw(pw, bcrypt.gensalt()).decode())
+' 2>>"$INSTALL_LOG"
+}
+
+# #4548 — the web UI admin password, asked after the OS password. Only the
+# first node has a web UI. Default yes: reuse the OS password. Tracing is OFF
+# on entry (the caller holds it off for the password loop) and stays off.
+# Reads the plaintext from $1 (the OS password just accepted).
+_ask_web_admin_password() {
+    local os_pw="$1" w1 w2 werr h=""
+    # An additional node has no web UI: nothing to ask.
+    [ "$ROLE" = "appliance" ] && return 0
+    if whiptail --backtitle "$BACKTITLE" --title "Web UI admin password" \
+        --yes-button "Use it" --no-button "Choose another" \
+        --yesno "Use this same password for the web UI's 'admin' account?\n\nThe web UI is the browser interface on https://<this host>/. Setting it now means nobody has to set it at first login.\n\nChoose 'Choose another' to give the web UI its own password." \
+        15 70; then
+        h=$(printf '%s' "$os_pw" | _hash_web_password) || h=""
+    else
+        while true; do
+            w1=$(whiptail --backtitle "$BACKTITLE" --title "Web UI admin password" \
+                --passwordbox "Password for the web UI 'admin' account." 10 64 \
+                3>&1 1>&2 2>&3) || return 1
+            w2=$(whiptail --backtitle "$BACKTITLE" --title "Confirm password" \
+                --passwordbox "Repeat:" 10 60 3>&1 1>&2 2>&3) || return 1
+            if [ "$w1" != "$w2" ]; then
+                whiptail --backtitle "$BACKTITLE" \
+                    --msgbox "Passwords don't match. Try again." 8 50 || true
+                continue
+            fi
+            if ! werr=$(_check_field_stdin admin_password "$w1" admin "$HOSTNAME"); then
+                whiptail --backtitle "$BACKTITLE" --title "Password not accepted" \
+                    --msgbox "$werr" 12 66 || true
+                continue
+            fi
+            if [ -n "$werr" ]; then
+                if ! whiptail --backtitle "$BACKTITLE" --title "Weak password" \
+                    --defaultno --yes-button "Use it anyway" --no-button "Change it" \
+                    --yesno "$werr"$'\n\n'"Use this password anyway?" 13 66; then
+                    continue
+                fi
+            fi
+            h=$(printf '%s' "$w1" | _hash_web_password) || h=""
+            break
+        done
+    fi
+    if [ -n "$h" ]; then
+        WEB_ADMIN_PASSWORD_HASH="$h"
+        log "Web UI admin password will be set from the installer"
+    else
+        WEB_ADMIN_PASSWORD_HASH=""
+        log "WARN: could not hash the web UI password (python3 bcrypt missing?); the web UI keeps admin / admin"
+        whiptail --backtitle "$BACKTITLE" --title "Web UI password not set" \
+            --msgbox "The installer could not prepare the web UI password, so the web UI will start on admin / admin and ask for a new password at first login." 10 66 || true
+    fi
+    return 0
+}
+
 ask_user_password() {
     log "Step: ask_user_password"
     # Username prompt is skipped when the admin user is preseeded, OR
@@ -2329,7 +2402,7 @@ ask_user_password() {
         while true; do
             ADMIN_USER=$(whiptail --backtitle "$BACKTITLE" --title "Admin OS user" \
                 --cancel-button "Back" \
-                --inputbox "OS-level admin username (for SSH + sudo).\n\nThe SpatiumDDI web UI uses 'admin/admin' separately - change it on first login." \
+                --inputbox "OS-level admin username (for SSH + sudo).\n\nThe web UI has its own 'admin' account, separate from this one." \
                 12 70 -- "$ADMIN_USER" 3>&1 1>&2 2>&3) \
                 || return 1
             if [ -z "$ADMIN_USER" ]; then
@@ -2393,6 +2466,14 @@ ask_user_password() {
         ADMIN_PASSWORD="$p1"
         break
     done
+    # #4548 — a Back to this screen re-asks; a preseeded hash is kept.
+    if [ -z "${PRESEED_HAS_WEB_ADMIN_PASSWORD:-}" ]; then
+        WEB_ADMIN_PASSWORD_HASH=""
+        if ! _ask_web_admin_password "$ADMIN_PASSWORD"; then
+            set -x
+            return 1
+        fi
+    fi
     set -x
 
     # #995 item 12 — root used to get the same password unconditionally.
@@ -4791,6 +4872,9 @@ EOF
         # overlay lower, where it would shadow STATE's.
         STATE_MNT="$MOUNT/var/lib/spatium-state"
         mkdir -p "$STATE_MNT/ssh"
+        # #4548 — an additional node serves no web UI; a preseeded hash has
+        # nothing to seed there.
+        [ "${ROLE:-}" = "appliance" ] && WEB_ADMIN_PASSWORD_HASH=""
         rm -f "$MOUNT/usr/lib/etc.image/ssh/"ssh_host_* "$MOUNT/etc/ssh/"ssh_host_*
 
         # spatium-config.yaml — the operator-authoritative machine
@@ -4844,8 +4928,24 @@ keymap: "$KEYMAP"
 # already on disk. Here so spatium-state can show what was chosen, and so
 # a support bundle explains why root has no password.
 root_password_set: "$SET_ROOT_PASSWORD"
+# #4548 — yes when the web UI's admin password was chosen at install (the
+# hash itself is in web-admin-password-hash, 0600, never in this 0644 file).
+# spatium-etc-render reads it for /etc/issue; "no" leaves admin / admin.
+web_admin_password_set: "$([ -n "${WEB_ADMIN_PASSWORD_HASH:-}" ] && echo yes || echo no)"
 EOF
         chmod 0644 "$STATE_MNT/spatium-config.yaml"
+
+        # #4548 — the web UI admin password hash, for spatiumddi-firstboot to
+        # hand to the control plane. Tracing off so the hash is not in the
+        # trace log; 0600 root; never copied into the preseed export below.
+        # Removed first so a reinstall without the option cannot inherit an
+        # older one (STATE is not reformatted on a reinstall).
+        rm -f "$STATE_MNT/web-admin-password-hash"
+        if [ -n "${WEB_ADMIN_PASSWORD_HASH:-}" ]; then
+            { set +x; } 2>/dev/null
+            ( umask 077; printf '%s\n' "$WEB_ADMIN_PASSWORD_HASH" > "$STATE_MNT/web-admin-password-hash" )
+            set -x
+        fi
 
         # #995 item 29 — the wizard's answers as a #549 answer file, so an
         # identical reinstall or a fleet clone is one file away instead of
@@ -4864,7 +4964,7 @@ EOF
 #
 # NOT directly reusable: admin_password (or admin_password_hash) is
 # required, and role: appliance additionally needs pairing_code. Both are
-# omitted on purpose. Add them, then lint with:
+# omitted on purpose, as is web_admin_password_hash (#4548). Add them, then lint with:
 #     spatium-install --check-preseed spatium-preseed.yaml
 spatium_preseed:
   role: "$ROLE"
@@ -5977,7 +6077,12 @@ EOF
         BOOT_LEG_WARNING=$(cat "$BOOT_LEG_MISSING_FILE" 2>/dev/null || true)
     fi
 
-    local done_next
+    local done_next done_login
+    if [ -n "$WEB_ADMIN_PASSWORD_HASH" ]; then
+        done_login="Login:   admin  (the web UI password you set in this installer)"
+    else
+        done_login="Login:   admin / admin  (change forced on first login)"
+    fi
     if [ "$ROLE" = "appliance" ]; then
         # No web UI on this node; the next action is on the control plane.
         done_next="\
@@ -5988,7 +6093,7 @@ EOF
     else
         done_next="\
   Web UI:  https://${done_addr:-<appliance IP>}/
-  Login:   admin / admin  (change forced on first login)"
+  $done_login"
         if [ -z "$done_addr" ]; then
             done_next+="
   Address unreadable here; see the console banner after reboot."
@@ -6449,6 +6554,22 @@ check_preseed() {
     fi
 
     rm -f "$tmp_env" "$tmp_secret"
+
+    # #4548 — say which web UI login this file produces. Never the hash.
+    if [ "$rc" -eq 0 ]; then
+        # ROLE defaults to appliance when the file names none, so only
+        # trust it when the file did.
+        local _pr_role="${PRESEED_HAS_ROLE:+${ROLE:-}}"
+        if [ -n "${PRESEED_HAS_WEB_ADMIN_PASSWORD:-}" ]; then
+            if [ "$_pr_role" = "appliance" ]; then
+                warns+=("web_admin_password_hash is ignored on an additional node (it has no web UI).")
+            else
+                echo "web UI admin password: set from web_admin_password_hash"
+            fi
+        elif [ "$_pr_role" != "appliance" ]; then
+            echo "web UI admin password: not in the file (admin / admin, change forced on first login)"
+        fi
+    fi
 
     local i
     for ((i = 0; i < ${#warns[@]}; i++)); do

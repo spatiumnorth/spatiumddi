@@ -58,6 +58,12 @@ spatium_preseed:
   admin_password: "change-me-please"
   # admin_password_hash: "$6$rounds=4096$abcd...$..."
 
+  # Optional: the web UI's `admin` password, as a BCRYPT hash (there is no
+  # plaintext form). Absent, the web UI starts on admin / admin and asks for
+  # a new password at first login. Make one with:
+  #   python3 -c 'import bcrypt,getpass; print(bcrypt.hashpw(getpass.getpass().encode(), bcrypt.gensalt()).decode())'
+  # web_admin_password_hash: "$2b$12$..."
+
   # Since #995 root is LOCKED (`passwd -l`) and you use sudo. sshd
   # refused root either way, so this removes a console login, not a
   # recovery path — `sudo -i`, `su -` and single-user mode all still

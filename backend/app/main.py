@@ -112,6 +112,17 @@ async def _assert_demo_mode_not_on_prod_data() -> None:
         )
 
 
+_BCRYPT_HASH_RE = re.compile(r"\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}")
+
+
+def _initial_admin_hash(value: str) -> str:
+    """The configured initial admin hash when it is a well-formed bcrypt hash,
+    else ``""`` (the default account). A malformed value must not become an
+    account nobody can log into."""
+    value = (value or "").strip()
+    return value if _BCRYPT_HASH_RE.fullmatch(value) else ""
+
+
 async def _seed_default_admin() -> None:
     """Create the default admin user if no users exist yet."""
     from sqlalchemy import func, select
@@ -133,23 +144,34 @@ async def _seed_default_admin() -> None:
                 # sticks for the next visitor); skip the
                 # force-password-change flag so the demo lands on the
                 # dashboard instead of a redirect to a 403'd form.
+                # #4548 — an install that was handed a password hash (the
+                # appliance installer) starts on it, with no forced change.
+                # The hash is never logged.
+                preset = _initial_admin_hash(settings.initial_admin_password_hash)
                 admin = User(
                     username="admin",
                     email="admin@localhost",
                     display_name="Administrator",
-                    hashed_password=hash_password("admin"),
+                    hashed_password=preset or hash_password("admin"),
                     is_superadmin=True,
                     is_active=True,
                     auth_source="local",
-                    force_password_change=not settings.demo_mode,
+                    force_password_change=False if preset else not settings.demo_mode,
                 )
                 session.add(admin)
                 await session.commit()
-                logger.warning(
-                    "default_admin_created",
-                    username="admin",
-                    message="Default admin created with password 'admin' — change it immediately",
-                )
+                if preset:
+                    logger.info(
+                        "default_admin_created",
+                        username="admin",
+                        message="Admin created with the password set at install",
+                    )
+                else:
+                    logger.warning(
+                        "default_admin_created",
+                        username="admin",
+                        message="Default admin created with password 'admin' — change it immediately",
+                    )
         except Exception as exc:
             # Table may not exist yet (pre-migration). Skip silently.
             logger.debug("default_admin_seed_skipped", reason=str(exc))

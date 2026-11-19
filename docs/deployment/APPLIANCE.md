@@ -504,7 +504,7 @@ single-node appliance restarting cluster DNS is a footgun.
 3. First-boot: `spatiumddi-firstboot` generates `/etc/spatiumddi/.env` with secrets, bakes the self-signed cert, writes the HelmChart bootstrap manifest, starts k3s.
 4. k3s comes up + imports baked images + helm-controller installs the bootstrap release. 30-90 s for control plane pods to reach Ready; another 15-30 s for migrate Job to complete schema migrations.
 5. Operator browses to `https://<appliance-ip>/`. Until the api is serving, the frontend nginx answers every page with the **"SpatiumDDI is initialising"** page (`frontend/public/_starting.html`, auto-refreshing every 5 s) instead of the SPA shell — `location /` gates on an `auth_request` probe of the api Service, so a cold boot reads as "still coming up" rather than a wall of failed XHRs (#767).
-6. Operator accepts the self-signed cert **once** and signs in `admin / admin`, then sets a real password. The cert firstboot minted in step 3 is the only one the operator ever sees: the api's startup bootstrap *adopts* it as the active `appliance_certificate` row rather than generating a rival (#767), so the fingerprint doesn't change mid-boot and the frontend isn't rolled underneath the operator.
+6. Operator accepts the self-signed cert **once** and signs in. On a first node whose installer collected a web UI password (below) that is `admin` with that password; otherwise it is `admin / admin`, followed by a forced change to a real password. The cert firstboot minted in step 3 is the only one the operator ever sees: the api's startup bootstrap *adopts* it as the active `appliance_certificate` row rather than generating a rival (#767), so the fingerprint doesn't change mid-boot and the frontend isn't rolled underneath the operator.
 7. (Appliance role, or a Control-plane node enabling DNS/DHCP) Operator approves the appliance from the control plane's `/appliance → Fleet` tab + picks roles. DaemonSet schedules role pods within ~30 s.
 
 For a step-by-step user-facing version, see the README's
@@ -2822,7 +2822,24 @@ LG_AGENT_KEY, BOOTSTRAP_PAIRING_CODE) on first run, writes the
 bootstrap HelmChart manifest into
 `/var/lib/rancher/k3s/server/manifests/`, and polls
 `http://127.0.0.1:8000/health/live`. Default web-UI login is
-`admin / admin` with `force_password_change=True`.
+`admin / admin` with `force_password_change=True`, unless the install
+set a web UI password (next section).
+
+**Web UI admin password (#4548).** On a first node the installer asks, right after the OS
+password, whether to use that password for the web UI's `admin` account too (default yes) or to
+enter a separate one, under the same checks. Only a bcrypt hash is kept: the installer hashes it
+with `python3-bcrypt`, writes it 0600 to `/var/lib/spatium-state/web-admin-password-hash`,
+`spatiumddi-firstboot` puts it in the `spatium-control-app-keys` Secret as
+`initial-admin-password-hash`, and the chart passes it to the api as `INITIAL_ADMIN_PASSWORD_HASH`.
+The api uses it only when it creates the very first user, with no forced password change, so nobody
+has to be first to the UI. A headless install supplies `web_admin_password_hash` (a bcrypt hash;
+there is no plaintext key) and `spatium-install --check-preseed` reports which login the file
+produces. Without it, and on an install from before this option, the web UI starts on
+`admin / admin` as before. An additional node has no web UI, so the option is not asked there and
+its console banner (`/etc/issue`) omits the web UI lines. The hash never enters the install log,
+the trace log, the exported answers file or a support bundle. Docker Compose and plain Helm installs
+keep `admin / admin` with a forced change, but the same `INITIAL_ADMIN_PASSWORD_HASH` variable works
+there too (Compose `environment:`, Helm `api.env`).
 
 `LG_AGENT_KEY` (the Looking Glass collector's agent key, #576) is
 generated on control-plane roles only. Because it is the first agent

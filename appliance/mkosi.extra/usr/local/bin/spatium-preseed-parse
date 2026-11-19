@@ -491,7 +491,8 @@ if ps is None:
     # pointing the installer at an unrelated YAML file).
     known = {
         "role", "target_disk", "confirm_wipe", "hostname", "admin_user",
-        "admin_password", "admin_password_hash", "timezone", "network",
+        "admin_password", "admin_password_hash", "web_admin_password_hash",
+        "timezone", "network",
         "k3s", "control_plane_url", "pairing_code", "set_root_password",
         "ntp_servers", "keymap", "ssh_authorized_keys", "ssh_disable_password",
     }
@@ -795,6 +796,24 @@ elif pw:
             note(f"admin_password: {pw_advice}")
         secret["ADMIN_PASSWORD"] = pw
         env["PRESEED_HAS_PASSWORD"] = "1"
+
+# ── Web UI admin password (issue #4548) ───────────────────────────────
+# A bcrypt hash only, in the backend's own format (app/core/security.py):
+# there is deliberately no plaintext key, so an answer file that gets copied
+# around never carries a password the web UI will accept. Optional; absent
+# leaves the web UI on admin / admin with a forced change. A hash cannot be
+# strength-checked, so (like admin_password_hash) the operator owns it.
+# Make one with:  python3 -c 'import bcrypt,getpass; print(bcrypt.hashpw(getpass.getpass().encode(), bcrypt.gensalt()).decode())'
+web_hash = as_str(ps.get("web_admin_password_hash"))
+if web_hash:
+    if not re.fullmatch(r"\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}", web_hash):
+        fail(
+            "web_admin_password_hash does not look like a bcrypt hash "
+            "(expected $2b$12$ followed by 53 characters)"
+        )
+    else:
+        secret["WEB_ADMIN_PASSWORD_HASH"] = web_hash
+        env["PRESEED_HAS_WEB_ADMIN_PASSWORD"] = "1"
 
 # ── Root account (issue #995 item 12) ─────────────────────────────────
 # Default FALSE, which changes the previous behaviour: root used to get

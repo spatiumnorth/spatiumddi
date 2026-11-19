@@ -36,6 +36,7 @@ spatium_preseed:
   admin_user: admin
   admin_password: "change-me-please"
   # admin_password_hash: "$6$rounds=4096$abcd...$..."
+  # web_admin_password_hash: not used here: an additional node has no web UI.
   # root is locked by default since #995; true restores the old
   # same-password-as-admin behaviour.
   set_root_password: false
