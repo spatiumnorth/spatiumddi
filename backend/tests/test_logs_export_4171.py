@@ -202,7 +202,16 @@ async def test_permission_refused_and_scoped_grant_narrows(
     r = await client.get(
         "/api/v1/logs/dns-queries/export", params={"server_id": str(b.id)}, headers=scoped
     )
-    assert r.status_code in (403, 404)
+    assert r.status_code == 403
+    # Same as the list: a group filter narrows to what the grant covers, so
+    # the sibling server B's rows are never in the file.
+    r = await client.get(
+        "/api/v1/logs/dns-queries/export",
+        params={"group_id": str(a.group_id), "format": "jsonl"},
+        headers=scoped,
+    )
+    assert r.status_code == 200
+    assert {json.loads(x)["server"] for x in r.text.splitlines()} == {a.name}
 
 
 async def test_dhcp_export(client: AsyncClient, db_session: AsyncSession) -> None:
@@ -234,3 +243,51 @@ async def test_dhcp_export(client: AsyncClient, db_session: AsyncSession) -> Non
     rows = list(csv.DictReader(io.StringIO(r.text)))
     assert [x["severity"] for x in rows] == ["ERROR"] and rows[0]["ip_address"] == "192.0.2.50"
     assert "dhcp-activity-all-" in r.headers["content-disposition"]
+
+
+async def test_session_open_until_last_chunk(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The get_db dependency must not tear the session down before the body
+    generator has finished (the ASGI test transport buffers the response, so
+    the check runs inside the generator)."""
+    from app.db import get_db
+    from app.main import app
+
+    await _dns(db_session)
+    h = await _user(db_session, None)
+    state: dict[str, object] = {"closed": False, "seen": []}
+
+    async def tracked():  # type: ignore[no-untyped-def]
+        try:
+            yield db_session
+        finally:
+            state["closed"] = True
+
+    real = logs_router.stream_export
+
+    async def watching(*a, **kw):  # type: ignore[no-untyped-def]
+        async for chunk in real(*a, **kw):
+            state["seen"].append(state["closed"])  # type: ignore[attr-defined]
+            yield chunk
+        state["seen"].append(state["closed"])  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(logs_router, "stream_export", watching)
+    app.dependency_overrides[get_db] = tracked
+    try:
+        r = await client.get(
+            "/api/v1/logs/dns-queries/export", params={"format": "jsonl"}, headers=h
+        )
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+    assert r.status_code == 200 and len(r.text.splitlines()) == 3
+    assert state["seen"] and not any(state["seen"])  # type: ignore[arg-type]
+    assert state["closed"] is True
+
+
+async def test_cors_exposes_export_headers() -> None:
+    from app.main import app
+
+    cors = [m for m in app.user_middleware if m.cls.__name__ == "CORSMiddleware"]
+    exposed = {h.lower() for h in cors[0].kwargs["expose_headers"]}
+    assert {"x-export-capped", "x-export-row-count", "x-export-row-cap"} <= exposed

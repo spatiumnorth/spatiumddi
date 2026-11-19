@@ -911,7 +911,6 @@ async def _export_response(
             "X-Export-Row-Count": str(rows),
             "X-Export-Capped": "true" if capped else "false",
             "X-Export-Row-Cap": str(EXPORT_ROW_CAP),
-            "Access-Control-Expose-Headers": "X-Export-Row-Count, X-Export-Capped, X-Export-Row-Cap, Content-Disposition",
         },
     )
 
