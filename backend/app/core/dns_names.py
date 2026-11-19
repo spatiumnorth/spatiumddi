@@ -69,10 +69,10 @@ _DNS_LABEL_RE = re.compile(r"^(?![-])[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_
 # record, ``;`` starts a comment, ``$`` starts a directive ($ORIGIN /
 # $TTL), ``()`` group across lines, ``"`` quotes, ``@`` means the origin,
 # ``\`` escapes, and any C0/C1 control byte is never legitimate in a name.
-_ZONEFILE_UNSAFE_RE = re.compile(r'[\s;$()"@\\]|[\x00-\x1f\x7f]')
+_ZONEFILE_UNSAFE_RE = re.compile(r'[\s;$()"@\\]|[\x00-\x1f\x7f-\x9f]')
 
 
-_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
 def contains_control_chars(value: str) -> bool:
