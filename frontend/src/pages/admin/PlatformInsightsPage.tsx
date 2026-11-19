@@ -23,6 +23,7 @@ import {
   redisApi,
   versionApi,
   type PostgresOverview,
+  type PostgresRetentionRow,
   type PostgresTableSize,
   type PostgresConnection,
   type PostgresSlowQuery,
@@ -130,6 +131,11 @@ function PostgresPanel() {
     queryFn: () => postgresApi.tables(50),
     refetchInterval: pollUnlessRefused(60_000),
   });
+  const retention = useQuery({
+    queryKey: ["pg-retention"],
+    queryFn: () => postgresApi.retention(),
+    refetchInterval: pollUnlessRefused(300_000),
+  });
   const connections = useQuery({
     queryKey: ["pg-conns"],
     queryFn: () => postgresApi.connections(),
@@ -153,6 +159,7 @@ function PostgresPanel() {
   const refusals = [
     overview.error,
     tables.error,
+    retention.error,
     connections.error,
     slow.error,
     schema.error,
@@ -324,6 +331,59 @@ function PostgresPanel() {
                   </td>
                   <td className="px-3 py-1.5 text-right font-mono">
                     {row.count}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section>
+        <h3 className="mb-2 text-sm font-semibold">
+          Data retention{" "}
+          <span className="font-normal text-muted-foreground">
+            (row counts are estimates; windows are set under Settings, Data
+            Retention)
+          </span>
+        </h3>
+        <div className="overflow-x-auto rounded border">
+          <table className="w-full min-w-[800px] text-sm">
+            <thead className="bg-muted/40 text-xs">
+              <tr>
+                <th className="px-3 py-2 text-left font-medium">Table</th>
+                <th className="px-3 py-2 text-right font-medium">Size</th>
+                <th className="px-3 py-2 text-right font-medium">
+                  Rows (est.)
+                </th>
+                <th className="px-3 py-2 text-left font-medium">Retention</th>
+                <th className="px-3 py-2 text-left font-medium">Oldest row</th>
+              </tr>
+            </thead>
+            <tbody className={zebraBodyCls}>
+              {(retention.data ?? []).map((r: PostgresRetentionRow) => (
+                <tr key={r.table}>
+                  <td className="px-3 py-1.5 font-mono text-xs">{r.table}</td>
+                  <td className="px-3 py-1.5 text-right font-mono">
+                    {formatBytes(r.total_bytes)}
+                  </td>
+                  <td className="px-3 py-1.5 text-right font-mono">
+                    {formatNumber(r.estimated_rows)}
+                  </td>
+                  <td className="px-3 py-1.5 text-xs">
+                    {r.retention_setting === null
+                      ? "Never pruned"
+                      : r.keeps_forever
+                        ? "Kept forever (0)"
+                        : `${r.retention_window ?? "default"} ${r.retention_unit ?? ""}`}
+                    {r.note && (
+                      <div className="text-muted-foreground">{r.note}</div>
+                    )}
+                  </td>
+                  <td className="px-3 py-1.5 text-xs text-muted-foreground">
+                    {r.oldest_row
+                      ? new Date(r.oldest_row).toLocaleString()
+                      : (r.oldest_row_note ?? "empty")}
                   </td>
                 </tr>
               ))}

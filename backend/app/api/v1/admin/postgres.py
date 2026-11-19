@@ -80,6 +80,24 @@ class OverviewResponse(BaseModel):
     longest_transaction: LongestTransactionRow | None
 
 
+class RetentionRow(BaseModel):
+    table: str
+    total_bytes: int
+    estimated_rows: int  # pg_class.reltuples, not count(*)
+    retention_setting: str | None  # PlatformSettings column; None = no setting
+    retention_window: int | None
+    retention_unit: str | None  # "days" | "hours"
+    keeps_forever: bool
+    oldest_row_column: str
+    oldest_row: str | None  # ISO timestamp; None = empty, or see oldest_row_note
+    oldest_row_note: str | None
+    note: str | None
+
+
+class RetentionOverviewResponse(BaseModel):
+    rows: list[RetentionRow]
+
+
 class TableSizesResponse(BaseModel):
     rows: list[TableSizeRow]
 
@@ -296,6 +314,17 @@ async def postgres_table_sizes(
         for r in res.all()
     ]
     return TableSizesResponse(rows=rows)
+
+
+@router.get("/postgres/retention", response_model=RetentionOverviewResponse)
+async def postgres_retention(db: DB, _: SuperAdmin) -> RetentionOverviewResponse:
+    """Per table: size, row estimate, governing retention setting, oldest row
+    (#2274). The oldest row is only read where its column leads an index."""
+    from app.services.retention_overview import build_retention_overview  # noqa: PLC0415
+
+    return RetentionOverviewResponse(
+        rows=[RetentionRow(**r) for r in await build_retention_overview(db)]
+    )
 
 
 @router.get("/postgres/connections", response_model=ConnectionsResponse)

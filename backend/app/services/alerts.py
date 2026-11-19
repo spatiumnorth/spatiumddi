@@ -435,6 +435,25 @@ RULE_TYPE_APPLIANCE_DISK_USAGE = "appliance_disk_usage"
 # instance, not per finding.
 RULE_TYPE_POSTGRES_INSTANCE_UNHEALTHY = "postgres_instance_unhealthy"
 
+# Issue #2274: the control-plane database growing past a size the operator
+# chose. Subject = the database (a single row per install).
+#
+# ``appliance_disk_usage`` (#2240) already alarms on the volume holding
+# Postgres on an appliance, but not on a Compose / Kubernetes install, and
+# not on the database itself: a table nobody prunes shows up here long
+# before the disk does. ``threshold_percent`` is reused as a size in GiB
+# (the ``voice_lease_count_below`` precedent for a raw-count threshold).
+# WARNING at the threshold (default 50 GiB), CRITICAL at 1.5x it. There is
+# no percent-of-volume form: the database cannot see its volume's size, and
+# the appliance's /var is covered by the rule above.
+RULE_TYPE_DATABASE_SIZE_HIGH = "database_size_high"
+_DATABASE_SIZE_RULE_NAME = "Database size high"
+_DATABASE_SIZE_DEFAULT_GIB = 50
+_DATABASE_SIZE_CRITICAL_FACTOR = 1.5
+# An open event stands until the size is this far below the threshold, so a
+# database hovering at the line does not open and resolve on every pass.
+_DATABASE_SIZE_RESOLVE_FACTOR = 0.95
+
 
 class AlertDataUnavailable(Exception):
     """A rule could not be evaluated because its input is temporarily gone.
@@ -801,6 +820,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_APPLIANCE_DISK_USAGE,
         RULE_TYPE_APPLIANCE_HEARTBEAT_STALE,
         RULE_TYPE_POSTGRES_INSTANCE_UNHEALTHY,
+        RULE_TYPE_DATABASE_SIZE_HIGH,
         RULE_TYPE_DECOM_EXPIRING,
         RULE_TYPE_DNS_NXDOMAIN_SPIKE,
         RULE_TYPE_DNS_QUERY_RATE_SPIKE,
@@ -5425,6 +5445,73 @@ async def _matching_appliance_disk_usage_subjects(
     return matches
 
 
+async def _database_size_bytes(db: AsyncSession) -> int:
+    try:
+        size = (await db.execute(text("SELECT pg_database_size(current_database())"))).scalar()
+    except SQLAlchemyError as exc:
+        raise AlertDataUnavailable(f"pg_database_size unreadable: {exc}") from exc
+    if not isinstance(size, int) or size <= 0:
+        raise AlertDataUnavailable("pg_database_size returned no usable value")
+    return size
+
+
+async def _matching_database_size_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+) -> list[tuple[str, str, str, str]]:
+    """``[(subject_id, display, message, severity)]`` when
+    ``pg_database_size`` is above the rule's GiB threshold (#2274).
+
+    Warning at ``threshold_percent`` GiB (default
+    :data:`_DATABASE_SIZE_DEFAULT_GIB`), critical at
+    :data:`_DATABASE_SIZE_CRITICAL_FACTOR` times it. An open event stands
+    until the size is under :data:`_DATABASE_SIZE_RESOLVE_FACTOR` of the
+    threshold. An unreadable size raises :class:`AlertDataUnavailable`
+    (skip the pass, resolve nothing).
+    """
+    size = await _database_size_bytes(db)
+    threshold_gib = float(
+        rule.threshold_percent if rule.threshold_percent is not None else _DATABASE_SIZE_DEFAULT_GIB
+    )
+    warn = threshold_gib * 1024**3
+    held = (
+        await db.execute(
+            select(AlertEvent.severity).where(
+                AlertEvent.rule_id == rule.id,
+                AlertEvent.resolved_at.is_(None),
+            )
+        )
+    ).first()
+    shown = _fmt_bytes(size)
+    if size >= warn * _DATABASE_SIZE_CRITICAL_FACTOR:
+        sev = "critical"
+    elif size >= warn:
+        sev = "warning"
+    elif held is not None and size >= warn * _DATABASE_SIZE_RESOLVE_FACTOR:
+        return [
+            (
+                "database",
+                "database",
+                f"The database is {shown}, just under the rule's {threshold_gib:g} GiB "
+                "threshold; the alert resolves once it is clearly below.",
+                held[0],
+            )
+        ]
+    else:
+        return []
+    return [
+        (
+            "database",
+            "database",
+            f"The database is {shown}, at or above the rule's {threshold_gib:g} GiB "
+            f"threshold (critical at {threshold_gib * _DATABASE_SIZE_CRITICAL_FACTOR:g} GiB). "
+            "See Platform Insights, Postgres, Data retention for the tables behind it and "
+            "the retention window that governs each.",
+            sev,
+        )
+    ]
+
+
 async def _evaluate_circuit_status_changed_rule(
     db: AsyncSession,
     rule: AlertRule,
@@ -6439,6 +6526,41 @@ async def seed_appliance_disk_usage_alert_rule() -> None:
                 severity="warning",
                 enabled=True,
                 threshold_percent=_APPLIANCE_DISK_USAGE_DEFAULT_PCT,
+            )
+        )
+        await session.commit()
+
+
+async def seed_database_size_alert_rule() -> None:
+    """Seed the #2274 rule, ENABLED by default, warning at 50 GiB.
+
+    Silent on any database under the threshold. Keyed on ``name``; an
+    operator who disables or retunes it is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _DATABASE_SIZE_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_DATABASE_SIZE_RULE_NAME,
+                description=(
+                    "Fires when the control-plane database is larger than the "
+                    f"threshold ({_DATABASE_SIZE_DEFAULT_GIB} GiB by default); "
+                    "critical at 1.5 times it. The threshold is in GiB. Check "
+                    "Platform Insights, Postgres, Data retention for the tables "
+                    "behind the growth. Auto-resolves once the size is back "
+                    "under 95% of the threshold."
+                ),
+                rule_type=RULE_TYPE_DATABASE_SIZE_HIGH,
+                severity="warning",
+                enabled=True,
+                threshold_percent=_DATABASE_SIZE_DEFAULT_GIB,
             )
         )
         await session.commit()
@@ -8708,6 +8830,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in pg_hits]
                 # The CNPG instance (pod) name: an instance has no row here.
                 subject_type = "postgres_instance"
+            elif rule.rule_type == RULE_TYPE_DATABASE_SIZE_HIGH:
+                size_hits = await _matching_database_size_subjects(db, rule)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in size_hits]
+                subject_type = "database"
             elif rule.rule_type == RULE_TYPE_FIREWALL_APPLY_STALLED:
                 stalled = await _matching_firewall_apply_stalled_subjects(db, rule, now)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in stalled]
