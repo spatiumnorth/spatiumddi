@@ -162,3 +162,19 @@ async def test_list_usage_and_idle_filter(
     tool = await find_api_tokens(db_session, owner, FindApiTokensArgs(idle_days=90))
     assert {t["id"] for t in tool["api_tokens"]} == {str(stale.id), str(never.id)}
     assert all("token_hash" not in t for t in tool["api_tokens"])
+
+
+@pytest.mark.asyncio
+async def test_usage_is_owner_only(
+    client: AsyncClient, db_session: AsyncSession, fake_redis: FakeRedis
+) -> None:
+    mine, raw_mine, owner_mine = await _token(db_session, datetime.now(UTC))
+    theirs, _r, owner_theirs = await _token(db_session, datetime.now(UTC))
+    owner_mine.is_superadmin = False
+    owner_theirs.is_superadmin = False
+    await db_session.commit()
+    h = {"Authorization": f"Bearer {raw_mine}"}
+
+    assert (await client.get(f"/api/v1/api-tokens/{mine.id}/usage", headers=h)).status_code == 200
+    # Another user's token answers 404, not 403, so its existence does not leak.
+    assert (await client.get(f"/api/v1/api-tokens/{theirs.id}/usage", headers=h)).status_code == 404
