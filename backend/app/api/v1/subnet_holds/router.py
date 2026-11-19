@@ -18,12 +18,12 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser
-from app.core.permissions import user_has_permission
+from app.core.permissions import require_permission, token_scope_allows, user_has_permission
 from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.ipam import IPBlock, IPSpace
@@ -139,6 +139,14 @@ def _audit(
 
 
 def _need(user: User, action: str) -> None:
+    # A hold is a space-level object, so a token bound to specific subnets
+    # (or to another resource type) is refused; only a wildcard ``subnet``
+    # grant, a plain token or a session passes.
+    if not token_scope_allows(user, "subnet", None):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="API token is bound to specific resources; holds are space-level",
+        )
     if not user_has_permission(user, action, "subnet"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -160,7 +168,11 @@ def _require_active(row: SubnetHold) -> None:
         )
 
 
-@router.get("", response_model=list[HoldResponse])
+@router.get(
+    "",
+    response_model=list[HoldResponse],
+    dependencies=[Depends(require_permission("read", "subnet"))],
+)
 async def list_holds(
     current_user: CurrentUser,
     db: DB,
@@ -201,7 +213,11 @@ async def list_holds(
     return [_to_response(r) for r in rows]
 
 
-@router.get("/{hold_id}", response_model=HoldResponse)
+@router.get(
+    "/{hold_id}",
+    response_model=HoldResponse,
+    dependencies=[Depends(require_permission("read", "subnet"))],
+)
 async def get_hold(hold_id: uuid.UUID, current_user: CurrentUser, db: DB) -> HoldResponse:
     _need(current_user, "read")
     return _to_response(await _get(db, hold_id))
@@ -210,7 +226,7 @@ async def get_hold(hold_id: uuid.UUID, current_user: CurrentUser, db: DB) -> Hol
 @router.post("", response_model=HoldResponse, status_code=status.HTTP_201_CREATED)
 @token_write("Creates a hold that blocks subnet allocation in the CIDR")
 async def create_hold(body: HoldCreate, current_user: CurrentUser, db: DB) -> HoldResponse:
-    _need(current_user, "write")
+    _need(current_user, "write")  # also holds a bound token out via token_scope_allows(
     if await db.get(IPSpace, body.space_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
     try:
