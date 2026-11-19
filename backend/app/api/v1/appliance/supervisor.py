@@ -9018,6 +9018,23 @@ def _require_k8s_name(field: str, value: str, *, pattern: str = _K8S_NAME_PATTER
         )
 
 
+#: The one namespace the supervisor's kubeapi proxy runs requests in (#3618:
+#: ``agent/supervisor/spatium_supervisor/k8s_proxy.py`` answers anything else
+#: 403 unexecuted). Refusing here keeps that refusal a caller error instead of
+#: a "502 kubeapi returned 403" for a request the kubeapi never received.
+_K8S_SERVED_NAMESPACE = "spatium"
+
+
+def _require_served_namespace(namespace: str) -> None:
+    _require_k8s_name("namespace", namespace, pattern=_K8S_LABEL_PATTERN)
+    if namespace != _K8S_SERVED_NAMESPACE:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"namespace: only {_K8S_SERVED_NAMESPACE!r} is served by the appliance "
+            f"kubeapi proxy, not {namespace!r}.",
+        )
+
+
 class ApplianceWorkloadsResponse(BaseModel):
     workloads: list[ApplianceWorkloadRow]
     #: Per-kind failures. Reported rather than raised so a cluster with an
@@ -9055,7 +9072,7 @@ async def k8s_list_workloads(
     from app.services.appliance import k8s_proxy as _proxy  # noqa: PLC0415
     from app.services.service_control import kube as _kube  # noqa: PLC0415
 
-    _require_k8s_name("namespace", namespace, pattern=_K8S_LABEL_PATTERN)
+    _require_served_namespace(namespace)
     row = await db.get(Appliance, appliance_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
@@ -9141,6 +9158,7 @@ async def k8s_rollout_restart(
     """
     from app.services.appliance import k8s_proxy as _proxy  # noqa: PLC0415
 
+    _require_served_namespace(body.namespace)
     row = await db.get(Appliance, appliance_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
@@ -9483,10 +9501,10 @@ async def k8s_list_pods(
 ) -> K8sPodListResponse:
     """List pods in the named namespace via the kubeapi proxy.
 
-    Default namespace ``spatium`` covers every chart-deployed pod.
-    Operators who want kube-system / default visibility pass the
-    namespace explicitly — same kubeapi surface as ``kubectl get
-    pods``.
+    Only ``spatium`` is served, which covers every chart-deployed pod:
+    the supervisor's kubeapi proxy refuses any other namespace (#3618),
+    so another one answers 422 here rather than a 502 from the proxy.
+    For kube-system / default use ``kubectl`` on the appliance.
     """
     from app.services.appliance import k8s_proxy as _proxy  # noqa: PLC0415
 
@@ -9499,7 +9517,7 @@ async def k8s_list_pods(
             f"Appliance in state {row.state!r}; kubeapi proxy unavailable.",
         )
 
-    _require_k8s_name("namespace", namespace, pattern=_K8S_LABEL_PATTERN)
+    _require_served_namespace(namespace)
     path = f"/api/v1/namespaces/{namespace}/pods"
     try:
         status_code, body = await _proxy.k8s_call(row.id, "GET", path, timeout=15.0)
@@ -9594,7 +9612,7 @@ async def k8s_get_pod_logs(
     # Reject path / query injection on operator-supplied strings —
     # the proxy concatenates them into the kubeapi URL (#3618).
     _require_k8s_name("pod", pod)
-    _require_k8s_name("namespace", namespace, pattern=_K8S_LABEL_PATTERN)
+    _require_served_namespace(namespace)
     if container:
         _require_k8s_name("container", container, pattern=_K8S_LABEL_PATTERN)
     tail = max(1, min(10_000, tail_lines))
