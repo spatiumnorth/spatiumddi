@@ -10999,8 +10999,9 @@ async function downloadLogExport(
   const match = disp.match(/filename="?([^";]+)"?/i);
   const stamp = new Date()
     .toISOString()
-    .slice(0, 16)
     .replace(/[-:]/g, "")
+    .replace(/\.\d+Z$/, "")
+    .slice(0, 13)
     .concat("Z");
   const filename = match ? match[1] : `log-export-${stamp}.${format}`;
   const blob = new Blob([res.data as BlobPart]);
