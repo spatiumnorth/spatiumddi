@@ -2227,7 +2227,7 @@ export function SettingsPage() {
                       </span>
                     )}
                     {rdnsRun === "error" && (
-                      <span className="text-xs text-destructive">
+                      <span role="alert" className="text-xs text-destructive">
                         Could not queue — broker unreachable?
                       </span>
                     )}

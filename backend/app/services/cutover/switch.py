@@ -48,7 +48,7 @@ from app.models.auth import User
 from app.models.cutover import CutoverEvent, CutoverItem, CutoverPlan
 from app.models.dhcp import DHCPScope, DHCPServer
 from app.models.dns import DNSZone
-from app.services.cutover.canonical import Blocker, blocking
+from app.services.cutover.canonical import BLOCKER_POOL_CLASS_UNAVAILABLE, Blocker, blocking
 
 logger = structlog.get_logger(__name__)
 
@@ -271,6 +271,19 @@ async def _cutover_dhcp(
     source_server = await _require_source_dhcp_server(db, plan)
     driver = WindowsDHCPReadOnlyDriver()
     actions: list[str] = []
+
+    # #4376 — re-check at the point of no return: the preflight verdict can be
+    # stale, and once Windows is down a refusal here would leave the subnet
+    # with no DHCP at all.
+    from app.api.v1.dhcp.pools import scope_activation_class_problems  # noqa: PLC0415
+
+    problems = await scope_activation_class_problems(db, scope)
+    if problems:
+        raise CutoverBlocked(
+            f"{item.source_ref} is not ready to cut over: the managed scope cannot be "
+            f"activated: {problems[0]}",
+            [Blocker(BLOCKER_POOL_CLASS_UNAVAILABLE, "block", msg) for msg in problems],
+        )
 
     await driver.set_scope_state(source_server, item.source_ref, active=False)
     actions.append(f"Deactivated scope {item.source_ref} on {source_server.name}")

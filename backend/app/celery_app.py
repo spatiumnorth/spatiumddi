@@ -22,6 +22,7 @@ from celery.signals import (
     worker_shutdown,
 )
 from celery.worker.consumer import Consumer
+from celery.worker.consumer.connection import Connection as ConnectionStep
 from redis.backoff import NoBackoff
 from redis.retry import Retry
 
@@ -186,6 +187,7 @@ celery_app = SpatiumCelery(
         "app.tasks.backup_sweep",
         "app.tasks.backup_drill",
         "app.tasks.dns_threat",
+        "app.tasks.dns_server_removal",
         "app.tasks.prune_internal_errors",
         "app.tasks.prune_logs",
         "app.tasks.prune_metrics",
@@ -250,6 +252,10 @@ celery_app.conf.update(
     task_acks_late=True,  # Required for idempotency — task not acked until complete
     task_reject_on_worker_lost=True,
     worker_prefetch_multiplier=1,
+    # #4306 — replace a prefork child after N tasks / once it passes the
+    # memory cap (KiB). 0 means off, which Celery spells None.
+    worker_max_tasks_per_child=settings.worker_max_tasks_per_child or None,
+    worker_max_memory_per_child=settings.worker_max_memory_per_child_kib or None,
     broker_pool_limit=BROKER_POOL_LIMIT,
     task_routes={
         "app.tasks.ipam_dns_sync.*": {"queue": "ipam"},
@@ -268,6 +274,7 @@ celery_app.conf.update(
         "app.tasks.backup_sweep.*": {"queue": "default"},
         "app.tasks.backup_drill.*": {"queue": "default"},
         "app.tasks.dns_threat.*": {"queue": "default"},
+        "app.tasks.dns_server_removal.*": {"queue": "default"},
         "app.tasks.prune_internal_errors.*": {"queue": "default"},
         "app.tasks.prune_logs.*": {"queue": "default"},
         "app.tasks.prune_metrics.*": {"queue": "default"},
@@ -1116,6 +1123,35 @@ def build_redis_transport_options(
     return opts
 
 
+class SpatiumConnectionStep(ConnectionStep):
+    """Consumer connection step whose ``inspect stats`` broker info is JSON-safe (#4330).
+
+    ``stats`` replies carry ``connection.info()``, which includes
+    ``transport_options``; on Sentinel that holds ``sentinel_kwargs`` with a
+    ``redis.retry.Retry`` object (see ``build_redis_transport_options``) that
+    kombu cannot JSON-encode, so the reply died with ``EncodeError`` and no
+    node answered. ``sentinel_kwargs`` is connection configuration, not a
+    statistic, and it can carry the Sentinel password, so it is left out of
+    the report; the live connection keeps it.
+
+    ``name`` is the stock step's, and ``SpatiumConsumer.Blueprint`` points the
+    steps that require the stock ``Connection`` at this one, so it REPLACES the
+    stock step: ``Events.requires`` names the stock class, and a blueprint that
+    kept it ran both, two broker connections per consumer start (#4436).
+    """
+
+    name = "celery.worker.consumer.connection.Connection"
+
+    def info(self, c: Any) -> dict[str, Any]:
+        out = super().info(c)
+        broker = out.get("broker")
+        if isinstance(broker, dict) and isinstance(broker.get("transport_options"), dict):
+            broker["transport_options"] = {
+                k: v for k, v in broker["transport_options"].items() if k != "sentinel_kwargs"
+            }
+        return out
+
+
 class SpatiumConsumer(Consumer):
     """Worker consumer whose broker reconnect retries every <= 2 s (#1669).
 
@@ -1136,6 +1172,24 @@ class SpatiumConsumer(Consumer):
     worker exits and its restart policy brings it back; the k8s liveness
     probe (5 x 30 s) restarts it sooner than either.
     """
+
+    class Blueprint(Consumer.Blueprint):
+        default_steps = [
+            "app.celery_app:SpatiumConnectionStep" if step.endswith(":Connection") else step
+            for step in Consumer.Blueprint.default_steps
+        ]
+
+        def claim_steps(self) -> dict[str, Any]:
+            # Dependents (``Events``) name the stock class in ``requires``;
+            # the dependency graph keys on the class, so left alone it holds
+            # the stock step next to ours (#4436).
+            steps = super().claim_steps()
+            for step in steps.values():
+                step.requires = tuple(
+                    SpatiumConnectionStep if req is ConnectionStep else req
+                    for req in step.requires or ()
+                )
+            return steps
 
     def ensure_connected(self, conn: Any) -> Any:
         conn.ensure_connection = functools.partial(

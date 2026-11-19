@@ -6,7 +6,7 @@ names as a server default, so an existing install starts pruning on the
 next nightly run with those windows; 0 turns a window off (keep forever).
 
 Revision ID: c7a41d9e5b32
-Revises: b6d2e9f41a07
+Revises: d8b3f6a1c274
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "c7a41d9e5b32"
-down_revision: str | None = "b6d2e9f41a07"
+down_revision: str | None = "d8b3f6a1c274"
 branch_labels: str | None = None
 depends_on: str | None = None
 

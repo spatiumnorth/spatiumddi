@@ -15,7 +15,7 @@ metadata:
 type: Opaque
 stringData:
   DNS_AGENT_KEY: {{ .Values.dnsAgents.agentKey.value | quote }}
----
+{{- "\n---\n" }}
 {{- end }}
 {{- range $server := .Values.dnsAgents.servers }}
 {{- $flavor := $server.flavor | default "bind9" -}}
@@ -53,6 +53,11 @@ stringData:
 {{- end -}}
 {{- $repo := $flavorImg.repository | default $root.Values.dnsAgents.image.repository -}}
 {{- $imgTag := $flavorImg.tag | default $tag -}}
+{{- /* #3913 — image.tagSuffix ("-ubi") picks the UBI build, which exists for
+       the BIND9 image only. */ -}}
+{{- if eq $flavor "bind9" -}}
+  {{- $imgTag = printf "%s%s" $imgTag ($root.Values.image.tagSuffix | default "") -}}
+{{- end -}}
 {{- /* Volume mount path for the driver's zone-state volume. BIND9 caches
        zone files under /var/cache/bind; PowerDNS LMDB lives at
        /var/lib/powerdns; Technitium's own config + zone store lives at
@@ -247,7 +252,7 @@ spec:
         resources:
           requests:
             storage: {{ (get ($server.storage | default dict) "dnsState") | default "2Gi" }}
----
+{{- "\n---\n" }}
 {{- $svc := $server.service | default dict -}}
 {{- /* #3229 — ClusterIP by default. A LoadBalancer default turns into a
        hostPort-53 svclb pod on every node under k3s's bundled servicelb,
@@ -313,7 +318,7 @@ spec:
     {{- with $server.doqPort }}
     - { name: dns-doq, port: {{ . }}, targetPort: {{ . }}, protocol: UDP }
     {{- end }}
----
+{{- "\n---\n" }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -339,6 +344,6 @@ spec:
     {{- with $server.doqPort }}
     - { name: dns-doq, port: {{ . }}, protocol: UDP }
     {{- end }}
----
+{{- "\n---\n" }}
 {{- end }}
 {{- end }}
