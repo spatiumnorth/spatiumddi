@@ -10,9 +10,10 @@ counts, never a request.
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import structlog
+from sqlalchemy import ColumnElement, and_, or_
 
 from app.config import settings
 from app.core.redis_client import make_async_redis
@@ -51,3 +52,27 @@ async def record_call(token_id: object, client_ip: str | None) -> None:
         await pipe.execute()
     except Exception as exc:  # noqa: BLE001 — usage counting is best-effort
         logger.warning("api_token_usage_record_failed", error=str(exc))
+
+
+IDLE_DEFAULT_DAYS = 90
+
+
+def live_idle_clause(now: datetime, days: int) -> ColumnElement[bool]:
+    """SQL predicate: an active, unexpired token with no call in ``days`` days.
+
+    A token never used counts from ``created_at``. Revoked (``is_active`` false)
+    and expired tokens are excluded: they cannot be called, so "unused" is not
+    a finding for them. Shared by the ``api_token_unused`` alert rule and the
+    Security dashboard tile (#4491).
+    """
+    from app.models.auth import APIToken  # noqa: PLC0415
+
+    cutoff = now - timedelta(days=days)
+    return and_(
+        APIToken.is_active.is_(True),
+        or_(APIToken.expires_at.is_(None), APIToken.expires_at > now),
+        or_(
+            APIToken.last_used_at < cutoff,
+            and_(APIToken.last_used_at.is_(None), APIToken.created_at < cutoff),
+        ),
+    )

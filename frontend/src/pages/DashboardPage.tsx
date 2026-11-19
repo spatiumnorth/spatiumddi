@@ -5844,6 +5844,15 @@ function SecurityPanel() {
           <p className="text-[11px] text-muted-foreground">
             of {data.api_tokens_total} tokens · within 30 d
           </p>
+          {data.api_tokens_idle_count !== undefined && (
+            <p
+              className="text-[11px] text-muted-foreground"
+              data-testid="tokens-idle"
+            >
+              {data.api_tokens_idle_count} idle{" "}
+              {data.api_tokens_idle_days ?? 90} d+
+            </p>
+          )}
         </Link>
         <Link
           to="/admin/audit"

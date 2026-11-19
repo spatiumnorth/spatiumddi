@@ -5,6 +5,7 @@ import { usePermissions } from "@/hooks/usePermissions";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Copy,
+  BarChart3,
   Eye,
   EyeOff,
   Plus,
@@ -25,6 +26,7 @@ import {
   type ApiTokenScope,
   formatApiError,
 } from "@/lib/api";
+import { ApiTokenUsageChart } from "@/components/ApiTokenUsageChart";
 import { ReauthFields } from "@/components/ReauthFields";
 import { copyToClipboard } from "@/lib/clipboard";
 import {
@@ -827,6 +829,7 @@ export function ApiTokensPage() {
   const [confirmDelete, setConfirmDelete] = useState<ApiToken | null>(null);
   const [reenable, setReenable] = useState<ApiToken | null>(null);
   const [revokeTarget, setRevokeTarget] = useState<ApiToken | null>(null);
+  const [usageTarget, setUsageTarget] = useState<ApiToken | null>(null);
   // Only a superadmin can re-enable an inactive token; owners mint a new one.
   const { isSuperadmin } = usePermissions();
 
@@ -979,6 +982,13 @@ export function ApiTokensPage() {
                     </td>
                     <td className="px-3 py-2">
                       <div className="flex justify-end gap-1">
+                        <button
+                          onClick={() => setUsageTarget(t)}
+                          className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                          title="Usage"
+                        >
+                          <BarChart3 className="h-3.5 w-3.5" />
+                        </button>
                         {t.is_active ? (
                           <button
                             onClick={() => setRevokeTarget(t)}
@@ -1067,6 +1077,15 @@ export function ApiTokensPage() {
           onClose={() => setRevokeTarget(null)}
           onConfirm={() => revokeTarget && revokeMut.mutate(revokeTarget)}
         />
+        {usageTarget && (
+          <Modal
+            title={`Usage — ${usageTarget.name}`}
+            onClose={() => setUsageTarget(null)}
+            wide
+          >
+            <ApiTokenUsageChart tokenId={usageTarget.id} />
+          </Modal>
+        )}
         {confirmDelete && (
           <Modal
             title="Delete API Token"

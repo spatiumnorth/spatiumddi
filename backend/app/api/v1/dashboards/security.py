@@ -35,6 +35,7 @@ from app.api.deps import DB, CurrentUser
 from app.core.permissions import is_effective_superadmin, user_has_permission
 from app.models.audit import AuditLog
 from app.models.auth import APIToken, User
+from app.services.api_token_usage import IDLE_DEFAULT_DAYS, live_idle_clause
 
 router = APIRouter()
 
@@ -95,6 +96,9 @@ class SecurityDashboardSummary(BaseModel):
     api_tokens_total: int
     api_tokens_expiring_count: int
     api_tokens_expiring: list[APITokenRow]
+    # Active tokens with no call in ``api_tokens_idle_days`` (#4491).
+    api_tokens_idle_count: int = 0
+    api_tokens_idle_days: int = 90
 
     # Failed logins
     failed_login_window_hours: int
@@ -202,6 +206,15 @@ async def security_summary(db: DB, current_user: CurrentUser) -> SecurityDashboa
         .scalars()
         .all()
     )
+    idle_count = int(
+        (
+            await db.execute(
+                select(func.count())
+                .select_from(APIToken)
+                .where(live_idle_clause(now, IDLE_DEFAULT_DAYS))
+            )
+        ).scalar_one()
+    )
     user_ids = {t.user_id for t in expiring_tokens if t.user_id}
     user_lookup: dict[str, str] = {}
     if user_ids:
@@ -299,6 +312,8 @@ async def security_summary(db: DB, current_user: CurrentUser) -> SecurityDashboa
         api_tokens_total=int(tokens_total),
         api_tokens_expiring_count=len(expiring_tokens),
         api_tokens_expiring=expiring_rows if privileged else [],
+        api_tokens_idle_count=idle_count,
+        api_tokens_idle_days=IDLE_DEFAULT_DAYS,
         failed_login_window_hours=_FAILED_LOGIN_WINDOW_HOURS,
         failed_login_total=len(failed_rows),
         failed_login_top_sources=grouped[:_DETAIL_LIMIT] if privileged else [],

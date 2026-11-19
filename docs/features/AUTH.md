@@ -939,6 +939,32 @@ once a minute per token and commits on its own, so a token used only for
 reads shows its use too (#1158). JWTs take the original path. A
 missing / wrong / revoked token returns 401 (`Invalid or revoked API token`; an expired one, `API token has expired`), a different detail from an invalid JWT.
 
+**Usage tracking and idle tokens (#4491).** Besides `last_used_at`, each token
+keeps calls per UTC day (90 days) and the address of its last call. A call costs
+one pipelined Redis write and no database write; a beat task folds the counters
+into `api_token_usage_daily` and onto `api_token.last_client_ip` every five
+minutes, so these figures lag a call by up to that long and a Redis outage loses
+counts, never a request. Nothing recorded contains the token or its hash.
+
+- `GET /api/v1/api-tokens` adds `calls_30d` and `last_client_ip` to each row, and
+  `?idle_days=N` keeps the tokens not used in N days (a token never used counts
+  from its creation date).
+- `GET /api/v1/api-tokens/{id}/usage?days=30` (1 to 90) returns a zero-filled
+  daily series. The API Tokens page shows it as a bar chart from each row's
+  **Usage** button, with a 30 / 90-day toggle.
+- The **Security** dashboard tile "Tokens expiring" also prints how many tokens
+  are idle for 90 days or more.
+- The `api_token_unused` alert rule (Alerts, type "API token unused") fires per
+  token that is active, unexpired, and has had no call in `threshold_days`
+  (default 90). A never-used token counts from creation; revoked and expired
+  tokens never fire. It is not seeded: create the rule when you want it, and use
+  it alongside `secret_expiring`, which covers the opposite risk. The message
+  names the token and its non-secret prefix only. The Copilot reads the same
+  figures through `find_api_tokens`.
+
+Not covered: service-account token views (#2144), automatically revoking an idle
+token, and a per-endpoint breakdown of calls.
+
 **Lifecycle.**
 - Create via the Admin → API Tokens UI or `POST /api/v1/api-tokens`
   (JSON: `{name, description?, expires_at?, expires_in_days?, scopes?,
