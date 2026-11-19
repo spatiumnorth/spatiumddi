@@ -17,7 +17,7 @@ from .bootstrap import reauthenticate
 from .cache import save_token
 from .config import AgentConfig
 from .config_apply import ApplyStatus
-from .ha_tls import AGENT_CAPABILITIES
+from .ha_tls import current_capabilities
 from .instance import AGENT_INSTANCE, AGENT_INSTANCE_HEADER
 from .oom_watch import OomWatch
 from .spool import SpoolManager
@@ -76,6 +76,13 @@ class HeartbeatClient:
         # upgraded under it without the agent re-registering — a latched drop
         # would keep the gate shut until something restarted the agent.
         self._capabilities_retry_at = 0.0
+        # #3790 — Kea subnet ids the daemon runs, set by SyncLoop after each
+        # apply. None until the first one. The partner's bundle carries them
+        # (the HA ordering rule). Dropped for good when the control plane 422s
+        # the field (it predates #3790; capabilities, which gate use of it,
+        # are then not honoured either).
+        self.applied_subnet_ids: list[int] | None = None
+        self._applied_field_unsupported = False
 
     def stop(self) -> None:
         self._stop.set()
@@ -174,7 +181,9 @@ class HeartbeatClient:
             "kea_version": None if announce else self._kea_version(),
         }
         if time.monotonic() >= self._capabilities_retry_at:
-            body["capabilities"] = list(AGENT_CAPABILITIES)
+            body["capabilities"] = current_capabilities()
+        if self.applied_subnet_ids is not None and not self._applied_field_unsupported:
+            body["applied_subnet_ids"] = list(self.applied_subnet_ids)
         if self.spool_manager is not None and not self._spool_field_unsupported:
             try:
                 body["spool"] = self._spool_with_pending(self.spool_manager.status())
@@ -203,6 +212,19 @@ class HeartbeatClient:
                         time.monotonic() + CAPABILITIES_RETRY_SECONDS
                     )
                     body.pop("capabilities")
+                    resp = c.post(
+                        "/api/v1/dhcp/agents/heartbeat",
+                        json=body,
+                        headers=self._auth_headers(),
+                    )
+                if (
+                    resp.status_code == 422
+                    and "applied_subnet_ids" in body
+                    and "applied_subnet_ids" in resp.text
+                ):
+                    log.warning("heartbeat_applied_subnet_ids_field_unsupported")
+                    self._applied_field_unsupported = True
+                    body.pop("applied_subnet_ids")
                     resp = c.post(
                         "/api/v1/dhcp/agents/heartbeat",
                         json=body,

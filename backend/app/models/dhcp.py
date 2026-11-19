@@ -312,6 +312,12 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # older than 2.7, so upgrading an HA pair one node at a time breaks HA
     # mid-run. NULL = not reported yet (treat as UNKNOWN, never as "old").
     kea_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # #3790 — the Kea subnet ids the agent has applied, as last reported on the
+    # heartbeat. A member of an HA pair only ever carries subnets its partner
+    # also has, so each member's bundle names the other's set
+    # (``ConfigBundle.incremental``). NULL = never reported (older agent, or no
+    # apply yet): UNKNOWN, never "no subnets".
+    applied_subnet_ids: Mapped[list[int] | None] = mapped_column(JSONB, nullable=True)
 
     # ── #882 last config-apply verdict ────────────────────────────────────
     #

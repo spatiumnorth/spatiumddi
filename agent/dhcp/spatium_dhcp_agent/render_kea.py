@@ -1340,8 +1340,13 @@ def render(
     lease_file_v6: str | None = None,
     v6_unicast: list[tuple[str, str]] | None = None,
     ha_tls_dir: str = DEFAULT_HA_TLS_DIR,
+    extra_hooks: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Render a ConfigBundle into a Kea config document.
+
+    ``extra_hooks`` are additional ``hooks-libraries`` entries for the DHCPv4
+    daemon (the subnet_cmds / host_cmds hooks, #3790). The caller passes only
+    libraries the image carries: Kea refuses a config naming a missing one.
 
     Always returns BOTH a ``{"Dhcp4": {...}}`` and a ``{"Dhcp6": {...}}``
     block — the agent container runs kea-dhcp4 AND kea-dhcp6 always-on
@@ -1441,6 +1446,7 @@ def render(
     # a DHCPFailoverChannel. Kea rejects a config that references
     # ``libdhcp_ha.so`` without matching ``libdhcp_lease_cmds.so``, so
     # the lease_cmds hook above is load-bearing here too.
+    dhcp4["hooks-libraries"].extend(extra_hooks or [])
     failover = bundle.get("failover")
     if isinstance(failover, dict) and failover.get("peers"):
         dhcp4["hooks-libraries"].append(_ha_hook(failover, ha_tls_dir))
