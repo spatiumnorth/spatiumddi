@@ -40,12 +40,15 @@ from app.services.dhcp.static_ipam import (
 from app.services.dhcp.windows_writethrough import push_scope_restore
 from app.services.dns.record_ops import push_records_restore, retract_address_records
 from app.services.dns.view_collisions import RenderGuard, collision_detail
+from app.services.e911.address_bindings import bound_static_mirror_ids
 from app.services.e911.delete_guard import refuse_if_e911_bound
 from app.services.ipam.orphan_aliases import (
     is_withdrawn_alias,
     orphan_record_owners,
     orphan_record_reason,
     refusal_reason,
+    superseded_record_owners,
+    superseded_record_reason,
     withdrawn_alias_owners,
 )
 from app.services.ipam.utilization import recount_subnets_and_blocks
@@ -662,6 +665,16 @@ async def restore_row(
                 status_code=409,
                 detail=f"Cannot restore {_row_label(target)}: {orphan_record_reason(owner[2])}.",
             )
+        # #4361 — and one whose address was renamed or blanked meanwhile.
+        superseded = (await superseded_record_owners(db, record_ids=[target.id])).get(target.id)
+        if superseded is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Cannot restore {_row_label(target)}: "
+                    f"{superseded_record_reason(superseded[2])}."
+                ),
+            )
 
     batch_id = target.deletion_batch_id
     if batch_id is None:
@@ -814,8 +827,17 @@ async def restore_row(
     # task: a restore is rare and operator-driven, and the zone must not answer
     # a name IPAM gave up for even a moment (nor for good if the broker is down
     # and the opt-in auto-sync is off). The task is the retry if this fails.
-    if restored_zone_ids:
+    # #4227 — the same for the subnets a restore brought back (a subnet, or a
+    # block / space holding some): the zone restore before it left their
+    # records with the subnet's batch, and they come back as the Trash held
+    # them. One pass over zone + subnets, so the order of the two restores
+    # does not matter.
+    reconcile_subnet_ids = {o.id for o in restored if isinstance(o, Subnet)}
+    if restored_zone_ids or reconcile_subnet_ids:
+        from app.core.celery_dispatch import dispatch as _dispatch  # noqa: PLC0415
         from app.tasks.ipam_dns_sync import (  # noqa: PLC0415
+            reconcile_restored_subnet_records,
+            reconcile_restored_subnet_records_task,
             reconcile_restored_zone_records,
             reconcile_restored_zone_records_task,
         )
@@ -823,22 +845,37 @@ async def restore_row(
         # The restore's UPDATE left the identity map holding the rows as they
         # were read; the planner must read them as they are now.
         db.expunge_all()
-        try:
-            _changed, reconcile_wake = await reconcile_restored_zone_records(
-                db, list(restored_zone_ids)
-            )
-            restore_wake_groups |= set(reconcile_wake)
-        except Exception as exc:  # noqa: BLE001 — the restore is committed and stands
-            await db.rollback()
-            logger.warning("trash.restore_zone_reconcile_failed", error=str(exc))
-            from app.core.celery_dispatch import dispatch as _dispatch  # noqa: PLC0415
-
+        if restored_zone_ids:
             try:
-                await _dispatch(
-                    reconcile_restored_zone_records_task, [str(i) for i in restored_zone_ids]
+                _changed, reconcile_wake = await reconcile_restored_zone_records(
+                    db, list(restored_zone_ids)
                 )
-            except Exception as exc2:  # noqa: BLE001
-                logger.warning("trash.restore_zone_reconcile_enqueue_failed", error=str(exc2))
+                restore_wake_groups |= set(reconcile_wake)
+            except Exception as exc:  # noqa: BLE001 — the restore is committed and stands
+                await db.rollback()
+                logger.warning("trash.restore_zone_reconcile_failed", error=str(exc))
+                try:
+                    await _dispatch(
+                        reconcile_restored_zone_records_task, [str(i) for i in restored_zone_ids]
+                    )
+                except Exception as exc2:  # noqa: BLE001
+                    logger.warning("trash.restore_zone_reconcile_enqueue_failed", error=str(exc2))
+        if reconcile_subnet_ids:
+            try:
+                _changed, reconcile_wake = await reconcile_restored_subnet_records(
+                    db, list(reconcile_subnet_ids)
+                )
+                restore_wake_groups |= set(reconcile_wake)
+            except Exception as exc:  # noqa: BLE001 — the restore is committed and stands
+                await db.rollback()
+                logger.warning("trash.restore_subnet_reconcile_failed", error=str(exc))
+                try:
+                    await _dispatch(
+                        reconcile_restored_subnet_records_task,
+                        [str(i) for i in reconcile_subnet_ids],
+                    )
+                except Exception as exc2:  # noqa: BLE001
+                    logger.warning("trash.restore_subnet_reconcile_enqueue_failed", error=str(exc2))
     if republish_subnet_ids:
         from app.core.celery_dispatch import dispatch  # noqa: PLC0415
         from app.tasks.ipam_dns_sync import (  # noqa: PLC0415
@@ -980,6 +1017,8 @@ async def permanent_delete_from_trash(
     # before the commit (#3354).
     touched_subnets: set[uuid.UUID] = set()
     if isinstance(target, DHCPScope):
+        # #4286: the purge takes the binding on a reservation's address (#3891).
+        await refuse_if_e911_bound(db, label, ip_ids=await bound_static_mirror_ids(db, [target.id]))
         await _tear_down_scope_leases_before_purge(db, target.id, label)
     try:
         if isinstance(target, DHCPScope):
@@ -990,7 +1029,9 @@ async def permanent_delete_from_trash(
             # back into free gaps, and purge any dynamic leases still pointing here —
             # defense-in-depth for pre-fix strays / convergence-race leftovers (the
             # first soft-delete normally already cleaned both up).
-            await remove_ipam_for_scope_statics(db, target.id, touched_subnets=touched_subnets)
+            await remove_ipam_for_scope_statics(
+                db, target.id, touched_subnets=touched_subnets, user=current_user
+            )
             await delete_leases_for_scope(db, target.id, touched_subnets=touched_subnets)
         elif isinstance(target, Customer):
             # network_service.customer_id is RESTRICT, so a customer that still

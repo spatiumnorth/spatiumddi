@@ -6,6 +6,7 @@ import {
   type DHCPFailoverActionResult,
   type DHCPFailoverMode,
   type DHCPFailoverRelationship,
+  type DHCPFailoverRelationshipUpdate,
   type DHCPGroupFailover,
 } from "@/lib/api";
 import { Btns, Field, Modal, errMsg, inputCls } from "./_shared";
@@ -126,25 +127,53 @@ export function RelationshipModal({
     onDone(r);
     onClose();
   });
+  const tuningNow = () => ({
+    max_client_lead_time_seconds: toInt(mclt),
+    auto_state_transition: autoState,
+    state_switch_interval_seconds: autoState ? toInt(switchInterval) : null,
+    shared_secret: secret || null,
+    ...(mode === "HotStandby"
+      ? { server_role: role, reserve_percent: toInt(reserve) }
+      : { load_balance_percent: toInt(lbPercent) }),
+  });
+  // An edit sends only what the operator changed against the relationship read
+  // when the dialog opened (#4379), so a value another client set since is not
+  // put back; the per-mode fields go with a change of mode. Null when nothing
+  // changed. A blank secret is kept.
+  const editBody = (): DHCPFailoverRelationshipUpdate | null => {
+    const t = tuningNow();
+    const modeChanged = mode !== currentMode;
+    const was: Record<string, unknown> = {
+      max_client_lead_time_seconds: relationship!.max_client_lead_time_seconds,
+      auto_state_transition: relationship!.auto_state_transition ?? false,
+      state_switch_interval_seconds:
+        relationship!.state_switch_interval_seconds,
+      server_role: editSide?.server_role ?? "Active",
+      reserve_percent: editSide?.reserve_percent ?? 5,
+      load_balance_percent: editSide?.load_balance_percent ?? 50,
+    };
+    const perMode = ["server_role", "reserve_percent", "load_balance_percent"];
+    const body: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(t)) {
+      if (k === "shared_secret") {
+        if (v) body[k] = v;
+      } else if (modeChanged && perMode.includes(k)) body[k] = v;
+      else if (JSON.stringify(was[k] ?? null) !== JSON.stringify(v ?? null))
+        body[k] = v;
+    }
+    if (modeChanged) body.mode = mode;
+    if (Object.keys(body).length === 0) return null;
+    body.server_id = editSide?.server_id ?? null;
+    return body as DHCPFailoverRelationshipUpdate;
+  };
   const mut = useMutation(
     action(() => {
-      const tuning = {
-        max_client_lead_time_seconds: toInt(mclt),
-        auto_state_transition: autoState,
-        state_switch_interval_seconds: autoState ? toInt(switchInterval) : null,
-        shared_secret: secret || null,
-        ...(mode === "HotStandby"
-          ? { server_role: role, reserve_percent: toInt(reserve) }
-          : { load_balance_percent: toInt(lbPercent) }),
-      };
       if (editing) {
-        return dhcpApi.updateFailoverRelationship(groupId, relationship!.name, {
-          ...tuning,
-          // Only a real change of mode is sent; resending the current one
-          // would make Windows re-validate every per-mode field.
-          mode: mode !== currentMode ? mode : null,
-          server_id: editSide?.server_id ?? null,
-        });
+        return dhcpApi.updateFailoverRelationship(
+          groupId,
+          relationship!.name,
+          editBody()!,
+        );
       }
       return dhcpApi.createFailoverRelationship(groupId, {
         name: name.trim(),
@@ -152,7 +181,7 @@ export function RelationshipModal({
         partner_server_id: partnerId,
         mode,
         scope_ids: [...picked].map((cidr) => cidr.split("/")[0]),
-        ...tuning,
+        ...tuningNow(),
       });
     }),
   );
@@ -171,6 +200,10 @@ export function RelationshipModal({
         className="space-y-3"
         onSubmit={(e) => {
           e.preventDefault();
+          if (editing && editBody() === null) {
+            onClose();
+            return;
+          }
           mut.mutate();
         }}
       >

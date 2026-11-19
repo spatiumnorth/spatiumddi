@@ -203,7 +203,11 @@ export function TldRegistrySection({
         }
         confirmLabel="Refresh"
         loading={refresh.isPending}
-        onClose={() => setConfirm(false)}
+        error={error || null}
+        onClose={() => {
+          setConfirm(false);
+          setError("");
+        }}
         onConfirm={() => refresh.mutate()}
       />
     </>

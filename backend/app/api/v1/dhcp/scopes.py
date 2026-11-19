@@ -631,6 +631,7 @@ async def _assert_no_overlapping_group_cidr(
     subnet: Subnet,
     *,
     exclude_scope_id: uuid.UUID | None = None,
+    restoring: bool = False,
 ) -> None:
     """Refuse a scope whose subnet CIDR overlaps another ACTIVE scope's subnet
     in the same group (#844).
@@ -643,7 +644,11 @@ async def _assert_no_overlapping_group_cidr(
     reservation guard (#619): refuse at the API instead of shipping a config
     the daemon will refuse. Overlap within one space is already impossible
     (IPAM validates), so a hit here means two IP spaces — the fix is a
-    separate DHCP server group per overlapping space.
+    separate DHCP server group per overlapping space. The Trash's Restore
+    cannot follow that advice (it takes no group, and a scope cannot move to
+    another group), so ``restoring=True`` words the refusal with what the
+    operator can do there instead (#4363): name the live scope and say to
+    deactivate or delete it first.
 
     Raw SQL for the ``&&`` cidr operator (mirrors the IPAM overlap checks);
     that bypasses the ORM soft-delete filter, hence the explicit
@@ -651,8 +656,9 @@ async def _assert_no_overlapping_group_cidr(
     """
     res = await db.execute(
         sa_text("""
-            SELECT s.network FROM subnet s
+            SELECT s.network, sc.name, COALESCE(sp.name, '') FROM subnet s
             JOIN dhcp_scope sc ON sc.subnet_id = s.id
+            LEFT JOIN ip_space sp ON sp.id = s.space_id
             WHERE sc.group_id = CAST(:gid AS uuid)
               AND sc.subnet_id != CAST(:sid AS uuid)
               AND sc.is_active
@@ -669,6 +675,19 @@ async def _assert_no_overlapping_group_cidr(
         },
     )
     row = res.first()
+    if row and restoring:
+        # Not .capitalize(): it lower-cases the rest, scope name included.
+        live = f"Scope '{row[1]}'" if row[1] else "A scope"
+        space = f" (IP space '{row[2]}')" if row[2] else " (another IP space)"
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{live}{space} in this DHCP server group now holds "
+                f"{row[0]}, which overlaps {subnet.network}; two scopes on one "
+                f"prefix would make the server reject the whole config (#844). "
+                f"Deactivate or delete that scope, then restore this one."
+            ),
+        )
     if row:
         raise HTTPException(
             status_code=409,
@@ -1034,6 +1053,17 @@ async def update_scope(
         # an active scope; another scope's pool may still name it.
         await refuse_scope_removal_orphaning_classes(db, scope, "deactivate this scope")
     if changes.get("is_active") is True and not scope.is_active:
+        # #4367 — activation brings the scope's pools back into the rendered
+        # config with their class restriction; a class that stopped rendering
+        # while the scope was inactive (profile / policy disabled) would leave
+        # a pool that matches no client. Same rule as the pool API and Restore.
+        from app.api.v1.dhcp.pools import scope_activation_class_problems  # noqa: PLC0415
+
+        _problems = await scope_activation_class_problems(db, scope)
+        if _problems:
+            raise HTTPException(
+                status_code=409, detail=f"Cannot activate this scope: {_problems[0]}"
+            )
         subnet = await db.get(Subnet, scope.subnet_id)
         if subnet is not None:
             await _assert_no_overlapping_group_cidr(

@@ -329,3 +329,35 @@ async def test_restore_helpers_read_the_host_the_way_apt_does() -> None:
         validate_apt_authority("http://***@a:1?@b:2")
     # No path (a proxy): the whole remainder is the host part.
     assert restore_proxy_credentials("http://***@a:1/y?q=@z", stored) == "http://u:p@a:1/y?q=@z"
+
+
+async def test_smtp_security_downgrade_needs_the_password_again(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h = await _admin(db_session)
+    r = await client.post(
+        "/api/v1/settings/audit-forward-targets",
+        headers=h,
+        json={
+            "name": f"smtp-{uuid.uuid4().hex[:6]}",
+            "kind": "smtp",
+            "smtp_host": "mail.example.com",
+            "smtp_port": 587,
+            "smtp_security": "starttls",
+            "smtp_username": "svc",
+            "smtp_password": "stored-pw",
+            "smtp_from_address": "ddi@example.com",
+            "smtp_to_addresses": ["ops@example.com"],
+        },
+    )
+    assert r.status_code in (200, 201), r.text
+    tid = r.json()["id"]
+    url = f"/api/v1/settings/audit-forward-targets/{tid}"
+    r = await client.put(url, headers=h, json={"smtp_security": "none"})
+    assert r.status_code == 422, r.text
+    assert "smtp_security" in r.json()["detail"] and "smtp_password" in r.json()["detail"]
+    # A stronger or unchanged mode, or the password sent again, is fine.
+    r = await client.put(url, headers=h, json={"smtp_security": "ssl"})
+    assert r.status_code == 200, r.text
+    r = await client.put(url, headers=h, json={"smtp_security": "none", "smtp_password": "pw2"})
+    assert r.status_code == 200, r.text

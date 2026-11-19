@@ -9,8 +9,8 @@ This is **operator triage**, not analytics. We keep a short rolling
 window (default 24 h) so the UI stays responsive and the table size
 is bounded; longer retention belongs in Loki / a SIEM.
 
-The FK cascade drops a server's entries when the server row is
-removed.
+Deleting a server keeps its entries: the FK is ``ON DELETE SET NULL``
+(#4173) and the retention prune ages them out as usual.
 """
 
 from __future__ import annotations
@@ -56,11 +56,17 @@ class DNSQueryLogEntry(Base):
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    server_id: Mapped[uuid.UUID] = mapped_column(
+    # SET NULL, not CASCADE (#4173): the row records what a client asked, not
+    # anything about the server, so retiring a server must not erase it (and
+    # the cascade made the delete minutes long on a big table). ``server_name``
+    # keeps the row attributable once the id is gone; NULL ``server_id`` means
+    # "the server was deleted", never "unknown server".
+    server_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("dns_server.id", ondelete="CASCADE"),
-        nullable=False,
+        ForeignKey("dns_server.id", ondelete="SET NULL"),
+        nullable=True,
     )
+    server_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     client_ip: Mapped[str | None] = mapped_column(INET, nullable=True)
     client_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -114,11 +120,17 @@ class DHCPLogEntry(Base):
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    server_id: Mapped[uuid.UUID] = mapped_column(
+    # SET NULL, not CASCADE (#4173): the row records what a client asked, not
+    # anything about the server, so retiring a server must not erase it (and
+    # the cascade made the delete minutes long on a big table). ``server_name``
+    # keeps the row attributable once the id is gone; NULL ``server_id`` means
+    # "the server was deleted", never "unknown server".
+    server_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("dhcp_server.id", ondelete="CASCADE"),
-        nullable=False,
+        ForeignKey("dhcp_server.id", ondelete="SET NULL"),
+        nullable=True,
     )
+    server_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     severity: Mapped[str | None] = mapped_column(String(16), nullable=True)
     code: Mapped[str | None] = mapped_column(String(64), nullable=True)

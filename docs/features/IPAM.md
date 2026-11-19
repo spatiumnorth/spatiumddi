@@ -2133,7 +2133,9 @@ settings (plus an optional sub-subnet `child_layout`) and stamps
 them onto blocks or subnets at apply time. ``applies_to`` locks
 each template to one of the two carriers so apply-time semantics
 stay unambiguous. ``force=False`` fills only empty/null target
-columns; ``force=True`` overwrites unconditionally and is the path
+columns; ``force=True`` overwrites unconditionally, except that
+tags and custom fields are merged (the template's keys win, keys the
+template does not hold stay, #4420), and is the path
 ``/reapply-all`` uses to refresh drift across every recorded
 instance (cap 200). ``IPBlockCreate.template_id`` /
 ``SubnetCreate.template_id`` add optional pre-fill on the create

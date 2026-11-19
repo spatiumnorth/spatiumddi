@@ -1,0 +1,102 @@
+# SpatiumDDI web UI — Red Hat UBI 9 variant (#3913).
+# Published as ghcr.io/spatiumnorth/spatiumddi-frontend:<version>-ubi. Same UI, same
+# nginx config template and entrypoint scripts as frontend/Dockerfile; only the base
+# (ubi9/ubi-minimal + nginx 1.26 from the UBI AppStream) and the entrypoint plumbing differ.
+# Multi-arch: linux/amd64, linux/arm64 (non-negotiable #11)
+
+# ── Stage 1: build (platform independent output; see frontend/Dockerfile) ─────
+FROM --platform=$BUILDPLATFORM node:22-alpine AS builder
+ARG VITE_APP_VERSION=dev
+ENV VITE_APP_VERSION=${VITE_APP_VERSION}
+WORKDIR /app
+COPY frontend/package.json frontend/package-lock.json* ./
+RUN npm install --prefer-offline
+COPY frontend/ .
+COPY NOTICE LICENSE ./legal/
+RUN npm run build
+
+
+# ── Stage 2: serve via nginx on UBI ───────────────────────────────────────────
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.9@sha256:baafce2d34783a28b4a472779f304e97e00f9d35c99553bc53b068b14344d9a9 AS runtime
+
+# RPM_SNAPSHOT busts BuildKit's layer cache so the nightly/weekly rebuild really
+# re-runs ``microdnf upgrade`` (same reasoning as APK_SNAPSHOT / APT_SNAPSHOT in the
+# other images). nginx comes from the AppStream ``nginx:1.26`` module stream; gettext
+# provides envsubst and findutils the ``find`` the entrypoint scripts use.
+ARG RPM_SNAPSHOT=dev
+RUN --mount=type=bind,from=builder,source=/app/dist,target=/mnt/dist \
+    echo "rpm snapshot ${RPM_SNAPSHOT}" >/dev/null \
+ && microdnf -y module enable nginx:1.26 \
+ && microdnf -y --setopt=install_weak_deps=0 --nodocs install nginx gettext findutils \
+ && microdnf -y upgrade \
+ && microdnf -y clean all \
+ && rm -rf /var/cache/dnf /var/cache/yum \
+ && rm -rf /etc/nginx/conf.d/*.conf /usr/share/nginx/html/* \
+ # The web root is filled in THIS layer, the one that installs nginx. The nginx rpm
+ # owns /usr/share/nginx/html/index.html, and Red Hat's preflight HasModifiedFiles
+ # fails an image whose LATER layer replaces a file an rpm installed (#3913).
+ && cp -a /mnt/dist/. /usr/share/nginx/html/
+
+# #3852 — OpenShift runs this image as an arbitrary uid in group 0. Everything nginx
+# or its entrypoint WRITES is group-0 owned and group-writable: the temp dirs under
+# /var/lib/nginx (RHEL's temp path) and /var/cache/nginx, the rendered conf.d, the
+# logs dir, /run (pid file). The official nginx image uses /var/cache/nginx; RHEL's
+# nginx.conf builds default to /var/lib/nginx/tmp, so both are prepared and nginx.conf
+# below pins them.
+COPY frontend/ubi/nginx.conf /etc/nginx/nginx.conf
+RUN mkdir -p /var/cache/nginx /var/log/nginx /docker-entrypoint.d /etc/nginx/templates \
+ && chgrp -R 0 /var/cache/nginx /var/lib/nginx /var/log/nginx /etc/nginx /run \
+ && chmod -R g=u /var/cache/nginx /var/lib/nginx /var/log/nginx /etc/nginx /run
+
+COPY --from=builder /app/dist-legal /usr/share/spatiumddi/legal
+COPY frontend/default.conf.template /etc/nginx/templates/default.conf.template
+
+# Entrypoint plumbing: the official nginx image's entrypoint + the two scripts we keep
+# from /docker-entrypoint.d (the rest are replaced by ours, same as frontend/Dockerfile).
+COPY frontend/ubi/docker-entrypoint.sh /docker-entrypoint.sh
+COPY frontend/ubi/20-envsubst-on-templates.sh /docker-entrypoint.d/20-envsubst-on-templates.sh
+COPY frontend/ubi/30-tune-worker-processes.sh /docker-entrypoint.d/30-tune-worker-processes.sh
+COPY frontend/15-local-resolvers.envsh /docker-entrypoint.d/15-local-resolvers.envsh
+COPY frontend/16-trusted-proxies.envsh /docker-entrypoint.d/16-trusted-proxies.envsh
+COPY frontend/17-ipv6.envsh /docker-entrypoint.d/17-ipv6.envsh
+COPY frontend/14-http-port.envsh /docker-entrypoint.d/14-http-port.envsh
+COPY frontend/40-tls-reload-watch.sh /docker-entrypoint.d/40-tls-reload-watch.sh
+RUN chmod 0755 /docker-entrypoint.sh /docker-entrypoint.d/*
+
+# Unprivileged by default: :8080 (a non-root uid cannot bind :80). The chart sets the
+# same value for the Alpine image on OpenShift.
+ENV API_UPSTREAM_HOST=api \
+    API_UPSTREAM_PORT=8000 \
+    FRONTEND_HTTP_PORT=8080
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
+    CMD curl -fsS -o /dev/null "http://127.0.0.1:${FRONTEND_HTTP_PORT:-8080}/nginx-health" || exit 1
+
+# #3913 — labels + /licenses (see frontend/Dockerfile). The nginx and gettext licence
+# texts come from the installed RPMs.
+ARG APP_VERSION=dev
+ARG IMAGE_RELEASE=1
+COPY LICENSE NOTICE /licenses/
+RUN mkdir -p /licenses/nginx /licenses/gettext \
+ && cp -a /usr/share/licenses/nginx*/. /licenses/nginx/ \
+ && cp -a /usr/share/licenses/gettext*/. /licenses/gettext/ 2>/dev/null || true
+LABEL name="spatiumddi-frontend" \
+      vendor="Spatium North Inc." \
+      version="${APP_VERSION:-dev}" \
+      release="${IMAGE_RELEASE}" \
+      summary="SpatiumDDI web UI" \
+      description="nginx serving the SpatiumDDI React web UI and reverse-proxying the API." \
+      maintainer="Spatium North Inc. <https://www.spatiumddi.com/>" \
+      url="https://www.spatiumddi.com/" \
+      org.opencontainers.image.title="spatiumddi-frontend" \
+      org.opencontainers.image.vendor="Spatium North Inc." \
+      org.opencontainers.image.url="https://www.spatiumddi.com/" \
+      org.opencontainers.image.source="https://github.com/spatiumnorth/spatiumddi" \
+      org.opencontainers.image.documentation="https://www.spatiumddi.com/" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
+USER 1001
+ENTRYPOINT ["/docker-entrypoint.sh"]
+CMD ["nginx", "-g", "daemon off;"]
