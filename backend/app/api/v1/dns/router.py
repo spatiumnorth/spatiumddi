@@ -6539,7 +6539,9 @@ async def get_zone_server_state(
         entry_in_sync = (
             current is not None
             and not pending
-            and zone_state_in_sync(zone, current, target, srv.driver)
+            and zone_state_in_sync(
+                zone, current, target, srv.driver, srv.agent_reports_served_serials
+            )
         )
         entries.append(
             ServerZoneStateEntry(
@@ -6756,7 +6758,9 @@ async def get_server_zone_state(
         # #2042 — an unacknowledged op is drift whatever the serial says.
         in_sync = (
             current is not None
-            and zone_state_in_sync(z, current, target, server.driver)
+            and zone_state_in_sync(
+                z, current, target, server.driver, server.agent_reports_served_serials
+            )
             and not pending
         )
         if current is None:

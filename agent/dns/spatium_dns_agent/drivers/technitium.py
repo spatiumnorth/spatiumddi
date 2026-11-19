@@ -2479,6 +2479,9 @@ class TechnitiumDriver(DriverBase):
     _unapplied_acl: dict[str, list[str]] | None = None
     # Zone names in the ledger before the current pass; see _retire_dropped_zones.
     _owned_before: frozenset[str] | None = None
+    # The ledger file did not exist this pass (lost / replaced state dir, or
+    # a first run), so an absent name is "not recorded", not "not ours" (#4441).
+    _ledger_lost: bool = False
 
     def _note_apply_failure(self, what: str) -> None:
         if self._apply_failures is not None:
@@ -2936,11 +2939,13 @@ class TechnitiumDriver(DriverBase):
         # the reconcile meets a zone that already exists on the daemon the
         # file can no longer say whether we put it there. ``None`` = unknown.
         self._owned_before = None
+        self._ledger_lost = False
         try:
             managed = {str(n).lower() for n in json.loads(path.read_text())}
             self._owned_before = frozenset(managed)
         except FileNotFoundError:
             self._owned_before = frozenset()
+            self._ledger_lost = True
             managed = set()
             try:
                 previous = json.loads(previous_render.read_text())
@@ -4800,7 +4805,7 @@ class TechnitiumDriver(DriverBase):
                 ns_retimed=retimed,
             )
 
-    def _zone_is_ours(self, token: str, zone: str) -> bool:
+    def _zone_is_ours(self, token: str, zone: str, ztype: str = "Primary") -> bool:
         """May this agent take over a zone that already exists on the daemon?
 
         Only a zone from its own ledger, one carrying the owner marker on
@@ -4808,8 +4813,14 @@ class TechnitiumDriver(DriverBase):
         opted in with ``TECHNITIUM_ADOPT_EXISTING_ZONES``. An unknown ledger
         (unreadable, or the retire step never ran) does not block: refusing
         there would stop every zone on a guess. Only a Primary can carry the
-        marker; a Secondary / Stub / Forwarder rests on the ledger alone.
+        marker; a Secondary / Stub / Forwarder rests on the ledger alone, so
+        when the ledger file is missing altogether those are not refused: they
+        hold no operator-authored records for a takeover to delete (a secondary
+        re-transfers, a forwarder has only the FWD records the bundle names),
+        and refusing them on a lost state dir would never converge (#4441).
         """
+        if self._ledger_lost and ztype != "Primary":
+            return True
         return self._zone_owned(token, zone, self._owned_before)
 
     def _ledger_names(self) -> frozenset[str] | None:
@@ -4958,7 +4969,7 @@ class TechnitiumDriver(DriverBase):
         body = resp.json()
         if body.get("status") == "error":
             if _is_zone_exists(body.get("errorMessage")):
-                if check_owned and not self._zone_is_ours(token, zone):
+                if check_owned and not self._zone_is_ours(token, zone, ztype):
                     # #1775: a zone the operator made on the daemon. Taking
                     # it over deletes every record the bundle lacks, and
                     # retiring it later deletes the zone, so leave it alone.
