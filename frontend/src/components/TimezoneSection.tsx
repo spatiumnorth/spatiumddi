@@ -3,6 +3,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Clock, Loader2 } from "lucide-react";
 
 import { settingsApi, formatApiError } from "@/lib/api";
+import { HOST_TZ_ALIASES, canonicalHostTimezone } from "@/lib/hostTimezones";
 import { isValidTimeZone, timeZoneSuggestions } from "@/lib/timezones";
 
 /**
@@ -42,6 +43,8 @@ interface Props {
   applianceMode: boolean;
 }
 
+const CANONICAL_TARGETS = new Set(Object.values(HOST_TZ_ALIASES));
+
 export function TimezoneSection({
   currentValue,
   isSuperadmin,
@@ -52,16 +55,23 @@ export function TimezoneSection({
   const [savedNote, setSavedNote] = useState<string | null>(null);
 
   // Suggestions only; validity is asked of Intl (see lib/timezones).
-  const ianaList = useMemo(() => timeZoneSuggestions(), []);
+  // Chromium spells some zones only by a legacy alias (Asia/Calcutta,
+  // Europe/Kiev ...) and the host has no tzdata-legacy, so map every
+  // entry to its canonical name rather than dropping it (#4416).
+  const ianaList = useMemo(
+    () => [...new Set(timeZoneSuggestions().map(canonicalHostTimezone))],
+    [],
+  );
 
   const save = useMutation({
     mutationFn: (value: string) => settingsApi.update({ timezone: value }),
-    onSuccess: () => {
+    onSuccess: (_data, value) => {
       qc.invalidateQueries({ queryKey: ["settings"] });
+      setTz(value);
       setSavedNote(
-        tz === ""
+        value === ""
           ? "Timezone override cleared — the host keeps its current value. Set the field to your desired tz to change it."
-          : `Timezone set to ${tz}. Applies on the host within one heartbeat cycle.`,
+          : `Timezone set to ${value}. Applies on the host within one heartbeat cycle.`,
       );
     },
     onError: () => setSavedNote(null),
@@ -69,8 +79,13 @@ export function TimezoneSection({
 
   const disabled = !isSuperadmin || !applianceMode || save.isPending;
   const trimmed = tz.trim();
-  const isValid = trimmed === "" || isValidTimeZone(trimmed);
-  const dirty = trimmed !== currentValue.trim();
+  // An alias is saved as its canonical name (the API does the same).
+  const canonical = canonicalHostTimezone(trimmed);
+  const isValid =
+    trimmed === "" ||
+    isValidTimeZone(canonical) ||
+    CANONICAL_TARGETS.has(canonical);
+  const dirty = canonical !== currentValue.trim();
 
   return (
     <section className="rounded-lg border bg-card p-4">
@@ -114,7 +129,7 @@ export function TimezoneSection({
         <button
           type="button"
           disabled={disabled || !isValid || !dirty}
-          onClick={() => save.mutate(trimmed)}
+          onClick={() => save.mutate(canonical)}
           className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:opacity-90 disabled:opacity-50"
         >
           {save.isPending && <Loader2 className="h-3.5 w-3.5 animate-spin" />}

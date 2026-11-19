@@ -13739,6 +13739,10 @@ export interface ApplianceRow {
       state: "applying" | "retrying" | "failing";
       attempts: number;
       at: string | null;
+      // The host runner's own verdict for the plane, when it left one
+      // (timezone only today, #4416): e.g. ``unknown_timezone``.
+      reason?: string;
+      requested?: string;
     }
   >;
   // #395 — host-migration reconcile health. Keyed by patch id (e.g.
