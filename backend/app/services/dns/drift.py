@@ -79,9 +79,9 @@ def zone_state_in_sync(zone: DNSZone, current: int, target: int, driver: str) ->
     either. A BIND9 agent from before #3940 reports 0 for a secondary it never
     read back, but its start-up report reads every zone from named, so a
     secondary at a non-zero serial is served at it whichever agent says so;
-    a 0 from such an agent is "not reported", never synced. Technitium reads both ways like
-    PowerDNS: a primary being in sync at or past our serial (#1779). Other
-    drivers compare with the target."""
+    a 0 from such an agent is "not reported", never synced. Technitium reads back the
+    serial it serves like PowerDNS, and a primary there is in sync at or past
+    our serial (#1779). Other drivers compare with the target."""
     if (zone.zone_type or "primary") in ("secondary", "stub"):
         if driver in ("powerdns", "bind9") or driver in TECHNITIUM_DRIVERS:
             return current != 0
