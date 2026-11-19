@@ -12,6 +12,7 @@ import {
   ChevronDown,
   ChevronRight,
   Copy,
+  Download,
   FileClock,
   Info,
   Maximize2,
@@ -28,6 +29,8 @@ import {
   type DhcpAuditRow,
   type DHCPActivityLogRow,
   type DNSQueryLogRow,
+  type LogExportFormat,
+  type LogExportResult,
   type LogEventRow,
   type LogSource,
   formatApiError,
@@ -1129,6 +1132,58 @@ function ServerCell({ name }: { name: string }) {
   );
 }
 
+/** CSV / JSON Lines export of exactly what the tab's filters select (#4171). */
+export function LogExportButtons({
+  onExport,
+  disabled,
+}: {
+  onExport: (format: LogExportFormat) => Promise<LogExportResult>;
+  disabled?: boolean;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
+  const run = async (format: LogExportFormat) => {
+    setBusy(true);
+    setNote(null);
+    try {
+      const r = await onExport(format);
+      setNote(
+        r.capped
+          ? `Export capped at ${r.rowCap.toLocaleString()} rows. Narrow the filter to get the rest.`
+          : `Exported ${r.rows.toLocaleString()} rows.`,
+      );
+    } catch {
+      setNote("Export failed.");
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <span className="flex items-center gap-1.5">
+      <Download className="h-3.5 w-3.5 text-muted-foreground" />
+      {(["csv", "jsonl"] as const).map((f) => (
+        <button
+          key={f}
+          type="button"
+          disabled={disabled || busy}
+          onClick={() => run(f)}
+          title={`Download every row the current filters select as ${
+            f === "csv" ? "CSV" : "JSON Lines"
+          }`}
+          className="rounded-md border bg-background px-3 py-1.5 text-xs hover:bg-accent/50 disabled:opacity-50"
+        >
+          {f === "csv" ? "Export CSV" : "Export JSON Lines"}
+        </button>
+      ))}
+      {note && (
+        <span role="status" className="text-xs text-muted-foreground">
+          {note}
+        </span>
+      )}
+    </span>
+  );
+}
+
 function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
   const [selection, setSelection] = useState<AgentLogSelection | null>(() =>
     defaultSelection(sources),
@@ -1303,6 +1358,23 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
               Clear
             </button>
           )}
+          <LogExportButtons
+            disabled={!enabled}
+            onExport={(format) =>
+              logsApi.exportDnsQueries(
+                {
+                  ...scope,
+                  since: sinceIso,
+                  q: q.trim() || null,
+                  qtype: qtype.trim() || null,
+                  client_ip: clientIp.trim() || null,
+                  view: view.trim() || null,
+                  rcode: rcode.trim() || null,
+                },
+                format,
+              )
+            }
+          />
           <RefreshButton query={dnsQueriesQuery} enabled={enabled} />
         </div>
       </div>
@@ -1780,6 +1852,23 @@ function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
         <MaxEventsPicker value={maxEvents} onChange={setMaxEvents} />
         <FilterSearch value={q} onChange={setQ} />
         <div className="ml-auto">
+          <LogExportButtons
+            disabled={!enabled}
+            onExport={(format) =>
+              logsApi.exportDhcpActivity(
+                {
+                  ...scope,
+                  since: sinceIso,
+                  q: q.trim() || null,
+                  severity: severity.trim() || null,
+                  code: code.trim() || null,
+                  mac_address: mac.trim() || null,
+                  ip_address: ip.trim() || null,
+                },
+                format,
+              )
+            }
+          />
           <RefreshButton query={activityQuery} enabled={enabled} />
         </div>
       </div>

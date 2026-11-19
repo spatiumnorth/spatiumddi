@@ -1186,7 +1186,18 @@ def create_app() -> FastAPI:
         # frontend the feature would silently degrade to the dead end it
         # fixes. ``X-Stepup-Required`` marks a 403 that wants the operator
         # step-up, so a dialog can prompt and resubmit (#1412).
-        expose_headers=["X-Total-Count", "X-Adoption-Required", "X-Stepup-Required"],
+        # The log exports (#4171) report their row cap in X-Export-*; a
+        # route-set Access-Control-Expose-Headers would be overwritten by
+        # this middleware, so they are listed here.
+        expose_headers=[
+            "X-Total-Count",
+            "X-Adoption-Required",
+            "X-Stepup-Required",
+            "X-Export-Row-Count",
+            "X-Export-Capped",
+            "X-Export-Row-Cap",
+            "Content-Disposition",
+        ],
     )
 
     # SECURITY (#400 / L3): Host-header allow-list. Added LAST so — given
