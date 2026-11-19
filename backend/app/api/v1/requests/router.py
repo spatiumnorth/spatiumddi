@@ -640,6 +640,7 @@ async def get_current_preview(
     if cr.state != "pending":
         return stored
     from app.services.ai import operations  # noqa: PLC0415
+    from app.services.ai.operations import previewing_for_requester  # noqa: PLC0415
 
     op = operations.get_operation(cr.operation)
     if op is None:
@@ -651,7 +652,12 @@ async def get_current_preview(
         )
     try:
         args = op.args_model.model_validate(cr.args or {})
-        preview = await op.preview(db, current_user, args)
+        if _can_see_all(current_user):
+            preview = await op.preview(db, current_user, args)
+        else:
+            # The requester re-reads their own request: same view as at submit.
+            with previewing_for_requester():
+                preview = await op.preview(db, current_user, args)
     except HTTPException as exc:
         await db.rollback()
         return CurrentPreviewResponse(

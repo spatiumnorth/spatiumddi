@@ -3880,11 +3880,19 @@ def _check_merged_target(t: AuditForwardTarget, body: AuditTargetUpdate) -> None
             secrets={"auth_header": t.auth_header_encrypted},
         )
     elif kind == "smtp":
+        # Dropping to ``none`` sends the stored password unprotected, so it is
+        # treated as a move of the credential, like a new host.
+        weakened = (
+            ("smtp_security",)
+            if carried.get("smtp_security") == "none" and (t.smtp_security or "starttls") != "none"
+            else ()
+        )
         require_secret_with_destination_change(
             t,
             carried,
-            destination=("smtp_host", "smtp_port"),
+            destination=("smtp_host", "smtp_port", *weakened),
             secrets={"smtp_password": t.smtp_password_encrypted},
+            transport=weakened,
         )
 
 
