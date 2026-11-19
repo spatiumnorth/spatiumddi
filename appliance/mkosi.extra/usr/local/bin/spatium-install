@@ -4045,12 +4045,26 @@ _assert_safe_wipe_target() {
 # two ESP spellings.
 _foreign_labelled_partitions() {
     local skip=" " d real node label
+    local s
     for d in "$@"; do
         [ -n "$d" ] || continue
-        skip+="$(readlink -f "$d" 2>/dev/null || echo "$d") "
+        real=$(readlink -f "$d" 2>/dev/null || echo "$d")
+        skip+="$real "
+        # A multipath target is the map; its paths are whole disks that
+        # lsblk lists the map's partitions (and labels) under. They ARE
+        # the target, not another disk.
+        for s in "${SYS_BLOCK:-/sys/block}/$(basename "$real")/slaves"/*; do
+            [ -e "$s" ] && skip+="/dev/$(basename "$s") "
+        done
     done
+    # The live install medium: never ours to relabel, and an ISO written
+    # to a USB stick may carry an ESP-labelled partition.
+    while read -r d; do
+        [ -n "$d" ] && skip+="$(readlink -f "$d" 2>/dev/null || echo "$d") "
+    done < <(_live_boot_disks)
     while read -r d _; do
         [ -n "$d" ] || continue
+        case "${d##*/}" in sr*|loop*|zram*|ram*|fd*|nbd*) continue ;; esac
         real=$(readlink -f "$d" 2>/dev/null || echo "$d")
         case "$skip" in *" $real "*) continue ;; esac
         while read -r node label; do

@@ -17,7 +17,7 @@ from _installer_source import INSTALLER, SRC, extract_fn
 
 FNS = "\n".join(
     extract_fn(n)
-    for n in ("_foreign_labelled_partitions", "_clear_fs_label", "_assert_no_foreign_labels")
+    for n in ("_live_boot_disks", "_foreign_labelled_partitions", "_clear_fs_label", "_assert_no_foreign_labels")
 )
 
 # disk -> [(partition, label, fstype)]
@@ -46,6 +46,7 @@ D
   ;;
   "-nrpo NAME,LABEL "*) d="${{@: -1}}"
      while read -r p l f; do case "$p" in "$d"*) echo "$p $l";; esac; done < {st} ;;
+  "-no PKNAME "*) d="${{@: -1}}"; echo "$(basename "$d" | sed 's/[0-9]*$//')" ;;
   "-nro FSTYPE "*) d="${{@: -1}}"; while read -r p l f; do [ "$p" = "$d" ] && echo "$f"; done < {st} ;;
   "-nro LABEL "*) d="${{@: -1}}"; while read -r p l f; do [ "$p" = "$d" ] && echo "$l"; done < {st} ;;
 esac
@@ -72,7 +73,7 @@ exit 0
     script.write_text(
         f"""set -u
 export PATH={bind}:$PATH
-INSTALL_LOG={tmp}/log; BACKTITLE=t; FULLY_UNATTENDED={unattended}
+PROC_MOUNTS={tmp}/mounts; SYS_BLOCK={tmp}/sys; INSTALL_LOG={tmp}/log; BACKTITLE=t; FULLY_UNATTENDED={unattended}
 PRESEED_CLEAR_FOREIGN_LABELS={allow!r}
 log() {{ echo "$*" >> "$INSTALL_LOG"; }}
 on_cancel() {{ echo "CANCELLED: $*"; exit 10; }}
@@ -82,6 +83,8 @@ set +x
 "$@"
 """
     )
+    (tmp / "mounts").write_text("")
+    (tmp / "sys").mkdir()
     return script, st
 
 
@@ -167,3 +170,23 @@ def test_fstab_still_label_based_for_new_installs():
     # mirror and etc-render paths that resolve the same labels.
     assert "LABEL=var    /var" in SRC and "LABEL=ESP    /boot/efi" in SRC
     assert os.path.exists(INSTALLER)
+
+
+def test_live_boot_medium_is_not_foreign(tmp_path):
+    script, _ = _rig(tmp_path, LAYOUT)
+    (tmp_path / "mounts").write_text("/dev/sdb2 /run/live/medium iso9660 ro 0 0\n")
+    r = _run(script, "_foreign_labelled_partitions", "/dev/sda")
+    assert r.stdout == ""
+
+
+def test_multipath_paths_of_the_target_are_not_foreign(tmp_path):
+    script, _ = _rig(tmp_path, LAYOUT)
+    slaves = tmp_path / "sys" / "mpatha" / "slaves"
+    slaves.mkdir(parents=True)
+    (slaves / "sdb").touch()
+    r = _run(script, "_foreign_labelled_partitions", "/dev/mapper/mpatha")
+    assert r.stdout.splitlines() == [
+        "/dev/sda2 ESP /dev/sda",
+        "/dev/sda3 state /dev/sda",
+        "/dev/sda6 var /dev/sda",
+    ]
