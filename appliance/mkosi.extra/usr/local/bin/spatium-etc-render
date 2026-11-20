@@ -108,6 +108,38 @@ else
     echo "no hostname in $CONFIG — leaving image-baseline hostname"
 fi
 
+# ── Domain, FQDN and /etc/hosts (#4550) ──────────────────────────────
+# /etc/hostname stays the short name (the kernel hostname, the k3s node
+# name and the agent's SERVER_NAME all key off it). The FQDN lives in
+# /etc/hosts, canonical name first, because that is what `hostname -f`
+# resolves: glibc takes the first name on the 127.0.1.1 line.
+#
+# Rewritten on every boot rather than only at install, so a domain changed
+# in STATE later (or removed) is picked up. Only the 127.0.1.1 line is ours;
+# every other line, including an operator's own additions, is kept.
+DOMAIN_VAL="$(get_cfg domain)"
+DNS_SEARCH_VAL="$(get_cfg dns_search)"
+if [ -n "$HOSTNAME_VAL" ] && [ -f /etc/hosts ]; then
+    if [ -n "$DOMAIN_VAL" ]; then
+        _hosts_line="127.0.1.1 $HOSTNAME_VAL.$DOMAIN_VAL $HOSTNAME_VAL"
+    else
+        _hosts_line="127.0.1.1 $HOSTNAME_VAL"
+    fi
+    if ! grep -qxF "$_hosts_line" /etc/hosts; then
+        _hosts_tmp="$(mktemp /etc/hosts.XXXXXX)"
+        { grep -v '^127\.0\.1\.1[[:space:]]' /etc/hosts || true; } > "$_hosts_tmp"
+        # Directly after the 127.0.0.1 line, where the installer put it.
+        if grep -q '^127\.0\.0\.1[[:space:]]' "$_hosts_tmp"; then
+            sed -i "/^127\.0\.0\.1[[:space:]]/a $_hosts_line" "$_hosts_tmp"
+        else
+            echo "$_hosts_line" >> "$_hosts_tmp"
+        fi
+        chmod 0644 "$_hosts_tmp"
+        mv "$_hosts_tmp" /etc/hosts
+        echo "/etc/hosts → $_hosts_line"
+    fi
+fi
+
 # ── SSH host keys ────────────────────────────────────────────────────
 # Authoritative copy lives in STATE. Restore into /etc/ssh so sshd
 # presents a stable identity across slot swaps. If STATE has none yet
@@ -238,6 +270,7 @@ fi
 _render_ipv6_block() {
     if [ "$NET6_MODE_VAL" != "static" ]; then
         echo "method=auto"
+        _dns_search_line
         return 0
     fi
     _v6_ip="$(get_cfg network6_ip)"
@@ -245,6 +278,7 @@ _render_ipv6_block() {
     _v6_gw="$(get_cfg network6_gateway)"
     if [ -z "$_v6_ip" ]; then
         echo "method=auto"
+        _dns_search_line
         return 0
     fi
     echo "method=manual"
@@ -253,6 +287,28 @@ _render_ipv6_block() {
     else
         echo "address1=$_v6_ip/${_v6_prefix:-64}"
     fi
+    _dns_search_line
+}
+
+# #4550 — ``dns-search=a.example;b.example;`` for a keyfile's [ipv4] /
+# [ipv6] section, or nothing. The config key was validated by the installer
+# (<= 6 names, label syntax), but this file is also readable by an operator
+# editing STATE, so anything that is not a plain domain name is dropped
+# rather than written into a file NetworkManager would reject whole.
+# Prints nothing and returns 0 when there is no search list.
+_dns_search_line() {
+    _ds_val="$(get_cfg dns_search)"
+    _ds_out=""
+    for _ds in $(echo "$_ds_val" | tr ',' ' '); do
+        case "$_ds" in
+            ''|*[!A-Za-z0-9.-]*|.*|*..*|-*) continue ;;
+        esac
+        _ds_out="$_ds_out$_ds;"
+    done
+    if [ -n "$_ds_out" ]; then
+        echo "dns-search=$_ds_out"
+    fi
+    return 0
 }
 
 # #1017 — the [ethernet] section's optional ``mtu=``.
@@ -390,6 +446,7 @@ ${NET_MTU_EFFECTIVE:+mtu=$NET_MTU_EFFECTIVE}
 method=manual
 address1=$NET_IP_VAL/$NET_PREFIX_VAL,$NET_GATEWAY_VAL
 dns=$net_dns_csv;
+$(_dns_search_line)
 
 [ipv6]
 $(_render_ipv6_block)
@@ -462,6 +519,7 @@ ${NET_MTU_EFFECTIVE:+mtu=$NET_MTU_EFFECTIVE}
 
 [ipv4]
 method=auto
+$(_dns_search_line)
 
 [ipv6]
 $(_render_ipv6_block)
@@ -473,6 +531,26 @@ EOF
         rm -f "$NM_DHCP_KEYFILE"
         echo "network → dhcp on any port (removed stale pinned keyfile)"
     fi
+fi
+
+# ── DNS search list when no keyfile carries it (#4550) ───────────────
+# The search list rides in whichever keyfile was just written. A DHCP
+# install that pins no port writes none (NetworkManager's own auto profile
+# is what runs), so the list goes into NetworkManager's global [global-dns]
+# section instead, which overrides the per-connection search domains only.
+# Removed again when the list is empty or a keyfile now carries it, so a
+# stale drop-in never outlives the setting.
+NM_SEARCH_CONF=/etc/NetworkManager/conf.d/10-spatium-search.conf
+_global_search="$(_dns_search_line | sed 's/^dns-search=//')"
+if [ -n "$_global_search" ] && [ "$NET_KEYFILE_WRITTEN" != "yes" ]; then
+    install -d -m 0755 /etc/NetworkManager/conf.d
+    printf '# Rendered by spatium-etc-render (#4550) from dns_search in spatium-config.yaml.\n[global-dns]\nsearches=%s\n' \
+        "$_global_search" > "$NM_SEARCH_CONF"
+    chmod 0644 "$NM_SEARCH_CONF"
+    echo "dns search → $_global_search (global-dns drop-in: no keyfile on this box)"
+elif [ -f "$NM_SEARCH_CONF" ]; then
+    rm -f "$NM_SEARCH_CONF"
+    echo "dns search: removed the global-dns drop-in"
 fi
 
 # ── cloud-init leftovers (#1511) ─────────────────────────────────────

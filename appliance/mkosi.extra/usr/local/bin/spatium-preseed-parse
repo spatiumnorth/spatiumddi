@@ -302,7 +302,82 @@ def validate_mtu(
     return ""
 
 
+_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+#: glibc's resolver reads at most six search domains and 256 characters of
+#: them; anything past either is silently ignored, which is worse than a
+#: refusal here.
+_MAX_SEARCH_DOMAINS = 6
+_MAX_SEARCH_CHARS = 256
+
+
+def _domain_problem(name: str, what: str) -> str:
+    """Return "" for a syntactically valid DNS domain name, else why not."""
+    if any(c.isspace() for c in name):
+        return f"{what} {name!r} contains whitespace"
+    if len(name) > 253:
+        return f"{what} is longer than 253 characters"
+    for label in name.split("."):
+        if not label:
+            return f"{what} {name!r} has an empty label (a doubled or leading dot)"
+        if not _LABEL_RE.fullmatch(label):
+            return (
+                f"{what} {name!r}: each label must be 1-63 letters, digits or "
+                "hyphens, and not start or end with a hyphen"
+            )
+    return ""
+
+
+def validate_domain(value: str, hostname: str = "") -> str:
+    """Return "" when the optional domain is usable, else the reason (#4550).
+
+    Empty is legal: it means no domain, the old behaviour. A trailing dot is
+    tolerated by ``normalise_domain`` and so not rejected here. With the
+    hostname as context the FQDN as a whole must fit DNS's 253 characters,
+    since that string is what lands in /etc/hosts and the certificate SAN.
+    """
+    value = normalise_domain(value)
+    if not value:
+        return ""
+    reason = _domain_problem(value, "domain")
+    if reason:
+        return reason
+    if hostname and len(f"{hostname}.{value}") > 253:
+        return (
+            f"hostname + domain make a {len(hostname) + 1 + len(value)}-character "
+            "name; a fully qualified name can be at most 253"
+        )
+    return ""
+
+
+def normalise_domain(value: str) -> str:
+    return value.strip().rstrip(".").lower()
+
+
+def split_search(value: str) -> list[str]:
+    """Search domains arrive space- or comma-separated (or as a list)."""
+    return [normalise_domain(x) for x in value.replace(",", " ").split() if x.strip(".")]
+
+
+def validate_dns_search(value: str) -> str:
+    """Return "" when the search-domain list is usable, else the reason (#4550)."""
+    domains = split_search(value)
+    for d in domains:
+        reason = _domain_problem(d, "dns_search entry")
+        if reason:
+            return reason
+    if len(domains) > _MAX_SEARCH_DOMAINS:
+        return (
+            f"dns_search lists {len(domains)} domains; the resolver reads at "
+            f"most {_MAX_SEARCH_DOMAINS}"
+        )
+    if len(" ".join(domains)) > _MAX_SEARCH_CHARS:
+        return f"dns_search is longer than {_MAX_SEARCH_CHARS} characters in total"
+    return ""
+
+
 _FIELD_VALIDATORS = {
+    "domain": validate_domain,
+    "dns_search": validate_dns_search,
     "admin_user": validate_admin_user,
     "timezone": validate_timezone,
     "admin_password": validate_admin_password,
@@ -490,7 +565,8 @@ if ps is None:
     # only if it carries at least one field we recognise (guards against
     # pointing the installer at an unrelated YAML file).
     known = {
-        "role", "target_disk", "confirm_wipe", "hostname", "admin_user",
+        "role", "target_disk", "confirm_wipe", "hostname", "domain", "dns_search",
+        "admin_user",
         "admin_password", "admin_password_hash", "timezone", "network",
         "k3s", "control_plane_url", "pairing_code", "set_root_password",
         "ntp_servers", "keymap", "ssh_authorized_keys", "ssh_disable_password",
@@ -738,6 +814,33 @@ if hostname:
     if ok:
         env["HOSTNAME"] = hostname
         env["PRESEED_HAS_HOSTNAME"] = "1"
+
+# ── Domain + DNS search domains (#4550) ───────────────────────────────
+# Both optional. The domain makes the FQDN (/etc/hosts, `hostname -f`, the
+# self-signed Web UI certificate's SAN); the search list goes to the
+# NetworkManager keyfile. With a domain and no explicit list, the search
+# list defaults to the domain, which is what an operator typing
+# ddi1.corp.example.com expects of `ping ddi2`.
+_domain_raw = as_str(ps.get("domain"))
+if _domain_raw:
+    _reason = validate_domain(_domain_raw, hostname)
+    if _reason:
+        fail(_reason)
+    else:
+        env["DOMAIN_NAME"] = normalise_domain(_domain_raw)
+        env["PRESEED_HAS_DOMAIN"] = "1"
+_search_raw = ps.get("dns_search")
+if _search_raw is not None:
+    if isinstance(_search_raw, list):
+        _search_raw = " ".join(as_str(x) for x in _search_raw)
+    else:
+        _search_raw = as_str(_search_raw)
+    _reason = validate_dns_search(_search_raw)
+    if _reason:
+        fail(_reason)
+    else:
+        env["DNS_SEARCH"] = " ".join(split_search(_search_raw))
+        env["PRESEED_HAS_DNS_SEARCH"] = "1"
 
 # ── Admin user + password ─────────────────────────────────────────────
 # ── Admin OS user (issue #581) ────────────────────────────────────────

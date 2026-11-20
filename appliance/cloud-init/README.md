@@ -54,7 +54,9 @@ Summary:
 | `role` | `control-plane` (aka `first-node`) or `appliance` (aka `add-node` / `application`) |
 | `confirm_wipe` | **Must be `true`** to auto-wipe a disk unattended |
 | `target_disk` | Prefer `/dev/disk/by-id/…` or `by-path/…` (stable). Absent / unresolvable ⇒ interactive picker |
-| `hostname` | RFC 1123 (alnum + hyphen, ≤ 63) |
+| `hostname` | RFC 1123 (alnum + hyphen, ≤ 63); the short name, no dots |
+| `domain` | optional DNS domain (#4550), e.g. `corp.example.com`. Labels of letters, digits and hyphens; `hostname.domain` at most 253 characters. Written to `/etc/hosts` as the FQDN (`hostname -f` prints it) and added to the self-signed Web UI certificate's SANs |
+| `dns_search` | optional resolver search domains, string or list, at most 6 and 256 characters in all (#4550). Written to `dns-search=` in the NetworkManager keyfile. Defaults to `domain` |
 | `admin_user` | default `admin`. Must match `[a-z_][a-z0-9_-]*$?`, ≤ 32 chars, and not be an existing system account (`root`, `www-data`, …) |
 | `admin_password` **or** `admin_password_hash` | plaintext, or a crypt(3) hash from `openssl passwd -6`. Plaintext is checked against the same floor the wizard applies (≥ 8 chars, not the username or hostname); a weak-but-allowed one becomes a `WARN` from `--check-preseed`. A hash cannot be checked — that is the point of a hash — so its strength is yours to own |
 | `set_root_password` | default **`false`** — root is locked (`passwd -l`) and you use `sudo`. Set `true` for the pre-#995 behaviour, where root got the same password. sshd refuses root either way, so this only affects the physical / IPMI console |

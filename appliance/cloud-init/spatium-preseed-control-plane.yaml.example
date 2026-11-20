@@ -48,6 +48,12 @@ spatium_preseed:
 
   # ── Identity ────────────────────────────────────────────────────────
   hostname: ddi-control-1          # RFC 1123: alnum + hyphen, <= 63 chars
+  # Optional DNS domain (#4550): the FQDN becomes <hostname>.<domain> in
+  # /etc/hosts (so `hostname -f` prints it) and in the Web UI certificate's
+  # SANs. dns_search is the resolver search list (string or list, at most 6);
+  # it defaults to the domain.
+  # domain: corp.example.com
+  # dns_search: [corp.example.com, example.com]
 
   # ── OS admin account (for SSH + sudo) ───────────────────────────────
   admin_user: admin
