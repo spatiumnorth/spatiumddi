@@ -4853,6 +4853,33 @@ async def update_options(
             "cache-access ACL, so the value would be ignored. Move the PowerDNS "
             "server to its own group, or leave it at its default.",
         )
+    # #4562: the PowerDNS image ships the Authoritative Server only (no
+    # recursor) and the agent never renders either recursion field, so turning
+    # recursion on or widening its ACL would store a policy every query then
+    # contradicts with REFUSED. Transition-only like the gates above: a group
+    # that already stores recursion on (the column defaults to true) re-saves
+    # untouched, and turning it off stays allowed. Forwarders stay accepted:
+    # they feed ALIAS expansion. Adding a PowerDNS server to a group that
+    # already has recursion on is not refused here, same as blackhole.
+    if "powerdns" in await _group_driver_names(db, group_id):
+        recursion_refused = []
+        if changes.get("recursion_enabled") and not opts.recursion_enabled:
+            recursion_refused.append("recursion_enabled")
+        if (
+            "allow_recursion" in changes
+            and list(changes["allow_recursion"] or []) != list(DEFAULT_ALLOW_RECURSION)
+            and list(changes["allow_recursion"] or []) != list(opts.allow_recursion or [])
+        ):
+            recursion_refused.append("allow_recursion")
+        if recursion_refused:
+            raise HTTPException(
+                422,
+                "This group has a PowerDNS server, which cannot apply: "
+                + ", ".join(recursion_refused)
+                + ": PowerDNS authoritative does not recurse (there is no recursor), so "
+                "queries for names outside the served zones would be REFUSED. Use a "
+                "BIND9 or Technitium group for a resolver, or leave recursion off.",
+            )
     resolver_before = alias_resolver(opts.forwarders, opts.forward_transport)
     forwarders_before = list(opts.forwarders or [])
     transport_before = opts.forward_transport

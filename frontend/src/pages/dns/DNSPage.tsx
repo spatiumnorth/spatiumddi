@@ -8565,6 +8565,10 @@ export function OptionsTab({ groupId }: { groupId: string }) {
     queryFn: () => dnsApi.listServers(groupId),
   });
   const techUnsupported = groupServers.some((s) => s.driver === "technitium");
+  // #4562: PowerDNS is authoritative only (no recursor), so the Recursion card
+  // is read-only there; the API refuses turning it on. Forwarders still feed
+  // ALIAS expansion.
+  const pdnsNoRecursion = groupServers.some((s) => s.driver === "powerdns");
   const techLocked = {
     minimal: techUnsupported && !opts?.minimal_responses,
     tcpClients: techUnsupported && opts?.tcp_clients == null,
@@ -9173,6 +9177,12 @@ export function OptionsTab({ groupId }: { groupId: string }) {
                 </option>
               </select>
             </Field>
+            {pdnsNoRecursion && (
+              <p className="text-xs text-muted-foreground">
+                This group has a PowerDNS server, which uses forwarders only to
+                expand ALIAS records; it does not forward client queries.
+              </p>
+            )}
             {techUnsupported && (
               <p className="text-xs text-muted-foreground">
                 This group has a Technitium server, which resolves only through
@@ -9186,9 +9196,17 @@ export function OptionsTab({ groupId }: { groupId: string }) {
 
       <div className={card}>
         <h4 className={cardTitle}>Recursion</h4>
+        {pdnsNoRecursion && (
+          <p className="text-xs text-muted-foreground">
+            This group has a PowerDNS server, which does not recurse (it is
+            authoritative only), so recursion cannot be enabled here. Use a
+            BIND9 or Technitium group for a resolver.
+          </p>
+        )}
         <label className="flex items-center gap-2 cursor-pointer">
           <input
             type="checkbox"
+            disabled={pdnsNoRecursion && !opts?.recursion_enabled}
             checked={recursionEnabled}
             onChange={(e) => {
               setRecursionEnabled(e.target.checked);
@@ -9201,6 +9219,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
         <Field label="allow-recursion (comma-separated CIDRs / ACL names)">
           <input
             className={inputCls}
+            disabled={pdnsNoRecursion}
             value={allowRecursion}
             onChange={(e) => {
               setAllowRecursion(e.target.value);
