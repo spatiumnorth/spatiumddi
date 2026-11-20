@@ -4247,7 +4247,8 @@ function MoveZoneModal({
       !!preview.tsig_algorithm_refusal ||
       !!preview.forward_transport_refusal ||
       !!preview.technitium_acl_refusal ||
-      !!preview.classless_refusal);
+      !!preview.classless_refusal ||
+      !!preview.powerdns_refusal);
   const canSubmit =
     !!targetGroupId &&
     !!preview &&
@@ -4326,6 +4327,11 @@ function MoveZoneModal({
             {preview.classless_refusal && (
               <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
                 {preview.classless_refusal}
+              </div>
+            )}
+            {preview.powerdns_refusal && (
+              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+                {preview.powerdns_refusal}
               </div>
             )}
             {preview.acl_names_lost.length > 0 && (

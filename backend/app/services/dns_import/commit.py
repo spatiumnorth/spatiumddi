@@ -39,7 +39,7 @@ from app.services.dns.record_ops import (
     record_op_payload,
     resolve_primary_server,
 )
-from app.services.dns.server_move import classless_zone_refusal
+from app.services.dns.server_move import classless_zone_refusal, powerdns_zone_type_refusal
 from app.services.dns.view_collisions import RenderGuard
 from app.services.dns.zone_apex import apex_name_length_error
 from app.services.dns_import.soa_mailbox import (
@@ -382,21 +382,26 @@ async def _create_zone_at(
         )
         if apex_err is not None:
             raise ValueError(apex_err)
+    group_drivers = {
+        d
+        for d in (
+            await db.execute(select(DNSServer.driver).where(DNSServer.group_id == target_group_id))
+        )
+        .scalars()
+        .all()
+        if d
+    }
     if "/" in target_name:
         # #4435 — an RFC 2317 classless zone lands only where the group's
         # driver can serve it; fails this zone only, like the checks above.
-        drivers = (
-            (
-                await db.execute(
-                    select(DNSServer.driver).where(DNSServer.group_id == target_group_id)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        refusal = classless_zone_refusal({d for d in drivers if d}, target_name)
+        refusal = classless_zone_refusal(group_drivers, target_name)
         if refusal is not None:
             raise ValueError(refusal)
+    # #4570 — a forward / stub zone is accepted by a PowerDNS group and never
+    # served; fails this zone only, not the whole import.
+    refusal = powerdns_zone_type_refusal(group_drivers, parsed.zone_type)
+    if refusal is not None:
+        raise ValueError(refusal)
     # #2275 — the slot being empty is not enough: a zone with no view renders
     # into every view, so it must not land beside a same-name pinned zone (and
     # vice versa). Raising fails this zone only; the caller rolls it back.

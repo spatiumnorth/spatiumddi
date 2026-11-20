@@ -240,9 +240,11 @@ from app.services.dns.server_move import (
     elect_primary,
     ensure_group_catalog_compatible,
     ensure_group_classless_compatible,
+    ensure_group_powerdns_compatible,
     ensure_group_single_driver,
     lock_server_row,
     move_server_to_group,
+    powerdns_zone_type_refusal,
 )
 from app.services.dns.server_resync import resync_after_reenable
 from app.services.dns.technitium_options import (
@@ -2774,6 +2776,7 @@ async def create_server(
         )
         await ensure_group_catalog_compatible(db, group, body.driver)
         await ensure_group_classless_compatible(db, group, body.driver)
+        await ensure_group_powerdns_compatible(db, group, body.driver)  # #4570
     except ServerMoveError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     await _refuse_second_signer(db, group, driver=body.driver)
@@ -2923,6 +2926,7 @@ async def update_server(
             )
             await ensure_group_catalog_compatible(db, group, body.driver)
             await ensure_group_classless_compatible(db, group, body.driver)
+            await ensure_group_powerdns_compatible(db, group, body.driver)  # #4570
         except ServerMoveError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     # #1563 — explicit null clears api_port; null for a NOT NULL column
@@ -6244,20 +6248,9 @@ async def _refuse_powerdns_unsupported_zone_type(
         return
     if current is not None and current.zone_type == zone_type:
         return
-    if "powerdns" not in await _group_driver_names(db, group_id):
-        return
-    raise HTTPException(
-        status_code=422,
-        detail=(
-            f"a {zone_type} zone cannot be served by a PowerDNS group: the PowerDNS "
-            "driver supports primary and secondary zones only"
-            + (
-                ", and creates a stub as a full secondary."
-                if zone_type == "stub"
-                else ", so the zone would be accepted and never answer."
-            )
-        ),
-    )
+    refusal = powerdns_zone_type_refusal(await _group_driver_names(db, group_id), zone_type)
+    if refusal is not None:
+        raise HTTPException(status_code=422, detail=refusal)
 
 
 async def _check_zone_forward_transport(
@@ -8617,6 +8610,7 @@ class ZoneMovePreviewResponse(BaseModel):
     #: refuses, not waivable by acknowledgement.
     technitium_acl_refusal: str | None = None
     classless_refusal: str | None = None
+    powerdns_refusal: str | None = None
     warnings: list[str]
     required_acknowledgements: list[str]
 
@@ -8660,6 +8654,7 @@ class ZoneMovePreviewResponse(BaseModel):
             forward_transport_refusal=plan.forward_transport_refusal,
             technitium_acl_refusal=plan.technitium_acl_refusal,
             classless_refusal=plan.classless_refusal,
+            powerdns_refusal=plan.powerdns_refusal,
             warnings=plan.warnings,
             required_acknowledgements=plan.required_acknowledgements,
         )
@@ -8736,7 +8731,6 @@ async def move_zone_commit(
     # Technitium group is accepted and then silently never created on the
     # daemon (#743). A move is just another way to arrive there.
     await _assert_forward_zone_serviceable(target_group.id, zone.zone_type, zone.forwarders, db)
-    await _refuse_powerdns_unsupported_zone_type(db, target_group.id, zone.zone_type)
     # And the forwarder grammar (#1357): a Technitium zone's hostname or DoH
     # URL is fine where it is, but a BIND9 group would drop it at render and
     # the zone would quietly stop forwarding. Refused, not rewritten.
