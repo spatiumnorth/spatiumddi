@@ -77,7 +77,7 @@ export function evaluatePolicy(
   const notes: string[] = [];
   if (policy.history_count > 0) {
     notes.push(
-      `Cannot match your last ${policy.history_count} passwords — checked when you submit`,
+      `Cannot match your last ${policy.history_count === 1 ? "password" : `${policy.history_count} passwords`} — checked when you submit`,
     );
   }
 
