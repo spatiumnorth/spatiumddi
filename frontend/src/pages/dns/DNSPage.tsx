@@ -11181,12 +11181,26 @@ function BlocklistScopeFields({
     new Set(servers.filter((s) => s.driver !== "bind9").map((s) => s.driver)),
   );
   const nothingSelected = !wholeGroup && picked.size === 0;
+  // #4608 — only BIND9 (RPZ) and agent-managed Technitium render a blocklist
+  // (the backend's `blocklist` driver capability). A group with servers and
+  // none of those applies nothing, and the server refuses a NEW assignment to
+  // it, so the unchecked boxes are disabled (a stored one can be unchecked).
+  const inert =
+    servers.length > 0 &&
+    !servers.some((s) => s.driver === "bind9" || s.driver === "technitium");
 
   return (
     <fieldset className="space-y-3 rounded-md border p-3">
       <legend className="px-1 text-xs font-medium text-muted-foreground">
         Applies to
       </legend>
+      {inert && (
+        <div className="rounded-md border border-red-500/40 bg-red-500/5 p-2 text-xs text-red-700 dark:text-red-400">
+          This group runs {nonBind.join(" / ")}, which renders no blocklist, so
+          a blocklist here blocks nothing. Assign the list to a BIND9 group
+          instead.
+        </div>
+      )}
       {nonBind.length > 0 && (
         <div className="rounded-md border border-amber-500/40 bg-amber-500/5 p-2 text-xs text-amber-700 dark:text-amber-400">
           This group also runs {nonBind.join(" / ")}, which
@@ -11200,6 +11214,7 @@ function BlocklistScopeFields({
           type="checkbox"
           className="mt-0.5"
           checked={wholeGroup}
+          disabled={inert && !wholeGroup}
           onChange={(e) => setWholeGroup(e.target.checked)}
         />
         <span className="text-sm">
@@ -11234,6 +11249,7 @@ function BlocklistScopeFields({
                   type="checkbox"
                   className="mt-0.5"
                   checked={picked.has(v.id)}
+                  disabled={inert && !picked.has(v.id)}
                   onChange={() =>
                     setPicked((prev) => {
                       const next = new Set(prev);
