@@ -215,3 +215,25 @@ def test_an_unchanged_catalog_is_not_repatched_and_a_change_notifies(
     drv._reconcile_zones("k", [_catalog_payload(["a.example.", "b.example."])])
     assert [c for c in fake.calls if c[0] == "PATCH"]
     assert [c for c in fake.calls if c[1].endswith("/notify")]
+
+
+def test_a_membership_change_moves_the_serial_past_a_date_form_serial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PowerDNS's DEFAULT serial is YYYYMMDDnn, always above a clock serial;
+    the catalog must still advance on every change, or a consumer comparing
+    serials ignores the NOTIFY (#4574)."""
+    fake = _fake(monkeypatch)
+    drv = PowerDNSDriver(state_dir=tmp_path)
+    # Created by a pre-fix agent: SOA-EDIT-API DEFAULT, date-form serial.
+    fake.seed("catalog.pdns.example.", 2_026_112_001, kind="Native")
+    drv._reconcile_zones("k", [_catalog_payload(["a.example."])])
+    first = fake.serial("catalog.pdns.example.")
+    assert fake.zones["catalog.pdns.example."]["soa_edit_api"] == ""
+    drv._reconcile_zones("k", [_catalog_payload(["a.example."])])
+    assert fake.serial("catalog.pdns.example.") == first  # unchanged: no creep
+    drv._reconcile_zones("k", [_catalog_payload(["a.example.", "b.example."])])
+    second = fake.serial("catalog.pdns.example.")
+    assert second > first
+    drv._reconcile_zones("k", [_catalog_payload(["b.example."])])
+    assert fake.serial("catalog.pdns.example.") > second

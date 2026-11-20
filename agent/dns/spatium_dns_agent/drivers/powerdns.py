@@ -340,6 +340,27 @@ def _catalog_unchanged(current: dict[str, Any], desired: list[dict[str, Any]]) -
     return norm(current.get("rrsets")) == norm(desired)
 
 
+def _advance_soa_serial(zone: str, desired: list[dict[str, Any]], doc: Any) -> None:
+    """Make the apex SOA in ``desired`` strictly later than the one served.
+
+    A catalog that changed must move its serial, or a consumer comparing
+    serials ignores the NOTIFY (#4574). ``_floor_soa_content`` returns the
+    served SOA when only the serial differs and the clock serial is behind
+    PowerDNS's date-form one, which is no bump at all.
+    """
+    served = _soa_from_zone_doc(doc, zone)
+    if served is None:
+        return
+    have = _soa_serial(served[0])
+    for rs in desired:
+        if rs.get("type") != "SOA" or not rs.get("records"):
+            continue
+        content = rs["records"][0].get("content", "")
+        want = _soa_serial(content)
+        if have is not None and (want is None or not _serial_later(want, have)):
+            rs["records"][0]["content"] = _soa_with_serial(content, (have + 1) % 2**32)
+
+
 def _render_catalog_zone_payload(
     catalog: dict[str, Any], opts: dict[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -428,10 +449,14 @@ def _render_catalog_zone_payload(
         "also_notify": [str(e) for e in opts.get("also_notify") or []],
         "catalog": True,
         "serial": serial,
-        # The catalog's serial is the agent's own (a timestamp, bumped by
-        # PowerDNS's SOA-EDIT-API DEFAULT on every change), not the control
-        # plane's: it keeps that rule (#1965).
-        "serial_managed": False,
+        # The catalog's serial is the agent's own (a timestamp), not the
+        # control plane's, but the agent owns it all the same: left to
+        # PowerDNS's SOA-EDIT-API DEFAULT, a PATCH carrying a timestamp lower
+        # than PowerDNS's date-form serial (2026112001) is rewritten to that
+        # date serial, so a membership change within a day never moved the
+        # serial and a consumer that compares serials ignored the NOTIFY
+        # (#4574). Owned, it is floored and bumped in the reconcile.
+        "serial_managed": True,
         "rrsets": rrsets,
     }
 
@@ -2732,7 +2757,9 @@ class PowerDNSDriver(DriverBase):
                             desired = []
                         else:
                             rrsets.extend(_absent_rrsets(zone_name, desired, current))
-                            catalog_changed = bool(zone_payload.get("catalog"))
+                            if zone_payload.get("catalog"):
+                                catalog_changed = True
+                                _advance_soa_serial(zone_name, desired, current)
                     deleted = len(rrsets)
                     for rs in desired:
                         rrsets.append(
