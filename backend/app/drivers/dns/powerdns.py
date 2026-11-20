@@ -21,7 +21,9 @@ Phase 1 scope (this driver):
 Out of scope until Phase 2/3:
 
 * Views (PowerDNS does split-horizon via tags / different zones, the
-  mapping needs cross-design with the BIND views work in #24).
+  mapping needs cross-design with the BIND views work in #24). The API
+  refuses them on a group that runs this driver (#4565), reading
+  ``capabilities()["views"]``.
 * RPZ blocklists (RPZ is a Recursor feature; PowerDNS-Authoritative
   doesn't consume it).
 * Catalog zones (PowerDNS 4.8+ supports them; covered in Phase 3).

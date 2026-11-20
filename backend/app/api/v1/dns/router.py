@@ -241,6 +241,9 @@ from app.services.dns.server_move import (
     ensure_group_catalog_compatible,
     ensure_group_classless_compatible,
     ensure_group_single_driver,
+    ensure_group_views_compatible,
+    views_refusal,
+    views_unsupported_message,
     lock_server_row,
     move_server_to_group,
 )
@@ -769,7 +772,8 @@ class ServerGroupResponse(BaseModel):
     catalog_unsupported_warning: str | None = None
     # #1784 — set when the group holds an experimental ``technitium_api``
     # server, and says where an already-existing group falls outside the
-    # supported scope (second server, pools). Empty for every other group.
+    # supported scope (second server, pools). #4565 — also set when the group
+    # holds views its servers cannot serve. Empty for every other group.
     scope_warnings: list[str] = []
     # #3551 — the group's estimated named memory against its agents' limit.
     # Filled by ``GET /groups/{id}`` only (counting the RPZ entries each view
@@ -832,6 +836,37 @@ async def _drivers_by_group(db: DB, group_ids: list[uuid.UUID]) -> dict[uuid.UUI
     for gid, driver in rows:
         if driver:
             out.setdefault(gid, []).append(driver)
+    return out
+
+
+async def _scope_warnings_by_group(
+    db: DB, group_ids: list[uuid.UUID], drivers: dict[uuid.UUID, list[str]]
+) -> dict[uuid.UUID, list[str]]:
+    """Each group's ``scope_warnings``: the ``technitium_api`` scope (#1784),
+    and views held by a group whose servers cannot serve them (#4565).
+
+    Views are refused on such a group now, but one may hold them from before
+    (or an agent registered straight into it); this is where that shows.
+    One query for every group, like :func:`_drivers_by_group`.
+    """
+    out = await technitium_api_scope.scope_warnings_by_group(db, group_ids)
+    unable = [gid for gid in group_ids if views_refusal(drivers.get(gid) or [])]
+    if not unable:
+        return out
+    rows = (
+        await db.execute(
+            select(DNSView.group_id, DNSView.name)
+            .where(DNSView.group_id.in_(unable))
+            .order_by(DNSView.name)
+        )
+    ).all()
+    names: dict[uuid.UUID, list[str]] = {}
+    for gid, name in rows:
+        names.setdefault(gid, []).append(name)
+    for gid, view_names in names.items():
+        msg = views_unsupported_message(view_names, drivers.get(gid) or [])
+        if msg:
+            out.setdefault(gid, []).append(msg)
     return out
 
 
@@ -2362,7 +2397,7 @@ async def list_groups(db: DB, current_user: CurrentUser) -> list[ServerGroupResp
     result = await db.execute(stmt)
     groups = list(result.scalars().all())
     drivers = await _drivers_by_group(db, [g.id for g in groups])
-    warns = await technitium_api_scope.scope_warnings_by_group(db, [g.id for g in groups])
+    warns = await _scope_warnings_by_group(db, [g.id for g in groups], drivers)
     return [ServerGroupResponse.from_model(g, drivers.get(g.id), warns.get(g.id)) for g in groups]
 
 
@@ -2411,7 +2446,7 @@ async def get_group(group_id: uuid.UUID, db: DB, _: CurrentUser) -> ServerGroupR
     if not group:
         raise HTTPException(status_code=404, detail="Server group not found")
     drivers = await _drivers_by_group(db, [group.id])
-    warns = await technitium_api_scope.scope_warnings_by_group(db, [group.id])
+    warns = await _scope_warnings_by_group(db, [group.id], drivers)
     out = ServerGroupResponse.from_model(group, drivers.get(group.id), warns.get(group.id))
     est = await group_memory_estimate(db, group.id)
     if est is not None:
@@ -2509,7 +2544,7 @@ async def update_group(
     await db.commit()
     await db.refresh(group)
     drivers = await _drivers_by_group(db, [group.id])
-    warns = await technitium_api_scope.scope_warnings_by_group(db, [group.id])
+    warns = await _scope_warnings_by_group(db, [group.id], drivers)
     return ServerGroupResponse.from_model(group, drivers.get(group.id), warns.get(group.id))
 
 
@@ -2546,7 +2581,7 @@ async def rotate_group_key(
     await db.commit()
     await db.refresh(group)
     drivers = await _drivers_by_group(db, [group.id])
-    warns = await technitium_api_scope.scope_warnings_by_group(db, [group.id])
+    warns = await _scope_warnings_by_group(db, [group.id], drivers)
     return ServerGroupResponse.from_model(group, drivers.get(group.id), warns.get(group.id))
 
 
@@ -2774,6 +2809,7 @@ async def create_server(
         )
         await ensure_group_catalog_compatible(db, group, body.driver)
         await ensure_group_classless_compatible(db, group, body.driver)
+        await ensure_group_views_compatible(db, group, body.driver)
     except ServerMoveError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     await _refuse_second_signer(db, group, driver=body.driver)
@@ -2923,6 +2959,7 @@ async def update_server(
             )
             await ensure_group_catalog_compatible(db, group, body.driver)
             await ensure_group_classless_compatible(db, group, body.driver)
+            await ensure_group_views_compatible(db, group, body.driver)
         except ServerMoveError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     # #1563 — explicit null clears api_port; null for a NOT NULL column
@@ -5946,6 +5983,7 @@ async def create_view(
     group_id: uuid.UUID, body: ViewCreate, db: DB, current_user: CurrentUser
 ) -> DNSView:
     await _require_group(group_id, db)
+    await _refuse_views_on_group(db, group_id)  # #4565
     payload = body.model_dump()
     # Validate BEFORE the duplicate check: the validator strips the name, so
     # checking ``body.name`` would let " guest" past a pre-check that "guest"
@@ -8583,6 +8621,9 @@ class ZoneMovePreviewResponse(BaseModel):
     #: refuses, not waivable by acknowledgement.
     technitium_acl_refusal: str | None = None
     classless_refusal: str | None = None
+    #: #4565 — a view the zone or its records would keep in a target group
+    #: that cannot serve views; non-null means the commit refuses.
+    views_refusal: str | None = None
     warnings: list[str]
     required_acknowledgements: list[str]
 
@@ -8626,6 +8667,7 @@ class ZoneMovePreviewResponse(BaseModel):
             forward_transport_refusal=plan.forward_transport_refusal,
             technitium_acl_refusal=plan.technitium_acl_refusal,
             classless_refusal=plan.classless_refusal,
+            views_refusal=plan.views_refusal,
             warnings=plan.warnings,
             required_acknowledgements=plan.required_acknowledgements,
         )
@@ -10155,6 +10197,20 @@ async def _refuse_cname_conflict(
             )
 
 
+async def _refuse_views_on_group(db: DB, group_id: uuid.UUID) -> None:
+    """422 a new view, or a zone or record newly scoped to one, in a group
+    whose servers cannot serve views (#4565).
+
+    Read from each driver's ``capabilities()["views"]``; only BIND9 offers
+    them. Every caller checks a value being written, never one already stored,
+    so a group that held views before this refusal can still be edited (and
+    its views removed).
+    """
+    refusal = views_refusal(await _group_driver_names(db, group_id))
+    if refusal is not None:
+        raise HTTPException(status_code=422, detail=refusal)
+
+
 async def _enforce_zone_view_in_group(
     db: DB, group_id: uuid.UUID, view_id: uuid.UUID | None
 ) -> None:
@@ -10176,6 +10232,7 @@ async def _enforce_zone_view_in_group(
             status_code=422,
             detail="view_id does not name a view in this zone's server group",
         )
+    await _refuse_views_on_group(db, group_id)  # #4565
 
 
 async def _enforce_no_records_in_other_view(
@@ -10267,6 +10324,7 @@ async def _enforce_views_in_zone_group(
     pin_error = _zone_pin_view_error(zone, wanted)
     if pin_error is not None:
         raise HTTPException(status_code=422, detail=pin_error)
+    await _refuse_views_on_group(db, zone.group_id)  # #4565
 
 
 @router.post(

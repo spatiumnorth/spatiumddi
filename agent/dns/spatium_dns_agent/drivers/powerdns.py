@@ -301,6 +301,46 @@ def _absent_rrsets(
     return out
 
 
+def _resolve_view_copies(
+    payload: list[dict[str, Any]], views: list[str | None]
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """One payload entry per zone name, and the zones that cannot have one (#4565).
+
+    PowerDNS has no views and holds one zone per name. Under split-horizon
+    the bundle carries a copy of a zone for each view it renders in
+    (``views[i]`` is the view of ``payload[i]``), and reconciling every copy
+    wrote them all into that one zone: the copy reconciled last won, and its
+    sweep removed the others' records, so a record of one view was answered
+    to every client.
+
+    The rule, in bundle order:
+
+    * copies that render the same (a zone no view changes) are one zone, sent
+      once;
+    * copies that differ are never merged and none is sent. The zone is left
+      exactly as PowerDNS holds it and named in the second list, one
+      ``"<zone> views: <reason>"`` each, which the apply reports through
+      ``refused_zones()``.
+    """
+    by_name: dict[str, list[int]] = {}
+    for i, entry in enumerate(payload):
+        by_name.setdefault(str(entry["name"]).lower(), []).append(i)
+    kept: list[dict[str, Any]] = []
+    conflicts: list[str] = []
+    for indexes in by_name.values():
+        first = payload[indexes[0]]
+        if all(payload[i] == first for i in indexes[1:]):
+            kept.append(first)
+            continue
+        names = ", ".join(sorted({str(views[i]) for i in indexes if views[i]}))
+        conflicts.append(
+            f"{first['name']} views: this zone differs between views ({names}) and "
+            "PowerDNS has no views, so the copies are not merged and the zone is "
+            "left as PowerDNS holds it; remove the views or use a BIND9 group"
+        )
+    return kept, conflicts
+
+
 def _render_catalog_zone_payload(catalog: dict[str, Any]) -> dict[str, Any]:
     """Build the zones.json payload entry for an RFC 9432 catalog zone.
 
@@ -918,6 +958,10 @@ class PowerDNSDriver(DriverBase):
     #: in, a retry compares the new file with itself and would otherwise
     #: never restart, leaving pdns on the old settings for good.
     _conf_restart_owed: bool = False
+    #: Zones the last ``render`` left out because their copies differ between
+    #: views (#4565), as ``refused_zones()`` entries. Added to the reconcile's
+    #: own refusals once it has run.
+    _view_conflicts: tuple[str, ...] = ()
 
     # ── Render / validate / swap ────────────────────────────────────────────
 
@@ -1038,6 +1082,8 @@ class PowerDNSDriver(DriverBase):
             k.get("name"): k for k in (bundle.get("tsig_keys") or []) if k.get("name")
         }
         zones_payload = []
+        # The view each payload entry was rendered from (None without views).
+        payload_views: list[str | None] = []
         for zone in bundle.get("zones", []) or []:
             zname = (zone.get("name") or "").rstrip(".") + "."
             if not zname or zname == ".":
@@ -1271,6 +1317,30 @@ class PowerDNSDriver(DriverBase):
                     ),
                 }
             )
+            payload_views.append(zone.get("view_name") or None)
+
+        # Views (#4565): PowerDNS has none. The control plane refuses them on
+        # this group; a bundle that carries them anyway (stored before that,
+        # or a server registered into a group that has them) is never merged
+        # into one zone. See ``_resolve_view_copies`` for the rule.
+        zones_payload, conflicts = _resolve_view_copies(zones_payload, payload_views)
+        self._view_conflicts = tuple(conflicts)
+        bundle_views = sorted(
+            {str(v.get("name")) for v in bundle.get("views") or [] if v.get("name")}
+            | {v for v in payload_views if v}
+        )
+        if bundle_views:
+            log.warning(
+                "powerdns_views_unsupported",
+                views=bundle_views[:5],
+                zones_not_reconciled=[c.split(" ", 1)[0] for c in conflicts][:5],
+                hint=(
+                    "PowerDNS authoritative has no views: match-clients are not "
+                    "applied, a zone that is the same in every view is served to "
+                    "every client, and a zone that differs between views is not "
+                    "reconciled. Remove the views or use a BIND9 group."
+                ),
+            )
 
         # Catalog zones (RFC 9432, Phase 3d). Producer mode renders the
         # catalog itself as a regular zone with the canonical record
@@ -1503,6 +1573,9 @@ class PowerDNSDriver(DriverBase):
         # the timing race fired. A zone whose data PowerDNS refuses does NOT
         # raise: it lands in ``refused_zones()`` for the sync loop to report.
         self._reconcile_zones(api_key, payload)
+        # Zones the render left out over views (#4565) are reported with the
+        # ones PowerDNS refused: same verdict, a partial apply.
+        self._refused_zones = (*self._refused_zones, *self._view_conflicts)
 
     def daemon_restarting(self) -> bool:
         return self._restarting
