@@ -222,7 +222,10 @@ function Chip({
 
 function ErrorBanner({ message }: { message: string }) {
   return (
-    <div className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive">
+    <div
+      role="alert"
+      className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive"
+    >
       <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0" />
       <div className="min-w-0 break-all">{message}</div>
     </div>
@@ -625,8 +628,12 @@ function PlanListView({
         }
         confirmLabel="Delete plan"
         loading={deleteMut.isPending}
+        error={deleteMut.error ? extractError(deleteMut.error) : null}
         onConfirm={() => deleting && deleteMut.mutate(deleting.id)}
-        onClose={() => setDeleting(null)}
+        onClose={() => {
+          setDeleting(null);
+          deleteMut.reset();
+        }}
       />
     </div>
   );
@@ -1262,8 +1269,12 @@ function ItemsTab({
         }
         confirmLabel="Remove item"
         loading={removeMut.isPending}
+        error={removeMut.error ? extractError(removeMut.error) : null}
         onConfirm={() => removing && removeMut.mutate(removing.id)}
-        onClose={() => setRemoving(null)}
+        onClose={() => {
+          setRemoving(null);
+          removeMut.reset();
+        }}
       />
     </div>
   );
