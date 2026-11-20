@@ -1069,7 +1069,7 @@ async def agent_blocklist_stream(
     db: DB,
     if_none_match: str | None = Header(default=None, alias="If-None-Match"),
     auth: tuple[DNSServer, dict[str, Any]] = Depends(_auth_agent),
-) -> Any:
+) -> Response:
     """The blocklist entries of the server's newest stored bundle (#4041).
 
     A bundle rendered for an agent that sends ``blocklist-stream`` leaves its
