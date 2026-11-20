@@ -447,6 +447,14 @@ async def update_group(
         resource_display=f"update group {g.name}",
     )
 
+    unchanged = (
+        (body.name is None or body.name == g.name)
+        and (body.description is None or body.description == g.description)
+        and (body.external_dn is None or body.external_dn == g.external_dn)
+        and (new_roles is None or {r.id for r in new_roles} == current_role_ids)
+        and (new_users is None or {u.id for u in new_users} == current_member_ids)
+    )
+
     if body.name is not None:
         g.name = body.name
     if body.description is not None:
@@ -458,7 +466,10 @@ async def update_group(
     if new_users is not None:
         g.users = new_users
 
-    db.add(_audit(current_user, "update", g, f"Updated group {g.name}", method, granted))
+    # An edit that changes nothing writes no audit row (#4452); a step-up
+    # that was verified is still recorded.
+    if not unchanged or method is not None:
+        db.add(_audit(current_user, "update", g, f"Updated group {g.name}", method, granted))
     await db.commit()
     g = await _load_group(db, g.id)
     return _to_response(g)

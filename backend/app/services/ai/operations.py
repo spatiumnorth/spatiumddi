@@ -61,7 +61,7 @@ from app.services.ipam.address_create_rules import (
     take_address_row,
 )
 from app.services.ipam.probe_policy import check_probe_target
-from app.services.nmap import NmapArgError, build_argv
+from app.services.nmap import NmapArgError, build_argv, resolve_target
 from app.services.pcap import (
     PcapArgError,
     build_pcap_argv,
@@ -136,6 +136,16 @@ class Operation:
     # off ``preview`` because the copilot shares that and deliberately only
     # hints at conflicts; apply re-enforces regardless.
     validate_submit: Callable[[AsyncSession, User, Any], Awaitable[None]] | None = None
+    # Optional per-object approver gate (#4382): the refusal ``apply`` raises
+    # for the instance the args name, as an ``OperationPermissionError`` or
+    # ``None`` when ``user`` may act on it. ``apply`` and the request portal's
+    # per-row ``can_approve`` both call the SAME function, so the queue never
+    # offers an Approve the press would refuse. Set it wherever
+    # ``enforce_operation_permission`` alone is weaker than the apply (a
+    # ``scoped_grant_types`` operation, or a target-block gate).
+    target_refusal: (
+        Callable[[AsyncSession, User, Any], Awaitable[OperationPermissionError | None]] | None
+    ) = None
 
 
 @dataclass(frozen=True)
@@ -372,18 +382,44 @@ async def _user_can_write_address(
     return user_can_write_ip(user, int(addr), subnet_writable, set_ranges)
 
 
+async def _address_write_refusal(
+    db: AsyncSession,
+    user: User,
+    subnet: Subnet,
+    addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> OperationPermissionError | None:
+    if await _user_can_write_address(db, user, subnet, addr):
+        return None
+    return OperationPermissionError(
+        "write",
+        "subnet",
+        f"No write permission on subnet or any address set covering {addr}",
+    )
+
+
 async def _require_address_writable(
     db: AsyncSession,
     user: User,
     subnet: Subnet,
     addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
 ) -> None:
-    if not await _user_can_write_address(db, user, subnet, addr):
-        raise OperationPermissionError(
-            "write",
-            "subnet",
-            f"No write permission on subnet or any address set covering {addr}",
-        )
+    refusal = await _address_write_refusal(db, user, subnet, addr)
+    if refusal is not None:
+        raise refusal
+
+
+async def _address_target_refusal(
+    db: AsyncSession, user: User, args: CreateIPAddressArgs
+) -> OperationPermissionError | None:
+    """``create_ip_address``'s per-subnet gate, for the portal's ``can_approve``."""
+    subnet = await db.get(Subnet, args.subnet_id)
+    try:
+        addr = ipaddress.ip_address(args.address)
+    except ValueError:
+        return None  # the apply refuses it as invalid, for every approver alike
+    if subnet is None:
+        return None
+    return await _address_write_refusal(db, user, subnet, addr)
 
 
 def expires_at_default() -> datetime:
@@ -1028,6 +1064,7 @@ async def _preview_run_nmap_scan(
 
     try:
         argv = build_argv(target, args.preset, args.port_spec, args.extra_args)
+        await resolve_target(target)
     except NmapArgError as exc:
         return PreviewResult(
             ok=False,
@@ -1080,6 +1117,7 @@ async def _apply_run_nmap_scan(
     # Re-validate at apply time too — argv builder gates dangerous flags.
     try:
         build_argv(target, args.preset, args.port_spec, args.extra_args)
+        await resolve_target(target)
     except NmapArgError as exc:
         raise ValueError(f"nmap arg validation failed: {exc}") from exc
 
@@ -2226,6 +2264,17 @@ def _target_block_refusal(user: User, block: IPBlock) -> OperationPermissionErro
     return OperationPermissionError("write", "ip_block", target_block_write_refusal(user, block))
 
 
+async def _allocate_subnet_target_refusal(
+    db: AsyncSession, user: User, args: AllocateSubnetArgs
+) -> OperationPermissionError | None:
+    """``allocate_subnet``'s target-block gate, for the portal's ``can_approve``."""
+    try:
+        block = await db.get(IPBlock, UUID(args.block_id))
+    except ValueError:
+        return None
+    return _target_block_refusal(user, block) if block is not None else None
+
+
 async def _preview_allocate_subnet(
     db: AsyncSession, user: User, args: AllocateSubnetArgs
 ) -> PreviewResult:
@@ -2371,11 +2420,9 @@ async def _apply_allocate_subnet(
     # REST handler's 403: it is about THIS applier, so an approve leaves the
     # portal request pending for one who may write the block instead of
     # failing it.
-    block = await db.get(IPBlock, UUID(args.block_id))
-    if block is not None:
-        refusal = _target_block_refusal(user, block)
-        if refusal is not None:
-            raise refusal
+    refusal = await _allocate_subnet_target_refusal(db, user, args)
+    if refusal is not None:
+        raise refusal
 
     if args.template_id:
         from app.models.ipam import IPAMTemplate  # noqa: PLC0415
@@ -2420,6 +2467,7 @@ register(
         preview=_preview_allocate_subnet,
         apply=_apply_allocate_subnet,
         validate_submit=_validate_submit_allocate_subnet,
+        target_refusal=_allocate_subnet_target_refusal,
         category="ipam",
         required_permission=("write", "subnet"),
     )
@@ -2449,6 +2497,7 @@ register(
         # ``_require_address_writable`` holds either to its own subnet / set.
         required_permission=("write", "subnet"),
         scoped_grant_types=("subnet", "address_set"),
+        target_refusal=_address_target_refusal,
     )
 )
 
@@ -3277,8 +3326,8 @@ class CreateDNSZoneArgs(BaseModel):
             "``technitium_api`` (agentless, an install the operator "
             "already runs), or ``windows_dns``. Pair it with "
             "``dnssec_enabled=true`` to auto-select a group whose driver "
-            "can sign (``bind9`` and ``powerdns``; ``technitium``, "
-            "``technitium_api`` and ``windows_dns`` cannot, #1783). "
+            "can sign (``bind9``, ``powerdns`` and ``technitium``; "
+            "``technitium_api`` and ``windows_dns`` cannot). "
             "When ``group_id`` is set, this is validated against the "
             "group's actual driver mix."
         ),
@@ -3883,7 +3932,7 @@ async def _apply_create_dhcp_static(
     # counts. All in this one transaction, committed below.
     await push_static_change(db, row, action="create")
     collect_wake(dhcp_group_channel(scope.group_id))
-    await upsert_ipam_for_static(db, scope, row)
+    await upsert_ipam_for_static(db, scope, row, user=user)
     await _recount_subnet(db, scope.subnet_id)
 
     write_audit(
@@ -4966,13 +5015,11 @@ async def _assign_role_cluster_dns_problem(
 async def _assign_role_catalog_problem(
     db: AsyncSession, row: Any, args: AssignApplianceRoleArgs
 ) -> str | None:
-    """#1782 / #1858 — same refusals as the REST role-assign route: a
-    Technitium appliance must not be pointed at a catalog-enabled DNS group
-    (#1766), nor at one holding a TSIG key Technitium cannot use
-    (hmac-sha224). Only on a change, so a pre-existing assignment can still
-    be re-saved."""
+    """#1858 — same refusal as the REST role-assign route: a Technitium
+    appliance must not be pointed at a DNS group holding a TSIG key
+    Technitium cannot use (hmac-sha224). Only on a change, so a
+    pre-existing assignment can still be re-saved."""
     from app.models.dns import DNSServerGroup  # noqa: PLC0415
-    from app.services.dns.server_move import catalog_unsupported_message  # noqa: PLC0415
 
     if "dns-technitium" not in args.roles:
         return None
@@ -4990,15 +5037,11 @@ async def _assign_role_catalog_problem(
     group = await db.get(DNSServerGroup, group_id)
     if group is None:
         return None
-    if not group.catalog_zones_enabled:
-        # #1858 — same refusal as the REST route: a key Technitium cannot use.
-        from app.services.dns.tsig_algorithms import group_key_refusal  # noqa: PLC0415
+    # #1858 — a key Technitium cannot use.
+    from app.services.dns.tsig_algorithms import group_key_refusal  # noqa: PLC0415
 
-        key_problem = await group_key_refusal(db, group.id, {"technitium"})
-        return f"DNS server group {group.name!r}: {key_problem}" if key_problem else None
-    return f"DNS server group {group.name!r} has catalog zones enabled. " + (
-        catalog_unsupported_message({"technitium"})
-    )
+    key_problem = await group_key_refusal(db, group.id, {"technitium"})
+    return f"DNS server group {group.name!r}: {key_problem}" if key_problem else None
 
 
 async def _assign_role_dns_move_problem(
@@ -5357,7 +5400,7 @@ class GrantTemporaryAccessArgs(BaseModel):
 _GRANT_MAKES_SUPERADMIN = (
     "This grant would make {n} member(s) of the group superadmins, and that needs "
     "your password or authenticator code, which a chat Apply cannot ask for "
-    "(#1412). Grant it from Groups → Time-bound grants instead."
+    "(#1412). Grant it from Administration → Groups → Time-bound grants instead."
 )
 
 
@@ -5551,7 +5594,10 @@ async def _preview_approve_change_request(
         RESOURCE_TYPE_CHANGE_REQUEST,
         user_has_permission,
     )
-    from app.services.approvals.service import get_change_request  # noqa: PLC0415
+    from app.services.approvals.service import (  # noqa: PLC0415
+        REQUESTER_GONE_MESSAGE,
+        get_change_request,
+    )
 
     cr_id = _parse_cr_id(args.change_request_id)
     if cr_id is None:
@@ -5572,7 +5618,7 @@ async def _preview_approve_change_request(
     if cr.requested_by_user_id is None:
         return PreviewResult(
             ok=False,
-            detail="Requester no longer exists; cancel and recreate this change request.",
+            detail=REQUESTER_GONE_MESSAGE,
         )
     if user.id == cr.requested_by_user_id:
         return PreviewResult(ok=False, detail="You cannot approve your own change request.")

@@ -27,8 +27,8 @@ from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.dns import DNSServer, DNSServerGroup, DNSZone
 
-# Drivers SpatiumDDI signs on. Technitium signing is refused outright (#1783,
-# covered by test_technitium_dnssec_withdrawn.py), so its 422 is not this one.
+# Drivers whose multi-signer 422 is exercised here; Technitium signs too
+# (#1767, covered by test_technitium_dnssec_1767.py).
 DRIVERS = ["bind9", "powerdns"]
 
 
@@ -400,10 +400,10 @@ def test_signing_drivers_match_the_router_gate() -> None:
     from app.services.dns.dnssec_signers import SIGNING_DRIVERS
     from app.services.dns.zone_move import DNSSEC_SIGN_DRIVERS
 
-    # One list, not copies kept in step (#1783 removed Technitium from it).
+    # One list, not copies kept in step.
     assert _DRIVER_GATED_OPERATIONS["dnssec_sign"] is SIGNING_DRIVERS
     assert DNSSEC_SIGN_DRIVERS is SIGNING_DRIVERS
-    assert "technitium" not in SIGNING_DRIVERS
+    assert "technitium" in SIGNING_DRIVERS
 
 
 # ── Existing multi-signer zones: flagged, not unsigned ───────────────────

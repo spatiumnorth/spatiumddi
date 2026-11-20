@@ -320,9 +320,13 @@ export function CertificatesTab() {
         }
         confirmLabel="Delete"
         tone="destructive"
-        onClose={() => setDeleteTarget(null)}
+        onClose={() => {
+          setDeleteTarget(null);
+          remove.reset();
+        }}
         onConfirm={() => deleteTarget && remove.mutate(deleteTarget.id)}
         loading={remove.isPending}
+        error={remove.error ? extractError(remove.error) : null}
       />
     </div>
   );
@@ -1368,7 +1372,6 @@ function AcmeIssueModal({
       qc.invalidateQueries({ queryKey: ["appliance", "acme", "account"] });
       qc.invalidateQueries({ queryKey: ["appliance", "acme", "orders"] });
     },
-    onError: (err) => setError(extractError(err)),
   });
 
   const issue = useMutation({
@@ -1795,7 +1798,11 @@ function AcmeIssueModal({
         confirmLabel="Deregister"
         tone="destructive"
         loading={deregister.isPending}
-        onClose={() => setConfirmDeregister(false)}
+        error={deregister.error ? extractError(deregister.error) : null}
+        onClose={() => {
+          setConfirmDeregister(false);
+          deregister.reset();
+        }}
         onConfirm={() => deregister.mutate()}
       />
     </Modal>

@@ -890,6 +890,13 @@ export default function RequestsPage() {
                         <>
                           <HeaderButton
                             variant="primary"
+                            disabled={!r.can_approve}
+                            title={
+                              r.can_approve
+                                ? undefined
+                                : (r.approve_blocked_reason ??
+                                  "You cannot approve this")
+                            }
                             onClick={() =>
                               setDecision({ request: r, action: "approve" })
                             }
