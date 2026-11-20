@@ -120,6 +120,7 @@ from app.services.ipam.address_set_gate import (
 from app.services.ipam.custom_field_rules import (
     enforce_required_custom_fields,
     inherited_block_custom_fields,
+    is_empty_value,
     validate_custom_field_values,
 )
 from app.services.ipam.gateway_rules import gateway_problem
@@ -5975,7 +5976,9 @@ async def update_block(
     # Required custom fields (#2478): checked only when the request sends
     # custom_fields, and only for a field it sends or the block already holds.
     if body.custom_fields is not None:
-        await validate_custom_field_values(db, "ip_block", body.custom_fields)
+        await validate_custom_field_values(
+            db, "ip_block", body.custom_fields, stored=block.custom_fields
+        )
         await enforce_required_custom_fields(
             db,
             "ip_block",
@@ -8141,7 +8144,9 @@ async def update_subnet(
     # Required custom fields (#2478): checked only when the request sends
     # custom_fields, and only for a field it sends or the subnet already holds.
     if body.custom_fields is not None:
-        await validate_custom_field_values(db, "subnet", body.custom_fields)
+        await validate_custom_field_values(
+            db, "subnet", body.custom_fields, stored=subnet.custom_fields
+        )
         await enforce_required_custom_fields(
             db,
             "subnet",
@@ -11183,7 +11188,9 @@ async def update_address(
     # ``reserved_until`` by sending an explicit null. ``dns_zone_id`` /
     # ``force`` are routing fields, not row attrs.
     changes = body.model_dump(exclude_unset=True, exclude={"dns_zone_id", "force"})
-    await validate_custom_field_values(db, "ip_address", changes.get("custom_fields"))
+    await validate_custom_field_values(
+        db, "ip_address", changes.get("custom_fields"), stored=ip.custom_fields
+    )
     changes_for_audit = body.model_dump(
         mode="json", exclude_unset=True, exclude={"dns_zone_id", "force"}
     )
@@ -13162,6 +13169,11 @@ async def get_effective_fields(
             tags[k] = v
             tag_sources[k] = src
         for k, v in cmap.items():
+            # ``""`` / null is "no value of its own" (#4558): the console's
+            # spelling of a cleared field, and what the Required rule already
+            # reads as empty. It must not hide an ancestor's value.
+            if is_empty_value(v):
+                continue
             custom_fields[k] = v
             custom_field_sources[k] = src
 
@@ -13227,6 +13239,11 @@ async def get_block_effective_fields(
             tags[k] = v
             tag_sources[k] = src
         for k, v in cmap.items():
+            # ``""`` / null is "no value of its own" (#4558): the console's
+            # spelling of a cleared field, and what the Required rule already
+            # reads as empty. It must not hide an ancestor's value.
+            if is_empty_value(v):
+                continue
             custom_fields[k] = v
             custom_field_sources[k] = src
 

@@ -1316,6 +1316,13 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         DateTime(timezone=True), nullable=True
     )
 
+    # #1771 — ids (as strings) of the agentless servers where SpatiumDDI itself
+    # created this auto-generated zone (the provider create reported a change).
+    # Retiring the zone sends ``delete`` only to those: a same-named zone the
+    # operator already had on a server is not ours to delete. NULL (every zone
+    # that pre-dates the column) means none.
+    agentless_created_server_ids: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+
     # Zone-level ACL overrides (inherit from server options if null)
     allow_query: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     allow_transfer: Mapped[list | None] = mapped_column(JSONB, nullable=True)

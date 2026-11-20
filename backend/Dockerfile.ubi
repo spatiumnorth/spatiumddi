@@ -81,8 +81,12 @@ ARG PGDG_KEY_DIGEST=a70c9527426017d00fa4e6f9d2941d515357a27a7be82e155248ece53bbe
 # PGDG by URL, verify both against the pinned PGDG key with ``rpm --checksig``,
 # install what they require from the UBI repos (microdnf cannot install a local
 # file), then ``rpm -i`` them; rpm refuses if any requirement is still missing.
-# Go back to ``install postgresql16`` from the repo once PGDG publishes the 9.9 build.
-ARG PGDG_PG_BUILD=16.16-1PGDG.rhel9.8
+# PGDG has since replaced the 9.8 build with RHEL 9.9 builds whose release differs
+# per architecture (x86_64 -1PGDG, aarch64 -2PGDG), and the 9.8 files are gone. The
+# fetch-by-URL path stays, pinned per architecture, so a rebuild takes the same
+# client a repo install would only take by chance.
+ARG PGDG_PG_BUILD_X86_64=16.16-1PGDG.rhel9.9
+ARG PGDG_PG_BUILD_AARCH64=16.16-2PGDG.rhel9.9
 RUN echo "rpm snapshot ${RPM_SNAPSHOT}" >/dev/null \
     && microdnf -y upgrade \
     && microdnf -y --setopt=install_weak_deps=0 --nodocs install \
@@ -92,6 +96,11 @@ RUN echo "rpm snapshot ${RPM_SNAPSHOT}" >/dev/null \
     && echo "${PGDG_KEY_DIGEST}  /tmp/pgdg.key" | sha256sum -c - \
     && rpm --import /tmp/pgdg.key && rm -f /tmp/pgdg.key \
     && arch="$(uname -m)" \
+    && case "${arch}" in \
+         x86_64) PGDG_PG_BUILD="${PGDG_PG_BUILD_X86_64}" ;; \
+         aarch64) PGDG_PG_BUILD="${PGDG_PG_BUILD_AARCH64}" ;; \
+         *) echo "no PGDG build pinned for ${arch}" >&2; exit 1 ;; \
+       esac \
     && pgdg="https://download.postgresql.org/pub/repos/yum/16/redhat/rhel-9-${arch}" \
     && mkdir /tmp/pgdg \
     && for p in postgresql16 postgresql16-libs; do \

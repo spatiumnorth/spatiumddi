@@ -57,6 +57,12 @@ services:
       AGENT_ROLES: ${DNS_AGENT_ROLES:-authoritative}
       # AGENT_DRIVER is baked into the image (powerdns); no override.
 
+      # ── Zone removal (#4564) ──────────────────────────────────────
+      # The agent deletes zones the bundle drops, but holds back a delete
+      # that would remove EVERY managed zone. Uncomment (and add to .env
+      # as PDNS_ALLOW_EMPTY_RETIRE=1) to allow an empty server.
+      # PDNS_ALLOW_EMPTY_RETIRE: "${PDNS_ALLOW_EMPTY_RETIRE:-0}"
+
       # ── TLS ───────────────────────────────────────────────────────
       # The control plane's certificate is verified (#1220). A cert from a
       # public CA needs nothing here. For a private CA or a self-signed

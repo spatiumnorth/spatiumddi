@@ -1,4 +1,6 @@
 import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { Field } from "@/components/ui/field";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -537,12 +539,20 @@ export function DICOMPage() {
         </section>
       </div>
 
-      {modal && (
-        <AEModal
-          mode={modal.mode}
-          ae={modal.mode === "edit" ? modal.ae : null}
+      {modal && modal.mode === "create" && (
+        <AEModal mode="create" ae={null} onClose={() => setModal(null)} />
+      )}
+      {modal && modal.mode === "edit" && (
+        <FreshEdit
+          row={modal.ae}
+          load={() => dicomApi.getAe(modal.ae.id)}
+          title="Edit Application Entity"
           onClose={() => setModal(null)}
-        />
+        >
+          {(fresh) => (
+            <AEModal mode="edit" ae={fresh} onClose={() => setModal(null)} />
+          )}
+        </FreshEdit>
       )}
       {impactOf && (
         <ImpactModal ae={impactOf} onClose={() => setImpactOf(null)} />
@@ -565,8 +575,16 @@ export function DICOMPage() {
         tone="destructive"
         confirmLabel="Delete"
         loading={delPeerMut.isPending}
+        error={
+          delPeerMut.error
+            ? formatApiError(delPeerMut.error, "Failed to delete association")
+            : null
+        }
         onConfirm={() => delPeer && delPeerMut.mutate(delPeer.id)}
-        onClose={() => setDelPeer(null)}
+        onClose={() => {
+          setDelPeer(null);
+          delPeerMut.reset();
+        }}
       />
       <ConfirmModal
         open={del !== null}
@@ -583,8 +601,19 @@ export function DICOMPage() {
         tone="destructive"
         confirmLabel="Delete"
         loading={delMut.isPending}
+        error={
+          delMut.error
+            ? formatApiError(
+                delMut.error,
+                "Failed to delete application entity",
+              )
+            : null
+        }
         onConfirm={() => del && delMut.mutate(del.id)}
-        onClose={() => setDel(null)}
+        onClose={() => {
+          setDel(null);
+          delMut.reset();
+        }}
       />
     </div>
   );
@@ -1126,11 +1155,15 @@ export function AEModal({
         // indistinguishable from "don't touch it".
         // An unchanged stored title is omitted: a legacy row may hold one
         // the server now refuses, and re-sending it would block every edit.
-        const body: DICOMAEUpdate = {
+        const full: DICOMAEUpdate = {
           ...shared,
           ...(aeTitle === ae.ae_title ? {} : { ae_title: aeTitle.trim() }),
           ip_address_id: ipAddressId,
         };
+        // Send only what changed from the row read when the dialog opened
+        // (#4379), so a field another client set since is not put back.
+        const body = changedFields(ae, full);
+        if (Object.keys(body).length === 0) return Promise.resolve(ae);
         return dicomApi.updateAe(ae.id, body);
       }
       const body: DICOMAECreate = {

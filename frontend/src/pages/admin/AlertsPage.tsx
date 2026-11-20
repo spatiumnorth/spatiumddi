@@ -1,3 +1,4 @@
+import { FreshEdit } from "@/components/FreshEdit";
 import { cloneElement, isValidElement, useId, useState } from "react";
 import {
   useInfiniteQuery,
@@ -876,10 +877,19 @@ export function AlertsPage() {
           />
         )}
         {editing && (
-          <RuleEditorModal
-            existing={editing}
+          <FreshEdit
+            row={editing}
+            queryKeys={[["alert-rules"]]}
+            title="Edit alert rule"
             onClose={() => setEditing(null)}
-          />
+          >
+            {(fresh) => (
+              <RuleEditorModal
+                existing={fresh}
+                onClose={() => setEditing(null)}
+              />
+            )}
+          </FreshEdit>
         )}
       </div>
     </div>

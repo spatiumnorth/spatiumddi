@@ -104,4 +104,18 @@ describe("Drill schedule dialog (#4271)", () => {
     await waitFor(() => expect(update).toHaveBeenCalled());
     expect(update).toHaveBeenCalledWith("t1", { drill_enabled: true });
   });
+
+  it("blocks Save while enabled with an empty schedule (#4450)", async () => {
+    list.mockResolvedValue([row({ drill_enabled: true })]);
+    await open();
+    await screen.findByRole("checkbox");
+    fireEvent.change(screen.getByPlaceholderText("0 5 * * 0"), {
+      target: { value: "" },
+    });
+    const save = screen.getByRole("button", { name: "Save" });
+    expect((save as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText(/never runs/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("checkbox"));
+    expect((save as HTMLButtonElement).disabled).toBe(false);
+  });
 });

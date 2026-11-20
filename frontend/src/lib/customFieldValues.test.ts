@@ -108,6 +108,19 @@ describe("withCustomFieldDefaults (#1303)", () => {
     const values = { owner: "helpdesk", managed: false };
     expect(withCustomFieldDefaults(defs, values)).toBe(values);
   });
+
+  it("leaves a field the parent chain gives a value unset (#4556)", () => {
+    expect(withCustomFieldDefaults(defs, {}, { owner: "team-a" })).toEqual({
+      managed: true,
+    });
+  });
+
+  it("still applies the default when the inherited value is blank", () => {
+    expect(withCustomFieldDefaults(defs, {}, { owner: "" })).toEqual({
+      owner: "netops",
+      managed: true,
+    });
+  });
 });
 
 describe("multi_select and date (#4288)", () => {
@@ -137,5 +150,10 @@ describe("multi_select and date (#4288)", () => {
     expect(customFieldDisplay(["a", "b"])).toBe("a, b");
     expect(customFieldDisplay("2026-12-31")).toBe("2026-12-31");
     expect(customFieldDisplay(null)).toBe("");
+  });
+
+  it("shows an object as JSON text, never [object Object] (#4421)", () => {
+    expect(customFieldDisplay({ k: "v" })).toBe('{"k":"v"}');
+    expect(customFieldDisplay([{ k: "v" }, "x"])).toBe('{"k":"v"}, x');
   });
 });

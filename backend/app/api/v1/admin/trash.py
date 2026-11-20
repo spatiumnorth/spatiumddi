@@ -1024,7 +1024,9 @@ async def permanent_delete_from_trash(
             # back into free gaps, and purge any dynamic leases still pointing here —
             # defense-in-depth for pre-fix strays / convergence-race leftovers (the
             # first soft-delete normally already cleaned both up).
-            await remove_ipam_for_scope_statics(db, target.id, touched_subnets=touched_subnets)
+            await remove_ipam_for_scope_statics(
+                db, target.id, touched_subnets=touched_subnets, user=current_user
+            )
             await delete_leases_for_scope(db, target.id, touched_subnets=touched_subnets)
         elif isinstance(target, Customer):
             # network_service.customer_id is RESTRICT, so a customer that still

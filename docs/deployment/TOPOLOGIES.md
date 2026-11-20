@@ -222,7 +222,7 @@ Control plane runs in your cloud account (AWS / Azure / GCP / Hetzner /
 DigitalOcean / Vultr — any provider). DNS and DHCP agents stay
 on-prem because they're network-path dependencies — DNS recursion has
 to terminate close to the queriers, DHCP has to be on the same broadcast
-domain as its clients.
+domain as its clients or one relay hop from them.
 
 <p align="center">
   <img src="../assets/topologies/topology-5-hybrid-cloud.svg" alt="Topology 5 — Hybrid cloud control plane + on-prem agents" width="900"/>
@@ -375,7 +375,7 @@ the appliance internals are in [`APPLIANCE.md`](APPLIANCE.md#control-plane-high-
 
 ## PowerDNS-primary + BIND-secondary hybrid (driver crossover)
 
-SpatiumDDI ships three agent-managed authoritative DNS drivers: BIND9 (default), PowerDNS and Technitium. Each `DNSServerGroup` is single-driver — but **multiple groups, each on a different driver, can serve overlapping namespaces** via plain per-zone AXFR. RFC 9432 catalog zones are a different tool: the producer and its consumers are resolved inside one group and one driver, so they never span the crossover. The two shapes below use PowerDNS + BIND9 as the worked example; a Technitium group substitutes for either side over plain AXFR, which it transfers over TSIG the same way. It does not do catalog zones: both roles are broken and refused until [#1766](https://github.com/spatiumnorth/spatiumddi/issues/1766) ([#1782](https://github.com/spatiumnorth/spatiumddi/issues/1782)), so a catalog-zone shape needs BIND9 on every member of the group.
+SpatiumDDI ships three agent-managed authoritative DNS drivers: BIND9 (default), PowerDNS and Technitium. Each `DNSServerGroup` is single-driver — but **multiple groups, each on a different driver, can serve overlapping namespaces** via plain per-zone AXFR. RFC 9432 catalog zones are a different tool: the producer and its consumers are resolved inside one group and one driver, so they never span the crossover. The two shapes below use PowerDNS + BIND9 as the worked example; a Technitium group substitutes for either side over plain AXFR, which it transfers over TSIG the same way. Catalog zones work on it as a producer, like the other two drivers ([#1766](https://github.com/spatiumnorth/spatiumddi/issues/1766)).
 
 **Shape A — PowerDNS-authoritative + BIND-secondary on the same zones.** PowerDNS handles writes (online DNSSEC signing, ALIAS records, LUA records); BIND fans the zones out to a battle-tested edge. The BIND servers are ordinary per-zone secondaries of the PowerDNS server, pulling by AXFR from the per-zone `masters` list. A group holding signed zones takes one agent server only (the single-signer rule, #1762), so `internal-pdns` is a single PowerDNS server.
 

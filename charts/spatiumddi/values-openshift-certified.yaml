@@ -22,6 +22,14 @@
 #     Referenced below through ``image.pullSecrets``, which every pod of the
 #     release uses; GHCR's pull is anonymous and ignores it.
 #
+#   * the chart creates the agents' SecurityContextConstraints, as it does by
+#     default (``openshift.scc.create: true``): Red Hat confirmed that SCCs in a
+#     certified chart are acceptable. The control plane needs no SCC
+#     (restricted-v2). Where your cluster admins manage SCCs, set
+#     ``openshift.scc.create: false`` and apply the manifests in
+#     ``files/openshift/`` yourself; see "If your cluster admins manage SCCs"
+#     in docs/deployment/KUBERNETES.md.
+#
 # Not changed: the PostgreSQL and Redis here are still the chart's single-pod
 # StatefulSets. For HA bring your own (set ``postgresql.enabled=false`` and
 # fill ``externalDatabase``, same for Redis) — a certified PostgreSQL operator
@@ -32,6 +40,10 @@
 
 global:
   platform: openshift
+
+openshift:
+  scc:
+    create: true
 
 image:
   tagSuffix: "-ubi"

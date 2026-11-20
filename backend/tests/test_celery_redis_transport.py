@@ -351,3 +351,14 @@ def test_consumer_blueprint_uses_spatium_connection_step_4330():
     assert "app.celery_app:SpatiumConnectionStep" in steps
     assert "celery.worker.consumer.connection:Connection" not in steps
     assert len(steps) == len(Consumer.Blueprint.default_steps)
+
+
+def test_consumer_blueprint_holds_one_connection_step_4436():
+    """The subclass replaces the stock Connection step; it does not join it."""
+    from celery.worker.consumer.connection import Connection as StockConnection
+
+    blueprint = SpatiumConsumer.Blueprint()
+    steps = blueprint._finalize_steps(blueprint.claim_steps())
+    # ``_finalize_steps`` yields step classes, in start order.
+    connection_steps = [s for s in steps if issubclass(s, StockConnection)]
+    assert [s.__name__ for s in connection_steps] == ["SpatiumConnectionStep"], steps

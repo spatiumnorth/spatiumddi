@@ -265,7 +265,9 @@ class BlockListUpdate(BaseModel):
     block_mode: str | None = None
     sinkhole_ip: str | None = None
     feed_wildcard_mode: str | None = None
-    # Deprecated boolean spelling (#4190); ``feed_wildcard_mode`` wins.
+    # Deprecated boolean spelling (#4190); ``feed_wildcard_mode`` wins. Kept
+    # on the model, not folded here: whether it means a change depends on the
+    # stored mode (#4446), which only the handler knows.
     feed_entries_are_wildcard: bool | None = None
     enabled: bool | None = None
 
@@ -273,16 +275,6 @@ class BlockListUpdate(BaseModel):
     @classmethod
     def _v_wildcard_mode(cls, v: str | None) -> str | None:
         return None if v is None else _check_wildcard_mode(v)
-
-    @model_validator(mode="after")
-    def _fold_legacy_wildcard(self) -> Self:
-        legacy = self.feed_entries_are_wildcard
-        if legacy is not None and "feed_wildcard_mode" not in self.model_fields_set:
-            self.feed_wildcard_mode = _legacy_wildcard_mode(legacy)
-            self.model_fields_set.add("feed_wildcard_mode")
-        self.model_fields_set.discard("feed_entries_are_wildcard")
-        self.feed_entries_are_wildcard = None
-        return self
 
     @field_validator("source_type")
     @classmethod
@@ -1314,6 +1306,7 @@ async def update_blocklist(
     # NOT NULL column is a 422.
     changes = resolve_update_changes(
         body,
+        exclude={"feed_entries_are_wildcard"},
         clearable={"feed_url", "sinkhole_ip"},
         non_nullable={
             "name",
@@ -1327,6 +1320,17 @@ async def update_blocklist(
             "enabled",
         },
     )
+    legacy = body.feed_entries_are_wildcard
+    if (
+        legacy is not None
+        and "feed_wildcard_mode" not in body.model_fields_set
+        # The read model reports True for everything but "never", so a client
+        # echoing back what it GOT sends the value the stored mode already
+        # derives; that is no change, and must not collapse by_syntax into
+        # always (#4446).
+        and legacy != (bl.feed_wildcard_mode != "never")
+    ):
+        changes["feed_wildcard_mode"] = _legacy_wildcard_mode(legacy)
     if (
         "feed_url" in changes
         and changes["feed_url"]
