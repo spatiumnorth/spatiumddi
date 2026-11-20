@@ -11,6 +11,9 @@ import {
 } from "lucide-react";
 import { ListReadError } from "@/components/ui/list-read-error";
 import { Modal } from "@/components/ui/modal";
+import { Field } from "@/components/ui/field";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import {
   NEEDS_SUPERADMIN,
@@ -36,26 +39,6 @@ import { CreateTokenModal, RevealTokenModal } from "./ApiTokensPage";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
-
-function Field({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-      {hint && <p className="text-[11px] text-muted-foreground/80">{hint}</p>}
-    </div>
-  );
-}
 
 function GroupPicker({
   selected,
@@ -206,16 +189,18 @@ function EditServiceAccountModal({
 }) {
   const qc = useQueryClient();
   const [displayName, setDisplayName] = useState(account.display_name);
-  const [groupIds, setGroupIds] = useState<string[]>(
-    account.groups.map((g) => g.id),
-  );
+  const initialGroupIds = account.groups.map((g) => g.id);
+  const [groupIds, setGroupIds] = useState<string[]>(initialGroupIds);
   const [error, setError] = useState<string | null>(null);
   const mut = useMutation({
     mutationFn: () =>
-      serviceAccountsApi.update(account.id, {
-        display_name: displayName,
-        group_ids: groupIds,
-      }),
+      serviceAccountsApi.update(
+        account.id,
+        changedFields(
+          { display_name: account.display_name, group_ids: initialGroupIds },
+          { display_name: displayName, group_ids: groupIds },
+        ),
+      ),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["service-accounts"] });
       onClose();
@@ -312,10 +297,6 @@ function TokensModal({
     onSuccess: () => {
       setConfirmDelete(null);
       refresh();
-    },
-    onError: (err: unknown) => {
-      setConfirmDelete(null);
-      setError(formatDialogError(err, "Failed to delete token."));
     },
   });
   const rows = tokens.data ?? [];
@@ -457,6 +438,11 @@ function TokensModal({
         autoFocusCancel
         confirmLabel="Delete"
         loading={remove.isPending}
+        error={
+          remove.isError
+            ? formatDialogError(remove.error, "Failed to delete token.")
+            : null
+        }
         message={
           <>
             Permanently delete{" "}
@@ -465,7 +451,10 @@ function TokensModal({
           </>
         }
         onConfirm={() => confirmDelete && remove.mutate(confirmDelete)}
-        onClose={() => setConfirmDelete(null)}
+        onClose={() => {
+          remove.reset();
+          setConfirmDelete(null);
+        }}
       />
     </>
   );
@@ -484,7 +473,6 @@ export function ServiceAccountsPage() {
   const [tokensFor, setTokensFor] = useState<ServiceAccount | null>(null);
   const [toggle, setToggle] = useState<ServiceAccount | null>(null);
   const [remove, setRemove] = useState<ServiceAccount | null>(null);
-  const [error, setError] = useState<string | null>(null);
   const accounts = useQuery({
     queryKey: ["service-accounts"],
     queryFn: serviceAccountsApi.list,
@@ -500,20 +488,12 @@ export function ServiceAccountsPage() {
       setToggle(null);
       refresh();
     },
-    onError: (err: unknown) => {
-      setToggle(null);
-      setError(formatDialogError(err, "Failed to update service account."));
-    },
   });
   const deleteMut = useMutation({
     mutationFn: (a: ServiceAccount) => serviceAccountsApi.delete(a.id),
     onSuccess: () => {
       setRemove(null);
       refresh();
-    },
-    onError: (err: unknown) => {
-      setRemove(null);
-      setError(formatDialogError(err, "Failed to delete service account."));
     },
   });
   const rows = accounts.data ?? [];
@@ -543,7 +523,6 @@ export function ServiceAccountsPage() {
             New Service Account
           </button>
         </div>
-        <ErrorBox error={error} />
 
         <div className="overflow-x-auto rounded-lg border">
           <table className="w-full min-w-[760px] text-sm">
@@ -704,7 +683,19 @@ export function ServiceAccountsPage() {
         <CreateServiceAccountModal onClose={() => setShowCreate(false)} />
       )}
       {edit && (
-        <EditServiceAccountModal account={edit} onClose={() => setEdit(null)} />
+        <FreshEdit
+          row={edit}
+          queryKeys={[["service-accounts"]]}
+          title="Edit Service Account"
+          onClose={() => setEdit(null)}
+        >
+          {(fresh) => (
+            <EditServiceAccountModal
+              account={fresh}
+              onClose={() => setEdit(null)}
+            />
+          )}
+        </FreshEdit>
       )}
       {tokensFor && (
         <TokensModal account={tokensFor} onClose={() => setTokensFor(null)} />
@@ -719,6 +710,14 @@ export function ServiceAccountsPage() {
         tone={toggle?.is_active ? "destructive" : "default"}
         confirmLabel={toggle?.is_active ? "Disable" : "Enable"}
         loading={toggleMut.isPending}
+        error={
+          toggleMut.isError
+            ? formatDialogError(
+                toggleMut.error,
+                "Failed to update service account.",
+              )
+            : null
+        }
         message={
           toggle?.is_active ? (
             <>
@@ -736,7 +735,10 @@ export function ServiceAccountsPage() {
           )
         }
         onConfirm={() => toggle && toggleMut.mutate(toggle)}
-        onClose={() => setToggle(null)}
+        onClose={() => {
+          toggleMut.reset();
+          setToggle(null);
+        }}
       />
       <ConfirmModal
         open={remove !== null}
@@ -745,6 +747,14 @@ export function ServiceAccountsPage() {
         autoFocusCancel
         confirmLabel="Delete"
         loading={deleteMut.isPending}
+        error={
+          deleteMut.isError
+            ? formatDialogError(
+                deleteMut.error,
+                "Failed to delete service account.",
+              )
+            : null
+        }
         message={
           <>
             Permanently delete{" "}
@@ -753,7 +763,10 @@ export function ServiceAccountsPage() {
           </>
         }
         onConfirm={() => remove && deleteMut.mutate(remove)}
-        onClose={() => setRemove(null)}
+        onClose={() => {
+          deleteMut.reset();
+          setRemove(null);
+        }}
       />
     </div>
   );
