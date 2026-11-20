@@ -237,6 +237,9 @@ def _thaw(frozen: bytes | None) -> Any:
 
 
 class SyncLoop:
+    # Class default so a loop built without __init__ (tests) reads "not known".
+    _live_etag: str | None = None
+
     def __init__(
         self,
         cfg: AgentConfig,
@@ -257,6 +260,12 @@ class SyncLoop:
         # but leave structural_etag alone — the agent then drains record ops
         # via RFC 2136 over loopback without bouncing the daemon.
         self._current_structural_etag: str | None = None
+        # #4564 — full etag of the bundle whose structure the daemon runs, or
+        # None when that is not known to be any one bundle (a failed apply, a
+        # revert). ``_current_etag`` is not it: a quarantined bundle is parked
+        # on its etag while the last-known-good serves. See
+        # ``_confirm_live_bundle``.
+        self._live_etag: str | None = None
         # structural_etag of the bundle _apply_with_revert is applying, so a
         # failure is quarantined by structure (#2647).
         self._applying_structural: str | None = None
@@ -390,8 +399,10 @@ class SyncLoop:
         The startup path, and (#2019) the offline end of a startup hold, where
         ``before_sync`` is False: the control plane has been asked already."""
         self._current_etag = etag
+        self._live_etag = None
         try:
             self._guarded_apply(bundle, etag)
+            self._live_etag = etag
             self._current_structural_etag = self._applied_fingerprint(bundle)
             if not booting_from_previous:
                 # Zones refused or held back are reported, not reverted —
@@ -465,6 +476,19 @@ class SyncLoop:
                     )
                 self._bootstrap_fallback(etag, e, before_sync=before_sync)
             return False
+
+    def _confirm_live_bundle(self) -> None:
+        """Tell the driver the control plane vouches for the live bundle (#4564).
+
+        Reached only from an answer of the control plane's in this poll: a 304
+        for the bundle that is live, or a 200 whose structure is live. Never
+        from the cache at startup, a revert, or a boot-hold fallback, so what
+        the driver does here (PowerDNS deletes the zones the bundle dropped)
+        cannot happen while the control plane is unreachable."""
+        try:
+            self.driver.control_plane_confirmed()
+        except Exception:
+            log.exception("control_plane_confirmed_hook_failed")
 
     def _guarded_apply(self, bundle: dict[str, Any], etag: str | None) -> None:
         """``driver.apply_config`` under the #2019 death-during-apply marker.
@@ -1090,6 +1114,8 @@ class SyncLoop:
             return
 
         if resp.status_code == 304:
+            if self._live_etag is not None and self._live_etag == self._current_etag:
+                self._confirm_live_bundle()
             return
         if resp.status_code in (401, 404):
             # 401 = token expired/invalid. 404 = the server row was deleted
@@ -1240,6 +1266,9 @@ class SyncLoop:
                 log.exception("rendered_config_push_failed")
 
         self._current_etag = etag
+        # Either applied just above or structurally what was already live.
+        self._live_etag = etag
+        self._confirm_live_bundle()
 
         # Drain pending record ops via RFC 2136 (no daemon reload)
         dnssec_states: list[dict[str, Any]] = []
@@ -1384,6 +1413,7 @@ class SyncLoop:
         needs the previous config put back on disk.
         """
         self._applying_structural = bundle.get("structural_etag")
+        self._live_etag = None
         try:
             self._guarded_apply(bundle, etag)
         except ConfigApplyError as e:
