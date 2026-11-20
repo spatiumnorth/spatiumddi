@@ -66,9 +66,11 @@ async def _detach_history(
             text(
                 f"UPDATE {table} SET server_id = NULL, "  # noqa: S608 - fixed table names
                 "server_name = COALESCE(server_name, :name) "
-                # ``id``, not ``ctid``: these tables are partitioned (#2185) and a
-                # ctid is only unique within one partition.
-                f"WHERE id IN (SELECT id FROM {table} "
+                # These tables are partitioned (#2185): a ctid is unique only
+                # within one partition, so the row is named by its partition
+                # too. Matching on ``id`` instead finds the batch with a hash
+                # join over every row of every partition, once per batch.
+                f"WHERE (tableoid, ctid) IN (SELECT tableoid, ctid FROM {table} "
                 "WHERE server_id = :sid LIMIT :n)"
             ),
             {"sid": server_id, "name": name, "n": batch},
