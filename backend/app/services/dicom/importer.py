@@ -260,15 +260,22 @@ def _resolve_headers(
     return resolved
 
 
-def _cell(raw_row: Mapping[str, Any], headers: Mapping[str, str], target: str) -> str:
-    """Read one mapped cell as a stripped string ("" when absent/blank)."""
+def _cell(
+    raw_row: Mapping[str, Any], headers: Mapping[str, str], target: str, *, strip: str | None = None
+) -> str:
+    """Read one mapped cell as a stripped string ("" when absent/blank).
+
+    ``strip`` is the character set to trim; the default trims all whitespace.
+    The AE Title column passes ``" "`` so a tab or no-break space is
+    reported by the validator instead of being silently trimmed away.
+    """
     header = headers.get(target)
     if header is None:
         return ""
     value = raw_row.get(header)
     if value is None:
         return ""
-    return str(value).strip()
+    return str(value).strip(strip)
 
 
 def _parse_one(
@@ -279,7 +286,7 @@ def _parse_one(
     default_port: int,
     default_department: str,
 ) -> ParsedRow:
-    raw_title = _cell(raw_row, headers, "ae_title")
+    raw_title = _cell(raw_row, headers, "ae_title", strip=" ")
     if not raw_title:
         return ParsedRow(line=line, raw_title="", ae_title=None, error="missing AE Title")
     try:

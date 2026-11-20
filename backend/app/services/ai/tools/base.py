@@ -197,7 +197,7 @@ class Tool:
     # ``default_enabled`` controls whether the tool appears in the
     # effective set for a fresh install. Niche tools (TLS chain
     # check, public WHOIS lookups, propose-* writes) ship as False so
-    # operators opt in via Settings → AI → Tool Catalog. The default
+    # operators opt in via Administration → AI Tool Catalog. The default
     # can always be overridden per-platform via
     # ``PlatformSettings.ai_tools_enabled`` and per-provider via
     # ``AIProvider.enabled_tools``.

@@ -73,6 +73,13 @@ describe("Reapply dialog (#3895)", () => {
     expect(screen.getByText(/200 handled per call/)).toBeTruthy();
   });
 
+  it("says before the press that tags and custom fields are merged", () => {
+    render(<ReapplyConfirmModal {...base} />);
+    expect(document.body.textContent).toMatch(
+      /Tags and custom fields are merged.*keys the template does not hold are kept/,
+    );
+  });
+
   it("shows a refused reapply's reason", () => {
     render(<ReapplyConfirmModal {...base} error="Forbidden thing" />);
     expect(screen.getByRole("alert").textContent).toBe("Forbidden thing");

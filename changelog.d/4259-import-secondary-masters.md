@@ -1,0 +1,3 @@
+### Fixed
+
+- The BIND9 configuration import stored a `type secondary` / `slave` / `stub` zone with no masters and with its zone file's records, a zone the zone API refuses and nothing serves. It now reads the zone's `masters` / `primaries` list (addresses, `port`, IPv6, and named lists defined in `named.conf`), stores it on the zone, and imports the zone with no records, saying in the preview that they come from the masters. A secondary or stub zone with no readable master is skipped with a warning; the PowerDNS import keeps a Slave zone's masters the same way, and the Windows DNS import (whose zone listing carries none) skips its secondary and stub zones with a warning.

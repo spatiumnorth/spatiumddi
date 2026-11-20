@@ -36,6 +36,8 @@ import {
 import { HeaderButton } from "@/components/ui/header-button";
 import { Modal, ModalTabs } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { FormError } from "@/components/ui/form-error";
 import { Pager } from "@/components/ui/pager";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
@@ -458,25 +460,53 @@ function LocationsTab({ canQuery }: { canQuery: boolean }) {
         onChange={setPage}
       />
 
-      {modal && (
-        <ERLModal
-          erl={modal.mode === "edit" ? modal.erl : null}
-          onClose={() => setModal(null)}
-          onSaved={() => {
-            setModal(null);
-            void qc.invalidateQueries({ queryKey: ["e911-erls"] });
-          }}
-        />
-      )}
+      {modal &&
+        (modal.mode === "edit" ? (
+          <FreshEdit
+            row={modal.erl}
+            load={() => e911Api.getErl(modal.erl.id)}
+            title="Edit location"
+            onClose={() => setModal(null)}
+          >
+            {(fresh) => (
+              <ERLModal
+                erl={fresh}
+                onClose={() => setModal(null)}
+                onSaved={() => {
+                  setModal(null);
+                  void qc.invalidateQueries({ queryKey: ["e911-erls"] });
+                }}
+              />
+            )}
+          </FreshEdit>
+        ) : (
+          <ERLModal
+            erl={null}
+            onClose={() => setModal(null)}
+            onSaved={() => {
+              setModal(null);
+              void qc.invalidateQueries({ queryKey: ["e911-erls"] });
+            }}
+          />
+        ))}
       {verdictFor && (
-        <VerdictModal
-          erl={verdictFor}
+        <FreshEdit
+          row={verdictFor}
+          load={() => e911Api.getErl(verdictFor.id)}
+          title="Record validation verdict"
           onClose={() => setVerdictFor(null)}
-          onSaved={() => {
-            setVerdictFor(null);
-            void qc.invalidateQueries({ queryKey: ["e911-erls"] });
-          }}
-        />
+        >
+          {(fresh) => (
+            <VerdictModal
+              erl={fresh}
+              onClose={() => setVerdictFor(null)}
+              onSaved={() => {
+                setVerdictFor(null);
+                void qc.invalidateQueries({ queryKey: ["e911-erls"] });
+              }}
+            />
+          )}
+        </FreshEdit>
       )}
       <ConfirmModal
         open={del !== null}
@@ -582,7 +612,13 @@ function ERLModal({
         notes,
         is_active: isActive,
       };
-      return erl ? e911Api.updateErl(erl.id, body) : e911Api.createErl(body);
+      if (!erl) return e911Api.createErl(body);
+      // Only what the operator changed, against the row read when the
+      // dialog opened (#4379): a civic element another client corrected
+      // since is not put back, and an untouched Save sends nothing.
+      const diff = changedFields(erl, body);
+      if (Object.keys(diff).length === 0) return Promise.resolve(erl);
+      return e911Api.updateErl(erl.id, diff);
     },
     onSuccess: onSaved,
     onError: (e) => setError(formatApiError(e)),
