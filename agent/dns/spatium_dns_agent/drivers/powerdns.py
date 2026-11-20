@@ -1531,19 +1531,23 @@ class PowerDNSDriver(DriverBase):
         return self.state_dir / _MANAGED_ZONES_FILE
 
     def _load_managed_zones(self) -> set[str] | None:
-        """The ledger (lowercased, trailing dot); ``None`` when there is none
-        yet. An unparsable one counts as none, so it is rebuilt the way a
-        first run builds it."""
+        """The ledger (lowercased, trailing dot); ``None`` only when there is
+        no file, which is a first run and adopts what PowerDNS holds. An
+        unreadable or unparsable one is a damaged record of what the agent
+        owns, not a first run: it fails closed as an EMPTY ledger, so nothing
+        is deleted on its strength and no zone is adopted from it. Zones the
+        bundle names are claimed again by the next reconcile; an orphan stays
+        until an operator removes it."""
         try:
             raw = json.loads(self._managed_zones_path().read_text())
         except FileNotFoundError:
             return None
-        except ValueError as exc:
+        except (OSError, ValueError) as exc:
             log.warning("powerdns_managed_zones_unreadable", error=str(exc))
-            return None
+            return set()
         if not isinstance(raw, list):
             log.warning("powerdns_managed_zones_unreadable", error="not a list")
-            return None
+            return set()
         return {str(n).lower() for n in raw if n}
 
     def _save_managed_zones(self, zones: set[str]) -> None:

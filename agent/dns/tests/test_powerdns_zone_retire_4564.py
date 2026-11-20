@@ -174,6 +174,19 @@ def test_the_first_run_adopts_the_zones_already_there(tmp_path: Path, monkeypatc
     assert pdns.zones == {"keep.test."}
 
 
+def test_a_corrupt_ledger_fails_closed(tmp_path: Path, monkeypatch) -> None:
+    """A damaged ledger is not a first run: it must not re-adopt every zone
+    PowerDNS holds (a hand-made one included) and delete the lot."""
+    pdns = _Pdns(monkeypatch, "keep.test.", "byhand.test.")
+    (tmp_path / "pdns-managed-zones.json").write_text("{not json")
+    driver = _driver(tmp_path, monkeypatch)
+    _apply(driver, _bundle("keep.test"))
+    driver.control_plane_confirmed()
+    assert pdns.deletes == []
+    assert pdns.zones == {"keep.test.", "byhand.test."}
+    assert _ledger(tmp_path) == {"keep.test."}
+
+
 def test_the_ledger_survives_a_restart(tmp_path: Path, monkeypatch) -> None:
     pdns = _Pdns(monkeypatch)
     _apply(_driver(tmp_path, monkeypatch), _bundle("keep.test", "gone.test"))
