@@ -229,7 +229,15 @@ def _filtered(
     if origin is not None:
         stmt = stmt.where(ChangeRequest.origin == origin)
     if state is not None:
-        stmt = stmt.where(ChangeRequest.state == state)
+        # Several states as a comma list ("executed,rejected"): the admin
+        # History reads the decided ones without the pending ones eating its
+        # window (#4383).
+        states = [x.strip() for x in state.split(",") if x.strip()]
+        stmt = stmt.where(
+            ChangeRequest.state == states[0]
+            if len(states) == 1
+            else ChangeRequest.state.in_(states)
+        )
     if resource_type is not None:
         stmt = stmt.where(ChangeRequest.resource_type == resource_type)
     if requested_by_user_id is not None:
@@ -902,6 +910,13 @@ REQUESTER_GONE_MESSAGE = (
 )
 
 
+SCOPE_CHANGED_MESSAGE = (
+    "The change's scope changed since it was requested, so it can no longer be "
+    "approved as reviewed. Reject it; the requester can cancel it and submit it "
+    "again to capture the new scope."
+)
+
+
 def approval_refusal(approver: User, cr: ChangeRequest) -> DecisionError | None:
     """Why ``approver`` may not approve ``cr``, or ``None`` when they may.
 
@@ -953,6 +968,33 @@ def approval_refusal(approver: User, cr: ChangeRequest) -> DecisionError | None:
             "Approving a control-plane change to the approval workflow requires superadmin"
         )
     return None
+
+
+async def approval_refusal_at_target(
+    db: AsyncSession, approver: User, cr: ChangeRequest
+) -> DecisionError | None:
+    """:func:`approval_refusal` plus the operation's per-object gate (#4382).
+
+    ``approval_refusal`` asks only the operation's type-wide permission, which
+    admits a grant scoped to one subnet for an address request in another. An
+    operation that declares ``target_refusal`` has the same function run by its
+    ``apply``, so a row's ``can_approve`` matches what the press does. One
+    ``db.get`` per row, served from the identity map for a repeated target.
+    """
+    from app.services.ai import operations  # noqa: PLC0415
+
+    refusal = approval_refusal(approver, cr)
+    if refusal is not None:
+        return refusal
+    op = operations.get_operation(cr.operation)
+    if op is None or op.target_refusal is None:
+        return None
+    try:
+        args = op.args_model.model_validate(cr.args or {})
+    except Exception:  # noqa: BLE001 — the approve answers a stale schema itself
+        return None
+    target = await op.target_refusal(db, approver, args)
+    return DecisionForbidden(str(target)) if target is not None else None
 
 
 async def approve_change_request(
@@ -1170,7 +1212,8 @@ async def approve_change_request(
     #     request and approval (e.g. the requester added 50 IPs to a subnet
     #     queued for soft-delete) — refuse so the approver never rubber-stamps
     #     a scope larger than the one they reviewed. Treat any drift as stale;
-    #     the requester must cancel and re-submit to capture the new scope.
+    #     the approver can only reject it (#4381) and the requester cancel and
+    #     re-submit to capture the new scope.
     #     This closes the TOCTOU for both soft and permanent paths via one rule.
     #
     #     GATE ROWS ONLY (#696). The rule assumes the preview describes a
@@ -1200,10 +1243,7 @@ async def approve_change_request(
             frozen_preview=cr.preview_text,
             fresh_preview=preview.preview_text,
         )
-        raise DecisionConflict(
-            "The change's scope changed since it was requested — cancel and "
-            "re-submit to capture the new scope."
-        )
+        raise DecisionConflict(SCOPE_CHANGED_MESSAGE)
 
     requester_id = cr.requested_by_user_id
 
@@ -1348,6 +1388,7 @@ def _can_approve(user: User) -> bool:
 __all__ = [
     "REQUESTER_GONE_MESSAGE",
     "approval_refusal",
+    "approval_refusal_at_target",
     "ChangeRequestStateError",
     "DecisionConflict",
     "DecisionError",

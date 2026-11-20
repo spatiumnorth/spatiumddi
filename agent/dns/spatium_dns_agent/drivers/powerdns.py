@@ -59,11 +59,27 @@ log = structlog.get_logger(__name__)
 _PDNS_API_BASE = "http://127.0.0.1:8081/api/v1/servers/localhost"
 _PDNS_API_TIMEOUT = 10.0
 _API_KEY_FILE = "pdns-api.key"
+# ``ALLOW-DNSUPDATE-FROM`` for a zone whose update ACL grants by TSIG key
+# only: the key is the gate, so the address check has to pass for everyone.
+_ANY_ADDRESS = ("0.0.0.0/0", "::/0")
+
+# Zones this agent manages in PowerDNS: the ones it created or reconciled from
+# a bundle, plus every zone PowerDNS held the first time the ledger was
+# written. Only these are deleted when the bundle drops them (#4564; see
+# ``_retire_dropped_zones``).
+_MANAGED_ZONES_FILE = "pdns-managed-zones.json"
 
 # ``resolver=`` takes ``ip``, ``ip:port`` or ``[v6]:port``, comma-separated.
 _ALIAS_RESOLVER_PORTED_RE = re.compile(
     r"^(?:\[([0-9A-Fa-f:.]+)\]|([0-9.]+)):([0-9]{1,5})$"
 )
+
+
+def _allow_empty_retire() -> bool:
+    """PDNS_ALLOW_EMPTY_RETIRE=1: the operator wants the server emptied when
+    the bundle drops every managed zone (#4564)."""
+    value = os.environ.get("PDNS_ALLOW_EMPTY_RETIRE", "")
+    return value.strip().lower() in ("1", "true", "yes", "on")
 
 
 def _alias_resolver_entry_ok(entry: str) -> bool:
@@ -638,10 +654,14 @@ def _axfr_grants(
 
     The source is the one BIND9 renders ``allow-transfer`` from (#734): the
     zone's ``allow_transfer`` when set, else the server options', in BIND's
-    vocabulary, plus every TSIG key in the bundle, granted unconditionally —
-    the same keys the BIND9 agent grants, so ``resolve_group_transfer_key``
-    signs with a key this server accepts. PowerDNS's ``ALLOW-AXFR-FROM`` is a
-    list of subnets with no negation and no named ACLs, so:
+    vocabulary. A TSIG key is granted only when that list names it (#4568),
+    unlike BIND9, which grants every bundle key: PowerDNS signs the NOTIFY it
+    sends for a zone with the first key in ``TSIG-ALLOW-AXFR``, so a key
+    granted unasked made a secondary that lacks it reject every NOTIFY. The
+    control plane never signs a transfer from a PowerDNS server
+    (``AXFR_TSIG_DRIVERS``), so it needs no grant. PowerDNS's
+    ``ALLOW-AXFR-FROM`` is a list of subnets with no negation and no named
+    ACLs, so:
 
     * ``any`` → ``0.0.0.0/0`` and ``::/0``; ``none`` grants nothing;
     * an address or prefix is granted as one;
@@ -652,9 +672,7 @@ def _axfr_grants(
       dropped (keys still apply) — failing closed.
     """
     cidrs: list[str] = []
-    keys: dict[str, dict[str, Any]] = {
-        str(name): k for name, k in bundle_keys.items() if name and k.get("secret")
-    }
+    keys: dict[str, dict[str, Any]] = {}
     dropped: list[str] = []
     negated = False
     for entry in acl or []:
@@ -918,6 +936,14 @@ class PowerDNSDriver(DriverBase):
     #: in, a retry compares the new file with itself and would otherwise
     #: never restart, leaving pdns on the old settings for good.
     _conf_restart_owed: bool = False
+    #: Set by an apply whose zone reconcile went through, cleared by a retire
+    #: pass that left nothing behind (#4564). In memory on purpose: a restart
+    #: applies the cached bundle again, which sets it again.
+    _retire_owed: bool = False
+    #: Whether the bundle of the last render carried a zone list at all. One
+    #: without (key absent, ``null``, not a list) is not a claim that the
+    #: group has no zones, and retires nothing.
+    _bundle_has_zone_list: bool = False
 
     # ── Render / validate / swap ────────────────────────────────────────────
 
@@ -1038,6 +1064,7 @@ class PowerDNSDriver(DriverBase):
             k.get("name"): k for k in (bundle.get("tsig_keys") or []) if k.get("name")
         }
         zones_payload = []
+        self._bundle_has_zone_list = isinstance(bundle.get("zones"), list)
         for zone in bundle.get("zones", []) or []:
             zname = (zone.get("name") or "").rstrip(".") + "."
             if not zname or zname == ".":
@@ -1449,6 +1476,8 @@ class PowerDNSDriver(DriverBase):
         new_dir = self.state_dir / "rendered.new"
         current = self.state_dir / "rendered"
         backup = self.state_dir / "rendered.prev"
+        # Nothing is retired on the strength of an apply that did not finish.
+        self._retire_owed = False
         old_conf = _read_text_or_none(current / "pdns.conf")
         if current.exists():
             if backup.exists():
@@ -1503,6 +1532,132 @@ class PowerDNSDriver(DriverBase):
         # the timing race fired. A zone whose data PowerDNS refuses does NOT
         # raise: it lands in ``refused_zones()`` for the sync loop to report.
         self._reconcile_zones(api_key, payload)
+        # Every zone of the bundle was attempted, so the zones it dropped can
+        # go — once the control plane confirms this bundle is its current one
+        # (``control_plane_confirmed``), never from here: this apply may be
+        # the cached bundle or the last-known-good, with no control plane.
+        self._retire_owed = True
+
+    # ── Zones the bundle dropped (#4564) ────────────────────────────────────
+
+    #: Set while a confirmed bundle's retire pass is held because it would
+    #: delete every managed zone; the sync loop reports it as a warning.
+    retire_warning: str | None = None
+
+    def _managed_zones_path(self) -> Path:
+        return self.state_dir / _MANAGED_ZONES_FILE
+
+    def _load_managed_zones(self) -> set[str] | None:
+        """The ledger (lowercased, trailing dot); ``None`` only when there is
+        no file, which is a first run and adopts what PowerDNS holds. An
+        unreadable or unparsable one is a damaged record of what the agent
+        owns, not a first run: it fails closed as an EMPTY ledger, so nothing
+        is deleted on its strength and no zone is adopted from it. Zones the
+        bundle names are claimed again by the next reconcile; an orphan stays
+        until an operator removes it."""
+        try:
+            raw = json.loads(self._managed_zones_path().read_text())
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as exc:
+            log.warning("powerdns_managed_zones_unreadable", error=str(exc))
+            return set()
+        if not isinstance(raw, list):
+            log.warning("powerdns_managed_zones_unreadable", error="not a list")
+            return set()
+        return {str(n).lower() for n in raw if n}
+
+    def _save_managed_zones(self, zones: set[str]) -> None:
+        write_private(self._managed_zones_path(), json.dumps(sorted(zones)))
+
+    def control_plane_confirmed(self) -> None:
+        """The control plane just answered that the applied bundle is current.
+
+        The only trigger for deleting zones (non-negotiable #5): an agent
+        serving its cached bundle because the control plane is unreachable
+        never gets here, and neither does one that reverted to the
+        last-known-good."""
+        if self._retire_owed:
+            self._retire_dropped_zones()
+
+    def _retire_dropped_zones(self) -> None:
+        """Delete the managed zones the applied bundle no longer carries.
+
+        ``_reconcile_zones`` creates and updates and never deletes, so a zone
+        deleted in SpatiumDDI, moved to another group, converted to a forward
+        zone, a secondary left without primaries, a switched-off catalog
+        zone, and every zone of the group a moved server left all kept
+        answering authoritatively with the data they last had (#4564). BIND9
+        has no such gap: a zone that leaves the bundle leaves ``named.conf``.
+
+        Candidates are the ledger minus the zones just reconciled
+        (``rendered/zones.json``, which the reconcile attempted in full
+        before this is ever owed; a zone PowerDNS refused is still in it and
+        stays). A zone made behind the agent's back after the ledger exists
+        is in neither and is never touched. A delete that fails keeps its
+        name in the ledger and the pass owed, so the next confirmation
+        retries it.
+        """
+        if not self._bundle_has_zone_list:
+            log.warning("powerdns_zone_retire_held_back", reason="bundle_has_no_zone_list")
+            self._retire_owed = False
+            return
+        try:
+            payload = json.loads((self.state_dir / "rendered" / "zones.json").read_text())
+            desired = {str(z["name"]).lower() for z in payload}
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            log.warning("powerdns_zone_retire_held_back", reason="payload_unreadable", error=str(exc))
+            return
+        managed = self._load_managed_zones()
+        dropped = sorted((managed or set()) - desired)
+        self.retire_warning = None
+        if managed is None or not dropped:
+            self._retire_owed = False
+            return
+        if set(dropped) == managed and not _allow_empty_retire():
+            # One confirmed apply would empty the server. A bundle that
+            # carries none of the managed zones is as likely a control-plane
+            # mishap (wrong group, emptied group) as an intent, and the
+            # delete cannot be undone, so hold it: the ledger stays, normal
+            # retire resumes once a bundle carries a zone again, and an
+            # operator who wants an empty server sets PDNS_ALLOW_EMPTY_RETIRE.
+            self.retire_warning = (
+                f"holding deletion of all {len(managed)} managed zones; the bundle carries none"
+            )
+            log.warning(
+                "powerdns_zone_retire_held_all",
+                zones=len(managed),
+                opt_in="PDNS_ALLOW_EMPTY_RETIRE",
+            )
+            self._retire_owed = False
+            return
+        headers = {"X-API-Key": self._load_or_generate_api_key()}
+        kept: set[str] = set()
+        with httpx.Client(timeout=_PDNS_API_TIMEOUT) as client:
+            for zone in dropped:
+                try:
+                    resp = client.delete(f"{_PDNS_API_BASE}/zones/{zone}", headers=headers)
+                except httpx.HTTPError as exc:
+                    kept.add(zone)
+                    log.warning("powerdns_zone_retire_failed", zone=zone, error=str(exc))
+                    continue
+                if resp.status_code < 400:
+                    log.info("powerdns_zone_retired", zone=zone)
+                elif resp.status_code == 404:
+                    # Already gone, e.g. removed by hand.
+                    log.info("powerdns_zone_retire_already_absent", zone=zone)
+                else:
+                    kept.add(zone)
+                    log.warning(
+                        "powerdns_zone_retire_failed",
+                        zone=zone,
+                        status=resp.status_code,
+                        error=_pdns_error(resp),
+                    )
+                    continue
+                self._forget_reached(zone)
+        self._save_managed_zones((managed & desired) | kept)
+        self._retire_owed = bool(kept)
 
     def daemon_restarting(self) -> bool:
         return self._restarting
@@ -2014,7 +2169,7 @@ class PowerDNSDriver(DriverBase):
         return [], False
 
     def _dnssec_sign(self, api_key: str, zone: str) -> list[str]:
-        """Generate KSK + ZSK, set PRESIGNED metadata, rectify zone.
+        """Generate KSK + ZSK and rectify the zone.
 
         Returns the DS rrset string list so the caller can ship it to the
         control plane (operator pastes the DS into their parent registrar).
@@ -2110,7 +2265,7 @@ class PowerDNSDriver(DriverBase):
         return out
 
     def _dnssec_unsign(self, api_key: str, zone: str) -> None:
-        """Delete every cryptokey + clear PRESIGNED metadata.
+        """Delete every cryptokey of the zone.
 
         Idempotent — missing keys / metadata are a no-op. Same convergence
         semantic as ``_dnssec_sign``.
@@ -2439,6 +2594,11 @@ class PowerDNSDriver(DriverBase):
                 # with zero LUA records simply don't trigger the LUA
                 # engine at query time).
                 "enable-lua-records=yes",
+                # DNAME substitution is off in pdns by default: the DNAME
+                # record is served but names below it answer NXDOMAIN
+                # instead of getting the synthesised CNAME BIND9 returns
+                # (#4571). A startup setting, like ``dnsupdate`` below.
+                "dname-processing=yes",
                 # RFC 2136 dynamic updates (issue #641). Enabled globally so
                 # the feature is available; per-zone acceptance is gated by the
                 # ``ALLOW-DNSUPDATE-FROM`` / ``TSIG-ALLOW-DNSUPDATE`` metadata
@@ -2468,9 +2628,11 @@ class PowerDNSDriver(DriverBase):
     def _reconcile_zones(self, api_key: str, payload: list[dict[str, Any]]) -> None:
         """Idempotently bring the local PowerDNS zone set in line with
         ``payload``: per-zone create-or-update. Zones present in PowerDNS
-        that aren't in the bundle are NOT deleted — that's a control-plane
-        safety call (operators should explicitly delete a zone, not have it
-        disappear because a sync glitched). Within a zone the bundle IS the
+        that aren't in the bundle are NOT deleted here: that is
+        ``_retire_dropped_zones``, which runs only once the control plane has
+        confirmed the bundle (#4564), so a zone cannot disappear because a
+        sync glitched. Every zone of the payload PowerDNS holds after this
+        pass goes into the ledger that pass reads. Within a zone the bundle IS the
         whole truth: an rrset PowerDNS holds and the bundle no longer does is
         deleted in the same PATCH (#1380), except the apex SOA / NS and the
         DNSSEC types, and except in a zone that accepts RFC 2136 updates,
@@ -2522,6 +2684,22 @@ class PowerDNSDriver(DriverBase):
                 z["name"].lower(): z for z in existing if isinstance(z, dict) and z.get("name")
             }
             existing_names = set(existing_by_name)
+
+            # The ledger of zones this agent may delete later (#4564). The
+            # first pass that keeps one adopts every zone PowerDNS holds: the
+            # daemon is the agent's own (its API listens on loopback inside
+            # the container, behind a key only the agent has), and without
+            # this the zones orphaned before the upgrade would stay for good.
+            # A zone of the payload that already exists is taken over by the
+            # PATCH below whoever made it, so it is managed from here on too.
+            managed = self._load_managed_zones()
+            if managed is None:
+                managed = set(existing_names)
+                log.info("powerdns_managed_zones_adopted", count=len(managed))
+            wanted = {str(z["name"]).lower() for z in payload}
+            managed |= wanted & existing_names
+            self._save_managed_zones(managed)
+            created: set[str] = set()
 
             for zone_payload in payload:
                 zone_name = zone_payload["name"]
@@ -2587,6 +2765,7 @@ class PowerDNSDriver(DriverBase):
                         self._zone_not_applied(zone_name, "create", resp, refused, failures)
                         continue
                     log.info("powerdns_zone_created", zone=zone_name)
+                    created.add(zone_name.lower())
                     if _kind_category(zone_payload.get("kind")) == "secondary":
                         # Do not wait for the next refresh cycle (up to a
                         # minute) for the first transfer (#1967).
@@ -2754,6 +2933,13 @@ class PowerDNSDriver(DriverBase):
                 # ``powerdns_lua_metadata_failed`` warning on every
                 # bulk reconcile of a LUA-bearing zone. The global
                 # knob makes the per-zone PUT unnecessary.
+
+            # Before the verdict below can raise: a created zone is in
+            # PowerDNS whatever became of the rest of the pass. A process
+            # that dies before this line loses nothing either, since the
+            # next pass finds those zones existing and claims them above.
+            if created:
+                self._save_managed_zones(managed | created)
 
         self._refused_zones = tuple(refused)
         if refused:
@@ -3116,6 +3302,14 @@ class PowerDNSDriver(DriverBase):
         empty ACL clears both so a zone whose dynamic updates were turned off
         stops accepting them.
 
+        PowerDNS checks the address first and then, when keys are listed, the
+        signature as well. So a key-only ACL also writes every address into
+        ``ALLOW-DNSUPDATE-FROM``: without it only loopback (the
+        ``allow-dnsupdate-from`` default) passes the address check and a
+        signed update from anywhere else is refused (#4569). An ACL with both
+        kinds stays "address and key": the control plane refuses to save one
+        for a PowerDNS group, and a stored one is not widened here.
+
         Returns what PowerDNS refused, for the caller to fail the apply with
         after the other zones are done (#1225). This used to be best-effort,
         which meant a failed CLEAR left a zone accepting updates the operator
@@ -3140,6 +3334,18 @@ class PowerDNSDriver(DriverBase):
             and e.get("match_kind") == "tsig_key"
             and e.get("tsig_key_name")
         ]
+        if key_names and not ip_from:
+            ip_from = list(_ANY_ADDRESS)
+        elif key_names and ip_from:
+            log.warning(
+                "powerdns_update_acl_address_and_key",
+                zone=zone,
+                hint=(
+                    "PowerDNS accepts an update only from a granted address "
+                    "AND signed with a granted key. Grant by key only, or by "
+                    "address only."
+                ),
+            )
         problems: list[str] = []
         for k in zone_payload.get("update_tsig_keys") or []:
             key_name = (k.get("name") or "").rstrip(".")

@@ -30,6 +30,7 @@ from app.models.dns import DNSPool, DNSPoolMember, DNSRecord, DNSZone
 from app.services.dns.cname_conflict import describe_cname_conflict, find_cname_conflict
 from app.services.dns.record_ops import enqueue_record_op
 from app.services.dns.serial import bump_zone_serial
+from app.services.dns.zone_synthesis import unauthored_zone_error
 
 logger = structlog.get_logger(__name__)
 
@@ -137,10 +138,17 @@ async def apply_pool_state(
     # at the name after the pool) renders nothing; rows already written there
     # are withdrawn, since the zone is held on its last good copy while they
     # stand. Checked once per pass, without autoflush like the reads above.
+    # #4390 — likewise a zone that is no longer a primary (turned secondary,
+    # stub or forward while the pool held no row): the rows would be listed and
+    # served by nobody, the state #3838 refuses at every other writer.
     blocked = None
     if pool.enabled:
-        with db.no_autoflush:
-            blocked = await pool_name_refusal(db, zone, pool.record_name, pool.record_type)
+        unauthored = unauthored_zone_error(zone, "add")
+        if unauthored is not None:
+            blocked = (409, unauthored)
+        else:
+            with db.no_autoflush:
+                blocked = await pool_name_refusal(db, zone, pool.record_name, pool.record_type)
         if blocked is not None:
             await _note_render_skipped(db, pool, zone, *blocked)
 

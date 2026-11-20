@@ -1,6 +1,8 @@
 import { useMemo, useState } from "react";
 import { Field } from "@/components/ui/field";
 import { FormError } from "@/components/ui/form-error";
+import { FreshRowError } from "@/components/FreshRowError";
+import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Pencil, Plus, Trash2 } from "lucide-react";
 import {
@@ -112,7 +114,39 @@ function MultiPicker<T extends { id: string }>({
   );
 }
 
+// Edit reads the group when it opens: the row the list holds can be stale, and
+// the Save used to send the whole `role_ids` and `user_ids` back, re-adding a
+// member another administrator removed since. It now sends only what was
+// changed against the row read here.
 function GroupModal({
+  group: listed,
+  ...rest
+}: {
+  group: InternalGroup | null;
+  roles: AppRole[] | undefined;
+  users: AppUser[] | undefined;
+  rolesError?: unknown;
+  usersError?: unknown;
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const fresh = useFreshRow<InternalGroup>(listed ?? undefined, () =>
+    refetchRow<InternalGroup>(qc, [["groups"]], (listed as InternalGroup).id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title={`Edit group — ${listed?.name ?? ""}`}
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={rest.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <GroupForm group={fresh.row ?? null} {...rest} />;
+}
+
+function GroupForm({
   group,
   roles,
   users,
@@ -140,17 +174,30 @@ function GroupModal({
   const [stepTotp, setStepTotp] = useState("");
 
   const mutation = useMutation({
-    mutationFn: () => {
-      const payload: InternalGroupCreate | InternalGroupUpdate = {
-        name,
-        description,
-        role_ids: roleIds,
-        user_ids: userIds,
+    mutationFn: async () => {
+      if (!group) {
+        return groupsApi.create({
+          name,
+          description,
+          role_ids: roleIds,
+          user_ids: userIds,
+        } as InternalGroupCreate);
+      }
+      // Only what changed; an untouched Save sends nothing (#4452).
+      const diff = changedFields(
+        {
+          name: group.name,
+          description: group.description,
+          role_ids: group.role_ids,
+          user_ids: group.user_ids,
+        },
+        { name, description, role_ids: roleIds, user_ids: userIds },
+      ) as InternalGroupUpdate;
+      if (Object.keys(diff).length === 0 && !needsStepUp) return null;
+      return groupsApi.update(group.id, {
+        ...diff,
         ...(needsStepUp ? stepUpBody(stepPassword, stepTotp) : {}),
-      };
-      return group
-        ? groupsApi.update(group.id, payload as InternalGroupUpdate)
-        : groupsApi.create(payload as InternalGroupCreate);
+      });
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["groups"] });

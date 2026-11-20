@@ -692,7 +692,10 @@ export function WebhooksPage() {
 
   const del = useMutation({
     mutationFn: (id: string) => webhooksApi.delete(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["webhooks"] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["webhooks"] });
+      setConfirm(null);
+    },
   });
 
   const test = useMutation({
@@ -716,8 +719,9 @@ export function WebhooksPage() {
             <h1 className="text-xl font-semibold">Webhooks</h1>
             <p className="max-w-2xl text-xs text-muted-foreground">
               Typed-event subscriptions for downstream automation. Every enabled
-              subscription whose event-type filter matches receives one
-              HMAC-signed POST per event with exponential-backoff retry and a
+              subscription whose event-type filter matches receives one POST per
+              event, HMAC-signed when the subscription has a secret (unsigned
+              when it has none), with exponential-backoff retry and a
               dead-letter state. Distinct from the generic audit-forward webhook
               under Settings — that ships every audit row in your chosen wire
               format; this fires typed events shaped for code.
@@ -893,11 +897,13 @@ export function WebhooksPage() {
         message={`Delete subscription "${confirm?.name ?? ""}"? Pending and dead-letter deliveries are removed too.`}
         confirmLabel="Delete"
         tone="destructive"
-        onConfirm={() => {
-          confirm?.onConfirm();
+        loading={del.isPending}
+        error={del.error ? formatApiError(del.error, "Delete failed") : null}
+        onConfirm={() => confirm?.onConfirm()}
+        onClose={() => {
           setConfirm(null);
+          del.reset();
         }}
-        onClose={() => setConfirm(null)}
       />
     </div>
   );

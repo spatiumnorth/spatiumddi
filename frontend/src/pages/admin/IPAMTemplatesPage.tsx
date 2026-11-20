@@ -648,8 +648,10 @@ export function ReapplyConfirmModal({
         <p>
           This will stamp the template across every recorded instance with
           <code className="mx-1">force=True</code>, overwriting any operator
-          overrides. Capped at 200 instances per call. An instance whose child
-          layout cannot be carved is skipped and left as it was.
+          overrides of the template&apos;s fields. Tags and custom fields are
+          merged: the template&apos;s keys are set, and keys the template does
+          not hold are kept. Capped at 200 instances per call. An instance whose
+          child layout cannot be carved is skipped and left as it was.
         </p>
         <p>
           Type the template name to confirm:{" "}

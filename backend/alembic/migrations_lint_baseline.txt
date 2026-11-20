@@ -397,8 +397,8 @@ backend/alembic/versions/c4e1a87b3920_tailscale_integration.py:drop_column:115
 backend/alembic/versions/c4e1a87b3920_tailscale_integration.py:drop_column:118
 backend/alembic/versions/c4e1a87b3920_tailscale_integration.py:drop_table:120
 backend/alembic/versions/c4e2b7f81a39_appliance_role_health.py:drop_column:40
-backend/alembic/versions/c4e7a1d93b52_dns_server_delete_keeps_history.py:drop_column:72
-backend/alembic/versions/c4e7a1d93b52_dns_server_delete_keeps_history.py:drop_column:73
+backend/alembic/versions/c4e7a1d93b52_dns_server_delete_keeps_history.py:drop_column:80
+backend/alembic/versions/c4e7a1d93b52_dns_server_delete_keeps_history.py:drop_column:81
 backend/alembic/versions/c4e7a2f813b9_network_devices.py:drop_table:298
 backend/alembic/versions/c4e7a2f813b9_network_devices.py:drop_table:303
 backend/alembic/versions/c4e7a2f813b9_network_devices.py:drop_table:306
@@ -616,6 +616,7 @@ backend/alembic/versions/d7e5b8c91a3f_dhcp_failover_channel.py:drop_table:148
 backend/alembic/versions/d7f2a91c4b58_server_maintenance_mode.py:drop_column:67
 backend/alembic/versions/d7f2a91c4b58_server_maintenance_mode.py:drop_column:68
 backend/alembic/versions/d7f2a91c4b58_server_maintenance_mode.py:drop_column:69
+backend/alembic/versions/d8b3f6a1c274_dns_zone_agentless_created_server_ids.py:drop_column:34
 backend/alembic/versions/d8c5f12a47b9_query_log_entries.py:drop_table:82
 backend/alembic/versions/d8c5f12a47b9_query_log_entries.py:drop_table:85
 backend/alembic/versions/d8e1b5a26c47_dns_record_op_backoff.py:drop_column:54

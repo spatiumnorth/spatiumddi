@@ -710,12 +710,6 @@ async def update_target(
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
             row.drill_cron = payload["drill_cron"]
 
-    if payload.get("drill_enabled") and not (payload.get("drill_cron") or row.drill_cron):
-        raise HTTPException(
-            status_code=422,
-            detail="drill_enabled requires drill_cron — set a drill schedule first",
-        )
-
     if "passphrase" in payload and payload["passphrase"] is not None:
         row.passphrase_encrypted = encrypt_str(payload["passphrase"])
 
@@ -736,6 +730,20 @@ async def update_target(
             if payload[key] is None and key not in _NULLABLE_UPDATE_KEYS:
                 continue
             setattr(row, key, payload[key])
+
+    # Judge the state the edit leaves behind, not the payload (#4450):
+    # blanking the cron of an already-enabled drill sends no drill_enabled,
+    # and would otherwise store an enabled drill no sweep can ever fire. An
+    # edit touching neither field is left alone so a legacy row saves.
+    if (
+        ("drill_enabled" in payload or "drill_cron" in payload)
+        and row.drill_enabled
+        and not row.drill_cron
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="drill_enabled requires drill_cron — set a drill schedule first",
+        )
 
     # Audit only what this edit changed (#3697): the console's Save sends
     # the whole form, so a payload key is not evidence of a change. Config
