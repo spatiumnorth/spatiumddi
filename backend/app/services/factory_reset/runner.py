@@ -263,6 +263,10 @@ async def preview_factory_reset(
             preview.table_counts = counts
             preview.affected_rows = sum(counts.values())
             preview.notes.append("calling superadmin + built-in roles preserved")
+            preview.notes.append(
+                "every login session ends, including yours: "
+                f"{counts['user_session']} session(s) deleted"
+            )
             if AUTH_RBAC_CASCADE_DEPENDENTS:
                 preview.notes.append(
                     "rows owned by a deleted user go with it: "
@@ -386,6 +390,9 @@ async def _auth_rbac_counts(db: AsyncSession, calling_user_id: UUID) -> dict[str
     counts["group"] = int((await db.execute(text('SELECT COUNT(*) FROM "group"'))).scalar() or 0)
     counts["role"] = int(
         (await db.execute(text("SELECT COUNT(*) FROM role WHERE is_builtin = false"))).scalar() or 0
+    )
+    counts["user_session"] = int(
+        (await db.execute(text("SELECT COUNT(*) FROM user_session"))).scalar() or 0
     )
     counts["api_token"] = int(
         (await db.execute(text("SELECT COUNT(*) FROM api_token"))).scalar() or 0
