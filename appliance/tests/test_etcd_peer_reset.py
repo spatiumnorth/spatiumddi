@@ -27,7 +27,7 @@ def _run(tmp_path: Path, found: str | None, *, join: bool = False, config: bool 
     bindir.mkdir(exist_ok=True)
     (tmp_path / "journal").write_text(REFUSAL.format(found=found) + "\n" if found else "")
     jc = bindir / "journalctl"
-    jc.write_text(f'#!/bin/sh\ncat "{tmp_path}/journal"\n')
+    jc.write_text(f'#!/bin/sh\necho "$@" >"{tmp_path}/jc.args"\ncat "{tmp_path}/journal"\n')
     k3s = bindir / "k3s"
     k3s.write_text(f'#!/bin/sh\necho "$@" >>"{tmp_path}/k3s.calls"\n')
     for f in (jc, k3s):
@@ -67,6 +67,19 @@ def test_stamped_reset_is_not_repeated_for_old_lines(tmp_path: Path) -> None:
     assert (tmp_path / "stamp").exists()
     text = SCRIPT.read_text()
     assert '--since "@$since"' in text
+
+
+def test_journal_is_bounded_to_this_boot_and_a_recent_window(tmp_path: Path) -> None:
+    # A stale refusal (earlier boot, or before the node became an HA seed) must
+    # not trigger a reset: journalctl is asked for -b and a --since that is never
+    # older than the window, even with no stamp.
+    import time
+
+    _run(tmp_path, "n1-abc=https://10.0.0.5:2380")
+    args = (tmp_path / "jc.args").read_text().split()
+    assert "-b" in args
+    since = int(args[args.index("--since") + 1].lstrip("@"))
+    assert since >= time.time() - 700
 
 
 def test_multi_member_is_left_alone(tmp_path: Path) -> None:

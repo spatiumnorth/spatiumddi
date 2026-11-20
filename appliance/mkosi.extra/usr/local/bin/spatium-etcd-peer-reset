@@ -61,7 +61,14 @@ if [ -f "$STAMP" ]; then
     case "$since" in '' | *[!0-9]*) since=0 ;; esac
 fi
 
-line=$("$JOURNALCTL" -u k3s -o cat --no-pager --since "@$since" 2>/dev/null \
+# Only THIS boot, and only the last 10 minutes of it: the refusal that matters
+# is the one the previous start logged seconds ago. An older line (an earlier
+# boot, or from before the node became an HA seed) describes a membership that
+# may no longer exist, and resetting on it would collapse a real cluster.
+now=$(date +%s)
+floor=$((now - ${SPATIUM_ETCD_PEER_RESET_WINDOW:-600}))
+[ "$since" -ge "$floor" ] || since=$floor
+line=$("$JOURNALCTL" -b -u k3s -o cat --no-pager --since "@$since" 2>/dev/null \
     | grep 'this server is not a member of the etcd cluster' | tail -n 1)
 [ -n "$line" ] || exit 0
 
@@ -93,7 +100,12 @@ fi
 [ "$found" != "$expect" ] || exit 0
 
 say "single-node etcd member is registered at ${found#*=} but this node is now ${expect#*=} (kept /var, new address): running k3s --cluster-reset once (#4591)"
-if "$K3S" server --cluster-reset >>"$LOG" 2>&1; then
+# The unit has TimeoutStartSec=0, so bound a hung reset here (it normally
+# exits within seconds); a timeout counts as a failed reset.
+TO=""
+command -v timeout >/dev/null 2>&1 && TO="timeout 900"
+# shellcheck disable=SC2086
+if $TO "$K3S" server --cluster-reset >>"$LOG" 2>&1; then
     date +%s >"$STAMP"
     say "cluster-reset done; k3s starts on the new address with its data intact"
 else
