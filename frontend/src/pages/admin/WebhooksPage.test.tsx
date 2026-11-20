@@ -199,3 +199,23 @@ describe("Edit webhook saves only what changed (#4236)", () => {
     expect(update).not.toHaveBeenCalled();
   });
 });
+
+describe("Webhooks header (#4373)", () => {
+  it("does not promise a signature to every enabled subscription", async () => {
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter>
+          <WebhooksPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    const p = (await screen.findByText(/Typed-event subscriptions/))
+      .textContent as string;
+    expect(p).toMatch(/HMAC-signed when the subscription has a secret/);
+    expect(p).toMatch(/unsigned when it has none/);
+    expect(p).not.toMatch(/receives one\s+HMAC-signed POST/);
+  });
+});

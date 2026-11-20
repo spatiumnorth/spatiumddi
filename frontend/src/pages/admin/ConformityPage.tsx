@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { Field } from "@/components/ui/field";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ListEmpty } from "@/components/ui/list-read-error";
 import {
@@ -28,6 +29,8 @@ import {
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { HeaderButton } from "@/components/ui/header-button";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { exportErrorMessage, isRefused } from "@/lib/refusal";
@@ -134,9 +137,10 @@ export function ConformityPage() {
             </div>
             <p className="mt-1 text-xs text-muted-foreground">
               Periodic policy checks against PCI / HIPAA / internet-facing
-              classifications. Built-in policies are seeded disabled — toggle
-              them on to start collecting evidence. Companion to the reactive
-              compliance-change alerts in #105.
+              classifications. Built-in policies are seeded disabled.
+              {!adminGate.disabled &&
+                " Toggle them on to start collecting evidence."}{" "}
+              Companion to the reactive compliance-change alerts in #105.
             </p>
           </div>
           <div className="flex shrink-0 flex-wrap items-center gap-1.5">
@@ -177,6 +181,11 @@ export function ConformityPage() {
         {/* Policies */}
         <section className="space-y-2">
           <h2 className="text-sm font-semibold">Policies</h2>
+          <FormError className="text-sm">
+            {deletePolicyMut.error
+              ? formatApiError(deletePolicyMut.error, "Delete failed")
+              : null}
+          </FormError>
           <div className="overflow-hidden rounded-lg border bg-card">
             <table className="w-full text-sm">
               <thead className="bg-muted/30 text-[11px] uppercase tracking-wider text-muted-foreground">
@@ -305,6 +314,7 @@ export function ConformityPage() {
                             title="Delete"
                             aria-label="Delete"
                             onClick={() => {
+                              deletePolicyMut.reset();
                               if (
                                 confirm(
                                   `Delete policy "${p.name}"? This removes the policy and every evaluation result it produced.`,
@@ -376,11 +386,20 @@ export function ConformityPage() {
         />
       )}
       {editing && (
-        <PolicyEditorModal
-          existing={editing}
-          checks={checksQ.data ?? []}
+        <FreshEdit
+          row={editing}
+          queryKeys={[["conformity-policies"]]}
+          title="Edit conformity policy"
           onClose={() => setEditing(null)}
-        />
+        >
+          {(fresh) => (
+            <PolicyEditorModal
+              existing={fresh}
+              checks={checksQ.data ?? []}
+              onClose={() => setEditing(null)}
+            />
+          )}
+        </FreshEdit>
       )}
     </div>
   );
@@ -549,6 +568,8 @@ function ResultsList({
     [policies],
   );
   const [expanded, setExpanded] = useState<string | null>(null);
+  // Re-evaluate now is an admin's on conformity (#4314).
+  const canAdmin = usePermissions().can("admin", "conformity");
 
   if (loading) {
     return (
@@ -560,8 +581,10 @@ function ResultsList({
   if (results.length === 0) {
     return (
       <div className="rounded-lg border bg-card p-6 text-center text-xs text-muted-foreground">
-        No results match the current filter. Re-evaluate a policy or relax the
-        filter.
+        No results match the current filter.{" "}
+        {canAdmin
+          ? "Re-evaluate a policy or relax the filter."
+          : "Relax the filter."}
       </div>
     );
   }
@@ -693,26 +716,6 @@ const CLASSIFIABLE_TARGET_KINDS = [
   "dhcp_scope",
 ];
 
-function Field({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-      {hint && <p className="text-[11px] text-muted-foreground/80">{hint}</p>}
-    </div>
-  );
-}
-
 function PolicyEditorModal({
   existing,
   checks,
@@ -780,7 +783,14 @@ function PolicyEditorModal({
         update.severity = severity;
         update.enabled = enabled;
         update.eval_interval_hours = intervalHours;
-        return conformityApi.updatePolicy(existing.id, update);
+        // Only what the operator changed against the row read when the dialog
+        // opened (#4379); a null description is shown as "".
+        const changed = changedFields(
+          { ...existing, description: existing.description ?? "" },
+          update,
+        );
+        if (Object.keys(changed).length === 0) return existing;
+        return conformityApi.updatePolicy(existing.id, changed);
       }
       const body: ConformityPolicyCreate = {
         name,

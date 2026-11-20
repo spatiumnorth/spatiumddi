@@ -18,6 +18,8 @@ import {
 import { formatDateOnly, termDaysLeft } from "@/lib/localTime";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal, ModalTabs } from "@/components/ui/modal";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ServicesUsingButton } from "@/components/ServicesUsingButton";
@@ -246,7 +248,13 @@ export function CircuitEditorModal({
         status,
         notes,
       };
-      if (existing) return circuitsApi.update(existing.id, body);
+      if (existing) {
+        // Only what the operator changed, against the row read when the
+        // dialog opened (#4379).
+        const diff = changedFields(existing, body);
+        if (Object.keys(diff).length === 0) return existing;
+        return circuitsApi.update(existing.id, diff);
+      }
       return circuitsApi.create(body as CircuitCreate);
     },
     onSuccess: () => {
@@ -1003,10 +1011,19 @@ export function CircuitsPage() {
           />
         )}
         {editing && (
-          <CircuitEditorModal
-            existing={editing}
+          <FreshEdit
+            row={editing}
+            load={() => circuitsApi.get(editing.id)}
+            title="Edit circuit"
             onClose={() => setEditing(null)}
-          />
+          >
+            {(fresh) => (
+              <CircuitEditorModal
+                existing={fresh}
+                onClose={() => setEditing(null)}
+              />
+            )}
+          </FreshEdit>
         )}
         <ConfirmModal
           open={confirm !== null}

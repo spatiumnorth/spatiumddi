@@ -429,6 +429,11 @@ class RecordChange:
     # #783 — the complete desired RRset this op resolves to. Set on the
     # agentless path by ``record_ops``; ``None`` when the caller opted out.
     rrset: RRsetData | None = None
+    # #1769 — the per-op escape hatch the caller set on the record payload
+    # (``"add"`` from DNS pools: append this one value, never replace the
+    # RRset). Only meaningful when ``rrset`` is ``None``; a driver with a
+    # per-value append honours it, the rest ignore it.
+    rrset_action: str | None = None
 
 
 @dataclass(frozen=True)
