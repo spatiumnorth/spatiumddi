@@ -323,7 +323,9 @@ PowerDNS it carries the group's transfer grant); its member zones keep the
 group's transfer grant (§3.6), so the external secondary signs
 member transfers with the group's TSIG key (shown under **Group TSIG key** in
 the group editor) or with a key or address the operator adds to the group's
-or zone's `allow_transfer`. On the external BIND (9.18 or later):
+or zone's `allow_transfer`. A PowerDNS primary grants a key only when
+`allow_transfer` names it (`key <name>`), the group key included (#4568). On
+the external BIND (9.18 or later):
 
 ```
 key "<group key name>" { algorithm hmac-sha256; secret "<group key secret>"; };

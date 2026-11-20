@@ -638,10 +638,14 @@ def _axfr_grants(
 
     The source is the one BIND9 renders ``allow-transfer`` from (#734): the
     zone's ``allow_transfer`` when set, else the server options', in BIND's
-    vocabulary, plus every TSIG key in the bundle, granted unconditionally —
-    the same keys the BIND9 agent grants, so ``resolve_group_transfer_key``
-    signs with a key this server accepts. PowerDNS's ``ALLOW-AXFR-FROM`` is a
-    list of subnets with no negation and no named ACLs, so:
+    vocabulary. A TSIG key is granted only when that list names it (#4568),
+    unlike BIND9, which grants every bundle key: PowerDNS signs the NOTIFY it
+    sends for a zone with the first key in ``TSIG-ALLOW-AXFR``, so a key
+    granted unasked made a secondary that lacks it reject every NOTIFY. The
+    control plane never signs a transfer from a PowerDNS server
+    (``AXFR_TSIG_DRIVERS``), so it needs no grant. PowerDNS's
+    ``ALLOW-AXFR-FROM`` is a list of subnets with no negation and no named
+    ACLs, so:
 
     * ``any`` → ``0.0.0.0/0`` and ``::/0``; ``none`` grants nothing;
     * an address or prefix is granted as one;
@@ -652,9 +656,7 @@ def _axfr_grants(
       dropped (keys still apply) — failing closed.
     """
     cidrs: list[str] = []
-    keys: dict[str, dict[str, Any]] = {
-        str(name): k for name, k in bundle_keys.items() if name and k.get("secret")
-    }
+    keys: dict[str, dict[str, Any]] = {}
     dropped: list[str] = []
     negated = False
     for entry in acl or []:
