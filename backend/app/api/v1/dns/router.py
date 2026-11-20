@@ -242,10 +242,10 @@ from app.services.dns.server_move import (
     ensure_group_classless_compatible,
     ensure_group_single_driver,
     ensure_group_views_compatible,
-    views_refusal,
-    views_unsupported_message,
     lock_server_row,
     move_server_to_group,
+    views_refusal,
+    views_unsupported_message,
 )
 from app.services.dns.server_resync import resync_after_reenable
 from app.services.dns.technitium_options import (
