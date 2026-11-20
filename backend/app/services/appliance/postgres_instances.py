@@ -25,9 +25,11 @@ is absent from the view almost all of the time. CNPG names each WAL
 sender after the instance (``application_name`` is the pod name), which is
 what joins the two lists.
 
-The app's role is not in ``pg_monitor`` (CNPG manages the role and reverts
-a manual GRANT, #1445), so it sees each WAL sender's ``application_name``
-but not its ``state``. Presence is therefore the signal: a WAL sender we
+The chart makes the app's role a member of ``pg_monitor`` through CNPG
+``managed.roles`` (#4610; CNPG reverts a manual GRANT, #1445). Where that is
+absent (``postgresql.cnpg.appRoleMonitor=false``, or the role not reconciled
+yet) the role sees each WAL sender's ``application_name`` but not its
+``state``. Presence is therefore the fallback signal: a WAL sender we
 can see but whose state is hidden is UNVERIFIED and is not flagged; a
 visible state other than ``streaming`` is flagged; no WAL sender at all is
 flagged. ``None`` from :func:`read_walsenders` (the query failed, or the
