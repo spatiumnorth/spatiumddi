@@ -329,6 +329,9 @@ REC_CP_RAM_GIB=8
 # a confirm guard on the control-plane choice in ask_role() — makes that
 # accident hard. The very first install actively picks "First node".
 ROLE="appliance"
+# #4551 — set once the operator has actually chosen on the role screen, so
+# ROLE's safe fallback value is not shown as a pre-selected answer.
+ROLE_PICKED=""
 # Installer roles (#272 — collapsed from the old three to two; the
 # old full-stack / frontend-core distinction is now a runtime DNS/DHCP
 # role toggle, not an install choice):
@@ -425,13 +428,17 @@ welcome() {
 This installer will ERASE a target disk and install SpatiumDDI to it.\n\n\
 You'll be asked for:\n\
   - Role (First node / Additional node)\n\
+  - Pre-flight summary of this machine (disks, network, clock)\n\
   - Target disk\n\
   - Hostname\n\
-  - Admin OS user + password (for SSH access)\n\
+  - Admin OS user + password, optional SSH public key\n\
+  - Keyboard layout\n\
   - Network (DHCP or static)\n\
+  - Time source (NTP servers)\n\
   - Timezone\n\
   - k3s pod + service CIDRs (defaults are fine on most LANs)\n\
   - Control-plane URL + 8-digit pairing code (Additional node only)\n\n\
+Licences of the bundled software: /etc/spatiumddi/NOTICE (after install).\n\n\
 Press OK to begin, or Cancel to drop to a shell."
     whiptail --backtitle "$BACKTITLE" --title "Welcome" \
         --yes-button "OK" --no-button "Cancel" \
@@ -1106,22 +1113,30 @@ ask_role() {
     # the internal ROLE values (``appliance`` / ``control-plane``) that
     # firstboot + the supervisor consume — so downstream is unchanged.
     #
-    # ``add-node`` (appliance) is listed first + default: it's the common
-    # case once a control plane exists, and it's the non-destructive
-    # choice. ``first-node`` (control-plane) creates a NEW, standalone
+    # ``add-node`` (appliance) is listed first and stays ROLE's fallback
+    # value: it's the non-destructive choice. ``first-node`` (control-plane)
+    # creates a NEW, standalone
     # SpatiumDDI (its own DB + cluster), so a wrong pick there is the
     # real footgun — it's guarded by an explicit confirm below. The
     # per-row ON flag reflects $ROLE so backing in preserves the pick.
+    #
+    # #4551 — NOTHING is pre-selected on a first visit. "Additional node"
+    # used to be the default, so a first-time operator pressing Enter was
+    # asked for a control-plane URL and pairing code they do not have.
+    # Backing in still preserves the pick; an Enter with no selection gets
+    # the "Please pick an option" prompt below.
     local first_flag=OFF add_flag=OFF
-    case "$ROLE" in
-        control-plane) first_flag=ON ;;
-        *) add_flag=ON ;;  # appliance (or unset) → default
-    esac
+    if [ -n "$ROLE_PICKED" ]; then
+        case "$ROLE" in
+            control-plane) first_flag=ON ;;
+            appliance) add_flag=ON ;;
+        esac
+    fi
     local pick
     while true; do
         pick=$(whiptail --backtitle "$BACKTITLE" --title "What is this node?" \
             --cancel-button "Back" \
-            --radiolist "Is this your FIRST SpatiumDDI node, or are you adding one to an existing install?\n\n  Additional node  (default)\n    Pairs with an EXISTING SpatiumDDI over an 8-digit code; an\n    admin then approves it and assigns DNS / DHCP roles in the\n    Fleet UI. Can be PROMOTED into the control-plane cluster later\n    — this is how you add control-plane nodes for HA (NOT by\n    installing 'First node' again).\n\n  First node\n    Creates a NEW SpatiumDDI: the control plane (api + database +\n    web UI) + k3s seed. DNS + DHCP stay OFF — enable them per node\n    from the Fleet UI. Pick this for a homelab, a single box, or\n    the seed of a brand-new HA cluster." \
+            --radiolist "Is this your FIRST SpatiumDDI node, or are you adding one to an existing install?\n\n  FIRST INSTALL? Choose \"First node\".\n\n  Additional node\n    Pairs with an EXISTING SpatiumDDI over an 8-digit code; an\n    admin then approves it and assigns DNS / DHCP roles in the\n    Fleet UI. Can be PROMOTED into the control-plane cluster later\n    — this is how you add control-plane nodes for HA (NOT by\n    installing 'First node' again).\n\n  First node\n    Creates a NEW SpatiumDDI: the control plane (api + database +\n    web UI) + k3s seed. DNS + DHCP stay OFF — enable them per node\n    from the Fleet UI. Pick this for a homelab, a single box, or\n    the seed of a brand-new HA cluster." \
             27 84 2 \
             "add-node"   "Additional node — DNS/DHCP agent (promotable)" "$add_flag" \
             "first-node" "First node — new control plane (api+db+UI)" "$first_flag" \
@@ -1133,6 +1148,7 @@ ask_role() {
         case "$pick" in
             add-node)
                 ROLE="appliance"
+                ROLE_PICKED=1
                 break
                 ;;
             first-node)
@@ -1146,11 +1162,12 @@ ask_role() {
                     --yesno "This creates a NEW, standalone SpatiumDDI — its own database and cluster.\n\nIf you are ADDING a node to an existing SpatiumDDI (for HA, or as a DNS / DHCP agent), choose \"Additional node\" instead, then promote it from the Fleet UI.\n\nCreate a new control plane on this box?" \
                     16 76; then
                     ROLE="control-plane"
+                    ROLE_PICKED=1
                     break
                 fi
-                # No → re-show the radio with the safe default pre-selected.
+                # No → re-show the radio with nothing selected.
                 first_flag=OFF
-                add_flag=ON
+                add_flag=OFF
                 continue
                 ;;
         esac
@@ -1258,7 +1275,7 @@ ask_application_config() {
             CONTROL_PLANE_URL=$(whiptail --backtitle "$BACKTITLE" \
                 --title "Control plane URL" \
                 --cancel-button "Back" \
-                --inputbox "Where does this Additional node register?\n\nFormat: https://<control-plane-host>/  — the URL of the SpatiumDDI control plane this supervisor pairs against. The supervisor submits its Ed25519 pubkey here, sits in pending until an admin clicks Approve, then receives a control-plane-CA-signed identity cert.\n\nHA TIP: if the control plane is a multi-node cluster, point this at the MetalLB virtual IP (VIP), NOT a single node's IP — otherwise this appliance loses its control plane whenever that one node is down. Configure the VIP under Appliance -> Network & Host on the control plane.\n\nUse https:// in production; http:// is acceptable for lab installs." \
+                --inputbox "Where does this Additional node register?\n\nFormat: https://<control-plane-host>/  — the address you open the SpatiumDDI web UI on. This node registers there, waits as \"pending\" until an admin approves it under Appliance -> Fleet, then joins.\n\nHA TIP: if the control plane is a multi-node cluster, point this at the MetalLB virtual IP (VIP), NOT a single node's IP — otherwise this appliance loses its control plane whenever that one node is down. Configure the VIP under Appliance -> Network & Host on the control plane.\n\nUse https:// in production; http:// is acceptable for lab installs." \
                 21 78 -- "$default_url" 3>&1 1>&2 2>&3) \
                 || return 1
             if [ -z "$CONTROL_PLANE_URL" ] || [ "$CONTROL_PLANE_URL" = "https://" ]; then
@@ -1975,7 +1992,7 @@ pick_disk() {
     if [ ${#options[@]} -eq 0 ]; then
         log "No installable disks found (lsblk: $(lsblk -dn -o NAME,SIZE,TYPE 2>&1 | tr '\n' ';'))"
         whiptail --backtitle "$BACKTITLE" --title "No disks" \
-            --msgbox "No installable disks found.\n\nAttach a target disk to the VM and reboot." 10 60 \
+            --msgbox "No installable disks found.\n\nAttach a disk (or a virtual disk, on a VM) and reboot the installer." 10 60 \
             || true
         on_cancel "disk picker (no disks present)"
     fi
@@ -2035,7 +2052,7 @@ pick_disk() {
                             20 76 2 \
                             "keep"  "Keep /var and STATE" \
                             "erase" "Erase everything on $TARGET_DISK" \
-                            3>&1 1>&2 2>&3) || continue
+                            3>&1 1>&2 2>&3) || continue 2   # Back = the disk menu, not this one again
                         case "$keepvar_pick" in
                             keep)  KEEP_VAR="yes"; break ;;
                             erase) KEEP_VAR="no";  break ;;
@@ -2104,7 +2121,7 @@ _control_plane_sizing_ok() {
     msg+="Recommended:  ≥ ${REC_CP_DISK_GIB} GiB disk,  ≥ ${REC_CP_RAM_GIB} GiB RAM\n"
     msg+="This machine:  ${disk_gib} GiB disk"
     [ "$ram_kib" -gt 0 ] && msg+=",  ~${ram_gib} GiB RAM"
-    msg+="\n\nIt will INSTALL and boot, but at this size the first boot pulls the full control-plane image set onto /var while the Postgres + Redis volumes also land there — very likely tipping the kubelet's DiskPressure threshold into a pod-eviction / image-GC thrash loop that never converges.\n\n"
+    msg+="\n\nIt will INSTALL and boot, but at this size the control-plane workloads' Postgres + Redis volumes, logs and container runtime state all land on /var — very likely tipping the kubelet's DiskPressure threshold into a pod-eviction / image-GC thrash loop that never converges.\n\n"
     msg+="See \"Recommended sizing\" in the README / docs/deployment/APPLIANCE.md.\n\n"
     msg+="Continue with this disk anyway?"
 
@@ -2870,19 +2887,19 @@ ask_network() {
         # an invalid keyfile. Back (Cancel) on any field still exits the
         # step backward via ``return 1``.
         while true; do
-            NET_IP=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -address" \
+            NET_IP=$(whiptail --backtitle "$BACKTITLE" --title "Static IP - address" \
                 --cancel-button "Back" \
                 --inputbox "IPv4 address (e.g. 192.168.1.10):" 10 60 -- "$NET_IP" 3>&1 1>&2 2>&3) \
                 || return 1
-            NET_PREFIX=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -prefix" \
+            NET_PREFIX=$(whiptail --backtitle "$BACKTITLE" --title "Static IP - prefix" \
                 --cancel-button "Back" \
                 --inputbox "Prefix length:" 10 60 -- "$NET_PREFIX" 3>&1 1>&2 2>&3) \
                 || return 1
-            NET_GATEWAY=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -gateway" \
+            NET_GATEWAY=$(whiptail --backtitle "$BACKTITLE" --title "Static IP - gateway" \
                 --cancel-button "Back" \
                 --inputbox "Gateway:" 10 60 -- "$NET_GATEWAY" 3>&1 1>&2 2>&3) \
                 || return 1
-            NET_DNS=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -DNS" \
+            NET_DNS=$(whiptail --backtitle "$BACKTITLE" --title "Static IP - DNS" \
                 --cancel-button "Back" \
                 --inputbox "DNS servers (space-separated):" 10 60 -- "$NET_DNS" 3>&1 1>&2 2>&3) \
                 || return 1
