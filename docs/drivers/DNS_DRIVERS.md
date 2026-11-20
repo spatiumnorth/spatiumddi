@@ -1301,6 +1301,18 @@ PowerDNS is coarse-only — no per-name / per-type / `deny`, so
    `TSIG-ALLOW-DNSUPDATE` ← grant key names. An empty ACL DELETEs both so a
    zone whose dynamic updates were turned off stops accepting them.
 
+**Address and key (#4569)** — PowerDNS checks the source address first
+(`ALLOW-DNSUPDATE-FROM` plus the global `allow-dnsupdate-from`, default
+loopback) and then, when `TSIG-ALLOW-DNSUPDATE` is set, the signature too.
+The two combine as "both", where BIND9's `allow-update` means "either". So:
+
+- a **key-only** ACL also writes `ALLOW-DNSUPDATE-FROM = 0.0.0.0/0, ::/0`, so
+  a signed update is accepted from any address and the key is the gate;
+- an **IP-only** ACL writes the granted ranges and no key;
+- an ACL with **both** kinds is refused by `validate_update_acl` (422). One
+  stored before that check keeps "address and key" on the agent, which logs
+  `powerdns_update_acl_address_and_key`.
+
 **Drift** — in a zone with a dynamic-update ACL the pdns reconciler is
 additive per-rrset (`REPLACE` per managed `name+type`, never a blanket zone
 replace), so records RFC 2136 clients injected (new names) **survive** a

@@ -2695,7 +2695,7 @@ consults it **before** accepting an ACL:
 | Backend | ip | tsig | name-scope | per-type | notes |
 |---|---|---|---|---|---|
 | **BIND9** | ✅ | ✅ | ✅ | ✅ | coarse `allow-update` + fine `update-policy` |
-| **PowerDNS** | ✅ | ✅ | ⬜ | ⬜ | coarse per-zone metadata (`ALLOW-DNSUPDATE-FROM` / `TSIG-ALLOW-DNSUPDATE`) |
+| **PowerDNS** | ✅ | ✅ | ⬜ | ⬜ | coarse per-zone metadata (`ALLOW-DNSUPDATE-FROM` / `TSIG-ALLOW-DNSUPDATE`). IP grants or TSIG grants, not both in one ACL: PowerDNS would require the address **and** the key, so the mix is a 422 (#4569) |
 | **Windows DNS** | ⚠️ | ✅ | ⬜ | ⬜ | coarse zone enum (`None` / `Secure` / `NonsecureAndSecure`); an IP entry → `NonsecureAndSecure` + loud warning |
 | **Route53 / Azure / Cloudflare / Google** | ⬜ | ⬜ | ⬜ | ⬜ | no RFC 2136 → 422 `DYNAMIC_UPDATE_UNSUPPORTED` |
 

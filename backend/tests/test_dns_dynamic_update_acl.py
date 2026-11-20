@@ -500,6 +500,51 @@ def test_powerdns_rejects_fine_grained() -> None:
         )
 
 
+def test_powerdns_accepts_one_grant_kind() -> None:
+    drv = get_driver("powerdns")
+    assert drv.validate_update_acl("z.", [UpdateAclEntry(match_kind="tsig_key")]) == []
+    warnings = drv.validate_update_acl("z.", [UpdateAclEntry(match_kind="ip", ip_cidr="10.0.0.5")])
+    assert any("spoofable" in w.lower() for w in warnings)
+
+
+def test_powerdns_rejects_ip_mixed_with_key() -> None:
+    """PowerDNS would require the address AND the key, where the ACL means
+    either (#4569)."""
+    with pytest.raises(ValueError, match="AND"):
+        get_driver("powerdns").validate_update_acl(
+            "z.",
+            [
+                UpdateAclEntry(match_kind="ip", ip_cidr="10.0.0.0/24"),
+                UpdateAclEntry(match_kind="tsig_key", tsig_key_name="k."),
+            ],
+        )
+
+
+async def test_put_mixed_acl_on_powerdns_group_422(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, headers = await _superadmin(db_session)
+    group, zone, key = await _bind9_group_zone_key(db_session)
+    server = (
+        await db_session.execute(select(DNSServer).where(DNSServer.group_id == group.id))
+    ).scalar_one()
+    server.driver = "powerdns"
+    await db_session.commit()
+    url = f"/api/v1/dns/groups/{group.id}/zones/{zone.id}/update-acl"
+    ip = {"match_kind": "ip", "ip_cidr": "10.0.0.0/24"}
+    tsig = {"match_kind": "tsig_key", "tsig_key_id": str(key.id)}
+
+    r = await client.put(url, headers=headers, json={"entries": [ip, tsig]})
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["code"] == "DYNAMIC_UPDATE_UNSUPPORTED"
+    assert "AND" in r.json()["detail"]["message"]
+
+    # Either kind alone is saved.
+    for entries in ([tsig], [ip]):
+        r = await client.put(url, headers=headers, json={"entries": entries})
+        assert r.status_code == 200, r.text
+
+
 def test_powerdns_conf_enables_dnsupdate() -> None:
     from app.drivers.dns.powerdns import render_pdns_conf
 
