@@ -285,6 +285,16 @@ function isControlPlaneRow(row: ApplianceRow): boolean {
   );
 }
 
+// #4613 — one rule and one reason for "this row cannot be revoked", shared
+// by the table's Revoke button and the drilldown's Delete (which opens the
+// same revoke dialog). The server refuses the only control-plane node with
+// 409, so every entry point to the revoke must agree with it.
+const REVOKE_BLOCKED_REASON =
+  "Demote this node from the control-plane cluster first (Manage control plane cluster…) before revoking.";
+function canRevokeRow(row: ApplianceRow): boolean {
+  return !isControlPlaneRow(row);
+}
+
 // #590 — is this row pinned in a cluster transition that will never
 // converge on its own? Every transition settles only when a supervisor
 // reports back (``ready`` / ``left`` / the seed's eviction), and none of
@@ -2263,7 +2273,7 @@ function ApplianceTableSection({
                   onDelete={() => onDelete(row)}
                   onReauthorize={() => onReauthorize(row)}
                   onPermanentDelete={() => onPermanentDelete(row)}
-                  canRevoke={!isControlPlaneRow(row)}
+                  canRevoke={canRevokeRow(row)}
                   onReplace={onReplace ? () => onReplace(row) : undefined}
                   onClearClusterState={
                     onClearClusterState
@@ -2284,7 +2294,7 @@ function ApplianceTableSection({
                   onDelete={() => onDelete(row)}
                   onReauthorize={() => onReauthorize(row)}
                   onPermanentDelete={() => onPermanentDelete(row)}
-                  canRevoke={!isControlPlaneRow(row)}
+                  canRevoke={canRevokeRow(row)}
                   onReplace={onReplace ? () => onReplace(row) : undefined}
                   onClearClusterState={
                     onClearClusterState
@@ -2540,7 +2550,7 @@ export function ApplianceTableRow({
                 title={
                   canRevoke
                     ? "Revoke — flip to revoked state, supervisor tears down service containers. Re-authorize on the same row to recover."
-                    : "Demote this node from the control-plane cluster first (Manage control plane cluster…) before revoking."
+                    : REVOKE_BLOCKED_REASON
                 }
               >
                 <Ban className="h-3 w-3" />
@@ -2576,7 +2586,7 @@ export function ApplianceTableRow({
   );
 }
 
-function ApplianceDrilldownModal({
+export function ApplianceDrilldownModal({
   row,
   onClose,
   onApprove,
@@ -2863,8 +2873,10 @@ function ApplianceDrilldownModal({
             <>
               <button
                 type="button"
-                onClick={onDelete}
-                className="inline-flex items-center gap-1 rounded-md border bg-background px-3 py-1.5 text-xs hover:bg-muted"
+                onClick={canRevokeRow(row) ? onDelete : undefined}
+                disabled={!canRevokeRow(row)}
+                title={canRevokeRow(row) ? undefined : REVOKE_BLOCKED_REASON}
+                className="inline-flex items-center gap-1 rounded-md border bg-background px-3 py-1.5 text-xs hover:bg-muted disabled:cursor-not-allowed disabled:opacity-40"
               >
                 <Trash2 className="h-3.5 w-3.5" />
                 Delete
