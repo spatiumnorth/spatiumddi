@@ -5832,7 +5832,12 @@ export function ZoneDetailView({
                                   </span>
                                 ) : (
                                   <span
-                                    title="This record was created automatically by IPAM. Edit the IP address in IPAM to change it."
+                                    title={`This record was created automatically by IPAM.${
+                                      can("write", "subnet") ||
+                                      can("write", "address_set")
+                                        ? " Edit the IP address in IPAM to change it."
+                                        : ""
+                                    }`}
                                     className="flex items-center gap-1 rounded border border-amber-300/60 bg-amber-50 px-1.5 py-0.5 text-xs text-amber-700 dark:border-amber-700/40 dark:bg-amber-900/20 dark:text-amber-400"
                                   >
                                     <Lock className="h-2.5 w-2.5" />

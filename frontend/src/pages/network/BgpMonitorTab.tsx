@@ -300,7 +300,8 @@ export function BgpMonitorTab({
           ) : prefixes.length === 0 ? (
             <div className="p-8 text-center text-sm text-muted-foreground">
               No tracked prefixes. The poll auto-populates these from RPKI ROAs
-              and RIPEstat announced-prefixes; you can also add one manually.
+              and RIPEstat announced-prefixes
+              {!writeGate.disabled && "; you can also add one manually"}.
             </div>
           ) : (
             <table className="w-full text-xs">
