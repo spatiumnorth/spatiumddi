@@ -530,6 +530,8 @@ $r | ConvertTo-Json -Compress -Depth 3
 
 ## 4. PowerDNS Driver
 
+> **Known issues in 1.0.0:** the agent does not delete a zone from PowerDNS when it leaves the bundle ([#4564](https://github.com/spatiumnorth/spatiumddi/issues/4564)), so the "Delete zone" row in §4.1 does not hold yet, and views are merged into one zone ([#4565](https://github.com/spatiumnorth/spatiumddi/issues/4565)). See [DNS.md §0](../features/DNS.md) for the workarounds.
+
 Located at [`app/drivers/dns/powerdns.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/drivers/dns/powerdns.py). Class: `PowerDNSDriver`. Shipped in issue #127.
 
 PowerDNS is a second authoritative driver running side-by-side with BIND9. It is **agent-managed** the same way BIND9 is — there is one DNS agent per server, the agent owns the local PowerDNS daemon (`pdns_server`), and the control plane never opens a connection to PowerDNS directly. The agent talks to PowerDNS's REST API on `127.0.0.1:8081`; the control plane talks to the agent through the existing long-poll `/config` channel.
