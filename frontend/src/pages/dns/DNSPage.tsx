@@ -2694,6 +2694,7 @@ function DnssecCard({
   const enabled = info.data?.dnssec_enabled ?? initiallyEnabled;
   const dsRecords = info.data?.dnssec_ds_records ?? [];
   const syncedAt = info.data?.dnssec_synced_at ?? null;
+  const dsChangedAt = info.data?.dnssec_ds_changed_at ?? null;
   const keys = info.data?.keys ?? [];
   const multiSigner = info.data?.dnssec_multi_signer ?? false;
   const signingServers = info.data?.signing_servers ?? 0;
@@ -2902,6 +2903,27 @@ function DnssecCard({
             </div>
           ) : (
             <ul className="space-y-1">
+              {/* #4566: the server generated new keys (a zone re-created
+                  after a lost volume or on a replaced node is signed again)
+                  or rolled them, so the parent holds a DS that is going
+                  stale. */}
+              {dsChangedAt && (
+                <li
+                  role="alert"
+                  className="rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-xs text-amber-700 dark:text-amber-300"
+                >
+                  <span className="font-medium">
+                    DS records changed{" "}
+                    <time dateTime={dsChangedAt}>
+                      {new Date(dsChangedAt).toLocaleString()}
+                    </time>
+                    .
+                  </span>{" "}
+                  The server&apos;s keys were regenerated or rolled. Publish the
+                  records below at the parent zone: validating resolvers fail
+                  the zone while the parent holds only the earlier DS.
+                </li>
+              )}
               {dsRecords.map((ds, idx) => (
                 <li
                   key={idx}

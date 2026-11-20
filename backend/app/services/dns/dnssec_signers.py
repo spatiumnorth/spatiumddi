@@ -11,11 +11,12 @@ server A's report) that does not match B's keys, and gets SERVFAIL.
 **Every agent server in the group counts, enabled or not.** ``is_enabled``
 only pauses the record-op fan-out (``record_ops``); a disabled agent still
 long-polls and receives the full bundle (nothing in the bundle path reads
-``is_enabled``), so a disabled BIND9 server renders ``inline-signing`` and
-serves the zone signed with ITS OWN keys, and a disabled PowerDNS /
-Technitium server serves it unsigned under the parent's DS (no sign op
-reaches it) — bogus either way. A ``pending_approval`` server counts too:
-approving it hands it the bundle.
+``is_enabled``), so a disabled server still signs the zone with ITS OWN
+keys: BIND9 renders ``inline-signing``, and the PowerDNS (#4566) and
+Technitium (#1767) agents sign a flagged zone they hold no key for on every
+reconcile. Before those two it was served unsigned under the parent's DS (no
+sign op reaches a disabled server) — bogus either way. A ``pending_approval``
+server counts too: approving it hands it the bundle.
 
 Agentless drivers (``technitium_api``, Windows, cloud) are outside the rule:
 the cloud providers hold one key set per hosted zone whatever the number of
@@ -43,10 +44,12 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Iterable
+from datetime import datetime
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.audit import AuditLog
 from app.models.dns import DNSServer, DNSServerGroup, DNSZone
 
 #: Agent drivers SpatiumDDI signs on: the single source for the router's
@@ -55,6 +58,7 @@ from app.models.dns import DNSServer, DNSServerGroup, DNSZone
 #: since #1767: the agent reconciles a zone's signing state from every bundle
 #: (a new server, a re-created zone or a lost volume is signed again), maps the
 #: zone's ``DNSSECPolicy`` onto the sign parameters and reports key state back.
+#: The PowerDNS agent reconciles the same way since #4566.
 SIGNING_DRIVERS: frozenset[str] = frozenset({"bind9", "powerdns", "technitium"})
 
 #: Agent drivers that SpatiumDDI no longer signs on but may still serve a
@@ -71,6 +75,17 @@ PER_SERVER_SIGNING_DRIVERS: frozenset[str] = SIGNING_DRIVERS | UNMANAGED_SIGNING
 #: per-server keys SpatiumDDI created and has no agent to reconcile signing
 #: state from the bundle, so a sign op against it would be one-shot.
 SIGN_REFUSED_TECHNITIUM_DRIVERS: frozenset[str] = frozenset({"technitium_api"})
+
+#: Audit action written when an agent reports a different DS set for a zone
+#: that already had one (#4566): its keys were regenerated (a zone re-created
+#: after a lost volume, on a replaced node) or rolled.
+DS_CHANGED_AUDIT_ACTION = "dns.zone.dnssec_ds_changed"
+DS_CHANGED_WARNING = (
+    "The server reported a different DS set for this signed zone: its keys were "
+    "regenerated or rolled. Publish the current DS records at the parent zone; "
+    "validating resolvers fail the zone while the parent holds only a DS that "
+    "no longer matches."
+)
 
 WORKAROUND = (
     "Keep a single DNS server in the group (delete it or move the others to "
@@ -274,3 +289,30 @@ def register_warning_message(group_name: str, server_name: str, signed: int, n: 
         f"its own keys, so resolvers that reach a server whose keys the published DS does "
         f"not match will SERVFAIL. Move the agent to another group (or unsign the zones)."
     )
+
+
+async def ds_changed_at(db: AsyncSession, zone: DNSZone) -> datetime | None:
+    """When the zone's current DS set replaced an earlier one, or None.
+
+    Read from the newest :data:`DS_CHANGED_AUDIT_ACTION` row, and only while
+    that row still describes the DS on the zone: after an unsign and a fresh
+    sign the zone has a first DS again, not a changed one.
+    """
+    current = {str(d) for d in zone.dnssec_ds_records or []}
+    if not zone.dnssec_enabled or not current:
+        return None
+    row = (
+        await db.execute(
+            select(AuditLog.timestamp, AuditLog.new_value)
+            .where(
+                AuditLog.resource_type == "dns_zone",
+                AuditLog.resource_id == str(zone.id),
+                AuditLog.action == DS_CHANGED_AUDIT_ACTION,
+            )
+            .order_by(AuditLog.timestamp.desc())
+            .limit(1)
+        )
+    ).first()
+    if row is None or set((row.new_value or {}).get("ds_records") or []) != current:
+        return None
+    return row.timestamp

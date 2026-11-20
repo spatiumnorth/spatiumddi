@@ -1240,6 +1240,11 @@ class PowerDNSDriver(DriverBase):
                     "notify_enabled": eff_notify,
                     "also_notify": [str(e) for e in eff_also or []],
                     "serial": zone.get("serial") or 1,
+                    # Signed zone (#4566): the reconciler signs it when
+                    # PowerDNS holds no active key for it. Primary only: a
+                    # secondary serves the signatures it transfers.
+                    "dnssec_enabled": kind in ("Native", "Master")
+                    and bool(zone.get("dnssec_enabled")),
                     # The apex NS a record op restores when it deletes the
                     # zone's last one (#1985); None on a secondary.
                     "default_apex_ns": default_ns,
@@ -2014,24 +2019,23 @@ class PowerDNSDriver(DriverBase):
         return [], False
 
     def _dnssec_sign(self, api_key: str, zone: str) -> list[str]:
-        """Generate KSK + ZSK, set PRESIGNED metadata, rectify zone.
+        """Generate KSK + ZSK, rectify zone.
 
         Returns the DS rrset string list so the caller can ship it to the
         control plane (operator pastes the DS into their parent registrar).
         Empty list means we couldn't extract DS — log-only, not fatal,
         operator can re-trigger sign to retry.
 
-        Idempotent — if keys already exist for the zone, pdns refuses with
-        a 409 / 422 and we treat that as success. Operators expect the
-        result of repeated 'Sign zone' clicks to converge to "signed",
-        not error out.
+        Idempotent — a zone that already has an active key is left as it
+        is and its DS returned. Operators expect the result of repeated
+        'Sign zone' clicks to converge to "signed", not error out.
         """
         headers = {"X-API-Key": api_key, "Content-Type": "application/json"}
         with httpx.Client(timeout=_PDNS_API_TIMEOUT) as client:
             existing = client.get(
                 f"{_PDNS_API_BASE}/zones/{zone}/cryptokeys", headers=headers
             )
-            if existing.status_code == 200 and existing.json():
+            if existing.status_code == 200 and self._has_active_key(existing.json()):
                 # Keys already there — nothing to create. Just rectify
                 # (idempotent) so NSEC/NSEC3 chains stay current. This
                 # covers the "operator clicked twice" case + the
@@ -2039,54 +2043,146 @@ class PowerDNSDriver(DriverBase):
                 self._rectify(client, headers, zone)
                 log.info("powerdns_dnssec_already_signed", zone=zone)
                 return self._extract_ds_records(existing.json())
+            return self._create_signing_keys(client, headers, zone)
 
-            for kind, key_type in (("ksk", "ksk"), ("zsk", "zsk")):
-                # PowerDNS 4.9 picks a sensible default algorithm for
-                # KSK creation when ``algorithm`` is omitted, but the
-                # ZSK default-picker resolves to algorithm -1
-                # (Unallocated) and the API rejects with "Creating an
-                # algorithm -1 (Unallocated/Reserved) key requires the
-                # size (in bits) to be passed." Pin both keys to
-                # ECDSAP256SHA256 (algorithm 13) — RFC 6605, the
-                # current online-signing default in pdns docs — so the
-                # call is portable across KSK/ZSK iterations.
-                resp = client.post(
-                    f"{_PDNS_API_BASE}/zones/{zone}/cryptokeys",
-                    headers=headers,
-                    json={
-                        "keytype": key_type,
-                        "active": True,
-                        "published": True,
-                        "algorithm": "ecdsa256",
-                    },
-                )
-                if resp.status_code >= 400:
-                    raise RuntimeError(
-                        f"PowerDNS create {kind.upper()} for {zone} returned "
-                        f"{resp.status_code}: {resp.text[:200]}"
-                    )
+    @staticmethod
+    def _has_active_key(cryptokeys: Any) -> bool:
+        """Whether the ``cryptokeys`` listing holds a key PowerDNS signs with."""
+        return any(
+            isinstance(k, dict) and k.get("active") for k in (cryptokeys or [])
+        )
 
-            # Note: we deliberately do NOT set the ``PRESIGNED`` zone
-            # metadata for online-signing zones. ``PRESIGNED`` is for
-            # zones signed by an external signer (e.g. via
-            # ``dnssec-signzone``) and loaded as already-signed; for
-            # online signing pdns derives signing intent from the
-            # presence of cryptokeys + active/published flags. Setting
-            # it actually trips the API's metadata-kind filter
-            # ("Unsupported metadata kind 'PRESIGNED'"), and the
-            # resulting warning is misleading. Re-verified against pdns
-            # 5.0.5 while bumping the image in #638: still HTTP 422.
-            self._rectify(client, headers, zone)
-
-            # Re-fetch after creation so we get the freshly-rendered DS
-            # rrset (PowerDNS computes DS from the KSK we just made).
-            after = client.get(
-                f"{_PDNS_API_BASE}/zones/{zone}/cryptokeys", headers=headers
+    def _create_signing_keys(
+        self, client: httpx.Client, headers: dict[str, str], zone: str
+    ) -> list[str]:
+        """Create an active KSK + ZSK, rectify, and return the new DS rrset."""
+        for kind, key_type in (("ksk", "ksk"), ("zsk", "zsk")):
+            # PowerDNS 4.9 picks a sensible default algorithm for
+            # KSK creation when ``algorithm`` is omitted, but the
+            # ZSK default-picker resolves to algorithm -1
+            # (Unallocated) and the API rejects with "Creating an
+            # algorithm -1 (Unallocated/Reserved) key requires the
+            # size (in bits) to be passed." Pin both keys to
+            # ECDSAP256SHA256 (algorithm 13) — RFC 6605, the
+            # current online-signing default in pdns docs — so the
+            # call is portable across KSK/ZSK iterations.
+            resp = client.post(
+                f"{_PDNS_API_BASE}/zones/{zone}/cryptokeys",
+                headers=headers,
+                json={
+                    "keytype": key_type,
+                    "active": True,
+                    "published": True,
+                    "algorithm": "ecdsa256",
+                },
             )
-            log.info("powerdns_dnssec_signed", zone=zone)
-            if after.status_code == 200:
-                return self._extract_ds_records(after.json())
-            return []
+            if resp.status_code >= 400:
+                raise RuntimeError(
+                    f"PowerDNS create {kind.upper()} for {zone} returned "
+                    f"{resp.status_code}: {resp.text[:200]}"
+                )
+
+        # Note: we deliberately do NOT set the ``PRESIGNED`` zone
+        # metadata for online-signing zones. ``PRESIGNED`` is for
+        # zones signed by an external signer (e.g. via
+        # ``dnssec-signzone``) and loaded as already-signed; for
+        # online signing pdns derives signing intent from the
+        # presence of cryptokeys + active/published flags. Setting
+        # it actually trips the API's metadata-kind filter
+        # ("Unsupported metadata kind 'PRESIGNED'"), and the
+        # resulting warning is misleading. Re-verified against pdns
+        # 5.0.5 while bumping the image in #638: still HTTP 422.
+        self._rectify(client, headers, zone)
+
+        # Re-fetch after creation so we get the freshly-rendered DS
+        # rrset (PowerDNS computes DS from the KSK we just made).
+        after = client.get(
+            f"{_PDNS_API_BASE}/zones/{zone}/cryptokeys", headers=headers
+        )
+        log.info("powerdns_dnssec_signed", zone=zone)
+        if after.status_code == 200:
+            return self._extract_ds_records(after.json())
+        return []
+
+    def _reconcile_dnssec(
+        self, client: httpx.Client, headers: dict[str, str], zone: str
+    ) -> str | None:
+        """Sign a zone the bundle flags signed when PowerDNS holds no active
+        key for it (#4566). Returns the problem, or None.
+
+        The one-shot ``dnssec_sign`` op is never re-sent, so a zone re-created
+        after a lost LMDB volume, on a replaced node or on a new server came
+        back unsigned under a DS the control plane still showed. The new keys
+        are this server's own: ``collect_dnssec_state`` reports their DS after
+        the apply, and the operator has to publish it at the parent.
+
+        One-directional, like the Technitium driver's: a zone the bundle does
+        not flag keeps its keys (``dnssec_unsign`` is the operator's explicit
+        action; deleting keys on a missing flag would destroy them on a guess).
+        """
+        try:
+            resp = client.get(f"{_PDNS_API_BASE}/zones/{zone}/cryptokeys", headers=headers)
+            if resp.status_code >= 400:
+                return f"cannot read its keys: HTTP {resp.status_code} {_pdns_error(resp)}"
+            if self._has_active_key(resp.json()):
+                return None
+            log.warning(
+                "powerdns_dnssec_zone_unsigned_signing",
+                zone=zone,
+                detail="flagged signed but PowerDNS held no active key; new keys "
+                "are generated, so the DS at the parent must be replaced",
+            )
+            self._create_signing_keys(client, headers, zone)
+        except (httpx.HTTPError, ValueError, RuntimeError) as exc:
+            log.error("powerdns_dnssec_reconcile_failed", zone=zone, error=str(exc))
+            return str(exc)
+        return None
+
+    # Set by ``collect_dnssec_state`` when a flagged zone's keys could not be
+    # read or are not there yet; the sync loop then looks again soon.
+    dnssec_incomplete = False
+
+    def collect_dnssec_state(self, bundle: dict[str, Any]) -> list[dict[str, Any]]:
+        """The DS rrset of every signed primary zone in ``bundle`` (#4566).
+
+        The sync loop calls this after each structural apply and on its
+        periodic refresh, and POSTs what changed. That is what carries the DS
+        of a zone ``_reconcile_dnssec`` just re-signed to the control plane; it
+        used to learn a DS only from the ``dnssec_sign`` op's result. A zone
+        with no active key or an unreadable key list is left out and
+        ``dnssec_incomplete`` set: an empty DS report would read as "unsigned
+        on purpose" and clear the control plane's copy. ``keys`` is omitted,
+        as in the op's report (the API has no per-key rollover state).
+        """
+        self.dnssec_incomplete = False
+        zones = [
+            (z.get("name") or "").rstrip(".") + "."
+            for z in bundle.get("zones") or []
+            if z.get("dnssec_enabled")
+            and _KIND_BY_ZONE_TYPE.get(str(z.get("type") or "primary").lower()) == "Native"
+        ]
+        out: list[dict[str, Any]] = []
+        if not zones:
+            return out
+        headers = {"X-API-Key": self._load_or_generate_api_key()}
+        with httpx.Client(timeout=_PDNS_API_TIMEOUT) as client:
+            for zone in dict.fromkeys(zones):
+                if zone == ".":
+                    continue
+                try:
+                    resp = client.get(
+                        f"{_PDNS_API_BASE}/zones/{zone}/cryptokeys", headers=headers
+                    )
+                    keys = resp.json() if resp.status_code == 200 else None
+                except (httpx.HTTPError, ValueError) as exc:
+                    log.warning("dnssec_state_collect_failed", zone=zone, error=str(exc))
+                    keys = None
+                ds_records = self._extract_ds_records(keys) if self._has_active_key(keys) else []
+                if not ds_records:
+                    self.dnssec_incomplete = True
+                    continue
+                out.append({"zone_name": zone, "ds_records": ds_records})
+        return out
 
     @staticmethod
     def _extract_ds_records(cryptokeys: list[dict[str, Any]]) -> list[str]:
@@ -2743,6 +2839,13 @@ class PowerDNSDriver(DriverBase):
                 notify_problem = self._apply_notify_settings(client, headers, zone_payload)
                 if notify_problem:
                     failures.append(f"{zone_name} also-notify: {notify_problem}")
+
+                # DNSSEC (#4566): a zone the bundle flags signed is signed
+                # here too, not only by the one-shot ``dnssec_sign`` op.
+                if zone_payload.get("dnssec_enabled"):
+                    dnssec_problem = self._reconcile_dnssec(client, headers, zone_name)
+                    if dnssec_problem:
+                        failures.append(f"{zone_name} DNSSEC: {dnssec_problem}")
 
                 # LUA records are enabled globally via
                 # ``enable-lua-records=yes`` in pdns.conf (see

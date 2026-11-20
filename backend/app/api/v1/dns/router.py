@@ -8205,6 +8205,10 @@ class ZoneDNSSECInfo(BaseModel):
     dnssec_policy_id: uuid.UUID | None = None
     dnssec_ds_records: list[str] = []
     dnssec_synced_at: datetime | None = None
+    # #4566 — when the DS set above replaced an earlier one (the server
+    # regenerated or rolled its keys), so it has to be published at the
+    # parent again. None for the first DS after signing.
+    dnssec_ds_changed_at: datetime | None = None
     keys: list[DNSSECKeyState] = []
     # #1762 — the zone is signed and its group has more than one DNS server,
     # each signing with its own keys; ``signing_servers`` is that count.
@@ -8312,6 +8316,7 @@ async def get_zone_dnssec_info(
     unmanaged = bool(await dnssec_signers.unmanaged_signing_group_ids(db, {zone.group_id}))
     return ZoneDNSSECInfo.model_validate(
         {
+            "dnssec_ds_changed_at": await dnssec_signers.ds_changed_at(db, zone),
             "dnssec_multi_signer": bool(zone.dnssec_enabled) and signers > 1,
             "signing_servers": signers,
             "signing_unmanaged": unmanaged,

@@ -2076,6 +2076,37 @@ async def agent_dnssec_state(
         zone = zones_by_name.get(entry.zone_name.rstrip("."))
         if zone is None:
             continue
+        # #4566 — a signed zone whose DS set moved: the server generated new
+        # keys (a zone re-created after a lost volume or on a replaced node
+        # is signed afresh; a KSK rollover). The parent still holds the old
+        # DS, so the change is recorded for the DNSSEC card and the audit
+        # log. The first DS after signing, and an unsign, are not a change.
+        old_ds = [str(d) for d in zone.dnssec_ds_records or []]
+        if old_ds and entry.ds_records and set(old_ds) != set(entry.ds_records):
+            logger.warning(
+                "dns_zone_dnssec_ds_changed",
+                zone=zone.name,
+                server_id=str(reporter.id),
+                replaced=not set(old_ds) & set(entry.ds_records),
+            )
+            db.add(
+                AuditLog(
+                    user_display_name="system:dns-agent",
+                    auth_source="system",
+                    action=dnssec_signers.DS_CHANGED_AUDIT_ACTION,
+                    resource_type="dns_zone",
+                    resource_id=str(zone.id),
+                    resource_display=zone.name,
+                    old_value={"ds_records": old_ds},
+                    new_value={
+                        "ds_records": list(entry.ds_records),
+                        "server_id": str(reporter.id),
+                        "server": reporter.name,
+                        "warning": dnssec_signers.DS_CHANGED_WARNING,
+                    },
+                    result="success",
+                )
+            )
         zone.dnssec_ds_records = entry.ds_records or None
         zone.dnssec_synced_at = now
         # Per-key state (issue #49) — replace the zone's DNSKey rows wholesale
