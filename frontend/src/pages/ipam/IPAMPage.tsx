@@ -2994,7 +2994,9 @@ export function CreateSubnetModal({
     queryKey: ["block-effective-fields", blockId],
     queryFn: () => ipamApi.effectiveBlockFields(blockId),
     enabled: !!blockId,
-    staleTime: 30_000,
+    // Re-read on open: a save elsewhere changes inherited values (#4581).
+    staleTime: 0,
+    refetchOnMount: "always",
   });
   const cfInherited = parentFields?.custom_fields ?? {};
 
@@ -8841,7 +8843,9 @@ function EditSubnetModalForm({
   const { data: effectiveFields } = useQuery({
     queryKey: ["effective-fields", subnet.id],
     queryFn: () => ipamApi.effectiveFields(subnet.id),
-    staleTime: 30_000,
+    // Re-read on open: a save elsewhere changes inherited values (#4581).
+    staleTime: 0,
+    refetchOnMount: "always",
   });
   const { data: allSpaces = [] } = useQuery({
     queryKey: ["spaces"],
@@ -13363,7 +13367,9 @@ export function CreateBlockModal({
     queryKey: ["block-effective-fields", parentBlockId],
     queryFn: () => ipamApi.effectiveBlockFields(parentBlockId),
     enabled: !!parentBlockId,
-    staleTime: 30_000,
+    // Re-read on open: a save elsewhere changes inherited values (#4581).
+    staleTime: 0,
+    refetchOnMount: "always",
   });
   const cfInherited = parentFields?.custom_fields ?? {};
 
@@ -13752,7 +13758,9 @@ function EditBlockModalForm({
   const { data: effectiveFields } = useQuery({
     queryKey: ["block-effective-fields", block.id],
     queryFn: () => ipamApi.effectiveBlockFields(block.id),
-    staleTime: 30_000,
+    // Re-read on open: a save elsewhere changes inherited values (#4581).
+    staleTime: 0,
+    refetchOnMount: "always",
   });
   const { data: allSpaces = [] } = useQuery({
     queryKey: ["spaces"],
