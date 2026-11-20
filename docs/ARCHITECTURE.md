@@ -182,9 +182,12 @@ shapes, etc.). Concrete drivers (`bind9.py`, `powerdns.py`,
 `technitium.py`, `kea.py`)
 render backend-specific config from those dataclasses; the services
 layer only ever speaks to the ABC. There are also **agentless**
-drivers — Windows DNS/DHCP over WinRM, cloud DNS (Cloudflare / Route 53
-/ Azure DNS / Google Cloud DNS) over the provider SDK — which the api
-drives directly with no agent on the far side. See
+drivers, which the api drives directly with no agent on the far side:
+Windows DNS over WinRM (or RFC 2136 when the server has no WinRM
+credentials), Windows DHCP over WinRM, an operator's own Technitium
+over its HTTP API, eight cloud DNS providers (Cloudflare, Route 53,
+Azure DNS, Google Cloud DNS, DigitalOcean, Hetzner, Linode, Vultr)
+over their own APIs, and FortiGate DHCP over the FortiOS REST API. See
 [`drivers/DNS_DRIVERS.md`](drivers/DNS_DRIVERS.md) and
 [`drivers/DHCP_DRIVERS.md`](drivers/DHCP_DRIVERS.md).
 
@@ -353,7 +356,10 @@ DNS and DHCP are made HA by running **multiple agents per group**.
 Every DNS agent renders its group's zones as an independent
 authoritative copy, so adding a second BIND9 / PowerDNS / Technitium
 agent to a group gives you a redundant authoritative server with no
-extra coordination.
+extra coordination. The exception is DNSSEC: a group that holds a
+signed zone takes one agent server only, since each server would sign
+with its own keys (see [`drivers/DNS_DRIVERS.md`](drivers/DNS_DRIVERS.md)
+§2.5).
 For DHCP, two or more Kea members in a server group form a Kea HA pair
 (scopes/pools/statics live on the group;
 `agent/dhcp/spatium_dhcp_agent/peer_resolve.py` self-heals peer IP

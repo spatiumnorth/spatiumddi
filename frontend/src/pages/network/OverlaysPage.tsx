@@ -1,3 +1,5 @@
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { useOwnershipModules } from "@/hooks/useOwnershipModules";
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
@@ -173,7 +175,12 @@ export function OverlayEditorModal({
         status,
         notes,
       };
-      if (existing) return overlaysApi.update(existing.id, body);
+      if (existing) {
+        // Only what changed against the row read when the dialog opened (#4379).
+        const changed = changedFields(existing, body);
+        if (Object.keys(changed).length === 0) return existing;
+        return overlaysApi.update(existing.id, changed);
+      }
       return overlaysApi.create(body as OverlayCreate);
     },
     onSuccess: () => {
@@ -712,10 +719,19 @@ export function OverlaysPage() {
           />
         )}
         {editing && (
-          <OverlayEditorModal
-            existing={editing}
+          <FreshEdit
+            row={editing}
+            load={() => overlaysApi.get(editing.id)}
+            title="Edit overlay"
             onClose={() => setEditing(null)}
-          />
+          >
+            {(fresh) => (
+              <OverlayEditorModal
+                existing={fresh}
+                onClose={() => setEditing(null)}
+              />
+            )}
+          </FreshEdit>
         )}
         <ConfirmModal
           open={confirm !== null}
