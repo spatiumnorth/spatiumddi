@@ -450,7 +450,7 @@ def test_supervisor_reads_env_as_root_before_dropping_privileges() -> None:
 
 def test_supervisor_ids_are_outside_the_host_system_range() -> None:
     """The supervisor's state lives on the host's STATE partition, so its ids
-    must not be ones a host system account owns (100/101 were _chrony / _ssh).
+    must not be ones a host system account owns.
     Dockerfile, firstboot's pcap dir and the trigger guard must all agree."""
     assert SUPERVISOR_UID >= 1000 and SUPERVISOR_UID != API_UID
     docker = _read(SUPERVISOR_DOCKERFILE)
