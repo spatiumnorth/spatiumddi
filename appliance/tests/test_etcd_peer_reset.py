@@ -199,3 +199,39 @@ def test_console_verdict_names_the_mismatch(tmp_path: Path) -> None:
     assert ns["etcd_peer_mismatch_reason"]() == ""
     flag.write_text("address changed\n")
     assert ns["etcd_peer_mismatch_reason"]() == "address changed"
+
+
+def _record_fn() -> str:
+    text = (EXTRA / "usr" / "local" / "bin" / "spatiumddi-firstboot").read_text()
+    start = text.index("record_etcd_peer_addr() {")
+    return text[start : text.index("\n}\n", start) + 3]
+
+
+def test_record_never_ends_firstboot_before_the_node_registers(tmp_path: Path) -> None:
+    """#4592: on a fresh install the Node is not registered yet when /readyz
+    answers; ``grep -c`` then exits 1, and under ``set -eu`` the assignment
+    ended firstboot. The function must return, and the script must go on."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name, body in {
+        "k3s": "#!/bin/sh\nexit 0\n",  # no nodes yet
+        "ip": "#!/bin/sh\necho '2: eth0    inet 10.0.0.9/24 brd 10.0.0.255 scope global eth0'\n",
+        "sleep": "#!/bin/sh\nexit 0\n",
+    }.items():
+        p = bin_dir / name
+        p.write_text(body)
+        p.chmod(0o755)
+    fn = _record_fn().replace("/usr/local/bin/k3s", str(bin_dir / "k3s"))
+    script = f"set -eu\n{fn}\nrecord_etcd_peer_addr\necho AFTER\n"
+    env = {"PATH": f"{bin_dir}:/usr/bin:/bin"}
+    proc = subprocess.run(["sh", "-c", script], env=env, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    assert "AFTER" in proc.stdout
+
+
+def test_record_is_called_last_and_guarded() -> None:
+    text = (EXTRA / "usr" / "local" / "bin" / "spatiumddi-firstboot").read_text()
+    ready = text.split('if [ "$ready" = 1 ]; then', 1)[1].split("\nfi\n", 1)[0]
+    assert "record_etcd_peer_addr || true" in ready
+    assert ready.index("record_etcd_peer_addr || true") > ready.index("commit_slot_if_healthy")
+    assert ready.count("record_etcd_peer_addr") == 1

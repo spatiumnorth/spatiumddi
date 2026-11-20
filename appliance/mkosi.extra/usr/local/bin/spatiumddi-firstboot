@@ -2915,8 +2915,17 @@ place_deferred_control_manifest() {
 # peer-reset). Skipped when the count cannot be read.
 record_etcd_peer_addr() {
     _ip=$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -n 1)
-    _n=$(/usr/local/bin/k3s kubectl get nodes -l node-role.kubernetes.io/etcd \
-        --no-headers 2>/dev/null | grep -c .)
+    # #4592 — on a fresh install the Node registers some time after /readyz
+    # (107 s in a walk), so wait for it, bounded. ``grep -c`` exits 1 on a
+    # count of 0, and under ``set -e`` an assignment takes that status, so
+    # every count read is guarded: this function must never end firstboot.
+    _n=0
+    for _ in $(seq 1 36); do
+        _n=$(/usr/local/bin/k3s kubectl get nodes -l node-role.kubernetes.io/etcd \
+            --no-headers 2>/dev/null | grep -c .) || _n=0
+        [ "${_n:-0}" -gt 0 ] && break
+        sleep 5
+    done
     if [ -n "$_ip" ] && [ "${_n:-0}" -gt 0 ]; then
         mkdir -p /var/lib/spatiumddi 2>/dev/null
         echo "$_ip $_n" > /var/lib/spatiumddi/etcd-peer-addr 2>/dev/null || true
@@ -2973,7 +2982,6 @@ fi
 if [ "$ready" = 1 ]; then
     tighten_kubeconfig
     date -Iseconds > "$STAMP"
-    record_etcd_peer_addr
     IP=$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1)
     echo "Ready: k3s up on ${IP:-<appliance-ip>}; supervisor pod auto-deploys via $BOOTSTRAP_MANIFEST"
     # #3022 — the bootstrap chart this boot staged goes live, or stays held,
@@ -3002,6 +3010,10 @@ if [ "$ready" = 1 ]; then
     # Never fails firstboot — the finding lands in the state file + log
     # either way.
     /usr/local/bin/spatiumddi-webui-selfcheck || true
+    # #4592 — last, after the chart releases and the slot commit: on a fresh
+    # install it waits (up to 3 min) for the Node to register, and it must
+    # never fail firstboot.
+    record_etcd_peer_addr || true
     exit 0
 fi
 echo "WARN: k3s /readyz did not respond within 5 minutes." >&2
