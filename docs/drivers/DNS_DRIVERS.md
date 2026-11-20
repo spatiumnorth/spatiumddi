@@ -664,7 +664,7 @@ class PowerDNSDriver(DNSDriver):
     def capabilities(cls) -> dict[str, Any]:
         return {
             "alias_records": True,         # CNAME-at-apex via PATCH
-            "lua_records": True,           # ENABLE-LUA-RECORDS=1 zone metadata auto-set
+            "lua_records": True,           # global enable-lua-records=yes in pdns.conf
             "dnssec_inline_signing": True, # online sign / unsign / re-sign
             "catalog_zones": "producer-only",  # consumer not wired up in the agent
             "views": False,                # tag-based; not surfaced as views in UI yet
@@ -676,7 +676,7 @@ class PowerDNSDriver(DNSDriver):
 
 ### 4.4 LUA records
 
-LUA records are PowerDNS's mechanism for computed responses — geo-routing, weighted answers, conditional `pickrandom` / `ifportup` / `createReverse` snippets. The frontend exposes a `<textarea>` for the LUA value when the operator selects record type `LUA`; the agent auto-sets `ENABLE-LUA-RECORDS=1` zone metadata via the PowerDNS REST API the first time a zone gains a LUA record (idempotent — the metadata stays harmless when no LUA records remain).
+LUA records are PowerDNS's mechanism for computed responses — geo-routing, weighted answers, conditional `pickrandom` / `ifportup` / `createReverse` snippets. The frontend exposes a `<textarea>` for the LUA value when the operator selects record type `LUA`; the agent renders the global `enable-lua-records=yes` into `pdns.conf` for every zone. The per-zone `ENABLE-LUA-RECORDS` metadata is not used: pdns refuses it over the REST API.
 
 **Security note.** LUA records execute server-side at query time. Treat them as code. The frontend's contextual banner explains this; restrict who can create LUA records via the existing RBAC `dns.record.create` permission scoped to PowerDNS groups only.
 

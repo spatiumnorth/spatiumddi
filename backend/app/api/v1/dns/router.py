@@ -8517,8 +8517,8 @@ async def rollover_zone_dnssec_key(
     (issue #49, #1767).
 
     BIND9 (``rndc dnssec -rollover``) and Technitium
-    (``zones/dnssec/properties/rolloverDnsKey``); PowerDNS rolls on its own
-    schedule and Windows DNS isn't supported. Enqueues a ``dnssec_rollover``
+    (``zones/dnssec/properties/rolloverDnsKey``); PowerDNS does not roll keys
+    and Windows DNS isn't supported. Enqueues a ``dnssec_rollover``
     op carrying the key tag; the agent runs the rollover and reports the new
     key set back on its next sync. The zone must already be signed.
     """

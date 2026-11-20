@@ -61,7 +61,7 @@ Driver-gated features are enforced server-side by the API's `_DRIVER_GATED_RECOR
 | `dnssec_unsign` | `bind9`, `powerdns`, `technitium` |
 | `dnssec_rollover` (manual key rollover) | `bind9`, `technitium` |
 
-Manual rollover is BIND9 and Technitium only: PowerDNS rolls on its own schedule. Technitium's ZSK rolls automatically (`zskRolloverDays`, from the policy's ZSK lifetime) but its KSK `rolloverDays` defaults to 0 (never), so a KSK rolls only through the manual rollover (`rolloverDnsKey`, #1767).
+Manual rollover is BIND9 and Technitium only. PowerDNS does not roll keys at all: pdns-auth has no scheduled rollover and the agent starts none, so a PowerDNS zone keeps the keys it was signed with until it is unsigned and signed again (which changes the DS the parent holds). Technitium's ZSK rolls automatically (`zskRolloverDays`, from the policy's ZSK lifetime) but its KSK `rolloverDays` defaults to 0 (never), so a KSK rolls only through the manual rollover (`rolloverDnsKey`, #1767).
 
 The Operator Copilot's `propose_create_dns_zone` tool accepts an explicit `driver_hint` argument (`bind9` / `powerdns` / `technitium` / `windows_dns`) so the LLM can route a zone to a matching group without operators having to specify the group UUID by hand. See `app.services.ai.operations.CreateDNSZoneArgs`.
 
@@ -302,7 +302,7 @@ records in its bundle.
 
 ### Catalog zones (RFC 9432) — published for external secondaries (#3764)
 
-With **Use BIND9 catalog zones** on, the group's primary (`is_primary`)
+With **Publish a catalog zone** on, the group's primary (`is_primary`)
 publishes an RFC 9432 catalog zone (default name `catalog.spatium.invalid.`)
 listing every primary zone in the group. BIND9 and PowerDNS producers render
 the same records.
@@ -1025,7 +1025,7 @@ carries the same RR twice.
 **PowerDNS:**
 - Record add/modify/delete → `PATCH /api/v1/servers/localhost/zones/<zone>` rrset patch via the REST API
 - Record changes are atomic and immediate — no restart, no reload
-- Zone creation/deletion via the REST API; PowerDNS handles the serial bump internally
+- Zone creation via the REST API (`POST .../zones`); a zone the bundle no longer carries is deleted the same way (see the zone-delete row in the driver reference). The control plane owns the SOA serial (#1965): every record op carries a `target_serial` and the agent writes it into the apex SOA, PowerDNS does not bump it
 
 ### Driver Method: `apply_record_change()`
 
