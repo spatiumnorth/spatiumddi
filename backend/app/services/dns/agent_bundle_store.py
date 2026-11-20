@@ -110,7 +110,10 @@ _MAX_ERROR = 2000
 #   a re-pin or a restore). Unchanged for every other zone; a group holding
 #   such a zone stops serving it in the other view at the upgrade instead of
 #   at its next change.
-RENDERER_REVISION = 17
+# 18 (#4594): every BIND9 bundle's options carry ``query_log_severity``,
+#   ``query_log_print_category`` and ``query_log_print_severity``. The ETag
+#   moves once at the upgrade for every group.
+RENDERER_REVISION = 18
 
 
 def _serves(revision: int | None) -> bool:
