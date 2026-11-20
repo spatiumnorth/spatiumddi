@@ -91,6 +91,8 @@ describe("blocklist scope on a PowerDNS group (#4573)", () => {
       /Whole group/,
     )) as HTMLInputElement;
     expect(box.disabled).toBe(false);
-    expect(screen.queryByText(/renders no blocklist, so a blocklist here/)).toBeNull();
+    expect(
+      screen.queryByText(/renders no blocklist, so a blocklist here/),
+    ).toBeNull();
   });
 });
