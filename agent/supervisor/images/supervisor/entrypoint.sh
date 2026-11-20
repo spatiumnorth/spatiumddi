@@ -11,7 +11,9 @@
 # Two paths still need write access:
 #
 # * /var/lib/spatium-supervisor → identity key + cert + session token
-#   + role-compose.env + role-switch-state. Chowned below.
+#   + role-compose.env + role-switch-state. Chowned below, every start:
+#   that is also what re-owns state written by the old uid 100 / gid 101
+#   (ids that belong to host system accounts) to the dedicated 10001.
 # * /etc/nftables.d → spatium-role.nft drop-in (the only file the
 #   supervisor manages there). Chown the *directory* only; existing
 #   host-managed SNMP / NTP drop-ins keep their canonical ownership.

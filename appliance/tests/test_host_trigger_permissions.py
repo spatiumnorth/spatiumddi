@@ -59,7 +59,7 @@ API_TEMPLATE = REPO / "charts" / "spatiumddi" / "templates" / "api.yaml"
 CHART_VALUES = REPO / "charts" / "spatiumddi" / "values.yaml"
 
 HOST_GID = 2770
-SUPERVISOR_UID = 100
+SUPERVISOR_UID = 10001
 API_UID = 1000
 
 needs_bash = pytest.mark.skipif(shutil.which("bash") is None, reason="bash required")
@@ -331,8 +331,8 @@ def test_guard_rejects_a_symlinked_trigger(tmp_path: Path, trig_dir: Path) -> No
 
 @needs_bash
 def test_guard_distrusts_owner_in_a_world_writable_directory(tmp_path: Path) -> None:
-    # On the legacy 1777 directory an owner uid proves nothing: host uid 100
-    # is some system daemon, not the supervisor.
+    # On the legacy 1777 directory an owner uid proves nothing: a host uid
+    # below 1000 is some system daemon, not the supervisor.
     legacy = tmp_path / "release-state"
     legacy.mkdir()
     legacy.chmod(0o1777)
@@ -392,7 +392,7 @@ def test_guard_with_no_arguments_refuses(tmp_path: Path) -> None:
 
 def test_supervisor_ids_are_pinned_and_it_carries_the_host_gid() -> None:
     text = _read(SUPERVISOR_DOCKERFILE)
-    assert "addgroup -S -g 101 spatium" in text
+    assert "addgroup -S -g 10001 spatium" in text
     assert f"adduser -S -u {SUPERVISOR_UID} -G spatium spatium" in text
     assert f"addgroup -S -g {HOST_GID} spatium-host" in text
     assert "addgroup spatium spatium-host" in text
@@ -446,3 +446,24 @@ def test_supervisor_reads_env_as_root_before_dropping_privileges() -> None:
     # it while still root, then su-execs.
     text = _read(SUPERVISOR_ENTRYPOINT)
     assert text.index('done < "$HOST_ENV"') < text.index("exec su-exec spatium")
+
+
+def test_supervisor_ids_are_outside_the_host_system_range() -> None:
+    """The supervisor's state lives on the host's STATE partition, so its ids
+    must not be ones a host system account owns (100/101 were _chrony / _ssh).
+    Dockerfile, firstboot's pcap dir and the trigger guard must all agree."""
+    assert SUPERVISOR_UID >= 1000 and SUPERVISOR_UID != API_UID
+    docker = _read(SUPERVISOR_DOCKERFILE)
+    gid = re.search(r"addgroup -S -g (\d+) spatium \\?$", docker, re.M)
+    uid = re.search(r"adduser -S -u (\d+) -G spatium spatium", docker)
+    assert gid and uid
+    assert int(gid.group(1)) >= 1000 and int(uid.group(1)) >= 1000
+    assert int(uid.group(1)) == SUPERVISOR_UID
+    first = _read(FIRSTBOOT)
+    assert f"chown {uid.group(1)}:{gid.group(1)} . " in first
+    # Existing installs: stale 100:101 files in release-state are re-owned,
+    # and the entrypoint re-owns the state dir on every start.
+    assert "-user 100 -group 101 -exec chown -h" in first
+    assert "chown -R spatium:spatium /var/lib/spatium-supervisor" in _read(
+        SUPERVISOR_ENTRYPOINT
+    )

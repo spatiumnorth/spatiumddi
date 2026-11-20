@@ -66,22 +66,25 @@ RUN echo "apk snapshot ${APK_SNAPSHOT}" >/dev/null \
       nftables libcap \
       ca-certificates tzdata \
       iputils traceroute bind-tools \
- && addgroup -S -g 101 spatium \
- && adduser -S -u 100 -G spatium spatium \
+ && addgroup -S -g 10001 spatium \
+ && adduser -S -u 10001 -G spatium spatium \
  && addgroup -S -g 2770 spatium-host \
  && addgroup spatium spatium-host \
  && mkdir -p /var/lib/spatium-supervisor \
  && chown -R spatium:spatium /var/lib/spatium-supervisor \
  && setcap cap_net_admin+eip /usr/sbin/nft \
  && setcap cap_net_raw+ep /usr/bin/traceroute
-# GHSA-h2j9-qrg7-grfw — the ``spatium`` ids are PINNED (100/101: what
-# ``-S`` happened to allocate on this base, so nothing already on disk
-# changes owner) and the user is a member of ``spatium-host`` (2770). The
+# GHSA-h2j9-qrg7-grfw — the ``spatium`` ids are PINNED, at 10001/10001:
+# outside the host's system-account range, because the supervisor's state
+# lives on the host (STATE partition) and ids 100/101 there belong to host
+# system accounts. They were 100/101 until then (what ``-S`` allocated on
+# this base); the entrypoint's ``chown -R`` re-owns existing state to the
+# new ids on the first start after the upgrade. The user is a member of ``spatium-host`` (2770). The
 # host's trigger directory /var/lib/spatiumddi/release-state is 1770
 # root:2770, no longer 1777, so that membership is what lets the
 # supervisor write triggers; the host kubeconfig is 0640 root:2770 for the
 # same reason. ``spatiumddi-trigger-guard`` on the host accepts triggers
-# owned by uid 100, so a dynamically allocated uid would break every
+# owned by uid 10001, so a dynamically allocated uid would break every
 # trigger plane. The entrypoint's ``su-exec spatium`` runs initgroups(),
 # which is how the 2770 membership reaches the process — a pod-level
 # supplementalGroups would not survive it. All three numbers must match
