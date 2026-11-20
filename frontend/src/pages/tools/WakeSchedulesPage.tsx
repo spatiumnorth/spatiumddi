@@ -1399,8 +1399,8 @@ function CalendarsTab() {
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <p className="max-w-2xl text-xs text-muted-foreground">
-          Subscribe a holiday / term calendar as an iCal <code>.ics</code> URL
-          (Google Calendar public link, most published school calendars) or an
+          A holiday / term calendar is an iCal <code>.ics</code> URL (Google
+          Calendar public link, most published school calendars) or an
           authenticated CalDAV collection (Nextcloud / Radicale / school
           servers). Its all-day events flatten into date spans a schedule’s gate
           consults — skip on a holiday feed, or fire only on a school-day feed.

@@ -1,0 +1,3 @@
+### Fixed
+
+- A read-only user is no longer told to use a control its role is not offered: the Platform Insights conformity card, the Dashboard RPKI tiles, ASN Communities and BGP Monitoring, the DHCP Responders and router advertisements tabs, subnet Aliases, PXE profiles, IP network discovery, Wake Schedules calendars, overlay Policies, the Subnet Planner how-to, the "gateway" note, the MAC lookup and E911 module-off notices, and the legacy-tag, alias, DNS-drift, Sites tree and block-with-children hints now draw their instruction only for a user who holds the permission, and the UniFi controller page draws its Edit link only for a superadmin (#4588).

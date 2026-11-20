@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { ExternalLink, Loader2, Network as NetworkIcon } from "lucide-react";
 
 import { networkApi } from "@/lib/api";
+import { usePermissions } from "@/hooks/usePermissions";
 import { cn } from "@/lib/utils";
 import { FdbTypePill, humanTime } from "@/pages/network/_shared";
 
@@ -31,6 +32,8 @@ const PILL_BASE =
 // data VLAN. Each tuple gets its own row, sorted by ``last_seen DESC``.
 export function IPNetworkTab({ addressId }: { addressId: string }) {
   const { data: rows = [], isLoading, isError } = useNetworkContext(addressId);
+  // Devices are added on /network behind write on network devices (#4588).
+  const canAddDevice = usePermissions().can("write", "manage_network_devices");
 
   if (isLoading) {
     return (
@@ -52,11 +55,18 @@ export function IPNetworkTab({ addressId }: { addressId: string }) {
       <div className="rounded-md border border-dashed bg-muted/20 p-4 text-center">
         <NetworkIcon className="mx-auto mb-1 h-4 w-4 text-muted-foreground" />
         <p className="text-xs text-muted-foreground">
-          No network discovery data — add the upstream switch in{" "}
-          <Link to="/network" className="text-primary hover:underline">
-            /network
-          </Link>{" "}
-          and wait a polling cycle.
+          No network discovery data
+          {canAddDevice && (
+            <>
+              {" "}
+              — add the upstream switch in{" "}
+              <Link to="/network" className="text-primary hover:underline">
+                /network
+              </Link>{" "}
+              and wait a polling cycle
+            </>
+          )}
+          .
         </p>
       </div>
     );
