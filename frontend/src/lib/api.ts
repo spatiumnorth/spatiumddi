@@ -7388,6 +7388,8 @@ export interface DNSBlockList {
   /** #3551 — set when a BIND9 group this list is applied to is estimated at
    *  80 % or more of its agents' memory limit. */
   memory_warning?: string | null;
+  /** #4573 — set when a group the list is applied to runs only PowerDNS (no RPZ). */
+  unapplied_warning?: string | null;
 }
 
 export interface DNSBlockListFeedSkipped {
