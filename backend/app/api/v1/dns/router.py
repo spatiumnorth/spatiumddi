@@ -3974,7 +3974,10 @@ async def sync_group_with_servers(
                     result=result,
                 )
             )
-            servers_succeeded += 1
+            # A server whose every zone failed (PowerDNS: all unsupported)
+            # did not sync; don't report it as a success (#4604 B6).
+            if not (result.items and all(i.error for i in result.items)):
+                servers_succeeded += 1
             total_imported += result.total_imported
             total_pushed += result.total_pushed
             total_queued += result.total_queued

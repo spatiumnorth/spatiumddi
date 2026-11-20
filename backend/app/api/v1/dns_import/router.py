@@ -796,11 +796,15 @@ async def powerdns_preview(
     and asks the operator to split the migration.
     """
 
+    drivers_res = await db.execute(
+        select(DNSServer.driver).where(DNSServer.group_id == body.target_group_id)
+    )
     try:
         preview = await parse_powerdns_server(
             api_url=body.api_url,
             api_key=body.api_key,
             server_name=body.server_name,
+            target_drivers=frozenset(d for d in drivers_res.scalars().all() if d),
         )
     except PowerDNSImportError as exc:
         raise HTTPException(status_code=502, detail=str(exc))

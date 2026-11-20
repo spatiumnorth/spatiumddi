@@ -13064,6 +13064,11 @@ function GroupDetailView({
   const tabs = allTabs.filter(
     (t) => !(t.id === "options" && technitiumApiGroup),
   );
+  // #4604 B6 — Sync with Servers reads zones back over a server API; a
+  // PowerDNS agent exposes none, so every zone answers "unsupported".
+  const powerdnsOnlyGroup =
+    (group.server_drivers ?? []).length > 0 &&
+    (group.server_drivers ?? []).every((d) => d === "powerdns");
 
   const typeBadge: Record<string, string> = {
     internal: "bg-blue-500/15 text-blue-600",
@@ -13114,8 +13119,12 @@ function GroupDetailView({
             <button
               className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-50"
               onClick={runGroupSync}
-              disabled={syncing}
-              title="Bi-directional additive sync against every enabled server in this group. Pulls missing zones and records from the servers (imports into SpatiumDDI), and pushes any SpatiumDDI zones / records not yet on the servers."
+              disabled={syncing || powerdnsOnlyGroup}
+              title={
+                powerdnsOnlyGroup
+                  ? "Not supported for PowerDNS groups: the PowerDNS driver cannot read zones back from the server, so every zone would be reported unsupported. SpatiumDDI pushes changes to PowerDNS automatically."
+                  : "Bi-directional additive sync against every enabled server in this group. Pulls missing zones and records from the servers (imports into SpatiumDDI), and pushes any SpatiumDDI zones / records not yet on the servers."
+              }
               {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
             >
               <RefreshCw className={cn("h-3 w-3", syncing && "animate-spin")} />

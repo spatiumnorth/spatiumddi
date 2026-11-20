@@ -25,6 +25,8 @@ the first ship.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import ipaddress
 import json
@@ -928,8 +930,8 @@ class PowerDNSDriver(DriverBase):
         ``pdns.conf`` is largely static after first boot — listen
         addresses, the API key, and the LMDB filename don't change at
         runtime. We still rewrite it on every render so operators
-        editing options through the UI (loglevel, query logging, the
-        ALIAS resolver) see the change: ``swap_and_reload`` restarts
+        editing options through the UI (query logging, the ALIAS
+        resolver) see the change: ``swap_and_reload`` restarts
         pdns when the rendered file differs, since pdns reads it only
         at startup.
         """
@@ -956,10 +958,9 @@ class PowerDNSDriver(DriverBase):
         # out before they reach stderr. Bump to 6 only when query
         # logging is enabled so quiet operators don't get noisy logs
         # for free; otherwise stick with the configured level (or 4
-        # default) so startup banners + errors still show through.
-        log_level = int(opts.get("log_level", 4))
-        if query_log_enabled and log_level < 6:
-            log_level = 6
+        # default) so startup banners + errors still show through. The
+        # bundle carries no log-level option (#4604), so the base is 4.
+        log_level = 6 if query_log_enabled else 4
 
         # The ALIAS resolver is the group's own plain-DNS forwarders,
         # computed by the control plane (#1353); "" turns ALIAS expansion
@@ -1602,18 +1603,20 @@ class PowerDNSDriver(DriverBase):
         # branch off here rather than building a rrset PATCH.
         if op_kind == "dnssec_sign":
             ds_records = self._dnssec_sign(api_key, zone)
-            return {
-                "dnssec_state": {
-                    "zone_name": zone,
-                    "ds_records": ds_records,
-                }
-            }
+            state: dict[str, Any] = {"zone_name": zone, "ds_records": ds_records}
+            # #4604 — the key table too, so dnssec/info is not empty for a
+            # signed zone. Additive: an older control plane ignores ``keys``.
+            cryptokeys = self._fetch_cryptokeys(api_key, zone)
+            if cryptokeys is not None:
+                state["keys"] = self._extract_keys(cryptokeys)
+            return {"dnssec_state": state}
         if op_kind == "dnssec_unsign":
             self._dnssec_unsign(api_key, zone)
             return {
                 "dnssec_state": {
                     "zone_name": zone,
                     "ds_records": [],
+                    "keys": [],
                 }
             }
 
@@ -2089,6 +2092,110 @@ class PowerDNSDriver(DriverBase):
             return []
 
     @staticmethod
+    def _dnskey_tag(dnskey: str) -> int | None:
+        """RFC 4034 appendix B key tag of ``"<flags> <proto> <alg> <base64>"``."""
+        parts = dnskey.split(None, 3)
+        if len(parts) != 4:
+            return None
+        try:
+            rdata = (
+                int(parts[0]).to_bytes(2, "big")
+                + bytes([int(parts[1]), int(parts[2])])
+                + base64.b64decode("".join(parts[3].split()), validate=True)
+            )
+        except (ValueError, binascii.Error, OverflowError):
+            return None
+        acc = sum((b << 8) if i % 2 == 0 else b for i, b in enumerate(rdata))
+        return ((acc & 0xFFFF) + (acc >> 16)) & 0xFFFF
+
+    @classmethod
+    def _extract_keys(cls, cryptokeys: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Per-key rows (tag / type / algorithm number / state) for the
+        control plane's ``DNSKey`` table, from ``GET .../cryptokeys``."""
+        out: list[dict[str, Any]] = []
+        for k in cryptokeys or []:
+            dnskey = str(k.get("dnskey") or "")
+            tag = cls._dnskey_tag(dnskey)
+            if tag is None:
+                continue
+            try:
+                algorithm = int(dnskey.split()[2])
+            except (IndexError, ValueError):
+                algorithm = 0
+            key_type = str(k.get("keytype") or "").lower()
+            if key_type not in ("ksk", "zsk", "csk"):
+                key_type = "ksk" if k.get("flags") == 257 else "zsk"
+            ds = [d.strip() for d in k.get("ds") or [] if isinstance(d, str) and d.strip()]
+            out.append(
+                {
+                    "key_tag": tag,
+                    "key_type": key_type,
+                    "algorithm": algorithm,
+                    "state": "active" if k.get("active") else "published",
+                    "ds_records": ds if key_type in ("ksk", "csk") else [],
+                    "timing": {},
+                }
+            )
+        return sorted(out, key=lambda x: (x["key_type"], x["key_tag"]))
+
+    def _fetch_cryptokeys(self, api_key: str, zone: str) -> list[dict[str, Any]] | None:
+        """``GET .../cryptokeys`` for a zone, or None when it could not be read
+        (never ``[]`` on a failure: that would wipe the control plane's rows)."""
+        try:
+            with httpx.Client(timeout=_PDNS_API_TIMEOUT) as client:
+                resp = client.get(
+                    f"{_PDNS_API_BASE}/zones/{zone}/cryptokeys",
+                    headers={"X-API-Key": api_key},
+                )
+            if resp.status_code != 200:
+                log.warning(
+                    "powerdns_dnssec_keys_read_non200",
+                    zone=zone,
+                    status=resp.status_code,
+                )
+                return None
+            data = resp.json()
+        except (httpx.HTTPError, ValueError) as e:
+            log.warning("powerdns_dnssec_keys_read_failed", zone=zone, error=str(e))
+            return None
+        return data if isinstance(data, list) else None
+
+    def collect_dnssec_state(self, bundle: dict[str, Any]) -> list[dict[str, Any]]:
+        """DS + key state for every signed primary zone, for
+        ``POST /dns/agents/dnssec-state`` (#4604; the BIND9 / Technitium
+        agents already report this). Read-only; a zone whose keys cannot be
+        read is left out so the control plane keeps what it has."""
+        self.dnssec_incomplete = False
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        api_key = self._load_or_generate_api_key()
+        for z in bundle.get("zones", []):
+            if not z.get("dnssec_enabled"):
+                continue
+            if z.get("type", "primary") not in {"primary", "master"}:
+                continue
+            zname = (z.get("name") or "").rstrip(".")
+            if not zname or zname in seen:
+                continue
+            seen.add(zname)
+            zone = zname + "."
+            cryptokeys = self._fetch_cryptokeys(api_key, zone)
+            if cryptokeys is None:
+                self.dnssec_incomplete = True
+                continue
+            keys = self._extract_keys(cryptokeys)
+            if not keys:
+                self.dnssec_incomplete = True
+            out.append(
+                {
+                    "zone_name": zone,
+                    "ds_records": self._extract_ds_records(cryptokeys),
+                    "keys": keys,
+                }
+            )
+        return out
+
+    @staticmethod
     def _extract_ds_records(cryptokeys: list[dict[str, Any]]) -> list[str]:
         """Walk the PowerDNS cryptokeys response and pull out every DS
         rrset string.
@@ -2358,10 +2465,10 @@ class PowerDNSDriver(DriverBase):
         query_log_enabled: bool = False,
         alias_resolver: str = "",
     ) -> str:
-        # Mirrors backend/app/drivers/dns/powerdns.py::render_pdns_conf.
-        # Agent and control plane render the same shape; the agent
-        # owns the API key while the control plane sees only the
-        # placeholder.
+        # The authoritative renderer. backend/app/drivers/dns/powerdns.py::
+        # render_pdns_conf is a preview TEMPLATE of this (#4604): keep its
+        # fixed values in step. The agent owns the API key; the control plane
+        # sees only a placeholder.
         log_queries_value = "yes" if query_log_enabled else "no"
         return "\n".join(
             [
@@ -3286,15 +3393,3 @@ class PowerDNSDriver(DriverBase):
             # bundle may carry another spelling (``Case.Test.``).
             out[str(z["name"]).rstrip(".").lower()] = serial
         return out
-
-    def _reload_via_api(self) -> None:
-        """Optional — issue a notify on every zone after a bulk
-        change. PowerDNS is master-only by default; this only matters
-        when secondaries are configured. Currently unused but kept
-        as a hook for Phase 2 supermaster wiring.
-        """
-        if self.daemon_pid:
-            try:
-                os.kill(self.daemon_pid, signal.SIGUSR1)
-            except OSError as exc:
-                log.warning("pdns_sigusr1_failed", error=str(exc))
