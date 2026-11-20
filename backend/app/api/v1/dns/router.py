@@ -10408,11 +10408,16 @@ async def update_record(
     # #1563 — explicit null clears view_id and ttl (ttl null = inherit
     # the zone TTL; exclude_none dropped both, so the clear never
     # landed); null for a NOT NULL column is a 422.
+    # #4557 — an explicit null priority/weight/port is kept too, not dropped:
+    # MX turns a null priority into the create default (10), SRV refuses it
+    # (422, via _normalize_record_struct_fields), other types hold no value.
     changes = resolve_update_changes(
         body,
-        clearable={"view_id", "ttl"},
+        clearable={"view_id", "ttl", "priority", "weight", "port"},
         non_nullable={"name", "value", "tags"},
     )
+    if record.record_type.upper() == "MX" and "priority" in changes and changes["priority"] is None:
+        changes["priority"] = 10
     # An untouched Save sends every field the dialog shows; only a field whose
     # value differs is a change (#2463). Nothing changed → nothing to bump,
     # queue or audit.
