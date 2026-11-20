@@ -383,7 +383,6 @@ class PowerDNSDriver(DNSDriver):
             "name": "powerdns",
             "views": False,
             "rpz": False,
-            "recursion": False,  # auth only — no recursor (#4562)
             "dnssec_inline_signing": True,  # Phase 3c — landed (agent-side)
             "incremental_updates": "rest_api",
             "zone_types": ["primary", "secondary"],

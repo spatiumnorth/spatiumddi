@@ -112,6 +112,77 @@ class DNSDriver(ABC):
 
 ---
 
+## 1A. Group options each driver applies ([#4562](https://github.com/spatiumnorth/spatiumddi/issues/4562))
+
+The Options tab and `PUT /dns/groups/{id}/options` are driver-agnostic, and every driver applies only a subset of them. `backend/app/services/dns/option_support.py` is the one table of that subset: each (driver, option) pair is **applied**, **partial** (applied with the stated limit) or **not applied**. The Technitium column is built from `technitium_options.UNSUPPORTED_OPTIONS`.
+
+| Option | BIND9 | PowerDNS | Technitium (agent) |
+|---|---|---|---|
+| `forwarders` | yes | partial: PowerDNS uses forwarders only to expand ALIAS records; it does not forward client queries | yes |
+| `forward_policy` | yes | no | partial: Technitium resolves only through its forwarders ('only'); it never falls back to recursion |
+| `recursion_enabled` | yes | no | yes |
+| `allow_recursion` | yes | no | yes |
+| `dnssec_validation` | yes | no | yes |
+| `notify_enabled` | yes | yes | yes |
+| `also_notify` | yes | yes | partial: Technitium notifies bare IP addresses only |
+| `allow_notify` | yes | no | no |
+| `allow_query` | yes | no | partial: applied per zone, for the address-match grammar Technitium can express |
+| `allow_query_cache` | yes | no | no |
+| `allow_transfer` | yes | partial: PowerDNS applies addresses and keys; a negated element is dropped | partial: applied per zone, for the address-match grammar Technitium can express |
+| `blackhole` | yes | no | no |
+| `query_log_enabled` | yes | yes | no |
+| `query_log_channel` | no | no | no |
+| `query_log_file` | no | no | no |
+| `query_log_severity` | yes | no | no |
+| `query_log_print_category` | yes | no | no |
+| `query_log_print_severity` | yes | no | no |
+| `query_log_print_time` | no | no | no |
+| `response_log_enabled` | yes | no | no |
+| `rrl_enabled` | yes | no | yes |
+| `rrl_responses_per_second` | yes | no | yes |
+| `rrl_window` | yes | no | yes |
+| `rrl_slip` | yes | no | yes |
+| `rrl_qps_scale` | yes | no | no |
+| `rrl_exempt_clients` | yes | no | yes |
+| `rrl_log_only` | yes | no | no |
+| `minimal_responses` | yes | no | no |
+| `tcp_clients` | yes | no | no |
+| `clients_per_query` | yes | no | no |
+| `max_clients_per_query` | yes | no | no |
+| `dnsdist_enabled` | no | yes | no |
+| `dnsdist_max_qps_per_client` | no | yes | no |
+| `dnsdist_action` | no | yes | no |
+| `dnsdist_dynblock_qps` | no | yes | no |
+| `dnsdist_dynblock_seconds` | no | yes | no |
+| `dot_enabled` | yes | yes | yes |
+| `dot_port` | yes | yes | yes |
+| `doh_enabled` | yes | yes | yes |
+| `doh_port` | yes | yes | yes |
+| `doh_path` | yes | yes | yes |
+| `doq_enabled` | no | no | yes |
+| `doq_port` | no | no | yes |
+| `tls_certificate_id` | yes | yes | yes |
+| `forward_transport` | partial: BIND9 forwards over do53 or tls only (no https or quic) | partial: only plain-DNS (do53) forwarders feed PowerDNS ALIAS expansion | partial: an encrypted transport needs forward_tls_hostname on Technitium |
+| `forward_tls_hostname` | yes | no | yes |
+| `forward_tls_verify` | yes | no | no |
+| `is_recursive` (group field) | yes | no | yes |
+
+`query_log_channel`, `query_log_file` and `query_log_print_time` are fixed on every driver (#2265). Trust anchors are BIND9 only and have their own endpoints and refusal.
+
+**Windows DNS, the hosted providers (Cloudflare, Route 53, Azure DNS, Google Cloud DNS, DigitalOcean, Hetzner, Linode, Vultr) and the agentless `technitium_api` driver apply no group option**: SpatiumDDI writes zones and records to them, not server settings. The Options tab shows one line saying so in place of the form.
+
+What the table drives:
+
+- **The API refuses a change** to an option a driver in the group does not apply, with a 422 naming the option and the driver. This covers the options PUT and the group's `is_recursive` (which folds into `recursion_enabled`).
+- **Transition-only.** Re-saving the stored value passes, because the form posts every field on every save, and so does putting an option back to its default. A value stored before the gate therefore never blocks an unrelated save, and can always be cleared.
+- **`recursion_enabled` and `is_recursive` default to on.** On PowerDNS and the hosted providers, which never recurse, "off" is the value a change may set: a fresh group re-saves untouched, turning recursion off is accepted, turning it back on is refused. On Windows DNS and agentless Technitium the server keeps whatever recursion it is configured with, so neither value is true and any real change is refused.
+- **A mixed-driver group gets what every driver applies.** An empty group has no driver, so nothing is refused.
+- **A server joining a group that already stores a value** does not pass through the PUT. The options response lists such values in `unapplied_warnings` (`technitium_warnings` for Technitium).
+- **The Options tab reads the table from the options response** (`option_support`: per option the `state`, the `drivers`, a `note` and `locked`) and disables a locked control with the note. The group response carries the same shape for `is_recursive` in `unapplied_fields`. There is no copy of the table in the frontend.
+- **`backend/tests/test_dns_option_support_4562.py` fails** when an options column or a registered driver has no decision, so a new option or driver has to pick one.
+
+---
+
 ## 2. BIND9 Driver
 
 ### Update Strategy: RFC 2136 + rndc (never named restart)
@@ -914,6 +985,8 @@ The Options tab and `PUT /dns/groups/{id}/options` are driver-agnostic and the b
 | `forward_tls_verify` | **not supported** (#1764): Technitium always validates an encrypted upstream's certificate. The API refuses a change to `false` on a Technitium group; the default `true`, and a stored `false`, stay allowed. |
 
 A value stored before the gate, or before a Technitium server joined the group (agent registration, a server move, a Fleet role assignment), never passes through the PUT gate. `GET`/`PUT /dns/groups/{id}/options` return it in `technitium_warnings`, and the Options tab shows it as a banner.
+
+Not applied either, and refused the same way (#4562): `query_log_enabled`, `response_log_enabled` and the query-log channel settings (query logging is not collected from Technitium servers yet, #742), `rrl_log_only` and `rrl_qps_scale` (the rate limit has neither), and the `dnsdist_*` options (the dnsdist front is PowerDNS only). This section is the Technitium column of the table in §1A.
 
 The gate covers the agent-managed `technitium` driver; the agentless `technitium_api` driver applies no group option.
 
