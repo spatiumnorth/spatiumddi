@@ -66,6 +66,7 @@ from app.services.dns.record_ops import (
     count_queued_zone_ops,
     sweep_zone_ops,
 )
+from app.services.dns.server_move import classless_zone_refusal
 from app.services.dns.technitium_options import allow_query_problem, allow_transfer_problem
 from app.services.dns.tsig import ensure_group_tsig_key, group_key_names
 from app.services.dns.tsig_algorithms import key_refusal
@@ -227,6 +228,9 @@ class ZoneMovePlan:
     #: "left as the daemon has it" means open to every client. Refused,
     #: never waived.
     technitium_acl_refusal: str | None = None
+    #: #4435 — an RFC 2317 classless zone name (``64/26.…``) landing in a group
+    #: whose driver cannot serve one. Refused, never waived.
+    classless_refusal: str | None = None
 
     warnings: list[str] = field(default_factory=list)
     #: Acknowledgement keys the commit will demand.
@@ -823,6 +827,11 @@ async def assemble_move_plan(
         if msg:
             plan.forward_transport_refusal = f"Group {target_group.name!r}: {msg}"
 
+    # ── A classless name the target's driver cannot serve (#4435, a refusal) ──
+    plan.classless_refusal = classless_zone_refusal(plan.target_drivers, zone.name)
+    if plan.classless_refusal:
+        plan.classless_refusal = f"Group {target_group.name!r}: {plan.classless_refusal}"
+
     _fill_warnings(plan)
     shared = await shared_provider_sources(db, zone.group_id, target_group.id)
     # The commit also keeps the source copy for a third group's (or a sibling
@@ -1113,6 +1122,8 @@ async def commit_move(
         raise ZoneMoveError(plan.tsig_algorithm_refusal, status_code=422)
     if plan.forward_transport_refusal:
         raise ZoneMoveError(plan.forward_transport_refusal, status_code=422)
+    if plan.classless_refusal:
+        raise ZoneMoveError(plan.classless_refusal, status_code=422)
     if plan.technitium_acl_refusal:
         raise ZoneMoveError(plan.technitium_acl_refusal, status_code=422)
     if plan.technitium_api_refusal:

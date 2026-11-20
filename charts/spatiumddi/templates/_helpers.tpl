@@ -69,7 +69,9 @@ Control-plane image — pass `imageName` (e.g. "spatiumddi-api") via merge:
 */}}
 {{- define "spatiumddi.image" -}}
 {{- $tag := .Values.image.tag | default .Chart.AppVersion -}}
-{{- printf "%s/%s/%s:%s" .Values.image.registry .Values.image.repository .imageName $tag -}}
+{{- /* #3913 — ``image.tagSuffix`` ("-ubi") selects the Red Hat UBI variant of
+       the same version; empty (the default) leaves every tag as it was. */ -}}
+{{- printf "%s/%s/%s:%s%s" .Values.image.registry .Values.image.repository .imageName $tag (.Values.image.tagSuffix | default "") -}}
 {{- end -}}
 
 {{/*

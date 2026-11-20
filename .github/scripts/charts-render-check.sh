@@ -305,6 +305,25 @@ lint "$UMBRELLA"
 lint "$UMBRELLA" "${UMBRELLA_ALL_ON[@]}"
 lint "$UMBRELLA" "${UMBRELLA_HA[@]}"
 lint "$UMBRELLA" "${UMBRELLA_HA_AUTH[@]}"
+# #4278 — ``helm lint`` parses each template's raw output as ONE YAML stream,
+# which ``helm template`` / ``helm install`` do not: a ``---`` glued to the next
+# object's ``apiVersion`` by ``{{-`` trimming installs fine and fails lint. It
+# only shows with a server listed (a loop body) and a generated agent-key Secret
+# (the first ``---``), which none of the lints above set, and Red Hat's
+# chart-verifier lints with whatever values it is given. So lint with DNS +
+# DHCP servers and both keys, plainly and with the OpenShift set.
+UMBRELLA_LINT_SERVERS=(
+    --set dnsAgents.enabled=true
+    --set dnsAgents.agentKey.value=lint-key
+    --set dnsAgents.servers[0].name=ns1
+    --set dnsAgents.servers[1].name=ns2
+    --set dhcpAgents.enabled=true
+    --set dhcpAgents.agentKey.value=lint-key
+    --set dhcpAgents.servers[0].name=dhcp1
+    --set dhcpAgents.servers[1].name=dhcp2
+)
+lint "$UMBRELLA" "${UMBRELLA_LINT_SERVERS[@]}"
+lint "$UMBRELLA" "${UMBRELLA_LINT_SERVERS[@]}" --set global.platform=openshift
 render umbrella-defaults "$UMBRELLA"
 render umbrella-all-on "$UMBRELLA" "${UMBRELLA_ALL_ON[@]}"
 render umbrella-ha "$UMBRELLA" "${UMBRELLA_HA[@]}"
@@ -354,11 +373,87 @@ render umbrella-openshift-no-scc "$UMBRELLA" "${UMBRELLA_OPENSHIFT_API[@]}" \
     --set openshift.scc.create=false \
     --set dnsAgents.enabled=true --set dnsAgents.servers[0].name=ns1 \
     --set dhcpAgents.enabled=true --set dhcpAgents.servers[0].name=dhcp1
+# #3913 — a render with DHCP off hostNetwork, to compare the shipped static SCC
+# manifests (the option for clusters whose admins manage SCCs) with.
+render umbrella-openshift-scc-plain "$UMBRELLA" "${UMBRELLA_OPENSHIFT_API[@]}" \
+    --set dnsAgents.enabled=true --set dnsAgents.servers[0].name=ns1 \
+    --set dhcpAgents.enabled=true --set dhcpAgents.servers[0].name=dhcp1
 # #3907 — the pre-upgrade hook Job is only rendered with --is-upgrade; check it
 # here too (no pinned uid, its ServiceAccount exists).
 render umbrella-openshift-upgrade "$UMBRELLA" --is-upgrade "${UMBRELLA_OPENSHIFT[@]}"
+# #3913 — the certified profile: the -ubi image variants and Red Hat's own
+# PostgreSQL / Redis from registry.redhat.io. Rendered with the agents on (they
+# carry the other two -ubi tags) and Redis auth on (the rhel flavor passes the
+# password through REDIS_PASSWORD, not a command line).
+render umbrella-openshift-certified "$UMBRELLA" "${UMBRELLA_OPENSHIFT_API[@]}" \
+    --set dnsAgents.enabled=true --set dnsAgents.servers[0].name=ns1 \
+    --set dhcpAgents.enabled=true --set dhcpAgents.servers[0].name=dhcp1 \
+    --set dhcpAgents.servers[0].hostNetwork=true \
+    --set ingress.enabled=true \
+    -f "$UMBRELLA/values-openshift-certified.yaml" \
+    --set redis.auth.enabled=true
+echo "── OpenShift: static SCC manifests equal the chart's rendered SCCs (#3913)"
+python3 "$ROOT/.github/scripts/chart-openshift-scc-files.py" \
+    "$ROOT/charts/spatiumddi/files/openshift" \
+    "$OUT/umbrella-openshift-scc-plain.yaml" "$OUT/umbrella-openshift.yaml" \
+    || failures=$((failures + 1))
+# The certified profile lets the chart create the agents' SCCs (Red Hat accepts
+# SCCs in a certified chart): both agent kinds' SCCs must be in its render.
+for kind in dns-agent dhcp-agent; do
+    if ! grep -qE "^  name: [a-z0-9-]+-$kind$" "$OUT/umbrella-openshift-certified.yaml" \
+            || ! grep -qE '^kind: SecurityContextConstraints$' "$OUT/umbrella-openshift-certified.yaml"; then
+        echo "   FAIL #3913: the certified profile renders no $kind SCC" >&2
+        failures=$((failures + 1))
+    fi
+done
+echo "── OpenShift certified profile: -ubi tags, Red Hat PostgreSQL / Redis (#3913)"
+CERT="$OUT/umbrella-openshift-certified.yaml"
+for img in spatiumddi-api spatiumddi-frontend dns-bind9 dhcp-kea; do
+    if ! grep -qE "image: \"?ghcr\.io/[a-z]+/$img:[^\" ]+-ubi\"?$" "$CERT"; then
+        echo "   FAIL #3913: the certified profile renders no $img:<version>-ubi image" >&2
+        failures=$((failures + 1))
+    fi
+done
+if grep -E "image: \"?ghcr\.io/[a-z]+/(spatiumddi-api|spatiumddi-frontend|dns-bind9|dhcp-kea):" "$CERT" \
+        | grep -qv -- '-ubi'; then
+    echo "   FAIL #3913: the certified profile renders a non-UBI image of the four" >&2
+    failures=$((failures + 1))
+fi
+for ref in registry.redhat.io/rhel9/postgresql-16 registry.redhat.io/rhel9/redis-7; do
+    if ! grep -q "image: \"$ref:" "$CERT"; then
+        echo "   FAIL #3913: the certified profile does not run $ref" >&2
+        failures=$((failures + 1))
+    fi
+done
+if ! grep -q 'name: POSTGRESQL_PASSWORD' "$CERT" || grep -q 'name: PGDATA$' "$CERT"; then
+    echo "   FAIL #3913: the rhel PostgreSQL flavor must set POSTGRESQL_* and not the official image's PGDATA" >&2
+    failures=$((failures + 1))
+fi
+if grep -Eq '^ +- .*aof-load-corrupt-tail-max-size' "$CERT"; then
+    echo "   FAIL #3913: Redis 7 (rhel flavor) does not know aof-load-corrupt-tail-max-size" >&2
+    failures=$((failures + 1))
+fi
+# The rhel images start through their own command (run-postgresql / run-redis);
+# args replace it, so it must come first or the entrypoint execs the first
+# argument and the pod crash-loops (found on OpenShift Local, 15 Nov 2026).
+for cmd in run-postgresql run-redis; do
+    if ! grep -Eq "^ +- $cmd\$" "$CERT"; then
+        echo "   FAIL #3913: the rhel flavor's args do not start with $cmd" >&2
+        failures=$((failures + 1))
+    fi
+done
 echo "── OpenShift: no pinned uid / fsGroup, Route + SCCs present (#3852)"
 python3 "$ROOT/.github/scripts/chart-openshift.py" --require-scc "$OUT/umbrella-openshift.yaml" \
+    || failures=$((failures + 1))
+# The certified render creates the agents' SCCs through the chart.
+python3 "$ROOT/.github/scripts/chart-openshift.py" --require-scc \
+    "$OUT/umbrella-openshift-certified.yaml" \
+    || failures=$((failures + 1))
+# scc.create=false (admin-managed SCCs): no SCC in the render, the shipped static
+# ones stand in for them.
+python3 "$ROOT/.github/scripts/chart-openshift.py" \
+    --external-sccs "$ROOT/charts/spatiumddi/files/openshift" \
+    "$OUT/umbrella-openshift-no-scc.yaml" \
     || failures=$((failures + 1))
 python3 "$ROOT/.github/scripts/chart-openshift.py" \
     "$OUT/umbrella-openshift-ha.yaml" "$OUT/umbrella-openshift-defaults.yaml" \
