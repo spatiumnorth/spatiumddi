@@ -7312,6 +7312,8 @@ async def update_zone(
                     f"holds none, so as a primary it would be served empty. {how}"
                 ),
             )
+    if changes.get("dnssec_policy_id") is not None:
+        await _refuse_policy_on_powerdns(db, group_id, zone, changes["dnssec_policy_id"])
     # DNSSEC flag flips through the generic update path (#811). Same
     # behaviour as the dedicated sign/unsign endpoints — before this,
     # PATCHing dnssec_enabled set the flag and nothing ever signed (or
@@ -8343,7 +8345,8 @@ async def get_zone_dnssec_info(
 
 class DNSSECSignRequest(BaseModel):
     # Optional signing policy. null ⇒ BIND9 built-in "default". Ignored by
-    # the PowerDNS path (online signing uses its own defaults).
+    # the PowerDNS path (online signing uses its own defaults), so a custom
+    # policy on a PowerDNS group is refused with a 422 (#4567).
     policy_id: uuid.UUID | None = None
 
 
@@ -8409,6 +8412,7 @@ async def sign_zone_dnssec(
             pol = await db.get(DNSSECPolicy, body.policy_id)
             if pol is None:
                 raise HTTPException(status_code=404, detail="DNSSEC policy not found")
+            await _refuse_policy_on_powerdns(db, group_id, zone, body.policy_id)
             zone.dnssec_policy_id = body.policy_id
     await enqueue_dnssec_op(db, zone, "dnssec_sign")
     db.add(
@@ -12640,6 +12644,40 @@ async def _require_zone(
     if user is not None:
         _enforce_zone_token_scope(user, zone_id)
     return zone
+
+
+async def _refuse_policy_on_powerdns(
+    db: DB, group_id: uuid.UUID, zone: DNSZone, policy_id: uuid.UUID | None
+) -> None:
+    """422 a custom DNSSEC policy on a group that has a PowerDNS server (#4567).
+
+    The PowerDNS agent signs every zone with its own fixed settings (ECDSA
+    P-256, plain NSEC, no scheduled rollover) and never reads the policy, so a
+    stored custom policy would claim an algorithm / NSEC3 / lifetimes the zone
+    is not signed with. Only a *change* to a custom policy is refused: an
+    untouched save of a value already stored passes, and the built-in default
+    (which matches what PowerDNS does) is always accepted.
+    """
+    if policy_id is None or policy_id == zone.dnssec_policy_id:
+        return
+    pol = await db.get(DNSSECPolicy, policy_id)
+    if pol is None or pol.is_builtin:
+        return
+    res = await db.execute(
+        select(func.count())
+        .select_from(DNSServer)
+        .where(DNSServer.group_id == group_id, DNSServer.driver == "powerdns")
+    )
+    if res.scalar_one():
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "PowerDNS does not apply a custom DNSSEC policy: it signs zones with ECDSA "
+                "P-256 and plain NSEC and does no scheduled key rollover, so the policy "
+                f"{pol.name!r} would be stored but not honoured. Use the built-in default "
+                "policy, or put the zone in a BIND9 group."
+            ),
+        )
 
 
 async def _check_driver_gated_operation(op: str, group_id: uuid.UUID, db: DB) -> None:
