@@ -22,10 +22,21 @@ REFUSAL = (
 )
 
 
-def _run(tmp_path: Path, found: str | None, *, join: bool = False, config: bool = True):
+def _run(
+    tmp_path: Path,
+    found: str | None,
+    *,
+    join: bool = False,
+    config: bool = True,
+    record: str | None = None,
+    node_ip: str = "10.0.0.9",
+    quote: bool = False,
+):
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
-    (tmp_path / "journal").write_text(REFUSAL.format(found=found) + "\n" if found else "")
+    (tmp_path / "journal").write_text(
+        REFUSAL.format(found=found) + ('"' if quote else "") + "\n" if found else ""
+    )
     jc = bindir / "journalctl"
     jc.write_text(f'#!/bin/sh\necho "$@" >"{tmp_path}/jc.args"\ncat "{tmp_path}/journal"\n')
     k3s = bindir / "k3s"
@@ -47,7 +58,12 @@ def _run(tmp_path: Path, found: str | None, *, join: bool = False, config: bool 
         "SPATIUM_ETCD_PEER_RESET_STAMP": str(tmp_path / "stamp"),
         "SPATIUM_ETCD_PEER_RESET_LOG": str(tmp_path / "log"),
         "SPATIUM_CONSOLE": str(tmp_path / "console"),
+        "SPATIUM_NODE_IP": node_ip,
+        "SPATIUM_ETCD_PEER_ADDR_RECORD": str(tmp_path / "addr-record"),
+        "SPATIUM_ETCD_PEER_MISMATCH": str(tmp_path / "mismatch"),
     }
+    if record is not None:
+        (tmp_path / "addr-record").write_text(record + "\n")
     proc = subprocess.run(["sh", str(SCRIPT)], env=env, capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
     calls = tmp_path / "k3s.calls"
@@ -112,3 +128,74 @@ def test_no_kept_datastore_does_nothing(tmp_path: Path) -> None:
 def test_unit_runs_it_before_k3s() -> None:
     unit = (EXTRA / "etc" / "systemd" / "system" / "k3s.service").read_text()
     assert "ExecStartPre=-/usr/local/bin/spatium-etcd-peer-reset" in unit
+
+
+def test_reason_line_has_no_stray_quote(tmp_path: Path) -> None:
+    # k3s's journal line ends the expect: value with a double quote.
+    _run(tmp_path, 'n1-abc=https://10.0.0.5:2380', quote=True)
+    text = (tmp_path / "log").read_text()
+    assert "now https://10.0.0.9:2380 (kept" in text
+    assert '"' not in text
+
+
+def test_multi_member_names_the_reason_for_the_console(tmp_path: Path) -> None:
+    _run(tmp_path, "n1-abc=https://10.0.0.5:2380 n2-def=https://10.0.0.6:2380")
+    reason = (tmp_path / "mismatch").read_text()
+    assert "cannot rejoin under a new address" in reason
+    assert "remove the member" in reason
+
+
+def test_recorded_address_change_in_ha_is_named_without_a_refusal(tmp_path: Path) -> None:
+    # An HA member never logs k3s's refusal: the recorded address is the signal.
+    proc, calls = _run(tmp_path, None, record="10.0.0.5 3", node_ip="10.0.0.9")
+    assert calls == []
+    reason = (tmp_path / "mismatch").read_text()
+    assert "10.0.0.5 -> 10.0.0.9" in reason
+    assert "3-member" in reason
+    assert "cannot rejoin" in (tmp_path / "console").read_text()
+
+
+def test_recorded_single_node_or_same_address_is_silent_and_clears_the_flag(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "mismatch").write_text("stale\n")
+    _run(tmp_path, None, record="10.0.0.5 1", node_ip="10.0.0.9")
+    assert not (tmp_path / "mismatch").exists()
+    _run(tmp_path, None, record="10.0.0.9 3", node_ip="10.0.0.9")
+    assert not (tmp_path / "mismatch").exists()
+
+
+def test_firstboot_waits_for_a_pending_peer_reset() -> None:
+    text = (EXTRA / "usr" / "local" / "bin" / "spatiumddi-firstboot").read_text()
+    assert "etcd_peer_reset_pending()" in text
+    assert text.index('if [ "$ready" != 1 ] && etcd_peer_reset_pending') < text.index(
+        'echo "WARN: k3s /readyz did not respond within 5 minutes."'
+    )
+    assert "record_etcd_peer_addr" in text
+
+
+def test_console_verdict_names_the_mismatch(tmp_path: Path) -> None:
+    import ast
+
+    console = EXTRA / "usr" / "local" / "bin" / "spatium-console"
+    src = console.read_text()
+    assert "etcd_peer_mismatch_reason()" in src.split("def overall_verdict", 1)[1].split(
+        "def render_header", 1
+    )[0]
+    tree = ast.parse(src)
+    body = [
+        n
+        for n in tree.body
+        if (isinstance(n, ast.FunctionDef) and n.name == "etcd_peer_mismatch_reason")
+        or (
+            isinstance(n, ast.Assign)
+            and any(getattr(t, "id", "") == "_ETCD_PEER_MISMATCH" for t in n.targets)
+        )
+    ]
+    ns: dict = {"Path": Path}
+    exec(compile(ast.Module(body=body, type_ignores=[]), "c", "exec"), ns)  # noqa: S102
+    flag = tmp_path / "flag"
+    ns["_ETCD_PEER_MISMATCH"] = flag
+    assert ns["etcd_peer_mismatch_reason"]() == ""
+    flag.write_text("address changed\n")
+    assert ns["etcd_peer_mismatch_reason"]() == "address changed"

@@ -2910,6 +2910,18 @@ place_deferred_control_manifest() {
 # Up to 5 min — first boot has to pull no images (everything's in
 # containerd via the airgap-import path) but k3s itself + helm-
 # controller + the supervisor pod still need to settle.
+# #4591 — remember this node's address and the etcd member count, so a later
+# start on another address is recognised without k3s's refusal (spatium-etcd-
+# peer-reset). Skipped when the count cannot be read.
+record_etcd_peer_addr() {
+    _ip=$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -n 1)
+    _n=$(/usr/local/bin/k3s kubectl get nodes -l node-role.kubernetes.io/etcd \
+        --no-headers 2>/dev/null | grep -c .)
+    if [ -n "$_ip" ] && [ "${_n:-0}" -gt 0 ]; then
+        mkdir -p /var/lib/spatiumddi 2>/dev/null
+        echo "$_ip $_n" > /var/lib/spatiumddi/etcd-peer-addr 2>/dev/null || true
+    fi
+}
 echo "Waiting for k3s /readyz …"
 export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 # #3919 — the role pods must not start on the previous release's image and be
@@ -2925,6 +2937,21 @@ for _ in $(seq 1 120); do
     fi
     sleep 1
 done
+# #4591 — a kept /var on a new address: k3s refuses its own etcd member for
+# ~15 min, and only its second start runs spatium-etcd-peer-reset. Waiting 5
+# min failed this oneshot for the whole boot, skipping everything after
+# /readyz. True while k3s's refusal names a single member and this node is not
+# a joined one, i.e. exactly when that reset is going to run.
+etcd_peer_reset_pending() {
+    [ -f /etc/rancher/k3s/config.yaml.d/spatium-cluster.yaml ] && return 1
+    _l=$(journalctl -b -u k3s -o cat --no-pager 2>/dev/null \
+        | grep 'this server is not a member of the etcd cluster' | tail -n 1)
+    [ -n "$_l" ] || return 1
+    _f=$(printf '%s\n' "$_l" | sed -n 's/.*Found \[\([^]]*\)\].*/\1/p')
+    [ -n "$_f" ] || return 1
+    case "$_f" in *' '* | *,*) return 1 ;; esac
+    return 0
+}
 ready=0
 for _ in $(seq 1 60); do
     if /usr/local/bin/k3s kubectl get --raw=/readyz 2>/dev/null | grep -q '^ok'; then
@@ -2933,9 +2960,20 @@ for _ in $(seq 1 60); do
     fi
     sleep 5
 done
+if [ "$ready" != 1 ] && etcd_peer_reset_pending; then
+    echo "k3s refuses its etcd member (kept /var, new address): waiting up to 25 more minutes for spatium-etcd-peer-reset (#4591) …"
+    for _ in $(seq 1 300); do
+        if /usr/local/bin/k3s kubectl get --raw=/readyz 2>/dev/null | grep -q '^ok'; then
+            ready=1
+            break
+        fi
+        sleep 5
+    done
+fi
 if [ "$ready" = 1 ]; then
     tighten_kubeconfig
     date -Iseconds > "$STAMP"
+    record_etcd_peer_addr
     IP=$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1)
     echo "Ready: k3s up on ${IP:-<appliance-ip>}; supervisor pod auto-deploys via $BOOTSTRAP_MANIFEST"
     # #3022 — the bootstrap chart this boot staged goes live, or stays held,

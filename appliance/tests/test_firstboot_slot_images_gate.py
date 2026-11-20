@@ -98,6 +98,7 @@ ready=1
 date() {{ echo 2026-10-06T20:00:00+00:00; }}
 ip() {{ :; }}
 tighten_kubeconfig() {{ :; }}
+record_etcd_peer_addr() {{ :; }}
 pin_control_failure_policy() {{ :; }}
 place_deferred_tls_manifest() {{ :; }}
 reassert_control_plane_class() {{ :; }}
@@ -255,6 +256,7 @@ ready=1
 date() {{ echo 2026-10-06T20:00:00+00:00; }}
 ip() {{ :; }}
 tighten_kubeconfig() {{ :; }}
+record_etcd_peer_addr() {{ :; }}
 pin_control_failure_policy() {{ :; }}
 place_deferred_tls_manifest() {{ :; }}
 reassert_control_plane_class() {{ :; }}
