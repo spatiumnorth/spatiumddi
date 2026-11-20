@@ -13168,6 +13168,11 @@ async def get_effective_fields(
             tags[k] = v
             tag_sources[k] = src
         for k, v in cmap.items():
+            # ``""`` / null is "no value of its own" (#4558): the console's
+            # spelling of a cleared field, and what the Required rule already
+            # reads as empty. It must not hide an ancestor's value.
+            if v is None or v == "":
+                continue
             custom_fields[k] = v
             custom_field_sources[k] = src
 
@@ -13233,6 +13238,11 @@ async def get_block_effective_fields(
             tags[k] = v
             tag_sources[k] = src
         for k, v in cmap.items():
+            # ``""`` / null is "no value of its own" (#4558): the console's
+            # spelling of a cleared field, and what the Required rule already
+            # reads as empty. It must not hide an ancestor's value.
+            if v is None or v == "":
+                continue
             custom_fields[k] = v
             custom_field_sources[k] = src
 

@@ -809,6 +809,16 @@ function NetworkContextCell({ entries }: { entries: NetworkContextEntry[] }) {
   );
 }
 
+// A cleared custom field is "no value of its own": send no key for it, so
+// the row inherits the parent block's value again (#4558).
+function withoutEmptyValues(
+  fields: Record<string, unknown>,
+): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(fields).filter(([, v]) => v !== "" && v != null),
+  );
+}
+
 // ─── Custom Fields Section ───────────────────────────────────────────────────
 
 function CustomFieldsSection({
@@ -8899,7 +8909,7 @@ function EditSubnetModalForm({
         vlan_ref_id: vlanRefId,
         vxlan_id: vxlanId.trim() ? Number(vxlanId.trim()) : null,
         status,
-        custom_fields: customFields,
+        custom_fields: withoutEmptyValues(customFields),
         tags: tagRowsToRecord(tagRows),
         dns_inherit_settings: dnsInherit,
         dns_group_ids: dnsInherit ? null : dnsGroupIds,
@@ -13798,7 +13808,7 @@ function EditBlockModalForm({
         // ``""`` when cleared, as for a subnet (#3370).
         name,
         description,
-        custom_fields: customFields,
+        custom_fields: withoutEmptyValues(customFields),
         tags: tagRowsToRecord(tagRows),
         dns_inherit_settings: dnsInherit,
         dns_group_ids: dnsInherit ? null : dnsGroupIds,
