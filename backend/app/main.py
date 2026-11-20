@@ -286,7 +286,8 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         "(AV-over-IP flows, BACnet/IP devices, industrial-OT devices, "
         "DICOM application entities), and "
         "the logical ownership tags (customer / site / provider) those "
-        "entities reference.",
+        "entities reference; read IP spaces, subnets and addresses, which "
+        "those registries anchor to.",
         [
             {"action": "admin", "resource_type": "manage_network_devices"},
             {"action": "admin", "resource_type": "manage_nmap_scans"},
@@ -311,6 +312,13 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "admin", "resource_type": "provider"},
             {"action": "admin", "resource_type": "tls_cert"},
             {"action": "admin", "resource_type": "dnsbl"},
+            # The IP space, subnet and address its multicast, AV range, OT and
+            # BACnet creates anchor to are chosen from the IPAM lists; without
+            # these reads every one of those dialogs offers an empty choice
+            # (#4635). Read only: no IPAM write comes with it.
+            {"action": "read", "resource_type": "ip_space"},
+            {"action": "read", "resource_type": "subnet"},
+            {"action": "read", "resource_type": "ip_address"},
             {"action": "read", "resource_type": "alert"},
         ],
     ),

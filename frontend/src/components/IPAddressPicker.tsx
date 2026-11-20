@@ -5,6 +5,7 @@ import { searchApi } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { useFieldControl } from "@/components/ui/field";
 import { closePopupOnEscape } from "@/components/ui/use-draggable-modal";
+import { ListReadError } from "@/components/ui/list-read-error";
 
 /**
  * Debounced IP address picker. Used by the multicast Memberships
@@ -71,6 +72,12 @@ export function IPAddressPicker({
   const results = (q.data?.results ?? []).filter(
     (r) => r.type === "ip_address",
   );
+  // /search answers 200 and quietly drops every type the caller may not read,
+  // so a role without read on IP addresses gets an empty list that looks like
+  // "no match" (#4635). `searched_types` names what was consulted.
+  const cannotSearchIps =
+    q.data != null &&
+    !q.data.searched_types.some((t) => t.type === "ip_address");
 
   return (
     <div
@@ -140,11 +147,25 @@ export function IPAddressPicker({
               Searching…
             </p>
           )}
-          {!q.isFetching && results.length === 0 && (
-            <p className="px-3 py-2 text-xs text-muted-foreground">
-              No IPs match &ldquo;{debouncedQuery}&rdquo;.
+          {q.isError && (
+            <p className="px-3 py-2 text-xs">
+              <ListReadError error={q.error} what="IP addresses" />
             </p>
           )}
+          {!q.isFetching && cannotSearchIps && (
+            <p className="px-3 py-2 text-xs text-muted-foreground">
+              You don&apos;t have permission to see IP addresses, so none can be
+              picked here.
+            </p>
+          )}
+          {!q.isFetching &&
+            !q.isError &&
+            !cannotSearchIps &&
+            results.length === 0 && (
+              <p className="px-3 py-2 text-xs text-muted-foreground">
+                No IPs match &ldquo;{debouncedQuery}&rdquo;.
+              </p>
+            )}
           {results.map((r) => {
             const label =
               r.subnet_network && r.space_name
