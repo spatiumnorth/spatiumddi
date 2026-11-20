@@ -235,12 +235,13 @@ async def test_an_archive_from_before_the_tables_were_partitioned_still_restores
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
             await conn.exec_driver_sql("DROP TABLE dns_rpz_hit")
+            # As the release before the partitions had it, #4173's columns included.
             await conn.exec_driver_sql(
                 "CREATE TABLE dns_rpz_hit (id bigserial PRIMARY KEY, "
-                "server_id uuid NOT NULL REFERENCES dns_server (id) ON DELETE CASCADE, "
+                "server_id uuid REFERENCES dns_server (id) ON DELETE SET NULL, "
                 "ts timestamptz NOT NULL, client_ip inet, qname varchar(512), "
                 "trigger varchar(16) NOT NULL, policy varchar(16) NOT NULL, "
-                "rpz_zone varchar(255), raw text NOT NULL DEFAULT '')"
+                "rpz_zone varchar(255), raw text NOT NULL DEFAULT '', server_name varchar(255))"
             )
             await conn.exec_driver_sql(
                 "CREATE TABLE alembic_version (version_num varchar(32) NOT NULL, "

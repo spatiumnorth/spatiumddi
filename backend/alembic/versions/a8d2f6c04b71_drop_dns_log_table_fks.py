@@ -9,8 +9,8 @@ retired partition ``ACCESS EXCLUSIVE``). Every connected agent's config long
 poll holds a read on that table in a transaction for up to 30 seconds, most of
 the time, so on a live install neither lock would be granted. Without the key,
 maintenance never touches the server tables. What it did for the application
-was a cleanup: the rows of a deleted server now stay until the retention window
-removes them, and nothing reads them by a server that is gone.
+was the ``ON DELETE SET NULL`` of #4173 (``c4e7a1d93b52``); a server delete now
+detaches its rows itself (``server_id`` NULL, ``server_name`` stamped).
 
 Dropping the key itself takes ``ACCESS EXCLUSIVE`` on ``dns_server``, once. There
 is no way round that, and a short ``lock_timeout`` would never see a gap between
@@ -27,8 +27,9 @@ depends on the key. The constraints are found in the catalog and dropped
 with plain SQL. The migration-shape linter does not see that, which is fine here:
 no column or table the previous release uses changes.
 
-Downgrade puts the keys back, after removing the rows of servers that are
-gone, which the keys would refuse.
+Downgrade puts the keys back as #4173 left them, ``ON DELETE SET NULL``. A row
+whose server is gone, which the keys would refuse, is detached rather than
+deleted, the same as a server delete does; detached rows are kept.
 
 Revision ID: a8d2f6c04b71
 Revises: d8b3f6a1c274
@@ -94,8 +95,11 @@ def upgrade() -> None:
 def downgrade() -> None:
     body = "".join(
         f"""
-      DELETE FROM {table} t WHERE NOT EXISTS (SELECT 1 FROM {_SERVER} s WHERE s.id = t.server_id);
+      UPDATE {table} t SET server_id = NULL
+        WHERE t.server_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM {_SERVER} s WHERE s.id = t.server_id);
       ALTER TABLE {table} ADD CONSTRAINT {table}_server_id_fkey
-        FOREIGN KEY (server_id) REFERENCES {_SERVER} (id) ON DELETE CASCADE;""" for table in _TABLES
+        FOREIGN KEY (server_id) REFERENCES {_SERVER} (id) ON DELETE SET NULL;"""
+        for table in _TABLES
     )
     op.execute(_retrying(body))

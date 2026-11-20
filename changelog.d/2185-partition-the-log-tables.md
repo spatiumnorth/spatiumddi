@@ -18,8 +18,9 @@
   - `server_id` on these tables is no longer a foreign key. With one,
     attaching a partition and dropping a retired one would each lock
     `dns_server` / `dhcp_server`, and every connected agent's config long
-    poll holds a read on those in a transaction for up to 30 s. A deleted
-    server's rows now stay until the retention window removes them.
+    poll holds a read on those in a transaction for up to 30 s. A server
+    delete detaches its rows itself (#4173) instead of the key's `ON DELETE
+    SET NULL`.
     Maintenance never touches the server tables; every step waits at most
     500 ms for a lock and is otherwise retried next tick.
   - Autovacuum never analyzes a partitioned table, so the task also runs
@@ -51,8 +52,8 @@
   log tables into `dns_server` and `dhcp_server`, one server table per
   revision. Each takes `ACCESS EXCLUSIVE` on that server table once and waits
   past an agent's 30 s long poll for it, so that table's readers can wait
-  that long during the upgrade. Downgrade puts the keys back, removing the
-  rows of servers that are gone.
+  that long during the upgrade. Downgrade puts the keys back as #4173 left
+  them, `ON DELETE SET NULL`, detaching the rows of servers that are gone.
 - `e5a93c1b7d24` — #2185, swaps each of the three tables for a
   partitioned one under the same name (same columns and indexes; primary
   key `(id, ts)`), creates daily partitions covering the retention window,

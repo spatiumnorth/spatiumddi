@@ -43,29 +43,35 @@ _DROP_DNS_FKS, _DROP_DHCP_FK, _SWAP = "a8d2f6c04b71", "b6e1c94f3a02", "e5a93c1b7
 #: In upgrade order.
 _REVISIONS = (_DROP_DNS_FKS, _DROP_DHCP_FK, _SWAP)
 
-#: The three tables as the previous release had them.
+#: The three tables as the previous release had them: plain, with #4173's
+#: nullable ``server_id`` under an ``ON DELETE SET NULL`` key, its ``server_name``
+#: column and ``ix_dns_rpz_hit_server_id`` (``c4e7a1d93b52``).
 LEGACY_DDL = (
     """CREATE TABLE dns_query_log_entry (
         id bigserial PRIMARY KEY,
-        server_id uuid NOT NULL REFERENCES dns_server (id) ON DELETE CASCADE,
+        server_id uuid REFERENCES dns_server (id) ON DELETE SET NULL,
         ts timestamptz NOT NULL, client_ip inet, client_port integer, qname varchar(512),
         qclass varchar(8), qtype varchar(16), flags varchar(64), view varchar(255),
-        raw text NOT NULL DEFAULT '', rcode varchar(16), answer_count integer)""",
+        raw text NOT NULL DEFAULT '', rcode varchar(16), answer_count integer,
+        server_name varchar(255))""",
     "CREATE INDEX ix_dns_query_log_server_ts ON dns_query_log_entry (server_id, ts)",
     "CREATE INDEX ix_dns_query_log_ts ON dns_query_log_entry (ts)",
     """CREATE TABLE dhcp_log_entry (
         id bigserial PRIMARY KEY,
-        server_id uuid NOT NULL REFERENCES dhcp_server (id) ON DELETE CASCADE,
+        server_id uuid REFERENCES dhcp_server (id) ON DELETE SET NULL,
         ts timestamptz NOT NULL, severity varchar(16), code varchar(64), mac_address macaddr,
-        ip_address inet, transaction_id varchar(32), raw text NOT NULL DEFAULT '')""",
+        ip_address inet, transaction_id varchar(32), raw text NOT NULL DEFAULT '',
+        server_name varchar(255))""",
     "CREATE INDEX ix_dhcp_log_server_ts ON dhcp_log_entry (server_id, ts)",
     "CREATE INDEX ix_dhcp_log_ts ON dhcp_log_entry (ts)",
     """CREATE TABLE dns_rpz_hit (
         id bigserial PRIMARY KEY,
-        server_id uuid NOT NULL REFERENCES dns_server (id) ON DELETE CASCADE,
+        server_id uuid REFERENCES dns_server (id) ON DELETE SET NULL,
         ts timestamptz NOT NULL, client_ip inet, qname varchar(512), trigger varchar(16) NOT NULL,
-        policy varchar(16) NOT NULL, rpz_zone varchar(255), raw text NOT NULL DEFAULT '')""",
+        policy varchar(16) NOT NULL, rpz_zone varchar(255), raw text NOT NULL DEFAULT '',
+        server_name varchar(255))""",
     "CREATE INDEX ix_dns_rpz_hit_client_ts ON dns_rpz_hit (client_ip, ts)",
+    "CREATE INDEX ix_dns_rpz_hit_server_id ON dns_rpz_hit (server_id)",
     "CREATE INDEX ix_dns_rpz_hit_ts ON dns_rpz_hit (ts)",
     "CREATE INDEX ix_dns_rpz_hit_zone_ts ON dns_rpz_hit (rpz_zone, ts)",
 )
@@ -244,13 +250,20 @@ async def test_downgrade_brings_back_the_old_tables_with_the_rpz_hits(
         ),
         {"s": dns},
     )
-    # A hit from a server deleted while there was no key to take it along.
+    # A hit from a server deleted while there was no key to take it along, and
+    # one a server delete detached (#4173).
     await conn.execute(
         text(
             "INSERT INTO dns_rpz_hit (server_id, ts, qname, trigger, policy) "
             "VALUES (:s, now(), 'orphan.example', 'QNAME', 'NXDOMAIN')"
         ),
         {"s": uuid.uuid4()},
+    )
+    await conn.execute(
+        text(
+            "INSERT INTO dns_rpz_hit (server_id, server_name, ts, qname, trigger, policy) "
+            "VALUES (NULL, 'gone', now(), 'detached.example', 'QNAME', 'NXDOMAIN')"
+        )
     )
 
     await conn.run_sync(run, "downgrade")
@@ -271,14 +284,22 @@ async def test_downgrade_brings_back_the_old_tables_with_the_rpz_hits(
         await _column(conn, "SELECT relname FROM pg_class WHERE relname ~ '^dns_rpz_hit_p[0-9]'")
         == []
     )
+    # The keys are back as #4173 left them, and nothing #4173 keeps is deleted:
+    # the orphan is detached as a server delete would have, the detached row stays.
     assert sorted(await _column(conn, "SELECT qname FROM dns_rpz_hit")) == [
+        "detached.example",
         "last-month.example",
+        "orphan.example",
         "recent.example",
     ]
+    assert await _column(
+        conn,
+        "SELECT qname FROM dns_rpz_hit WHERE server_id IS NULL ORDER BY qname",
+    ) == ["detached.example", "orphan.example"]
     assert await _foreign_keys(conn) == [
-        "dhcp_log_entry FOREIGN KEY (server_id) REFERENCES dhcp_server(id) ON DELETE CASCADE",
-        "dns_query_log_entry FOREIGN KEY (server_id) REFERENCES dns_server(id) ON DELETE CASCADE",
-        "dns_rpz_hit FOREIGN KEY (server_id) REFERENCES dns_server(id) ON DELETE CASCADE",
+        "dhcp_log_entry FOREIGN KEY (server_id) REFERENCES dhcp_server(id) ON DELETE SET NULL",
+        "dns_query_log_entry FOREIGN KEY (server_id) REFERENCES dns_server(id) ON DELETE SET NULL",
+        "dns_rpz_hit FOREIGN KEY (server_id) REFERENCES dns_server(id) ON DELETE SET NULL",
     ]
     assert await _scalar(conn, "SELECT count(*) FROM dns_query_log_entry") == 0
     await conn.execute(
@@ -295,7 +316,7 @@ async def test_downgrade_brings_back_the_old_tables_with_the_rpz_hits(
         await _scalar(conn, "SELECT relkind::text FROM pg_class WHERE relname = 'dns_rpz_hit'")
         == "p"
     )
-    assert await _scalar(conn, "SELECT count(*) FROM dns_rpz_hit") == 2
+    assert await _scalar(conn, "SELECT count(*) FROM dns_rpz_hit") == 4
 
 
 # ── with a second session ─────────────────────────────────────────────────
@@ -374,7 +395,7 @@ async def test_the_foreign_keys_go_behind_the_agents_long_polls(
         async with engine.connect() as conn:
             assert await _foreign_keys(conn) == [
                 "dhcp_log_entry FOREIGN KEY (server_id) "
-                "REFERENCES dhcp_server(id) ON DELETE CASCADE",
+                "REFERENCES dhcp_server(id) ON DELETE SET NULL",
             ]
     finally:
         stop.set()
