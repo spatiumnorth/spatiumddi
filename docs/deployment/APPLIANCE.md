@@ -899,7 +899,7 @@ worker, beat and the role agents.
 
 ### Guided etcd restore (Phase 9b)
 
-`/appliance → Fleet → Control plane` carries an **etcd snapshots**
+`/appliance → Cluster → etcd snapshots` carries an **etcd snapshots**
 disaster-recovery card. The seed reports its local
 `k3s etcd-snapshot list` on every heartbeat — read from the
 `ETCDSnapshotFile` CRs over the kubeapi (no host `k3s` binary needed),
@@ -1496,7 +1496,7 @@ of that floor *can* be source-scoped, but only by the separate `ssh_lockdown`
 setting ([#1009](https://github.com/spatiumnorth/spatiumddi/issues/1009)) — a
 deliberate act with its own guards, never a consequence of a firewall rule.
 
-**Fleet → Firewall tab.** A **left sub-nav** (#404 — was top sub-tabs) over
+**Appliance → Firewall tab.** A **left sub-nav** (#404 — was top sub-tabs) over
 five sections: **Policies** (fleet/role/appliance list + rule editor, with the
 **Enforcement** + **Web-UI-access** cards nested compactly at the top rather
 than as full-width bars), **Aliases** (named CIDR/port sets), **Preview
@@ -1652,7 +1652,7 @@ The fix:
   - **Frontend / core** (was `control-only`): control plane only.
   - **Application**: supervisor only; pairs against a remote control plane.
 - **Pairing codes** are kind-agnostic (no more `deployment_kind` field) with two flavours: ephemeral (single-use, short expiry) and persistent (multi-claim, optional max_claims, disable/enable, password-gated reveal).
-- **Ed25519 identity + mTLS**. The supervisor generates an Ed25519 keypair on first boot, submits the pubkey when claiming a pairing code, and gets an X.509 cert signed by the control plane's internal CA on admin approval. Cert lifetime is 90 days; the supervisor auto-renews. Every request the supervisor makes with the cert carries an Ed25519 signature over the method, the path and query string, a SHA-256 of the body, a nonce and a timestamp (±300 s), and the control plane accepts each signature once (recorded in Redis; if Redis is unreachable the check is skipped with a warning rather than stopping the fleet's heartbeats). Supervisors older than #3631 sign only the method, path and timestamp; that form is accepted while `APPLIANCE_LEGACY_SIGNATURE_ALLOWED` is true (the default) and logged per appliance as `appliance_cert_auth_legacy_signature`, so set it to `false` once those lines stop. Every heartbeat answer carries `X-Appliance-Signature-Versions: 2`; a supervisor that gets an answer without it (an older control plane, e.g. between a node's slot upgrade and the application roll) signs the older form until one carries it, and never falls back again in that process once it has. The heartbeat still accepts the session token as a fallback when the cert does not validate. Registration is signed too: the request carries the registering key's Ed25519 signature over a fresh timestamp and nonce, and re-registering an existing appliance (which returns a new session token) needs it. A supervisor that has reported it signs registrations is refused when it sends one unsigned; a supervisor from before that was added is accepted unsigned, and logged as `supervisor_register_unsigned`, while `APPLIANCE_LEGACY_SIGNATURE_ALLOWED` is true. The supervisor-to-api hop inside the cluster is TLS too (#4430, see **Node-local api traffic**): the api pod serves the web UI certificate on 8443 and the supervisor verifies it against the certificate it pins. The one remaining plain-http case is the rolling-upgrade window described there.
+- **Ed25519 identity + mTLS**. The supervisor generates an Ed25519 keypair on first boot, submits the pubkey when claiming a pairing code, and gets an X.509 cert signed by the control plane's internal CA on admin approval. Cert lifetime is 90 days; the supervisor auto-renews. Every request the supervisor makes with the cert carries an Ed25519 signature over the method, the path and query string, a SHA-256 of the body, a nonce and a timestamp (±300 s), and the control plane accepts each signature once (recorded in Redis; if Redis is unreachable the check is skipped with a warning rather than stopping the fleet's heartbeats). Supervisors older than #3631 sign only the method, path and timestamp; that form is accepted while `APPLIANCE_LEGACY_SIGNATURE_ALLOWED` is true (the default) and logged per appliance as `appliance_cert_auth_legacy_signature`, so set it to `false` once those lines stop. Every heartbeat answer carries `X-Appliance-Signature-Versions: 2`; a supervisor that gets an answer without it (an older control plane, e.g. between a node's slot upgrade and the application roll) signs the older form until one carries it, and never falls back again in that process once it has. The heartbeat still accepts the session token as a fallback when the cert does not validate. Registration is signed too: the request carries the registering key's Ed25519 signature over a fresh timestamp and nonce, and re-registering an existing appliance (which returns a new session token) needs it. A supervisor that has reported it signs registrations is refused when it sends one unsigned. `APPLIANCE_UNSIGNED_REGISTER_ALLOWED` (separate from `APPLIANCE_LEGACY_SIGNATURE_ALLOWED`, which covers heartbeats only) decides the rest: with `legacy` (the default in 1.0.1) an unsigned re-registration is accepted only for an appliance whose last reported supervisor version is older than 1.0.1 (or was never reported), is recorded in the audit log as `appliance.supervisor_register_unsigned` and counts against the registration attempt budget; with `never` it is always refused. The default becomes `never` in 1.1.0. A refused supervisor is told to upgrade, or to have its Fleet row deleted and be paired again. The supervisor-to-api hop inside the cluster is TLS too (#4430, see **Node-local api traffic**): the api pod serves the web UI certificate on 8443 and the supervisor verifies it against the certificate it pins. The one remaining plain-http case is the rolling-upgrade window described there.
 - **Per-role nftables firewall**. The supervisor renders `/etc/nftables.d/spatium-role.nft` every heartbeat with always-open management rules (tcp/22, icmp echo, loopback) + per-role service ports (udp+tcp/53 for DNS; udp/67-68, plus udp/547 for DHCPv6, for DHCP; the Kea HA listener, scoped to the other HA members, when the DHCP group is an HA pair; tcp/179 for Looking Glass) + an operator-pasted override fragment. `nft -c -f` dry-run before live-swap rejects syntax errors without putting the firewall in a half-rendered state.
 - **Baked-in container images**. Every container image needed for any install role is baked in at release time as `/var/lib/rancher/k3s/agent/images/*.tar.zst`, which k3s imports into its containerd store at start; no boot ever reaches out to ghcr.io. Air-gapped installs are first-class.
 - **A/B slot upgrades and container upgrades are one unit**. A slot upgrade is also a container upgrade — operators can't get out of sync between OS and container versions.
@@ -2923,8 +2923,12 @@ covers how to get off 2026.10.02-1 on each deployment shape (#3915).
 The normal [slot upgrade](#5b-phase-8-atomic-ab-image-upgrades-slot-upgrade)
 works: it was verified from 2026.10.02-1 to 1.0.0-rc.2 on real release
 images (#1181). It went through in under 10 minutes, with DNS down for
-about 4 minutes during the reboot. A second, shorter DNS and DHCP
-interruption of a few seconds can follow about 3 minutes after boot
+about 4 minutes during the reboot. Upgrading from a release that
+predates #3919's fix, a second, shorter DNS and DHCP interruption of a few
+seconds can follow about 3 minutes after boot; a release that carries it
+moves the role pods onto its own image during the boot, so they restart
+once, and the upgrade unpacks the new role images while the old slot is still
+running, so the first container start after the reboot is not slowed by it
 (#3919).
 
 ### Multi-node cluster, from 2026.10.02-1
@@ -3985,7 +3989,7 @@ from a snapshot taken before the upgrade** — and the order and the
 vantage both matter.
 
 **The Fleet UI path only works while the control plane still serves.**
-Fleet → Control plane → etcd snapshots drives the restore through the
+Appliance → Cluster → etcd snapshots drives the restore through the
 api pod → the seed's heartbeat → a host trigger file, so every hop
 needs the very cluster you are recovering to be up. Use it while things
 still work: on a partial rollout, or when you have decided to abandon
@@ -4226,7 +4230,15 @@ the operator installing a CA anywhere:
    control plane serves signed by the appliance CA (whose certificate the
    supervisor received on approval), and re-pins only if the new certificate
    is on it. Otherwise it keeps the old pin and logs
-   `supervisor.tls.certificate_not_vouched`.
+   `supervisor.tls.certificate_not_vouched`. A member on the node-local http
+   path does not wait for that failure: every ~5 minutes it reads the same
+   list over the in-cluster path (trust is the CA signature, not the
+   transport), which also carries the vouched certificates' PEM, and replaces
+   its pin when the list names a certificate it does not hold
+   (`supervisor.tls.pin_refreshed`). A read that fails (its own api is
+   down) stays pending: it is retried with backoff and as soon as the
+   node-local path returns, and is dropped with
+   `supervisor.tls.pin_refresh_satisfied_by_repin` if a repin got there first.
 3. **Once approved, the first-contact pin is checked.** When the CA arrives,
    the supervisor checks that the certificate it pinned at first contact is on
    the CA's list, and logs `supervisor.tls.pin_not_vouched` if not.

@@ -1,0 +1,3 @@
+### Fixed
+
+- A DNS pool's record name is now held to the rules the record API applies to an A / AAAA owner: a name with an underscore label is refused with a 422, and a name that holds a CNAME with a 409, instead of the pool writing a row that makes BIND refuse the zone and hold it on its last good copy. A pool whose name later turns bad (a CNAME added at it) renders nothing, withdraws its rows, and logs a warning plus a `dns.pool.render_skipped` audit row; the record API refuses a CNAME at a name a pool owns. An existing pool already at such a name shows up as a held zone ("named-checkzone refused a zone file", Drift "Behind") until its next health check, which now withdraws its rows.
