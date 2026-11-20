@@ -153,7 +153,12 @@ from app.services.appliance.group_names import (
 )
 from app.services.appliance.tls import certificate_store_location
 from app.services.approvals.gate import gate_or_execute
-from app.services.dns import dnssec_signers, option_support, technitium_api_scope
+from app.services.dns import (
+    dnssec_policy_support,
+    dnssec_signers,
+    option_support,
+    technitium_api_scope,
+)
 from app.services.dns.agent_instance import duplicate_active as duplicate_agent_active
 from app.services.dns.bundle_dirty import mark_bundles_dirty
 from app.services.dns.cname_conflict import (
@@ -239,6 +244,7 @@ from app.services.dns.server_move import (
     elect_primary,
     ensure_group_catalog_compatible,
     ensure_group_classless_compatible,
+    ensure_group_dnssec_policy_compatible,
     ensure_group_single_driver,
     lock_server_row,
     move_server_to_group,
@@ -2815,6 +2821,7 @@ async def create_server(
         )
         await ensure_group_catalog_compatible(db, group, body.driver)
         await ensure_group_classless_compatible(db, group, body.driver)
+        await ensure_group_dnssec_policy_compatible(db, group, body.driver)
     except ServerMoveError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     await _refuse_second_signer(db, group, driver=body.driver)
@@ -2964,6 +2971,7 @@ async def update_server(
             )
             await ensure_group_catalog_compatible(db, group, body.driver)
             await ensure_group_classless_compatible(db, group, body.driver)
+            await ensure_group_dnssec_policy_compatible(db, group, body.driver)
         except ServerMoveError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     # #1563 — explicit null clears api_port; null for a NOT NULL column
@@ -8285,6 +8293,8 @@ class ZoneDNSSECInfo(BaseModel):
     # ``dnssec_enabled`` this is a zone signed before the refusal.
     signing_unmanaged: bool = False
     dnssec_unmanaged_warning: bool = False
+    # #4623 — the zone holds a custom policy its PowerDNS group ignores.
+    unapplied_warning: str | None = None
 
 
 class ZoneTemplateParameter(BaseModel):
@@ -8386,6 +8396,7 @@ async def get_zone_dnssec_info(
             "signing_servers": signers,
             "signing_unmanaged": unmanaged,
             "dnssec_unmanaged_warning": bool(zone.dnssec_enabled) and unmanaged,
+            "unapplied_warning": await dnssec_policy_support.stored_policy_warning(db, zone),
             "zone_id": str(zone.id),
             "zone_name": zone.name,
             "dnssec_enabled": zone.dnssec_enabled,
@@ -8655,6 +8666,8 @@ class ZoneMovePreviewResponse(BaseModel):
     #: refuses, not waivable by acknowledgement.
     technitium_acl_refusal: str | None = None
     classless_refusal: str | None = None
+    #: #4623 — a custom DNSSEC policy the PowerDNS target would ignore.
+    dnssec_policy_refusal: str | None = None
     warnings: list[str]
     required_acknowledgements: list[str]
 
@@ -8698,6 +8711,7 @@ class ZoneMovePreviewResponse(BaseModel):
             forward_transport_refusal=plan.forward_transport_refusal,
             technitium_acl_refusal=plan.technitium_acl_refusal,
             classless_refusal=plan.classless_refusal,
+            dnssec_policy_refusal=plan.dnssec_policy_refusal,
             warnings=plan.warnings,
             required_acknowledgements=plan.required_acknowledgements,
         )
@@ -12724,33 +12738,12 @@ async def _refuse_policy_on_powerdns(
 ) -> None:
     """422 a custom DNSSEC policy on a group that has a PowerDNS server (#4567).
 
-    The PowerDNS agent signs every zone with its own fixed settings (ECDSA
-    P-256, plain NSEC, no scheduled rollover) and never reads the policy, so a
-    stored custom policy would claim an algorithm / NSEC3 / lifetimes the zone
-    is not signed with. Only a *change* to a custom policy is refused: an
-    untouched save of a value already stored passes, and the built-in default
-    (which matches what PowerDNS does) is always accepted.
+    The rule lives in :mod:`app.services.dns.dnssec_policy_support`, shared
+    with the Copilot apply, the zone move and the server move (#4623).
     """
-    if policy_id is None or policy_id == zone.dnssec_policy_id:
-        return
-    pol = await db.get(DNSSECPolicy, policy_id)
-    if pol is None or pol.is_builtin:
-        return
-    res = await db.execute(
-        select(func.count())
-        .select_from(DNSServer)
-        .where(DNSServer.group_id == group_id, DNSServer.driver == "powerdns")
-    )
-    if res.scalar_one():
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "PowerDNS does not apply a custom DNSSEC policy: it signs zones with ECDSA "
-                "P-256 and plain NSEC and does no scheduled key rollover, so the policy "
-                f"{pol.name!r} would be stored but not honoured. Use the built-in default "
-                "policy, or put the zone in a BIND9 group."
-            ),
-        )
+    msg = await dnssec_policy_support.set_policy_refusal(db, group_id, zone, policy_id)
+    if msg:
+        raise HTTPException(status_code=422, detail=msg)
 
 
 async def _check_driver_gated_operation(op: str, group_id: uuid.UUID, db: DB) -> None:
