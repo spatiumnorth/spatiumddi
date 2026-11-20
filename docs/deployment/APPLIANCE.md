@@ -3758,7 +3758,12 @@ so a first-time operator never gets stuck looking for the upload.
 3. Picks source (Uploaded or URL — see above).
 4. Clicks **Run preflight**. Verdict surfaces inline as a checklist:
    `inflight_conflict` (or `kubeapi_unreachable` when the API did not answer the
-   lease read, #2779), `replication_lag`, `disk_headroom` (each
+   lease read, #2779), `replication_lag` (a replica visibly not
+   streaming fails; if the app's database role cannot see the replicas'
+   state it warns "could not verify" and the run may proceed. The chart
+   makes the role a member of `pg_monitor` through CNPG's
+   `managed.roles` so the check can measure lag; CNPG reverts a GRANT
+   made by hand, #1445, #4610), `disk_headroom` (each
    node's reported `/var`; a missing or stale report warns; a node
    already on the target stages nothing and is named instead of
    judged), `mirror_disk_headroom` (mirror PVC; skipped if not
