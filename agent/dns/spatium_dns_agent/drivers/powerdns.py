@@ -389,7 +389,7 @@ def _render_catalog_zone_payload(catalog: dict[str, Any]) -> dict[str, Any]:
 # dnsdist-side paths, not agent-side ones: the agent writes
 # ``<state_dir>/tls/listener.crt``, dnsdist reads
 # ``/agent-state/tls/listener.crt``. Both images create ``spatium`` as
-# uid 101, so the 0600 key the agent writes is readable by dnsdist.
+# uid 10002, so the 0600 key the agent writes is readable by dnsdist.
 DNSDIST_STATE_MOUNT = os.environ.get("DNSDIST_STATE_MOUNT", "/agent-state")
 TLS_DIR_NAME = "tls"
 TLS_CERT_FILENAME = "listener.crt"
@@ -971,7 +971,7 @@ class PowerDNSDriver(DriverBase):
         conf_path = new_dir / "pdns.conf"
         # 0600, not write_text: this file embeds ``api-key=`` in cleartext,
         # and that key grants zone CRUD + DNSSEC over the pdns REST API
-        # (#869). ``pdns_server`` and the dnsdist front both run as uid 101,
+        # (#869). ``pdns_server`` and the dnsdist front both run as uid 10002,
         # the same owner, so the owner bit is all either of them needs —
         # what 0600 removes is group/other, i.e. any OTHER uid that can see
         # this path (a differently-run sidecar, a host bind-mount, a future
@@ -1373,7 +1373,7 @@ class PowerDNSDriver(DriverBase):
 
         Written 0600 via O_NOFOLLOW like the BIND9 driver's TSIG key: the
         private key must never exist world-readable, not even between
-        create and chmod. Both images run ``spatium`` as uid 101, so 0600
+        create and chmod. Both images run ``spatium`` as uid 10002, so 0600
         is still readable by the dnsdist process.
 
         Removing the pair when the listeners are off matters — a stale key
