@@ -147,7 +147,7 @@ from app.services.agents.memory_status import (
 from app.services.agents.spool_status import SpoolStatus
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteZoneArgs
-from app.services.api_token_scopes import read_only_post, token_outbound
+from app.services.api_token_scopes import read_only_post, token_outbound, token_write
 from app.services.appliance.group_names import (
     group_assigned_to_appliance,
     group_name_problem,
@@ -8351,6 +8351,7 @@ async def get_zone_dnssec_info(
     "/groups/{group_id}/zones/{zone_id}/dnssec/ack-ds-change",
     response_model=ZoneDNSSECInfo,
 )
+@token_write("Records the operator's DS-published acknowledgement as an audit row")
 async def acknowledge_zone_dnssec_ds_change(
     group_id: uuid.UUID,
     zone_id: uuid.UUID,
