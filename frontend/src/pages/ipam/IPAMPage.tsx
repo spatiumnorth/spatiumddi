@@ -139,6 +139,7 @@ import {
 import { CustomFieldMultiSelect } from "@/components/CustomFieldMultiSelect";
 import { GatewayHostnameNote } from "@/components/GatewayHostnameNote";
 import { cn, selectedRowClass, swatchTintCls, zebraBodyCls } from "@/lib/utils";
+import { withoutEmptyValues } from "@/lib/withoutEmptyValues";
 import { StatusTag } from "@/components/ui/status-tag";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
 import { useStickyLocation } from "@/lib/stickyLocation";
@@ -2985,18 +2986,25 @@ export function CreateSubnetModal({
     staleTime: 0,
     refetchOnMount: "always",
   });
-  // What the Custom Fields section shows, defaults included, is what the
-  // request sends (#1303).
-  const shownCustomFields = withCustomFieldDefaults(cfDefs, customFields);
   // Values the new subnet inherits from its block chain count towards a
   // Required field (#2478).
   const { data: parentFields } = useQuery({
     queryKey: ["block-effective-fields", blockId],
     queryFn: () => ipamApi.effectiveBlockFields(blockId),
     enabled: !!blockId,
-    staleTime: 30_000,
+    // Re-read on open: a save elsewhere changes inherited values (#4581).
+    staleTime: 0,
+    refetchOnMount: "always",
   });
   const cfInherited = parentFields?.custom_fields ?? {};
+  // What the Custom Fields section shows, defaults included, is what the
+  // request sends (#1303); a value the block chain gives wins over the
+  // default and is left to inherit (#4556).
+  const shownCustomFields = withCustomFieldDefaults(
+    cfDefs,
+    customFields,
+    cfInherited,
+  );
 
   // Available subnets query (only active when in size mode and block + prefix are set)
   const { data: availableNets = [], isFetching: searchingNets } = useQuery({
@@ -8841,7 +8849,9 @@ function EditSubnetModalForm({
   const { data: effectiveFields } = useQuery({
     queryKey: ["effective-fields", subnet.id],
     queryFn: () => ipamApi.effectiveFields(subnet.id),
-    staleTime: 30_000,
+    // Re-read on open: a save elsewhere changes inherited values (#4581).
+    staleTime: 0,
+    refetchOnMount: "always",
   });
   const { data: allSpaces = [] } = useQuery({
     queryKey: ["spaces"],
@@ -8899,7 +8909,7 @@ function EditSubnetModalForm({
         vlan_ref_id: vlanRefId,
         vxlan_id: vxlanId.trim() ? Number(vxlanId.trim()) : null,
         status,
-        custom_fields: customFields,
+        custom_fields: withoutEmptyValues(customFields),
         tags: tagRowsToRecord(tagRows),
         dns_inherit_settings: dnsInherit,
         dns_group_ids: dnsInherit ? null : dnsGroupIds,
@@ -13354,18 +13364,25 @@ export function CreateBlockModal({
     staleTime: 0,
     refetchOnMount: "always",
   });
-  // What the Custom Fields section shows, defaults included, is what the
-  // request sends (#1303).
-  const shownCustomFields = withCustomFieldDefaults(cfDefs, customFields);
   // Values inherited from the parent block chain count towards a Required
   // field (#2478).
   const { data: parentFields } = useQuery({
     queryKey: ["block-effective-fields", parentBlockId],
     queryFn: () => ipamApi.effectiveBlockFields(parentBlockId),
     enabled: !!parentBlockId,
-    staleTime: 30_000,
+    // Re-read on open: a save elsewhere changes inherited values (#4581).
+    staleTime: 0,
+    refetchOnMount: "always",
   });
   const cfInherited = parentFields?.custom_fields ?? {};
+  // What the Custom Fields section shows, defaults included, is what the
+  // request sends (#1303); a value the block chain gives wins over the
+  // default and is left to inherit (#4556).
+  const shownCustomFields = withCustomFieldDefaults(
+    cfDefs,
+    customFields,
+    cfInherited,
+  );
 
   // Re-read on open, and hold the picker until it answers: applying a
   // template copies its DHCP group and tags into the form, and another client
@@ -13752,7 +13769,9 @@ function EditBlockModalForm({
   const { data: effectiveFields } = useQuery({
     queryKey: ["block-effective-fields", block.id],
     queryFn: () => ipamApi.effectiveBlockFields(block.id),
-    staleTime: 30_000,
+    // Re-read on open: a save elsewhere changes inherited values (#4581).
+    staleTime: 0,
+    refetchOnMount: "always",
   });
   const { data: allSpaces = [] } = useQuery({
     queryKey: ["spaces"],
@@ -13798,7 +13817,7 @@ function EditBlockModalForm({
         // ``""`` when cleared, as for a subnet (#3370).
         name,
         description,
-        custom_fields: customFields,
+        custom_fields: withoutEmptyValues(customFields),
         tags: tagRowsToRecord(tagRows),
         dns_inherit_settings: dnsInherit,
         dns_group_ids: dnsInherit ? null : dnsGroupIds,

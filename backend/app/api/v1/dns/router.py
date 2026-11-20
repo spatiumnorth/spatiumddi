@@ -107,7 +107,6 @@ from app.drivers.dns.windows import test_winrm_credentials
 from app.models.appliance import ApplianceCertificate
 from app.models.audit import AuditLog
 from app.models.dns import (
-    DEFAULT_ALLOW_QUERY_CACHE,
     DEFAULT_ALLOW_RECURSION,
     DNS_TTL_MAX,
     DNSSEC_ALGORITHMS,
@@ -154,7 +153,7 @@ from app.services.appliance.group_names import (
 )
 from app.services.appliance.tls import certificate_store_location
 from app.services.approvals.gate import gate_or_execute
-from app.services.dns import dnssec_signers, technitium_api_scope
+from app.services.dns import dnssec_signers, option_support, technitium_api_scope
 from app.services.dns.agent_instance import duplicate_active as duplicate_agent_active
 from app.services.dns.bundle_dirty import mark_bundles_dirty
 from app.services.dns.cname_conflict import (
@@ -743,6 +742,15 @@ class DNSMemoryEstimateResponse(BaseModel):
         )
 
 
+class OptionSupportEntry(BaseModel):
+    """One row of the per-driver option table, for one group (#4562)."""
+
+    state: str
+    drivers: list[str]
+    note: str
+    locked: bool
+
+
 class ServerGroupResponse(BaseModel):
     id: uuid.UUID
     name: str
@@ -771,6 +779,10 @@ class ServerGroupResponse(BaseModel):
     # server, and says where an already-existing group falls outside the
     # supported scope (second server, pools). Empty for every other group.
     scope_warnings: list[str] = []
+    # #4562 — group fields a driver in the group does not apply
+    # (``is_recursive``), in the shape of the options response's
+    # ``option_support``. Empty when every field is applied.
+    unapplied_fields: dict[str, OptionSupportEntry] = {}
     # #3551 — the group's estimated named memory against its agents' limit.
     # Filled by ``GET /groups/{id}`` only (counting the RPZ entries each view
     # loads is too heavy for the list); null there and for non-BIND9 groups.
@@ -807,6 +819,12 @@ class ServerGroupResponse(BaseModel):
                 else None
             ),
             scope_warnings=list(warnings or []),
+            unapplied_fields={
+                field: OptionSupportEntry(**entry)
+                for field, entry in option_support.group_support(
+                    drivers or [], g, option_support.GROUP_FIELDS
+                ).items()
+            },
             created_at=g.created_at,
             modified_at=g.modified_at,
         )
@@ -1429,6 +1447,20 @@ class ServerOptionsResponse(BaseModel):
     # instead: ``yes`` with no trust anchor on a BIND9 group renders as
     # ``auto`` (#3560), a static root anchor as initial-key (#3609).
     dnssec_warnings: list[str] = Field(default_factory=list)
+    # #4562: the group's slice of the per-driver table (``option_support``).
+    # One entry per option some driver in the group applies in part or not at
+    # all: ``state`` (``partial`` / ``not_applied``), the ``drivers`` it is
+    # about, a ``note`` and ``locked`` (disable the control: not applied, and
+    # the stored value already does nothing). An applied option is absent.
+    option_support: dict[str, OptionSupportEntry] = Field(default_factory=dict)
+    # Set when a driver in the group applies no option at all (Windows DNS,
+    # the hosted providers, agentless Technitium): the page shows this line in
+    # place of the form.
+    options_unmanaged_note: str | None = None
+    # Stored non-default values a driver in the group does not apply, saved
+    # before the gate or before the server joined. Technitium's are in
+    # ``technitium_warnings``.
+    unapplied_warnings: list[str] = Field(default_factory=list)
 
     model_config = {"from_attributes": True}
 
@@ -2469,6 +2501,15 @@ async def update_group(
         raise technitium_api_scope.refusal(
             "catalog zones are not written to the Technitium server."
         )
+    # #4562 — ``is_recursive`` folds into the bundle's ``recursion_enabled``,
+    # which only the BIND9 and Technitium agents apply. Same table and
+    # transition-only rule as the options PUT.
+    if "is_recursive" in changes:
+        for driver in sorted((await _drivers_by_group(db, [group.id])).get(group.id, [])):
+            if refused := option_support.refusals(
+                driver, {"is_recursive": changes["is_recursive"]}, group
+            ):
+                raise HTTPException(422, option_support.refusal_message(driver, refused))
     # #1468 — an appliance's supervisor gets this group by NAME and drops a
     # name it won't put in its role env, so don't rename an assigned group
     # into one. Only on an actual change: re-saving a legacy name is fine.
@@ -4436,6 +4477,21 @@ async def _options_response(
 ) -> ServerOptionsResponse:
     out = ServerOptionsResponse.model_validate(opts)
     out.forwarder_warnings = _stored_forwarder_warnings(opts)
+    # #4562: the real members, not ``_group_driver_names``' bind9 fallback: an
+    # empty group has no driver that would ignore an option.
+    members = (await _drivers_by_group(db, [group_id])).get(group_id, [])
+    out.option_support = {
+        field: OptionSupportEntry(**entry)
+        for field, entry in option_support.group_support(members, opts).items()
+    }
+    out.options_unmanaged_note = option_support.unmanaged_note(members)
+    if out.options_unmanaged_note is None:
+        out.unapplied_warnings = [
+            f"{option_support.label(driver)} does not apply {warning}"
+            for driver in sorted(members)
+            if driver != "technitium"
+            for warning in option_support.stored_warnings(driver, opts)
+        ]
     drivers = await _group_driver_names(db, group_id)
     if opts.dnssec_validation == "yes" and not opts.trust_anchors and "bind9" in drivers:
         out.dnssec_warnings.append(
@@ -4808,51 +4864,30 @@ async def update_options(
     if await technitium_api_scope.group_is_technitium_api(db, group_id):
         technitium_api_scope.refuse_unapplied_option_changes(changes, stored_opts)
     changes.update(await _validated_option_changes(group_id, changes, opts, db))
-    # Options the agent-managed Technitium driver cannot apply (#1763): refuse
-    # rather than store a value the daemon will silently ignore. Same subset
-    # semantics as the transport gates: any Technitium server in the group.
-    if "technitium" in await _group_driver_names(db, group_id):
-        if refused := technitium_option_refusals(
-            changes, opts, await _group_acl_definitions(db, group_id)
-        ):
-            raise HTTPException(
-                422,
-                "This group has a Technitium server, which cannot apply: "
-                + "; ".join(refused)
-                + ". Move the Technitium server to its own group, or leave these at "
-                "their defaults.",
-            )
-    # #2263: ``blackhole`` is rendered by the BIND9 agent only. pdns auth has
-    # no client ACL of any kind (the agent already says so for allow_query),
-    # so a PowerDNS server would serve the clients the operator meant to drop.
-    # Same transition-only semantics as the Technitium gate: re-saving a stored
-    # value, or clearing it, stays allowed.
-    if (
-        changes.get("blackhole")
-        and changes["blackhole"] != list(getattr(opts, "blackhole", None) or [])
-        and "powerdns" in await _group_driver_names(db, group_id)
-    ):
-        raise HTTPException(
-            422,
-            "This group has a PowerDNS server, which cannot apply: blackhole: PowerDNS "
-            "authoritative has no setting to drop queries from a client address. Move "
-            "the PowerDNS server to its own group, or leave blackhole empty.",
-        )
-    # #2264: only BIND9 renders ``allow-query-cache``. PowerDNS has no such
-    # setting either, so refuse a changed non-default value rather than store
-    # one the daemon ignores (same rule as the Technitium gate above).
-    if (
-        "allow_query_cache" in changes
-        and list(changes["allow_query_cache"] or []) != list(DEFAULT_ALLOW_QUERY_CACHE)
-        and list(changes["allow_query_cache"] or []) != list(opts.allow_query_cache or [])
-        and "powerdns" in await _group_driver_names(db, group_id)
-    ):
-        raise HTTPException(
-            422,
-            "allow_query_cache: this group has a PowerDNS server, which has no "
-            "cache-access ACL, so the value would be ignored. Move the PowerDNS "
-            "server to its own group, or leave it at its default.",
-        )
+    # #4562: an option a driver in the group does not apply is refused rather
+    # than stored and ignored. ``option_support`` is the one per-driver table;
+    # the blackhole (#2263), allow_query_cache (#2264), Technitium (#1763) and
+    # PowerDNS recursion gates are rows of it. Transition-only: re-saving a
+    # stored value, or putting an option back to a value at which it does
+    # nothing, stays allowed, so a value stored before the gate does not block
+    # an unrelated save. ``recursion_enabled`` defaults to on, so "off" is that
+    # value where the server never recurses. A mixed group gets what every
+    # driver applies. A server joining a group that already stores a value is
+    # not refused here; the options response warns instead. An empty group has
+    # no driver to contradict.
+    for driver in sorted((await _drivers_by_group(db, [group_id])).get(group_id, [])):
+        refused = option_support.refusals(driver, changes, opts)
+        if driver == "technitium":
+            # Value-specific limits of options Technitium applies in part.
+            refused += [
+                r
+                for r in technitium_option_refusals(
+                    changes, opts, await _group_acl_definitions(db, group_id)
+                )
+                if r not in refused
+            ]
+        if refused:
+            raise HTTPException(422, option_support.refusal_message(driver, refused))
     resolver_before = alias_resolver(opts.forwarders, opts.forward_transport)
     forwarders_before = list(opts.forwarders or [])
     transport_before = opts.forward_transport
@@ -10408,11 +10443,16 @@ async def update_record(
     # #1563 — explicit null clears view_id and ttl (ttl null = inherit
     # the zone TTL; exclude_none dropped both, so the clear never
     # landed); null for a NOT NULL column is a 422.
+    # #4557 — an explicit null priority/weight/port is kept too, not dropped:
+    # MX turns a null priority into the create default (10), SRV refuses it
+    # (422, via _normalize_record_struct_fields), other types hold no value.
     changes = resolve_update_changes(
         body,
-        clearable={"view_id", "ttl"},
+        clearable={"view_id", "ttl", "priority", "weight", "port"},
         non_nullable={"name", "value", "tags"},
     )
+    if record.record_type.upper() == "MX" and "priority" in changes and changes["priority"] is None:
+        changes["priority"] = 10
     # An untouched Save sends every field the dialog shows; only a field whose
     # value differs is a change (#2463). Nothing changed → nothing to bump,
     # queue or audit.
