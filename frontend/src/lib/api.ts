@@ -5347,6 +5347,9 @@ export interface DNSServerGroup {
    *  driver; says where an existing group falls outside its supported scope
    *  (second server, pools). Empty for every other group. */
   scope_warnings?: string[];
+  /** #4562 — group fields (`is_recursive`) a driver in the group does not
+   *  apply, from the same table as the options response. */
+  unapplied_fields?: Record<string, DNSOptionSupport>;
   /** #3551 — estimated named memory against the agents' limit. Filled by
    *  `getGroup` only (null on the list, and for a group with no BIND9
    *  server); `getMemoryEstimate` returns the same object. */
@@ -5947,6 +5950,22 @@ export interface DNSServerOptions {
   forwarder_warnings?: string[];
   // #2266: dnssec_validation "yes" with no trust anchor validates nothing.
   dnssec_warnings?: string[];
+  // #4562: the group's slice of the API's per-driver option table. Absent
+  // field = applied by every driver in the group.
+  option_support?: Record<string, DNSOptionSupport>;
+  // Set when a driver in the group applies no option at all.
+  options_unmanaged_note?: string | null;
+  // Stored non-default values a (non-Technitium) driver does not apply.
+  unapplied_warnings?: string[];
+}
+
+/** One row of the per-driver option table for one group (#4562). `locked`:
+ *  not applied and the stored value already does nothing, so disable it. */
+export interface DNSOptionSupport {
+  state: "partial" | "not_applied";
+  drivers: string[];
+  note: string;
+  locked: boolean;
 }
 
 /** A curated public upstream resolver (issue #877). ``tls_hostname`` is the
