@@ -2985,9 +2985,6 @@ export function CreateSubnetModal({
     staleTime: 0,
     refetchOnMount: "always",
   });
-  // What the Custom Fields section shows, defaults included, is what the
-  // request sends (#1303).
-  const shownCustomFields = withCustomFieldDefaults(cfDefs, customFields);
   // Values the new subnet inherits from its block chain count towards a
   // Required field (#2478).
   const { data: parentFields } = useQuery({
@@ -2997,6 +2994,14 @@ export function CreateSubnetModal({
     staleTime: 30_000,
   });
   const cfInherited = parentFields?.custom_fields ?? {};
+  // What the Custom Fields section shows, defaults included, is what the
+  // request sends (#1303); a value the block chain gives wins over the
+  // default and is left to inherit (#4556).
+  const shownCustomFields = withCustomFieldDefaults(
+    cfDefs,
+    customFields,
+    cfInherited,
+  );
 
   // Available subnets query (only active when in size mode and block + prefix are set)
   const { data: availableNets = [], isFetching: searchingNets } = useQuery({
@@ -13354,9 +13359,6 @@ export function CreateBlockModal({
     staleTime: 0,
     refetchOnMount: "always",
   });
-  // What the Custom Fields section shows, defaults included, is what the
-  // request sends (#1303).
-  const shownCustomFields = withCustomFieldDefaults(cfDefs, customFields);
   // Values inherited from the parent block chain count towards a Required
   // field (#2478).
   const { data: parentFields } = useQuery({
@@ -13366,6 +13368,14 @@ export function CreateBlockModal({
     staleTime: 30_000,
   });
   const cfInherited = parentFields?.custom_fields ?? {};
+  // What the Custom Fields section shows, defaults included, is what the
+  // request sends (#1303); a value the block chain gives wins over the
+  // default and is left to inherit (#4556).
+  const shownCustomFields = withCustomFieldDefaults(
+    cfDefs,
+    customFields,
+    cfInherited,
+  );
 
   // Re-read on open, and hold the picker until it answers: applying a
   // template copies its DHCP group and tags into the form, and another client
