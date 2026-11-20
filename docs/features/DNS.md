@@ -61,7 +61,7 @@ Driver-gated features are enforced server-side by the API's `_DRIVER_GATED_RECOR
 | `dnssec_unsign` | `bind9`, `powerdns`, `technitium` |
 | `dnssec_rollover` (manual key rollover) | `bind9`, `technitium` |
 
-Manual rollover is BIND9 and Technitium only: PowerDNS rolls on its own schedule. Technitium's ZSK rolls automatically (`zskRolloverDays`, from the policy's ZSK lifetime) but its KSK `rolloverDays` defaults to 0 (never), so a KSK rolls only through the manual rollover (`rolloverDnsKey`, #1767).
+Manual rollover is BIND9 and Technitium only. PowerDNS does not roll keys at all: pdns-auth has no scheduled rollover and the agent starts none, so a PowerDNS zone keeps the keys it was signed with until it is unsigned and signed again (which changes the DS the parent holds). Technitium's ZSK rolls automatically (`zskRolloverDays`, from the policy's ZSK lifetime) but its KSK `rolloverDays` defaults to 0 (never), so a KSK rolls only through the manual rollover (`rolloverDnsKey`, #1767).
 
 The Operator Copilot's `propose_create_dns_zone` tool accepts an explicit `driver_hint` argument (`bind9` / `powerdns` / `technitium` / `windows_dns`) so the LLM can route a zone to a matching group without operators having to specify the group UUID by hand. See `app.services.ai.operations.CreateDNSZoneArgs`.
 
@@ -302,7 +302,7 @@ records in its bundle.
 
 ### Catalog zones (RFC 9432) — published for external secondaries (#3764)
 
-With **Use BIND9 catalog zones** on, the group's primary (`is_primary`)
+With **Publish a catalog zone** on, the group's primary (`is_primary`)
 publishes an RFC 9432 catalog zone (default name `catalog.spatium.invalid.`)
 listing every primary zone in the group. BIND9 and PowerDNS producers render
 the same records.
@@ -620,6 +620,8 @@ and `kea-dhcp6`.
 
 Server-level options control how each DNS server (or server group) behaves globally — independent of any individual zone. These map to BIND9 `options {}` / `view {}` blocks. All settings are stored in the `DNSServerOptions` model and pushed to the server by the driver on change.
 
+**Not every driver applies every option** (#4562). BIND9 applies all of them except the PowerDNS dnsdist front and DNS-over-QUIC. PowerDNS (authoritative only) applies notify, `allow_transfer`, query logging, the dnsdist front and the DoT/DoH listeners, uses forwarders for ALIAS expansion only, and applies no recursion, validation, query ACL or RRL option. The Technitium agent applies recursion, forwarders, validation, notify, the query and transfer ACLs, RRL and the encrypted listeners, and not query logging, `blackhole`, `allow_query_cache` or the BIND tuning knobs. Windows DNS, the hosted providers and the agentless Technitium driver apply none. The full table, and the rule the API follows (a change to an option the group's driver does not apply is a 422; an untouched Save and turning an option off keep working), is in [DNS_DRIVERS.md §1A](../drivers/DNS_DRIVERS.md#1a-group-options-each-driver-applies-4562). The Options tab disables what the group's driver does not apply, with a note naming the driver.
+
 ### 3.1 Forwarders
 
 Forwarders are upstream resolvers used when the server cannot answer from its own zones.
@@ -647,6 +649,7 @@ DNSServerOptions.allow_recursion: list[str]     -- CIDR list; who may use this s
 ```
 
 - **BIND9:** `recursion yes|no;` + `allow-recursion { <acl>; };` in `options {}`, rendered **literally** (#1786, #1817). The stored default is local + private networks, `["localhost", "localnets", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7", "fe80::/10"]`, so a recursive group nobody configured is not an open resolver. The private ranges are part of it because `localnets` is the subnets of the interfaces `named` sees: on the plain appliance BIND9 runs on host networking and that is the LAN, but behind the appliance DNS VIP, in the umbrella Helm chart, the `k8s/` manifests and Docker Compose it runs on a pod or bridge network, so `localnets` alone matches only that network. A client on a public address (a routed public subnet, or globally routable IPv6 on a pod-network shape) or a CGNAT / Tailscale address (`100.64.0.0/10` is deliberately not in the default) is refused until you add its network. An explicit `["any"]` renders `any` and really opens recursion (an open resolver, deliberately). `["none"]` refuses everyone. Saving the field blank stores the default (the group-options PUT normalises `[]`); a stored empty list that reaches the agent anyway renders `none` (fail closed), not an omitted line: an omitted `allow-recursion` inherits `allow-query` (BIND 9.20 `server.c`), which the agent renders as `any` by default. Recursion off renders no line. Upgrading rewrites groups stored as exactly `["any"]` (or empty) to the new default (migration `b8e41c7a2d95`); set the client networks or `any` to keep wider recursion. An explicit list applies to every view, and the view's own `allow-query-cache` inherits it unless set. Elements named-checkconf would refuse (malformed, or an ACL not defined in the group) are dropped by the agent; if none survive the line renders as `none` (fail closed). Named ACLs must exist in the group (§8.2), and an ACL the server options cite cannot be deleted or renamed.
+- **PowerDNS** does not recurse (authoritative only, no recursor), so the group-options PUT refuses turning `recursion_enabled` on or setting a non-default `allow_recursion` on a group with a PowerDNS server, and the group PUT refuses turning `is_recursive` on (#4562). A group that already stores the values re-saves untouched, and turning recursion off stays allowed. Forwarders are accepted: they are used for ALIAS expansion only. Adding a PowerDNS server to a group that already has recursion on is not refused. Use a BIND9 or Technitium group for a resolver. The hosted providers follow the same rule; on Windows DNS and agentless Technitium, whose own recursion SpatiumDDI does not manage, any change to either field is refused.
 - **Technitium** follows the same values (#1817): the default maps to `UseSpecifiedNetworkACL` with one deduplicated ACL of loopback plus the RFC 1918 + ULA + link-local ranges, `["any"]` to `Allow`, empty to `Deny`. The one difference is `localnets`: BIND's is the server's directly attached subnets, Technitium has no equivalent, so it uses the private ranges (the same set as its own private-networks default).
 - Authoritative-only servers must have `recursion_enabled: false` + `allow_recursion: ["none"]`
 
@@ -1022,7 +1025,7 @@ carries the same RR twice.
 **PowerDNS:**
 - Record add/modify/delete → `PATCH /api/v1/servers/localhost/zones/<zone>` rrset patch via the REST API
 - Record changes are atomic and immediate — no restart, no reload
-- Zone creation/deletion via the REST API; PowerDNS handles the serial bump internally
+- Zone creation via the REST API (`POST .../zones`); a zone the bundle no longer carries is deleted the same way (see the zone-delete row in the driver reference). The control plane owns the SOA serial (#1965): every record op carries a `target_serial` and the agent writes it into the apex SOA, PowerDNS does not bump it
 
 ### Driver Method: `apply_record_change()`
 
