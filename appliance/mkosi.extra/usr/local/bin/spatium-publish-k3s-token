@@ -32,7 +32,7 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
         # the predictable ``$SIDECAR.new`` name in the release-state dir,
         # which was 1777 until GHSA-h2j9-qrg7-grfw — the token is
         # cluster-admin-equivalent). The FINAL sidecar stays 0644 on
-        # purpose: the supervisor's unprivileged process user (uid 100
+        # purpose: the supervisor's unprivileged process user (uid 10001
         # spatium, su-exec'd from root by the entrypoint) must read it
         # through the release-state bind mount. A 0600-root sidecar is
         # invisible to that user → read_k3s_join_token() returns None → the

@@ -16,10 +16,10 @@
 # owned by an allowed uid, and — unless root owns it — sits in a directory
 # that is not world-writable. Allowed uids, by default:
 #   0     root (host runners, the console, firstboot)
-#   100   the supervisor's in-pod ``spatium`` user (pinned in its Dockerfile)
+#   10001 the supervisor's in-pod ``spatium`` user (pinned in its Dockerfile)
 #   1000  the api pod (runAsUser 1000) — also the installer's admin account
-# The world-writable check exists because uid 100 on the HOST is whichever
-# system daemon happened to be created first; it can only matter while the
+# The world-writable check exists because the supervisor's old uid 100 on the
+# HOST is a system daemon (and any other id could be a host account); it can only matter while the
 # directory is still the legacy 1777, and there it is the only thing that
 # tells the supervisor's file from that daemon's.
 #
@@ -42,7 +42,7 @@
 
 set -u
 
-ALLOWED_UIDS="${SPATIUM_TRIGGER_ALLOWED_UIDS:-0 100 1000}"
+ALLOWED_UIDS="${SPATIUM_TRIGGER_ALLOWED_UIDS:-0 10001 1000}"
 TRIGGER_ROOT="${SPATIUM_TRIGGER_ROOT:-/var/lib/spatiumddi/release-state}"
 LOG="${SPATIUM_TRIGGER_GUARD_LOG:-/var/log/spatiumddi/trigger-guard.log}"
 
