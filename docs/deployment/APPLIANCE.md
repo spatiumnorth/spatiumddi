@@ -2721,6 +2721,18 @@ one whole disk. Prefer a stable `/dev/disk/by-id/…` or `by-path/…` id
 (a bare `sda` can renumber). A supplied-but-unresolvable disk drops to
 the interactive picker rather than guessing.
 
+**Other disks carrying SpatiumDDI labels (#4547).** The installed
+system mounts `/var`, STATE and the ESP by filesystem label (`var`,
+`state`, `ESP`), so a second attached disk with the same labels (an old
+system disk, a former mirror member, another test install) can be
+mounted instead of the installed one. Before the wipe the installer
+scans every disk it is not about to write and stops if one carries
+those labels. Interactively you can cancel (detach the disk) or clear
+the labels on the other disk after typing `CLEAR`; only the filesystem
+labels are blanked. A headless install halts unless the preseed carries
+`clear_foreign_labels: true`. Mounting by filesystem UUID instead is not
+done yet; existing installs keep their label-based fstab.
+
 **Lint a preseed offline (#581).**
 `spatium-install --check-preseed <preseed.yaml>` dry-runs the answer
 file **without installing anything** — it is unprivileged, read-only,
