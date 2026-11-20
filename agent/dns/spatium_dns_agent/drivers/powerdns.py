@@ -25,8 +25,6 @@ the first ship.
 
 from __future__ import annotations
 
-import base64
-import binascii
 import hashlib
 import ipaddress
 import json
@@ -1603,20 +1601,18 @@ class PowerDNSDriver(DriverBase):
         # branch off here rather than building a rrset PATCH.
         if op_kind == "dnssec_sign":
             ds_records = self._dnssec_sign(api_key, zone)
-            state: dict[str, Any] = {"zone_name": zone, "ds_records": ds_records}
-            # #4604 — the key table too, so dnssec/info is not empty for a
-            # signed zone. Additive: an older control plane ignores ``keys``.
-            cryptokeys = self._fetch_cryptokeys(api_key, zone)
-            if cryptokeys is not None:
-                state["keys"] = self._extract_keys(cryptokeys)
-            return {"dnssec_state": state}
+            return {
+                "dnssec_state": {
+                    "zone_name": zone,
+                    "ds_records": ds_records,
+                }
+            }
         if op_kind == "dnssec_unsign":
             self._dnssec_unsign(api_key, zone)
             return {
                 "dnssec_state": {
                     "zone_name": zone,
                     "ds_records": [],
-                    "keys": [],
                 }
             }
 
@@ -2090,110 +2086,6 @@ class PowerDNSDriver(DriverBase):
             if after.status_code == 200:
                 return self._extract_ds_records(after.json())
             return []
-
-    @staticmethod
-    def _dnskey_tag(dnskey: str) -> int | None:
-        """RFC 4034 appendix B key tag of ``"<flags> <proto> <alg> <base64>"``."""
-        parts = dnskey.split(None, 3)
-        if len(parts) != 4:
-            return None
-        try:
-            rdata = (
-                int(parts[0]).to_bytes(2, "big")
-                + bytes([int(parts[1]), int(parts[2])])
-                + base64.b64decode("".join(parts[3].split()), validate=True)
-            )
-        except (ValueError, binascii.Error, OverflowError):
-            return None
-        acc = sum((b << 8) if i % 2 == 0 else b for i, b in enumerate(rdata))
-        return ((acc & 0xFFFF) + (acc >> 16)) & 0xFFFF
-
-    @classmethod
-    def _extract_keys(cls, cryptokeys: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Per-key rows (tag / type / algorithm number / state) for the
-        control plane's ``DNSKey`` table, from ``GET .../cryptokeys``."""
-        out: list[dict[str, Any]] = []
-        for k in cryptokeys or []:
-            dnskey = str(k.get("dnskey") or "")
-            tag = cls._dnskey_tag(dnskey)
-            if tag is None:
-                continue
-            try:
-                algorithm = int(dnskey.split()[2])
-            except (IndexError, ValueError):
-                algorithm = 0
-            key_type = str(k.get("keytype") or "").lower()
-            if key_type not in ("ksk", "zsk", "csk"):
-                key_type = "ksk" if k.get("flags") == 257 else "zsk"
-            ds = [d.strip() for d in k.get("ds") or [] if isinstance(d, str) and d.strip()]
-            out.append(
-                {
-                    "key_tag": tag,
-                    "key_type": key_type,
-                    "algorithm": algorithm,
-                    "state": "active" if k.get("active") else "published",
-                    "ds_records": ds if key_type in ("ksk", "csk") else [],
-                    "timing": {},
-                }
-            )
-        return sorted(out, key=lambda x: (x["key_type"], x["key_tag"]))
-
-    def _fetch_cryptokeys(self, api_key: str, zone: str) -> list[dict[str, Any]] | None:
-        """``GET .../cryptokeys`` for a zone, or None when it could not be read
-        (never ``[]`` on a failure: that would wipe the control plane's rows)."""
-        try:
-            with httpx.Client(timeout=_PDNS_API_TIMEOUT) as client:
-                resp = client.get(
-                    f"{_PDNS_API_BASE}/zones/{zone}/cryptokeys",
-                    headers={"X-API-Key": api_key},
-                )
-            if resp.status_code != 200:
-                log.warning(
-                    "powerdns_dnssec_keys_read_non200",
-                    zone=zone,
-                    status=resp.status_code,
-                )
-                return None
-            data = resp.json()
-        except (httpx.HTTPError, ValueError) as e:
-            log.warning("powerdns_dnssec_keys_read_failed", zone=zone, error=str(e))
-            return None
-        return data if isinstance(data, list) else None
-
-    def collect_dnssec_state(self, bundle: dict[str, Any]) -> list[dict[str, Any]]:
-        """DS + key state for every signed primary zone, for
-        ``POST /dns/agents/dnssec-state`` (#4604; the BIND9 / Technitium
-        agents already report this). Read-only; a zone whose keys cannot be
-        read is left out so the control plane keeps what it has."""
-        self.dnssec_incomplete = False
-        out: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        api_key = self._load_or_generate_api_key()
-        for z in bundle.get("zones", []):
-            if not z.get("dnssec_enabled"):
-                continue
-            if z.get("type", "primary") not in {"primary", "master"}:
-                continue
-            zname = (z.get("name") or "").rstrip(".")
-            if not zname or zname in seen:
-                continue
-            seen.add(zname)
-            zone = zname + "."
-            cryptokeys = self._fetch_cryptokeys(api_key, zone)
-            if cryptokeys is None:
-                self.dnssec_incomplete = True
-                continue
-            keys = self._extract_keys(cryptokeys)
-            if not keys:
-                self.dnssec_incomplete = True
-            out.append(
-                {
-                    "zone_name": zone,
-                    "ds_records": self._extract_ds_records(cryptokeys),
-                    "keys": keys,
-                }
-            )
-        return out
 
     @staticmethod
     def _extract_ds_records(cryptokeys: list[dict[str, Any]]) -> list[str]:
