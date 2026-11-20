@@ -22,7 +22,6 @@ from app.core.security import create_access_token, hash_password
 from app.drivers.dns import _DRIVERS
 from app.models.auth import User
 from app.models.dns import DNSServer, DNSServerGroup, DNSView, DNSZone
-from app.services.dns.server_move import views_unsupported_drivers
 from app.services.dns.zone_move import assemble_move_plan
 from app.services.dns_import.canonical import ImportedSOA, ImportedZone, ImportPreview
 from app.services.dns_import.commit import commit_import
@@ -73,6 +72,8 @@ async def _stored_view(db: AsyncSession, grp: DNSServerGroup, name: str = "inter
 
 def test_only_bind9_offers_views() -> None:
     """The gate reads the capability, so this names what it refuses today."""
+    from app.services.dns.server_move import views_unsupported_drivers
+
     assert views_unsupported_drivers(_DRIVERS) == sorted(set(_DRIVERS) - {"bind9"})
 
 

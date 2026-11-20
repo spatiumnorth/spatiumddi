@@ -7099,7 +7099,7 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
         >
           <strong>This group cannot serve views.</strong> {viewsUnsupported}
           {views.length > 0 &&
-            " The views below were stored before this was refused: a zone that is the same in every view is served to every client, a zone that differs between views is not updated on the server. Remove them."}
+            " The views below were stored before this was refused: a zone that is the same in every view is served to every client, a zone that differs between views serves only the records identical in every view. Remove them."}
         </div>
       )}
 

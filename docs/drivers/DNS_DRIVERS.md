@@ -606,7 +606,7 @@ class PowerDNSDriver(DNSDriver):
 **Views (#4565).** `views: False` is enforced, not advisory: the API reads it for every driver and refuses a view, a view-scoped zone or record, and a server joining a group that has views (see [DNS.md §2](../features/DNS.md)). BIND9 is the only driver that returns `True`. A bundle can still carry views for a group that held them before the refusal, and the agent's rule for it is fixed (`_resolve_view_copies`): the bundle ships one copy of a zone per view it renders in, and PowerDNS holds one zone per name, so
 
 - copies that render the same payload are one zone, reconciled once and served to every client;
-- copies that differ are never merged and none is sent. The zone is left exactly as PowerDNS holds it (not created if it is new), is named in `refused_zones()` as `"<zone> views: …"`, and the apply is reported as partial, like a zone PowerDNS itself refused. It is also left out of the zone-state report, so it never reads converged.
+- copies that differ are reduced to the rrsets identical (name, type, TTL, records) in every copy and sent as one zone, so no client is answered from another view's data and the reconcile sweeps what an earlier merged render left. The zone is named in `refused_zones()` as `"<zone> views: …"`, and the apply is reported as partial, like a zone PowerDNS itself refused. It is also left out of the zone-state report, so it never reads converged.
 
 `powerdns_views_unsupported` is logged on every render of such a bundle. Removing the views, or making the zone the same in each, clears it on the next render.
 

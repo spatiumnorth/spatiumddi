@@ -242,7 +242,7 @@ def views_unsupported_message(view_names: Sequence[str], drivers: Iterable[str])
     return (
         f"This group has views ({shown}). {refusal} A zone that is the same in every "
         "view it renders in is served once, to every client; a zone that differs "
-        "between views is not updated on the server until the views are removed."
+        "between views serves only the records identical in every view until the views are removed."
     )
 
 

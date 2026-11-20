@@ -317,8 +317,12 @@ def _resolve_view_copies(
 
     * copies that render the same (a zone no view changes) are one zone, sent
       once;
-    * copies that differ are never merged and none is sent. The zone is left
-      exactly as PowerDNS holds it and named in the second list, one
+    * copies that differ are reduced to the rrsets every copy agrees on (name,
+      type, TTL and records identical), sent as one zone. A record that exists
+      in one view only, or has a different value in each, is not served to
+      anyone, so no client is answered from another view's data, whatever the
+      zone held before; the reconcile's sweep removes what an earlier merged
+      render left behind. The zone is also named in the second list, one
       ``"<zone> views: <reason>"`` each, which the apply reports through
       ``refused_zones()``.
     """
@@ -332,11 +336,17 @@ def _resolve_view_copies(
         if all(payload[i] == first for i in indexes[1:]):
             kept.append(first)
             continue
+        common = [
+            rrset
+            for rrset in first["rrsets"]
+            if all(rrset in payload[i]["rrsets"] for i in indexes[1:])
+        ]
+        kept.append({**first, "rrsets": common})
         names = ", ".join(sorted({str(views[i]) for i in indexes if views[i]}))
         conflicts.append(
             f"{first['name']} views: this zone differs between views ({names}) and "
-            "PowerDNS has no views, so the copies are not merged and the zone is "
-            "left as PowerDNS holds it; remove the views or use a BIND9 group"
+            "PowerDNS has no views, so only the records identical in every view are "
+            "served; remove the views or use a BIND9 group"
         )
     return kept, conflicts
 
@@ -1337,8 +1347,8 @@ class PowerDNSDriver(DriverBase):
                 hint=(
                     "PowerDNS authoritative has no views: match-clients are not "
                     "applied, a zone that is the same in every view is served to "
-                    "every client, and a zone that differs between views is not "
-                    "reconciled. Remove the views or use a BIND9 group."
+                    "every client, and a zone that differs between views serves only the "
+                    "records identical in every view. Remove the views or use a BIND9 group."
                 ),
             )
 

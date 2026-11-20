@@ -7,8 +7,8 @@ sweep removed the others' records, so a record of an internal view was
 answered to every client, with the apply reported ok.
 
 The rule now: copies that render the same are one zone, sent once; copies that
-differ are never merged, none is sent, and the zone is reported through
-``refused_zones()``.
+differ are reduced to the rrsets identical in every copy (no view's data reaches
+another view's clients) and the zone is reported through ``refused_zones()``.
 """
 
 from __future__ import annotations
@@ -61,13 +61,17 @@ def _render(tmp_path: Path, zones: list[dict[str, Any]]) -> tuple[PowerDNSDriver
     return driver, json.loads((tmp_path / "rendered.new" / "zones.json").read_text())
 
 
-def test_copies_that_differ_between_views_are_never_merged(tmp_path: Path) -> None:
-    """Neither copy reaches the payload, in either bundle order: whichever was
-    reconciled last used to win."""
+def test_copies_that_differ_between_views_keep_only_what_they_share(tmp_path: Path) -> None:
+    """Only rrsets identical in every copy reach the payload, in either bundle
+    order: ``www`` differs and ``secret`` is internal only, so neither is
+    served to anyone."""
     for zones in (_SPLIT, list(reversed(_SPLIT))):
         _, payload = _render(tmp_path, zones)
-        assert payload == []
-        assert "10.9.9.9" not in json.dumps(payload)
+        (zone,) = payload
+        served = json.dumps(zone["rrsets"])
+        assert "10.9.9.9" not in served
+        assert "10.1.1.1" not in served
+        assert "198.51.100.1" not in served
 
 
 def test_a_zone_no_view_changes_is_sent_once(tmp_path: Path) -> None:
@@ -78,7 +82,9 @@ def test_a_zone_no_view_changes_is_sent_once(tmp_path: Path) -> None:
         _zone("plain.example.", "external", "192.0.2.1"),
     ]
     driver, payload = _render(tmp_path, same + _SPLIT)
-    assert [z["name"] for z in payload] == ["plain.example."]
+    assert sorted(z["name"] for z in payload) == ["plain.example.", "split.example."]
+    plain = next(z for z in payload if z["name"] == "plain.example.")
+    assert any("192.0.2.1" in json.dumps(r) for r in plain["rrsets"])
     assert len(driver._view_conflicts) == 1
 
 
@@ -141,9 +147,9 @@ class _FakeClient:
 def test_apply_leaves_the_zone_alone_and_reports_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Through ``apply_config``: PowerDNS gets no write for the zone (it keeps
-    what it holds), every other zone is reconciled, and the zone is named in
-    ``refused_zones()`` so the apply is reported as partial, not ok."""
+    """Through ``apply_config``: what PowerDNS is sent carries no view's own
+    data, and the zone is named in ``refused_zones()`` so the apply is reported
+    as partial, not ok."""
     calls: list[tuple[str, str, Any]] = []
     monkeypatch.setattr(
         powerdns_mod,
@@ -165,8 +171,9 @@ def test_apply_leaves_the_zone_alone_and_reports_it(
 
     writes = [(m, u) for m, u, _ in calls if m != "GET"]
     assert writes, "the zone no view changes is still reconciled"
-    assert not [u for _, u in writes if "split.example" in u]
-    assert "10.9.9.9" not in json.dumps([body for _, _, body in calls])
+    sent = json.dumps([body for _, _, body in calls])
+    for leaked in ("10.9.9.9", "10.1.1.1", "198.51.100.1"):
+        assert leaked not in sent
     (refusal,) = driver.refused_zones()
     assert refusal.startswith("split.example. views: ")
     assert "external, internal" in refusal
