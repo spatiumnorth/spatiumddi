@@ -18,7 +18,7 @@ from app.services.dns.zone_apex import (
     served_apex_for_zones,
 )
 
-_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
 def _fqdn(name: str) -> str:

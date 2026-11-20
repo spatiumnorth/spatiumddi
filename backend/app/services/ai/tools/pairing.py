@@ -18,7 +18,7 @@ for the canonical pattern; the LLM itself has no input on this.
 No ``propose_create_pairing_code`` write tool by design. Issuing a
 pairing code returns the cleartext code in the response, and we don't
 want the operator's copilot transcript carrying a live bootstrap-auth
-secret. The dedicated Appliance → Pairing UI flow is the friendly path.
+secret. The dedicated Appliance → Fleet → Pairing codes UI flow is the friendly path.
 """
 
 from __future__ import annotations

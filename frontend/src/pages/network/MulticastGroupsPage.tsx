@@ -1,3 +1,5 @@
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { useOwnershipModules } from "@/hooks/useOwnershipModules";
 import { useEffect, useMemo, useState } from "react";
 import { MissingCustomerOption } from "@/components/ownership/pickers";
@@ -145,7 +147,11 @@ export function MulticastGroupModal({
         // wave; that's a Wave 3 / Phase 2 conversation).
         const upd: MulticastGroupUpdate = { ...body };
         delete (upd as { space_id?: string }).space_id;
-        return multicastApi.update(existing.id, upd);
+        // Only what changed against the row read when the dialog opened
+        // (#4379), so a field another client set since is not put back.
+        const changed = changedFields(existing, upd);
+        if (Object.keys(changed).length === 0) return existing;
+        return multicastApi.update(existing.id, changed);
       }
       return multicastApi.create(body as MulticastGroupCreate);
     },
@@ -1205,15 +1211,28 @@ export function MulticastGroupsPage() {
         )}
       </div>
 
-      {(showNew || editing) && (
+      {showNew && (
         <MulticastGroupModal
-          existing={editing}
+          existing={null}
           spaces={spacesQ.data ?? []}
-          onClose={() => {
-            setShowNew(false);
-            setEditing(null);
-          }}
+          onClose={() => setShowNew(false)}
         />
+      )}
+      {editing && (
+        <FreshEdit
+          row={editing}
+          load={() => multicastApi.get(editing.id)}
+          title="Edit multicast group"
+          onClose={() => setEditing(null)}
+        >
+          {(fresh) => (
+            <MulticastGroupModal
+              existing={fresh}
+              spaces={spacesQ.data ?? []}
+              onClose={() => setEditing(null)}
+            />
+          )}
+        </FreshEdit>
       )}
       {showBulk && (
         <BulkAllocateModal
