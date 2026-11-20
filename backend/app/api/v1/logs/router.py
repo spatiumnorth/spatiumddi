@@ -54,6 +54,8 @@ from app.services.logs.agent_logs import (
     LogScopeError,
     count_dns_queries_capped,
     dns_query_analytics,
+    include_orphaned_logs,
+    log_row_server_name,
     resolve_dhcp_log_servers,
     resolve_dns_log_servers,
     search_dhcp_activity,
@@ -540,7 +542,9 @@ class DNSQueryLogRow(BaseModel):
     id: int
     ts: datetime
     # Which server logged it (#2120) — a group or "all" read merges several.
-    server_id: uuid.UUID
+    # ``server_id`` is NULL once the server was deleted (#4173); the row stays
+    # and ``server_name`` is the name it logged under.
+    server_id: uuid.UUID | None
     server_name: str
     client_ip: str | None
     client_port: int | None
@@ -627,6 +631,9 @@ async def query_dns_queries(
             view=body.view,
             rcode=body.rcode,
             limit=body.max_events,
+            include_orphans=include_orphaned_logs(
+                current_user, server_id=body.server_id, group_id=body.group_id
+            ),
         )
     except InvalidLogFilter as exc:
         raise HTTPException(status_code=422, detail=exc.detail) from exc
@@ -635,7 +642,7 @@ async def query_dns_queries(
             id=r.id,
             ts=r.ts,
             server_id=r.server_id,
-            server_name=names.get(r.server_id, str(r.server_id)),
+            server_name=log_row_server_name(r.server_id, r.server_name, names),
             client_ip=str(r.client_ip) if r.client_ip is not None else None,
             client_port=r.client_port,
             qname=r.qname,
@@ -718,10 +725,13 @@ async def _export_dns_queries(
         raise _scope_http_error(exc) from exc
     names = {s.id: s.name for s in servers}
     ids = list(names)
+    include_orphans = include_orphaned_logs(current_user, server_id=server_id, group_id=group_id)
     try:
         # Counted (to cap + 1) before the audit row and the first byte, so a
         # bad filter is a 422 and the truncation header is truthful.
-        matched = await count_dns_queries_capped(db, ids, cap=EXPORT_ROW_CAP, **filters)
+        matched = await count_dns_queries_capped(
+            db, ids, cap=EXPORT_ROW_CAP, include_orphans=include_orphans, **filters
+        )
     except InvalidLogFilter as exc:
         raise HTTPException(status_code=422, detail=exc.detail) from exc
     truncated = matched > EXPORT_ROW_CAP
@@ -773,8 +783,10 @@ async def _export_dns_queries(
         if fmt == "csv":
             writer.writerow(EXPORT_COLUMNS)
         pending = 0
-        async for row in stream_dns_queries(db, ids, limit=EXPORT_ROW_CAP, **filters):
-            rec = _export_record(row, names.get(row.server_id, str(row.server_id)))
+        async for row in stream_dns_queries(
+            db, ids, limit=EXPORT_ROW_CAP, include_orphans=include_orphans, **filters
+        ):
+            rec = _export_record(row, log_row_server_name(row.server_id, row.server_name, names))
             if fmt == "csv":
                 writer.writerow(
                     ["" if rec[c] is None else sanitize_cell(rec[c]) for c in EXPORT_COLUMNS]
@@ -944,7 +956,14 @@ async def query_dns_analytics(
         raise _scope_http_error(exc) from exc
     server_ids = [s.id for s in servers]
     a = await dns_query_analytics(
-        db, server_ids, since=body.since, until=body.until, limit=body.limit
+        db,
+        server_ids,
+        since=body.since,
+        until=body.until,
+        limit=body.limit,
+        include_orphans=include_orphaned_logs(
+            current_user, server_id=body.server_id, group_id=body.group_id
+        ),
     )
     return DNSQueryAnalyticsResponse(
         server_id=body.server_id,
@@ -964,8 +983,8 @@ async def query_dns_analytics(
 class DHCPActivityLogRow(BaseModel):
     id: int
     ts: datetime
-    # Which server logged it (#2120).
-    server_id: uuid.UUID
+    # Which server logged it (#2120); NULL once it was deleted (#4173).
+    server_id: uuid.UUID | None
     server_name: str
     severity: str | None
     code: str | None
@@ -1030,6 +1049,9 @@ async def query_dhcp_activity(
             mac_address=body.mac_address,
             ip_address=body.ip_address,
             limit=body.max_events,
+            include_orphans=include_orphaned_logs(
+                current_user, server_id=body.server_id, group_id=body.group_id
+            ),
         )
     except InvalidLogFilter as exc:
         raise HTTPException(status_code=422, detail=exc.detail) from exc
@@ -1038,7 +1060,7 @@ async def query_dhcp_activity(
             id=r.id,
             ts=r.ts,
             server_id=r.server_id,
-            server_name=names.get(r.server_id, str(r.server_id)),
+            server_name=log_row_server_name(r.server_id, r.server_name, names),
             severity=r.severity,
             code=r.code,
             mac_address=str(r.mac_address) if r.mac_address is not None else None,

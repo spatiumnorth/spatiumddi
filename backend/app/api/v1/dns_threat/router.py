@@ -457,6 +457,8 @@ class RPZHitRow(BaseModel):
     id: str
     ts: datetime
     server_id: str | None
+    # Name at ingest; the only attribution left once the server is deleted (#4173).
+    server_name: str | None = None
     client_ip: str | None
     qname: str | None
     trigger: str

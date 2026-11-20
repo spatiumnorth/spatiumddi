@@ -2,6 +2,7 @@ import base64
 import binascii
 import re
 import sys
+from typing import Literal
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -114,6 +115,15 @@ class Settings(BaseSettings):
     task_db_connect_timeout: float = 5
     task_db_command_timeout: float = 120
     task_db_long_command_timeout: float = 900
+
+    # Celery worker child recycling (#4306). A prefork child that grows is
+    # replaced after this many tasks or once its RSS passes the memory cap,
+    # so a slow leak is bounded per child rather than per pod. 0 disables
+    # either one. Memory is in KiB (Celery's unit): 409600 = 400 MiB, well
+    # under the worker's 2Gi pod limit at concurrency 4 (children rest near
+    # 130 MB). Only the worker reads these; beat ignores them.
+    worker_max_tasks_per_child: int = 1000
+    worker_max_memory_per_child_kib: int = 409600
 
     # Redis
     redis_url: str = "redis://redis:6379/0"
@@ -419,6 +429,18 @@ class Settings(BaseSettings):
     # A request carrying the version header is always held to the current
     # form, whatever this says.
     appliance_legacy_signature_allowed: bool = True
+
+    # Re-registration of an appliance that is already paired returns a fresh
+    # session token, so a supervisor signs it with its own key. This is
+    # separate from the flag above, which covers heartbeat signatures only.
+    #   legacy - an unsigned re-registration is accepted when the appliance
+    #            has never reported that it signs AND its last reported
+    #            supervisor version is older than 1.0.1 (or unknown). Each one
+    #            is recorded in the audit log and counts against the
+    #            registration attempt budget.
+    #   never  - an unsigned re-registration is always refused.
+    # The default becomes ``never`` in 1.1.0.
+    appliance_unsigned_register_allowed: Literal["legacy", "never"] = "legacy"
 
     # #1003 item 2 — the OS installer's "Time source" answer, stamped into
     # the api's environment by spatiumddi-firstboot from the STATE config.

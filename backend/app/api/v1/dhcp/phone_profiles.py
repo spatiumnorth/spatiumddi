@@ -229,16 +229,24 @@ async def refuse_if_phone_class_stops_rendering(
     otherwise: a profile that renders nothing today can still be tidied up.
     ``exclude_scope_id``'s own pools leave with that scope, so they don't
     count."""
+    # A disable counts the Trash: a restore re-attaches the profile and brings
+    # its pools back, to a class a disabled profile no longer renders (#4362).
+    # A detach leaves a trashed scope's attachment (and so its class) alone.
+    trashed = always or enabled is False
     if not always:
-        if not await phone_profile_rendered(db, p):
+        if not await phone_profile_rendered(db, p, include_trashed=trashed):
             return
         if await phone_profile_rendered(
-            db, p, enabled=enabled, scope_ids=scope_ids, exclude_scope_id=exclude_scope_id
+            db,
+            p,
+            enabled=enabled,
+            scope_ids=scope_ids,
+            exclude_scope_id=exclude_scope_id,
         ):
             return
     name = phone_class_name(p.id)
     pools = await pools_restricted_to(
-        db, p.group_id, name, exclude_scope_id=exclude_scope_id, include_trashed=always
+        db, p.group_id, name, exclude_scope_id=exclude_scope_id, include_trashed=trashed
     )
     if pools:
         raise HTTPException(
