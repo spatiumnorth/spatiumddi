@@ -65,5 +65,5 @@ def test_dnsdist_front_sends_proxy_protocol_only_when_enabled(
     conf = out.read_text()
     assert ("useProxyProtocol=true" in conf) is expected
     # Quieter health check, never the 1 s default (#4576).
-    assert "checkInterval=30" in conf
+    assert "checkInterval=5" in conf
     assert 'checkName="spatium-healthcheck.invalid."' in conf
