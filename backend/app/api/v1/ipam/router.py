@@ -120,6 +120,7 @@ from app.services.ipam.address_set_gate import (
 from app.services.ipam.custom_field_rules import (
     enforce_required_custom_fields,
     inherited_block_custom_fields,
+    is_empty_value,
     validate_custom_field_values,
 )
 from app.services.ipam.gateway_rules import gateway_problem
@@ -13171,7 +13172,7 @@ async def get_effective_fields(
             # ``""`` / null is "no value of its own" (#4558): the console's
             # spelling of a cleared field, and what the Required rule already
             # reads as empty. It must not hide an ancestor's value.
-            if v is None or v == "":
+            if is_empty_value(v):
                 continue
             custom_fields[k] = v
             custom_field_sources[k] = src
@@ -13241,7 +13242,7 @@ async def get_block_effective_fields(
             # ``""`` / null is "no value of its own" (#4558): the console's
             # spelling of a cleared field, and what the Required rule already
             # reads as empty. It must not hide an ancestor's value.
-            if v is None or v == "":
+            if is_empty_value(v):
                 continue
             custom_fields[k] = v
             custom_field_sources[k] = src

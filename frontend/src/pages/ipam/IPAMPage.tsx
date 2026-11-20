@@ -139,6 +139,7 @@ import {
 import { CustomFieldMultiSelect } from "@/components/CustomFieldMultiSelect";
 import { GatewayHostnameNote } from "@/components/GatewayHostnameNote";
 import { cn, selectedRowClass, swatchTintCls, zebraBodyCls } from "@/lib/utils";
+import { withoutEmptyValues } from "@/lib/withoutEmptyValues";
 import { StatusTag } from "@/components/ui/status-tag";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
 import { useStickyLocation } from "@/lib/stickyLocation";
@@ -806,16 +807,6 @@ function NetworkContextCell({ entries }: { entries: NetworkContextEntry[] }) {
         </span>
       )}
     </span>
-  );
-}
-
-// A cleared custom field is "no value of its own": send no key for it, so
-// the row inherits the parent block's value again (#4558).
-function withoutEmptyValues(
-  fields: Record<string, unknown>,
-): Record<string, unknown> {
-  return Object.fromEntries(
-    Object.entries(fields).filter(([, v]) => v !== "" && v != null),
   );
 }
 

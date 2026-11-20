@@ -13,7 +13,7 @@ from tests.test_ipam_alias_cname_exclusive_2080 import _headers
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("empty", ["", None])
+@pytest.mark.parametrize("empty", ["", None, "  ", []])
 async def test_empty_value_inherits_from_block_chain(
     client: AsyncClient, db_session: AsyncSession, empty: object
 ) -> None:
