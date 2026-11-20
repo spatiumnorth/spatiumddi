@@ -11,12 +11,19 @@
  */
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { DNSZone, ZoneDnssecInfo } from "@/lib/api";
 
 const pending = () => new Promise<never>(() => {});
 let dnssecInfo: ZoneDnssecInfo | null = null;
+const ack = vi.fn(() => Promise.resolve(null));
 
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
@@ -28,6 +35,7 @@ vi.mock("@/lib/api", async () => {
       classifyZoneName: pending,
       listGroups: () =>
         Promise.resolve([{ id: "grp-1", server_drivers: ["bind9"] }]),
+      ackZoneDnssecDsChange: ack,
       getZoneDnssecInfo: () => Promise.resolve(dnssecInfo),
       listDnssecPolicies: () => Promise.resolve([]),
       // Edit Zone reads the zone fresh on open (#3269): answer with the row
@@ -122,5 +130,20 @@ describe("the DNSSEC card when the DS set changed (#4566)", () => {
     const said = await dsSection({ ...INFO, dnssec_ds_changed_at: null });
 
     expect(said).not.toMatch(/DS records changed/);
+  });
+});
+
+describe("acknowledging the DS change (#4566)", () => {
+  it("posts the acknowledgement from the warning", async () => {
+    await dsSection({
+      ...INFO,
+      dnssec_ds_changed_at: "2026-11-19T05:51:40Z",
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /I have published it/ }),
+    );
+
+    await waitFor(() => expect(ack).toHaveBeenCalledWith("grp-1", "zone-1"));
   });
 });

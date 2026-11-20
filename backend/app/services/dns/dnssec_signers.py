@@ -87,6 +87,11 @@ DS_CHANGED_WARNING = (
     "no longer matches."
 )
 
+#: Written when the operator says the current DS set is published at the
+#: parent (#4566); it carries that set, so a later change shows the warning
+#: again.
+DS_ACK_AUDIT_ACTION = "dns.zone.dnssec_ds_acknowledged"
+
 WORKAROUND = (
     "Keep a single DNS server in the group (delete it or move the others to "
     "another group; disabling a server does not stop it serving the zone), "
@@ -296,23 +301,39 @@ async def ds_changed_at(db: AsyncSession, zone: DNSZone) -> datetime | None:
 
     Read from the newest :data:`DS_CHANGED_AUDIT_ACTION` row, and only while
     that row still describes the DS on the zone: after an unsign and a fresh
-    sign the zone has a first DS again, not a changed one.
+    sign the zone has a first DS again, not a changed one. An operator's
+    acknowledgement of this DS set (:data:`DS_ACK_AUDIT_ACTION`) clears it.
     """
     current = {str(d) for d in zone.dnssec_ds_records or []}
     if not zone.dnssec_enabled or not current:
         return None
-    row = (
+    rows = (
         await db.execute(
-            select(AuditLog.timestamp, AuditLog.new_value)
+            select(AuditLog.action, AuditLog.timestamp, AuditLog.new_value)
             .where(
                 AuditLog.resource_type == "dns_zone",
                 AuditLog.resource_id == str(zone.id),
-                AuditLog.action == DS_CHANGED_AUDIT_ACTION,
+                AuditLog.action.in_((DS_CHANGED_AUDIT_ACTION, DS_ACK_AUDIT_ACTION)),
             )
             .order_by(AuditLog.timestamp.desc())
-            .limit(1)
         )
-    ).first()
-    if row is None or set((row.new_value or {}).get("ds_records") or []) != current:
+    ).all()
+    changed = next(
+        (
+            r.timestamp
+            for r in rows
+            if r.action == DS_CHANGED_AUDIT_ACTION
+            and {str(d) for d in (r.new_value or {}).get("ds_records") or []} == current
+        ),
+        None,
+    )
+    if changed is None:
         return None
-    return row.timestamp
+    # Acknowledged: the operator confirmed this very DS set is at the parent.
+    for r in rows:
+        if (
+            r.action == DS_ACK_AUDIT_ACTION
+            and {str(d) for d in (r.new_value or {}).get("ds_records") or []} == current
+        ):
+            return None
+    return changed

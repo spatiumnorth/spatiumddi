@@ -412,6 +412,7 @@ _DNS_ROUTE_TYPES: dict[str, tuple[str, ...]] = {
     "POST /groups/{group_id}/zones/{zone_id}/dnssec/sign": _Z,
     "POST /groups/{group_id}/zones/{zone_id}/dnssec/unsign": _Z,
     "POST /groups/{group_id}/zones/{zone_id}/dnssec/rollover": _Z,
+    "POST /groups/{group_id}/zones/{zone_id}/dnssec/ack-ds-change": _Z,
     "POST /groups/{group_id}/zones/{zone_id}/move/preview": _Z,
     "POST /groups/{group_id}/zones/{zone_id}/move/commit": _Z,
     "GET /zone-templates": _Z,
@@ -8344,6 +8345,40 @@ async def get_zone_dnssec_info(
             ],
         }
     )
+
+
+@router.post(
+    "/groups/{group_id}/zones/{zone_id}/dnssec/ack-ds-change",
+    response_model=ZoneDNSSECInfo,
+)
+async def acknowledge_zone_dnssec_ds_change(
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    db: DB,
+    current_user: SuperAdmin,
+) -> ZoneDNSSECInfo:
+    """The operator published the zone's current DS set at the parent (#4566).
+
+    Clears the "DS records changed" warning on the DNSSEC card. SpatiumDDI
+    cannot see the parent zone, so this is the operator's word, recorded in the
+    audit log with the DS set it covers; a later DS change warns again.
+    """
+    zone = await _require_zone(group_id, zone_id, db, current_user)
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action=dnssec_signers.DS_ACK_AUDIT_ACTION,
+            resource_type="dns_zone",
+            resource_id=str(zone.id),
+            resource_display=zone.name,
+            new_value={"ds_records": [str(d) for d in zone.dnssec_ds_records or []]},
+            result="success",
+        )
+    )
+    await db.commit()
+    return await get_zone_dnssec_info(group_id, zone_id, db, current_user)
 
 
 class DNSSECSignRequest(BaseModel):

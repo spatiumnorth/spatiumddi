@@ -144,3 +144,26 @@ async def test_a_fresh_sign_after_an_unsign_is_a_first_ds_again(
 
     assert len(await _changes(db_session, zone)) == 1
     assert (await _info(client, db_session, zone))["dnssec_ds_changed_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_acknowledging_the_ds_clears_the_warning_until_it_changes_again(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    server, zone = await _signed_zone(db_session)
+    await _report(db_session, server, zone, OLD)
+    await _report(db_session, server, zone, NEW)
+    assert (await _info(client, db_session, zone))["dnssec_ds_changed_at"] is not None
+
+    r = await client.post(
+        f"/api/v1/dns/groups/{zone.group_id}/zones/{zone.id}/dnssec/ack-ds-change",
+        headers=await _headers(db_session),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["dnssec_ds_changed_at"] is None
+    assert (await _info(client, db_session, zone))["dnssec_ds_changed_at"] is None
+
+    # The keys change again: the parent is stale again, so it warns again.
+    third = "3003 13 2 " + "ef" * 32
+    await _report(db_session, server, zone, third)
+    assert (await _info(client, db_session, zone))["dnssec_ds_changed_at"] is not None

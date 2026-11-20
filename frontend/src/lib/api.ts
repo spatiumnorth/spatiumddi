@@ -6899,6 +6899,12 @@ export const dnsApi = {
     api
       .post<DNSZone>(`/dns/groups/${groupId}/zones/${zoneId}/dnssec/unsign`)
       .then((r) => r.data),
+  ackZoneDnssecDsChange: (groupId: string, zoneId: string) =>
+    api
+      .post<ZoneDnssecInfo>(
+        `/dns/groups/${groupId}/zones/${zoneId}/dnssec/ack-ds-change`,
+      )
+      .then((r) => r.data),
   rolloverZoneDnssecKey: (groupId: string, zoneId: string, keyTag: number) =>
     api
       .post<{

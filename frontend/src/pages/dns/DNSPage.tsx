@@ -2681,6 +2681,14 @@ function DnssecCard({
     },
     onError: (e: ApiError) => setError(formatApiError(e, "Unsign failed")),
   });
+  const ackDsMut = useMutation({
+    mutationFn: () => dnsApi.ackZoneDnssecDsChange(groupId, zoneId),
+    onSuccess: () => {
+      setError(null);
+      invalidate();
+    },
+    onError: (e: ApiError) => setError(formatApiError(e, "Acknowledge failed")),
+  });
   const rolloverMut = useMutation({
     mutationFn: (keyTag: number) =>
       dnsApi.rolloverZoneDnssecKey(groupId, zoneId, keyTag),
@@ -2921,7 +2929,15 @@ function DnssecCard({
                   </span>{" "}
                   The server&apos;s keys were regenerated or rolled. Publish the
                   records below at the parent zone: validating resolvers fail
-                  the zone while the parent holds only the earlier DS.
+                  the zone while the parent holds only the earlier DS.{" "}
+                  <button
+                    type="button"
+                    className="underline"
+                    disabled={ackDsMut.isPending}
+                    onClick={() => ackDsMut.mutate()}
+                  >
+                    I have published it
+                  </button>
                 </li>
               )}
               {dsRecords.map((ds, idx) => (
