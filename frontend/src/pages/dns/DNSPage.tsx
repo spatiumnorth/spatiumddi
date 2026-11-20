@@ -11309,7 +11309,7 @@ function BlocklistScopeFields({
           nothing. Assign the list to a BIND9 group instead.
         </div>
       )}
-      {nonBind.length > 0 && (
+      {nonBind.length > 0 && !inert && (
         <div className="rounded-md border border-amber-500/40 bg-amber-500/5 p-2 text-xs text-amber-700 dark:text-amber-400">
           This group also runs {nonBind.join(" / ")}, which
           {nonBind.length === 1 ? " does" : " do"} not render RPZ blocking.
@@ -11528,6 +11528,8 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
     },
   });
 
+  // #4624 — why the last Apply (row or bulk) was refused, shown above the lists.
+  const [applyError, setApplyError] = useState<string | null>(null);
   const toggleAssignment = useMutation({
     mutationFn: async ({
       list,
@@ -11543,7 +11545,12 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
           : { remove_server_group_ids: [group.id] },
       );
     },
+    onMutate: () => setApplyError(null),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["dns-blocklists"] }),
+    // #4624 — a refused assignment (a group that cannot apply a blocklist is
+    // a 422) says why; the list stays where it was.
+    onError: (e, { list }) =>
+      setApplyError(`${list.name}: ${formatApiError(e, "Update failed")}`),
   });
 
   const refreshMut = useMutation({
@@ -11572,17 +11579,39 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
       const targets = lists.filter(
         (l) => ids.includes(l.id) && !l.applied_group_ids.includes(group.id),
       );
-      await Promise.allSettled(
+      const results = await Promise.allSettled(
         targets.map((l) =>
           dnsBlocklistApi.updateAssignments(l.id, {
             add_server_group_ids: [group.id],
           }),
         ),
       );
+      return { targets, results };
     },
-    onSuccess: () => {
+    onMutate: () => setApplyError(null),
+    onSuccess: ({ targets, results }) => {
       qc.invalidateQueries({ queryKey: ["dns-blocklists"] });
-      setSelectedIds(new Set());
+      // #4624 — every result is read: a refused list (name + reason) is
+      // reported and stays selected; the lists that did apply are counted.
+      const refused = targets.flatMap((l, i) => {
+        const r = results[i];
+        return r.status === "rejected"
+          ? [`${l.name}: ${formatApiError(r.reason, "Update failed")}`]
+          : [];
+      });
+      const applied = targets.length - refused.length;
+      setSelectedIds(
+        new Set(
+          targets
+            .filter((_, i) => results[i].status === "rejected")
+            .map((l) => l.id),
+        ),
+      );
+      if (refused.length > 0) {
+        setApplyError(
+          `${applied} applied, ${refused.length} refused. ${refused.join("; ")}`,
+        );
+      }
     },
   });
   const bulkDetach = useMutation({
@@ -11724,6 +11753,14 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
           ]),
         )}
       />
+      {applyError && (
+        <p
+          role="alert"
+          className="rounded-md border border-red-500/40 bg-red-500/5 p-2 text-xs text-red-700 dark:text-red-400"
+        >
+          {applyError}
+        </p>
+      )}
       {showCatalog && (
         <BlocklistCatalogModal onClose={() => setShowCatalog(false)} />
       )}
@@ -11853,7 +11890,7 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                   <div
                     key={l.id}
                     className={cn(
-                      "flex items-center gap-2 rounded-md border bg-card px-3 py-2 group hover:bg-accent/30 cursor-pointer",
+                      "flex flex-wrap items-center gap-2 rounded-md border bg-card px-3 py-2 group hover:bg-accent/30 cursor-pointer",
                       isSel && "ring-1 ring-primary/40 bg-primary/5",
                     )}
                     onClick={() => setSelected(l)}
@@ -11990,6 +12027,16 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                         <Trash2 className="h-3 w-3" />
                       </button>
                     </div>
+                    {/* #4624 — applied here but a group it is applied to has
+                        no server that renders a blocklist. */}
+                    {l.unapplied_warning && appliesHere(l) && (
+                      <span
+                        role="note"
+                        className="basis-full text-xs text-amber-700 dark:text-amber-400"
+                      >
+                        {l.unapplied_warning}
+                      </span>
+                    )}
                   </div>
                 );
               })}
@@ -12722,6 +12769,12 @@ export function BlocklistDetail({
       {feedSkippedTotal(list) > 0 && (
         <p className="text-xs text-muted-foreground">
           {feedSkippedTitle(list)}
+        </p>
+      )}
+      {/* #4624 — applied, but to a group no server of which renders it. */}
+      {list.unapplied_warning && (
+        <p role="note" className="text-xs text-amber-700 dark:text-amber-400">
+          {list.unapplied_warning}
         </p>
       )}
 
