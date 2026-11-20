@@ -330,8 +330,10 @@ export function CommunitiesTab({ asnId }: { asnId: string }) {
       <div className="flex items-center justify-between">
         <p className="text-xs text-muted-foreground">
           Operator-defined community values for this AS plus a copy of the
-          well-known catalog. The catalog rows are read-only — use the "Use on
-          this AS" button to attach one to this row with operator notes.
+          well-known catalog. The catalog rows are read-only
+          {!writeGate.disabled &&
+            ' — use the "Use on this AS" button to attach one to this row with operator notes'}
+          .
         </p>
         <button
           type="button"
