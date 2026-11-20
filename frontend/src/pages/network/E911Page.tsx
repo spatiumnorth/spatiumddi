@@ -109,6 +109,7 @@ type Tab = "locations" | "bindings" | "lookup";
 
 export function E911Page() {
   const { enabled, ready } = useFeatureModules();
+  const isSuperadmin = usePermissions().isSuperadmin;
   const e911Enabled = enabled("network.e911");
   // ``enabled()`` is optimistic while the module list loads, so queries
   // wait for ``ready`` too — a hard page load must not fire a request
@@ -123,8 +124,10 @@ export function E911Page() {
           E911 dispatchable location
         </h1>
         <p className="text-sm text-muted-foreground">
-          The <code>network.e911</code> feature module is disabled. Enable it
-          under Features & Integrations.
+          The <code>network.e911</code> feature module is disabled.{" "}
+          {isSuperadmin
+            ? "Enable it under Features & Integrations."
+            : "Ask an administrator to enable it."}
         </p>
       </div>
     );

@@ -1467,7 +1467,9 @@ function GroupModalForm({
               onChange={(e) => setCatalogZonesEnabled(e.target.checked)}
               className="h-4 w-4"
             />
-            <span className="text-sm font-medium">Use BIND9 catalog zones</span>
+            <span className="text-sm font-medium">
+              Publish a catalog zone (RFC 9432)
+            </span>
           </label>
           <p className="mt-1 text-[11px] text-muted-foreground">
             The group primary publishes a catalog of this group&apos;s zones for
@@ -2812,7 +2814,7 @@ function DnssecCard({
                 onChange={(e) => setPolicyId(e.target.value)}
                 className="rounded border bg-background px-2 py-1 text-xs"
                 aria-label="DNSSEC signing policy"
-                title="DNSSEC signing policy (BIND9)"
+                title="DNSSEC signing policy (applied by BIND9 and Technitium; PowerDNS ignores it)"
                 {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
               >
                 <option value="">default policy</option>
@@ -2931,9 +2933,9 @@ function DnssecCard({
             </ul>
           )}
           <div className="mt-2 text-[11px] text-muted-foreground">
-            Multiple algorithms are normal — publish them all. Keys rotate
-            automatically per the policy (BIND9) or pdns schedule; this list
-            refreshes after each rollover.
+            Multiple algorithms are normal — publish them all. BIND9 and
+            Technitium roll keys per the policy; PowerDNS never rolls them. This
+            list refreshes after each rollover.
           </div>
         </div>
       )}
@@ -5832,7 +5834,12 @@ export function ZoneDetailView({
                                   </span>
                                 ) : (
                                   <span
-                                    title="This record was created automatically by IPAM. Edit the IP address in IPAM to change it."
+                                    title={`This record was created automatically by IPAM.${
+                                      can("write", "subnet") ||
+                                      can("write", "address_set")
+                                        ? " Edit the IP address in IPAM to change it."
+                                        : ""
+                                    }`}
                                     className="flex items-center gap-1 rounded border border-amber-300/60 bg-amber-50 px-1.5 py-0.5 text-xs text-amber-700 dark:border-amber-700/40 dark:bg-amber-900/20 dark:text-amber-400"
                                   >
                                     <Lock className="h-2.5 w-2.5" />

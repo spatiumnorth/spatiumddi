@@ -130,7 +130,7 @@ import {
 } from "@/lib/dnsNames";
 import {
   GATEWAY_FORWARD_SKIPPED_LABEL,
-  GATEWAY_FORWARD_SKIPPED_NOTE,
+  gatewayForwardSkippedNote,
   classifyIpDnsState,
   isDefaultGatewayHostnameInput,
   staleReasonText,
@@ -6382,7 +6382,7 @@ export function SubnetDetail({
               <span className="text-xs text-muted-foreground">VLAN</span>
               <span
                 className="text-xs font-medium"
-                title="Legacy tag — assign a Router/VLAN from the Edit modal to manage"
+                title={`Legacy tag${canEditSubnet ? " — assign a Router/VLAN from the Edit modal to manage" : ""}`}
               >
                 {subnet.vlan_id}
               </span>
@@ -6620,7 +6620,7 @@ export function SubnetDetail({
 
       {activeSubnetTab === "aliases" && dnsOn && (
         <div className="flex-1 overflow-auto">
-          <AliasesSubnetPanel subnetId={subnet.id} />
+          <AliasesSubnetPanel subnetId={subnet.id} canAdd={canAllocate} />
         </div>
       )}
 
@@ -7270,7 +7270,7 @@ export function SubnetDetail({
                                   {(addr.alias_count ?? 0) > 0 && (
                                     <span
                                       className="inline-flex items-center rounded bg-indigo-100 px-1.5 py-0.5 text-[10px] font-medium text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400"
-                                      title={`${addr.alias_count} alias${(addr.alias_count ?? 0) === 1 ? "" : "es"} — edit IP to view`}
+                                      title={`${addr.alias_count} alias${(addr.alias_count ?? 0) === 1 ? "" : "es"}${canEdit ? " — edit IP to view" : ""}`}
                                     >
                                       +{addr.alias_count}{" "}
                                       {addr.alias_count === 1
@@ -7455,7 +7455,7 @@ export function SubnetDetail({
                                   ) : dnsState === "out-of-sync" ? (
                                     <span
                                       className="inline-flex items-center gap-1 text-xs text-amber-600"
-                                      title="DNS records are missing or differ — open Sync DNS to reconcile"
+                                      title={`DNS records are missing or differ${canDnsSync ? " — open Sync DNS to reconcile" : ""}`}
                                     >
                                       <span className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500" />
                                       out of sync
@@ -7463,7 +7463,9 @@ export function SubnetDetail({
                                   ) : dnsState === "forward-skipped" ? (
                                     <span
                                       className="inline-flex items-center gap-1 text-xs text-muted-foreground"
-                                      title={GATEWAY_FORWARD_SKIPPED_NOTE}
+                                      title={gatewayForwardSkippedNote(
+                                        permitsWrite,
+                                      )}
                                     >
                                       <span className="inline-block h-1.5 w-1.5 rounded-full bg-muted-foreground/50" />
                                       {GATEWAY_FORWARD_SKIPPED_LABEL}
@@ -10917,7 +10919,15 @@ function NatMappingsForIpModal({
   );
 }
 
-export function AliasesSubnetPanel({ subnetId }: { subnetId: string }) {
+export function AliasesSubnetPanel({
+  subnetId,
+  canAdd = false,
+}: {
+  subnetId: string;
+  // Aliases are added from an address's edit / allocate modal: only a user
+  // Allocate IP is offered to is told so (#4588).
+  canAdd?: boolean;
+}) {
   const qc = useQueryClient();
   const perms = usePermissions();
   const { data: aliases = [], isLoading } = useQuery({
@@ -10955,9 +10965,11 @@ export function AliasesSubnetPanel({ subnetId }: { subnetId: string }) {
         <p className="text-sm text-muted-foreground">
           No aliases in this subnet.
         </p>
-        <p className="mt-1 text-xs text-muted-foreground/70">
-          Add aliases from the IP address edit or allocate modal.
-        </p>
+        {canAdd && (
+          <p className="mt-1 text-xs text-muted-foreground/70">
+            Add aliases from the IP address edit or allocate modal.
+          </p>
+        )}
       </div>
     );
   }
@@ -15582,7 +15594,7 @@ export function BlockDetailView({
                             ) : (
                               <span
                                 className="inline-block h-3.5 w-3.5"
-                                title="Block has child blocks or subnets — delete those first"
+                                title={`Block has child blocks or subnets${selectionDeleteGateFor(perms, true, true).disabled ? "" : " — delete those first"}`}
                               />
                             )}
                           </td>
@@ -15703,7 +15715,7 @@ export function BlockDetailView({
                             ) : s.vlan_id != null ? (
                               <span
                                 className="text-muted-foreground/70"
-                                title="Legacy tag — assign a Router/VLAN from the Edit modal"
+                                title={`Legacy tag${canWriteSubnets ? " — assign a Router/VLAN from the Edit modal" : ""}`}
                               >
                                 {s.vlan_id}
                               </span>
@@ -16640,7 +16652,7 @@ export function SpaceTableView({
                           ) : (
                             <span
                               className="inline-block h-3.5 w-3.5"
-                              title="Block has child blocks or subnets — delete those first"
+                              title={`Block has child blocks or subnets${selectionDeleteGateFor(perms, true, true).disabled ? "" : " — delete those first"}`}
                             />
                           )}
                         </td>
@@ -16747,7 +16759,7 @@ export function SpaceTableView({
                           ) : s.vlan_id != null ? (
                             <span
                               className="text-muted-foreground/70"
-                              title="Legacy tag — assign a Router/VLAN from the Edit modal"
+                              title={`Legacy tag${canWriteSubnets ? " — assign a Router/VLAN from the Edit modal" : ""}`}
                             >
                               {s.vlan_id}
                             </span>
