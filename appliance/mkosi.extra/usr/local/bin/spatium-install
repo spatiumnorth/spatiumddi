@@ -3476,7 +3476,11 @@ confirm() {
     fi
     if [ "$KEEP_VAR" = "yes" ]; then
         s+="\nREINSTALL: both OS slots on $TARGET_DISK are replaced.\n"
-        s+="/var and STATE are KEPT. There is no undo.\n\n"
+        s+="/var and STATE are KEPT. There is no undo.\n"
+        if [ "$NET_MODE" = "dhcp" ]; then
+            s+="DHCP may give this node a new address; a single-node control plane resets its etcd peer address on first boot.\n"
+        fi
+        s+="\n"
     elif [ "$MIRROR_MODE" = "yes" ]; then
         s+="\nWARNING: BOTH $TARGET_DISK and $TARGET_DISK2 will be ERASED.\n"
         s+="There is no undo.\n\n"
