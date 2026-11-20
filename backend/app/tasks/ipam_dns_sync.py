@@ -772,9 +772,7 @@ async def _reconcile_subnet_records(db: Any, subnet_ids: list[Any]) -> tuple[int
 async def _run_reconcile_restored_subnets(subnet_ids: list[str]) -> dict[str, Any]:
     import uuid  # noqa: PLC0415
 
-    engine = create_async_engine(
-        settings.database_url, future=True, connect_args=task_connect_args()
-    )
+    engine = task_engine()
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
@@ -785,7 +783,7 @@ async def _run_reconcile_restored_subnets(subnet_ids: list[str]) -> dict[str, An
             await publish_wake(dns_group_channel(gid))
         return {"status": "ok", "records_changed": changed}
     finally:
-        await engine.dispose()
+        await release_task_engine(engine)
 
 
 @celery_app.task(name="app.tasks.ipam_dns_sync.reconcile_restored_subnet_records", bind=True)
@@ -796,7 +794,7 @@ def reconcile_restored_subnet_records_task(  # type: ignore[type-arg]
     """#4227 — post-commit retry of a Trash restore of a subnet: bring its
     IPAM-generated records up to what IPAM holds now."""
     try:
-        return asyncio.run(_run_reconcile_restored_subnets(subnet_ids))
+        return run_task(_run_reconcile_restored_subnets(subnet_ids))
     except Exception as exc:  # noqa: BLE001
         logger.exception("restore_subnet_reconcile_failed", error=str(exc))
         raise
