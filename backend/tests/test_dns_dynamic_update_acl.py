@@ -838,3 +838,41 @@ async def test_copilot_proposal_pins_acl_version(
     await _apply_set_zone_update_acl(db_session, user, fresh)
     after = (await client.get(url, headers=headers)).json()
     assert [e["ip_cidr"] for e in after["entries"]] == ["10.9.9.9/32"]
+
+
+async def test_stored_mixed_acl_on_powerdns_group_only_refused_on_change(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """An install that already stores IP + key on a PowerDNS group (#4569) can
+    still re-save it untouched and toggle ``dynamic_update_enabled``; changing
+    the ACL is what is refused. The read warns about what it renders."""
+    _, headers = await _superadmin(db_session)
+    group, zone, key = await _bind9_group_zone_key(db_session)
+    url = f"/api/v1/dns/groups/{group.id}/zones/{zone.id}/update-acl"
+    ip = {"match_kind": "ip", "ip_cidr": "10.0.0.0/24"}
+    tsig = {"match_kind": "tsig_key", "tsig_key_id": str(key.id)}
+    # Stored while the group was BIND9 (or before the refusal existed).
+    r = await client.put(url, headers=headers, json={"entries": [ip, tsig]})
+    assert r.status_code == 200, r.text
+    server = (
+        await db_session.execute(select(DNSServer).where(DNSServer.group_id == group.id))
+    ).scalar_one()
+    server.driver = "powerdns"
+    await db_session.commit()
+
+    r = await client.get(url, headers=headers)
+    assert r.status_code == 200, r.text
+    assert any("AND" in w for w in r.json()["warnings"]), r.json()["warnings"]
+
+    r = await client.put(url, headers=headers, json={"entries": [ip, tsig]})
+    assert r.status_code == 200, r.text
+    assert any("AND" in w for w in r.json()["warnings"])
+
+    r = await client.put(
+        url, headers=headers, json={"entries": [ip, tsig], "dynamic_update_enabled": False}
+    )
+    assert r.status_code == 200, r.text
+
+    changed = {"match_kind": "ip", "ip_cidr": "10.1.0.0/24"}
+    r = await client.put(url, headers=headers, json={"entries": [changed, tsig]})
+    assert r.status_code == 422, r.text

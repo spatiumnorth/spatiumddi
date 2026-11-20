@@ -54,6 +54,7 @@ from app.drivers.dns.base import (
     RecordChange,
     RecordData,
     ServerOptions,
+    UpdateAclConflictError,
     UpdateAclEntry,
     ZoneData,
 )
@@ -420,7 +421,7 @@ class PowerDNSDriver(DNSDriver):
         warnings = super().validate_update_acl(zone_name, entries)
         kinds = {e.match_kind for e in entries if e.action == "grant"}
         if {"ip", "tsig_key"} <= kinds:
-            raise ValueError(
+            raise UpdateAclConflictError(
                 "PowerDNS cannot accept a dynamic update from a granted address OR "
                 "a granted TSIG key: with both kinds in one ACL it requires an update "
                 "to come from a granted address AND be signed with a granted key. "

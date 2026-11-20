@@ -1311,7 +1311,9 @@ The two combine as "both", where BIND9's `allow-update` means "either". So:
 - an **IP-only** ACL writes the granted ranges and no key;
 - an ACL with **both** kinds is refused by `validate_update_acl` (422). One
   stored before that check keeps "address and key" on the agent, which logs
-  `powerdns_update_acl_address_and_key`.
+  `powerdns_update_acl_address_and_key`; saving it again unchanged (or only
+  flipping `dynamic_update_enabled`) is accepted with a warning, and only a
+  change to the ACL is refused.
 
 **Drift** — in a zone with a dynamic-update ACL the pdns reconciler is
 additive per-rrset (`REPLACE` per managed `name+type`, never a blanket zone
