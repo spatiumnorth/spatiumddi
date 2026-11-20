@@ -152,12 +152,15 @@ describe.each(cases)("$name sync interval (#2110)", (c) => {
     ).toBe(1000);
   });
 
-  it("an edit that leaves the field alone sends the stored number", async () => {
+  it("an edit that leaves the field alone does not send the default", async () => {
     c.edit();
     submit();
     await waitFor(() => expect(c.updateFn).toHaveBeenCalledTimes(1));
+    // A Save sends only what changed (#4370): the stored 90 / 120 is left
+    // alone, and above all the field is not read as the 60 / 300 default.
     expect(
-      (c.updated() as { sync_interval_seconds: unknown }).sync_interval_seconds,
-    ).toBe(c === cases[0] ? 90 : 120);
+      (c.updated() as { sync_interval_seconds?: unknown })
+        .sync_interval_seconds,
+    ).toBeUndefined();
   });
 });

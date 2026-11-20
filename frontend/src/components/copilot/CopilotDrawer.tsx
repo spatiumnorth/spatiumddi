@@ -411,6 +411,8 @@ export function CopilotDrawer({
   // drawer's own focus calls move focus into it.
   const titleId = useId();
   const drawerRef = useRef<HTMLDivElement | null>(null);
+  const selectAllRef = useRef<HTMLButtonElement | null>(null);
+  const focusSelectAllRef = useRef(false);
   const openerRef = useRef<HTMLElement | null | undefined>(undefined);
   if (openerRef.current === undefined) {
     openerRef.current = document.activeElement as HTMLElement | null;
@@ -621,6 +623,12 @@ export function CopilotDrawer({
   // Multi-select for bulk delete in the History panel.
   // Local-only state — the ids don't need to survive close/reopen.
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    if (focusSelectAllRef.current && selectedIds.size === 0) {
+      focusSelectAllRef.current = false;
+      selectAllRef.current?.focus();
+    }
+  }, [selectedIds]);
   const bulkDeleteMut = useMutation({
     // No dedicated bulk-delete endpoint — fan out per-id deletes in
     // parallel. Practical chat-history sizes (single-digit to low-100s)
@@ -774,7 +782,12 @@ export function CopilotDrawer({
                   <div className="flex items-center gap-2">
                     <button
                       type="button"
-                      onClick={() => setSelectedIds(new Set())}
+                      onClick={() => {
+                        setSelectedIds(new Set());
+                        // Cancel leaves with the selection bar; focus lands
+                        // on Select all, which takes its place (#4355).
+                        focusSelectAllRef.current = true;
+                      }}
                       className="rounded border px-2 py-0.5 hover:bg-accent"
                     >
                       Cancel
@@ -804,6 +817,7 @@ export function CopilotDrawer({
                 <>
                   <button
                     type="button"
+                    ref={selectAllRef}
                     onClick={() => {
                       const all = new Set(
                         (sessionsQ.data ?? []).map((s) => s.id),
@@ -945,7 +959,12 @@ export function CopilotDrawer({
           </span>
           <button
             type="button"
-            onClick={() => onContextConsumed?.()}
+            onClick={() => {
+              onContextConsumed?.();
+              // The strip removes itself with its focused button: hand
+              // focus to the question box rather than the page body (#4355).
+              drawerRef.current?.querySelector("textarea")?.focus();
+            }}
             title="Clear context"
             aria-label="Clear context"
             className="ml-auto inline-flex shrink-0 rounded p-0.5 hover:bg-amber-500/20"

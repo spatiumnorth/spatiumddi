@@ -602,8 +602,13 @@ async def retire_auto_reverse_zones(
             await add_to_batch(db, batch, zone)
         else:
             from app.api.v1.dns.router import _push_zone_to_agentless_servers  # noqa: PLC0415
+            from app.services.dns.record_ops import servers_not_created_by_us  # noqa: PLC0415
 
-            await _push_zone_to_agentless_servers(db, zone, "delete")
+            # #1771: only where SpatiumDDI created the zone; a same-named zone
+            # the operator had there first is theirs.
+            await _push_zone_to_agentless_servers(
+                db, zone, "delete", skip_server_ids=await servers_not_created_by_us(db, zone)
+            )
             await db.execute(sa_delete(DNSRecord).where(DNSRecord.zone_id == zone.id))
             await db.delete(zone)
             await prune_zone_ids(db, [zone.id])

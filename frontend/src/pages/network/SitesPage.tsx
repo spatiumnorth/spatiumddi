@@ -34,6 +34,8 @@ import {
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { useSessionState } from "@/lib/useSessionState";
 import { Modal } from "@/components/ui/modal";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ServicesUsingButton } from "@/components/ServicesUsingButton";
@@ -122,7 +124,11 @@ export function SiteEditorModal({
           parent_site_id: parentId || null,
           notes,
         };
-        return sitesApi.update(existing.id, body);
+        // Only what the operator changed, against the row read when the
+        // dialog opened (#4379).
+        const diff = changedFields(existing, body);
+        if (Object.keys(diff).length === 0) return existing;
+        return sitesApi.update(existing.id, diff);
       }
       const body: SiteCreate = {
         name,
@@ -1122,11 +1128,20 @@ export function SitesPage() {
           />
         )}
         {editing && (
-          <SiteEditorModal
-            existing={editing}
-            sites={allSites}
+          <FreshEdit
+            row={editing}
+            load={() => sitesApi.get(editing.id)}
+            title="Edit site"
             onClose={() => setEditing(null)}
-          />
+          >
+            {(fresh) => (
+              <SiteEditorModal
+                existing={fresh}
+                sites={allSites}
+                onClose={() => setEditing(null)}
+              />
+            )}
+          </FreshEdit>
         )}
         {moving && (
           <MoveSiteModal

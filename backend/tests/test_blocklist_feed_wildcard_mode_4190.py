@@ -334,3 +334,26 @@ async def test_legacy_boolean_column_follows_the_mode(db_session: AsyncSession) 
         )
         is True
     )
+
+
+async def test_echoing_the_derived_legacy_boolean_keeps_by_syntax(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """#4446: a client that GETs a by_syntax list and PUTs back the boolean it
+    received (True) changed nothing; only a differing boolean is a choice."""
+    h = await _admin_headers(db_session)
+    r = await client.post("/api/v1/dns/blocklists", headers=h, json={"name": "echo4446"})
+    lid = r.json()["id"]
+    assert r.json()["feed_entries_are_wildcard"] is True
+
+    r = await client.put(
+        f"/api/v1/dns/blocklists/{lid}", headers=h, json={"feed_entries_are_wildcard": True}
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["feed_wildcard_mode"] == "by_syntax"
+
+    # False differs from the derived True: still the explicit "never".
+    r = await client.put(
+        f"/api/v1/dns/blocklists/{lid}", headers=h, json={"feed_entries_are_wildcard": False}
+    )
+    assert r.json()["feed_wildcard_mode"] == "never"

@@ -16,7 +16,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import and_, delete, exists, func, or_, select, union
+from sqlalchemy import String, and_, cast, delete, exists, func, or_, select, union
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import aliased
 
@@ -27,7 +27,8 @@ from app.db import task_session
 from app.models.audit import AuditLog
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
 from app.models.dns import DNSRecord, DNSZone
-from app.models.ipam import IPBlock, IPSpace, Subnet
+from app.models.e911 import ERLBinding
+from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.models.network_service import NetworkService
 from app.models.overlay import OverlayNetwork
 from app.models.ownership import Customer
@@ -98,6 +99,7 @@ async def _release_ipam_mirrors(db: Any, cutoff: datetime, touched_subnets: set[
                 and_(
                     DHCPStaticAssignment.deleted_at.is_not(None),
                     DHCPStaticAssignment.deleted_at < cutoff,
+                    ~_bound_in_trashed_scope(),
                 ),
                 # The same predicate the scope DELETE uses: a scope held back
                 # because a live pool / reservation sits on it (#1957) keeps its
@@ -382,6 +384,23 @@ def _scopes_with_live_children() -> Any:
     )
 
 
+def _bound_in_trashed_scope() -> Any:
+    """SQL predicate: this reservation's address carries an E911 binding and its
+    scope is in the Trash. Such a reservation waits with its scope (#4286); one
+    trashed alone, under a live scope, is purged as always."""
+    return and_(
+        exists()
+        .where(
+            ERLBinding.ip_address_id == IPAddress.id,
+            IPAddress.static_assignment_id == cast(DHCPStaticAssignment.id, String),
+        )
+        .correlate(DHCPStaticAssignment),
+        exists()
+        .where(DHCPScope.id == DHCPStaticAssignment.scope_id, DHCPScope.deleted_at.is_not(None))
+        .correlate(DHCPStaticAssignment),
+    )
+
+
 def _expired_where(model: type, cutoff: datetime) -> list[Any]:
     """The rows of ``model`` the sweep may delete: expired, and with nothing LIVE under them.
 
@@ -412,7 +431,21 @@ def _expired_where(model: type, cutoff: datetime) -> list[Any]:
             ~subnet_e911_bound_clause(),
         ]
     elif model is DHCPScope:
-        where.append(DHCPScope.id.not_in(_scopes_with_live_children()))
+        where += [
+            DHCPScope.id.not_in(_scopes_with_live_children()),
+            # A reservation's address an E911 binding names is kept with its
+            # scope in the Trash; the purge would drop that binding, so the
+            # scope is held back for the operator to move it (#4286).
+            ~exists()
+            .where(
+                ERLBinding.ip_address_id == IPAddress.id,
+                IPAddress.static_assignment_id == cast(DHCPStaticAssignment.id, String),
+                DHCPStaticAssignment.scope_id == DHCPScope.id,
+            )
+            .correlate(DHCPScope),
+        ]
+    elif model is DHCPStaticAssignment:
+        where.append(~_bound_in_trashed_scope())
     elif model is Customer:
         # network_service.customer_id is RESTRICT: a customer with any service
         # (live, or trashed but not yet expired) waits for it (#2738).

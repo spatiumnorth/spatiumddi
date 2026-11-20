@@ -16,6 +16,7 @@ partial-success state cleanly.
 
 from __future__ import annotations
 
+import ipaddress
 import uuid
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -34,9 +35,11 @@ from app.services.dns.named_conf_validation import split_zone_forwarders
 from app.services.dns.new_object_defaults import load_dns_defaults
 from app.services.dns.record_ops import (
     enqueue_record_ops_bulk,
+    provision_zone_at_agentless_servers,
     record_op_payload,
     resolve_primary_server,
 )
+from app.services.dns.server_move import classless_zone_refusal
 from app.services.dns.view_collisions import RenderGuard
 from app.services.dns.zone_apex import apex_name_length_error
 from app.services.dns_import.soa_mailbox import (
@@ -49,6 +52,7 @@ from app.services.ipam.zone_binding import prune_zone_ids
 from . import cname_check
 from .apex_ns import ApexNsPolicy, group_names, is_apex_ns_warning, replace_apex_ns
 from .canonical import (
+    REPLICA_ZONE_TYPES,
     ConflictAction,
     ImportedZone,
     ImportPreview,
@@ -252,6 +256,16 @@ async def _build_records_for_zone(
     return rows, skipped
 
 
+def _is_master(entry: str) -> bool:
+    """``ip`` or ``ip@port``, the shapes the zone API stores."""
+    host, sep, port = entry.partition("@")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return not sep or (port.isascii() and port.isdigit() and 1 <= int(port) <= 65535)
+
+
 def _timer(value: int | None, default: int) -> int:
     servable = servable_ttl(value)
     return default if servable is None else servable
@@ -302,6 +316,7 @@ def _zone_kwargs_from_parsed(
         admin_email=importable_admin_email(soa.admin_email if soa else None)[0],
         last_serial=soa.serial if soa else 0,
         forwarders=parsed.forwarders or [],
+        masters=list(parsed.masters) if parsed.zone_type in REPLICA_ZONE_TYPES else [],
         forward_only=parsed.zone_type == "forward",
         import_source=source,
         imported_at=now,
@@ -333,6 +348,18 @@ async def _create_zone_at(
     distinguishes the case via ``audit_extra``.
     """
 
+    # #4259 — the plan comes back from the client, so the rule the preview
+    # applied is applied again: a secondary / stub zone needs masters the zone
+    # API would accept, and stores no records (its masters serve them).
+    if parsed.zone_type in REPLICA_ZONE_TYPES:
+        bad = [m for m in parsed.masters if not _is_master(m)]
+        if bad or not parsed.masters:
+            raise ValueError(
+                f"a {parsed.zone_type} zone requires at least one master "
+                "(primary server IP) to transfer from"
+                + (f"; not an address: {', '.join(repr(m) for m in bad)}" if bad else "")
+            )
+        parsed = replace(parsed, records=[])
     zone_kwargs = _zone_kwargs_from_parsed(
         parsed,
         name=target_name,
@@ -355,6 +382,21 @@ async def _create_zone_at(
         )
         if apex_err is not None:
             raise ValueError(apex_err)
+    if "/" in target_name:
+        # #4435 — an RFC 2317 classless zone lands only where the group's
+        # driver can serve it; fails this zone only, like the checks above.
+        drivers = (
+            (
+                await db.execute(
+                    select(DNSServer.driver).where(DNSServer.group_id == target_group_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        refusal = classless_zone_refusal({d for d in drivers if d}, target_name)
+        if refusal is not None:
+            raise ValueError(refusal)
     # #2275 — the slot being empty is not enough: a zone with no view renders
     # into every view, so it must not land beside a same-name pinned zone (and
     # vice versa). Raising fails this zone only; the caller rolls it back.
@@ -363,6 +405,11 @@ async def _create_zone_at(
     db.add(zone)
     await db.flush()  # populate zone.id for the FK
     await render_guard.check(db, f"import zone {target_name!r}", error=ValueError)
+    # #1771 — an agentless group (technitium_api / Windows Path B / cloud) only
+    # gets the zone when it is created there; a row alone leaves the record
+    # ops below failing "no such zone" or landing in an enclosing zone. Queued
+    # for after the commit, ahead of those ops. No-op for agent-managed groups.
+    await provision_zone_at_agentless_servers(db, zone)
 
     record_rows, skipped_records = await _build_records_for_zone(
         db,

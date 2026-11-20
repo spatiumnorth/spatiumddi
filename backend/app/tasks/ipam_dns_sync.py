@@ -672,11 +672,26 @@ async def reconcile_restored_zone_records(db: Any, zone_ids: list[Any]) -> tuple
     only for the records IPAM generated, so a hand-made record is untouched.
     Stale records are left to the sync's own rules (blank names are retracted).
     Returns ``(records_changed, dns_group_ids_to_wake)``."""
+    return await _reconcile_subnet_records(db, await restored_zone_candidate_subnets(db, zone_ids))
+
+
+async def reconcile_restored_subnet_records(db: Any, subnet_ids: list[Any]) -> tuple[int, set[Any]]:
+    """#4227 — the other half of #3924: a subnet (or a block / space holding
+    subnets) restored from the Trash brings its IPAM-generated records back as
+    the Trash held them, and the zone restore before it handed them over
+    unchanged. The same reconcile as a zone's, over ``subnet_ids``, so the
+    outcome does not depend on which of the two was restored first. A subnet
+    whose zone is still in the Trash publishes nothing (the zone's own restore
+    reconciles then)."""
+    return await _reconcile_subnet_records(db, sorted(subnet_ids, key=str))
+
+
+async def _reconcile_subnet_records(db: Any, subnet_ids: list[Any]) -> tuple[int, set[Any]]:
     from app.api.v1.ipam.router import _resolve_effective_dns  # noqa: PLC0415
 
     changed = 0
     wake: set[Any] = set()
-    for subnet_id in await restored_zone_candidate_subnets(db, zone_ids):
+    for subnet_id in subnet_ids:
         try:
             units = await _plan_subnet(db, subnet_id, delete_stale=False)
             await db.rollback()
@@ -703,8 +718,22 @@ async def reconcile_restored_zone_records(db: Any, zone_ids: list[Any]) -> tuple
                 .scalars()
                 .all()
             )
+            # A lease mirror's records belong to the DDNS re-apply, not to the
+            # drift create, which would publish an expired lease too (#4227).
+            freed |= await _auto_from_lease_ip_ids(db, subnet_id)
             for u in units:
                 u.create_ip_ids = [i for i in u.create_ip_ids if i not in freed]
+            units = [
+                u
+                for u in units
+                if u.create_ip_ids or u.update_record_ids or u.delete_record_ids or u.mirror_ip_ids
+            ]
+        # The DDNS re-apply a restore runs is the Trash-restore republish's own
+        # (#3787): active, unexpired lease mirrors only, as the lease path would.
+        if any(u.mirror_ip_ids for u in units):
+            active = set(await active_lease_mirror_ids(db, subnet_id))
+            for u in units:
+                u.mirror_ip_ids = [i for i in u.mirror_ip_ids if i in active]
             units = [
                 u
                 for u in units
@@ -714,10 +743,13 @@ async def reconcile_restored_zone_records(db: Any, zone_ids: list[Any]) -> tuple
             batch = units[i : i + SYNC_BATCH_SIZE]
             errors: list[str] = []
             try:
-                created, updated, deleted, _re = await _sync_batch(
+                created, updated, deleted, reapplied = await _sync_batch(
                     db, subnet_id, batch, errors=errors
                 )
-                n = created + updated + deleted
+                # A restore that only republishes live lease mirrors (the DDNS
+                # re-apply) still queued record ops: count it and wake the group,
+                # or the agents see them only on their next safety tick (#4227).
+                n = created + updated + deleted + reapplied
                 if n:
                     subnet = await db.get(Subnet, subnet_id)
                     if subnet is not None:
@@ -735,6 +767,39 @@ async def reconcile_restored_zone_records(db: Any, zone_ids: list[Any]) -> tuple
                     error=_first_line(exc),
                 )
     return changed, wake
+
+
+async def _run_reconcile_restored_subnets(subnet_ids: list[str]) -> dict[str, Any]:
+    import uuid  # noqa: PLC0415
+
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with session_factory() as db:
+            changed, wake = await reconcile_restored_subnet_records(
+                db, [uuid.UUID(s) for s in subnet_ids]
+            )
+        for gid in wake:
+            await publish_wake(dns_group_channel(gid))
+        return {"status": "ok", "records_changed": changed}
+    finally:
+        await engine.dispose()
+
+
+@celery_app.task(name="app.tasks.ipam_dns_sync.reconcile_restored_subnet_records", bind=True)
+@module_gated("core.dns")
+def reconcile_restored_subnet_records_task(  # type: ignore[type-arg]
+    self: object, subnet_ids: list[str]
+) -> dict[str, Any]:
+    """#4227 — post-commit retry of a Trash restore of a subnet: bring its
+    IPAM-generated records up to what IPAM holds now."""
+    try:
+        return asyncio.run(_run_reconcile_restored_subnets(subnet_ids))
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("restore_subnet_reconcile_failed", error=str(exc))
+        raise
 
 
 async def _run_reconcile_restored_zones(zone_ids: list[str]) -> dict[str, Any]:
