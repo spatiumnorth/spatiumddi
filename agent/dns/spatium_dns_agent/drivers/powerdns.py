@@ -301,8 +301,55 @@ def _absent_rrsets(
     return out
 
 
-def _render_catalog_zone_payload(catalog: dict[str, Any]) -> dict[str, Any]:
+#: SOA refresh of a catalog zone, seconds. NOTIFY is the fast path; this is
+#: how soon a consumer recovers from one that was lost (#4574).
+_CATALOG_SOA_REFRESH = 300
+
+
+def _catalog_unchanged(current: dict[str, Any], desired: list[dict[str, Any]]) -> bool:
+    """True when the live catalog already holds ``desired``, serial aside.
+
+    The catalog is re-rendered with a fresh timestamp serial on every sync;
+    PATCHing it each time would bump the serial and NOTIFY every consumer
+    each sync (#4574), so an unchanged catalog is left alone.
+    """
+
+    def norm(rrsets: Any) -> set[tuple[str, str, int, frozenset[str]]]:
+        out: set[tuple[str, str, int, frozenset[str]]] = set()
+        for rs in rrsets or []:
+            rtype = str(rs.get("type") or "").upper()
+            contents = {
+                str(r.get("content") or "")
+                for r in rs.get("records") or []
+                if not r.get("disabled")
+            }
+            if rtype == "SOA":
+                contents = {
+                    _soa_with_serial(c, 0) if _soa_parts(c) else c for c in contents
+                }
+            out.add(
+                (
+                    str(rs.get("name") or "").lower().rstrip("."),
+                    rtype,
+                    int(rs.get("ttl") or 0),
+                    frozenset(contents),
+                )
+            )
+        return out
+
+    return norm(current.get("rrsets")) == norm(desired)
+
+
+def _render_catalog_zone_payload(
+    catalog: dict[str, Any], opts: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Build the zones.json payload entry for an RFC 9432 catalog zone.
+
+    The zone is kind ``Master`` (unless the server options turn NOTIFY off)
+    and carries the server options' also-notify targets: a ``Native`` zone
+    never sends NOTIFY, so a consumer learned of a new or removed member only
+    at the next SOA refresh (#4574). The SOA refresh is short for the same
+    reason: it is the consumer's fallback when a NOTIFY is lost.
 
     PowerDNS accepts the canonical catalog-zone shape verbatim: SOA + NS
     + a ``version`` TXT pinned to ``"2"`` (the only schema PowerDNS
@@ -320,6 +367,8 @@ def _render_catalog_zone_payload(catalog: dict[str, Any]) -> dict[str, Any]:
     if not zname or zname == ".":
         return {"name": "invalid.", "kind": "Native", "rrsets": []}
 
+    opts = opts or {}
+    notify = str(opts.get("notify_enabled") or "yes").strip().lower()
     serial = int(time.time())
     rrsets: list[dict[str, Any]] = [
         {
@@ -328,7 +377,9 @@ def _render_catalog_zone_payload(catalog: dict[str, Any]) -> dict[str, Any]:
             "ttl": 86400,
             "records": [
                 {
-                    "content": (f"invalid. invalid. {serial} 86400 3600 86400 86400"),
+                    "content": (
+                        f"invalid. invalid. {serial} {_CATALOG_SOA_REFRESH} 600 86400 3600"
+                    ),
                     "disabled": False,
                 }
             ],
@@ -373,7 +424,9 @@ def _render_catalog_zone_payload(catalog: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "name": zname,
-        "kind": "Native",
+        "kind": "Native" if notify == "no" else "Master",
+        "also_notify": [str(e) for e in opts.get("also_notify") or []],
+        "catalog": True,
         "serial": serial,
         # The catalog's serial is the agent's own (a timestamp, bumped by
         # PowerDNS's SOA-EDIT-API DEFAULT on every change), not the control
@@ -1280,7 +1333,7 @@ class PowerDNSDriver(DriverBase):
         # we'll add in a follow-up — see the warning branch below).
         catalog = bundle.get("catalog") or None
         if catalog and catalog.get("mode") == "producer":
-            catalog_payload = _render_catalog_zone_payload(catalog)
+            catalog_payload = _render_catalog_zone_payload(catalog, opts)
             # Consumers transfer the catalog like any zone, under the
             # server's transfer policy.
             catalog_payload.update(
@@ -2644,6 +2697,7 @@ class PowerDNSDriver(DriverBase):
                             log.error("powerdns_soa_serial_failed", zone=zone_name, error=problem)
                             failures.append(f"{zone_name} soa serial: {problem}")
                             continue
+                    catalog_changed = False
                     rrsets: list[dict[str, Any]] = []
                     if _kind_category(desired_kind) == "secondary":
                         # A secondary's rrsets are the transfer's (#1521):
@@ -2672,7 +2726,13 @@ class PowerDNSDriver(DriverBase):
                                 f"{zone_name} read: HTTP {resp.status_code} {_pdns_error(resp)}"
                             )
                             continue
-                        rrsets.extend(_absent_rrsets(zone_name, desired, current))
+                        if zone_payload.get("catalog") and _catalog_unchanged(current, desired):
+                            # Nothing to publish: no PATCH, so no serial bump
+                            # and no NOTIFY storm (#4574).
+                            desired = []
+                        else:
+                            rrsets.extend(_absent_rrsets(zone_name, desired, current))
+                            catalog_changed = bool(zone_payload.get("catalog"))
                     deleted = len(rrsets)
                     for rs in desired:
                         rrsets.append(
@@ -2716,7 +2776,7 @@ class PowerDNSDriver(DriverBase):
                             deleted=deleted,
                         )
                         if (
-                            serial_changed
+                            (serial_changed or catalog_changed)
                             and soa_landed
                             and _kind_category(desired_kind) == "primary"
                         ):
