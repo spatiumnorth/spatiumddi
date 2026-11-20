@@ -14,6 +14,16 @@ BACKEND="${DNSDIST_BACKEND:-dns-powerdns:53}"
 RULES_FILE="${DNSDIST_RULES_FILE:-/agent-state/dnsdist-rules.conf}"
 FULL_CONF="${DNSDIST_CONF:-/tmp/dnsdist.conf}"
 POLL="${DNSDIST_POLL_SECONDS:-5}"
+# PROXY protocol v2 to the backend (#4576), so pdns sees the real client for
+# allow-axfr / dynamic-update ACLs and its query log. Must be paired with
+# PDNS_PROXY_PROTOCOL_FROM=<this front> on the PowerDNS agent: a backend that
+# is not expecting the header drops every query.
+PROXY_PROTOCOL="${DNSDIST_PROXY_PROTOCOL:-0}"
+# Health-check query + interval. The default (". NS" every 1 s) was ~all of the
+# backend's query log; a name that never exists, every 30 s, still proves pdns
+# answers (any reply, REFUSED included, marks it up).
+CHECK_NAME="${DNSDIST_CHECK_NAME:-spatium-healthcheck.invalid.}"
+CHECK_INTERVAL="${DNSDIST_CHECK_INTERVAL:-30}"
 DNSDIST_BIN="$(command -v dnsdist)"
 
 pid=""
@@ -43,7 +53,9 @@ build_conf() {
     echo 'setSecurityPollSuffix("")'
     echo "setLocal(\"0.0.0.0:53\")"
     echo "addLocal(\"[::]:53\")"
-    echo "newServer({address=\"${backend_ip}\", name=\"pdns\"})"
+    local proxy_opt=""
+    case "$PROXY_PROTOCOL" in 1|true|yes) proxy_opt=", useProxyProtocol=true" ;; esac
+    echo "newServer({address=\"${backend_ip}\", name=\"pdns\"${proxy_opt}, checkName=\"${CHECK_NAME}\", checkInterval=${CHECK_INTERVAL}})"
     echo 'setACL({"0.0.0.0/0", "::/0"})'
     if [ -s "$RULES_FILE" ]; then
       cat "$RULES_FILE"
