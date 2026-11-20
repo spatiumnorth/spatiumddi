@@ -2594,6 +2594,11 @@ class PowerDNSDriver(DriverBase):
                 # with zero LUA records simply don't trigger the LUA
                 # engine at query time).
                 "enable-lua-records=yes",
+                # DNAME substitution is off in pdns by default: the DNAME
+                # record is served but names below it answer NXDOMAIN
+                # instead of getting the synthesised CNAME BIND9 returns
+                # (#4571). A startup setting, like ``dnsupdate`` below.
+                "dname-processing=yes",
                 # RFC 2136 dynamic updates (issue #641). Enabled globally so
                 # the feature is available; per-zone acceptance is gated by the
                 # ``ALLOW-DNSUPDATE-FROM`` / ``TSIG-ALLOW-DNSUPDATE`` metadata
