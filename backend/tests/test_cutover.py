@@ -896,6 +896,98 @@ async def test_dhcp_cutover_deactivates_windows_before_activating_kea(
     assert item.cut_over_at is not None
 
 
+async def _disabled_phone_pool(db: AsyncSession, group: DHCPServerGroup, scope: DHCPScope):
+    """A scope pool restricted to a phone profile that has since been disabled
+    (#4376): the class no longer renders, so the pool would match no client."""
+    from app.models.dhcp import DHCPPhoneProfile, DHCPPhoneProfileScope
+    from app.services.dhcp.class_refs import phone_class_name
+
+    prof = DHCPPhoneProfile(
+        group_id=group.id, name="poly", enabled=False, vendor_class_match="Polycom", option_set=[]
+    )
+    db.add(prof)
+    await db.flush()
+    db.add(DHCPPhoneProfileScope(profile_id=prof.id, scope_id=scope.id))
+    db.add(
+        DHCPPool(
+            scope_id=scope.id,
+            start_ip="10.20.0.10",
+            end_ip="10.20.0.50",
+            pool_type="dynamic",
+            class_restriction=phone_class_name(prof.id),
+        )
+    )
+    await db.flush()
+
+
+async def test_dhcp_cutover_refused_when_a_pool_class_is_disabled(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#4376: activation by cutover applies the #4367 rule, and Windows is
+    never touched when it refuses."""
+    from app.services.cutover.canonical import BLOCKER_POOL_CLASS_UNAVAILABLE
+
+    user = await _user(db_session)
+    group, source, scope, _subnet = await _dhcp_side(db_session, is_active=False)
+    await _disabled_phone_pool(db_session, group, scope)
+    plan, item = await _plan_with_item(
+        db_session,
+        kind="dhcp_scope",
+        source_ref="10.20.0.0",
+        user=user,
+        source_dhcp=source,
+        dhcp_group_id=group.id,
+        scope=scope,
+        parity_ok=True,
+    )
+    await db_session.commit()
+
+    driver = _FakeDHCPDriver(scopes=[_windows_scope()])
+    monkeypatch.setattr(switch_mod, "WindowsDHCPReadOnlyDriver", lambda: driver)
+    monkeypatch.setattr(readiness_mod, "get_dhcp_driver", lambda _d: driver)
+
+    with pytest.raises(switch_mod.CutoverBlocked) as exc:
+        await switch_mod.execute_cutover(
+            db_session, plan=plan, item=item, current_user=user, force=True
+        )
+    assert any(b.code == BLOCKER_POOL_CLASS_UNAVAILABLE for b in exc.value.blockers)
+    assert "10.20.0.10-10.20.0.50" in str(exc.value)
+    assert "disabled" in str(exc.value)
+    assert driver.state_calls == []
+    assert scope.is_active is False
+
+
+async def test_dhcp_cutover_rechecks_pool_classes_before_touching_windows(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale preflight must not get past ``_cutover_dhcp``: with readiness
+    reporting clean, the switch itself still refuses before the WinRM call."""
+    user = await _user(db_session)
+    group, source, scope, _subnet = await _dhcp_side(db_session, is_active=False)
+    await _disabled_phone_pool(db_session, group, scope)
+    plan, item = await _plan_with_item(
+        db_session,
+        kind="dhcp_scope",
+        source_ref="10.20.0.0",
+        user=user,
+        source_dhcp=source,
+        dhcp_group_id=group.id,
+        scope=scope,
+        parity_ok=True,
+    )
+    await db_session.commit()
+
+    driver = _FakeDHCPDriver(scopes=[_windows_scope()])
+    monkeypatch.setattr(switch_mod, "WindowsDHCPReadOnlyDriver", lambda: driver)
+
+    with pytest.raises(switch_mod.CutoverBlocked):
+        await switch_mod._cutover_dhcp(
+            db_session, plan=plan, item=item, current_user=user, acknowledged=[]
+        )
+    assert driver.state_calls == []
+    assert scope.is_active is False
+
+
 async def test_dhcp_rollback_reverses_the_switch(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:

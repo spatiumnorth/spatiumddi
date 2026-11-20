@@ -20,7 +20,8 @@ for as long as it has existed:
      line that never executes is indistinguishable, in the built image, from
      no upgrade line at all. The Alpine images solve this with an
      ``ARG APK_SNAPSHOT`` the nightly passes its date tag to; the Debian ones
-     use ``ARG APT_SNAPSHOT``. An image declaring neither ignores both build
+     use ``ARG APT_SNAPSHOT``, and the Red Hat UBI variants (#3913) ``ARG
+     RPM_SNAPSHOT``. An image declaring none ignores the build
      args without a word — which is how the same nightly reported ``perl`` at
      5.40.1-6 while the index had offered 5.40.1-6+deb13u1 for days.
 
@@ -29,7 +30,9 @@ and the only symptom is a Trivy report weeks later blaming packages nobody
 touched. So this asserts both, over the SAME image list the nightly and
 release matrices build from (``.github/images.json``) — a new image is
 covered the moment it is added there, rather than when somebody remembers to
-add it here.
+add it here. The UBI variants are listed in ``.github/images-ubi.json`` (they are
+published to GHCR only, as ``<image>:<version>-ubi``, and are not part of the
+appliance) and are held to the same two rules.
 
 stdlib-only, no network, no docker. Exit 1 on any finding.
 """
@@ -51,12 +54,14 @@ IMAGES = REPO_ROOT / ".github" / "images.json"
 _UPGRADES = (
     re.compile(r"\bapk\s+upgrade\b"),
     re.compile(r"\bapt-get\s+(?:-\S+\s+)*(?:dist-upgrade|upgrade)\b"),
+    # Red Hat UBI (#3913): ``microdnf upgrade`` (ubi-minimal) or ``dnf upgrade``.
+    re.compile(r"\b(?:micro)?dnf\s+(?:-\S+\s+)*(?:upgrade|update)\b"),
 )
 
 # The cache-busting ARG, declared in the Dockerfile so the build arg the
 # workflow passes is not silently discarded. An ARG declared but never
 # referenced is equally inert, so the reference is checked too.
-_SNAPSHOT_ARG = re.compile(r"^\s*ARG\s+(AP[KT]_SNAPSHOT)\b", re.MULTILINE)
+_SNAPSHOT_ARG = re.compile(r"^\s*ARG\s+((?:AP[KT]|RPM)_SNAPSHOT)\b", re.MULTILINE)
 
 # ``FROM [--platform=…] <base> [AS <name>]``.
 _FROM = re.compile(
@@ -117,17 +122,27 @@ def _shipped_body(body: str, target: str) -> str:
     return "\n".join("\n".join(stages[i][2]) for i in chain)
 
 
-def _images() -> list[dict[str, str]]:
+def _read_list(path: pathlib.Path) -> list[dict[str, str]]:
     try:
-        images = json.loads(IMAGES.read_text())
+        images = json.loads(path.read_text())
     except (OSError, ValueError) as exc:
-        raise SystemExit(f"{IMAGES}: cannot read the image list ({exc})") from exc
+        raise SystemExit(f"{path}: cannot read the image list ({exc})") from exc
     # An empty list would make every check below vacuous and print success.
     if not isinstance(images, list) or not images:
         raise SystemExit(
-            f"{IMAGES}: expected a non-empty JSON list of images — a linter that checks "
+            f"{path}: expected a non-empty JSON list of images — a linter that checks "
             "nothing must not report success"
         )
+    return images
+
+
+def _images() -> list[dict[str, str]]:
+    images = _read_list(IMAGES)
+    # #3913 — the UBI variants sit beside the main list; it is optional so a
+    # tree without them (and the tests, which point IMAGES at a temp dir) still lints.
+    ubi = IMAGES.with_name("images-ubi.json")
+    if ubi.is_file():
+        images = images + _read_list(ubi)
     return images
 
 
@@ -198,14 +213,15 @@ def main() -> int:
 
         if not any(pattern.search(body) for pattern in _UPGRADES):
             findings.append(
-                f"{rel} ({image['image']}): no `apk upgrade` / `apt-get upgrade` — the base "
+                f"{rel} ({image['image']}): no `apk upgrade` / `apt-get upgrade` / `microdnf "
+                "upgrade` — the base "
                 "image's own packages can never be patched by this build"
             )
 
         declared = {m.group(1) for m in _SNAPSHOT_ARG.finditer(body)}
         if not declared:
             findings.append(
-                f"{rel} ({image['image']}): declares no ARG APK_SNAPSHOT / APT_SNAPSHOT — "
+                f"{rel} ({image['image']}): declares no ARG APK_SNAPSHOT / APT_SNAPSHOT / RPM_SNAPSHOT — "
                 "the nightly's cache will serve a frozen package layer and the upgrade "
                 "above will not run"
             )

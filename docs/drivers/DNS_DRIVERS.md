@@ -4,7 +4,7 @@
 
 DNS drivers implement the `DNSDriver` abstract base class in [`app/drivers/dns/base.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/drivers/dns/base.py). They are responsible for translating SpatiumDDI's internal DNS model into backend-neutral config + per-record ops. The critical constraint: **no DNS driver may restart the DNS daemon** as part of normal record or zone operations.
 
-The control-plane driver is a *thin* translator (CLAUDE.md non-negotiable #10): it takes SpatiumDDI DB models and emits a canonical `ConfigBundle` (plus per-record `RecordChange` ops) in neutral types. For agent-managed drivers (BIND9, PowerDNS) the actual daemon lifecycle — `nsupdate`, `rndc`, the PowerDNS REST API — runs inside the agent container; the control-plane `apply_record_change` is a formulate-only no-op that logs the op. For agentless drivers (Windows DNS, the cloud providers) `apply_record_change` runs from the control plane, after the request's database transaction commits (#1539).
+The control-plane driver is a *thin* translator (CLAUDE.md non-negotiable #10): it takes SpatiumDDI DB models and emits a canonical `ConfigBundle` (plus per-record `RecordChange` ops) in neutral types. For agent-managed drivers (BIND9, PowerDNS) the actual daemon lifecycle — `nsupdate`, `rndc`, the PowerDNS REST API — runs inside the agent container; the control-plane `apply_record_change` is a formulate-only no-op that logs the op. For agentless drivers (Windows DNS, an operator's own Technitium, the cloud providers) `apply_record_change` runs from the control plane, after the request's database transaction commits (#1539).
 
 ---
 
@@ -119,11 +119,11 @@ class DNSDriver(ABC):
 | Operation | Mechanism | Notes |
 |---|---|---|
 | Add/update/delete record | RFC 2136 `nsupdate` (via `dnspython`) | Incremental, instant, TSIG-signed |
-| Create zone | `rndc addzone` | No restart; zone active immediately |
-| Delete zone | `rndc delzone` | No restart |
+| Create zone | A `zone` stanza in the rendered `named.conf`, then `rndc reconfig` | No restart; no `rndc addzone` |
+| Delete zone | The stanza is dropped from the rendered `named.conf`, then `rndc reconfig` | No restart; no `rndc delzone` |
 | Update zone options (SOA, TTL) | `nsupdate` SOA record replacement | Incremental |
-| Add/update view | Regenerate `named.conf` → SCP → `rndc reconfig` | No restart; new config loaded in-place |
-| Update forwarders, options | Regenerate `named.conf` → SCP → `rndc reconfig` | No restart |
+| Add/update view | Agent re-renders `named.conf`, checks it with `named-checkconf`, swaps the tree in, `rndc reconfig` | No restart; new config loaded in-place |
+| Update forwarders, options | Same: re-render, check, swap, `rndc reconfig` | No restart |
 | Update RPZ (blocking), small change | RFC 2136 update of the added / removed names to the RPZ zone ([#4191](https://github.com/spatiumnorth/spatiumddi/issues/4191)) | No reload, no second copy of the zone in memory |
 | Update RPZ (blocking), large change | `rndc reload <rpz-zone>` after writing RPZ zone file | Zone-level reload only |
 | **Full daemon restart** | ❌ NEVER for normal operations | Only for: initial install, major version upgrade |
@@ -222,24 +222,18 @@ keyring = dns.tsigkeyring.from_text({
 update = dns.update.Update(zone, keyring=keyring, keyalgorithm=dns.tsig.HMAC_SHA256)
 ```
 
-### Zone Creation via rndc addzone
+### Zone creation and `named.conf` management
 
-```bash
-rndc addzone example.com '{ type primary; file "/var/named/example.com.db"; };'
-```
+The BIND9 driver runs in the DNS agent next to `named` ([DNS_AGENT.md](../deployment/DNS_AGENT.md) §1 and §3). The control plane never runs `rndc` and never copies files to the host: its driver only renders and builds the config bundle (`backend/app/drivers/dns/bind9.py`), and `reload_config` / `reload_zone` there only log.
 
-The driver:
-1. Generates the zone file from SpatiumDDI zone data
-2. SCPs zone file to BIND9 host
-3. Runs `rndc addzone`
-4. Verifies zone is active with `rndc zonestatus example.com`
+`named.conf` is **never edited by hand** when SpatiumDDI manages BIND9. On each new config bundle the agent:
 
-### Named.conf Management
+1. Renders `named.conf` and every zone file into a fresh tree under `/var/lib/spatium-dns-agent/rendered`. A new zone is a `zone` stanza in that `named.conf`, with its file under `zones/`; there is no `named.conf.spatiumddi` and no `rndc addzone`.
+2. Checks the tree with `named-checkconf` and declines the whole bundle if that fails.
+3. Swaps the new tree in and reloads: `rndc reconfig` for config changes and added or removed zones, then freeze / reload / thaw for zones whose file changed (a plain reload does not re-read a dynamic zone's file).
+4. Reads each changed zone's serial back with `rndc zonestatus` to confirm it loaded.
 
-`named.conf` is **never edited by hand** when SpatiumDDI manages BIND9. The driver maintains:
-- `named.conf.spatiumddi` — generated includes (views, zones, options)
-- `named.conf` includes `named.conf.spatiumddi`
-- Changes: regenerate `named.conf.spatiumddi` → SCP → `rndc reconfig`
+Record changes do not go through this path: they reach `named` as RFC 2136 updates over loopback, signed with the TSIG key the bundle carries.
 
 **Geo-steering views (issue #530).** GSLB pool members that carry a
 *serving scope* (client CIDRs and/or a Site) render as synthesized
@@ -256,26 +250,11 @@ documented future improvement. See DNS.md §17.
 
 Zone serial follows `YYYYMMDDnn` format:
 - On each record change via `nsupdate`, serial auto-increments (BIND handles this)
-- Driver tracks and displays current serial from `rndc zonestatus`
+- The agent reads the serial back from `rndc zonestatus` after a reload
 
 ### BIND9 Driver Configuration
 
-```python
-@dataclass
-class BIND9DriverConfig:
-    host: str
-    ssh_port: int = 22
-    ssh_user: str = "bind-mgmt"
-    ssh_key: str                  # Path to SSH private key (or key content)
-    rndc_key_name: str
-    rndc_key_secret: str          # Encrypted in DB
-    tsig_key_name: str
-    tsig_key_secret: str          # Encrypted in DB
-    named_conf_dir: str = "/etc/bind"
-    zone_file_dir: str = "/var/cache/bind"
-    rndc_host: str = "127.0.0.1"
-    rndc_port: int = 953
-```
+There is no driver-config dataclass, and a BIND9 server row carries no SSH, host or remote-`rndc` settings: the product has no SSH transport for DNS. The agent runs `rndc` against `named` on the same host, and takes its own settings (control-plane URL, key, state directory) from its environment (`agent/dns/spatium_dns_agent/config.py`).
 
 ### 2.5 DNSSEC — inline-signing (issue #49)
 
@@ -322,9 +301,8 @@ config-driven, not op-driven (unlike PowerDNS's REST sign):
 
 Gating: `_DRIVER_GATED_OPERATIONS` allows `dnssec_sign` on `{powerdns, bind9}`
 (`dnssec_signers.SIGNING_DRIVERS`, the one list the router, zone move and the
-single-signer rule all read), `dnssec_unsign` on `{powerdns, bind9, technitium}`
-(Technitium only so a zone signed before #1783 can be turned off), and
-`dnssec_rollover` on `{bind9}`.
+single-signer rule all read; Technitium joined it again in #1767),
+`dnssec_unsign` on the same set, and `dnssec_rollover` on `{bind9, technitium}`.
 
 **One signer per group ([#1762](https://github.com/spatiumnorth/spatiumddi/issues/1762)).**
 Keys are node-local on every agent engine — BIND9's `K*` files in the agent
@@ -452,12 +430,12 @@ In [`app/drivers/dns/__init__.py`](https://github.com/spatiumnorth/spatiumddi/bl
 
 ```python
 AGENTLESS_DRIVERS: frozenset[str] = frozenset(
-    {"windows_dns", "cloudflare", "route53", "azure_dns", "google_dns",
-     "digitalocean", "hetzner", "linode", "vultr"}
+    {"windows_dns", "technitium_api", "cloudflare", "route53", "azure_dns",
+     "google_dns", "digitalocean", "hetzner", "linode", "vultr"}
 )
 ```
 
-Agentless drivers don't emit a `ConfigBundle`; the API's `record_ops.enqueue_record_op` short-circuits them and calls `apply_record_change` directly instead of queueing for a co-located agent. The cloud-hosted DNS providers (§4A) joined this set in issue #37 (the four SDK-backed ones) and issue #327 (the token-only tier: DigitalOcean / Hetzner / Linode / Vultr).
+Agentless drivers don't emit a `ConfigBundle`; the API's `record_ops.enqueue_record_op` short-circuits them and calls `apply_record_change` directly instead of queueing for a co-located agent. The cloud-hosted DNS providers (§4A) joined this set in issue #37 (Cloudflare, Route 53, Azure DNS and Google Cloud DNS; of these only Route 53, Azure DNS and Google Cloud DNS import a provider SDK, Cloudflare calls its HTTP API through `httpx`) and issue #327 (the token-only tier: DigitalOcean / Hetzner / Linode / Vultr).
 
 ### 3.5 Write-through pattern
 
@@ -471,6 +449,10 @@ await db.commit()
 If the push fails, the 502 response prevents the DB commit — the Windows DNS state and SpatiumDDI state stay consistent. Record ops follow the same pattern via the agent-side op queue for agented drivers and direct calls for agentless.
 
 **Zone create / delete converge on retry (#1537).** Because a multi-server push can fail partway (the DB rolls back, servers already done are not), the agentless drivers treat the end state as success: a zone create that finds the zone already there, and a zone delete that finds it already gone, return normally. Only the provider's own "exists" / "not found" signal counts, never auth, throttling or 5xx errors: Windows Win32 9609 / 9601; Cloudflare error code 1061 on create, confirmed by a name lookup scoped to the configured `account_id` (Cloudflare also returns 1061 when a different account holds the domain), and an empty scoped lookup or HTTP 404 on delete; Route 53 a hosted zone carrying this zone row's deterministic `CallerReference` on create (a same-named zone SpatiumDDI did not create is refused with a 409, never adopted) and `NoSuchHostedZone` on delete; Azure a create-only PUT (`If-None-Match: *`, 412 = exists) and 404 on delete; Google Cloud DNS HTTP 409 on create (only when a managed zone with the same `dns_name` is visible) and 404 on delete; Technitium API `Zone already exists: <zone>` on create and `No such zone was found` on delete; Hetzner HTTP 404 on delete; DigitalOcean HTTP 404 carrying `{"id": "not_found"}`, Linode HTTP 404 carrying its `errors` envelope or a domain absent from the account's `X-Filter`ed domain list, and Vultr HTTP 404, all on delete (#1889). A zone create that finds the zone already there is not yet idempotent on DigitalOcean, Linode and Vultr.
+
+**Zones created outside the zone endpoints (#1771).** A DNS import commit queues the zone's create for the group's agentless servers the same way an auto-created reverse zone does (#1932): marked in the importing transaction, sent after the commit and ahead of the imported records. Sync with Servers' "push missing zones" step is skipped when the server's zone list could not be read (the error is reported), and a zone the server already held is not counted as pushed.
+
+**Retiring an auto reverse zone deletes only what SpatiumDDI created ([#1771](https://github.com/spatiumnorth/spatiumddi/issues/1771)).** `dns_zone.agentless_created_server_ids` lists the agentless servers where the provider create *reported a change*. A same-named zone the operator already had there (Technitium adopts an empty one, a cloud provider refuses a foreign one) is not listed. Retiring the zone with its subnet, or purging it from the Trash, sends `delete` only to the listed servers; every other server keeps its copy. Zones created before the column existed have no list, so they are treated as not ours: retiring one deletes nothing at the provider, and a leftover zone there has to be removed by hand. A zone delete the operator asks for explicitly is unchanged.
 
 Unlike Route 53, Windows, Azure, Google and Cloudflare adopt a same-named zone that already exists, whoever created it. Technitium (agentless) adopts only an empty Primary (§4C), and the agent-managed Technitium driver adopts a same-named zone only if it is in its own ledger of zones it created, carries the owner marker (the comment `managed by SpatiumDDI agent` on the apex SOA, stamped on every Primary the agent creates and, as a self-heal, on a ledger zone that lacks it; it survives a lost state dir; Secondary / Stub / Forwarder zones rest on the ledger alone), or `TECHNITIUM_ADOPT_EXISTING_ZONES=true` is set on the agent; otherwise the zone is left untouched and reported as a refused zone (#1775).
 
@@ -649,17 +631,9 @@ Producer-side only. When `DNSServerGroup.catalog_zones_enabled` is on and this s
 
 Consumer mode logs a structured warning at agent startup: the agent does not wire up PowerDNS catalog-consumer mode. Operators with PowerDNS secondaries pull via plain AXFR against the producer; full consumer-side support is still a Phase 5 polish item.
 
-### 4.7 PowerDNSDriver Configuration
+### 4.7 PowerDNS agent configuration
 
-```python
-@dataclass
-class PowerDNSDriverConfig:
-    api_url: str = "http://127.0.0.1:8081"   # local-only by design
-    api_key: str                             # generated by entrypoint, agent reads from env
-    api_timeout: float = 10.0
-```
-
-There is no `host` / `ssh_user` / `ssh_key` / RNDC counterpart — PowerDNS configuration is entirely REST-driven, and the REST endpoint is bound to loopback. This is significantly less surface area than the BIND9 driver maintains.
+There is no driver-config dataclass. The agent talks to its co-located PowerDNS on `http://127.0.0.1:8081` (a module constant in `agent/dns/spatium_dns_agent/drivers/powerdns.py`) and reads the API key from the file `pdns-api.key` in its state directory, `/var/lib/spatium-dns-agent/pdns-api.key` by default (§4.2); the container entrypoint creates it on first boot, and only the directory can be moved, with `AGENT_STATE_DIR`. The key is never read from the agent's environment. PowerDNS configuration is entirely REST-driven and the REST endpoint is bound to loopback; neither agent driver carries SSH settings.
 
 **Listen addresses (#2307).** The agent renders `local-address=0.0.0.0, ::` so the authoritative server answers on IPv4 and IPv6, matching BIND9's `listen-on` / `listen-on-v6 { any; }`. Setting the option replaces pdns's own default, so the IPv6 entry has to be named. On a host with no IPv6 stack at all (kernel `ipv6.disable=1`, no `AF_INET6` sockets) pdns aborts on a `::` entry, so the agent probes for an `AF_INET6` socket and renders `0.0.0.0` alone there. `net.ipv6.conf.*.disable_ipv6=1` is not that case: pdns still binds `::`.
 
@@ -818,7 +792,7 @@ The token never reaches the control plane — same agent-local trust boundary as
     "name": "technitium",
     "views": False,
     "rpz": False,
-    "dnssec_inline_signing": False,   # #1783 - not advertised; see 4B.3b
+    "dnssec_inline_signing": True,    # #1767 - agent reconciles signing; see 4B.3b
     "incremental_updates": "rest_api",
     "zone_types": ["forward", "primary", "secondary", "stub"],
     "record_types": [...],            # A/AAAA/CNAME/MX/TXT/NS/PTR/SRV/CAA/
@@ -855,17 +829,19 @@ Three behaviours worth knowing, all confirmed against a live daemon:
 
 **TSIG keys** live in *global* settings, not per zone. The wire format is a **flat pipe-delimited token list read in triples** — `name|secret|algorithm|name2|secret2|algorithm2|…`. Not JSON, and not `name|algorithm|secret` (that fails with "TSIG algorithm is not supported", because it reads the secret as the algorithm). `settings/set` **replaces the whole list**, so keys an operator added directly in the Technitium console are dropped on the next sync — the same control-plane-is-truth stance the rest of the driver takes, but worth knowing. Note also that `zoneTransferTsigKeyNames` accepts a key the server does not have, so keys are pushed *before* anything references them. Technitium's usable algorithms are `hmac-md5`, `hmac-sha1`, `hmac-sha256`, `hmac-sha256-128`, `hmac-sha384`, `hmac-sha384-192`, `hmac-sha512` and `hmac-sha512-256`. **`hmac-sha224` is not usable** ([#1858](https://github.com/spatiumnorth/spatiumddi/issues/1858)): `TsigKey.cs` lists it and the settings API stores it, but `DnsDatagram.GetTsigMacSize` has no case for it, so every request signed with it answers TSIG BADKEY. A sha224 key is therefore refused with a 422 naming the algorithm for a `technitium` / `technitium_api` group (SpatiumDDI accepts hmac-sha1 / sha224 / sha256 / sha384 / sha512 on a key; BIND9 and PowerDNS take all five, and Windows DNS and the cloud drivers use no group TSIG keys, so Technitium is the only gap): on key create, on an algorithm change, when a Technitium server joins a group that holds one (server create, driver change, move, Fleet role assignment, Copilot), and when a zone that uses one moves into such a group (the move preview reports it as `tsig_algorithm_refusal`). An agent that auto-registers into such a group is not refused (it would loop) and logs `dns_agent_tsig_algorithm_unsupported`. A key stored before the gate is not installed, is left out of every zone's pinned names, and is reported as an apply failure (which raises the `agent_config_rejected` alert), as is any key the agent cannot install (no secret, another algorithm).
 
-**Catalog zones (RFC 9432) are NOT supported on Technitium** ([#1782](https://github.com/spatiumnorth/spatiumddi/issues/1782); the fix is [#1766](https://github.com/spatiumnorth/spatiumddi/issues/1766), 1.1.0). Both roles are broken: as **producer**, turning the catalog on makes every member zone inherit the catalog zone's transfer `Deny` and notify `None`, which silently undoes the #734 transfer grant, so drift, Sync with Servers and NOTIFY all stop; as **consumer** (a role removed in #3764), the `SecondaryCatalog` zone was created without TSIG, could not transfer the producer's denied catalog, and stayed empty. The driver reports `catalog_zones: False`; enabling `catalog_zones_enabled` on a group with a `technitium` / `technitium_api` server is a 422, as is putting such a server into a catalog-enabled group: on server create, on a driver change, on a server move, and on a Fleet or Copilot role assignment that points a `dns-technitium` appliance at one. An agent that auto-registers straight into a catalog group (its `AGENT_GROUP` names one) is *not* refused, because a refused registration re-bootstraps in a loop; it logs `dns_agent_catalog_unsupported_driver` and the group carries the warning below. A group that already had it on keeps rendering as before, and `GET /dns/groups` carries a `catalog_unsupported_warning` (also shown in the group editor). The agent code (`_apply_catalog`: producer `Catalog` zone + `catalog=<name>` stamping, `catalog=""` to unenrol) is retained for #1766. There is no consumer role any more ([#3764](https://github.com/spatiumnorth/spatiumddi/issues/3764)): group members get every zone in their bundle, so the control plane sends a consumer block to nobody, and an agent that still receives one from an older control plane treats it as catalog off, deleting a `SecondaryCatalog` it created earlier and logging `technitium_catalog_consumer_ignored`.
+**Catalog zones (RFC 9432), producer only** ([#1766](https://github.com/spatiumnorth/spatiumddi/issues/1766), closing #1782). Only the group primary gets a catalog block (no consumer role, #3764). `_apply_catalog` creates the `Catalog` zone and stamps `catalog=<name>` on each Primary. Two Technitium behaviours made the first version of this harmful, and both are handled: (1) a new `Catalog` zone is created with `ZoneTransfer=Deny` and `Notify=None`, and a member takes its transfer, notify and query access from the catalog zone unless its `overrideCatalogZoneTransfer` / `overrideCatalogNotify` / `overrideCatalogQueryAccess` are set (`DnsServer` transfer check, `AuthZoneInfo` notify), so the catalog silently replaced the #734 TSIG transfer grant on every zone. The agent now sends all three override flags together with `catalog=`, so each member keeps the options the reconcile applied; un-enrolling sends `catalog=""` only. (2) The catalog zone's own options were never set, so no external consumer could transfer it. `render` resolves them like a Primary's (`zoneTransfer` + `zoneTransferTsigKeyNames` from the group's `allow_transfer` and keys) and the agent applies them after creating the zone. Notify on the catalog zone goes to the group's also-notify addresses only (`SpecifiedNameServers`); with none it is `None`, because the catalog's own NS is not a real server (RFC 9432 `invalid.`). The agentless `technitium_api` driver writes no catalog state and still refuses `catalog_zones_enabled` (422, also on server create / driver change / move). `GET /dns/groups` carries a `catalog_unsupported_warning` for an existing group that has it on with such a server. The retired consumer role is as before: an agent that receives a `mode: "consumer"` block from an older control plane treats it as catalog off, deleting a `SecondaryCatalog` it created earlier and logging `technitium_catalog_consumer_ignored`.
 
-### 4B.3b DNSSEC (issue #740, withdrawn in #1783)
+### 4B.3b DNSSEC (issue #740; withdrawn in #1783, restored in #1767)
 
-> **SpatiumDDI does not support DNSSEC signing on Technitium (#1783).** `technitium` is absent from `_DRIVER_GATED_OPERATIONS["dnssec_sign"]`, so the sign endpoint, `dnssec_enabled` on zone create or update, and the Copilot all answer 422 naming #1767 (the same for `technitium_api`, #3806), and `capabilities()` reports `dnssec_inline_signing: False`. The reason: signing here is one-shot. The sign op is sent once, so a zone is not re-signed when a server joins the group, when the zone is re-created or restored, or when a data volume is lost; the zone's `DNSSECPolicy` is ignored (always ECDSA P256 / NSEC); and key state is re-reported only while the zone is signed. The zone then shows signed in SpatiumDDI while being unsigned on the wire. Full support is tracked in [#1767](https://github.com/spatiumnorth/spatiumddi/issues/1767) (1.1.0).
->
+> **Signing on agent-managed `technitium` is supported (#1767).** `technitium` is in `dnssec_signers.SIGNING_DRIVERS`, so the sign endpoint, `dnssec_enabled` on zone create or update, zone move and the Copilot accept it, and `capabilities()` reports `dnssec_inline_signing: True`. The agentless `technitium_api` driver stays refused with a 422 (#3806): it has no agent to keep a zone signed, and `capabilities()` still reports `False` there. The single-signer rule (#1762) applies: keys are per server, so a signed zone is refused on a group with more than one Technitium server (shared keys are future work).
+
 > **Console reachability (#1776).** The daemon's web console and API listen on loopback only (`127.0.0.1:5380`, plaintext HTTP), so nothing outside the container, pod or host can reach them ([#1776](https://github.com/spatiumnorth/spatiumddi/issues/1776)). A fresh `/etc/dns` takes the bind from `DNS_SERVER_WEB_SERVICE_LOCAL_ADDRESSES=127.0.0.1`, which the agent sets on every daemon start; Technitium reads that variable only when `webservice.config` does not exist yet, so on an existing `/etc/dns` the agent sends `settings/set webServiceLocalAddresses=127.0.0.1` once (it restarts the web service) after reading `settings/get`, and does nothing once pinned. Loopback is IPv4 only on purpose: Kestrel fails to start on `::1` where IPv6 is disabled in the container. The `admin` account still carries a random 192-bit password generated at first boot. To reach the console for debugging, run `curl` inside the container with `docker exec` / `kubectl exec`; `kubectl port-forward` does not work, as it connects to the pod IP rather than loopback. An operator who sets a different bind in the console will see it reset on the next structural apply.
 
-> **Zones already signed on Technitium are left alone.** The agent does not unsign them and they keep serving signed. Their zone response carries `dnssec_unmanaged_warning: true` and the UI shows a "DNSSEC not managed" badge. `dnssec_unsign` stays allowed on `technitium`, so an operator can still turn DNSSEC off.
->
-> The rest of this section describes the agent mechanism that remains for those zones. Disregard its claims of sign-on-demand and of rollover being left to the daemon: Technitium's own key rollover is not surfaced here.
+Signing state is **structural**, as on BIND9. `render()` attaches a `dnssec` block (the sign parameters derived from the zone's policy) to every Primary zone the bundle flags `dnssec_enabled`, and after each zone's records are reconciled `swap_and_reload` reads `zones/dnssec/properties/get`: a zone found `Unsigned` is signed. So a server added to the group, a zone retired and re-added (soft-delete then restore included) and a lost `/etc/dns` volume all come back signed. The reconcile is deliberately one-directional: a zone the bundle does *not* flag is never unsigned by it (a missing flag is not proof the operator wants the keys destroyed); `dnssec_unsign` stays the explicit action, and also still works on a group whose zones were signed some other way.
+
+**Policy mapping.** `DNSSECPolicy` maps onto `zones/dnssec/sign` (`_dnssec_sign_spec`): `ecdsap256sha256` / `ecdsap384sha384` → `ECDSA` + `curve=P256|P384`; `ed25519` / `ed448` → `EDDSA` + `curve`; `rsasha256` / `rsasha512` → `RSA` + `hashAlgorithm` + 2048-bit `kskKeySize` / `zskKeySize`; `nsec3` → `nxProof=NSEC3` + `iterations` + `saltLength`; `zsk_lifetime_days` → `zskRolloverDays` (0 disables, clamped to 365). No policy (the built-in `default`) is ECDSA P256 / NSEC with Technitium's own 30-day ZSK roll. Two policy settings Technitium cannot express are logged (`technitium_dnssec_policy_not_expressible`) rather than silently dropped: a **KSK lifetime** (a Technitium KSK's `rolloverDays` is set per key at creation and defaults to 0, so a KSK never rolls on its own; use manual rollover below) and **NSEC3 opt-out**. **Changing the policy of an already-signed zone is reported, not applied**: moving to another algorithm or between NSEC and NSEC3 needs unsign + sign, which generates new keys and invalidates the published DS, so the apply instead carries a partial-apply note naming the zone ("signed with a different algorithm … unsign and re-sign") and leaves the zone serving.
+
+**Key state is reported on every apply and on the periodic refresh.** The agent's `collect_dnssec_state(bundle)` (public, as on BIND9; it used to exist only as a private per-zone helper reached from the sign op, so state was reported once) reads each signed Primary zone's keys and DS and the sync loop posts changes, so a ZSK auto-rollover, or a KSK moving from Ready to Active after the DS lands, updates the `DNSKey` rows and DS shown. A zone whose keys cannot be read yet is left out of the report and the loop retries soon, instead of reporting an empty key set that would wipe the stored rows.
 
 Online signing, op-driven — the same shape as PowerDNS, not BIND9's config-rendered `dnssec-policy`. `dnssec_sign` / `dnssec_unsign` ride the record-op queue and branch out before any rrset machinery.
 
@@ -874,7 +850,7 @@ POST /api/zones/dnssec/sign?zone=<z>&algorithm=ECDSA&curve=P256&nxProof=NSEC
 POST /api/zones/dnssec/unsign?zone=<z>
 ```
 
-The neutral op carries no algorithm — it is a bare "sign this zone" from the UI, and BIND expresses the choice through a `dnssec-policy` name that means nothing here — so the driver picks **ECDSA P256 / NSEC**. RSA (with `hashAlgorithm` + `kskKeySize`/`zskKeySize`), ECDSA P384, EDDSA ED25519, and NSEC3 (`nxProof=NSEC3` + `iterations`/`saltLength`) all sign successfully if that default ever needs to become operator-selectable.
+The neutral op carries no algorithm, so the sign op uses the parameters the last reconcile derived from the zone's policy (ECDSA P256 / NSEC for a zone not seen yet). RSA, ECDSA P384, EDDSA and NSEC3 all sign successfully (verified live).
 
 Signing is idempotent: an already-signed zone answers `Cannot sign zone: the zone is already signed.`, which is treated as success so repeated "Sign zone" clicks converge on signed rather than erroring.
 
@@ -894,7 +870,7 @@ Unlike the PowerDNS agent, this driver reports `keys` as well as `ds_records` �
 
 > ⚠️ A signed zone serves DNSKEY / RRSIG / NSEC / NSEC3 / NSEC3PARAM records that **no bundle describes**. `_DNSSEC_RECORD_TYPES` filters them out of `_get_zone_records`; without that, the full-zone reconcile treats every signing artefact as an extra record and tries to delete the zone's own signatures on every single pass. There is a regression test for exactly this.
 
-Manual key rollover stays BIND9-only. Technitium DNSSEC is unsupported in 1.0 (#1783), so `dnssec_rollover` is not widened to technitium. Its KSK `rolloverDays` defaults to 0, which means never roll; nothing in SpatiumDDI sets or reads it.
+**Manual key rollover** (`dnssec_rollover`, #1767) calls `zones/dnssec/properties/rolloverDnsKey?zone=&keyTag=`: Technitium publishes a replacement and retires the old key once it is active, then the agent re-reads the zone so the new DS is reported. Technitium does *not* roll on its own schedule for the KSK (`rolloverDays` defaults to 0 = never; only the ZSK rolls, every `zskRolloverDays`, 30 by default), so this is the way a KSK rolls; republish the DS at the parent afterwards.
 
 ### 4B.3c Encrypted transports (issue #741)
 
@@ -1135,6 +1111,8 @@ _DRIVERS: dict[str, type[DNSDriver]] = {
     "bind9": BIND9Driver,
     "powerdns": PowerDNSDriver,
     "technitium": TechnitiumDriver,
+    # Agentless Technitium (#810): an install the operator already runs.
+    "technitium_api": TechnitiumAPIDriver,
     "windows_dns": WindowsDNSDriver,
     # Agentless cloud-hosted DNS providers (issue #37, Part B).
     "cloudflare": CloudflareDNSDriver,
@@ -1150,8 +1128,8 @@ _DRIVERS: dict[str, type[DNSDriver]] = {
 
 # Drivers whose record ops run from the control plane directly, no agent.
 AGENTLESS_DRIVERS: frozenset[str] = frozenset(
-    {"windows_dns", "cloudflare", "route53", "azure_dns", "google_dns",
-     "digitalocean", "hetzner", "linode", "vultr"}
+    {"windows_dns", "technitium_api", "cloudflare", "route53", "azure_dns",
+     "google_dns", "digitalocean", "hetzner", "linode", "vultr"}
 )
 # The cloud subset (used by the cloud import + sync-from-server widening).
 CLOUD_DNS_DRIVERS: frozenset[str] = frozenset(
@@ -1183,10 +1161,10 @@ Mixed installs work via multiple groups:
 | Reference impl, BIND muscle memory, RPZ blocking | **BIND9** |
 | ALIAS records (CNAME at apex) | **PowerDNS** |
 | LUA records (computed responses, geo-routing) | **PowerDNS** |
-| One-toggle online DNSSEC | **PowerDNS** (BIND9 signs inline from a policy; Technitium is not supported, #1783) |
+| One-toggle online DNSSEC | **PowerDNS** (BIND9 signs inline from a policy; Technitium signs structurally from the bundle, #1767) |
 | Manual NSEC3 + KSK / ZSK rollover control | **BIND9** |
 | First-class views / split-horizon (issue #24) | **BIND9** |
-| Catalog zones as **producer** | BIND9 or PowerDNS (Technitium refused, #1782) |
+| Catalog zones as **producer** | BIND9, PowerDNS or Technitium (agent-managed; `technitium_api` refused) |
 | Catalog zones as **consumer** | None inside a group (#3764): members get every zone in their bundle. External BIND secondaries consume the producer's catalog (§2.8) |
 | Native DoT / DoH with no sidecar | **BIND9** or **Technitium** |
 | DNS-over-QUIC, or encrypted *upstream* forwarding over DoH / DoQ | **Technitium** (BIND 9.20 has no client-side HTTP or QUIC transport; pdns doesn't forward at all) |
@@ -1199,7 +1177,7 @@ BIND9, PowerDNS, and Technitium drivers are all supported indefinitely. PowerDNS
 
 **Picking between the two Technitium drivers** comes down to one question — do you want SpatiumDDI to *run* the daemon?
 
-- Yes → `technitium` (§4B). Encrypted transports, forwarders, blocklists. Not catalog zones (#1782) or DNSSEC signing (#1783; #1767).
+- Yes → `technitium` (§4B). Encrypted transports, forwarders, blocklists, DNSSEC signing on the agent-managed driver (#1767), catalog zones as a producer (#1766).
 - No, it's already running → `technitium_api` (§4C). Zones and records only; the rest stays managed in Technitium's own console.
 
 A group is single-driver, so servers of the two kinds live in separate groups.
