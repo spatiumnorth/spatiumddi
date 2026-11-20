@@ -474,7 +474,7 @@ class Settings(BaseSettings):
     # #4550 — ``hostname.domain`` when the operator gave the appliance a DNS
     # domain at install (empty otherwise). Threaded in by firstboot like the
     # two above; the self-signed Web UI cert carries it as a DNS SAN so
-    # https://ddi1.corp.example.com validates against the right name.
+    # https://<hostname>.<domain> validates against the right name.
     appliance_fqdn: str = ""
     # #272 Phase 6 — extra SAN entries the self-signed cert MUST cover
     # beyond the host's own IPs: the control-plane VIP (and any other
