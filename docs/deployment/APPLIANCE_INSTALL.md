@@ -18,9 +18,9 @@ the fleet firewall, control-plane HA internals — lives in
 [APPLIANCE.md](APPLIANCE.md). Prefer containers you manage yourself? See
 [Docker Compose](DOCKER.md) or [Kubernetes](KUBERNETES.md) instead.
 
-> **Beta.** The appliance is stable enough for labs, homelabs and pilots in
-> front of non-critical client populations. Pin to a tested release for
-> anything business-critical, and snapshot the VM before an OS upgrade.
+> **Stable.** The appliance is a supported install path as of 1.0.0. Pin to a
+> tested release for anything business-critical, and snapshot the VM before an
+> OS upgrade.
 
 ---
 
