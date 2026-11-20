@@ -174,6 +174,33 @@ def test_firstboot_waits_for_a_pending_peer_reset() -> None:
     assert "record_etcd_peer_addr" in text
 
 
+def _unit_timeout_s() -> int:
+    import re
+
+    unit = (EXTRA / "etc" / "systemd" / "system" / "spatiumddi-firstboot.service").read_text()
+    m = re.search(r"^TimeoutStartSec=(\d+)min$", unit, re.M)
+    assert m, "TimeoutStartSec must be whole minutes"
+    return int(m.group(1)) * 60
+
+
+def test_unit_timeout_outlasts_the_reset_wait() -> None:
+    """#4592 — systemd killed firstboot at 10 min, before the reset (which needs
+    k3s's first start to give up, ~15 min after boot) could matter."""
+    import re
+
+    text = (EXTRA / "usr" / "local" / "bin" / "spatiumddi-firstboot").read_text()
+    ready = int(re.search(r"for _ in \$\(seq 1 (\d+)\); do\n    if /usr/local/bin/k3s kubectl get --raw=/readyz", text).group(1)) * 5
+    pend = int(re.search(r"seq 1 (\d+)\); do\n        if /usr/local/bin/k3s kubectl get --raw=/readyz", text).group(1)) * 5
+    # the waits, plus the post-ready steps (slot-image window) and 5 min of margin
+    assert _unit_timeout_s() >= ready + pend + 600 + 300
+
+
+def test_reset_wait_re_anchors_the_image_check_window() -> None:
+    text = (EXTRA / "usr" / "local" / "bin" / "spatiumddi-firstboot").read_text()
+    wait = text.split('if [ "$ready" != 1 ] && etcd_peer_reset_pending', 1)[1].split('if [ "$ready" = 1 ]; then', 1)[0]
+    assert "FIRSTBOOT_T0=$(uptime_s" in wait
+
+
 def test_console_verdict_names_the_mismatch(tmp_path: Path) -> None:
     import ast
 

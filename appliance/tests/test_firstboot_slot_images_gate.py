@@ -181,9 +181,9 @@ def test_the_gate_gives_the_helper_what_is_left_of_the_units_timeout(tmp_path, u
 
 def test_the_timeout_in_the_script_is_the_units() -> None:
     unit = (FIRSTBOOT.parents[3] / "etc" / "systemd" / "system" / "spatiumddi-firstboot.service").read_text()
-    assert "TimeoutStartSec=10min" in unit.splitlines()
-    assert "FIRSTBOOT_TIMEOUT_S=600   # TimeoutStartSec=10min in spatiumddi-firstboot.service" in _lines(), (
-        "spatiumddi-firstboot sizes the image check's wait to its unit's TimeoutStartSec; "
+    assert "TimeoutStartSec=45min" in unit.splitlines()
+    assert any(l.startswith("FIRSTBOOT_TIMEOUT_S=600 ") and "TimeoutStartSec=45min" in l for l in _lines()), (
+        "spatiumddi-firstboot sizes the image check's wait inside its unit's TimeoutStartSec; "
         "change both together"
     )
 

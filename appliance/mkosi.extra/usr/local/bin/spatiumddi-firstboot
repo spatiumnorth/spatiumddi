@@ -21,7 +21,7 @@ set -eu
 # #2109 — seconds since boot, and when this run began. The slot-image check
 # near the end may wait for as long as this unit has left of its start
 # timeout, so it can report its own verdict instead of being killed mid-wait.
-FIRSTBOOT_TIMEOUT_S=600   # TimeoutStartSec=10min in spatiumddi-firstboot.service
+FIRSTBOOT_TIMEOUT_S=600   # the slot-image check's window, inside TimeoutStartSec=45min (re-anchored after the #4591 reset wait)
 uptime_s() {
     read -r _up _ </proc/uptime && echo "${_up%.*}"
 }
@@ -2978,6 +2978,9 @@ if [ "$ready" != 1 ] && etcd_peer_reset_pending; then
         fi
         sleep 5
     done
+    # #4592 — the wait spent most of the unit's budget on purpose; the slot-image
+    # check below gets its usual window from here (the unit has 45 min in all).
+    FIRSTBOOT_T0=$(uptime_s 2>/dev/null || echo 0)
 fi
 if [ "$ready" = 1 ]; then
     tighten_kubeconfig

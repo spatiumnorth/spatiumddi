@@ -25,7 +25,14 @@ After=etc.mount
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-TimeoutStartSec=10min
+# #4592 — 5 min /readyz + up to 25 min waiting for spatium-etcd-peer-reset
+# (a kept /var on a new address: k3s's first start refuses its etcd member for
+# ~15 min, and the reset can only run on its second) + the post-ready steps.
+# 10 min killed firstboot before the reset could matter. Only that path runs
+# past ~5 min: a normal boot finishes in minutes, and a boot where k3s never
+# comes up stops waiting after 5 min as before, so multi-user.target is held
+# no longer than it was.
+TimeoutStartSec=45min
 ExecStart=/usr/local/bin/spatiumddi-firstboot
 # No ExecStop — the appliance is k3s-only; shutdown is k3s's job
 # (it cleanly evicts pods on systemctl stop k3s.service).
