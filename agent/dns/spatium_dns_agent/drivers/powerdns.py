@@ -71,6 +71,13 @@ _ALIAS_RESOLVER_PORTED_RE = re.compile(
 )
 
 
+def _allow_empty_retire() -> bool:
+    """PDNS_ALLOW_EMPTY_RETIRE=1: the operator wants the server emptied when
+    the bundle drops every managed zone (#4564)."""
+    value = os.environ.get("PDNS_ALLOW_EMPTY_RETIRE", "")
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
 def _alias_resolver_entry_ok(entry: str) -> bool:
     """One ``resolver=`` element: an address, optionally with a port."""
     ported = _ALIAS_RESOLVER_PORTED_RE.fullmatch(entry)
@@ -1527,6 +1534,10 @@ class PowerDNSDriver(DriverBase):
 
     # ── Zones the bundle dropped (#4564) ────────────────────────────────────
 
+    #: Set while a confirmed bundle's retire pass is held because it would
+    #: delete every managed zone; the sync loop reports it as a warning.
+    retire_warning: str | None = None
+
     def _managed_zones_path(self) -> Path:
         return self.state_dir / _MANAGED_ZONES_FILE
 
@@ -1593,7 +1604,25 @@ class PowerDNSDriver(DriverBase):
             return
         managed = self._load_managed_zones()
         dropped = sorted((managed or set()) - desired)
+        self.retire_warning = None
         if managed is None or not dropped:
+            self._retire_owed = False
+            return
+        if set(dropped) == managed and not _allow_empty_retire():
+            # One confirmed apply would empty the server. A bundle that
+            # carries none of the managed zones is as likely a control-plane
+            # mishap (wrong group, emptied group) as an intent, and the
+            # delete cannot be undone, so hold it: the ledger stays, normal
+            # retire resumes once a bundle carries a zone again, and an
+            # operator who wants an empty server sets PDNS_ALLOW_EMPTY_RETIRE.
+            self.retire_warning = (
+                f"holding deletion of all {len(managed)} managed zones; the bundle carries none"
+            )
+            log.warning(
+                "powerdns_zone_retire_held_all",
+                zones=len(managed),
+                opt_in="PDNS_ALLOW_EMPTY_RETIRE",
+            )
             self._retire_owed = False
             return
         headers = {"X-API-Key": self._load_or_generate_api_key()}

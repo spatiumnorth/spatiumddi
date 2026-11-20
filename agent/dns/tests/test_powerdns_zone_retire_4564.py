@@ -40,6 +40,7 @@ class _Pdns:
         self.list_status = 200
         self.delete_status: int | None = None
         self.deletes: list[str] = []
+        self.create_status = 201
         real_client = httpx.Client
 
         def client(*args: Any, **kwargs: Any) -> httpx.Client:
@@ -57,6 +58,8 @@ class _Pdns:
                 return httpx.Response(
                     200, json=[{"name": z, "kind": "Master", "masters": []} for z in self.zones]
                 )
+            if self.create_status != 201:
+                return httpx.Response(self.create_status, json={"error": "refused"})
             self.zones.add(json.loads(request.content)["name"].lower())
             return httpx.Response(201, json={})
         rest = path[len(_ZONES) + 1 :]
@@ -211,15 +214,82 @@ def test_a_bundle_with_no_zone_list_deletes_nothing(tmp_path: Path, monkeypatch)
     assert _ledger(tmp_path) == {"a.test.", "b.test."}
 
 
-def test_an_empty_zone_list_deletes_every_managed_zone(tmp_path: Path, monkeypatch) -> None:
+def test_an_empty_zone_list_is_held(tmp_path: Path, monkeypatch) -> None:
     """What a group whose last zone was deleted sends, and what a server moved
-    to an empty group gets."""
+    to an empty group gets: one pass must not empty the server."""
+    pdns = _Pdns(monkeypatch)
+    driver = _driver(tmp_path, monkeypatch)
+    _apply(driver, _bundle("a.test", "b.test"))
+    _apply(driver, _bundle())
+    driver.control_plane_confirmed()
+    assert pdns.zones == {"a.test.", "b.test."}
+    assert pdns.deletes == []
+    assert _ledger(tmp_path) == {"a.test.", "b.test."}
+    assert driver.retire_warning == (
+        "holding deletion of all 2 managed zones; the bundle carries none"
+    )
+
+
+def test_every_zone_dropped_is_held(tmp_path: Path, monkeypatch) -> None:
+    pdns = _Pdns(monkeypatch)
+    driver = _driver(tmp_path, monkeypatch)
+    _apply(driver, _bundle("a.test", "b.test"))
+    # The one zone the bundle carries is not one of the managed ones, and
+    # PowerDNS refuses it, so it never enters the ledger.
+    pdns.create_status = 422
+    _apply(driver, _bundle("other.test"))
+    driver.control_plane_confirmed()
+    assert pdns.deletes == []
+    assert pdns.zones == {"a.test.", "b.test."}
+    assert _ledger(tmp_path) == {"a.test.", "b.test."}
+    assert driver.retire_warning is not None
+
+
+def test_a_ledger_of_one_zone_that_is_dropped_is_held(tmp_path: Path, monkeypatch) -> None:
+    pdns = _Pdns(monkeypatch)
+    driver = _driver(tmp_path, monkeypatch)
+    _apply(driver, _bundle("only.test"))
+    _apply(driver, _bundle())
+    driver.control_plane_confirmed()
+    assert pdns.deletes == []
+    assert driver.retire_warning is not None
+
+
+def test_a_partial_drop_still_deletes(tmp_path: Path, monkeypatch) -> None:
+    pdns = _Pdns(monkeypatch)
+    driver = _driver(tmp_path, monkeypatch)
+    _apply(driver, _bundle("a.test", "b.test", "c.test"))
+    _apply(driver, _bundle("a.test"))
+    driver.control_plane_confirmed()
+    assert sorted(pdns.deletes) == ["b.test.", "c.test."]
+    assert driver.retire_warning is None
+
+
+def test_the_opt_in_empties_the_server(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("PDNS_ALLOW_EMPTY_RETIRE", "1")
     pdns = _Pdns(monkeypatch)
     driver = _driver(tmp_path, monkeypatch)
     _apply(driver, _bundle("a.test", "b.test"))
     _apply(driver, _bundle())
     driver.control_plane_confirmed()
     assert pdns.zones == set()
+    assert _ledger(tmp_path) == set()
+    assert driver.retire_warning is None
+
+
+def test_a_later_bundle_with_zones_resumes_retire(tmp_path: Path, monkeypatch) -> None:
+    pdns = _Pdns(monkeypatch)
+    driver = _driver(tmp_path, monkeypatch)
+    _apply(driver, _bundle("a.test", "b.test"))
+    _apply(driver, _bundle())
+    driver.control_plane_confirmed()
+    assert pdns.deletes == []
+
+    _apply(driver, _bundle("a.test"))
+    driver.control_plane_confirmed()
+    assert pdns.deletes == ["b.test."]
+    assert pdns.zones == {"a.test."}
+    assert driver.retire_warning is None
 
 
 def test_a_failed_apply_deletes_nothing(tmp_path: Path, monkeypatch) -> None:
@@ -452,3 +522,24 @@ def test_a_bundle_that_fails_to_apply_confirms_nothing(tmp_path: Path, monkeypat
     assert driver.applied == ["good", "good"], "reverted to the last-known-good"
     _poll(loop, monkeypatch, _Resp(304))
     assert driver.confirmed == 0
+
+
+def test_a_held_retire_is_reported_and_clears(tmp_path: Path, monkeypatch) -> None:
+    """The warning reaches the server row through the partial-apply channel
+    and goes away when the pass no longer holds."""
+    driver = _Driver(tmp_path)
+    loop = _loop(tmp_path, driver, monkeypatch)
+    driver.retire_warning = "holding deletion of all 3 managed zones; the bundle carries none"
+    _poll(loop, monkeypatch, _Resp(200, _cp_bundle("e1")))
+    assert loop.apply_status.status == sync_mod.STATUS_REVERTED
+    assert "holding deletion of all 3 managed zones" in loop.apply_status.error
+    assert loop.heartbeat.config_apply is loop.apply_status
+    assert loop.heartbeat.daemon_status["status"] == "degraded"
+
+    _poll(loop, monkeypatch, _Resp(304))
+    assert not loop.apply_status.healthy
+
+    driver.retire_warning = None
+    _poll(loop, monkeypatch, _Resp(304))
+    assert loop.apply_status.healthy
+    assert loop.heartbeat.daemon_status["status"] == "ok"

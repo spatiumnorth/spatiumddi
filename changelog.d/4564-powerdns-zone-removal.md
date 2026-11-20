@@ -15,3 +15,9 @@
   created by hand in the agent's PowerDNS and not present in
   SpatiumDDI is removed with them: add it in SpatiumDDI before
   upgrading to keep it.
+  The first run after the upgrade removes zones on the PowerDNS server
+  that SpatiumDDI does not manage, including any created there by hand.
+  A pass that would delete every managed zone (an empty bundle, or one
+  carrying none of them) is held instead: nothing is deleted, the server
+  row shows a warning, and removal resumes once a bundle carries a zone.
+  Set `PDNS_ALLOW_EMPTY_RETIRE=1` on the agent to allow an empty server.

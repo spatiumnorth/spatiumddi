@@ -239,6 +239,7 @@ def _thaw(frozen: bytes | None) -> Any:
 class SyncLoop:
     # Class default so a loop built without __init__ (tests) reads "not known".
     _live_etag: str | None = None
+    _retire_held = False
 
     def __init__(
         self,
@@ -489,6 +490,41 @@ class SyncLoop:
             self.driver.control_plane_confirmed()
         except Exception:
             log.exception("control_plane_confirmed_hook_failed")
+        self._report_retire_hold()
+
+    def _report_retire_hold(self) -> None:
+        """Surface a held zone-retire pass (#4564) as a warning on the server row.
+
+        Same channel as a partial apply (``reverted`` + the partial prefix, a
+        degraded daemon echo), since nothing here is a failure to revert and
+        the status vocabulary has no warning of its own. Cleared when a later
+        pass no longer holds."""
+        msg = getattr(self.driver, "retire_warning", None)
+        if msg:
+            error = truncate_error(PARTIAL_APPLY_PREFIX + msg)
+            self._retire_held = True
+            self._zones_refused = True
+            self.apply_status = ApplyStatus(
+                status=STATUS_REVERTED,
+                etag=self._live_etag,
+                failed_etag=self._live_etag,
+                phase=PHASE_RELOAD,
+                error=error,
+            )
+            self.heartbeat.config_apply = self.apply_status
+            self.heartbeat.daemon_status = {
+                **self.heartbeat.daemon_status,
+                "status": "degraded",
+                "reason": f"config_apply_{STATUS_REVERTED}: {error}",
+            }
+        elif self._retire_held:
+            self._retire_held = False
+            self._zones_refused = False
+            self.apply_status = ApplyStatus(status=STATUS_OK, etag=self._live_etag)
+            self.heartbeat.config_apply = self.apply_status
+            reason = str(self.heartbeat.daemon_status.get("reason") or "")
+            if reason.startswith("config_apply_"):
+                self.heartbeat.daemon_status = {"status": "ok"}
 
     def _guarded_apply(self, bundle: dict[str, Any], etag: str | None) -> None:
         """``driver.apply_config`` under the #2019 death-during-apply marker.
