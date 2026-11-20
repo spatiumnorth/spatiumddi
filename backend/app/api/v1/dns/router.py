@@ -6230,6 +6230,36 @@ async def _assert_forward_zone_serviceable(
         )
 
 
+async def _refuse_powerdns_unsupported_zone_type(
+    db: DB, group_id: uuid.UUID, zone_type: str, current: DNSZone | None = None
+) -> None:
+    """422 a forward / stub zone on a group with a PowerDNS server (#4570).
+
+    PowerDNS Authoritative has no forward-zone type, so the agent logs and
+    drops the zone (clients get REFUSED), and it creates a ``stub`` as a
+    full ``Slave``. Refused on the transition only: a zone already stored
+    with that type (``current``) stays editable and re-saveable.
+    """
+    if zone_type not in {"forward", "stub"}:
+        return
+    if current is not None and current.zone_type == zone_type:
+        return
+    if "powerdns" not in await _group_driver_names(db, group_id):
+        return
+    raise HTTPException(
+        status_code=422,
+        detail=(
+            f"a {zone_type} zone cannot be served by a PowerDNS group: the PowerDNS "
+            "driver supports primary and secondary zones only"
+            + (
+                ", and creates a stub as a full secondary."
+                if zone_type == "stub"
+                else ", so the zone would be accepted and never answer."
+            )
+        ),
+    )
+
+
 async def _check_zone_forward_transport(
     group_id: uuid.UUID,
     changes: dict[str, Any],
@@ -6316,6 +6346,7 @@ async def create_zone(
         zone_fields["ttl"] = await default_zone_ttl(db, group_id)
     _refuse_superadmin_zone_fields(current_user, zone_fields, None)
     await _enforce_technitium_api_zone_scope(db, group_id, zone_fields, None)
+    await _refuse_powerdns_unsupported_zone_type(db, group_id, body.zone_type)
     await _assert_forward_zone_serviceable(
         group_id, body.zone_type, list(body.forwarders or []), db
     )
@@ -7175,6 +7206,9 @@ async def update_zone(
     if "masters" in changes:
         changes["masters"] = [m.strip() for m in changes["masters"] if m and m.strip()]
     await _enforce_technitium_api_zone_scope(db, zone.group_id, changes, zone)
+    await _refuse_powerdns_unsupported_zone_type(
+        db, zone.group_id, changes.get("zone_type", zone.zone_type), zone
+    )
     changes.update(await _validated_zone_named_conf_fields(zone.group_id, changes, zone, db))
     effective_zone_type = changes.get("zone_type", zone.zone_type)
     await _assert_forward_zone_serviceable(
@@ -8702,6 +8736,7 @@ async def move_zone_commit(
     # Technitium group is accepted and then silently never created on the
     # daemon (#743). A move is just another way to arrive there.
     await _assert_forward_zone_serviceable(target_group.id, zone.zone_type, zone.forwarders, db)
+    await _refuse_powerdns_unsupported_zone_type(db, target_group.id, zone.zone_type)
     # And the forwarder grammar (#1357): a Technitium zone's hostname or DoH
     # URL is fine where it is, but a BIND9 group would drop it at render and
     # the zone would quietly stop forwarding. Refused, not rewritten.

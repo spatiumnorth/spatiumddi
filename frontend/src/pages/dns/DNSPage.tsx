@@ -2999,6 +2999,8 @@ function ZoneModalForm({
   const groupDrivers =
     groupList?.find((g) => g.id === groupId)?.server_drivers ?? [];
   const technitiumApi = groupDrivers.includes("technitium_api");
+  // PowerDNS serves primary and secondary zones only (#4570).
+  const powerdns = groupDrivers.includes("powerdns");
   // #3087 — Type and TTL start from Settings → DNS (Default Zone Type /
   // Default Zone TTL) until the operator changes them. An existing zone
   // shows its own values. The settings read is best-effort: a role that
@@ -3022,7 +3024,7 @@ function ZoneModalForm({
   // stock TTL (above), so a stored default it would refuse is not offered.
   const zoneType =
     pickedZoneType ??
-    (technitiumApi
+    (technitiumApi || powerdns
       ? "primary"
       : (dnsDefaults?.dns_default_zone_type ?? "primary"));
   const setZoneType = setPickedZoneType;
@@ -3308,12 +3310,14 @@ function ZoneModalForm({
               {(!technitiumApi || zoneType === "secondary") && (
                 <option value="secondary">Secondary</option>
               )}
-              {(!technitiumApi || zoneType === "stub") && (
-                <option value="stub">Stub</option>
-              )}
-              {(!technitiumApi || zoneType === "forward") && (
-                <option value="forward">Forward</option>
-              )}
+              {(!technitiumApi || zoneType === "stub") &&
+                (!powerdns || zone?.zone_type === "stub") && (
+                  <option value="stub">Stub</option>
+                )}
+              {(!technitiumApi || zoneType === "forward") &&
+                (!powerdns || zone?.zone_type === "forward") && (
+                  <option value="forward">Forward</option>
+                )}
             </select>
           </Field>
           <Field label="Kind">
