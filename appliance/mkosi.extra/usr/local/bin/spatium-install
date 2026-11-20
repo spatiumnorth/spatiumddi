@@ -6304,6 +6304,9 @@ Log:    $INSTALL_LOG
 
 EOF
     log "Preseed halt: $1"
+    # #4589 — tell on_failure this exit is deliberate: its generic failure
+    # screen would clear the banner above and bury the reason in log tails.
+    PRESEED_HALTED=1
     exit 1
 }
 
@@ -6763,6 +6766,13 @@ on_failure() {
             _logs_kept=1
         fi
     fi
+    if [ -n "${PRESEED_HALTED:-}" ]; then
+        # #4589 — preseed_halt already drew its PRESEED ERROR banner. Leave
+        # it on screen: no clear, no raw log tails (they would scroll it off).
+        echo "Install halted on its answer file (status $exit_code); see the banner above."
+        echo "Log: $INSTALL_LOG"
+        echo
+    else
     clear
     echo "Installer exited with status $exit_code"
     echo
@@ -6779,6 +6789,7 @@ on_failure() {
         || echo "  (trace log empty - script bailed before set -x at line 51)"
     echo "------------------------------------------------------------------"
     echo
+    fi
     if [ -r /var/log/spatium-live-ssh-password ]; then
         echo "Live-mode SSH (for log capture from a real terminal):"
         echo "  user:     root"
