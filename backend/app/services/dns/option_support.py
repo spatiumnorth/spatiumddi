@@ -193,12 +193,100 @@ _UNMANAGED: dict[str, str] = {
 _RECURSION_UNKNOWN = frozenset({"technitium_api", "windows_dns"})
 
 
+# What each agent driver renders or writes in full. Named, not inferred: a new
+# options column is in none of a driver's three sets, so it lands in
+# ``UNDECIDED`` and the guard test fails until someone reads the renderer and
+# picks one. (At runtime an undecided column is treated as applied, so a
+# missed decision never refuses a working setting.)
+_LISTENER_FIELDS = (
+    "dot_enabled",
+    "dot_port",
+    "doh_enabled",
+    "doh_port",
+    "doh_path",
+    "tls_certificate_id",
+)
+_BIND9_APPLIED = frozenset(
+    {
+        *_LISTENER_FIELDS,
+        "forwarders",
+        "forward_policy",
+        "forward_tls_hostname",
+        "forward_tls_verify",
+        "recursion_enabled",
+        "is_recursive",
+        "allow_recursion",
+        "dnssec_validation",
+        "notify_enabled",
+        "also_notify",
+        "allow_notify",
+        "allow_query",
+        "allow_query_cache",
+        "allow_transfer",
+        "blackhole",
+        "query_log_enabled",
+        "query_log_severity",
+        "query_log_print_category",
+        "query_log_print_severity",
+        "response_log_enabled",
+        "rrl_enabled",
+        "rrl_responses_per_second",
+        "rrl_window",
+        "rrl_slip",
+        "rrl_qps_scale",
+        "rrl_exempt_clients",
+        "rrl_log_only",
+        "minimal_responses",
+        "tcp_clients",
+        "clients_per_query",
+        "max_clients_per_query",
+    }
+)
+_POWERDNS_APPLIED = frozenset(
+    {*_LISTENER_FIELDS, *_DNSDIST_FIELDS, "notify_enabled", "also_notify", "query_log_enabled"}
+)
+_TECHNITIUM_APPLIED = frozenset(
+    {
+        *_LISTENER_FIELDS,
+        "doq_enabled",
+        "doq_port",
+        "forwarders",
+        "forward_tls_hostname",
+        "recursion_enabled",
+        "is_recursive",
+        "allow_recursion",
+        "dnssec_validation",
+        "notify_enabled",
+        "rrl_enabled",
+        "rrl_responses_per_second",
+        "rrl_window",
+        "rrl_slip",
+        "rrl_exempt_clients",
+    }
+)
+
+#: driver -> fields with no decision. Must stay empty (the guard test).
+UNDECIDED: dict[str, list[str]] = {}
+#: driver -> fields named in more than one of its three sets.
+CONFLICTING: dict[str, list[str]] = {}
+
+
 def _column(
-    not_applied: dict[str, str], partial: dict[str, str], *, recursion_off: bool = False
+    driver: str,
+    applied: frozenset[str],
+    not_applied: dict[str, str],
+    partial: dict[str, str],
+    *,
+    recursion_off: bool = False,
 ) -> dict[str, Support]:
-    """One driver's column: every field not named is ``applied``."""
+    """One driver's column, from its three named sets."""
     out: dict[str, Support] = {}
     for field in (*OPTION_FIELDS, *GROUP_FIELDS):
+        named = (field in applied) + (field in not_applied) + (field in partial)
+        if named == 0:
+            UNDECIDED.setdefault(driver, []).append(field)
+        elif named > 1:
+            CONFLICTING.setdefault(driver, []).append(field)
         if field in not_applied:
             inert = (False,) if recursion_off and field in _RECURSION_FIELDS else None
             out[field] = Support(NOT_APPLIED, not_applied[field], inert)
@@ -219,11 +307,19 @@ def _unmanaged_column(driver: str) -> dict[str, Support]:
 
 #: driver -> field -> decision. The one table.
 OPTION_SUPPORT: dict[str, dict[str, Support]] = {
-    "bind9": _column(_BIND9_NOT_APPLIED, _BIND9_PARTIAL),
+    "bind9": _column("bind9", _BIND9_APPLIED, _BIND9_NOT_APPLIED, _BIND9_PARTIAL),
     # ``recursion_enabled`` defaults to on, which PowerDNS never is: "off" is
     # the value a change may set, and a stored "on" re-saves untouched.
-    "powerdns": _column(_POWERDNS_NOT_APPLIED, _POWERDNS_PARTIAL, recursion_off=True),
-    "technitium": _column(_TECHNITIUM_NOT_APPLIED, _TECHNITIUM_PARTIAL),
+    "powerdns": _column(
+        "powerdns",
+        _POWERDNS_APPLIED,
+        _POWERDNS_NOT_APPLIED,
+        _POWERDNS_PARTIAL,
+        recursion_off=True,
+    ),
+    "technitium": _column(
+        "technitium", _TECHNITIUM_APPLIED, _TECHNITIUM_NOT_APPLIED, _TECHNITIUM_PARTIAL
+    ),
     **{driver: _unmanaged_column(driver) for driver in _UNMANAGED},
 }
 
@@ -231,6 +327,9 @@ OPTION_SUPPORT: dict[str, dict[str, Support]] = {
 #: there that is not an options column is a typo that would decide nothing.
 DECLARED_FIELDS: frozenset[str] = frozenset(
     {
+        *_BIND9_APPLIED,
+        *_POWERDNS_APPLIED,
+        *_TECHNITIUM_APPLIED,
         *_BIND9_NOT_APPLIED,
         *_BIND9_PARTIAL,
         *_POWERDNS_NOT_APPLIED,

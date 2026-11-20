@@ -179,7 +179,7 @@ What the table drives:
 - **A mixed-driver group gets what every driver applies.** An empty group has no driver, so nothing is refused.
 - **A server joining a group that already stores a value** does not pass through the PUT. The options response lists such values in `unapplied_warnings` (`technitium_warnings` for Technitium).
 - **The Options tab reads the table from the options response** (`option_support`: per option the `state`, the `drivers`, a `note` and `locked`) and disables a locked control with the note. The group response carries the same shape for `is_recursive` in `unapplied_fields`. There is no copy of the table in the frontend.
-- **`backend/tests/test_dns_option_support_4562.py` fails** when an options column or a registered driver has no decision, so a new option or driver has to pick one.
+- **`backend/tests/test_dns_option_support_4562.py` fails** when an options column or a registered driver has no decision, so a new option or driver has to pick one. "Applied" is a named decision too (the `_*_APPLIED` sets), not what a column gets by being left out.
 
 ---
 

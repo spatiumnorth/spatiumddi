@@ -40,6 +40,36 @@ def test_every_option_and_driver_pair_has_a_decision() -> None:
     assert not missing, f"no decision in option_support.OPTION_SUPPORT for: {missing}"
     states = {e.state for column in table.OPTION_SUPPORT.values() for e in column.values()}
     assert states <= {table.APPLIED, table.PARTIAL, table.NOT_APPLIED}
+    # "Applied" is a decision too: a column no set names is undecided, not
+    # applied by omission.
+    assert table.UNDECIDED == {}, f"no decision in option_support for: {table.UNDECIDED}"
+    assert table.CONFLICTING == {}, f"decided twice in option_support: {table.CONFLICTING}"
+
+
+def test_a_new_options_column_is_undecided(monkeypatch: pytest.MonkeyPatch) -> None:
+    # What a migration adding ``DNSServerOptions.brand_new_option`` does to the
+    # table: the agent drivers must not read as applying it by default.
+    monkeypatch.setattr(table, "OPTION_FIELDS", (*table.OPTION_FIELDS, "brand_new_option"))
+    monkeypatch.setattr(table, "UNDECIDED", {})
+    for driver, sets in {
+        "bind9": (table._BIND9_APPLIED, table._BIND9_NOT_APPLIED, table._BIND9_PARTIAL),
+        "powerdns": (
+            table._POWERDNS_APPLIED,
+            table._POWERDNS_NOT_APPLIED,
+            table._POWERDNS_PARTIAL,
+        ),
+        "technitium": (
+            table._TECHNITIUM_APPLIED,
+            table._TECHNITIUM_NOT_APPLIED,
+            table._TECHNITIUM_PARTIAL,
+        ),
+    }.items():
+        table._column(driver, *sets)
+    assert table.UNDECIDED == {
+        "bind9": ["brand_new_option"],
+        "powerdns": ["brand_new_option"],
+        "technitium": ["brand_new_option"],
+    }
 
 
 def test_table_names_only_real_drivers_and_fields() -> None:
@@ -172,6 +202,62 @@ async def test_untouched_save_of_a_fresh_group_passes(
     # And again over the row the first save created.
     r = await client.put(url, json=body, headers=headers)
     assert r.status_code == 200, r.text
+
+
+_STORED_BEFORE_THE_GATE: dict[str, dict] = {
+    "powerdns": {
+        "allow_query": ["10.0.0.0/8"],
+        "dnssec_validation": "no",
+        "rrl_enabled": True,
+        "rrl_log_only": True,
+        "minimal_responses": True,
+        "tcp_clients": 200,
+        "forward_policy": "only",
+        "allow_notify": ["192.0.2.9"],
+    },
+    "bind9": {"dnsdist_enabled": True, "dnsdist_max_qps_per_client": 50, "dnsdist_action": "drop"},
+    "technitium": {
+        "query_log_enabled": True,
+        "response_log_enabled": True,
+        "rrl_log_only": True,
+        "rrl_qps_scale": 5,
+        "dnsdist_enabled": True,
+    },
+    "windows_dns": {
+        "forwarders": ["192.0.2.53"],
+        "recursion_enabled": False,
+        "allow_query": ["10.0.0.0/8"],
+        "blackhole": ["10.9.9.9"],
+    },
+    "route53": {"rrl_enabled": True, "allow_transfer": ["192.0.2.7"]},
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("driver", sorted(_STORED_BEFORE_THE_GATE))
+async def test_upgraded_group_with_stored_unapplied_values_keeps_saving(
+    client: AsyncClient, db_session: AsyncSession, driver: str
+) -> None:
+    # The upgrade case: values the driver does not apply were stored while the
+    # API still took them. A full-form Save that leaves them alone must pass,
+    # and so must an unrelated change beside them.
+    headers = await _superadmin(db_session)
+    group = await _group(db_session, driver)
+    db_session.add(DNSServerOptions(group_id=group.id, **_STORED_BEFORE_THE_GATE[driver]))
+    await db_session.commit()
+    url = f"/api/v1/dns/groups/{group.id}/options"
+    stored = (await client.get(url, headers=headers)).json()
+    for field, value in _STORED_BEFORE_THE_GATE[driver].items():
+        assert stored[field] == value
+    body = {f: stored[f] for f in _COLUMNS if f != "tls_certificate_id" and f in stored}
+    r = await client.put(url, json=body, headers=headers)
+    assert r.status_code == 200, r.text
+    if not table.applies_no_option(driver):
+        r = await client.put(url, json={**body, "notify_enabled": "explicit"}, headers=headers)
+        assert r.status_code == 200, r.text
+        assert r.json()["notify_enabled"] == "explicit"
+    for field, value in _STORED_BEFORE_THE_GATE[driver].items():
+        assert r.json()[field] == value
 
 
 @pytest.mark.asyncio
