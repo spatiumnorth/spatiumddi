@@ -463,7 +463,24 @@ def test_supervisor_ids_are_outside_the_host_system_range() -> None:
     assert f"chown {uid.group(1)}:{gid.group(1)} . " in first
     # Existing installs: stale 100:101 files in release-state are re-owned,
     # and the entrypoint re-owns the state dir on every start.
-    assert "-user 100 -group 101 -exec chown -h" in first
+    for text in (first, _read(SUPERVISOR_ENTRYPOINT)):
+        assert "-maxdepth 2" in text
+        flat = re.sub(r"\\\n\s*", "", text)
+        assert "-user 100 -group 101 -execdir chown -h 10001:10001" in flat
     assert "chown -R spatium:spatium /var/lib/spatium-supervisor" in _read(
         SUPERVISOR_ENTRYPOINT
     )
+
+
+def test_entrypoint_reowns_old_release_state_names_as_root_before_dropping_privileges() -> None:
+    """A pod still on the old image can write uid-100 names after firstboot
+    has run; the new supervisor must re-own them (including the storage/
+    request directory it created) before its first write."""
+    text = _read(SUPERVISOR_ENTRYPOINT)
+    code = re.sub(r"(?m)^\s*#.*$", "", text)
+    flat = re.sub(r"\\\n\s*", "", code)
+    m = re.search(r"find -P /var/lib/spatiumddi-host/release-state .*", flat)
+    assert m, "entrypoint does not re-own release-state"
+    assert "-type d" in m.group(0) and "-xdev" in m.group(0)
+    assert "-execdir chown -h 10001:10001" in m.group(0)
+    assert code.index(m.group(0)[:40]) < code.index("exec su-exec spatium")

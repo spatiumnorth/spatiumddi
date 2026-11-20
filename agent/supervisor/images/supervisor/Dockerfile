@@ -79,7 +79,8 @@ RUN echo "apk snapshot ${APK_SNAPSHOT}" >/dev/null \
 # lives on the host (STATE partition) and ids 100/101 there belong to host
 # system accounts. They were 100/101 until then (what ``-S`` allocated on
 # this base); the entrypoint's ``chown -R`` re-owns existing state to the
-# new ids on the first start after the upgrade. The user is a member of ``spatium-host`` (2770). The
+# new ids on the first start after the upgrade (so does its find over
+# release-state). The user is a member of ``spatium-host`` (2770). The
 # host's trigger directory /var/lib/spatiumddi/release-state is 1770
 # root:2770, no longer 1777, so that membership is what lets the
 # supervisor write triggers; the host kubeconfig is 0640 root:2770 for the
