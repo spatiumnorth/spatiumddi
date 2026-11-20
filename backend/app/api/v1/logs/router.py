@@ -44,6 +44,8 @@ from app.services.logs.agent_logs import (
     InvalidLogFilter,
     LogScopeError,
     dns_query_analytics,
+    include_orphaned_logs,
+    log_row_server_name,
     resolve_dhcp_log_servers,
     resolve_dns_log_servers,
     search_dhcp_activity,
@@ -529,7 +531,9 @@ class DNSQueryLogRow(BaseModel):
     id: int
     ts: datetime
     # Which server logged it (#2120) — a group or "all" read merges several.
-    server_id: uuid.UUID
+    # ``server_id`` is NULL once the server was deleted (#4173); the row stays
+    # and ``server_name`` is the name it logged under.
+    server_id: uuid.UUID | None
     server_name: str
     client_ip: str | None
     client_port: int | None
@@ -616,6 +620,9 @@ async def query_dns_queries(
             view=body.view,
             rcode=body.rcode,
             limit=body.max_events,
+            include_orphans=include_orphaned_logs(
+                current_user, server_id=body.server_id, group_id=body.group_id
+            ),
         )
     except InvalidLogFilter as exc:
         raise HTTPException(status_code=422, detail=exc.detail) from exc
@@ -624,7 +631,7 @@ async def query_dns_queries(
             id=r.id,
             ts=r.ts,
             server_id=r.server_id,
-            server_name=names.get(r.server_id, str(r.server_id)),
+            server_name=log_row_server_name(r.server_id, r.server_name, names),
             client_ip=str(r.client_ip) if r.client_ip is not None else None,
             client_port=r.client_port,
             qname=r.qname,
@@ -734,6 +741,9 @@ async def query_dns_analytics(
             view=body.view,
             rcode=body.rcode,
             limit=body.limit,
+            include_orphans=include_orphaned_logs(
+                current_user, server_id=body.server_id, group_id=body.group_id
+            ),
         )
     except InvalidLogFilter as exc:
         raise HTTPException(status_code=422, detail=exc.detail) from exc
@@ -755,8 +765,8 @@ async def query_dns_analytics(
 class DHCPActivityLogRow(BaseModel):
     id: int
     ts: datetime
-    # Which server logged it (#2120).
-    server_id: uuid.UUID
+    # Which server logged it (#2120); NULL once it was deleted (#4173).
+    server_id: uuid.UUID | None
     server_name: str
     severity: str | None
     code: str | None
@@ -821,6 +831,9 @@ async def query_dhcp_activity(
             mac_address=body.mac_address,
             ip_address=body.ip_address,
             limit=body.max_events,
+            include_orphans=include_orphaned_logs(
+                current_user, server_id=body.server_id, group_id=body.group_id
+            ),
         )
     except InvalidLogFilter as exc:
         raise HTTPException(status_code=422, detail=exc.detail) from exc
@@ -829,7 +842,7 @@ async def query_dhcp_activity(
             id=r.id,
             ts=r.ts,
             server_id=r.server_id,
-            server_name=names.get(r.server_id, str(r.server_id)),
+            server_name=log_row_server_name(r.server_id, r.server_name, names),
             severity=r.severity,
             code=r.code,
             mac_address=str(r.mac_address) if r.mac_address is not None else None,

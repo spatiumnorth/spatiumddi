@@ -95,14 +95,14 @@ describe("DNSBL page write gates (#2698)", () => {
     const ip = screen.getByPlaceholderText("203.0.113.5");
     await waitFor(() => expect(ip.getAttribute("title")).toBeTruthy());
     expect(off(ip)).toBe(true);
-    expect(ip.getAttribute("title")).toBe("Requires write on DNS blocklists");
-    const del = screen.getAllByTitle("Requires delete on DNS blocklists");
+    expect(ip.getAttribute("title")).toBe("Requires write on DNSBL lists");
+    const del = screen.getAllByTitle("Requires delete on DNSBL lists");
     expect(del).toHaveLength(2);
     expect(del.every(off)).toBe(true);
     expect(screen.queryByTitle("Unpin")).toBeNull();
     const sw = screen.getByRole("switch", { name: /daily DNSBL sweep/ });
     expect(off(sw)).toBe(true);
-    expect(sw.getAttribute("title")).toBe("Requires write on DNS blocklists");
+    expect(sw.getAttribute("title")).toBe("Requires write on DNSBL lists");
   });
 
   it("names a Viewer's Pinned IP inputs by what they take, the refusal as description (#3760)", async () => {
@@ -114,7 +114,7 @@ describe("DNSBL page write gates (#2698)", () => {
     const note = screen.getByRole("textbox", { name: "Pinned IP note" });
     expect(off(ip)).toBe(true);
     expect(off(note)).toBe(true);
-    expect(ip.getAttribute("title")).toBe("Requires write on DNS blocklists");
+    expect(ip.getAttribute("title")).toBe("Requires write on DNSBL lists");
   });
 
   it("splits write from delete", async () => {
@@ -123,8 +123,18 @@ describe("DNSBL page write gates (#2698)", () => {
     await waitFor(() =>
       expect(off(screen.getByPlaceholderText("203.0.113.5"))).toBe(false),
     );
-    expect(
-      screen.getAllByTitle("Requires delete on DNS blocklists"),
-    ).toHaveLength(2);
+    expect(screen.getAllByTitle("Requires delete on DNSBL lists")).toHaveLength(
+      2,
+    );
+  });
+
+  it("names the dnsbl type, not DNS blocklists, when only dns_blocklist is held (#4317)", async () => {
+    show(grants(["write", "dns_blocklist"], ["read", "dnsbl"]));
+    await screen.findByText("203.0.113.95");
+    const ip = screen.getByPlaceholderText("203.0.113.5");
+    await waitFor(() => expect(ip.getAttribute("title")).toBeTruthy());
+    expect(off(ip)).toBe(true);
+    expect(ip.getAttribute("title")).toBe("Requires write on DNSBL lists");
+    expect(ip.getAttribute("title")).not.toMatch(/DNS blocklists/);
   });
 });
