@@ -442,6 +442,7 @@ set -uo pipefail
 log() {{ :; }}
 FULLY_UNATTENDED=0
 CONFIRM_JUMP=""
+claim_console() {{ :; }}
 {stubs}
 {script_steps}
 _loop() {{
