@@ -59,6 +59,10 @@ log = structlog.get_logger(__name__)
 _PDNS_API_BASE = "http://127.0.0.1:8081/api/v1/servers/localhost"
 _PDNS_API_TIMEOUT = 10.0
 _API_KEY_FILE = "pdns-api.key"
+# ``ALLOW-DNSUPDATE-FROM`` for a zone whose update ACL grants by TSIG key
+# only: the key is the gate, so the address check has to pass for everyone.
+_ANY_ADDRESS = ("0.0.0.0/0", "::/0")
+
 # Zones this agent manages in PowerDNS: the ones it created or reconciled from
 # a bundle, plus every zone PowerDNS held the first time the ledger was
 # written. Only these are deleted when the bundle drops them (#4564; see
@@ -3293,6 +3297,14 @@ class PowerDNSDriver(DriverBase):
         empty ACL clears both so a zone whose dynamic updates were turned off
         stops accepting them.
 
+        PowerDNS checks the address first and then, when keys are listed, the
+        signature as well. So a key-only ACL also writes every address into
+        ``ALLOW-DNSUPDATE-FROM``: without it only loopback (the
+        ``allow-dnsupdate-from`` default) passes the address check and a
+        signed update from anywhere else is refused (#4569). An ACL with both
+        kinds stays "address and key": the control plane refuses to save one
+        for a PowerDNS group, and a stored one is not widened here.
+
         Returns what PowerDNS refused, for the caller to fail the apply with
         after the other zones are done (#1225). This used to be best-effort,
         which meant a failed CLEAR left a zone accepting updates the operator
@@ -3317,6 +3329,18 @@ class PowerDNSDriver(DriverBase):
             and e.get("match_kind") == "tsig_key"
             and e.get("tsig_key_name")
         ]
+        if key_names and not ip_from:
+            ip_from = list(_ANY_ADDRESS)
+        elif key_names and ip_from:
+            log.warning(
+                "powerdns_update_acl_address_and_key",
+                zone=zone,
+                hint=(
+                    "PowerDNS accepts an update only from a granted address "
+                    "AND signed with a granted key. Grant by key only, or by "
+                    "address only."
+                ),
+            )
         problems: list[str] = []
         for k in zone_payload.get("update_tsig_keys") or []:
             key_name = (k.get("name") or "").rstrip(".")

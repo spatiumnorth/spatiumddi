@@ -102,7 +102,7 @@ from app.drivers.dns import (
     supports_topology_pull,
     ttl_refusal,
 )
-from app.drivers.dns.base import DynamicUpdateCaps, UpdateAclEntry
+from app.drivers.dns.base import DynamicUpdateCaps, UpdateAclConflictError, UpdateAclEntry
 from app.drivers.dns.windows import test_winrm_credentials
 from app.models.appliance import ApplianceCertificate
 from app.models.audit import AuditLog
@@ -7723,6 +7723,11 @@ async def get_zone_update_acl(
         for name in driver_names:
             try:
                 warnings.extend(get_driver(name).validate_update_acl(zone.name, neutral))
+            except UpdateAclConflictError as exc:
+                # Stored before the driver refused the combination (#4569):
+                # it still renders, as the driver documents, and an untouched
+                # save is accepted, so say what it does rather than "re-save".
+                warnings.append(f"{name}: {exc}")
             except ValueError:
                 # A standing entry the current driver can't honour — surface
                 # it as a warning rather than 500 the read.
@@ -7786,14 +7791,22 @@ async def _push_windows_dynamic_update(
 
 
 async def _validate_update_acl_body(
-    db: DB, group_id: uuid.UUID, zone: DNSZone, body: ZoneUpdateAclReplace
+    db: DB,
+    group_id: uuid.UUID,
+    zone: DNSZone,
+    body: ZoneUpdateAclReplace,
+    *,
+    tolerate_conflict: bool = False,
 ) -> tuple[list[str], list[str]]:
     """Validate a full-replace ACL payload without writing (#3738).
 
     Verifies every referenced TSIG key belongs to the group and runs the
     driver capability gate (422 on a hard-unsupported entry). Returns
     ``(driver_names, warnings)``. Run before the no-op shortcut so an
-    unchanged save is refused exactly as it was before.
+    unchanged save is refused exactly as it was before, except for an ACL
+    whose entries conflict with each other on a driver (#4569): that is refused
+    only when the save changes the ACL (``tolerate_conflict`` turns it into a
+    warning), so an install that stored one can still save the rest.
     """
     driver_names = await _group_driver_names(db, group_id)
 
@@ -7835,6 +7848,13 @@ async def _validate_update_acl_body(
     for name in driver_names:
         try:
             warnings.extend(get_driver(name).validate_update_acl(zone.name, neutral))
+        except UpdateAclConflictError as exc:
+            if not tolerate_conflict:
+                raise HTTPException(
+                    status_code=422,
+                    detail={"code": "DYNAMIC_UPDATE_UNSUPPORTED", "message": str(exc)},
+                ) from exc
+            warnings.append(f"{name}: {exc}")
         except ValueError as exc:
             raise HTTPException(
                 status_code=422,
@@ -7844,7 +7864,12 @@ async def _validate_update_acl_body(
 
 
 async def _replace_update_acl_rows(
-    db: DB, group_id: uuid.UUID, zone: DNSZone, body: ZoneUpdateAclReplace
+    db: DB,
+    group_id: uuid.UUID,
+    zone: DNSZone,
+    body: ZoneUpdateAclReplace,
+    *,
+    tolerate_conflict: bool = False,
 ) -> tuple[list[str], list[str]]:
     """Validate + replace a zone's ACL rows in the session (no audit/commit).
 
@@ -7854,7 +7879,9 @@ async def _replace_update_acl_rows(
     ``dynamic_update_enabled``. Returns ``(driver_names, warnings)``; the
     caller writes the audit row + commits.
     """
-    driver_names, warnings = await _validate_update_acl_body(db, group_id, zone, body)
+    driver_names, warnings = await _validate_update_acl_body(
+        db, group_id, zone, body, tolerate_conflict=tolerate_conflict
+    )
 
     # Replace: drop existing rows, insert the new ordered set (seq = position).
     await db.execute(sa_delete(DNSZoneUpdateAcl).where(DNSZoneUpdateAcl.zone_id == zone.id))
@@ -7915,7 +7942,6 @@ async def replace_zone_update_acl(
 
     # #3738 — audit only what changed; a save that changes nothing writes no
     # audit row, no wake and no Windows push, and answers with the stored state.
-    await _validate_update_acl_body(db, group_id, zone, body)
     old_entries = await _load_acl_out(db, zone.id)
 
     # Entry order is meaningful (seq = first-match order in update-policy),
@@ -7942,10 +7968,17 @@ async def replace_zone_update_acl(
         and body.dynamic_update_enabled != zone.dynamic_update_enabled
     ):
         changed_fields.append("dynamic_update_enabled")
+    # Validate before the no-op shortcut so an unchanged save is refused as it
+    # always was, bar a stored conflict (#4569), which only a change refuses.
+    await _validate_update_acl_body(
+        db, group_id, zone, body, tolerate_conflict="update_acl" not in changed_fields
+    )
     if not changed_fields:
         return await get_zone_update_acl(group_id, zone_id, db, current_user)
 
-    driver_names, warnings = await _replace_update_acl_rows(db, group_id, zone, body)
+    driver_names, warnings = await _replace_update_acl_rows(
+        db, group_id, zone, body, tolerate_conflict="update_acl" not in changed_fields
+    )
 
     db.add(
         AuditLog(
