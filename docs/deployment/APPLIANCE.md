@@ -863,7 +863,7 @@ under the cluster instead of relying on this alone.
 
 ### Guided etcd restore (Phase 9b)
 
-`/appliance → Fleet → Control plane` carries an **etcd snapshots**
+`/appliance → Cluster → etcd snapshots` carries an **etcd snapshots**
 disaster-recovery card. The seed reports its local
 `k3s etcd-snapshot list` on every heartbeat — read from the
 `ETCDSnapshotFile` CRs over the kubeapi (no host `k3s` binary needed),
@@ -1460,7 +1460,7 @@ of that floor *can* be source-scoped, but only by the separate `ssh_lockdown`
 setting ([#1009](https://github.com/spatiumnorth/spatiumddi/issues/1009)) — a
 deliberate act with its own guards, never a consequence of a firewall rule.
 
-**Fleet → Firewall tab.** A **left sub-nav** (#404 — was top sub-tabs) over
+**Appliance → Firewall tab.** A **left sub-nav** (#404 — was top sub-tabs) over
 five sections: **Policies** (fleet/role/appliance list + rule editor, with the
 **Enforcement** + **Web-UI-access** cards nested compactly at the top rather
 than as full-width bars), **Aliases** (named CIDR/port sets), **Preview
@@ -2887,8 +2887,12 @@ covers how to get off 2026.10.02-1 on each deployment shape (#3915).
 The normal [slot upgrade](#5b-phase-8-atomic-ab-image-upgrades-slot-upgrade)
 works: it was verified from 2026.10.02-1 to 1.0.0-rc.2 on real release
 images (#1181). It went through in under 10 minutes, with DNS down for
-about 4 minutes during the reboot. A second, shorter DNS and DHCP
-interruption of a few seconds can follow about 3 minutes after boot
+about 4 minutes during the reboot. Upgrading from a release that
+predates #3919's fix, a second, shorter DNS and DHCP interruption of a few
+seconds can follow about 3 minutes after boot; a release that carries it
+moves the role pods onto its own image during the boot, so they restart
+once, and the upgrade unpacks the new role images while the old slot is still
+running, so the first container start after the reboot is not slowed by it
 (#3919).
 
 ### Multi-node cluster, from 2026.10.02-1
@@ -3949,7 +3953,7 @@ from a snapshot taken before the upgrade** — and the order and the
 vantage both matter.
 
 **The Fleet UI path only works while the control plane still serves.**
-Fleet → Control plane → etcd snapshots drives the restore through the
+Appliance → Cluster → etcd snapshots drives the restore through the
 api pod → the seed's heartbeat → a host trigger file, so every hop
 needs the very cluster you are recovering to be up. Use it while things
 still work: on a partial rollout, or when you have decided to abandon
@@ -4190,7 +4194,15 @@ the operator installing a CA anywhere:
    control plane serves signed by the appliance CA (whose certificate the
    supervisor received on approval), and re-pins only if the new certificate
    is on it. Otherwise it keeps the old pin and logs
-   `supervisor.tls.certificate_not_vouched`.
+   `supervisor.tls.certificate_not_vouched`. A member on the node-local http
+   path does not wait for that failure: every ~5 minutes it reads the same
+   list over the in-cluster path (trust is the CA signature, not the
+   transport), which also carries the vouched certificates' PEM, and replaces
+   its pin when the list names a certificate it does not hold
+   (`supervisor.tls.pin_refreshed`). A read that fails (its own api is
+   down) stays pending: it is retried with backoff and as soon as the
+   node-local path returns, and is dropped with
+   `supervisor.tls.pin_refresh_satisfied_by_repin` if a repin got there first.
 3. **Once approved, the first-contact pin is checked.** When the CA arrives,
    the supervisor checks that the certificate it pinned at first contact is on
    the CA's list, and logs `supervisor.tls.pin_not_vouched` if not.

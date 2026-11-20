@@ -3,6 +3,7 @@ import type { CustomField } from "@/lib/api";
 import {
   customFieldChecked,
   customFieldDefault,
+  customFieldDisplay,
   withCustomFieldDefaults,
 } from "./customFieldValues";
 
@@ -106,5 +107,40 @@ describe("withCustomFieldDefaults (#1303)", () => {
   it("returns the same object when there is nothing to fill", () => {
     const values = { owner: "helpdesk", managed: false };
     expect(withCustomFieldDefaults(defs, values)).toBe(values);
+  });
+});
+
+describe("multi_select and date (#4288)", () => {
+  it("reads a multi_select default as the options it names", () => {
+    const d = (default_value: string) =>
+      customFieldDefault(
+        def({
+          name: "m",
+          field_type: "multi_select",
+          options: ["a", "b"],
+          default_value,
+        }),
+      );
+    expect(d("a, b")).toEqual(["a", "b"]);
+    expect(d("a, z")).toEqual(["a"]);
+    expect(d("z")).toBeUndefined();
+  });
+
+  it("keeps a date default only when it is YYYY-MM-DD", () => {
+    const d = (default_value: string) =>
+      customFieldDefault(def({ name: "d", field_type: "date", default_value }));
+    expect(d("2026-12-31")).toBe("2026-12-31");
+    expect(d("tomorrow")).toBeUndefined();
+  });
+
+  it("shows a list comma-joined", () => {
+    expect(customFieldDisplay(["a", "b"])).toBe("a, b");
+    expect(customFieldDisplay("2026-12-31")).toBe("2026-12-31");
+    expect(customFieldDisplay(null)).toBe("");
+  });
+
+  it("shows an object as JSON text, never [object Object] (#4421)", () => {
+    expect(customFieldDisplay({ k: "v" })).toBe('{"k":"v"}');
+    expect(customFieldDisplay([{ k: "v" }, "x"])).toBe('{"k":"v"}, x');
   });
 });
