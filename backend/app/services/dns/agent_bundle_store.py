@@ -247,6 +247,16 @@ async def load_body(db: AsyncSession, bundle: DNSAgentBundle) -> bytes | None:
     ).scalar_one_or_none()
 
 
+async def load_blocklist_body(db: AsyncSession, bundle: DNSAgentBundle) -> bytes | None:
+    """The gzip bytes of one stored bundle's blocklist stream (#4041); ``None``
+    when the row is gone (pruned) or carries no stream."""
+    return (
+        await db.execute(
+            select(DNSAgentBundle.blocklist_body).where(DNSAgentBundle.id == bundle.id)
+        )
+    ).scalar_one_or_none()
+
+
 async def store(
     db: AsyncSession,
     server: DNSServer,
@@ -263,6 +273,9 @@ async def store(
     render_ms: int,
     rendered_by: str,
     packed_blocklists: bool = False,
+    blocklist_stream: bool = False,
+    blocklist_etag: str | None = None,
+    blocklist_body: bytes | None = None,
 ) -> DNSAgentBundle | None:
     """Insert one rendered bundle and mirror it onto the server row.
 
@@ -299,6 +312,9 @@ async def store(
         "app_version": app_version,
         "renderer_revision": RENDERER_REVISION,
         "packed_blocklists": packed_blocklists,
+        "blocklist_stream": blocklist_stream,
+        "blocklist_etag": blocklist_etag,
+        "blocklist_body": blocklist_body,
     }
     insert_stmt = pg_insert(DNSAgentBundle).values(
         id=uuid.uuid4(), server_id=server.id, dirty_watermark=dirty_watermark, **payload
@@ -453,6 +469,7 @@ __all__ = [
     "current",
     "encode_body",
     "is_current",
+    "load_blocklist_body",
     "load_body",
     "prune",
     "record_failure",

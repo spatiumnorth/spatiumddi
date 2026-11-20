@@ -674,6 +674,11 @@ class EncodedBody:
     has_views: bool
     # #4040 — the blocklist entries went out as packed runs.
     packed_blocklists: bool = False
+    # #4041 — the entries are not in ``body_gz`` but in ``blocklist_gz``, the
+    # stream document, whose ETag is ``blocklist_etag``.
+    blocklist_stream: bool = False
+    blocklist_etag: str | None = None
+    blocklist_gz: bytes | None = None
 
 
 #: Blocklist entries read, serialised and hashed per step of the streamed
@@ -694,6 +699,20 @@ class _StreamedEntries:
     hash_mark: str | None = None
     hasher: Any = None
     # #4040 — the server's agent reads packed runs of entries.
+    pack: bool = False
+
+
+@dataclass(frozen=True)
+class _SplitEntries:
+    """One RPZ zone whose entries are left out of the bundle for an agent that
+    reads the blocklist stream (#4041): the bundle's zone dict carries an empty
+    ``entries`` and no content hash, and ``encode_blocklist_stream`` writes
+    the entries (and, a BIND9 bundle, ``hasher``'s hash) into the stream."""
+
+    rpz_zone_name: str
+    view_name: str | None
+    lists: list[Any]
+    hasher: Any = None
     pack: bool = False
 
 
@@ -735,6 +754,8 @@ class _Assembled:
     has_views: bool
     streamed: list[_StreamedEntries] = field(default_factory=list)
     zones: _StreamedZones | None = None
+    # #4041 — the zones whose entries go into the blocklist stream instead.
+    split: list[_SplitEntries] = field(default_factory=list)
 
 
 def _placeholder() -> str:
@@ -1091,6 +1112,55 @@ async def _stream_zones(
     return records
 
 
+async def encode_blocklist_stream(
+    db: AsyncSession, zones: list[_SplitEntries]
+) -> tuple[bytes, str]:
+    """The blocklist stream document (#4041), gzipped, and its ETag.
+
+    ``{"blocklists": [{"rpz_zone_name", "view_name", "entries", "rpz_sha256"?}]}``,
+    one element per zone the bundle names with an empty ``entries``, each
+    entry list exactly as the bundle carried it before (packed or not, hash
+    over the per-entry form, #2157). The ETag is the SHA-256 of the
+    uncompressed document, so it moves exactly when an entry, the order of
+    entries, a zone's hash or the zone set does, and not with anything else in
+    the bundle. Written a batch at a time like the bundle's own entries.
+    """
+    writer = BodyWriter()
+    digest = hashlib.sha256()
+
+    def write(data: bytes) -> None:
+        digest.update(data)
+        writer.write(data)
+
+    write(b'{"blocklists":[')
+    for i, zone in enumerate(zones):
+        head = {"rpz_zone_name": zone.rpz_zone_name, "view_name": zone.view_name}
+        write(
+            (b"," if i else b"")
+            + json.dumps(head, **WIRE_JSON)[:-1].encode("utf-8")
+            + WIRE_JSON["separators"][0].encode("utf-8")
+            + b'"entries":'
+        )
+        await _stream_zone_entries(
+            db,
+            zone.lists,
+            (),
+            write,
+            zone.pack,
+            zone.hasher.update if zone.hasher is not None else None,
+        )
+        if zone.hasher is not None:
+            write(
+                b',"'
+                + RPZ_CONTENT_HASH_KEY.encode("ascii")
+                + b'":'
+                + json.dumps(_rpz_hash_value(zone.hasher), **WIRE_JSON).encode("utf-8")
+            )
+        write(b"}")
+    write(b"]}")
+    return writer.finish(), "sha256:" + digest.hexdigest()
+
+
 async def encode_bundle_body(db: AsyncSession, server: DNSServer) -> EncodedBody:
     """``render_bundle_body``, serialised and gzipped as the store keeps it:
     the same bytes, ETag and structural ETag, without ever holding the group's
@@ -1199,6 +1269,13 @@ async def encode_bundle_body(db: AsyncSession, server: DNSServer) -> EncodedBody
             + json.dumps(structural_etag, **WIRE_JSON).encode("utf-8")
             + wire_parts[n + 2]
         )
+        # #4041 — the entries an agent that reads the stream fetches on their
+        # own. Always written for such a server, an empty document when no
+        # list has an entry, so its ETag is always defined.
+        stream_gz: bytes | None = None
+        stream_etag: str | None = None
+        if server.agent_reads_blocklist_stream:
+            stream_gz, stream_etag = await encode_blocklist_stream(db, assembled.split)
     finally:
         etag_spool.close()
         structural_spool.close()
@@ -1210,6 +1287,9 @@ async def encode_bundle_body(db: AsyncSession, server: DNSServer) -> EncodedBody
         records=records,
         has_views=assembled.has_views,
         packed_blocklists=bool(server.agent_renders_packed_blocklists),
+        blocklist_stream=stream_gz is not None,
+        blocklist_etag=stream_etag,
+        blocklist_gz=stream_gz,
     )
 
 
@@ -1950,10 +2030,14 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
 
     blocklists_payload: list[dict[str, Any]] = []
     streamed: list[_StreamedEntries] = []
+    split: list[_SplitEntries] = []
     # #2157 — only the BIND9 agent reads the per-zone content hash.
     rpz_hashes = server.driver == "bind9"
     # #4040 — an agent that reads packed entries is sent them packed.
     packs = bool(server.agent_renders_packed_blocklists)
+    # #4041 — an agent that reads the blocklist stream is sent a bundle with no
+    # entries in it (only the streamed render can split them out).
+    splits = stream and bool(server.agent_reads_blocklist_stream)
 
     async def _streamed_zone(
         lists: list[Any] | None, rpz_zone_name: str, view_name: str | None
@@ -1965,8 +2049,30 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         # bundle, so the next render drops it.
         if not lists or not await has_entries(db, lists):
             return False
-        mark = _placeholder()
         exceptions = sorted(await exception_domains(db, lists))
+        if splits:
+            # #4041 — the zone as the bundle carries it: its name, view and
+            # exceptions. The entries, and the content hash over them, are the
+            # stream's, so an entry edit does not move the bundle's ETag.
+            split.append(
+                _SplitEntries(
+                    rpz_zone_name=rpz_zone_name,
+                    view_name=view_name,
+                    lists=lists,
+                    hasher=_rpz_hasher(rpz_zone_name, exceptions) if rpz_hashes else None,
+                    pack=packs,
+                )
+            )
+            blocklists_payload.append(
+                {
+                    "rpz_zone_name": rpz_zone_name,
+                    "entries": [],
+                    "exceptions": exceptions,
+                    "view_name": view_name,
+                }
+            )
+            return True
+        mark = _placeholder()
         zone_dict: dict[str, Any] = {
             "rpz_zone_name": rpz_zone_name,
             "entries": mark,
@@ -2313,6 +2419,7 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         has_views=has_views,
         streamed=streamed,
         zones=zones_streamed,
+        split=split,
     )
 
 

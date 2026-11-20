@@ -356,6 +356,14 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     agent_renders_packed_blocklists: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    # #4041 — this server's agent fetches blocklist entries from their own
+    # versioned stream (``GET /dns/agents/blocklist``) instead of reading them
+    # out of the config bundle: it sent ``blocklist-stream`` in
+    # ``X-Spatium-Agent-Features``. False for an agent of an older release,
+    # whose bundle keeps the entries embedded.
+    agent_reads_blocklist_stream: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
 
     # ── #882 last config-apply verdict ────────────────────────────────────
     #
@@ -809,6 +817,15 @@ class DNSAgentBundle(UUIDPrimaryKeyMixin, Base):
     packed_blocklists: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    # #4041 — the blocklist entries are NOT in ``body``: they were rendered
+    # into ``blocklist_body`` (gzip of the stream document) under
+    # ``blocklist_etag``, for an agent that reads the stream. Only such an
+    # agent is served this bundle.
+    blocklist_stream: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    blocklist_etag: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    blocklist_body: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True, deferred=True)
     built_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
