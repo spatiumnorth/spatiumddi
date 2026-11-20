@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from spatium_dns_agent.drivers.technitium import TechnitiumDriver
+from spatium_dns_agent.drivers.technitium import _OWNER_MARKER, TechnitiumDriver
 
 from .test_technitium_first_create_soa import _SoaFake
 from .test_technitium_reconcile_churn import FORWARD
@@ -23,7 +23,10 @@ class _SerialFake(_SoaFake):
     def _respond(self, path: str, params: dict[str, Any], n: int) -> dict[str, Any]:
         zone = params.get("zone")
         if path == "zones/records/get" and zone not in self.zones:
-            return {"status": "error", "errorMessage": f"No such zone was found: {zone}"}
+            return {
+                "status": "error",
+                "errorMessage": f"No such zone was found: {zone}",
+            }
         if path.startswith("zones/records/") and params.get("type") == "SOA":
             wanted = int(params["serial"])
             stored = self.soa[zone]["serial"]
@@ -95,6 +98,10 @@ def test_no_serial_in_the_bundle_leaves_the_daemons_alone(tmp_path: Path) -> Non
         responsiblePerson="hostmaster@example.com", minimum=300, serial=77
     )
     fake.soa_ttl["example.com"] = FORWARD.get("ttl", 3600)
+    # Already stamped (#1775): the first pass over an unstamped zone writes the
+    # SOA once to add the owner marker, and Technitium bumps the serial on it.
+    # That is the marker's doing, not the serial being driven.
+    fake.soa_comments["example.com"] = _OWNER_MARKER
     d = _driver(tmp_path, fake)
     d._reconcile_zones("tok-1", _payload(d, None))
     assert fake.soa["example.com"]["serial"] == 77
