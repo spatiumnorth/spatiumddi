@@ -2014,7 +2014,7 @@ class PowerDNSDriver(DriverBase):
         return [], False
 
     def _dnssec_sign(self, api_key: str, zone: str) -> list[str]:
-        """Generate KSK + ZSK, set PRESIGNED metadata, rectify zone.
+        """Generate KSK + ZSK and rectify the zone.
 
         Returns the DS rrset string list so the caller can ship it to the
         control plane (operator pastes the DS into their parent registrar).
@@ -2110,7 +2110,7 @@ class PowerDNSDriver(DriverBase):
         return out
 
     def _dnssec_unsign(self, api_key: str, zone: str) -> None:
-        """Delete every cryptokey + clear PRESIGNED metadata.
+        """Delete every cryptokey of the zone.
 
         Idempotent — missing keys / metadata are a no-op. Same convergence
         semantic as ``_dnssec_sign``.
