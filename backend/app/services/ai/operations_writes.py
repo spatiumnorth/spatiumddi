@@ -2368,3 +2368,111 @@ register(
         required_permission=("write", "manage_asns"),
     )
 )
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Populate IPAM from existing DNS records (#2251)
+# ══════════════════════════════════════════════════════════════════════
+# Creates / links IPAM rows only. No DNS record is written, queued or
+# re-published, so there is no agent config bundle to wake.
+
+
+class PopulateIpamFromDnsArgs(BaseModel):
+    space_id: uuid.UUID | None = Field(default=None, description="Scope: a whole IP space.")
+    block_id: uuid.UUID | None = Field(default=None, description="Scope: a block and its children.")
+    subnet_id: uuid.UUID | None = Field(default=None, description="Scope: one subnet.")
+    zone_ids: list[uuid.UUID] | None = Field(
+        default=None, description="Source DNS zones; omit for every forward zone you can read."
+    )
+    status: Literal["allocated", "reserved", "deprecated"] = "allocated"
+    dynamic_action: Literal["skip", "dhcp", "static"] = Field(
+        default="skip",
+        description=(
+            "Records a DHCP server / client registered dynamically (Windows aging "
+            "timestamp): skip them, import as 'dhcp' rows, or as the chosen static status."
+        ),
+    )
+    link_ptr: bool = True
+
+
+async def populate_ipam_from_dns_plan(db: AsyncSession, user: User, args: PopulateIpamFromDnsArgs):  # type: ignore[no-untyped-def]
+    from app.services.ipam.populate_from_dns import (  # noqa: PLC0415
+        PopulateOptions,
+        build_plan,
+        resolve_subnets,
+    )
+
+    opts = PopulateOptions(
+        zone_ids=args.zone_ids,
+        status=args.status,
+        dynamic_action=args.dynamic_action,
+        link_ptr=args.link_ptr,
+    )
+    subnets = await resolve_subnets(
+        db, space_id=args.space_id, block_id=args.block_id, subnet_id=args.subnet_id
+    )
+    return await build_plan(db, user, subnets, opts), opts
+
+
+async def _preview_populate_ipam_from_dns(
+    db: AsyncSession, user: User, args: PopulateIpamFromDnsArgs
+) -> PreviewResult:
+    from app.services.ipam.populate_from_dns import PopulateError  # noqa: PLC0415
+
+    try:
+        plan, _ = await populate_ipam_from_dns_plan(db, user, args)
+    except PopulateError as exc:
+        return PreviewResult(ok=False, detail=exc.detail)
+    c = plan.counts()
+    todo = c.get("new", 0) + c.get("link", 0)
+    if not todo:
+        return PreviewResult(ok=False, detail="Nothing to create or link from these zones")
+    return PreviewResult(
+        ok=True,
+        detail="ready",
+        preview_text=(
+            f"Create {c.get('new', 0)} and link {c.get('link', 0)} IPAM address(es) from "
+            f"existing DNS records as '{args.status}'; {c.get('conflict', 0)} conflict(s) and "
+            f"{c.get('dynamic', 0)} dynamic record(s) are left alone. No DNS record is written."
+        ),
+    )
+
+
+async def _apply_populate_ipam_from_dns(
+    db: AsyncSession, user: User, args: PopulateIpamFromDnsArgs
+) -> dict[str, Any]:
+    _enforce_declared_gate(user, "populate_ipam_from_dns")
+    from app.services.ipam.populate_from_dns import (  # noqa: PLC0415
+        PopulateError,
+        commit_plan,
+    )
+
+    try:
+        plan, opts = await populate_ipam_from_dns_plan(db, user, args)
+        scope_type, scope_id = (
+            ("subnet", args.subnet_id)
+            if args.subnet_id
+            else ("ip_block", args.block_id) if args.block_id else ("ip_space", args.space_id)
+        )
+        assert scope_id is not None
+        result = await commit_plan(db, user, plan, opts, scope_type=scope_type, scope_id=scope_id)
+    except PopulateError as exc:
+        raise ValueError(exc.detail) from exc
+    await db.commit()
+    return result.as_dict()
+
+
+register(
+    Operation(
+        name="populate_ipam_from_dns",
+        description=(
+            "Create IPAM addresses from A / AAAA records that already exist in DNS and "
+            "link them to those records, writing no DNS (#2251)."
+        ),
+        args_model=PopulateIpamFromDnsArgs,
+        preview=_preview_populate_ipam_from_dns,
+        apply=_apply_populate_ipam_from_dns,
+        category="ipam",
+        required_permission=("write", "subnet"),
+    )
+)

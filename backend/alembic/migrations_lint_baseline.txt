@@ -373,6 +373,7 @@ backend/alembic/versions/c3a81f9d6b42_oui_vendor_lookup.py:drop_column:73
 backend/alembic/versions/c3a81f9d6b42_oui_vendor_lookup.py:drop_column:74
 backend/alembic/versions/c3a81f9d6b42_oui_vendor_lookup.py:drop_table:75
 backend/alembic/versions/c3d8a1f9e62b_acme_http_challenge.py:drop_table:56
+backend/alembic/versions/c3d8a41f7b52_dns_record_dynamic.py:drop_column:33
 backend/alembic/versions/c3e8b57a2f14_unifi_router_link.py:drop_column:48
 backend/alembic/versions/c3e9a2b71f48_dns_server_runtime_state.py:drop_table:42
 backend/alembic/versions/c3f1a7e09d52_api_token_resource_grants.py:drop_column:33

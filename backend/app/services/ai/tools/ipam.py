@@ -39,6 +39,7 @@ from app.models.network import NetworkDevice
 from app.models.network_service import NetworkService
 from app.models.overlay import OverlayNetwork
 from app.models.vrf import VRF
+from app.services.ai.operations_writes import PopulateIpamFromDnsArgs
 from app.services.ai.tools.base import register_tool, tool_permission_allows
 from app.services.ai.tools.scope import token_allows_subnet, token_subnet_ids, token_zone_ids
 from app.services.integration_ownership import owning_integration
@@ -1334,3 +1335,43 @@ async def find_ip_hygiene_findings(
         squat_days=args.squat_days,
         limit=args.limit,
     )
+
+
+# ── Populate IPAM from DNS — read-only preview (#2251) ────────────────
+
+
+@register_tool(
+    name="preview_populate_ipam_from_dns",
+    honours_token_binding=True,
+    permission=("write", "subnet"),
+    description=(
+        "Preview what 'populate IPAM from existing DNS records' would do, WITHOUT doing it: "
+        "which A / AAAA records in the chosen zones would become new IPAM addresses, which "
+        "would be linked to an address that already exists, and which are held back "
+        "(conflicting names, DDNS / DHCP-registered dynamic records, records outside every "
+        "subnet). Pass exactly one of space_id / block_id / subnet_id and optionally "
+        "zone_ids. Read-only; the commit writes no DNS either. Applying it is "
+        "propose_populate_ipam_from_dns or the IPAM UI."
+    ),
+    args_model=PopulateIpamFromDnsArgs,
+    category="ipam",
+)
+async def preview_populate_ipam_from_dns(
+    db: AsyncSession, user: User, args: PopulateIpamFromDnsArgs
+) -> dict[str, Any]:
+    from app.services.ai.operations_writes import populate_ipam_from_dns_plan  # noqa: PLC0415
+    from app.services.ipam.populate_from_dns import PopulateError  # noqa: PLC0415
+
+    try:
+        plan, _opts = await populate_ipam_from_dns_plan(db, user, args)
+    except PopulateError as exc:
+        return {"error": exc.detail}
+    return {
+        "records_scanned": plan.records_scanned,
+        "subnets_in_scope": plan.subnets_in_scope,
+        "counts": plan.counts(),
+        "reasons": plan.reasons(),
+        "dynamic_unknown": plan.dynamic_unknown,
+        "outside_subnet_groups": plan.outside[:50],
+        "sample": [e.as_dict() for e in plan.entries[:50]],
+    }

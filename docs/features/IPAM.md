@@ -840,6 +840,43 @@ Import behavior:
 - **Export**: Export zone as RFC 1035 zone file or JSON
 - Bulk import of multiple zones via ZIP of zone files
 
+### Populate IPAM from existing DNS records (#2251)
+
+For an estate that already lives in DNS (zones pulled in from a Windows DNS
+server, say) and an empty IPAM. **Populate from DNS** is a button on a space,
+block or subnet. Pick the source zones (none ticked = every forward zone you
+can read), a status for the new rows, and what to do with dynamic records, then
+**Preview** and **Populate IPAM**. REST: `POST /api/v1/ipam/import/dns/preview`
+and `/commit`; MCP: `preview_populate_ipam_from_dns` (read) and
+`propose_populate_ipam_from_dns` (approval-gated, off by default).
+
+- **No DNS writes at all.** The commit creates `IPAddress` rows and links each
+  to the record that is already there (`dns_record_id` / `forward_zone_id`, and
+  `reverse_zone_id` when a PTR for the address points at the same name). The
+  record stays the operator's: nothing is queued to a server, no serial moves,
+  and the next Sync DNS reads the pair as in sync instead of writing a twin.
+- **Every A / AAAA record is classified**: *new* (no IPAM row, created with
+  `hostname` = the record's label), *link* (a row exists with the same or no
+  hostname: linked, not changed), *already linked* (no-op, so a re-run is safe),
+  *conflict* (several names at one address, or a row with another hostname:
+  never overwritten, only the record you name in `resolutions` wins), *dynamic*,
+  and *skipped* (apex / wildcard / invalid label, network or broadcast address,
+  integration-owned, or no write permission on the subnet). Records outside
+  every subnet in scope are grouped by /24 (/64) so you can create the subnet
+  first.
+- **Dynamic records.** The Windows Path B pull now records the aging timestamp
+  (`dns_record.dynamic`: true / false). Dynamic records are skipped by default;
+  choose to import them as `dhcp` rows or as the chosen static status. AXFR
+  (Path A, BIND9, Technitium) carries no timestamp, so those records read as
+  static and the preview says how many are of unknown kind; rows pulled before
+  this was recorded stay unknown until deleted and pulled again.
+- **Permissions.** `write` on the target subnets and `read` on every source
+  zone; an explicit zone you cannot read is a 403. Provenance is
+  `import_source = "dns"` + `imported_at`; every row is audited, plus one
+  batch entry. Not a feature module: it is an action on IPAM, not a surface.
+- Creating the missing subnets from the *outside* suggestions is not done by
+  this flow.
+
 ### NetBox migration import (#36)
 
 For migrating a whole IPAM estate out of a live NetBox install — prefixes / IP
