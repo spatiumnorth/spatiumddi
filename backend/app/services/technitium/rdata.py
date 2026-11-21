@@ -77,6 +77,14 @@ SUPPORTED_RECORD_TYPES = frozenset(
     }
 )
 
+# The subset SpatiumDDI itself models (mirrors ``VALID_RECORD_TYPES``). URI is
+# translatable above so a row already stored (an old import) can still be
+# written, updated and deleted, but it is NOT modelled: the record API
+# refuses it as a type, so importing or mirroring more would create rows
+# nobody can edit, and drift would list every one on the server as extra
+# (#1778). What the importers, the pull and ``capabilities()`` report.
+MODELLED_RECORD_TYPES = SUPPORTED_RECORD_TYPES - {"URI"}
+
 # Signing artefacts. Never imported and never written by hand — the zone is
 # re-signed at the destination instead of carrying signatures across.
 DNSSEC_RECORD_TYPES = frozenset({"DNSKEY", "RRSIG", "NSEC", "NSEC3", "NSEC3PARAM", "DS"})
@@ -806,6 +814,7 @@ def record_params(
 
 __all__ = [
     "DNSSEC_RECORD_TYPES",
+    "MODELLED_RECORD_TYPES",
     "SUPPORTED_RECORD_TYPES",
     "canonical_ip",
     "classify_zone",

@@ -410,7 +410,8 @@ class TechnitiumDriver(DNSDriver):
             "dnssec_inline_signing": True,  # #1767: agent reconciles signing state
             "incremental_updates": "rest_api",
             "zone_types": sorted(_SUPPORTED_ZONE_TYPES),
-            "record_types": sorted(_SUPPORTED_RECORD_TYPES),
+            # URI is translated but not modelled by SpatiumDDI (#1778).
+            "record_types": sorted(_SUPPORTED_RECORD_TYPES - {"URI"}),
             "alias_records": False,
             "lua_records": False,
             # #1766 — producer only (#3764 removed the consumer role). The
