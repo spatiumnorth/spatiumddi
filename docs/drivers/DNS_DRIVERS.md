@@ -836,6 +836,8 @@ Each driver's `capabilities()` returns the same dict shape Windows / PowerDNS us
 
 Third authoritative driver, alongside BIND9 and PowerDNS. Same agent-colocated shape as PowerDNS (control-plane driver is a thin/no-op translator; the real work — reconcile, auth, lifecycle — lives in the agent-side driver talking to the daemon over `127.0.0.1`), but even thinner: Technitium has **no config file for zone/record state at all**. The daemon persists its own config under `/etc/dns` and is configured entirely through its HTTP API (`http://127.0.0.1:5380/api/...`, called by the agent; the daemon itself listens on loopback only, see §4B.3b below).
 
+**Clustering is unsupported on agent-managed nodes ([#1781](https://github.com/spatiumnorth/spatiumddi/issues/1781)).** Technitium cluster parameters (forwarders, blocking, TSIG, recursion) replicate between peer nodes, so two agents in different groups on clustered nodes would overwrite each other. Do not initialise Technitium clustering on a node the agent manages. The TSIG sync does keep any `cluster-catalog.*` key the daemon holds, so an apply is not refused on such a node, but that is tolerance, not support.
+
 ### 4B.1 Update Strategy: REST API, full-zone diff reconcile
 
 Unlike PowerDNS's rrset-REPLACE PATCH semantics, Technitium's `/api/zones/records/add` **appends** at a given `(name, type)` by default (round-robin A records coexist without a GET-merge-PATCH dance) and only wipes the rrset when `overwrite=true` is passed explicitly. The agent driver exploits this:

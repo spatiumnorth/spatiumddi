@@ -3043,8 +3043,32 @@ class TechnitiumDriver(DriverBase):
         operator added directly in the Technitium console is dropped on the
         next sync. That is the same "control plane is the source of truth"
         stance the rest of the driver takes, but it is worth knowing.
+
+        One exception (#1781): a daemon with Technitium clustering
+        initialised owns ``cluster-catalog.<domain>`` keys, and it refuses a
+        ``tsigKeys`` write that omits them, so every apply would record a
+        refusal. Those keys are read back and re-sent untouched. Clustering
+        agent-managed nodes is still unsupported: cluster parameters
+        replicate between peers, so two groups would overwrite each other.
         """
         tokens: list[str] = []
+        desired_names = {(k.get("name") or "").rstrip(".").lower() for k in keys}
+        try:
+            got = self._call(token, "GET", "settings/get", {}).json()
+            for existing in (got.get("response") or {}).get("tsigKeys") or []:
+                ename = str(existing.get("keyName") or "")
+                if ename.lower().startswith("cluster-catalog.") and (
+                    ename.lower() not in desired_names
+                ):
+                    tokens.extend(
+                        [
+                            ename,
+                            str(existing.get("sharedSecret") or ""),
+                            str(existing.get("algorithmName") or "hmac-sha256").lower(),
+                        ]
+                    )
+        except (httpx.HTTPError, ValueError, RuntimeError, AttributeError) as exc:
+            log.warning("technitium_cluster_keys_read_failed", error=str(exc))
         for k in keys:
             name = (k.get("name") or "").rstrip(".")
             secret = k.get("secret") or ""
