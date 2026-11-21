@@ -102,6 +102,7 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     "test_lint_image_upgrades.py": "scripts/lint_image_upgrades.py",
     "test_release_version_script.py": "scripts/release_version.py",
     "test_changelog_assemble.py": "scripts/changelog_assemble.py",
+    "test_alembic_heads_script.py": ".github/scripts/alembic_heads.py",
     "test_format_release_notes.py": "scripts/format_release_notes.py",
     "test_check_contributors.py": (
         ".github/scripts/check_contributors.py",
