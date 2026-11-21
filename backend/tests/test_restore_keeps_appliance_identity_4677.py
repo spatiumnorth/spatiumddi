@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.models.appliance import Appliance, ApplianceCA
 from app.models.dns import DNSServerGroup
+from app.models.network import ApplianceLldpNeighbour
 from app.services.backup import appliance_identity as ident
 from tests.conftest import _TestSessionLocal
 
@@ -185,3 +186,116 @@ async def test_apply_backup_restore_keeps_the_running_appliance(
         rows = (await s.execute(select(Appliance))).scalars().all()
         assert [(r.id, r.cert_pem) for r in rows] == [(live_id, "CERT-node1")]
         assert (await s.execute(select(ApplianceCA))).scalar_one().cert_pem == "LIVE-CA"
+
+
+@pytest.mark.asyncio
+async def test_same_id_row_takes_the_live_identity(db_session: AsyncSession) -> None:
+    """An archive that carries the running row's id but an older copy of it
+    (taken before approval, a revoke or a rotation) must not log the supervisor out."""
+    live = _appliance("node1", cert_pem="LIVE-CERT", cert_serial="0a")
+    db_session.add_all([live, _ca("SAME-CA")])
+    await db_session.commit()
+    live_id, live_der = live.id, live.public_key_der
+    snap = await ident.snapshot(str(settings.database_url))
+    assert snap is not None
+
+    stale = _appliance(
+        "node1",
+        id=live_id,
+        state="pending_approval",
+        cert_pem=None,
+        cert_serial=None,
+        revoked_at=datetime.now(UTC),
+        assigned_roles=["dns-bind9"],
+    )
+    await _replay_with(db_session, [stale], _ca("SAME-CA"))
+
+    out = await ident.adopt(str(settings.database_url), snap)
+    assert out.refreshed == ["node1"] and out.adopted == []
+
+    db_session.expire_all()
+    row = (await db_session.execute(select(Appliance))).scalar_one()
+    assert row.id == live_id and row.state == "approved" and row.revoked_at is None
+    assert row.cert_pem == "LIVE-CERT" and row.cert_serial == "0a"
+    assert row.public_key_der == live_der
+    # Everything that is not identity stays the archive's.
+    assert row.assigned_roles == ["dns-bind9"]
+
+
+@pytest.mark.asyncio
+async def test_rows_of_the_stale_identity_move_to_the_live_one(
+    db_session: AsyncSession,
+) -> None:
+    live = _appliance("node1")
+    db_session.add_all([live, _ca("LIVE-CA")])
+    await db_session.commit()
+    live_id = live.id
+    snap = await ident.snapshot(str(settings.database_url))
+    assert snap is not None
+
+    old = _appliance("node1", cert_pem="OLD")
+    await _replay_with(db_session, [old], _ca("ARCHIVE-CA"))
+    db_session.add(
+        ApplianceLldpNeighbour(
+            appliance_id=old.id,
+            local_iface="eth0",
+            remote_chassis_id="aa",
+            remote_port_id="1",
+            last_seen=datetime.now(UTC),
+        )
+    )
+    await db_session.commit()
+
+    await ident.adopt(str(settings.database_url), snap)
+
+    db_session.expire_all()
+    neighbours = (await db_session.execute(select(ApplianceLldpNeighbour))).scalars().all()
+    assert [n.appliance_id for n in neighbours] == [live_id]
+
+
+@pytest.mark.asyncio
+async def test_unreadable_identity_is_reported_not_hidden(
+    db_session: AsyncSession, monkeypatch
+) -> None:
+    """A failed capture must not pass silently into the outage."""
+    import os
+
+    from app.services.backup import restore as restore_mod
+    from app.services.backup.migrations import MigrationOutcome
+    from app.services.backup.rewrap import RewrapOutcome
+
+    async def _boom(_url):
+        raise RuntimeError("db hiccup")
+
+    async def _async(value):
+        return value
+
+    manifest = {"format_version": next(iter(restore_mod.SUPPORTED_FORMAT_VERSIONS))}
+    monkeypatch.setattr(restore_mod.appliance_identity, "snapshot", _boom)
+    monkeypatch.setattr(
+        restore_mod, "extract_archive_members", lambda _b: (manifest, b"dump", "custom", b"enc")
+    )
+    monkeypatch.setattr(restore_mod, "decrypt_secrets", lambda *_a, **_k: {})
+    monkeypatch.setattr(restore_mod, "schema_direction_error", lambda _v: None)
+    monkeypatch.setattr(restore_mod, "_write_pre_restore_safety_dump", lambda _db: _async(None))
+    monkeypatch.setattr(
+        restore_mod,
+        "maybe_upgrade_after_restore",
+        lambda **_k: _async(
+            MigrationOutcome(
+                state="up_to_date", source_head=None, local_head=None, migrations_applied=[]
+            )
+        ),
+    )
+    monkeypatch.setattr(restore_mod, "rewrap_secrets", lambda **_k: _async(RewrapOutcome()))
+    monkeypatch.setattr(restore_mod, "_collect_post_restore_warnings", lambda _u: _async([]))
+    monkeypatch.setattr(restore_mod, "_run_pg_restore", lambda *_a: _async(None))
+
+    outcome = await restore_mod.apply_backup_restore(
+        db_session,
+        db_url=os.environ["DATABASE_URL"],
+        archive_bytes=b"zip",
+        passphrase="hunter2hunter2",
+        confirmation_phrase=restore_mod.CONFIRM_PHRASE,
+    )
+    assert any("could not be read" in w and "db hiccup" in w for w in outcome.warnings)

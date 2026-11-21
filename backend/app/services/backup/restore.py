@@ -1323,7 +1323,13 @@ async def _apply_backup_restore_inner(
     # The appliance registry is replaced by a full restore, and by a selective
     # one whose TRUNCATE ... CASCADE reaches it. Capture the live rows first
     # so the running supervisor stays known to the restored database (#4677).
-    identity_snapshot = await appliance_identity.snapshot(db_url)
+    identity_snapshot = None
+    identity_snapshot_error: str | None = None
+    try:
+        identity_snapshot = await appliance_identity.snapshot(db_url)
+    except Exception as exc:  # noqa: BLE001 — never block a restore on the capture
+        logger.error("backup_restore_identity_snapshot_failed", error=str(exc))
+        identity_snapshot_error = str(exc)
 
     with tempfile.TemporaryDirectory(prefix="spatium-restore-") as tmpdir:
         if selective:
@@ -1486,6 +1492,12 @@ async def _apply_backup_restore_inner(
 
     # Phase 7b (#4677): put this install's own appliance identity back.
     adoption = appliance_identity.AdoptionOutcome()
+    if identity_snapshot_error is not None:
+        adoption.warnings.append(
+            "This install's appliance identity could not be read before the restore "
+            f"({identity_snapshot_error}), so it was not kept. The appliance will be refused "
+            "by the control plane until it is paired again."
+        )
     if identity_snapshot is not None and (
         restored_tables is None or "appliance" in restored_tables
     ):

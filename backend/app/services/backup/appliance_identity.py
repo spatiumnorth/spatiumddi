@@ -61,7 +61,17 @@ class AdoptionOutcome:
     adopted: list[dict[str, Any]] = field(default_factory=list)
     ca_replaced: bool = False
     archive_only: list[str] = field(default_factory=list)
+    refreshed: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+
+
+def _warning(hosts: list[str], out: AdoptionOutcome) -> str:
+    names = ", ".join(sorted(set(hosts) | set(out.refreshed))) or "this install"
+    return (
+        f"Kept this install's own appliance identity for {names}: the restore carried a "
+        "different appliance registry or certificate authority, and replacing it would have "
+        "revoked the appliance running this control plane."
+    )
 
 
 def _engine(db_url: str):
@@ -77,7 +87,9 @@ def _engine(db_url: str):
 
 async def snapshot(db_url: str) -> IdentitySnapshot | None:
     """Capture the live appliance identity rows. None when there are none
-    (Compose, Kubernetes without an appliance) or the read fails."""
+    (Compose, Kubernetes without an appliance). A failed read raises: the
+    caller says so in the restore warnings rather than restoring into the
+    outage this module exists to prevent without a word."""
     engine = _engine(db_url)
     try:
         async with engine.connect() as conn:
@@ -110,9 +122,6 @@ async def snapshot(db_url: str) -> IdentitySnapshot | None:
                 for r in (await conn.execute(text("SELECT id::text, name FROM dhcp_server_group")))
             }
         return IdentitySnapshot(ca_json, rows, dns, dhcp)
-    except Exception as exc:  # noqa: BLE001 — never block a restore on the capture
-        logger.warning("backup_restore_identity_snapshot_failed", error=str(exc))
-        return None
     finally:
         await engine.dispose()
 
@@ -138,10 +147,8 @@ async def adopt(db_url: str, snap: IdentitySnapshot) -> AdoptionOutcome:
                 for r in await conn.execute(text("SELECT name, id::text FROM dhcp_server_group"))
             }
             todo = [a for a in snap.appliances if str(a["id"]) not in existing]
-            if not todo:
-                return out  # the same install: the archive carries the running rows
 
-            # The CA the adopted certificates chain to.
+            # The CA the live certificates chain to, whatever the ids say.
             snap_ca = json.loads(snap.ca_json)
             restored_ca = (
                 await conn.execute(text("SELECT cert_pem FROM appliance_ca WHERE id = 1"))
@@ -157,19 +164,69 @@ async def adopt(db_url: str, snap: IdentitySnapshot) -> AdoptionOutcome:
                 )
                 out.ca_replaced = True
 
+            # Rows the archive carries by id keep the archive's state, but the
+            # live row is what the supervisor authenticates against (state,
+            # revoked_at, public key, certificate, session token), and the
+            # archive's copy can predate an approval, a re-key or a revoke.
+            # Another archive row holding a live fingerprint is dropped first
+            # (the column is unique).
+            present = [a for a in snap.appliances if str(a["id"]) in existing]
+            if present:
+                present_ids = [str(a["id"]) for a in present]
+                for rid, (fp, _host) in existing.items():
+                    if rid not in present_ids and fp in {
+                        a["public_key_fingerprint"] for a in present
+                    }:
+                        await conn.execute(
+                            text("DELETE FROM appliance WHERE id = CAST(:i AS uuid)"), {"i": rid}
+                        )
+                refreshed = await conn.execute(
+                    text(
+                        "UPDATE appliance a SET state = s.state, revoked_at = s.revoked_at, "
+                        "public_key_der = s.public_key_der, "
+                        "public_key_fingerprint = s.public_key_fingerprint, "
+                        "cert_pem = s.cert_pem, cert_serial = s.cert_serial, "
+                        "cert_issued_at = s.cert_issued_at, cert_expires_at = s.cert_expires_at, "
+                        "session_token_hash = s.session_token_hash "
+                        "FROM json_populate_recordset(null::appliance, CAST(:j AS json)) s "
+                        "WHERE a.id = s.id AND (a.state, a.revoked_at, a.public_key_der, "
+                        "a.cert_pem, a.cert_serial, a.session_token_hash) IS DISTINCT FROM "
+                        "(s.state, s.revoked_at, s.public_key_der, s.cert_pem, s.cert_serial, "
+                        "s.session_token_hash) RETURNING a.hostname"
+                    ),
+                    {"j": json.dumps(present)},
+                )
+                out.refreshed = sorted(str(r[0]) for r in refreshed)
+            if not todo:
+                # The same install: the archive carries the running rows.
+                if out.refreshed or out.ca_replaced:
+                    out.warnings.append(_warning([], out))
+                return out
+
             adopted_ids = {str(a["id"]) for a in todo}
-            hostnames = {str(a["hostname"]).lower() for a in todo}
-            fingerprints = {a["public_key_fingerprint"] for a in todo}
-            replaced: list[str] = []
+            kept_ids = {str(a["id"]) for a in present}
+            hostnames = {str(a["hostname"]).lower(): str(a["id"]) for a in todo}
+            fingerprints = {a["public_key_fingerprint"]: str(a["id"]) for a in todo}
+            # archive row id -> the live row that stands in for it
+            replaced: dict[str, str] = {}
             for rid, (fp, host) in existing.items():
-                if rid in adopted_ids:
+                if rid in adopted_ids or rid in kept_ids:
                     continue
-                if fp in fingerprints or host in hostnames:
-                    await conn.execute(
-                        text("DELETE FROM appliance WHERE id = CAST(:i AS uuid)"), {"i": rid}
-                    )
-                    replaced.append(rid)
-            out.archive_only = sorted(set(existing) - set(replaced))
+                target = fingerprints.get(fp) or hostnames.get(host)
+                if target is not None:
+                    replaced[rid] = target
+            out.archive_only = sorted(set(existing) - set(replaced) - kept_ids)
+
+            # Free the unique fingerprint so the live row can take its place;
+            # the stale row itself goes after its dependents are re-pointed.
+            for rid in replaced:
+                await conn.execute(
+                    text(
+                        "UPDATE appliance SET public_key_fingerprint = 'replaced-' || id::text "
+                        "WHERE id = CAST(:i AS uuid)"
+                    ),
+                    {"i": rid},
+                )
 
             for a in todo:
                 row = dict(a)
@@ -192,15 +249,47 @@ async def adopt(db_url: str, snap: IdentitySnapshot) -> AdoptionOutcome:
                         "hostname": row["hostname"],
                         "state": row.get("state"),
                         "assigned_roles": row.get("assigned_roles"),
-                        "replaced_archive_rows": replaced,
+                        "replaced_archive_rows": sorted(
+                            r for r, t in replaced.items() if t == str(row["id"])
+                        ),
                     }
                 )
-        names = ", ".join(sorted(str(a["hostname"]) for a in out.adopted))
-        out.warnings.append(
-            f"Kept this install's own appliance identity for {names}: the restore carried a "
-            "different appliance registry, and replacing it would have revoked the appliance "
-            "running this control plane."
-        )
+
+            # Rows hanging off the stale identity (a firewall rule scoped to the
+            # node, its DNS / DHCP server rows, LLDP neighbours, collectors) move
+            # to the live one; deleting the stale row would cascade them away.
+            fks = (
+                await conn.execute(
+                    text(
+                        "SELECT c.conrelid::regclass::text, a.attname FROM pg_constraint c "
+                        "JOIN pg_attribute a ON a.attrelid = c.conrelid "
+                        "AND a.attnum = c.conkey[1] "
+                        "WHERE c.contype = 'f' AND c.confrelid = 'appliance'::regclass "
+                        "AND array_length(c.conkey, 1) = 1"
+                    )
+                )
+            ).all()
+            for old_id, new_id in replaced.items():
+                for table, column in fks:
+                    try:
+                        async with conn.begin_nested():
+                            await conn.execute(
+                                text(
+                                    f'UPDATE {table} SET "{column}" = CAST(:n AS uuid) '  # noqa: S608
+                                    f'WHERE "{column}" = CAST(:o AS uuid)'
+                                ),
+                                {"n": new_id, "o": old_id},
+                            )
+                    except Exception as exc:  # noqa: BLE001 — falls back to the cascade
+                        logger.warning(
+                            "backup_restore_identity_repoint_failed",
+                            table=table,
+                            error=str(exc),
+                        )
+                await conn.execute(
+                    text("DELETE FROM appliance WHERE id = CAST(:i AS uuid)"), {"i": old_id}
+                )
+        out.warnings.append(_warning([str(a["hostname"]) for a in out.adopted], out))
         if out.ca_replaced and out.archive_only:
             out.warnings.append(
                 f"{len(out.archive_only)} appliance row(s) from the archive were kept but their "
