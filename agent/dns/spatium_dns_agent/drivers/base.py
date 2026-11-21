@@ -167,6 +167,17 @@ class DriverBase(ABC):
         """
         return list(self._refused_zones)
 
+    def control_plane_confirmed(self) -> None:
+        """The control plane just answered that the live bundle is its current
+        one: a 304 for it, or a 200 whose structure is the one applied.
+
+        The hook for work that must never run off a cached bundle while the
+        control plane is unreachable (non-negotiable #5); the PowerDNS driver
+        deletes the zones the bundle dropped here (#4564). Called on the sync
+        thread, possibly on every poll, so it must be cheap when idle.
+        """
+        return None
+
     def apply_config(self, bundle: dict[str, Any]) -> None:
         """Default orchestration: render → validate → swap+reload.
 
