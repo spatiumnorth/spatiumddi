@@ -146,7 +146,7 @@ from app.services.agents.memory_status import (
 from app.services.agents.spool_status import SpoolStatus
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteZoneArgs
-from app.services.api_token_scopes import read_only_post, token_outbound
+from app.services.api_token_scopes import read_only_post, token_outbound, token_write
 from app.services.appliance.group_names import (
     group_assigned_to_appliance,
     group_name_problem,
@@ -239,10 +239,12 @@ from app.services.dns.server_move import (
     elect_primary,
     ensure_group_catalog_compatible,
     ensure_group_classless_compatible,
+    ensure_group_powerdns_compatible,
     ensure_group_single_driver,
     ensure_group_views_compatible,
     lock_server_row,
     move_server_to_group,
+    powerdns_zone_type_refusal,
     views_refusal,
     views_unsupported_message,
 )
@@ -414,6 +416,7 @@ _DNS_ROUTE_TYPES: dict[str, tuple[str, ...]] = {
     "POST /groups/{group_id}/zones/{zone_id}/dnssec/sign": _Z,
     "POST /groups/{group_id}/zones/{zone_id}/dnssec/unsign": _Z,
     "POST /groups/{group_id}/zones/{zone_id}/dnssec/rollover": _Z,
+    "POST /groups/{group_id}/zones/{zone_id}/dnssec/ack-ds-change": _Z,
     "POST /groups/{group_id}/zones/{zone_id}/move/preview": _Z,
     "POST /groups/{group_id}/zones/{zone_id}/move/commit": _Z,
     "GET /zone-templates": _Z,
@@ -2850,6 +2853,7 @@ async def create_server(
         )
         await ensure_group_catalog_compatible(db, group, body.driver)
         await ensure_group_classless_compatible(db, group, body.driver)
+        await ensure_group_powerdns_compatible(db, group, body.driver)  # #4570
         await ensure_group_views_compatible(db, group, body.driver)
     except ServerMoveError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
@@ -3000,6 +3004,7 @@ async def update_server(
             )
             await ensure_group_catalog_compatible(db, group, body.driver)
             await ensure_group_classless_compatible(db, group, body.driver)
+            await ensure_group_powerdns_compatible(db, group, body.driver)  # #4570
             await ensure_group_views_compatible(db, group, body.driver)
         except ServerMoveError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
@@ -6303,6 +6308,25 @@ async def _assert_forward_zone_serviceable(
         )
 
 
+async def _refuse_powerdns_unsupported_zone_type(
+    db: DB, group_id: uuid.UUID, zone_type: str, current: DNSZone | None = None
+) -> None:
+    """422 a forward / stub zone on a group with a PowerDNS server (#4570).
+
+    PowerDNS Authoritative has no forward-zone type, so the agent logs and
+    drops the zone (clients get REFUSED), and it creates a ``stub`` as a
+    full ``Slave``. Refused on the transition only: a zone already stored
+    with that type (``current``) stays editable and re-saveable.
+    """
+    if zone_type not in {"forward", "stub"}:
+        return
+    if current is not None and current.zone_type == zone_type:
+        return
+    refusal = powerdns_zone_type_refusal(await _group_driver_names(db, group_id), zone_type)
+    if refusal is not None:
+        raise HTTPException(status_code=422, detail=refusal)
+
+
 async def _check_zone_forward_transport(
     group_id: uuid.UUID,
     changes: dict[str, Any],
@@ -6389,6 +6413,7 @@ async def create_zone(
         zone_fields["ttl"] = await default_zone_ttl(db, group_id)
     _refuse_superadmin_zone_fields(current_user, zone_fields, None)
     await _enforce_technitium_api_zone_scope(db, group_id, zone_fields, None)
+    await _refuse_powerdns_unsupported_zone_type(db, group_id, body.zone_type)
     await _assert_forward_zone_serviceable(
         group_id, body.zone_type, list(body.forwarders or []), db
     )
@@ -7248,6 +7273,9 @@ async def update_zone(
     if "masters" in changes:
         changes["masters"] = [m.strip() for m in changes["masters"] if m and m.strip()]
     await _enforce_technitium_api_zone_scope(db, zone.group_id, changes, zone)
+    await _refuse_powerdns_unsupported_zone_type(
+        db, zone.group_id, changes.get("zone_type", zone.zone_type), zone
+    )
     changes.update(await _validated_zone_named_conf_fields(zone.group_id, changes, zone, db))
     effective_zone_type = changes.get("zone_type", zone.zone_type)
     await _assert_forward_zone_serviceable(
@@ -8313,6 +8341,10 @@ class ZoneDNSSECInfo(BaseModel):
     dnssec_policy_id: uuid.UUID | None = None
     dnssec_ds_records: list[str] = []
     dnssec_synced_at: datetime | None = None
+    # #4566 — when the DS set above replaced an earlier one (the server
+    # regenerated or rolled its keys), so it has to be published at the
+    # parent again. None for the first DS after signing.
+    dnssec_ds_changed_at: datetime | None = None
     keys: list[DNSSECKeyState] = []
     # #1762 — the zone is signed and its group has more than one DNS server,
     # each signing with its own keys; ``signing_servers`` is that count.
@@ -8420,6 +8452,7 @@ async def get_zone_dnssec_info(
     unmanaged = bool(await dnssec_signers.unmanaged_signing_group_ids(db, {zone.group_id}))
     return ZoneDNSSECInfo.model_validate(
         {
+            "dnssec_ds_changed_at": await dnssec_signers.ds_changed_at(db, zone),
             "dnssec_multi_signer": bool(zone.dnssec_enabled) and signers > 1,
             "signing_servers": signers,
             "signing_unmanaged": unmanaged,
@@ -8447,6 +8480,41 @@ async def get_zone_dnssec_info(
             ],
         }
     )
+
+
+@router.post(
+    "/groups/{group_id}/zones/{zone_id}/dnssec/ack-ds-change",
+    response_model=ZoneDNSSECInfo,
+)
+@token_write("Records the operator's DS-published acknowledgement as an audit row")
+async def acknowledge_zone_dnssec_ds_change(
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    db: DB,
+    current_user: SuperAdmin,
+) -> ZoneDNSSECInfo:
+    """The operator published the zone's current DS set at the parent (#4566).
+
+    Clears the "DS records changed" warning on the DNSSEC card. SpatiumDDI
+    cannot see the parent zone, so this is the operator's word, recorded in the
+    audit log with the DS set it covers; a later DS change warns again.
+    """
+    zone = await _require_zone(group_id, zone_id, db, current_user)
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action=dnssec_signers.DS_ACK_AUDIT_ACTION,
+            resource_type="dns_zone",
+            resource_id=str(zone.id),
+            resource_display=zone.name,
+            new_value={"ds_records": [str(d) for d in zone.dnssec_ds_records or []]},
+            result="success",
+        )
+    )
+    await db.commit()
+    return await get_zone_dnssec_info(group_id, zone_id, db, current_user)
 
 
 class DNSSECSignRequest(BaseModel):
@@ -8693,6 +8761,7 @@ class ZoneMovePreviewResponse(BaseModel):
     #: refuses, not waivable by acknowledgement.
     technitium_acl_refusal: str | None = None
     classless_refusal: str | None = None
+    powerdns_refusal: str | None = None
     #: #4565 — a view the zone or its records would keep in a target group
     #: that cannot serve views; non-null means the commit refuses.
     views_refusal: str | None = None
@@ -8739,6 +8808,7 @@ class ZoneMovePreviewResponse(BaseModel):
             forward_transport_refusal=plan.forward_transport_refusal,
             technitium_acl_refusal=plan.technitium_acl_refusal,
             classless_refusal=plan.classless_refusal,
+            powerdns_refusal=plan.powerdns_refusal,
             views_refusal=plan.views_refusal,
             warnings=plan.warnings,
             required_acknowledgements=plan.required_acknowledgements,

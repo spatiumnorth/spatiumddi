@@ -5303,6 +5303,8 @@ export interface ZoneMovePreview {
    *  refuses — not waivable by acknowledgement. */
   technitium_acl_refusal?: string | null;
   classless_refusal?: string | null;
+  /** #4570 — a forward / stub zone landing in a PowerDNS group. Refused. */
+  powerdns_refusal?: string | null;
   /** #4565 — the zone or a record of it would keep a view in a target group
    *  that cannot serve views. Non-null means the commit refuses. */
   views_refusal?: string | null;
@@ -6527,6 +6529,9 @@ export interface ZoneDnssecInfo {
   dnssec_policy_id: string | null;
   dnssec_ds_records: string[];
   dnssec_synced_at: string | null;
+  // #4566 — when the DS set replaced an earlier one (keys regenerated or
+  // rolled on the server); null for the first DS after signing.
+  dnssec_ds_changed_at?: string | null;
   keys: DNSKeyState[];
   // #1762 — see Zone.dnssec_multi_signer; signing_servers is the group's count.
   dnssec_multi_signer?: boolean;
@@ -6918,6 +6923,12 @@ export const dnsApi = {
   unsignZoneDnssec: (groupId: string, zoneId: string) =>
     api
       .post<DNSZone>(`/dns/groups/${groupId}/zones/${zoneId}/dnssec/unsign`)
+      .then((r) => r.data),
+  ackZoneDnssecDsChange: (groupId: string, zoneId: string) =>
+    api
+      .post<ZoneDnssecInfo>(
+        `/dns/groups/${groupId}/zones/${zoneId}/dnssec/ack-ds-change`,
+      )
       .then((r) => r.data),
   rolloverZoneDnssecKey: (groupId: string, zoneId: string, keyTag: number) =>
     api

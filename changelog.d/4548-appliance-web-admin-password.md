@@ -1,0 +1,3 @@
+### Fixed
+
+- The appliance installer now sets the web UI's `admin` password. After the OS password it asks whether to use it for the web UI too (default yes) or to enter another, and the first node starts on it with no forced change, so the first person to reach the UI is no longer the one who sets the password. Only a bcrypt hash is stored. A headless install can supply `web_admin_password_hash`, which `--check-preseed` reports; without it the web UI starts on `admin / admin` as before. The Done screen and `/etc/issue` say which password applies, and additional nodes no longer show web UI lines. The installer keeps the hash out of its trace log, which is copied to the installed node. (#4548)
