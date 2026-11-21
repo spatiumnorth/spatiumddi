@@ -214,6 +214,15 @@ const SECTION_FIELDS: Record<SectionId, (keyof PlatformSettings)[]> = {
     "appliance_revoked_retention_days",
     "e911_resolution_log_retention_days",
     "e911_lookup_log_budget_per_minute",
+    "alert_event_retention_days",
+    "ip_mac_history_retention_days",
+    "nmap_scan_retention_days",
+    "conformity_result_retention_days",
+    "event_outbox_retention_days",
+    "user_session_retention_days",
+    "ai_chat_retention_days",
+    "change_request_retention_days",
+    "run_log_retention_days",
   ],
   dns: [
     "dns_default_ttl",
@@ -506,7 +515,16 @@ type RetentionKey =
   | "metric_retention_days"
   | "log_retention_hours"
   | "e911_resolution_log_retention_days"
-  | "e911_lookup_log_budget_per_minute";
+  | "e911_lookup_log_budget_per_minute"
+  | "alert_event_retention_days"
+  | "ip_mac_history_retention_days"
+  | "nmap_scan_retention_days"
+  | "conformity_result_retention_days"
+  | "event_outbox_retention_days"
+  | "user_session_retention_days"
+  | "ai_chat_retention_days"
+  | "change_request_retention_days"
+  | "run_log_retention_days";
 
 const RETENTION_ROWS: {
   key: RetentionKey;
@@ -596,6 +614,96 @@ const RETENTION_ROWS: {
     min: 1,
     max: 6000,
     fallback: 120,
+  },
+  {
+    key: "alert_event_retention_days",
+    label: "Alert events",
+    description:
+      "Resolved alert events; open ones and the newest per rule and subject are kept. 0–3650 days; 0 keeps them forever.",
+    unit: "days",
+    min: 0,
+    max: 3650,
+    fallback: 180,
+  },
+  {
+    key: "ip_mac_history_retention_days",
+    label: "IP-MAC history",
+    description:
+      "MAC sightings not seen for this long. Acknowledged and known MACs are kept. 0–3650 days; 0 keeps them forever.",
+    unit: "days",
+    min: 0,
+    max: 3650,
+    fallback: 365,
+  },
+  {
+    key: "nmap_scan_retention_days",
+    label: "Nmap scans",
+    description:
+      "Finished nmap scans, with their raw output. 0–3650 days; 0 keeps them forever.",
+    unit: "days",
+    min: 0,
+    max: 3650,
+    fallback: 90,
+  },
+  {
+    key: "conformity_result_retention_days",
+    label: "Conformity results",
+    description:
+      "Older results; the newest per policy and resource is always kept. 0–3650 days; 0 keeps them forever.",
+    unit: "days",
+    min: 0,
+    max: 3650,
+    fallback: 365,
+  },
+  {
+    key: "event_outbox_retention_days",
+    label: "Delivered event deliveries",
+    description:
+      "Event-subscription outbox rows already delivered. Pending, failed and dead rows are kept. 0–3650 days; 0 keeps them forever.",
+    unit: "days",
+    min: 0,
+    max: 3650,
+    fallback: 7,
+  },
+  {
+    key: "user_session_retention_days",
+    label: "Login sessions",
+    description:
+      "Expired and revoked sessions, counted from expiry or last activity. 0–3650 days; 0 keeps them forever.",
+    unit: "days",
+    min: 0,
+    max: 3650,
+    fallback: 30,
+  },
+  {
+    key: "ai_chat_retention_days",
+    label: "Copilot chats",
+    description:
+      "Chats with no activity for this long, with their messages and proposals. 0–3650 days; 0 keeps them forever.",
+    unit: "days",
+    min: 0,
+    max: 3650,
+    fallback: 90,
+  },
+  {
+    key: "change_request_retention_days",
+    label: "Change requests",
+    description:
+      "Decided, executed, failed, cancelled and expired requests; pending ones are kept. 0–3650 days; 0 keeps them forever.",
+    unit: "days",
+    min: 0,
+    max: 3650,
+    fallback: 365,
+  },
+  {
+    key: "run_log_retention_days",
+    label: "Run logs",
+    description:
+      "Finished Wake-on-LAN runs and system-upgrade runs. 0–3650 days; 0 keeps them forever.",
+    unit: "days",
+    min: 0,
+    max: 3650,
+    fallback: 90,
   },
 ];
 

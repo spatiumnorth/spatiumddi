@@ -4080,6 +4080,16 @@ export interface PlatformSettings {
   /** E911 lookup trail bounds (#3514). Superadmin-only. */
   e911_resolution_log_retention_days: number;
   e911_lookup_log_budget_per_minute: number;
+  /** Unbounded-table windows in days (#2274); 0 keeps forever. */
+  alert_event_retention_days: number;
+  ip_mac_history_retention_days: number;
+  nmap_scan_retention_days: number;
+  conformity_result_retention_days: number;
+  event_outbox_retention_days: number;
+  user_session_retention_days: number;
+  ai_chat_retention_days: number;
+  change_request_retention_days: number;
+  run_log_retention_days: number;
   /** Write-only acknowledgement for the self-lockout pre-flight —
    *  never returned by the API. */
   ssh_lockdown_force?: boolean;

@@ -13,12 +13,12 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 
 import structlog
-from sqlalchemy import delete
 
 from app.celery_app import celery_app
 from app.db import task_session
 from app.models.e911 import E911ResolutionLog
 from app.models.settings import PlatformSettings
+from app.services.retention import batched_delete
 
 logger = structlog.get_logger(__name__)
 
@@ -32,12 +32,8 @@ async def _sweep() -> int:
         days = DEFAULT_RETENTION_DAYS
         if ps is not None and ps.e911_resolution_log_retention_days > 0:
             days = ps.e911_resolution_log_retention_days
-        cutoff = datetime.now(UTC) - timedelta(days=days)
-        res = await db.execute(
-            delete(E911ResolutionLog).where(E911ResolutionLog.queried_at < cutoff)
-        )
-        await db.commit()
-        return res.rowcount or 0
+    cutoff = datetime.now(UTC) - timedelta(days=days)
+    return await batched_delete(E911ResolutionLog, E911ResolutionLog.queried_at < cutoff)
 
 
 @celery_app.task(name="app.tasks.prune_e911_resolution_log.prune_e911_resolution_log")

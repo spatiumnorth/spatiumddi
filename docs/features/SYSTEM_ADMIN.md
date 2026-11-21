@@ -359,6 +359,25 @@ window deletes the older data on the next nightly run.
 | `pcap_retention_days` | Finished packet captures and their `.pcap` files | 7 days | 1–90 days |
 | `appliance_revoked_retention_days` | Deleted (revoked) Fleet appliance rows | 30 days | 0–365 days (0 = keep until permanently deleted) |
 | `e911_resolution_log_retention_days` | The E911 location-lookup trail (`e911_resolution_log`, #3514) | 90 days | 7–3650 days |
+| `alert_event_retention_days` | Resolved alert events; open ones are never deleted, and the newest event per rule and subject is kept (rules compare against it). | 180 days | 0–3650 days (0 = keep forever) |
+| `ip_mac_history_retention_days` | MAC sightings not seen for this long. Acknowledged and known MACs are kept. | 365 days | 0–3650 days (0 = keep forever) |
+| `nmap_scan_retention_days` | Finished nmap scans, with their raw output. | 90 days | 0–3650 days (0 = keep forever) |
+| `conformity_result_retention_days` | Older results; the newest per policy and resource is always kept. | 365 days | 0–3650 days (0 = keep forever) |
+| `event_outbox_retention_days` | Event-subscription outbox rows already delivered. Pending, failed and dead rows are kept. | 7 days | 0–3650 days (0 = keep forever) |
+| `user_session_retention_days` | Expired and revoked sessions, counted from expiry or last activity. | 30 days | 0–3650 days (0 = keep forever) |
+| `ai_chat_retention_days` | Chats with no activity for this long, with their messages and proposals. | 90 days | 0–3650 days (0 = keep forever) |
+| `change_request_retention_days` | Decided, executed, failed, cancelled and expired requests; pending ones are kept. | 365 days | 0–3650 days (0 = keep forever) |
+| `run_log_retention_days` | Finished Wake-on-LAN runs and system-upgrade runs. | 90 days | 0–3650 days (0 = keep forever) |
+
+The last nine rows (#2274) are read by one daily sweep
+(`prune_unbounded_tables`, 04:30 UTC) over tables that used to grow
+forever. It only deletes *terminal* rows (resolved, delivered, finished,
+decided or expired), never open or in-flight ones, and it deletes in
+batches of 10,000 rows, each batch its own transaction, so no prune
+becomes one long transaction. `audit_log` is never pruned. Still tracked
+in [#2274](https://github.com/spatiumnorth/spatiumddi/issues/2274):
+settings for the windows that are still fixed in code, a database-size /
+disk-fill alert, and archiving before an audit-log prune.
 
 `log_retention_hours` is capped at a week because the prune is a single
 `DELETE`, and a longer window makes that one transaction larger;

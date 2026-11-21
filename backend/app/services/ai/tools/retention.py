@@ -35,9 +35,12 @@ class FindRetentionSettingsArgs(BaseModel):
         "(``log_retention_hours``), DNS/DHCP metric samples "
         "(``metric_retention_days``), DHCP lease history, trash "
         "(soft-deleted rows), packet captures, revoked appliances, and the "
-        "E911 location-lookup trail (``e911_resolution_log_retention_days``). A "
-        "value of 0 on lease history / trash / revoked appliances means "
-        "never delete. The audit log is never pruned. Use for 'how far "
+        "E911 location-lookup trail (``e911_resolution_log_retention_days``), "
+        "plus the terminal rows of alert events, IP-MAC history, nmap scans, "
+        "conformity results, event outbox, sessions, AI chats, change "
+        "requests and run logs (``*_retention_days``). A "
+        "value of 0 on any window except logs, metrics, packet captures and "
+        "the E911 trail means never delete. The audit log is never pruned. Use for 'how far "
         "back can I see query logs?' or 'when will this deleted subnet be "
         "purged?'."
     ),
@@ -59,10 +62,33 @@ async def find_retention_settings(
         "pcap_retention_days": settings.pcap_retention_days,
         "appliance_revoked_retention_days": settings.appliance_revoked_retention_days,
         "e911_resolution_log_retention_days": settings.e911_resolution_log_retention_days,
+        **{
+            f: getattr(settings, f)
+            for f in (
+                "alert_event_retention_days",
+                "ip_mac_history_retention_days",
+                "nmap_scan_retention_days",
+                "conformity_result_retention_days",
+                "event_outbox_retention_days",
+                "user_session_retention_days",
+                "ai_chat_retention_days",
+                "change_request_retention_days",
+                "run_log_retention_days",
+            )
+        },
         "audit_log": "never pruned",
         "zero_means_keep_forever": [
             "dhcp_lease_history_retention_days",
             "soft_delete_purge_days",
             "appliance_revoked_retention_days",
+            "alert_event_retention_days",
+            "ip_mac_history_retention_days",
+            "nmap_scan_retention_days",
+            "conformity_result_retention_days",
+            "event_outbox_retention_days",
+            "user_session_retention_days",
+            "ai_chat_retention_days",
+            "change_request_retention_days",
+            "run_log_retention_days",
         ],
     }
