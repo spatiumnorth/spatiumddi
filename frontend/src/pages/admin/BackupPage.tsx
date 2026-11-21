@@ -18,6 +18,10 @@ import {
   type BackupManifestPreviewResponse,
   type BackupRestoreResponse,
 } from "@/lib/api";
+import {
+  RESTORE_IN_FLIGHT_KEY,
+  clearRestoreInFlight,
+} from "@/lib/restoreInFlight";
 import { BackupSectionsPicker } from "./BackupSectionsPicker";
 import { BackupTargetsSection } from "./BackupTargetsSection";
 import { FactoryResetSection } from "./FactoryResetSection";
@@ -300,9 +304,23 @@ function RestoreBackupCard() {
     },
   });
 
+  // A restore revokes every session (the restored auth tables replace the
+  // live ones), so this response may never arrive: the next call 401s and
+  // the page jumps to sign-in. The flag tells the sign-in page why, and the
+  // outcome is read back from the audit row after signing in (#4676).
+  const lastRestore = useQuery({
+    queryKey: ["backup", "last-restore"],
+    queryFn: () => backupApi.lastRestore(),
+    retry: false,
+  });
   const restoreMut = useMutation({
     mutationFn: () => {
       if (!file) throw new Error("no archive selected");
+      try {
+        sessionStorage.setItem(RESTORE_IN_FLIGHT_KEY, "1");
+      } catch {
+        // storage blocked: the sign-in page just loses its explanation.
+      }
       return backupApi.restore(
         file,
         passphrase,
@@ -310,7 +328,17 @@ function RestoreBackupCard() {
         mode === "selective" ? sections : undefined,
       );
     },
-    onSuccess: setOutcome,
+    onSuccess: (data) => {
+      clearRestoreInFlight();
+      setOutcome(data);
+    },
+    onError: (err: unknown) => {
+      // 401 / no response is the session loss the restore itself causes;
+      // anything else is a real refusal, so drop the flag.
+      const status = (err as { response?: { status?: number } })?.response
+        ?.status;
+      if (status && status !== 401) clearRestoreInFlight();
+    },
   });
 
   function onPickFile(f: File | null) {
@@ -499,6 +527,16 @@ function RestoreBackupCard() {
         </div>
 
         {outcome && <RestoreResultCard outcome={outcome} />}
+        {!outcome && lastRestore.data && (
+          <RestoreResultCard
+            outcome={lastRestore.data}
+            heading={`Last restore, ${new Date(lastRestore.data.performed_at).toLocaleString()}${
+              lastRestore.data.performed_by
+                ? ` by ${lastRestore.data.performed_by}`
+                : ""
+            }`}
+          />
+        )}
       </form>
     </section>
   );
@@ -562,12 +600,18 @@ function Row({
   );
 }
 
-function RestoreResultCard({ outcome }: { outcome: BackupRestoreResponse }) {
+function RestoreResultCard({
+  outcome,
+  heading = "Restore complete",
+}: {
+  outcome: BackupRestoreResponse;
+  heading?: string;
+}) {
   const warnings = outcome.warnings ?? [];
   return (
     <div className="space-y-2">
       <div className="rounded-md border border-emerald-500/30 bg-emerald-500/5 px-3 py-2 text-xs text-emerald-700 dark:text-emerald-300">
-        <div className="mb-1 font-medium">Restore complete</div>
+        <div className="mb-1 font-medium">{heading}</div>
         <div className="space-y-0.5">
           <div>Duration: {outcome.duration_ms} ms</div>
           {outcome.pre_restore_safety_path && (
