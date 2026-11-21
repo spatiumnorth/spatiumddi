@@ -938,6 +938,58 @@ lease on the group's Leases tab under DHCP. Packet logging is on by default
 
 ---
 
+### Several agents from one entry (`replicas`, #4175)
+
+A DNS entry can run N agents instead of listing N entries:
+
+```yaml
+dnsAgents:
+  servers:
+    - name: ns
+      group: internal-resolvers
+      replicas: 3
+      requiredAntiAffinity: true            # one per node, hard rule
+      podDisruptionBudget: { enabled: true } # maxUnavailable: 1
+      service: { type: LoadBalancer }
+```
+
+- **Identity.** Each replica is a pod of the entry's StatefulSet and registers as
+  its own server in the group, named after the pod (`ns-0`, `ns-1`, `ns-2`,
+  prefixed by flavor in the object names). Each has its own `agent-state` and
+  `dns-state` volumes, so it keeps serving from its cached config if the control
+  plane is unreachable. Scaling down leaves the removed pods' server rows and
+  PVCs behind; delete them yourself.
+- **Rolling.** The StatefulSet's `OrderedReady` RollingUpdate restarts one agent
+  at a time and waits for Ready, so a `helm upgrade` or Argo sync never takes
+  every agent down at once.
+- **Placement.** `requiredAntiAffinity: true` adds a required one-per-node rule
+  scoped to this entry (the chart's built-in rule is only preferred, and a
+  `podAntiAffinity` of your own replaces it). `topologySpreadConstraints` is
+  per entry; a constraint without a `labelSelector` is scoped to the entry.
+  Without a required rule or a constraint two replicas can share a node. The
+  shared `component=dns-agent` label spans **every** entry, so a constraint
+  you write with your own selector on that label counts agents across all
+  entries.
+- **PodDisruptionBudget.** `podDisruptionBudget.enabled` renders one per entry
+  when `replicas > 1` (`maxUnavailable`, default 1, or `minAvailable`). Its
+  selector is the entry's own pods, so budgets of different entries never
+  overlap.
+- **Group label.** `groupLabel: true` puts `spatiumddi.org/agent-group: <group>`
+  on the pods so a Service of your own can select one group's agents.
+- **Services.** The per-entry Service selects all replicas. With
+  `externalTrafficPolicy: Local` (the default for LoadBalancer) MetalLB BGP mode
+  announces the address from every node with a ready pod, L2 mode from one of
+  them; the "announced from the pod's node" assumption only holds at
+  `replicas: 1`.
+- **DHCP stays at 1.** `dhcpAgents.servers[].replicas` above 1 fails the render:
+  Kea HA needs exactly two peers that know each other's URLs. Declare two
+  entries and configure HA in the DHCP server group. The placement knobs
+  (`requiredAntiAffinity`, `topologySpreadConstraints`, `groupLabel`) apply to
+  DHCP too.
+- `replicas: 1` (the default) renders the same objects as before.
+- Storage must let a pod's volume follow it to another node (RWX or replicated
+  storage such as Longhorn) if you want pods to move after a node loss.
+
 ## 4. Migrations
 
 `migrate.enabled` (default `true`) renders a **regular Job** named per Helm

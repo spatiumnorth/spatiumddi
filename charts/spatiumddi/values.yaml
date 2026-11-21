@@ -1341,6 +1341,29 @@ dnsAgents:
     #   role: primary            # primary | secondary
     #   group: internal-resolvers
     #   storage: { agentState: 1Gi, dnsState: 2Gi }
+    #   # #4175 — N agents from ONE entry. Each replica is a pod of the
+    #   # entry's StatefulSet: it registers as its own server (named after
+    #   # the pod, <entry>-0, <entry>-1, ...) in `group`, with its own PVCs
+    #   # holding its cached config, and the StatefulSet's OrderedReady
+    #   # RollingUpdate restarts them one at a time. Default 1 renders exactly
+    #   # what earlier releases did. Scaling DOWN leaves the removed pods'
+    #   # server rows and PVCs behind: delete them in the UI / with kubectl.
+    #   replicas: 3
+    #   # Hard one-per-node rule across THIS entry's replicas (the chart's own
+    #   # component-wide anti-affinity is only preferred). A replica that
+    #   # cannot find a free node stays Pending.
+    #   requiredAntiAffinity: true
+    #   # Spread the entry's replicas over a topology. A constraint with no
+    #   # labelSelector gets one scoped to this entry.
+    #   topologySpreadConstraints:
+    #     - { maxSkew: 1, topologyKey: topology.kubernetes.io/zone, whenUnsatisfiable: ScheduleAnyway }
+    #   # PodDisruptionBudget for the entry, rendered only when replicas > 1.
+    #   # maxUnavailable (default 1) or minAvailable; scoped to this entry's
+    #   # pods alone.
+    #   podDisruptionBudget: { enabled: true, maxUnavailable: 1 }
+    #   # Label the pods spatiumddi.org/agent-group=<group> so a Service of
+    #   # your own can select one group's agents across entries.
+    #   groupLabel: true
     #   # Optional placement. Agents only PREFER separate nodes; pin with
     #   # nodeSelector to keep one per node across drains.
     #   nodeSelector: { kubernetes.io/hostname: node-a }
@@ -1358,8 +1381,9 @@ dnsAgents:
     #   storageClass: fast-ssd   # overrides dnsAgents.storageClass
     #   service: { type: LoadBalancer }
     #   # LoadBalancer Services keep the client address by default
-    #   # (externalTrafficPolicy: Local — each server is a single-replica
-    #   # StatefulSet, so the announcing node is the pod's node anyway);
+    #   # (externalTrafficPolicy: Local — at replicas: 1 the announcing node is
+    #   # the pod's node; at replicas > 1 BGP announces from every node with a
+    #   # ready pod, L2 from one of them);
     #   # set externalTrafficPolicy: Cluster to opt out. The remaining
     #   # fields are rendered when set (#1548):
     #   # service:
@@ -1434,6 +1458,11 @@ dhcpAgents:
     #   group: default
     #   storage: { agentState: 1Gi, keaState: 2Gi }
     #   storageClass: fast-ssd   # overrides dhcpAgents.storageClass (#3206)
+    #   # #4175 — replicas is fixed at 1 for DHCP: setting it above 1 fails the
+    #   # render, because Kea HA needs exactly two peers that know each other's
+    #   # URLs. Declare two entries and configure HA in the DHCP server group.
+    #   # topologySpreadConstraints, requiredAntiAffinity and groupLabel work as
+    #   # on dnsAgents.servers.
     #   # Placement (#3206). ``affinity`` is merged with the chart's preferred
     #   # one-per-node anti-affinity; only your own podAntiAffinity replaces it.
     #   nodeSelector: { kubernetes.io/hostname: node-a }

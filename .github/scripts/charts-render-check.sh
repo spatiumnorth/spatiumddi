@@ -1243,6 +1243,88 @@ python3 "$ROOT/.github/scripts/chart-dns-agent-service.py" --require \
     --expect-annotation metallb.universe.tf/loadBalancerIPs=10.0.0.53 \
     --expect-annotation metallb.universe.tf/address-pool=default \
     "$OUT/umbrella-dns-agent-lb.yaml" || failures=$((failures + 1))
+# #4175 — a DNS entry with replicas > 1 plus every per-entry placement knob.
+# One render so kubeconform checks the shapes; the grep below asserts them,
+# and that an entry left at the default still renders replicas: 1 with no
+# required anti-affinity, spread or PDB.
+render umbrella-agent-replicas "$UMBRELLA" \
+    --set dnsAgents.enabled=true --set dnsAgents.agentKey.value=x \
+    --set dhcpAgents.enabled=true --set dhcpAgents.agentKey.value=x \
+    --set-json 'dnsAgents.servers=[{"name":"ns","group":"Edge Group","replicas":3,"requiredAntiAffinity":true,"groupLabel":true,"podDisruptionBudget":{"enabled":true},"topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"topology.kubernetes.io/zone","whenUnsatisfiable":"ScheduleAnyway"}],"service":{"type":"LoadBalancer"}},{"name":"solo","podDisruptionBudget":{"enabled":true}}]' \
+    --set-json 'dhcpAgents.servers=[{"name":"d1","requiredAntiAffinity":true,"groupLabel":true}]'
+echo "── agent replicas (umbrella, #4175)"
+python3 - "$OUT/umbrella-agent-replicas.yaml" <<'PY' || failures=$((failures + 1))
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+bad = []
+sts = {d["metadata"]["labels"]["app.kubernetes.io/instance-name"]: d for d in docs
+       if d["kind"] == "StatefulSet" and d["metadata"]["labels"].get("app.kubernetes.io/component") in ("dns-agent", "dhcp-agent")}
+ns, solo, d1 = sts["ns"], sts["solo"], sts["d1"]
+if ns["spec"]["replicas"] != 3:
+    bad.append(f"ns replicas {ns['spec']['replicas']} != 3")
+if solo["spec"]["replicas"] != 1:
+    bad.append("an entry with no replicas must render replicas: 1")
+pa = ns["spec"]["template"]["spec"]["affinity"]["podAntiAffinity"]
+req = pa.get("requiredDuringSchedulingIgnoredDuringExecution") or []
+if len(req) != 1 or req[0]["labelSelector"]["matchLabels"].get("app.kubernetes.io/instance-name") != "ns":
+    bad.append(f"ns required anti-affinity not scoped to the entry: {req}")
+if "preferredDuringSchedulingIgnoredDuringExecution" not in pa:
+    bad.append("ns lost the chart's preferred anti-affinity")
+if "requiredDuringSchedulingIgnoredDuringExecution" in solo["spec"]["template"]["spec"]["affinity"]["podAntiAffinity"]:
+    bad.append("solo got a required anti-affinity it did not ask for")
+tsc = ns["spec"]["template"]["spec"].get("topologySpreadConstraints") or []
+if len(tsc) != 1 or tsc[0]["labelSelector"]["matchLabels"].get("app.kubernetes.io/instance-name") != "ns":
+    bad.append(f"ns topologySpreadConstraints not scoped to the entry: {tsc}")
+if "topologySpreadConstraints" in solo["spec"]["template"]["spec"]:
+    bad.append("solo rendered topologySpreadConstraints")
+if ns["spec"]["template"]["metadata"]["labels"].get("spatiumddi.org/agent-group") != "Edge-Group":
+    bad.append("ns pods lack the sanitised group label")
+if "spatiumddi.org/agent-group" in solo["spec"]["template"]["metadata"]["labels"]:
+    bad.append("solo got a group label it did not ask for")
+if "spatiumddi.org/agent-group" not in d1["spec"]["template"]["metadata"]["labels"]:
+    bad.append("dhcp d1 lacks the group label")
+envs = {e["name"]: e for e in ns["spec"]["template"]["spec"]["containers"][0]["env"]}
+if envs["SERVER_NAME"]["valueFrom"]["fieldRef"]["fieldPath"] != "metadata.name":
+    bad.append("SERVER_NAME is no longer the pod name, so replicas would collide")
+if len(ns["spec"]["volumeClaimTemplates"]) != 2:
+    bad.append("ns replicas must each get their own claims via volumeClaimTemplates")
+pdbs = [d for d in docs if d["kind"] == "PodDisruptionBudget"]
+if len(pdbs) != 1:
+    bad.append(f"expected exactly 1 PDB (ns only; solo is single-replica), got {[p['metadata']['name'] for p in pdbs]}")
+else:
+    p = pdbs[0]
+    if p["spec"].get("maxUnavailable") != 1:
+        bad.append("PDB maxUnavailable != 1")
+    if p["spec"]["selector"]["matchLabels"].get("app.kubernetes.io/instance-name") != "ns":
+        bad.append("PDB selector is not scoped to the entry")
+for b in bad:
+    print("   FAIL:", b, file=sys.stderr)
+if not bad:
+    print("   ok: #4175 replicas / placement / PDB / group label shapes")
+sys.exit(1 if bad else 0)
+PY
+echo "── negative controls: agent replicas (#4175)"
+neg4175() { # label expected-message [helm args...]
+    local label="$1" msg="$2"; shift 2
+    local out
+    if out="$(helm template neg "$UMBRELLA" --kube-version "$K8S_VERSION" "$@" 2>&1)"; then
+        echo "   FAIL: #4175 $label rendered" >&2; failures=$((failures + 1))
+    elif printf '%s' "$out" | grep -q "$msg"; then
+        echo "   ok: #4175 $label refused"
+    else
+        echo "   FAIL: #4175 $label failed for another reason:" >&2
+        printf '%s\n' "$out" | tail -3 >&2; failures=$((failures + 1))
+    fi
+}
+neg4175 "dhcp replicas 2" "Kea HA needs exactly two peers" \
+    --set dhcpAgents.enabled=true --set-json 'dhcpAgents.servers=[{"name":"d1","replicas":2}]'
+neg4175 "dns replicas 0" "replicas must be an integer >= 1" \
+    --set dnsAgents.enabled=true --set-json 'dnsAgents.servers=[{"name":"ns","replicas":0}]'
+neg4175 "dns replicas 1.5" "replicas must be an integer >= 1" \
+    --set dnsAgents.enabled=true --set-json 'dnsAgents.servers=[{"name":"ns","replicas":1.5}]'
+neg4175 "dns replicas string" "replicas must be an integer >= 1" \
+    --set dnsAgents.enabled=true --set-json 'dnsAgents.servers=[{"name":"ns","replicas":"3"}]'
+
 # #3229 — a DNS agent server with no service.type must render ClusterIP, and
 # a DHCP agent likewise: a LoadBalancer default is a hostPort-53 svclb pod on
 # k3s that captures the node's own 127.0.0.53 resolver. Explicit
