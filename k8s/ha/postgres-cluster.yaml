@@ -58,6 +58,17 @@ spec:
     topologyKey: kubernetes.io/hostname
 
   postgresql:
+    # #1261 — optional synchronous replication (operator 1.25+). Off by
+    # default: replication is asynchronous and a failover can lose the last
+    # few commits. Uncomment for zero data loss on failover; the trade-off
+    # is that with `dataDurability: required` writes BLOCK whenever fewer
+    # than `number` sync replicas are available, and every commit waits for
+    # a replica round-trip. `preferred` degrades to async instead of
+    # blocking. `number` must be below `instances`.
+    # synchronous:
+    #   method: any            # any | first
+    #   number: 1
+    #   dataDurability: required   # required | preferred
     parameters:
       # #2955 — 371 = api HPA max 10 x (30 pool + 2 hooks + 1 probe) + worker
       # 2 x (4 x 3 + 1) + beat 3 + 2 WAL senders + 10 reserve. Re-derive it

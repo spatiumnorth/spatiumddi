@@ -1135,12 +1135,38 @@ Set `postgresql.kind: cnpg` to render a CloudNativePG `Cluster` CR (a
 primary + streaming replicas with automatic failover) instead of the
 single-node StatefulSet.
 
-Replication is **asynchronous**: the `Cluster` sets no
+Replication is **asynchronous by default**: the `Cluster` sets no
 `postgresql.synchronous`, so a commit returns before a replica has it, and a
 failover can lose the last few commits (RPO > 0). That trades a small window
-of possible loss for write latency that does not depend on a replica. If you
-need zero data loss on failover, configure synchronous replication on the
-`Cluster` yourself and accept the latency.
+of possible loss for write latency that does not depend on a replica.
+
+For zero data loss on failover, opt in to synchronous replication with
+`postgresql.cnpg.synchronous.enabled: true` (it renders the `Cluster`'s
+`spec.postgresql.synchronous`; CNPG operator 1.25 or later, and the render
+fails with fewer than two instances). The trade-off is availability:
+
+- `dataDurability: required` (the default): every commit waits for `number`
+  replicas, and **writes block** while fewer than that many sync replicas are
+  available (for example a replica node is down and `number` equals the
+  replica count). Nothing is lost, but the API cannot write until a replica
+  returns or you turn the setting off.
+- `dataDurability: preferred`: the cluster drops to asynchronous replication
+  when no sync replica is available instead of blocking, so durability is not
+  guaranteed during that window.
+
+Every commit also pays a replica round-trip in either mode. `method` is `any`
+(quorum; default) or `first` (priority order); `number` is 1 to
+`instances - 1`.
+
+```yaml
+postgresql:
+  cnpg:
+    synchronous:
+      enabled: true
+      method: any
+      number: 1
+      dataDurability: required   # or preferred
+```
 
 ```yaml
 postgresql:

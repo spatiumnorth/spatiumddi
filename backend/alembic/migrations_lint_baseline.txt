@@ -565,6 +565,7 @@ backend/alembic/versions/d4a18b20e3c7_dhcp_mac_blocks.py:drop_table:83
 backend/alembic/versions/d4a8b2e6f193_dns_group_tsig_key.py:drop_column:40
 backend/alembic/versions/d4a8b2e6f193_dns_group_tsig_key.py:drop_column:41
 backend/alembic/versions/d4a8b2e6f193_dns_group_tsig_key.py:drop_column:42
+backend/alembic/versions/d4a8c27e91f3_postgres_synchronous_replication.py:drop_column:40
 backend/alembic/versions/d4a8e2b16f39_dhcp_server_kea_version.py:drop_column:42
 backend/alembic/versions/d4c1f7e3b821_appliance_k3s_cert_and_cidrs.py:drop_column:52
 backend/alembic/versions/d4c1f7e3b821_appliance_k3s_cert_and_cidrs.py:drop_column:53

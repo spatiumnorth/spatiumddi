@@ -668,6 +668,49 @@ async def find_control_plane_vip(
     }
 
 
+# ── find_postgres_synchronous ──────────────────────────────────────
+
+
+class FindPostgresSynchronousArgs(BaseModel):
+    pass
+
+
+@register_tool(
+    name="find_postgres_synchronous",
+    permission="superadmin",
+    description=(
+        "Read the cluster's synchronous Postgres replication setting "
+        "(superadmin only, #1261): whether it is on, the method (any / "
+        "first), how many replicas must confirm each commit, and the data "
+        "durability mode. 'required' blocks writes while too few sync "
+        "replicas are available; 'preferred' degrades to asynchronous "
+        "instead. Off (the default) means asynchronous replication, where "
+        "a failover can lose the last few commits. Read-only — changing it "
+        "is done in Appliance → Cluster → Database."
+    ),
+    args_model=FindPostgresSynchronousArgs,
+    category="admin",
+    default_enabled=True,
+)
+async def find_postgres_synchronous(
+    db: AsyncSession, user: User, args: FindPostgresSynchronousArgs
+) -> dict[str, Any]:
+    if (err := _superadmin_gate(user)) is not None:
+        return err
+    from app.models.settings import PlatformSettings
+
+    row = (
+        await db.execute(select(PlatformSettings).where(PlatformSettings.id == 1))
+    ).scalar_one_or_none()
+    raw = dict(row.postgres_synchronous or {}) if row else {}
+    return {
+        "enabled": bool(raw.get("enabled", False)),
+        "method": raw.get("method", "any"),
+        "number": int(raw.get("number", 1)),
+        "data_durability": raw.get("data_durability", "required"),
+    }
+
+
 # ── find_k8s_pods ──────────────────────────────────────────────────
 
 

@@ -2076,6 +2076,7 @@ def heartbeat_once(
                 mem_total_mib=k8s_api.sizing_memory_mib(cfg.state_dir),
                 cpu_count=k8s_api.node_cpu_count(),
                 cnpg_instances=cnpg_instances,
+                postgres_synchronous=body_out.get("desired_postgres_synchronous") or {},
             )
             if cp_changed:
                 log.info(

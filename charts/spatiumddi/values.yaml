@@ -929,6 +929,26 @@ postgresql:
     # clusters. CNPG enforces odd counts implicitly via its leader-
     # election layer.
     instances: 3
+    # #1261 — opt-in synchronous replication (CNPG ``spec.postgresql.
+    # synchronous``, operator 1.25+). Off (the default): replication is
+    # asynchronous, a commit returns before a replica has it, and a failover
+    # can lose the last few commits (RPO > 0). On: ``number`` replicas must
+    # confirm every commit before it returns (RPO 0), at the cost of write
+    # latency that now includes a replica round-trip.
+    #   method          any   = any ``number`` replicas (quorum; default)
+    #                   first = priority order (the first ``number``)
+    #   number          sync replicas per commit; 1 .. instances-1
+    #   dataDurability  required  = writes BLOCK while fewer than ``number``
+    #                             sync replicas are available (no data loss,
+    #                             less availability)
+    #                   preferred = degrade to async instead of blocking
+    #                             (availability over durability)
+    # Needs instances >= 2; the render fails otherwise.
+    synchronous:
+      enabled: false
+      method: any
+      number: 1
+      dataDurability: required
     # #2831: how CNPG updates the PRIMARY once a spec change has rolled the
     # replicas (a resources or parameter change, on an upgrade, a resize or
     # a promote). ``switchover`` promotes an already-updated replica first
