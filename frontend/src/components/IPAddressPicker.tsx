@@ -76,7 +76,7 @@ export function IPAddressPicker({
   // so a role without read on IP addresses gets an empty list that looks like
   // "no match" (#4635). `searched_types` names what was consulted.
   const cannotSearchIps =
-    q.data != null &&
+    q.data?.searched_types != null &&
     !q.data.searched_types.some((t) => t.type === "ip_address");
 
   return (
