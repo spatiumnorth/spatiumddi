@@ -4296,7 +4296,25 @@ the operator installing a CA anywhere:
    `supervisor.tls.pin_refresh_satisfied_by_repin` if a repin got there first.
 3. **Once approved, the first-contact pin is checked.** When the CA arrives,
    the supervisor checks that the certificate it pinned at first contact is on
-   the CA's list, and logs `supervisor.tls.pin_not_vouched` if not.
+   the CA's list, and logs `supervisor.tls.pin_not_vouched` (a warning) if not.
+
+**Control plane behind an OpenShift Route, Kubernetes Ingress or your own
+reverse proxy (#4647).** The certificate the supervisor sees is the router's,
+which the appliance CA has never seen, so no CA list can vouch for it. The
+appliance still pairs and works, the pin is the router's certificate, and the
+`supervisor.tls.pin_not_vouched` warning is expected and harmless there; the
+**Web UI Certificate** fingerprint comparison does not apply (compare with
+`openssl s_client -connect <host>:443 | openssl x509 -noout -fingerprint
+-sha256` instead). The same property means a router certificate rotation is
+not adopted automatically: the supervisor keeps the old pin, heartbeats fail
+verification, and it logs `supervisor.tls.certificate_not_vouched`. To
+re-pin, confirm the new certificate's fingerprint, then on the appliance
+delete `tls/control-plane.pem` under the supervisor state directory
+(`/var/persist/spatium-supervisor/`) and restart `spatium-supervisor`; it
+pins whatever the URL presents next. A router that keeps its certificate
+across renewals (same key) never needs this. Verification is not weakened
+for any other topology: an appliance-to-appliance control plane is still
+rotated only through the CA's signed list.
 
 An `http://` control-plane URL (acceptable for labs, per the installer) is
 probed once with a bare `GET /` to learn the `https://` it redirects to; that
