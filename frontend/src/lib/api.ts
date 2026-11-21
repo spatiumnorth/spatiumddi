@@ -2546,7 +2546,7 @@ export const ipamIoApi = {
         } catch {
           // body wasn't JSON — fall back to the raw text
         }
-        throw new Error(detail);
+        throw Object.assign(new Error(detail), { cause: err });
       }
       throw err;
     }
@@ -3027,7 +3027,7 @@ export const auditApi = {
         } catch {
           // body wasn't JSON — fall back to the raw text
         }
-        throw new Error(detail);
+        throw Object.assign(new Error(detail), { cause: err });
       }
       throw err;
     }
