@@ -630,7 +630,9 @@ describe("Delete permanently names what goes with the row (#2602)", () => {
 
   it("names a space's plans, VLAN mappings and AV ranges, a block's not (#3894)", async () => {
     const space = await openDelete("ip_space", 1);
-    expect(space).toMatch(/subnet plans, VLAN mappings and AV reserved ranges/);
+    expect(space).toMatch(
+      /subnet plans, VLAN mappings, AV reserved ranges and subnet holds/,
+    );
     cleanup();
     const block = await openDelete("ip_block", 1);
     expect(block).not.toMatch(/subnet plans/);

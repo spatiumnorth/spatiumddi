@@ -31,6 +31,41 @@ The IPAM module is the core of SpatiumDDI. It manages the hierarchy of IP space 
 - Subnets cannot overlap within the same IP Space
 - Subnets in *different* IP Spaces **may** overlap (VRF semantics) — but overlapping spaces must use **disjoint DHCP and DNS server groups**: one Kea server cannot serve two same-prefix subnets, and one DNS group cannot hold two same-name reverse zones. Enforced per #844 (scope create/activate `409`; reverse-zone attach refused)
 
+### Subnet Holds (#4492)
+
+A **hold** sets a CIDR aside for a future project, with a reason, an optional
+owner (user, group, customer) and an optional expiry. It is its own row, not a
+`reserved` subnet, so it creates no gateway, placeholder addresses, reverse
+zone or DHCP scope.
+
+- **What a hold blocks.** Every path that gives a subnet a CIDR refuses an
+  overlap with an *active* hold with `409`: create, trash restore,
+  allocate-next-subnet, resize (preview lists it as a `subnet_hold`
+  conflict), split and merge. Allocate-next-subnet without a `network` skips
+  held CIDRs and carves the next free one. Split and merge cannot normally
+  reach a hold (their CIDRs are inside or exactly the union of existing
+  subnets, which a hold cannot overlap); the check covers a hold that predates
+  the guard.
+- **Expiry.** An expired hold keeps holding and is flagged `expired`. Nothing
+  frees it automatically: release it, convert it, or extend `expires_at`.
+- **Convert.** `POST /api/v1/ipam/holds/{id}/convert` ends the hold and runs
+  the normal subnet create, so templates, gateway, placeholders and
+  inheritance apply. If create refuses, the hold stays active.
+- **UI.** The block detail view has a **Holds** panel listing the block's
+  active holds with Edit, Convert to subnet and Release (confirmed) actions.
+- **API.** `GET/POST /api/v1/ipam/holds`, `GET/PUT /{id}`, `POST /{id}/release`,
+  `POST /{id}/convert`. Permissions are `read` / `write` on `subnet`; every
+  mutation is audited. The copilot has `find_subnet_holds`,
+  `count_subnet_holds` and `propose_subnet_hold`.
+- **Alert.** The `subnet_hold_expiring` rule (Settings → Alerts, threshold in
+  days, default 30) fires per active hold whose `expires_at` is inside the
+  window, escalating as it nears; a hold already past its expiry is critical.
+  It resolves when the hold is released, converted or extended.
+
+Not yet: self-service requests for a hold through the request portal, an
+option to free expired holds automatically, and showing held CIDRs in the
+free-space band and treemap.
+
 ---
 
 ## 2. IP Block & Subnet Tree UI

@@ -69,6 +69,7 @@ from app.models.network_service import NetworkService, NetworkServiceResource
 from app.models.overlay import OverlayNetwork
 from app.models.ownership import Site
 from app.models.settings import PlatformSettings
+from app.models.subnet_hold import SubnetHold
 from app.models.tls_cert import (
     STATE_MISMATCH,
     STATE_UNREACHABLE,
@@ -496,6 +497,14 @@ _POSTGRES_INSTANCE_RULE_NAME = "PostgreSQL instance not Ready or not streaming"
 # segment for retirement and forgot" failure mode.
 RULE_TYPE_DECOM_EXPIRING = "decom_expiring"
 
+# Issue #4492 — a CIDR held for a future project. Subject = subnet_hold. Fires
+# when an *active* hold's ``expires_at`` falls within ``threshold_days``
+# (default 30), with the same escalation as the other ``*_expiring`` rules; a
+# hold already past its expiry (it keeps holding until an operator releases or
+# converts it) is critical. Resolves when the hold is released, converted or
+# extended.
+RULE_TYPE_SUBNET_HOLD_EXPIRING = "subnet_hold_expiring"
+
 # DNS query-behaviour anomalies — issue #371. Subject = dns_server. Evaluated
 # on the 60 s tick against the per-server ``dns_metric_sample`` rcode deltas
 # the agents already report (no new collection). Both reuse the generic
@@ -802,6 +811,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_APPLIANCE_HEARTBEAT_STALE,
         RULE_TYPE_POSTGRES_INSTANCE_UNHEALTHY,
         RULE_TYPE_DECOM_EXPIRING,
+        RULE_TYPE_SUBNET_HOLD_EXPIRING,
         RULE_TYPE_DNS_NXDOMAIN_SPIKE,
         RULE_TYPE_DNS_QUERY_RATE_SPIKE,
         RULE_TYPE_DNS_RATE_LIMIT_DROPPING,
@@ -5668,6 +5678,60 @@ async def _matching_decom_expiring_subjects(
     return matches
 
 
+async def _matching_subnet_hold_expiring_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+    now: datetime,
+) -> list[tuple[str, str, str, str]]:
+    """Return ``[(subject_id, display, message, severity)]`` for the
+    ``subnet_hold_expiring`` rule type (#4492). Only ``active`` holds with an
+    ``expires_at`` count; a hold past its expiry is still holding, so it is
+    reported as overdue at critical severity."""
+    threshold_days = rule.threshold_days or _DEFAULT_EXPIRING_THRESHOLD_DAYS
+    cutoff = now + timedelta(days=threshold_days)
+
+    rows = (
+        (
+            await db.execute(
+                select(SubnetHold)
+                .where(SubnetHold.status == "active")
+                .where(SubnetHold.expires_at.is_not(None))
+                .where(SubnetHold.expires_at <= cutoff)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    matches: list[tuple[str, str, str, str]] = []
+    for h in rows:
+        if h.expires_at is None:
+            continue
+        expires = h.expires_at if h.expires_at.tzinfo else h.expires_at.replace(tzinfo=UTC)
+        days_to_expiry = (expires.date() - now.date()).days
+        sev = _escalate_severity_for_expiring(
+            rule.severity,
+            threshold_days=threshold_days,
+            days_to_expiry=days_to_expiry,
+        )
+        network = str(h.network)
+        if expires <= now:
+            descriptor = "expired and is still holding the CIDR"
+        elif days_to_expiry == 0:
+            descriptor = "expires today"
+        elif days_to_expiry == 1:
+            descriptor = "expires tomorrow"
+        else:
+            descriptor = f"expires in {days_to_expiry} day(s)"
+        reason = f" ({h.reason})" if h.reason else ""
+        message = (
+            f"Hold on {network}{reason} {descriptor} "
+            f"(expires_at {expires.date().isoformat()}, threshold {_thr(threshold_days)} d)"
+        )
+        matches.append((str(h.id), network, message, sev))
+    return matches
+
+
 async def _matching_service_resource_orphaned_subjects(
     db: AsyncSession,
     rule: AlertRule,  # noqa: ARG001 — symmetry with sibling evaluators
@@ -8720,6 +8784,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 expiring = await _matching_decom_expiring_subjects(db, rule, now)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in expiring]
                 subject_type = "subnet"
+            elif rule.rule_type == RULE_TYPE_SUBNET_HOLD_EXPIRING:
+                expiring = await _matching_subnet_hold_expiring_subjects(db, rule, now)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in expiring]
+                subject_type = "subnet_hold"
             elif rule.rule_type == RULE_TYPE_TLS_CERT_EXPIRING:
                 expiring = await _matching_tls_cert_expiring_subjects(db, rule, now)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in expiring]

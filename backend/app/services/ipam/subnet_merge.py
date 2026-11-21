@@ -71,6 +71,7 @@ from app.models.dhcp import (
 )
 from app.models.ipam import IPAddress, Subnet, SubnetDomain
 from app.services.dhcp.config_bundle import build_config_bundle
+from app.services.ipam.holds import hold_conflicts
 from app.services.ipam.subnet_boundary import (
     boundary_addresses,
     boundary_host_conflicts,
@@ -428,6 +429,13 @@ async def preview_subnet_merge(
                     ),
                 )
             )
+
+    # A merged CIDR must not take a CIDR held for a future project (#4492).
+    if merged is not None:
+        conflicts.extend(
+            MergeConflict(type="subnet_hold", detail=d)
+            for d in await hold_conflicts(db, sources[0].space_id, str(merged))
+        )
 
     # Metadata compatibility.
     conflicts.extend(_check_metadata_compat(sources))
