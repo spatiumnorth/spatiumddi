@@ -507,6 +507,8 @@ single-node appliance restarting cluster DNS is a footgun.
 6. Operator accepts the self-signed cert **once** and signs in `admin / admin`, then sets a real password. The cert firstboot minted in step 3 is the only one the operator ever sees: the api's startup bootstrap *adopts* it as the active `appliance_certificate` row rather than generating a rival (#767), so the fingerprint doesn't change mid-boot and the frontend isn't rolled underneath the operator.
 7. (Appliance role, or a Control-plane node enabling DNS/DHCP) Operator approves the appliance from the control plane's `/appliance → Fleet` tab + picks roles. DaemonSet schedules role pods within ~30 s.
 
+**Joining a control plane that runs from the Helm chart** (plain Kubernetes or OpenShift) needs two control-plane settings first, supervisor registration and the agent keys; see [Join an appliance agent node to a Helm or OpenShift control plane](KUBERNETES.md#join-an-appliance-agent-node-to-a-helm-or-openshift-control-plane).
+
 For a step-by-step user-facing version, see the README's
 ["Quick start with the OS appliance ISO" section](https://github.com/spatiumnorth/spatiumddi/blob/main/README.md#quick-start-with-the-os-appliance-iso-recommended).
 
@@ -2378,6 +2380,33 @@ trigger: release tag push (CalVer up to the bridge, SemVer from 1.0.0)
 >   time, so correcting the hostname from the last screen before a wipe
 >   meant pressing Back past four screens and OK through them again.
 >   Picking a row jumps straight to it; `Install` is the last thing.
+>   A jump re-runs the screens whose answers depend on the one you
+>   changed (#4546): a different role brings back the sizing check, the
+>   k3s ranges and the control-plane URL and pairing code; a different
+>   network re-checks the k3s ranges against it; a different disk
+>   re-asks the partition-layout acknowledgement; a new hostname
+>   re-checks the password against it. There are rows for the k3s ranges
+>   (First node) and the control-plane URL and code (Additional node),
+>   and `Install` is refused, and the screen that fixes it opened, while
+>   an Additional node has no URL or code or the k3s ranges overlap the
+>   LAN. Review lists the DNS servers of a static network.
+> - **Static network and control-plane URL are checked.** A static
+>   address that is the network or broadcast address of its subnet,
+>   loopback, multicast or unspecified, a gateway equal to the address,
+>   and an empty DNS list (unless you confirm "No DNS") are refused; a
+>   dotted netmask such as `255.255.255.0` is accepted and converted.
+>   The control-plane URL must be `http://` or `https://` with a host and
+>   no spaces or quotes (the preseed parser applies the same rule), and
+>   plain `http://` needs an explicit choice because the pairing code
+>   would cross the network unencrypted.
+> - **Keep /var and STATE reads what it keeps.** The previous
+>   `spatium-config.yaml` and exported answers on STATE become the
+>   defaults of the hostname, admin account, timezone and network
+>   screens, and the role and k3s ranges are fixed to the values the kept
+>   data was built with (k3s stops on a mismatch), with a notice on the
+>   screen and on Review. If STATE cannot be read, Review says nothing
+>   was checked. The partition-layout screen then says the two OS slots
+>   are replaced rather than that everything is erased.
 > - **The answers are exported** to
 >   `/var/lib/spatium-state/spatium-preseed.yaml` in the #549 format, so
 >   an identical reinstall or a fleet clone is one file away. Secrets are
@@ -2758,6 +2787,18 @@ with the interactive path by construction.
 one whole disk. Prefer a stable `/dev/disk/by-id/…` or `by-path/…` id
 (a bare `sda` can renumber). A supplied-but-unresolvable disk drops to
 the interactive picker rather than guessing.
+
+**Other disks carrying SpatiumDDI labels (#4547).** The installed
+system mounts `/var`, STATE and the ESP by filesystem label (`var`,
+`state`, `ESP`), so a second attached disk with the same labels (an old
+system disk, a former mirror member, another test install) can be
+mounted instead of the installed one. Before the wipe the installer
+scans every disk it is not about to write and stops if one carries
+those labels. Interactively you can cancel (detach the disk) or clear
+the labels on the other disk after typing `CLEAR`; only the filesystem
+labels are blanked. A headless install halts unless the preseed carries
+`clear_foreign_labels: true`. Mounting by filesystem UUID instead is not
+done yet; existing installs keep their label-based fstab.
 
 **Lint a preseed offline (#581).**
 `spatium-install --check-preseed <preseed.yaml>` dry-runs the answer

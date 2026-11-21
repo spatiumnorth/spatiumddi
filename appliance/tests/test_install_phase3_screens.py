@@ -43,7 +43,15 @@ def run_validator(**env) -> str:
     )
     base.update(env)
     script = "\n".join(f'{k}={v!r}' for k, v in base.items())
-    script += "\n" + extract_fn("_validate_static_net") + "\n_validate_static_net\n"
+    # #4546 — the verdict is the shape checks plus the host-address rules
+    # shared with the parser through --check-field.
+    script += (
+        f"\nlog() {{ :; }}\nINSTALL_LOG=/dev/null\n"
+        f"_preseed_parser_path() {{ printf '%s' {str(PARSER)!r}; }}\n"
+        + extract_fn("_check_field") + "\n"
+        + extract_fn("_validate_static_net_shape") + "\n"
+        + extract_fn("_validate_static_net") + "\n_validate_static_net\n"
+    )
     r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
     return r.stdout.strip()
 
@@ -443,6 +451,11 @@ log() {{ :; }}
 FULLY_UNATTENDED=0
 CONFIRM_JUMP=""
 claim_console() {{ :; }}
+# #4546 - state the loop reads for the dependents of a Confirm jump; the
+# dependents themselves are covered in test_install_confirm_edits_4546.py.
+ROLE=control-plane
+CONFIRM_EDITING=""
+_run_confirm_deps() {{ :; }}
 {stubs}
 {script_steps}
 _loop() {{
