@@ -287,13 +287,9 @@ def powerdns_zone_type_refusal(drivers: list[str] | set[str], zone_type: str) ->
     )
 
 
-async def ensure_group_powerdns_compatible(
-    db: AsyncSession, group: DNSServerGroup, driver: str
-) -> None:
-    """Refuse (422) putting a PowerDNS server into a group that holds a forward
-    or stub zone (#4570)."""
-    if driver != "powerdns":
-        return
+async def group_powerdns_refusal(db: AsyncSession, group: DNSServerGroup) -> str | None:
+    """Why a PowerDNS server cannot join *group* (it holds a forward or stub
+    zone), or None (#4570). Names the group and the zone."""
     row = (
         await db.execute(
             select(DNSZone.name, DNSZone.zone_type)
@@ -305,12 +301,24 @@ async def ensure_group_powerdns_compatible(
             .limit(1)
         )
     ).first()
-    if row is not None:
-        raise ServerMoveError(
-            f"Group {group.name!r} holds the {row.zone_type} zone {row.name.rstrip('.')!r}, "
-            f"and {powerdns_zone_type_refusal({'powerdns'}, row.zone_type)}",
-            status_code=422,
-        )
+    if row is None:
+        return None
+    return (
+        f"Group {group.name!r} holds the {row.zone_type} zone {row.name.rstrip('.')!r}, "
+        f"and {powerdns_zone_type_refusal({'powerdns'}, row.zone_type)}"
+    )
+
+
+async def ensure_group_powerdns_compatible(
+    db: AsyncSession, group: DNSServerGroup, driver: str
+) -> None:
+    """Refuse (422) putting a PowerDNS server into a group that holds a forward
+    or stub zone (#4570)."""
+    if driver != "powerdns":
+        return
+    message = await group_powerdns_refusal(db, group)
+    if message is not None:
+        raise ServerMoveError(message, status_code=422)
 
 
 async def ensure_group_catalog_compatible(

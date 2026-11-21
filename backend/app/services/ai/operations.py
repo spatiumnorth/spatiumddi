@@ -5026,11 +5026,12 @@ async def _assign_role_catalog_problem(
 ) -> str | None:
     """#1858 — same refusal as the REST role-assign route: a Technitium
     appliance must not be pointed at a DNS group holding a TSIG key
-    Technitium cannot use (hmac-sha224). Only on a change, so a
+    Technitium cannot use (hmac-sha224); #4681 — nor a PowerDNS one at a
+    group holding a forward or stub zone. Only on a change, so a
     pre-existing assignment can still be re-saved."""
     from app.models.dns import DNSServerGroup  # noqa: PLC0415
 
-    if "dns-technitium" not in args.roles:
+    if "dns-technitium" not in args.roles and "dns-powerdns" not in args.roles:
         return None
     if "dns_group_id" in args.model_fields_set:
         try:
@@ -5041,10 +5042,21 @@ async def _assign_role_catalog_problem(
         group_id = row.assigned_dns_group_id
     if group_id is None:
         return None
-    if "dns-technitium" in (row.assigned_roles or []) and group_id == row.assigned_dns_group_id:
-        return None
     group = await db.get(DNSServerGroup, group_id)
     if group is None:
+        return None
+    if "dns-powerdns" in args.roles:
+        # #4681 — an engine change to PowerDNS keeps the group; same refusal
+        # as the REST route (and as adding a PowerDNS server to the group).
+        from app.services.dns.server_move import group_powerdns_refusal  # noqa: PLC0415
+
+        if (
+            "dns-powerdns" not in (row.assigned_roles or [])
+            or group_id != row.assigned_dns_group_id
+        ):
+            return await group_powerdns_refusal(db, group)
+        return None
+    if "dns-technitium" in (row.assigned_roles or []) and group_id == row.assigned_dns_group_id:
         return None
     # #1858 — a key Technitium cannot use.
     from app.services.dns.tsig_algorithms import group_key_refusal  # noqa: PLC0415
