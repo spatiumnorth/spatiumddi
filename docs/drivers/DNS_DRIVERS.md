@@ -439,6 +439,25 @@ and can't break pdns. Default-off; deploy via the `dns-powerdns-with-dnsdist`
 compose profile. **docker-compose only for now** — the k8s/appliance front (a
 dnsdist Deployment fronting the hostNetwork pdns DaemonSet) is a follow-up.
 
+**Real client address through the front (#4576).** By default pdns sees every
+query as coming from the front's address, so `ALLOW-AXFR-FROM`,
+`ALLOW-DNSUPDATE-FROM` and the query log all name the front. Opt in to PROXY
+protocol v2 by setting `PDNS_PROXY_PROTOCOL_FROM` in `.env` to the front's
+address or the compose network's CIDR (`docker network inspect
+<project>_spatiumddi`; a single IP is safest, a CIDR trusts every container on
+that network, and a hostname is resolved once, when pdns.conf is rendered).
+The one variable does both halves: the pdns agent writes
+`proxy-protocol-from=<value>` and the front's `newServer` gets
+`useProxyProtocol=true`. They must go together. A pdns trusting the front
+drops headerless queries from it, and a front sending headers to a pdns that
+is not expecting them is dropped as well, so recreate both containers after
+changing it. Clients not in the trusted list still reach pdns directly with
+plain DNS. Unset (the default) = unchanged behaviour. The front's own health
+check queries `spatium-healthcheck.invalid.` every 5 s
+(`DNSDIST_CHECK_NAME` / `DNSDIST_CHECK_INTERVAL`) instead of `. NS` every
+second, so it no longer fills the query log. Compose has no fixed address for
+the front, which is why this is not on by default.
+
 ---
 
 **Unparseable records are skipped, not fatal (#2510).** Each stored record is checked with dnspython before it is written to the zone file. A row whose rdata does not parse (for example a CAA without a tag, or an MX with extra tokens, stored before the API refused them) is left out, because one such line makes `named-checkzone` refuse the whole zone. The rest of the zone renders, and every skipped record is named (zone, owner, type, value) in a `partial apply:` config-apply error on the server and in the `zone_record_unparseable_skipped` log line. Editing the row to valid rdata clears it on the next apply.
