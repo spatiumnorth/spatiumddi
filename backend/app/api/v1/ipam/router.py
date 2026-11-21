@@ -219,6 +219,7 @@ _SUBNET_INSTANCE_ROUTES = (
             "GET /subnets/{subnet_id}/probe-policy",
             "GET /subnets/{subnet_id}/reconciliation",
             "GET /subnets/{subnet_id}/utilization-history",
+            "GET /subnets/capacity-forecast",
         }
     ),
     frozenset({"PUT /subnets/{subnet_id}", "POST /subnets/{subnet_id}/addresses"}),
@@ -333,6 +334,7 @@ _IPAM_ROUTE_TYPES: dict[str, tuple[str, ...]] = {
     "PUT /subnets/{subnet_id}": _SUBNET,
     "DELETE /subnets/{subnet_id}": _SUBNET,
     "GET /subnets/{subnet_id}/utilization-history": _SUBNET,
+    "GET /subnets/capacity-forecast": _SUBNET,
     "GET /subnets/{subnet_id}/probe-policy": _SUBNET,
     "GET /subnets/{subnet_id}/effective-dns": _SUBNET,
     "GET /subnets/{subnet_id}/effective-ddns": _SUBNET,
@@ -7243,6 +7245,50 @@ async def allocate_subnet(
         }
     )
     return await create_subnet(create_body, current_user, db)
+
+
+class CapacityForecastEntry(BaseModel):
+    subnet_id: uuid.UUID
+    network: str
+    name: str
+    utilization_percent: float
+    slope_percent_per_day: float
+    sample_count: int
+    days_to_full: int
+    forecast_full_date: date
+
+
+# Registered before ``/subnets/{subnet_id}`` so the literal path wins.
+@router.get("/subnets/capacity-forecast", response_model=list[CapacityForecastEntry])
+async def get_subnet_capacity_forecast(
+    current_user: CurrentUser,
+    db: DB,
+    subnet_id: list[uuid.UUID] = Query(default_factory=list),
+    max_days: int | None = Query(default=None, ge=0, le=3650),
+) -> list[CapacityForecastEntry]:
+    """Projected full date per subnet (#43), soonest first.
+
+    A least-squares fit over the last 30 days of the #44 utilisation history,
+    computed for every subnet in one query. Only subnets with a projectable
+    trend appear: no row means too little history (< 14 snapshots), a flat or
+    falling trend, or a prefix excluded from utilisation. ``subnet_id``
+    (repeatable) narrows to specific subnets; ``max_days`` keeps those full
+    within that many days.
+    """
+    from app.services.ipam.capacity_forecast import compute_capacity_forecasts
+
+    scoped = _token_subnet_scope_uuids(current_user)
+    ids: list[uuid.UUID] | None = list(subnet_id) if subnet_id else None
+    if scoped is not None:
+        ids = [i for i in ids if i in scoped] if ids is not None else list(scoped)
+    if ids is not None and not ids:
+        return []
+    rows = await compute_capacity_forecasts(db, subnet_ids=ids)
+    if not type_level_allows(current_user, "read", "subnet"):
+        rows = [r for r in rows if user_has_permission(current_user, "read", "subnet", r.subnet_id)]
+    if max_days is not None:
+        rows = [r for r in rows if r.days_to_full <= max_days]
+    return [CapacityForecastEntry(**vars(r)) for r in rows]
 
 
 @router.get("/subnets/{subnet_id}", response_model=SubnetResponse)

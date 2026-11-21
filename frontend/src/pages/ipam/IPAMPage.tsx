@@ -217,6 +217,7 @@ import { PlanAllocationModal } from "@/components/ipam/PlanAllocationModal";
 import { AggregationCandidatesBadge } from "@/components/ipam/AggregationSuggestions";
 import { toLocalInputValue } from "@/lib/localTime";
 import { FreeSpaceTreemap } from "@/components/ipam/FreeSpaceTreemap";
+import { DaysToFull } from "@/components/ipam/DaysToFull";
 import { SubnetUtilizationHistory } from "@/components/ipam/SubnetUtilizationHistory";
 import {
   ContextMenu,
@@ -15736,6 +15737,7 @@ export function BlockDetailView({
                               percent={s.utilization_percent}
                               uncountable={isUncountable(s.total_ips)}
                             />
+                            <DaysToFull subnetId={s.id} />
                           </td>
                           <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">
                             {subnetSizeLabel(s.total_ips, s.network)}
@@ -16778,6 +16780,7 @@ export function SpaceTableView({
                             percent={s.utilization_percent}
                             uncountable={isUncountable(s.total_ips)}
                           />
+                          <DaysToFull subnetId={s.id} />
                         </td>
                         <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">
                           {subnetSizeLabel(s.total_ips, s.network)}

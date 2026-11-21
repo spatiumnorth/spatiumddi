@@ -1055,6 +1055,17 @@ enabled-gate + interval. Each sweep writes one summary audit row.
 - `IPBlock.utilization_percent` is the share of the block's **whole CIDR** in use (#2982). `total_ips` is the CIDR size (clamped to 2^63 - 1 for huge IPv6 blocks). `allocated_ips` rolls up every descendant subnet's `allocated_ips` **plus that subnet's non-usable addresses** — network and broadcast for IPv4 below /31, the network address for IPv6 below /127, nothing for /31, /32, /127 and /128 — each counted once even when a row already sits on it. So a /30 block holding one full /30 subnet reads 4 / 4, 100%, while the subnet itself reads 2 / 2. A block is clamped to its CIDR size and never reads over 100%. Both counters are rewritten on every write under the block and by the hourly `recount_ipam_utilization` sweep.
 - Alerts are configured in the notification system when utilization exceeds thresholds (default: warn at 80%, critical at 95%)
 
+### Capacity forecasting (issue #43)
+
+A subnet that is 60% full and growing is not the same as one that is 60% full and flat. The forecast fits a least-squares line through the last 30 days of the daily utilization snapshots (the Trend tab's data, #44) and extends it from the subnet's current utilization to 100%.
+
+- **Where it shows.** A "full in N d" caption beside the utilization bar in the block and space subnet tables, and a "Trends to 100% on YYYY-MM-DD at the current rate" line on the subnet's **Trend** tab. A subnet already at 100% and still growing reads "full now".
+- **When there is no forecast.** Fewer than 14 snapshots in the window (a new subnet, or the history has not built up), a flat or falling trend, a projected date more than ten years out, or a prefix excluded from utilization (`utilization_max_prefix_ipv4` / `_ipv6`, so point-to-point and loopback subnets stay quiet). The subnet simply has no row; nothing is shown.
+- **History depth.** Snapshots are kept 90 days and the fit uses the latest 30, so a rule threshold above 90 days is an extrapolation from a short window. Treat a far-out date as a direction, not a promise.
+- **API.** `GET /api/v1/ipam/subnets/capacity-forecast` returns one row per subnet that has a forecast (`subnet_id`, `network`, `name`, `utilization_percent`, `slope_percent_per_day`, `sample_count`, `days_to_full`, `forecast_full_date`), soonest first. `subnet_id` (repeatable) narrows it and `max_days` keeps only subnets full within that many days. It is a separate endpoint rather than a field on the subnet list so the regression runs once for the whole estate, in a single grouped query, instead of being attached to every subnet response.
+- **Alert rule.** `subnet_capacity_forecast` fires per subnet when the projected full date is within `threshold_days` (default 90). The severity is the rule's own, so a two-tier setup is two rules (for example 180 days as a warning and 90 days as critical). No rules are created for you.
+- **Copilot.** The `find_subnet_forecasts` tool lists the subnets projected to fill within N days.
+
 ---
 
 ## 10. Global search
