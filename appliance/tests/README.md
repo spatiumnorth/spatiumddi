@@ -24,6 +24,7 @@ helm or a cluster.
 | `test_host_runner_stdin_programs.py` | The three runners that piped data into a `python3 -` whose program came from a heredoc — the SSH source-CIDR allowlist failing OPEN, TLS-syslog CAs, image pruning (#1001) |
 | `test_host_trigger_permissions.py` | The local-account-to-root modes: k3s kubeconfig, the release-state trigger directory + sidecars, `.env`, and `spatiumddi-trigger-guard` executed against right- and wrong-owner triggers (GHSA-h2j9-qrg7-grfw) |
 | `test_install_done_gate.py` | The headless-install Done-screen gate |
+| `test_install_serial_console.py` | The installer on the serial console: console arbitration (one wizard installs, the other says where), the preseed verdict hand-off, and the `spatium-install@.service` wiring (#4549) |
 | `test_k3s_kubelet_eviction.py` | `config.yaml`'s kubelet args give the kubelet a `memory.available` eviction threshold beside k3s's restated disk floors, a short pressure-transition period and node reserves (#1124) |
 | `test_install_ntp_decline.py` | Blanking the installer's **Time source** really disabling NTP — the rendered on-target `chrony.conf` plus firstboot's explicit-decline sentinel (#1002) |
 | `test_snmp_agentx_probe.py` | `spatiumddi-snmp-reload`'s config probe running on a throwaway AgentX socket, so it never takes the live snmpd's `/run/agentx/master` (and lldpd's LLDP-MIB registration) — against a stub and, when installed, the real `snmpd` (#2154) |

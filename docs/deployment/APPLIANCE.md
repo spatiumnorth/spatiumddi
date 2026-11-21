@@ -2718,6 +2718,44 @@ consequence is inspectable.
 > drove the disk installer. Post-#183 the install-to-disk step is the
 > whiptail installer `spatium-install`; #549 preseeds **that**.
 
+### Installing over a serial console (#4549)
+
+The installer media already mirrors GRUB and the kernel to `ttyS0` at
+115200 8N1, and the interactive wizard now runs there too, so IPMI
+Serial-over-LAN, a headless server or a serial-only VM can be installed
+without a preseed. Two units start on the installer media:
+`spatium-install.service` on `tty1` (unchanged) and
+`spatium-install@ttyS0.service` on the serial port, which is skipped,
+not failed, when no UART is behind `/dev/ttyS0`.
+
+- **Whichever console you answer first runs the install.** Both show the
+  Welcome screen. Pressing OK on one takes a lock; the other console then
+  prints "The SpatiumDDI installer is already running on `<tty>`" and
+  exits. If the install is cancelled or fails, the recovery shell on the
+  winning console releases the lock, and `spatium-install` run from a
+  shell on the other console starts the wizard there.
+- **Terminal.** The serial wizard sets `TERM=vt220` (no colour, box
+  drawing through the ACS set that any serial terminal emulator handles).
+  The kernel does not know a serial terminal's size, so dialogs are sized
+  for 80x24, which fits any size above that.
+- **Only `ttyS0`.** That is the port GRUB, the kernel command line and the
+  installed system's console dashboard use. A BMC that presents SOL on
+  another port needs the same `console=` and a unit instance for it.
+- **Preseeded installs are unchanged.** `tty1` looks for the answer file;
+  the serial instance waits for its verdict and exits whenever one exists,
+  so a fully or partly preseeded run is driven (and its prompts shown) on
+  `tty1` only.
+- **Logs.** The wizard on the serial console writes its xtrace to
+  `/var/log/spatium-install-trace-ttyS0.log`, so two wizards never share
+  one trace file; the install log is the usual
+  `/var/log/spatium-install.log`.
+- **Live SSH credentials.** The rescue / diagnostics boot
+  (`spatium-mode=live`) also shows its banner, with the SSH address and the
+  one-time password, on `ttyS0`.
+
+Not verified on serial hardware: the wiring is covered by host tests and
+by reading the units, not by an installation over a real SOL session.
+
 On boot of the **installer media** (`spatium-mode=install` in the
 kernel cmdline), `spatium-install` looks for a **preseed answer file**
 before launching whiptail. When one is present it runs the installer

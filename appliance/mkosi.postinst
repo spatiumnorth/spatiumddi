@@ -205,6 +205,17 @@ if [ -f "$BUILDROOT/etc/systemd/system/spatium-console@.service" ]; then
         "$BUILDROOT/etc/systemd/system/multi-user.target.wants/spatium-console@ttyS0.service"
 fi
 
+# #4549 — the installer wizard and the rescue banner on the serial console,
+# the serial twins of the tty1 units enabled above. Same template-instance
+# shape as spatium-console@ttyS0; both are condition-gated on spatium-mode=
+# so they never start on an installed system.
+for tmpl in spatium-install spatium-live-banner; do
+    if [ -f "$BUILDROOT/etc/systemd/system/${tmpl}@.service" ]; then
+        ln -sfn "/etc/systemd/system/${tmpl}@.service" \
+            "$BUILDROOT/etc/systemd/system/multi-user.target.wants/${tmpl}@ttyS0.service"
+    fi
+done
+
 # Phase 8a-3 — /etc overlay mount unit (issue #138). Wants etc.mount
 # at local-fs.target so the overlay is in place before any user-mode
 # service reads operator config.
@@ -356,6 +367,8 @@ chmod 0755 "$BUILDROOT/usr/lib/spatiumddi/host-patches/002-k3s-cidr-canonical.sh
 chmod 0644 "$BUILDROOT/usr/lib/spatiumddi/host-template-version"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-firstboot.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-install.service"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-install@.service"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-live-banner@.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-live-banner.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-live-bootstrap.service"
 # GHSA-vvh9-6gfw-wphp — generates SSH host keys where etc-render did not.

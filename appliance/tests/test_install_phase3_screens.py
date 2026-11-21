@@ -450,6 +450,7 @@ set -uo pipefail
 log() {{ :; }}
 FULLY_UNATTENDED=0
 CONFIRM_JUMP=""
+claim_console() {{ :; }}
 # #4546 - state the loop reads for the dependents of a Confirm jump; the
 # dependents themselves are covered in test_install_confirm_edits_4546.py.
 ROLE=control-plane

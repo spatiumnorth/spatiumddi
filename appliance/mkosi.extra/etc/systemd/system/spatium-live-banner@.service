@@ -1,0 +1,30 @@
+[Unit]
+Description=SpatiumDDI live-mode banner on the serial console (%I)
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/4549
+# Serial twin of spatium-live-banner.service (tty1): rescue / diagnostics
+# mode has no getty on the serial port either, so without this a serial-only
+# box shows the SSH address and one-time password nowhere.
+ConditionKernelCommandLine=spatium-mode=live
+ConditionPathExists=/dev/%I
+# Skip, not fail, when no UART is behind the device node (see
+# spatium-install@.service).
+ExecCondition=/bin/sh -c ': > /dev/%I'
+After=getty@tty1.service systemd-user-sessions.service plymouth-quit.service
+After=spatiumddi-firstboot.service spatium-live-bootstrap.service
+
+[Service]
+Type=idle
+ExecStartPre=-/usr/bin/systemctl stop serial-getty@%I.service
+ExecStart=/usr/local/bin/spatium-live-banner
+Environment=TERM=vt220
+StandardInput=tty
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/%I
+TTYReset=yes
+TTYVHangup=yes
+Restart=on-failure
+
+# No [Install]: enabled per instance by an explicit symlink in mkosi.postinst
+# (spatium-console@ttyS0's shape), since a template's [Install] cannot name
+# which port to start.
