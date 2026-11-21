@@ -63,9 +63,27 @@ def test_producer_still_publishes_the_catalog(tmp_path: Path) -> None:
         {"mode": "producer", "zone_name": "cat.test.", "members": [{"zone_name": "example.com."}]},
     )
     assert 'zone "cat.test." { type master;' in conf
-    # Transferable by external secondaries, signed with the group key or not.
-    assert "allow-transfer { any; }; notify yes;" in conf
+    # #3578 — not world-transferable: the group key (plus the operator's
+    # allow_transfer, none here), and the same list gates queries.
+    assert "allow-transfer { any; }" not in conf
+    line = next(ln for ln in conf.splitlines() if ln.startswith('zone "cat.test."'))
+    assert 'allow-transfer { key "spatium-group"; };' in line
+    assert 'allow-query { key "spatium-group"; };' in line
+    assert "notify yes;" in line
     assert "catalog-zones" not in conf
     zfile = (tmp_path / "rendered.new" / "zones" / "cat.test.db").read_text()
     assert 'version IN TXT "2"' in zfile
     assert "IN PTR example.com." in zfile
+
+
+def test_catalog_follows_the_operator_transfer_acl(tmp_path: Path) -> None:
+    b = _split_horizon_bundle()
+    b["views"] = []
+    b["tsig_keys"] = [_KEY]
+    b["options"] = {**(b.get("options") or {}), "allow_transfer": ["198.51.100.7"]}
+    b["catalog"] = {"mode": "producer", "zone_name": "cat.test.", "members": []}
+    Bind9Driver(state_dir=tmp_path).render(b)
+    conf = (tmp_path / "rendered.new" / "named.conf").read_text()
+    line = next(ln for ln in conf.splitlines() if ln.startswith('zone "cat.test."'))
+    assert 'allow-transfer { key "spatium-group"; 198.51.100.7; };' in line
+    assert 'allow-query { key "spatium-group"; 198.51.100.7; };' in line
