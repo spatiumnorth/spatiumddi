@@ -36,5 +36,7 @@ def test_alias_and_lua_are_dropped_with_a_warning_and_the_rest_is_kept() -> None
     z = _build_imported_zone({"name": "example.com.", "kind": "Native"}, full)
     assert [(r.name, r.record_type, r.value) for r in z.records] == [("host", "A", "192.0.2.9")]
     assert z.skipped_record_types == {"ALIAS": 1, "LUA": 2}
-    (warning,) = [w for w in z.parse_warnings if "unsupported" in w]
+    # #4604: with no target group named, ALIAS / LUA are dropped as
+    # PowerDNS-only (they import only into an all-PowerDNS group).
+    (warning,) = [w for w in z.parse_warnings if "PowerDNS-only" in w]
     assert "ALIAS=1" in warning and "LUA=2" in warning
