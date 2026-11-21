@@ -285,6 +285,34 @@ and would strand an appliance whose STATE says one thing and whose `/etc`
 overlay says another. STATE stays the single source of truth; the adopt-back
 changes what STATE says rather than who owns the file.
 
+### Reinstall with Keep /var when the address changed (#4591)
+
+"Keep /var and STATE" keeps k3s's datastore, whose etcd member is registered
+under the node's old address. On new hardware, a new VM or a new NIC, DHCP
+usually gives the node another address, and k3s refuses its own member
+(`this server is not a member of the etcd cluster. Found [...]`).
+
+`spatium-etcd-peer-reset` (a `k3s.service` `ExecStartPre`) handles the
+single-node case: when k3s's refusal lists exactly one member, that member is
+this node, and the node is not a joined member, it runs `k3s server
+--cluster-reset` once, as the snapshot restore does, and k3s then starts on
+the new address with the data intact. It logs to the console and to
+`/var/log/spatiumddi/etcd-peer-reset.log`. The first start still fails once
+before the reset (about 15 minutes after boot), then k3s restarts itself;
+`spatiumddi-firstboot` waits for that, up to 25 more minutes, so it completes
+on that boot.
+
+It is detected from k3s's own message because the member list cannot be read
+offline (the db is a bbolt file, no `etcdutl` ships). A control plane with more
+than one etcd member is never reset, since that would orphan the others: a
+member whose address changed there needs its peer address updated or a rejoin
+(Fleet, Replace). The reason is printed on the console and shown in the
+health verdict ("etcd member address changed"); nothing is done automatically.
+It is recognised from the node address `spatiumddi-firstboot` records at each
+good boot (`/var/lib/spatiumddi/etcd-peer-addr`), since an HA member never logs
+k3s's refusal. Pin the address
+(static IP or a DHCP reservation) to avoid all of this.
+
 ### Interface MTU (#1017)
 
 `network_mtu` in `spatium-config.yaml` sets the MTU on the connection
