@@ -319,6 +319,7 @@ them:
 | `image.pullPolicy` | `IfNotPresent` |  |
 | `image.pullSecrets` | `[]` |  |
 | `auth.secretKey` | `""` | Fernet key; auto-generated on first install if empty |
+| `supervisorRegistration.initiallyEnabled` | `false` | Initial state of Appliance registration on a fresh install (#4659); never overrides a later choice. Turn on for an install meant to take appliance agent nodes |
 | `auth.existingSecret` | `""` | BYO secret with key `secret-key` |
 | `fullnameOverride` | `""` |  |
 | `nameOverride` | `""` |  |

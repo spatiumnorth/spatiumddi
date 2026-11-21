@@ -5303,6 +5303,11 @@ export interface ZoneMovePreview {
    *  refuses — not waivable by acknowledgement. */
   technitium_acl_refusal?: string | null;
   classless_refusal?: string | null;
+  /** #4570 — a forward / stub zone landing in a PowerDNS group. Refused. */
+  powerdns_refusal?: string | null;
+  /** #4565 — the zone or a record of it would keep a view in a target group
+   *  that cannot serve views. Non-null means the commit refuses. */
+  views_refusal?: string | null;
   warnings: string[];
   /** Keys the commit will demand: view_widening | dnssec_rollover |
    *  lost_update_grants. */
@@ -5345,7 +5350,8 @@ export interface DNSServerGroup {
   catalog_unsupported_warning?: string | null;
   /** #1784 — set for a group holding the experimental `technitium_api`
    *  driver; says where an existing group falls outside its supported scope
-   *  (second server, pools). Empty for every other group. */
+   *  (second server, pools). #4565 — also set for a group holding views its
+   *  servers cannot serve. Empty for every other group. */
   scope_warnings?: string[];
   /** #4562 — group fields (`is_recursive`) a driver in the group does not
    *  apply, from the same table as the options response. */
@@ -6523,6 +6529,9 @@ export interface ZoneDnssecInfo {
   dnssec_policy_id: string | null;
   dnssec_ds_records: string[];
   dnssec_synced_at: string | null;
+  // #4566 — when the DS set replaced an earlier one (keys regenerated or
+  // rolled on the server); null for the first DS after signing.
+  dnssec_ds_changed_at?: string | null;
   keys: DNSKeyState[];
   // #1762 — see Zone.dnssec_multi_signer; signing_servers is the group's count.
   dnssec_multi_signer?: boolean;
@@ -6914,6 +6923,12 @@ export const dnsApi = {
   unsignZoneDnssec: (groupId: string, zoneId: string) =>
     api
       .post<DNSZone>(`/dns/groups/${groupId}/zones/${zoneId}/dnssec/unsign`)
+      .then((r) => r.data),
+  ackZoneDnssecDsChange: (groupId: string, zoneId: string) =>
+    api
+      .post<ZoneDnssecInfo>(
+        `/dns/groups/${groupId}/zones/${zoneId}/dnssec/ack-ds-change`,
+      )
       .then((r) => r.data),
   rolloverZoneDnssecKey: (groupId: string, zoneId: string, keyTag: number) =>
     api
@@ -12861,6 +12876,11 @@ export const applianceTlsApi = {
     api
       .get<ApplianceCertificateDetail>(`/appliance/tls/${id}`)
       .then((r) => r.data),
+  // Public certificate PEM, for a standalone agent's TLS_CA_PATH (#4660).
+  downloadPem: (id: string) =>
+    api
+      .get<string>(`/appliance/tls/${id}/pem`, { responseType: "text" })
+      .then((r) => r.data),
   upload: (body: CertificateUploadPayload) =>
     api
       .post<ApplianceCertificate>("/appliance/tls/upload", body)
@@ -13501,6 +13521,9 @@ export interface PairingCodeCreated {
   max_claims: number | null;
   note: string | null;
   created_at: string;
+  // #4659 — set when the code was minted while appliance registration is
+  // off, so an appliance using it cannot register yet.
+  warning?: string | null;
 }
 
 export interface PairingCodeRow {

@@ -1722,7 +1722,7 @@ async def _app_base_url(db: DB, request: Request) -> str:
         built_url=fallback,
         path=request.url.path,
         hint=(
-            "Settings > General > External URL is empty, so the OIDC redirect_uri / "
+            "Settings → Application → Branding & URL → External URL is empty, so the OIDC redirect_uri / "
             "SAML ACS is built from the incoming request. Behind a reverse proxy "
             "set it to the public https:// URL (docs/deployment/REVERSE_PROXY.md)."
         ),

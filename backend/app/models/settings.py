@@ -80,6 +80,21 @@ def _initial_ntp_servers() -> list[str]:
     return servers or ["pool.ntp.org"]
 
 
+def _initial_supervisor_registration() -> bool:
+    """Initial ``supervisor_registration_enabled`` — the deploy-time answer.
+
+    #4659. A Compose or Helm control plane ships with appliance registration
+    off, and nothing told an operator that pairing an agent node then silently
+    does nothing. ``INITIAL_SUPERVISOR_REGISTRATION`` lets an install meant to
+    take appliance nodes start with it on. Like ``_initial_ntp_servers`` it is
+    a Python-side default, so it applies at row creation only and never undoes
+    a later change in Settings.
+    """
+    from app.config import settings  # noqa: PLC0415
+
+    return bool(settings.initial_supervisor_registration)
+
+
 # Default managed APT repos (issue #155) — mirror the Debian 13 (trixie)
 # set baked into the appliance ISO so enabling APT management starts from
 # the working defaults rather than an empty sources.list. Used as both
@@ -1034,7 +1049,10 @@ class PlatformSettings(Base):
     # shape as "endpoint does not exist" so a probing attacker can't
     # distinguish "disabled" from "doesn't exist."
     supervisor_registration_enabled: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default=sa_text("false")
+        Boolean,
+        nullable=False,
+        default=_initial_supervisor_registration,
+        server_default=sa_text("false"),
     )
 
     # ── Appliance soft-delete retention (#170 Wave E follow-up) ─────

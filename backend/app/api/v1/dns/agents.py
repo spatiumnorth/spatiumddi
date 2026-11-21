@@ -112,7 +112,11 @@ from app.services.dns.row_locks import (
     lock_server_key_share,
     lock_zone_state_rows,
 )
-from app.services.dns.server_move import CATALOG_UNSUPPORTED_DRIVERS
+from app.services.dns.server_move import (
+    CATALOG_UNSUPPORTED_DRIVERS,
+    group_view_names,
+    views_unsupported_drivers,
+)
 from app.services.dns.soa_timers import (
     AGENT_FEATURES_HEADER,
     reconcile_soa_timers,
@@ -719,6 +723,20 @@ async def agent_register(
             driver=body.driver,
             issue="#1766",
         )
+
+    # #4565 — and for views: only BIND9 serves them. The group's
+    # ``scope_warnings`` shows it, and the agent refuses to merge the copies
+    # of a zone that differs between views.
+    if views_unsupported_drivers({body.driver}):
+        if stranded_views := await group_view_names(db, group.id):
+            logger.warning(
+                "dns_agent_views_unsupported_driver",
+                server_id=str(server.id),
+                group=group.name,
+                driver=body.driver,
+                views=stranded_views[:5],
+                issue="#4565",
+            )
 
     # #1858 — same posture for a key Technitium cannot use (hmac-sha224): the
     # agent skips installing it, the group's keys page shows why.
@@ -2076,6 +2094,37 @@ async def agent_dnssec_state(
         zone = zones_by_name.get(entry.zone_name.rstrip("."))
         if zone is None:
             continue
+        # #4566 — a signed zone whose DS set moved: the server generated new
+        # keys (a zone re-created after a lost volume or on a replaced node
+        # is signed afresh; a KSK rollover). The parent still holds the old
+        # DS, so the change is recorded for the DNSSEC card and the audit
+        # log. The first DS after signing, and an unsign, are not a change.
+        old_ds = [str(d) for d in zone.dnssec_ds_records or []]
+        if old_ds and entry.ds_records and set(old_ds) != set(entry.ds_records):
+            logger.warning(
+                "dns_zone_dnssec_ds_changed",
+                zone=zone.name,
+                server_id=str(reporter.id),
+                replaced=not set(old_ds) & set(entry.ds_records),
+            )
+            db.add(
+                AuditLog(
+                    user_display_name="system:dns-agent",
+                    auth_source="system",
+                    action=dnssec_signers.DS_CHANGED_AUDIT_ACTION,
+                    resource_type="dns_zone",
+                    resource_id=str(zone.id),
+                    resource_display=zone.name,
+                    old_value={"ds_records": old_ds},
+                    new_value={
+                        "ds_records": list(entry.ds_records),
+                        "server_id": str(reporter.id),
+                        "server": reporter.name,
+                        "warning": dnssec_signers.DS_CHANGED_WARNING,
+                    },
+                    result="success",
+                )
+            )
         zone.dnssec_ds_records = entry.ds_records or None
         zone.dnssec_synced_at = now
         # Per-key state (issue #49) — replace the zone's DNSKey rows wholesale

@@ -513,6 +513,30 @@ function CertificateCard({
               </button>
             )
           )}
+          {!cert.pending && (
+            <button
+              type="button"
+              onClick={() => {
+                void applianceTlsApi.downloadPem(cert.id).then((pem) => {
+                  const url = URL.createObjectURL(
+                    new Blob([pem], { type: "application/x-pem-file" }),
+                  );
+                  const a = document.createElement("a");
+                  a.href = url;
+                  a.download = `${cert.name}.pem`;
+                  document.body.appendChild(a);
+                  a.click();
+                  document.body.removeChild(a);
+                  URL.revokeObjectURL(url);
+                });
+              }}
+              className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-xs hover:bg-accent"
+              title="Download the public certificate (no key), e.g. for an agent's TLS_CA_PATH"
+            >
+              <Download className="h-3 w-3" />
+              Download cert
+            </button>
+          )}
           <button
             type="button"
             onClick={onDelete}

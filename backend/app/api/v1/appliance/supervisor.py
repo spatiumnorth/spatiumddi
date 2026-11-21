@@ -776,7 +776,8 @@ async def _module_enabled(db: DB) -> bool:
     stmt = select(PlatformSettings).where(PlatformSettings.id == 1)
     row = (await db.execute(stmt)).scalar_one_or_none()
     if row is None:
-        return False
+        # No row yet: what the row will be created with (#4659).
+        return bool(settings.initial_supervisor_registration)
     return bool(row.supervisor_registration_enabled)
 
 

@@ -439,6 +439,25 @@ and can't break pdns. Default-off; deploy via the `dns-powerdns-with-dnsdist`
 compose profile. **docker-compose only for now** — the k8s/appliance front (a
 dnsdist Deployment fronting the hostNetwork pdns DaemonSet) is a follow-up.
 
+**Real client address through the front (#4576).** By default pdns sees every
+query as coming from the front's address, so `ALLOW-AXFR-FROM`,
+`ALLOW-DNSUPDATE-FROM` and the query log all name the front. Opt in to PROXY
+protocol v2 by setting `PDNS_PROXY_PROTOCOL_FROM` in `.env` to the front's
+address or the compose network's CIDR (`docker network inspect
+<project>_spatiumddi`; a single IP is safest, a CIDR trusts every container on
+that network, and a hostname is resolved once, when pdns.conf is rendered).
+The one variable does both halves: the pdns agent writes
+`proxy-protocol-from=<value>` and the front's `newServer` gets
+`useProxyProtocol=true`. They must go together. A pdns trusting the front
+drops headerless queries from it, and a front sending headers to a pdns that
+is not expecting them is dropped as well, so recreate both containers after
+changing it. Clients not in the trusted list still reach pdns directly with
+plain DNS. Unset (the default) = unchanged behaviour. The front's own health
+check queries `spatium-healthcheck.invalid.` every 5 s
+(`DNSDIST_CHECK_NAME` / `DNSDIST_CHECK_INTERVAL`) instead of `. NS` every
+second, so it no longer fills the query log. Compose has no fixed address for
+the front, which is why this is not on by default.
+
 ---
 
 **Unparseable records are skipped, not fatal (#2510).** Each stored record is checked with dnspython before it is written to the zone file. A row whose rdata does not parse (for example a CAA without a tag, or an MX with extra tokens, stored before the API refused them) is left out, because one such line makes `named-checkzone` refuse the whole zone. The rest of the zone renders, and every skipped record is named (zone, owner, type, value) in a `partial apply:` config-apply error on the server and in the `zone_record_unparseable_skipped` log line. Editing the row to valid rdata clears it on the next apply.
@@ -596,6 +615,8 @@ $r | ConvertTo-Json -Compress -Depth 3
 
 ## 4. PowerDNS Driver
 
+> **Known issues in 1.0.0:** the agent does not delete a zone from PowerDNS when it leaves the bundle ([#4564](https://github.com/spatiumnorth/spatiumddi/issues/4564)), so the "Delete zone" row in §4.1 does not hold yet, and views are merged into one zone ([#4565](https://github.com/spatiumnorth/spatiumddi/issues/4565)). See [DNS.md §0](../features/DNS.md) for the workarounds.
+
 Located at [`app/drivers/dns/powerdns.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/drivers/dns/powerdns.py). Class: `PowerDNSDriver`. Shipped in issue #127.
 
 PowerDNS is a second authoritative driver running side-by-side with BIND9. It is **agent-managed** the same way BIND9 is — there is one DNS agent per server, the agent owns the local PowerDNS daemon (`pdns_server`), and the control plane never opens a connection to PowerDNS directly. The agent talks to PowerDNS's REST API on `127.0.0.1:8081`; the control plane talks to the agent through the existing long-poll `/config` channel.
@@ -675,12 +696,19 @@ class PowerDNSDriver(DNSDriver):
             "lua_records": True,           # global enable-lua-records=yes in pdns.conf
             "dnssec_inline_signing": True, # online sign / unsign / re-sign
             "catalog_zones": "producer-only",  # consumer not wired up in the agent
-            "views": False,                # tag-based; not surfaced as views in UI yet
+            "views": False,                # pdns-auth has no views; refused by the API (#4565)
             "rpz": False,                  # authoritative-only — RPZ is a recursor feature
         }
 ```
 
 `alias_records: True` and `lua_records: True` are PowerDNS-only: the `ALIAS` / `LUA` record types are gated server-side by the API's `_DRIVER_GATED_RECORD_TYPES` map to `{powerdns}`, so creating them against a non-PowerDNS group returns 422 with a remediation message ("move to a PowerDNS-only group"). Online DNSSEC sign/unsign is no longer PowerDNS-only — BIND9 ships inline-signing via `dnssec-policy` (§2.5), so `_DRIVER_GATED_OPERATIONS` allows `dnssec_sign`/`dnssec_unsign` on both `{powerdns, bind9}` (and `dnssec_rollover` on `{bind9}`); only the *mechanism* differs (PowerDNS signs online via REST, BIND9 via config-driven inline-signing).
+
+**Views (#4565).** `views: False` is enforced, not advisory: the API reads it for every driver and refuses a view, a view-scoped zone or record, and a server joining a group that has views (see [DNS.md §2](../features/DNS.md)). BIND9 is the only driver that returns `True`. A bundle can still carry views for a group that held them before the refusal, and the agent's rule for it is fixed (`_resolve_view_copies`): the bundle ships one copy of a zone per view it renders in, and PowerDNS holds one zone per name, so
+
+- copies that render the same payload are one zone, reconciled once and served to every client;
+- copies that differ are reduced to the rrsets identical (name, type, TTL, records) in every copy and sent as one zone, so no client is answered from another view's data and the reconcile sweeps what an earlier merged render left. The zone is named in `refused_zones()` as `"<zone> views: …"`, and the apply is reported as partial, like a zone PowerDNS itself refused. It is also left out of the zone-state report, so it never reads converged.
+
+`powerdns_views_unsupported` is logged on every render of such a bundle. Removing the views, or making the zone the same in each, clears it on the next render.
 
 ### 4.4 LUA records
 

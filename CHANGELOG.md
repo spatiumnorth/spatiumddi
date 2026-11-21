@@ -25,6 +25,37 @@ the formatter handles the rest.
 
 ## Unreleased
 
+## 1.0.0 — 2026-11-20
+
+SpatiumDDI 1.0.0, the first stable SemVer release. It is built from
+1.0.0-rc.3 after that candidate's soak; since rc.3 only docs and the
+looking-glass image's Go toolchain have changed. For the fixes since
+1.0.0-beta.5, see the 1.0.0-rc.1, rc.2 and rc.3 sections below.
+
+### Upgrading
+
+- **Versioning changes from CalVer to SemVer (#1182).** Every SemVer
+  release ranks above every CalVer one, but only code that carries the
+  new comparison can tell. 2026.10.02-1, the last CalVer release, is the
+  bridge: an install on anything older upgrades to 2026.10.02-1 first,
+  then to 1.0.0. Take a database backup before every upgrade, and do not
+  roll back to a CalVer release afterwards: 1.0.0 adds migrations those
+  releases cannot run on.
+- **Multi-node appliance clusters on 2026.10.02-1** must not use the
+  Rolling Upgrade tab. See "Upgrading to 1.0.0 from 2026.10.02-1" in the
+  1.0.0-rc.3 section below and "Upgrading to 1.0.0" in
+  `docs/deployment/APPLIANCE.md` (#3915).
+
+### Known issues
+
+- Three PowerDNS issues (#4564, #4565, #4562) are open in 1.0.0 and
+  fixed in 1.0.1. They are listed under "Known issues with PowerDNS in
+  1.0.0" in `docs/features/DNS.md`.
+
+### Fixed
+
+- **The looking-glass image's GoBGP builder moves to Go 1.27.4.** Go links its standard library into `gobgpd`, so the image scan gate failed the 1.27.3 build on a standard-library finding fixed in 1.27.4; only a newer toolchain clears it ([#4526](https://github.com/spatiumnorth/spatiumddi/issues/4526)).
+
 ## 1.0.0-rc.3 — 2026-11-13
 
 ### Changed
