@@ -234,6 +234,30 @@ its next heartbeat) is sent the per-entry shape. The cache holds the packed
 bundle as received, so a restart with the control plane down renders from it
 alone. Measured on three catalogue lists: 69 MB down to the figures in the PR.
 
+### Blocklist entries in their own versioned stream (#4041)
+
+An entry edit used to move the whole bundle's ETag, so every agent re-fetched a
+bundle whose entries are most of its size. An agent that sends
+`blocklist-stream` in `X-Spatium-Agent-Features` (recorded as
+`dns_server.agent_reads_blocklist_stream`) is sent a bundle whose RPZ zones keep
+their name, view and exceptions but carry an empty `entries` and no
+`rpz_sha256`. The entries live in a second document the same render stores
+beside the bundle (`dns_agent_bundle.blocklist_body`), served by
+`GET /api/v1/dns/agents/blocklist` with its own ETag, the SHA-256 of the
+document, and named in the long-poll reply as `blocklist_etag` (outside the
+hashed body). The poll answers when the bundle ETag moves **or** when the
+`X-Spatium-Blocklist-Etag` the agent sends differs from the stored stream's, so
+an entry edit wakes the agent without touching the bundle ETag or structural
+ETag. The agent downloads the stream only when its version is not the one on
+disk (`config/blocklist.json`), merges it into the bundle (entries and
+`rpz_sha256`) so drivers and the cache see the embedded shape, and folds the
+stream ETag into its own structural fingerprint (`<structural>+<stream>`) so an
+entries-only change is still applied, incrementally where #4191 allows. If the
+stream cannot be fetched (a 503 while the render is pending) nothing is saved or
+applied and the daemon keeps serving its last config. Every other agent is sent
+the entries embedded exactly as before; the choice is the request's own
+features header, never a stored flag alone.
+
 ### Stored bundles — rendered once, served as bytes (#1111)
 
 The bundle the long-poll hands out is **not assembled in the request**. It

@@ -52,7 +52,14 @@ from .config_apply import (
     truncate_error,
 )
 from .drivers.base import SERIAL_UNREAD, DriverBase, HeldZone
-from .fetch import get_config
+from .fetch import (
+    BLOCKLIST_ETAG_HEADER,
+    BlocklistUnavailable,
+    get_blocklist,
+    get_config,
+    held_blocklist_etag,
+    merge_blocklist_stream,
+)
 from .instance import (
     AGENT_INSTANCE,
     AGENT_INSTANCE_HEADER,
@@ -237,6 +244,9 @@ def _thaw(frozen: bytes | None) -> Any:
 
 
 class SyncLoop:
+    # #4041 — the blocklist stream version the last bundle held (see __init__);
+    # a class default so a loop built without ``__init__`` polls without one.
+    _blocklist_etag: str | None = None
     # Class default so a loop built without __init__ (tests) reads "not known".
     _live_etag: str | None = None
     _retire_held = False
@@ -255,6 +265,9 @@ class SyncLoop:
         self.heartbeat = heartbeat
         self._stop = threading.Event()
         self._current_etag: str | None = None
+        # #4041 — the blocklist stream version the bundle last fetched holds,
+        # sent on every poll so the control plane answers when it moves alone.
+        self._blocklist_etag: str | None = None
         # Tracks the structural-only fingerprint of the last applied bundle.
         # We re-render config + reload the daemon only when this changes.
         # Record-only changes rotate the full etag (so we get 200 not 304)
@@ -400,6 +413,7 @@ class SyncLoop:
         The startup path, and (#2019) the offline end of a startup hold, where
         ``before_sync`` is False: the control plane has been asked already."""
         self._current_etag = etag
+        self._blocklist_etag = bundle.get("blocklist_etag")
         self._live_etag = None
         try:
             self._guarded_apply(bundle, etag)
@@ -887,6 +901,7 @@ class SyncLoop:
             log.exception("bootstrap_last_known_good_apply_failed")
             return
         self._current_etag = prev_etag
+        self._blocklist_etag = prev_bundle.get("blocklist_etag")
         self._current_structural_etag = self._applied_fingerprint(prev_bundle)
         self._arm_boot_report(prev_bundle)
         self.apply_status = ApplyStatus(
@@ -1128,6 +1143,8 @@ class SyncLoop:
             self._current_etag = None
         if self._current_etag:
             headers["If-None-Match"] = self._current_etag
+            if self._blocklist_etag:
+                headers[BLOCKLIST_ETAG_HEADER] = self._blocklist_etag
         try:
             if self._boot_hold is not None and not self._current_etag:
                 # #2019 — nothing is serving while the cache is held, and with
@@ -1214,6 +1231,12 @@ class SyncLoop:
         etag = bundle.get("etag") or resp.headers.get("ETag")
         if not etag:
             log.warning("sync_bundle_missing_etag")
+            return
+
+        # #4041 — a bundle that names a blocklist stream carries no entries:
+        # take them from the stream (downloaded only when its version is not
+        # the one on disk) before anything below reads the bundle.
+        if bundle.get("blocklist_etag") is not None and not self._attach_blocklists(bundle):
             return
 
         # #882 — the quarantine names ONE bundle. If the control plane is no
@@ -1516,6 +1539,30 @@ class SyncLoop:
             # the config, so the supervisor clears it once the daemon has
             # stayed up (``oom_watch.STABLE_SECONDS``).
             self.heartbeat.daemon_status = {"status": "ok"}
+
+    def _attach_blocklists(self, bundle: dict[str, Any]) -> bool:
+        """Merge the blocklist stream into a bundle that names one (#4041).
+
+        False when it could not be had: nothing is saved or applied, the
+        daemon keeps serving what it has (non-negotiable #5), and the next
+        poll tries again."""
+        want = bundle["blocklist_etag"]
+        try:
+            held = held_blocklist_etag(self.cfg.state_dir)
+            if held != want:
+                with self._client() as c:
+                    held = get_blocklist(c, self.cfg.state_dir)
+            merge_blocklist_stream(bundle, self.cfg.state_dir, held)
+        except BlocklistUnavailable as e:
+            log.warning("sync_blocklist_stream_unavailable", error=str(e))
+        except (httpx.HTTPError, OSError, ValueError) as e:
+            log.warning("sync_blocklist_stream_error", error=str(e))
+        else:
+            self._blocklist_etag = held
+            return True
+        self._boot_hold_fallback()
+        time.sleep(5.0)
+        return False
 
     def _applied_fingerprint(self, bundle: dict[str, Any]) -> str | None:
         """The structural etag to record for a bundle the driver just applied.

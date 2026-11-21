@@ -39,6 +39,20 @@ PACK_MIN_RUN = 32
 PACK_MAX_RUN = 100_000
 
 
+#: The feature token an agent sends to say it fetches blocklist entries from
+#: the blocklist stream (#4041) instead of reading them out of the bundle.
+FEATURE_BLOCKLIST_STREAM = "blocklist-stream"
+
+#: The request header an agent names the stream version it holds in.
+BLOCKLIST_ETAG_HEADER = "X-Spatium-Blocklist-Etag"
+
+
+def reads_blocklist_stream(header: str | None) -> bool:
+    from app.services.dns.soa_timers import agent_features
+
+    return FEATURE_BLOCKLIST_STREAM in agent_features(header)
+
+
 def renders_packed_blocklists(header: str | None) -> bool:
     from app.services.dns.soa_timers import agent_features
 

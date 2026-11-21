@@ -157,6 +157,10 @@ backend/alembic/versions/a3f7c1e92b48_decom_date_awareness.py:drop_column:38
 backend/alembic/versions/a3f7c1e92b48_decom_date_awareness.py:drop_column:41
 backend/alembic/versions/a4040c7e91d3_dns_server_packed_blocklists.py:drop_column:52
 backend/alembic/versions/a4040c7e91d3_dns_server_packed_blocklists.py:drop_column:53
+backend/alembic/versions/a4041b8d62e5_dns_blocklist_stream.py:drop_column:47
+backend/alembic/versions/a4041b8d62e5_dns_blocklist_stream.py:drop_column:48
+backend/alembic/versions/a4041b8d62e5_dns_blocklist_stream.py:drop_column:49
+backend/alembic/versions/a4041b8d62e5_dns_blocklist_stream.py:drop_column:50
 backend/alembic/versions/a4b8c2d619e7_ai_provider.py:drop_table:92
 backend/alembic/versions/a4d92f61c08b_drop_discovery_scan_settings.py:drop_column:31
 backend/alembic/versions/a4d92f61c08b_drop_discovery_scan_settings.py:drop_column:32

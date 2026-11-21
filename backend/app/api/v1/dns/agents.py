@@ -96,7 +96,11 @@ from app.services.dns.agent_token import (
     needs_rotation,
     verify_agent_token,
 )
-from app.services.dns.blocklist_pack import renders_packed_blocklists
+from app.services.dns.blocklist_pack import (
+    BLOCKLIST_ETAG_HEADER,
+    reads_blocklist_stream,
+    renders_packed_blocklists,
+)
 from app.services.dns.bundle_dirty import enqueue_renders, mark_bundles_dirty
 from app.services.dns.new_object_defaults import add_group_with_defaults
 from app.services.dns.record_ops import (
@@ -408,9 +412,16 @@ async def _set_packed_blocklists(db: AsyncSession, server: DNSServer, features: 
     of the body, and an agent rolled back to a release that cannot read it
     must not be served the packed one."""
     packed = renders_packed_blocklists(features)
-    if server.agent_renders_packed_blocklists == packed:
+    # #4041 — the same for the blocklist stream: a bundle without its entries
+    # must not be served to an agent that cannot fetch them.
+    streams = reads_blocklist_stream(features)
+    if (
+        server.agent_renders_packed_blocklists == packed
+        and server.agent_reads_blocklist_stream == streams
+    ):
         return
     server.agent_renders_packed_blocklists = packed
+    server.agent_reads_blocklist_stream = streams
     await mark_bundles_dirty(db, server_ids=[server.id])
 
 
@@ -790,19 +801,41 @@ async def agent_register(
 _BODY_CHUNK = 64 * 1024
 
 
-def _bundle_prefix(etag: str, ops: list[dict[str, Any]], remaining: int) -> bytes:
+def _bundle_prefix(
+    etag: str, ops: list[dict[str, Any]], remaining: int, blocklist_etag: str | None = None
+) -> bytes:
     """The per-poll head of the response: ``etag`` and the ops page, in the
     #958 wire shape. This ``json.dumps`` of at most ``dns_agent_ops_batch``
-    small dicts is the only serialisation left on the request loop."""
+    small dicts is the only serialisation left on the request loop.
+    ``blocklist_etag`` (#4041) names the blocklist stream the bundle goes
+    with; it is outside the body and the bundle's ETag, so it can move alone."""
     return (
         b'{"etag":'
         + json.dumps(etag).encode("utf-8")
+        + (
+            b',"blocklist_etag":' + json.dumps(blocklist_etag).encode("utf-8")
+            if blocklist_etag is not None
+            else b""
+        )
         + b',"pending_record_ops":'
         + encode_body(ops)
         + b',"pending_ops_remaining":'
         + str(int(remaining)).encode("ascii")
         + b","
     )
+
+
+def _iter_gz(body_gz: bytes) -> Iterator[bytes]:
+    """The gunzipped stored document, a chunk at a time (a sync iterator, so
+    Starlette runs it in its threadpool)."""
+    inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    for offset in range(0, len(body_gz), _BODY_CHUNK):
+        out = inflater.decompress(body_gz[offset : offset + _BODY_CHUNK])
+        if out:
+            yield out
+    tail = inflater.flush()
+    if tail:
+        yield tail
 
 
 def _iter_bundle_bytes(prefix: bytes, body_gz: bytes) -> Iterator[bytes]:
@@ -834,7 +867,15 @@ def _bundle_response(
     bundle: DNSAgentBundle, body_gz: bytes, ops: list[dict[str, Any]], remaining: int
 ) -> StreamingResponse:
     return StreamingResponse(
-        _iter_bundle_bytes(_bundle_prefix(bundle.etag, ops, remaining), body_gz),
+        _iter_bundle_bytes(
+            _bundle_prefix(
+                bundle.etag,
+                ops,
+                remaining,
+                bundle.blocklist_etag if bundle.blocklist_stream else None,
+            ),
+            body_gz,
+        ),
         media_type="application/json",
         headers={"ETag": format_etag(bundle.etag)},
     )
@@ -1015,6 +1056,55 @@ def _duplicate_instance_response(server: DNSServer) -> JSONResponse:
     )
 
 
+def _wrong_shape(bundle: DNSAgentBundle, packed: bool, streams: bool) -> bool:
+    """The stored bundle is in a shape this request's agent cannot read:
+    packed entries (#4040) or entries left for the blocklist stream (#4041)
+    that it did not ask for, or the reverse."""
+    return bundle.packed_blocklists != packed or bundle.blocklist_stream != streams
+
+
+@router.get("/blocklist")
+async def agent_blocklist_stream(
+    request: Request,
+    db: DB,
+    if_none_match: str | None = Header(default=None, alias="If-None-Match"),
+    auth: tuple[DNSServer, dict[str, Any]] = Depends(_auth_agent),
+) -> Response:
+    """The blocklist entries of the server's newest stored bundle (#4041).
+
+    A bundle rendered for an agent that sends ``blocklist-stream`` leaves its
+    RPZ zones' entries out and names this document by ``blocklist_etag``; the
+    ETag here is that name (the SHA-256 of the document), so it moves only when
+    an entry does. 304 when ``If-None-Match`` already names it. 503 (never 404,
+    which would make the agent re-bootstrap) while no render in that shape is
+    stored yet; the agent retries."""
+    server, _payload = auth
+    features = request.headers.get(AGENT_FEATURES_HEADER)
+    bundle = await bundle_store.newest(db, server)
+    if (
+        bundle is None
+        or not reads_blocklist_stream(features)
+        or _wrong_shape(bundle, renders_packed_blocklists(features), True)
+        or bundle.blocklist_etag is None
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail="blocklist stream not rendered yet",
+            headers={"Retry-After": "5"},
+        )
+    headers = {"ETag": format_etag(bundle.blocklist_etag)}
+    if etag_matches(if_none_match, bundle.blocklist_etag):
+        return Response(status_code=304, headers=headers)
+    body_gz = await bundle_store.load_blocklist_body(db, bundle)
+    if body_gz is None:
+        raise HTTPException(
+            status_code=503,
+            detail="blocklist stream superseded; retry",
+            headers={"Retry-After": "1"},
+        )
+    return StreamingResponse(_iter_gz(body_gz), media_type="application/json", headers=headers)
+
+
 @router.get("/config")
 async def agent_config_longpoll(
     request: Request,
@@ -1124,7 +1214,12 @@ async def agent_config_longpoll(
     # heartbeats. A change is recorded (and the bundle re-rendered) here, and
     # a stored bundle of the other shape is never served meanwhile.
     req_packed = renders_packed_blocklists(request.headers.get(AGENT_FEATURES_HEADER))
-    if req_packed != bool(server.agent_renders_packed_blocklists):
+    # #4041 — and whether it fetches the entries from the blocklist stream.
+    req_stream = reads_blocklist_stream(request.headers.get(AGENT_FEATURES_HEADER))
+    held_blocklist_etag = request.headers.get(BLOCKLIST_ETAG_HEADER)
+    if req_packed != bool(server.agent_renders_packed_blocklists) or req_stream != bool(
+        server.agent_reads_blocklist_stream
+    ):
         await _set_packed_blocklists(db, server, request.headers.get(AGENT_FEATURES_HEADER))
         await db.commit()
 
@@ -1153,7 +1248,7 @@ async def agent_config_longpoll(
             # write storm no render is current until the writes stop, and
             # each one that lands is served as it lands (docstring).
             bundle = await bundle_store.newest(db, server)
-            wrong_shape = bundle is not None and bundle.packed_blocklists != req_packed
+            wrong_shape = bundle is not None and _wrong_shape(bundle, req_packed, req_stream)
             if wrong_shape:
                 # Rendered for an agent that read packed entries (or the
                 # reverse): this one cannot read it. Wait for the re-render.
@@ -1170,7 +1265,7 @@ async def agent_config_longpoll(
                         inline_tried = True
                         await refresh_agent_server(db, server)
                         bundle = await bundle_store.newest(db, server)
-                        if bundle is not None and bundle.packed_blocklists != req_packed:
+                        if bundle is not None and _wrong_shape(bundle, req_packed, req_stream):
                             bundle = None
                 if not enqueued and (wrong_shape or not bundle_store.is_current(server)):
                     await enqueue_renders([server.id])
@@ -1204,7 +1299,15 @@ async def agent_config_longpoll(
                     AGENT_BUNDLE_SERVED.labels(family="dns", outcome="client_gone").inc()
                     return Response(status_code=304)
                 # Early return if there are pending ops (fast-path per §3)
-                if not etag_matches(if_none_match, bundle.etag) or ops:
+                # #4041 — the blocklist stream moves without the bundle's ETag:
+                # an agent holding another version of it is answered too (the
+                # bundle is small without its entries).
+                stream_moved = (
+                    req_stream
+                    and bundle.blocklist_etag is not None
+                    and held_blocklist_etag != bundle.blocklist_etag
+                )
+                if not etag_matches(if_none_match, bundle.etag) or ops or stream_moved:
                     # The body before the commit, and never assumed: the
                     # worker keeps dns_agent_bundle_keep_versions rows per
                     # server, and under a write storm (the api's loop
