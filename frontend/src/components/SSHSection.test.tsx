@@ -13,12 +13,19 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   cleanup,
+  configure,
   fireEvent,
   render,
   screen,
   waitFor,
 } from "@testing-library/react";
 import type { PlatformSettings } from "@/lib/api";
+
+// Every wait here sits behind a lazily-loaded modal. testing-library's 1 s
+// default is enough on an idle box and not on a CI runner mid-way through the
+// full suite (the 1.0 s failures in the React 19 PR's run, all three at
+// 1030-1046 ms, all three green when the file runs alone).
+configure({ asyncUtilTimeout: 5000 });
 
 const update = vi.fn();
 vi.mock("@/lib/api", async () => {
