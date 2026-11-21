@@ -274,6 +274,17 @@
       "note": "The one bake-array/chart-values pair the first pass of this manifest missed, and the pair where a divergence is worst: the appliance imports baked images into containerd and never pulls, so a chart naming a tag the bake did not save is ImagePullBackOff on an AIR-GAPPED box -- no error until the cluster is already offline and no network to recover over. `cnpg.imageName` in the umbrella chart and the CNPG_IMAGES entry must stay byte-identical."
     },
 
+    "node": {
+      "version": "24.22.2",
+      "pinned_in": [
+        { "path": "frontend/Dockerfile", "match": "FROM --platform=$BUILDPLATFORM node:{version}-alpine AS builder", "count": 1 },
+        { "path": ".github/workflows/ci.yml", "match": "node-version: \"{version}\"", "count": 2 },
+        { "path": "docs/THIRD_PARTY.md", "match": "| {version}-alpine |", "count": 1 }
+      ],
+      "upstream": { "kind": "dockerhub", "repo": "library/node", "track": "^24\\.[0-9]+\\.[0-9]+-alpine$" },
+      "note": "Frontend build stage and CI's two `setup-node` steps; Node 24 is the Active LTS line (#2236). The `setup-node` inputs are the copies Dependabot cannot see. The image tag is not digest-pinned, matching nginx beside it. Choose a release at least two weeks old."
+    },
+
     "nginx": {
       "version": "1.31.8-alpine",
       "pinned_in": [

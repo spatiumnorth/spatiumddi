@@ -174,7 +174,7 @@ export default defineConfig({
     // Node 26 ships its own global `localStorage` (Web Storage), which
     // is undefined unless --localstorage-file is given and shadows
     // jsdom's, so tests calling localStorage.clear() throw. Turn
-    // Node's off for the test workers so jsdom's is used. Node 22.4+
+    // Node's off for the test workers so jsdom's is used. Node 22.4+ (CI runs Node 24)
     // accepts the flag as a no-op for behaviour (the feature is off
     // by default there). Node 20 doesn't know the flag and refuses to
     // start a worker given it, so pass it only where it is accepted.
