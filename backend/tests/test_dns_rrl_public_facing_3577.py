@@ -135,8 +135,8 @@ async def test_extra_knobs_refused_on_powerdns_and_technitium(
         r = await client.put(url, json={"rrl_nxdomains_per_second": 5}, headers=h)
         assert r.status_code == 422, (driver, r.text)
         assert "rrl_nxdomains_per_second" in r.text
-        # Unset / default re-save passes.
-        r = await client.put(url, json={"rrl_window": 20}, headers=h)
+        # Putting a knob back to unset passes.
+        r = await client.put(url, json={"rrl_nxdomains_per_second": None}, headers=h)
         assert r.status_code == 200, (driver, r.text)
 
 

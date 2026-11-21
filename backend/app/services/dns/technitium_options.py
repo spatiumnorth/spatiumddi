@@ -21,10 +21,16 @@ import ipaddress
 import re
 from typing import Any
 
+_NO_QUERY_LOG = "query logging is not collected from Technitium servers yet"
+_NO_DNSDIST = "the dnsdist front is part of the PowerDNS image only"
+
 #: field -> (default, why Technitium cannot honour another value)
 #:
 #: ``forward_policy`` is not in this table: its default (``first``) is the
 #: value Technitium cannot honour, so it has its own rule (``refusals``).
+#: ``option_support`` (#4562) builds the Technitium column of the per-driver
+#: table from this dict, so an entry added here is refused, warned about and
+#: disabled on the options page with no second edit.
 UNSUPPORTED_OPTIONS: dict[str, tuple[Any, str]] = {
     "minimal_responses": (False, "Technitium has no minimal-responses setting"),
     "tcp_clients": (None, "Technitium has no TCP client limit setting"),
@@ -85,6 +91,25 @@ UNSUPPORTED_OPTIONS: dict[str, tuple[Any, str]] = {
         "Technitium always validates an encrypted upstream's certificate and has no "
         "setting to skip it, so opportunistic DoT (verification off) cannot be honoured",
     ),
+    # #4562: no consumer in the agent. Query logging is deferred (#742), the
+    # rate limit has no log-only mode or per-load scaling, and dnsdist is the
+    # PowerDNS front.
+    "query_log_enabled": (False, _NO_QUERY_LOG),
+    "response_log_enabled": (False, _NO_QUERY_LOG),
+    "query_log_severity": ("info", _NO_QUERY_LOG),
+    "query_log_print_category": (True, _NO_QUERY_LOG),
+    "query_log_print_severity": (True, _NO_QUERY_LOG),
+    "rrl_log_only": (
+        False,
+        "Technitium's rate limit has no log-only mode (the agent leaves rate "
+        "limiting off instead)",
+    ),
+    "rrl_qps_scale": (None, "Technitium's rate limit has no qps-scale setting"),
+    "dnsdist_enabled": (False, _NO_DNSDIST),
+    "dnsdist_max_qps_per_client": (None, _NO_DNSDIST),
+    "dnsdist_action": ("truncate", _NO_DNSDIST),
+    "dnsdist_dynblock_qps": (None, _NO_DNSDIST),
+    "dnsdist_dynblock_seconds": (60, _NO_DNSDIST),
 }
 
 #: Why ``forward_policy = first`` is not true on Technitium (#1764). With

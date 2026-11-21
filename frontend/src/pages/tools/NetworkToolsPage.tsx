@@ -1084,6 +1084,7 @@ function PropagationTool() {
 // ── MAC vendor ────────────────────────────────────────────────────────
 
 function MacVendorTool() {
+  const isSuperadmin = usePermissions().isSuperadmin;
   const [raw, setRaw] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -1126,8 +1127,10 @@ function MacVendorTool() {
         <div className="space-y-2">
           {!res.oui_enabled && (
             <p className="rounded-md border border-amber-500/40 bg-amber-500/5 p-2 text-xs text-amber-700 dark:text-amber-400">
-              OUI lookup is disabled. Enable it under Settings → IPAM → OUI
-              vendor lookup to resolve vendor names.
+              OUI lookup is disabled.{" "}
+              {isSuperadmin
+                ? "Enable it under Settings → IPAM → OUI vendor lookup to resolve vendor names."
+                : "Ask an administrator to enable it to resolve vendor names."}
             </p>
           )}
           <table className="w-full text-xs">
