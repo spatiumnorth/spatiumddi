@@ -516,7 +516,7 @@ async def test_a_selective_restore_leaves_each_sequence_it_reloads_past_its_rows
     try:
         # What migration d92f4a18c763 makes on an appliance; create_all does not.
         await conn.execute("ALTER SEQUENCE audit_log_seq_seq OWNED BY audit_log.seq")
-        await conn.execute("CREATE UNIQUE INDEX ix_audit_log_seq ON audit_log (seq)")
+        await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ix_audit_log_seq ON audit_log (seq)")
         for i in range(5):
             await conn.fetchval(_AUDIT_INSERT, uuid.uuid4(), f"archived-{i}")
     finally:
