@@ -146,7 +146,7 @@ from app.services.agents.memory_status import (
 from app.services.agents.spool_status import SpoolStatus
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteZoneArgs
-from app.services.api_token_scopes import read_only_post, token_outbound
+from app.services.api_token_scopes import read_only_post, token_outbound, token_write
 from app.services.appliance.group_names import (
     group_assigned_to_appliance,
     group_name_problem,
@@ -291,6 +291,7 @@ from app.services.dns.zone_move import (
 from app.services.dns.zone_move import commit_move as commit_zone_move
 from app.services.dns.zone_move import preview_move as preview_zone_move
 from app.services.dns.zone_synthesis import synthesised_zone_error, unauthored_zone_error
+from app.services.dns.zone_templates import ZoneTemplate as ZoneTemplateDef
 from app.services.dns.zone_templates import (
     get_template,
     list_templates,
@@ -414,6 +415,8 @@ _DNS_ROUTE_TYPES: dict[str, tuple[str, ...]] = {
     "POST /groups/{group_id}/zones/{zone_id}/move/preview": _Z,
     "POST /groups/{group_id}/zones/{zone_id}/move/commit": _Z,
     "GET /zone-templates": _Z,
+    "POST /groups/{group_id}/zones/{zone_id}/apply-template/preview": _R,
+    "POST /groups/{group_id}/zones/{zone_id}/apply-template": _R,
     "GET /tld-registry": _Z,
     "GET /tld-registry/classify": _Z,
     "POST /tld-registry/refresh": _Z,
@@ -8308,6 +8311,8 @@ class ZoneTemplate(BaseModel):
     #: How many records the template stamps — rendered by the wizard, so it
     #: has to be on the schema and not left to ``extra``.
     record_count: int | None = None
+    version: str | None = None
+    source: str | None = None
 
 
 class ZoneTemplateCatalog(BaseModel):
@@ -9048,6 +9053,8 @@ async def list_zone_templates(_: CurrentUser) -> ZoneTemplateCatalog:
                         for p in t.parameters
                     ],
                     "record_count": t.max_record_count,
+                    "version": t.version,
+                    "source": t.source,
                 }
                 for t in templates
             ]
@@ -9231,6 +9238,322 @@ async def create_zone_from_template(
     out = await _zone_out(db, zone)
     out.adopted_existing_on = list(adopted_on or [])
     return out
+
+
+# ── Apply a template to an existing zone (#2183) ───────────────────────────
+# Preview classifies every record the template would write; apply writes the
+# ones classified ``add`` through the bulk-create path (one serial bump, one
+# dispatch, one audit row) and nothing else.
+
+#: TXT values of which a name may publish only one (RFC 7208 section 3.2 SPF,
+#: RFC 7489 DMARC, RFC 8461 MTA-STS, RFC 8460 TLS-RPT): a second one makes the
+#: policy undefined, so a different value at the name is a conflict, never a
+#: second record.
+_SINGLETON_TXT_VERSIONS = ("v=spf1", "v=dmarc1", "v=stsv1", "v=tlsrptv1")
+
+
+def _singleton_txt_tag(value: str) -> str | None:
+    text = value.strip().strip('"').strip().lower()
+    for tag in _SINGLETON_TXT_VERSIONS:
+        if text == tag or text.startswith(tag + " ") or text.startswith(tag + ";"):
+            return tag
+    return None
+
+
+class ApplyTemplateRequest(BaseModel):
+    template_id: str
+    params: dict[str, str] = {}
+    view_id: uuid.UUID | None = None
+    #: Apply: write the records classified ``add`` even though others are
+    #: ``conflict`` / ``unsupported`` (which are left alone). Off, any such
+    #: record refuses the whole apply with a 409.
+    skip_conflicts: bool = False
+
+
+class ApplyTemplateItem(BaseModel):
+    name: str
+    record_type: str
+    value: str
+    ttl: int | None = None
+    priority: int | None = None
+    weight: int | None = None
+    port: int | None = None
+    #: add | present | conflict | unsupported
+    status: str
+    reason: str | None = None
+    existing_id: str | None = None
+
+
+class ApplyTemplatePreview(BaseModel):
+    zone_id: uuid.UUID
+    zone_name: str
+    template_id: str
+    template_name: str
+    template_version: str | None = None
+    source: str | None = None
+    items: list[ApplyTemplateItem]
+    add: int
+    present: int
+    conflict: int
+    unsupported: int
+
+
+class ApplyTemplateResult(BaseModel):
+    zone_id: uuid.UUID
+    template_id: str
+    created: int
+    present: int
+    skipped: list[ApplyTemplateItem]
+    target_serial: int | None
+
+
+async def _classify_template_for_zone(
+    db: DB,
+    zone: DNSZone,
+    body: ApplyTemplateRequest,
+    current_user: Any,
+) -> tuple[ZoneTemplateDef, list[tuple[ApplyTemplateItem, RecordCreate]]]:
+    """Resolve the template against *zone* and classify each record. Writes
+    nothing. Parameter and rdata problems are a 422 for the whole template
+    (the operator's input is wrong); a clash with what the zone holds, or a
+    record the group's drivers cannot carry, is per-record."""
+    template = get_template(body.template_id)
+    if template is None:
+        raise HTTPException(status_code=404, detail=f"Unknown template: {body.template_id}")
+    errors = validate_params(template, body.params)
+    if errors:
+        raise HTTPException(status_code=422, detail="; ".join(errors))
+    await _enforce_views_in_zone_group(db, zone, [body.view_id])
+
+    payloads = materialize(template, zone.name, body.params)
+    out: list[tuple[ApplyTemplateItem, RecordCreate]] = []
+    seen: set[tuple[Any, ...]] = set()
+    needs_absolute = await group_needs_absolute_targets(db, zone.group_id)
+    for r in payloads:
+        if r["record_type"] not in VALID_RECORD_TYPES:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Template {template.id} produced invalid record type {r['record_type']}",
+            )
+        try:
+            rec = RecordCreate(
+                name=r["name"],
+                record_type=r["record_type"],
+                value=r["value"],
+                ttl=r["ttl"],
+                priority=r["priority"],
+                weight=r["weight"],
+                port=r["port"],
+                view_id=body.view_id,
+            )
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=_validation_message(exc)) from exc
+        rec.priority, rec.weight, rec.port = _normalize_record_struct_fields(
+            rec.record_type, rec.priority, rec.weight, rec.port
+        )
+        _validate_address_record_value(
+            rec.record_type,
+            rec.value,
+            priority=rec.priority,
+            weight=rec.weight,
+            port=rec.port,
+            origin=zone.name,
+        )
+        if needs_absolute:
+            target_err = dotless_target_error(rec.record_type, rec.value, zone.name)
+            if target_err is not None:
+                raise HTTPException(status_code=422, detail=f"{rec.name}: {target_err}")
+        fqdn = f"{rec.name}.{zone.name}" if rec.name != "@" else zone.name
+        _enforce_bind_check_names(rec.record_type, fqdn, rec.value, zone.name)
+        item = ApplyTemplateItem(
+            name=rec.name,
+            record_type=rec.record_type,
+            value=rec.value,
+            ttl=rec.ttl,
+            priority=rec.priority,
+            weight=rec.weight,
+            port=rec.port,
+            status="add",
+        )
+        key = (rec.name.lower(), rec.record_type.upper(), rec.value.strip(), rec.priority)
+        status_, reason, existing_id = await _classify_one_template_record(
+            db, zone, rec, fqdn, current_user, seen_in_template=key in seen
+        )
+        seen.add(key)
+        item.status, item.reason, item.existing_id = status_, reason, existing_id
+        out.append((item, rec))
+    return template, out
+
+
+async def _classify_one_template_record(
+    db: DB,
+    zone: DNSZone,
+    rec: RecordCreate,
+    fqdn: str,
+    current_user: Any,
+    *,
+    seen_in_template: bool,
+) -> tuple[str, str | None, str | None]:
+    if seen_in_template:
+        return "present", "listed twice by the template", None
+    try:
+        await _require_superadmin_for_lua(
+            db, current_user, [rec.record_type], what="create a LUA record"
+        )
+        await _check_driver_gated_record_type(rec.record_type, zone.group_id, db)
+        await _check_driver_refusals([(rec.record_type, rec.value, rec.ttl)], zone.group_id, db)
+    except HTTPException as exc:
+        return "unsupported", str(exc.detail), None
+    same = await find_identical_record(
+        db,
+        zone.id,
+        view_id=rec.view_id,
+        name=rec.name,
+        record_type=rec.record_type,
+        value=rec.value,
+        priority=rec.priority,
+        weight=rec.weight,
+        port=rec.port,
+    )
+    if same is not None:
+        return "present", "an identical record already exists", str(same.id)
+    if rec.record_type.upper() == "CNAME" and is_apex(rec.name):
+        return "conflict", APEX_CNAME_DETAIL, None
+    other = await find_cname_conflict(
+        db, zone.id, view_id=rec.view_id, name=rec.name, record_type=rec.record_type
+    )
+    if other is not None:
+        return "conflict", describe_cname_conflict(rec.record_type, fqdn, other), str(other.id)
+    tag = _singleton_txt_tag(rec.value) if rec.record_type.upper() == "TXT" else None
+    if tag is not None:
+        rows = (
+            await db.execute(
+                select(DNSRecord).where(
+                    DNSRecord.zone_id == zone.id,
+                    func.lower(DNSRecord.name) == rec.name.strip().lower(),
+                    func.upper(DNSRecord.record_type) == "TXT",
+                )
+            )
+        ).scalars()
+        for row in rows:
+            if views_overlap(row.view_id, rec.view_id) and _singleton_txt_tag(row.value) == tag:
+                return (
+                    "conflict",
+                    f"{fqdn} already publishes a {tag} record ({row.value.strip()!r}); a name "
+                    "may publish only one. Edit that record to merge the two.",
+                    str(row.id),
+                )
+    return "add", None, None
+
+
+def _template_preview(
+    zone: DNSZone,
+    template: ZoneTemplateDef,
+    classified: list[tuple[ApplyTemplateItem, RecordCreate]],
+) -> ApplyTemplatePreview:
+    items = [i for i, _ in classified]
+
+    def n(status_: str) -> int:
+        return sum(1 for i in items if i.status == status_)
+
+    return ApplyTemplatePreview(
+        zone_id=zone.id,
+        zone_name=zone.name,
+        template_id=template.id,
+        template_name=template.name,
+        template_version=template.version,
+        source=template.source,
+        items=items,
+        add=n("add"),
+        present=n("present"),
+        conflict=n("conflict"),
+        unsupported=n("unsupported"),
+    )
+
+
+@router.post(
+    "/groups/{group_id}/zones/{zone_id}/apply-template/preview",
+    response_model=ApplyTemplatePreview,
+    dependencies=[Depends(_dns_records_read), _RECORD_WRITE_FOR_PREVIEW],
+)
+@read_only_post
+async def apply_template_preview(
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    body: ApplyTemplateRequest,
+    db: DB,
+    current_user: CurrentUser,
+) -> ApplyTemplatePreview:
+    """What applying a template to this zone would do. Writes nothing."""
+    zone = await _require_zone(group_id, zone_id, db, current_user)
+    _reject_if_synthesised_zone(zone, "add records to")
+    _reject_if_unauthored_zone(zone, "add")
+    template, classified = await _classify_template_for_zone(db, zone, body, current_user)
+    return _template_preview(zone, template, classified)
+
+
+@token_write("Creates the template's missing records in the zone and queues their DNS ops")
+@router.post(
+    "/groups/{group_id}/zones/{zone_id}/apply-template",
+    response_model=ApplyTemplateResult,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(_dns_records_read)],
+)
+async def apply_template(
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    body: ApplyTemplateRequest,
+    db: DB,
+    current_user: CurrentUser,
+) -> ApplyTemplateResult:
+    """Write a template's new records into an existing zone, as one audited
+    operation. Re-applying writes nothing twice: a record the zone already
+    holds is ``present`` and skipped."""
+    zone = await _require_zone(group_id, zone_id, db, current_user, lock="write")
+    _reject_if_synthesised_zone(zone, "add records to")
+    _reject_if_unauthored_zone(zone, "add")
+    template, classified = await _classify_template_for_zone(db, zone, body, current_user)
+    blocked = [i for i, _ in classified if i.status in ("conflict", "unsupported")]
+    if blocked and not body.skip_conflicts:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "; ".join(f"{i.name} {i.record_type}: {i.reason}" for i in blocked)
+            + " Resolve them, or apply with skip_conflicts to write only the rest.",
+        )
+    to_add = [rec for item, rec in classified if item.status == "add"]
+    present = sum(1 for i, _ in classified if i.status == "present")
+    skipped = [i for i, _ in classified if i.status != "add"]
+    if not to_add:
+        return ApplyTemplateResult(
+            zone_id=zone.id,
+            template_id=template.id,
+            created=0,
+            present=present,
+            skipped=skipped,
+            target_serial=None,
+        )
+    result = await _bulk_create_records(
+        group_id,
+        zone_id,
+        BulkCreateRecordsRequest(records=to_add),
+        db,
+        current_user,
+        template_audit={
+            "template_id": template.id,
+            "template_version": template.version,
+            "params": body.params,
+            "already_present": present,
+            "skipped_conflicts": len(blocked),
+        },
+    )
+    return ApplyTemplateResult(
+        zone_id=zone.id,
+        template_id=template.id,
+        created=result.created,
+        present=present,
+        skipped=skipped,
+        target_serial=result.target_serial,
+    )
 
 
 # ── Zone delegation wizard ──────────────────────────────────────────────────
@@ -11082,6 +11405,24 @@ async def bulk_create_records(
     current_user: CurrentUser,
 ) -> BulkCreateRecordsResponse:
     """Bulk-create records in one zone — one serial bump, one commit, one dispatch."""
+    return await _bulk_create_records(group_id, zone_id, body, db, current_user)
+
+
+async def _bulk_create_records(
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    body: BulkCreateRecordsRequest,
+    db: DB,
+    current_user: Any,
+    *,
+    template_audit: dict[str, Any] | None = None,
+) -> BulkCreateRecordsResponse:
+    """The bulk create, shared with applying a template (#2183).
+
+    ``template_audit`` marks the call as a template apply: the one summary
+    audit row is then ``apply_template`` and carries it, so the apply is one
+    audited operation in the same transaction as the records.
+    """
     zone = await _require_zone(group_id, zone_id, db, lock="write")
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_zone(zone, "add records to")
@@ -11238,7 +11579,7 @@ async def bulk_create_records(
             user_id=current_user.id,
             user_display_name=current_user.display_name,
             auth_source=current_user.auth_source,
-            action="bulk_create",
+            action="apply_template" if template_audit else "bulk_create",
             resource_type="dns_record",
             # One summary row keyed on the zone (the bulk op's target) — a
             # per-record audit row would reintroduce the audit-chain hash cost
@@ -11249,6 +11590,7 @@ async def bulk_create_records(
                 "created": len(records),
                 "zone": zone.name,
                 "target_serial": target_serial,
+                **(template_audit or {}),
             },
             result="success",
         )

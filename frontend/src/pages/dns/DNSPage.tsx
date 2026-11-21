@@ -78,6 +78,7 @@ import { DelegationModal } from "./DelegationModal";
 import { DynamicUpdateAclModal } from "./DynamicUpdateAclModal";
 import { ZoneTemplateModal } from "./ZoneTemplateModal";
 import { ZoneSpreadsheetImportModal } from "./ZoneSpreadsheetImportModal";
+import { ApplyTemplateModal } from "./ApplyTemplateModal";
 import { ServerDetailModal } from "./ServerDetailModal";
 import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import { PoolsView } from "./PoolsView";
@@ -4507,6 +4508,7 @@ export function ZoneDetailView({
   const [deleteNotice, setDeleteNotice] = useState<string | null>(null);
   const [showImport, setShowImport] = useState(false);
   const [showSheetImport, setShowSheetImport] = useState(false);
+  const [showApplyTemplate, setShowApplyTemplate] = useState(false);
   const [showRecFilters, setShowRecFilters] = useState(false);
   const [recFilter, setRecFilter] = useState({ name: "", type: "", value: "" });
   // Server-side pagination + search (#455): a large zone (20k+ records) no
@@ -5099,6 +5101,21 @@ export function ZoneDetailView({
                       onSelect: () => setShowSheetImport(true),
                       title:
                         "Bulk-edit records from a spreadsheet: preview the adds, changes and deletes, then import",
+                      ...(unauthoredReason
+                        ? { disabled: true, title: unauthoredReason }
+                        : {}),
+                      ...permissionGate(
+                        can("write", "dns_record"),
+                        NEEDS_RECORD_WRITE,
+                      ),
+                    },
+                    {
+                      key: "apply-template",
+                      label: "Apply template…",
+                      icon: Sparkles,
+                      onSelect: () => setShowApplyTemplate(true),
+                      title:
+                        "Add a template's records (mail hardening, CAA, Active Directory …) to this zone: preview first, nothing is overwritten",
                       ...(unauthoredReason
                         ? { disabled: true, title: unauthoredReason }
                         : {}),
@@ -6134,6 +6151,13 @@ export function ZoneDetailView({
           groupId={group.id}
           zone={zone}
           onClose={() => setShowSheetImport(false)}
+        />
+      )}
+      {showApplyTemplate && (
+        <ApplyTemplateModal
+          groupId={group.id}
+          zone={zone}
+          onClose={() => setShowApplyTemplate(false)}
         />
       )}
       {confirmDelete && (

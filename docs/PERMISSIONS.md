@@ -347,7 +347,7 @@ classified.
 |---|---|
 | `/groups`, `/groups/{id}`, servers, server options and trust anchors, forwarder presets, DNSSEC policies, views, ACLs, TSIG keys, dynamic-update capabilities, a server's events / rendered config / `rndc status` (except `POST /servers/{server_id}/apply-record`, which is superadmin-only: its handler takes `SuperAdmin`, so no grant reaches it) | `dns_group` |
 | `/groups/{id}/zones`, a zone and its settings (DNSSEC, move), zone templates, the TLD registry | `dns_zone` |
-| `/groups/{id}/records`, a zone's records (list, create, edit, delete, bulk), zone-file and spreadsheet import, sync with server, the import template, `/tools/propagation-check`, `/tools/default-resolvers` | `dns_record` |
+| `/groups/{id}/records`, a zone's records (list, create, edit, delete, bulk), zone-file and spreadsheet import, apply a template to a zone (preview and apply), sync with server, the import template, `/tools/propagation-check`, `/tools/default-resolvers` | `dns_record` |
 
 A route whose answer carries several types needs each of them:
 
