@@ -48,7 +48,6 @@ import {
 } from "@/lib/agent-log-scope";
 import { copyToClipboard } from "@/lib/clipboard";
 import { cn } from "@/lib/utils";
-import { useSessionState } from "@/lib/useSessionState";
 import { DNSThreatTab } from "./logs/DNSThreatTab";
 import {
   analyticsFilterParams,
