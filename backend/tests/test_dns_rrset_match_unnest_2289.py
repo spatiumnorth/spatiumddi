@@ -28,6 +28,7 @@ from app.services.dns.record_ops import (
     ack_op,
     backed_off_match_where,
     op_rrset_key,
+    op_scope,
     rrset_match_where,
 )
 
@@ -182,7 +183,11 @@ async def test_the_match_selects_exactly_the_ops_whose_key_is_listed(
     ]
     db_session.add_all(ops)
     await db_session.flush()
-    keys = [("a.example.", "@", "A"), ("a.example.", "www", "CNAME"), ("c.example.", "x", "A")]
+    keys = [
+        (op_scope("a.example.", None), "@", "A"),
+        (op_scope("a.example.", None), "www", "CNAME"),
+        (op_scope("c.example.", None), "x", "A"),
+    ]
 
     got = set(
         (

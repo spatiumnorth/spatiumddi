@@ -422,9 +422,10 @@ worker's cores).
 op per server in the group (#170), so 2M records on seven servers is about
 14M op rows, and they pile up while no render finishes. A group *without*
 views never reads them in a render: they ship a page at a time (5,000 ops,
-about 1.4 s) against the stored bundle that covers them. A group *with* views
-cannot apply a record op incrementally, so its render retires every queued op
-its body covers. That retire used to load the ops as ORM rows, about 4 kB
+about 1.4 s) against the stored bundle that covers them. A group *with* views,
+for a server whose agent cannot apply a record op per view (see below), cannot
+apply it incrementally, so that server's render retires every queued op its
+body covers. That retire used to load the ops as ORM rows, about 4 kB
 each, and after a load it was the larger half of the render: measured on the
 2,000,000-record group with one view (the scale lab's shape) and 813,000
 queued ops for the server, the render peaked at 1,797 MB and the retire at
@@ -432,13 +433,67 @@ queued ops for the server, the render peaked at 1,797 MB and the retire at
 (`RETIRE_CHUNK`, 5,000) with one UPDATE each and loads none: the same render
 and retire peaked at 231 MB and the retire took 31 s.
 
-Bounded is not the same as keeping up. Under views every record change
-re-renders every server of the group in full, where a group without views
-ships the change as an op. With two views and the same backlog a
-2,000,000-record render took about four minutes here, so a seven-server
-group under a sustained write storm re-renders continuously and never sits
-settled; it converges once the writes stop. View-aware incremental ops is
-the follow-up that changes this (#2240).
+Bounded is not the same as keeping up. For a server whose agent cannot
+apply per view, every record change re-renders it in full under views, where a
+group without views ships the change as an op. With two views and the same
+backlog a 2,000,000-record render took about four minutes here, so a
+seven-server group under a sustained write storm re-renders continuously and
+never sits settled; it converges once the writes stop.
+
+**Per-view record ops (#2242).** A BIND9 agent that says `per-view-ops` (every
+agent from the release that added it) takes a group's record changes as ops
+even under views, so the same change is N ops and no structural render. What
+changes for such a server, and only such a server:
+
+- **The structural payload carries placement, not records.** A record change
+  leaves the structural ETag where it was, as in a group without views; a
+  record that makes the zone appear in (or vanish from) a view still moves it,
+  because each view's copy of the zone is a separate entry. The full ETag (the
+  stored body) still moves, so the worker refreshes the stored bundle as it
+  does without views (reason `records` on `dns_agent_bundle_renders_total`,
+  not `structural`).
+- **An op names its view and carries that view's RRset.** A record change
+  queues one op per view whose copy carries the record (a record scoped to one
+  view reaches that view alone, a shared one every view that renders the zone),
+  each stamped with the RRset *of its own view's copy*, so two views serving
+  one name each get their own members. An op for a name in one view neither
+  supersedes nor is superseded by the op for the same name in another view.
+- **The agent signs the update with the view's update key.** Each view in the
+  bundle carries an `update_key`, derived from the group's own key as the
+  transfer key is, under a separate label, and a separate key so that one
+  that reads (AXFR) cannot write and the reverse. The agent admits it into
+  exactly its own view's `match-clients` (refusing it in every other),
+  grants it `allow-update` on that view's copy of each zone only, and signs the
+  RFC 2136 update, and the SOA read around it, with it; named routes both
+  into that view. An op that names no view, or one the agent has no key for,
+  is acked `failed` and carried by the next structural render.
+- **No `in-view` sharing of primary zones.** An identical copy used to be
+  loaded once and referenced from the later views (#3551). An update to a shared
+  copy would reach every view, so each view loads its own copy of a primary
+  zone while per-view ops are in use: memory scales with views again for
+  primary zones (secondary, stub and RPZ zones are unchanged).
+- **The render retires queued ops only when it moved something the agent
+  re-applies from the body:** a placement change or any other structural
+  change, the server's first render, or a renderer revision. Otherwise the ops
+  stay queued and ship.
+
+**Geo steering rides the same path** (#2242 slice 5). Which view a pool
+member's record is served in is decided by `records_for_view`, the one
+predicate the bundle's zone copies, the op fan-out and the op's RRset stamp all
+use, so an op for a geo view carries exactly what a full render would put in
+that view (an all-geo pool's no-blackhole fallback and unreachable members
+included). The geo plan itself (which member is in which geo view, the
+all-geo fallback set, unreachable members) is part of the structural
+fingerprint, because a change to it re-files records without writing one: it
+re-renders and retires the queued ops it covers.
+
+What stays on the re-render path, whatever the agent says: a group holding a
+DNSSEC-signed zone (the agent's signed-serial handling is per zone name, not
+per view), a group without the product's own TSIG key (the view keys are
+derived from it), and any server whose agent does not say `per-view-ops`. A
+mixed group is fine: each server follows its own agent, so a control plane
+upgraded before its agents keeps today's behaviour until each agent reports
+in.
 
 This is the control plane's side. The agent and its daemon have their own
 memory to size for the same group (#2223), and

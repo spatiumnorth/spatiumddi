@@ -193,13 +193,7 @@ async def apply_pool_state(
             # carries the old IP. Delete-then-recreate on the same
             # serial so the live daemon moves to the new value
             # atomically (same shape as the rename branch below).
-            old_snapshot = {
-                "name": rec.name,
-                "type": rec.record_type,
-                "value": rec.value,
-                "ttl": rec.ttl,
-                "rrset_action": "delete_value",
-            }
+            old_snapshot = _delete_snapshot(rec)
             target_serial = bump_zone_serial(zone)
             await enqueue_record_op(db, zone, "delete", old_snapshot, target_serial=target_serial)
             rec.value = member.address
@@ -223,13 +217,7 @@ async def apply_pool_state(
             # actually moves to the new identity. Done as two ops on
             # the same serial so the replay is atomic from the
             # operator's perspective.
-            old_snapshot = {
-                "name": rec.name,
-                "type": rec.record_type,
-                "value": rec.value,
-                "ttl": rec.ttl,
-                "rrset_action": "delete_value",
-            }
+            old_snapshot = _delete_snapshot(rec)
             target_serial = bump_zone_serial(zone)
             await enqueue_record_op(db, zone, "delete", old_snapshot, target_serial=target_serial)
             fqdn = zone.name if pool.record_name == "@" else f"{pool.record_name}.{zone.name}"
@@ -411,6 +399,9 @@ def _delete_snapshot(rec: DNSRecord) -> dict[str, object]:
         "value": rec.value,
         "ttl": rec.ttl,
         "rrset_action": "delete_value",
+        # The row is gone by the time the op is queued; the member names the
+        # views that served it (``record_ops.resolve_op_views``, #2242).
+        "pool_member_id": str(rec.pool_member_id) if rec.pool_member_id else None,
     }
 
 
@@ -441,4 +432,6 @@ def _record_payload(pool: DNSPool, member: DNSPoolMember, ttl: int | None) -> di
         "value": member.address,
         "ttl": ttl,
         "rrset_action": "add",
+        # Which geo view serves the record follows its member (#2242).
+        "pool_member_id": str(member.id),
     }

@@ -1,0 +1,3 @@
+### Fixed
+
+- A DNS server group with views no longer re-renders and reloads every server on each record change. A BIND9 agent that applies a record op into the view it names (it now says so with `per-view-ops`, signing each update with that view's own key) is sent the op, and the bundle's structural fingerprint keeps which views hold a zone but not its records, so only a change that adds or removes a zone from a view re-renders. Each view loads its own copy of a primary zone while this is in use, and groups with a DNSSEC-signed zone, and servers whose agent is older, keep the previous behaviour. (#2242)

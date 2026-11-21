@@ -26,6 +26,15 @@ def test_the_header_names_soa_timers() -> None:
     assert features.headers() == {"X-Spatium-Agent-Features": "soa-timers,served-serials,packed-blocklists"}
 
 
+def test_only_the_bind9_driver_says_it_applies_ops_per_view() -> None:
+    """#2242 — per-view record ops are a BIND9 capability; the other drivers
+    have no view-scoped update and never say so."""
+    bind9 = features.headers("bind9")["X-Spatium-Agent-Features"].split(",")
+    assert bind9[-1] == "per-view-ops" and "soa-timers" in bind9
+    for driver in ("powerdns", "technitium", None):
+        assert "per-view-ops" not in features.headers(driver)["X-Spatium-Agent-Features"]
+
+
 def test_register_sends_it_on_the_wire(
     agent_cfg: AgentConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -48,7 +57,10 @@ def test_register_sends_it_on_the_wire(
 
     bootstrap.register(agent_cfg)
 
-    assert seen["x-spatium-agent-features"] == "soa-timers,served-serials,packed-blocklists"
+    assert (
+        seen["x-spatium-agent-features"]
+        == "soa-timers,served-serials,packed-blocklists,per-view-ops"
+    )
     assert seen["x-dns-agent-key"] == "test-key"
     # #2078 — the build's stamp, not a literal that nothing rewrote.
     assert bodies[0]["version"] == __version__
@@ -61,4 +73,7 @@ def test_the_heartbeat_and_the_config_poll_send_it(agent_cfg: AgentConfig, cls: 
     holder.cfg = agent_cfg
 
     with holder._client() as c:
-        assert c.headers["X-Spatium-Agent-Features"] == "soa-timers,served-serials,packed-blocklists"
+        assert (
+            c.headers["X-Spatium-Agent-Features"]
+            == "soa-timers,served-serials,packed-blocklists,per-view-ops"
+        )
