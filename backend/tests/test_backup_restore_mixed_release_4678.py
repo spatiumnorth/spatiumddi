@@ -145,3 +145,24 @@ def test_restore_gate_fails_open_without_a_database(monkeypatch: pytest.MonkeyPa
     assert restore_gate.main() == 0
     monkeypatch.delenv("DATABASE_URL")
     assert restore_gate.main() == 0
+
+
+@pytest.mark.asyncio
+async def test_restore_gate_never_takes_the_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Taking it, even briefly, would refuse a restore starting that instant."""
+    queries: list[str] = []
+
+    class _Conn:
+        async def fetchval(self, query: str, *args: object) -> bool:
+            queries.append(query)
+            return False
+
+        async def close(self) -> None:
+            pass
+
+    async def _connect(**_: object) -> _Conn:
+        return _Conn()
+
+    monkeypatch.setattr(asyncpg, "connect", _connect)
+    assert await restore_gate.restore_in_progress("postgresql://x") is False
+    assert queries and not any("advisory_lock" in q for q in queries)

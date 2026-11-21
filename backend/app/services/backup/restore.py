@@ -58,7 +58,7 @@ from typing import Any
 import asyncpg
 import structlog
 
-from app.core.restore_gate import RESTORE_LOCK_KEY
+from app.core.restore_gate import RESTORE_LOCK_HOLDERS_SQL, RESTORE_LOCK_KEY
 from app.services.backup.archive import (
     BackupArchiveError,
     _pg_env_from_url,
@@ -1037,12 +1037,7 @@ _RESTORE_LOCK_KEY = RESTORE_LOCK_KEY
 #: (#1648). ``pg_locks`` shows a bigint key as its high half in ``classid``
 #: and its low half in ``objid``, with ``objsubid`` 1. ``pid IS NOT NULL``
 #: keeps a prepared transaction's lock from turning ``NOT IN`` into NULL.
-_RESTORE_LOCK_HOLDERS_SQL = (
-    "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted "
-    "AND pid IS NOT NULL AND objsubid = 1 "
-    f"AND ((classid::bigint << 32) | objid::bigint) = {_RESTORE_LOCK_KEY} "
-    "AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
-)
+_RESTORE_LOCK_HOLDERS_SQL = RESTORE_LOCK_HOLDERS_SQL
 
 
 async def restore_lock_held(db) -> bool:

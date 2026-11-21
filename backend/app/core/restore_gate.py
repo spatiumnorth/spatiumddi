@@ -28,16 +28,31 @@ import zlib
 RESTORE_LOCK_KEY = zlib.crc32(b"spatiumddi:backup-restore") - 2**31
 
 
+#: Sessions holding the restore lock. ``pg_locks`` shows a bigint key as its
+#: high half in ``classid`` and its low half in ``objid``, with ``objsubid`` 1.
+#: ``pid IS NOT NULL`` keeps a prepared transaction's lock from turning a
+#: ``NOT IN`` over this into NULL.
+RESTORE_LOCK_HOLDERS_SQL = (
+    "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted "
+    "AND pid IS NOT NULL AND objsubid = 1 "
+    f"AND ((classid::bigint << 32) | objid::bigint) = {RESTORE_LOCK_KEY} "
+    "AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
+)
+
+
 async def restore_in_progress(dsn: str) -> bool:
-    """True when another session holds the restore lock."""
+    """True when a session holds the restore lock.
+
+    A read of ``pg_locks``, never a ``pg_try_advisory_lock``: taking the lock,
+    even for an instant, would refuse a restore that started in that instant
+    as "already in progress", and every waiting pod polls this every few
+    seconds.
+    """
     import asyncpg  # noqa: PLC0415
 
     conn = await asyncpg.connect(dsn=dsn, timeout=5, command_timeout=10)
     try:
-        if await conn.fetchval("SELECT pg_try_advisory_lock($1)", RESTORE_LOCK_KEY):
-            await conn.fetchval("SELECT pg_advisory_unlock($1)", RESTORE_LOCK_KEY)
-            return False
-        return True
+        return bool(await conn.fetchval(f"SELECT EXISTS ({RESTORE_LOCK_HOLDERS_SQL})"))
     finally:
         await conn.close()
 
