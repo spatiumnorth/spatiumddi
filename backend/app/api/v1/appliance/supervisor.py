@@ -2549,6 +2549,35 @@ async def supervisor_heartbeat(
     response.headers[SIGNATURE_VERSIONS_HEADER] = SIGNATURE_VERSION
     try:
         return await _supervisor_heartbeat(body, request, db)
+    except HTTPException as exc:
+        # #4677 — a restore replays the appliance registry and only then puts
+        # the running appliance back, under the install-wide restore lock. A
+        # heartbeat landing between the two finds no row for its credential;
+        # answering that 403 is a revocation strike, and two in a row tear the
+        # node's roles down. While the lock is held the refusal is not a
+        # verdict on the row: 503 + Retry-After, which the supervisor retries
+        # without a strike (only a marked 403 counts).
+        if exc.status_code == status.HTTP_403_FORBIDDEN and REVOCATION_HEADER in (
+            exc.headers or {}
+        ):
+            from app.services.backup.restore import restore_lock_held  # noqa: PLC0415
+
+            try:
+                restoring = await restore_lock_held(db)
+            except Exception as lock_exc:  # noqa: BLE001 — the refusal below stands
+                logger.warning("supervisor_heartbeat_restore_check_failed", error=str(lock_exc))
+                restoring = False
+            if restoring:
+                logger.info(
+                    "supervisor_heartbeat_deferred_restore",
+                    appliance_id=str(body.appliance_id),
+                )
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "A restore is in progress. Retry.",
+                    headers={"Retry-After": "1"},
+                ) from exc
+        raise
     except Exception as exc:
         # #2845 — a CNPG switchover drops the connection under whichever
         # statement is in flight: most often the re-read after the long-poll

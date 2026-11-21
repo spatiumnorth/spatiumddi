@@ -21,7 +21,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models.appliance import Appliance, ApplianceCA
-from app.models.dns import DNSServerGroup
+from app.models.dhcp import DHCPServer, DHCPServerGroup
+from app.models.dns import DNSServer, DNSServerGroup
 from app.models.network import ApplianceLldpNeighbour
 from app.services.backup import appliance_identity as ident
 from tests.conftest import _TestSessionLocal
@@ -299,3 +300,107 @@ async def test_unreadable_identity_is_reported_not_hidden(
         confirmation_phrase=restore_mod.CONFIRM_PHRASE,
     )
     assert any("could not be read" in w and "db hiccup" in w for w in outcome.warnings)
+
+
+@pytest.mark.asyncio
+async def test_restored_servers_of_the_adopted_appliance_keep_the_live_agent_identity(
+    db_session: AsyncSession,
+) -> None:
+    """Finding of the #4680 walk: the agent registers onto the restored row
+    (matched by hostname), whose fingerprint is the archive install's, so the
+    DHCP handler un-approves it and the config long-poll answers pending."""
+    live = _appliance("node1")
+    db_session.add_all([live, _ca("LIVE-CA")])
+    await db_session.flush()
+    live_agent = uuid.uuid4()
+    dgroup = DHCPServerGroup(name="g")
+    nsgroup = DNSServerGroup(name="ns")
+    db_session.add_all([dgroup, nsgroup])
+    await db_session.flush()
+    db_session.add_all(
+        [
+            DHCPServer(
+                name="node1",
+                driver="kea",
+                host="node1",
+                appliance_id=live.id,
+                server_group_id=dgroup.id,
+                agent_id=live_agent,
+                agent_approved=True,
+                agent_fingerprint="live-fp",
+            ),
+            DNSServer(
+                name="node1",
+                driver="bind9",
+                host="node1",
+                appliance_id=live.id,
+                group_id=nsgroup.id,
+                agent_id=uuid.uuid4(),
+                agent_fingerprint="live-dns-fp",
+                pending_approval=False,
+            ),
+        ]
+    )
+    await db_session.commit()
+    live_id = live.id
+    snap = await ident.snapshot(str(settings.database_url))
+    assert snap is not None
+
+    # The replay: the archive's group, its row for the same host, and an
+    # unrelated server whose name happens to match nothing of ours.
+    old = _appliance("node1", cert_pem="OLD")
+    await _replay_with(db_session, [old], _ca("ARCHIVE-CA"))
+    await db_session.execute(delete(DHCPServer))
+    await db_session.execute(delete(DNSServer))
+    await db_session.commit()
+    ng = DNSServerGroup(name="ns")
+    dg2 = DHCPServerGroup(name="g2")
+    db_session.add_all([ng, dg2])
+    await db_session.flush()
+    db_session.add_all(
+        [
+            DHCPServer(
+                name="node1",
+                driver="kea",
+                host="node1",
+                appliance_id=old.id,
+                server_group_id=dg2.id,
+                agent_id=uuid.uuid4(),
+                agent_approved=False,
+                agent_fingerprint="archive-fp",
+            ),
+            DHCPServer(
+                name="other",
+                driver="kea",
+                host="other",
+                appliance_id=None,
+                agent_id=uuid.uuid4(),
+                agent_approved=False,
+                agent_fingerprint="other-fp",
+            ),
+            DNSServer(
+                name="node1",
+                driver="bind9",
+                host="node1",
+                appliance_id=old.id,
+                group_id=ng.id,
+                agent_id=uuid.uuid4(),
+                agent_fingerprint="archive-dns-fp",
+                pending_approval=True,
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    await ident.adopt(str(settings.database_url), snap)
+
+    db_session.expire_all()
+    dhcp = {r.name: r for r in (await db_session.execute(select(DHCPServer))).scalars()}
+    assert dhcp["node1"].appliance_id == live_id
+    assert dhcp["node1"].agent_fingerprint == "live-fp"
+    assert dhcp["node1"].agent_id == live_agent
+    assert dhcp["node1"].agent_approved is True
+    # A hostname the live appliance does not own is the archive's, untouched.
+    assert dhcp["other"].agent_fingerprint == "other-fp" and dhcp["other"].agent_approved is False
+    dns = (await db_session.execute(select(DNSServer))).scalar_one()
+    assert dns.agent_fingerprint == "live-dns-fp" and dns.pending_approval is False

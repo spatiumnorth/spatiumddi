@@ -23,6 +23,10 @@ rewrap (:func:`adopt`):
   the same host (same hostname, another identity: the appliance was
   reinstalled) is dropped, or the fleet would count the node twice.
 
+* the agent identity (fingerprint, id, approval) of the live appliances' DHCP
+  and DNS server rows, put on the restored rows of the same appliance, so the
+  agent's next register is not read as a changed fingerprint.
+
 A restore onto the *same* install finds its own ids in the archive and
 changes nothing. Rows are copied by ``json_populate_recordset`` into the
 table's own row type, so a column added later needs no change here, and bytea
@@ -54,6 +58,12 @@ class IdentitySnapshot:
     appliances: list[dict[str, Any]]
     dns_group_names: dict[str, str]
     dhcp_group_names: dict[str, str]
+    # The live appliances' own DHCP / DNS server rows: the agent identity each
+    # one registered with. Without it the restored row (install 1's, matched
+    # by hostname) keeps install 1's fingerprint and the agent's next register
+    # reads as a fingerprint change.
+    dhcp_servers: list[dict[str, Any]] = field(default_factory=list)
+    dns_servers: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -121,9 +131,85 @@ async def snapshot(db_url: str) -> IdentitySnapshot | None:
                 r[0]: r[1]
                 for r in (await conn.execute(text("SELECT id::text, name FROM dhcp_server_group")))
             }
-        return IdentitySnapshot(ca_json, rows, dns, dhcp)
+            dhcp_servers = [
+                dict(r._mapping)
+                for r in await conn.execute(
+                    text(
+                        "SELECT name, appliance_id::text AS appliance_id, "
+                        "agent_id::text AS agent_id, agent_fingerprint, agent_approved "
+                        "FROM dhcp_server WHERE agent_fingerprint IS NOT NULL AND appliance_id IN "
+                        "(SELECT id FROM appliance WHERE revoked_at IS NULL)"
+                    )
+                )
+            ]
+            dns_servers = [
+                dict(r._mapping)
+                for r in await conn.execute(
+                    text(
+                        "SELECT name, appliance_id::text AS appliance_id, "
+                        "agent_id::text AS agent_id, agent_fingerprint, pending_approval "
+                        "FROM dns_server WHERE agent_fingerprint IS NOT NULL AND appliance_id IN "
+                        "(SELECT id FROM appliance WHERE revoked_at IS NULL)"
+                    )
+                )
+            ]
+        return IdentitySnapshot(ca_json, rows, dns, dhcp, dhcp_servers, dns_servers)
     finally:
         await engine.dispose()
+
+
+_SERVER_CARRY = (
+    (
+        "dhcp_server",
+        "dhcp_servers",
+        "agent_approved",
+    ),
+    (
+        "dns_server",
+        "dns_servers",
+        "pending_approval",
+    ),
+)
+
+
+async def _carry_agent_identity(conn: Any, snap: IdentitySnapshot, live_ids: set[str]) -> None:
+    """Put the live agent identity on the restored server rows of an adopted
+    appliance (#4677).
+
+    The agent registers onto the restored row matched by hostname, whose stored
+    fingerprint is the archive install's. DHCP then sets ``agent_approved``
+    false, and the config long-poll answers pending until an operator approves
+    (DNS does the same when the approval gate is on). The row of the *adopted*
+    appliance (``appliance_id``, already re-pointed at the live row) with the
+    live server's name takes the live fingerprint, agent id and approval, so
+    the agent's register finds no change. Only those rows: the anti-hijack
+    rule in the register handlers is untouched, and a hostname match to some
+    other appliance's archive row is never rewritten."""
+    for table, attr, flag in _SERVER_CARRY:
+        for srv in getattr(snap, attr):
+            if str(srv["appliance_id"]) not in live_ids:
+                continue
+            try:
+                async with conn.begin_nested():
+                    await conn.execute(
+                        text(
+                            f"UPDATE {table} SET agent_fingerprint = :fp, "  # noqa: S608
+                            f"agent_id = CAST(:aid AS uuid), {flag} = :flag "
+                            "WHERE appliance_id = CAST(:app AS uuid) "
+                            "AND lower(name) = lower(:name)"
+                        ),
+                        {
+                            "fp": srv["agent_fingerprint"],
+                            "aid": srv["agent_id"],
+                            "flag": srv[flag],
+                            "app": str(srv["appliance_id"]),
+                            "name": srv["name"],
+                        },
+                    )
+            except Exception as exc:  # noqa: BLE001 — the agent just registers afresh
+                logger.warning(
+                    "backup_restore_agent_identity_carry_failed", table=table, error=str(exc)
+                )
 
 
 async def adopt(db_url: str, snap: IdentitySnapshot) -> AdoptionOutcome:
@@ -171,6 +257,7 @@ async def adopt(db_url: str, snap: IdentitySnapshot) -> AdoptionOutcome:
             # Another archive row holding a live fingerprint is dropped first
             # (the column is unique).
             present = [a for a in snap.appliances if str(a["id"]) in existing]
+            kept_ids_now = {str(a["id"]) for a in present}
             if present:
                 present_ids = [str(a["id"]) for a in present]
                 for rid, (fp, _host) in existing.items():
@@ -199,6 +286,7 @@ async def adopt(db_url: str, snap: IdentitySnapshot) -> AdoptionOutcome:
                 out.refreshed = sorted(str(r[0]) for r in refreshed)
             if not todo:
                 # The same install: the archive carries the running rows.
+                await _carry_agent_identity(conn, snap, kept_ids_now)
                 if out.refreshed or out.ca_replaced:
                     out.warnings.append(_warning([], out))
                 return out
@@ -289,6 +377,7 @@ async def adopt(db_url: str, snap: IdentitySnapshot) -> AdoptionOutcome:
                 await conn.execute(
                     text("DELETE FROM appliance WHERE id = CAST(:i AS uuid)"), {"i": old_id}
                 )
+            await _carry_agent_identity(conn, snap, adopted_ids | kept_ids)
         out.warnings.append(_warning([str(a["hostname"]) for a in out.adopted], out))
         if out.ca_replaced and out.archive_only:
             out.warnings.append(
