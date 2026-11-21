@@ -41,6 +41,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.dhcp._audit import write_audit
+from app.api.v1.dns.router import (
+    ENCRYPTED_LISTENER_OPTION_FIELDS as _ENCRYPTED_LISTENER_OPTION_FIELDS,
+)
+from app.api.v1.dns.router import NULLABLE_OPTION_FIELDS as _NULLABLE_OPTION_FIELDS
+from app.api.v1.dns.router import ServerOptionsUpdate as _ServerOptionsUpdate
+from app.api.v1.dns.router import TrustAnchorCreate as _TrustAnchorCreate
 from app.core import maintenance_mode
 from app.core.config_text import has_control_chars, reject_control_chars
 from app.core.permissions import is_effective_superadmin
@@ -1370,6 +1376,267 @@ register(
         args_model=SetZoneUpdateAclArgs,
         preview=_preview_set_zone_update_acl,
         apply=_apply_set_zone_update_acl,
+        category="dns",
+        requires_superadmin=True,
+    )
+)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# DNS server-group options + DNSSEC trust anchors (#4429)
+# ══════════════════════════════════════════════════════════════════════
+#
+# The REST twins are superadmin-only, and every refusal they make (per-driver
+# gates, transport sanity, the #3560 / #3609 anchor rules) lives in helpers the
+# route and these operations share, so a proposal is refused for what the PUT /
+# POST / DELETE refuses and never stores a value the route would not.
+
+
+def _http_detail(exc: Any) -> str:
+    detail = exc.detail
+    if isinstance(detail, dict):
+        return str(detail.get("message") or detail)
+    return str(detail)
+
+
+class UpdateDnsGroupOptionsArgs(_ServerOptionsUpdate):
+    """The REST ``PUT /dns/groups/{id}/options`` body plus the group.
+
+    Only the fields that are set change. A field whose "unset" is a real value
+    (the RRL / client limits, the TLS certificate, the upstream TLS hostname)
+    goes in ``clear`` to return to its default.
+    """
+
+    group_id: uuid.UUID
+    clear: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Nullable options to clear back to their default: "
+            + ", ".join(_NULLABLE_OPTION_FIELDS)
+            + "."
+        ),
+    )
+
+
+def _options_body(args: UpdateDnsGroupOptionsArgs) -> Any:
+    """The router's validated body. The persisted args hold every field with
+    None for unset, so null means "leave alone" here and ``clear`` is the only
+    way to ask for a clear, which survives the proposal's round-trip."""
+    bad = sorted(set(args.clear) - set(_NULLABLE_OPTION_FIELDS))
+    if bad:
+        raise ValueError(
+            f"cannot clear {', '.join(bad)}; clearable: {list(_NULLABLE_OPTION_FIELDS)}"
+        )
+    data = args.model_dump(exclude_none=True, exclude={"group_id", "clear"})
+    data.update(dict.fromkeys(args.clear))
+    return _ServerOptionsUpdate(**data)
+
+
+async def _preview_update_dns_group_options(
+    db: AsyncSession, user: User, args: UpdateDnsGroupOptionsArgs
+) -> PreviewResult:
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    from app.api.v1.dns import router as dns_router  # noqa: PLC0415
+
+    if (blocked := _superadmin_preview_block(user)) is not None:
+        return blocked
+    try:
+        body = _options_body(args)
+    except ValueError as exc:
+        return PreviewResult(ok=False, detail=str(exc))
+    # Stage inside a savepoint and roll it back: the preview runs the PUT's own
+    # checks, including the ones that need the merged row, and keeps nothing.
+    nested = await db.begin_nested()
+    try:
+        _opts, changes, before = await dns_router._stage_options_update(  # noqa: SLF001
+            args.group_id, body, db
+        )
+        summary = ", ".join(f"{k}: {before.get(k)!r} -> {v!r}" for k, v in sorted(changes.items()))
+    except HTTPException as exc:
+        return PreviewResult(ok=False, detail=_http_detail(exc))
+    finally:
+        await nested.rollback()
+    if not changes:
+        return PreviewResult(ok=False, detail="No option is set; nothing to change.")
+    return PreviewResult(
+        ok=True,
+        detail="ready",
+        preview_text=f"Update DNS server-group options for group {args.group_id}: {summary}",
+    )
+
+
+async def _apply_update_dns_group_options(
+    db: AsyncSession, user: User, args: UpdateDnsGroupOptionsArgs
+) -> dict[str, Any]:
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    from app.api.v1.dns import router as dns_router  # noqa: PLC0415
+    from app.core.agent_wake import collect_wake, dns_group_channel  # noqa: PLC0415
+
+    _require_superadmin(user)
+    body = _options_body(args)
+    try:
+        opts, changes, _before = await dns_router._stage_options_update(  # noqa: SLF001
+            args.group_id, body, db
+        )
+    except HTTPException as exc:
+        raise ValueError(_http_detail(exc)) from exc
+    write_audit(
+        db,
+        user=user,
+        action="update",
+        resource_type="dns_server_options",
+        resource_id=str(opts.id),
+        resource_display=f"options for group {args.group_id}",
+        new_value={"via": "ai_proposal", "changed_fields": sorted(changes)},
+    )
+    collect_wake(dns_group_channel(args.group_id))
+    if any(f in changes for f in _ENCRYPTED_LISTENER_OPTION_FIELDS):
+        await dns_router._collect_appliance_wakes_for_dns_group(db, args.group_id)  # noqa: SLF001
+    await db.commit()
+    return {"group_id": str(args.group_id), "changed_fields": sorted(changes)}
+
+
+register(
+    Operation(
+        name="update_dns_group_options",
+        description="Update a DNS server group's options (ACLs, forwarders, transports, RRL).",
+        args_model=UpdateDnsGroupOptionsArgs,
+        preview=_preview_update_dns_group_options,
+        apply=_apply_update_dns_group_options,
+        category="dns",
+        requires_superadmin=True,
+    )
+)
+
+
+class AddDnsTrustAnchorArgs(_TrustAnchorCreate):
+    """The REST ``POST /dns/groups/{id}/options/trust-anchors`` body plus the group."""
+
+    group_id: uuid.UUID
+
+
+async def _preview_add_dns_trust_anchor(
+    db: AsyncSession, user: User, args: AddDnsTrustAnchorArgs
+) -> PreviewResult:
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    from app.api.v1.dns import router as dns_router  # noqa: PLC0415
+
+    if (blocked := _superadmin_preview_block(user)) is not None:
+        return blocked
+    try:
+        await dns_router._check_trust_anchor_add(  # noqa: SLF001
+            args.group_id, _TrustAnchorCreate(**args.model_dump(exclude={"group_id"})), db
+        )
+    except HTTPException as exc:
+        return PreviewResult(ok=False, detail=_http_detail(exc))
+    kind = "initial-key" if args.is_initial_key else "static-key"
+    return PreviewResult(
+        ok=True,
+        detail="ready",
+        preview_text=(
+            f"Add {kind} trust anchor {args.zone_name} (key tag {args.key_tag}, "
+            f"algorithm {args.algorithm}) to DNS group {args.group_id}"
+        ),
+    )
+
+
+async def _apply_add_dns_trust_anchor(
+    db: AsyncSession, user: User, args: AddDnsTrustAnchorArgs
+) -> dict[str, Any]:
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    from app.api.v1.dns import router as dns_router  # noqa: PLC0415
+
+    _require_superadmin(user)
+    try:
+        anchor = await dns_router._stage_trust_anchor_add(  # noqa: SLF001
+            args.group_id,
+            _TrustAnchorCreate(**args.model_dump(exclude={"group_id"})),
+            db,
+            user,
+        )
+    except HTTPException as exc:
+        raise ValueError(_http_detail(exc)) from exc
+    await db.commit()
+    return {
+        "id": str(anchor.id),
+        "group_id": str(args.group_id),
+        "zone_name": anchor.zone_name,
+        "key_tag": anchor.key_tag,
+    }
+
+
+register(
+    Operation(
+        name="add_dns_trust_anchor",
+        description="Add a DNSSEC trust anchor to a DNS server group (BIND9).",
+        args_model=AddDnsTrustAnchorArgs,
+        preview=_preview_add_dns_trust_anchor,
+        apply=_apply_add_dns_trust_anchor,
+        category="dns",
+        requires_superadmin=True,
+    )
+)
+
+
+class DeleteDnsTrustAnchorArgs(BaseModel):
+    group_id: uuid.UUID
+    anchor_id: uuid.UUID
+
+
+async def _preview_delete_dns_trust_anchor(
+    db: AsyncSession, user: User, args: DeleteDnsTrustAnchorArgs
+) -> PreviewResult:
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    from app.api.v1.dns import router as dns_router  # noqa: PLC0415
+
+    if (blocked := _superadmin_preview_block(user)) is not None:
+        return blocked
+    try:
+        anchor = await dns_router._load_deletable_trust_anchor(  # noqa: SLF001
+            args.group_id, args.anchor_id, db
+        )
+    except HTTPException as exc:
+        return PreviewResult(ok=False, detail=_http_detail(exc))
+    return PreviewResult(
+        ok=True,
+        detail="ready",
+        preview_text=(
+            f"Delete trust anchor {anchor.zone_name} (key tag {anchor.key_tag}) "
+            f"from DNS group {args.group_id}"
+        ),
+    )
+
+
+async def _apply_delete_dns_trust_anchor(
+    db: AsyncSession, user: User, args: DeleteDnsTrustAnchorArgs
+) -> dict[str, Any]:
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    from app.api.v1.dns import router as dns_router  # noqa: PLC0415
+
+    _require_superadmin(user)
+    try:
+        anchor = await dns_router._stage_trust_anchor_delete(  # noqa: SLF001
+            args.group_id, args.anchor_id, db, user
+        )
+    except HTTPException as exc:
+        raise ValueError(_http_detail(exc)) from exc
+    await db.commit()
+    return {"id": str(args.anchor_id), "zone_name": anchor.zone_name, "deleted": True}
+
+
+register(
+    Operation(
+        name="delete_dns_trust_anchor",
+        description="Delete a DNSSEC trust anchor from a DNS server group.",
+        args_model=DeleteDnsTrustAnchorArgs,
+        preview=_preview_delete_dns_trust_anchor,
+        apply=_apply_delete_dns_trust_anchor,
         category="dns",
         requires_superadmin=True,
     )

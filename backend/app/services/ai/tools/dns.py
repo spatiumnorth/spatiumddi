@@ -31,7 +31,12 @@ from app.models.dns import (
     DNSZoneUpdateAcl,
 )
 from app.services.agents.memory_status import fresh_memory_status
-from app.services.ai.operations_writes import SetZoneUpdateAclArgs
+from app.services.ai.operations_writes import (
+    AddDnsTrustAnchorArgs,
+    DeleteDnsTrustAnchorArgs,
+    SetZoneUpdateAclArgs,
+    UpdateDnsGroupOptionsArgs,
+)
 from app.services.ai.tools.base import register_tool
 from app.services.ai.tools.scope import token_allows_zone, token_zone_ids
 from app.services.dns.agent_instance import duplicate_active as duplicate_agent_active
@@ -1747,6 +1752,169 @@ async def propose_set_zone_update_acl(
     from app.services.ai.tools.proposals import _propose_via  # noqa: PLC0415
 
     return await _propose_via(db=db, user=user, operation_name="set_zone_update_acl", args=args)
+
+
+class FindDnsGroupOptionsArgs(BaseModel):
+    group_id: uuid.UUID = Field(description="UUID of the DNS server group.")
+
+
+@register_tool(
+    name="find_dns_group_options",
+    permission=("read", "dns_group"),
+    description=(
+        "Return a DNS server group's options (#4429), the same answer as the "
+        "REST ``GET /dns/groups/{id}/options``: forwarders and forward policy, "
+        "recursion, DNSSEC validation mode, the query / transfer / notify ACLs "
+        "(allow-query, allow-query-cache, allow-transfer, allow-notify, "
+        "also-notify, blackhole), query logging, RRL, encrypted transports, "
+        "and its trust anchors, plus warnings for stored values a server in "
+        "the group will not apply. A group with no stored options row answers "
+        "with the defaults. Read-only — ``propose_update_dns_group_options`` "
+        "is the matching write."
+    ),
+    args_model=FindDnsGroupOptionsArgs,
+    category="dns",
+    module="core.dns",
+)
+async def find_dns_group_options(
+    db: AsyncSession, user: User, args: FindDnsGroupOptionsArgs
+) -> dict[str, Any]:
+    from app.api.v1.dns import router as dns_router  # noqa: PLC0415
+
+    if await db.get(DNSServerGroup, args.group_id) is None:
+        return {"error": "DNS server group not found", "group_id": str(args.group_id)}
+    opts = await dns_router._load_options(args.group_id, db)  # noqa: SLF001
+    stored = opts is not None
+    if opts is None:
+        opts = dns_router._default_options(args.group_id)  # noqa: SLF001
+    out = await dns_router._options_response(db, args.group_id, opts)  # noqa: SLF001
+    if not stored:
+        out.id = None
+    return out.model_dump(mode="json")
+
+
+class FindDnsTrustAnchorsArgs(BaseModel):
+    group_id: uuid.UUID | None = Field(
+        default=None, description="Filter to one DNS server group UUID. Omit for every group."
+    )
+
+
+@register_tool(
+    name="find_dns_trust_anchors",
+    permission=("read", "dns_group"),
+    description=(
+        "List DNSSEC trust anchors (#4429) per DNS server group: zone, "
+        "algorithm, key tag, public key, whether it is an initial-key (RFC "
+        "5011) or static anchor, and when it was added. Only BIND9 groups "
+        "apply them. Use this to answer 'does the corp group trust the "
+        "internal zone's key?'. Read-only — ``propose_add_dns_trust_anchor`` "
+        "and ``propose_delete_dns_trust_anchor`` are the matching writes."
+    ),
+    args_model=FindDnsTrustAnchorsArgs,
+    category="dns",
+    module="core.dns",
+)
+async def find_dns_trust_anchors(
+    db: AsyncSession, user: User, args: FindDnsTrustAnchorsArgs
+) -> list[dict[str, Any]]:
+    from app.models.dns import DNSTrustAnchor  # noqa: PLC0415
+
+    stmt = (
+        select(DNSTrustAnchor, DNSServerOptions.group_id)
+        .join(DNSServerOptions, DNSTrustAnchor.server_options_id == DNSServerOptions.id)
+        .order_by(DNSServerOptions.group_id, DNSTrustAnchor.zone_name, DNSTrustAnchor.key_tag)
+    )
+    if args.group_id is not None:
+        stmt = stmt.where(DNSServerOptions.group_id == args.group_id)
+    return [
+        {
+            "id": str(a.id),
+            "group_id": str(group_id),
+            "zone_name": a.zone_name,
+            "algorithm": a.algorithm,
+            "key_tag": a.key_tag,
+            "public_key": a.public_key,
+            "is_initial_key": a.is_initial_key,
+            "added_at": a.added_at.isoformat() if a.added_at else None,
+        }
+        for a, group_id in (await db.execute(stmt)).all()
+    ]
+
+
+@register_tool(
+    name="propose_update_dns_group_options",
+    permission=("write", "dns_group"),
+    description=(
+        "Propose changing a DNS server group's options (#4429): ACLs, "
+        "forwarders, recursion, DNSSEC validation, logging, RRL, encrypted "
+        "transports. Only the fields you set change; list a nullable field in "
+        "``clear`` to return it to its default. It goes through the same "
+        "per-driver refusals as the REST PUT. Preview/apply: the model "
+        "proposes, the operator clicks Apply. Group-wide and superadmin-only, "
+        "so this is disabled by default."
+    ),
+    args_model=UpdateDnsGroupOptionsArgs,
+    category="dns",
+    writes=False,  # The propose tool itself is read-only; apply is the write.
+    default_enabled=False,
+    module="core.dns",
+)
+async def propose_update_dns_group_options(
+    db: AsyncSession, user: User, args: UpdateDnsGroupOptionsArgs
+) -> dict[str, Any]:
+    from app.services.ai.tools.proposals import _propose_via  # noqa: PLC0415
+
+    return await _propose_via(
+        db=db, user=user, operation_name="update_dns_group_options", args=args
+    )
+
+
+@register_tool(
+    name="propose_add_dns_trust_anchor",
+    permission=("write", "dns_group"),
+    description=(
+        "Propose adding a DNSSEC trust anchor to a BIND9 DNS server group "
+        "(#4429). The root zone must be an initial-key anchor. Preview/apply: "
+        "the model proposes, the operator clicks Apply. A trust anchor decides "
+        "what the group's resolvers validate against and is superadmin-only, "
+        "so this is disabled by default."
+    ),
+    args_model=AddDnsTrustAnchorArgs,
+    category="dns",
+    writes=False,  # The propose tool itself is read-only; apply is the write.
+    default_enabled=False,
+    module="core.dns",
+)
+async def propose_add_dns_trust_anchor(
+    db: AsyncSession, user: User, args: AddDnsTrustAnchorArgs
+) -> dict[str, Any]:
+    from app.services.ai.tools.proposals import _propose_via  # noqa: PLC0415
+
+    return await _propose_via(db=db, user=user, operation_name="add_dns_trust_anchor", args=args)
+
+
+@register_tool(
+    name="propose_delete_dns_trust_anchor",
+    permission=("write", "dns_group"),
+    description=(
+        "Propose deleting a DNSSEC trust anchor from a DNS server group "
+        "(#4429), by the anchor id ``find_dns_trust_anchors`` returns. Refused "
+        "for the last anchor of a group validating with ``yes``. Preview/apply: "
+        "the model proposes, the operator clicks Apply. Superadmin-only, so "
+        "this is disabled by default."
+    ),
+    args_model=DeleteDnsTrustAnchorArgs,
+    category="dns",
+    writes=False,  # The propose tool itself is read-only; apply is the write.
+    default_enabled=False,
+    module="core.dns",
+)
+async def propose_delete_dns_trust_anchor(
+    db: AsyncSession, user: User, args: DeleteDnsTrustAnchorArgs
+) -> dict[str, Any]:
+    from app.services.ai.tools.proposals import _propose_via  # noqa: PLC0415
+
+    return await _propose_via(db=db, user=user, operation_name="delete_dns_trust_anchor", args=args)
 
 
 class FindDNSEncryptedTransportsArgs(BaseModel):

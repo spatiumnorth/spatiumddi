@@ -106,6 +106,7 @@ from app.drivers.dns.base import DynamicUpdateCaps, UpdateAclConflictError, Upda
 from app.drivers.dns.windows import test_winrm_credentials
 from app.models.appliance import ApplianceCertificate
 from app.models.audit import AuditLog
+from app.models.auth import User
 from app.models.dns import (
     DEFAULT_ALLOW_RECURSION,
     DNS_TTL_MAX,
@@ -4858,10 +4859,45 @@ def _refuse_plain_port_forwarders_on_encrypted(
         )
 
 
-@router.put("/groups/{group_id}/options", response_model=ServerOptionsResponse)
-async def update_options(
-    group_id: uuid.UUID, body: ServerOptionsUpdate, db: DB, current_user: SuperAdmin
-) -> ServerOptionsResponse:
+#: Option fields whose change also alters the appliance firewall's role
+#: assignment, so the update wakes the appliance channel (#50). Shared with the
+#: MCP ``update_dns_group_options`` apply.
+ENCRYPTED_LISTENER_OPTION_FIELDS = (
+    "dot_enabled",
+    "dot_port",
+    "doh_enabled",
+    "doh_port",
+    "doq_enabled",
+    "doq_port",
+    "tls_certificate_id",
+)
+
+#: Option fields where an explicit null means "clear back to the default", which
+#: ``update_options`` re-injects past ``exclude_none``.
+NULLABLE_OPTION_FIELDS = (
+    "rrl_qps_scale",
+    "tcp_clients",
+    "clients_per_query",
+    "max_clients_per_query",
+    "dnsdist_max_qps_per_client",
+    "dnsdist_dynblock_qps",
+    "tls_certificate_id",
+    "forward_tls_hostname",
+)
+
+
+async def _stage_options_update(
+    group_id: uuid.UUID, body: ServerOptionsUpdate, db: DB
+) -> tuple[DNSServerOptions, dict[str, Any], dict[str, Any]]:
+    """Validate ``body`` against the group and stage it on the options row.
+
+    Everything the PUT refuses (per-driver gates, transport sanity, the
+    #3560 anchor rule, response logging) is decided here, so the MCP
+    ``update_dns_group_options`` operation previews and applies through the
+    same code. Flushes a new row but never audits or commits: the caller
+    does, or rolls the session back for a dry run. Returns the row, the
+    changes applied and the values they replaced.
+    """
     await _require_group(group_id, db)
     opts = await _load_options(group_id, db)
     stored_opts = opts
@@ -4883,19 +4919,9 @@ async def update_options(
     # operator explicitly sent null (mirrors the update_zone color /
     # dnssec_policy_id pattern). Without this an amplification limit can never
     # be removed via the UI/API once set (issue #146 review finding).
-    for field in (
-        "rrl_qps_scale",
-        "tcp_clients",
-        "clients_per_query",
-        "max_clients_per_query",
-        "dnsdist_max_qps_per_client",
-        "dnsdist_dynblock_qps",
-        # Issue #50 — clearing the cert (un-linking it before deleting the
-        # cert row) and clearing the upstream hostname both have to survive
-        # exclude_none, same as the knobs above.
-        "tls_certificate_id",
-        "forward_tls_hostname",
-    ):
+    # (Issue #50 — clearing the cert, to unlink it before deleting the cert
+    # row, and the upstream hostname are in the list for the same reason.)
+    for field in NULLABLE_OPTION_FIELDS:
         if field in body.model_fields_set and getattr(body, field) is None:
             changes[field] = None
     if await technitium_api_scope.group_is_technitium_api(db, group_id):
@@ -4970,7 +4996,14 @@ async def update_options(
             )
         opts.response_log_enabled = False
         changes["response_log_enabled"] = False
+    return opts, changes, before
 
+
+@router.put("/groups/{group_id}/options", response_model=ServerOptionsResponse)
+async def update_options(
+    group_id: uuid.UUID, body: ServerOptionsUpdate, db: DB, current_user: SuperAdmin
+) -> ServerOptionsResponse:
+    opts, changes, before = await _stage_options_update(group_id, body, db)
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -4991,18 +5024,7 @@ async def update_options(
     # the firewall waits for the next heartbeat interval, leaving the listener
     # up on a port nftables still drops. Cross-cutting pattern #2: a
     # per-appliance desired-state change wakes the appliance channel too.
-    if any(
-        f in changes
-        for f in (
-            "dot_enabled",
-            "dot_port",
-            "doh_enabled",
-            "doh_port",
-            "doq_enabled",
-            "doq_port",
-            "tls_certificate_id",
-        )
-    ):
+    if any(f in changes for f in ENCRYPTED_LISTENER_OPTION_FIELDS):
         await _collect_appliance_wakes_for_dns_group(db, group_id)
     await db.commit()
     reloaded = await _load_options(group_id, db)
@@ -5010,14 +5032,10 @@ async def update_options(
     return await _options_response(db, group_id, reloaded)
 
 
-@router.post(
-    "/groups/{group_id}/options/trust-anchors",
-    response_model=TrustAnchorResponse,
-    status_code=201,
-)
-async def add_trust_anchor(
-    group_id: uuid.UUID, body: TrustAnchorCreate, db: DB, current_user: SuperAdmin
-) -> DNSTrustAnchor:
+async def _check_trust_anchor_add(group_id: uuid.UUID, body: TrustAnchorCreate, db: DB) -> None:
+    """The refusals of ``POST …/options/trust-anchors``, shared with the MCP
+    ``add_dns_trust_anchor`` operation so a proposal is refused for what the
+    route refuses. Raises HTTPException; writes nothing."""
     await _require_group(group_id, db)
     # #3609: a static root anchor is never right — BIND refuses it under
     # ``auto`` and it breaks at the next root key rollover under ``yes``.
@@ -5033,6 +5051,27 @@ async def add_trust_anchor(
             + ", ".join(others)
             + " server, which would ignore them. Use a group of BIND9 servers.",
         )
+
+
+@router.post(
+    "/groups/{group_id}/options/trust-anchors",
+    response_model=TrustAnchorResponse,
+    status_code=201,
+)
+async def add_trust_anchor(
+    group_id: uuid.UUID, body: TrustAnchorCreate, db: DB, current_user: SuperAdmin
+) -> DNSTrustAnchor:
+    anchor = await _stage_trust_anchor_add(group_id, body, db, current_user)
+    await db.commit()
+    await db.refresh(anchor)
+    return anchor
+
+
+async def _stage_trust_anchor_add(
+    group_id: uuid.UUID, body: TrustAnchorCreate, db: DB, current_user: User
+) -> DNSTrustAnchor:
+    """Refuse or add the anchor, audit it and queue the wake; the caller commits."""
+    await _check_trust_anchor_add(group_id, body, db)
     result = await db.execute(select(DNSServerOptions).where(DNSServerOptions.group_id == group_id))
     opts = result.scalar_one_or_none()
     if not opts:
@@ -5068,15 +5107,15 @@ async def add_trust_anchor(
         )
     )
     collect_wake(dns_group_channel(group_id))
-    await db.commit()
-    await db.refresh(anchor)
     return anchor
 
 
-@router.delete("/groups/{group_id}/options/trust-anchors/{anchor_id}", status_code=204)
-async def delete_trust_anchor(
-    group_id: uuid.UUID, anchor_id: uuid.UUID, db: DB, current_user: SuperAdmin
-) -> None:
+async def _load_deletable_trust_anchor(
+    group_id: uuid.UUID, anchor_id: uuid.UUID, db: DB
+) -> DNSTrustAnchor:
+    """Find the anchor and apply the refusals of ``DELETE …/trust-anchors/{id}``,
+    shared with the MCP ``delete_dns_trust_anchor`` operation. Raises
+    HTTPException; writes nothing."""
     await _require_group(group_id, db)
     result = await db.execute(
         select(DNSTrustAnchor)
@@ -5102,6 +5141,22 @@ async def delete_trust_anchor(
                 "removing this one."
             ),
         )
+    return anchor
+
+
+@router.delete("/groups/{group_id}/options/trust-anchors/{anchor_id}", status_code=204)
+async def delete_trust_anchor(
+    group_id: uuid.UUID, anchor_id: uuid.UUID, db: DB, current_user: SuperAdmin
+) -> None:
+    await _stage_trust_anchor_delete(group_id, anchor_id, db, current_user)
+    await db.commit()
+
+
+async def _stage_trust_anchor_delete(
+    group_id: uuid.UUID, anchor_id: uuid.UUID, db: DB, current_user: User
+) -> DNSTrustAnchor:
+    """Refuse or delete the anchor, audit it and queue the wake; the caller commits."""
+    anchor = await _load_deletable_trust_anchor(group_id, anchor_id, db)
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -5123,7 +5178,7 @@ async def delete_trust_anchor(
     )
     collect_wake(dns_group_channel(group_id))
     await db.delete(anchor)
-    await db.commit()
+    return anchor
 
 
 # ── ACL endpoints ───────────────────────────────────────────────────────────
