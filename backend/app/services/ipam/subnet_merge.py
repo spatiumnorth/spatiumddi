@@ -87,7 +87,10 @@ from app.services.ipam.subnet_dependents import (
     merge_conflicts,
     merge_warnings,
 )
-from app.services.ipam.subnet_placeholders import registry_referenced_ip_ids
+from app.services.ipam.subnet_placeholders import (
+    registry_referenced_ip_ids,
+    untouched_gateway_row,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -172,26 +175,34 @@ def _is_default_placeholder(row: IPAddress) -> bool:
     return True
 
 
-def _is_default_gateway_row(row: IPAddress) -> bool:
-    """The Gateway row create_subnet seeds, untouched (same test as resize)."""
-    return (
-        row.status == "reserved"
-        and row.hostname == "gateway"
-        and row.description == "Gateway"
-        and row.dns_record_id is None
+async def _untouched_gateway_ids(db: AsyncSession, sources: list[Subnet]) -> set[uuid.UUID]:
+    """Ids of the sources' Gateway rows that are still the bare row create made.
+
+    The rule Edit Subnet and the import use (``untouched_gateway_row``, #3042):
+    a row the operator renamed, tagged, gave a MAC, an owner or custom fields
+    is theirs and survives the merge (#4280)."""
+    res = await db.execute(
+        select(IPAddress.id)
+        .join(Subnet, Subnet.id == IPAddress.subnet_id)
+        .where(IPAddress.subnet_id.in_([s.id for s in sources]), untouched_gateway_row())
     )
+    return {i for (i,) in res.all()}
 
 
 def _gateway_plan(
-    sources: list[Subnet], merged: IPNetwork, rows: list[IPAddress]
+    sources: list[Subnet],
+    merged: IPNetwork,
+    rows: list[IPAddress],
+    untouched: set[uuid.UUID],
 ) -> tuple[str | None, set[str]]:
     """``(surviving_gateway, retired_gateway_addresses)`` for a merge (#2976).
 
     One gateway among the sources survives as-is. When they differ, a subnet
     created at the merged prefix would get its gateway at network + 1, so a
     source gateway there wins, and every other source's gateway is retired
-    when it is still the default row create seeded at that source's own
-    network + 1 (an operator-set or renamed gateway is kept, and the merged
+    when it is still the untouched row create seeded at that source's own
+    network + 1 (``untouched`` holds those row ids; an operator-set, renamed or
+    annotated gateway is kept, and the merged
     subnet's gateway field stays empty as before). Otherwise nothing wins.
     """
     gateways: dict[str, Subnet] = {}
@@ -225,7 +236,7 @@ def _gateway_plan(
             row is not None
             and row.subnet_id == src.id
             and gw == str(src_net.network_address + 1)
-            and _is_default_gateway_row(row)
+            and row.id in untouched
         ):
             retired.add(gw)
     return create_gw, retired
@@ -457,7 +468,9 @@ async def preview_subnet_merge(
                 )
             )
 
-        surviving_gw, retired_gw = _gateway_plan(sources, merged, list(host_rows))
+        surviving_gw, retired_gw = _gateway_plan(
+            sources, merged, list(host_rows), await _untouched_gateway_ids(db, sources)
+        )
         if len({str(src.gateway) for src in sources if src.gateway}) > 1:
             if surviving_gw is None:
                 warnings.append(
@@ -468,7 +481,7 @@ async def preview_subnet_merge(
             else:
                 kept = (
                     f"The default Gateway row(s) at {', '.join(sorted(retired_gw))} are retired "
-                    "(one an E911 binding or a device record names is kept)."
+                    "(one an operator edited, or an E911 binding or a device record names, is kept)."
                     if retired_gw
                     else "The other sources' gateway rows were edited and are kept."
                 )
@@ -610,7 +623,10 @@ async def commit_subnet_merge(
         .scalars()
         .all()
     )
-    surviving_gateway, retired_gateways = _gateway_plan(sources, merged_net, source_rows)
+    untouched_gateways = await _untouched_gateway_ids(db, sources)
+    surviving_gateway, retired_gateways = _gateway_plan(
+        sources, merged_net, source_rows, untouched_gateways
+    )
 
     merged_subnet = Subnet(
         space_id=target.space_id,
@@ -691,7 +707,7 @@ async def commit_subnet_merge(
             if (
                 str(row.address) in retired_gateways
                 and row.id not in registry_kept
-                and _is_default_gateway_row(row)
+                and row.id in untouched_gateways
             ):
                 await db.delete(row)
                 retired_gateway_rows += 1

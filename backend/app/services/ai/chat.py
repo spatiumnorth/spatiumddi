@@ -38,6 +38,7 @@ import structlog
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.permissions import user_has_permission
 from app.drivers.llm import get_driver
 from app.drivers.llm.base import (
     ChatMessage,
@@ -202,7 +203,7 @@ their work faster, not to teach them what DDI is.
 * **Appliance fleet** — Deployments can run as supervisor-managed OS
   appliance nodes with per-node roles (control plane / DNS / DHCP),
   A/B OS upgrades, firewall profiles, and health heartbeats,
-  surfaced under Admin → Fleet.
+  surfaced under Appliance → Fleet.
 * **Vertical registries** — Optional modules for AV-over-IP multicast
   flows (Dante / AES67 / SMPTE 2110), BACnet/IP devices + BBMDs,
   industrial-OT devices with Purdue zoning, and DICOM AE titles +
@@ -401,7 +402,7 @@ backup / restore, appliance OS upgrades and reboots. Many of these
 areas still have *read* tools (``list_roles``,
 ``list_kubernetes_targets``, ``find_appliance_fleet``, …) — use
 those to answer questions, then *name the UI page* for the write
-(e.g. "Features & Integrations", "Admin → Roles", "DNS → Zone →
+(e.g. "Features & Integrations", "Administration → Roles", "DNS → Zone →
 Views tab") rather than guessing at the data model.
 
 If you genuinely can't help, say so — and offer the closest
@@ -423,65 +424,74 @@ async def gather_dynamic_context(db: AsyncSession, user: User) -> dict[str, Any]
     system prompt. Pure read-only — runs on session creation only, so
     we trade a few count queries for a markedly more useful first turn.
 
-    Counts are global (the operator is admin in v1); when group-scoped
-    visibility lands we'll filter these by ``user``'s permission set.
+    The context holds only what ``user`` may read: each count appears only
+    when the user has type-level ``read`` on that resource type (the gate
+    the REST list route uses), and the recent activity only with ``read``
+    on ``audit_log``. A user who reads nothing gets an empty context.
     Soft-deleted rows are excluded — those don't exist for the operator.
     """
 
     async def _count(stmt: Any) -> int:
         return int((await db.execute(stmt)).scalar_one() or 0)
 
-    spaces = await _count(
-        select(func.count()).select_from(IPSpace).where(IPSpace.deleted_at.is_(None))
-    )
-    blocks = await _count(
-        select(func.count()).select_from(IPBlock).where(IPBlock.deleted_at.is_(None))
-    )
-    subnets = await _count(
-        select(func.count()).select_from(Subnet).where(Subnet.deleted_at.is_(None))
-    )
-    addresses = await _count(select(func.count()).select_from(IPAddress))
-    dns_groups = await _count(select(func.count()).select_from(DNSServerGroup))
-    dns_zones = await _count(
-        select(func.count()).select_from(DNSZone).where(DNSZone.deleted_at.is_(None))
-    )
-    dns_records = await _count(
-        select(func.count()).select_from(DNSRecord).where(DNSRecord.deleted_at.is_(None))
-    )
-    dhcp_groups = await _count(select(func.count()).select_from(DHCPServerGroup))
-    dhcp_scopes = await _count(
-        select(func.count()).select_from(DHCPScope).where(DHCPScope.deleted_at.is_(None))
-    )
-    devices = await _count(select(func.count()).select_from(NetworkDevice))
-
-    cutoff = datetime.now(UTC) - _RECENT_ACTIVITY_WINDOW
-    recent_audits = (
+    # (key, resource type the REST list route gates on, count statement)
+    families: list[tuple[str, str, Any]] = [
         (
-            await db.execute(
-                select(AuditLog)
-                .where(AuditLog.timestamp >= cutoff)
-                .order_by(desc(AuditLog.timestamp))
-                .limit(_RECENT_ACTIVITY_LIMIT)
-            )
-        )
-        .scalars()
-        .all()
-    )
+            "spaces",
+            "ip_space",
+            select(func.count()).select_from(IPSpace).where(IPSpace.deleted_at.is_(None)),
+        ),
+        (
+            "blocks",
+            "ip_block",
+            select(func.count()).select_from(IPBlock).where(IPBlock.deleted_at.is_(None)),
+        ),
+        (
+            "subnets",
+            "subnet",
+            select(func.count()).select_from(Subnet).where(Subnet.deleted_at.is_(None)),
+        ),
+        ("addresses", "ip_address", select(func.count()).select_from(IPAddress)),
+        ("dns_groups", "dns_group", select(func.count()).select_from(DNSServerGroup)),
+        (
+            "dns_zones",
+            "dns_zone",
+            select(func.count()).select_from(DNSZone).where(DNSZone.deleted_at.is_(None)),
+        ),
+        (
+            "dns_records",
+            "dns_record",
+            select(func.count()).select_from(DNSRecord).where(DNSRecord.deleted_at.is_(None)),
+        ),
+        ("dhcp_groups", "dhcp_server", select(func.count()).select_from(DHCPServerGroup)),
+        (
+            "dhcp_scopes",
+            "dhcp_scope",
+            select(func.count()).select_from(DHCPScope).where(DHCPScope.deleted_at.is_(None)),
+        ),
+        ("devices", "manage_network_devices", select(func.count()).select_from(NetworkDevice)),
+    ]
+    topology: dict[str, int] = {}
+    for key, rtype, stmt in families:
+        if user_has_permission(user, "read", rtype):
+            topology[key] = await _count(stmt)
 
-    return {
-        "topology": {
-            "spaces": spaces,
-            "blocks": blocks,
-            "subnets": subnets,
-            "addresses": addresses,
-            "dns_groups": dns_groups,
-            "dns_zones": dns_zones,
-            "dns_records": dns_records,
-            "dhcp_groups": dhcp_groups,
-            "dhcp_scopes": dhcp_scopes,
-            "devices": devices,
-        },
-        "recent_activity": [
+    recent_activity: list[dict[str, Any]] | None = None
+    if user_has_permission(user, "read", "audit_log"):
+        cutoff = datetime.now(UTC) - _RECENT_ACTIVITY_WINDOW
+        recent_audits = (
+            (
+                await db.execute(
+                    select(AuditLog)
+                    .where(AuditLog.timestamp >= cutoff)
+                    .order_by(desc(AuditLog.timestamp))
+                    .limit(_RECENT_ACTIVITY_LIMIT)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        recent_activity = [
             {
                 "timestamp": ev.timestamp.isoformat() if ev.timestamp else None,
                 "action": ev.action,
@@ -491,8 +501,9 @@ async def gather_dynamic_context(db: AsyncSession, user: User) -> dict[str, Any]
                 "result": ev.result,
             }
             for ev in recent_audits
-        ],
-    }
+        ]
+
+    return {"topology": topology, "recent_activity": recent_activity}
 
 
 def _format_topology_line(topology: dict[str, int]) -> str:
@@ -501,16 +512,20 @@ def _format_topology_line(topology: dict[str, int]) -> str:
     "0 DNS zones · 0 DHCP scopes" on a fresh install.
     """
     parts: list[tuple[str, int]] = [
-        ("space", topology["spaces"]),
-        ("block", topology["blocks"]),
-        ("subnet", topology["subnets"]),
-        ("IP", topology["addresses"]),
-        ("DNS group", topology["dns_groups"]),
-        ("DNS zone", topology["dns_zones"]),
-        ("DNS record", topology["dns_records"]),
-        ("DHCP group", topology["dhcp_groups"]),
-        ("DHCP scope", topology["dhcp_scopes"]),
-        ("network device", topology["devices"]),
+        (label, topology.get(key, 0))
+        for label, key in (
+            ("space", "spaces"),
+            ("block", "blocks"),
+            ("subnet", "subnets"),
+            ("IP", "addresses"),
+            ("DNS group", "dns_groups"),
+            ("DNS zone", "dns_zones"),
+            ("DNS record", "dns_records"),
+            ("DHCP group", "dhcp_groups"),
+            ("DHCP scope", "dhcp_scopes"),
+            ("network device", "devices"),
+        )
+        if key in topology
     ]
     pieces: list[str] = []
     for label, n in parts:
@@ -569,15 +584,21 @@ async def build_system_prompt(
     The dynamic block carries:
         * Who: username + display name.
         * When: today's UTC date.
-        * What: live topology counts (skipping zeros).
-        * What changed: last few audit events.
+        * What: live topology counts (skipping zeros), only for resource
+          types the user may read.
+        * What changed: last few audit events, only with ``read`` on
+          ``audit_log``.
     Total payload is well under 500 tokens for a typical deployment;
     quiet installs come in under 200.
     """
     today = datetime.now(UTC).strftime("%Y-%m-%d")
     ctx = await gather_dynamic_context(db, user)
-    topology_line = _format_topology_line(ctx["topology"])
-    activity_block = _format_recent_activity(ctx["recent_activity"])
+    topology_line = _format_topology_line(ctx["topology"]) if ctx["topology"] else None
+    activity_block = (
+        _format_recent_activity(ctx["recent_activity"])
+        if ctx["recent_activity"] is not None
+        else None
+    )
 
     # Disabled-tool block. Lists every registered tool that's NOT in
     # the effective set, with its one-liner. The model uses this to
@@ -605,10 +626,13 @@ async def build_system_prompt(
         f"- Operator: {user.username!r} (display name {user.display_name!r}).\n"
         f"- Today (UTC): {today}.\n"
         f"- Tools available: {len(tools)}.\n"
-        f"- Topology: {topology_line}.\n"
-        f"\nRecent activity (last 24 h):\n"
-        f"{activity_block}"
-        f"{disabled_block}\n---"
+        + (f"- Topology: {topology_line}.\n" if topology_line is not None else "")
+        + (
+            f"\nRecent activity (last 24 h):\n{activity_block}"
+            if activity_block is not None
+            else ""
+        )
+        + f"{disabled_block}\n---"
     )
     return _resolve_static_prompt(provider) + dynamic
 
@@ -1114,7 +1138,7 @@ class ChatOrchestrator:
                     is_error = True
                 except ToolDisabled as exc:
                     # The operator has disabled this tool in
-                    # Settings → AI → Tool Catalog (or in the
+                    # Administration → AI Tool Catalog (or in the
                     # provider's allowlist). The model picked it
                     # anyway — surface a clear message so it can
                     # explain to the user how to enable it.
