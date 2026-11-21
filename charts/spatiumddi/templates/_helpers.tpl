@@ -829,9 +829,12 @@ URL comes from commonEnv.
         CUR=$(printf '%s\n' "$OUT" | awk '$1 ~ /^[0-9a-f]+$/ {print $1}' | sort | tr '\n' ',')
         if [ -n "$CUR" ] && [ "$CUR" = "$HEADS" ]; then
           # #4678 — a restore replays the archive's head before it migrates
-          # up, so head alone is not enough while one is running. Exit 1
-          # means it is; anything else (no module, no database) passes.
-          if python -m app.core.restore_gate >/dev/null 2>&1; then
+          # up, so head alone is not enough while one is running. Exit 3
+          # means it is; anything else (no module, no database, an error)
+          # passes, so this can only ever add waiting.
+          GATE=0
+          python -m app.core.restore_gate || GATE=$?
+          if [ "$GATE" -ne 3 ]; then
             echo "alembic at head ($CUR)"
             break
           fi

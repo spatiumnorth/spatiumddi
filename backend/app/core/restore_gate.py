@@ -8,8 +8,10 @@ moves on from. The restore holds a session-level advisory lock for the whole
 replay and upgrade (``apply_backup_restore``); the init container asks this
 module whether it is held and keeps waiting while it is.
 
-``python -m app.core.restore_gate`` exits 1 while a restore is running, 0
-otherwise. It fails OPEN on anything it cannot answer (no database yet, no
+``python -m app.core.restore_gate`` exits 3 while a restore is running, 0
+otherwise. Not 1: the interpreter itself exits 1 on an import error or an
+uncaught exception, and the init container must read that as "cannot tell",
+which passes. It fails OPEN on anything it cannot answer (no database yet, no
 asyncpg, an older image without this module): the schema comparison the wait
 already does stays the gate, and this only ever adds waiting.
 """
@@ -32,6 +34,9 @@ RESTORE_LOCK_KEY = zlib.crc32(b"spatiumddi:backup-restore") - 2**31
 #: high half in ``classid`` and its low half in ``objid``, with ``objsubid`` 1.
 #: ``pid IS NOT NULL`` keeps a prepared transaction's lock from turning a
 #: ``NOT IN`` over this into NULL.
+#: Exit status meaning "a restore holds the lock"; every other status passes.
+RESTORE_RUNNING_EXIT = 3
+
 RESTORE_LOCK_HOLDERS_SQL = (
     "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted "
     "AND pid IS NOT NULL AND objsubid = 1 "
@@ -63,7 +68,7 @@ def main() -> int:
         return 0
     dsn = url.replace("postgresql+asyncpg://", "postgresql://", 1)
     try:
-        return 1 if asyncio.run(restore_in_progress(dsn)) else 0
+        return RESTORE_RUNNING_EXIT if asyncio.run(restore_in_progress(dsn)) else 0
     except Exception:  # noqa: BLE001 — fail open, see the module docstring
         return 0
 

@@ -166,3 +166,17 @@ async def test_restore_gate_never_takes_the_lock(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(asyncpg, "connect", _connect)
     assert await restore_gate.restore_in_progress("postgresql://x") is False
     assert queries and not any("advisory_lock" in q for q in queries)
+
+
+def test_restore_gate_signals_a_running_restore_with_its_own_exit_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """3, never 1: the interpreter exits 1 on an import error or a crash, and
+    the init container must read that as "cannot tell", which passes."""
+
+    async def _held(_dsn: str) -> bool:
+        return True
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://u:p@db/x")
+    monkeypatch.setattr(restore_gate, "restore_in_progress", _held)
+    assert restore_gate.main() == restore_gate.RESTORE_RUNNING_EXIT == 3
