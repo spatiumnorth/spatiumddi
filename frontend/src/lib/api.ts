@@ -12861,6 +12861,11 @@ export const applianceTlsApi = {
     api
       .get<ApplianceCertificateDetail>(`/appliance/tls/${id}`)
       .then((r) => r.data),
+  // Public certificate PEM, for a standalone agent's TLS_CA_PATH (#4660).
+  downloadPem: (id: string) =>
+    api
+      .get<string>(`/appliance/tls/${id}/pem`, { responseType: "text" })
+      .then((r) => r.data),
   upload: (body: CertificateUploadPayload) =>
     api
       .post<ApplianceCertificate>("/appliance/tls/upload", body)
