@@ -11177,8 +11177,21 @@ export interface ApiToken {
   blocked_reason?: string | null;
   expires_at: string | null;
   last_used_at: string | null;
+  /** Address of the most recent call, and calls in the last 30 days (#4491);
+   * older servers omit both. Both lag the call by a few minutes. */
+  last_client_ip?: string | null;
+  calls_30d?: number;
   is_active: boolean;
   created_at: string;
+}
+
+/** Calls per UTC day, oldest first, zero-filled (#4491). */
+export interface ApiTokenUsage {
+  token_id: string;
+  days: { day: string; calls: number }[];
+  total: number;
+  last_used_at: string | null;
+  last_client_ip: string | null;
 }
 
 export interface ApiTokenCreate {
@@ -11233,6 +11246,10 @@ export const apiTokensApi = {
   update: (id: string, body: ApiTokenUpdate) =>
     api.patch<ApiToken>(`/api-tokens/${id}`, body).then((r) => r.data),
   delete: (id: string) => api.delete(`/api-tokens/${id}`),
+  usage: (id: string, days = 30) =>
+    api
+      .get<ApiTokenUsage>(`/api-tokens/${id}/usage`, { params: { days } })
+      .then((r) => r.data),
 };
 
 // ── Alerts ─────────────────────────────────────────────────────────────────────
@@ -11767,6 +11784,10 @@ export interface SecurityDashboardSummary {
   api_tokens_total: number;
   api_tokens_expiring_count: number;
   api_tokens_expiring: SecurityDashboardAPITokenRow[];
+  /** Active tokens with no call in ``api_tokens_idle_days`` (#4491);
+   *  older servers omit both. */
+  api_tokens_idle_count?: number;
+  api_tokens_idle_days?: number;
   failed_login_window_hours: number;
   failed_login_total: number;
   failed_login_top_sources: SecurityDashboardFailedLoginRow[];

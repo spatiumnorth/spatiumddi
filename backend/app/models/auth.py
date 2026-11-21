@@ -1,10 +1,11 @@
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import (
     Boolean,
     Column,
+    Date,
     DateTime,
     ForeignKey,
     Index,
@@ -281,6 +282,23 @@ class UserSession(UUIDPrimaryKeyMixin, Base):
     user: Mapped[User] = relationship("User", back_populates="sessions")
 
 
+class APITokenUsageDaily(Base):
+    """Calls made with one API token on one UTC day (#4491).
+
+    Counted in Redis on the request path and folded in here in batches by
+    ``tasks.api_token_usage``; rows older than 90 days are pruned.
+    """
+
+    __tablename__ = "api_token_usage_daily"
+    __table_args__ = (Index("ix_api_token_usage_daily_day", "day"),)
+
+    token_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("api_token.id", ondelete="CASCADE"), primary_key=True
+    )
+    day: Mapped[date] = mapped_column(Date, primary_key=True)
+    calls: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+
+
 class APIToken(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "api_token"
 
@@ -332,6 +350,9 @@ class APIToken(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Address of the most recent call (#4491). Written in batches by
+    # ``tasks.api_token_usage`` from a Redis hash, never on the request path.
+    last_client_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
 
     user: Mapped[User | None] = relationship(
         "User", foreign_keys=[user_id], back_populates="api_tokens"

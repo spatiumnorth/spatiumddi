@@ -204,6 +204,7 @@ celery_app = SpatiumCelery(
         "app.tasks.subnet_utilization_snapshot",
         "app.tasks.reverse_dns",
         "app.tasks.dhcp_lease_history_prune",
+        "app.tasks.api_token_usage",
         "app.tasks.update_check",
         "app.tasks.kubernetes_sync",
         "app.tasks.docker_sync",
@@ -288,6 +289,7 @@ celery_app.conf.update(
         "app.tasks.ipam_discovery.*": {"queue": "ipam"},
         "app.tasks.reverse_dns.*": {"queue": "ipam"},
         "app.tasks.dhcp_lease_history_prune.*": {"queue": "dhcp"},
+        "app.tasks.api_token_usage.*": {"queue": "default"},
         "app.tasks.update_check.*": {"queue": "default"},
         "app.tasks.kubernetes_sync.*": {"queue": "default"},
         "app.tasks.docker_sync.*": {"queue": "default"},
@@ -596,6 +598,12 @@ celery_app.conf.update(
         # Daily at 03:15 UTC, prune DHCPLeaseHistory rows older than the
         # configured retention window (default 90 d). Offset from trash-purge
         # to avoid simultaneous heavy writes.
+        # Every 5 min, fold the Redis API-token call counters into
+        # api_token_usage_daily and prune past 90 d (#4491).
+        "api-token-usage-flush": {
+            "task": "app.tasks.api_token_usage.flush_api_token_usage",
+            "schedule": schedule(run_every=300.0),
+        },
         "dhcp-lease-history-prune": {
             "task": "app.tasks.dhcp_lease_history_prune.prune_lease_history",
             "schedule": crontab(hour=3, minute=15),

@@ -642,6 +642,20 @@ _SPECS: list[tuple[str, str, str, list[ParamSpec]]] = [
     # ── Security / certificates ────────────────────────────────────────
     (a.RULE_TYPE_SECRET_EXPIRING, "Secret / certificate expiring", "Security", [_expiry()]),
     (
+        a.RULE_TYPE_API_TOKEN_UNUSED,
+        "API token unused",
+        "Security",
+        [
+            _days(
+                "Idle window (days)",
+                90,
+                "An active API token with no call for longer than this is reported; "
+                "a token never used counts from its creation date. Revoked and "
+                "expired tokens are ignored.",
+            )
+        ],
+    ),
+    (
         a.RULE_TYPE_K3S_API_CERT_EXPIRING,
         "k3s API server certificate expiring",
         "Security",

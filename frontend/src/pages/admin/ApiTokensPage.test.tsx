@@ -5,6 +5,7 @@
  * operator step-up. The page offers Re-enable only to a superadmin, asks for
  * the step-up before sending, and asks before Revoke (#4212).
  */
+import { isIdleToken } from "@/lib/apiTokenIdle";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   act,
@@ -22,12 +23,13 @@ const list = vi.fn();
 const update = vi.fn();
 const create = vi.fn();
 const myPermissions = vi.fn();
+const usage = vi.fn();
 
 vi.mock("@/lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api")>();
   return {
     ...actual,
-    apiTokensApi: { ...actual.apiTokensApi, list, update, create },
+    apiTokensApi: { ...actual.apiTokensApi, list, update, create, usage },
     authApi: { ...actual.authApi, myPermissions },
   };
 });
@@ -286,5 +288,101 @@ describe("Delete API Token refusal (#3822)", () => {
       ),
     );
     await waitFor(() => expect(list.mock.calls.length).toBeGreaterThan(calls));
+  });
+});
+
+describe("API token usage and idle filter (#4491)", () => {
+  it("classifies idle tokens, counting a never-used one from creation", () => {
+    const now = Date.parse("2026-11-19T00:00:00Z");
+    expect(
+      isIdleToken(
+        { last_used_at: "2026-11-18T00:00:00Z", created_at: "2026-01-01Z" },
+        90,
+        now,
+      ),
+    ).toBe(false);
+    expect(
+      isIdleToken(
+        { last_used_at: "2026-01-01T00:00:00Z", created_at: "2025-01-01Z" },
+        90,
+        now,
+      ),
+    ).toBe(true);
+    expect(
+      isIdleToken(
+        { last_used_at: null, created_at: "2026-11-10T00:00:00Z" },
+        90,
+        now,
+      ),
+    ).toBe(false);
+    expect(
+      isIdleToken(
+        { last_used_at: null, created_at: "2026-01-01T00:00:00Z" },
+        90,
+        now,
+      ),
+    ).toBe(true);
+  });
+
+  it("shows the last client address and call count, and filters idle", async () => {
+    myPermissions.mockResolvedValue({ is_superadmin: true, grants: [] });
+    list.mockResolvedValue([
+      {
+        ...token("t-busy", "busy-token", true),
+        last_used_at: new Date().toISOString(),
+        last_client_ip: "198.51.100.4",
+        calls_30d: 1234,
+      },
+      {
+        ...token("t-old", "old-token", true),
+        created_at: "2025-01-01T00:00:00Z",
+      },
+    ]);
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <ApiTokensPage />
+      </QueryClientProvider>,
+    );
+    await screen.findByText("busy-token");
+    expect(screen.getByText("198.51.100.4")).toBeTruthy();
+    expect(screen.getByText(/1,234 calls/)).toBeTruthy();
+    fireEvent.click(screen.getByLabelText(/Idle only/));
+    expect(screen.queryByText("busy-token")).toBeNull();
+    expect(screen.getByText("old-token")).toBeTruthy();
+  });
+
+  it("opens a per-token usage chart over the usage endpoint", async () => {
+    myPermissions.mockResolvedValue({ is_superadmin: true, grants: [] });
+    list.mockResolvedValue([token("t-busy", "busy-token", true)]);
+    usage.mockResolvedValue({
+      token_id: "t-busy",
+      days: [
+        { day: "2026-11-17", calls: 3 },
+        { day: "2026-11-18", calls: 0 },
+      ],
+      total: 3,
+      last_used_at: "2026-11-17T10:00:00Z",
+      last_client_ip: "198.51.100.4",
+    });
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <ApiTokensPage />
+      </QueryClientProvider>,
+    );
+    await screen.findByText("busy-token");
+    expect(usage).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTitle("Usage"));
+    await waitFor(() => expect(usage).toHaveBeenCalledWith("t-busy", 30));
+    expect((await screen.findByTestId("usage-total")).textContent).toContain(
+      "3 calls in the last 30 days",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "90d" }));
+    await waitFor(() => expect(usage).toHaveBeenCalledWith("t-busy", 90));
   });
 });

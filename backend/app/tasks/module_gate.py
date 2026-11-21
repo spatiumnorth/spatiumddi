@@ -122,6 +122,9 @@ UNGATED_BEAT_TASKS: Final[dict[str, str]] = {
     "app.tasks.update_check.check_github_release": (
         "core: own opt-out (Settings → Updates), documented in PRIVACY.md §3.1"
     ),
+    "app.tasks.api_token_usage.flush_api_token_usage": (
+        "core auth: folds API-token usage counters; API tokens are not a module"
+    ),
     "app.tasks.oui_update.auto_update_oui_database": "core IPAM: own opt-in setting",
     "app.tasks.influxdb_push.push_influxdb_metrics": (
         "not a feature module by decision (#889): off is enabled=false on the target row"

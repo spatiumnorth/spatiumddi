@@ -34,9 +34,9 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, or_, select
 
 from app.api.deps import DB, CurrentUser
 from app.api.stepup import require_operator_stepup
@@ -49,7 +49,7 @@ from app.core.permissions import (
 from app.core.security import generate_api_token
 from app.models.appliance import ApplianceCertificate
 from app.models.audit import AuditLog
-from app.models.auth import APIToken, User
+from app.models.auth import APIToken, APITokenUsageDaily, User
 from app.models.dns import DNSZone
 from app.models.ipam import Subnet
 from app.services.api_token_scopes import validate_resource_grant_shape, validate_scopes
@@ -136,6 +136,10 @@ class ApiTokenResponse(BaseModel):
     blocked_reason: str | None = None
     expires_at: datetime | None
     last_used_at: datetime | None
+    # Address of the most recent call, and calls in the last 30 UTC days
+    # (#4491). Both lag the call by up to the 5-minute usage flush.
+    last_client_ip: str | None = None
+    calls_30d: int = 0
     is_active: bool
     created_at: datetime
 
@@ -311,7 +315,19 @@ class EnrolmentContext(BaseModel):
 
 
 @router.get("", response_model=list[ApiTokenResponse])
-async def list_tokens(db: DB, current_user: CurrentUser) -> list[ApiTokenResponse]:
+async def list_tokens(
+    db: DB,
+    current_user: CurrentUser,
+    idle_days: int | None = Query(
+        None,
+        ge=1,
+        le=3650,
+        description=(
+            "Only tokens not used in this many days, including tokens never "
+            "used and created at least that long ago (#4491)."
+        ),
+    ),
+) -> list[ApiTokenResponse]:
     """List tokens owned by the caller. Superadmin sees everyone's, each
     row naming its owner."""
     stmt = (
@@ -321,9 +337,20 @@ async def list_tokens(db: DB, current_user: CurrentUser) -> list[ApiTokenRespons
     )
     if not is_effective_superadmin(current_user):
         stmt = stmt.where(APIToken.user_id == current_user.id)
+    if idle_days is not None:
+        cutoff = datetime.now(UTC) - timedelta(days=idle_days)
+        stmt = stmt.where(
+            or_(
+                APIToken.last_used_at < cutoff,
+                (APIToken.last_used_at.is_(None)) & (APIToken.created_at < cutoff),
+            )
+        )
+    rows = (await db.execute(stmt)).all()
+    calls = await _calls_last_30d(db, [t.id for t, _ in rows])
     out: list[ApiTokenResponse] = []
-    for token, owner in (await db.execute(stmt)).all():
+    for token, owner in rows:
         row = ApiTokenResponse.model_validate(token)
+        row.calls_30d = calls.get(token.id, 0)
         if owner is not None:
             row.owner_username = owner.username
             row.owner_display_name = owner.display_name or None
@@ -634,6 +661,68 @@ async def delete_token(
     )
     await db.execute(delete(APIToken).where(APIToken.id == token_id))
     await db.commit()
+
+
+async def _calls_last_30d(db: DB, token_ids: list[uuid.UUID]) -> dict[uuid.UUID, int]:
+    if not token_ids:
+        return {}
+    since = datetime.now(UTC).date() - timedelta(days=29)
+    res = await db.execute(
+        select(APITokenUsageDaily.token_id, func.sum(APITokenUsageDaily.calls))
+        .where(APITokenUsageDaily.token_id.in_(token_ids), APITokenUsageDaily.day >= since)
+        .group_by(APITokenUsageDaily.token_id)
+    )
+    return {tid: int(n) for tid, n in res.all()}
+
+
+class UsageDay(BaseModel):
+    day: str
+    calls: int
+
+
+class ApiTokenUsage(BaseModel):
+    token_id: uuid.UUID
+    days: list[UsageDay]
+    total: int
+    last_used_at: datetime | None
+    last_client_ip: str | None
+
+
+@router.get("/{token_id}/usage", response_model=ApiTokenUsage)
+async def get_token_usage(
+    token_id: uuid.UUID,
+    db: DB,
+    current_user: CurrentUser,
+    days: int = Query(30, ge=1, le=90),
+) -> ApiTokenUsage:
+    """Calls per UTC day, oldest first, zero-filled (#4491)."""
+    token = await _require_owned(token_id, db, current_user)
+    today = datetime.now(UTC).date()
+    start = today - timedelta(days=days - 1)
+    found = {
+        d: n
+        for d, n in (
+            await db.execute(
+                select(APITokenUsageDaily.day, APITokenUsageDaily.calls).where(
+                    APITokenUsageDaily.token_id == token.id, APITokenUsageDaily.day >= start
+                )
+            )
+        ).all()
+    }
+    series = [
+        UsageDay(
+            day=(start + timedelta(days=i)).isoformat(),
+            calls=found.get(start + timedelta(days=i), 0),
+        )
+        for i in range(days)
+    ]
+    return ApiTokenUsage(
+        token_id=token.id,
+        days=series,
+        total=sum(x.calls for x in series),
+        last_used_at=token.last_used_at,
+        last_client_ip=token.last_client_ip,
+    )
 
 
 async def _with_owner(db: DB, token: APIToken) -> ApiTokenResponse:

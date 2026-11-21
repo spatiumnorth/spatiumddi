@@ -210,6 +210,13 @@ RULE_TYPE_FIREWALL_APPLY_STALLED = "firewall.apply_stalled"
 # critical). Catches the "we forgot to rotate" 3am-page failure mode.
 RULE_TYPE_SECRET_EXPIRING = "secret_expiring"
 
+# #4491 — an active API token nobody has called in ``threshold_days`` (default
+# 90). Never-used tokens count from ``created_at``; revoked and expired tokens
+# are excluded. The mirror image of ``secret_expiring``: that one warns about a
+# credential about to stop working, this one about a credential still working
+# that nothing uses. Not seeded; an operator creates it.
+RULE_TYPE_API_TOKEN_UNUSED = "api_token_unused"
+
 # Issue #882 — an agent reported that it could NOT apply the config we sent
 # and has reverted to its last-known-good (or has nothing to revert to).
 # Subject = the dns_server / dhcp_server / looking_glass_collector row.
@@ -782,6 +789,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_DHCP_PACKETS_DROPPED,
         RULE_TYPE_FIREWALL_APPLY_STALLED,
         RULE_TYPE_SECRET_EXPIRING,
+        RULE_TYPE_API_TOKEN_UNUSED,
         RULE_TYPE_AGENT_CONFIG_REJECTED,
         RULE_TYPE_AGENT_SPOOL_TRIMMED,
         RULE_TYPE_DNS_MEMORY_PRESSURE,
@@ -1245,6 +1253,37 @@ async def _matching_dhcp_pool_exhaustion_subjects(
         if held_pct and not under_free and pct_threshold is not None:
             message += _held_note(_pct_resolve_floor(pct_threshold))
         matches.append((str(pool.id), display, message))
+    return matches
+
+
+async def _matching_api_token_unused_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+    now: datetime,
+) -> list[tuple[str, str, str]]:
+    """Active, unexpired API tokens with no call in ``threshold_days``
+    (default 90; #4491). A never-used token counts from ``created_at``.
+    The message carries the name and the non-secret prefix only."""
+    from app.models.auth import APIToken  # noqa: PLC0415
+    from app.services.api_token_usage import (  # noqa: PLC0415
+        IDLE_DEFAULT_DAYS,
+        live_idle_clause,
+    )
+
+    days = max(1, int(rule.threshold_days or IDLE_DEFAULT_DAYS))
+    tokens = (await db.execute(select(APIToken).where(live_idle_clause(now, days)))).scalars().all()
+    matches: list[tuple[str, str, str]] = []
+    for t in tokens:
+        if t.last_used_at is None:
+            since = f"never used (created {t.created_at.date().isoformat()})"
+        else:
+            since = f"last used {t.last_used_at.date().isoformat()}"
+        message = (
+            f"API token '{t.name}' ({t.prefix}…) has not been called in {_thr(days)}+ "
+            f"days: {since}. Revoke it from Administration → API Tokens if it is no "
+            f"longer needed."
+        )
+        matches.append((f"api_token:{t.id}", f"{t.name} API token", message))
     return matches
 
 
@@ -8604,6 +8643,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 expiring = await _matching_k3s_api_cert_expiring_subjects(db, rule, now)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in expiring]
                 subject_type = "appliance"
+            elif rule.rule_type == RULE_TYPE_API_TOKEN_UNUSED:
+                base = await _matching_api_token_unused_subjects(db, rule, now)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
+                subject_type = "api_token"
             elif rule.rule_type == RULE_TYPE_SECRET_EXPIRING:
                 expiring = await _matching_secret_expiring_subjects(db, rule, now)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in expiring]

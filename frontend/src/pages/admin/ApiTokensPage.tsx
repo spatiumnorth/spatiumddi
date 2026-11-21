@@ -1,3 +1,4 @@
+import { IDLE_DAYS, isIdleToken } from "@/lib/apiTokenIdle";
 import { useMemo, useState } from "react";
 import { Field } from "@/components/ui/field";
 import { useModuleOn } from "@/hooks/useModuleOn";
@@ -5,6 +6,7 @@ import { usePermissions } from "@/hooks/usePermissions";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Copy,
+  BarChart3,
   Eye,
   EyeOff,
   Plus,
@@ -25,6 +27,7 @@ import {
   type ApiTokenScope,
   formatApiError,
 } from "@/lib/api";
+import { ApiTokenUsageChart } from "@/components/ApiTokenUsageChart";
 import { ReauthFields } from "@/components/ReauthFields";
 import { copyToClipboard } from "@/lib/clipboard";
 import {
@@ -810,11 +813,14 @@ export function ApiTokensPage() {
   // A superadmin's list spans users (#2443): name the owner once more than
   // one user's tokens are present.
   const showOwner = new Set(tokens.map((t) => t.user_id)).size > 1;
+  const [idleOnly, setIdleOnly] = useState(false);
+  const visible = idleOnly ? tokens.filter((t) => isIdleToken(t)) : tokens;
   const [showCreate, setShowCreate] = useState(false);
   const [justCreated, setJustCreated] = useState<ApiTokenCreated | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<ApiToken | null>(null);
   const [reenable, setReenable] = useState<ApiToken | null>(null);
   const [revokeTarget, setRevokeTarget] = useState<ApiToken | null>(null);
+  const [usageTarget, setUsageTarget] = useState<ApiToken | null>(null);
   // Only a superadmin can re-enable an inactive token; owners mint a new one.
   const { isSuperadmin } = usePermissions();
 
@@ -855,6 +861,15 @@ export function ApiTokensPage() {
           </button>
         </div>
 
+        <label className="flex items-center gap-2 text-xs text-muted-foreground">
+          <input
+            type="checkbox"
+            checked={idleOnly}
+            onChange={(e) => setIdleOnly(e.target.checked)}
+          />
+          Idle only (not used in {IDLE_DAYS} days)
+        </label>
+
         <div className="rounded-lg border bg-card">
           {isLoading ? (
             <p className="px-4 py-6 text-sm text-muted-foreground">Loading…</p>
@@ -878,7 +893,7 @@ export function ApiTokensPage() {
                 </tr>
               </thead>
               <tbody className={zebraBodyCls}>
-                {tokens.map((t) => (
+                {visible.map((t) => (
                   <tr key={t.id} className="border-b last:border-0">
                     <td className="px-3 py-2">
                       <div className="font-medium">{t.name}</div>
@@ -924,6 +939,12 @@ export function ApiTokensPage() {
                       {t.last_used_at
                         ? new Date(t.last_used_at).toLocaleString()
                         : "—"}
+                      {t.last_client_ip && (
+                        <div className="font-mono">{t.last_client_ip}</div>
+                      )}
+                      {t.calls_30d !== undefined && (
+                        <div>{t.calls_30d.toLocaleString()} calls / 30 d</div>
+                      )}
                     </td>
                     <td className="px-3 py-2">
                       <span
@@ -951,6 +972,13 @@ export function ApiTokensPage() {
                     </td>
                     <td className="px-3 py-2">
                       <div className="flex justify-end gap-1">
+                        <button
+                          onClick={() => setUsageTarget(t)}
+                          className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                          title="Usage"
+                        >
+                          <BarChart3 className="h-3.5 w-3.5" />
+                        </button>
                         {t.is_active ? (
                           <button
                             onClick={() => setRevokeTarget(t)}
@@ -1047,6 +1075,15 @@ export function ApiTokensPage() {
           }}
           onConfirm={() => revokeTarget && revokeMut.mutate(revokeTarget)}
         />
+        {usageTarget && (
+          <Modal
+            title={`Usage — ${usageTarget.name}`}
+            onClose={() => setUsageTarget(null)}
+            wide
+          >
+            <ApiTokenUsageChart tokenId={usageTarget.id} />
+          </Modal>
+        )}
         {confirmDelete && (
           <Modal
             title="Delete API Token"

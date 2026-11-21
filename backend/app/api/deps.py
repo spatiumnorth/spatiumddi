@@ -13,6 +13,7 @@ from sqlalchemy.orm.attributes import set_committed_value
 from app.api.token_binding import route_honours_token_binding
 from app.core.denial_audit import remember_caller
 from app.core.jwt_compat import JWTError
+from app.core.request_meta import client_ip
 from app.core.security import decode_access_token, hash_api_token, live_access_session
 from app.core.session_idle import (
     activity_write_interval,
@@ -21,6 +22,7 @@ from app.core.session_idle import (
 )
 from app.db import AsyncSessionLocal, get_db
 from app.models.auth import APIToken, User
+from app.services import api_token_usage
 from app.services.api_token_scopes import (
     is_read_only_post,
     is_token_outbound,
@@ -207,6 +209,8 @@ async def _resolve_api_token(
     # never commits the request's session, so a bump left on it was lost.
     if record_activity:
         await _record_api_token_use(token, now)
+        # #4491: a Redis counter, flushed to the database in batches.
+        await api_token_usage.record_call(token.id, client_ip(request))
     await _load_time_bound_grants(db, user)
     # Stash this token's resource grants (issue #374) so the permission layer
     # can intersect them with the owner's RBAC. Empty/None = unrestricted.
