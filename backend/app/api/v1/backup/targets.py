@@ -1305,6 +1305,12 @@ async def restore_from_archive(
     back the install on a hunch.
     """
     _archive_name(body.filename)
+    # #4678 — same refusal as POST /backup/restore.
+    from app.services.upgrades.schema_rollback import (  # noqa: PLC0415
+        assert_restore_allowed_for_release,
+    )
+
+    assert_restore_allowed_for_release()
     row = await db.get(BackupTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="backup target not found")

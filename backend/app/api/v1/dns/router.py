@@ -239,10 +239,12 @@ from app.services.dns.server_move import (
     elect_primary,
     ensure_group_catalog_compatible,
     ensure_group_classless_compatible,
+    ensure_group_powerdns_compatible,
     ensure_group_single_driver,
     ensure_group_views_compatible,
     lock_server_row,
     move_server_to_group,
+    powerdns_zone_type_refusal,
     views_refusal,
     views_unsupported_message,
 )
@@ -2851,6 +2853,7 @@ async def create_server(
         )
         await ensure_group_catalog_compatible(db, group, body.driver)
         await ensure_group_classless_compatible(db, group, body.driver)
+        await ensure_group_powerdns_compatible(db, group, body.driver)  # #4570
         await ensure_group_views_compatible(db, group, body.driver)
     except ServerMoveError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
@@ -3001,6 +3004,7 @@ async def update_server(
             )
             await ensure_group_catalog_compatible(db, group, body.driver)
             await ensure_group_classless_compatible(db, group, body.driver)
+            await ensure_group_powerdns_compatible(db, group, body.driver)  # #4570
             await ensure_group_views_compatible(db, group, body.driver)
         except ServerMoveError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
@@ -6304,6 +6308,25 @@ async def _assert_forward_zone_serviceable(
         )
 
 
+async def _refuse_powerdns_unsupported_zone_type(
+    db: DB, group_id: uuid.UUID, zone_type: str, current: DNSZone | None = None
+) -> None:
+    """422 a forward / stub zone on a group with a PowerDNS server (#4570).
+
+    PowerDNS Authoritative has no forward-zone type, so the agent logs and
+    drops the zone (clients get REFUSED), and it creates a ``stub`` as a
+    full ``Slave``. Refused on the transition only: a zone already stored
+    with that type (``current``) stays editable and re-saveable.
+    """
+    if zone_type not in {"forward", "stub"}:
+        return
+    if current is not None and current.zone_type == zone_type:
+        return
+    refusal = powerdns_zone_type_refusal(await _group_driver_names(db, group_id), zone_type)
+    if refusal is not None:
+        raise HTTPException(status_code=422, detail=refusal)
+
+
 async def _check_zone_forward_transport(
     group_id: uuid.UUID,
     changes: dict[str, Any],
@@ -6390,6 +6413,7 @@ async def create_zone(
         zone_fields["ttl"] = await default_zone_ttl(db, group_id)
     _refuse_superadmin_zone_fields(current_user, zone_fields, None)
     await _enforce_technitium_api_zone_scope(db, group_id, zone_fields, None)
+    await _refuse_powerdns_unsupported_zone_type(db, group_id, body.zone_type)
     await _assert_forward_zone_serviceable(
         group_id, body.zone_type, list(body.forwarders or []), db
     )
@@ -7249,6 +7273,9 @@ async def update_zone(
     if "masters" in changes:
         changes["masters"] = [m.strip() for m in changes["masters"] if m and m.strip()]
     await _enforce_technitium_api_zone_scope(db, zone.group_id, changes, zone)
+    await _refuse_powerdns_unsupported_zone_type(
+        db, zone.group_id, changes.get("zone_type", zone.zone_type), zone
+    )
     changes.update(await _validated_zone_named_conf_fields(zone.group_id, changes, zone, db))
     effective_zone_type = changes.get("zone_type", zone.zone_type)
     await _assert_forward_zone_serviceable(
@@ -8734,6 +8761,7 @@ class ZoneMovePreviewResponse(BaseModel):
     #: refuses, not waivable by acknowledgement.
     technitium_acl_refusal: str | None = None
     classless_refusal: str | None = None
+    powerdns_refusal: str | None = None
     #: #4565 — a view the zone or its records would keep in a target group
     #: that cannot serve views; non-null means the commit refuses.
     views_refusal: str | None = None
@@ -8780,6 +8808,7 @@ class ZoneMovePreviewResponse(BaseModel):
             forward_transport_refusal=plan.forward_transport_refusal,
             technitium_acl_refusal=plan.technitium_acl_refusal,
             classless_refusal=plan.classless_refusal,
+            powerdns_refusal=plan.powerdns_refusal,
             views_refusal=plan.views_refusal,
             warnings=plan.warnings,
             required_acknowledgements=plan.required_acknowledgements,

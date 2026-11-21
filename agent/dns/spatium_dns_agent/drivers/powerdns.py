@@ -39,6 +39,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+import dns.rdata
+import dns.rdataclass
+import dns.rdatatype
 import httpx
 import structlog
 
@@ -160,6 +163,27 @@ def _qualify_last_token(content: str, zone: str | None) -> str:
     return f"{m.group(1)}{_qualify_target(m.group(2), zone)}{m.group(3)}"
 
 
+_LOC_DIRECTION = re.compile(r"(?<=\s)([nsew])(?=\s|$)")
+
+
+def _loc_content(value: str) -> str:
+    """A LOC value in the one spelling PowerDNS accepts (#4572).
+
+    BIND takes ``-2.00m 0.00m 10000m 10m``; PowerDNS refuses anything but
+    its own printed form (``10000.00m 10.00m``) and a refused rrset refuses
+    the whole PATCH carrying it. A wire round trip gives that form, and
+    rounds size / precision to the one-digit-times-power-of-ten the wire
+    holds, as every server does. An unparseable value is sent as typed."""
+    text = value.strip()
+    text = _LOC_DIRECTION.sub(lambda m: m.group(1).upper(), text)
+    try:
+        rdtype = dns.rdatatype.LOC
+        wire = dns.rdata.from_text(dns.rdataclass.IN, rdtype, text).to_wire()
+        return dns.rdata.from_wire(dns.rdataclass.IN, rdtype, wire, 0, len(wire)).to_text()
+    except Exception:  # noqa: BLE001 - dnspython raises several types; send as typed
+        return value
+
+
 def _record_content(rec: dict[str, Any], zone: str | None = None) -> str:
     """Stitch wire-format content for a single record dict.
 
@@ -198,6 +222,8 @@ def _record_content(rec: dict[str, Any], zone: str | None = None) -> str:
         return f"{m.group(1)}{_qualify_target(m.group(2), zone)}{value[m.end():]}"
     if rtype == "NAPTR":
         return _qualify_last_token(value, zone)
+    if rtype == "LOC":
+        return _loc_content(value)
     return value
 
 
@@ -367,8 +393,76 @@ def _resolve_view_copies(
     return kept, conflicts
 
 
-def _render_catalog_zone_payload(catalog: dict[str, Any]) -> dict[str, Any]:
+#: SOA refresh of a catalog zone, seconds. NOTIFY is the fast path; this is
+#: how soon a consumer recovers from one that was lost (#4574).
+_CATALOG_SOA_REFRESH = 300
+
+
+def _catalog_unchanged(current: dict[str, Any], desired: list[dict[str, Any]]) -> bool:
+    """True when the live catalog already holds ``desired``, serial aside.
+
+    The catalog is re-rendered with a fresh timestamp serial on every sync;
+    PATCHing it each time would bump the serial and NOTIFY every consumer
+    each sync (#4574), so an unchanged catalog is left alone.
+    """
+
+    def norm(rrsets: Any) -> set[tuple[str, str, int, frozenset[str]]]:
+        out: set[tuple[str, str, int, frozenset[str]]] = set()
+        for rs in rrsets or []:
+            rtype = str(rs.get("type") or "").upper()
+            contents = {
+                str(r.get("content") or "")
+                for r in rs.get("records") or []
+                if not r.get("disabled")
+            }
+            if rtype == "SOA":
+                contents = {
+                    _soa_with_serial(c, 0) if _soa_parts(c) else c for c in contents
+                }
+            out.add(
+                (
+                    str(rs.get("name") or "").lower().rstrip("."),
+                    rtype,
+                    int(rs.get("ttl") or 0),
+                    frozenset(contents),
+                )
+            )
+        return out
+
+    return norm(current.get("rrsets")) == norm(desired)
+
+
+def _advance_soa_serial(zone: str, desired: list[dict[str, Any]], doc: Any) -> None:
+    """Make the apex SOA in ``desired`` strictly later than the one served.
+
+    A catalog that changed must move its serial, or a consumer comparing
+    serials ignores the NOTIFY (#4574). ``_floor_soa_content`` returns the
+    served SOA when only the serial differs and the clock serial is behind
+    PowerDNS's date-form one, which is no bump at all.
+    """
+    served = _soa_from_zone_doc(doc, zone)
+    if served is None:
+        return
+    have = _soa_serial(served[0])
+    for rs in desired:
+        if rs.get("type") != "SOA" or not rs.get("records"):
+            continue
+        content = rs["records"][0].get("content", "")
+        want = _soa_serial(content)
+        if have is not None and (want is None or not _serial_later(want, have)):
+            rs["records"][0]["content"] = _soa_with_serial(content, (have + 1) % 2**32)
+
+
+def _render_catalog_zone_payload(
+    catalog: dict[str, Any], opts: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Build the zones.json payload entry for an RFC 9432 catalog zone.
+
+    The zone is kind ``Master`` (unless the server options turn NOTIFY off)
+    and carries the server options' also-notify targets: a ``Native`` zone
+    never sends NOTIFY, so a consumer learned of a new or removed member only
+    at the next SOA refresh (#4574). The SOA refresh is short for the same
+    reason: it is the consumer's fallback when a NOTIFY is lost.
 
     PowerDNS accepts the canonical catalog-zone shape verbatim: SOA + NS
     + a ``version`` TXT pinned to ``"2"`` (the only schema PowerDNS
@@ -386,6 +480,8 @@ def _render_catalog_zone_payload(catalog: dict[str, Any]) -> dict[str, Any]:
     if not zname or zname == ".":
         return {"name": "invalid.", "kind": "Native", "rrsets": []}
 
+    opts = opts or {}
+    notify = str(opts.get("notify_enabled") or "yes").strip().lower()
     serial = int(time.time())
     rrsets: list[dict[str, Any]] = [
         {
@@ -394,7 +490,9 @@ def _render_catalog_zone_payload(catalog: dict[str, Any]) -> dict[str, Any]:
             "ttl": 86400,
             "records": [
                 {
-                    "content": (f"invalid. invalid. {serial} 86400 3600 86400 86400"),
+                    "content": (
+                        f"invalid. invalid. {serial} {_CATALOG_SOA_REFRESH} 600 86400 3600"
+                    ),
                     "disabled": False,
                 }
             ],
@@ -439,12 +537,18 @@ def _render_catalog_zone_payload(catalog: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "name": zname,
-        "kind": "Native",
+        "kind": "Native" if notify == "no" else "Master",
+        "also_notify": [str(e) for e in opts.get("also_notify") or []],
+        "catalog": True,
         "serial": serial,
-        # The catalog's serial is the agent's own (a timestamp, bumped by
-        # PowerDNS's SOA-EDIT-API DEFAULT on every change), not the control
-        # plane's: it keeps that rule (#1965).
-        "serial_managed": False,
+        # The catalog's serial is the agent's own (a timestamp), not the
+        # control plane's, but the agent owns it all the same: left to
+        # PowerDNS's SOA-EDIT-API DEFAULT, a PATCH carrying a timestamp lower
+        # than PowerDNS's date-form serial (2026112001) is rewritten to that
+        # date serial, so a membership change within a day never moved the
+        # serial and a consumer that compares serials ignored the NOTIFY
+        # (#4574). Owned, it is floored and bumped in the reconcile.
+        "serial_managed": True,
         "rrsets": rrsets,
     }
 
@@ -1426,7 +1530,7 @@ class PowerDNSDriver(DriverBase):
         # we'll add in a follow-up — see the warning branch below).
         catalog = bundle.get("catalog") or None
         if catalog and catalog.get("mode") == "producer":
-            catalog_payload = _render_catalog_zone_payload(catalog)
+            catalog_payload = _render_catalog_zone_payload(catalog, opts)
             # Consumers transfer the catalog like any zone, under the
             # server's transfer policy.
             catalog_payload.update(
@@ -3048,6 +3152,7 @@ class PowerDNSDriver(DriverBase):
                             log.error("powerdns_soa_serial_failed", zone=zone_name, error=problem)
                             failures.append(f"{zone_name} soa serial: {problem}")
                             continue
+                    catalog_changed = False
                     rrsets: list[dict[str, Any]] = []
                     if _kind_category(desired_kind) == "secondary":
                         # A secondary's rrsets are the transfer's (#1521):
@@ -3076,7 +3181,15 @@ class PowerDNSDriver(DriverBase):
                                 f"{zone_name} read: HTTP {resp.status_code} {_pdns_error(resp)}"
                             )
                             continue
-                        rrsets.extend(_absent_rrsets(zone_name, desired, current))
+                        if zone_payload.get("catalog") and _catalog_unchanged(current, desired):
+                            # Nothing to publish: no PATCH, so no serial bump
+                            # and no NOTIFY storm (#4574).
+                            desired = []
+                        else:
+                            rrsets.extend(_absent_rrsets(zone_name, desired, current))
+                            if zone_payload.get("catalog"):
+                                catalog_changed = True
+                                _advance_soa_serial(zone_name, desired, current)
                     deleted = len(rrsets)
                     for rs in desired:
                         rrsets.append(
@@ -3120,7 +3233,7 @@ class PowerDNSDriver(DriverBase):
                             deleted=deleted,
                         )
                         if (
-                            serial_changed
+                            (serial_changed or catalog_changed)
                             and soa_landed
                             and _kind_category(desired_kind) == "primary"
                         ):

@@ -5303,6 +5303,8 @@ export interface ZoneMovePreview {
    *  refuses — not waivable by acknowledgement. */
   technitium_acl_refusal?: string | null;
   classless_refusal?: string | null;
+  /** #4570 — a forward / stub zone landing in a PowerDNS group. Refused. */
+  powerdns_refusal?: string | null;
   /** #4565 — the zone or a record of it would keep a view in a target group
    *  that cannot serve views. Non-null means the commit refuses. */
   views_refusal?: string | null;
