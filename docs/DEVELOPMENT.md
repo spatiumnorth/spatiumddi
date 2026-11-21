@@ -896,14 +896,19 @@ nobody has to remember to. The order lives in one file,
 add a new release branch there. `main` into the first branch is not part of
 it, that sync stays a manual `syncrel` step.
 
-A push to a branch in the chain (or the 15-minute schedule, or *Run workflow*
-with a `from` branch) opens a PR from `forward/<source>-to-<target>` into the
-next branch, labelled `forward-merge`, carrying the source merged in with a
-signed-off **merge commit**. Once every status check the target's ruleset
-requires has passed, the workflow merges it with a merge commit (never a
-squash, so the target keeps the source's history). That merge pushes the
-target, which starts the next hop. Only a bot-authored `forward/*` PR with the
-`forward-merge` label is ever merged, and no release branch is force-pushed.
+Twice a day (11:00 and 23:00 UTC), or on *Run workflow* with an optional
+`from` branch, each branch in the chain that the next one does not yet contain
+gets a PR from `forward/<source>-to-<target>` into the next branch, labelled
+`forward-merge`, carrying the source merged in with a signed-off **merge
+commit**. An open forward PR is reused and its branch updated, never
+duplicated. Once every status check the target's ruleset requires has passed,
+the workflow merges it with a merge commit (never a squash, so the target keeps
+the source's history), and then plans again for the branch it just merged
+into, so the next hop opens straight away rather than at the next scheduled
+run. It does not run on every push on purpose: each run that moves a source
+restarts the full CI on its forward PR. Only a bot-authored `forward/*` PR with
+the `forward-merge` label is ever merged, and no release branch is
+force-pushed.
 
 A human steps in only when a stop label appears; fix it on the
 `forward/...` branch (check it out, push to it), then remove the label and the
