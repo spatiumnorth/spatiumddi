@@ -351,6 +351,14 @@ class ConfigBundle:
     # structured ``ra_configs`` rides along for the etag + debug/MCP view.
     ra_configs: tuple[RAConfigDef, ...] = ()
     radvd_conf: str = ""
+    # #3790 — incremental subnet apply. ``None`` = the agent reloads the whole
+    # config on every change, as before. Otherwise ``{"ok": True, "role":
+    # "standalone" | "primary" | "standby", "partner_applied_subnet_ids":
+    # [...] | None}``: the agent may apply a subnet-only change through Kea's
+    # subnet_cmds / host_cmds hooks, and in an HA pair applies the ordering
+    # rule (the standby carries desired + what the primary has, the primary
+    # carries desired limited to what the standby has).
+    incremental: dict[str, Any] | None = None
 
     def compute_etag(self) -> str:
         """Compute a stable SHA-256 of the bundle contents (excluding etag/timestamp)."""
@@ -375,6 +383,9 @@ class ConfigBundle:
             "ra_configs": [asdict(r) for r in self.ra_configs],
             "radvd_conf": self.radvd_conf,
         }
+        # Only when set, so every bundle that does not use it keeps its etag.
+        if self.incremental is not None:
+            payload["incremental"] = self.incremental
         blob = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
         return "sha256:" + hashlib.sha256(blob).hexdigest()
 

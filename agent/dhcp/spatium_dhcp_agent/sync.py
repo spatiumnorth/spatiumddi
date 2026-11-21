@@ -60,6 +60,7 @@ from .instance import (
     DUPLICATE_INSTANCE_BACKOFF,
     DUPLICATE_INSTANCE_HEADER,
 )
+from . import incremental
 from .kea_ctrl import (
     KeaCheckUnavailable,
     KeaConfigRejected,
@@ -67,6 +68,7 @@ from .kea_ctrl import (
     config_check,
     config_hash_get,
     config_reload,
+    send_command,
 )
 from .radvd_apply import apply_radvd
 from .render_kea import render as render_kea
@@ -189,6 +191,11 @@ class SyncLoop:
         # Set by _reload_socket so the raised ConfigApplyError can carry
         # Kea's own words rather than a generic "rejected".
         self._last_reload_error: str | None = None
+        # #3790 — the Dhcp4 document (and HA TLS fingerprint) the running
+        # daemon last confirmed, i.e. the base an incremental apply diffs
+        # against. None = unknown (start-up, or any apply the daemon did not
+        # confirm), which forces a full reload.
+        self._applied_doc4: tuple[dict[str, Any], str] | None = None
         # #882 — did a Kea daemon actually ACCEPT the config we just wrote?
         # An unreachable control socket is not a rejection (Kea may be
         # restarting) so it must not revert — but it is not an acceptance
@@ -388,7 +395,7 @@ class SyncLoop:
         """
         with self._apply_lock:
             try:
-                self._apply_bundle(bundle, reload_kea=True)
+                self._apply_bundle(bundle, reload_kea=True, allow_incremental=True)
             except ConfigApplyError as e:
                 self._handle_apply_failure(etag, e.phase, e.cause)
                 return False
@@ -612,6 +619,126 @@ class SyncLoop:
             self._applied.pop(daemon, None)
         return result
 
+    def _known_subnets_v4(self) -> list[dict[str, Any]]:
+        """The subnet4 entries the daemon runs now: the confirmed document, or
+        failing that the file on disk (written by the previous apply)."""
+        if self._applied_doc4 is not None:
+            return list(self._applied_doc4[0].get("subnet4") or [])
+        try:
+            doc = json.loads(self.cfg.kea_config_path.read_text())
+            return list((doc.get("Dhcp4") or {}).get("subnet4") or [])
+        except (OSError, ValueError):
+            return []
+
+    def _reload_dhcp4(
+        self,
+        dhcp4_doc: dict[str, Any],
+        tls_fp: str,
+        reload_retry_timeout: float,
+        *,
+        allow_incremental: bool,
+        permission: dict[str, Any] | None,
+    ) -> str:
+        """Bring kea-dhcp4 onto ``dhcp4_doc`` (#3790).
+
+        A change confined to ``subnet4`` is applied through the subnet_cmds /
+        host_cmds hooks, which leaves the HA hook alone; anything else, or any
+        failure on the way, is the full ``config-reload`` from the file this
+        apply already wrote, so the daemon always ends on the whole document.
+        """
+        socket_path = self.cfg.kea_control_socket
+        fingerprint = _doc_fingerprint(dhcp4_doc, tls_fp)
+        base = self._applied.get("dhcp4")
+        unchanged = base is not None and base[0] == fingerprint
+        if allow_incremental and not unchanged:
+            outcome = self._try_incremental(dhcp4_doc, tls_fp, permission)
+            if outcome is not None:
+                if outcome == RELOAD_OK:
+                    live = config_hash_get(socket_path)
+                    if live is not None:
+                        self._applied["dhcp4"] = (fingerprint, live)
+                    else:
+                        self._applied.pop("dhcp4", None)
+                    self._applied_doc4 = (dhcp4_doc["Dhcp4"], tls_fp)
+                    self._publish_applied_ids(dhcp4_doc["Dhcp4"])
+                return outcome
+        result = self._reload_if_changed(
+            socket_path,
+            self.cfg.kea_config_path,
+            "dhcp4",
+            reload_retry_timeout,
+            fingerprint,
+        )
+        if result == RELOAD_OK:
+            self._applied_doc4 = (dhcp4_doc["Dhcp4"], tls_fp)
+            self._publish_applied_ids(dhcp4_doc["Dhcp4"])
+        else:
+            self._applied_doc4 = None
+        return result
+
+    def _publish_applied_ids(self, doc: dict[str, Any]) -> None:
+        if incremental.hooks_installed():
+            self.heartbeat.applied_subnet_ids = incremental.subnet_ids(doc)
+
+    def _try_incremental(
+        self,
+        dhcp4_doc: dict[str, Any],
+        tls_fp: str,
+        permission: dict[str, Any] | None,
+    ) -> str | None:
+        """Apply a subnet-only change in memory. Returns ``RELOAD_OK`` when it
+        landed, ``RELOAD_REJECTED`` when ``kea-dhcp4 -t`` refused the document,
+        and None for "not applicable or failed: reload in full"."""
+        base = self._applied_doc4
+        if (
+            base is None
+            or not permission
+            or not permission.get("ok")
+            or base[1] != tls_fp
+            or not incremental.hooks_installed()
+        ):
+            return None
+        try:
+            plan = incremental.plan_subnet_diff(base[0], dhcp4_doc["Dhcp4"])
+        except incremental.PlanError as e:
+            log.info("kea_incremental_not_applicable", reason=str(e))
+            return None
+        if plan is None:
+            return None
+        # Same validation as a reload: the whole file, before the daemon is
+        # touched. A refusal keeps the #882 meaning (quarantine + revert).
+        try:
+            config_check("dhcp4", self.cfg.kea_config_path)
+        except KeaConfigRejected as e:
+            return self._report_rejected("dhcp4", e)
+        except KeaCheckUnavailable:
+            return None
+
+        socket_path = self.cfg.kea_control_socket
+
+        def send(
+            command: str, args: dict[str, Any] | None, accept: tuple[int, ...]
+        ) -> dict[str, Any]:
+            return send_command(socket_path, command, args, accept_results=accept)
+
+        try:
+            if not incremental.hooks_loaded(send):
+                log.info("kea_incremental_hooks_not_loaded")
+                return None
+            if incremental.live_subnet_ids(send) != incremental.subnet_ids(base[0]):
+                # The daemon is not where we think it is (restarted, or an
+                # earlier apply half-landed): a reload resets it to the file.
+                log.warning("kea_incremental_base_mismatch")
+                return None
+            incremental.execute(plan, send)
+        except (KeaCtrlError, OSError, RuntimeError) as e:
+            log.warning("kea_incremental_failed_reloading", error=str(e))
+            self._applied_doc4 = None
+            self._applied.pop("dhcp4", None)
+            return None
+        log.info("kea_incremental_applied", commands=len(plan.commands))
+        return RELOAD_OK
+
     def _report_rejected(self, daemon: str, err: Exception) -> str:
         log.warning("kea_config_rejected", daemon=daemon, error=str(err))
         self.heartbeat.daemon_status = {
@@ -627,8 +754,14 @@ class SyncLoop:
         *,
         reload_kea: bool,
         reload_retry_timeout: float = 0.0,
+        allow_incremental: bool = False,
     ) -> None:
         """Render bundle → write Kea config → reload daemon.
+
+        ``allow_incremental`` lets a subnet-only change reach kea-dhcp4 through
+        the subnet_cmds / host_cmds hooks instead of ``config-reload`` (#3790).
+        Only the control plane's own bundle asks for it: a revert or a host
+        re-render always reloads in full.
 
         The control-plane long-poll returns an envelope ``{server_id,
         etag, bundle: {...}, pending_ops}``. The render expects the
@@ -680,7 +813,15 @@ class SyncLoop:
                 lease_file_v6=lease_file_v6,
                 v6_unicast=v6_unicast,
                 ha_tls_dir=str(ha_tls_dir),
+                extra_hooks=incremental.hook_libraries(),
             )
+            if incremental.hooks_installed():
+                # #3790 — an HA member never carries a subnet its partner lacks.
+                rendered["Dhcp4"]["subnet4"] = incremental.apply_ordering(
+                    rendered["Dhcp4"].get("subnet4") or [],
+                    self._known_subnets_v4(),
+                    inner.get("incremental"),
+                )
         except Exception as e:
             # #882 — tag the phase. A render failure never reached Kea, so
             # the caller knows the running config is untouched.
@@ -723,12 +864,12 @@ class SyncLoop:
             # heartbeat daemon_status reflects the worst of the two.
             self._last_reload_error = None
             tls_fp = self._tls_fingerprint(ha_tls_dir)
-            r4 = self._reload_if_changed(
-                self.cfg.kea_control_socket,
-                self.cfg.kea_config_path,
-                "dhcp4",
+            r4 = self._reload_dhcp4(
+                dhcp4_doc,
+                tls_fp,
                 reload_retry_timeout,
-                _doc_fingerprint(dhcp4_doc, tls_fp),
+                allow_incremental=allow_incremental,
+                permission=inner.get("incremental"),
             )
             r6 = self._reload_if_changed(
                 self.cfg.kea_control_socket_v6,
@@ -1054,6 +1195,8 @@ class SyncLoop:
             # reloaded: that would reset its HA state for nothing.
             if daemon in self._reloaded:
                 self._applied.pop(daemon, None)
+                if daemon == "dhcp4":
+                    self._applied_doc4 = None
                 self._reload_socket(socket_path, path, daemon, 0.0)
 
     def _recheck_v6_unicast(self) -> None:

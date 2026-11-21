@@ -54,6 +54,7 @@ SHIPPED: frozenset[str] = frozenset(
         "kea_packet_logging",  # #980 → "server" block
         "radvd_conf",
         "ra_configs",
+        "incremental",  # #3790
     }
 )
 

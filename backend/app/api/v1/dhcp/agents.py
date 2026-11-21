@@ -144,6 +144,22 @@ def _record_capabilities(server: DHCPServer, reported: list[str]) -> None:
     collect_wake(*dhcp_wake_channels(server))
 
 
+def _record_applied_subnet_ids(server: DHCPServer, reported: list[int] | None) -> None:
+    """Store the subnet ids the agent applied (#3790); wake the partner on change.
+
+    Only overwritten when the heartbeat carries the field. The partner's bundle
+    names this set (the HA ordering rule), so a change wakes the whole group
+    rather than leaving the partner to the safety tick.
+    """
+    if reported is None:
+        return
+    ids = sorted(set(reported))
+    if server.applied_subnet_ids == ids:
+        return
+    server.applied_subnet_ids = ids
+    collect_wake(*dhcp_wake_channels(server))
+
+
 class AgentRegisterRequest(BaseModel):
     # Bounds mirror the columns these land in (DHCPServer.name/host 255,
     # .driver 50, .agent_fingerprint 128, DHCPServerGroup.name 255) — an
@@ -208,6 +224,8 @@ class AgentHeartbeatRequest(BaseModel):
     capabilities: list[Annotated[str, Field(max_length=64)]] | None = Field(
         default=None, max_length=32
     )
+    # #3790 — Kea subnet ids the agent has applied (None = not reported).
+    applied_subnet_ids: list[int] | None = Field(default=None, max_length=100000)
     daemon: dict[str, Any] = {}
     # #882 — the agent's last config-apply verdict:
     # ``{status, etag, failed_etag, phase, error}``. See the DNS agent's
@@ -1152,6 +1170,9 @@ async def agent_config_longpoll(
                         # radvd from when RADVD_MANAGED=1. Empty string when
                         # no scope in the group has ``ra_enabled`` set.
                         "radvd_conf": bundle.radvd_conf,
+                        # #3790 — incremental subnet apply permission + the HA
+                        # ordering input. Absent = reload everything.
+                        **({"incremental": bundle.incremental} if bundle.incremental else {}),
                     },
                     "pending_ops": pending_ops,
                     # Phase 8f-3 — fleet upgrade intent the operator set
@@ -1236,6 +1257,7 @@ async def _apply_heartbeat_reports(
     if body.kea_version:
         server.kea_version = body.kea_version
     _record_capabilities(server, body.capabilities or [])
+    _record_applied_subnet_ids(server, body.applied_subnet_ids)
 
     # Phase 8f-2 — persist whatever slot state the agent reported. Only
     # overwrite when the agent actually sent a value (older agents

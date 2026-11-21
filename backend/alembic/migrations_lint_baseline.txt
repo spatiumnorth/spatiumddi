@@ -562,6 +562,7 @@ backend/alembic/versions/d3f8b6c02a41_branding_banners_and_logo.py:drop_column:1
 backend/alembic/versions/d3f8b6c02a41_branding_banners_and_logo.py:drop_column:160
 backend/alembic/versions/d3f8b6c02a41_branding_banners_and_logo.py:drop_table:151
 backend/alembic/versions/d4a18b20e3c7_dhcp_mac_blocks.py:drop_table:83
+backend/alembic/versions/d4a7c2e9f1b3_dhcp_server_applied_subnet_ids.py:drop_column:35
 backend/alembic/versions/d4a8b2e6f193_dns_group_tsig_key.py:drop_column:40
 backend/alembic/versions/d4a8b2e6f193_dns_group_tsig_key.py:drop_column:41
 backend/alembic/versions/d4a8b2e6f193_dns_group_tsig_key.py:drop_column:42
