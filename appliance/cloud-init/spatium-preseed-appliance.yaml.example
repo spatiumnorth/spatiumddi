@@ -14,6 +14,12 @@ spatium_preseed:
   role: appliance
 
   confirm_wipe: true
+
+  # Another attached disk carrying SpatiumDDI labels (var / state / ESP)
+  # halts the install, because the installed system mounts by label and
+  # could mount that disk instead. Uncomment to blank those labels (only
+  # the labels, on the OTHER disk) and carry on. Detaching the disk is safer.
+  # clear_foreign_labels: true
   target_disk: /dev/disk/by-id/ata-QEMU_HARDDISK_QM00002
 
   # ── Storage redundancy (#999 Part C2) ───────────────────────────────

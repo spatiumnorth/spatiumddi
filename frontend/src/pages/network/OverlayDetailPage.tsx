@@ -1061,8 +1061,10 @@ function PoliciesTab({ overlayId }: { overlayId: string }) {
                   colSpan={7}
                   className="px-3 py-6 text-center text-muted-foreground"
                 >
-                  No policies yet — create one to override the default path
-                  strategy.
+                  No policies yet
+                  {!writeGate.disabled &&
+                    " — create one to override the default path strategy"}
+                  .
                 </td>
               </tr>
             )}
