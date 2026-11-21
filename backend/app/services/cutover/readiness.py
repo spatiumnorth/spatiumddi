@@ -51,6 +51,7 @@ from app.services.cutover.canonical import (
     BLOCKER_NO_TARGET_ZONE,
     BLOCKER_PARITY_DIFFERENCES,
     BLOCKER_PARITY_NOT_VERIFIED,
+    BLOCKER_POOL_CLASS_UNAVAILABLE,
     BLOCKER_SOURCE_SCOPE_INACTIVE,
     BLOCKER_SOURCE_SCOPE_MISSING,
     BLOCKER_SOURCE_ZONE_MISSING,
@@ -461,6 +462,21 @@ async def evaluate_dhcp_item(
                 "activate it.",
             )
         )
+
+    if not cut_over and not scope.is_active:
+        # #4376 — the switch turns the managed scope on, which brings its
+        # class-restricted pools into the rendered config. Same activation
+        # rule as the scope update (#4367): refuse before Windows is touched.
+        from app.api.v1.dhcp.pools import scope_activation_class_problems  # noqa: PLC0415
+
+        for problem in await scope_activation_class_problems(db, scope):
+            blockers.append(
+                Blocker(
+                    BLOCKER_POOL_CLASS_UNAVAILABLE,
+                    "block",
+                    f"The managed scope cannot be activated: {problem}",
+                )
+            )
 
     if item.lease_handover is None and not cut_over:
         blockers.append(

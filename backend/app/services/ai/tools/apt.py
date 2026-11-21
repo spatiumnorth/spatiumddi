@@ -11,7 +11,7 @@ a credential embedded in a proxy URL reads as ``***``.
 Read-only. No ``propose_update_apt_settings`` — same reasoning as the
 SNMP tool: APT management touches Fernet-encrypted fields + a
 validate-before-swap host runner, and the friendly path is the
-Settings → Appliance → APT form (which has the all-important Validate
+Appliance → Fleet → APT form (which has the all-important Validate
 button). Read visibility is the high value-per-token tool here.
 
 ``module=None`` (always available) — there is no ``appliance.apt``

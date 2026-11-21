@@ -24,7 +24,10 @@ from app.core.demo_mode import forbid_in_demo_mode
 from app.core.header_credentials import header_secret
 from app.core.permissions import require_resource_permission
 from app.core.ssrf import assert_safe_target
-from app.core.stored_secret_guard import require_secret_with_destination_change
+from app.core.stored_secret_guard import (
+    require_secret_for_changed_connection,
+    require_secret_with_destination_change,
+)
 from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.fortinet import FortinetFirewall
@@ -323,6 +326,7 @@ async def update_firewall(
         changes,
         destination=["host", "port"],
         secrets={"api_token": f.api_token_encrypted},
+        blank_keeps=("api_token",),
     )
     new_ipam = changes.get("ipam_space_id", f.ipam_space_id)
     new_dns = changes.get("dns_group_id", f.dns_group_id)
@@ -496,6 +500,12 @@ async def test_connection(
         stored = await db.get(FortinetFirewall, body.firewall_id)
         if stored is None:
             raise HTTPException(status_code=404, detail="Fortinet firewall not found")
+        require_secret_for_changed_connection(
+            stored,
+            {"host": body.host, "port": body.port, "api_token": body.api_token},
+            destination=("host", "port"),
+            secrets={"api_token": stored.api_token_encrypted},
+        )
         host = host or stored.host
         port = body.port or stored.port
         verify_tls = body.verify_tls if body.verify_tls is not None else stored.verify_tls

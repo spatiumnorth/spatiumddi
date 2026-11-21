@@ -36,6 +36,7 @@ need only have read access on the source server.
 
 from __future__ import annotations
 
+import ipaddress
 from typing import Any
 
 import httpx
@@ -47,6 +48,7 @@ from .canonical import (
     ImportedSOA,
     ImportedZone,
     ImportPreview,
+    settle_replica_zones,
 )
 
 
@@ -215,6 +217,29 @@ def _rel_name(rrset_name: str, zone_fqdn: str) -> str:
     return rrset_name
 
 
+def _powerdns_masters(raw: Any) -> list[str]:
+    """PowerDNS's ``masters`` (``ip``, ``ip:port``, ``[v6]:port``) as the
+    ``ip`` / ``ip@port`` the zone API stores; what is neither is dropped."""
+
+    out: list[str] = []
+    for item in raw if isinstance(raw, list) else []:
+        text = str(item).strip()
+        host, port = text, ""
+        if text.startswith("["):
+            host, _, rest = text[1:].partition("]")
+            port = rest.lstrip(":")
+        elif text.count(":") == 1:
+            host, _, port = text.partition(":")
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            continue
+        entry = f"{host}@{port}" if port.isdigit() and port != "53" else host
+        if entry not in out:
+            out.append(entry)
+    return out
+
+
 def _build_imported_zone(
     summary: dict[str, Any],
     full: dict[str, Any],
@@ -319,6 +344,11 @@ def _build_imported_zone(
         records=records,
         view_name=None,  # PowerDNS doesn't expose the view tag in v1 REST
         forwarders=[],
+        masters=(
+            _powerdns_masters(full.get("masters") or summary.get("masters"))
+            if zone_type == "secondary"
+            else []
+        ),
         skipped_record_types=skipped,
         parse_warnings=warnings,
     )
@@ -431,6 +461,7 @@ async def parse_powerdns_server(
                         records=[],
                         view_name=None,
                         forwarders=[],
+                        masters=_powerdns_masters(summary.get("masters")),
                         skipped_record_types={},
                         parse_warnings=[f"Failed to fetch full zone payload: {describe_exc(exc)}"],
                     )
@@ -443,6 +474,10 @@ async def parse_powerdns_server(
             "PowerDNS returned no zones. Check that the API key has "
             "read access and that the server is the right server-id."
         )
+
+    # #4259 — a secondary imports with its masters and no records; one the
+    # source names no master for is left out, named.
+    zones = settle_replica_zones(zones, overall_warnings)
 
     total_records = sum(len(z.records) for z in zones)
     histogram: dict[str, int] = {}

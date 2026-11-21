@@ -1,0 +1,3 @@
+### Fixed
+
+- Dialogs that pre-fill or decide from a shared list now read it again when they open instead of serving a read up to 30 s old: New IP Block's template list and the custom field defaults of New IP Block, New Subnet and Allocate IP; Add Zone's and New Server Group's Settings defaults (an untouched Default TTL or Recursive is no longer sent, so the server applies Settings as stored); Delegate's NS preview (Apply delegation now re-reads it and shows the changed list instead of creating records that were not listed); and the DHCP, DNS group and zone lists of Edit Subnet, Edit Block and Edit Space (#4308, #4309, #4310, #4311).

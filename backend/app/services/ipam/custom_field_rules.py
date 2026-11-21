@@ -19,6 +19,8 @@ already exist uneditable:
 
 from __future__ import annotations
 
+import datetime
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -120,3 +122,74 @@ async def missing_required_custom_fields(
     except HTTPException as exc:
         return str(exc.detail)
     return None
+
+
+_ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+async def validate_custom_field_values(
+    db: AsyncSession,
+    resource_type: str,
+    values: Mapping[str, Any] | None,
+    *,
+    stored: Mapping[str, Any] | None = None,
+) -> None:
+    """Raise 422 when a ``multi_select`` or ``date`` value is not of its type (#4288).
+
+    ``multi_select`` holds a list, each item one of the definition's options;
+    ``date`` holds an ISO ``YYYY-MM-DD`` string. ``None`` and an empty string
+    are the "clear this field" spellings the console and the bulk editor send,
+    so they pass. Other field types are stored as sent, as before.
+
+    ``stored`` is the row's current ``custom_fields`` on an update: a key whose
+    value equals what the row already holds is not re-validated (#4443), since
+    the edit forms send the whole dict and an option removed from a definition
+    since must not block edits of a row still holding it. Only a changed key is
+    checked.
+    """
+    if stored:
+        values = {k: v for k, v in (values or {}).items() if k not in stored or stored[k] != v}
+    if not values:
+        return
+    defs = (
+        (
+            await db.execute(
+                select(CustomFieldDefinition).where(
+                    CustomFieldDefinition.resource_type == resource_type,
+                    CustomFieldDefinition.field_type.in_(("multi_select", "date")),
+                    CustomFieldDefinition.name.in_(list(values)),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    problems: list[str] = []
+    for d in defs:
+        v = values[d.name]
+        if v is None or (isinstance(v, str) and not v.strip()):
+            continue
+        if d.field_type == "date":
+            ok = isinstance(v, str) and bool(_ISO_DATE.match(v))
+            if ok:
+                try:
+                    datetime.date.fromisoformat(v)
+                except ValueError:
+                    ok = False
+            if not ok:
+                problems.append(f"{d.label} ({d.name}) must be a date as YYYY-MM-DD")
+        else:
+            options = d.options if isinstance(d.options, list) else []
+            if not isinstance(v, list) or not all(isinstance(i, str) for i in v):
+                problems.append(f"{d.label} ({d.name}) must be a list of options")
+            else:
+                bad = [i for i in v if i not in options]
+                if bad:
+                    problems.append(
+                        f"{d.label} ({d.name}) has option(s) not in its list: " + ", ".join(bad)
+                    )
+    if problems:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid custom field value(s): " + "; ".join(problems),
+        )

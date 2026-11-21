@@ -86,6 +86,12 @@ spec:
             - -Q
             - ipam,dns,dhcp,default,bundles
           env:
+            # #4306 — prefork child recycling (read by app/celery_app.py);
+            # memory is KiB, 0 disables. Mirrors the chart's worker.max* values.
+            - name: WORKER_MAX_TASKS_PER_CHILD
+              value: "1000"
+            - name: WORKER_MAX_MEMORY_PER_CHILD_KIB
+              value: "409600"
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
