@@ -1,10 +1,14 @@
 name: Release — Forward merge
 
 # Cascade the long-lived release branches into each other, in the order kept in
-# .github/release-chain.json (the one place the order lives): every push to a
-# branch in the chain opens a PR that merges it into the NEXT branch, with a
-# real merge commit. Merging that PR pushes the next branch, which starts the
-# next hop. main -> first branch is out of scope (syncrel.sh handles it).
+# .github/release-chain.json (the one place the order lives): twice a day each
+# branch in the chain that the next one does not yet contain gets a PR that
+# merges it into the NEXT branch, with a real merge commit. When the workflow
+# merges one of those PRs it plans again at once for the branch it just merged
+# into, so the next hop opens straight away rather than at the next run. It is
+# not run on every push: each run that moves a source re-runs the full CI on
+# its forward PR, and a busy release branch would keep the runners full.
+# main -> first branch is out of scope (syncrel.sh handles it).
 #
 # Jobs:
 #   plan     which hops (source -> target) need a forward merge.
@@ -14,6 +18,8 @@ name: Release — Forward merge
 #            human can resolve it on the branch) or on two Alembic heads.
 #   land     merge a forward-merge PR (merge commit, never a squash) once
 #            every status check the target's ruleset requires has passed.
+#            Runs first; plan then follows only the branches it merged into
+#            (on a CI completion) or every hop (on the schedule or by hand).
 #
 # Needs a GitHub App (secrets FORWARD_MERGE_APP_ID / FORWARD_MERGE_APP_KEY),
 # for two reasons the default token cannot meet: a push or PR made with
@@ -27,12 +33,10 @@ name: Release — Forward merge
 # written; land merges only a PR that has the forward-merge label, is authored
 # by a bot, and whose head is a forward/* branch of this repository.
 #
-# The schedule is the backstop: it runs from the default branch, so it also
-# catches a push to a release branch that does not carry this workflow yet.
+# Every trigger runs from the default branch (schedule, workflow_run and
+# workflow_dispatch all do), so the release branches need not carry this file.
 
 on:
-  push:
-    branches: ["release/**"]
   workflow_dispatch:
     inputs:
       from:
@@ -40,7 +44,8 @@ on:
         required: false
         default: ""
   schedule:
-    - cron: "*/15 * * * *"
+    # 11:00 and 23:00 UTC (6 am and 6 pm in New York, winter time).
+    - cron: "0 11,23 * * *"
   workflow_run:
     workflows: ["CI"]
     types: [completed]
@@ -52,14 +57,18 @@ permissions:
 jobs:
   plan:
     name: Plan the hops
-    if: github.event_name != 'workflow_run'
+    needs: land
+    # After land: on a CI completion only when land merged something, and then
+    # only for the branches it merged into (the next hop of the chain).
+    if: >-
+      always() && (github.event_name != 'workflow_run' ||
+      (needs.land.result == 'success' && needs.land.outputs.merged != '' && needs.land.outputs.merged != '[]'))
     runs-on: ubuntu-latest
     outputs:
       hops: ${{ steps.plan.outputs.hops }}
       count: ${{ steps.plan.outputs.count }}
     steps:
-      # The chain and the scripts always come from the default branch, never
-      # from the (possibly stale) release branch that was pushed.
+      # The chain and the scripts always come from the default branch.
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.repository.default_branch }}
@@ -67,23 +76,23 @@ jobs:
       - id: plan
         env:
           EVENT: ${{ github.event_name }}
-          PUSHED: ${{ github.ref_name }}
           INPUT_FROM: ${{ inputs.from }}
+          MERGED: ${{ needs.land.outputs.merged }}
         run: |
           set -euo pipefail
           git fetch --quiet origin '+refs/heads/release/*:refs/remotes/origin/release/*'
           chain=$(jq -r '.chain[]' .github/release-chain.json)
           mapfile -t C <<< "$chain"
+          # Sources to plan for, one per line; empty = every hop in the chain.
           only=""
           case "$EVENT" in
-            push) only="$PUSHED" ;;
             workflow_dispatch) only="$INPUT_FROM" ;;
+            workflow_run) only=$(jq -r '.[]' <<< "${MERGED:-[]}") ; [ -n "$only" ] || only="-" ;;
           esac
-          if [ "$EVENT" = push ] && [ -z "$only" ]; then only="-"; fi
           hops='[]'
           for ((i = 0; i + 1 < ${#C[@]}; i++)); do
             s="${C[$i]}"; t="${C[$((i + 1))]}"
-            if [ -n "$only" ] && [ "$only" != "$s" ]; then continue; fi
+            if [ -n "$only" ] && ! grep -qxF -- "$s" <<< "$only"; then continue; fi
             git rev-parse --verify --quiet "origin/$s" >/dev/null || { echo "skip $s: no such branch"; continue; }
             git rev-parse --verify --quiet "origin/$t" >/dev/null || { echo "skip $t: no such branch"; continue; }
             if git merge-base --is-ancestor "origin/$s" "origin/$t"; then
@@ -98,7 +107,7 @@ jobs:
   forward:
     name: Forward ${{ matrix.hop.source }} to ${{ matrix.hop.target }}
     needs: plan
-    if: needs.plan.outputs.count != '0'
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.count != '0'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -235,8 +244,11 @@ jobs:
 
   land:
     name: Merge passing forward-merge PRs
-    if: github.event_name != 'push' && (github.event_name != 'workflow_run' || github.event.workflow_run.event == 'pull_request')
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.event == 'pull_request'
     runs-on: ubuntu-latest
+    outputs:
+      # JSON list of the release branches this run merged a forward PR into.
+      merged: ${{ steps.merge.outputs.merged }}
     permissions:
       contents: read
     concurrency:
@@ -253,6 +265,7 @@ jobs:
           app-id: ${{ secrets.FORWARD_MERGE_APP_ID }}
           private-key: ${{ secrets.FORWARD_MERGE_APP_KEY }}
       - name: Merge
+        id: merge
         if: steps.app.outputs.token != ''
         uses: actions/github-script@v9
         with:
@@ -260,6 +273,7 @@ jobs:
           script: |
             const { owner, repo } = context.repo;
             const GOOD = new Set(["success", "skipped", "neutral"]);
+            const mergedInto = [];
             const prs = await github.paginate(github.rest.pulls.list, {
               owner, repo, state: "open", per_page: 100,
             });
@@ -318,7 +332,9 @@ jobs:
                   owner, repo, pull_number: p.number, merge_method: "merge", sha,
                 });
                 core.info(`${tag}: merged ${p.head.ref} into ${p.base.ref} (merge commit)`);
+                mergedInto.push(p.base.ref);
               } catch (e) {
                 core.warning(`${tag}: merge refused: ${e.message}`);
               }
             }
+            core.setOutput("merged", JSON.stringify([...new Set(mergedInto)]));
