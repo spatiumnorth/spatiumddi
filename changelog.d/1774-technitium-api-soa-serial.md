@@ -1,0 +1,3 @@
+### Fixed
+
+- On a Technitium group managed through the API (`technitium_api`), a zone's Primary NS, Admin Email, SOA timers, default TTL and apex name servers are now written to the server when the zone is created and whenever you change them, instead of staying at Technitium's own defaults. The zone's serial is raised to SpatiumDDI's when the server is behind it, for example after a zone is re-created, and the serial shown in the sync status is the one read back from each server. On the agent-managed Technitium driver the sync status likewise shows the serial the daemon serves, so a zone that was skipped or refused no longer reads as in sync, and a Technitium server counts as in sync once it is at or past the zone's serial.

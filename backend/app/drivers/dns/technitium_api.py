@@ -57,7 +57,8 @@ Per non-negotiable #5 and the #430 degraded-read guards, that would let a
 sync diff live state against nothing and propose deleting the world.
 :meth:`_unwrap` is the only way responses are read here — keep it that way.
 
-Scope: zone + record CRUD and topology reads. Online DNSSEC, forwarders and
+Scope: zone + record CRUD, the zone's SOA / apex NS / serial (#1774) and
+topology reads. Zone transfer / notify / query ACLs, online DNSSEC, forwarders and
 the native blocklists are the agent driver's today and are deliberately not
 advertised in :meth:`capabilities` — ``technitium_api`` is absent from the
 router's ``_DRIVER_GATED_OPERATIONS["dnssec_sign"]`` set, so the sign/unsign
@@ -81,6 +82,7 @@ from app.drivers.dns._cloud_base import (
     normalize_fqdn,
 )
 from app.drivers.dns.base import RecordChange, RecordData
+from app.services.technitium.apex import SOA_TIMERS
 from app.services.technitium.rdata import (
     DNSSEC_RECORD_TYPES,
     SUPPORTED_RECORD_TYPES,
@@ -673,6 +675,149 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
             # test_unsupported_zone_op_is_refused_before_any_request.
             raise CloudDNSError(f"Technitium: unsupported zone op {op!r}")
 
+    # ── Zone apex: SOA, apex NS and serial (#1774, #1779) ───────────────
+
+    async def apply_zone_apex(
+        self,
+        server: Any,
+        zone_name: str,
+        apex: dict[str, Any] | None,
+        serial: int | None = None,
+    ) -> int | None:
+        """Bring a Primary zone's SOA and apex NS set in line with ``apex``,
+        and return the SOA serial the server serves afterwards.
+
+        Technitium owns the serial: a zone starts at 1 and every write bumps
+        it, so two servers of one zone never serve the same number, and a
+        re-created zone restarts at 1, below what an external secondary holds.
+        A SOA update that carries a serial HIGHER than the stored one is
+        adopted as given; a lower or equal one is stored as ``stored + 1``
+        (``ApexZone.GetNewSerial``, 15.4.0). So when ``serial`` (the zone's
+        ``last_serial``) is ahead of the server's, the SOA is written with it,
+        and otherwise the server's own is kept: the write never lowers it.
+
+        The SOA is written only when it differs (fields or a serial behind
+        ``serial``), because each update bumps the serial. NS targets are added
+        before the old ones are removed, so the zone is never left without a
+        name server when a call fails halfway.
+
+        The return is READ BACK from the server after the writes: ``None`` when
+        it could not be read. Never the serial that was asked for.
+        """
+        creds = self._load_credentials(server)
+        api_url, token, verify = self._creds(creds)
+        bare = normalize_fqdn(zone_name).rstrip(".")
+        apex = apex or {}
+        async with self._client(api_url, token, verify) as client:
+
+            async def read() -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+                body = self._as_dict(
+                    await self._call(
+                        client,
+                        "zones/records/get",
+                        f"apex read for {bare!r}",
+                        {"domain": bare, "zone": bare},
+                    )
+                )
+                self._assert_zone_resolved(body, bare)
+                at_apex = [
+                    r
+                    for r in body.get("records") or []
+                    if isinstance(r, dict) and str(r.get("name") or "").lower() == bare.lower()
+                ]
+                soa = next((r for r in at_apex if r.get("type") == "SOA"), None)
+                return soa, at_apex
+
+            soa, at_apex = await read()
+            if soa is None:
+                raise CloudDNSError(f"Technitium: zone {bare!r} has no SOA to update.")
+            current = self._as_dict(soa.get("rData"))
+            current_serial = int_or(current.get("serial"), 0)
+
+            desired_soa = apex.get("soa") or {}
+            ttl = apex.get("ttl")
+            fields: dict[str, Any] = {
+                key: str(current.get(key) or "").rstrip(".").lower()
+                for key in ("primaryNameServer", "responsiblePerson")
+            }
+            fields.update({f: current.get(f) for f in SOA_TIMERS})
+            differs = any(fields.get(k) != v for k, v in desired_soa.items())
+            if ttl is not None and soa.get("ttl") != ttl:
+                differs = True
+            behind = serial is not None and int(serial) > current_serial
+            if differs or behind:
+                params: dict[str, Any] = {
+                    "zone": bare,
+                    "domain": bare,
+                    "type": "SOA",
+                    "serial": (
+                        max(current_serial, int(serial)) if serial is not None else current_serial
+                    ),
+                    "ttl": ttl if ttl is not None else soa.get("ttl"),
+                    "primaryNameServer": fields["primaryNameServer"],
+                    "responsiblePerson": fields["responsiblePerson"],
+                    **{f: current.get(f) for f in SOA_TIMERS},
+                }
+                params.update(desired_soa)
+                await self._call(client, "zones/records/update", f"SOA update for {bare!r}", params)
+
+            live_ns = {
+                str(self._as_dict(r.get("rData")).get("nameServer") or "").rstrip(".").lower(): r
+                for r in at_apex
+                if r.get("type") == "NS"
+            }
+            desired_ns = list(apex.get("ns") or [])
+            ns_ttl = apex.get("ns_ttl")
+            if desired_ns:
+                for target in desired_ns:
+                    if target in live_ns:
+                        if ns_ttl is not None and live_ns[target].get("ttl") != ns_ttl:
+                            # In place: a delete and add would leave the zone
+                            # without that name server for a moment.
+                            await self._call(
+                                client,
+                                "zones/records/update",
+                                f"apex NS retime for {bare!r}",
+                                {
+                                    "zone": bare,
+                                    "domain": bare,
+                                    "type": "NS",
+                                    "nameServer": target,
+                                    "ttl": ns_ttl,
+                                },
+                            )
+                        continue
+                    await self._call(
+                        client,
+                        "zones/records/add",
+                        f"apex NS add for {bare!r}",
+                        {
+                            "zone": bare,
+                            "domain": bare,
+                            "type": "NS",
+                            "ttl": (
+                                ns_ttl if ns_ttl is not None else (ttl if ttl is not None else 3600)
+                            ),
+                            "nameServer": target,
+                        },
+                    )
+                for target in live_ns:
+                    if target in desired_ns:
+                        continue
+                    await self._call(
+                        client,
+                        "zones/records/delete",
+                        f"apex NS delete for {bare!r}",
+                        {"zone": bare, "domain": bare, "type": "NS", "nameServer": target},
+                    )
+            try:
+                soa, _ = await read()
+            except CloudDNSError:
+                return None
+            if soa is None:
+                return None
+            return int_or(self._as_dict(soa.get("rData")).get("serial"), 0) or None
+
     async def _refuse_unsafe_adoption(
         self,
         client: httpx.AsyncClient,
@@ -900,7 +1045,7 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
                 "is no agent to deploy. DNSSEC, forwarders and the native "
                 "blocklists remain on the agent-managed 'technitium' driver. "
                 "EXPERIMENTAL in 1.0: one server per group, zones SpatiumDDI "
-                "creates, no DNS pools, no group or zone options."
+                "creates, no DNS pools, no group options, no zone ACLs."
             ),
         }
 

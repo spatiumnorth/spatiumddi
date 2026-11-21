@@ -297,12 +297,11 @@ async def _technitium_api_group(db: AsyncSession) -> DNSServerGroup:
 
 
 @pytest.mark.asyncio
-async def test_technitium_api_zone_create_without_ttl_keeps_the_stock_ttl(
+async def test_technitium_api_zone_create_without_ttl_takes_the_settings_default(
     client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The agentless Technitium driver never writes a zone TTL and its scope
-    gate refuses anything but the stock value (#1784): an omitted TTL there
-    must not become the stored default and turn the create into a 422."""
+    """The agentless Technitium driver writes the zone TTL into the SOA
+    (#1774), so an omitted TTL takes Settings' default like any other driver."""
     from app.api.v1.dns import router as dns_router
 
     async def _no_push(*_a: object, **_k: object) -> list[str]:
@@ -317,11 +316,11 @@ async def test_technitium_api_zone_create_without_ttl_keeps_the_stock_ttl(
         f"/api/v1/dns/groups/{group.id}/zones", json={"name": "t.test."}, headers=headers
     )
     assert r.status_code == 201, r.text
-    assert r.json()["ttl"] == 3600
+    assert r.json()["ttl"] == 5400
 
 
 @pytest.mark.asyncio
-async def test_copilot_zone_ttl_on_technitium_api_is_the_stock_ttl(
+async def test_copilot_zone_ttl_on_technitium_api_is_the_settings_default(
     db_session: AsyncSession,
 ) -> None:
     from app.services.ai.operations import CreateDNSZoneArgs, _effective_zone_ttl
@@ -333,7 +332,7 @@ async def test_copilot_zone_ttl_on_technitium_api_is_the_stock_ttl(
     await _set_defaults(db_session, dns_default_ttl=5400)
 
     args = CreateDNSZoneArgs(name="c.test.")
-    assert await _effective_zone_ttl(db_session, args, group.id) == 3600
+    assert await _effective_zone_ttl(db_session, args, group.id) == 5400
     assert await _effective_zone_ttl(db_session, args, other.id) == 5400
 
 

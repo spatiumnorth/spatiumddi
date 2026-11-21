@@ -118,11 +118,10 @@ describe("Add Zone", () => {
     });
   });
 
-  it("offers Primary / 3600 on a technitium_api group whatever Settings holds", async () => {
+  it("offers Primary on a technitium_api group whatever Settings holds, at the stored TTL", async () => {
     stored = { dns_default_zone_type: "forward", dns_default_ttl: 5400 };
     groups = [{ id: "g1", name: "t", server_drivers: ["technitium_api"] }];
     wrap(<ZoneModal groupId="g1" views={[]} onClose={() => {}} />);
-    // The SOA / TTL inputs are hidden there; what matters is what is sent.
     await new Promise((r) => setTimeout(r, 0));
     await waitFor(() => expect(control("Type").value).toBe("primary"));
     fireEvent.change(control("Zone Name (FQDN)"), {
@@ -132,7 +131,7 @@ describe("Add Zone", () => {
     await waitFor(() => expect(createZone).toHaveBeenCalledTimes(1));
     expect(createZone.mock.calls[0][1]).toMatchObject({
       zone_type: "primary",
-      ttl: 3600,
+      ttl: 5400,
     });
   });
 

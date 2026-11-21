@@ -153,7 +153,12 @@ from app.services.appliance.group_names import (
 )
 from app.services.appliance.tls import certificate_store_location
 from app.services.approvals.gate import gate_or_execute
-from app.services.dns import dnssec_signers, option_support, technitium_api_scope
+from app.services.dns import (
+    dnssec_signers,
+    option_support,
+    technitium_api_apex,
+    technitium_api_scope,
+)
 from app.services.dns.agent_instance import duplicate_active as duplicate_agent_active
 from app.services.dns.bundle_dirty import mark_bundles_dirty
 from app.services.dns.cname_conflict import (
@@ -7392,6 +7397,23 @@ async def update_zone(
     # Left for the commit, this UPDATE ran after the lock and deadlocked with
     # a record writer holding the row (see ``_replace_update_acl_rows``).
     await db.flush()
+    if soa_changed:
+        # #1774: a technitium_api server holds the zone in a daemon the bundle
+        # never reaches, so a changed SOA / NS / TTL is written to it now, before
+        # the commit, as the create is. A refusal is a 502 and the row rolls back.
+        for api_server in await technitium_api_apex.technitium_api_servers(db, zone.group_id):
+            try:
+                await technitium_api_apex.sync_zone_apex(
+                    db, zone, api_server, get_driver(api_server.driver)
+                )
+            except Exception as exc:  # noqa: BLE001 — surfaced verbatim
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        f"Failed to update zone {zone.name} on {api_server.name}: "
+                        f"{_exc_text(exc).rstrip('. ')}. The change was not saved in SpatiumDDI."
+                    ),
+                ) from exc
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -9534,6 +9556,27 @@ async def _push_zone_to_agentless_servers(
                     this_op == "create" and server.id in (adopt_existing_server_ids or set())
                 ),
             )
+            if this_op == "create" and server.driver == technitium_api_apex.DRIVER:
+                # #1774: the create gives Technitium's own SOA and NS; the
+                # zone's apex goes in before the zone counts as created.
+                try:
+                    await technitium_api_apex.sync_zone_apex(db, zone, server, driver)
+                except Exception:
+                    if result is not False:
+                        # This request made the zone: take it back out, or the
+                        # failure leaves it live on the server and absent here.
+                        try:
+                            await driver.apply_zone_change(
+                                server, zone, "delete", managed_records=[]
+                            )
+                        except Exception as undo_exc:  # noqa: BLE001 — reported by the raise below
+                            logger.warning(
+                                "dns.zone.apex_failure_rollback_failed",
+                                server=str(server.id),
+                                zone=zone.name,
+                                error=_exc_text(undo_exc),
+                            )
+                    raise
         else:
             result = await driver.apply_zone_change(server, zone, this_op)
         return result is not False

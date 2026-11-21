@@ -185,27 +185,30 @@ describe("Add Zone's Kind", () => {
 });
 
 describe("Add Zone on an experimental technitium_api group (#1784)", () => {
-  it("offers Primary only and hides the SOA / TTL fields the driver never writes", async () => {
+  it("offers Primary only and keeps the SOA / TTL fields the driver now writes (#1774)", async () => {
     groups = [{ id: "grp-1", server_drivers: ["technitium_api"] }];
     open();
     await waitFor(() =>
       expect(
-        screen.queryByText("Primary NS", { selector: "label" }),
-      ).toBeNull(),
+        screen.getByText("Primary NS", { selector: "label" }),
+      ).toBeTruthy(),
     );
-    expect(screen.queryByText("Admin Email", { selector: "label" })).toBeNull();
+    expect(screen.getByText("Admin Email", { selector: "label" })).toBeTruthy();
     expect(
-      screen.queryByText("Default TTL (seconds)", { selector: "label" }),
-    ).toBeNull();
+      screen.getByText("Default TTL (seconds)", { selector: "label" }),
+    ).toBeTruthy();
     const type = control("Type") as HTMLSelectElement;
-    expect([...type.options].map((o) => o.value)).toEqual(["primary"]);
+    await waitFor(() =>
+      expect([...type.options].map((o) => o.value)).toEqual(["primary"]),
+    );
+    fireEvent.change(control("Primary NS"), {
+      target: { value: "ns1.example.com." },
+    });
     typeName("corp.example.com");
     await save();
-    // Defaults still sent, which the API accepts as "unchanged".
     expect(createZone.mock.calls[0][1]).toMatchObject({
       zone_type: "primary",
-      primary_ns: "",
-      admin_email: "",
+      primary_ns: "ns1.example.com.",
       ttl: 3600,
     });
   });
