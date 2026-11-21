@@ -4350,6 +4350,12 @@ the long ``DNS_AGENT_KEY`` / ``DHCP_AGENT_KEY`` hex string.
 > ``POST /api/v1/appliance/supervisor/register`` returns 404 and the
 > supervisor idles (#407).
 >
+> To start a fresh install with it on, set `INITIAL_SUPERVISOR_REGISTRATION=true`
+> in the Compose `.env`, or `supervisorRegistration.initiallyEnabled: true` in
+> the Helm values (#4659). It is read only when the settings row is first
+> created and never overrides a later choice. Minting a pairing code while the
+> flag is off returns a `warning` and the UI shows it.
+>
 > The flag refuses **new** pairings only. Appliances already registered
 > keep heartbeating and serving while it is off: `/supervisor/heartbeat`
 > and `/supervisor/poll` are not behind it (#2798). Before that fix,

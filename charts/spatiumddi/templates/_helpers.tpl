@@ -661,6 +661,10 @@ $(REDIS_PASSWORD) reference secrets; everything else is inline.
       name: {{ include "spatiumddi.appSecretName" . }}
       key: metrics-token
       optional: true
+{{- /* #4659 — initial Appliance registration state on a fresh install only. */}}
+- name: INITIAL_SUPERVISOR_REGISTRATION
+  value: {{ ((.Values.supervisorRegistration).initiallyEnabled | default false) | quote }}
+
 # #4548 — bcrypt hash the very first `admin` user is created with, instead of
 # admin / admin (and without a forced password change). Optional: absent on
 # every install that did not choose one, which keeps the old default account.

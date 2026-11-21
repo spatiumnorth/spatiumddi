@@ -538,6 +538,25 @@ externalRedis:
 
 ---
 
+### Joining appliance agent nodes (#4659)
+
+Appliance registration (`supervisor_registration_enabled`) is **off** on a
+Helm install, on OpenShift too. An appliance that joins with a pairing code
+while it is off cannot register and idles, with nothing in Fleet. Turn it on
+before the first pairing, either from the UI (**Appliance → Fleet → Pairing →
+Enable registration**) or at install time:
+
+```yaml
+supervisorRegistration:
+  initiallyEnabled: true
+```
+
+The value is read only when the settings row is first created, so it sets a
+fresh install's starting state and never overrides a later choice. Minting a
+pairing code while registration is off shows a warning in the UI and returns
+`warning` in the API response. Docker Compose has the same switch as
+`INITIAL_SUPERVISOR_REGISTRATION=true` in `.env`.
+
 ## 3. Managed DNS / DHCP agents
 
 The chart can optionally stand up one StatefulSet (+ Service) per managed DNS

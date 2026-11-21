@@ -80,6 +80,9 @@ services:
       SERVICE_CONTROL_ENABLED: ${SERVICE_CONTROL_ENABLED:-false}
       # #2780 — cap on a request body sent to the api (413 over it).
       MAX_REQUEST_BODY_BYTES: ${MAX_REQUEST_BODY_BYTES:-8388608}
+      # #4659 — initial state of Appliance registration on a FRESH install
+      # (see .env.example). Ignored once the settings row exists.
+      INITIAL_SUPERVISOR_REGISTRATION: ${INITIAL_SUPERVISOR_REGISTRATION:-false}
     # Docker integration — uncomment both entries below to poll the
     # host's Docker daemon over its local Unix socket. Required when
     # adding a Docker host with connection_type=unix, and by service
@@ -155,6 +158,8 @@ services:
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2
       VERSION: ${SPATIUMDDI_VERSION:-dev}
+      # #4659 — the worker can create the settings row too; keep in step with the api.
+      INITIAL_SUPERVISOR_REGISTRATION: ${INITIAL_SUPERVISOR_REGISTRATION:-false}
     # Docker integration — the worker runs the reconcile tasks, so it
     # also needs the host socket when polling a local daemon.
     # Uncomment alongside the matching entries on the api service
