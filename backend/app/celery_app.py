@@ -554,7 +554,8 @@ celery_app.conf.update(
             "schedule": crontab(hour=2, minute=15),
         },
         # Hourly (:05 UTC) prune of agent-shipped query / activity log
-        # entries older than the retention window (default 24 h). Query
+        # entries older than the retention window (default 24 h), plus
+        # terminal outbox / record-op / config-op rows (#1254). Query
         # logs are a firehose, so the table must hold ~retention rows,
         # not retention + a day. A crontab, not a 24 h interval: beat
         # keeps no state, so every restart reset that timer and the
