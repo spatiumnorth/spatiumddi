@@ -1,0 +1,324 @@
+name: Release — Forward merge
+
+# Cascade the long-lived release branches into each other, in the order kept in
+# .github/release-chain.json (the one place the order lives): every push to a
+# branch in the chain opens a PR that merges it into the NEXT branch, with a
+# real merge commit. Merging that PR pushes the next branch, which starts the
+# next hop. main -> first branch is out of scope (syncrel.sh handles it).
+#
+# Jobs:
+#   plan     which hops (source -> target) need a forward merge.
+#   forward  per hop: branch forward/<S>-to-<T> cut from T, S merged in,
+#            pushed, PR into T labelled forward-merge. Stops with a label and
+#            a comment on a conflict (the conflicted tree is committed so a
+#            human can resolve it on the branch) or on two Alembic heads.
+#   land     merge a forward-merge PR (merge commit, never a squash) once
+#            every status check the target's ruleset requires has passed.
+#
+# Needs a GitHub App (secrets FORWARD_MERGE_APP_ID / FORWARD_MERGE_APP_KEY),
+# for two reasons the default token cannot meet: a push or PR made with
+# GITHUB_TOKEN never starts another workflow (no CI on the PR, no next hop),
+# and release/1.0.1..1.2.0 sit behind a SQUASH merge queue, so only an actor on
+# the ruleset bypass list can merge with a merge commit. Without the secrets the
+# PRs are still opened, but CI will not start on them by itself and an admin
+# merges (the PR body says so). Setup: docs/DEVELOPMENT.md §12 "Forward merges".
+#
+# Safety: no release branch is ever force-pushed; only forward/* branches are
+# written; land merges only a PR that has the forward-merge label, is authored
+# by a bot, and whose head is a forward/* branch of this repository.
+#
+# The schedule is the backstop: it runs from the default branch, so it also
+# catches a push to a release branch that does not carry this workflow yet.
+
+on:
+  push:
+    branches: ["release/**"]
+  workflow_dispatch:
+    inputs:
+      from:
+        description: "Source branch to forward (e.g. release/1.0.1); empty = every hop in the chain"
+        required: false
+        default: ""
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: ["forward/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: Plan the hops
+    if: github.event_name != 'workflow_run'
+    runs-on: ubuntu-latest
+    outputs:
+      hops: ${{ steps.plan.outputs.hops }}
+      count: ${{ steps.plan.outputs.count }}
+    steps:
+      # The chain and the scripts always come from the default branch, never
+      # from the (possibly stale) release branch that was pushed.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+      - id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          PUSHED: ${{ github.ref_name }}
+          INPUT_FROM: ${{ inputs.from }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin '+refs/heads/release/*:refs/remotes/origin/release/*'
+          chain=$(jq -r '.chain[]' .github/release-chain.json)
+          mapfile -t C <<< "$chain"
+          only=""
+          case "$EVENT" in
+            push) only="$PUSHED" ;;
+            workflow_dispatch) only="$INPUT_FROM" ;;
+          esac
+          if [ "$EVENT" = push ] && [ -z "$only" ]; then only="-"; fi
+          hops='[]'
+          for ((i = 0; i + 1 < ${#C[@]}; i++)); do
+            s="${C[$i]}"; t="${C[$((i + 1))]}"
+            if [ -n "$only" ] && [ "$only" != "$s" ]; then continue; fi
+            git rev-parse --verify --quiet "origin/$s" >/dev/null || { echo "skip $s: no such branch"; continue; }
+            git rev-parse --verify --quiet "origin/$t" >/dev/null || { echo "skip $t: no such branch"; continue; }
+            if git merge-base --is-ancestor "origin/$s" "origin/$t"; then
+              echo "$t already contains $s"; continue
+            fi
+            hops=$(jq -c --arg s "$s" --arg t "$t" '. + [{source: $s, target: $t}]' <<< "$hops")
+          done
+          echo "hops=$hops" >> "$GITHUB_OUTPUT"
+          echo "count=$(jq 'length' <<< "$hops")" >> "$GITHUB_OUTPUT"
+          echo "Hops: $hops"
+
+  forward:
+    name: Forward ${{ matrix.hop.source }} to ${{ matrix.hop.target }}
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        hop: ${{ fromJSON(needs.plan.outputs.hops) }}
+    concurrency:
+      group: release-forward-merge-${{ matrix.hop.target }}
+      cancel-in-progress: false
+    env:
+      HAS_APP: ${{ secrets.FORWARD_MERGE_APP_ID != '' && secrets.FORWARD_MERGE_APP_KEY != '' }}
+      SRC: ${{ matrix.hop.source }}
+      TGT: ${{ matrix.hop.target }}
+    steps:
+      - name: App token
+        id: app
+        if: env.HAS_APP == 'true'
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.FORWARD_MERGE_APP_ID }}
+          private-key: ${{ secrets.FORWARD_MERGE_APP_KEY }}
+      - name: Tools from the default branch
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: ops
+          persist-credentials: false
+      - name: Target branch
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ matrix.hop.target }}
+          path: work
+          fetch-depth: 0
+          token: ${{ steps.app.outputs.token || github.token }}
+      - name: Forward merge
+        working-directory: work
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          Q=$(printf '\140')  # a literal backtick, for the Markdown in the comments
+          nl=$'\n'
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git fetch --quiet origin "$SRC" "$TGT"
+          if git merge-base --is-ancestor "origin/$SRC" "origin/$TGT"; then
+            echo "$TGT already contains $SRC"; exit 0
+          fi
+
+          FB="forward/${SRC//\//-}-to-${TGT//\//-}"
+          case "$FB" in forward/*) ;; *) echo "refusing to write $FB"; exit 1 ;; esac
+
+          for l in "forward-merge:0E8A16" "forward-merge:conflict:B60205" "forward-merge:alembic-heads:B60205"; do
+            gh label create "${l%:*}" --color "${l##*:}" --force \
+              --description "Automatic forward merge between release branches" >/dev/null
+          done
+
+          PR=$(gh pr list --head "$FB" --base "$TGT" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$PR" ] && git ls-remote --exit-code --heads origin "$FB" >/dev/null; then
+            # Keep what is on the branch (a person may have resolved something):
+            # only bring the new commits of the source in.
+            git fetch --quiet origin "$FB"
+            git checkout --quiet -B "$FB" "origin/$FB"
+            FRESH=0
+          else
+            # A stale branch of a closed PR is replaced (forward/* only); fetching
+            # it first gives --force-with-lease the ref it expects.
+            git fetch --quiet origin "$FB" 2>/dev/null || true
+            git checkout --quiet -B "$FB" "origin/$TGT"
+            FRESH=1
+          fi
+
+          CONFLICT=0
+          if ! git merge --no-ff --signoff --no-edit -m "Merge $SRC into $TGT (forward merge)" "origin/$SRC"; then
+            files=$(git diff --name-only --diff-filter=U)
+            if [ "$FRESH" = 1 ]; then
+              # Commit the conflicted tree so a person can resolve it on the branch.
+              git add -A
+              git commit --quiet --signoff -m "Merge $SRC into $TGT (forward merge, CONFLICTS TO RESOLVE)"
+              CONFLICT=1
+            else
+              git merge --abort
+              if [ -n "$PR" ]; then
+                gh pr edit "$PR" --add-label "forward-merge:conflict"
+                gh pr comment "$PR" --body "Merging new commits of ${Q}${SRC}${Q} into this branch conflicts in:${nl}${nl}$(printf '%s\n' "$files" | sed 's/^/- /')${nl}${nl}Resolve it on ${Q}${FB}${Q} and remove the label."
+              fi
+              exit 1
+            fi
+          fi
+
+          HEADS=$(python3 ../ops/.github/scripts/alembic_heads.py backend/alembic/versions | grep -c . || true)
+
+          if [ "$FRESH" = 1 ]; then
+            git push --force-with-lease origin "HEAD:refs/heads/$FB"
+          else
+            git push origin "HEAD:refs/heads/$FB"
+          fi
+
+          if [ "$HAS_APP" = true ]; then
+            NOTE="Merges by itself, with a merge commit, once the checks the ruleset requires of \`$TGT\` pass."
+          else
+            NOTE="**An admin must merge this** (no GitHub App is configured): \`gh pr merge <N> --merge --admin\`. CI does not start on a branch pushed with the default token; close and reopen the PR to start it."
+          fi
+          cat > "$RUNNER_TEMP/body.md" <<BODY
+          Automatic forward merge: \`$SRC\` into \`$TGT\` (release-forward-merge.yml, #3948 branch model).
+
+          Merge with a **merge commit**, never a squash, so \`$TGT\` keeps \`$SRC\`'s history. $NOTE
+
+          Stop labels: \`forward-merge:conflict\` (resolve it on \`$FB\`) and \`forward-merge:alembic-heads\` (re-point a \`down_revision\`). Remove the label once fixed. See docs/DEVELOPMENT.md section 12, "Forward merges".
+          BODY
+
+          if [ -z "$PR" ]; then
+            PR=$(gh pr create --base "$TGT" --head "$FB" --title "chore: forward-merge $SRC into $TGT" \
+              --body-file "$RUNNER_TEMP/body.md" --label forward-merge | grep -oE '[0-9]+$')
+          else
+            gh pr edit "$PR" --body-file "$RUNNER_TEMP/body.md"
+          fi
+          echo "PR #$PR"
+
+          if [ "$CONFLICT" = 1 ]; then
+            gh pr edit "$PR" --add-label "forward-merge:conflict"
+            gh pr comment "$PR" --body "Merging ${Q}${SRC}${Q} conflicts in:${nl}${nl}$(printf '%s\n' "$files" | sed 's/^/- /')${nl}${nl}The conflicted tree is committed on ${Q}${FB}${Q}. Check it out, resolve it, push, and remove the ${Q}forward-merge:conflict${Q} label."
+          fi
+          if [ "$HEADS" -gt 1 ]; then
+            gh pr edit "$PR" --add-label "forward-merge:alembic-heads"
+            gh pr comment "$PR" --body "The merged tree has ${HEADS} Alembic heads:${nl}${nl}$(python3 ../ops/.github/scripts/alembic_heads.py backend/alembic/versions | sed 's/^/- /')${nl}${nl}Re-point the ${Q}down_revision${Q} of the first migration the incoming side added at the other side's head, push to ${Q}${FB}${Q}, and remove the ${Q}forward-merge:alembic-heads${Q} label."
+          fi
+
+  land:
+    name: Merge passing forward-merge PRs
+    if: github.event_name != 'push' && (github.event_name != 'workflow_run' || github.event.workflow_run.event == 'pull_request')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: release-forward-merge-land
+      cancel-in-progress: false
+    env:
+      HAS_APP: ${{ secrets.FORWARD_MERGE_APP_ID != '' && secrets.FORWARD_MERGE_APP_KEY != '' }}
+    steps:
+      - name: App token
+        id: app
+        if: env.HAS_APP == 'true'
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.FORWARD_MERGE_APP_ID }}
+          private-key: ${{ secrets.FORWARD_MERGE_APP_KEY }}
+      - name: Merge
+        if: steps.app.outputs.token != ''
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ steps.app.outputs.token }}
+          script: |
+            const { owner, repo } = context.repo;
+            const GOOD = new Set(["success", "skipped", "neutral"]);
+            const prs = await github.paginate(github.rest.pulls.list, {
+              owner, repo, state: "open", per_page: 100,
+            });
+            for (const p of prs) {
+              const labels = p.labels.map((l) => l.name);
+              if (!labels.includes("forward-merge")) continue;
+              const tag = `#${p.number}`;
+              // Never merge anything that is not the bot's own forward/* PR.
+              if (p.user.type !== "Bot" || !p.head.ref.startsWith("forward/") ||
+                  p.head.repo?.full_name !== `${owner}/${repo}` || p.draft) {
+                core.info(`${tag}: not a bot-authored forward/* PR, skipped`);
+                continue;
+              }
+              if (!p.base.ref.startsWith("release/")) { core.info(`${tag}: base ${p.base.ref}, skipped`); continue; }
+              const stop = labels.filter((n) => n.startsWith("forward-merge:"));
+              if (stop.length) { core.info(`${tag}: stopped by ${stop.join(", ")}`); continue; }
+
+              const full = (await github.rest.pulls.get({ owner, repo, pull_number: p.number })).data;
+              if (full.mergeable_state === "behind") {
+                await github.rest.pulls.updateBranch({ owner, repo, pull_number: p.number });
+                core.info(`${tag}: behind ${p.base.ref}, branch updated; CI restarts`);
+                continue;
+              }
+              if (full.mergeable_state === "dirty") {
+                await github.rest.issues.addLabels({ owner, repo, issue_number: p.number, labels: ["forward-merge:conflict"] });
+                core.info(`${tag}: conflicts with ${p.base.ref}, labelled`);
+                continue;
+              }
+
+              // The checks the target's ruleset requires, all of which must have passed.
+              const rules = await github.paginate(github.rest.repos.getBranchRules, {
+                owner, repo, branch: p.base.ref, per_page: 100,
+              });
+              const required = rules
+                .filter((r) => r.type === "required_status_checks")
+                .flatMap((r) => r.parameters.required_status_checks.map((c) => c.context));
+              if (!required.length) { core.warning(`${tag}: no required checks found for ${p.base.ref}; not merging`); continue; }
+              const sha = p.head.sha;
+              const runs = await github.paginate(github.rest.checks.listForRef, { owner, repo, ref: sha, per_page: 100 });
+              const statuses = (await github.rest.repos.getCombinedStatusForRef({ owner, repo, ref: sha, per_page: 100 })).data.statuses;
+              const state = (name) => {
+                const rs = runs.filter((r) => r.name === name)
+                  .sort((a, b) => new Date(b.started_at ?? 0) - new Date(a.started_at ?? 0));
+                if (rs.length) return rs[0].status !== "completed" ? "pending" : GOOD.has(rs[0].conclusion) ? "ok" : "failed";
+                const s = statuses.find((x) => x.context === name);
+                if (s) return s.state === "success" ? "ok" : s.state === "pending" ? "pending" : "failed";
+                return "pending";
+              };
+              const states = required.map((n) => [n, state(n)]);
+              const failed = states.filter(([, s]) => s === "failed").map(([n]) => n);
+              if (failed.length) { core.warning(`${tag}: failed checks: ${failed.join(", ")}`); continue; }
+              if (states.some(([, s]) => s !== "ok")) { core.info(`${tag}: checks still pending`); continue; }
+
+              try {
+                await github.rest.pulls.merge({
+                  owner, repo, pull_number: p.number, merge_method: "merge", sha,
+                });
+                core.info(`${tag}: merged ${p.head.ref} into ${p.base.ref} (merge commit)`);
+              } catch (e) {
+                core.warning(`${tag}: merge refused: ${e.message}`);
+              }
+            }

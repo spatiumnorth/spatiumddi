@@ -218,3 +218,8 @@ docker-compose.dev.yml
 # script as a subprocess, so editing it (or its ignore list) must run it.
 .github/scripts/check_contributors.py
 .github/contributors-ignore.txt
+
+# test_alembic_heads_script.py loads the forward-merge workflow's Alembic
+# head check (release-forward-merge.yml), which decides whether a merge of one
+# release branch into the next left two migration heads.
+.github/scripts/alembic_heads.py

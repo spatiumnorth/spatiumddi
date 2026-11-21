@@ -887,6 +887,53 @@ goes on long-lived `release/X.Y.Z` branches (#3948), for example
 - **Changelog fragments** come along with the merge; release prep folds them
   as usual.
 
+### Forward merges
+
+`release-forward-merge.yml` cascades the release branches into each other so
+nobody has to remember to. The order lives in one file,
+[`.github/release-chain.json`](https://github.com/spatiumnorth/spatiumddi/blob/main/.github/release-chain.json)
+(today `release/1.0.1`, `release/1.0.2`, `release/1.1.0`, `release/1.2.0`);
+add a new release branch there. `main` into the first branch is not part of
+it, that sync stays a manual `syncrel` step.
+
+A push to a branch in the chain (or the 15-minute schedule, or *Run workflow*
+with a `from` branch) opens a PR from `forward/<source>-to-<target>` into the
+next branch, labelled `forward-merge`, carrying the source merged in with a
+signed-off **merge commit**. Once every status check the target's ruleset
+requires has passed, the workflow merges it with a merge commit (never a
+squash, so the target keeps the source's history). That merge pushes the
+target, which starts the next hop. Only a bot-authored `forward/*` PR with the
+`forward-merge` label is ever merged, and no release branch is force-pushed.
+
+A human steps in only when a stop label appears; fix it on the
+`forward/...` branch (check it out, push to it), then remove the label and the
+workflow carries on:
+
+- `forward-merge:conflict` — the merge conflicted. The conflicted tree is
+  committed on the forward branch and the comment lists the files. Resolve
+  them, commit, push.
+- `forward-merge:alembic-heads` — the merged tree has two Alembic heads.
+  Re-point the `down_revision` of the first migration the incoming side added
+  at the other side's head (see *Alembic heads* above), push.
+- A failed required check is not labelled; the PR just waits. Fix the cause on
+  the branch (or on the source branch) and the checks re-run.
+
+One-time setup (until it is done, PRs are opened but an admin merges them, and
+CI does not start on them by itself, because a push made with the default
+`GITHUB_TOKEN` starts no workflow):
+
+1. Create a GitHub App with repository permissions **Contents: read & write**
+   and **Pull requests: read & write** (plus Metadata: read, which is implied).
+2. Install it on this repository only.
+3. Store its App ID and a generated private key as the repository secrets
+   `FORWARD_MERGE_APP_ID` and `FORWARD_MERGE_APP_KEY`.
+4. Add the App to the bypass list of the `release-merge-queue` and
+   `protect-release` rulesets, **for pull requests only**. The queue squashes
+   everything, and only a bypass actor can merge a PR with a merge commit.
+5. Merge the workflow into `main`, then sync it into `release/1.0.1` (the
+   cascade carries it from there); the schedule, which runs from `main`,
+   covers the branches that do not have it yet.
+
 ### Changelog fragments
 
 Every PR used to add its entry at the top of `### Fixed` under
