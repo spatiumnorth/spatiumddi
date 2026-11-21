@@ -1120,8 +1120,8 @@ class PowerDNSDriver(DriverBase):
         ``pdns.conf`` is largely static after first boot — listen
         addresses, the API key, and the LMDB filename don't change at
         runtime. We still rewrite it on every render so operators
-        editing options through the UI (loglevel, query logging, the
-        ALIAS resolver) see the change: ``swap_and_reload`` restarts
+        editing options through the UI (query logging, the ALIAS
+        resolver) see the change: ``swap_and_reload`` restarts
         pdns when the rendered file differs, since pdns reads it only
         at startup.
         """
@@ -1148,10 +1148,9 @@ class PowerDNSDriver(DriverBase):
         # out before they reach stderr. Bump to 6 only when query
         # logging is enabled so quiet operators don't get noisy logs
         # for free; otherwise stick with the configured level (or 4
-        # default) so startup banners + errors still show through.
-        log_level = int(opts.get("log_level", 4))
-        if query_log_enabled and log_level < 6:
-            log_level = 6
+        # default) so startup banners + errors still show through. The
+        # bundle carries no log-level option (#4604), so the base is 4.
+        log_level = 6 if query_log_enabled else 4
 
         # The ALIAS resolver is the group's own plain-DNS forwarders,
         # computed by the control plane (#1353); "" turns ALIAS expansion
@@ -2804,10 +2803,10 @@ class PowerDNSDriver(DriverBase):
         query_log_enabled: bool = False,
         alias_resolver: str = "",
     ) -> str:
-        # Mirrors backend/app/drivers/dns/powerdns.py::render_pdns_conf.
-        # Agent and control plane render the same shape; the agent
-        # owns the API key while the control plane sees only the
-        # placeholder.
+        # The authoritative renderer. backend/app/drivers/dns/powerdns.py::
+        # render_pdns_conf is a preview TEMPLATE of this (#4604): keep its
+        # fixed values in step. The agent owns the API key; the control plane
+        # sees only a placeholder.
         log_queries_value = "yes" if query_log_enabled else "no"
         proxy_from = _proxy_protocol_sources()
         return "\n".join(
@@ -3811,15 +3810,3 @@ class PowerDNSDriver(DriverBase):
             # bundle may carry another spelling (``Case.Test.``).
             out[str(z["name"]).rstrip(".").lower()] = serial
         return out
-
-    def _reload_via_api(self) -> None:
-        """Optional — issue a notify on every zone after a bulk
-        change. PowerDNS is master-only by default; this only matters
-        when secondaries are configured. Currently unused but kept
-        as a hook for Phase 2 supermaster wiring.
-        """
-        if self.daemon_pid:
-            try:
-                os.kill(self.daemon_pid, signal.SIGUSR1)
-            except OSError as exc:
-                log.warning("pdns_sigusr1_failed", error=str(exc))
