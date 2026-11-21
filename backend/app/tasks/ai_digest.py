@@ -33,11 +33,9 @@ from typing import Any
 
 import structlog
 from sqlalchemy import desc, func, select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.celery_app import celery_app
-from app.config import settings
-from app.db import task_connect_args
 from app.drivers.llm import ChatMessage, ChatRequest, get_driver
 from app.models.ai import AIProvider
 from app.models.alerts import AlertEvent
@@ -45,6 +43,7 @@ from app.models.audit import AuditLog
 from app.models.dhcp import DHCPLease
 from app.models.settings import PlatformSettings
 from app.services import audit_forward
+from app.task_runtime import release_task_engine, run_task, task_engine
 from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
@@ -305,9 +304,7 @@ async def _dispatch_digest(summary: str, rollup: dict[str, Any]) -> int:
 
 
 async def _run() -> dict[str, Any]:
-    engine = create_async_engine(
-        settings.database_url, future=True, connect_args=task_connect_args()
-    )
+    engine = task_engine()
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
@@ -367,7 +364,7 @@ async def _run() -> dict[str, Any]:
             "usage": usage,
         }
     finally:
-        await engine.dispose()
+        await release_task_engine(engine)
 
 
 @celery_app.task(
@@ -380,7 +377,7 @@ async def _run() -> dict[str, Any]:
 @module_gated("ai.copilot")
 def send_daily_digest(self: Any) -> dict[str, Any]:  # noqa: ARG001
     """Beat-fired entrypoint. The async helper does all the real work."""
-    return asyncio.run(_run())
+    return run_task(_run())
 
 
 __all__ = ["send_daily_digest"]

@@ -14,31 +14,27 @@ any explicit trigger from the API path.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime
 from typing import Any
 
 import structlog
 from sqlalchemy import or_, select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.celery_app import celery_app
-from app.config import settings
-from app.db import task_connect_args
 from app.drivers.dhcp import is_agentless
 from app.drivers.dhcp.base import MACBlockDef
 from app.drivers.dhcp.registry import get_driver
 from app.models.dhcp import DHCPMACBlock, DHCPServer
 from app.services.feature_modules import is_module_enabled
+from app.task_runtime import release_task_engine, run_task, task_engine
 from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
 
 async def _run_sync() -> dict[str, Any]:
-    engine = create_async_engine(
-        settings.database_url, future=True, connect_args=task_connect_args()
-    )
+    engine = task_engine()
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
     try:
@@ -115,7 +111,7 @@ async def _run_sync() -> dict[str, Any]:
                 "errors": errors,
             }
     finally:
-        await engine.dispose()
+        await release_task_engine(engine)
 
 
 @celery_app.task(
@@ -128,7 +124,7 @@ async def _run_sync() -> dict[str, Any]:
 @module_gated("core.dhcp")
 def sync_dhcp_mac_blocks(self: Any) -> dict[str, Any]:  # noqa: ARG001
     """Beat-fired entrypoint. Runs the async reconciler under asyncio."""
-    return asyncio.run(_run_sync())
+    return run_task(_run_sync())
 
 
 __all__ = ["sync_dhcp_mac_blocks"]

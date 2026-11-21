@@ -31,23 +31,21 @@ Idempotent: re-running is a no-op whenever DB and wire already agree.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
 from sqlalchemy import or_, select, update
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.celery_app import celery_app
-from app.config import settings
 from app.core.agent_wake import dns_group_channel, publish_wake
-from app.db import task_connect_args
 from app.drivers.dhcp import is_agentless
 from app.models.audit import AuditLog
 from app.models.dhcp import DHCPServer
 from app.models.settings import PlatformSettings
 from app.services.feature_modules import is_module_enabled
+from app.task_runtime import release_task_engine, run_task, task_engine
 from app.tasks._interval_gate import FAST_BEAT_JITTER_TOLERANCE, interval_skip
 from app.tasks.module_gate import module_gated
 
@@ -66,9 +64,7 @@ async def _run_pull() -> dict[str, Any]:
         recount_subnets_and_blocks,
     )
 
-    engine = create_async_engine(
-        settings.database_url, future=True, connect_args=task_connect_args()
-    )
+    engine = task_engine()
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
     try:
@@ -297,7 +293,7 @@ async def _run_pull() -> dict[str, Any]:
                 "errors": len(errors),
             }
     finally:
-        await engine.dispose()
+        await release_task_engine(engine)
 
 
 @celery_app.task(name="app.tasks.dhcp_pull_leases.auto_pull_dhcp_leases", bind=True)
@@ -306,7 +302,7 @@ def auto_pull_dhcp_leases(self: object) -> dict[str, Any]:  # type: ignore[type-
     """Celery beat entrypoint — fires every 10s; the task itself checks the
     platform-settings gate and the per-run interval (in seconds)."""
     try:
-        return asyncio.run(_run_pull())
+        return run_task(_run_pull())
     except Exception as exc:  # noqa: BLE001
         logger.exception("dhcp_pull_leases_failed", error=str(exc))
         raise

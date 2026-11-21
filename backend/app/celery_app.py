@@ -17,6 +17,7 @@ from celery.signals import (
     task_postrun,
     task_prerun,
     worker_init,
+    worker_process_init,
     worker_process_shutdown,
     worker_ready,
     worker_shutdown,
@@ -1360,6 +1361,23 @@ def _close_after_commit_dispatch(**_: object) -> None:
     once it finds no loop owned by this PID). It still matters for the solo /
     threads pools, where the main process runs the tasks."""
     _drain_after_commit_dispatch()
+
+
+@worker_process_init.connect
+def _install_task_loop(**_: object) -> None:
+    """#4515 — give this prefork child one event loop and (lazily) one async
+    engine for all its tasks, instead of an ``asyncio.run`` and a fresh engine
+    per task. See ``app.task_runtime``."""
+    importlib.import_module("app.task_runtime").install_child_loop()
+
+
+@worker_process_shutdown.connect
+def _close_task_loop_in_child(**_: object) -> None:
+    """#4515 — dispose the child's shared engine and close its loop."""
+    try:
+        importlib.import_module("app.task_runtime").close_child_loop()
+    except Exception:  # noqa: BLE001 — shutdown must never be blocked
+        structlog.get_logger(__name__).warning("task_loop_shutdown_failed", exc_info=True)
 
 
 @worker_process_shutdown.connect

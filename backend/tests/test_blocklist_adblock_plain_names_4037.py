@@ -162,7 +162,7 @@ async def test_refresh_stores_literal_entries_with_their_own_flag(
         "GuardedTransport",
         lambda **kw: httpx.MockTransport(lambda r: httpx.Response(200, text=feed)),
     )
-    monkeypatch.setattr(dns_tasks, "create_async_engine", lambda *a, **kw: _NullEngine())
+    monkeypatch.setattr(dns_tasks, "task_engine", lambda *a, **kw: _NullEngine())
 
     @contextlib.asynccontextmanager
     async def _cm():  # type: ignore[no-untyped-def]

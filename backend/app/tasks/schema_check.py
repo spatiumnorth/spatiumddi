@@ -32,7 +32,6 @@ k8s with zero orchestration-specific branching.
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from time import monotonic
@@ -46,6 +45,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import settings
 from app.core.schema_check import SchemaCheck, schema_at_head
+from app.task_runtime import run_task
 
 logger = structlog.get_logger(__name__)
 
@@ -81,7 +81,7 @@ _STRICT_EXEMPT_TASKS = frozenset(
 async def _check() -> SchemaCheck:
     """Run the schema comparison on a per-call engine.
 
-    Celery's ``asyncio.run(...)`` pattern spins a fresh event loop per
+    Celery's ``run_task(...)`` pattern spins a fresh event loop per
     invocation; the shared ``AsyncSessionLocal`` engine binds asyncpg
     connections to the *first* loop, so a later reuse raises
     ``RuntimeError: Future attached to a different loop`` (see
@@ -115,7 +115,7 @@ def _log_startup(result: SchemaCheck, *, who: str) -> None:
 def _worker_ready_schema_check(**_: object) -> None:
     """One-shot schema-at-head check when the worker finishes booting."""
     try:
-        result = asyncio.run(_check())
+        result = run_task(_check())
     except Exception as exc:  # noqa: BLE001 — never block worker start
         logger.warning("schema_check_startup_failed", who="worker", error=str(exc))
         return
@@ -128,7 +128,7 @@ def _worker_ready_schema_check(**_: object) -> None:
 def _beat_init_schema_check(**_: object) -> None:
     """One-shot schema-at-head check when beat starts."""
     try:
-        result = asyncio.run(_check())
+        result = run_task(_check())
     except Exception as exc:  # noqa: BLE001 — never block beat start
         logger.warning("schema_check_startup_failed", who="beat", error=str(exc))
         return
@@ -156,7 +156,7 @@ def _strict_schema_gate(sender: object | None = None, **_: object) -> None:
     now = monotonic()
     if checked_at is None or (now - checked_at) > _STRICT_CACHE_TTL_SECONDS:
         try:
-            result = asyncio.run(_check())
+            result = run_task(_check())
         except Exception as exc:  # noqa: BLE001 — fail open, don't wedge on a blip
             logger.warning("strict_schema_gate_check_failed", error=str(exc))
             return
@@ -316,4 +316,4 @@ async def _async_check_and_alert() -> dict:
 )
 def check_schema_at_head(self: object) -> dict:  # type: ignore[type-arg]
     """Periodic beat entry point. Idempotent + self-resolving."""
-    return asyncio.run(_async_check_and_alert())
+    return run_task(_async_check_and_alert())

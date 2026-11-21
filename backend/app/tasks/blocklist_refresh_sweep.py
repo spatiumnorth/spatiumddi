@@ -18,19 +18,17 @@ for the next tick, longest-overdue first.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.celery_app import celery_app
-from app.config import settings
-from app.db import task_connect_args
 from app.models.dns import DNSBlockList
 from app.services.feature_modules import is_module_enabled
+from app.task_runtime import release_task_engine, run_task, task_engine
 from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
@@ -75,9 +73,7 @@ async def due_blocklist_ids(db: AsyncSession, now: datetime) -> list[str]:
 async def _dispatch_due_async() -> int:
     from app.tasks.dns import refresh_blocklist_feed
 
-    engine = create_async_engine(
-        settings.database_url, future=True, connect_args=task_connect_args()
-    )
+    engine = task_engine()
     factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with factory() as db:
@@ -86,7 +82,7 @@ async def _dispatch_due_async() -> int:
                 return 0
             ids = await due_blocklist_ids(db, datetime.now(UTC))
     finally:
-        await engine.dispose()
+        await release_task_engine(engine)
 
     deferred = max(0, len(ids) - MAX_PER_TICK)
     ids = ids[:MAX_PER_TICK]
@@ -107,7 +103,7 @@ async def _dispatch_due_async() -> int:
 @module_gated("core.dns")
 def dispatch_due_blocklists(self: Any) -> int:  # noqa: ARG001
     """Beat-fired sweep — queues ``refresh_blocklist_feed`` per due list."""
-    return asyncio.run(_dispatch_due_async())
+    return run_task(_dispatch_due_async())
 
 
 __all__ = ["dispatch_due_blocklists", "due_blocklist_ids"]

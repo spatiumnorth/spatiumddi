@@ -25,7 +25,6 @@ no-op; a still-active announcement just bumps ``last_seen_at``.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -42,6 +41,7 @@ from app.services.bgp.hijack_monitor import (
     refresh_tracked_prefixes_for_asn,
     resolve_stale_detections,
 )
+from app.task_runtime import run_task
 from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
@@ -212,7 +212,7 @@ def poll_bgp_hijacks(self: object) -> dict[str, Any]:  # type: ignore[type-arg]
     HTTP failures are already swallowed at the client layer into a soft
     ``available: False`` so a flaky upstream just skips this pass."""
     try:
-        return asyncio.run(_run_poll())
+        return run_task(_run_poll())
     except Exception as exc:  # noqa: BLE001
         logger.exception("bgp_hijack_poll_failed", error=str(exc))
         raise

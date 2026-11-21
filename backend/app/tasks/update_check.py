@@ -20,20 +20,19 @@ a nightly is always offered one.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 import structlog
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.celery_app import celery_app
 from app.config import settings
 from app.core.exc_text import describe_http_exc
 from app.core.versions import canonical_version, includes_release, parse_release
-from app.db import task_connect_args
 from app.models.settings import PlatformSettings
+from app.task_runtime import release_task_engine, run_task, task_engine
 
 logger = structlog.get_logger(__name__)
 
@@ -75,9 +74,7 @@ def running_version() -> str:
 
 
 async def _run_check() -> dict[str, Any]:
-    engine = create_async_engine(
-        settings.database_url, future=True, connect_args=task_connect_args()
-    )
+    engine = task_engine()
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
@@ -163,7 +160,7 @@ async def _run_check() -> dict[str, Any]:
                 "update_available": ps.update_available,
             }
     finally:
-        await engine.dispose()
+        await release_task_engine(engine)
 
 
 @celery_app.task(
@@ -175,7 +172,7 @@ async def _run_check() -> dict[str, Any]:
 )
 def check_github_release(self: Any) -> dict[str, Any]:  # noqa: ARG001
     """Beat-fired entrypoint. Runs the async checker under asyncio."""
-    return asyncio.run(_run_check())
+    return run_task(_run_check())
 
 
 __all__ = ["check_github_release"]

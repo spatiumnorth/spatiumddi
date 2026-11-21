@@ -13,7 +13,6 @@ targets concurrently.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime
 
 import structlog
@@ -23,6 +22,7 @@ from app.celery_app import celery_app
 from app.db import task_session
 from app.models.influxdb import InfluxDBTarget
 from app.services.influxdb.push import is_due, push_target
+from app.task_runtime import run_task
 
 logger = structlog.get_logger(__name__)
 
@@ -66,7 +66,7 @@ async def _push_all() -> dict[str, int]:
 
 @celery_app.task(name="app.tasks.influxdb_push.push_influxdb_metrics")
 def push_influxdb_metrics() -> dict[str, int]:
-    result = asyncio.run(_push_all())
+    result = run_task(_push_all())
     if result.get("targets"):
         logger.info("influxdb_push_sweep", **result)
     return result

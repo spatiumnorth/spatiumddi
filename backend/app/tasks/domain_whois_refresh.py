@@ -24,7 +24,6 @@ the row that triggered them; the rest of the sweep proceeds.
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -43,6 +42,7 @@ from app.services.domain_refresh import (
     refresh_one_domain,
 )
 from app.services.feature_modules import is_module_enabled
+from app.task_runtime import run_task
 
 logger = structlog.get_logger(__name__)
 
@@ -233,7 +233,7 @@ def refresh_due_domains(self: object) -> dict[str, Any]:  # type: ignore[type-ar
     treat every row as "not due".
     """
     try:
-        return asyncio.run(_refresh_due_async())
+        return run_task(_refresh_due_async())
     except Exception as exc:  # noqa: BLE001
         logger.exception("domain_whois_refresh_failed", error=str(exc))
         raise
@@ -313,7 +313,7 @@ def refresh_one_domain_by_id(self: object, domain_id: str) -> dict[str, Any]:  #
     the shared ``refresh_one_domain`` service.
     """
     try:
-        return asyncio.run(_refresh_one_by_id_async(domain_id))
+        return run_task(_refresh_one_by_id_async(domain_id))
     except Exception as exc:  # noqa: BLE001
         logger.exception("domain_whois_refresh_one_failed", domain_id=domain_id, error=str(exc))
         raise

@@ -9,7 +9,6 @@ still past the cutoff.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime, timedelta
 
 import structlog
@@ -19,6 +18,7 @@ from app.celery_app import celery_app
 from app.db import task_session
 from app.models.e911 import E911ResolutionLog
 from app.models.settings import PlatformSettings
+from app.task_runtime import run_task
 
 logger = structlog.get_logger(__name__)
 
@@ -42,6 +42,6 @@ async def _sweep() -> int:
 
 @celery_app.task(name="app.tasks.prune_e911_resolution_log.prune_e911_resolution_log")
 def prune_e911_resolution_log() -> dict[str, int]:
-    removed = asyncio.run(_sweep())
+    removed = run_task(_sweep())
     logger.info("e911_resolution_log_pruned", removed=removed)
     return {"removed": removed}

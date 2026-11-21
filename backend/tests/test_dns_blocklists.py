@@ -378,7 +378,7 @@ async def test_feed_sync_counts_and_wildcards(
     monkeypatch.setattr(dns_tasks.httpx, "AsyncClient", _Client)
     # The task builds its own engine + session factory; hand it the test
     # session so it writes where the assertions can see it.
-    monkeypatch.setattr(dns_tasks, "create_async_engine", lambda *a, **kw: _NullEngine())
+    monkeypatch.setattr(dns_tasks, "task_engine", lambda *a, **kw: _NullEngine())
 
     @contextlib.asynccontextmanager
     async def _factory_cm():  # type: ignore[no-untyped-def]
@@ -477,7 +477,7 @@ async def test_feed_wildcard_flag_defaults_on_and_drives_new_rows(
                 return _Resp()
 
         monkeypatch.setattr(dns_tasks.httpx, "AsyncClient", _Client)
-        monkeypatch.setattr(dns_tasks, "create_async_engine", lambda *a, **kw: _NullEngine())
+        monkeypatch.setattr(dns_tasks, "task_engine", lambda *a, **kw: _NullEngine())
 
         @contextlib.asynccontextmanager
         async def _factory_cm():  # type: ignore[no-untyped-def]

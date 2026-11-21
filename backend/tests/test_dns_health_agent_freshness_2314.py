@@ -36,7 +36,7 @@ def _wire(monkeypatch: pytest.MonkeyPatch, db_session: AsyncSession, soa_ok: boo
     async def _factory_cm():  # type: ignore[no-untyped-def]
         yield db_session
 
-    monkeypatch.setattr(dns_tasks, "create_async_engine", lambda *a, **kw: _NullEngine())
+    monkeypatch.setattr(dns_tasks, "task_engine", lambda *a, **kw: _NullEngine())
     monkeypatch.setattr(dns_tasks, "async_sessionmaker", lambda *a, **kw: _factory_cm)
     monkeypatch.setattr(dns_tasks, "_probe_server_soa", _probe)
     return probes

@@ -25,25 +25,22 @@ from uuid import UUID
 
 import structlog
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.celery_app import celery_app
-from app.config import settings
 from app.core.agent_wake import dns_group_channel, publish_wake
-from app.db import task_connect_args
 from app.models.dns import DNSPool
 from app.services.dns.pool_apply import apply_pool_state
 from app.services.dns.pool_healthcheck import apply_check_to_member, run_check
 from app.services.feature_modules import is_module_enabled
+from app.task_runtime import release_task_engine, run_task, task_engine
 from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
 
 async def _run_pool_check_async(pool_id_str: str) -> dict[str, Any]:
-    engine = create_async_engine(
-        settings.database_url, future=True, connect_args=task_connect_args()
-    )
+    engine = task_engine()
     factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with factory() as db:
@@ -112,7 +109,7 @@ async def _run_pool_check_async(pool_id_str: str) -> dict[str, Any]:
                 "rendered": apply_summary,
             }
     finally:
-        await engine.dispose()
+        await release_task_engine(engine)
 
 
 @celery_app.task(name="app.tasks.dns_pool_healthcheck.run_pool_check", bind=True)
@@ -122,16 +119,14 @@ def run_pool_check(self: Any, pool_id_str: str) -> dict[str, Any]:  # noqa: ARG0
     Idempotent — safe to retry. Acquires a per-pool row lock so
     concurrent runs don't double-poll.
     """
-    return asyncio.run(_run_pool_check_async(pool_id_str))
+    return run_task(_run_pool_check_async(pool_id_str))
 
 
 # ── Beat-fired dispatcher ───────────────────────────────────────────
 
 
 async def _dispatch_due_async() -> int:
-    engine = create_async_engine(
-        settings.database_url, future=True, connect_args=task_connect_args()
-    )
+    engine = task_engine()
     factory = async_sessionmaker(engine, expire_on_commit=False)
     queued = 0
     try:
@@ -162,14 +157,14 @@ async def _dispatch_due_async() -> int:
                     break
         return queued
     finally:
-        await engine.dispose()
+        await release_task_engine(engine)
 
 
 @celery_app.task(name="app.tasks.dns_pool_healthcheck.dispatch_due_pools", bind=True)
 @module_gated("core.dns")
 def dispatch_due_pools(self: Any) -> int:  # noqa: ARG001
     """Beat-fired sweep — queues ``run_pool_check`` per due pool."""
-    return asyncio.run(_dispatch_due_async())
+    return run_task(_dispatch_due_async())
 
 
 __all__ = ["run_pool_check", "dispatch_due_pools"]

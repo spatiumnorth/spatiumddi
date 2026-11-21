@@ -20,7 +20,6 @@ task is safe to retry (non-negotiable #9).
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -35,6 +34,7 @@ from app.models.dns_rpz_hit import DNSRPZHit
 from app.models.logs import DHCPLogEntry, DNSQueryLogEntry
 from app.models.settings import PlatformSettings
 from app.services.agents.ingest_receipt import RECEIPT_RETENTION_DAYS, prune_receipts
+from app.task_runtime import run_task
 
 logger = structlog.get_logger(__name__)
 
@@ -147,6 +147,6 @@ async def _sweep() -> dict[str, Any]:
 
 @celery_app.task(name="app.tasks.prune_logs.prune_log_entries")
 def prune_log_entries() -> dict[str, Any]:
-    result = asyncio.run(_sweep())
+    result = run_task(_sweep())
     logger.info("log_entries_pruned", **result)
     return result

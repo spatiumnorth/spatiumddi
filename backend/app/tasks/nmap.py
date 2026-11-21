@@ -11,7 +11,6 @@ absorbs the dispatch-before-commit race (#510).
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 from typing import Any
 
@@ -20,6 +19,7 @@ import structlog
 from app.celery_app import celery_app
 from app.core.task_lock import single_flight
 from app.services.nmap.runner import NmapScanRowMissing, run_scan
+from app.task_runtime import run_task
 
 logger = structlog.get_logger(__name__)
 
@@ -36,7 +36,7 @@ def run_scan_task(self: Any, scan_id_str: str) -> dict[str, str]:
     scan_id = uuid.UUID(scan_id_str)
     logger.info("nmap_run_scan_task_started", scan_id=scan_id_str)
     try:
-        asyncio.run(run_scan(scan_id))
+        run_task(run_scan(scan_id))
     except NmapScanRowMissing as exc:
         # The dispatcher flushed the row but hadn't committed when we picked up
         # the task. Retry with capped exponential backoff — a lease-event

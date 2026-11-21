@@ -9,17 +9,13 @@ without double-delivery.
 
 from __future__ import annotations
 
-import asyncio
-
 import structlog
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.pool import NullPool
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.celery_app import celery_app
-from app.config import settings as _app_settings
-from app.db import task_connect_args
 from app.services.event_delivery import process_due_outbox
+from app.task_runtime import release_task_engine, run_task, task_engine
 
 logger = structlog.get_logger(__name__)
 
@@ -39,27 +35,22 @@ logger = structlog.get_logger(__name__)
 def process_event_outbox(self: object) -> dict[str, object]:  # type: ignore[type-arg]
     """Tick the event outbox worker.
 
-    Uses a fresh ``NullPool`` engine per tick. Celery's prefork worker
-    reuses processes across tasks, and SQLAlchemy's pooled engines
-    bind asyncpg connections to the loop that first checked them out —
-    re-entering with ``asyncio.run`` (a new loop) surfaces as
-    ``RuntimeError: Future attached to a different loop`` or
-    ``InterfaceError: another operation is in progress``. ``NullPool``
-    has no cross-task connection state to leak.
+    Runs on the child's one loop with its shared task engine (#4515), so the
+    pooled connections stay on the loop that opened them. Outside a child the
+    tick gets a throwaway engine on its own ``asyncio.run`` loop, disposed
+    at the end (previously a ``NullPool`` engine, for the same reason).
     """
 
     async def _run() -> dict[str, int]:
-        engine = create_async_engine(
-            _app_settings.database_url, poolclass=NullPool, connect_args=task_connect_args()
-        )
+        engine = task_engine()
         try:
             async with AsyncSession(engine, expire_on_commit=False) as session:
                 return await process_due_outbox(session)
         finally:
-            await engine.dispose()
+            await release_task_engine(engine)
 
     try:
-        return dict(asyncio.run(_run()))
+        return dict(run_task(_run()))
     except (SQLAlchemyError, ConnectionError, OSError):
         # Let Celery autoretry these — re-raise unchanged.
         raise

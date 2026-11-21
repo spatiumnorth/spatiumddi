@@ -34,7 +34,6 @@ beat fires many tasks on the same tick, so most checks hit it.
 
 from __future__ import annotations
 
-import asyncio
 import functools
 import inspect
 from collections.abc import Callable
@@ -44,6 +43,7 @@ import structlog
 
 from app.db import task_session
 from app.services import feature_modules
+from app.task_runtime import run_task
 
 logger = structlog.get_logger(__name__)
 
@@ -72,7 +72,7 @@ def module_gated(module_id: str) -> Callable[[_F], _F]:
 
         @functools.wraps(fn)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
-            if not asyncio.run(_module_enabled(module_id)):
+            if not run_task(_module_enabled(module_id)):
                 if task_label not in _logged_skips:
                     _logged_skips.add(task_label)
                     logger.debug(

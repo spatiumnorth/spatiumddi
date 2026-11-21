@@ -12,7 +12,6 @@ place "the trash sweep ran, here's what it removed".
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -38,6 +37,7 @@ from app.services.dhcp.static_ipam import remove_ipam_for_static
 from app.services.e911.delete_guard import subnet_e911_bound_clause
 from app.services.ipam.orphan_aliases import is_withdrawn_alias, withdrawn_alias_owners
 from app.services.ipam.utilization import recount_subnets_and_blocks
+from app.task_runtime import run_task
 
 logger = structlog.get_logger(__name__)
 
@@ -676,6 +676,6 @@ async def _sweep() -> dict[str, Any]:
 
 @celery_app.task(name="app.tasks.trash_purge.purge_expired_soft_deletes")
 def purge_expired_soft_deletes() -> dict[str, Any]:
-    result = asyncio.run(_sweep())
+    result = run_task(_sweep())
     logger.info("trash_purge.completed", **result)
     return result

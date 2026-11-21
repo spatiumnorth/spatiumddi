@@ -7,20 +7,18 @@ Plus a ``sync_firewall_now`` task for the UI's "Sync Now" button.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.celery_app import celery_app
-from app.config import settings
-from app.db import task_connect_args
 from app.models.panos import PANOSFirewall
 from app.services.feature_modules import is_module_enabled
 from app.services.integration_sync_failure import record_sync_crash
+from app.task_runtime import release_task_engine, run_task, task_engine
 from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
@@ -29,9 +27,7 @@ logger = structlog.get_logger(__name__)
 async def _run_sweep() -> dict[str, Any]:
     from app.services.panos.reconcile import reconcile_firewall  # noqa: PLC0415
 
-    engine = create_async_engine(
-        settings.database_url, future=True, connect_args=task_connect_args()
-    )
+    engine = task_engine()
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
@@ -101,7 +97,7 @@ async def _run_sweep() -> dict[str, Any]:
                 "error_messages": errors[:20],
             }
     finally:
-        await engine.dispose()
+        await release_task_engine(engine)
 
 
 async def _run_one(firewall_id: str) -> dict[str, Any]:
@@ -109,9 +105,7 @@ async def _run_one(firewall_id: str) -> dict[str, Any]:
 
     from app.services.panos.reconcile import reconcile_firewall  # noqa: PLC0415
 
-    engine = create_async_engine(
-        settings.database_url, future=True, connect_args=task_connect_args()
-    )
+    engine = task_engine()
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
@@ -155,18 +149,18 @@ async def _run_one(firewall_id: str) -> dict[str, Any]:
                 "warnings": summary.warnings[:20],
             }
     finally:
-        await engine.dispose()
+        await release_task_engine(engine)
 
 
 @celery_app.task(name="app.tasks.panos_sync.sweep_panos_firewalls", bind=True)
 @module_gated("integrations.paloalto")
 def sweep_panos_firewalls(self: Any) -> dict[str, Any]:  # noqa: ARG001
-    return asyncio.run(_run_sweep())
+    return run_task(_run_sweep())
 
 
 @celery_app.task(name="app.tasks.panos_sync.sync_firewall_now", bind=True)
 def sync_firewall_now(self: Any, firewall_id: str) -> dict[str, Any]:  # noqa: ARG001
-    return asyncio.run(_run_one(firewall_id))
+    return run_task(_run_one(firewall_id))
 
 
 __all__ = ["sweep_panos_firewalls", "sync_firewall_now"]
