@@ -115,10 +115,6 @@ export function BgpMonitorTab({
       setStopTarget(null);
       invalidate();
     },
-    onError: (e) => {
-      setStopTarget(null);
-      setErr(errMsg(e, "Delete failed"));
-    },
   });
 
   const ackM = useMutation({
@@ -127,7 +123,6 @@ export function BgpMonitorTab({
       setAckTarget(null);
       invalidate();
     },
-    onError: (e) => setErr(errMsg(e, "Acknowledge failed")),
   });
 
   const allowM = useMutation({
@@ -136,7 +131,6 @@ export function BgpMonitorTab({
       setAllowTarget(null);
       invalidate();
     },
-    onError: (e) => setErr(errMsg(e, "Allowlist failed")),
   });
 
   const prefixes = prefixesQ.data ?? [];
@@ -145,7 +139,10 @@ export function BgpMonitorTab({
   return (
     <div className="space-y-6">
       {err && (
-        <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-700 dark:text-rose-400">
+        <div
+          role="alert"
+          className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-700 dark:text-rose-400"
+        >
           {err}
         </div>
       )}
@@ -303,7 +300,8 @@ export function BgpMonitorTab({
           ) : prefixes.length === 0 ? (
             <div className="p-8 text-center text-sm text-muted-foreground">
               No tracked prefixes. The poll auto-populates these from RPKI ROAs
-              and RIPEstat announced-prefixes; you can also add one manually.
+              and RIPEstat announced-prefixes
+              {!writeGate.disabled && "; you can also add one manually"}.
             </div>
           ) : (
             <table className="w-full text-xs">
@@ -409,7 +407,11 @@ export function BgpMonitorTab({
         tone="destructive"
         autoFocusCancel
         loading={delM.isPending}
-        onClose={() => setStopTarget(null)}
+        error={delM.error ? errMsg(delM.error, "Delete failed") : null}
+        onClose={() => {
+          setStopTarget(null);
+          delM.reset();
+        }}
         onConfirm={() => stopTarget && delM.mutate(stopTarget.id)}
       />
       {ackTarget && (
@@ -418,7 +420,11 @@ export function BgpMonitorTab({
           title="Acknowledge detection"
           message={`Suppress the alert for AS${ackTarget.observed_origin_asn} announcing ${ackTarget.observed_prefix}? This mutes the alert without waiting for the announcement to delist.`}
           confirmLabel="Acknowledge"
-          onClose={() => setAckTarget(null)}
+          error={ackM.error ? errMsg(ackM.error, "Acknowledge failed") : null}
+          onClose={() => {
+            setAckTarget(null);
+            ackM.reset();
+          }}
           onConfirm={() => ackM.mutate(ackTarget.id)}
         />
       )}
@@ -429,7 +435,11 @@ export function BgpMonitorTab({
           title="Allowlist expected origin"
           message={`Mark AS${allowTarget.observed_origin_asn} as an EXPECTED additional origin for ${allowTarget.tracked_prefix}? Future announcements from this origin will no longer fire, and this detection is acknowledged.`}
           confirmLabel="Allowlist origin"
-          onClose={() => setAllowTarget(null)}
+          error={allowM.error ? errMsg(allowM.error, "Allowlist failed") : null}
+          onClose={() => {
+            setAllowTarget(null);
+            allowM.reset();
+          }}
           onConfirm={() => allowM.mutate(allowTarget.id)}
         />
       )}

@@ -23,6 +23,7 @@ import uuid
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import delete as sa_delete
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -311,6 +312,11 @@ async def test_a_forward_zone_made_secondary_takes_no_more_records(
     sid = await _subnet(client, headers, space, block, grp, zone)
     first = await _allocate(client, headers, sid, "10.97.5.10", "host")
     assert await _records(db_session, zone.id) == [("host", "A", "10.97.5.10")]
+
+    # #4257: a zone that holds records cannot change type, so the operator
+    # empties it first; the point below is what IPAM does once it is secondary.
+    await db_session.execute(sa_delete(DNSRecord).where(DNSRecord.zone_id == zone.id))
+    await db_session.commit()
 
     resp = await client.put(
         f"/api/v1/dns/groups/{grp.id}/zones/{zone.id}",

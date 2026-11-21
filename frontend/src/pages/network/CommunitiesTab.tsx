@@ -10,6 +10,8 @@ import {
   type BGPCommunityKind,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { cn } from "@/lib/utils";
 import { FormError } from "@/components/ui/form-error";
@@ -101,12 +103,17 @@ function CommunityFormModal({
         outbound_action: outboundAction,
       };
       if (existing) {
-        return asnsApi.updateCommunity(existing.id, {
+        // Send only what changed from the row read when the dialog opened
+        // (#4379), so a field another client set since is not put back.
+        const full = {
           name,
           description,
           inbound_action: inboundAction,
           outbound_action: outboundAction,
-        });
+        };
+        const update = changedFields(existing, full);
+        if (Object.keys(update).length === 0) return Promise.resolve(existing);
+        return asnsApi.updateCommunity(existing.id, update);
       }
       return asnsApi.createCommunity(asnId, body);
     },
@@ -323,8 +330,10 @@ export function CommunitiesTab({ asnId }: { asnId: string }) {
       <div className="flex items-center justify-between">
         <p className="text-xs text-muted-foreground">
           Operator-defined community values for this AS plus a copy of the
-          well-known catalog. The catalog rows are read-only — use the "Use on
-          this AS" button to attach one to this row with operator notes.
+          well-known catalog. The catalog rows are read-only
+          {!writeGate.disabled &&
+            ' — use the "Use on this AS" button to attach one to this row with operator notes'}
+          .
         </p>
         <button
           type="button"
@@ -399,6 +408,12 @@ export function CommunitiesTab({ asnId }: { asnId: string }) {
         )}
       </div>
 
+      <FormError className="text-sm">
+        {deleteMut.error
+          ? formatApiError(deleteMut.error, "Delete failed")
+          : null}
+      </FormError>
+
       {/* Per-ASN communities. */}
       {communities.length === 0 ? (
         <p className="rounded-lg border p-8 text-center text-sm text-muted-foreground">
@@ -464,6 +479,7 @@ export function CommunitiesTab({ asnId }: { asnId: string }) {
                           <button
                             type="button"
                             onClick={() => {
+                              deleteMut.reset();
                               if (
                                 confirm(
                                   `Delete community "${c.value}"? This cannot be undone.`,
@@ -490,10 +506,10 @@ export function CommunitiesTab({ asnId }: { asnId: string }) {
         </div>
       )}
 
-      {showAdd && (
+      {showAdd && !editing && (
         <CommunityFormModal
           asnId={asnId}
-          existing={editing}
+          existing={null}
           presetValue={presetValue}
           presetKind={presetKind}
           onClose={() => {
@@ -503,6 +519,28 @@ export function CommunitiesTab({ asnId }: { asnId: string }) {
             setPresetKind(undefined);
           }}
         />
+      )}
+      {showAdd && editing && (
+        <FreshEdit
+          row={editing}
+          queryKeys={[["asn-communities", asnId]]}
+          title="Edit BGP community"
+          onClose={() => {
+            setShowAdd(false);
+            setEditing(null);
+          }}
+        >
+          {(fresh) => (
+            <CommunityFormModal
+              asnId={asnId}
+              existing={fresh}
+              onClose={() => {
+                setShowAdd(false);
+                setEditing(null);
+              }}
+            />
+          )}
+        </FreshEdit>
       )}
     </div>
   );

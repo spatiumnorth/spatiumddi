@@ -51,6 +51,24 @@ vi.mock("@/lib/api", async () => {
           doq_port: 853,
           doh_path: "/dns-query",
           tls_certificate_id: null,
+          // #4562: the API reports what the group's drivers do not apply; a
+          // PowerDNS group locks both lists unless one already holds a value.
+          option_support: state.servers.some((x) => x.driver === "powerdns")
+            ? {
+                blackhole: {
+                  state: "not_applied",
+                  drivers: ["powerdns"],
+                  note: "PowerDNS authoritative has no setting to drop queries from a client address",
+                  locked: state.blackhole.length === 0,
+                },
+                allow_query_cache: {
+                  state: "not_applied",
+                  drivers: ["powerdns"],
+                  note: "PowerDNS has no cache-access ACL",
+                  locked: true,
+                },
+              }
+            : {},
         }),
       updateOptions: (_g: string, d: unknown) => {
         state.update(d);

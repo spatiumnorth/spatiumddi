@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import httpx
 import pytest
 
 from spatium_dns_agent.drivers.technitium import (
@@ -177,3 +178,78 @@ def test_a_wiped_state_dir_does_not_adopt_a_zone_a_previous_render_named(
     assert [r["name"] for r in fake.zones[FORWARD]] == [f"keep.{FORWARD}"]
     assert fake.soa_comments.get(FORWARD) != _OWNER_MARKER
     assert FORWARD not in json.loads((tmp_path / _MANAGED_ZONES_FILE).read_text())
+
+
+class _AbortingFake(_SoaFake):
+    """Raises on creating ``boom.test``, as a daemon timeout would."""
+
+    broken = True
+
+    def respond(self, path: str, params: dict, n: int) -> dict:
+        if self.broken and path == "zones/create" and params.get("zone") == "boom.test":
+            raise httpx.ReadTimeout("timed out")
+        return super().respond(path, params, n)
+
+
+def _pass(tmp_path: Path, fake: _SoaFake, zones: list[str]) -> TechnitiumDriver:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _seed_token(d)
+    d.daemon_running = lambda: True  # type: ignore[method-assign]
+    d._wait_for_api_up = lambda **_: None  # type: ignore[method-assign]
+    _install_fake_request(d, fake.respond)
+    d.render({"zones": [_zone(z, "primary") for z in zones], "options": {}, "tsig_keys": []})
+    d.validate()
+    d.swap_and_reload()
+    return d
+
+
+def _run_type(tmp_path: Path, fake: _SoaFake, ztype: str, ledger: list[str] | None):
+    d = TechnitiumDriver(state_dir=tmp_path)
+    if ledger is not None:
+        (tmp_path / _MANAGED_ZONES_FILE).write_text(json.dumps(ledger))
+    _seed_token(d)
+    d.daemon_running = lambda: True  # type: ignore[method-assign]
+    d._wait_for_api_up = lambda **_: None  # type: ignore[method-assign]
+    _install_fake_request(d, fake.respond)
+    d.render({"zones": [_zone(FORWARD, ztype)], "options": {}, "tsig_keys": []})
+    d.validate()
+    d.swap_and_reload()
+    return d
+
+
+@pytest.mark.parametrize(
+    ("ztype", "daemon_type"),
+    [("secondary", "Secondary"), ("stub", "Stub"), ("forward", "Forwarder")],
+)
+def test_a_missing_ledger_does_not_refuse_a_non_primary_zone_4441(
+    tmp_path: Path, ztype: str, daemon_type: str
+) -> None:
+    """A lost state dir leaves no ledger; a Secondary / Stub / Forwarder has no
+    owner marker and no authored records to protect, so it converges."""
+    fake = _SoaFake({FORWARD: daemon_type})
+    d = _run_type(tmp_path, fake, ztype, ledger=None)
+    assert not d._refused_zones
+    assert FORWARD in json.loads((tmp_path / _MANAGED_ZONES_FILE).read_text())
+
+
+def test_a_missing_ledger_still_refuses_a_foreign_primary_4441(tmp_path: Path) -> None:
+    fake = _foreign()
+    d = _run_type(tmp_path, fake, "primary", ledger=None)
+    assert d._refused_zones
+    assert [r["name"] for r in fake.zones[FORWARD]] == [f"keep.{FORWARD}"]
+
+
+def test_an_aborted_pass_does_not_mark_a_hand_made_zone_as_ours(tmp_path: Path) -> None:
+    """#4431: the ledger was written before the ownership check ran."""
+    fake = _AbortingFake({FORWARD: "Primary"})
+    fake.zones[FORWARD] = _foreign().zones[FORWARD]
+    with pytest.raises(httpx.HTTPError):
+        _pass(tmp_path, fake, ["boom.test", FORWARD])
+    ledger = json.loads((tmp_path / _MANAGED_ZONES_FILE).read_text())
+    assert FORWARD not in ledger
+    # The next pass (the fault gone) still refuses to take it over.
+    fake.broken = False
+    d = _pass(tmp_path, fake, ["boom.test", FORWARD])
+    assert [r["name"] for r in fake.zones[FORWARD]] == [f"keep.{FORWARD}"]
+    assert not _deletes(fake)
+    assert any(FORWARD in r and "did not create" in r for r in d._refused_zones)
