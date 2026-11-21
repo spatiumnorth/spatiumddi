@@ -828,8 +828,19 @@ URL comes from commonEnv.
         # Revision lines only: a failure prints a multi-line explanation.
         CUR=$(printf '%s\n' "$OUT" | awk '$1 ~ /^[0-9a-f]+$/ {print $1}' | sort | tr '\n' ',')
         if [ -n "$CUR" ] && [ "$CUR" = "$HEADS" ]; then
-          echo "alembic at head ($CUR)"
-          break
+          # #4678 — a restore replays the archive's head before it migrates
+          # up, so head alone is not enough while one is running. Exit 3
+          # means it is; anything else (no module, no database, an error)
+          # passes, so this can only ever add waiting.
+          GATE=0
+          python -m app.core.restore_gate || GATE=$?
+          if [ "$GATE" -ne 3 ]; then
+            echo "alembic at head ($CUR)"
+            break
+          fi
+          echo "alembic at head ($CUR), but a backup restore is running; waiting"
+          sleep 3
+          continue
         fi
         # #1227 — a database a NEWER release migrated never reaches this
         # image's head, so this loop cannot end on its own. env.py names the
