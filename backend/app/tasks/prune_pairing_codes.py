@@ -37,6 +37,7 @@ from sqlalchemy import delete, exists, func, select
 from app.celery_app import celery_app
 from app.db import task_session
 from app.models.appliance import PairingClaim, PairingCode
+from app.tasks._system_audit import add_system_audit
 
 logger = structlog.get_logger(__name__)
 
@@ -91,12 +92,24 @@ async def _sweep() -> dict[str, int]:
                 no_claims_subq,
             )
         )
-        await db.commit()
-        return {
+        counts = {
             "claimed_removed": claimed_del.rowcount or 0,
             "revoked_removed": revoked_del.rowcount or 0,
             "expired_removed": expired_del.rowcount or 0,
         }
+        if any(counts.values()):
+            # Deleting pairing codes is a mutation (non-negotiable #4, #1257):
+            # one summary row per run, counts only (no code material).
+            add_system_audit(
+                db,
+                action="pairing-code-prune",
+                resource_type="pairing_code",
+                resource_id="prune-pairing-codes",
+                resource_display="spent pairing codes",
+                new_value=dict(counts),
+            )
+        await db.commit()
+        return counts
 
 
 @celery_app.task(name="app.tasks.prune_pairing_codes.prune_pairing_codes")
