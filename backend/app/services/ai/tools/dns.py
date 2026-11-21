@@ -1541,6 +1541,11 @@ class FindDNSQueriesArgs(BaseModel):
             "UNKNOWN for queries whose outcome was never recorded."
         ),
     )
+    view: str | None = Field(
+        default=None,
+        max_length=255,
+        description="Exact DNS view name (split-horizon), as listed on the server group.",
+    )
     server_id: str | None = Field(default=None, description="Filter to one DNS server UUID.")
     group_id: str | None = Field(
         default=None,
@@ -1620,6 +1625,7 @@ async def find_dns_queries(
             qname_contains=args.qname_contains,
             qtype=args.qtype,
             rcode=args.rcode,
+            view=args.view,
             limit=args.limit,
             include_orphans=include_orphaned_logs(user, **scope),
         )

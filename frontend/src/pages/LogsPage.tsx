@@ -25,6 +25,7 @@ import {
   XCircle,
 } from "lucide-react";
 import {
+  dnsApi,
   logsApi,
   type AgentLogSource,
   type DhcpAuditDay,
@@ -42,6 +43,7 @@ import {
   ALL_SERVERS,
   type AgentLogSelection,
   defaultSelection,
+  selectionGroupId,
   selectionHost,
   selectionIsValid,
   selectionToScope,
@@ -49,6 +51,11 @@ import {
 import { copyToClipboard } from "@/lib/clipboard";
 import { cn } from "@/lib/utils";
 import { DNSThreatTab } from "./logs/DNSThreatTab";
+import {
+  ActiveViewChip,
+  ExportControl,
+  ViewFilter,
+} from "./logs/DNSQueryFilterControls";
 
 /**
  * Logs page — central log viewer.
@@ -1207,7 +1214,7 @@ function ServerCell({ name }: { name: string }) {
   );
 }
 
-function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
+export function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
   const ready = useFreshAgentSources();
   const [pickedSelection, setSelection] =
     useSessionState<AgentLogSelection | null>("logs-dns-queries-server", null);
@@ -1273,6 +1280,19 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
     retry: false,
   });
 
+  // The group's configured views (#4170) — the DNS page already loads this
+  // under the same key. Only a single group's views make sense to list, so
+  // "All servers" shows no select (an active view still shows as a chip).
+  const viewGroupId = selectionGroupId(selection, sources);
+  const viewsQuery = useQuery({
+    queryKey: ["dns-views", viewGroupId],
+    queryFn: () => dnsApi.listViews(viewGroupId as string),
+    enabled: !!viewGroupId,
+    staleTime: 60_000,
+    retry: false,
+  });
+  const viewNames = (viewsQuery.data ?? []).map((v) => v.name);
+
   const pickGone = useDropGonePick(dnsQueriesQuery.error, selection, () =>
     setSelection(null),
   );
@@ -1305,6 +1325,9 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
             className="w-24 rounded-md border bg-background px-2 py-1 text-sm"
           />
         </label>
+        {viewNames.length > 0 && (
+          <ViewFilter views={viewNames} value={view} onChange={setView} />
+        )}
         <label className="flex items-center gap-1.5 text-xs">
           <span className="text-muted-foreground">Client IP</span>
           <input
@@ -1357,7 +1380,20 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
         </label>
         <MaxEventsPicker value={maxEvents} onChange={setMaxEvents} />
         <FilterSearch value={q} onChange={setQ} />
+        <ActiveViewChip view={view} onClear={() => setView("")} />
         <div className="ml-auto flex items-center gap-2">
+          <ExportControl
+            disabled={!enabled}
+            params={{
+              ...scope,
+              since: sinceIso,
+              q: q.trim() || null,
+              qtype: qtype.trim() || null,
+              client_ip: clientIp.trim() || null,
+              view: view.trim() || null,
+              rcode: rcode.trim() || null,
+            }}
+          />
           {(q || qtype || clientIp || view || rcode || since) && (
             <button
               type="button"

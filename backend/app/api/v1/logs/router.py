@@ -21,28 +21,38 @@ Authorisation:
 
 from __future__ import annotations
 
+import csv
+import io
+import json
 import uuid
-from datetime import datetime
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.api.deps import DB, CurrentUser
 from app.api.token_binding import honours_token_binding
+from app.core.content_disposition import content_disposition, slugify_filename_part
 from app.core.permissions import require_permission, require_permission_or_scoped
+from app.core.responses import CsvResponse, JsonLinesResponse
 from app.drivers.dhcp import AGENTLESS_DRIVERS as DHCP_AGENTLESS
 from app.drivers.dhcp import get_driver as get_dhcp_driver
 from app.drivers.dns import AGENTLESS_DRIVERS as DNS_AGENTLESS
 from app.drivers.dns import get_driver as get_dns_driver
+from app.models.audit import AuditLog
 from app.models.dhcp import DHCPServer
 from app.models.dns import DNSServer
 from app.services.api_token_scopes import read_only_post, token_write
 from app.services.feature_modules import get_enabled_modules, require_module
+from app.services.ipam_io.export import sanitize_cell
 from app.services.logs.agent_logs import (
     InvalidLogFilter,
     LogScopeError,
+    count_dns_queries_capped,
     dns_query_analytics,
     include_orphaned_logs,
     log_row_server_name,
@@ -50,6 +60,7 @@ from app.services.logs.agent_logs import (
     resolve_dns_log_servers,
     search_dhcp_activity,
     search_dns_queries,
+    stream_dns_queries,
 )
 
 logger = structlog.get_logger(__name__)
@@ -651,6 +662,228 @@ async def query_dns_queries(
         server_ids=list(names),
         events=events,
         truncated=len(events) >= body.max_events,
+    )
+
+
+# ── DNS query log export (#4171) ────────────────────────────────────────────
+
+#: Most rows one export carries. The table is pruned at 24 h, so this is a
+#: ceiling on a busy day's worth, not a limit on any normal slice. Past it the
+#: response says so in ``X-Export-Truncated`` and the page tells the operator
+#: to narrow the filter; the file itself stays a clean CSV / JSONL.
+EXPORT_ROW_CAP = 100_000
+
+EXPORT_COLUMNS: tuple[str, ...] = (
+    "ts",
+    "server",
+    "client_ip",
+    "client_port",
+    "qname",
+    "qclass",
+    "qtype",
+    "flags",
+    "view",
+    "rcode",
+    "answer_count",
+    "raw",
+)
+_EXPORT_AUDIT_RESOURCE = "dns_query_log"
+
+
+def _export_record(row: Any, server_name: str) -> dict[str, Any]:
+    ts = row.ts.astimezone(UTC) if row.ts.tzinfo else row.ts.replace(tzinfo=UTC)
+    return {
+        "ts": ts.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        "server": server_name,
+        "client_ip": str(row.client_ip) if row.client_ip is not None else None,
+        "client_port": row.client_port,
+        "qname": row.qname,
+        "qclass": row.qclass,
+        "qtype": row.qtype,
+        "flags": row.flags,
+        "view": row.view,
+        "rcode": row.rcode,
+        "answer_count": row.answer_count,
+        "raw": row.raw,
+    }
+
+
+async def _export_dns_queries(
+    *,
+    fmt: Literal["csv", "jsonl"],
+    db: DB,
+    current_user: CurrentUser,
+    server_id: uuid.UUID | None,
+    group_id: uuid.UUID | None,
+    filters: dict[str, Any],
+) -> StreamingResponse:
+    try:
+        servers = await resolve_dns_log_servers(
+            db, current_user, server_id=server_id, group_id=group_id
+        )
+    except LogScopeError as exc:
+        raise _scope_http_error(exc) from exc
+    names = {s.id: s.name for s in servers}
+    ids = list(names)
+    include_orphans = include_orphaned_logs(current_user, server_id=server_id, group_id=group_id)
+    try:
+        # Counted (to cap + 1) before the audit row and the first byte, so a
+        # bad filter is a 422 and the truncation header is truthful.
+        matched = await count_dns_queries_capped(
+            db, ids, cap=EXPORT_ROW_CAP, include_orphans=include_orphans, **filters
+        )
+    except InvalidLogFilter as exc:
+        raise HTTPException(status_code=422, detail=exc.detail) from exc
+    truncated = matched > EXPORT_ROW_CAP
+    rows_out = min(matched, EXPORT_ROW_CAP)
+
+    if server_id is not None and servers:
+        label = servers[0].name
+    elif group_id is not None and servers and servers[0].group_name:
+        label = servers[0].group_name
+    else:
+        label = "all"
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%MZ")
+    filename = f"dns-queries-{slugify_filename_part(label, fallback='all')}-{stamp}.{fmt}"
+
+    applied = {
+        k: (v.astimezone(UTC).isoformat() if isinstance(v, datetime) else v)
+        for k, v in filters.items()
+        if v not in (None, "")
+    }
+    scope = {
+        "server_id": str(server_id) if server_id else None,
+        "group_id": str(group_id) if group_id else None,
+    }
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="export",
+            resource_type=_EXPORT_AUDIT_RESOURCE,
+            resource_id=str(server_id or group_id or "all"),
+            resource_display=f"DNS query log export ({fmt}, {rows_out} row(s))",
+            new_value={
+                "format": fmt,
+                "scope": scope,
+                "filter": applied,
+                "server_count": len(ids),
+                "rows": rows_out,
+                "truncated": truncated,
+                "row_cap": EXPORT_ROW_CAP,
+            },
+        )
+    )
+    await db.commit()
+
+    async def _body() -> AsyncIterator[str]:
+        buf = io.StringIO()
+        writer = csv.writer(buf, lineterminator="\r\n")
+        if fmt == "csv":
+            writer.writerow(EXPORT_COLUMNS)
+        pending = 0
+        async for row in stream_dns_queries(
+            db, ids, limit=EXPORT_ROW_CAP, include_orphans=include_orphans, **filters
+        ):
+            rec = _export_record(row, log_row_server_name(row.server_id, row.server_name, names))
+            if fmt == "csv":
+                writer.writerow(
+                    ["" if rec[c] is None else sanitize_cell(rec[c]) for c in EXPORT_COLUMNS]
+                )
+            else:
+                buf.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            pending += 1
+            if pending >= 500:
+                yield buf.getvalue()
+                buf.seek(0)
+                buf.truncate()
+                pending = 0
+        # Also flushes a header-only CSV when nothing matched.
+        if buf.tell():
+            yield buf.getvalue()
+
+    return StreamingResponse(
+        _body(),
+        media_type="text/csv" if fmt == "csv" else "application/x-ndjson",
+        headers={
+            "Content-Disposition": content_disposition(filename),
+            "X-Export-Rows": str(rows_out),
+            "X-Export-Row-Cap": str(EXPORT_ROW_CAP),
+            "X-Export-Truncated": "true" if truncated else "false",
+            "Access-Control-Expose-Headers": "X-Export-Rows, X-Export-Row-Cap, X-Export-Truncated",
+        },
+    )
+
+
+@router.get(
+    "/dns-queries/export.csv",
+    response_class=CsvResponse,
+    dependencies=[_AGENT_READ, Depends(require_module("core.dns"))],
+)
+@honours_token_binding
+async def export_dns_queries_csv(
+    db: DB,
+    current_user: CurrentUser,
+    server_id: uuid.UUID | None = None,
+    group_id: uuid.UUID | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    q: str | None = Query(default=None, max_length=255),
+    qtype: str | None = Query(default=None, max_length=16),
+    client_ip: str | None = Query(default=None, max_length=64),
+    view: str | None = Query(default=None, max_length=255),
+    rcode: str | None = Query(default=None, max_length=16),
+) -> StreamingResponse:
+    """The DNS query log slice the filters select, as CSV, streamed.
+
+    Same scope, filters and read permission as ``POST /logs/dns-queries``
+    (a filter narrows what the caller may already read, it never widens it),
+    capped at ``EXPORT_ROW_CAP`` rows with ``X-Export-Truncated: true`` when
+    more matched. Each export writes an ``audit_log`` row naming the filter.
+    Cells that start with a spreadsheet formula character are quoted.
+    """
+    filters = dict(since=since, until=until, q=q, qtype=qtype, client_ip=client_ip, view=view)
+    filters["rcode"] = rcode
+    return await _export_dns_queries(
+        fmt="csv",
+        db=db,
+        current_user=current_user,
+        server_id=server_id,
+        group_id=group_id,
+        filters=filters,
+    )
+
+
+@router.get(
+    "/dns-queries/export.jsonl",
+    response_class=JsonLinesResponse,
+    dependencies=[_AGENT_READ, Depends(require_module("core.dns"))],
+)
+@honours_token_binding
+async def export_dns_queries_jsonl(
+    db: DB,
+    current_user: CurrentUser,
+    server_id: uuid.UUID | None = None,
+    group_id: uuid.UUID | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    q: str | None = Query(default=None, max_length=255),
+    qtype: str | None = Query(default=None, max_length=16),
+    client_ip: str | None = Query(default=None, max_length=64),
+    view: str | None = Query(default=None, max_length=255),
+    rcode: str | None = Query(default=None, max_length=16),
+) -> StreamingResponse:
+    """:func:`export_dns_queries_csv` as JSON Lines (one object per row)."""
+    filters = dict(since=since, until=until, q=q, qtype=qtype, client_ip=client_ip, view=view)
+    filters["rcode"] = rcode
+    return await _export_dns_queries(
+        fmt="jsonl",
+        db=db,
+        current_user=current_user,
+        server_id=server_id,
+        group_id=group_id,
+        filters=filters,
     )
 
 
