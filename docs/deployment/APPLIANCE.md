@@ -3389,6 +3389,33 @@ so a reinstall during the rollback can mint a new `SECRET_KEY` and
 leave every credential encrypted at rest unreadable. If you must go
 back, restore the pre-upgrade backup together with the older release.
 
+**Restoring a backup onto a fresh install (#4677).** This is the way back
+when an appliance is lost and rebuilt, or when you reinstall the older
+release and restore the pre-upgrade backup. The steps:
+
+1. Install the release the backup was taken on, or a newer one (a newer
+   schema than the install knows is refused), and sign in with the install's
+   own admin.
+2. Backup → Restore from file or destination → Full restore, with the
+   passphrase and `RESTORE-FROM-BACKUP`. Keep "Exclude secrets" archives out
+   of this path: they carry no credentials, so nobody can sign in after one.
+3. Sign in with the **backup's** accounts; the install's own admin is gone.
+
+A restore replaces the appliance registry and the internal CA with the
+archive's. Since #4677 the restore keeps the rows of the appliances that
+are alive in this install before the replay (certificate, roles, state),
+puts the install's CA back when the archive's differs, and drops an
+archive row for the same hostname, so the supervisor on this node keeps
+heartbeating and its DNS and DHCP roles keep serving. The restore result
+names what was kept, and the audit entry `backup_restored` carries
+`adopted_appliances`. Group assignments are matched by group name; a node
+whose group the archive lacks has no group until you assign one. Archive
+appliances that exist no more stay in the Fleet list with no heartbeat:
+delete them there. One that does still exist, on another node, has a
+certificate from the archive's CA, so re-key it or pair it again.
+Releases before this fix revoke the appliance about 30 seconds after the
+restore, and nothing in the console brings it back.
+
 **Where SECRET_KEY lives (#1448).** From the release after 2026.10.02-1,
 firstboot keeps `SECRET_KEY` in `spatium-control-app-keys` in the
 `spatium` namespace, a Secret no Helm release owns, and points the

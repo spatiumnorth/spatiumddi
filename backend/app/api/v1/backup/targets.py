@@ -1411,6 +1411,7 @@ async def restore_from_archive(
                     "allow_newer_schema": body.allow_newer_schema,
                     "warnings": outcome.warnings,
                     "reconciled_backup_targets": outcome.reconciled_backup_targets,
+                    "adopted_appliances": outcome.adopted_appliances,
                 },
             )
         )
