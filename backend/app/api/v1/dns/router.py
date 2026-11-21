@@ -11,7 +11,9 @@ import uuid
 import zipfile
 import zlib
 from collections.abc import Iterable, Sequence
+from dataclasses import asdict
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any, Literal, Self
 
 import structlog
@@ -60,6 +62,7 @@ from app.core.agent_wake import (
     dns_group_channel,
     dns_server_channel,
 )
+from app.core.celery_dispatch import dispatch
 from app.core.content_disposition import content_disposition
 from app.core.crypto import decrypt_dict, encrypt_dict, encrypt_str
 from app.core.dns_names import (
@@ -99,12 +102,11 @@ from app.drivers.dns import (
     supports_topology_pull,
     ttl_refusal,
 )
-from app.drivers.dns.base import DynamicUpdateCaps, UpdateAclEntry
+from app.drivers.dns.base import DynamicUpdateCaps, UpdateAclConflictError, UpdateAclEntry
 from app.drivers.dns.windows import test_winrm_credentials
 from app.models.appliance import ApplianceCertificate
 from app.models.audit import AuditLog
 from app.models.dns import (
-    DEFAULT_ALLOW_QUERY_CACHE,
     DEFAULT_ALLOW_RECURSION,
     DNS_TTL_MAX,
     DNSSEC_ALGORITHMS,
@@ -116,6 +118,7 @@ from app.models.dns import (
     DNSAclEntry,
     DNSBlockList,
     DNSKey,
+    DNSPool,
     DNSRecord,
     DNSSECPolicy,
     DNSServer,
@@ -130,8 +133,16 @@ from app.models.dns import (
     dns_blocklist_view_assoc,
     dnssec_algorithm_name,
 )
+from app.models.metrics import DNSMetricSample
 from app.services.agents.container_oom import daemon_reported_by
 from app.services.agents.daemon_state import is_not_serving
+from app.services.agents.memory_status import (
+    MAX_HISTORY_HOURS,
+    MemoryHistory,
+    MemoryStatus,
+    fresh_memory_status,
+    memory_history,
+)
 from app.services.agents.spool_status import SpoolStatus
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteZoneArgs
@@ -142,7 +153,7 @@ from app.services.appliance.group_names import (
 )
 from app.services.appliance.tls import certificate_store_location
 from app.services.approvals.gate import gate_or_execute
-from app.services.dns import dnssec_signers, technitium_api_scope
+from app.services.dns import dnssec_signers, option_support, technitium_api_scope
 from app.services.dns.agent_instance import duplicate_active as duplicate_agent_active
 from app.services.dns.bundle_dirty import mark_bundles_dirty
 from app.services.dns.cname_conflict import (
@@ -158,6 +169,7 @@ from app.services.dns.delegation import (
     compute_delegation,
     find_parent_zone,
     preview_to_dict,
+    unauthored_parent_reason,
 )
 from app.services.dns.dnssec_trust import (
     NEEDS_ANCHOR_MESSAGE,
@@ -223,8 +235,10 @@ from app.services.dns.server_move import (
     ServerMoveError,
     ServerMoveResult,
     catalog_unsupported_message,
+    classless_zone_refusal,
     elect_primary,
     ensure_group_catalog_compatible,
+    ensure_group_classless_compatible,
     ensure_group_single_driver,
     lock_server_row,
     move_server_to_group,
@@ -347,6 +361,7 @@ _DNS_ROUTE_TYPES: dict[str, tuple[str, ...]] = {
     "POST /groups/{group_id}/servers/{server_id}/sync-from-server": _G,
     "POST /test-windows-credentials": _G,
     "GET /servers/{server_id}/recent-events": _G,
+    "GET /servers/{server_id}/memory-history": _G,
     "GET /servers/{server_id}/rendered-config": _G,
     "GET /servers/{server_id}/rndc-status": _G,
     # a server's view of every zone in its group, and its queued record ops
@@ -522,20 +537,16 @@ _DRIVER_GATED_RECORD_TYPES: dict[str, frozenset[str]] = {
 # dance that's #49's umbrella scope.
 _DRIVER_GATED_OPERATIONS: dict[str, frozenset[str]] = {
     # PowerDNS (online signing) and BIND9 (inline-signing via dnssec-policy,
-    # issue #49) can sign; the set lives in ``dnssec_signers`` so the
-    # single-signer rule (#1762) and zone move read the same one. Technitium
-    # is deliberately NOT in it (#1783): its
-    # signing is one-shot (never re-signed on a new server, a re-created zone
-    # or a lost volume, policy ignored, key state reported only while signed),
-    # so SpatiumDDI would show a zone signed that is not. Full support is
-    # #1767. Windows DNS cannot sign.
+    # issue #49) and Technitium (#1767: the agent reconciles signing state
+    # from every bundle) can sign; the set lives in ``dnssec_signers`` so the
+    # single-signer rule (#1762) and zone move read the same one. The
+    # agentless ``technitium_api`` and Windows DNS cannot sign.
     "dnssec_sign": dnssec_signers.SIGNING_DRIVERS,
-    # UNSIGN stays allowed on Technitium so an operator can turn a zone that
-    # was signed before #1783 back off; the flip-off path is ungated.
     "dnssec_unsign": dnssec_signers.PER_SERVER_SIGNING_DRIVERS,
-    # Manual key rollover is BIND9-only (rndc dnssec -rollover); PowerDNS
-    # rolls on its own schedule + Windows DNS isn't supported.
-    "dnssec_rollover": frozenset({"bind9"}),
+    # Manual key rollover: BIND9 (rndc dnssec -rollover) and Technitium
+    # (zones/dnssec/properties/rolloverDnsKey, #1767); PowerDNS rolls on its
+    # own schedule + Windows DNS isn't supported.
+    "dnssec_rollover": frozenset({"bind9", "technitium"}),
 }
 VALID_FORWARD_POLICIES = {"first", "only"}
 VALID_DNSSEC = set(DNSSEC_VALIDATION_MODES)
@@ -570,6 +581,27 @@ _RESERVED_DNS_PORTS: dict[int, str] = {
 # ── Pydantic schemas ────────────────────────────────────────────────────────
 
 
+# #4185 — a BIND size for ``max-cache-size``: a positive integer with an
+# optional k / m / g suffix. ``unlimited`` and ``0`` are refused on purpose:
+# BIND 9.21.21+ ignores both and falls back to 90 % of physical memory, the
+# ceiling this setting exists to defeat (#3565). The agent applies the same rule.
+_MAX_CACHE_SIZE_RE = re.compile(r"[1-9]\d*[kKmMgG]?")
+
+
+def _validate_max_cache_size(v: str | None) -> str | None:
+    if v is None:
+        return None
+    v = v.strip().lower()
+    if not v:
+        return None
+    if not _MAX_CACHE_SIZE_RE.fullmatch(v) or len(v) > 16:
+        raise ValueError(
+            "max_cache_size must be a BIND size such as 64m, 512m or 1g "
+            "(unlimited and 0 are not accepted)"
+        )
+    return v
+
+
 class ServerGroupCreate(BaseModel):
     name: str
     description: str = ""
@@ -590,6 +622,13 @@ class ServerGroupCreate(BaseModel):
     # #1932 — auto-create subnet reverse zones in a cloud DNS group. Off by
     # default: the provider bills per hosted zone. Other drivers ignore it.
     auto_reverse_zones_at_provider: bool = False
+    # #4185 — BIND ``max-cache-size`` per recursive view; null = agent default.
+    max_cache_size: str | None = None
+
+    @field_validator("max_cache_size")
+    @classmethod
+    def validate_max_cache_size(cls, v: str | None) -> str | None:
+        return _validate_max_cache_size(v)
 
     @field_validator("group_type")
     @classmethod
@@ -609,6 +648,12 @@ class ServerGroupUpdate(BaseModel):
     catalog_zone_name: str | None = None
     is_public_facing: bool | None = None
     auto_reverse_zones_at_provider: bool | None = None
+    max_cache_size: str | None = None
+
+    @field_validator("max_cache_size")
+    @classmethod
+    def validate_max_cache_size(cls, v: str | None) -> str | None:
+        return _validate_max_cache_size(v)
 
     @field_validator("group_type")
     @classmethod
@@ -625,6 +670,18 @@ class DNSMemoryRpzLoad(BaseModel):
     views: list[str]
     entries: int
     estimated_bytes: int
+
+
+class DNSMemoryServer(BaseModel):
+    """One BIND9 server's reported memory, next to the group estimate (#4193).
+    Null fields are unreported (an older agent), never 0."""
+
+    name: str
+    daemon_rss_bytes: int | None = None
+    used_bytes: int | None = None
+    peak_bytes: int | None = None
+    limit_bytes: int | None = None
+    reported_at: str | None = None
 
 
 class DNSMemoryEstimateResponse(BaseModel):
@@ -653,6 +710,9 @@ class DNSMemoryEstimateResponse(BaseModel):
     rpz_bytes: int
     rpz: list[DNSMemoryRpzLoad] = []
     views: list[str] = []
+    # #4193 — what each BIND9 server actually reports using (named's RSS and
+    # the container's usage), beside the estimate above.
+    servers: list[DNSMemoryServer] = []
 
     @classmethod
     def from_estimate(cls, est: GroupMemoryEstimate) -> DNSMemoryEstimateResponse:
@@ -678,7 +738,17 @@ class DNSMemoryEstimateResponse(BaseModel):
                 for r in est.rpz
             ],
             views=list(est.views),
+            servers=[DNSMemoryServer(**asdict(s)) for s in est.servers],
         )
+
+
+class OptionSupportEntry(BaseModel):
+    """One row of the per-driver option table, for one group (#4562)."""
+
+    state: str
+    drivers: list[str]
+    note: str
+    locked: bool
 
 
 class ServerGroupResponse(BaseModel):
@@ -692,6 +762,7 @@ class ServerGroupResponse(BaseModel):
     catalog_zone_name: str
     is_public_facing: bool = False
     auto_reverse_zones_at_provider: bool = False
+    max_cache_size: str | None = None
     # #934 follow-up — the distinct drivers of the servers currently in this
     # group. Empty means an empty group, which is compatible with anything.
     # A group is single-driver, so one entry is the normal case; two or more
@@ -713,6 +784,10 @@ class ServerGroupResponse(BaseModel):
     # server, and says where an already-existing group falls outside the
     # supported scope (second server, pools). Empty for every other group.
     scope_warnings: list[str] = []
+    # #4562 — group fields a driver in the group does not apply
+    # (``is_recursive``), in the shape of the options response's
+    # ``option_support``. Empty when every field is applied.
+    unapplied_fields: dict[str, OptionSupportEntry] = {}
     # #3551 — the group's estimated named memory against its agents' limit.
     # Filled by ``GET /groups/{id}`` only (counting the RPZ entries each view
     # loads is too heavy for the list); null there and for non-BIND9 groups.
@@ -742,6 +817,7 @@ class ServerGroupResponse(BaseModel):
             catalog_zone_name=g.catalog_zone_name,
             is_public_facing=g.is_public_facing,
             auto_reverse_zones_at_provider=g.auto_reverse_zones_at_provider,
+            max_cache_size=g.max_cache_size,
             server_drivers=sorted(drivers or []),
             catalog_unsupported_warning=(
                 catalog_unsupported_message(drivers or [])
@@ -754,6 +830,12 @@ class ServerGroupResponse(BaseModel):
                 else None
             ),
             scope_warnings=list(warnings or []),
+            unapplied_fields={
+                field: OptionSupportEntry(**entry)
+                for field, entry in option_support.group_support(
+                    drivers or [], g, option_support.GROUP_FIELDS
+                ).items()
+            },
             created_at=g.created_at,
             modified_at=g.modified_at,
         )
@@ -960,6 +1042,9 @@ class ServerResponse(BaseModel):
     agent_version: str | None = None
     last_config_etag: str | None
     pending_approval: bool
+    # #4173 — a delete was requested and the worker is still removing the
+    # server's rows; the UI shows "Removing…" and disables its actions.
+    removing: bool = False
     is_primary: bool
     # Per-server maintenance mode (issue #182).
     maintenance_mode: bool = False
@@ -976,6 +1061,10 @@ class ServerResponse(BaseModel):
     # NULL when never reported (a pre-#1077 agent, or an agentless driver):
     # UNKNOWN, never "empty".
     spool_status: SpoolStatus | None = None
+    # #4193 — the agent's actual memory use as last reported on its heartbeat
+    # (container used / peak / limit, daemon and agent RSS). NULL when never
+    # reported (an older agent, an agentless driver): UNKNOWN, never 0.
+    memory_status: MemoryStatus | None = None
     # #1067 — the daemon state the agent reports on its heartbeat. ``ok`` or
     # ``degraded`` (the agent's own word); NULL when the agent has never
     # reported one — UNKNOWN, never "fine". ``daemon_status_since`` is when
@@ -1065,6 +1154,7 @@ class ServerResponse(BaseModel):
             agent_version=s.agent_version,
             last_config_etag=s.last_config_etag,
             pending_approval=s.pending_approval,
+            removing=s.removing_at is not None,
             is_primary=s.is_primary,
             maintenance_mode=s.maintenance_mode,
             maintenance_started_at=s.maintenance_started_at,
@@ -1073,6 +1163,7 @@ class ServerResponse(BaseModel):
             config_failed_etag=s.config_failed_etag,
             config_apply_at=s.config_apply_at,
             spool_status=s.spool_status,
+            memory_status=fresh_memory_status(s.memory_status),
             daemon_status=s.daemon_status,
             daemon_reason=s.daemon_reason,
             daemon_status_since=s.daemon_status_since,
@@ -1384,6 +1475,20 @@ class ServerOptionsResponse(BaseModel):
     # instead: ``yes`` with no trust anchor on a BIND9 group renders as
     # ``auto`` (#3560), a static root anchor as initial-key (#3609).
     dnssec_warnings: list[str] = Field(default_factory=list)
+    # #4562: the group's slice of the per-driver table (``option_support``).
+    # One entry per option some driver in the group applies in part or not at
+    # all: ``state`` (``partial`` / ``not_applied``), the ``drivers`` it is
+    # about, a ``note`` and ``locked`` (disable the control: not applied, and
+    # the stored value already does nothing). An applied option is absent.
+    option_support: dict[str, OptionSupportEntry] = Field(default_factory=dict)
+    # Set when a driver in the group applies no option at all (Windows DNS,
+    # the hosted providers, agentless Technitium): the page shows this line in
+    # place of the form.
+    options_unmanaged_note: str | None = None
+    # Stored non-default values a driver in the group does not apply, saved
+    # before the gate or before the server joined. Technitium's are in
+    # ``technitium_warnings``.
+    unapplied_warnings: list[str] = Field(default_factory=list)
 
     model_config = {"from_attributes": True}
 
@@ -1882,9 +1987,9 @@ class ZoneResponse(BaseModel):
     # the create handlers; empty everywhere else. A later delete removes the
     # zone from those servers too, so the operator should know it was found.
     adopted_existing_on: list[str] = Field(default_factory=list)
-    # #1783 — True when the zone is flagged signed on a group with a Technitium
-    # server: signed before SpatiumDDI stopped claiming Technitium signing, and
-    # SpatiumDDI will not keep it signed (#1767). Derived at serialisation.
+    # True when the zone is flagged signed on a group with an agentless Technitium
+    # server (agentless API): SpatiumDDI will not keep it signed. Derived at
+    # serialisation.
     dnssec_unmanaged_warning: bool = False
 
     model_config = {"from_attributes": True}
@@ -2410,7 +2515,7 @@ async def update_group(
     # NOT NULL column is a 422.
     changes = resolve_update_changes(
         body,
-        clearable={"default_view"},
+        clearable={"default_view", "max_cache_size"},
         non_nullable={
             "name",
             "description",
@@ -2433,6 +2538,15 @@ async def update_group(
         raise technitium_api_scope.refusal(
             "catalog zones are not written to the Technitium server."
         )
+    # #4562 — ``is_recursive`` folds into the bundle's ``recursion_enabled``,
+    # which only the BIND9 and Technitium agents apply. Same table and
+    # transition-only rule as the options PUT.
+    if "is_recursive" in changes:
+        for driver in sorted((await _drivers_by_group(db, [group.id])).get(group.id, [])):
+            if refused := option_support.refusals(
+                driver, {"is_recursive": changes["is_recursive"]}, group
+            ):
+                raise HTTPException(422, option_support.refusal_message(driver, refused))
     # #1468 — an appliance's supervisor gets this group by NAME and drops a
     # name it won't put in its role env, so don't rename an assigned group
     # into one. Only on an actual change: re-saving a legacy name is fine.
@@ -2747,6 +2861,7 @@ async def create_server(
             hint=f"create it in a {body.driver}-only group, or an empty one.",
         )
         await ensure_group_catalog_compatible(db, group, body.driver)
+        await ensure_group_classless_compatible(db, group, body.driver)
     except ServerMoveError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     await _refuse_second_signer(db, group, driver=body.driver)
@@ -2895,6 +3010,7 @@ async def update_server(
                 exclude_server_id=server.id,
             )
             await ensure_group_catalog_compatible(db, group, body.driver)
+            await ensure_group_classless_compatible(db, group, body.driver)
         except ServerMoveError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     # #1563 — explicit null clears api_port; null for a NOT NULL column
@@ -3040,6 +3156,19 @@ async def update_server(
                     # rewrap): treat the submitted set as the whole truth
                     # rather than refusing the edit that would fix it.
                     merged = {}
+            # The stored API token goes with the API URL it was entered for: a
+            # new URL needs the token sent again in the same request.
+            if "api_url" in body.cloud_credentials:
+                require_secret_with_destination_change(
+                    SimpleNamespace(api_url=_url_key(merged.get("api_url"))),
+                    {
+                        "api_url": _url_key(body.cloud_credentials.get("api_url")),
+                        "api_token": body.cloud_credentials.get("api_token"),
+                    },
+                    destination=("api_url",),
+                    secrets={"api_token": merged.get("api_token")},
+                    blank_keeps=("api_token",),
+                )
             merged.update(body.cloud_credentials)
             await _validate_driver_credentials(server.driver, merged)
             server.credentials_encrypted = encrypt_dict(merged)
@@ -3123,37 +3252,66 @@ async def update_server(
     return ServerResponse.from_model(server)
 
 
-@router.delete("/groups/{group_id}/servers/{server_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/groups/{group_id}/servers/{server_id}",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=ServerResponse,
+)
 async def delete_server(
     group_id: uuid.UUID, server_id: uuid.UUID, db: DB, current_user: SuperAdmin
-) -> None:
+) -> ServerResponse:
+    """Start deleting a server; a worker finishes it (#4173).
+
+    The cascade over a server's query log, bundles and record ops used to run
+    inside this request, minutes long on a big install. Now the row is marked
+    ``removing`` (its agent is refused, the UI shows "Removing…"), and the
+    ``dns_server_removal`` task deletes the rest in batches and the row last.
+    Answers 202, not 204; a client that treats any 2xx as success is unaffected.
+    Calling it again on a server already being removed re-enqueues the task,
+    which is the recovery if the first enqueue was lost.
+    """
     server = await _require_server(group_id, server_id, db)
-    # #2276 — deleting the primary elects a successor in the same transaction,
-    # the way the #934 move does. A group left without one used to drop every
-    # later record write before the agent fan-out, behind a 200.
-    successor = None
-    if server.is_primary:
-        successor = await elect_primary(db, server.group_id, exclude_id=server.id)
-    db.add(
-        AuditLog(
-            user_id=current_user.id,
-            user_display_name=current_user.display_name,
-            auth_source=current_user.auth_source,
-            action="delete",
-            resource_type="dns_server",
-            resource_id=str(server.id),
-            resource_display=server.name,
-            new_value=(
-                {"primary_elected": str(successor.id), "primary_elected_name": successor.name}
-                if successor is not None
-                else None
-            ),
-            result="success",
+    already = server.removing_at is not None
+    if not already:
+        # #2276 — deleting the primary elects a successor in the same
+        # transaction, the way the #934 move does. A group left without one
+        # used to drop every later record write before the agent fan-out,
+        # behind a 200.
+        successor = None
+        if server.is_primary:
+            successor = await elect_primary(db, server.group_id, exclude_id=server.id)
+            # The row outlives this request now; two primaries in a group
+            # 500s the agent long-poll, so it stops being one here.
+            server.is_primary = False
+        server.removing_at = datetime.now(UTC)
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="delete",
+                resource_type="dns_server",
+                resource_id=str(server.id),
+                resource_display=server.name,
+                new_value=(
+                    {"primary_elected": str(successor.id), "primary_elected_name": successor.name}
+                    if successor is not None
+                    else None
+                ),
+                result="success",
+            )
         )
-    )
-    collect_wake(dns_server_channel(server.id), dns_group_channel(server.group_id))
-    await db.delete(server)
-    await db.commit()
+        collect_wake(dns_server_channel(server.id), dns_group_channel(server.group_id))
+        await db.commit()
+        await db.refresh(server)
+    try:
+        from app.tasks.dns_server_removal import remove_dns_server  # noqa: PLC0415
+
+        await dispatch(remove_dns_server, str(server.id))
+    except Exception:
+        # The row stays "removing"; DELETE again re-enqueues (idempotent).
+        logger.exception("dns_server_removal_enqueue_failed", server_id=str(server.id))
+    return ServerResponse.from_model(server)
 
 
 # ── Agent approval (spatiumddi#1121) ────────────────────────────────────────
@@ -3521,7 +3679,8 @@ class SyncFromServerResponse(BaseModel):
     zones_imported: list[str]
     # Discovered but deliberately not adopted: SpatiumDDI's own reserved
     # names, plus zones the driver reports as non-manageable (a Technitium
-    # Secondary / Stub / Forwarder — #810).
+    # Secondary / Stub / Forwarder — #810), and names the zone-name validator
+    # refuses (#4445).
     zones_skipped_system: list[str]
     # Zones present in SpatiumDDI but not on the server, that we pushed
     # over WinRM during this sync. Only populated for windows_dns+creds —
@@ -3623,6 +3782,9 @@ async def _sync_single_server(
     # 1. Topology discovery (Path B for Windows / REST API for the rest).
     zones_on_server: list[str] = []
     zone_meta_by_name: dict[str, dict[str, Any]] = {}
+    # #1771 — a failed zone listing is not an empty server: step 3 must not
+    # read "nothing on the server" and create every zone in the group.
+    zone_pull_failed = False
     if topology_capable:
         try:
             discovered = await get_driver(server.driver).pull_zones_from_server(server)  # type: ignore[attr-defined]
@@ -3633,6 +3795,7 @@ async def _sync_single_server(
                 zones_on_server.append(name)
                 zone_meta_by_name[name] = z
         except Exception as exc:  # noqa: BLE001 — informational, keep going
+            zone_pull_failed = True
             logger.warning(
                 "dns.sync_from_server.pull_zones_failed",
                 server=str(server.id),
@@ -3666,20 +3829,28 @@ async def _sync_single_server(
                 continue
             is_reverse = bool(meta.get("is_reverse_lookup"))
             kind = _infer_zone_kind(name, is_reverse)
-            zone = DNSZone(
-                group_id=group_id,
-                name=name if name.endswith(".") else name + ".",
-                zone_type="primary",
-                kind=kind,
-                ttl=pull_ttl,
-                refresh=ZONE_DEFAULT_REFRESH,
-                retry=ZONE_DEFAULT_RETRY,
-                expire=ZONE_DEFAULT_EXPIRE,
-                minimum=ZONE_DEFAULT_MINIMUM,
-                primary_ns="",
-                admin_email="",
-                dnssec_enabled=False,
-            )
+            try:
+                zone = DNSZone(
+                    group_id=group_id,
+                    name=name if name.endswith(".") else name + ".",
+                    zone_type="primary",
+                    kind=kind,
+                    ttl=pull_ttl,
+                    refresh=ZONE_DEFAULT_REFRESH,
+                    retry=ZONE_DEFAULT_RETRY,
+                    expire=ZONE_DEFAULT_EXPIRE,
+                    minimum=ZONE_DEFAULT_MINIMUM,
+                    primary_ns="",
+                    admin_email="",
+                    dnssec_enabled=False,
+                )
+            except ValueError as exc:
+                # A name the zone-name validator refuses (a Route 53 ``\057``
+                # escape, an IDN label) is reported and skipped; it must not
+                # abort the sync of every other zone (#4445).
+                logger.warning("dns_sync_zone_name_rejected", zone=name, error=str(exc))
+                zones_skipped_system.append(name)
+                continue
             db.add(zone)
             await db.flush()  # column-default id must exist before the audit row reads it (#2006)
             zones_imported.append(name)
@@ -3707,7 +3878,11 @@ async def _sync_single_server(
     #    Windows DNS over WinRM + cloud DNS via provider API).
     zones_pushed_to_server: list[str] = []
     zones_push_to_server_errors: list[str] = []
-    if topology_capable:
+    if topology_capable and zone_pull_failed:
+        zones_push_to_server_errors.append(
+            "zone listing from the server failed, so no missing zone was pushed"
+        )
+    elif topology_capable:
         server_zone_set = {n for n in zones_on_server}
         driver = get_driver(server.driver)
         # Re-query zones after the import step so newly-imported rows
@@ -3718,7 +3893,11 @@ async def _sync_single_server(
             if bare in server_zone_set:
                 continue
             try:
-                await driver.apply_zone_change(server, zone, "create")
+                changed = await driver.apply_zone_change(server, zone, "create")
+                if changed is False:
+                    # Already on the server (a zone the listing hid from this
+                    # token): adopted, not pushed (#1771).
+                    continue
                 zones_pushed_to_server.append(bare)
                 db.add(
                     AuditLog(
@@ -4345,6 +4524,21 @@ async def _options_response(
 ) -> ServerOptionsResponse:
     out = ServerOptionsResponse.model_validate(opts)
     out.forwarder_warnings = _stored_forwarder_warnings(opts)
+    # #4562: the real members, not ``_group_driver_names``' bind9 fallback: an
+    # empty group has no driver that would ignore an option.
+    members = (await _drivers_by_group(db, [group_id])).get(group_id, [])
+    out.option_support = {
+        field: OptionSupportEntry(**entry)
+        for field, entry in option_support.group_support(members, opts).items()
+    }
+    out.options_unmanaged_note = option_support.unmanaged_note(members)
+    if out.options_unmanaged_note is None:
+        out.unapplied_warnings = [
+            f"{option_support.label(driver)} does not apply {warning}"
+            for driver in sorted(members)
+            if driver != "technitium"
+            for warning in option_support.stored_warnings(driver, opts)
+        ]
     drivers = await _group_driver_names(db, group_id)
     if opts.dnssec_validation == "yes" and not opts.trust_anchors and "bind9" in drivers:
         out.dnssec_warnings.append(
@@ -4717,51 +4911,30 @@ async def update_options(
     if await technitium_api_scope.group_is_technitium_api(db, group_id):
         technitium_api_scope.refuse_unapplied_option_changes(changes, stored_opts)
     changes.update(await _validated_option_changes(group_id, changes, opts, db))
-    # Options the agent-managed Technitium driver cannot apply (#1763): refuse
-    # rather than store a value the daemon will silently ignore. Same subset
-    # semantics as the transport gates: any Technitium server in the group.
-    if "technitium" in await _group_driver_names(db, group_id):
-        if refused := technitium_option_refusals(
-            changes, opts, await _group_acl_definitions(db, group_id)
-        ):
-            raise HTTPException(
-                422,
-                "This group has a Technitium server, which cannot apply: "
-                + "; ".join(refused)
-                + ". Move the Technitium server to its own group, or leave these at "
-                "their defaults.",
-            )
-    # #2263: ``blackhole`` is rendered by the BIND9 agent only. pdns auth has
-    # no client ACL of any kind (the agent already says so for allow_query),
-    # so a PowerDNS server would serve the clients the operator meant to drop.
-    # Same transition-only semantics as the Technitium gate: re-saving a stored
-    # value, or clearing it, stays allowed.
-    if (
-        changes.get("blackhole")
-        and changes["blackhole"] != list(getattr(opts, "blackhole", None) or [])
-        and "powerdns" in await _group_driver_names(db, group_id)
-    ):
-        raise HTTPException(
-            422,
-            "This group has a PowerDNS server, which cannot apply: blackhole: PowerDNS "
-            "authoritative has no setting to drop queries from a client address. Move "
-            "the PowerDNS server to its own group, or leave blackhole empty.",
-        )
-    # #2264: only BIND9 renders ``allow-query-cache``. PowerDNS has no such
-    # setting either, so refuse a changed non-default value rather than store
-    # one the daemon ignores (same rule as the Technitium gate above).
-    if (
-        "allow_query_cache" in changes
-        and list(changes["allow_query_cache"] or []) != list(DEFAULT_ALLOW_QUERY_CACHE)
-        and list(changes["allow_query_cache"] or []) != list(opts.allow_query_cache or [])
-        and "powerdns" in await _group_driver_names(db, group_id)
-    ):
-        raise HTTPException(
-            422,
-            "allow_query_cache: this group has a PowerDNS server, which has no "
-            "cache-access ACL, so the value would be ignored. Move the PowerDNS "
-            "server to its own group, or leave it at its default.",
-        )
+    # #4562: an option a driver in the group does not apply is refused rather
+    # than stored and ignored. ``option_support`` is the one per-driver table;
+    # the blackhole (#2263), allow_query_cache (#2264), Technitium (#1763) and
+    # PowerDNS recursion gates are rows of it. Transition-only: re-saving a
+    # stored value, or putting an option back to a value at which it does
+    # nothing, stays allowed, so a value stored before the gate does not block
+    # an unrelated save. ``recursion_enabled`` defaults to on, so "off" is that
+    # value where the server never recurses. A mixed group gets what every
+    # driver applies. A server joining a group that already stores a value is
+    # not refused here; the options response warns instead. An empty group has
+    # no driver to contradict.
+    for driver in sorted((await _drivers_by_group(db, [group_id])).get(group_id, [])):
+        refused = option_support.refusals(driver, changes, opts)
+        if driver == "technitium":
+            # Value-specific limits of options Technitium applies in part.
+            refused += [
+                r
+                for r in technitium_option_refusals(
+                    changes, opts, await _group_acl_definitions(db, group_id)
+                )
+                if r not in refused
+            ]
+        if refused:
+            raise HTTPException(422, option_support.refusal_message(driver, refused))
     resolver_before = alias_resolver(opts.forwarders, opts.forward_transport)
     forwarders_before = list(opts.forwarders or [])
     transport_before = opts.forward_transport
@@ -6229,6 +6402,7 @@ async def create_zone(
         group_id, body.zone_type, list(body.forwarders or []), db
     )
     await _check_zone_forward_transport(group_id, zone_fields, None, db)
+    await _check_classless_zone_name(group_id, body.name, db)
     if body.zone_type == "primary":
         # #3672 — a name too long to carry the apex defaults is never served.
         apex_err = apex_name_length_error(body.name, body.primary_ns, body.admin_email)
@@ -6447,7 +6621,9 @@ async def get_zone_server_state(
         entry_in_sync = (
             current is not None
             and not pending
-            and zone_state_in_sync(zone, current, target, srv.driver)
+            and zone_state_in_sync(
+                zone, current, target, srv.driver, srv.agent_reports_served_serials
+            )
         )
         entries.append(
             ServerZoneStateEntry(
@@ -6664,7 +6840,9 @@ async def get_server_zone_state(
         # #2042 — an unacknowledged op is drift whatever the serial says.
         in_sync = (
             current is not None
-            and zone_state_in_sync(z, current, target, server.driver)
+            and zone_state_in_sync(
+                z, current, target, server.driver, server.agent_reports_served_serials
+            )
             and not pending
         )
         if current is None:
@@ -6884,6 +7062,22 @@ async def get_server_recent_events(
     return ServerEventsResponse(server_id=server.id, items=items)
 
 
+@router.get("/servers/{server_id}/memory-history", response_model=MemoryHistory)
+async def get_server_memory_history(
+    server_id: uuid.UUID,
+    db: DB,
+    current_user: CurrentUser,
+    hours: int = Query(6, ge=1, le=MAX_HISTORY_HOURS),
+) -> MemoryHistory:
+    """#4193 — the agent's memory samples (container used / peak, daemon and
+    agent RSS), one per minute, for the Server modal's sparkline. Empty for an
+    agent that does not report memory. Refused for a resource-scoped token."""
+    _refuse_resource_scoped_token(current_user)
+    if await db.get(DNSServer, server_id) is None:
+        raise HTTPException(status_code=404, detail="Server not found")
+    return await memory_history(db, DNSMetricSample, server_id, hours)
+
+
 # ── Server runtime-state read endpoints (rendered config + rndc) ─────
 
 
@@ -7097,6 +7291,8 @@ async def update_zone(
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if "name" in changes:
+        await _check_classless_zone_name(zone.group_id, changes["name"] or "", db)
     # #3265 — a record's fqdn, the fqdn IPAM keeps on each address and every PTR
     # value IPAM published are stored absolute under the zone's name, so a rename
     # of a zone that holds records leaves all of them on the old name (and can put
@@ -7131,6 +7327,75 @@ async def update_zone(
                     "them first (and purge them from the Trash)."
                 ),
             )
+    # #4257 — #3838 refuses a record written into a zone SpatiumDDI does not
+    # serve as primary, but Edit Zone could still turn a primary zone that holds
+    # records into a secondary / stub / forward one, leaving them stored, listed
+    # and served by nobody. Refused like the rename above, Trash included (a
+    # restore brings the record back).
+    # #4261 — the other direction: a secondary / stub holds none of its data in
+    # SpatiumDDI, and a type change imports nothing, so promoting one that holds
+    # no records makes the agent render it from nothing and serve it empty.
+    new_type = changes.get("zone_type")
+    old_type = zone.zone_type or "primary"
+    if new_type is not None and new_type != "primary" and new_type != old_type:
+        # #4390 — a pool holds no row while it is disabled or its members are
+        # down, so the record count below misses it; once it renders again it
+        # would write into a zone nobody serves as primary. Refuse by name.
+        pool_names = (
+            (await db.execute(select(DNSPool.name).where(DNSPool.zone_id == zone.id)))
+            .scalars()
+            .all()
+        )
+        if pool_names:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"zone {zone.name!r} is the zone of DNS pool(s) {', '.join(sorted(pool_names))}"
+                    f", and its type cannot be changed to {new_type} while they target it: a "
+                    f"{new_type} zone is not one SpatiumDDI serves records from, so the pool's "
+                    "records would be listed but served by nobody. A superadmin can delete the "
+                    "pool (or move it to a primary zone) first."
+                ),
+            )
+    if new_type is not None and new_type != old_type:
+        held, trashed = (
+            await db.execute(
+                select(
+                    func.count(),
+                    func.count().filter(DNSRecord.deleted_at.is_not(None)),
+                )
+                .select_from(DNSRecord)
+                .where(DNSRecord.zone_id == zone.id)
+                .execution_options(include_deleted=True)
+            )
+        ).one()
+        if new_type != "primary" and held:
+            in_trash = f", {trashed} of them in the Trash" if trashed else ""
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"zone {zone.name!r} holds {held} record(s){in_trash}, and its type "
+                    f"cannot be changed to {new_type} while it does: a {new_type} zone is "
+                    "not one SpatiumDDI serves records from, so they would be stored and "
+                    "listed but served by nobody. Delete them first (and purge them from "
+                    "the Trash), or create the zone under the new type and move the records."
+                ),
+            )
+        if new_type == "primary" and old_type in {"secondary", "stub"} and held == trashed:
+            how = (
+                "Pull them first with Sync with server, then change the type."
+                if old_type == "secondary"
+                else "Add its records first, then change the type."
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"This {old_type} zone's records come from its masters and SpatiumDDI "
+                    f"holds none, so as a primary it would be served empty. {how}"
+                ),
+            )
+    if changes.get("dnssec_policy_id") is not None:
+        await _refuse_policy_on_powerdns(db, group_id, zone, changes["dnssec_policy_id"])
     # DNSSEC flag flips through the generic update path (#811). Same
     # behaviour as the dedicated sign/unsign endpoints — before this,
     # PATCHing dnssec_enabled set the flag and nothing ever signed (or
@@ -7507,6 +7772,11 @@ async def get_zone_update_acl(
         for name in driver_names:
             try:
                 warnings.extend(get_driver(name).validate_update_acl(zone.name, neutral))
+            except UpdateAclConflictError as exc:
+                # Stored before the driver refused the combination (#4569):
+                # it still renders, as the driver documents, and an untouched
+                # save is accepted, so say what it does rather than "re-save".
+                warnings.append(f"{name}: {exc}")
             except ValueError:
                 # A standing entry the current driver can't honour — surface
                 # it as a warning rather than 500 the read.
@@ -7570,14 +7840,22 @@ async def _push_windows_dynamic_update(
 
 
 async def _validate_update_acl_body(
-    db: DB, group_id: uuid.UUID, zone: DNSZone, body: ZoneUpdateAclReplace
+    db: DB,
+    group_id: uuid.UUID,
+    zone: DNSZone,
+    body: ZoneUpdateAclReplace,
+    *,
+    tolerate_conflict: bool = False,
 ) -> tuple[list[str], list[str]]:
     """Validate a full-replace ACL payload without writing (#3738).
 
     Verifies every referenced TSIG key belongs to the group and runs the
     driver capability gate (422 on a hard-unsupported entry). Returns
     ``(driver_names, warnings)``. Run before the no-op shortcut so an
-    unchanged save is refused exactly as it was before.
+    unchanged save is refused exactly as it was before, except for an ACL
+    whose entries conflict with each other on a driver (#4569): that is refused
+    only when the save changes the ACL (``tolerate_conflict`` turns it into a
+    warning), so an install that stored one can still save the rest.
     """
     driver_names = await _group_driver_names(db, group_id)
 
@@ -7619,6 +7897,13 @@ async def _validate_update_acl_body(
     for name in driver_names:
         try:
             warnings.extend(get_driver(name).validate_update_acl(zone.name, neutral))
+        except UpdateAclConflictError as exc:
+            if not tolerate_conflict:
+                raise HTTPException(
+                    status_code=422,
+                    detail={"code": "DYNAMIC_UPDATE_UNSUPPORTED", "message": str(exc)},
+                ) from exc
+            warnings.append(f"{name}: {exc}")
         except ValueError as exc:
             raise HTTPException(
                 status_code=422,
@@ -7628,7 +7913,12 @@ async def _validate_update_acl_body(
 
 
 async def _replace_update_acl_rows(
-    db: DB, group_id: uuid.UUID, zone: DNSZone, body: ZoneUpdateAclReplace
+    db: DB,
+    group_id: uuid.UUID,
+    zone: DNSZone,
+    body: ZoneUpdateAclReplace,
+    *,
+    tolerate_conflict: bool = False,
 ) -> tuple[list[str], list[str]]:
     """Validate + replace a zone's ACL rows in the session (no audit/commit).
 
@@ -7638,7 +7928,9 @@ async def _replace_update_acl_rows(
     ``dynamic_update_enabled``. Returns ``(driver_names, warnings)``; the
     caller writes the audit row + commits.
     """
-    driver_names, warnings = await _validate_update_acl_body(db, group_id, zone, body)
+    driver_names, warnings = await _validate_update_acl_body(
+        db, group_id, zone, body, tolerate_conflict=tolerate_conflict
+    )
 
     # Replace: drop existing rows, insert the new ordered set (seq = position).
     await db.execute(sa_delete(DNSZoneUpdateAcl).where(DNSZoneUpdateAcl.zone_id == zone.id))
@@ -7699,7 +7991,6 @@ async def replace_zone_update_acl(
 
     # #3738 — audit only what changed; a save that changes nothing writes no
     # audit row, no wake and no Windows push, and answers with the stored state.
-    await _validate_update_acl_body(db, group_id, zone, body)
     old_entries = await _load_acl_out(db, zone.id)
 
     # Entry order is meaningful (seq = first-match order in update-policy),
@@ -7726,10 +8017,17 @@ async def replace_zone_update_acl(
         and body.dynamic_update_enabled != zone.dynamic_update_enabled
     ):
         changed_fields.append("dynamic_update_enabled")
+    # Validate before the no-op shortcut so an unchanged save is refused as it
+    # always was, bar a stored conflict (#4569), which only a change refuses.
+    await _validate_update_acl_body(
+        db, group_id, zone, body, tolerate_conflict="update_acl" not in changed_fields
+    )
     if not changed_fields:
         return await get_zone_update_acl(group_id, zone_id, db, current_user)
 
-    driver_names, warnings = await _replace_update_acl_rows(db, group_id, zone, body)
+    driver_names, warnings = await _replace_update_acl_rows(
+        db, group_id, zone, body, tolerate_conflict="update_acl" not in changed_fields
+    )
 
     db.add(
         AuditLog(
@@ -8029,9 +8327,9 @@ class ZoneDNSSECInfo(BaseModel):
     # each signing with its own keys; ``signing_servers`` is that count.
     dnssec_multi_signer: bool = False
     signing_servers: int = 0
-    # #1783 — the group runs a driver SpatiumDDI no longer signs on
-    # (Technitium); sign / re-sign are refused there (#1767). With
-    # ``dnssec_enabled`` this is a zone signed before the withdrawal.
+    # The group runs a driver SpatiumDDI does not sign on (the agentless
+    # Technitium API driver); sign / re-sign are refused there. With
+    # ``dnssec_enabled`` this is a zone signed before the refusal.
     signing_unmanaged: bool = False
     dnssec_unmanaged_warning: bool = False
 
@@ -8073,12 +8371,15 @@ class DelegationRecordPreview(BaseModel):
 class DelegationPreviewResponse(BaseModel):
     """What stamping a delegation into the parent zone would change.
 
-    ``has_parent`` false means no managed parent zone exists, so there is
-    nothing to delegate *from* — every other field is absent, and a client
+    ``has_parent`` false means no managed primary parent zone exists, so there
+    is nothing to delegate *from* — every other field is absent, and a client
     must not read that as "nothing to do".
     """
 
     has_parent: bool
+    # #4258 — set with has_parent false when the nearest parent zone exists but
+    # is a secondary / stub: why it cannot take the delegation.
+    reason: str | None = None
     parent_zone_id: uuid.UUID | None = None
     parent_zone_name: str | None = None
     child_zone_id: uuid.UUID | None = None
@@ -8090,6 +8391,11 @@ class DelegationPreviewResponse(BaseModel):
     existing_glue_records: list[DelegationRecordPreview] = []
     warnings: list[str] = []
     child_apex_ns_count: int | None = None
+    # #4389 — the view the parent zone is pinned to (None: every view).
+    parent_view_name: str | None = None
+    # #4388 — rows the delegation would write beside a CNAME in the parent: the
+    # apply refuses (409) while any is listed.
+    cname_conflicts: list[str] = []
 
 
 @router.get("/groups/{group_id}/zones/{zone_id}/dnssec/info", response_model=ZoneDNSSECInfo)
@@ -8154,7 +8460,8 @@ async def get_zone_dnssec_info(
 
 class DNSSECSignRequest(BaseModel):
     # Optional signing policy. null ⇒ BIND9 built-in "default". Ignored by
-    # the PowerDNS path (online signing uses its own defaults).
+    # the PowerDNS path (online signing uses its own defaults), so a custom
+    # policy on a PowerDNS group is refused with a 422 (#4567).
     policy_id: uuid.UUID | None = None
 
 
@@ -8220,6 +8527,7 @@ async def sign_zone_dnssec(
             pol = await db.get(DNSSECPolicy, body.policy_id)
             if pol is None:
                 raise HTTPException(status_code=404, detail="DNSSEC policy not found")
+            await _refuse_policy_on_powerdns(db, group_id, zone, body.policy_id)
             zone.dnssec_policy_id = body.policy_id
     await enqueue_dnssec_op(db, zone, "dnssec_sign")
     db.add(
@@ -8289,10 +8597,12 @@ async def rollover_zone_dnssec_key(
     db: DB,
     current_user: SuperAdmin,
 ) -> dict[str, Any]:
-    """Force a manual KSK/ZSK rollover for a signed BIND9 zone (issue #49).
+    """Force a manual KSK/ZSK rollover for a signed BIND9 or Technitium zone
+    (issue #49, #1767).
 
-    BIND9-only (``rndc dnssec -rollover``); PowerDNS rolls on its own
-    schedule and Windows DNS isn't supported. Enqueues a ``dnssec_rollover``
+    BIND9 (``rndc dnssec -rollover``) and Technitium
+    (``zones/dnssec/properties/rolloverDnsKey``); PowerDNS does not roll keys
+    and Windows DNS isn't supported. Enqueues a ``dnssec_rollover``
     op carrying the key tag; the agent runs the rollover and reports the new
     key set back on its next sync. The zone must already be signed.
     """
@@ -8391,6 +8701,7 @@ class ZoneMovePreviewResponse(BaseModel):
     #: by a Technitium server in the target; non-null means the commit
     #: refuses, not waivable by acknowledgement.
     technitium_acl_refusal: str | None = None
+    classless_refusal: str | None = None
     warnings: list[str]
     required_acknowledgements: list[str]
 
@@ -8433,6 +8744,7 @@ class ZoneMovePreviewResponse(BaseModel):
             tsig_algorithm_refusal=plan.tsig_algorithm_refusal,
             forward_transport_refusal=plan.forward_transport_refusal,
             technitium_acl_refusal=plan.technitium_acl_refusal,
+            classless_refusal=plan.classless_refusal,
             warnings=plan.warnings,
             required_acknowledgements=plan.required_acknowledgements,
         )
@@ -8810,6 +9122,7 @@ async def create_zone_from_template(
         raise HTTPException(status_code=422, detail="; ".join(errors))
 
     await _enforce_zone_view_in_group(db, group_id, body.view_id)  # #2917
+    await _check_classless_zone_name(group_id, body.zone_name, db)  # #4435
 
     # #2915 — every record the template would write goes through the record
     # API's rules before anything is written or pushed.
@@ -8980,13 +9293,23 @@ async def get_delegation_preview(
     """Compute the NS + glue records needed to delegate this zone from its parent.
 
     Returns ``{has_parent: false}`` when no eligible parent zone exists in
-    the same group; otherwise the dict is the full preview shape from
+    the same group and view; otherwise the dict is the full preview shape from
     ``preview_to_dict`` plus ``has_parent: true``.
     """
     child = await _require_zone(group_id, zone_id, db, current_user)
-    parent = await find_parent_zone(db, group_id, child.name)
+    parent = await find_parent_zone(db, group_id, child.name, child.view_id)
     if parent is None:
         return DelegationPreviewResponse(has_parent=False)
+    # #4258 — only a primary parent can take the NS + glue records; a secondary
+    # or stub parent is named with the reason, and has_parent stays false.
+    reason = unauthored_parent_reason(parent)
+    if reason is not None:
+        return DelegationPreviewResponse(
+            has_parent=False,
+            parent_zone_id=parent.id,
+            parent_zone_name=parent.name,
+            reason=reason,
+        )
     # The preview reads the parent's records and the apply writes them: a
     # zone-bound token must be bound to the parent as well as the child.
     _enforce_zone_token_scope(current_user, parent.id)
@@ -9006,6 +9329,9 @@ async def apply_delegation(
 ) -> list[DNSRecord]:
     """Materialise the delegation records into the parent zone.
 
+    The parent is the one in the child's own view (#4389). A row that would sit
+    beside a CNAME in the parent is refused with 409 (#4388).
+
     Idempotent — records that already exist in the parent are skipped, so a
     second call after the first succeeds is a no-op. Each created record
     flows through ``enqueue_record_op`` so the parent zone's serial bumps
@@ -9017,17 +9343,20 @@ async def apply_delegation(
     # probed first, locked, and re-found: a parent that changed meanwhile is a
     # 409, not a write into the wrong zone.
     child = await _require_zone(group_id, zone_id, db, current_user)
-    parent = await find_parent_zone(db, group_id, child.name)
+    parent = await find_parent_zone(db, group_id, child.name, child.view_id)
     if parent is None:
         raise HTTPException(
             status_code=404,
             detail=f"No parent zone found in this group for {child.name.rstrip('.')}",
         )
     _enforce_zone_token_scope(current_user, parent.id)
+    reason = unauthored_parent_reason(parent)
+    if reason is not None:
+        raise HTTPException(status_code=409, detail=reason)
     parent_id = parent.id
     await lock_zone_rows(db, [child.id, parent_id])
     child = await _require_zone(group_id, zone_id, db, current_user, lock="write")
-    parent = await find_parent_zone(db, group_id, child.name)
+    parent = await find_parent_zone(db, group_id, child.name, child.view_id)
     if parent is None:
         raise HTTPException(
             status_code=404,
@@ -9037,8 +9366,15 @@ async def apply_delegation(
         raise HTTPException(
             status_code=409, detail="The zone hierarchy changed during the request; retry"
         )
+    reason = unauthored_parent_reason(parent)
+    if reason is not None:
+        raise HTTPException(status_code=409, detail=reason)
     await db.refresh(parent)
     preview = await compute_delegation(db, parent, child)
+    if preview.cname_conflicts:
+        # #4388 — the record API's CNAME rule: the parent keeps its CNAME and
+        # nothing is written beside it.
+        raise HTTPException(status_code=409, detail=" ".join(preview.cname_conflicts))
     pending = preview.ns_records_to_create + preview.glue_records_to_create
     if not pending:
         return []
@@ -9911,6 +10247,31 @@ async def _refuse_cname_conflict(
         raise HTTPException(
             status.HTTP_409_CONFLICT, describe_cname_conflict(record_type, fqdn, other)
         )
+    # #4260 — a pool owns its name even while none of its members is healthy
+    # (no row yet), and would write its A / AAAA beside the CNAME later.
+    if record_type.upper() == "CNAME":
+        pool = (
+            (
+                await db.execute(
+                    select(DNSPool)
+                    .where(
+                        DNSPool.zone_id == zone_id,
+                        func.lower(DNSPool.record_name) == name.strip().lower(),
+                    )
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if pool is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"{fqdn.rstrip('.')} is owned by the DNS pool {pool.name!r}, so it can "
+                "hold no CNAME. A CNAME must be the only record at its name (RFC 1034 "
+                "section 3.6.2, RFC 2181 section 10.1); PowerDNS and BIND both refuse "
+                "a zone that breaks this, and the server stops applying it.",
+            )
 
 
 async def _enforce_zone_view_in_group(
@@ -10166,11 +10527,16 @@ async def update_record(
     # #1563 — explicit null clears view_id and ttl (ttl null = inherit
     # the zone TTL; exclude_none dropped both, so the clear never
     # landed); null for a NOT NULL column is a 422.
+    # #4557 — an explicit null priority/weight/port is kept too, not dropped:
+    # MX turns a null priority into the create default (10), SRV refuses it
+    # (422, via _normalize_record_struct_fields), other types hold no value.
     changes = resolve_update_changes(
         body,
-        clearable={"view_id", "ttl"},
+        clearable={"view_id", "ttl", "priority", "weight", "port"},
         non_nullable={"name", "value", "tags"},
     )
+    if record.record_type.upper() == "MX" and "priority" in changes and changes["priority"] is None:
+        changes["priority"] = 10
     # An untouched Save sends every field the dialog shows; only a field whose
     # value differs is a change (#2463). Nothing changed → nothing to bump,
     # queue or audit.
@@ -10629,23 +10995,15 @@ async def bulk_delete_records(
     # zone skipped every record and returned ``deleted: 0`` while the
     # singular route deleted the same rows (appliance sizing campaign,
     # 2026-09-02).
-    # Rows whose wire delete was DISPATCHED (queued or applied) — the ones
-    # about to leave the live table. Not "kept in the DB": that is the
-    # ``failed`` branch above.
+    # Rows whose wire delete was DISPATCHED (queued or applied) or had no
+    # server to go to — the ones about to leave the live table. Not "kept in
+    # the DB": that is the ``failed`` branch above.
     dispatched: list[DNSRecord] = []
     for rec, op_row in zip(targets, op_rows, strict=True):
-        if op_row is None:
-            skipped.append(
-                {
-                    "record_id": str(rec.id),
-                    "reason": (
-                        "no enabled server in the zone's group to send it to — "
-                        "wire delete skipped"
-                    ),
-                }
-            )
-            continue
-        if op_row.state == "failed":
+        # ``None`` = no wire op was queued (a group with no server, #2276, or a
+        # paused agentless primary): nothing is published, so there is nothing
+        # to retract. The singular route deletes in that case too (#4368).
+        if op_row is not None and op_row.state == "failed":
             skipped.append(
                 {
                     "record_id": str(rec.id),
@@ -12232,6 +12590,12 @@ async def import_zone_spreadsheet_commit(
 # ── Helper functions ────────────────────────────────────────────────────────
 
 
+def _url_key(value: Any) -> str:
+    """An API URL as compared for "did the destination change": case and a
+    trailing slash do not move it."""
+    return str(value or "").strip().rstrip("/").lower()
+
+
 async def _require_group(group_id: uuid.UUID, db: DB) -> DNSServerGroup:
     group = await db.get(DNSServerGroup, group_id)
     if not group:
@@ -12402,6 +12766,40 @@ async def _require_zone(
     return zone
 
 
+async def _refuse_policy_on_powerdns(
+    db: DB, group_id: uuid.UUID, zone: DNSZone, policy_id: uuid.UUID | None
+) -> None:
+    """422 a custom DNSSEC policy on a group that has a PowerDNS server (#4567).
+
+    The PowerDNS agent signs every zone with its own fixed settings (ECDSA
+    P-256, plain NSEC, no scheduled rollover) and never reads the policy, so a
+    stored custom policy would claim an algorithm / NSEC3 / lifetimes the zone
+    is not signed with. Only a *change* to a custom policy is refused: an
+    untouched save of a value already stored passes, and the built-in default
+    (which matches what PowerDNS does) is always accepted.
+    """
+    if policy_id is None or policy_id == zone.dnssec_policy_id:
+        return
+    pol = await db.get(DNSSECPolicy, policy_id)
+    if pol is None or pol.is_builtin:
+        return
+    res = await db.execute(
+        select(func.count())
+        .select_from(DNSServer)
+        .where(DNSServer.group_id == group_id, DNSServer.driver == "powerdns")
+    )
+    if res.scalar_one():
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "PowerDNS does not apply a custom DNSSEC policy: it signs zones with ECDSA "
+                "P-256 and plain NSEC and does no scheduled key rollover, so the policy "
+                f"{pol.name!r} would be stored but not honoured. Use the built-in default "
+                "policy, or put the zone in a BIND9 group."
+            ),
+        )
+
+
 async def _check_driver_gated_operation(op: str, group_id: uuid.UUID, db: DB) -> None:
     """Reject driver-specific zone-level operations on groups whose
     servers can't serve them. Used by Phase 3c DNSSEC sign/unsign
@@ -12421,13 +12819,11 @@ async def _check_driver_gated_operation(op: str, group_id: uuid.UUID, db: DB) ->
         raise HTTPException(
             status_code=422,
             detail=(
-                "DNSSEC signing is not supported on Technitium servers "
-                "(agent-managed or agentless API) in 1.0: "
-                "SpatiumDDI cannot keep a Technitium zone signed (it is signed "
-                "once and never re-signed on a new server, a re-created zone "
-                "or a lost volume, and the zone's DNSSEC policy is ignored). "
-                "Use a BIND9 or PowerDNS group for signed zones; full "
-                "Technitium support is tracked in #1767."
+                "DNSSEC signing is not supported on the agentless Technitium "
+                "API driver: there is no agent to keep the zone signed on a "
+                "new server, a re-created zone or a lost volume. Use an "
+                "agent-managed Technitium, BIND9 or PowerDNS group for "
+                "signed zones."
             ),
         )
     if not incompatible and op == "dnssec_sign":
@@ -12540,6 +12936,16 @@ async def _check_driver_gated_record_type(record_type: str, group_id: uuid.UUID,
             )
 
 
+async def _check_classless_zone_name(group_id: uuid.UUID, name: str, db: DB) -> None:
+    """422 an RFC 2317 classless zone name in a group whose driver cannot serve
+    one (#4435). A name without a ``/`` costs no query."""
+    if "/" not in name:
+        return
+    refusal = classless_zone_refusal(await _group_driver_names(db, group_id), name)
+    if refusal is not None:
+        raise HTTPException(status_code=422, detail=refusal)
+
+
 async def _check_driver_refusals(
     records: Iterable[tuple[str, str | None, int | None]], group_id: uuid.UUID, db: DB
 ) -> None:
@@ -12627,14 +13033,18 @@ def _reject_if_unauthored_zone(zone: DNSZone, op: str) -> None:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=msg)
 
 
+_PAST_TENSE = {"edit": "edited", "delete": "deleted", "add": "added", "create": "created"}
+
+
 def _reject_if_synthesised_record(record: DNSRecord, op: str) -> None:
     """Same gate, applied to records belonging to a synthesised zone."""
+    done = _PAST_TENSE.get(op, f"{op}ed")
     if record.tailscale_tenant_id is not None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=(
                 f"Record {record.fqdn!r} is synthesised by the Tailscale "
-                f"integration and cannot be {op}ed manually. Edits would be "
+                f"integration and cannot be {done} manually. Edits would be "
                 f"overwritten on the next sync."
             ),
         )
@@ -12643,7 +13053,7 @@ def _reject_if_synthesised_record(record: DNSRecord, op: str) -> None:
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=(
                 f"Record {record.fqdn!r} is synthesised by the NetBird "
-                f"integration and cannot be {op}ed manually. Edits would be "
+                f"integration and cannot be {done} manually. Edits would be "
                 f"overwritten on the next sync."
             ),
         )
@@ -12652,8 +13062,8 @@ def _reject_if_synthesised_record(record: DNSRecord, op: str) -> None:
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=(
                 f"Record {record.fqdn!r} is managed by a DNS pool and cannot "
-                f"be {op}ed manually. Edits would be overwritten on the next "
-                f"health-check pass — manage the pool / member instead."
+                f"be {done} manually. Edits would be overwritten on the next "
+                f"health-check pass — a superadmin manages the pool or its member."
             ),
         )
 

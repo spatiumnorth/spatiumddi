@@ -107,6 +107,8 @@ class ImportedZoneOut(BaseModel):
     records: list[ImportedRecordOut]
     view_name: str | None = None
     forwarders: list[str] = Field(default_factory=list)
+    # #4259 — a secondary / stub zone's primaries (``ip`` / ``ip@port``).
+    masters: list[str] = Field(default_factory=list)
     skipped_record_types: dict[str, int] = Field(default_factory=dict)
     parse_warnings: list[str] = Field(default_factory=list)
     # #986 — TLD scope of the incoming zone name, so a bulk import is where
@@ -342,6 +344,7 @@ def _zone_to_pydantic(z: ImportedZone, tlds: frozenset[str] | None = None) -> Im
         records=[ImportedRecordOut(**r.__dict__) for r in z.records],
         view_name=z.view_name,
         forwarders=list(z.forwarders),
+        masters=list(z.masters),
         skipped_record_types=dict(z.skipped_record_types),
         parse_warnings=list(z.parse_warnings),
         foreign_apex_ns=list(z.foreign_apex_ns),
@@ -378,6 +381,7 @@ def _zone_from_pydantic(o: ImportedZoneOut) -> ImportedZone:
         records=[ImportedRecord(**r.model_dump()) for r in o.records],
         view_name=o.view_name,
         forwarders=list(o.forwarders),
+        masters=list(o.masters),
         skipped_record_types=dict(o.skipped_record_types),
         parse_warnings=list(o.parse_warnings),
     )

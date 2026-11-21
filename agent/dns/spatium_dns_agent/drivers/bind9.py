@@ -697,12 +697,20 @@ def sinkhole_rdatas(sinkhole_ip: Any) -> tuple[tuple[str, ...], bool]:
 # memory limit in total, split across the recursive views.
 # ``NAMED_MAX_CACHE_SIZE`` overrides it (a BIND size, e.g. ``512m``; per view,
 # as BIND applies it; ``unlimited`` and ``0`` are ignored with a warning).
+# The server group's own ``max_cache_size`` (#4185, in the bundle's options)
+# wins over both: group setting > ``NAMED_MAX_CACHE_SIZE`` > the derived ceiling.
 _CACHE_SHARE_OF_LIMIT = 0.25
 _CACHE_MIN_MIB = 32
 
 
+_BIND_SIZE_RE = r"(?:0*[1-9]\d*[kKmMgG]?|default)"
+
+
 def _render_max_cache_size(
-    environ: Any = None, limit_bytes: int | None = None, caches: int = 1
+    environ: Any = None,
+    limit_bytes: int | None = None,
+    caches: int = 1,
+    group_value: str | None = None,
 ) -> str:
     """``max-cache-size`` line for ``options {}``; "" when there is neither an
     override nor a container memory limit (named then keeps its own default,
@@ -710,7 +718,21 @@ def _render_max_cache_size(
 
     ``caches`` is the number of views that keep a resolver cache (recursion
     on); the quarter of the limit is split between them, since the option in
-    ``options {}`` is inherited by every view as its OWN cache's ceiling."""
+    ``options {}`` is inherited by every view as its OWN cache's ceiling.
+
+    ``group_value`` is the server group's setting (#4185), the first choice;
+    an unusable one (the API refuses them, so only a hand-edited bundle) is
+    ignored with a warning like the env override."""
+    group_value = (group_value or "").strip()
+    if group_value:
+        if re.fullmatch(_BIND_SIZE_RE, group_value):
+            return f"    max-cache-size {group_value};\n"
+        log.warning(
+            "bind9_max_cache_size_ignored",
+            value=group_value,
+            source="server_group",
+            hint="use an explicit size such as 512m; BIND 9.21.21+ ignores unlimited and 0",
+        )
     env = os.environ if environ is None else environ
     override = (env.get("NAMED_MAX_CACHE_SIZE") or "").strip()
     if override:
@@ -719,7 +741,7 @@ def _render_max_cache_size(
         # ceiling this override exists to defeat (#3565). An existing install
         # that still sets one must not fail to start, so it is ignored with a
         # warning and the cgroup-derived ceiling below applies.
-        if re.fullmatch(r"(?:0*[1-9]\d*[kKmMgG]?|default)", override):
+        if re.fullmatch(_BIND_SIZE_RE, override):
             return f"    max-cache-size {override};\n"
         log.warning(
             "bind9_max_cache_size_ignored",
@@ -3604,7 +3626,10 @@ class Bind9Driver(DriverBase):
             notify_block=_render_notify_block(opts),
             response_policy=response_policy_block,
             rate_limit=_render_rate_limit_block(opts),
-            max_cache_size=_render_max_cache_size(caches=_resolver_cache_count(bundle)),
+            max_cache_size=_render_max_cache_size(
+                caches=_resolver_cache_count(bundle),
+                group_value=opts.get("max_cache_size"),
+            ),
             query_log=_render_query_log_option(opts),
             response_log=_render_response_log_option(opts),
             logging_block=logging_block,

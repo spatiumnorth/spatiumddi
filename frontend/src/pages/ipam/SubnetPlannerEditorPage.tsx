@@ -327,8 +327,9 @@ export function SubnetPlannerEditorPage() {
                 nest a child of that kind. Click a node to edit it on the right
                 (CIDR, name, kind, optional DNS / DHCP / gateway). Drag the grip
                 handle to reparent (drops onto subnets are refused — subnets
-                can't have children). Save, then Apply to materialise everything
-                in IPAM in one transaction.
+                can't have children).
+                {!applyGate.disabled &&
+                  " Save, then Apply to materialise everything in IPAM in one transaction."}
               </div>
             )}
             <TreeNodeRow
