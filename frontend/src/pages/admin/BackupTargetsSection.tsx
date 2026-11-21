@@ -981,6 +981,10 @@ function TargetFormModal({
     existing?.retention_keep_days?.toString() ?? "30",
   );
   const [writeOnly, setWriteOnly] = useState(existing?.write_only ?? false);
+  // Off for a new target (opt-in); an existing one shows what it has stored (#1362).
+  const [encryptArchive, setEncryptArchive] = useState(
+    existing?.encrypt_archive ?? false,
+  );
   const [error, setError] = useState<string | null>(null);
 
   const kindMeta = useMemo<BackupTargetKind | undefined>(
@@ -1061,6 +1065,7 @@ function TargetFormModal({
             ? Number(retentionDays)
             : null,
         write_only: effectiveWriteOnly,
+        encrypt_archive: encryptArchive,
       };
       if (mode === "create") {
         if (passphrase.length < 8) {
@@ -1073,7 +1078,7 @@ function TargetFormModal({
         } as BackupTargetCreate;
         return backupTargetsApi.create(body);
       }
-      // The eight top-level fields go only when changed against what the
+      // The nine top-level fields go only when changed against what the
       // dialog read (#4236), so one another client set since is not put back.
       const { config: _cfg, ...topLevel } = sharedFields;
       void _cfg;
@@ -1087,6 +1092,7 @@ function TargetFormModal({
           retention_keep_last_n: existing!.retention_keep_last_n,
           retention_keep_days: existing!.retention_keep_days,
           write_only: existing!.write_only,
+          encrypt_archive: existing!.encrypt_archive ?? false,
         },
         topLevel,
       );
@@ -1329,6 +1335,28 @@ function TargetFormModal({
               />
             </div>
           </Field>
+
+          <fieldset className="space-y-2 rounded-md border bg-muted/30 px-3 py-2">
+            <legend className="px-1 text-xs font-medium">Encryption</legend>
+            <label className="flex items-start gap-2 text-xs">
+              <input
+                type="checkbox"
+                checked={encryptArchive}
+                onChange={(e) => setEncryptArchive(e.target.checked)}
+                className="mt-0.5"
+              />
+              <span>
+                <span className="font-medium">Encrypt the whole archive</span>
+                <span className="block text-muted-foreground">
+                  Encrypts the database dump as well as <code>secrets.enc</code>{" "}
+                  (AES-256-GCM, key derived from this target&apos;s passphrase).
+                  Without it the dump is stored readable, so anyone who can read
+                  the destination can read the database. Restore asks for the
+                  same passphrase; archives already written are not changed.
+                </span>
+              </span>
+            </label>
+          </fieldset>
 
           <fieldset className="space-y-2 rounded-md border bg-muted/30 px-3 py-2">
             <legend className="px-1 text-xs font-medium">Immutability</legend>

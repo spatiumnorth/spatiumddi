@@ -87,6 +87,15 @@ class BackupTarget(Base):
         Boolean, nullable=False, default=False, server_default=text("false")
     )
 
+    # Whole-archive encryption (#1362). Off, only ``secrets.enc`` is
+    # encrypted and the database dump is stored as is. On, the dump is
+    # encrypted too under a key derived from ``passphrase_encrypted``.
+    # FALSE for every row that pre-dates the column; the API creates new
+    # targets with it on.
+    encrypt_archive: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+
     last_run_status: Mapped[str] = mapped_column(String(20), nullable=False, default="never")
     last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_run_filename: Mapped[str | None] = mapped_column(String(255), nullable=True)

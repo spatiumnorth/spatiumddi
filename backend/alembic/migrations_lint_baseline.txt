@@ -442,6 +442,7 @@ backend/alembic/versions/c7d3f9a15e28_dhcp_lease_cache.py:drop_column:71
 backend/alembic/versions/c7d3f9a15e28_dhcp_lease_cache.py:drop_column:72
 backend/alembic/versions/c7d3f9a15e28_dhcp_lease_cache.py:drop_column:73
 backend/alembic/versions/c7d3f9a15e28_dhcp_lease_cache.py:drop_column:74
+backend/alembic/versions/c7e19a4b5d28_backup_target_encrypt_archive.py:drop_column:37
 backend/alembic/versions/c7e2f5a91d48_audit_forward_targets.py:drop_table:172
 backend/alembic/versions/c7e5d918a3f2_appliance_cluster_health.py:drop_column:42
 backend/alembic/versions/c7e9b3a481f2_appliance_approval_workflow.py:drop_column:152
