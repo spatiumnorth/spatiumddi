@@ -62,8 +62,9 @@ async def test_entries_are_read_as_columns_not_entities(db_session: AsyncSession
     """The point of #1109: a ~596k-entry profile must not be hydrated into
     ORM objects on every bundle build. Every value assertion here would
     still pass if the query went back to ``select(DNSBlockListEntry)``, so
-    pin the SQL: the four columns the bundle needs, and nothing an entity
-    load would add (its ``id``, ``list_id``, ``source``, ...). The identity
+    pin the SQL: the columns the bundle needs (a list-position integer
+    tells the one query's rows apart), and nothing an entity load would add (its ``id``,
+    ``source``, ...). The identity
     map cannot show this: it holds weak references, and the entities are
     gone again before the call returns."""
     a = await _list(db_session, "nxdomain", ["one.example", "two.example"])
@@ -83,7 +84,9 @@ async def test_entries_are_read_as_columns_not_entities(db_session: AsyncSession
     assert [e.domain for e in entries] == ["one.example", "two.example"]
     assert len(statements) == 1, statements
     selected = statements[0][len("SELECT ") : statements[0].index(" FROM ")]
-    assert [c.strip() for c in selected.split(",")] == [
+    head, _, columns = selected.partition(" AS position, ")
+    assert head.startswith("CASE dns_blocklist_entry.list_id"), selected
+    assert [c.strip() for c in columns.split(",")] == [
         "dns_blocklist_entry.domain",
         "dns_blocklist_entry.entry_type",
         "dns_blocklist_entry.target",
