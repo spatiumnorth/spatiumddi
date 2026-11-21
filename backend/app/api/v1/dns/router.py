@@ -212,7 +212,7 @@ from app.services.dns.new_object_defaults import (
     default_zone_ttl,
     load_dns_defaults,
 )
-from app.services.dns.powerdns_alias import alias_resolver
+from app.services.dns.powerdns_alias import alias_resolver, group_can_resolve_alias
 from app.services.dns.record_identity import describe_identical, find_identical_record
 from app.services.dns.record_ops import (
     clear_dnssec_key_state,
@@ -12681,12 +12681,7 @@ async def _check_driver_gated_record_type(record_type: str, group_id: uuid.UUID,
         # PowerDNS expands an ALIAS through the group's own plain-DNS
         # forwarders and nothing else (#1353); without them the record would
         # be stored and answer nothing.
-        opts = (
-            await db.execute(select(DNSServerOptions).where(DNSServerOptions.group_id == group_id))
-        ).scalar_one_or_none()
-        if not alias_resolver(
-            getattr(opts, "forwarders", None), getattr(opts, "forward_transport", None)
-        ):
+        if not await group_can_resolve_alias(db, group_id):
             raise HTTPException(
                 status_code=422,
                 detail=(

@@ -28,6 +28,7 @@ from app.core.ssrf import assert_safe_target
 from app.models.dns import DNSServer, DNSServerGroup
 from app.services.api_token_scopes import read_only_post, token_write
 from app.services.dns.name_scope import classify_zone_name
+from app.services.dns.powerdns_alias import group_can_resolve_alias
 from app.services.dns.tld_registry import effective_registry
 from app.services.dns_import import (
     CLOUD_DRIVERS,
@@ -805,6 +806,7 @@ async def powerdns_preview(
             api_key=body.api_key,
             server_name=body.server_name,
             target_drivers=frozenset(d for d in drivers_res.scalars().all() if d),
+            alias_resolvable=await group_can_resolve_alias(db, body.target_group_id),
         )
     except PowerDNSImportError as exc:
         raise HTTPException(status_code=502, detail=str(exc))

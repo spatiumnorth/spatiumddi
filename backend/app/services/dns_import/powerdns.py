@@ -100,6 +100,14 @@ _SUPPORTED_RECORD_TYPES = {
 # PowerDNS driver); otherwise dropped with a warning naming the target driver.
 _POWERDNS_ONLY_RECORD_TYPES = {"ALIAS", "LUA"}
 
+# Same wording at preview (here) and at commit (commit.py), so a plan that
+# already carries it is not warned twice.
+ALIAS_DROPPED_WARNING = (
+    "Dropped {count} ALIAS record(s): the target group has no forwarders over plain "
+    "DNS (Do53) to resolve them; set forwarders under the group's server options "
+    "and import again"
+)
+
 _DNSSEC_RECORDS = {"DNSKEY", "RRSIG", "NSEC", "NSEC3", "NSEC3PARAM", "DS", "CDS", "CDNSKEY"}
 
 
@@ -251,13 +259,15 @@ def _build_imported_zone(
     summary: dict[str, Any],
     full: dict[str, Any],
     target_drivers: frozenset[str] | None = None,
+    alias_resolvable: bool = True,
 ) -> ImportedZone:
     """Translate one PowerDNS zone (summary + full record set) into
     the canonical :class:`ImportedZone`. Per-rrset oddities (LUA
     records, disabled records, malformed SOA) become
     ``parse_warnings`` on the returned zone. ``target_drivers`` is the set of
     drivers in the target group; ALIAS / LUA import only when it is exactly
-    ``{"powerdns"}`` (#4604)."""
+    ``{"powerdns"}`` (#4604). ALIAS is dropped when ``alias_resolvable`` is
+    False: the group has no Do53 forwarders to expand it through."""
 
     pdns_target = target_drivers == frozenset({"powerdns"})
 
@@ -271,6 +281,7 @@ def _build_imported_zone(
     skipped: dict[str, int] = {}
     warnings: list[str] = []
     disabled_count = 0
+    alias_dropped = 0
 
     for rrset in full.get("rrsets") or []:
         rtype = str(rrset.get("type") or "").upper()
@@ -299,6 +310,10 @@ def _build_imported_zone(
             pdns_target and rtype in _POWERDNS_ONLY_RECORD_TYPES
         ):
             skipped[rtype] = skipped.get(rtype, 0) + len(rec_list)
+            continue
+
+        if rtype == "ALIAS" and not alias_resolvable:
+            alias_dropped += len(rec_list)
             continue
 
         rel = _rel_name(rname, fqdn)
@@ -359,6 +374,8 @@ def _build_imported_zone(
                 f"({', '.join(f'{k}={v}' for k, v in sorted(rest.items()))}) "
                 "— no SpatiumDDI record type models them"
             )
+    if alias_dropped:
+        warnings.append(ALIAS_DROPPED_WARNING.format(count=alias_dropped))
     if soa is None and zone_type in {"primary", "secondary"}:
         warnings.append(
             "Source did not return SOA in rrsets — zone created with "
@@ -390,6 +407,7 @@ async def parse_powerdns_server(
     server_name: str = "localhost",
     timeout: httpx.Timeout = _DEFAULT_TIMEOUT,
     target_drivers: frozenset[str] | None = None,
+    alias_resolvable: bool = True,
 ) -> ImportPreview:
     """Live-pull every zone + its records from a PowerDNS REST API.
 
@@ -497,7 +515,7 @@ async def parse_powerdns_server(
                     )
                 )
                 continue
-            zones.append(_build_imported_zone(summary, full, target_drivers))
+            zones.append(_build_imported_zone(summary, full, target_drivers, alias_resolvable))
 
     if not zones:
         overall_warnings.append(
