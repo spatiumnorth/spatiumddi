@@ -323,6 +323,105 @@ only: a Route carries HTTP and TLS, not DNS on 53 or DHCP on 67. Both need a
 `hostNetwork`. See [Exposing DNS to clients](#exposing-dns-to-clients) and
 [Exposing DHCP to clients](#exposing-dhcp-to-clients).
 
+### Join an appliance agent node to a Helm or OpenShift control plane
+
+An OS appliance installed in the **agent role** (the installer's *Additional
+node*) can serve DNS and DHCP for a control plane that runs from this chart,
+on plain Kubernetes or on OpenShift. This was tested on OpenShift 4.22 with a
+1.0.0 chart and a 1.0.0 appliance: the appliance registered, took the
+`dns-bind9` and `dhcp` roles, answered a zone made on the control plane and
+handed out a relayed DHCP lease. Two steps below (2 and 3) are off by default
+on a Helm install, and skipping either leaves the appliance idle with no error
+in the UI, so do them in this order.
+
+1. **Make the API reachable from the appliance.** Expose the frontend with
+   the chart's Ingress (see [Exposing the UI](#exposing-the-ui)) or, on
+   OpenShift, the Route (`openshift.route.host`). The hostname must resolve
+   **from the appliance**: the installer's answer file has no hosts-entry
+   option, so use a real DNS name. For a lab, a nip.io-style name works with
+   no DNS server (`ddi.192.0.2.51.nip.io` resolves to `192.0.2.51`). The
+   default `*.apps-crc.testing` style names of OpenShift Local do not resolve
+   from another machine. The appliance needs outbound access to the host on
+   443, and the DNS and DHCP agents it runs reach the API through the same URL.
+
+2. **Turn on supervisor registration.** `supervisor_registration_enabled` is
+   **off** on a Helm control plane. While it is off the supervisor logs
+   `supervisor_registration_enabled=false` and idles, and nothing appears in
+   Fleet. Turn it on under **Appliance → Pairing → Enable registration**, or:
+
+   ```bash
+   curl -sk -X PUT https://<host>/api/v1/settings \
+     -H "Authorization: Bearer <superadmin token>" \
+     -H "Content-Type: application/json" \
+     -d '{"supervisor_registration_enabled": true}'
+   ```
+
+3. **Make the DNS and DHCP agent keys reach the api and worker.** The chart
+   sets `DNS_AGENT_KEY` and `DHCP_AGENT_KEY` on the api and worker only while
+   `dnsAgents.enabled` / `dhcpAgents.enabled` is true. With them off, the
+   roles you assign later stay at `roles_awaiting_key` in the supervisor's
+   log and no role pod starts. Until [#4648](https://github.com/spatiumnorth/spatiumddi/issues/4648)
+   makes the keys an independent value, set both with an empty server list,
+   which injects the keys and starts **no** in-cluster agent pods:
+
+   ```yaml
+   # values.yaml
+   dnsAgents:
+     enabled: true
+     servers: []            # no in-cluster DNS agents
+     agentKey:
+       existingSecret: ddi-dns-agent-key   # or value: <random string>
+   dhcpAgents:
+     enabled: true
+     servers: []            # no in-cluster DHCP agents
+     agentKey:
+       existingSecret: ddi-dhcp-agent-key  # or value: <random string>
+   ```
+
+   Apply it with `helm upgrade`. The api and worker roll, and the supervisor
+   picks the keys up on its next heartbeat. This section will change when
+   #4648 lands.
+
+4. **Mint a pairing code.** In **Appliance → Fleet → Pairing codes** create a
+   code. Codes expire within 60 minutes at most, so mint it just before the
+   install.
+
+5. **Install the appliance in the agent role.** In the installer pick
+   *Additional node* and enter the control-plane URL (`https://<host>`, the
+   hostname from step 1) and the 8-digit code; see
+   [APPLIANCE_INSTALL.md](APPLIANCE_INSTALL.md#5-add-dns--dhcp-nodes). For an
+   unattended install, set `role: appliance`, `control_plane_url` and
+   `pairing_code` in the answer file
+   (`appliance/cloud-init/spatium-preseed-appliance.yaml.example`). The
+   supervisor is running about six minutes after boot.
+
+6. **Approve it and assign roles.** The node shows as *pending* in
+   **Appliance → Fleet**. Approve it, then assign `dns-bind9` and / or `dhcp`
+   with their server groups. Role pods start on the appliance within about a
+   minute, and each registers in its group.
+
+7. **Verify.**
+   - The Fleet row is approved and heartbeats about every 30 seconds.
+   - On the appliance, the role pods are running (`sudo k3s kubectl get pods -A`).
+   - Create a test zone with an A record in the DNS group and query the
+     appliance's own IP: `dig @<appliance-ip> www.test.example A`.
+   - Create a subnet, scope and pool in the DHCP group, send a relayed
+     request to the appliance (relay `giaddr` in that subnet) and check that
+     the lease appears in the control plane's lease list.
+
+**TLS.** The supervisor pins the certificate the control plane serves on first
+contact (`supervisor.tls.pinned_on_first_contact` in its log), and it does not
+match the hostname against it, so the router's default certificate works and
+no insecure flag is needed. Known caveat, tracked in
+[#4647](https://github.com/spatiumnorth/spatiumddi/issues/4647): the pin is
+not one the control plane's appliance CA vouches for, so the supervisor logs
+`supervisor.tls.pin_not_vouched` once after approval and everything still
+works, but Fleet cannot show that certificate's fingerprint for an
+out-of-band comparison, and after the router's certificate is replaced the
+supervisor may not re-pin on its own (re-pair the appliance if it loses
+contact).
+
+
 ---
 
 ## 2. Install

@@ -322,6 +322,12 @@ services:
       SERVER_NAME: dns-powerdns
       AGENT_GROUP: default-powerdns
       AGENT_ROLES: authoritative
+      # Trust a PROXY protocol header from the dnsdist front ONLY (#4576), so
+      # allow-axfr / dynamic-update ACLs and the query log see the real
+      # client. Set to the front's address or this compose network's CIDR
+      # (`docker network inspect <project>_spatiumddi`); empty = off. The
+      # front's DNSDIST_PROXY_PROTOCOL follows this same variable.
+      PDNS_PROXY_PROTOCOL_FROM: ${PDNS_PROXY_PROTOCOL_FROM:-}
     volumes:
       - dns_powerdns_state:/var/lib/spatium-dns-agent
       - dns_powerdns_lmdb:/var/lib/powerdns
@@ -385,6 +391,9 @@ services:
       - spatiumddi
     environment:
       DNSDIST_BACKEND: dns-powerdns:53
+      # PROXY protocol to pdns (#4576): on when PDNS_PROXY_PROTOCOL_FROM is
+      # set in .env (see dns-powerdns below), off otherwise.
+      DNSDIST_PROXY_PROTOCOL: "${PDNS_PROXY_PROTOCOL_FROM:+1}"
     cap_add:
       - NET_BIND_SERVICE
     volumes:

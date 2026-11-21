@@ -664,6 +664,16 @@ $(REDIS_PASSWORD) reference secrets; everything else is inline.
 {{- /* #4659 — initial Appliance registration state on a fresh install only. */}}
 - name: INITIAL_SUPERVISOR_REGISTRATION
   value: {{ ((.Values.supervisorRegistration).initiallyEnabled | default false) | quote }}
+
+# #4548 — bcrypt hash the very first `admin` user is created with, instead of
+# admin / admin (and without a forced password change). Optional: absent on
+# every install that did not choose one, which keeps the old default account.
+- name: INITIAL_ADMIN_PASSWORD_HASH
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "spatiumddi.appSecretName" . }}
+      key: initial-admin-password-hash
+      optional: true
 - name: DATABASE_URL
   value: "postgresql+asyncpg://{{ include "spatiumddi.postgresUser" . }}:$(POSTGRES_PASSWORD)@{{ include "spatiumddi.postgresHost" . }}:{{ include "spatiumddi.postgresPort" . }}/{{ include "spatiumddi.postgresDatabase" . }}"
 {{- if eq (include "spatiumddi.redisIsSentinel" .) "true" }}

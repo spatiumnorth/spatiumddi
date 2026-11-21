@@ -1,0 +1,148 @@
+#!/bin/sh
+# spatium-etcd-peer-reset — runs before every k3s start (k3s.service
+# ExecStartPre), #4591.
+#
+# A reinstall with "Keep /var and STATE" keeps the k3s datastore, whose etcd
+# member is registered under the node's OLD address. When the node comes up on
+# another one (new hardware, a new VM or NIC, so a new DHCP lease) k3s refuses
+# its own etcd and never starts:
+#
+#   this server is not a member of the etcd cluster. Found
+#   [<name>=https://<old>:2380], expect: <name>=https://<new>:2380
+#
+# For a SINGLE-member etcd the fix is what the snapshot restore does
+# (spatium-cluster-restore): ``k3s server --cluster-reset`` collapses etcd to
+# a fresh one-member cluster on the current address, keeping every key.
+#
+# Detection. The member list cannot be read offline (the db is a bbolt file
+# and the appliance ships no etcdutl), and etcd's config file under db/etcd
+# lists only the members known at bootstrap, so it cannot prove an HA seed has
+# no peers. k3s's own refusal CAN: its "Found [...]" is the live member list.
+# So this acts on that exact message, read from the journal of the previous
+# start (the unit restarts after 5 s, Restart=always), and only when:
+#   * the list holds exactly one member, and it is this node's etcd name;
+#   * this node is not a joined member (no spatium-cluster.yaml drop-in);
+#   * the member's address is not the one k3s expects.
+# More than one member (an HA control plane) is never touched: a member whose
+# address changed there needs a real member update or a rejoin. The reason is
+# printed on the console and written to /run/spatiumddi/etcd-peer-mismatch,
+# which the console's health verdict shows. An HA member never logs k3s's
+# refusal (its etcd dials time out first), so that case is also recognised
+# from the node address spatiumddi-firstboot recorded at the last good boot.
+#
+# The reset can only follow k3s's refusal, i.e. at its second start (~15 min
+# after boot), so spatiumddi-firstboot extends its /readyz wait while that
+# refusal is pending.
+#
+# Idempotent: a stamp records when a reset ran, and only refusals logged after
+# it count, so a reset never repeats for an old message. A reset that died
+# half way leaves no stamp and k3s fails the same way again, so the next start
+# runs it again; ``--cluster-reset`` is itself re-runnable.
+#
+# Never fails k3s's start (the unit runs it as ExecStartPre=-).
+set -u
+
+K3S="${SPATIUM_K3S_BIN:-/usr/local/bin/k3s}"
+JOURNALCTL="${SPATIUM_JOURNALCTL:-journalctl}"
+JOIN_DROPIN="${SPATIUM_K3S_JOIN_DROPIN:-/etc/rancher/k3s/config.yaml.d/spatium-cluster.yaml}"
+ETCD_CONFIG="${SPATIUM_ETCD_CONFIG_FILE:-/var/lib/rancher/k3s/server/db/etcd/config}"
+STAMP="${SPATIUM_ETCD_PEER_RESET_STAMP:-/var/lib/spatiumddi/etcd-peer-reset.stamp}"
+LOG="${SPATIUM_ETCD_PEER_RESET_LOG:-/var/log/spatiumddi/etcd-peer-reset.log}"
+CONSOLE="${SPATIUM_CONSOLE:-/dev/console}"
+# Written by spatiumddi-firstboot once k3s is ready: "<node address> <etcd
+# members>". Lets a start recognise an address change WITHOUT k3s's refusal,
+# which an HA member never logs (its etcd dials time out first).
+ADDR_RECORD="${SPATIUM_ETCD_PEER_ADDR_RECORD:-/var/lib/spatiumddi/etcd-peer-addr}"
+# The console's health verdict reads this (tmpfs, so a reboot clears it).
+MISMATCH="${SPATIUM_ETCD_PEER_MISMATCH:-/run/spatiumddi/etcd-peer-mismatch}"
+
+say() {
+    msg="spatium-etcd-peer-reset: $*"
+    printf '[%s] %s\n' "$(date -Iseconds)" "$msg" >>"$LOG" 2>/dev/null
+    printf '%s\n' "$msg" >&2
+    printf '%s\n' "$msg" >"$CONSOLE" 2>/dev/null || true
+}
+
+mkdir -p "$(dirname "$LOG")" "$(dirname "$STAMP")" "$(dirname "$MISMATCH")" 2>/dev/null
+
+# Only a kept datastore can hold a stale member.
+[ -f "$ETCD_CONFIG" ] || exit 0
+
+# Multi-member etcd whose member address changed (#4591): never reset, but
+# name the reason on the console. Nothing is done automatically: the member
+# cannot rejoin under a new address, and the peers' firewall still allows
+# only the old one.
+cur_ip="${SPATIUM_NODE_IP:-$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n 1)}"
+rec_ip=""
+rec_count=0
+if [ -f "$ADDR_RECORD" ]; then
+    read -r rec_ip rec_count <"$ADDR_RECORD" 2>/dev/null
+    case "$rec_count" in '' | *[!0-9]*) rec_count=0 ;; esac
+fi
+rm -f "$MISMATCH" 2>/dev/null
+mismatch_reason() {
+    printf '%s\n' "$1" >"$MISMATCH" 2>/dev/null
+    say "$1"
+}
+if [ -n "$cur_ip" ] && [ -n "$rec_ip" ] && [ "$cur_ip" != "$rec_ip" ] \
+    && [ "$rec_count" -gt 1 ]; then
+    mismatch_reason "etcd member address changed ($rec_ip -> $cur_ip) in a $rec_count-member control plane: this member cannot rejoin under a new address. Restore $rec_ip on this node, or remove the member from the cluster and re-add the node (Fleet -> Replace). Not resetting etcd."
+fi
+
+since=0
+if [ -f "$STAMP" ]; then
+    since=$(cat "$STAMP" 2>/dev/null)
+    case "$since" in '' | *[!0-9]*) since=0 ;; esac
+fi
+
+# Only THIS boot, and only the last 10 minutes of it: the refusal that matters
+# is the one the previous start logged seconds ago. An older line (an earlier
+# boot, or from before the node became an HA seed) describes a membership that
+# may no longer exist, and resetting on it would collapse a real cluster.
+now=$(date +%s)
+floor=$((now - ${SPATIUM_ETCD_PEER_RESET_WINDOW:-600}))
+[ "$since" -ge "$floor" ] || since=$floor
+line=$("$JOURNALCTL" -b -u k3s -o cat --no-pager --since "@$since" 2>/dev/null \
+    | grep 'this server is not a member of the etcd cluster' | tail -n 1)
+[ -n "$line" ] || exit 0
+
+# Found [a=https://x:2380 b=https://y:2380], expect: a=https://z:2380
+found=$(printf '%s\n' "$line" | sed -n 's/.*Found \[\([^]]*\)\].*/\1/p')
+expect=$(printf '%s\n' "$line" | sed -n 's/.*expect: *\([^ "]*\).*/\1/p')
+[ -n "$found" ] && [ -n "$expect" ] || exit 0
+
+# members separated by spaces or commas
+count=$(printf '%s\n' "$found" | tr ', ' '\n\n' | grep -c .)
+if [ "$count" -ne 1 ]; then
+    mismatch_reason "etcd member address changed in a $count-member control plane ($line): this member cannot rejoin under a new address. Restore the old address, or remove the member from the cluster and re-add the node (Fleet -> Replace). NOT resetting: that would orphan the other members."
+    exit 0
+fi
+
+if [ -f "$JOIN_DROPIN" ]; then
+    say "this node joined another node's cluster; not resetting its etcd ($line). Rejoin it (Fleet -> Replace)."
+    exit 0
+fi
+
+found_name=${found%%=*}
+expect_name=${expect%%=*}
+etcd_name=$(sed -n 's/^name: *//p' "$ETCD_CONFIG" | head -n 1 | tr -d "\"'")
+if [ "$found_name" != "$expect_name" ] \
+    || { [ -n "$etcd_name" ] && [ "$found_name" != "$etcd_name" ]; }; then
+    say "the only etcd member ($found_name) is not this node ($expect_name); not resetting."
+    exit 0
+fi
+[ "$found" != "$expect" ] || exit 0
+
+say "single-node etcd member is registered at ${found#*=} but this node is now ${expect#*=} (kept /var, new address): running k3s --cluster-reset once (#4591)"
+# The unit has TimeoutStartSec=0, so bound a hung reset here (it normally
+# exits within seconds); a timeout counts as a failed reset.
+TO=""
+command -v timeout >/dev/null 2>&1 && TO="timeout 900"
+# shellcheck disable=SC2086
+if $TO "$K3S" server --cluster-reset >>"$LOG" 2>&1; then
+    date +%s >"$STAMP"
+    say "cluster-reset done; k3s starts on the new address with its data intact"
+else
+    say "cluster-reset FAILED (see $LOG); k3s will fail again and this retries on the next start"
+fi
+exit 0
