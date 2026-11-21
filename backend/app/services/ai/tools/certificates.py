@@ -26,7 +26,7 @@ Read-only. The matching ``propose_*`` issuance write (model proposes
 "issue a cert for X via Let's Encrypt", operator clicks Apply) is
 deferred — issuance is irreversible at the CA (the serial is logged)
 and the friendly path is the "Issue via Let's Encrypt" flow under
-Appliance → Fleet → Web UI Certificate. The Operation/preview seam can be filled in a later
+Appliance → Fleet → Web UI Certificate (TLS certificates on Docker / Kubernetes). The Operation/preview seam can be filled in a later
 wave without touching this module.
 
 All three carry ``module="security.certificates"`` so disabling the
@@ -108,7 +108,8 @@ class FindCertificatesArgs(BaseModel):
         "the expiry on the wildcard?'. Filter by source or active_only. "
         "Read-only — the private key is NEVER returned. Issuance goes "
         "through the 'Issue via Let's Encrypt' flow under Appliance → "
-        "Fleet → Web UI Certificate."
+        "Fleet → Web UI Certificate (the same entry reads 'TLS "
+        "certificates' on Docker and Kubernetes installs)."
     ),
     args_model=FindCertificatesArgs,
     category="admin",
