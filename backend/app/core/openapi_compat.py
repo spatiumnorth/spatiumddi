@@ -46,7 +46,8 @@ The union still collapses on the way in, so a generated client cannot send an
 explicit ``null`` to clear a field — but it could not before either, because
 the property it would have sent was dropped from the request model entirely.
 Clearing through such a client goes through whatever the endpoint's own
-convention is; being able to set the field at all is the step forward.
+convention is (the ``clear`` list on the address, subnet and DNS record
+updates, #1211); being able to set the field at all is the step forward.
 
 Applied to the served document (``app.openapi()``), so ``/api/openapi.json``,
 ``/api/docs`` and the release artifact ``scripts/export_openapi.py`` publishes
