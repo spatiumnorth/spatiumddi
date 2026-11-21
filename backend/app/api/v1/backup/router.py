@@ -320,6 +320,13 @@ async def restore_backup(
 
     await assert_no_upgrade_in_flight(db, operation_hint="backup restore")
 
+    # #4678 — not while the booted slot and the serving api are different releases.
+    from app.services.upgrades.schema_rollback import (  # noqa: PLC0415
+        assert_restore_allowed_for_release,
+    )
+
+    assert_restore_allowed_for_release()
+
     archive_bytes = await archive.read()
     if not archive_bytes:
         raise HTTPException(status_code=422, detail="archive is empty")

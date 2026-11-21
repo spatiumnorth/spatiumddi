@@ -50,7 +50,6 @@ import asyncio
 import os
 import secrets
 import tempfile
-import zlib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -59,6 +58,7 @@ from typing import Any
 import asyncpg
 import structlog
 
+from app.core.restore_gate import RESTORE_LOCK_KEY
 from app.services.backup.archive import (
     BackupArchiveError,
     _pg_env_from_url,
@@ -1027,14 +1027,10 @@ async def _collect_post_restore_warnings(db_url: str) -> list[str]:
     ]
 
 
-#: Session-level Postgres advisory lock serialising restores (#1571).
-#: Neither restore endpoint took any lock, so two concurrent restores
-#: interleaved their schema clear and replay — each replaying over
-#: the other's half-cleared schema. Fixed key (this is a whole-install
-#: operation, there is only ever one restore at a time), derived from
-#: a label rather than hand-picked so it cannot collide with the
-#: crc32-based per-resource keys elsewhere by accident.
-_RESTORE_LOCK_KEY = zlib.crc32(b"spatiumddi:backup-restore") - 2**31
+#: Session-level Postgres advisory lock serialising restores (#1571). The key
+#: lives in ``app.core.restore_gate``, which the chart's ``wait-for-migrate``
+#: init container also reads (#4678).
+_RESTORE_LOCK_KEY = RESTORE_LOCK_KEY
 
 #: The backend holding the restore lock, if any: the running restore's own
 #: lock connection, which ``_terminate_other_db_connections`` must not end
