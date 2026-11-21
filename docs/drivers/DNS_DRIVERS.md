@@ -1546,7 +1546,7 @@ pdns Authoritative speaks neither protocol and doesn't recurse, so:
    mounts the agent's state dir at `/agent-state`, so the rendered rules
    reference `/agent-state/tls/listener.crt`, not the agent's own
    `state_dir`. Override with `DNSDIST_STATE_MOUNT` if that mount moves.
-2. **uid alignment.** Both images create `spatium` as uid 101, so the 0600
+2. **uid alignment.** Both images create `spatium` as uid 10002, so the 0600
    key the pdns agent writes is readable by dnsdist. If either image's
    user ever changes, the listeners break with a fatal TLS-load error.
 
