@@ -14,7 +14,6 @@ from app.services.upgrades import preflight
 
 _REPO = Path(__file__).resolve().parents[2]
 _CNPG = _REPO / "charts" / "spatiumddi" / "templates" / "cnpg-cluster.yaml"
-_VALUES = _REPO / "charts" / "spatiumddi" / "values.yaml"
 
 
 def test_chart_grants_app_role_pg_monitor_via_managed_roles() -> None:
@@ -26,7 +25,7 @@ def test_chart_grants_app_role_pg_monitor_via_managed_roles() -> None:
     assert (
         "or .Values.postgresql.cnpg.appRoleCreateDb .Values.postgresql.cnpg.appRoleMonitor" in tpl
     )
-    assert "appRoleMonitor: true" in _VALUES.read_text()
+    # The default (on) is asserted on the rendered chart by charts-render-check.sh.
 
 
 def _patch_rows(monkeypatch: pytest.MonkeyPatch, rows: list[Any]) -> None:

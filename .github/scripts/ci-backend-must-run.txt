@@ -214,6 +214,11 @@ frontend/40-tls-reload-watch.sh
 frontend/Dockerfile
 charts/spatiumddi/templates/frontend.yaml
 
+# test_replication_lag_pg_monitor_4610.py (#4610) reads the CNPG cluster
+# template: the app role is granted pg_monitor (the default is checked on the
+# rendered chart by charts-render-check.sh).
+charts/spatiumddi/templates/cnpg-cluster.yaml
+
 # test_rolling_upgrade_redis_master_2815.py (#2815) reads the worker's
 # liveness probe from both manifests: it must run app.worker_liveness with a
 # broker grace that stays bounded, and the two must agree.

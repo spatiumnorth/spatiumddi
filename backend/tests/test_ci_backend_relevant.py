@@ -203,6 +203,8 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
         "frontend/Dockerfile",
         "charts/spatiumddi/templates/frontend.yaml",
     ),
+    # #4610 — the CNPG app role carries pg_monitor by default, from the chart.
+    "test_replication_lag_pg_monitor_4610.py": ("charts/spatiumddi/templates/cnpg-cluster.yaml"),
     # #2895 — the About page's legal files sit outside the web root and both
     # nginx configs serve them only behind the api's session check.
     "test_about_files_gated_2895.py": (
