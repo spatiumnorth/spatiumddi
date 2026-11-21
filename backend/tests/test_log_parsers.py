@@ -406,3 +406,57 @@ def test_bind9_response_unparseable_returns_none() -> None:
     assert parse_response_line("23-Aug-2026 13:20:09.490 something: response: ") is None
     assert parse_response_line("") is None
     assert parse_response_line("plain text with no marker") is None
+
+
+# ── Answer source (#4251) ─────────────────────────────────────────────
+
+
+def test_pdns_packetcache_hit_is_cache() -> None:
+    line = (
+        "May 08 02:11:22 Remote 127.0.0.1 wants 'foo.example.com|AAAA', "
+        "do = 1, bufsize = 4096: packetcache HIT"
+    )
+    parsed = parse_pdns_query_line(line)
+    assert parsed is not None
+    assert parsed.answer_source == "cache"
+    assert parsed.answer_upstream is None
+
+
+def test_pdns_nonempty_answer_is_authoritative() -> None:
+    line = (
+        "May 08 02:11:22 Remote 192.0.2.5:54321 wants 'www.example.com|A', "
+        "do = 0, bufsize = 4096: 2 RR(s)"
+    )
+    parsed = parse_pdns_query_line(line)
+    assert parsed is not None
+    assert parsed.answer_source == "authoritative"
+
+
+def test_pdns_empty_answer_is_unknown_not_authoritative() -> None:
+    line = (
+        "May 08 02:11:22 Remote 192.0.2.5:54321 wants 'nope.example.com|A', "
+        "do = 0, bufsize = 4096: 0 RR(s)"
+    )
+    parsed = parse_pdns_query_line(line)
+    assert parsed is not None
+    assert parsed.answer_source is None
+
+
+def test_pdns_line_without_verdict_is_unknown() -> None:
+    parsed = parse_pdns_query_line(
+        "May 08 02:11:22 Remote 192.0.2.5 wants 'www.example.com|A', do = 0, bufsize = 4096"
+    )
+    assert parsed is not None
+    assert parsed.answer_source is None
+
+
+def test_bind9_never_reports_an_answer_source() -> None:
+    from app.services.logs.bind9_parser import parse_query_line
+
+    parsed = parse_query_line(
+        "25-Apr-2026 16:30:01.123 client @0x7f 192.0.2.5#54321 (example.com): "
+        "query: example.com IN A +E(0)K (10.0.0.1)"
+    )
+    assert parsed is not None
+    assert parsed.answer_source is None
+    assert parsed.answer_upstream is None

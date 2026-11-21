@@ -10766,6 +10766,14 @@ export interface DNSQueryLogRow {
   rcode?: string | null;
   /** RRs in the answer section. NOERROR with 0 is a NODATA response. */
   answer_count?: number | null;
+  /**
+   * How the server produced the answer (#4251): authoritative / cache /
+   * forwarded / recursion. `null` means the server's log does not say
+   * (every BIND9 row) — unknown, not a source.
+   */
+  answer_source?: string | null;
+  /** Upstream resolver for forwarded / recursion, when reported. */
+  answer_upstream?: string | null;
   raw: string;
 }
 
@@ -10779,6 +10787,8 @@ export interface DNSQueryLogRequest extends AgentLogScope {
   view?: string | null;
   /** Exact outcome (#914). `UNKNOWN` selects rows with no recorded rcode. */
   rcode?: string | null;
+  /** Exact answer source (#4251). `unknown` selects rows with none reported. */
+  answer_source?: string | null;
   max_events?: number;
 }
 

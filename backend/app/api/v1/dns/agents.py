@@ -2374,6 +2374,8 @@ async def agent_query_log_entries(
             flags=parsed.flags,
             view=parsed.view,
             raw=parsed.raw,
+            answer_source=getattr(parsed, "answer_source", None),
+            answer_upstream=getattr(parsed, "answer_upstream", None),
         )
         db.add(entry)
         if response_capable:

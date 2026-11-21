@@ -548,6 +548,11 @@ class DNSQueryLogRow(BaseModel):
     # render the two differently or an unrecorded query reads as healthy.
     rcode: str | None = None
     answer_count: int | None = None
+    # How the server produced the answer (#4251): ``authoritative`` /
+    # ``cache`` / ``forwarded`` / ``recursion``, or NULL when the server's
+    # log does not say (every BIND9 row). NULL is UNKNOWN, not a source.
+    answer_source: str | None = None
+    answer_upstream: str | None = None
     raw: str
 
 
@@ -570,6 +575,9 @@ class DNSQueryLogRequest(BaseModel):
     # never recorded, which is a question an operator genuinely asks
     # ("is response logging actually on?") and cannot express otherwise.
     rcode: str | None = None
+    # Exact answer source (#4251); ``unknown`` selects rows the server did
+    # not report one for.
+    answer_source: str | None = None
     max_events: int = Field(default=200, ge=1, le=1000)
 
 
@@ -619,6 +627,7 @@ async def query_dns_queries(
             client_ip=body.client_ip,
             view=body.view,
             rcode=body.rcode,
+            answer_source=body.answer_source,
             limit=body.max_events,
             include_orphans=include_orphaned_logs(
                 current_user, server_id=body.server_id, group_id=body.group_id
@@ -641,6 +650,8 @@ async def query_dns_queries(
             view=r.view,
             rcode=r.rcode,
             answer_count=r.answer_count,
+            answer_source=r.answer_source,
+            answer_upstream=r.answer_upstream,
             raw=r.raw,
         )
         for r in rows

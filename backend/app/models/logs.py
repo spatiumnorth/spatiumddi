@@ -100,6 +100,20 @@ class DNSQueryLogEntry(Base):
     #: identically without this.
     answer_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
+    # ── How the server produced the answer (issue #4251) ──────────────
+    #
+    # ``authoritative`` / ``cache`` / ``forwarded`` / ``recursion`` —
+    # filled only when the daemon's own log says so (PowerDNS
+    # Authoritative's per-query verdict today). BIND9's ``queries`` /
+    # ``responses`` categories carry nothing of the kind, so BIND rows
+    # stay NULL until a dnstap pipeline exists (#3580). **NULL means
+    # UNKNOWN, never "authoritative"**: nothing is inferred from zone
+    # membership or the rcode.
+    answer_source: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    #: Upstream resolver address for ``forwarded`` / ``recursion``, when the
+    #: reporting flavor names one. No flavor populates it yet.
+    answer_upstream: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
 
 class DHCPLogEntry(Base):
     """One parsed Kea ``kea-dhcp4.log`` line.
