@@ -1123,7 +1123,14 @@ class SpatiumConnectionStep(ConnectionStep):
     node answered. ``sentinel_kwargs`` is connection configuration, not a
     statistic, and it can carry the Sentinel password, so it is left out of
     the report; the live connection keeps it.
+
+    ``name`` is the stock step's, and ``SpatiumConsumer.Blueprint`` points the
+    steps that require the stock ``Connection`` at this one, so it REPLACES the
+    stock step: ``Events.requires`` names the stock class, and a blueprint that
+    kept it ran both, two broker connections per consumer start (#4436).
     """
+
+    name = "celery.worker.consumer.connection.Connection"
 
     def info(self, c: Any) -> dict[str, Any]:
         out = super().info(c)
@@ -1161,6 +1168,18 @@ class SpatiumConsumer(Consumer):
             "app.celery_app:SpatiumConnectionStep" if step.endswith(":Connection") else step
             for step in Consumer.Blueprint.default_steps
         ]
+
+        def claim_steps(self) -> dict[str, Any]:
+            # Dependents (``Events``) name the stock class in ``requires``;
+            # the dependency graph keys on the class, so left alone it holds
+            # the stock step next to ours (#4436).
+            steps = super().claim_steps()
+            for step in steps.values():
+                step.requires = tuple(
+                    SpatiumConnectionStep if req is ConnectionStep else req
+                    for req in step.requires or ()
+                )
+            return steps
 
     def ensure_connected(self, conn: Any) -> Any:
         conn.ensure_connection = functools.partial(

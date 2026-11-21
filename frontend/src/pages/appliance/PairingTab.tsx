@@ -295,7 +295,15 @@ export function PairingTab() {
         confirmLabel="Revoke"
         tone="destructive"
         loading={revokeMutation.isPending}
-        onClose={() => setRevokeTarget(null)}
+        error={
+          revokeMutation.error
+            ? formatApiError(revokeMutation.error, "Revoke failed")
+            : null
+        }
+        onClose={() => {
+          setRevokeTarget(null);
+          revokeMutation.reset();
+        }}
         onConfirm={() => revokeTarget && revokeMutation.mutate(revokeTarget.id)}
       />
 
@@ -659,7 +667,7 @@ export function GenerateCodeModal({
   );
 }
 
-function GeneratedView({
+export function GeneratedView({
   code,
   onClose,
   onCopied,
@@ -716,6 +724,21 @@ function GeneratedView({
           )}
         </button>
       </div>
+      {code.warning && (
+        <div
+          role="alert"
+          className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-400"
+        >
+          {code.warning}{" "}
+          <button
+            type="button"
+            onClick={onClose}
+            className="font-medium underline"
+          >
+            Go to the registration setting
+          </button>
+        </div>
+      )}
       {code.expires_at && (
         <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
           <Clock className="h-3 w-3" />

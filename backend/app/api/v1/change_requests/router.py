@@ -33,7 +33,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
@@ -63,6 +63,7 @@ from app.services.approvals.service import (
     DecisionError,
     approval_refusal,
     approve_change_request,
+    count_change_requests,
     get_change_request,
     list_change_requests,
     mark_cancelled,
@@ -297,6 +298,7 @@ def _can_see_all_change_requests(user: User) -> bool:
 async def list_requests(
     current_user: CurrentUser,
     db: DB,
+    response: Response,
     state: str | None = None,
     resource_type: str | None = None,
     mine: bool = False,
@@ -304,7 +306,11 @@ async def list_requests(
     offset: int = 0,
 ) -> list[ChangeRequestResponse]:
     """List change requests newest-first. ``mine=true`` scopes to the
-    caller's own requests; ``state`` / ``resource_type`` filter.
+    caller's own requests; ``state`` / ``resource_type`` filter (``state``
+    takes a comma list, e.g. ``executed,rejected``). ``offset`` pages past
+    ``limit`` and ``X-Total-Count`` carries the number of requests matching
+    the filters *before* the window, so a client can say "200 of 208" rather
+    than present a cut list as the whole history (#4383).
 
     READ RULE (#1): a caller who isn't a superadmin / approve-holder is
     ALWAYS scoped to their own requests regardless of the ``mine`` flag — a
@@ -318,6 +324,15 @@ async def list_requests(
     else:
         # Force own-scope — ignore the requested ``mine`` value.
         scope_user_id = current_user.id
+    response.headers["X-Total-Count"] = str(
+        await count_change_requests(
+            db,
+            state=state,
+            resource_type=resource_type,
+            requested_by_user_id=scope_user_id,
+            origin="gate",
+        )
+    )
     rows = await list_change_requests(
         db,
         state=state,
@@ -511,8 +526,6 @@ async def delete_policy(
         name=name,
     )
     await db.commit()
-    from fastapi import Response  # noqa: PLC0415
-
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -587,7 +600,8 @@ async def approve_request(
        they cannot reach — answers 403 and the row stays ``pending`` for
        another approver (#2934). If it still succeeds but its scope
        differs from what the approver reviewed, the approve answers 409 and
-       the row stays ``pending``: the requester can cancel and re-submit.
+       the row stays ``pending``: the approver can reject it, and the requester
+       can cancel and re-submit.
     6. ``apply()`` dispatches under the **approver's** identity; the audit
        ``executed`` row carries the approver as actor and the requester id
        in ``old_value.requested_by``. If ``apply()`` refuses — a 4xx, a 5xx

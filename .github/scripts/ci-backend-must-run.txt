@@ -232,3 +232,7 @@ docker-compose.dev.yml
 # script as a subprocess, so editing it (or its ignore list) must run it.
 .github/scripts/check_contributors.py
 .github/contributors-ignore.txt
+
+# test_host_timezone_4416.py (#4416) checks the frontend's host time zone alias
+# table mirrors the backend's, so editing that table must run it.
+frontend/src/lib/hostTimezones.ts

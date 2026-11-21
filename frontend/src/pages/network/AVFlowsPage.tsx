@@ -18,6 +18,8 @@ import {
   type AVReservedRangeUpdate,
 } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { Pager } from "@/components/ui/pager";
@@ -478,28 +480,60 @@ export function AVFlowsPage() {
         </section>
       </div>
 
-      {flowModal && (
-        <FlowModal
-          mode={flowModal.mode}
-          flow={flowModal.mode === "edit" ? flowModal.flow : null}
-          protocols={protocols.map((p) => ({
-            id: p.av_protocol,
-            label: p.label,
-          }))}
-          flowSources={presetsQ.data?.flow_sources ?? []}
-          ptpMin={presetsQ.data?.ptp_domain_min ?? 0}
-          ptpMax={presetsQ.data?.ptp_domain_max ?? 255}
-          onClose={() => setFlowModal(null)}
-        />
-      )}
-      {rangeModal && (
-        <RangeModal
-          mode={rangeModal.mode}
-          range={rangeModal.mode === "edit" ? rangeModal.range : null}
-          protocols={protocols}
-          onClose={() => setRangeModal(null)}
-        />
-      )}
+      {flowModal &&
+        (() => {
+          const flowDialog = (flow: AVFlow | null) => (
+            <FlowModal
+              mode={flowModal.mode}
+              flow={flow}
+              protocols={protocols.map((p) => ({
+                id: p.av_protocol,
+                label: p.label,
+              }))}
+              flowSources={presetsQ.data?.flow_sources ?? []}
+              ptpMin={presetsQ.data?.ptp_domain_min ?? 0}
+              ptpMax={presetsQ.data?.ptp_domain_max ?? 255}
+              onClose={() => setFlowModal(null)}
+            />
+          );
+          return flowModal.mode === "edit" ? (
+            <FreshEdit
+              row={flowModal.flow}
+              queryKeys={[["av-flows"]]}
+              title="Edit AV flow"
+              onClose={() => setFlowModal(null)}
+            >
+              {(fresh) => flowDialog(fresh)}
+            </FreshEdit>
+          ) : (
+            flowDialog(null)
+          );
+        })()}
+      {rangeModal &&
+        (rangeModal.mode === "edit" ? (
+          <FreshEdit
+            row={rangeModal.range}
+            queryKeys={[["av-reserved-ranges"]]}
+            title="Edit reserved range"
+            onClose={() => setRangeModal(null)}
+          >
+            {(fresh) => (
+              <RangeModal
+                mode="edit"
+                range={fresh}
+                protocols={protocols}
+                onClose={() => setRangeModal(null)}
+              />
+            )}
+          </FreshEdit>
+        ) : (
+          <RangeModal
+            mode="create"
+            range={null}
+            protocols={protocols}
+            onClose={() => setRangeModal(null)}
+          />
+        ))}
       <ConfirmModal
         open={deleteFlow !== null}
         title="Remove AV flow"
@@ -511,19 +545,16 @@ export function AVFlowsPage() {
               The multicast group itself is kept — it simply stops being an AV
               flow.
             </>
-            {deleteFlowMut.isError && (
-              <p role="alert" className="mt-2 text-destructive">
-                {formatApiError(
-                  deleteFlowMut.error,
-                  "Failed to delete AV flow",
-                )}
-              </p>
-            )}
           </>
         }
         tone="destructive"
         confirmLabel="Remove"
         loading={deleteFlowMut.isPending}
+        error={
+          deleteFlowMut.isError
+            ? formatApiError(deleteFlowMut.error, "Failed to delete AV flow")
+            : null
+        }
         onConfirm={() =>
           deleteFlow && deleteFlowMut.mutate(deleteFlow.group_id)
         }
@@ -542,19 +573,19 @@ export function AVFlowsPage() {
               Nothing cascades — groups and flows inside the range are
               untouched, they just stop being checkable against it.
             </>
-            {deleteRangeMut.isError && (
-              <p role="alert" className="mt-2 text-destructive">
-                {formatApiError(
-                  deleteRangeMut.error,
-                  "Failed to delete reserved range",
-                )}
-              </p>
-            )}
           </>
         }
         tone="destructive"
         confirmLabel="Delete"
         loading={deleteRangeMut.isPending}
+        error={
+          deleteRangeMut.isError
+            ? formatApiError(
+                deleteRangeMut.error,
+                "Failed to delete reserved range",
+              )
+            : null
+        }
         onConfirm={() => deleteRange && deleteRangeMut.mutate(deleteRange.id)}
         onClose={() => {
           setDeleteRange(null);
@@ -628,6 +659,15 @@ function FlowModal({
         seen_via: seenVia as AVFlowSource,
         notes,
       };
+      // The PUT carries the whole document, so a save with nothing changed
+      // against the row read when the dialog opened sends nothing (#4379),
+      // and any other save restates the fresh row's custom fields rather than
+      // clearing them.
+      if (mode === "edit" && flow) {
+        if (Object.keys(changedFields(flow, body)).length === 0)
+          return Promise.resolve(flow);
+        body.custom_fields = flow.custom_fields;
+      }
       return avApi.upsertFlow(groupId, body);
     },
     onSuccess: () => {
@@ -658,41 +698,50 @@ function FlowModal({
       >
         {mode === "create" ? (
           <Field label="Multicast group">
-            {ready && !multicastEnabled ? (
-              <p className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
-                The Multicast feature module is disabled, so there are no groups
-                to stamp. Enable it under Features & Integrations first.
-              </p>
-            ) : (
-              <>
-                <input
-                  className={inputCls}
-                  value={groupSearch}
-                  onChange={(e) => setGroupSearch(e.target.value)}
-                  placeholder="Filter groups by address or name…"
-                />
-                <select
-                  className={`${inputCls} mt-1`}
-                  value={groupId}
-                  onChange={(e) => setGroupId(e.target.value)}
-                  required
+            {(control) =>
+              ready && !multicastEnabled ? (
+                <p
+                  {...control}
+                  role="group"
+                  className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-400"
                 >
-                  <option value="">Select a multicast group…</option>
-                  {groups.map((g) => (
-                    <option key={g.id} value={g.id}>
-                      {g.address}
-                      {g.name ? ` — ${g.name}` : ""}
-                    </option>
-                  ))}
-                </select>
-                <p className="mt-1 text-[11px] text-muted-foreground">
-                  A group that already carries an AV profile is updated in
-                  place. Showing the first {groups.length} match
-                  {groups.length === 1 ? "" : "es"} — narrow the filter if the
-                  group you want is missing.
+                  The Multicast feature module is disabled, so there are no
+                  groups to stamp. Enable it under Features & Integrations
+                  first.
                 </p>
-              </>
-            )}
+              ) : (
+                <>
+                  <input
+                    aria-label="Filter multicast groups"
+                    className={inputCls}
+                    value={groupSearch}
+                    onChange={(e) => setGroupSearch(e.target.value)}
+                    placeholder="Filter groups by address or name…"
+                  />
+                  <select
+                    {...control}
+                    className={`${inputCls} mt-1`}
+                    value={groupId}
+                    onChange={(e) => setGroupId(e.target.value)}
+                    required
+                  >
+                    <option value="">Select a multicast group…</option>
+                    {groups.map((g) => (
+                      <option key={g.id} value={g.id}>
+                        {g.address}
+                        {g.name ? ` — ${g.name}` : ""}
+                      </option>
+                    ))}
+                  </select>
+                  <p className="mt-1 text-[11px] text-muted-foreground">
+                    A group that already carries an AV profile is updated in
+                    place. Showing the first {groups.length} match
+                    {groups.length === 1 ? "" : "es"} — narrow the filter if the
+                    group you want is missing.
+                  </p>
+                </>
+              )
+            }
           </Field>
         ) : (
           <Field label="Multicast group">
@@ -840,7 +889,9 @@ function RangeModal({
           description,
           exclusive,
         };
-        return avApi.updateReservedRange(range.id, body);
+        const diff = changedFields(range, body);
+        if (Object.keys(diff).length === 0) return Promise.resolve(range);
+        return avApi.updateReservedRange(range.id, diff);
       }
       const body: AVReservedRangeCreate = {
         space_id: spaceId,

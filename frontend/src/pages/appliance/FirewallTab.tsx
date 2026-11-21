@@ -55,6 +55,7 @@ import { useApplianceAdminGate } from "@/hooks/useApplianceAdmin";
 import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
 import { isRefused, pollUnlessRefused } from "@/lib/refusal";
 import { FormError } from "@/components/ui/form-error";
+import { countNoun } from "@/lib/count-noun";
 
 const ROLE_OPTIONS = [
   "dns-bind9",
@@ -551,7 +552,8 @@ function EnforcementCard() {
         </div>
       )}
 
-      {set.isError && (
+      {/* While a confirm is open it draws the refusal itself. */}
+      {set.isError && confirm === null && (
         <FormError className="mt-2 text-xs text-destructive">
           {formatApiError(set.error)}
         </FormError>
@@ -569,8 +571,12 @@ function EnforcementCard() {
           </>
         }
         confirmLabel="Enable"
+        error={set.error ? formatApiError(set.error) : null}
         onConfirm={() => set.mutate({ enabled: true })}
-        onClose={() => setConfirm(null)}
+        onClose={() => {
+          setConfirm(null);
+          set.reset();
+        }}
       />
       <ConfirmModal
         open={confirm === "enable-override"}
@@ -588,10 +594,14 @@ function EnforcementCard() {
           </>
         }
         confirmLabel="Enable anyway"
+        error={set.error ? formatApiError(set.error) : null}
         onConfirm={() =>
           set.mutate({ enabled: true, override_unhardened: true })
         }
-        onClose={() => setConfirm(null)}
+        onClose={() => {
+          setConfirm(null);
+          set.reset();
+        }}
       />
       <ConfirmModal
         open={confirm === "disable"}
@@ -599,8 +609,12 @@ function EnforcementCard() {
         loading={set.isPending}
         message="The fleet falls back to the in-pod (dark) render. Always safe — nothing tightens on disable."
         confirmLabel="Disable"
+        error={set.error ? formatApiError(set.error) : null}
         onConfirm={() => set.mutate({ enabled: false })}
-        onClose={() => setConfirm(null)}
+        onClose={() => {
+          setConfirm(null);
+          set.reset();
+        }}
       />
     </div>
   );
@@ -682,7 +696,7 @@ function PoliciesSection() {
         ))}
       </div>
 
-      {posture.isError && (
+      {posture.isError && confirmPreset === null && (
         <FormError className="text-xs text-destructive">
           {formatApiError(posture.error)}
         </FormError>
@@ -845,8 +859,12 @@ function PoliciesSection() {
           </>
         }
         confirmLabel="Delete"
+        error={del.error ? formatApiError(del.error) : null}
         onConfirm={() => confirmDelete && del.mutate(confirmDelete.id)}
-        onClose={() => setConfirmDelete(null)}
+        onClose={() => {
+          setConfirmDelete(null);
+          del.reset();
+        }}
       />
       <ConfirmModal
         open={confirmPreset !== null}
@@ -862,8 +880,12 @@ function PoliciesSection() {
           </>
         }
         confirmLabel="Apply preset"
+        error={posture.error ? formatApiError(posture.error) : null}
         onConfirm={() => confirmPreset && posture.mutate(confirmPreset)}
-        onClose={() => setConfirmPreset(null)}
+        onClose={() => {
+          setConfirmPreset(null);
+          posture.reset();
+        }}
       />
     </div>
   );
@@ -1555,7 +1577,9 @@ function EffectiveSection() {
             <span className="rounded bg-muted px-1.5 py-0.5 font-mono">
               {eff.hostname}
             </span>
-            <span className="text-muted-foreground">{totalRules} rules</span>
+            <span className="text-muted-foreground">
+              {countNoun(totalRules, "rule")}
+            </span>
             {eff.drift ? (
               <span className="inline-flex items-center gap-1 rounded bg-amber-500/15 px-1.5 py-0.5 text-amber-600 dark:text-amber-400">
                 <AlertTriangle className="h-3 w-3" /> drift: rendered ≠ applied

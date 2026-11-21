@@ -67,15 +67,17 @@ async def test_yes_with_anchor_is_accepted(client: AsyncClient, db_session: Asyn
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("driver", ["technitium", "powerdns"])
-async def test_other_drivers_still_accept_yes(
-    client: AsyncClient, db_session: AsyncSession, driver: str
+@pytest.mark.parametrize(("driver", "status"), [("technitium", 200), ("powerdns", 422)])
+async def test_other_drivers_follow_their_own_rule(
+    client: AsyncClient, db_session: AsyncSession, driver: str, status: int
 ) -> None:
+    # Technitium validates without an anchor list. PowerDNS authoritative does
+    # not validate at all, so any change to the mode is refused there (#4562).
     headers = await _superadmin(db_session)
     group, _ = await _group(db_session, driver)
     await db_session.commit()
     r = await client.put(_url(group), json={"dnssec_validation": "yes"}, headers=headers)
-    assert r.status_code == 200, r.text
+    assert r.status_code == status, r.text
 
 
 @pytest.mark.asyncio

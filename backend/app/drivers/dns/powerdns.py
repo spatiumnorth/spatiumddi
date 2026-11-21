@@ -21,7 +21,9 @@ Phase 1 scope (this driver):
 Out of scope until Phase 2/3:
 
 * Views (PowerDNS does split-horizon via tags / different zones, the
-  mapping needs cross-design with the BIND views work in #24).
+  mapping needs cross-design with the BIND views work in #24). The API
+  refuses them on a group that runs this driver (#4565), reading
+  ``capabilities()["views"]``.
 * RPZ blocklists (RPZ is a Recursor feature; PowerDNS-Authoritative
   doesn't consume it).
 * Catalog zones (PowerDNS 4.8+ supports them; covered in Phase 3).
@@ -38,6 +40,7 @@ powerdns.py``.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import structlog
@@ -53,6 +56,8 @@ from app.drivers.dns.base import (
     RecordChange,
     RecordData,
     ServerOptions,
+    UpdateAclConflictError,
+    UpdateAclEntry,
     ZoneData,
 )
 from app.services.dns.powerdns_alias import alias_resolver as _alias_resolver
@@ -421,13 +426,34 @@ class PowerDNSDriver(DNSDriver):
         # PowerDNS dynamic updates (issue #641) are coarse only: per-zone
         # ``ALLOW-DNSUPDATE-FROM`` (IP) + ``TSIG-ALLOW-DNSUPDATE`` (key) zone
         # metadata. There's no per-name / per-type / deny surface, so those
-        # fields are rejected by ``validate_update_acl``.
+        # fields are rejected by ``validate_update_acl``, and so is an ACL
+        # mixing the two kinds (PowerDNS would require both, #4569).
         return DynamicUpdateCaps(
             supports_ip_acl=True,
             supports_tsig_acl=True,
             supports_name_scoping=False,
             supports_per_type=False,
         )
+
+    def validate_update_acl(self, zone_name: str, entries: Sequence[UpdateAclEntry]) -> list[str]:
+        """Refuse an ACL that grants by address and by key together (#4569).
+
+        PowerDNS checks the source address first and then, when the zone
+        lists TSIG keys, the signature too: the two kinds combine as "both",
+        where the ACL means "either" (BIND9 ``allow-update``). Either kind on
+        its own renders exactly; the agent opens the address check for a
+        key-only ACL.
+        """
+        warnings = super().validate_update_acl(zone_name, entries)
+        kinds = {e.match_kind for e in entries if e.action == "grant"}
+        if {"ip", "tsig_key"} <= kinds:
+            raise UpdateAclConflictError(
+                "PowerDNS cannot accept a dynamic update from a granted address OR "
+                "a granted TSIG key: with both kinds in one ACL it requires an update "
+                "to come from a granted address AND be signed with a granted key. "
+                "Grant by TSIG key only (accepted from any address) or by IP only."
+            )
+        return warnings
 
 
 __all__ = ["PowerDNSDriver", "render_pdns_conf"]

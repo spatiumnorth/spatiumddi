@@ -48,6 +48,7 @@ import {
 import { FormError } from "@/components/ui/form-error";
 import { FreshRowError } from "@/components/FreshRowError";
 import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
+import { countNoun } from "@/lib/count-noun";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -692,7 +693,10 @@ export function WebhooksPage() {
 
   const del = useMutation({
     mutationFn: (id: string) => webhooksApi.delete(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["webhooks"] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["webhooks"] });
+      setConfirm(null);
+    },
   });
 
   const test = useMutation({
@@ -716,8 +720,9 @@ export function WebhooksPage() {
             <h1 className="text-xl font-semibold">Webhooks</h1>
             <p className="max-w-2xl text-xs text-muted-foreground">
               Typed-event subscriptions for downstream automation. Every enabled
-              subscription whose event-type filter matches receives one
-              HMAC-signed POST per event with exponential-backoff retry and a
+              subscription whose event-type filter matches receives one POST per
+              event, HMAC-signed when the subscription has a secret (unsigned
+              when it has none), with exponential-backoff retry and a
               dead-letter state. Distinct from the generic audit-forward webhook
               under Settings — that ships every audit row in your chosen wire
               format; this fires typed events shaped for code.
@@ -841,7 +846,7 @@ export function WebhooksPage() {
                   <span className="mr-3">
                     <strong>Events:</strong>{" "}
                     {s.event_types && s.event_types.length > 0
-                      ? `${s.event_types.length} types`
+                      ? countNoun(s.event_types.length, "type")
                       : "all"}
                   </span>
                   <span className="mr-3">
@@ -893,11 +898,13 @@ export function WebhooksPage() {
         message={`Delete subscription "${confirm?.name ?? ""}"? Pending and dead-letter deliveries are removed too.`}
         confirmLabel="Delete"
         tone="destructive"
-        onConfirm={() => {
-          confirm?.onConfirm();
+        loading={del.isPending}
+        error={del.error ? formatApiError(del.error, "Delete failed") : null}
+        onConfirm={() => confirm?.onConfirm()}
+        onClose={() => {
           setConfirm(null);
+          del.reset();
         }}
-        onClose={() => setConfirm(null)}
       />
     </div>
   );

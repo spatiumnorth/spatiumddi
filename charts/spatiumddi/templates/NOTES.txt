@@ -48,10 +48,25 @@ Chart:      {{ .Chart.Name }}-{{ .Chart.Version }} (app {{ .Chart.AppVersion }})
 {{- end }}
 
 {{- if .Values.postgresql.enabled }}
+{{- if eq (.Values.postgresql.kind | default "standalone") "cnpg" }}
 
-5. Postgres password (Bitnami-managed):
+5. Postgres: CloudNativePG cluster {{ include "spatiumddi.fullname" . }}-postgresql
+   (read/write service {{ include "spatiumddi.postgresHost" . }}). Password:
 
-     kubectl -n {{ .Release.Namespace }} get secret {{ .Release.Name }}-postgresql -o jsonpath='{.data.password}' | base64 -d
+     kubectl -n {{ .Release.Namespace }} get secret {{ include "spatiumddi.postgresSecretName" . }} -o jsonpath='{.data.password}' | base64 -d
+{{- else }}
+
+5. Postgres: in-chart StatefulSet {{ include "spatiumddi.postgresHost" . }}. Password:
+
+     kubectl -n {{ .Release.Namespace }} get secret {{ include "spatiumddi.postgresSecretName" . }} -o jsonpath='{.data.password}' | base64 -d
+{{- end }}
+{{- else }}
+
+5. Postgres: external database {{ include "spatiumddi.postgresHost" . }}:{{ include "spatiumddi.postgresPort" . }}.
+   The chart does not manage it. The password it connects with is the
+   `{{ include "spatiumddi.postgresSecretPasswordKey" . }}` key of Secret {{ include "spatiumddi.postgresSecretName" . }}:
+
+     kubectl -n {{ .Release.Namespace }} get secret {{ include "spatiumddi.postgresSecretName" . }} -o jsonpath='{.data.{{ include "spatiumddi.postgresSecretPasswordKey" . }}}' | base64 -d
 {{- end }}
 
 {{- if or .Values.dnsAgents.enabled .Values.dhcpAgents.enabled }}

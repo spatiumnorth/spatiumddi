@@ -12,7 +12,8 @@ import importlib.util
 import os
 import pathlib
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from types import ModuleType
 from typing import Any
@@ -45,9 +46,41 @@ def _migration() -> ModuleType:
     return module
 
 
-def _run(sync_conn: Any, step: Callable[[], None]) -> None:
-    with Operations.context(MigrationContext.configure(connection=sync_conn)):
-        step()
+def _run(sync_conn: Any, step: Callable[[], None], log: list[str] | None = None) -> None:
+    """Run a revision step on ``sync_conn``.
+
+    The fixture's connection owns the transaction, so a real
+    ``autocommit_block`` (which flips the isolation level) cannot run on it;
+    it is replaced by a marker, and every statement is logged with whether it
+    ran inside a block.
+    """
+    ctx = MigrationContext.configure(connection=sync_conn)
+    in_block = False
+
+    @contextmanager
+    def _block() -> Iterator[None]:
+        nonlocal in_block
+        in_block = True
+        try:
+            yield
+        finally:
+            in_block = False
+
+    def _record(_c: Any, _cur: Any, statement: str, *_a: Any) -> None:
+        if log is None:
+            return
+        if "VALIDATE CONSTRAINT" in statement:
+            log.append("VALIDATE in block" if in_block else "VALIDATE in transaction")
+        elif "NOT VALID" in statement:
+            log.append("ADD in block" if in_block else "ADD in transaction")
+
+    ctx.autocommit_block = _block  # type: ignore[method-assign]
+    sa.event.listen(sync_conn, "before_cursor_execute", _record)
+    try:
+        with Operations.context(ctx):
+            step()
+    finally:
+        sa.event.remove(sync_conn, "before_cursor_execute", _record)
 
 
 @pytest_asyncio.fixture
@@ -155,3 +188,15 @@ async def test_downgrade_then_upgrade_round_trips(conn: AsyncConnection) -> None
         )
         == 1
     )
+
+
+@pytest.mark.asyncio
+async def test_validate_runs_outside_the_transaction_that_adds_the_constraint(
+    conn: AsyncConnection,
+) -> None:
+    """#4449: VALIDATE in the ADD's transaction kept the ADD's lock for the whole scan."""
+    mig = _migration()
+    await conn.run_sync(_run, mig.downgrade)
+    log: list[str] = []
+    await conn.run_sync(_run, mig.upgrade, log)
+    assert log == ["ADD in transaction"] * 3 + ["VALIDATE in block"] * 3

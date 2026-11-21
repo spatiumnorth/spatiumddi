@@ -161,6 +161,32 @@ function DeviceForm({
     !v3PrivKey.trim();
   const mustEnterAny =
     mustEnterCommunity || mustEnterAuthKey || mustEnterPrivKey;
+  // #4451 — the server wants EVERY stored secret re-sent (or cleared) when the
+  // address or port moves, not only those of the selected SNMP version. The
+  // ones the chosen version no longer uses cannot be re-entered here, so the
+  // form says they are discarded and sends them as "" (clear), which the
+  // server accepts in place of a re-entry.
+  const staleSecrets: [string, string][] = reask.reask
+    ? (
+        [
+          ["community", "community string", !isV2, device?.has_community],
+          [
+            "v3_auth_key",
+            "SNMPv3 auth key",
+            !(snmpVersion === "v3" && needsAuth),
+            device?.has_auth_key,
+          ],
+          [
+            "v3_priv_key",
+            "SNMPv3 privacy key",
+            !(snmpVersion === "v3" && v3SecurityLevel === "authPriv"),
+            device?.has_priv_key,
+          ],
+        ] as [string, string, boolean, boolean | undefined][]
+      )
+        .filter(([, , unused, stored]) => unused && stored)
+        .map(([key, label]) => [key, label] as [string, string])
+    : [];
   const [v3ContextName, setV3ContextName] = useState(
     device?.v3_context_name ?? "",
   );
@@ -303,6 +329,9 @@ function DeviceForm({
         if (v3PrivKey) body.v3_priv_key = v3PrivKey;
       }
       body.v3_context_name = v3ContextName;
+    }
+    for (const [key] of staleSecrets) {
+      (body as Record<string, unknown>)[key] = "";
     }
     return body;
   }
@@ -520,6 +549,15 @@ function DeviceForm({
               more confusing than helpful. Render as plain text so the
               operator can see the value they're saving. (v3 auth/priv
               keys stay as ``type=password`` below — those ARE secrets.) */}
+          {staleSecrets.length > 0 && (
+            <p className="text-xs text-amber-600 dark:text-amber-400">
+              The address or port changed, so stored credentials are not
+              forwarded to it. The stored{" "}
+              {staleSecrets.map(([, label]) => label).join(", ")} no longer
+              applies to the selected SNMP settings and will be discarded on
+              Save.
+            </p>
+          )}
           {(snmpVersion === "v1" || snmpVersion === "v2c") && (
             <Field
               label="Community string"
@@ -853,7 +891,10 @@ function TestResultBanner({ result }: { result: NetworkTestConnectionResult }) {
     );
   }
   return (
-    <div className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+    <div
+      role="alert"
+      className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+    >
       <XCircle className="mt-0.5 h-4 w-4 flex-shrink-0" />
       <div className="space-y-0.5">
         <div className="font-medium">

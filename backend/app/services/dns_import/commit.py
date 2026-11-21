@@ -36,8 +36,14 @@ from app.services.dns.new_object_defaults import load_dns_defaults
 from app.services.dns.powerdns_alias import group_can_resolve_alias
 from app.services.dns.record_ops import (
     enqueue_record_ops_bulk,
+    provision_zone_at_agentless_servers,
     record_op_payload,
     resolve_primary_server,
+)
+from app.services.dns.server_move import (
+    classless_zone_refusal,
+    powerdns_zone_type_refusal,
+    views_refusal,
 )
 from app.services.dns.view_collisions import RenderGuard
 from app.services.dns.zone_apex import apex_name_length_error
@@ -382,6 +388,26 @@ async def _create_zone_at(
         )
         if apex_err is not None:
             raise ValueError(apex_err)
+    group_drivers = {
+        d
+        for d in (
+            await db.execute(select(DNSServer.driver).where(DNSServer.group_id == target_group_id))
+        )
+        .scalars()
+        .all()
+        if d
+    }
+    if "/" in target_name:
+        # #4435 — an RFC 2317 classless zone lands only where the group's
+        # driver can serve it; fails this zone only, like the checks above.
+        refusal = classless_zone_refusal(group_drivers, target_name)
+        if refusal is not None:
+            raise ValueError(refusal)
+    # #4570 — a forward / stub zone is accepted by a PowerDNS group and never
+    # served; fails this zone only, not the whole import.
+    refusal = powerdns_zone_type_refusal(group_drivers, parsed.zone_type)
+    if refusal is not None:
+        raise ValueError(refusal)
     # #2275 — the slot being empty is not enough: a zone with no view renders
     # into every view, so it must not land beside a same-name pinned zone (and
     # vice versa). Raising fails this zone only; the caller rolls it back.
@@ -390,6 +416,11 @@ async def _create_zone_at(
     db.add(zone)
     await db.flush()  # populate zone.id for the FK
     await render_guard.check(db, f"import zone {target_name!r}", error=ValueError)
+    # #1771 — an agentless group (technitium_api / Windows Path B / cloud) only
+    # gets the zone when it is created there; a row alone leaves the record
+    # ops below failing "no such zone" or landing in an enclosing zone. Queued
+    # for after the commit, ahead of those ops. No-op for agent-managed groups.
+    await provision_zone_at_agentless_servers(db, zone)
 
     record_rows, skipped_records = await _build_records_for_zone(
         db,
@@ -723,6 +754,20 @@ async def commit_import(
             raise ValueError(
                 f"Target view {target_view_id} does not exist in group {target_group_id}"
             )
+        # #4565 — a view-scoped zone lands only where the group's servers
+        # can serve views (the zone create API's rule).
+        drivers = (
+            (
+                await db.execute(
+                    select(DNSServer.driver).where(DNSServer.group_id == target_group_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        refusal = views_refusal(d for d in drivers if d)
+        if refusal is not None:
+            raise ValueError(refusal)
 
     # Re-detect conflicts in case the world moved between preview
     # and commit. The set is keyed by FQDN-with-trailing-dot lower-case.

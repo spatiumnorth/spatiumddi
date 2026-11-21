@@ -78,6 +78,8 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
         "docker-compose.yml",
         "docker-compose.dev.yml",
     ),
+    # #4416 — the frontend's host time zone alias table must mirror the backend's.
+    "test_host_timezone_4416.py": "frontend/src/lib/hostTimezones.ts",
     "test_ci_tested_on_pr_head.py": (
         ".github/scripts/ci-tested-on-pr-head.sh",
         ".github/scripts/ci-full-suite-passed.sh",

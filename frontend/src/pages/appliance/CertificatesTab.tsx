@@ -320,9 +320,13 @@ export function CertificatesTab() {
         }
         confirmLabel="Delete"
         tone="destructive"
-        onClose={() => setDeleteTarget(null)}
+        onClose={() => {
+          setDeleteTarget(null);
+          remove.reset();
+        }}
         onConfirm={() => deleteTarget && remove.mutate(deleteTarget.id)}
         loading={remove.isPending}
+        error={remove.error ? extractError(remove.error) : null}
       />
     </div>
   );
@@ -508,6 +512,30 @@ function CertificateCard({
                 {activating ? "Activating…" : "Activate"}
               </button>
             )
+          )}
+          {!cert.pending && (
+            <button
+              type="button"
+              onClick={() => {
+                void applianceTlsApi.downloadPem(cert.id).then((pem) => {
+                  const url = URL.createObjectURL(
+                    new Blob([pem], { type: "application/x-pem-file" }),
+                  );
+                  const a = document.createElement("a");
+                  a.href = url;
+                  a.download = `${cert.name}.pem`;
+                  document.body.appendChild(a);
+                  a.click();
+                  document.body.removeChild(a);
+                  URL.revokeObjectURL(url);
+                });
+              }}
+              className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-xs hover:bg-accent"
+              title="Download the public certificate (no key), e.g. for an agent's TLS_CA_PATH"
+            >
+              <Download className="h-3 w-3" />
+              Download cert
+            </button>
           )}
           <button
             type="button"
@@ -1368,7 +1396,6 @@ function AcmeIssueModal({
       qc.invalidateQueries({ queryKey: ["appliance", "acme", "account"] });
       qc.invalidateQueries({ queryKey: ["appliance", "acme", "orders"] });
     },
-    onError: (err) => setError(extractError(err)),
   });
 
   const issue = useMutation({
@@ -1795,7 +1822,11 @@ function AcmeIssueModal({
         confirmLabel="Deregister"
         tone="destructive"
         loading={deregister.isPending}
-        onClose={() => setConfirmDeregister(false)}
+        error={deregister.error ? extractError(deregister.error) : null}
+        onClose={() => {
+          setConfirmDeregister(false);
+          deregister.reset();
+        }}
         onConfirm={() => deregister.mutate()}
       />
     </Modal>

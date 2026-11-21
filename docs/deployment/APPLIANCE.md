@@ -285,6 +285,34 @@ and would strand an appliance whose STATE says one thing and whose `/etc`
 overlay says another. STATE stays the single source of truth; the adopt-back
 changes what STATE says rather than who owns the file.
 
+### Reinstall with Keep /var when the address changed (#4591)
+
+"Keep /var and STATE" keeps k3s's datastore, whose etcd member is registered
+under the node's old address. On new hardware, a new VM or a new NIC, DHCP
+usually gives the node another address, and k3s refuses its own member
+(`this server is not a member of the etcd cluster. Found [...]`).
+
+`spatium-etcd-peer-reset` (a `k3s.service` `ExecStartPre`) handles the
+single-node case: when k3s's refusal lists exactly one member, that member is
+this node, and the node is not a joined member, it runs `k3s server
+--cluster-reset` once, as the snapshot restore does, and k3s then starts on
+the new address with the data intact. It logs to the console and to
+`/var/log/spatiumddi/etcd-peer-reset.log`. The first start still fails once
+before the reset (about 15 minutes after boot), then k3s restarts itself;
+`spatiumddi-firstboot` waits for that, up to 25 more minutes, so it completes
+on that boot.
+
+It is detected from k3s's own message because the member list cannot be read
+offline (the db is a bbolt file, no `etcdutl` ships). A control plane with more
+than one etcd member is never reset, since that would orphan the others: a
+member whose address changed there needs its peer address updated or a rejoin
+(Fleet, Replace). The reason is printed on the console and shown in the
+health verdict ("etcd member address changed"); nothing is done automatically.
+It is recognised from the node address `spatiumddi-firstboot` records at each
+good boot (`/var/lib/spatiumddi/etcd-peer-addr`), since an HA member never logs
+k3s's refusal. Pin the address
+(static IP or a DHCP reservation) to avoid all of this.
+
 ### Interface MTU (#1017)
 
 `network_mtu` in `spatium-config.yaml` sets the MTU on the connection
@@ -504,8 +532,10 @@ single-node appliance restarting cluster DNS is a footgun.
 3. First-boot: `spatiumddi-firstboot` generates `/etc/spatiumddi/.env` with secrets, bakes the self-signed cert, writes the HelmChart bootstrap manifest, starts k3s.
 4. k3s comes up + imports baked images + helm-controller installs the bootstrap release. 30-90 s for control plane pods to reach Ready; another 15-30 s for migrate Job to complete schema migrations.
 5. Operator browses to `https://<appliance-ip>/`. Until the api is serving, the frontend nginx answers every page with the **"SpatiumDDI is initialising"** page (`frontend/public/_starting.html`, auto-refreshing every 5 s) instead of the SPA shell — `location /` gates on an `auth_request` probe of the api Service, so a cold boot reads as "still coming up" rather than a wall of failed XHRs (#767).
-6. Operator accepts the self-signed cert **once** and signs in `admin / admin`, then sets a real password. The cert firstboot minted in step 3 is the only one the operator ever sees: the api's startup bootstrap *adopts* it as the active `appliance_certificate` row rather than generating a rival (#767), so the fingerprint doesn't change mid-boot and the frontend isn't rolled underneath the operator.
+6. Operator accepts the self-signed cert **once** and signs in. On a first node whose installer collected a web UI password (below) that is `admin` with that password; otherwise it is `admin / admin`, followed by a forced change to a real password. The cert firstboot minted in step 3 is the only one the operator ever sees: the api's startup bootstrap *adopts* it as the active `appliance_certificate` row rather than generating a rival (#767), so the fingerprint doesn't change mid-boot and the frontend isn't rolled underneath the operator.
 7. (Appliance role, or a Control-plane node enabling DNS/DHCP) Operator approves the appliance from the control plane's `/appliance → Fleet` tab + picks roles. DaemonSet schedules role pods within ~30 s.
+
+**Joining a control plane that runs from the Helm chart** (plain Kubernetes or OpenShift) needs two control-plane settings first, supervisor registration and the agent keys; see [Join an appliance agent node to a Helm or OpenShift control plane](KUBERNETES.md#join-an-appliance-agent-node-to-a-helm-or-openshift-control-plane).
 
 For a step-by-step user-facing version, see the README's
 ["Quick start with the OS appliance ISO" section](https://github.com/spatiumnorth/spatiumddi/blob/main/README.md#quick-start-with-the-os-appliance-iso-recommended).
@@ -2378,6 +2408,33 @@ trigger: release tag push (CalVer up to the bridge, SemVer from 1.0.0)
 >   time, so correcting the hostname from the last screen before a wipe
 >   meant pressing Back past four screens and OK through them again.
 >   Picking a row jumps straight to it; `Install` is the last thing.
+>   A jump re-runs the screens whose answers depend on the one you
+>   changed (#4546): a different role brings back the sizing check, the
+>   k3s ranges and the control-plane URL and pairing code; a different
+>   network re-checks the k3s ranges against it; a different disk
+>   re-asks the partition-layout acknowledgement; a new hostname
+>   re-checks the password against it. There are rows for the k3s ranges
+>   (First node) and the control-plane URL and code (Additional node),
+>   and `Install` is refused, and the screen that fixes it opened, while
+>   an Additional node has no URL or code or the k3s ranges overlap the
+>   LAN. Review lists the DNS servers of a static network.
+> - **Static network and control-plane URL are checked.** A static
+>   address that is the network or broadcast address of its subnet,
+>   loopback, multicast or unspecified, a gateway equal to the address,
+>   and an empty DNS list (unless you confirm "No DNS") are refused; a
+>   dotted netmask such as `255.255.255.0` is accepted and converted.
+>   The control-plane URL must be `http://` or `https://` with a host and
+>   no spaces or quotes (the preseed parser applies the same rule), and
+>   plain `http://` needs an explicit choice because the pairing code
+>   would cross the network unencrypted.
+> - **Keep /var and STATE reads what it keeps.** The previous
+>   `spatium-config.yaml` and exported answers on STATE become the
+>   defaults of the hostname, admin account, timezone and network
+>   screens, and the role and k3s ranges are fixed to the values the kept
+>   data was built with (k3s stops on a mismatch), with a notice on the
+>   screen and on Review. If STATE cannot be read, Review says nothing
+>   was checked. The partition-layout screen then says the two OS slots
+>   are replaced rather than that everything is erased.
 > - **The answers are exported** to
 >   `/var/lib/spatium-state/spatium-preseed.yaml` in the #549 format, so
 >   an identical reinstall or a fleet clone is one file away. Secrets are
@@ -2721,6 +2778,18 @@ one whole disk. Prefer a stable `/dev/disk/by-id/…` or `by-path/…` id
 (a bare `sda` can renumber). A supplied-but-unresolvable disk drops to
 the interactive picker rather than guessing.
 
+**Other disks carrying SpatiumDDI labels (#4547).** The installed
+system mounts `/var`, STATE and the ESP by filesystem label (`var`,
+`state`, `ESP`), so a second attached disk with the same labels (an old
+system disk, a former mirror member, another test install) can be
+mounted instead of the installed one. Before the wipe the installer
+scans every disk it is not about to write and stops if one carries
+those labels. Interactively you can cancel (detach the disk) or clear
+the labels on the other disk after typing `CLEAR`; only the filesystem
+labels are blanked. A headless install halts unless the preseed carries
+`clear_foreign_labels: true`. Mounting by filesystem UUID instead is not
+done yet; existing installs keep their label-based fstab.
+
 **Lint a preseed offline (#581).**
 `spatium-install --check-preseed <preseed.yaml>` dry-runs the answer
 file **without installing anything** — it is unprivileged, read-only,
@@ -2822,7 +2891,24 @@ LG_AGENT_KEY, BOOTSTRAP_PAIRING_CODE) on first run, writes the
 bootstrap HelmChart manifest into
 `/var/lib/rancher/k3s/server/manifests/`, and polls
 `http://127.0.0.1:8000/health/live`. Default web-UI login is
-`admin / admin` with `force_password_change=True`.
+`admin / admin` with `force_password_change=True`, unless the install
+set a web UI password (next section).
+
+**Web UI admin password (#4548).** On a first node the installer asks, right after the OS
+password, whether to use that password for the web UI's `admin` account too (default yes) or to
+enter a separate one, under the same checks. Only a bcrypt hash is kept: the installer hashes it
+with `python3-bcrypt`, writes it 0600 to `/var/lib/spatium-state/web-admin-password-hash`,
+`spatiumddi-firstboot` puts it in the `spatium-control-app-keys` Secret as
+`initial-admin-password-hash`, and the chart passes it to the api as `INITIAL_ADMIN_PASSWORD_HASH`.
+The api uses it only when it creates the very first user, with no forced password change, so nobody
+has to be first to the UI. A headless install supplies `web_admin_password_hash` (a bcrypt hash;
+there is no plaintext key) and `spatium-install --check-preseed` reports which login the file
+produces. Without it, and on an install from before this option, the web UI starts on
+`admin / admin` as before. An additional node has no web UI, so the option is not asked there and
+its console banner (`/etc/issue`) omits the web UI lines. The hash never enters the install log,
+the trace log, the exported answers file or a support bundle. Docker Compose and plain Helm installs
+keep `admin / admin` with a forced change, but the same `INITIAL_ADMIN_PASSWORD_HASH` variable works
+there too (Compose `environment:`, Helm `api.env`).
 
 `LG_AGENT_KEY` (the Looking Glass collector's agent key, #576) is
 generated on control-plane roles only. Because it is the first agent
@@ -4263,6 +4349,12 @@ the long ``DNS_AGENT_KEY`` / ``DHCP_AGENT_KEY`` hex string.
 > *before* the first pairing — otherwise
 > ``POST /api/v1/appliance/supervisor/register`` returns 404 and the
 > supervisor idles (#407).
+>
+> To start a fresh install with it on, set `INITIAL_SUPERVISOR_REGISTRATION=true`
+> in the Compose `.env`, or `supervisorRegistration.initiallyEnabled: true` in
+> the Helm values (#4659). It is read only when the settings row is first
+> created and never overrides a later choice. Minting a pairing code while the
+> flag is off returns a `warning` and the UI shows it.
 >
 > The flag refuses **new** pairings only. Appliances already registered
 > keep heartbeating and serving while it is off: `/supervisor/heartbeat`

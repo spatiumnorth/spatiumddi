@@ -38,6 +38,7 @@ import {
   type NmapScanRead,
 } from "@/lib/api";
 import { FormError } from "@/components/ui/form-error";
+import { countNoun } from "@/lib/count-noun";
 
 /** Render assistant content as Markdown with a curated set of element
  *  overrides tuned for the chat-bubble aesthetic. Used by both the
@@ -836,7 +837,7 @@ export function CopilotDrawer({
                       if (
                         ids.length > 0 &&
                         confirm(
-                          `Delete all ${ids.length} chats? This cannot be undone.`,
+                          `Delete ${ids.length === 1 ? "" : "all "}${countNoun(ids.length, "chat")}? This cannot be undone.`,
                         )
                       ) {
                         bulkDeleteMut.mutate(ids);

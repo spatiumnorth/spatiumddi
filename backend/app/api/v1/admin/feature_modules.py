@@ -554,7 +554,7 @@ async def break_glass(
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN,
                 "Re-confirmation requires MFA. Your account has no local "
-                "password — enrol TOTP under Settings → Security, then retry.",
+                "password — enrol TOTP under Account → Two-factor authentication, then retry.",
             )
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Password or TOTP code is incorrect")
 

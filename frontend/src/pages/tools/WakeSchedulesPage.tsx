@@ -19,12 +19,15 @@ import {
 } from "lucide-react";
 
 import { Modal, ModalTabs } from "@/components/ui/modal";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import {
   applianceApprovalApi,
   formatApiError,
+  formatDialogError,
   ipamApi,
   wakeSchedulesApi,
   type ApplianceRow,
@@ -46,6 +49,7 @@ import {
 import { cn } from "@/lib/utils";
 import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { isValidTimeZone, timeZoneSuggestions } from "@/lib/timezones";
 
 // ─────────────────────────────────────────────────────────────────────
 // Scheduled Wake-on-LAN (#586 Phase 1) — Tools page.
@@ -446,20 +450,12 @@ function SchedulesTab() {
       qc.invalidateQueries({ queryKey: ["wol-schedule-preview"] });
       setConfirm(null);
     },
-    onError: (e) => {
-      setBanner(formatApiError(e, "Run-now failed"));
-      setConfirm(null);
-    },
   });
 
   const del = useMutation({
     mutationFn: (id: string) => wakeSchedulesApi.remove(id),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["wol-schedules"] });
-      setConfirm(null);
-    },
-    onError: (e) => {
-      setBanner(formatApiError(e, "Delete failed"));
       setConfirm(null);
     },
   });
@@ -596,17 +592,36 @@ function SchedulesTab() {
         </table>
       </div>
 
-      {editing && (
-        <WolScheduleModal
-          existing={editing.mode === "edit" ? editing.schedule : null}
-          onClose={() => setEditing(null)}
-          onSaved={() => {
+      {editing &&
+        (() => {
+          const onSaved = () => {
             setEditing(null);
             qc.invalidateQueries({ queryKey: ["wol-schedules"] });
             qc.invalidateQueries({ queryKey: ["wol-schedule-preview"] });
-          }}
-        />
-      )}
+          };
+          return editing.mode === "edit" ? (
+            <FreshEdit
+              row={editing.schedule}
+              queryKeys={[["wol-schedules"]]}
+              title="Edit wake schedule"
+              onClose={() => setEditing(null)}
+            >
+              {(fresh) => (
+                <WolScheduleModal
+                  existing={fresh}
+                  onClose={() => setEditing(null)}
+                  onSaved={onSaved}
+                />
+              )}
+            </FreshEdit>
+          ) : (
+            <WolScheduleModal
+              existing={null}
+              onClose={() => setEditing(null)}
+              onSaved={onSaved}
+            />
+          );
+        })()}
 
       {detailSchedule && (
         <ScheduleDetailModal
@@ -638,8 +653,19 @@ function SchedulesTab() {
         confirmLabel={confirm?.confirmLabel}
         tone={confirm?.tone}
         loading={runNow.isPending || del.isPending}
+        error={
+          runNow.error
+            ? formatApiError(runNow.error, "Run-now failed")
+            : del.error
+              ? formatApiError(del.error, "Delete failed")
+              : null
+        }
         onConfirm={() => confirm?.run()}
-        onClose={() => setConfirm(null)}
+        onClose={() => {
+          setConfirm(null);
+          runNow.reset();
+          del.reset();
+        }}
       />
     </div>
   );
@@ -1365,10 +1391,6 @@ function CalendarsTab() {
       qc.invalidateQueries({ queryKey: ["wol-schedules"] });
       setConfirm(null);
     },
-    onError: (e) => {
-      setBanner(formatApiError(e, "Delete failed"));
-      setConfirm(null);
-    },
   });
 
   const rows = calendarsQ.data ?? [];
@@ -1377,8 +1399,8 @@ function CalendarsTab() {
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <p className="max-w-2xl text-xs text-muted-foreground">
-          Subscribe a holiday / term calendar as an iCal <code>.ics</code> URL
-          (Google Calendar public link, most published school calendars) or an
+          A holiday / term calendar is an iCal <code>.ics</code> URL (Google
+          Calendar public link, most published school calendars) or an
           authenticated CalDAV collection (Nextcloud / Radicale / school
           servers). Its all-day events flatten into date spans a schedule’s gate
           consults — skip on a holiday feed, or fire only on a school-day feed.
@@ -1465,16 +1487,35 @@ function CalendarsTab() {
         </table>
       </div>
 
-      {editing && (
-        <CalendarModal
-          existing={editing.mode === "edit" ? editing.calendar : null}
-          onClose={() => setEditing(null)}
-          onSaved={() => {
+      {editing &&
+        (() => {
+          const onSaved = () => {
             setEditing(null);
             invalidate();
-          }}
-        />
-      )}
+          };
+          return editing.mode === "edit" ? (
+            <FreshEdit
+              row={editing.calendar}
+              queryKeys={[["wol-calendars"]]}
+              title="Edit calendar subscription"
+              onClose={() => setEditing(null)}
+            >
+              {(fresh) => (
+                <CalendarModal
+                  existing={fresh}
+                  onClose={() => setEditing(null)}
+                  onSaved={onSaved}
+                />
+              )}
+            </FreshEdit>
+          ) : (
+            <CalendarModal
+              existing={null}
+              onClose={() => setEditing(null)}
+              onSaved={onSaved}
+            />
+          );
+        })()}
 
       <ConfirmModal
         open={!!confirm}
@@ -1489,8 +1530,12 @@ function CalendarsTab() {
         confirmLabel="Delete"
         tone="destructive"
         loading={del.isPending}
+        error={del.error ? formatApiError(del.error, "Delete failed") : null}
         onConfirm={() => confirm && del.mutate(confirm.calendar.id)}
-        onClose={() => setConfirm(null)}
+        onClose={() => {
+          setConfirm(null);
+          del.reset();
+        }}
       />
     </div>
   );
@@ -1652,9 +1697,14 @@ function CalendarModal({
           enabled,
           refresh_interval_minutes: refreshInterval,
         };
-        if (clearPassword) body.password = "";
-        else if (password) body.password = password;
-        return wakeSchedulesApi.updateCalendar(existing.id, body);
+        // Only what the operator changed against the row read when the dialog
+        // opened (#4379); a typed or cleared password is never in the row, so
+        // it is always sent, and a blank one is kept.
+        const changed = changedFields(existing, body);
+        if (clearPassword) changed.password = "";
+        else if (password) changed.password = password;
+        if (Object.keys(changed).length === 0) return Promise.resolve(existing);
+        return wakeSchedulesApi.updateCalendar(existing.id, changed);
       }
       const body: WolCalendarCreate = {
         name: name.trim(),
@@ -1879,23 +1929,81 @@ const browserTz = (() => {
 })();
 
 function useIanaTimezones(): string[] {
-  return useMemo(() => {
-    type IntlWithList = typeof Intl & {
-      supportedValuesOf?: (key: "timeZone") => string[];
-    };
-    const I = Intl as IntlWithList;
-    if (typeof I.supportedValuesOf === "function") {
-      try {
-        return I.supportedValuesOf("timeZone");
-      } catch {
-        return ["UTC"];
-      }
-    }
-    return ["UTC"];
-  }, []);
+  return useMemo(() => timeZoneSuggestions(), []);
 }
 
-function WolScheduleModal({
+/**
+ * The form's view of a schedule: exactly what WolScheduleModal seeds its state
+ * with, so a null the form shows as a default ([] / "0 7 * * 1-5" / ...) is not
+ * read as an operator edit. It seeds the state AND is the baseline the Save
+ * diffs against (#4379), so the two cannot drift.
+ */
+function seedRow(existing: WolSchedule | null) {
+  return {
+    name: existing?.name ?? "",
+    description: existing?.description ?? "",
+    enabled: existing?.enabled ?? true,
+    mode: existing?.target_selector.mode ?? ("address_tags" as WolSelectorMode),
+    tags: existing?.target_selector.tags ?? [],
+    subnetIds: existing?.target_selector.subnet_ids ?? [],
+    addressIds: existing?.target_selector.address_ids ?? [],
+    cron: existing?.schedule_cron ?? "0 7 * * 1-5",
+    timezone: existing?.timezone ?? browserTz,
+    blackoutDates: existing?.blackout_dates ?? [],
+    activeFrom: existing?.active_from ?? "",
+    activeUntil: existing?.active_until ?? "",
+    calendarId: existing?.calendar_id ?? null,
+    calendarMode: existing?.calendar_mode ?? ("none" as WolCalendarMode),
+    calendarMatch: existing?.calendar_match ?? "",
+    vantage: existing?.vantage ?? ({ kind: "server", id: null } as WolVantage),
+    repeatCount: existing?.repeat_count ?? 2,
+    repeatIntervalMs: existing?.repeat_interval_ms ?? 150,
+    staggerMs: existing?.stagger_ms ?? 40,
+    port: existing?.port ?? 9,
+    verifyEnabled: existing?.verify_enabled ?? false,
+    verifyWaitSeconds: existing?.verify_wait_seconds ?? 60,
+    verifyRetries: existing?.verify_retries ?? 1,
+    verifyMethod: existing?.verify_method ?? ("auto" as WolVerifyMethod),
+    verifyAlertEnabled: existing?.verify_alert_enabled ?? true,
+  };
+}
+
+type ScheduleForm = ReturnType<typeof seedRow>;
+
+/** The API body for a form state (create body, and the diff's two sides). */
+function scheduleBody(f: ScheduleForm): WolScheduleCreate {
+  return {
+    name: f.name.trim(),
+    description: f.description.trim() || null,
+    enabled: f.enabled,
+    target_selector: {
+      mode: f.mode,
+      tags: f.tags,
+      subnet_ids: f.subnetIds,
+      address_ids: f.addressIds,
+    },
+    schedule_cron: f.cron.trim() || null,
+    timezone: f.timezone.trim(),
+    blackout_dates: f.blackoutDates,
+    active_from: f.activeFrom || null,
+    active_until: f.activeUntil || null,
+    calendar_id: f.calendarMode === "none" ? null : f.calendarId,
+    calendar_mode: f.calendarMode,
+    calendar_match: f.calendarMatch.trim() || null,
+    vantage: f.vantage,
+    repeat_count: f.repeatCount,
+    repeat_interval_ms: f.repeatIntervalMs,
+    stagger_ms: f.staggerMs,
+    port: f.port,
+    verify_enabled: f.verifyEnabled,
+    verify_wait_seconds: f.verifyWaitSeconds,
+    verify_retries: f.verifyRetries,
+    verify_method: f.verifyMethod,
+    verify_alert_enabled: f.verifyAlertEnabled,
+  };
+}
+
+export function WolScheduleModal({
   existing,
   onClose,
   onSaved,
@@ -1907,84 +2015,70 @@ function WolScheduleModal({
   const [tab, setTab] = useState<ModalTab>("target");
 
   // ── form state ──────────────────────────────────────────────────────
-  const [name, setName] = useState(existing?.name ?? "");
-  const [description, setDescription] = useState(existing?.description ?? "");
-  const [enabled, setEnabled] = useState(existing?.enabled ?? true);
+  const seed = seedRow(existing);
+  const [name, setName] = useState(seed.name);
+  const [description, setDescription] = useState(seed.description);
+  const [enabled, setEnabled] = useState(seed.enabled);
 
-  const [mode, setMode] = useState<WolSelectorMode>(
-    existing?.target_selector.mode ?? "address_tags",
-  );
-  const [tags, setTags] = useState<string[]>(
-    existing?.target_selector.tags ?? [],
-  );
-  const [subnetIds, setSubnetIds] = useState<string[]>(
-    existing?.target_selector.subnet_ids ?? [],
-  );
+  const [mode, setMode] = useState<WolSelectorMode>(seed.mode);
+  const [tags, setTags] = useState<string[]>(seed.tags);
+  const [subnetIds, setSubnetIds] = useState<string[]>(seed.subnetIds);
 
-  const [cron, setCron] = useState(existing?.schedule_cron ?? "0 7 * * 1-5");
-  const [timezone, setTimezone] = useState(existing?.timezone ?? browserTz);
+  const [cron, setCron] = useState(seed.cron);
+  const [timezone, setTimezone] = useState(seed.timezone);
 
   const [blackoutDates, setBlackoutDates] = useState<string[]>(
-    existing?.blackout_dates ?? [],
+    seed.blackoutDates,
   );
-  const [activeFrom, setActiveFrom] = useState(existing?.active_from ?? "");
-  const [activeUntil, setActiveUntil] = useState(existing?.active_until ?? "");
+  const [activeFrom, setActiveFrom] = useState(seed.activeFrom);
+  const [activeUntil, setActiveUntil] = useState(seed.activeUntil);
 
   // Phase 2 — external-calendar gate (layered on top of blackout/term).
-  const [calendarId, setCalendarId] = useState<string | null>(
-    existing?.calendar_id ?? null,
-  );
+  const [calendarId, setCalendarId] = useState<string | null>(seed.calendarId);
   const [calendarMode, setCalendarMode] = useState<WolCalendarMode>(
-    existing?.calendar_mode ?? "none",
+    seed.calendarMode,
   );
-  const [calendarMatch, setCalendarMatch] = useState(
-    existing?.calendar_match ?? "",
-  );
+  const [calendarMatch, setCalendarMatch] = useState(seed.calendarMatch);
 
-  const [vantage, setVantage] = useState<WolVantage>(
-    existing?.vantage ?? { kind: "server", id: null },
-  );
-  const [repeatCount, setRepeatCount] = useState(existing?.repeat_count ?? 2);
+  const [vantage, setVantage] = useState<WolVantage>(seed.vantage);
+  const [repeatCount, setRepeatCount] = useState(seed.repeatCount);
   const [repeatIntervalMs, setRepeatIntervalMs] = useState(
-    existing?.repeat_interval_ms ?? 150,
+    seed.repeatIntervalMs,
   );
-  const [staggerMs, setStaggerMs] = useState(existing?.stagger_ms ?? 40);
-  const [port, setPort] = useState(existing?.port ?? 9);
+  const [staggerMs, setStaggerMs] = useState(seed.staggerMs);
+  const [port, setPort] = useState(seed.port);
   // Router-help only — the vantage's source IP. Never persisted.
   const [senderIp, setSenderIp] = useState("");
 
   // Phase 3 — post-wake liveness verify + retry.
-  const [verifyEnabled, setVerifyEnabled] = useState(
-    existing?.verify_enabled ?? false,
-  );
+  const [verifyEnabled, setVerifyEnabled] = useState(seed.verifyEnabled);
   const [verifyWaitSeconds, setVerifyWaitSeconds] = useState(
-    existing?.verify_wait_seconds ?? 60,
+    seed.verifyWaitSeconds,
   );
-  const [verifyRetries, setVerifyRetries] = useState(
-    existing?.verify_retries ?? 1,
-  );
+  const [verifyRetries, setVerifyRetries] = useState(seed.verifyRetries);
   // Liveness source (#596). New schedules default to `auto`; an existing
   // schedule keeps whatever it stored (pre-#596 rows are all `ping`).
   const [verifyMethod, setVerifyMethod] = useState<WolVerifyMethod>(
-    existing?.verify_method ?? "auto",
+    seed.verifyMethod,
   );
   // Per-schedule mute for the wake-failure alert (#596). Defaults on: the alert
   // rule itself is seeded off, so this only matters once an operator enables it.
   const [verifyAlertEnabled, setVerifyAlertEnabled] = useState(
-    existing?.verify_alert_enabled ?? true,
+    seed.verifyAlertEnabled,
   );
 
   const [error, setError] = useState<string | null>(null);
   const ianaList = useIanaTimezones();
-  const tzValid = ianaList.includes(timezone.trim());
+  const tzValid = isValidTimeZone(timezone);
 
   const selector: WolTargetSelector = useMemo(
     () => ({
       mode,
       tags,
       subnet_ids: subnetIds,
-      address_ids: existing?.target_selector.address_ids ?? [],
+      address_ids: seed.addressIds,
     }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [mode, tags, subnetIds, existing],
   );
 
@@ -2005,36 +2099,44 @@ function WolScheduleModal({
 
   const save = useMutation({
     mutationFn: () => {
-      const body: WolScheduleCreate = {
-        name: name.trim(),
-        description: description.trim() || null,
+      const body = scheduleBody({
+        name,
+        description,
         enabled,
-        target_selector: selector,
-        schedule_cron: cron.trim() || null,
-        timezone: timezone.trim(),
-        blackout_dates: blackoutDates,
-        active_from: activeFrom || null,
-        active_until: activeUntil || null,
-        calendar_id: calendarMode === "none" ? null : calendarId,
-        calendar_mode: calendarMode,
-        calendar_match: calendarMatch.trim() || null,
+        mode,
+        tags,
+        subnetIds,
+        addressIds: seed.addressIds,
+        cron,
+        timezone,
+        blackoutDates,
+        activeFrom,
+        activeUntil,
+        calendarId,
+        calendarMode,
+        calendarMatch,
         vantage,
-        repeat_count: repeatCount,
-        repeat_interval_ms: repeatIntervalMs,
-        stagger_ms: staggerMs,
+        repeatCount,
+        repeatIntervalMs,
+        staggerMs,
         port,
-        verify_enabled: verifyEnabled,
-        verify_wait_seconds: verifyWaitSeconds,
-        verify_retries: verifyRetries,
-        verify_method: verifyMethod,
-        verify_alert_enabled: verifyAlertEnabled,
-      };
-      return existing
-        ? wakeSchedulesApi.update(existing.id, body)
-        : wakeSchedulesApi.create(body);
+        verifyEnabled,
+        verifyWaitSeconds,
+        verifyRetries,
+        verifyMethod,
+        verifyAlertEnabled,
+      });
+      if (!existing) return wakeSchedulesApi.create(body);
+      // Only what the operator changed against the row read when the dialog
+      // opened (#4379), so a field another client set since is kept. The
+      // baseline is the row as the form seeded it, so a null shown as a
+      // default is not an edit.
+      const changed = changedFields(scheduleBody(seed), body);
+      if (Object.keys(changed).length === 0) return Promise.resolve(existing);
+      return wakeSchedulesApi.update(existing.id, changed);
     },
     onSuccess: onSaved,
-    onError: (e) => setError(formatApiError(e, "Failed to save schedule")),
+    onError: (e) => setError(formatDialogError(e, "Failed to save schedule")),
   });
 
   // Send-option ranges mirror the backend schema (schemas.py) so an
@@ -2095,8 +2197,14 @@ function WolScheduleModal({
   const calendarValid =
     (calendarMode === "none" || !!calendarId) && calendarMatchError === null;
 
+  // The API refuses a tag mode with no tags (an empty list would match
+  // every host), so the button must not offer that save (#4417). "hosts"
+  // has no picker here and the schema accepts it as-is.
+  const targetValid = mode === "hosts" || hasSelection;
+
   const canSave =
     name.trim().length > 0 &&
+    targetValid &&
     tzValid &&
     sendValid &&
     verifyValid &&
@@ -2366,6 +2474,14 @@ function TargetStep({
           Explicit host lists are built from the IPAM tables. Tag your target
           IPs and use “By IP-address tags” for now — direct host picking lands
           in a follow-up.
+        </p>
+      )}
+
+      {!hasSelection && mode !== "hosts" && (
+        <p className="text-xs text-destructive">
+          {mode === "subnet"
+            ? "Pick at least one subnet."
+            : "Pick at least one tag."}
         </p>
       )}
 
@@ -2767,7 +2883,7 @@ function CalendarGateSection({
               placeholder="e.g. holiday|closed  (leave empty to count every event)"
             />
             {calendarMatchError ? (
-              <p className="mt-1 text-[11px] text-destructive">
+              <p role="alert" className="mt-1 text-[11px] text-destructive">
                 {calendarMatchError}
               </p>
             ) : (

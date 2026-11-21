@@ -276,12 +276,15 @@ function heatmapLegend(
 function InventoryStat({
   value,
   label,
+  singular,
   to,
   title,
   tone,
 }: {
   value: string | number;
   label: string;
+  /** Label for a value of exactly 1 (#4372); omit for non-count labels. */
+  singular?: string;
   to: string;
   title?: string;
   tone?: "warn" | "bad";
@@ -304,7 +307,9 @@ function InventoryStat({
       >
         {value}
       </span>
-      <span className="text-muted-foreground">{label}</span>
+      <span className="text-muted-foreground">
+        {value === 1 && singular ? singular : label}
+      </span>
     </Link>
   );
 }
@@ -2337,6 +2342,7 @@ export function DashboardPage() {
               <InventoryStat
                 value={spaces?.length ?? 0}
                 label="spaces"
+                singular="space"
                 to="/ipam"
               />
             )}
@@ -2344,6 +2350,7 @@ export function DashboardPage() {
               <InventoryStat
                 value={subnetsScoped.length}
                 label="subnets"
+                singular="subnet"
                 to="/ipam"
               />
             )}
@@ -2374,6 +2381,7 @@ export function DashboardPage() {
               <InventoryStat
                 value={totalZones}
                 label="DNS zones"
+                singular="DNS zone"
                 title={`across ${dnsGroups.length} group${dnsGroups.length === 1 ? "" : "s"}`}
                 to="/dns"
               />
@@ -2382,6 +2390,7 @@ export function DashboardPage() {
               <InventoryStat
                 value={allServers.length}
                 label="servers"
+                singular="server"
                 title={`${activeServers} active`}
                 to="/dns"
               />
@@ -4936,6 +4945,7 @@ export function ConformityPanel() {
 //     soon (left), circuit alerts + orphan services + overlay
 //     impact (right).
 function NetworkPanel() {
+  const canAddAsn = usePermissions().can("write", "manage_asns");
   const { data, isLoading, isError, error } = useQuery<NetworkDashboardSummary>(
     {
       queryKey: ["dashboards", "network"],
@@ -4991,7 +5001,7 @@ function NetworkPanel() {
             hint={NV}
           />
         ) : (
-          <RpkiExpiringKpi data={data} />
+          <RpkiExpiringKpi data={data} canAddAsn={canAddAsn} />
         )}
         {!w.asn && !rpkiUntracked && rpkiExpiryUnmeasured(data) ? (
           <NetworkKpi
@@ -5014,11 +5024,7 @@ function NetworkPanel() {
                   : "good"
             }
             hint={w.asn ? NV : rpkiUntracked ? "no ROAs tracked" : undefined}
-            title={
-              rpkiUntracked
-                ? "No RPKI ROAs have been pulled yet. Add a public ASN and the hourly refresh will populate them."
-                : undefined
-            }
+            title={rpkiUntracked ? rpkiUntrackedTitle(canAddAsn) : undefined}
             to="/network/asns"
           />
         )}
@@ -5263,7 +5269,24 @@ const RPKI_NO_LIFETIME_HINT = "source has no ROA lifetimes";
 const RPKI_NO_LIFETIME_TITLE =
   "The configured ROA source does not publish each ROA's certificate lifetime, so expiry is not measured. This is not an all-clear.";
 
-function RpkiExpiringKpi({ data }: { data: NetworkDashboardSummary }) {
+// The "add a public ASN" half is drawn only for a user New ASN is offered to
+// (#4588).
+function rpkiUntrackedTitle(canAddAsn: boolean): string {
+  return (
+    "No RPKI ROAs have been pulled yet." +
+    (canAddAsn
+      ? " Add a public ASN and the hourly refresh will populate them."
+      : "")
+  );
+}
+
+function RpkiExpiringKpi({
+  data,
+  canAddAsn,
+}: {
+  data: NetworkDashboardSummary;
+  canAddAsn: boolean;
+}) {
   const STALE_AFTER_MS = 24 * 60 * 60 * 1000;
   const checkedAt = data.rpki_last_checked_at;
   const ageMs = checkedAt ? Date.now() - new Date(checkedAt).getTime() : null;
@@ -5277,7 +5300,7 @@ function RpkiExpiringKpi({ data }: { data: NetworkDashboardSummary }) {
         tone="default"
         to="/network/asns"
         hint="no ROAs tracked"
-        title="No RPKI ROAs have been pulled yet. Add a public ASN and the hourly refresh will populate them."
+        title={rpkiUntrackedTitle(canAddAsn)}
       />
     );
   }

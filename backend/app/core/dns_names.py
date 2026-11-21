@@ -69,10 +69,10 @@ _DNS_LABEL_RE = re.compile(r"^(?![-])[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_
 # record, ``;`` starts a comment, ``$`` starts a directive ($ORIGIN /
 # $TTL), ``()`` group across lines, ``"`` quotes, ``@`` means the origin,
 # ``\`` escapes, and any C0/C1 control byte is never legitimate in a name.
-_ZONEFILE_UNSAFE_RE = re.compile(r'[\s;$()"@\\]|[\x00-\x1f\x7f]')
+_ZONEFILE_UNSAFE_RE = re.compile(r'[\s;$()"@\\]|[\x00-\x1f\x7f-\x9f]')
 
 
-_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
 def contains_control_chars(value: str) -> bool:
@@ -306,9 +306,10 @@ def classless_owner_error(record_type: str, owner: str, origin: str) -> str | No
     lowered = [x.lower() for x in labels]
     zone_lowered = [x.lower() for x in zone]
     # Only the part in front of the zone's own name counts: a classless zone
-    # carries a ``/`` in its name, and the records inside it do not.
+    # carries a ``/`` in its name, and the records inside it do not. At the
+    # apex ``own`` is 0 and nothing is in front of the zone's name (#4434).
     own = len(lowered) - len(zone_lowered)
-    relative = labels[:own] if own > 0 and lowered[own:] == zone_lowered else labels
+    relative = labels[:own] if own >= 0 and lowered[own:] == zone_lowered else labels
     if not any("/" in x for x in relative):
         return None
     if (
@@ -325,7 +326,7 @@ def classless_owner_error(record_type: str, owner: str, origin: str) -> str | No
     )
 
 
-_ZONE_STORAGE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./*-]*\.?$")
+_ZONE_STORAGE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./*-]*\.?\Z")
 
 
 def zone_name_storage_error(name: str) -> str | None:

@@ -213,3 +213,20 @@ def test_a_failed_restart_is_retried_by_the_next_apply(
     driver.swap_and_reload()  # paid: an identical render restarts nothing
 
     assert attempts == ["restart", "restart"]
+
+
+def test_axfr_expands_alias_when_resolver_set(tmp_path: Path) -> None:
+    """#4575: without it a non-PowerDNS secondary gets TYPE65401 blobs."""
+    conf = _lines(
+        PowerDNSDriver(state_dir=tmp_path)._render_conf(
+            api_key="k", log_level=4, alias_resolver="10.0.0.53"
+        )
+    )
+    assert "outgoing-axfr-expand-alias=yes" in conf
+
+
+def test_axfr_alias_expansion_off_without_resolver(tmp_path: Path) -> None:
+    conf = _lines(
+        PowerDNSDriver(state_dir=tmp_path)._render_conf(api_key="k", log_level=4)
+    )
+    assert not [line for line in conf if line.startswith("outgoing-axfr-expand-alias")]

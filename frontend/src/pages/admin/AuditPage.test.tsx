@@ -37,6 +37,10 @@ vi.mock("@/lib/api", async () => {
         breaks: [],
       }),
       get: (id: string) => get(id),
+      facets: vi.fn().mockResolvedValue({
+        actions: ["appliance.self_bootstrap_minted", "dns.server.approve"],
+        resource_types: ["pairing_code", "platform_settings"],
+      }),
     },
   };
 });
@@ -135,4 +139,26 @@ describe("AuditPage details", () => {
     expect(badge("skipped")).not.toContain("red");
     expect(badge("skipped")).not.toContain("green");
   });
+
+  it("offers the actions and resource types the log holds (#4482)", async () => {
+    const { container } = render(
+      <QueryClientProvider client={new QueryClient()}>
+        <AuditPage />
+      </QueryClientProvider>,
+    );
+    await screen.findAllByRole("button", { name: /show details/i });
+    await vi.waitFor(
+      () => {
+        const values = Array.from(container.querySelectorAll("option")).map(
+          (o) => (o as HTMLOptionElement).value,
+        );
+        expect(values).toContain("appliance.self_bootstrap_minted");
+        expect(values).toContain("dns.server.approve");
+        expect(values).toContain("pairing_code");
+        expect(values).toContain("platform_settings");
+        expect(values).toContain("create");
+      },
+      { timeout: 10000 },
+    );
+  }, 30000);
 });

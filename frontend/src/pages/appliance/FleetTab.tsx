@@ -285,6 +285,16 @@ function isControlPlaneRow(row: ApplianceRow): boolean {
   );
 }
 
+// #4613 — one rule and one reason for "this row cannot be revoked", shared
+// by the table's Revoke button and the drilldown's Delete (which opens the
+// same revoke dialog). The server refuses the only control-plane node with
+// 409, so every entry point to the revoke must agree with it.
+const REVOKE_BLOCKED_REASON =
+  "Demote this node from the control-plane cluster first (Manage control plane cluster…) before revoking.";
+function canRevokeRow(row: ApplianceRow): boolean {
+  return !isControlPlaneRow(row);
+}
+
 // #590 — is this row pinned in a cluster transition that will never
 // converge on its own? Every transition settles only when a supervisor
 // reports back (``ready`` / ``left`` / the seed's eviction), and none of
@@ -1678,8 +1688,14 @@ export function FleetTab({
           confirmLabel="Reject"
           tone="destructive"
           loading={reject.isPending}
+          error={
+            reject.error ? formatApiError(reject.error, "Action failed") : null
+          }
           onConfirm={() => reject.mutate(rejectTarget.id)}
-          onClose={() => setRejectTarget(null)}
+          onClose={() => {
+            setRejectTarget(null);
+            reject.reset();
+          }}
         />
       )}
 
@@ -1837,8 +1853,14 @@ export function FleetTab({
           }
           confirmLabel="Re-key"
           loading={rekey.isPending}
+          error={
+            rekey.error ? formatApiError(rekey.error, "Action failed") : null
+          }
           onConfirm={() => rekey.mutate(rekeyTarget.id)}
-          onClose={() => setRekeyTarget(null)}
+          onClose={() => {
+            setRekeyTarget(null);
+            rekey.reset();
+          }}
         />
       )}
 
@@ -1871,8 +1893,16 @@ export function FleetTab({
           }
           confirmLabel="Evict + mint replacement code"
           loading={replace.isPending}
+          error={
+            replace.error
+              ? formatApiError(replace.error, "Action failed")
+              : null
+          }
           onConfirm={() => replace.mutate(replaceTarget.id)}
-          onClose={() => setReplaceTarget(null)}
+          onClose={() => {
+            setReplaceTarget(null);
+            replace.reset();
+          }}
         />
       )}
 
@@ -1916,8 +1946,16 @@ export function FleetTab({
           }
           confirmLabel="Clear stuck state"
           loading={clearClusterState.isPending}
+          error={
+            clearClusterState.error
+              ? formatApiError(clearClusterState.error, "Action failed")
+              : null
+          }
           onConfirm={() => clearClusterState.mutate(clearStateTarget.id)}
-          onClose={() => setClearStateTarget(null)}
+          onClose={() => {
+            setClearStateTarget(null);
+            clearClusterState.reset();
+          }}
         />
       )}
 
@@ -2263,7 +2301,7 @@ function ApplianceTableSection({
                   onDelete={() => onDelete(row)}
                   onReauthorize={() => onReauthorize(row)}
                   onPermanentDelete={() => onPermanentDelete(row)}
-                  canRevoke={!isControlPlaneRow(row)}
+                  canRevoke={canRevokeRow(row)}
                   onReplace={onReplace ? () => onReplace(row) : undefined}
                   onClearClusterState={
                     onClearClusterState
@@ -2284,7 +2322,7 @@ function ApplianceTableSection({
                   onDelete={() => onDelete(row)}
                   onReauthorize={() => onReauthorize(row)}
                   onPermanentDelete={() => onPermanentDelete(row)}
-                  canRevoke={!isControlPlaneRow(row)}
+                  canRevoke={canRevokeRow(row)}
                   onReplace={onReplace ? () => onReplace(row) : undefined}
                   onClearClusterState={
                     onClearClusterState
@@ -2540,7 +2578,7 @@ export function ApplianceTableRow({
                 title={
                   canRevoke
                     ? "Revoke — flip to revoked state, supervisor tears down service containers. Re-authorize on the same row to recover."
-                    : "Demote this node from the control-plane cluster first (Manage control plane cluster…) before revoking."
+                    : REVOKE_BLOCKED_REASON
                 }
               >
                 <Ban className="h-3 w-3" />
@@ -2576,7 +2614,7 @@ export function ApplianceTableRow({
   );
 }
 
-function ApplianceDrilldownModal({
+export function ApplianceDrilldownModal({
   row,
   onClose,
   onApprove,
@@ -2863,8 +2901,10 @@ function ApplianceDrilldownModal({
             <>
               <button
                 type="button"
-                onClick={onDelete}
-                className="inline-flex items-center gap-1 rounded-md border bg-background px-3 py-1.5 text-xs hover:bg-muted"
+                onClick={canRevokeRow(row) ? onDelete : undefined}
+                disabled={!canRevokeRow(row)}
+                title={canRevokeRow(row) ? undefined : REVOKE_BLOCKED_REASON}
+                className="inline-flex items-center gap-1 rounded-md border bg-background px-3 py-1.5 text-xs hover:bg-muted disabled:cursor-not-allowed disabled:opacity-40"
               >
                 <Trash2 className="h-3.5 w-3.5" />
                 Delete
@@ -3756,14 +3796,11 @@ function ApplianceRemovableSection({ row }: { row: ApplianceRow }) {
           // here. The operator wants their disk back, and refusing would
           // leave them pulling it anyway with the filesystem un-flushed.
           message={
-            ejectError ? (
-              <span className="text-destructive">{ejectError}</span>
-            ) : (
-              `The disk is flushed and unmounted, so it is safe to pull once the node ` +
-              `reports it gone. Any backup destination pointing at ${ejecting.path} ` +
-              `will fail — loudly — until you mount it again.`
-            )
+            `The disk is flushed and unmounted, so it is safe to pull once the node ` +
+            `reports it gone. Any backup destination pointing at ${ejecting.path} ` +
+            `will fail — loudly — until you mount it again.`
           }
+          error={ejectError}
           confirmLabel="Eject"
           tone="destructive"
           loading={eject.isPending}
@@ -4158,6 +4195,12 @@ export function ApplianceHostConfigHealthSection({
                       />
                       {h.state}
                     </span>
+                    {h.reason && (
+                      <div className="mt-1 text-[11px] text-rose-700 dark:text-rose-300">
+                        Host refused{h.requested ? ` "${h.requested}"` : ""}:{" "}
+                        {h.reason.replace(/_/g, " ")}
+                      </div>
+                    )}
                   </td>
                   <td className="px-3 py-1.5 text-muted-foreground">
                     {h.attempts}
@@ -6125,7 +6168,10 @@ function ApplianceOsUpgradeSection({
         </p>
       )}
       {slotError && (
-        <p className="mt-1 text-xs text-rose-700 dark:text-rose-300">
+        <p
+          role="alert"
+          className="mt-1 text-xs text-rose-700 dark:text-rose-300"
+        >
           {formatApiError(slotError)}
         </p>
       )}
@@ -6328,8 +6374,14 @@ function ApplianceOsUpgradeSection({
           confirmLabel="Reboot"
           tone="destructive"
           loading={reboot.isPending}
+          error={
+            reboot.error ? formatApiError(reboot.error, "Reboot failed") : null
+          }
           onConfirm={() => reboot.mutate()}
-          onClose={() => setRebootConfirm(false)}
+          onClose={() => {
+            setRebootConfirm(false);
+            reboot.reset();
+          }}
           requireCheckboxLabel={`I understand ${row.hostname} will go offline for ~30–60 s`}
         />
       )}

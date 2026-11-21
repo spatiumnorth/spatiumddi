@@ -109,6 +109,11 @@ export function DelegationModal({
                 <span>{childDisplay}</span>
                 <ArrowRight className="h-3 w-3 text-muted-foreground" />
                 <span>{data.parent_zone_name.replace(/\.$/, "")}</span>
+                {data.parent_view_name && (
+                  <span className="text-muted-foreground">
+                    (view {data.parent_view_name})
+                  </span>
+                )}
               </div>
               <p className="mt-1 text-[11px] text-muted-foreground">
                 These records will be created in the parent zone so recursive
@@ -117,6 +122,16 @@ export function DelegationModal({
                 NS-chasing. The records mirror this zone's apex NS records.
               </p>
             </div>
+
+            {(data.cname_conflicts ?? []).length > 0 && (
+              <FormError className="text-xs text-destructive">
+                <ul className="list-disc space-y-0.5 pl-4">
+                  {(data.cname_conflicts ?? []).map((c, i) => (
+                    <li key={i}>{c}</li>
+                  ))}
+                </ul>
+              </FormError>
+            )}
 
             {data.warnings.length > 0 && (
               <div className="rounded border border-amber-300 bg-amber-50 p-2 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-900/20 dark:text-amber-200">
@@ -193,6 +208,7 @@ export function DelegationModal({
                 applyMut.isPending ||
                 isFetching ||
                 data.child_apex_ns_count === 0 ||
+                (data.cname_conflicts ?? []).length > 0 ||
                 (data.ns_records_to_create.length === 0 &&
                   data.glue_records_to_create.length === 0)
               }

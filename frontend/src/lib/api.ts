@@ -2982,6 +2982,11 @@ export const auditApi = {
     result?: string;
     source_ip?: string;
   }) => api.get<AuditLogPage>("/audit", { params }).then((r) => r.data),
+  /** Every distinct action / resource type the log holds (#4482). */
+  facets: () =>
+    api
+      .get<{ actions: string[]; resource_types: string[] }>("/audit/facets")
+      .then((r) => r.data),
   /** One entry with its old / new values and changed fields (#2009). */
   get: (id: string) =>
     api.get<AuditLogEntry>(`/audit/${id}`).then((r) => r.data),
@@ -5297,6 +5302,12 @@ export interface ZoneMovePreview {
    *  by a Technitium server in the target. Non-null means the commit
    *  refuses — not waivable by acknowledgement. */
   technitium_acl_refusal?: string | null;
+  classless_refusal?: string | null;
+  /** #4570 — a forward / stub zone landing in a PowerDNS group. Refused. */
+  powerdns_refusal?: string | null;
+  /** #4565 — the zone or a record of it would keep a view in a target group
+   *  that cannot serve views. Non-null means the commit refuses. */
+  views_refusal?: string | null;
   warnings: string[];
   /** Keys the commit will demand: view_widening | dnssec_rollover |
    *  lost_update_grants. */
@@ -5339,8 +5350,12 @@ export interface DNSServerGroup {
   catalog_unsupported_warning?: string | null;
   /** #1784 — set for a group holding the experimental `technitium_api`
    *  driver; says where an existing group falls outside its supported scope
-   *  (second server, pools). Empty for every other group. */
+   *  (second server, pools). #4565 — also set for a group holding views its
+   *  servers cannot serve. Empty for every other group. */
   scope_warnings?: string[];
+  /** #4562 — group fields (`is_recursive`) a driver in the group does not
+   *  apply, from the same table as the options response. */
+  unapplied_fields?: Record<string, DNSOptionSupport>;
   /** #3551 — estimated named memory against the agents' limit. Filled by
    *  `getGroup` only (null on the list, and for a group with no BIND9
    *  server); `getMemoryEstimate` returns the same object. */
@@ -5941,6 +5956,22 @@ export interface DNSServerOptions {
   forwarder_warnings?: string[];
   // #2266: dnssec_validation "yes" with no trust anchor validates nothing.
   dnssec_warnings?: string[];
+  // #4562: the group's slice of the API's per-driver option table. Absent
+  // field = applied by every driver in the group.
+  option_support?: Record<string, DNSOptionSupport>;
+  // Set when a driver in the group applies no option at all.
+  options_unmanaged_note?: string | null;
+  // Stored non-default values a (non-Technitium) driver does not apply.
+  unapplied_warnings?: string[];
+}
+
+/** One row of the per-driver option table for one group (#4562). `locked`:
+ *  not applied and the stored value already does nothing, so disable it. */
+export interface DNSOptionSupport {
+  state: "partial" | "not_applied";
+  drivers: string[];
+  note: string;
+  locked: boolean;
 }
 
 /** A curated public upstream resolver (issue #877). ``tls_hostname`` is the
@@ -6073,7 +6104,7 @@ export interface DNSZone {
   // #1762 — signed on a group with more than one DNS server, each signing
   // with its own keys (validating resolvers SERVFAIL on the mismatch).
   dnssec_multi_signer?: boolean;
-  /** #1783 - signed on a Technitium group; SpatiumDDI won't keep it signed (#1767). */
+  /** Signed on an agentless Technitium API group; SpatiumDDI won't keep it signed. */
   dnssec_unmanaged_warning?: boolean;
   auto_tls_probe?: boolean;
   dnssec_policy_id?: string | null;
@@ -6228,6 +6259,10 @@ export interface DelegationPreview {
   existing_glue_records: DelegationRecord[];
   warnings: string[];
   child_apex_ns_count: number;
+  // The view the parent zone is pinned to; null renders in every view (#4389).
+  parent_view_name?: string | null;
+  // Rows that would sit beside a CNAME in the parent; apply refuses (#4388).
+  cname_conflicts?: string[];
 }
 
 export type DelegationPreviewResponse =
@@ -6494,11 +6529,14 @@ export interface ZoneDnssecInfo {
   dnssec_policy_id: string | null;
   dnssec_ds_records: string[];
   dnssec_synced_at: string | null;
+  // #4566 — when the DS set replaced an earlier one (keys regenerated or
+  // rolled on the server); null for the first DS after signing.
+  dnssec_ds_changed_at?: string | null;
   keys: DNSKeyState[];
   // #1762 — see Zone.dnssec_multi_signer; signing_servers is the group's count.
   dnssec_multi_signer?: boolean;
   signing_servers?: number;
-  // #1783 - the group runs Technitium; sign / re-sign are refused (#1767).
+  // The group runs the agentless Technitium API driver; sign / re-sign are refused.
   signing_unmanaged?: boolean;
   dnssec_unmanaged_warning?: boolean;
 }
@@ -6885,6 +6923,12 @@ export const dnsApi = {
   unsignZoneDnssec: (groupId: string, zoneId: string) =>
     api
       .post<DNSZone>(`/dns/groups/${groupId}/zones/${zoneId}/dnssec/unsign`)
+      .then((r) => r.data),
+  ackZoneDnssecDsChange: (groupId: string, zoneId: string) =>
+    api
+      .post<ZoneDnssecInfo>(
+        `/dns/groups/${groupId}/zones/${zoneId}/dnssec/ack-ds-change`,
+      )
       .then((r) => r.data),
   rolloverZoneDnssecKey: (groupId: string, zoneId: string, keyTag: number) =>
     api
@@ -7359,6 +7403,8 @@ export interface DNSBlockList {
   /** #3551 — set when a BIND9 group this list is applied to is estimated at
    *  80 % or more of its agents' memory limit. */
   memory_warning?: string | null;
+  /** #4573 — set when a group the list is applied to runs only PowerDNS (no RPZ). */
+  unapplied_warning?: string | null;
 }
 
 export interface DNSBlockListFeedSkipped {
@@ -12107,6 +12153,30 @@ export const changeRequestsApi = {
     api
       .get<ChangeRequest[]>("/change-requests", { params })
       .then((r) => r.data),
+  // One window plus the number matching the filter (X-Total-Count), so the
+  // admin queue can say how many it did not draw (#4383). ``states`` is sent
+  // as the API's comma list.
+  listPage: (
+    params: Omit<ChangeRequestListParams, "state"> & {
+      states?: ChangeRequestState[];
+    } = {},
+  ) => {
+    const { states, ...rest } = params;
+    return api
+      .get<ChangeRequest[]>("/change-requests", {
+        params: {
+          ...rest,
+          ...(states?.length ? { state: states.join(",") } : {}),
+        },
+      })
+      .then((r) => {
+        const header = Number(r.headers?.["x-total-count"]);
+        return {
+          items: r.data,
+          total: Number.isFinite(header) ? header : r.data.length,
+        };
+      });
+  },
   get: (id: string) =>
     api.get<ChangeRequest>(`/change-requests/${id}`).then((r) => r.data),
   // No dedicated pending-count endpoint server-side — derive the badge from
@@ -12147,7 +12217,7 @@ export const changeRequestsApi = {
   // inline. Return the FULL axios response so callers can route it through
   // ``handleApprovalQueued``; strengthening edits + lock-off return the
   // 200/204 inline path. (See featureModulesApi.toggle for the same shape.)
-  updatePolicy: (id: string, body: ApprovalPolicyWrite) =>
+  updatePolicy: (id: string, body: Partial<ApprovalPolicyWrite>) =>
     api.put<ApprovalPolicy | ChangeRequestQueued>(
       `/change-requests/policies/${id}`,
       body,
@@ -12806,6 +12876,11 @@ export const applianceTlsApi = {
     api
       .get<ApplianceCertificateDetail>(`/appliance/tls/${id}`)
       .then((r) => r.data),
+  // Public certificate PEM, for a standalone agent's TLS_CA_PATH (#4660).
+  downloadPem: (id: string) =>
+    api
+      .get<string>(`/appliance/tls/${id}/pem`, { responseType: "text" })
+      .then((r) => r.data),
   upload: (body: CertificateUploadPayload) =>
     api
       .post<ApplianceCertificate>("/appliance/tls/upload", body)
@@ -13446,6 +13521,9 @@ export interface PairingCodeCreated {
   max_claims: number | null;
   note: string | null;
   created_at: string;
+  // #4659 — set when the code was minted while appliance registration is
+  // off, so an appliance using it cannot register yet.
+  warning?: string | null;
 }
 
 export interface PairingCodeRow {
@@ -13705,6 +13783,10 @@ export interface ApplianceRow {
       state: "applying" | "retrying" | "failing";
       attempts: number;
       at: string | null;
+      // The host runner's own verdict for the plane, when it left one
+      // (timezone only today, #4416): e.g. ``unknown_timezone``.
+      reason?: string;
+      requested?: string;
     }
   >;
   // #395 — host-migration reconcile health. Keyed by patch id (e.g.
