@@ -36,6 +36,7 @@ import { ListReadError } from "@/components/ui/list-read-error";
 import { isRefused, pollUnlessRefused } from "@/lib/refusal";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Link } from "react-router-dom";
+import { usePermissions } from "@/hooks/usePermissions";
 import { ShieldCheck } from "lucide-react";
 
 type TabKey =
@@ -1009,6 +1010,9 @@ function RedisPanel() {
 }
 
 function ConformityPanel() {
+  // The policy toggle lives on /admin/conformity behind admin on conformity
+  // (#4588): only a user who holds it is told to use it.
+  const canToggle = usePermissions().can("admin", "conformity");
   const summaryQ = useQuery({
     queryKey: ["conformity-summary"],
     queryFn: () => conformityApi.summary(),
@@ -1110,11 +1114,20 @@ function ConformityPanel() {
       )}
       {total === 0 && (
         <p className="mt-3 rounded-md border bg-muted/20 p-2 text-[11px] text-muted-foreground">
-          Built-in policies ship disabled. Toggle a policy on in{" "}
-          <Link to="/admin/conformity" className="text-primary hover:underline">
-            /admin/conformity
-          </Link>{" "}
-          to start collecting results.
+          Built-in policies ship disabled.
+          {canToggle && (
+            <>
+              {" "}
+              Toggle a policy on in{" "}
+              <Link
+                to="/admin/conformity"
+                className="text-primary hover:underline"
+              >
+                /admin/conformity
+              </Link>{" "}
+              to start collecting results.
+            </>
+          )}
         </p>
       )}
     </section>

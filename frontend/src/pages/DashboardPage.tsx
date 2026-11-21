@@ -4945,6 +4945,7 @@ export function ConformityPanel() {
 //     soon (left), circuit alerts + orphan services + overlay
 //     impact (right).
 function NetworkPanel() {
+  const canAddAsn = usePermissions().can("write", "manage_asns");
   const { data, isLoading, isError, error } = useQuery<NetworkDashboardSummary>(
     {
       queryKey: ["dashboards", "network"],
@@ -5000,7 +5001,7 @@ function NetworkPanel() {
             hint={NV}
           />
         ) : (
-          <RpkiExpiringKpi data={data} />
+          <RpkiExpiringKpi data={data} canAddAsn={canAddAsn} />
         )}
         {!w.asn && !rpkiUntracked && rpkiExpiryUnmeasured(data) ? (
           <NetworkKpi
@@ -5023,11 +5024,7 @@ function NetworkPanel() {
                   : "good"
             }
             hint={w.asn ? NV : rpkiUntracked ? "no ROAs tracked" : undefined}
-            title={
-              rpkiUntracked
-                ? "No RPKI ROAs have been pulled yet. Add a public ASN and the hourly refresh will populate them."
-                : undefined
-            }
+            title={rpkiUntracked ? rpkiUntrackedTitle(canAddAsn) : undefined}
             to="/network/asns"
           />
         )}
@@ -5272,7 +5269,24 @@ const RPKI_NO_LIFETIME_HINT = "source has no ROA lifetimes";
 const RPKI_NO_LIFETIME_TITLE =
   "The configured ROA source does not publish each ROA's certificate lifetime, so expiry is not measured. This is not an all-clear.";
 
-function RpkiExpiringKpi({ data }: { data: NetworkDashboardSummary }) {
+// The "add a public ASN" half is drawn only for a user New ASN is offered to
+// (#4588).
+function rpkiUntrackedTitle(canAddAsn: boolean): string {
+  return (
+    "No RPKI ROAs have been pulled yet." +
+    (canAddAsn
+      ? " Add a public ASN and the hourly refresh will populate them."
+      : "")
+  );
+}
+
+function RpkiExpiringKpi({
+  data,
+  canAddAsn,
+}: {
+  data: NetworkDashboardSummary;
+  canAddAsn: boolean;
+}) {
   const STALE_AFTER_MS = 24 * 60 * 60 * 1000;
   const checkedAt = data.rpki_last_checked_at;
   const ageMs = checkedAt ? Date.now() - new Date(checkedAt).getTime() : null;
@@ -5286,7 +5300,7 @@ function RpkiExpiringKpi({ data }: { data: NetworkDashboardSummary }) {
         tone="default"
         to="/network/asns"
         hint="no ROAs tracked"
-        title="No RPKI ROAs have been pulled yet. Add a public ASN and the hourly refresh will populate them."
+        title={rpkiUntrackedTitle(canAddAsn)}
       />
     );
   }
