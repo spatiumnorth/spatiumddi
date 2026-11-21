@@ -912,7 +912,7 @@ export function SitesPage() {
                     ? "bg-muted font-medium"
                     : "text-muted-foreground hover:bg-muted/50",
                 )}
-                title="Hierarchy tree (drag to re-parent)"
+                title={`Hierarchy tree${writeGate.disabled ? "" : " (drag to re-parent)"}`}
               >
                 <ListTree className="h-3.5 w-3.5" />
                 Tree

@@ -5303,6 +5303,9 @@ export interface ZoneMovePreview {
    *  refuses — not waivable by acknowledgement. */
   technitium_acl_refusal?: string | null;
   classless_refusal?: string | null;
+  /** #4565 — the zone or a record of it would keep a view in a target group
+   *  that cannot serve views. Non-null means the commit refuses. */
+  views_refusal?: string | null;
   warnings: string[];
   /** Keys the commit will demand: view_widening | dnssec_rollover |
    *  lost_update_grants. */
@@ -5345,8 +5348,12 @@ export interface DNSServerGroup {
   catalog_unsupported_warning?: string | null;
   /** #1784 — set for a group holding the experimental `technitium_api`
    *  driver; says where an existing group falls outside its supported scope
-   *  (second server, pools). Empty for every other group. */
+   *  (second server, pools). #4565 — also set for a group holding views its
+   *  servers cannot serve. Empty for every other group. */
   scope_warnings?: string[];
+  /** #4562 — group fields (`is_recursive`) a driver in the group does not
+   *  apply, from the same table as the options response. */
+  unapplied_fields?: Record<string, DNSOptionSupport>;
   /** #3551 — estimated named memory against the agents' limit. Filled by
    *  `getGroup` only (null on the list, and for a group with no BIND9
    *  server); `getMemoryEstimate` returns the same object. */
@@ -5947,6 +5954,22 @@ export interface DNSServerOptions {
   forwarder_warnings?: string[];
   // #2266: dnssec_validation "yes" with no trust anchor validates nothing.
   dnssec_warnings?: string[];
+  // #4562: the group's slice of the API's per-driver option table. Absent
+  // field = applied by every driver in the group.
+  option_support?: Record<string, DNSOptionSupport>;
+  // Set when a driver in the group applies no option at all.
+  options_unmanaged_note?: string | null;
+  // Stored non-default values a (non-Technitium) driver does not apply.
+  unapplied_warnings?: string[];
+}
+
+/** One row of the per-driver option table for one group (#4562). `locked`:
+ *  not applied and the stored value already does nothing, so disable it. */
+export interface DNSOptionSupport {
+  state: "partial" | "not_applied";
+  drivers: string[];
+  note: string;
+  locked: boolean;
 }
 
 /** A curated public upstream resolver (issue #877). ``tls_hostname`` is the
@@ -6504,6 +6527,9 @@ export interface ZoneDnssecInfo {
   dnssec_policy_id: string | null;
   dnssec_ds_records: string[];
   dnssec_synced_at: string | null;
+  // #4566 — when the DS set replaced an earlier one (keys regenerated or
+  // rolled on the server); null for the first DS after signing.
+  dnssec_ds_changed_at?: string | null;
   keys: DNSKeyState[];
   // #1762 — see Zone.dnssec_multi_signer; signing_servers is the group's count.
   dnssec_multi_signer?: boolean;
@@ -6895,6 +6921,12 @@ export const dnsApi = {
   unsignZoneDnssec: (groupId: string, zoneId: string) =>
     api
       .post<DNSZone>(`/dns/groups/${groupId}/zones/${zoneId}/dnssec/unsign`)
+      .then((r) => r.data),
+  ackZoneDnssecDsChange: (groupId: string, zoneId: string) =>
+    api
+      .post<ZoneDnssecInfo>(
+        `/dns/groups/${groupId}/zones/${zoneId}/dnssec/ack-ds-change`,
+      )
       .then((r) => r.data),
   rolloverZoneDnssecKey: (groupId: string, zoneId: string, keyTag: number) =>
     api
@@ -7369,6 +7401,8 @@ export interface DNSBlockList {
   /** #3551 — set when a BIND9 group this list is applied to is estimated at
    *  80 % or more of its agents' memory limit. */
   memory_warning?: string | null;
+  /** #4573 — set when a group the list is applied to runs only PowerDNS (no RPZ). */
+  unapplied_warning?: string | null;
 }
 
 export interface DNSBlockListFeedSkipped {

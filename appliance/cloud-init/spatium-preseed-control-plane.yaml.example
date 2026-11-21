@@ -28,6 +28,12 @@ spatium_preseed:
   # bare /dev/sda can renumber between boots. If target_disk is omitted
   # (or unresolvable), the console disk-picker runs instead.
   confirm_wipe: true
+
+  # Another attached disk carrying SpatiumDDI labels (var / state / ESP)
+  # halts the install, because the installed system mounts by label and
+  # could mount that disk instead. Uncomment to blank those labels (only
+  # the labels, on the OTHER disk) and carry on. Detaching the disk is safer.
+  # clear_foreign_labels: true
   target_disk: /dev/disk/by-id/ata-QEMU_HARDDISK_QM00001
 
   # ── Storage redundancy (#999 Part C2) ───────────────────────────────
@@ -57,6 +63,12 @@ spatium_preseed:
   # echoed to the console dashboard or logs.
   admin_password: "change-me-please"
   # admin_password_hash: "$6$rounds=4096$abcd...$..."
+
+  # Optional: the web UI's `admin` password, as a BCRYPT hash (there is no
+  # plaintext form). Absent, the web UI starts on admin / admin and asks for
+  # a new password at first login. Make one with:
+  #   python3 -c 'import bcrypt,getpass; print(bcrypt.hashpw(getpass.getpass().encode(), bcrypt.gensalt()).decode())'
+  # web_admin_password_hash: "$2b$12$..."
 
   # Since #995 root is LOCKED (`passwd -l`) and you use sudo. sshd
   # refused root either way, so this removes a console login, not a

@@ -84,6 +84,8 @@ CONTROL_RELEASE_UNIT=spatiumddi-control-release.service
 APP_KEY_SECRET=spatium-control-app-keys
 CHART_APP_SECRET=spatium-control-spatiumddi-app
 APP_KEY_STAMP=/var/lib/spatiumddi/app-key-secret.done
+# #4548 — bcrypt hash of the web UI admin password, written by spatium-install.
+WEB_ADMIN_HASH_FILE=/var/lib/spatium-state/web-admin-password-hash
 METALLB_MANIFEST="$K3S_MANIFESTS_DIR/spatium-metallb.yaml"
 SPATIUMDDI_VERSION_FILE=/usr/lib/spatiumddi/spatiumddi-version
 
@@ -325,7 +327,7 @@ chmod 0755 /var/lib/spatiumddi/removable
 # The supervisor (control-plane→host) drops <cid>.request here and the
 # spatiumddi-pcap.path unit watches it; the host runner writes <cid>.pcap
 # + <cid>.state back. Owned by the supervisor's unprivileged uid (the
-# spatium user, 100:101 in the supervisor image) so it can write the
+# spatium user, 10001:10001 in the supervisor image) so it can write the
 # request + clean up afterwards; the host runner writes the pcap/state as
 # root into this dir (root writes anywhere) and the supervisor (dir owner,
 # no sticky bit) can still unlink them. Created up front so the .path unit
@@ -333,7 +335,7 @@ chmod 0755 /var/lib/spatiumddi/removable
 #
 # The supervisor owns this name, so it can replace the directory with a
 # symlink, and chown / chmod follow one: on the next boot they would hand
-# whatever it points at (/etc, say) to uid 100. A symlink is removed (rm does
+# whatever it points at (/etc, say) to the supervisor's uid. A symlink is removed (rm does
 # not follow it), and the chown / chmod are applied to ``.`` from inside the
 # directory, after checking it resolved to itself, so a swap after the check
 # cannot redirect them.
@@ -342,9 +344,23 @@ SPATIUM_PCAP_DIR=/var/lib/spatiumddi/release-state/pcap
 mkdir -p "$SPATIUM_PCAP_DIR"
 if ! ( cd -P "$SPATIUM_PCAP_DIR" 2>/dev/null \
         && [ "$(pwd -P)" = "$(cd -P /var/lib/spatiumddi/release-state && pwd -P)/pcap" ] \
-        && chown 100:101 . && chmod 0755 . ); then
+        && chown 10001:10001 . && chmod 0755 . ); then
     echo "WARN: $SPATIUM_PCAP_DIR is not a plain directory; left as it is" >&2
 fi
+
+# The supervisor's ids moved from 100:101 (host system accounts) to
+# 10001:10001. Files and directories it created in release-state before the
+# upgrade (triggers, the storage/ request directory, markers) still carry the
+# old owner; the sticky directory means the new uid could neither replace nor
+# remove them, while the trigger guard no longer accepts uid 100. The
+# supervisor's entrypoint repeats this on every start (this runs in parallel
+# with the pods, and a pod still on the old image can write 100-owned names
+# until it is replaced). Two levels deep (release-state and its direct
+# subdirectories), files and directories only. -P / -h follow no symlink, and
+# -execdir chowns each entry by its bare name from inside its own directory,
+# so a parent swapped for a symlink mid-walk cannot redirect it.
+find -P /var/lib/spatiumddi/release-state -xdev -maxdepth 2 \( -type f -o -type d \) \
+    -user 100 -group 101 -execdir chown -h 10001:10001 {} + 2>/dev/null || true
 
 # Detect the host's root block device's rotational flag so the
 # supervisor pod (which can't see the host's /proc/mounts properly —
@@ -2846,6 +2862,14 @@ ensure_app_key_secret() {
         ckey=$(_new_credential_key_b64) || return 1
     fi
     [ -n "$token" ] || token=$(openssl rand -hex 24 | tr -d '\n' | base64 | tr -d '\n')
+    # #4548 — the web UI admin password the installer collected, as a bcrypt
+    # hash (spatium-install writes it 0600 to STATE). The api seeds the first
+    # `admin` user with it instead of admin / admin. Only the hash is carried;
+    # a missing file, as on an older STATE, leaves the default account.
+    local ahash=""
+    if [ -s "$WEB_ADMIN_HASH_FILE" ]; then
+        ahash=$(tr -d '\n' < "$WEB_ADMIN_HASH_FILE" | base64 | tr -d '\n') || ahash=""
+    fi
     # Values go through stdin as base64, never argv, so they never show in a
     # process listing. ``create`` (not ``apply``) fails if the Secret appeared
     # meanwhile, so a race can only ever keep the existing key.
@@ -2864,6 +2888,7 @@ ensure_app_key_secret() {
         "  metrics-token: ${token}" \
         "${ckey:+  credential-key: ${ckey}}" \
         "${since:+  credential-key-since: ${since}}" \
+        "${ahash:+  initial-admin-password-hash: ${ahash}}" \
         | $kc create -f - >/dev/null 2>&1; then
         found=$($kc get secret "$APP_KEY_SECRET" --ignore-not-found -o name 2>/dev/null) || return 1
         [ -n "$found" ] || return 1

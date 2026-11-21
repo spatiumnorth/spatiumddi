@@ -13,8 +13,24 @@ export const GATEWAY_HOSTNAME = "gateway";
 
 export const GATEWAY_FORWARD_SKIPPED_LABEL = "forward DNS skipped";
 
+const GATEWAY_FORWARD_SKIPPED_REASON =
+  "Hostnames named exactly 'gateway' get a PTR but no A/AAAA record, so every subnet's gateway doesn't collide on gateway.<zone>.";
+
+const GATEWAY_FORWARD_SKIPPED_ADVICE =
+  " Rename it (e.g. 'gw', 'core-rtr1') or add the A record by hand in the zone.";
+
+/** The note with its advice, for a surface only a user who can edit the
+ * address reaches (the create / edit forms). */
 export const GATEWAY_FORWARD_SKIPPED_NOTE =
-  "Hostnames named exactly 'gateway' get a PTR but no A/AAAA record, so every subnet's gateway doesn't collide on gateway.<zone>. Rename it (e.g. 'gw', 'core-rtr1') or add the A record by hand in the zone.";
+  GATEWAY_FORWARD_SKIPPED_REASON + GATEWAY_FORWARD_SKIPPED_ADVICE;
+
+/** The note for a surface every reader sees: the rename / add-record advice
+ * is kept for a user who may act on it (#4588). */
+export function gatewayForwardSkippedNote(canEdit: boolean): string {
+  return canEdit
+    ? GATEWAY_FORWARD_SKIPPED_NOTE
+    : GATEWAY_FORWARD_SKIPPED_REASON;
+}
 
 /** True for a stored hostname the forward-record rule skips. Exact match,
  * like the backend's ``ip.hostname == "gateway"``: a row an integration wrote
