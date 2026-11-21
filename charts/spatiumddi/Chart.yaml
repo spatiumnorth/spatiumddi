@@ -37,6 +37,46 @@ annotations:
   charts.openshift.io/supportURL: https://github.com/spatiumnorth/spatiumddi/issues
   charts.openshift.io/archs: x86_64
   charts.openshift.io/providerType: partner
+# #3858 — Artifact Hub listing (the repository metadata is artifacthub-repo.yml
+# at the chart root, pushed to the OCI `artifacthub.io` tag by release.yml).
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/links: |
+    - name: Documentation
+      url: https://www.spatiumddi.com/
+    - name: Source
+      url: https://github.com/spatiumnorth/spatiumddi
+    - name: Support
+      url: https://github.com/spatiumnorth/spatiumddi/issues
+# Generated from .github/images.json by scripts/artifacthub.py; release.yml
+# re-renders it with the release tag before packaging. Do not hand-edit.
+  # artifacthub:generated:begin
+  artifacthub.io/images: |
+    - name: spatiumddi-api
+      image: ghcr.io/spatiumnorth/spatiumddi-api:latest
+    - name: spatiumddi-frontend
+      image: ghcr.io/spatiumnorth/spatiumddi-frontend:latest
+    - name: dns-bind9
+      image: ghcr.io/spatiumnorth/dns-bind9:latest
+    - name: dns-powerdns
+      image: ghcr.io/spatiumnorth/dns-powerdns:latest
+    - name: dns-technitium
+      image: ghcr.io/spatiumnorth/dns-technitium:latest
+    - name: dns-dnsdist
+      image: ghcr.io/spatiumnorth/dns-dnsdist:latest
+    - name: dhcp-kea
+      image: ghcr.io/spatiumnorth/dhcp-kea:latest
+    - name: spatium-supervisor
+      image: ghcr.io/spatiumnorth/spatium-supervisor:latest
+    - name: looking-glass
+      image: ghcr.io/spatiumnorth/looking-glass:latest
+  artifacthub.io/prerelease: "false"
+  artifacthub.io/changes: |
+    - kind: changed
+      description: "See the release notes for latest"
+      links:
+        - name: Release notes
+          url: https://github.com/spatiumnorth/spatiumddi/releases/tag/latest
+  # artifacthub:generated:end
 # No subchart dependencies. Postgres + Redis ship as plain
 # StatefulSet + Service templates owned by this chart, using the
 # official ``postgres:16-alpine`` and ``redis:8.10.2-alpine`` images

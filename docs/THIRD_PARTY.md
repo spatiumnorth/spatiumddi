@@ -402,6 +402,7 @@ because CI gates depend on specific behaviour from several.
 | [Playwright](https://playwright.dev/) | Apache 2.0 | README/docs screenshot generation |
 | [Jekyll](https://jekyllrb.com/) + kramdown | MIT | This documentation site |
 | [Helm](https://helm.sh/) | Apache 2.0 | Chart packaging |
+| [ORAS](https://oras.land/) | Apache 2.0 | ORAS 1.3.0 in the release workflow: pushes the Artifact Hub repository metadata to the chart's OCI repository (#3858) |
 
 ## License obligations
 

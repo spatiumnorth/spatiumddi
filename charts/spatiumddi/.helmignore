@@ -15,3 +15,4 @@
 # tarballs in the rendered package. They ARE gitignored at the repo
 # level (see /.gitignore) so local `helm dependency update` runs don't
 # dirty the tree; CI fetches them fresh every release.
+artifacthub-repo.yml
