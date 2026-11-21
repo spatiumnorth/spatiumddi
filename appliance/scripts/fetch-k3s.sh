@@ -113,11 +113,44 @@ fetch() {
          -o "$dest" "$url"
 }
 
+# #1260 — verify every release artifact against the checksum file the
+# k3s release itself publishes (sha256sum-<arch>.txt) BEFORE it is baked
+# into the image. A truncated, corrupted or tampered download otherwise
+# ships in the slot rootfs, where k3s runs as root. The checksum file
+# comes from the same release as the artifacts, so this catches
+# corruption and a swapped single asset, not a compromised release as a
+# whole; pinning the hashes in-repo would be the stronger follow-up.
+# A mismatch, or a name missing from the file, fails the build.
+SUMS_FILE="$(mktemp)"
+trap 'rm -f "$SUMS_FILE"' EXIT
+
+verify_sha256() {
+    local file="$1" name="$2" want got
+    want="$(awk -v n="$name" '$2 == n || $2 == "*" n { print $1; exit }' "$SUMS_FILE")"
+    if [ -z "$want" ]; then
+        echo "ERROR: no checksum for '$name' in sha256sum-${AIRGAP_ARCH}.txt" >&2
+        rm -f "$file"
+        exit 3
+    fi
+    got="$(sha256sum "$file" | awk '{print $1}')"
+    if [ "$got" != "$want" ]; then
+        echo "ERROR: sha256 mismatch for $name" >&2
+        echo "       expected $want" >&2
+        echo "       got      $got" >&2
+        rm -f "$file"
+        exit 3
+    fi
+    echo "  ✓ sha256 verified: $name"
+}
+
 echo "→ Fetching k3s $K3S_VERSION for $AIRGAP_ARCH"
+
+fetch "${BASE_URL}/sha256sum-${AIRGAP_ARCH}.txt" "$SUMS_FILE"
 
 # 1. k3s binary itself
 TMP_BIN="${K3S_BIN}.partial"
 fetch "${BASE_URL}/k3s${K3S_ARCH}" "$TMP_BIN"
+verify_sha256 "$TMP_BIN" "k3s${K3S_ARCH}"
 mv "$TMP_BIN" "$K3S_BIN"
 chmod 0755 "$K3S_BIN"
 
@@ -139,6 +172,7 @@ done
 #   rancher/mirrored-pause             (containerd sandbox container)
 TMP_AIRGAP="${AIRGAP_TARBALL}.partial"
 fetch "${BASE_URL}/k3s-airgap-images-${AIRGAP_ARCH}.tar.zst" "$TMP_AIRGAP"
+verify_sha256 "$TMP_AIRGAP" "k3s-airgap-images-${AIRGAP_ARCH}.tar.zst"
 mv "$TMP_AIRGAP" "$AIRGAP_TARBALL"
 
 # 4. Image manifest — list of images + tags that ship in this k3s
