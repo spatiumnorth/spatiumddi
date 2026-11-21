@@ -48,6 +48,7 @@ NO_PERMISSION_DEPENDENCY: dict[str, str] = {
     # ── authenticated by something other than a user session ────────────
     "/api/v1/dns/agents/config": _AGENT,
     "/api/v1/dns/agents/record-ops": _AGENT,
+    "/api/v1/dns/agents/blocklist": _AGENT,
     "/api/v1/dhcp/agents/config": _AGENT,
     "/api/v1/looking-glass/agents/config": _AGENT,
     "/api/v1/appliance/supervisor/tls-pins": "supervisor re-pin; signed by the CA, nothing secret",
@@ -193,6 +194,7 @@ def test_dns_dhcp_and_capture_reads_are_all_gated() -> None:
     allowed = {
         "/api/v1/dns/agents/config",
         "/api/v1/dns/agents/record-ops",
+        "/api/v1/dns/agents/blocklist",
         "/api/v1/dhcp/agents/config",
         "/api/v1/dhcp/option-codes",
         "/api/v1/dhcp/voip-options",
