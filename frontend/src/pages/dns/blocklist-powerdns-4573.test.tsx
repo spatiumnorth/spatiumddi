@@ -78,7 +78,7 @@ describe("blocklist scope on a PowerDNS group (#4573)", () => {
   it("warns and disables Whole group on a PowerDNS-only group", async () => {
     listServers.mockResolvedValue([{ id: "s1", driver: "powerdns" }]);
     open();
-    await screen.findByText(/has no RPZ, so a blocklist here blocks/);
+    await screen.findByText(/renders no blocklist, so a blocklist here blocks/);
     expect(
       (screen.getByLabelText(/Whole group/) as HTMLInputElement).disabled,
     ).toBe(true);
@@ -91,6 +91,8 @@ describe("blocklist scope on a PowerDNS group (#4573)", () => {
       /Whole group/,
     )) as HTMLInputElement;
     expect(box.disabled).toBe(false);
-    expect(screen.queryByText(/has no RPZ, so a blocklist here/)).toBeNull();
+    expect(
+      screen.queryByText(/renders no blocklist, so a blocklist here/),
+    ).toBeNull();
   });
 });
