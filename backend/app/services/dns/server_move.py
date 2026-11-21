@@ -263,6 +263,56 @@ async def ensure_group_views_compatible(
         )
 
 
+# #4570 — PowerDNS Authoritative has no forward-zone type (the agent logs and
+# drops the zone, so clients get REFUSED) and the agent creates a ``stub`` as a
+# full ``Slave``. The driver advertises primary + secondary only; every path
+# that creates or converts a zone checks the group's drivers against this.
+POWERDNS_UNSUPPORTED_ZONE_TYPES = frozenset({"forward", "stub"})
+
+
+def powerdns_zone_type_refusal(drivers: list[str] | set[str], zone_type: str) -> str | None:
+    """Why a ``zone_type`` zone cannot live in a group whose servers run
+    *drivers*, or None (#4570). A group with no servers passes (a PowerDNS
+    server joining later is checked by :func:`ensure_group_powerdns_compatible`)."""
+    if zone_type not in POWERDNS_UNSUPPORTED_ZONE_TYPES or "powerdns" not in drivers:
+        return None
+    return (
+        f"a {zone_type} zone cannot be served by a PowerDNS group: the PowerDNS "
+        "driver supports primary and secondary zones only"
+        + (
+            ", and creates a stub as a full secondary."
+            if zone_type == "stub"
+            else ", so the zone would be accepted and never answer."
+        )
+    )
+
+
+async def ensure_group_powerdns_compatible(
+    db: AsyncSession, group: DNSServerGroup, driver: str
+) -> None:
+    """Refuse (422) putting a PowerDNS server into a group that holds a forward
+    or stub zone (#4570)."""
+    if driver != "powerdns":
+        return
+    row = (
+        await db.execute(
+            select(DNSZone.name, DNSZone.zone_type)
+            .where(
+                DNSZone.group_id == group.id,
+                DNSZone.deleted_at.is_(None),
+                DNSZone.zone_type.in_(sorted(POWERDNS_UNSUPPORTED_ZONE_TYPES)),
+            )
+            .limit(1)
+        )
+    ).first()
+    if row is not None:
+        raise ServerMoveError(
+            f"Group {group.name!r} holds the {row.zone_type} zone {row.name.rstrip('.')!r}, "
+            f"and {powerdns_zone_type_refusal({'powerdns'}, row.zone_type)}",
+            status_code=422,
+        )
+
+
 async def ensure_group_catalog_compatible(
     db: AsyncSession, group: DNSServerGroup, driver: str
 ) -> None:
@@ -462,6 +512,7 @@ async def move_server_to_group(
     await ensure_group_catalog_compatible(db, target_group, server.driver)
     await ensure_group_views_compatible(db, target_group, server.driver)
     await ensure_group_classless_compatible(db, target_group, server.driver)
+    await ensure_group_powerdns_compatible(db, target_group, server.driver)  # #4570
 
     # #1762 — a server joining a group that already has one and holds signed
     # zones would sign them with its own keys. Enabled or not: a disabled

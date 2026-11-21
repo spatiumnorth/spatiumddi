@@ -53,6 +53,7 @@ from app.models.auth import User
 from app.models.ipam import IP_STATUSES_CREATE_SETTABLE, IPAddress, IPBlock, Subnet
 from app.services.dns.name_targets import absolute_target_error
 from app.services.dns.new_object_defaults import default_zone_ttl
+from app.services.dns.server_move import powerdns_zone_type_refusal
 from app.services.dns.sync_check import ipam_authors_zone
 from app.services.dns.zone_synthesis import unauthored_zone_error
 from app.services.ipam.address_create_rules import (
@@ -3559,6 +3560,10 @@ async def _preview_create_dns_zone(
     )
     if conflict is not None:
         return PreviewResult(ok=False, detail=conflict)
+    # #4570 — the REST create's PowerDNS zone-type refusal.
+    conflict = powerdns_zone_type_refusal(drivers, args.zone_type)
+    if conflict is not None:
+        return PreviewResult(ok=False, detail=conflict)
     if args.dnssec_enabled:
         # #1762 — single-signer rule; read-only here, re-checked under lock
         # at apply.
@@ -3637,6 +3642,10 @@ async def _apply_create_dns_zone(
     conflict = _technitium_api_zone_arg_conflict(
         args, drivers, await _effective_zone_ttl(db, args, grp.id)
     )
+    if conflict is not None:
+        raise ValueError(conflict)
+    # #4570 — re-checked at apply, like the gates above.
+    conflict = powerdns_zone_type_refusal(drivers, args.zone_type)
     if conflict is not None:
         raise ValueError(conflict)
     # #1762 — the single-signer rule the REST create applies, re-checked at
