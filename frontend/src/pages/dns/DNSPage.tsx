@@ -95,6 +95,7 @@ import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
 import { FreshRowError } from "@/components/FreshRowError";
 import {
   NEEDS_SUPERADMIN,
+  disabledBecause,
   permissionGate,
   usePermissions,
 } from "@/hooks/usePermissions";
@@ -158,6 +159,7 @@ import {
   recordOwnerError,
   zoneKindForName,
 } from "@/lib/dnsNames";
+import { viewsUnsupportedReason } from "@/lib/dns-views";
 import { useTableSort, SortableTh } from "@/lib/useTableSort";
 import {
   ZONE_FORWARD_TRANSPORT_LABELS,
@@ -1401,11 +1403,20 @@ function GroupModalForm({
               <input
                 type="checkbox"
                 checked={isRecursive}
+                disabled={group?.unapplied_fields?.is_recursive?.locked}
                 onChange={(e) => setIsRecursive(e.target.checked)}
                 className="h-4 w-4"
               />
               <span className="text-sm">Allow recursion</span>
             </label>
+            {/* #4562: from the API's per-driver table. */}
+            {group?.unapplied_fields?.is_recursive && (
+              <p className="mt-1 text-xs text-muted-foreground">
+                Not applied by{" "}
+                {group.unapplied_fields.is_recursive.drivers.join(" / ")}:{" "}
+                {group.unapplied_fields.is_recursive.note}.
+              </p>
+            )}
           </Field>
         </div>
 
@@ -1458,7 +1469,9 @@ function GroupModalForm({
               onChange={(e) => setCatalogZonesEnabled(e.target.checked)}
               className="h-4 w-4"
             />
-            <span className="text-sm font-medium">Use BIND9 catalog zones</span>
+            <span className="text-sm font-medium">
+              Publish a catalog zone (RFC 9432)
+            </span>
           </label>
           <p className="mt-1 text-[11px] text-muted-foreground">
             The group primary publishes a catalog of this group&apos;s zones for
@@ -2803,7 +2816,7 @@ function DnssecCard({
                 onChange={(e) => setPolicyId(e.target.value)}
                 className="rounded border bg-background px-2 py-1 text-xs"
                 aria-label="DNSSEC signing policy"
-                title="DNSSEC signing policy (BIND9)"
+                title="DNSSEC signing policy (applied by BIND9 and Technitium; PowerDNS ignores it)"
                 {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
               >
                 <option value="">default policy</option>
@@ -2922,9 +2935,9 @@ function DnssecCard({
             </ul>
           )}
           <div className="mt-2 text-[11px] text-muted-foreground">
-            Multiple algorithms are normal — publish them all. Keys rotate
-            automatically per the policy (BIND9) or pdns schedule; this list
-            refreshes after each rollover.
+            Multiple algorithms are normal — publish them all. BIND9 and
+            Technitium roll keys per the policy; PowerDNS never rolls them. This
+            list refreshes after each rollover.
           </div>
         </div>
       )}
@@ -4248,7 +4261,8 @@ function MoveZoneModal({
       !!preview.forward_transport_refusal ||
       !!preview.technitium_acl_refusal ||
       !!preview.classless_refusal ||
-      !!preview.powerdns_refusal);
+      !!preview.powerdns_refusal ||
+      !!preview.views_refusal);
   const canSubmit =
     !!targetGroupId &&
     !!preview &&
@@ -4332,6 +4346,11 @@ function MoveZoneModal({
             {preview.powerdns_refusal && (
               <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
                 {preview.powerdns_refusal}
+              </div>
+            )}
+            {preview.views_refusal && (
+              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+                {preview.views_refusal}
               </div>
             )}
             {preview.acl_names_lost.length > 0 && (
@@ -5833,7 +5852,12 @@ export function ZoneDetailView({
                                   </span>
                                 ) : (
                                   <span
-                                    title="This record was created automatically by IPAM. Edit the IP address in IPAM to change it."
+                                    title={`This record was created automatically by IPAM.${
+                                      can("write", "subnet") ||
+                                      can("write", "address_set")
+                                        ? " Edit the IP address in IPAM to change it."
+                                        : ""
+                                    }`}
                                     className="flex items-center gap-1 rounded border border-amber-300/60 bg-amber-50 px-1.5 py-0.5 text-xs text-amber-700 dark:border-amber-700/40 dark:bg-amber-900/20 dark:text-amber-400"
                                   >
                                     <Lock className="h-2.5 w-2.5" />
@@ -7040,10 +7064,10 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
   // a no-op on Windows / PowerDNS / cloud, and Technitium blocks natively
   // with no per-view concept. Saying so here beats an operator scoping a
   // list to a view and waiting for filtering that will never arrive.
-  const nonBindDrivers = Array.from(
-    new Set(servers.filter((s) => s.driver !== "bind9").map((s) => s.driver)),
-  );
   const hasBind = servers.some((s) => s.driver === "bind9");
+  // #4565: only BIND9 serves views, and the API refuses a new one elsewhere.
+  // Views such a group already holds stay listed so they can be removed.
+  const viewsUnsupported = viewsUnsupportedReason(servers.map((s) => s.driver));
 
   const delMut = useMutation({
     // The modal lists the blocking lists scoped to the view, so confirming
@@ -7073,6 +7097,7 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
           onClick={() => {
             setCreating(true);
           }}
+          {...disabledBecause(viewsUnsupported != null, viewsUnsupported ?? "")}
           {...permissionGate(can("write", "dns_group"), NEEDS_GROUP_WRITE)}
         >
           <Plus className="h-3 w-3" /> New View
@@ -7093,11 +7118,14 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
         />
       )}
 
-      {servers.length > 0 && !hasBind && (
-        <div className="mb-3 rounded-md border border-amber-500/40 bg-amber-500/5 p-2 text-xs text-amber-700 dark:text-amber-400">
-          <strong>This group runs no BIND9 server.</strong> Views and
-          view-scoped blocking lists are rendered by the BIND9 driver only — on{" "}
-          {nonBindDrivers.join(" / ")} they are stored but never applied.
+      {viewsUnsupported != null && (
+        <div
+          role="note"
+          className="mb-3 rounded-md border border-amber-500/40 bg-amber-500/5 p-2 text-xs text-amber-700 dark:text-amber-400"
+        >
+          <strong>This group cannot serve views.</strong> {viewsUnsupported}
+          {views.length > 0 &&
+            " The views below were stored before this was refused: a zone that is the same in every view is served to every client, a zone that differs between views serves only the records identical in every view. Remove them."}
         </div>
       )}
 
@@ -8565,26 +8593,48 @@ export function OptionsTab({ groupId }: { groupId: string }) {
   });
   const applianceMode = versionInfo?.appliance_mode ?? true;
 
-  // Options the agent-managed Technitium driver cannot apply (#1763): the
-  // API refuses a non-default value for a group holding such a server, so the
-  // controls are disabled with the reason rather than offered and ignored. A
-  // control holding a stored non-default value stays enabled so it can be
-  // cleared back to the default.
+  // The group's servers, for the value-specific rules below (Technitium's
+  // forward policy and TLS hostname, BIND9's trust-anchor requirement).
   const { data: groupServers = [] } = useQuery({
     queryKey: ["dns-servers", groupId],
     queryFn: () => dnsApi.listServers(groupId),
   });
   const techUnsupported = groupServers.some((s) => s.driver === "technitium");
-  const techLocked = {
-    minimal: techUnsupported && !opts?.minimal_responses,
-    tcpClients: techUnsupported && opts?.tcp_clients == null,
-    clientsPerQuery: techUnsupported && opts?.clients_per_query == null,
-    maxClientsPerQuery: techUnsupported && opts?.max_clients_per_query == null,
-    // #1764: Technitium always validates an encrypted upstream's certificate,
-    // and with forwarders set it never falls back to recursion ('only').
-    tlsVerify: techUnsupported && opts?.forward_tls_verify !== false,
-    forwardFirst: techUnsupported && opts?.forward_policy !== "first",
+  // #4562: which options the group's drivers apply comes from the API's
+  // per-driver table (``option_support`` on the options response), not from a
+  // copy kept here. ``locked`` = a driver does not apply the option and the
+  // stored value already does nothing, so the control is disabled; a stored
+  // value that would be ignored stays editable so it can be cleared.
+  const support = opts?.option_support ?? {};
+  const lock = (field: string) => support[field]?.locked ?? false;
+  const supportNote = (fields: string[], states: string[]) => {
+    const lines = Array.from(
+      new Set(
+        fields
+          .map((f) => support[f])
+          .filter((e) => e && states.includes(e.state))
+          .map(
+            (e) =>
+              `This group has a ${e!.drivers.join(" / ")} server: ${e!.note}.`,
+          ),
+      ),
+    );
+    return lines.map((line) => (
+      <p key={line} className="text-xs text-muted-foreground">
+        {line}
+      </p>
+    ));
   };
+  // Every limit of the named options, or only the ones not applied at all
+  // (where the card already explains a partial one in more detail).
+  const note = (...fields: string[]) =>
+    supportNote(fields, ["not_applied", "partial"]);
+  const noteUnapplied = (...fields: string[]) =>
+    supportNote(fields, ["not_applied"]);
+  // #1764: with forwarders set Technitium never falls back to recursion
+  // ('only'), so 'first' is not offered unless it is what is stored.
+  const forwardFirstLocked =
+    techUnsupported && opts?.forward_policy !== "first";
   // #3560: BIND9 9.20 will not load ``dnssec-validation yes`` without a
   // trust anchor, so the API refuses the change on a group that renders
   // BIND9 (an empty group counts). Offered only once an anchor exists; a
@@ -8595,8 +8645,10 @@ export function OptionsTab({ groupId }: { groupId: string }) {
     rendersBind9 &&
     (opts?.trust_anchors?.length ?? 0) === 0 &&
     opts?.dnssec_validation !== "yes";
-  const techReason =
-    "Not supported by Technitium: this group has a Technitium server, which cannot apply it.";
+  const lockTitle = (field: string) =>
+    lock(field)
+      ? `Not applied by ${support[field].drivers.join(" / ")}: ${support[field].note}.`
+      : undefined;
 
   const [forwardersEnabled, setForwardersEnabled] = useState(false);
   const [forwarders, setForwarders] = useState("");
@@ -8966,6 +9018,17 @@ export function OptionsTab({ groupId }: { groupId: string }) {
   const card = "rounded-md border p-4 space-y-3";
   const cardTitle = "text-sm font-medium flex items-center gap-2";
 
+  // #4562: a driver that applies no group option at all (Windows DNS, the
+  // hosted providers, agentless Technitium). A form whose every save is
+  // refused or ignored says less than this one line.
+  if (opts?.options_unmanaged_note) {
+    return (
+      <p className="max-w-xl rounded-md border bg-muted/20 px-3 py-2 text-sm text-muted-foreground">
+        {opts.options_unmanaged_note}
+      </p>
+    );
+  }
+
   return (
     <div className="space-y-5 max-w-xl">
       <div className="flex items-center justify-between">
@@ -9009,6 +9072,22 @@ export function OptionsTab({ groupId }: { groupId: string }) {
           </p>
           <ul className="mt-1 list-disc pl-4">
             {opts?.technitium_warnings?.map((w) => (
+              <li key={w} className="break-words">
+                {w}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {/* Stored values another driver here does not apply (#4562). */}
+      {(opts?.unapplied_warnings?.length ?? 0) > 0 && (
+        <div className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+          <p className="font-medium">
+            Stored settings this group&apos;s servers do not apply:
+          </p>
+          <ul className="mt-1 list-disc pl-4">
+            {opts?.unapplied_warnings?.map((w) => (
               <li key={w} className="break-words">
                 {w}
               </li>
@@ -9160,6 +9239,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
             )}
             <Field label="Forward policy">
               <select
+                disabled={lock("forward_policy")}
                 className={selCls}
                 value={forwardPolicy}
                 onChange={(e) => {
@@ -9169,9 +9249,9 @@ export function OptionsTab({ groupId }: { groupId: string }) {
               >
                 <option
                   value="first"
-                  disabled={techLocked.forwardFirst}
+                  disabled={forwardFirstLocked}
                   title={
-                    techLocked.forwardFirst
+                    forwardFirstLocked
                       ? "Not supported by Technitium: with forwarders set it never falls back to recursion."
                       : undefined
                   }
@@ -9183,22 +9263,18 @@ export function OptionsTab({ groupId }: { groupId: string }) {
                 </option>
               </select>
             </Field>
-            {techUnsupported && (
-              <p className="text-xs text-muted-foreground">
-                This group has a Technitium server, which resolves only through
-                its forwarders and never falls back to recursion, so
-                &quot;only&quot; is what it does whichever is chosen here.
-              </p>
-            )}
+            {note("forwarders", "forward_policy")}
           </>
         )}
       </div>
 
       <div className={card}>
         <h4 className={cardTitle}>Recursion</h4>
+        {note("recursion_enabled", "allow_recursion")}
         <label className="flex items-center gap-2 cursor-pointer">
           <input
             type="checkbox"
+            disabled={lock("recursion_enabled")}
             checked={recursionEnabled}
             onChange={(e) => {
               setRecursionEnabled(e.target.checked);
@@ -9211,6 +9287,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
         <Field label="allow-recursion (comma-separated CIDRs / ACL names)">
           <input
             className={inputCls}
+            disabled={lock("allow_recursion")}
             value={allowRecursion}
             onChange={(e) => {
               setAllowRecursion(e.target.value);
@@ -9231,8 +9308,10 @@ export function OptionsTab({ groupId }: { groupId: string }) {
         <h4 className={cardTitle}>
           <Shield className="h-4 w-4 text-muted-foreground" /> DNSSEC Validation
         </h4>
+        {note("dnssec_validation")}
         <Field label="Validation mode">
           <select
+            disabled={lock("dnssec_validation")}
             className={selCls}
             value={dnssecValidation}
             onChange={(e) => {
@@ -9279,6 +9358,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
           </h4>
           <label className="flex items-center gap-2 cursor-pointer text-sm">
             <input
+              disabled={lock("rrl_enabled")}
               type="checkbox"
               checked={rrlEnabled}
               onChange={(e) => {
@@ -9295,11 +9375,13 @@ export function OptionsTab({ groupId }: { groupId: string }) {
           the same client /24 — the primary defense against DNS amplification.
           Applies to every view on this server group.
         </p>
+        {note("rrl_enabled", "rrl_qps_scale", "rrl_log_only")}
         {rrlEnabled && (
           <>
             <div className="grid grid-cols-3 gap-3">
               <Field label="responses/sec (1–1000)">
                 <input
+                  disabled={lock("rrl_responses_per_second")}
                   type="number"
                   min={1}
                   max={1000}
@@ -9313,6 +9395,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
               </Field>
               <Field label="window sec (1–3600)">
                 <input
+                  disabled={lock("rrl_window")}
                   type="number"
                   min={1}
                   max={3600}
@@ -9326,6 +9409,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
               </Field>
               <Field label="slip (0–10)">
                 <input
+                  disabled={lock("rrl_slip")}
                   type="number"
                   min={0}
                   max={10}
@@ -9340,6 +9424,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
             </div>
             <Field label="qps-scale (optional — tighten limit under load)">
               <input
+                disabled={lock("rrl_qps_scale")}
                 type="number"
                 min={1}
                 className={inputCls}
@@ -9353,6 +9438,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
             </Field>
             <Field label="exempt-clients (comma/newline CIDRs or ACL names)">
               <input
+                disabled={lock("rrl_exempt_clients")}
                 className={inputCls}
                 value={rrlExempt}
                 onChange={(e) => {
@@ -9364,6 +9450,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
             </Field>
             <label className="flex items-center gap-2 cursor-pointer text-sm">
               <input
+                disabled={lock("rrl_log_only")}
                 type="checkbox"
                 checked={rrlLogOnly}
                 onChange={(e) => {
@@ -9377,18 +9464,18 @@ export function OptionsTab({ groupId }: { groupId: string }) {
           </>
         )}
         <div className="border-t pt-3 space-y-3">
-          {techUnsupported && (
-            <p className="text-xs text-muted-foreground">
-              Technitium has no minimal-responses, tcp-clients or
-              clients-per-query settings, so these are disabled for this group.
-            </p>
+          {note(
+            "minimal_responses",
+            "tcp_clients",
+            "clients_per_query",
+            "max_clients_per_query",
           )}
           <label className="flex items-center gap-2 cursor-pointer text-sm">
             <input
               type="checkbox"
               checked={minimalResponses}
-              disabled={techLocked.minimal}
-              title={techLocked.minimal ? techReason : undefined}
+              disabled={lock("minimal_responses")}
+              title={lockTitle("minimal_responses")}
               onChange={(e) => {
                 setMinimalResponses(e.target.checked);
                 setDirty(true);
@@ -9404,8 +9491,8 @@ export function OptionsTab({ groupId }: { groupId: string }) {
                 min={1}
                 className={inputCls}
                 value={tcpClients}
-                disabled={techLocked.tcpClients}
-                title={techLocked.tcpClients ? techReason : undefined}
+                disabled={lock("tcp_clients")}
+                title={lockTitle("tcp_clients")}
                 onChange={(e) => {
                   setTcpClients(e.target.value);
                   setDirty(true);
@@ -9419,8 +9506,8 @@ export function OptionsTab({ groupId }: { groupId: string }) {
                 min={1}
                 className={inputCls}
                 value={clientsPerQuery}
-                disabled={techLocked.clientsPerQuery}
-                title={techLocked.clientsPerQuery ? techReason : undefined}
+                disabled={lock("clients_per_query")}
+                title={lockTitle("clients_per_query")}
                 onChange={(e) => {
                   setClientsPerQuery(e.target.value);
                   setDirty(true);
@@ -9434,8 +9521,8 @@ export function OptionsTab({ groupId }: { groupId: string }) {
                 min={1}
                 className={inputCls}
                 value={maxClientsPerQuery}
-                disabled={techLocked.maxClientsPerQuery}
-                title={techLocked.maxClientsPerQuery ? techReason : undefined}
+                disabled={lock("max_clients_per_query")}
+                title={lockTitle("max_clients_per_query")}
                 onChange={(e) => {
                   setMaxClientsPerQuery(e.target.value);
                   setDirty(true);
@@ -9457,9 +9544,11 @@ export function OptionsTab({ groupId }: { groupId: string }) {
           upstream resolvers over TLS instead of plaintext port 53. Listeners
           are <strong>additive</strong> — plain DNS on :53 keeps working.
         </p>
+        {noteUnapplied("dot_enabled", "doh_enabled", "doq_enabled")}
 
         <Field label="TLS certificate (served by both listeners)">
           <select
+            disabled={lock("tls_certificate_id")}
             className={selCls}
             value={tlsCertificateId}
             onChange={(e) => {
@@ -9510,6 +9599,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
           <span className="text-sm">DNS-over-TLS (DoT)</span>
           <label className="flex items-center gap-2 cursor-pointer text-sm">
             <input
+              disabled={lock("dot_enabled")}
               type="checkbox"
               checked={dotEnabled}
               onChange={(e) => {
@@ -9524,6 +9614,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
         {dotEnabled && (
           <Field label="DoT port">
             <input
+              disabled={lock("dot_port")}
               type="number"
               min={1}
               max={65535}
@@ -9541,6 +9632,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
           <span className="text-sm">DNS-over-HTTPS (DoH)</span>
           <label className="flex items-center gap-2 cursor-pointer text-sm">
             <input
+              disabled={lock("doh_enabled")}
               type="checkbox"
               checked={dohEnabled}
               onChange={(e) => {
@@ -9557,6 +9649,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
             <div className="grid grid-cols-2 gap-3">
               <Field label="DoH port">
                 <input
+                  disabled={lock("doh_port")}
                   type="number"
                   min={1}
                   max={65535}
@@ -9570,6 +9663,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
               </Field>
               <Field label="URL path">
                 <input
+                  disabled={lock("doh_path")}
                   className={inputCls}
                   value={dohPath}
                   placeholder="/dns-query"
@@ -9600,6 +9694,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
           </div>
           <label className="flex items-center gap-2 cursor-pointer text-sm">
             <input
+              disabled={lock("doq_enabled")}
               type="checkbox"
               checked={doqEnabled}
               onChange={(e) => {
@@ -9615,6 +9710,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
           <>
             <Field label="DoQ port">
               <input
+                disabled={lock("doq_port")}
                 type="number"
                 min={1}
                 max={65535}
@@ -9677,9 +9773,9 @@ export function OptionsTab({ groupId }: { groupId: string }) {
                   <input
                     type="checkbox"
                     checked={forwardTlsVerify}
-                    disabled={techLocked.tlsVerify}
+                    disabled={lock("forward_tls_verify")}
                     title={
-                      techLocked.tlsVerify
+                      lock("forward_tls_verify")
                         ? "Not supported by Technitium: it always validates the upstream certificate."
                         : undefined
                     }
@@ -9704,6 +9800,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
               techUnsupported ? (
                 <Field label="Upstream TLS hostname (required)">
                   <input
+                    disabled={lock("forward_tls_hostname")}
                     className={inputCls}
                     value={forwardTlsHostname}
                     placeholder="cloudflare-dns.com"
@@ -9740,6 +9837,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
           </h4>
           <label className="flex items-center gap-2 cursor-pointer text-sm">
             <input
+              disabled={lock("dnsdist_enabled")}
               type="checkbox"
               checked={dnsdistEnabled}
               onChange={(e) => {
@@ -9759,11 +9857,13 @@ export function OptionsTab({ groupId }: { groupId: string }) {
           docker-compose only for now). pdns is unaffected; with the front off
           it's a plain pass-through. Point DNS clients at the front.
         </p>
+        {note("dnsdist_enabled")}
         {dnsdistEnabled && (
           <>
             <div className="grid grid-cols-2 gap-3">
               <Field label="Max QPS per client IP (blank = none)">
                 <input
+                  disabled={lock("dnsdist_max_qps_per_client")}
                   type="number"
                   min={1}
                   className={inputCls}
@@ -9777,6 +9877,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
               </Field>
               <Field label="Over-limit action">
                 <select
+                  disabled={lock("dnsdist_action")}
                   className={selCls}
                   value={dnsdistAction}
                   onChange={(e) => {
@@ -9794,6 +9895,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
             <div className="grid grid-cols-2 gap-3">
               <Field label="Dynamic-block QPS (blank = off)">
                 <input
+                  disabled={lock("dnsdist_dynblock_qps")}
                   type="number"
                   min={1}
                   className={inputCls}
@@ -9807,6 +9909,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
               </Field>
               <Field label="Dynamic-block duration (s)">
                 <input
+                  disabled={lock("dnsdist_dynblock_seconds")}
                   type="number"
                   min={1}
                   max={86400}
@@ -9827,6 +9930,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
         <h4 className={cardTitle}>Notify</h4>
         <Field label="Notify mode">
           <select
+            disabled={lock("notify_enabled")}
             className={selCls}
             value={notifyEnabled}
             onChange={(e) => {
@@ -9850,6 +9954,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
 
       <div className={card}>
         <h4 className={cardTitle}>Query &amp; Transfer ACLs</h4>
+        {noteUnapplied("allow_query", "allow_transfer")}
         {techUnsupported && (
           <p className="text-xs text-muted-foreground">
             Technitium applies allow-query to each zone it serves as a network
@@ -9860,6 +9965,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
         )}
         <Field label="allow-query (comma-separated CIDRs / ACL names)">
           <input
+            disabled={lock("allow_query")}
             className={inputCls}
             value={allowQuery}
             onChange={(e) => {
@@ -9871,6 +9977,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
         </Field>
         <Field label="allow-transfer (comma-separated CIDRs / ACL names)">
           <input
+            disabled={lock("allow_transfer")}
             className={inputCls}
             value={allowTransfer}
             onChange={(e) => {
@@ -9889,6 +9996,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
           </h4>
           <label className="flex items-center gap-2 cursor-pointer text-sm">
             <input
+              disabled={lock("query_log_enabled")}
               type="checkbox"
               checked={queryLogEnabled}
               onChange={(e) => {
@@ -9902,11 +10010,12 @@ export function OptionsTab({ groupId }: { groupId: string }) {
         </div>
         {!queryLogEnabled && (
           <p className="text-xs text-muted-foreground">
-            DNS query logs are disabled. Enable to record every query received
-            by BIND for debugging or audit purposes (high volume — large file
-            growth).
+            DNS query logs are disabled. Enable to record every query the DNS
+            server receives, for debugging or audit purposes (high volume —
+            large file growth).
           </p>
         )}
+        {note("query_log_enabled", "response_log_enabled")}
         {queryLogEnabled && (
           <>
             {/* Response logging (#914). Nested inside the query-log gate
@@ -9915,6 +10024,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
                 than accepting a toggle that produces nothing. */}
             <label className="flex cursor-pointer items-start gap-2 rounded border bg-muted/20 p-2 text-sm">
               <input
+                disabled={lock("response_log_enabled")}
                 type="checkbox"
                 checked={responseLogEnabled}
                 onChange={(e) => {
@@ -9937,6 +10047,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
             </label>
             <Field label="Severity">
               <select
+                disabled={lock("query_log_severity")}
                 className={selCls}
                 value={queryLogSeverity}
                 onChange={(e) => {
@@ -11202,12 +11313,24 @@ function BlocklistScopeFields({
     new Set(servers.filter((s) => s.driver !== "bind9").map((s) => s.driver)),
   );
   const nothingSelected = !wholeGroup && picked.size === 0;
+  // #4573 — PowerDNS has no RPZ. A group with no BIND9 / Technitium server
+  // applies nothing, and the server refuses a NEW assignment to it, so the
+  // unchecked boxes are disabled (a stored one can still be unchecked).
+  const inert =
+    servers.some((s) => s.driver === "powerdns") &&
+    !servers.some((s) => s.driver === "bind9" || s.driver === "technitium");
 
   return (
     <fieldset className="space-y-3 rounded-md border p-3">
       <legend className="px-1 text-xs font-medium text-muted-foreground">
         Applies to
       </legend>
+      {inert && (
+        <div className="rounded-md border border-red-500/40 bg-red-500/5 p-2 text-xs text-red-700 dark:text-red-400">
+          This group runs PowerDNS, which has no RPZ, so a blocklist here blocks
+          nothing. Assign the list to a BIND9 group instead.
+        </div>
+      )}
       {nonBind.length > 0 && (
         <div className="rounded-md border border-amber-500/40 bg-amber-500/5 p-2 text-xs text-amber-700 dark:text-amber-400">
           This group also runs {nonBind.join(" / ")}, which
@@ -11221,6 +11344,7 @@ function BlocklistScopeFields({
           type="checkbox"
           className="mt-0.5"
           checked={wholeGroup}
+          disabled={inert && !wholeGroup}
           onChange={(e) => setWholeGroup(e.target.checked)}
         />
         <span className="text-sm">
@@ -11255,6 +11379,7 @@ function BlocklistScopeFields({
                   type="checkbox"
                   className="mt-0.5"
                   checked={picked.has(v.id)}
+                  disabled={inert && !picked.has(v.id)}
                   onChange={() =>
                     setPicked((prev) => {
                       const next = new Set(prev);

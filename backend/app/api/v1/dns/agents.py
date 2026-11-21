@@ -112,7 +112,11 @@ from app.services.dns.row_locks import (
     lock_server_key_share,
     lock_zone_state_rows,
 )
-from app.services.dns.server_move import CATALOG_UNSUPPORTED_DRIVERS
+from app.services.dns.server_move import (
+    CATALOG_UNSUPPORTED_DRIVERS,
+    group_view_names,
+    views_unsupported_drivers,
+)
 from app.services.dns.soa_timers import (
     AGENT_FEATURES_HEADER,
     reconcile_soa_timers,
@@ -719,6 +723,20 @@ async def agent_register(
             driver=body.driver,
             issue="#1766",
         )
+
+    # #4565 — and for views: only BIND9 serves them. The group's
+    # ``scope_warnings`` shows it, and the agent refuses to merge the copies
+    # of a zone that differs between views.
+    if views_unsupported_drivers({body.driver}):
+        if stranded_views := await group_view_names(db, group.id):
+            logger.warning(
+                "dns_agent_views_unsupported_driver",
+                server_id=str(server.id),
+                group=group.name,
+                driver=body.driver,
+                views=stranded_views[:5],
+                issue="#4565",
+            )
 
     # #1858 — same posture for a key Technitium cannot use (hmac-sha224): the
     # agent skips installing it, the group's keys page shows why.
