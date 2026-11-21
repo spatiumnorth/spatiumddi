@@ -84,6 +84,8 @@ CONTROL_RELEASE_UNIT=spatiumddi-control-release.service
 APP_KEY_SECRET=spatium-control-app-keys
 CHART_APP_SECRET=spatium-control-spatiumddi-app
 APP_KEY_STAMP=/var/lib/spatiumddi/app-key-secret.done
+# #4548 — bcrypt hash of the web UI admin password, written by spatium-install.
+WEB_ADMIN_HASH_FILE=/var/lib/spatium-state/web-admin-password-hash
 METALLB_MANIFEST="$K3S_MANIFESTS_DIR/spatium-metallb.yaml"
 SPATIUMDDI_VERSION_FILE=/usr/lib/spatiumddi/spatiumddi-version
 
@@ -2860,6 +2862,14 @@ ensure_app_key_secret() {
         ckey=$(_new_credential_key_b64) || return 1
     fi
     [ -n "$token" ] || token=$(openssl rand -hex 24 | tr -d '\n' | base64 | tr -d '\n')
+    # #4548 — the web UI admin password the installer collected, as a bcrypt
+    # hash (spatium-install writes it 0600 to STATE). The api seeds the first
+    # `admin` user with it instead of admin / admin. Only the hash is carried;
+    # a missing file, as on an older STATE, leaves the default account.
+    local ahash=""
+    if [ -s "$WEB_ADMIN_HASH_FILE" ]; then
+        ahash=$(tr -d '\n' < "$WEB_ADMIN_HASH_FILE" | base64 | tr -d '\n') || ahash=""
+    fi
     # Values go through stdin as base64, never argv, so they never show in a
     # process listing. ``create`` (not ``apply``) fails if the Secret appeared
     # meanwhile, so a race can only ever keep the existing key.
@@ -2878,6 +2888,7 @@ ensure_app_key_secret() {
         "  metrics-token: ${token}" \
         "${ckey:+  credential-key: ${ckey}}" \
         "${since:+  credential-key-since: ${since}}" \
+        "${ahash:+  initial-admin-password-hash: ${ahash}}" \
         | $kc create -f - >/dev/null 2>&1; then
         found=$($kc get secret "$APP_KEY_SECRET" --ignore-not-found -o name 2>/dev/null) || return 1
         [ -n "$found" ] || return 1

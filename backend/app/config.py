@@ -235,6 +235,13 @@ class Settings(BaseSettings):
     # False restores anonymous scraping. Not recommended: see above.
     prometheus_metrics_require_auth: bool = True
 
+    # #4548 — bcrypt hash the first ``admin`` user is created with, instead of
+    # admin / admin plus a forced password change. The appliance installer
+    # collects the web UI password and hands the hash over through the app
+    # Secret; Compose / Helm operators may set it themselves. Only read when
+    # the user table is empty; a value that is not a bcrypt hash is ignored.
+    initial_admin_password_hash: str = ""
+
     # DNS agent
     dns_agent_key: str = ""
     dns_agent_token_ttl_hours: int = 24
