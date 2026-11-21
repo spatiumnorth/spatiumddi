@@ -226,6 +226,10 @@ EOF
 # Wizard state — all set by the prompt functions below.
 TARGET_DISK=""
 HOSTNAME=""
+# #4550 — optional DNS domain (so the FQDN is $HOSTNAME.$DOMAIN_NAME) and
+# the DNS search list. Both may be empty, which is the pre-#4550 behaviour.
+DOMAIN_NAME=""
+DNS_SEARCH=""
 ADMIN_USER="admin"
 ADMIN_PASSWORD=""
 # Optional crypt(3) admin password hash (headless preseed, issue #549).
@@ -2490,7 +2494,7 @@ ask_hostname() {
         # that systemd-hostnamed would later refuse silently.
         case "$HOSTNAME" in
             *[!a-zA-Z0-9-]*|-*|*-)
-                whiptail --msgbox "Hostname must be alphanumeric + hyphen, not start or end with a hyphen, and contain no spaces or dots. Try again." 10 64 || true
+                whiptail --msgbox "Hostname must be alphanumeric + hyphen, not start or end with a hyphen, and contain no spaces or dots (a DNS domain is asked for next). Try again." 10 64 || true
                 continue
                 ;;
         esac
@@ -2498,7 +2502,63 @@ ask_hostname() {
             whiptail --msgbox "Hostname must be 63 characters or fewer." 8 60 || true
             continue
         fi
+        # #4550 — the optional domain and search list. The domain screen's
+        # Back returns to the hostname box rather than leaving the step.
+        if ! _ask_domain; then
+            continue
+        fi
         break
+    done
+}
+
+# #4550 — the search list that is actually rendered: the operator's own, else
+# the domain. Used for spatium-config.yaml only; DNS_SEARCH stays what was typed
+# so the exported answer file and the Confirm screen show the operator's input.
+_effective_dns_search() {
+    printf '%s' "${DNS_SEARCH:-$DOMAIN_NAME}"
+}
+
+# #4550 — second half of the hostname screen: the optional DNS domain and
+# the DNS search list. Returns 1 when the operator chose Back.
+#
+# Validated by the same code the preseed path runs (--check-field), so the
+# two doors cannot disagree. The search list defaults to the domain: an
+# operator who typed ddi1 + corp.example.com expects `ping ddi2` to resolve.
+_ask_domain() {
+    local d s reason
+    if [ -n "${PRESEED_HAS_DOMAIN:-}" ] && [ -n "${PRESEED_HAS_DNS_SEARCH:-}" ]; then
+        log "Preseed: domain=$DOMAIN_NAME dns_search=$DNS_SEARCH (skipping prompt)"
+        return 0
+    fi
+    while true; do
+        if [ -z "${PRESEED_HAS_DOMAIN:-}" ]; then
+            d=$(whiptail --backtitle "$BACKTITLE" --title "Domain (optional)" \
+                --cancel-button "Back" \
+                --inputbox "DNS domain for this appliance (e.g. corp.example.com). With it the full name becomes $HOSTNAME.<domain>: it is what 'hostname -f' prints and is added to the Web UI certificate.\n\nLeave blank for none." \
+                13 72 -- "$DOMAIN_NAME" 3>&1 1>&2 2>&3) \
+                || return 1
+            d=$(echo "$d" | tr -d '[:space:]')
+            d="${d%.}"
+            if [ -n "$d" ] && ! reason=$(_check_field domain "$d" "$HOSTNAME"); then
+                whiptail --msgbox "$reason" 10 70 || true
+                continue
+            fi
+            DOMAIN_NAME="$d"
+        fi
+        if [ -z "${PRESEED_HAS_DNS_SEARCH:-}" ]; then
+            s=$(whiptail --backtitle "$BACKTITLE" --title "DNS search domains (optional)" \
+                --cancel-button "Back" \
+                --inputbox "Domains tried when a short name is looked up (space-separated, at most 6). Blank uses the domain above, or none if that is blank too." \
+                11 72 -- "$DNS_SEARCH" 3>&1 1>&2 2>&3) \
+                || { [ -z "${PRESEED_HAS_DOMAIN:-}" ] && continue; return 1; }
+            s=$(echo "$s" | tr ',' ' ' | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//')
+            if [ -n "$s" ] && ! reason=$(_check_field dns_search "$s"); then
+                whiptail --msgbox "$reason" 10 70 || true
+                continue
+            fi
+            DNS_SEARCH="$s"
+        fi
+        return 0
     done
 }
 
@@ -3777,6 +3837,12 @@ confirm() {
         s+="             $TARGET_DISK_BY_ID\n"
     fi
     s+="Hostname:    $HOSTNAME\n"
+    if [ -n "$DOMAIN_NAME" ]; then
+        s+="FQDN:        $HOSTNAME.$DOMAIN_NAME\n"
+    fi
+    if [ -n "$DNS_SEARCH" ]; then
+        s+="DNS search:  $DNS_SEARCH\n"
+    fi
     s+="OS user:     $ADMIN_USER\n"
     s+="Network:     $NET_MODE"
     if [ "$NET_MODE" = "static" ]; then
@@ -3929,7 +3995,7 @@ confirm() {
         "pick_disk"     "Target disk        $(_ellipsis "$TARGET_DISK" "$_CONF_VAL_COLS")" \
         "ask_role"      "Role               $ROLE" \
         "${_role_rows[@]}" \
-        "ask_hostname"  "Hostname           $(_ellipsis "$HOSTNAME" "$_CONF_VAL_COLS")" \
+        "ask_hostname"  "Hostname           $(_ellipsis "${HOSTNAME}${DOMAIN_NAME:+.$DOMAIN_NAME}" "$_CONF_VAL_COLS")" \
         "ask_user_password" "Admin account      $(_ellipsis "$ADMIN_USER" "$_CONF_VAL_COLS")" \
         "ask_ssh_keys"  "SSH keys           $nkeys authorised" \
         "ask_network"   "Network            $NET_MODE" \
@@ -5420,6 +5486,11 @@ EOF
 # rendered into /etc by spatium-etc-render on every boot. Survives
 # OS slot swaps + a /var factory reset.
 hostname: "$HOSTNAME"
+# #4550 — optional DNS domain and search list. spatium-etc-render writes
+# the FQDN into /etc/hosts and the search list into the NetworkManager
+# keyfile; firstboot adds the FQDN to the Web UI certificate.
+domain: "$DOMAIN_NAME"
+dns_search: "$(_effective_dns_search)"
 # #995 item 18 — the operator-chosen admin account. spatiumddi-ssh-reload
 # reads this to find whose authorized_keys to manage; without it the #157
 # plane hardcodes "admin" and errors out on every appliance installed
@@ -5487,6 +5558,8 @@ spatium_preseed:
   confirm_wipe: true
   target_disk: "${TARGET_DISK_BY_ID:+/dev/disk/by-id/}${TARGET_DISK_BY_ID:-$TARGET_DISK}"
   hostname: "$HOSTNAME"
+$( [ -n "$DOMAIN_NAME" ] && printf '  domain: "%s"\n' "$DOMAIN_NAME" )
+$( [ -n "$DNS_SEARCH" ] && printf '  dns_search: "%s"\n' "$DNS_SEARCH" )
   admin_user: "$ADMIN_USER"
   set_root_password: $([ "$SET_ROOT_PASSWORD" = "yes" ] && echo true || echo false)
   timezone: "$TIMEZONE"
@@ -5694,7 +5767,7 @@ EOF
 
         cat > "$MOUNT/etc/hosts" <<EOF
 127.0.0.1 localhost
-127.0.1.1 $HOSTNAME
+127.0.1.1 ${DOMAIN_NAME:+$HOSTNAME.$DOMAIN_NAME }$HOSTNAME
 ::1 ip6-localhost ip6-loopback
 ff02::1 ip6-allnodes
 ff02::2 ip6-allrouters

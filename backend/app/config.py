@@ -471,6 +471,11 @@ class Settings(BaseSettings):
     # container's own socket-level view only knows the docker bridge IP).
     # Empty on non-appliance deploys.
     appliance_host_ips: str = ""
+    # #4550 — ``hostname.domain`` when the operator gave the appliance a DNS
+    # domain at install (empty otherwise). Threaded in by firstboot like the
+    # two above; the self-signed Web UI cert carries it as a DNS SAN so
+    # https://<hostname>.<domain> validates against the right name.
+    appliance_fqdn: str = ""
     # #272 Phase 6 — extra SAN entries the self-signed cert MUST cover
     # beyond the host's own IPs: the control-plane VIP (and any other
     # floating address the operator's browser / agents hit). The

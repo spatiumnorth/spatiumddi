@@ -497,9 +497,20 @@ the host resolver and that has not been a reported problem. There is no restart
 button either, for the same reason the Containers tab withholds one — on a
 single-node appliance restarting cluster DNS is a footgun.
 
+### Domain, FQDN and DNS search domains (#4550)
+
+The hostname screen takes an optional **domain** and an optional list of **DNS search domains** (preseed keys `domain` and `dns_search`). Both are stored in `spatium-config.yaml` on STATE and rendered on every boot by `spatium-etc-render`:
+
+- `/etc/hosts` gets `127.0.1.1 <host>.<domain> <host>`, so `hostname -f` prints the FQDN. `/etc/hostname`, the kernel hostname and the k3s node name stay the short name.
+- The NetworkManager keyfile gets `dns-search=` (static, and DHCP pinned to a port). A DHCP install that pins no port has no keyfile, so the list goes into a `[global-dns]` `searches=` drop-in under `/etc/NetworkManager/conf.d/`.
+- The search list defaults to the domain.
+- The self-signed Web UI certificate gains the FQDN as a SAN (`APPLIANCE_FQDN`). An existing self-signed certificate is regenerated when it does not cover it; an operator-uploaded or ACME certificate is never replaced.
+
+A Keep-/var reinstall asks the same questions: the domain lives on STATE, which the installer rewrites from the wizard's answers like every other field. Changing the domain after install is not yet possible from the UI or API; edit `domain` / `dns_search` in `/var/lib/spatium-state/spatium-config.yaml` and reboot. An outbound proxy setting is tracked separately and is not part of this.
+
 ### From-zero operator flow
 
-1. Boot the ISO → installer wizard asks for **role** + target disk + hostname + admin + network + timezone (+ pairing code / control-plane URL on Appliance).
+1. Boot the ISO → installer wizard asks for **role** + target disk + hostname (+ optional DNS domain and search domains, #4550) + admin + network + timezone (+ pairing code / control-plane URL on Appliance).
 2. Installer partitions (BIOS Boot + ESP + root_A + root_B + var), writes fstab + grub menuentries, runs postinst hardening, reboots.
 3. First-boot: `spatiumddi-firstboot` generates `/etc/spatiumddi/.env` with secrets, bakes the self-signed cert, writes the HelmChart bootstrap manifest, starts k3s.
 4. k3s comes up + imports baked images + helm-controller installs the bootstrap release. 30-90 s for control plane pods to reach Ready; another 15-30 s for migrate Job to complete schema migrations.
@@ -4191,6 +4202,7 @@ The appliance does not read `SPATIUMDDI_*` environment variables, and there is n
 | `APPLIANCE_VERSION` | The installed appliance version (rendered from the chart's `applianceVersion` value). |
 | `INITIAL_NTP_SERVERS` | The installer's Time source answer; it seeds the initial `ntp_pool_servers` setting and is ignored once that settings row exists. |
 | `APPLIANCE_HOSTNAME` / `APPLIANCE_HOST_IPS` | The host's hostname and global addresses, so every api replica builds the same self-signed Web UI certificate identity. |
+| `APPLIANCE_FQDN` | `hostname.domain` when the installer was given a DNS domain (#4550), else empty. Added to the self-signed Web UI certificate as a DNS SAN; re-read from `spatium-config.yaml` on every boot. |
 
 Update channels are future work (Phase 8d, pending).
 

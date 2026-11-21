@@ -555,6 +555,24 @@ if [ -f "$ENV_FILE" ]; then
     : "${APPLIANCE_HOST_IPS_VAL:=$(grep '^APPLIANCE_HOST_IPS=' "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2-)}"
 fi
 
+# #4550 — the appliance's fully qualified name, re-read from STATE on EVERY
+# boot (the operator can change the domain after install, and .env is
+# first-boot-only). Empty when no domain is configured. Read with the same flat
+# parser spatium-etc-render uses; the shape check keeps anything but a DNS name
+# out of the SAN list and the helm values this lands in.
+APPLIANCE_FQDN_VAL=""
+_fqdn_cfg=/var/lib/spatium-state/spatium-config.yaml
+if [ -f "$_fqdn_cfg" ]; then
+    _fqdn_host="$(sed -n 's/^hostname:[[:space:]]*//p' "$_fqdn_cfg" | head -1 | sed 's/[[:space:]]*$//; s/^"//; s/"$//')"
+    _fqdn_dom="$(sed -n 's/^domain:[[:space:]]*//p' "$_fqdn_cfg" | head -1 | sed 's/[[:space:]]*$//; s/^"//; s/"$//')"
+    if [ -n "$_fqdn_host" ] && [ -n "$_fqdn_dom" ]; then
+        case "$_fqdn_host.$_fqdn_dom" in
+            *[!A-Za-z0-9.-]*|.*|*..*|-*) echo "WARN: ignoring a malformed domain in $_fqdn_cfg" ;;
+            *) APPLIANCE_FQDN_VAL="$_fqdn_host.$_fqdn_dom" ;;
+        esac
+    fi
+fi
+
 # #2004 — the running slot's version for the control-plane pods' env. Read from
 # the slot's own appliance-release on EVERY boot (never from .env, which sits on
 # the shared /var and holds whatever the last boot wrote), so a slot upgrade
@@ -662,6 +680,10 @@ elif [ ! -f "$TLS_CERT_MANIFEST" ] && [ ! -f "$TLS_CERT_MANIFEST_DEFERRED" ]; th
     # IP:127.0.0.1. ip-of-this-host is what the operator will type
     # into the browser, so include each one.
     san_parts="DNS:${HN_VAL},DNS:localhost,IP:127.0.0.1"
+    # #4550 — the FQDN, when a domain is configured.
+    if [ -n "${APPLIANCE_FQDN_VAL:-}" ] && [ "$APPLIANCE_FQDN_VAL" != "$HN_VAL" ]; then
+        san_parts="$san_parts,DNS:$APPLIANCE_FQDN_VAL"
+    fi
     if [ -n "$IPS_VAL" ]; then
         for ip in $(echo "$IPS_VAL" | tr ',' ' '); do
             san_parts="$san_parts,IP:$ip"
@@ -1281,6 +1303,10 @@ spec:
         value: "${APPLIANCE_HOSTNAME_VAL}"
       - name: APPLIANCE_HOST_IPS
         value: "${APPLIANCE_HOST_IPS_VAL}"
+      # #4550 — hostname.domain when the operator gave a domain; the Web UI
+      # certificate carries it as a SAN. Empty otherwise.
+      - name: APPLIANCE_FQDN
+        value: "${APPLIANCE_FQDN_VAL:-}"
     # Phase 11 wave 3 — flip the api into appliance-mode so the
     # cert upload / activate endpoints write to the Kubernetes
     # Secret instead of the docker-compose volume + SIGHUP path.
