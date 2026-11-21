@@ -596,6 +596,8 @@ $r | ConvertTo-Json -Compress -Depth 3
 
 ## 4. PowerDNS Driver
 
+> **Known issues in 1.0.0:** the agent does not delete a zone from PowerDNS when it leaves the bundle ([#4564](https://github.com/spatiumnorth/spatiumddi/issues/4564)), so the "Delete zone" row in §4.1 does not hold yet, and views are merged into one zone ([#4565](https://github.com/spatiumnorth/spatiumddi/issues/4565)). See [DNS.md §0](../features/DNS.md) for the workarounds.
+
 Located at [`app/drivers/dns/powerdns.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/drivers/dns/powerdns.py). Class: `PowerDNSDriver`. Shipped in issue #127.
 
 PowerDNS is a second authoritative driver running side-by-side with BIND9. It is **agent-managed** the same way BIND9 is — there is one DNS agent per server, the agent owns the local PowerDNS daemon (`pdns_server`), and the control plane never opens a connection to PowerDNS directly. The agent talks to PowerDNS's REST API on `127.0.0.1:8081`; the control plane talks to the agent through the existing long-poll `/config` channel.
@@ -675,12 +677,19 @@ class PowerDNSDriver(DNSDriver):
             "lua_records": True,           # global enable-lua-records=yes in pdns.conf
             "dnssec_inline_signing": True, # online sign / unsign / re-sign
             "catalog_zones": "producer-only",  # consumer not wired up in the agent
-            "views": False,                # tag-based; not surfaced as views in UI yet
+            "views": False,                # pdns-auth has no views; refused by the API (#4565)
             "rpz": False,                  # authoritative-only — RPZ is a recursor feature
         }
 ```
 
 `alias_records: True` and `lua_records: True` are PowerDNS-only: the `ALIAS` / `LUA` record types are gated server-side by the API's `_DRIVER_GATED_RECORD_TYPES` map to `{powerdns}`, so creating them against a non-PowerDNS group returns 422 with a remediation message ("move to a PowerDNS-only group"). Online DNSSEC sign/unsign is no longer PowerDNS-only — BIND9 ships inline-signing via `dnssec-policy` (§2.5), so `_DRIVER_GATED_OPERATIONS` allows `dnssec_sign`/`dnssec_unsign` on both `{powerdns, bind9}` (and `dnssec_rollover` on `{bind9}`); only the *mechanism* differs (PowerDNS signs online via REST, BIND9 via config-driven inline-signing).
+
+**Views (#4565).** `views: False` is enforced, not advisory: the API reads it for every driver and refuses a view, a view-scoped zone or record, and a server joining a group that has views (see [DNS.md §2](../features/DNS.md)). BIND9 is the only driver that returns `True`. A bundle can still carry views for a group that held them before the refusal, and the agent's rule for it is fixed (`_resolve_view_copies`): the bundle ships one copy of a zone per view it renders in, and PowerDNS holds one zone per name, so
+
+- copies that render the same payload are one zone, reconciled once and served to every client;
+- copies that differ are reduced to the rrsets identical (name, type, TTL, records) in every copy and sent as one zone, so no client is answered from another view's data and the reconcile sweeps what an earlier merged render left. The zone is named in `refused_zones()` as `"<zone> views: …"`, and the apply is reported as partial, like a zone PowerDNS itself refused. It is also left out of the zone-state report, so it never reads converged.
+
+`powerdns_views_unsupported` is logged on every render of such a bundle. Removing the views, or making the zone the same in each, clears it on the next render.
 
 ### 4.4 LUA records
 

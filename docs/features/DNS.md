@@ -34,7 +34,7 @@ SpatiumDDI ships five authoritative DNS drivers (Technitium in two shapes — se
 | Encrypted *upstream* forwarding | DoT only (no client-side HTTP) | — | DoT / DoH / DoQ (#741) | — |
 | Catalog zones (RFC 9432) — producer | ✅ | ✅ | ✅ (agent-managed `technitium` only, #1766; `technitium_api` refused) | — |
 | Catalog zones (RFC 9432) — consumer | — (producer-only in a group, #3764; external BIND secondaries consume, §1) | — | — (producer-only, #3764) | — |
-| First-class views / split-horizon | ✅ | tag-based, not surfaced as views in UI | — | — (replication scope) |
+| First-class views / split-horizon | ✅ | — (refused, #4565) | — (refused) | — (refused) |
 | RPZ blocklists | ✅ | — (recursor feature only) | native blocking, not RPZ (#744) | — |
 | AD-integrated zones | — | — | — | ✅ |
 | Agent shape | sidecar agent + named | sidecar agent + pdns_server | sidecar agent + DnsServerApp.dll | agentless (control plane → WinRM) |
@@ -450,6 +450,16 @@ supported at.
 ## 2. DNS Views (Split-Horizon)
 
 Views allow the same zone name to return **different data** depending on the source IP of the DNS query. This is a native BIND9 feature.
+
+**Views are BIND9-only.** No other driver answers by client address (each driver says so in `capabilities()["views"]`), so on a group whose servers run PowerDNS, Technitium, Windows DNS or a cloud provider the API refuses, with a 422 ([#4565](https://github.com/spatiumnorth/spatiumddi/issues/4565)):
+
+- creating a view;
+- creating a zone in a view, pinning a zone to one, or scoping a record to one (zone and record create / update, the zone-template wizard, zone-file import, the DNS importers and the Copilot tools that use them);
+- adding such a server to a group that has views: server create, a driver change, a move, and a zone move that would keep a view in such a group (the move preview reports it as `views_refusal`).
+
+The Views tab disables **New View** on such a group and says why. An agent that auto-registers into a group with views is not refused (it would loop); it logs `dns_agent_views_unsupported_driver`.
+
+A group that held views before this was refused keeps working: stored views, zones and records are not rejected on an untouched save, and the views can still be edited and deleted. The group shows a warning (`scope_warnings`) until they are gone. Until then the PowerDNS agent does not merge a zone's per-view copies: a zone that renders the same in every view is served once, to every client (`match-clients` is not applied), and a zone that differs between views serves **only the records identical in every view** (a record of one view, or with a different value in each, is served to nobody, and a record an earlier merged render left behind is removed), and the server reports a partial apply naming the zone (see [`DNS_DRIVERS.md` §4.3](../drivers/DNS_DRIVERS.md)). Before the fix every copy was written into the one zone PowerDNS holds, so whichever view was reconciled last was answered to every client.
 
 ### View Model
 
