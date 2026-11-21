@@ -23,6 +23,7 @@ import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { FreshRowError } from "@/components/FreshRowError";
 import { changedFields, useFreshRow } from "@/hooks/useFreshRow";
 import { FormError } from "@/components/ui/form-error";
+import { VendorPresetPicker } from "./VendorPresetPicker";
 
 const PROFILE_KEY_BASE = "dhcp-phone-profiles";
 
@@ -396,6 +397,21 @@ function PhoneProfileEditorForm({
       prev.map((o, k) => (k === i ? { ...o, ...patch } : o)),
     );
   }
+  // #4490: a vendor preset's encoded option 43 replaces any existing 43 row;
+  // the option-60 fence is filled only when empty (never clobbers an edit).
+  function applyPreset(r: {
+    value: string;
+    vendor: string;
+    vendorClassMatch: string | null;
+  }) {
+    setOptionSet((prev) => [
+      ...prev.filter((o) => o.code !== 43),
+      { code: 43, name: "vendor-encapsulated-options", value: r.value },
+    ]);
+    if (!vendor) setVendor(r.vendor);
+    if (!vendorClassMatch && r.vendorClassMatch)
+      setVendorClassMatch(r.vendorClassMatch);
+  }
   function removeOption(i: number) {
     setOptionSet((prev) => prev.filter((_, k) => k !== i));
   }
@@ -481,6 +497,8 @@ function PhoneProfileEditorForm({
             placeholder="Polycom"
           />
         </Field>
+
+        <VendorPresetPicker onApply={applyPreset} />
 
         <div>
           <div className="mb-2 flex items-center justify-between">

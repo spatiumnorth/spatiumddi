@@ -1309,3 +1309,69 @@ async def preview_dhcp_device_policy(
             "next renewal, not instantly."
         ),
     }
+
+
+class FindDHCPVendorPresetsArgs(BaseModel):
+    preset_id: str | None = Field(
+        default=None,
+        description="Limit to one preset id (for example 'unifi' or 'cisco-wlc').",
+    )
+    controllers: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Controller IPv4 addresses. With a preset_id, the option 43 value "
+            "for them is encoded and returned as plain hex."
+        ),
+    )
+
+
+@register_tool(
+    name="find_dhcp_vendor_presets",
+    permission=("read", "dhcp_scope"),
+    description=(
+        "List the bundled DHCP option 43 vendor presets (Cisco WLC, UniFi, "
+        "Ruckus) with the source each byte layout was confirmed against and the "
+        "option 60 match, if any. With preset_id and controllers, also encode "
+        "the option 43 hex an operator would otherwise build by hand. Read-only "
+        "— it changes no configuration."
+    ),
+    args_model=FindDHCPVendorPresetsArgs,
+    category="dhcp",
+    default_enabled=True,
+    module="core.dhcp",
+)
+async def find_dhcp_vendor_presets(
+    db: AsyncSession, user: User, args: FindDHCPVendorPresetsArgs
+) -> dict[str, Any]:
+    from app.services.dhcp.vendor_presets import encode_preset, get_preset, list_presets
+
+    presets = list_presets()
+    if args.preset_id:
+        preset = get_preset(args.preset_id)
+        if preset is None:
+            return {"error": "Unknown vendor preset", "preset_id": args.preset_id}
+        presets = [preset]
+    out: dict[str, Any] = {
+        "presets": [
+            {
+                "id": p.id,
+                "vendor": p.vendor,
+                "product": p.product,
+                "description": p.description,
+                "option_code": p.option_code,
+                "controllers": f"{p.min_controllers}-{p.max_controllers}",
+                "vendor_class_match": p.vendor_class_match,
+                "vendor_class_note": p.vendor_class_note,
+                "source": p.source,
+            }
+            for p in presets
+        ]
+    }
+    if args.preset_id and args.controllers:
+        try:
+            enc = encode_preset(presets[0], args.controllers)
+        except ValueError as exc:
+            out["error"] = str(exc)
+        else:
+            out["encoded"] = {"value": enc.value_hex, "byte_length": enc.byte_length}
+    return out
