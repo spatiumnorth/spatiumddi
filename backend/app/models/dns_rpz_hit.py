@@ -34,7 +34,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Index, String, Text
+from sqlalchemy import BigInteger, DateTime, Index, String, Text
 from sqlalchemy.dialects.postgresql import INET, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -53,18 +53,19 @@ class DNSRPZHit(Base):
         Index("ix_dns_rpz_hit_ts", "ts"),
         # "Which feed is doing the work" rollup.
         Index("ix_dns_rpz_hit_zone_ts", "rpz_zone", "ts"),
-        # The server delete's SET NULL looks rows up by server (#4173).
+        # Time-partitioned like the other agent-shipped logs (#2185): retention
+        # is a partition drop, and ``ts`` is part of the primary key.
+        # The server delete's detach looks rows up by server (#4173).
         Index("ix_dns_rpz_hit_server_id", "server_id"),
+        {"postgresql_partition_by": "RANGE (ts)"},
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    # SET NULL (#4173): a hit is evidence about a client, not the server, so
-    # it outlives the server's deletion; ``server_name`` keeps it attributable.
-    server_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("dns_server.id", ondelete="SET NULL"), nullable=True
-    )
+    # Not a foreign key, for the reason given in ``app.models.logs``; a server
+    # delete detaches the row (#4173) and ``server_name`` keeps it attributable.
+    server_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     server_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
 
     # Nullable because a hit whose log head didn't parse is still worth
     # counting — it proves the blocklist fired — even though it cannot

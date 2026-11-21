@@ -66,7 +66,11 @@ async def _detach_history(
             text(
                 f"UPDATE {table} SET server_id = NULL, "  # noqa: S608 - fixed table names
                 "server_name = COALESCE(server_name, :name) "
-                f"WHERE ctid IN (SELECT ctid FROM {table} "
+                # These tables are partitioned (#2185): a ctid is unique only
+                # within one partition, so the row is named by its partition
+                # too. Matching on ``id`` instead finds the batch with a hash
+                # join over every row of every partition, once per batch.
+                f"WHERE (tableoid, ctid) IN (SELECT tableoid, ctid FROM {table} "
                 "WHERE server_id = :sid LIMIT :n)"
             ),
             {"sid": server_id, "name": name, "n": batch},
@@ -113,8 +117,8 @@ async def remove_server_with_session(
         counts[table] = await _detach_history(db, table, server_id, name, batch_size)
     for table in OPERATIONAL_TABLES:
         counts[table] = await _delete_operational(db, table, server_id, batch_size)
-    # The detached rows above are what ``ON DELETE SET NULL`` would have
-    # touched, so this delete only cascades what arrived since.
+    # The history tables have no foreign key (#2185), so the detach above is the
+    # whole job; this delete only cascades the operational rows that arrived since.
     await db.execute(delete(DNSServer).where(DNSServer.id == server_id))
     await db.commit()
     return {"status": "removed", "rows": counts}

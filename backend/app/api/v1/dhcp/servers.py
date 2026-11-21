@@ -9,7 +9,7 @@ from typing import Any, Literal
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE, MAX_PAGE_SIZE, Page, paginate
@@ -42,6 +42,7 @@ from app.drivers.dhcp.windows import test_winrm_credentials
 from app.models.audit import AuditLog
 from app.models.dhcp import DHCPConfigOp, DHCPLease, DHCPMACBlock, DHCPScope, DHCPServer
 from app.models.ipam import Subnet
+from app.models.logs import DHCPLogEntry
 from app.models.metrics import DHCPMetricSample
 from app.services.agents.container_oom import daemon_reported_by
 from app.services.agents.daemon_state import is_not_serving
@@ -923,6 +924,13 @@ async def delete_server(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
         resource_type="dhcp_server",
         resource_id=str(s.id),
         resource_display=s.name,
+    )
+    # ``dhcp_log_entry.server_id`` is not a foreign key (#2185), so nothing detaches
+    # the server's log entries for us (#4173): keep them, attributable by name.
+    await db.execute(
+        update(DHCPLogEntry)
+        .where(DHCPLogEntry.server_id == s.id)
+        .values(server_id=None, server_name=func.coalesce(DHCPLogEntry.server_name, s.name))
     )
     await db.delete(s)
     if gid is not None:

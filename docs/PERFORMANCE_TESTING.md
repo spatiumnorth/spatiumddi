@@ -380,7 +380,7 @@ Times are test-clock hours from start (T+), mapped to local clock by starting at
 | **4. PEAK / ceiling** | 16..17 | hold 150k but ramp DNS toward 100–150k qps; drop lease to 1h; inject 300/s storm; ramp operator stream to 50/s | (c) max throughput + first-to-give | identify the first-to-saturate component |
 | **5. EVENING peak** | 17..21 | departure → dorm re-attach → 19:00 peak (DORA 4/s, renew ~150/s, DNS 17k) | (b) second window; (a) | SLOs hold again; DB recovered from T+16 push |
 | **6. SOAK / overnight** | 21..24 | wind-down to floor; daily log-prune + lease-sweep + autovacuum recovery; **fault-injection mini-phase** (§7.6.6) | (d) soak | dead_tup recedes; prune completes; Redis flat; no restarts; queues → ~0; agents serve from cache through the injected blip |
-| **7. Query-log firehose** | overlay (own run, not headline) | flip `query_log_enabled=ON` at bounded 5k qps | (d) `dns_query_log_entry` growth + daily DELETE | ingestion keeps up; prune lands; bloat reclaimed |
+| **7. Query-log firehose** | overlay (own run, not headline) | flip `query_log_enabled=ON` at bounded 5k qps | (d) `dns_query_log_entry` growth + partition create / drop (#2185) | ingestion keeps up; partitions are created ahead and dropped on schedule; no bloat |
 
 ### 1.9 Short smoke variant (30–60 min) — and the baseline-tuning gate
 

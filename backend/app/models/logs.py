@@ -9,8 +9,20 @@ This is **operator triage**, not analytics. We keep a short rolling
 window (default 24 h) so the UI stays responsive and the table size
 is bounded; longer retention belongs in Loki / a SIEM.
 
-Deleting a server keeps its entries: the FK is ``ON DELETE SET NULL``
-(#4173) and the retention prune ages them out as usual.
+Both tables are ``PARTITION BY RANGE (ts)`` (#2185), so retention is a
+partition drop rather than a mass ``DELETE``. ``ts`` is therefore part of the
+primary key, and a row can only be stored where a partition covers its
+timestamp; ``app.services.logs.partitions`` creates and retires them and
+tells ingest what is covered.
+
+``server_id`` is deliberately not a foreign key (#2185). With one, attaching
+a partition locks the referenced server table and dropping a retired one takes
+``ACCESS EXCLUSIVE`` there, and every connected agent's long poll holds that
+table in a transaction most of the time, so neither would get through on a
+live install. Deleting a server keeps its entries (#4173) all the same: the
+delete detaches them itself (``server_id`` NULL, ``server_name`` stamped)
+instead of leaving it to ``ON DELETE SET NULL``, and the retention drop ages
+them out as usual.
 """
 
 from __future__ import annotations
@@ -21,7 +33,6 @@ from datetime import datetime
 from sqlalchemy import (
     BigInteger,
     DateTime,
-    ForeignKey,
     Index,
     Integer,
     String,
@@ -53,21 +64,17 @@ class DNSQueryLogEntry(Base):
     __table_args__ = (
         Index("ix_dns_query_log_server_ts", "server_id", "ts"),
         Index("ix_dns_query_log_ts", "ts"),
+        {"postgresql_partition_by": "RANGE (ts)"},
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    # SET NULL, not CASCADE (#4173): the row records what a client asked, not
-    # anything about the server, so retiring a server must not erase it (and
-    # the cascade made the delete minutes long on a big table). ``server_name``
-    # keeps the row attributable once the id is gone; NULL ``server_id`` means
-    # "the server was deleted", never "unknown server".
-    server_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("dns_server.id", ondelete="SET NULL"),
-        nullable=True,
-    )
+    # No foreign key (#2185), but the same contract as #4173: the row records what
+    # a client asked, not anything about the server, so a server delete detaches
+    # it (NULL ``server_id``, ``server_name`` stamped) rather than erasing it.
+    # NULL ``server_id`` means "the server was deleted", never "unknown server".
+    server_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     server_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
     client_ip: Mapped[str | None] = mapped_column(INET, nullable=True)
     client_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
     qname: Mapped[str | None] = mapped_column(String(512), nullable=True)
@@ -117,21 +124,17 @@ class DHCPLogEntry(Base):
     __table_args__ = (
         Index("ix_dhcp_log_server_ts", "server_id", "ts"),
         Index("ix_dhcp_log_ts", "ts"),
+        {"postgresql_partition_by": "RANGE (ts)"},
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    # SET NULL, not CASCADE (#4173): the row records what a client asked, not
-    # anything about the server, so retiring a server must not erase it (and
-    # the cascade made the delete minutes long on a big table). ``server_name``
-    # keeps the row attributable once the id is gone; NULL ``server_id`` means
-    # "the server was deleted", never "unknown server".
-    server_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("dhcp_server.id", ondelete="SET NULL"),
-        nullable=True,
-    )
+    # No foreign key (#2185), but the same contract as #4173: the row records what
+    # a client asked, not anything about the server, so a server delete detaches
+    # it (NULL ``server_id``, ``server_name`` stamped) rather than erasing it.
+    # NULL ``server_id`` means "the server was deleted", never "unknown server".
+    server_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     server_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
     severity: Mapped[str | None] = mapped_column(String(16), nullable=True)
     code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     mac_address: Mapped[str | None] = mapped_column(MACADDR, nullable=True)

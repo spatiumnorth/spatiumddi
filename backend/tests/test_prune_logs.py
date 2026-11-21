@@ -1,4 +1,9 @@
-"""Tests for the log retention sweep."""
+"""Tests for the nightly sweep, which since #2185 only retires agent ingest receipts.
+
+The agent-shipped log tables are time-partitioned and their retention is a
+partition drop (``test_log_partitions_2185.py``); the sweep no longer deletes
+from them.
+"""
 
 from __future__ import annotations
 
@@ -7,14 +12,17 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import func, select
-from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.agent_ingest import AgentIngestReceipt
 from app.models.dhcp import DHCPServer
 from app.models.dns import DNSServer, DNSServerGroup
 from app.models.dns_rpz_hit import DNSRPZHit
 from app.models.logs import DHCPLogEntry, DNSQueryLogEntry
-from app.tasks.prune_logs import DEFAULT_RETENTION_HOURS, _sweep_with_session
+from app.services.agents.ingest_receipt import RECEIPT_RETENTION_DAYS
+from app.services.logs.partitions import DEFAULT_RETENTION_HOURS, RPZ_HIT_RETENTION_DAYS
+from app.tasks import prune_logs
+from app.tasks.prune_logs import FAILED, _sweep_with_session
 
 
 async def _make_dns_server(db: AsyncSession) -> DNSServer:
@@ -43,136 +51,64 @@ async def _make_dhcp_server(db: AsyncSession) -> DHCPServer:
     return s
 
 
+async def _count(db: AsyncSession, model: type) -> int:
+    return await db.scalar(select(func.count()).select_from(model)) or 0
+
+
 @pytest.mark.asyncio
-async def test_prune_drops_old_dns_keeps_recent(db_session: AsyncSession) -> None:
+async def test_sweep_retires_old_receipts_and_reports_the_windows(db_session: AsyncSession) -> None:
     server = await _make_dns_server(db_session)
-    now = datetime.now(UTC)
-    # One row well past the cutoff, one inside the window.
-    db_session.add(
-        DNSQueryLogEntry(
-            server_id=server.id,
-            ts=now - timedelta(hours=DEFAULT_RETENTION_HOURS + 5),
-            qname="old.example",
-            raw="old",
+    old = datetime.now(UTC) - timedelta(days=RECEIPT_RETENTION_DAYS + 5)
+    for _ in range(2):
+        db_session.add(
+            AgentIngestReceipt(
+                server_id=server.id,
+                stream="dns.query_log",
+                batch_id=uuid.uuid4().hex,
+                received_at=old,
+            )
         )
-    )
-    db_session.add(
-        DNSQueryLogEntry(
-            server_id=server.id,
-            ts=now - timedelta(minutes=10),
-            qname="new.example",
-            raw="new",
-        )
-    )
     await db_session.commit()
 
     result = await _sweep_with_session(db_session)
-    assert result["dns_query_log_removed"] >= 1
-    assert result["retention_hours"] == DEFAULT_RETENTION_HOURS
 
-    remaining = (
-        await db_session.scalar(
-            select(func.count())
-            .select_from(DNSQueryLogEntry)
-            .where(DNSQueryLogEntry.server_id == server.id)
-        )
-        or 0
-    )
-    assert remaining == 1
+    assert result["agent_ingest_receipt_removed"] == 2
+    assert result["failed_tables"] == []
+    assert result["retention_hours"] == DEFAULT_RETENTION_HOURS
+    assert result["rpz_retention_days"] == RPZ_HIT_RETENTION_DAYS
+    assert result["receipt_retention_days"] == RECEIPT_RETENTION_DAYS
+    assert await _count(db_session, AgentIngestReceipt) == 0
 
 
 @pytest.mark.asyncio
-async def test_prune_drops_old_dhcp_keeps_recent(db_session: AsyncSession) -> None:
-    server = await _make_dhcp_server(db_session)
-    now = datetime.now(UTC)
+async def test_sweep_leaves_the_log_tables_to_the_partition_drop(db_session: AsyncSession) -> None:
+    dns = await _make_dns_server(db_session)
+    dhcp = await _make_dhcp_server(db_session)
+    old = datetime.now(UTC) - timedelta(days=20)
+    db_session.add(DNSQueryLogEntry(server_id=dns.id, ts=old, qname="o.example", raw="o"))
+    db_session.add(DHCPLogEntry(server_id=dhcp.id, ts=old, raw="o"))
     db_session.add(
-        DHCPLogEntry(
-            server_id=server.id,
-            ts=now - timedelta(hours=DEFAULT_RETENTION_HOURS + 1),
-            severity="INFO",
-            code="DHCP4_LEASE_ALLOC",
-            raw="old",
-        )
-    )
-    db_session.add(
-        DHCPLogEntry(
-            server_id=server.id,
-            ts=now - timedelta(minutes=5),
-            severity="INFO",
-            code="DHCP4_LEASE_ALLOC",
-            raw="new",
-        )
-    )
-    await db_session.commit()
-
-    result = await _sweep_with_session(db_session)
-    assert result["dhcp_log_removed"] >= 1
-
-    remaining = (
-        await db_session.scalar(
-            select(func.count())
-            .select_from(DHCPLogEntry)
-            .where(DHCPLogEntry.server_id == server.id)
-        )
-        or 0
-    )
-    assert remaining == 1
-
-
-async def _seed_old_rows(db: AsyncSession) -> tuple[uuid.UUID, uuid.UUID]:
-    dns = await _make_dns_server(db)
-    dhcp = await _make_dhcp_server(db)
-    old = datetime.now(UTC) - timedelta(days=60)
-    db.add(DNSQueryLogEntry(server_id=dns.id, ts=old, qname="o.example", raw="o"))
-    db.add(DHCPLogEntry(server_id=dhcp.id, ts=old, raw="o"))
-    db.add(
         DNSRPZHit(server_id=dns.id, ts=old, qname="o.example", trigger="qname", policy="NXDOMAIN")
     )
-    await db.commit()
-    return dns.id, dhcp.id
+    await db_session.commit()
 
+    await _sweep_with_session(db_session)
 
-async def _count(db: AsyncSession, model: type, server_id: uuid.UUID) -> int:
-    return (
-        await db.scalar(
-            select(func.count()).select_from(model).where(model.server_id == server_id)  # type: ignore[attr-defined]
-        )
-        or 0
-    )
+    assert await _count(db_session, DNSQueryLogEntry) == 1
+    assert await _count(db_session, DHCPLogEntry) == 1
+    assert await _count(db_session, DNSRPZHit) == 1
 
 
 @pytest.mark.asyncio
-async def test_prune_all_tables_commit_independently(db_session: AsyncSession) -> None:
-    dns_id, dhcp_id = await _seed_old_rows(db_session)
-    result = await _sweep_with_session(db_session)
-    assert result["failed_tables"] == []
-    assert result["dns_query_log_removed"] >= 1
-    assert result["dhcp_log_removed"] >= 1
-    assert await _count(db_session, DNSQueryLogEntry, dns_id) == 0
-    assert await _count(db_session, DHCPLogEntry, dhcp_id) == 0
-
-
-@pytest.mark.asyncio
-async def test_failed_dns_delete_does_not_roll_back_other_tables(
+async def test_failed_receipt_prune_is_reported_not_raised(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    dns_id, dhcp_id = await _seed_old_rows(db_session)
-    real_execute = db_session.execute
+    async def boom(_db: AsyncSession) -> int:
+        raise RuntimeError("canceling statement: timeout")
 
-    async def flaky(stmt, *a, **kw):  # type: ignore[no-untyped-def]
-        if str(stmt).startswith("DELETE FROM dns_query_log_entry"):
-            raise OperationalError("DELETE", {}, Exception("canceling statement: timeout"))
-        return await real_execute(stmt, *a, **kw)
+    monkeypatch.setattr(prune_logs, "prune_receipts", boom)
 
-    monkeypatch.setattr(db_session, "execute", flaky)
     result = await _sweep_with_session(db_session)
-    monkeypatch.undo()
 
-    assert result["dns_query_log_removed"] == -1
-    assert result["failed_tables"] == ["dns_query_log"]
-    assert result["dhcp_log_removed"] >= 1
-    # The DNS rows survive for the next run; the DHCP delete was committed.
-    assert await _count(db_session, DNSQueryLogEntry, dns_id) == 1
-    assert await _count(db_session, DHCPLogEntry, dhcp_id) == 0
-    assert result["dns_rpz_hit_removed"] >= 1
-    assert await _count(db_session, DNSRPZHit, dns_id) == 0
+    assert result["agent_ingest_receipt_removed"] == FAILED
+    assert result["failed_tables"] == ["agent_ingest_receipt"]
