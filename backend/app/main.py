@@ -363,6 +363,9 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "read", "resource_type": "dns_zone"},
             {"action": "read", "resource_type": "dns_record"},
             {"action": "read", "resource_type": "dhcp_scope"},
+            # The pools a scope holds (#4637): the subnet's DHCP card read them
+            # as "0 pools" without it.
+            {"action": "read", "resource_type": "dhcp_pool"},
             {"action": "read", "resource_type": "tls_cert"},
             {"action": "read", "resource_type": "alert"},
         ],
@@ -370,7 +373,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
     "Compliance Editor": (
         "Full CRUD on conformity policies (issue #106) plus read on the "
         "underlying resources (spaces / blocks / subnets / IPs / zones / "
-        "scopes) so the "
+        "scopes / pools) so the "
         "compliance team can author + tune policies without touching "
         "operational config.",
         [
@@ -388,6 +391,9 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "read", "resource_type": "dns_zone"},
             {"action": "read", "resource_type": "dns_record"},
             {"action": "read", "resource_type": "dhcp_scope"},
+            # The pools a scope holds (#4637): the subnet's DHCP card read them
+            # as "0 pools" without it.
+            {"action": "read", "resource_type": "dhcp_pool"},
             {"action": "read", "resource_type": "alert"},
         ],
     ),

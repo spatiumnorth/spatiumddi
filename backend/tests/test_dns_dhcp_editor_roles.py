@@ -611,3 +611,38 @@ async def test_auditor_reads_the_audit_log(client: AsyncClient, db_session: Asyn
     await db_session.commit()
     _ok(await client.get("/api/v1/audit?limit=5", headers=h), 200)
     _ok(await client.get("/api/v1/audit/integrity", headers=h), 200)
+
+
+@pytest.mark.parametrize("role", ["Auditor", "Compliance Editor", "Viewer"])
+async def test_audit_roles_read_the_pools_of_a_scope(
+    client: AsyncClient, db_session: AsyncSession, role: str
+) -> None:
+    # #4637 — both read scopes but not pools, so the subnet's DHCP card drew the
+    # refused pool read as "0 pools". They read pools now; the Viewer (read on
+    # everything) always could; none of them may write one.
+    h = await _headers(db_session, role=role)
+    editor = await _headers(db_session, role="DHCP Editor")
+    subnet, grp = await _subnet_and_dhcp_group(db_session)
+    scope = DHCPScope(group_id=grp.id, subnet_id=subnet.id, name="s")
+    db_session.add(scope)
+    await db_session.flush()
+    await db_session.commit()
+    s = f"/api/v1/dhcp/scopes/{scope.id}"
+    pool = _ok(
+        await client.post(
+            f"{s}/pools",
+            headers=editor,
+            json={"start_ip": "198.51.100.100", "end_ip": "198.51.100.150"},
+        ),
+        201,
+    )
+    listed = await client.get(f"{s}/pools", headers=h)
+    assert listed.status_code == 200, listed.text
+    assert [p["id"] for p in listed.json()] == [pool["id"]]
+    body = {"start_ip": "198.51.100.160", "end_ip": "198.51.100.170"}
+    r = await client.post(f"{s}/pools", headers=h, json=body)
+    assert r.status_code == 403, r.text
+    r = await client.put(f"/api/v1/dhcp/pools/{pool['id']}", headers=h, json={"name": "x"})
+    assert r.status_code == 403, r.text
+    r = await client.delete(f"/api/v1/dhcp/pools/{pool['id']}", headers=h)
+    assert r.status_code == 403, r.text
