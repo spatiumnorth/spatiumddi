@@ -730,29 +730,28 @@ $(REDIS_PASSWORD) reference secrets; everything else is inline.
 - name: CELERY_RESULT_BACKEND
   value: "redis://{{ include "spatiumddi.redisHost" . }}:{{ include "spatiumddi.redisPort" . }}/2"
 {{- end }}
-{{- if .Values.dnsAgents.enabled }}
-{{/* DNS agent PSK — agents bootstrap-register against the api with
-     this key, so the api / worker pods need it to verify the
-     incoming registration handshake. The Secret is rendered by
-     templates/dns-agent.yaml under the same name + key. */}}
+{{/* #4648 — the agent PSKs are injected whether or not the chart runs
+     in-cluster agents: an appliance agent node joined to a Helm control
+     plane registers with the same keys. The Secret is resolved by
+     spatiumddi.dnsAgentKeySecret / dhcpAgentKeySecret (operator-supplied,
+     else chart-generated). `optional` only matters on a render that cannot
+     generate the Secret (helm template / GitOps diff with no key set). */}}
 - name: DNS_AGENT_KEY
   valueFrom:
     secretKeyRef:
-      name: {{ .Values.dnsAgents.agentKey.existingSecret | default (printf "%s-dns-agent-key" (include "spatiumddi.fullname" .)) }}
+      name: {{ include "spatiumddi.dnsAgentKeySecret" . }}
       key: DNS_AGENT_KEY
-{{- end }}
-{{- if .Values.dhcpAgents.enabled }}
+      optional: true
 {{/* DHCP agent PSK. Agent side env var is SPATIUM_AGENT_KEY, but the
      control plane reads DHCP_AGENT_KEY (see backend/app/api/v1/dhcp/
-     agents.py). The dhcp-agent Secret stores under SPATIUM_AGENT_KEY
-     so we name the env var differently while pointing at the same
-     value. */}}
+     agents.py). The Secret stores under SPATIUM_AGENT_KEY so we name
+     the env var differently while pointing at the same value. */}}
 - name: DHCP_AGENT_KEY
   valueFrom:
     secretKeyRef:
-      name: {{ .Values.dhcpAgents.agentKey.existingSecret | default (printf "%s-dhcp-agent-key" (include "spatiumddi.fullname" .)) }}
+      name: {{ include "spatiumddi.dhcpAgentKeySecret" . }}
       key: SPATIUM_AGENT_KEY
-{{- end -}}
+      optional: true
 {{- end -}}
 
 {{/*
@@ -1296,4 +1295,34 @@ subjects:
     name: {{ . }}
     namespace: {{ $root.Release.Namespace }}
   {{- end }}
+{{- end -}}
+
+{{/*
+#4648 — name of the Secret carrying the DNS / DHCP agent PSK, shared by the
+api / worker env and the in-cluster agents. Precedence: agentKey.existingSecret;
+agentKey.value (the legacy chart-rendered <fullname>-{dns,dhcp}-agent-key
+Secret); an operator-precreated <fullname>-{dns,dhcp}-agent-key found by
+`lookup` (the pre-#4648 convention); else the chart-generated
+<fullname>-agent-keys (templates/agent-keys-secret.yaml).
+*/}}
+{{- define "spatiumddi.dnsAgentKeySecret" -}}
+{{- $legacy := printf "%s-dns-agent-key" (include "spatiumddi.fullname" .) -}}
+{{- if .Values.dnsAgents.agentKey.existingSecret -}}
+{{- .Values.dnsAgents.agentKey.existingSecret -}}
+{{- else if or .Values.dnsAgents.agentKey.value (lookup "v1" "Secret" .Release.Namespace $legacy) -}}
+{{- $legacy -}}
+{{- else -}}
+{{- printf "%s-agent-keys" (include "spatiumddi.fullname" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "spatiumddi.dhcpAgentKeySecret" -}}
+{{- $legacy := printf "%s-dhcp-agent-key" (include "spatiumddi.fullname" .) -}}
+{{- if .Values.dhcpAgents.agentKey.existingSecret -}}
+{{- .Values.dhcpAgents.agentKey.existingSecret -}}
+{{- else if or .Values.dhcpAgents.agentKey.value (lookup "v1" "Secret" .Release.Namespace $legacy) -}}
+{{- $legacy -}}
+{{- else -}}
+{{- printf "%s-agent-keys" (include "spatiumddi.fullname" .) -}}
+{{- end -}}
 {{- end -}}
