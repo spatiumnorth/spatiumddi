@@ -12,6 +12,7 @@ CASES = [
         "Diagnostics → Support bundle",
     ),
     ("services/ai/tools/certificates.py", "Certificates tab's", "Fleet → Web UI Certificate"),
+    ("services/ai/tools/certificates.py", "Fleet → Web UI Certificate.", "'TLS "),  # #4687
     ("api/v1/admin/feature_modules.py", "Settings → Security", "Account → Two-factor"),
     ("services/backup/archive.py", "Platform -> Backup", "Administration -> Backup"),
     ("api/v1/auth/router.py", "Settings > General", "Branding & URL"),
