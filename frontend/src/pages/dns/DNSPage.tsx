@@ -195,6 +195,7 @@ import {
   CHANGE_REQUEST_QUERY_KEY,
   handleApprovalQueued,
 } from "@/lib/approvalQueue";
+import { countNoun } from "@/lib/count-noun";
 
 // #1338 — a read-only user is offered no DNS write it would be refused.
 // Each DNS route needs the HTTP method's action on the type it serves
@@ -2743,7 +2744,7 @@ function DnssecCard({
           className="rounded border border-destructive/40 bg-destructive/10 p-2 text-xs text-destructive"
         >
           <span className="font-medium">
-            Signed by {signingServers} servers.
+            Signed by {countNoun(signingServers, "server")}.
           </span>{" "}
           Every server in this group signs the zone with its own keys, so the DS
           below matches at most one of them and validating resolvers get
@@ -6092,14 +6093,14 @@ export function ZoneDetailView({
       )}
       {confirmBulkDelete && (
         <DeleteChoiceModal
-          title={`Delete ${selectedRecords.size} records`}
+          title={`Delete ${countNoun(selectedRecords.size, "record")}`}
           intro={
             <>
               Delete the{" "}
               <span className="font-medium">{selectedRecords.size}</span>{" "}
-              selected records? Moved to Trash, a superadmin can restore them
-              from Administration → Trash. IPAM-managed records are excluded
-              automatically.
+              selected {selectedRecords.size === 1 ? "record" : "records"}?
+              Moved to Trash, a superadmin can restore them from Administration
+              → Trash. IPAM-managed records are excluded automatically.
             </>
           }
           softHeading="Move to Trash (reversible)"
@@ -7293,7 +7294,7 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
                       <span
                         key={b.id}
                         className="inline-flex items-center rounded bg-rose-500/10 px-1.5 py-0.5 text-xs text-rose-600 dark:text-rose-400"
-                        title={`${b.entry_count.toLocaleString()} entries`}
+                        title={countNoun(b.entry_count, "entry", "entries")}
                       >
                         {b.name}
                       </span>
@@ -11982,7 +11983,7 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                       </span>
                     )}
                     <span className="ml-auto text-xs text-muted-foreground">
-                      {l.entry_count} entries
+                      {countNoun(l.entry_count, "entry", "entries")}
                     </span>
                     <div
                       className="flex items-center gap-1"
@@ -12749,8 +12750,9 @@ export function BlocklistDetail({
           {/* Each count waits for its own read: a refused, failed or
               unanswered one draws none (#3426). */}
           {[
-            page !== undefined && `${total} entries`,
-            exceptionsData !== undefined && `${exceptions.length} exceptions`,
+            page !== undefined && countNoun(total, "entry", "entries"),
+            exceptionsData !== undefined &&
+              countNoun(exceptions.length, "exception"),
           ]
             .filter(Boolean)
             .join(" · ")}
