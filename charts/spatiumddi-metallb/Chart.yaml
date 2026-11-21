@@ -46,3 +46,17 @@ dependencies:
     version: 0.15.3
     repository: https://metallb.github.io/metallb
     condition: metallb.enabled
+# #2245 — frr-k8s as its OWN dependency, not the 0.0.21 subchart vendored
+# inside metallb-0.15.3.tgz. That subchart cannot run a frr-k8s >= v0.0.23
+# binary (native HTTPS metrics instead of kube-rbac-proxy sidecars, a
+# health-probe port that collides with the old --metrics-bind-address, and a
+# new FRRK8sConfiguration CRD + RBAC), and MetalLB itself stays held on 0.15.3
+# (metallb/metallb#3063), so the newer frr-k8s cannot arrive through it. The
+# metallb chart's vendored copy is switched OFF (``metallb.frrk8s.enabled:
+# false``) and the speaker is pointed at this release's frr-k8s instead
+# (``metallb.frrk8s.external: true``); the ``condition`` below is that same
+# flag, so ONE switch brings the dependency up and wires the speaker to it.
+  - name: frr-k8s
+    version: 0.0.27
+    repository: https://metallb.github.io/frr-k8s
+    condition: metallb.frrk8s.external

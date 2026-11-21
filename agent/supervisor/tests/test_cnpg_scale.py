@@ -215,7 +215,7 @@ def test_metallb_bgp_overrides_render(monkeypatch) -> None:
     assert (changed, err) == (True, None)
     body = next(json.loads(b) for m, _, b in rec.calls if m == "POST" and b)
     vals = yaml.safe_load(body["spec"]["valuesContent"])["metallb"]
-    assert vals["frrk8s"] == {"enabled": True}
+    assert vals["frrk8s"] == {"enabled": False, "external": True}
     assert vals["bgp"]["enabled"] is True
     assert vals["bgp"]["peers"] == [
         {
@@ -243,7 +243,7 @@ def test_metallb_bgp_overrides_disabled_shape(monkeypatch) -> None:
     assert (changed, err) == (True, None)
     body = next(json.loads(b) for m, _, b in rec.calls if m == "POST" and b)
     vals = yaml.safe_load(body["spec"]["valuesContent"])["metallb"]
-    assert vals["frrk8s"] == {"enabled": False}
+    assert vals["frrk8s"] == {"enabled": False, "external": False}
     assert vals["bgp"] == {"enabled": False, "peers": [], "advertisements": []}
     assert vals["ipPool"] == {"addresses": ["192.168.0.240/32"]}
 
