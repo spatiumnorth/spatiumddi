@@ -1356,8 +1356,10 @@ async def restore_from_archive(
     # session was closed inside ``apply_backup_restore`` (engine
     # disposed). Same shape the Phase 1a upload-restore endpoint
     # uses.
+    from app.api.v1.backup.router import _restore_note  # noqa: PLC0415
     from app.db import AsyncSessionLocal  # noqa: PLC0415
 
+    note = _restore_note(outcome)
     async with AsyncSessionLocal() as fresh:
         fresh.add(
             AuditLog(
@@ -1374,6 +1376,9 @@ async def restore_from_archive(
                     "filename": body.filename,
                     "manifest": outcome.manifest,
                     "duration_ms": outcome.duration_ms,
+                    # GET /backup/restore/last reads these back (#4676).
+                    "note": note,
+                    "secrets_payload_keys": outcome.secrets_payload_keys,
                     "selective": outcome.selective,
                     "restored_sections": outcome.restored_sections,
                     "pre_restore_safety_path": outcome.pre_restore_path,
