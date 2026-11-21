@@ -237,6 +237,10 @@ ADMIN_PASSWORD_HASH=""
 # the previous behaviour, where root always got it.
 SET_ROOT_PASSWORD="no"
 NET_MODE="dhcp"
+# #4546 - set once the Network screen has been answered, so Keep /var's
+# previous-answer defaults never replace a DHCP answer (whose NET_IP is
+# empty, like an unanswered screen's).
+NET_ANSWERED=""
 NET_INTERFACE=""
 NET_IP=""
 NET_PREFIX="24"
@@ -373,6 +377,33 @@ BOOTSTRAP_PAIRING_CODE=""
 # by the wizard loop. Set only by confirm(), which runs in main's own
 # shell rather than in the gauge subshell, so a variable is fine here.
 CONFIRM_JUMP=""
+
+# #4546 — the screens a Confirm-menu jump still has to re-run after the one
+# the operator picked, because their answers depend on it (a new role needs
+# the URL and code or the CIDRs; a new network needs the CIDR overlap
+# re-checked; a new disk needs the layout acknowledged). main() fills this.
+CONFIRM_DEPS=()
+# Non-empty while the operator is editing from the Confirm menu, so a
+# screen that cannot be changed (a role or CIDRs pinned by Keep /var) says
+# so instead of silently doing nothing.
+CONFIRM_EDITING=""
+# #4546 - what the existing install's STATE says it was built with, read
+# when the operator chooses "Keep /var and STATE". A kept datastore only
+# works with the role and k3s CIDRs it was created under, so these pin the
+# answers; the rest become the defaults of their screens.
+KEPT_ROLE=""
+KEPT_POD_CIDR=""
+KEPT_SVC_CIDR=""
+KEPT_HOSTNAME=""
+KEPT_ADMIN_USER=""
+KEPT_TIMEZONE=""
+KEPT_CONTROL_URL=""
+KEPT_NET_MODE=""
+KEPT_NET_INTERFACE=""
+KEPT_NET_IP=""
+KEPT_NET_PREFIX=""
+KEPT_NET_GATEWAY=""
+KEPT_NET_DNS=""
 BOOT_LEG_MISSING_FILE=/run/spatium-boot-leg-missing
 # #995 item 30 — post-install check failures, for the same subshell reason
 # as the line above.
@@ -791,8 +822,18 @@ ask_keyboard() {
                 --msgbox "'$pick' is not a layout this system can compile.\n\nRun 'localectl list-x11-keymap-layouts' from a shell to see the names." 11 68 || true
         done
     else
-        _apply_keymap "$pick" || \
+        # #4546 — a failed apply was only logged, and the operator went on
+        # to type the admin password on the OLD layout, which is the exact
+        # mangling this screen exists to prevent. Say so and let them
+        # choose again.
+        if ! _apply_keymap "$pick"; then
             log "WARN: could not apply keymap $pick; the console stays on the previous layout"
+            if ! whiptail --backtitle "$BACKTITLE" --title "Layout not applied" \
+                --yes-button "Use $pick anyway" --no-button "Choose again" \
+                --yesno "The '$pick' layout could not be applied to this console, so the next screens still use the PREVIOUS layout - a password with symbols typed there would not match what you meant."$'\n\n'"Use '$pick' for the installed system anyway?" 13 72; then
+                continue
+            fi
+        fi
     fi
     break
     done
@@ -803,9 +844,9 @@ ask_keyboard() {
 # loadkeys the given map. Non-zero when it does not exist, which is what
 # lets the "other" prompt above re-ask instead of accepting a typo.
 #
-# Returns 0 when loadkeys is absent: on a machine without it there is no
-# layout to get wrong, and refusing every name would make the prompt
-# impossible to satisfy.
+# Returns 1 when ckbcomp or loadkeys is absent (#4546): nothing was applied,
+# and saying otherwise lets "other" accept any string. The prompt still has
+# Back, so refusing every name does not trap the operator.
 _apply_keymap() {
     # #1003 item 1a — this used to be `loadkeys -- "$1"`, and it could
     # NEVER succeed. The image has no keymaps at all: Debian ships them in
@@ -825,8 +866,12 @@ _apply_keymap() {
     # is also the mechanism console-setup itself uses on the installed
     # system, so the live console and the installed console now agree
     # rather than being configured two different ways.
-    command -v ckbcomp >/dev/null 2>&1 || return 0
-    command -v loadkeys >/dev/null 2>&1 || return 0
+    # #4546 — a missing tool is a FAILURE, not "nothing to get wrong".
+    # Returning success here made the "Something else" prompt accept any
+    # string at all, which was then written to /etc/default/keyboard; and
+    # told the operator a listed layout had been applied when nothing had.
+    command -v ckbcomp >/dev/null 2>&1 || { log "WARN: ckbcomp not found - cannot apply keymap $1"; return 1; }
+    command -v loadkeys >/dev/null 2>&1 || { log "WARN: loadkeys not found - cannot apply keymap $1"; return 1; }
     local xkb_layout xkb_variant xkb_model
     _keymap_to_xkb "$1"
     # Array, not `${v:+-variant $v}`: an empty variant must contribute NO
@@ -1079,7 +1124,7 @@ ask_ssh_keys() {
             --cancel-button "Back" \
             --menu "Authorise an SSH key for '$ADMIN_USER'?\n\nOptional — password SSH works either way. Currently held: $(_ssh_key_count) key(s)." \
             17 74 4 \
-            "skip"   "No key — password SSH only" \
+            "skip"   "$([ "$(_ssh_key_count)" -gt 0 ] && echo "Remove the keys above — password SSH only" || echo "No key — password SSH only")" \
             "paste"  "Paste a public key" \
             "url"    "Fetch from a URL (or a GitHub username)" \
             "done"   "Finished — continue with the keys above" \
@@ -1087,6 +1132,14 @@ ask_ssh_keys() {
             || return 1
         case "$choice" in
             skip)
+                # #4546 — coming back to this screen from Confirm with keys
+                # already added, the first row cleared them without a word.
+                if [ "$(_ssh_key_count)" -gt 0 ] && ! whiptail --backtitle "$BACKTITLE" \
+                    --title "Remove the keys?" --defaultno \
+                    --yes-button "Remove them" --no-button "Keep them" \
+                    --yesno "$(_ssh_key_count) key(s) have been added for '$ADMIN_USER'. Remove all of them?" 9 70; then
+                    continue
+                fi
                 SSH_AUTHORIZED_KEYS=""
                 SSH_DISABLE_PASSWORD="no"
                 log "SSH: no authorized key"
@@ -1203,6 +1256,19 @@ ask_role() {
     log "Step: ask_role"
     if [ -n "${PRESEED_HAS_ROLE:-}" ]; then
         log "Preseed: role=$ROLE (skipping prompt)"
+        return 2
+    fi
+    # #4546 — Keep /var and STATE pins the role: the kept database and k3s
+    # datastore were built for it, and a reinstall as the other role leaves
+    # a node that cannot use them. Chosen on the disk screen, which comes
+    # after this one, so this is reached on a Back walk or a Confirm jump.
+    if [ "$KEEP_VAR" = "yes" ] && [ -n "$KEPT_ROLE" ]; then
+        ROLE="$KEPT_ROLE"
+        if [ -n "$CONFIRM_EDITING" ]; then
+            whiptail --backtitle "$BACKTITLE" --title "Role is fixed" \
+                --msgbox "This reinstall keeps /var and STATE, which were built for the role \"$ROLE\"."$'\n\n'"To change the role, choose \"Erase everything\" on the disk screen." 11 72 || true
+        fi
+        log "Role pinned to $ROLE by the kept data"
         return 2
     fi
     # #272 UX — reframe the install role around the decision operators
@@ -1378,9 +1444,35 @@ ask_application_config() {
                 --inputbox "Where does this Additional node register?\n\nFormat: https://<control-plane-host>/  — the address you open the SpatiumDDI web UI on. This node registers there, waits as \"pending\" until an admin approves it under Appliance -> Fleet, then joins.\n\nHA TIP: if the control plane is a multi-node cluster, point this at the MetalLB virtual IP (VIP), NOT a single node's IP — otherwise this appliance loses its control plane whenever that one node is down. Configure the VIP under Appliance -> Network & Host on the control plane.\n\nUse https:// in production; http:// is acceptable for lab installs." \
                 21 78 -- "$default_url" 3>&1 1>&2 2>&3) \
                 || return 1
+            # Trim only the ends: an inner space is an error to report,
+            # not something to quietly close up.
+            CONTROL_PLANE_URL="${CONTROL_PLANE_URL#"${CONTROL_PLANE_URL%%[![:space:]]*}"}"
+            CONTROL_PLANE_URL="${CONTROL_PLANE_URL%"${CONTROL_PLANE_URL##*[![:space:]]}"}"
             if [ -z "$CONTROL_PLANE_URL" ] || [ "$CONTROL_PLANE_URL" = "https://" ]; then
                 whiptail --msgbox "Control-plane URL is required for an Additional node." 8 62 || true
                 continue
+            fi
+            # #4546 — one shared rule (spatium-preseed-parse
+            # --check-field control_plane_url), the same one the preseed
+            # parser applies. Only "not empty" was checked, so a value with
+            # a space or a quote went into a quoted YAML string in
+            # spatium-config.yaml and a bare line in role-config.
+            local url_msg
+            if ! url_msg=$(_check_field control_plane_url "$CONTROL_PLANE_URL"); then
+                whiptail --backtitle "$BACKTITLE" --title "Control plane URL — invalid" \
+                    --msgbox "$url_msg" 11 72 || true
+                continue
+            fi
+            # A usable but plain-http URL sends the pairing code in clear:
+            # say so and make the operator choose it.
+            if [ -n "$url_msg" ]; then
+                if ! whiptail --backtitle "$BACKTITLE" --title "Plain http" \
+                    --defaultno --yes-button "Use http anyway" --no-button "Change it" \
+                    --yesno "$url_msg"$'\n\n'"Use $CONTROL_PLANE_URL anyway?" 13 72; then
+                    default_url="$CONTROL_PLANE_URL"
+                    continue
+                fi
+                log "Operator accepted a plain-http control-plane URL: $CONTROL_PLANE_URL"
             fi
             # #995 item 13 — probe before the disk is touched. A typo here
             # is otherwise discovered on the first boot of the installed
@@ -1959,6 +2051,162 @@ _ask_mirror_disk() {
     return 0
 }
 
+# #4546 — read the previous install's answers from its STATE partition.
+#
+# "Keep /var and STATE" used to ignore what it keeps: every screen started
+# blank, and a role, k3s CIDRs or hostname different from the kept
+# datastore's were accepted (a CIDR mismatch stops k3s). STATE holds the
+# machine config and the exported answer file, so read them. Mounted
+# read-only and without journal replay, for the same reason
+# _existing_install_version does it: enumeration must not write to a disk
+# the operator may still back out of. Nothing is evaluated: values are
+# read as plain text and only known keys are kept.
+#
+# Fills KEPT_*; all empty when STATE cannot be read.
+_load_kept_answers() {
+    KEPT_ROLE="" KEPT_POD_CIDR="" KEPT_SVC_CIDR="" KEPT_HOSTNAME=""
+    KEPT_ADMIN_USER="" KEPT_TIMEZONE="" KEPT_CONTROL_URL="" KEPT_NET_MODE=""
+    KEPT_NET_INTERFACE="" KEPT_NET_IP="" KEPT_NET_PREFIX="" KEPT_NET_GATEWAY=""
+    KEPT_NET_DNS=""
+    local dev="$1" state_dev mnt out k v
+    state_dev=$(_labelled_device_on "$dev" state) || return 0
+    mnt=$(mktemp -d) || return 0
+    if ! { timeout 10 mount -o ro,noload "$state_dev" "$mnt" 2>/dev/null \
+           || timeout 10 mount -o ro "$state_dev" "$mnt" 2>/dev/null; }; then
+        rmdir "$mnt" 2>/dev/null || true
+        log "Keep /var: could not mount STATE ($state_dev) to read the previous answers"
+        return 0
+    fi
+    out=$(_read_kept_answers "$mnt") || out=""
+    umount "$mnt" 2>/dev/null || true
+    rmdir "$mnt" 2>/dev/null || true
+    _set_kept_answers "$out"
+    log "Keep /var: previous answers read (role=${KEPT_ROLE:-?} pod=${KEPT_POD_CIDR:-?} svc=${KEPT_SVC_CIDR:-?})"
+}
+
+# Prints KEY=value lines for the answers in a mounted STATE directory
+# ($1). Plain-text parse, nothing evaluated.
+_read_kept_answers() {
+    python3 - "$1" <<'PY' 2>/dev/null
+import re
+import sys
+
+root = sys.argv[1]
+
+
+def lines(name):
+    try:
+        with open(f"{root}/{name}", encoding="utf-8", errors="replace") as fh:
+            return fh.read().splitlines()
+    except OSError:
+        return []
+
+
+def val(raw):
+    raw = raw.strip()
+    m = re.match(r'^"([^"\\]*)"', raw) or re.match(r"^'([^']*)'", raw)
+    return m.group(1) if m else raw.split("#")[0].strip()
+
+
+want = dict(
+    role="ROLE", hostname="HOSTNAME", admin_user="ADMIN_USER",
+    control_plane_url="CONTROL_URL", network_mode="NET_MODE",
+    network_interface="NET_INTERFACE", network_ip="NET_IP",
+    network_prefix="NET_PREFIX", network_gateway="NET_GATEWAY",
+    network_dns="NET_DNS",
+)
+out = {}
+for ln in lines("spatium-config.yaml"):
+    m = re.match(r"^([a-z_0-9]+):\s*(.*)$", ln)
+    if m and m.group(1) in want:
+        out[want[m.group(1)]] = val(m.group(2))
+names = dict(pod_cidr="POD_CIDR", service_cidr="SVC_CIDR", timezone="TIMEZONE")
+for ln in lines("spatium-preseed.yaml"):
+    m = re.match(r"^\s+(pod_cidr|service_cidr|timezone):\s*(.*)$", ln)
+    if m:
+        out[names[m.group(1)]] = val(m.group(2))
+for k, v in out.items():
+    print(f"{k}={v}")
+PY
+}
+
+# Take the KEY=value lines _read_kept_answers prints into KEPT_*.
+_set_kept_answers() {
+    local k v
+    while IFS='=' read -r k v; do
+        case "$k" in
+            ROLE) case "$v" in control-plane|appliance) KEPT_ROLE="$v" ;; esac ;;
+            POD_CIDR) KEPT_POD_CIDR="$v" ;;
+            SVC_CIDR) KEPT_SVC_CIDR="$v" ;;
+            HOSTNAME) KEPT_HOSTNAME="$v" ;;
+            ADMIN_USER) KEPT_ADMIN_USER="$v" ;;
+            TIMEZONE) KEPT_TIMEZONE="$v" ;;
+            CONTROL_URL) KEPT_CONTROL_URL="$v" ;;
+            NET_MODE) case "$v" in dhcp|static) KEPT_NET_MODE="$v" ;; esac ;;
+            NET_INTERFACE) KEPT_NET_INTERFACE="$v" ;;
+            NET_IP) KEPT_NET_IP="$v" ;;
+            NET_PREFIX) KEPT_NET_PREFIX="$v" ;;
+            NET_GATEWAY) KEPT_NET_GATEWAY="$v" ;;
+            NET_DNS) KEPT_NET_DNS="$v" ;;
+        esac
+    done <<< "$1"
+}
+
+# Are the k3s CIDRs pinned to the kept datastore's? Only for a control
+# plane: an Additional node writes none (#995 item 14).
+_keep_var_pins_cidrs() {
+    [ "$KEEP_VAR" = "yes" ] && [ "$ROLE" != "appliance" ] \
+        && [ -n "$KEPT_POD_CIDR" ] && [ -n "$KEPT_SVC_CIDR" ]
+}
+
+# Make the kept previous answers the defaults of their screens, and pin the
+# role. Each is applied only where the operator has not already answered
+# (or a preseed has not), because a default must never overwrite an
+# answer. Returns 1 when the operator declines the role switch, which the
+# caller treats as "pick another disk".
+_apply_kept_answers() {
+    if [ -n "$KEPT_ROLE" ] && [ "$KEPT_ROLE" != "$ROLE" ]; then
+        local kept_label
+        case "$KEPT_ROLE" in
+            control-plane) kept_label="First node (control plane)" ;;
+            *) kept_label="Additional node" ;;
+        esac
+        if ! whiptail --backtitle "$BACKTITLE" --title "Role is fixed by the kept data" \
+            --yes-button "Switch to it" --no-button "Pick another disk" \
+            --yesno "The data being kept was built as: $kept_label."$'\n\n'"A different role cannot reuse it (the database and k3s datastore belong to that role), so a reinstall that keeps /var has to stay as $kept_label."$'\n\n'"Switch this install to $kept_label? Choose \"Erase everything\" on the disk screen instead to change the role." 17 74; then
+            return 1
+        fi
+        log "Keep /var: role $ROLE -> $KEPT_ROLE to match the kept data"
+        ROLE="$KEPT_ROLE"
+    fi
+    if [ -z "${PRESEED_HAS_HOSTNAME:-}" ] && [ -z "$HOSTNAME" ]; then HOSTNAME="$KEPT_HOSTNAME"; fi
+    if [ -z "${PRESEED_HAS_ADMIN_USER:-}" ] && [ "$ADMIN_USER" = "admin" ] && [ -n "$KEPT_ADMIN_USER" ]; then
+        ADMIN_USER="$KEPT_ADMIN_USER"
+    fi
+    if [ -z "${PRESEED_HAS_TIMEZONE:-}" ] && [ "$TIMEZONE" = "UTC" ] && [ -n "$KEPT_TIMEZONE" ]; then
+        TIMEZONE="$KEPT_TIMEZONE"
+    fi
+    if [ "$ROLE" = "appliance" ] && [ -z "${PRESEED_HAS_CONTROL_URL:-}" ] && [ -z "$CONTROL_PLANE_URL" ]; then
+        CONTROL_PLANE_URL="$KEPT_CONTROL_URL"
+    fi
+    if [ -z "${PRESEED_HAS_NETWORK:-}" ] && [ -n "$KEPT_NET_MODE" ] && [ -z "$NET_IP" ] \
+       && [ -z "${NET_ANSWERED:-}" ]; then
+        NET_MODE="$KEPT_NET_MODE"
+        NET_INTERFACE="$KEPT_NET_INTERFACE"
+        if [ "$KEPT_NET_MODE" = "static" ]; then
+            NET_IP="$KEPT_NET_IP"
+            [ -n "$KEPT_NET_PREFIX" ] && NET_PREFIX="$KEPT_NET_PREFIX"
+            NET_GATEWAY="$KEPT_NET_GATEWAY"
+            [ -n "$KEPT_NET_DNS" ] && NET_DNS="$KEPT_NET_DNS"
+        fi
+    fi
+    if _keep_var_pins_cidrs; then
+        K3S_POD_CIDR=$(_k3s_cidr_canonical "$KEPT_POD_CIDR")
+        K3S_SERVICE_CIDR=$(_k3s_cidr_canonical "$KEPT_SVC_CIDR")
+    fi
+    return 0
+}
+
 # #4551 — the tail of a disk's serial number as " S/N <tail>", or nothing.
 # The tail, because vendors put the distinguishing digits last and the
 # whole string (40 chars on some NVMe) would not fit the menu row.
@@ -2184,6 +2432,22 @@ pick_disk() {
                         esac
                     done
                 fi
+                # #4546 — read what the kept data was built with, and hold
+                # the role and CIDRs to it. Declining the role switch is
+                # "pick another disk".
+                KEPT_ROLE="" KEPT_POD_CIDR="" KEPT_SVC_CIDR=""
+                if [ "$KEEP_VAR" = "yes" ]; then
+                    local role_was="$ROLE"
+                    _load_kept_answers "$TARGET_DISK"
+                    # The sizing gate above ran for the role chosen before
+                    # the kept data overrode it.
+                    if ! _apply_kept_answers || \
+                       { [ "$ROLE" != "$role_was" ] && ! _control_plane_sizing_ok "$DISK_BYTES"; }; then
+                        KEEP_VAR="no"
+                        ROLE="$role_was"
+                        continue
+                    fi
+                fi
                 log "Picked target disk $TARGET_DISK (${TARGET_DISK_BY_ID:-no by-id name}) ($((DISK_BYTES / 1024 / 1024 / 1024)) GiB) keep_var=$KEEP_VAR"
                 # #999 Part C2 — offer the mirror. Only after the target
                 # is settled, and never on the reinstall path: KEEP_VAR
@@ -2283,9 +2547,21 @@ confirm_partition_layout() {
     var_gib=$(( disk_gib - 17 - 1 ))
     [ "$var_gib" -lt 1 ] && var_gib=1
 
-    local layout
-    layout="Layout to be created on $TARGET_DISK ($disk_gib GiB):\n\n"
-    layout+="  p1  BIOS boot   1 MiB    legacy boot chain-load\n"
+    # #4546 — the wording follows the earlier answers. A mirror writes two
+    # disks and the screen named one; Keep /var reuses the table and erases
+    # nothing but the two OS slots, and the screen still said "ALL EXISTING
+    # DATA ... ERASED" and demanded a tick to that effect; and arm64 has no
+    # BIOS boot partition (_BIOS_BOOT_ARGS is empty there).
+    local disks_label="$TARGET_DISK"
+    [ "$MIRROR_MODE" = "yes" ] && disks_label="$TARGET_DISK and $TARGET_DISK2"
+    local layout bios_row=""
+    [ "$TARGET_ARCH" != "arm64" ] && bios_row="  p1  BIOS boot   1 MiB    legacy boot chain-load\n"
+    if [ "$KEEP_VAR" = "yes" ]; then
+        layout="Existing layout on $TARGET_DISK ($disk_gib GiB), reused as it is:\n\n"
+    else
+        layout="Layout to be created on $disks_label ($disk_gib GiB):\n\n"
+    fi
+    layout+="$bios_row"
     layout+="  p2  ESP       512 MiB    /boot/efi (FAT32)\n"
     layout+="  p3  STATE     256 MiB    /var/lib/spatium-state\n"
     layout+="                           machine config + SSH host keys +\n"
@@ -2293,24 +2569,33 @@ confirm_partition_layout() {
     layout+="                           slot swaps + a /var factory reset)\n"
     layout+="  p4  root_A      8 GiB    active OS slot (this install)\n"
     layout+="  p5  root_B      8 GiB    standby OS slot (next upgrade)\n"
-    layout+="  p6  var       ~$var_gib GiB    /var — database, k3s, logs\n\n"
-    layout+="ALL EXISTING DATA on $TARGET_DISK will be ERASED.\n"
-    layout+="There is no undo.\n\n"
+    if [ "$KEEP_VAR" = "yes" ]; then
+        layout+="  p6  var       KEPT       /var — database, k3s, logs\n\n"
+        layout+="Both OS slots on $TARGET_DISK are REPLACED. /var and STATE\n"
+        layout+="are kept. There is no undo.\n\n"
+    else
+        layout+="  p6  var       ~$var_gib GiB    /var — database, k3s, logs\n\n"
+        layout+="ALL EXISTING DATA on $disks_label will be ERASED.\n"
+        layout+="There is no undo.\n\n"
+    fi
     layout+="Tick the box and choose OK to proceed, or Back to pick\n"
     layout+="a different disk."
+
+    local tick_label="I understand all data on $disks_label will be erased"
+    [ "$KEEP_VAR" = "yes" ] && tick_label="I understand both OS slots on $TARGET_DISK will be replaced"
 
     while true; do
         local choice
         choice=$(whiptail --backtitle "$BACKTITLE" --title "Confirm Partition Layout" \
             --cancel-button "Back" \
             --checklist "$layout" 24 76 1 \
-            "erase" "I understand all data on $TARGET_DISK will be erased" OFF \
+            "erase" "$tick_label" OFF \
             3>&1 1>&2 2>&3) \
             || return 1
         # whiptail returns the ticked tags quoted, e.g. "erase".
         case "$choice" in
             *erase*)
-                log "Operator confirmed partition layout for $TARGET_DISK"
+                log "Operator confirmed partition layout for $disks_label"
                 return 0
                 ;;
             *)
@@ -2748,7 +3033,9 @@ _ask_mtu() {
     done
 }
 
-_validate_static_net() {
+# #4546 — the checks that need no dependency on the parser: shapes and
+# reachability (gateway on-link, resolver syntax, the IPv6 block).
+_validate_static_net_shape() {
     python3 - "$NET_IP" "$NET_PREFIX" "$NET_GATEWAY" "$NET_DNS" \
              "$NET6_MODE" "$NET6_IP" "$NET6_PREFIX" "$NET6_GATEWAY" <<'PY' 2>&1
 import ipaddress
@@ -2867,6 +3154,54 @@ if errs:
 PY
 }
 
+# #4546 — the whole static-IPv4 verdict: the shape checks above plus the
+# host-address rules shared with the preseed parser (network / broadcast
+# address, loopback, multicast, unspecified, gateway == the host itself).
+# One rule set, reached through --check-field like the MTU and URL rules, so
+# the wizard and a headless answer file cannot disagree. Prints the
+# problem(s) and returns 1; the exit status decides, not the output.
+_validate_static_net() {
+    local shape_out shape_rc=0 host_out host_rc=0
+    shape_out=$(_validate_static_net_shape) || shape_rc=$?
+    host_out=$(_check_field static_v4 "$NET_IP" "$NET_PREFIX" "$NET_GATEWAY") || host_rc=$?
+    if [ "$shape_rc" -eq 0 ] && [ "$host_rc" -eq 0 ]; then
+        return 0
+    fi
+    [ "$shape_rc" -ne 0 ] && printf '%s\n' "$shape_out"
+    [ "$host_rc" -ne 0 ] && printf '%s\n' "$host_out"
+    return 1
+}
+
+# #4546 — a netmask typed the way operators say it. "Prefix length" is the
+# label, but 255.255.255.0 is what most people have in their head, and the
+# check used to answer it with "Prefix must be a whole number". Prints the
+# prefix length for a dotted mask (contiguous ones only), strips a leading
+# "/", and leaves anything else untouched for the validator to explain.
+_netmask_to_prefix() {
+    local v="${1//[[:space:]]/}"
+    v="${v#/}"
+    if [[ "$v" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+        local o bits=0 seen_zero=0 oct b ok=1
+        for o in 1 2 3 4; do
+            oct="${BASH_REMATCH[$o]}"
+            if [ "$((10#$oct))" -gt 255 ]; then ok=0; break; fi
+            for b in 128 64 32 16 8 4 2 1; do
+                if [ $((10#$oct & b)) -ne 0 ]; then
+                    [ "$seen_zero" = 1 ] && ok=0
+                    bits=$((bits + 1))
+                else
+                    seen_zero=1
+                fi
+            done
+        done
+        if [ "$ok" = 1 ]; then
+            printf '%s' "$bits"
+            return 0
+        fi
+    fi
+    printf '%s' "$v"
+}
+
 ask_network() {
     log "Step: ask_network"
     if [ -n "${PRESEED_HAS_NETWORK:-}" ]; then
@@ -2895,11 +3230,13 @@ ask_network() {
     fi
     NET_MODE=$(whiptail --backtitle "$BACKTITLE" --title "Network" \
         --cancel-button "Back" \
+        --default-item "$NET_MODE" \
         --menu "How should the appliance configure its network?" 12 70 2 \
         "dhcp"   "Automatic via DHCP (recommended for evaluation)" \
         "static" "Static IP" \
         3>&1 1>&2 2>&3) \
         || return 1
+    NET_ANSWERED=1
 
     # A re-answer must not carry the previous one's IPv6 forward. These
     # were only ever reset inside the static branch, so static -> Back ->
@@ -3018,8 +3355,9 @@ ask_network() {
                 || return 1
             NET_PREFIX=$(whiptail --backtitle "$BACKTITLE" --title "Static IP - prefix" \
                 --cancel-button "Back" \
-                --inputbox "Prefix length:" 10 60 -- "$NET_PREFIX" 3>&1 1>&2 2>&3) \
+                --inputbox "Prefix length (24) or netmask (255.255.255.0):" 10 60 -- "$NET_PREFIX" 3>&1 1>&2 2>&3) \
                 || return 1
+            NET_PREFIX=$(_netmask_to_prefix "$NET_PREFIX")
             NET_GATEWAY=$(whiptail --backtitle "$BACKTITLE" --title "Static IP - gateway" \
                 --cancel-button "Back" \
                 --inputbox "Gateway:" 10 60 -- "$NET_GATEWAY" 3>&1 1>&2 2>&3) \
@@ -3069,6 +3407,20 @@ ask_network() {
             # above, through a wrapper that keeps stderr out of the way.
             local nerr
             if nerr=$(_validate_static_net); then
+                # #4546 — an empty resolver list was written as ``dns=;``
+                # and the appliance came up unable to resolve anything,
+                # including the control plane's name. Allowed, but only
+                # when it is a decision.
+                NET_DNS=$(printf '%s' "$NET_DNS" | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//')
+                if [ -z "$NET_DNS" ]; then
+                    if ! whiptail --backtitle "$BACKTITLE" --title "No DNS server" \
+                        --defaultno --yes-button "No DNS" --no-button "Enter one" \
+                        --yesno "No DNS server was entered.\n\nThe appliance will not be able to resolve names, including the control plane's and the time source's, unless they are given as addresses.\n\nContinue without DNS?" \
+                        14 70; then
+                        continue
+                    fi
+                    log "Operator confirmed a static network with no DNS server"
+                fi
                 break
             fi
             whiptail --backtitle "$BACKTITLE" --title "Static network — invalid" \
@@ -3215,6 +3567,28 @@ ask_k3s_cidrs() {
         return 2
     fi
     log "Step: ask_k3s_cidrs"
+    # #4546 — a kept datastore refuses any other cluster-cidr /
+    # service-cidr (k3s compares them at start and stops on a mismatch),
+    # so on a reinstall that keeps /var they are not a choice. If they now
+    # collide with the LAN the operator has to be told, not given a screen
+    # that cannot fix it: the way out is the network, or erasing.
+    if _keep_var_pins_cidrs; then
+        K3S_POD_CIDR=$(_k3s_cidr_canonical "$KEPT_POD_CIDR")
+        K3S_SERVICE_CIDR=$(_k3s_cidr_canonical "$KEPT_SVC_CIDR")
+        local pin_err
+        pin_err=$(_k3s_cidr_error "$K3S_POD_CIDR" "$K3S_SERVICE_CIDR" "$(_dhcp_lease_subnet)")
+        if [ -n "$pin_err" ] || [ -n "$CONFIRM_EDITING" ]; then
+            local pin_msg
+            pin_msg="This reinstall keeps /var and STATE, which were built with pod $K3S_POD_CIDR and service $K3S_SERVICE_CIDR. k3s will not start with any other ranges, so they cannot be changed here."
+            if [ -n "$pin_err" ]; then
+                pin_msg+=$'\n\n'"PROBLEM: $pin_err"$'\n\n'"Change the network so it does not overlap them, or choose \"Erase everything\" on the disk screen."
+            fi
+            whiptail --backtitle "$BACKTITLE" --title "k3s ranges are fixed" \
+                --msgbox "$pin_msg" 16 74 || true
+        fi
+        log "k3s CIDRs pinned to the kept data: pod=$K3S_POD_CIDR svc=$K3S_SERVICE_CIDR"
+        return 2
+    fi
     if [ -n "${PRESEED_HAS_K3S:-}" ]; then
         if [ -n "${PRESEED_HAS_NETWORK:-}" ]; then
             K3S_POD_CIDR=$(_k3s_cidr_canonical "$K3S_POD_CIDR")
@@ -3593,12 +3967,16 @@ confirm() {
         s+="             $role_detail\n"
     fi
     if [ "$ROLE" = "appliance" ]; then
-        s+="Control URL: $CONTROL_PLANE_URL\n"
+        s+="Control URL: ${CONTROL_PLANE_URL:-<NOT SET - use Control plane below>}\n"
         # Mask the code in the confirmation screen — the IPMI / serial
         # console operator already typed it; no need to flash all 8
         # digits back at them. ●●●●●●●● is enough confirmation that
         # something landed.
-        s+="Pair code:   ●●●●●●●●\n"
+        if [ -n "$BOOTSTRAP_PAIRING_CODE" ]; then
+            s+="Pair code:   ●●●●●●●●\n"
+        else
+            s+="Pair code:   <NOT SET - use Control plane below>\n"
+        fi
     fi
     s+="Target disk: $TARGET_DISK\n"
     # #999 Part C2 — a mirror changes what "ERASED" covers, so it is named
@@ -3621,6 +3999,12 @@ confirm() {
         s+=" (on $NET_INTERFACE)"
     else
         s+=" (any port)"
+    fi
+    # #4546 — the resolvers were the one static-network answer the review
+    # left out, so a mistyped DNS server was invisible until the wipe had
+    # run. DHCP takes them from the lease and has nothing to show.
+    if [ "$NET_MODE" = "static" ]; then
+        s+="\nDNS:         ${NET_DNS:-none (no resolver)}"
     fi
     if [ "$NET6_MODE" = "static" ]; then
         s+="\nIPv6:        $NET6_IP/$NET6_PREFIX${NET6_GATEWAY:+ via $NET6_GATEWAY}"
@@ -3680,14 +4064,22 @@ confirm() {
     # Only show the k3s CIDR row when the operator overrode either
     # default — keeps the confirm screen short for the common case.
     # ...and never for an Additional node, which pins none (#995 item 14).
+    # #4546 — ...but on a reinstall that keeps /var they are pinned to what
+    # the kept datastore was built with, so they are always shown.
     if [ "$ROLE" != "appliance" ] && { [ "$K3S_POD_CIDR" != "10.42.0.0/16" ] || \
-         [ "$K3S_SERVICE_CIDR" != "10.43.0.0/16" ]; }; then
+         [ "$K3S_SERVICE_CIDR" != "10.43.0.0/16" ] || [ "$KEEP_VAR" = "yes" ]; }; then
         s+="K3s pod CIDR: $K3S_POD_CIDR\n"
         s+="K3s svc CIDR: $K3S_SERVICE_CIDR\n"
     fi
     if [ "$KEEP_VAR" = "yes" ]; then
         s+="\nREINSTALL: both OS slots on $TARGET_DISK are replaced.\n"
-        s+="/var and STATE are KEPT. There is no undo.\n\n"
+        s+="/var and STATE are KEPT. There is no undo.\n"
+        if [ -n "$KEPT_ROLE" ]; then
+            s+="Role$([ "$ROLE" != "appliance" ] && echo " and k3s CIDRs") are fixed to what the kept data was built with.\n"
+        else
+            s+="WARNING: the previous answers could not be read, so nothing was checked against the kept data: the role and k3s CIDRs must match what it was built with, or k3s will not start.\n"
+        fi
+        s+="\n"
     elif [ "$MIRROR_MODE" = "yes" ]; then
         s+="\nWARNING: BOTH $TARGET_DISK and $TARGET_DISK2 will be ERASED.\n"
         s+="There is no undo.\n\n"
@@ -3728,6 +4120,15 @@ confirm() {
 
     CONFIRM_JUMP=""
     local pick
+    # #4546 — rows for the two role-dependent answers that had none (they
+    # could only be reached by walking Back through every screen). Each is
+    # shown only for the role it belongs to.
+    local -a _role_rows=()
+    if [ "$ROLE" = "appliance" ]; then
+        _role_rows=("ask_application_config" "Control plane       $(_ellipsis "${CONTROL_PLANE_URL:-<not set>}" "$_CONF_VAL_COLS")")
+    else
+        _role_rows=("ask_k3s_cidrs" "k3s networking      $(_ellipsis "$K3S_POD_CIDR $K3S_SERVICE_CIDR" "$_CONF_VAL_COLS")")
+    fi
     # --default-item is a field row, never `install`: this is the last
     # screen before an irreversible wipe and a reflexive Enter must not
     # be the thing that starts it. `install` is also LAST in the list,
@@ -3735,9 +4136,10 @@ confirm() {
     pick=$(whiptail --backtitle "$BACKTITLE" --title "Confirm" \
         --cancel-button "Back" \
         --default-item "pick_disk" \
-        --menu "Change a field, or choose Install to begin." 20 "$_CONF_MENU_W" 11 \
+        --menu "Change a field, or choose Install to begin." 21 "$_CONF_MENU_W" 12 \
         "pick_disk"     "Target disk        $(_ellipsis "$TARGET_DISK" "$_CONF_VAL_COLS")" \
         "ask_role"      "Role               $ROLE" \
+        "${_role_rows[@]}" \
         "ask_hostname"  "Hostname           $(_ellipsis "$HOSTNAME" "$_CONF_VAL_COLS")" \
         "ask_user_password" "Admin account      $(_ellipsis "$ADMIN_USER" "$_CONF_VAL_COLS")" \
         "ask_ssh_keys"  "SSH keys           $nkeys authorised" \
@@ -3753,6 +4155,69 @@ confirm() {
         log "Confirm: operator jumped to $pick"
         return 1
     fi
+    # #4546 — Install is refused while the answers contradict each other.
+    # The dependent screens re-run after an edit, but Back out of one of
+    # them leaves the contradiction in place, and this is the last screen
+    # before the wipe. Send the operator to the screen that fixes it.
+    local problem
+    problem=$(_install_consistency_problem)
+    if [ -n "$problem" ]; then
+        whiptail --backtitle "$BACKTITLE" --title "Cannot install yet" \
+            --msgbox "${problem#*$'\t'}"$'\n\n'"Nothing has been written." 14 72 || true
+        CONFIRM_JUMP="${problem%%$'\t'*}"
+        log "Confirm: install refused (${problem%%$'\t'*}): ${problem#*$'\t'}"
+        return 1
+    fi
+}
+
+# #4546 — do the answers contradict each other? Prints "<step>\t<why>" for
+# the first problem, nothing when consistent. The state machine re-runs the
+# screens that depend on an edited one, and this is what holds when it
+# could not: Confirm refuses Install on it and do_install asserts it again.
+#   * an Additional node with no control-plane URL or no pairing code
+#     boots with nothing to register against;
+#   * a control plane whose k3s CIDRs overlap the LAN (the overlap check
+#     ran when the CIDRs were chosen, before a later network edit).
+# ``$1`` is ``unattended`` when called from do_install on a headless run,
+# where the DHCP lease of the machine running the installer says nothing
+# the answer file's author could have known (same contract as
+# --check-preseed).
+_install_consistency_problem() {
+    local err lan=""
+    if [ "$ROLE" = "appliance" ]; then
+        if [ -z "$CONTROL_PLANE_URL" ] || [ -z "$BOOTSTRAP_PAIRING_CODE" ]; then
+            printf 'ask_application_config\tAn Additional node needs the control-plane URL and a pairing code, and %s is empty.' \
+                "$([ -z "$CONTROL_PLANE_URL" ] && echo "the URL" || echo "the pairing code")"
+        fi
+        return 0
+    fi
+    # Pinned CIDRs cannot be edited, so refusing on them would be a trap;
+    # ask_k3s_cidrs tells the operator about an overlap instead.
+    _keep_var_pins_cidrs && return 0
+    [ "${1:-}" = "unattended" ] || lan=$(_dhcp_lease_subnet)
+    err=$(_k3s_cidr_error "$K3S_POD_CIDR" "$K3S_SERVICE_CIDR" "$lan")
+    if [ -n "$err" ]; then
+        printf 'ask_k3s_cidrs\t%s' "$err"
+    fi
+    return 0
+}
+
+# #4546 — the address the Done screen shows for a DHCP install. It used to
+# print the first non-loopback IPv4 address on the whole box, which on a
+# multi-NIC server is not necessarily the port chosen on the network screen;
+# an IPv6-only network showed nothing at all. Read it from the chosen port
+# ($NET_INTERFACE, empty = "any port"), IPv4 first, then a global IPv6
+# address. Prints nothing when there is none.
+_done_screen_address() {
+    local dev=() addr
+    [ -n "$NET_INTERFACE" ] && dev=(dev "$NET_INTERFACE")
+    addr=$(ip -4 -br addr show "${dev[@]}" 2>/dev/null \
+        | awk '$1!="lo" && $3!="" {sub(/\/.*/, "", $3); print $3; exit}' || true)
+    if [ -z "$addr" ]; then
+        addr=$(ip -6 -br addr show "${dev[@]}" scope global 2>/dev/null \
+            | awk '$1!="lo" && $3!="" {sub(/\/.*/, "", $3); print $3; exit}' || true)
+    fi
+    printf '%s' "$addr"
 }
 
 # ── Install ───────────────────────────────────────────────────────────────────
@@ -4237,6 +4702,132 @@ _assert_safe_wipe_target() {
     on_cancel "pre-wipe safety check ($disk)"
 }
 
+# #4547 — SpatiumDDI filesystem labels on a disk the installer is NOT
+# about to wipe.
+#
+# The installed system mounts /var, STATE and the ESP by filesystem LABEL
+# (the image-baseline fstab), and ``spatium-etc-render`` / the ESP sync
+# resolve ``state`` / ``ESP2`` with ``blkid -L``. A second attached disk
+# carrying the same labels — an old system disk left in place, a former
+# mirror member, another test install — makes two filesystems answer to
+# one label, and the installed system can mount the OTHER disk's /var.
+# This lists such partitions; ``_assert_no_foreign_labels`` decides what
+# to do about them.
+#
+# Prints one ``<partition> <label> <disk>`` line per hit. Every disk in
+# the arguments is excluded (target, and the mirror member when there is
+# one). Labels are the filesystem ones, which is what fstab matches; the
+# set is the one ``_md_array_is_ours`` already treats as ours, plus the
+# two ESP spellings.
+_foreign_labelled_partitions() {
+    local skip=" " d real node label
+    local s
+    for d in "$@"; do
+        [ -n "$d" ] || continue
+        real=$(readlink -f "$d" 2>/dev/null || echo "$d")
+        skip+="$real "
+        # A multipath target is the map; its paths are whole disks that
+        # lsblk lists the map's partitions (and labels) under. They ARE
+        # the target, not another disk.
+        for s in "${SYS_BLOCK:-/sys/block}/$(basename "$real")/slaves"/*; do
+            [ -e "$s" ] && skip+="/dev/$(basename "$s") "
+        done
+    done
+    # The live install medium: never ours to relabel, and an ISO written
+    # to a USB stick may carry an ESP-labelled partition.
+    while read -r d; do
+        [ -n "$d" ] && skip+="$(readlink -f "$d" 2>/dev/null || echo "$d") "
+    done < <(_live_boot_disks)
+    while read -r d _; do
+        [ -n "$d" ] || continue
+        case "${d##*/}" in sr*|loop*|zram*|ram*|fd*|nbd*) continue ;; esac
+        real=$(readlink -f "$d" 2>/dev/null || echo "$d")
+        case "$skip" in *" $real "*) continue ;; esac
+        while read -r node label; do
+            case "$label" in
+                var|state|ESP|ESP2|root_a|root_b)
+                    printf '%s %s %s\n' "$node" "$label" "$d" ;;
+            esac
+        done < <(lsblk -nrpo NAME,LABEL "$d" 2>/dev/null)
+    done < <(lsblk -dnrpo NAME,TYPE 2>/dev/null | awk '$2 == "disk"')
+}
+
+# Blank the filesystem label of one partition: the signature stays, the
+# name that fstab matches on does not. Returns non-zero for a filesystem
+# type it cannot relabel in place, or when the label is still there after.
+_clear_fs_label() {
+    local node="$1" fstype
+    fstype=$(lsblk -nro FSTYPE "$node" 2>/dev/null | head -1)
+    case "$fstype" in
+        ext2|ext3|ext4) e2label "$node" "" >> "$INSTALL_LOG" 2>&1 || return 1 ;;
+        vfat)           fatlabel "$node" "NOLABEL" >> "$INSTALL_LOG" 2>&1 || return 1 ;;
+        *)              return 1 ;;
+    esac
+    udevadm settle >> "$INSTALL_LOG" 2>&1 || true
+    case "$(lsblk -nro LABEL "$node" 2>/dev/null | head -1)" in
+        var|state|ESP|ESP2|root_a|root_b) return 1 ;;
+    esac
+    return 0
+}
+
+# Pre-wipe guard for the above (#4547). Refuses by default; the operator
+# can clear the labels on the OTHER disk(s) after typing CLEAR, and a
+# headless run needs ``clear_foreign_labels: true`` in the preseed.
+# Only the labels change — nothing else on the other disk is touched.
+_assert_no_foreign_labels() {
+    local hits disks listing node label disk
+    hits=$(_foreign_labelled_partitions "$@")
+    [ -z "$hits" ] && return 0
+    disks=$(printf '%s\n' "$hits" | awk '{print $3}' | sort -u | tr '\n' ' ')
+    listing=$(printf '%s\n' "$hits" | awk '{printf "  %s  (label %s, on %s)\n", $1, $2, $3}')
+    log "Pre-wipe guard: other disk(s) carry SpatiumDDI labels: $disks"
+
+    if [ "$FULLY_UNATTENDED" = "1" ]; then
+        if [ "${PRESEED_CLEAR_FOREIGN_LABELS:-}" != "1" ]; then
+            preseed_halt "Another attached disk carries SpatiumDDI filesystem labels (var / state / ESP / root_a / root_b):"$'\n\n'"$listing"$'\n\n'"The installed system mounts by label and could mount that disk's /var instead. Detach it, or set clear_foreign_labels: true in the preseed to blank those labels."
+        fi
+    else
+        set +x
+        whiptail --backtitle "$BACKTITLE" --title "Another disk has SpatiumDDI labels" \
+            --msgbox "Besides the install target, these partitions carry the same filesystem labels the installed system mounts by:"$'\n\n'"$listing"$'\n\n'"The installed system could mount that disk's /var, STATE or ESP instead of its own. Detach the disk (recommended), or clear its labels on the next screen." 20 76 || true
+        local pick
+        pick=$(whiptail --backtitle "$BACKTITLE" --title "Other disk labels" \
+            --cancel-button "Cancel" \
+            --menu "What now?" 12 76 2 \
+            "stop"  "Cancel the install (nothing has been written)" \
+            "clear" "Clear the labels on the other disk(s)" \
+            3>&1 1>&2 2>&3) || pick="stop"
+        if [ "$pick" != "clear" ]; then
+            on_cancel "other disk carries SpatiumDDI labels ($disks)"
+        fi
+        local typed
+        typed=$(whiptail --backtitle "$BACKTITLE" --title "Confirm" \
+            --inputbox "Only the filesystem labels are blanked on: $disks"$'\n\n'"Type CLEAR to continue." 12 76 "" \
+            3>&1 1>&2 2>&3) || typed=""
+        if [ "$typed" != "CLEAR" ]; then
+            on_cancel "other disk labels not cleared ($disks)"
+        fi
+    fi
+
+    local failed=""
+    while read -r node label disk; do
+        if _clear_fs_label "$node"; then
+            log "Cleared filesystem label '$label' on $node ($disk)"
+        else
+            log "Could not clear filesystem label '$label' on $node"
+            failed+=" $node"
+        fi
+    done <<<"$hits"
+    if [ -n "$failed" ]; then
+        if [ "$FULLY_UNATTENDED" = "1" ]; then
+            preseed_halt "Could not clear the SpatiumDDI labels on:$failed"
+        fi
+        whiptail --backtitle "$BACKTITLE" --title "Could not clear labels" \
+            --msgbox "Could not clear the labels on:$failed"$'\n\n'"Detach that disk and run the installer again. Nothing has been written to the target." 12 72 || true
+        on_cancel "could not clear other disk labels"
+    fi
+}
+
 # #995 item 1 — carry the installer's own logs onto the installed
 # system, immediately before the unmount block.
 #
@@ -4429,7 +5020,29 @@ _keep_images_in_root_slot() {
     return "$_rc"
 }
 
+# #4546 — the backstop for the Confirm menu: refuse to start when the
+# answers contradict each other (an Additional node with no control-plane
+# URL or pairing code; k3s CIDRs that overlap the LAN). The wizard re-runs
+# dependent screens and Confirm refuses Install on the same test, so this
+# is the last line, and the only one a headless run can reach.
+_assert_install_consistent() {
+    local mode="" problem
+    [ "$FULLY_UNATTENDED" = "1" ] && mode="unattended"
+    problem=$(_install_consistency_problem "$mode")
+    [ -z "$problem" ] && return 0
+    log "Pre-wipe guard REFUSED: ${problem%%$'\t'*}: ${problem#*$'\t'}"
+    if [ "$FULLY_UNATTENDED" = "1" ]; then
+        preseed_halt "${problem#*$'\t'}"
+    fi
+    whiptail --backtitle "$BACKTITLE" --title "Inconsistent answers" \
+        --msgbox "${problem#*$'\t'}"$'\n\n'"Nothing has been written." 12 72 || true
+    on_cancel "pre-wipe consistency check (${problem%%$'\t'*})"
+}
+
 do_install() {
+    # #4546 — before anything, including the safe-wipe probes: the answers
+    # have to agree with each other.
+    _assert_install_consistent
     # #1026 — refuse an unbootable architecture/firmware pairing before
     # the disk is touched. Both the wizard and the headless preseed path
     # come through here, so one call covers both.
@@ -4470,6 +5083,9 @@ do_install() {
             on_cancel "pre-wipe safety check (mirror too small)"
         fi
     fi
+    # #4547 — no OTHER disk may answer to the labels the installed system
+    # mounts by.
+    _assert_no_foreign_labels "$TARGET_DISK" "${TARGET_DISK2:-}"
     # ...and the account that will be the only way into the installed
     # system, for the same reason and in the same place (#995 item 4).
     _assert_admin_user_available
@@ -6035,6 +6651,27 @@ EOF
         _verify "grubenv points at slot_a" _grubenv_points_at_slot_a
         _verify "the machine config on STATE is present" \
             test -s "$MOUNT/var/lib/spatium-state/spatium-config.yaml"
+        # #4546 — "non-empty" passed a file whose control-plane URL had
+        # broken out of its quoted string. Parse it, and compare what the
+        # installed system will read with what was asked for.
+        # shellcheck disable=SC2329  # invoked indirectly, via _verify "$@"
+        _machine_config_parses() {
+            python3 - "$MOUNT/var/lib/spatium-state/spatium-config.yaml" \
+                "$HOSTNAME" "$ROLE" "$CONTROL_PLANE_URL" <<'PY'
+import sys
+
+import yaml
+
+with open(sys.argv[1], encoding="utf-8") as fh:
+    cfg = yaml.safe_load(fh)
+want = {"hostname": sys.argv[2], "role": sys.argv[3], "control_plane_url": sys.argv[4]}
+for key, value in want.items():
+    if str(cfg.get(key) or "") != value:
+        sys.exit(f"{key}: file has {cfg.get(key)!r}, wanted {value!r}")
+PY
+        }
+        _verify "the machine config on STATE parses and carries the hostname, role and control-plane URL" \
+            _machine_config_parses
         _verify "the admin account exists in the installed system" \
             chroot "$MOUNT" getent passwd "$ADMIN_USER"
         # root_B was unmounted after the clone; re-mount briefly to check
@@ -6180,8 +6817,7 @@ EOF
     if [ "$NET_MODE" = "static" ] && [ -n "$NET_IP" ]; then
         done_addr="$NET_IP"
     else
-        done_addr=$(ip -4 -br addr 2>/dev/null \
-            | awk '$1!="lo" && $3!="" {sub(/\/.*/, "", $3); print $3; exit}' || true)
+        done_addr=$(_done_screen_address)
     fi
 
     if [ -f "$BOOT_LEG_MISSING_FILE" ]; then
@@ -6198,7 +6834,7 @@ EOF
     Approve it at:  Appliance -> Fleet -> Approvals"
     else
         done_next="\
-  Web UI:  https://${done_addr:-<appliance IP>}/
+  Web UI:  https://$([[ "$done_addr" == *:* ]] && echo "[$done_addr]" || echo "${done_addr:-<appliance IP>}")/
   Login:   admin / admin  (change forced on first login)"
         if [ -z "$done_addr" ]; then
             done_next+="
@@ -6575,6 +7211,9 @@ Log:    $INSTALL_LOG
 
 EOF
     log "Preseed halt: $1"
+    # #4589 — tell on_failure this exit is deliberate: its generic failure
+    # screen would clear the banner above and bury the reason in log tails.
+    PRESEED_HALTED=1
     exit 1
 }
 
@@ -6844,6 +7483,93 @@ load_preseed() {
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+# ── Confirm-menu jumps: the screens that depend on the edited one (#4546) ─────
+#
+# A jump from Confirm used to return to Confirm as soon as that ONE screen
+# was answered. Anything whose answer depends on it was never re-checked:
+#   * First node, then Confirm -> Role -> Additional node -> Install ran
+#     do_install with no control-plane URL and no pairing code;
+#   * DHCP with the default k3s CIDRs, then Confirm -> Network -> a static
+#     10.42.0.5/16 installed with the LAN inside the pod CIDR, because the
+#     overlap check had run against the lease it no longer applied to;
+#   * a different disk skipped the partition-layout acknowledgement for
+#     that disk; a role switch skipped the sizing gate and the k3s CIDR
+#     screen; a new hostname was never re-checked against the password.
+# Each dependent below returns the usual 0 / 1 / 2 (drew and went on /
+# Back / drew nothing). Back out of one leaves the rest unrun and returns
+# to Confirm, which refuses Install while the answers disagree
+# (_install_consistency_problem), so a skipped dependent cannot be walked
+# past.
+
+# After a role switch to a control plane: the soft sizing gate pick_disk
+# applies only when the role is already known. Declining goes back to the
+# disk screen (and its layout acknowledgement).
+_dep_role_sizing() {
+    [ "$ROLE" = "control-plane" ] || return 2
+    [ -n "${PRESEED_HAS_DISK:-}" ] && return 2
+    local bytes
+    bytes=$(blockdev --getsize64 "$TARGET_DISK" 2>/dev/null || echo 0)
+    [ "$bytes" -gt 0 ] || return 2
+    if _control_plane_sizing_ok "$bytes"; then
+        return 0
+    fi
+    CONFIRM_DEPS=(pick_disk confirm_partition_layout "${CONFIRM_DEPS[@]}")
+    return 0
+}
+
+# After a network edit: the k3s CIDRs were checked against the LAN as it
+# was. Silent when still clean.
+_dep_cidr_overlap() {
+    [ "$ROLE" != "appliance" ] || return 2
+    local err
+    err=$(_k3s_cidr_error "$K3S_POD_CIDR" "$K3S_SERVICE_CIDR" "$(_dhcp_lease_subnet)")
+    [ -n "$err" ] || return 2
+    ask_k3s_cidrs
+}
+
+# After a hostname edit: "the password is not the hostname" ran against
+# the OLD hostname. A passwordbox cannot be pre-filled, so a refusal means
+# asking for it again.
+_dep_password_vs_hostname() {
+    [ -z "${PRESEED_HAS_PASSWORD:-}" ] || return 2
+    [ -n "$ADMIN_PASSWORD" ] || return 2
+    local perr rc=0
+    { set +x; } 2>/dev/null
+    perr=$(_check_field_stdin admin_password "$ADMIN_PASSWORD" "$ADMIN_USER" "$HOSTNAME") || rc=$?
+    set -x
+    [ "$rc" -ne 0 ] || return 2
+    whiptail --backtitle "$BACKTITLE" --title "Password no longer acceptable" \
+        --msgbox "The new hostname changes what the password is checked against:"$'\n\n'"$perr"$'\n\n'"Enter the password again." 13 72 || true
+    ask_user_password
+}
+
+# Run what depends on the screen the operator just edited from Confirm.
+# $1 is that screen; $2 the role before the edit (a role change, from the
+# role screen or from a Keep /var pin, drags the role-dependent screens in).
+_run_confirm_deps() {
+    local jumped="$1" role_before="$2" dep rc
+    CONFIRM_DEPS=()
+    case "$jumped" in
+        pick_disk)  CONFIRM_DEPS=(confirm_partition_layout) ;;
+        ask_role)   [ "$ROLE" != "$role_before" ] && CONFIRM_DEPS=(_dep_role_sizing) ;;
+        ask_network) CONFIRM_DEPS=(_dep_cidr_overlap) ;;
+        ask_hostname) CONFIRM_DEPS=(_dep_password_vs_hostname) ;;
+    esac
+    if [ "$ROLE" != "$role_before" ]; then
+        CONFIRM_DEPS+=(ask_k3s_cidrs ask_application_config)
+    fi
+    while [ "${#CONFIRM_DEPS[@]}" -gt 0 ]; do
+        dep="${CONFIRM_DEPS[0]}"
+        CONFIRM_DEPS=("${CONFIRM_DEPS[@]:1}")
+        log "Confirm: re-running $dep after the change to $jumped"
+        "$dep"
+        rc=$?
+        [ "$rc" = 1 ] && break
+    done
+    CONFIRM_DEPS=()
+    return 0
+}
+
 main() {
     # Non-install command modes (issue #581). These run BEFORE the root
     # check so an operator can lint an answer file or read the help on any
@@ -6916,7 +7642,7 @@ main() {
         [ "${STEPS[$j2]}" = "confirm" ] && confirm_index="$j2"
         j2=$((j2 + 1))
     done
-    local i=0 dir="fwd" rc step RETURN_TO_CONFIRM=""
+    local i=0 dir="fwd" rc step RETURN_TO_CONFIRM="" JUMPED_STEP="" ROLE_BEFORE="$ROLE"
     while [ "$i" -lt "${#STEPS[@]}" ]; do
         step="${STEPS[$i]}"
         log "Wizard state: $step (dir=$dir)"
@@ -6951,10 +7677,18 @@ main() {
                 ;;
         esac
         # A field edited from the Confirm menu returns there rather than
-        # continuing the forward walk.
-        if [ -n "$RETURN_TO_CONFIRM" ] && [ "$rc" != "2" ] && [ "$step" != "confirm" ]; then
+        # continuing the forward walk -- after the screens that depend on
+        # it (#4546). A Back out of the edited screen itself abandons the
+        # edit and runs nothing. A screen that drew nothing (preseeded, or
+        # pinned) ends the edit too: walking on forward from it, as this
+        # used to, ran the rest of the wizard.
+        if [ -n "$RETURN_TO_CONFIRM" ] && [ "$step" != "confirm" ]; then
+            if [ "$rc" != "1" ]; then
+                _run_confirm_deps "$JUMPED_STEP" "$ROLE_BEFORE"
+            fi
             i="$RETURN_TO_CONFIRM"
             RETURN_TO_CONFIRM=""
+            CONFIRM_EDITING=""
             dir="fwd"
             continue
         fi
@@ -6968,6 +7702,8 @@ main() {
                 # preseeded one passing through toward confirm again is
                 # the right behaviour rather than reversing past it.
                 if [ -n "$CONFIRM_JUMP" ]; then
+                    JUMPED_STEP="$CONFIRM_JUMP"
+                    ROLE_BEFORE="$ROLE"
                     local jump_idx=0 jump_found=0
                     while [ "$jump_idx" -lt "${#STEPS[@]}" ]; do
                         if [ "${STEPS[$jump_idx]}" = "$CONFIRM_JUMP" ]; then
@@ -6988,6 +7724,7 @@ main() {
                         # rest. That is the half of the cost item 28 said
                         # it removed and did not.
                         RETURN_TO_CONFIRM="$confirm_index"
+                        CONFIRM_EDITING=1
                         dir="fwd"
                     else
                         # A renamed step, or a typo in a menu tag. Falling
@@ -7042,6 +7779,13 @@ on_failure() {
             _logs_kept=1
         fi
     fi
+    if [ -n "${PRESEED_HALTED:-}" ]; then
+        # #4589 — preseed_halt already drew its PRESEED ERROR banner. Leave
+        # it on screen: no clear, no raw log tails (they would scroll it off).
+        echo "Install halted on its answer file (status $exit_code); see the banner above."
+        echo "Log: $INSTALL_LOG"
+        echo
+    else
     clear
     echo "Installer exited with status $exit_code"
     echo
@@ -7058,6 +7802,7 @@ on_failure() {
         || echo "  (trace log empty - script bailed before set -x at line 51)"
     echo "------------------------------------------------------------------"
     echo
+    fi
     if [ -r /var/log/spatium-live-ssh-password ]; then
         echo "Live-mode SSH (for log capture from a real terminal):"
         echo "  user:     root"
