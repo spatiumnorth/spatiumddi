@@ -25,7 +25,13 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined, select_autoes
 from app.core.dns_names import strip_control_chars
 from app.drivers.dns._axfr import resolve_server_address
 from app.drivers.dns._caa import caa_presentation
-from app.drivers.dns._forwarders import bind_zone_forwarders, bind_zone_tls_statement
+from app.drivers.dns._forwarders import (
+    bind_zone_forwarder,
+    bind_zone_forwarders,
+    bind_zone_tls_statement,
+    safe_tls_hostname,
+    zone_tls_statement_name,
+)
 from app.drivers.dns._txt import quote_txt as _quote_txt
 from app.drivers.dns.base import (
     ConfigBundle,
@@ -256,6 +262,31 @@ def _shared_zone_views(
     return shared
 
 
+def _master_tokens(zone: ZoneData, tsig_keys: Sequence[Any] = ()) -> list[str]:
+    """``primaries`` tokens of a secondary / stub zone (#3568).
+
+    Mirrors ``_format_master`` in the agent's BIND9 renderer: ``ip [port n]
+    [key k] [tls t]``, a key the bundle does not hold left off, an explicit
+    port 53 never given ``tls``.
+    """
+    opts = {m: (key, host) for m, key, host in zone.master_options}
+    known = {
+        (getattr(k, "name", "") or "").rstrip(".").lower(): getattr(k, "name", "")
+        for k in tsig_keys
+    }
+    out: list[str] = []
+    for master in zone.masters:
+        key, host = opts.get(master, (None, None))
+        safe = safe_tls_hostname(host)
+        token = bind_zone_forwarder(master, zone_tls_statement_name(safe) if safe else None)
+        token, _sep, tls_part = token.partition(" tls ")
+        name = known.get((key or "").rstrip(".").lower()) if key else None
+        if name:
+            token += f' key "{name}"'
+        out.append(f"{token} tls {tls_part}" if tls_part else token)
+    return out
+
+
 def _zone_forward_view(zone: ZoneData) -> dict[str, Any]:
     """The bundle-shaped mapping ``_forwarders`` reads, from a ``ZoneData``."""
     return {
@@ -307,7 +338,7 @@ class BIND9Driver(DNSDriver):
         # Key by (view_name, name): under split-horizon (issue #24) the same
         # zone name appears once per view, so a name-only key would collapse
         # the copies and drop all but one view's stanza from the preview.
-        zone_stanzas = {(z.view_name, z.name): self.render_zone_config(z) for z in zones}
+        zone_stanzas = {(z.view_name, z.name): self.render_zone_config(z, tsig_keys) for z in zones}
         zone_in_view = _shared_zone_views(zones, views)
         # One ``tls`` statement per upstream hostname a TLS forward zone uses
         # (#2121), rendered above ``options`` exactly as the agent does.
@@ -317,6 +348,13 @@ class BIND9Driver(DNSDriver):
             if z.zone_type == "forward"
             for host in [bind_zone_forwarders(_zone_forward_view(z))[1]]
             if host
+        } | {
+            safe
+            for z in zones
+            if z.zone_type in ("secondary", "slave", "stub")
+            for _m, _key, host in z.master_options
+            for safe in [safe_tls_hostname(host)]
+            if safe
         }
         zone_tls_statements = "".join(bind_zone_tls_statement(h) for h in sorted(zone_tls_hosts))
 
@@ -331,6 +369,12 @@ class BIND9Driver(DNSDriver):
             tsig_keys=tsig_keys,
             allow_transfer_items=_allow_transfer_items(
                 getattr(options, "allow_transfer", None), tsig_keys
+            ),
+            allow_transfer_transport=(
+                "transport tls "
+                if getattr(options, "allow_transfer_tls_only", False)
+                and getattr(options, "dot_enabled", False)
+                else ""
             ),
             blocklists=blocklists,
             dnssec_policies=dnssec_policies,
@@ -348,7 +392,7 @@ class BIND9Driver(DNSDriver):
             tls_cert_present=True,
         )
 
-    def render_zone_config(self, zone: ZoneData) -> str:
+    def render_zone_config(self, zone: ZoneData, tsig_keys: Sequence[Any] = ()) -> str:
         env = _env()
         tmpl = env.get_template("zone.stanza.j2")
         forwarder_tokens: list[str] = []
@@ -365,6 +409,7 @@ class BIND9Driver(DNSDriver):
             zone=zone,
             update_clause=_render_update_clause(zone),
             forwarder_tokens=forwarder_tokens,
+            master_tokens=_master_tokens(zone, tsig_keys),
         )
 
     def render_zone_file(self, zone: ZoneData, records: list[RecordData]) -> str:

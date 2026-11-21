@@ -5930,6 +5930,8 @@ export interface DNSServerOptions {
   // DoQ) to Technitium-only groups and 422s otherwise.
   dot_enabled: boolean;
   dot_port: number;
+  // #3568 — offer zone transfers over the DoT listener only (XoT).
+  allow_transfer_tls_only?: boolean;
   doh_enabled: boolean;
   doh_port: number;
   // Technitium serves DoH on a fixed /dns-query and ignores this.
@@ -6126,6 +6128,13 @@ export interface DNSZone {
   // zone transfers FROM (ip or ip@port). Required when
   // zone_type==="secondary" | "stub"; empty otherwise.
   masters: string[];
+  // #3568 — per-primary TSIG key name / TLS hostname, keyed by a masters
+  // entry. Optional so a response from an older control plane still
+  // type-checks; absent = none.
+  master_options?: Record<
+    string,
+    { tsig_key?: string | null; tls_hostname?: string | null }
+  >;
   // Non-null when the zone was synthesised by the Tailscale Phase 2
   // reconciler. The UI shows a read-only badge and disables edit /
   // delete controls on the zone + its records.

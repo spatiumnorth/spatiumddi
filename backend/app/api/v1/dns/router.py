@@ -1285,6 +1285,8 @@ class ServerOptionsUpdate(BaseModel):
     # Encrypted transports (issue #50)
     dot_enabled: bool | None = None
     dot_port: int | None = Field(default=None, ge=1, le=65535)
+    # #3568 — serve zone transfers over the DoT listener only (XoT).
+    allow_transfer_tls_only: bool | None = None
     doh_enabled: bool | None = None
     doh_port: int | None = Field(default=None, ge=1, le=65535)
     # max_length mirrors the column widths (String(128) / String(255)) so an
@@ -1425,6 +1427,7 @@ class ServerOptionsResponse(BaseModel):
     dnsdist_dynblock_seconds: int
     dot_enabled: bool
     dot_port: int
+    allow_transfer_tls_only: bool = False
     doh_enabled: bool
     doh_port: int
     doh_path: str
@@ -1630,6 +1633,113 @@ def _validate_masters_format(v: list[str] | None) -> list[str]:
     return cleaned
 
 
+class ZoneMasterOptions(BaseModel):
+    """One primary's transfer options on a secondary / stub zone (#3568).
+
+    ``tsig_key`` is the name of a TSIG key of the zone's server group the
+    transfer from this primary is signed with (a Windows DC, an Infoblox grid
+    or an EfficientIP primary refuses an unsigned request). ``tls_hostname``
+    switches the transfer to XFR-over-TLS (RFC 9103) and is the certificate
+    name the primary must present. Both are optional.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    tsig_key: str | None = Field(default=None, max_length=255)
+    tls_hostname: str | None = Field(default=None, max_length=255)
+
+    @field_validator("tsig_key")
+    @classmethod
+    def validate_tsig_key(cls, v: str | None) -> str | None:
+        if v is None or not v.strip():
+            return None
+        name = v.strip()
+        if not _TSIG_NAME_RE.match(name.lower()):
+            raise ValueError("tsig_key must be a DNS-style TSIG key name (letters, digits, . -)")
+        return name
+
+    @field_validator("tls_hostname")
+    @classmethod
+    def validate_tls_hostname(cls, v: str | None) -> str | None:
+        if v is None or not v.strip():
+            return None
+        return validate_hostname(v, field="tls_hostname")
+
+
+def _clean_master_options(v: dict[str, ZoneMasterOptions] | None) -> dict[str, ZoneMasterOptions]:
+    """Drop empty entries and normalise the keys the way ``masters`` is held."""
+    out: dict[str, ZoneMasterOptions] = {}
+    for raw, opts in (v or {}).items():
+        key = str(raw).strip()
+        if opts.tsig_key or opts.tls_hostname:
+            out[key] = opts
+    return out
+
+
+def _master_options_dump(v: dict[str, ZoneMasterOptions] | None) -> dict[str, dict[str, str]]:
+    return {
+        k: {f: val for f, val in o.model_dump().items() if val}
+        for k, o in _clean_master_options(v).items()
+    }
+
+
+async def _check_zone_master_options(
+    db: DB,
+    group_id: uuid.UUID,
+    zone_type: str,
+    masters: list[str],
+    options: dict[str, Any],
+) -> None:
+    """422 per-primary options the zone cannot honour (#3568).
+
+    Every key must be one of the zone's masters (an option for a primary the
+    zone does not transfer from would be dead data), the zone must be a
+    secondary / stub, the group must be BIND9 only (PowerDNS signs transfers
+    through zone metadata and has no XFR-over-TLS; the Technitium mapping is
+    unverified), and a named TSIG key must be an operator key of this group:
+    the generated key is the control plane's own write identity and is never
+    offered to a remote primary.
+    """
+    if not options:
+        return
+    if zone_type not in {"secondary", "stub"}:
+        raise HTTPException(
+            422,
+            "master_options apply to secondary and stub zones only (zone_type is "
+            f"{zone_type!r})",
+        )
+    held = set(masters)
+    stray = sorted(k for k in options if k not in held)
+    if stray:
+        raise HTTPException(
+            422, f"master_options names {stray[0]!r}, which is not one of the zone's masters"
+        )
+    drivers = await _group_driver_names(db, group_id)
+    if any(d != "bind9" for d in drivers):
+        raise HTTPException(
+            422,
+            "a per-primary TSIG key or TLS hostname is rendered by BIND9 only; this group has "
+            f"{', '.join(sorted(set(drivers) - {'bind9'}))} servers",
+        )
+    wanted = {o["tsig_key"] for o in options.values() if o.get("tsig_key")}
+    if wanted:
+        have = {
+            normalize_tsig_name(n)
+            for n in (
+                await db.execute(select(DNSTSIGKey.name).where(DNSTSIGKey.group_id == group_id))
+            )
+            .scalars()
+            .all()
+        }
+        for name in sorted(wanted):
+            if normalize_tsig_name(name) not in have:
+                raise HTTPException(
+                    422,
+                    f"TSIG key {name!r} is not a key of this server group; add it under "
+                    "the group's TSIG keys first",
+                )
+
+
 # The SOA timers the agent writes into a zone file (#1171), with the zone's
 # default TTL ($TTL): a change to any of them is a change to what the zone
 # serves, so it moves the serial (update_zone).
@@ -1702,6 +1812,9 @@ class ZoneCreate(BaseModel):
     # ``zone_type`` in {secondary, stub}; ignored otherwise. Each entry is
     # an ``ip`` or ``ip@port`` string — the IP that this zone AXFRs from.
     masters: list[str] = []
+    # Per-primary TSIG key / TLS hostname (#3568), keyed by a ``masters``
+    # entry. Secondary / stub zones on a BIND9 group only.
+    master_options: dict[str, ZoneMasterOptions] = Field(default_factory=dict)
     # Logical ownership (issue #91). Optional FK to the Customer that
     # owns this zone (managed-DNS engagements typically have one
     # customer per zone).
@@ -1812,6 +1925,8 @@ class ZoneUpdate(BaseModel):
     # effective zone_type in the handler (the new value may come from this
     # same payload or stay as-is on the existing row).
     masters: list[str] | None = None
+    # #3568 — per-primary TSIG key / TLS hostname; see ZoneCreate.
+    master_options: dict[str, ZoneMasterOptions] | None = None
     customer_id: uuid.UUID | None = None
     tags: dict[str, Any] | None = None
 
@@ -1932,6 +2047,8 @@ class ZoneResponse(BaseModel):
     forward_transport: str = "do53"
     forward_tls_hostname: str | None = None
     masters: list[str]
+    # #3568 — per-primary TSIG key name / TLS hostname, keyed by master.
+    master_options: dict[str, ZoneMasterOptions] = Field(default_factory=dict)
     # Non-null when the zone was synthesised by the Tailscale Phase 2
     # reconciler. The UI uses this to render a read-only badge and
     # disable edit/delete controls; the API enforces it on the
@@ -4309,6 +4426,21 @@ async def _assert_encrypted_transport_sane(opts: DNSServerOptions, db: DB) -> No
                 "do53 or tls — move those servers to their own group, or pick a "
                 "transport every driver in this group can speak.",
             )
+    if opts.allow_transfer_tls_only:
+        # XoT (#3568): ``allow-transfer ... transport tls`` is served by the
+        # DoT listener, so it needs DoT on, and only BIND9 renders it.
+        if not opts.dot_enabled:
+            raise HTTPException(
+                422,
+                "allow_transfer_tls_only needs DoT enabled (dot_enabled): zone transfers "
+                "over TLS are served by the DoT listener",
+            )
+        if drivers - {"bind9"}:
+            raise HTTPException(
+                422,
+                "allow_transfer_tls_only is rendered by BIND9 only, but this group also runs "
+                f"{', '.join(sorted(drivers - {'bind9'}))}.",
+            )
     if opts.doq_enabled and drivers:
         incompatible = drivers - {"technitium"}
         if incompatible:
@@ -6347,6 +6479,10 @@ async def create_zone(
     # #3087 — an omitted TTL takes Settings → DNS "Default Zone TTL". Resolved
     # before the gates so they judge the value the zone will actually carry.
     zone_fields = body.model_dump()
+    zone_fields["master_options"] = _master_options_dump(body.master_options)
+    await _check_zone_master_options(
+        db, group_id, body.zone_type, list(body.masters), zone_fields["master_options"]
+    )
     if zone_fields["ttl"] is None:
         zone_fields["ttl"] = await default_zone_ttl(db, group_id)
     _refuse_superadmin_zone_fields(current_user, zone_fields, None)
@@ -7177,6 +7313,7 @@ async def update_zone(
             "dynamic_update_enabled",
             "forward_only",
             "forward_transport",
+            "master_options",
             "tags",
         },
     )
@@ -7209,6 +7346,22 @@ async def update_zone(
         )  # #3839
     if "masters" in changes:
         changes["masters"] = [m.strip() for m in changes["masters"] if m and m.strip()]
+    # #3568 — per-primary options. An explicit value is validated against the
+    # effective masters; a masters edit that leaves them out prunes the
+    # options of a primary the zone no longer has.
+    if "master_options" in changes:
+        changes["master_options"] = _master_options_dump(body.master_options)
+        await _check_zone_master_options(
+            db,
+            group_id,
+            changes.get("zone_type", zone.zone_type),
+            list(changes.get("masters", zone.masters) or []),
+            changes["master_options"],
+        )
+    elif "masters" in changes and zone.master_options:
+        kept = {k: v for k, v in zone.master_options.items() if k in set(changes["masters"])}
+        if kept != zone.master_options:
+            changes["master_options"] = kept
     await _enforce_technitium_api_zone_scope(db, zone.group_id, changes, zone)
     changes.update(await _validated_zone_named_conf_fields(zone.group_id, changes, zone, db))
     effective_zone_type = changes.get("zone_type", zone.zone_type)

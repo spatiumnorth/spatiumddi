@@ -542,6 +542,8 @@ backend/alembic/versions/d2a6e81f3b57_dns_serial_columns_bigint.py:alter_column_
 backend/alembic/versions/d2a6e81f3b57_dns_serial_columns_bigint.py:alter_column_type:39
 backend/alembic/versions/d2a8e417b9f3_backup_target.py:drop_table:112
 backend/alembic/versions/d2f7a91e4c8b_nmap_scans.py:drop_table:96
+backend/alembic/versions/d3568a7f1c42_dns_primary_tsig_tls_xot.py:drop_column:49
+backend/alembic/versions/d3568a7f1c42_dns_primary_tsig_tls_xot.py:drop_column:50
 backend/alembic/versions/d3a9c5b71e84_subnet_kind.py:drop_column:71
 backend/alembic/versions/d3b9f42a1c05_active_block_sync.py:drop_column:194
 backend/alembic/versions/d3b9f42a1c05_active_block_sync.py:drop_column:203

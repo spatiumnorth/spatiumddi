@@ -122,7 +122,9 @@ def _missing_read(user: User, *types: str) -> dict[str, Any] | None:
         "namespace, an undelegated TLD, or is a reverse zone. A forward "
         "zone also carries its forwarders and its OWN upstream transport "
         "(forward_transport do53 / tls / https / quic + "
-        "forward_tls_hostname), which does not inherit the group's."
+        "forward_tls_hostname), which does not inherit the group's. A "
+        "secondary / stub zone carries its masters and master_options "
+        "(per primary: the TSIG key name and TLS hostname it is reached with)."
     ),
     args_model=ListZonesArgs,
     category="dns",
@@ -200,6 +202,12 @@ async def list_dns_zones(db: AsyncSession, user: User, args: ListZonesArgs) -> l
             row["forward_only"] = bool(z.forward_only)
             row["forward_transport"] = z.forward_transport or "do53"
             row["forward_tls_hostname"] = z.forward_tls_hostname
+        if z.zone_type in ("secondary", "slave", "stub"):
+            # #3568 — the primaries a secondary pulls from, and the TSIG key
+            # name / TLS hostname each is reached with (names only: the key's
+            # secret is never part of a zone row).
+            row["masters"] = list(z.masters or [])
+            row["master_options"] = dict(z.master_options or {})
         out.append(row)
         if len(out) >= args.limit:
             break
@@ -1835,6 +1843,8 @@ async def find_dns_encrypted_transports(
                 "group_name": group.name,
                 "dot_enabled": opts.dot_enabled,
                 "dot_port": opts.dot_port,
+                # #3568 — zone transfers offered over the DoT listener only.
+                "allow_transfer_tls_only": bool(opts.allow_transfer_tls_only),
                 "doh_enabled": opts.doh_enabled,
                 "doh_port": opts.doh_port,
                 "doh_path": opts.doh_path,

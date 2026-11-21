@@ -10,7 +10,7 @@ zone "{{ zone.name }}" {
 zone "{{ zone.name }}" {
     type {{ "stub" if zone.zone_type == "stub" else "slave" }};
     file "/var/cache/bind/zones/{{ zone.name }}db";
-    masters { {% for m in zone.masters %}{{ m.replace("@", " port ") }}; {% endfor %}};
+    masters { {% for m in master_tokens %}{{ m }}; {% endfor %}};
     {%- if zone.allow_query %}
     allow-query { {% for a in zone.allow_query %}{{ a }}; {% endfor %}};
     {%- endif %}
