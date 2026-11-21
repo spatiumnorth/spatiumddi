@@ -66,6 +66,7 @@ export const GRANT_RESOURCE_TYPES = [
   "dicom_ae",
   "dnsbl",
   "e911_location",
+  "e911_resolution_log",
   "looking_glass_collector",
   "manage_asns",
   "manage_domains",

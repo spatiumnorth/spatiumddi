@@ -21864,7 +21864,78 @@ export interface E911Location {
   evidence: E911Evidence[];
 }
 
+// The resolution trail (#3598): who looked up which device's location.
+// Behind its own permission, `e911_resolution_log`, not `e911_location`.
+export interface E911ResolutionRow {
+  id: string;
+  kind: "lookup" | "counter";
+  queried_at: string;
+  identity_kind: string;
+  identity_value: string;
+  actor_kind: "user" | "api_token" | "device_self";
+  actor_id: string | null;
+  actor_label: string | null;
+  source_ip: string | null;
+  erl_id: string | null;
+  erl_name: string | null;
+  rule_matched: string | null;
+  confidence: string;
+  degraded_reason: string | null;
+  evidence_age_seconds: number | null;
+  window_start: string | null;
+  suppressed_count: number | null;
+}
+
+export interface E911ResolutionList {
+  items: E911ResolutionRow[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface E911ResolutionQuery {
+  identity?: string;
+  identity_kind?: "ip" | "mac" | "chassis_port";
+  since?: string;
+  until?: string;
+  actor_id?: string;
+  actor_kind?: "user" | "api_token" | "device_self";
+  confidence?: "observed" | "degraded" | "none";
+  erl_id?: string;
+  kind?: "lookup" | "counter";
+}
+
 export const e911Api = {
+  listResolutionLog: (
+    params?: E911ResolutionQuery & { limit?: number; offset?: number },
+  ) =>
+    api
+      .get<E911ResolutionList>("/e911/resolution-log", { params })
+      .then((r) => r.data),
+  downloadResolutionLog: async (params?: E911ResolutionQuery) => {
+    const res = await api
+      .get("/e911/resolution-log/export.csv", {
+        params,
+        responseType: "blob",
+      })
+      .catch(rethrowBlobError);
+    const disp = String(res.headers["content-disposition"] ?? "");
+    const match = disp.match(/filename="?([^"]+)"?/);
+    const ts = new Date()
+      .toISOString()
+      .slice(0, 19)
+      .replace(/[-:]/g, "")
+      .replace("T", "-");
+    const blob = new Blob([res.data as BlobPart]);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = match ? match[1] : `e911-resolution-log-${ts}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  },
   listErls: (params?: ERLListQuery) =>
     api.get<ERLListResponse>("/e911/erls", { params }).then((r) => r.data),
   getErl: (id: string) => api.get<ERL>(`/e911/erls/${id}`).then((r) => r.data),
