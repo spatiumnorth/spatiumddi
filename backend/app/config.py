@@ -438,9 +438,10 @@ class Settings(BaseSettings):
     #            supervisor version is older than 1.0.1 (or unknown). Each one
     #            is recorded in the audit log and counts against the
     #            registration attempt budget.
-    #   never  - an unsigned re-registration is always refused.
-    # The default becomes ``never`` in 1.1.0.
-    appliance_unsigned_register_allowed: Literal["legacy", "never"] = "legacy"
+    #   never  - an unsigned re-registration is always refused (the default
+    #            since 1.1.0; 1.0.x defaulted to ``legacy``). Set ``legacy``
+    #            for the upgrade window of a fleet still on older supervisors.
+    appliance_unsigned_register_allowed: Literal["legacy", "never"] = "never"
 
     # #1003 item 2 — the OS installer's "Time source" answer, stamped into
     # the api's environment by spatiumddi-firstboot from the STATE config.
