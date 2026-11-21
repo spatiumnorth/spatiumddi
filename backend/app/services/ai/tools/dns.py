@@ -6,7 +6,7 @@ import asyncio
 import ipaddress
 import uuid
 from dataclasses import asdict
-from typing import Any
+from typing import Any, Literal
 
 import dns.exception
 import dns.resolver
@@ -1552,6 +1552,14 @@ class FindDNSQueriesArgs(BaseModel):
     minutes: int = Field(
         default=60, ge=1, le=1440, description="Trailing window (the log is pruned at 24 h)."
     )
+    resolve_clients: Literal["none", "ipam"] = Field(
+        default="none",
+        description=(
+            "Add a client_name per row: 'ipam' = host name "
+            "in the IP space ip_space_id (required; only addresses you may read)."
+        ),
+    )
+    ip_space_id: str | None = Field(default=None, description="IP space UUID for 'ipam'.")
     limit: int = Field(default=50, ge=1, le=500)
 
 
@@ -1590,6 +1598,11 @@ async def find_dns_queries(
         resolve_dns_log_servers,
         search_dns_queries,
     )
+    from app.services.logs.client_names import (  # noqa: PLC0415
+        ClientNameError,
+        name_fields,  # noqa: PLC0415
+        resolve_client_names,
+    )
 
     client_ip = args.client_ip
     # A UUID column comparison raises a DBAPIError on anything that is not
@@ -1625,8 +1638,29 @@ async def find_dns_queries(
         )
     except InvalidLogFilter as exc:
         return [{"result": exc.detail}]
+    space_id: uuid.UUID | None = None
+    if args.ip_space_id:
+        try:
+            space_id = uuid.UUID(args.ip_space_id.strip())
+        except ValueError:
+            return [{"result": f"{args.ip_space_id!r} is not an IP space UUID"}]
+    try:
+        client_names = await resolve_client_names(
+            db,
+            user,
+            [str(r.client_ip) if r.client_ip is not None else None for r in rows],
+            args.resolve_clients,
+            space_id,
+        )
+    except ClientNameError as exc:
+        return [{"result": exc.detail}]
     return [
         {
+            **(
+                name_fields(client_names, str(r.client_ip) if r.client_ip is not None else None)
+                if args.resolve_clients != "none"
+                else {}
+            ),
             "ts": r.ts.isoformat(),
             "server_id": str(r.server_id) if r.server_id else None,
             "server_name": log_row_server_name(r.server_id, r.server_name, names),

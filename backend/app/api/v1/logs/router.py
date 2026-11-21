@@ -51,6 +51,8 @@ from app.services.logs.agent_logs import (
     search_dhcp_activity,
     search_dns_queries,
 )
+from app.services.logs.client_names import ClientNameError, name_fields, resolve_client_names
+from app.services.logs.client_names_ptr import resolve_ptr_batch
 
 logger = structlog.get_logger(__name__)
 
@@ -549,6 +551,10 @@ class DNSQueryLogRow(BaseModel):
     rcode: str | None = None
     answer_count: int | None = None
     raw: str
+    # Resolved host name for ``client_ip`` (#4249); only set when the request
+    # asked for ``resolve_clients`` and the address resolved.
+    client_name: str | None = None
+    client_name_source: Literal["ptr", "ipam"] | None = None
 
 
 class DNSQueryLogRequest(BaseModel):
@@ -570,6 +576,11 @@ class DNSQueryLogRequest(BaseModel):
     # never recorded, which is a question an operator genuinely asks
     # ("is response logging actually on?") and cannot express otherwise.
     rcode: str | None = None
+    # Client name resolution (#4249): "ptr" = reverse DNS through the
+    # platform's reverse-DNS resolvers; "ipam" = the host name in the IP space
+    # ``ip_space_id`` (required), limited to addresses the caller may read.
+    resolve_clients: Literal["none", "ptr", "ipam"] = "none"
+    ip_space_id: uuid.UUID | None = None
     max_events: int = Field(default=200, ge=1, le=1000)
 
 
@@ -626,6 +637,17 @@ async def query_dns_queries(
         )
     except InvalidLogFilter as exc:
         raise HTTPException(status_code=422, detail=exc.detail) from exc
+    try:
+        client_names = await resolve_client_names(
+            db,
+            current_user,
+            [str(r.client_ip) if r.client_ip is not None else None for r in rows],
+            body.resolve_clients,
+            body.ip_space_id,
+            ptr_batch=resolve_ptr_batch,
+        )
+    except ClientNameError as exc:
+        raise HTTPException(status_code=422, detail=exc.detail) from exc
     events = [
         DNSQueryLogRow(
             id=r.id,
@@ -642,6 +664,7 @@ async def query_dns_queries(
             rcode=r.rcode,
             answer_count=r.answer_count,
             raw=r.raw,
+            **name_fields(client_names, str(r.client_ip) if r.client_ip else None),
         )
         for r in rows
     ]
