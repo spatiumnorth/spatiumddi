@@ -47,6 +47,12 @@ export type HeaderMenuItem = {
   disabled?: boolean;
   /** Tooltip — carries the *reason* when disabled. */
   title?: string;
+  /**
+   * A line under the label, linked to the item with `aria-describedby`. Use
+   * it for the reason a disabled item is disabled: a `title` is a hover
+   * affordance a keyboard or touch user never sees (#4250).
+   */
+  description?: string;
   /** Renders in the destructive palette and, by convention, sits last. */
   destructive?: boolean;
   /** Draws a divider ABOVE this item. */
@@ -207,6 +213,9 @@ export function HeaderMenu({
                 aria-checked={it.checked}
                 title={it.title}
                 disabled={it.disabled}
+                aria-describedby={
+                  it.description ? `${menuId}-${it.key}-desc` : undefined
+                }
                 onClick={() => {
                   if (it.checked === undefined) {
                     // Hand focus back to the trigger BEFORE the item runs, so
@@ -239,7 +248,17 @@ export function HeaderMenu({
                     {it.checked ? "✓" : ""}
                   </span>
                 )}
-                <span className="min-w-0">{it.label}</span>
+                <span className="min-w-0">
+                  {it.label}
+                  {it.description && (
+                    <span
+                      id={`${menuId}-${it.key}-desc`}
+                      className="block text-[11px] font-normal text-muted-foreground"
+                    >
+                      {it.description}
+                    </span>
+                  )}
+                </span>
               </button>
             </div>
           ))}

@@ -7437,6 +7437,43 @@ export interface DNSBlockListException {
   created_at: string;
 }
 
+/** One entry of a blocking list that covers the queried name (#4250). */
+export interface BlocklistMatchEntry {
+  list_id: string;
+  list_name: string;
+  source_type: string;
+  block_mode: string;
+  sinkhole_ip: string | null;
+  enabled: boolean;
+  entry_id: string;
+  entry_domain: string;
+  is_wildcard: boolean;
+  entry_source: string;
+  entry_type: string;
+  target: string | null;
+  reason: string;
+  /** The list is enabled and assigned to the queried group / view. */
+  applies_here: boolean;
+  /** An exception takes this entry out for the queried name. */
+  excepted: boolean;
+}
+
+export interface BlocklistMatchException {
+  list_id: string;
+  list_name: string;
+  exception_id: string;
+  domain: string;
+  source: string;
+  applies_here: boolean;
+}
+
+export interface BlocklistMatch {
+  domain: string;
+  effective: "blocked" | "allowed" | "none";
+  matches: BlocklistMatchEntry[];
+  exceptions: BlocklistMatchException[];
+}
+
 export interface BlocklistCatalogSource {
   id: string;
   name: string;
@@ -8708,6 +8745,12 @@ export const dnsBlocklistApi = {
   deleteEntry: (id: string, entryId: string) =>
     api.delete(`/dns/blocklists/${id}/entries/${entryId}`),
 
+  /** Which lists cover one name, and is it blocked for a group / view (#4250). */
+  match: (params: { domain: string; group_id?: string; view_id?: string }) =>
+    api
+      .get<BlocklistMatch>("/dns/blocklists/match", { params })
+      .then((r) => r.data),
+
   listExceptions: (id: string) =>
     api
       .get<DNSBlockListException[]>(`/dns/blocklists/${id}/exceptions`)
@@ -9684,6 +9727,9 @@ export const dhcpApi = {
       .then((r) => r.data),
   resumeServer: (id: string) =>
     api.post<DHCPServer>(`/dhcp/servers/${id}/resume`).then((r) => r.data),
+  /** Leases across every server, exact IP match (#4250 client panel). */
+  findLeases: (params: { ip: string; state?: string; page_size?: number }) =>
+    api.get<Page<DHCPLease>>("/dhcp/leases", { params }).then((r) => r.data),
   getLeases: (
     id: string,
     params?: {

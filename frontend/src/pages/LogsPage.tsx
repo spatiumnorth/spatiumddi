@@ -49,6 +49,14 @@ import {
 import { copyToClipboard } from "@/lib/clipboard";
 import { cn } from "@/lib/utils";
 import { DNSThreatTab } from "./logs/DNSThreatTab";
+import {
+  ActionFooter,
+  BlockedByLine,
+  ClientPanel,
+  NotFromListNote,
+  UndoBanner,
+} from "./logs/DNSQueryActions";
+import { useDnsQueryTriage, type TriageDone } from "./logs/dnsQueryTriage";
 
 /**
  * Logs page — central log viewer.
@@ -1214,9 +1222,15 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
   const selection = effectiveSelection(pickedSelection, sources);
   const [maxEvents, setMaxEvents] = useState(200);
   const [since, setSince] = useState<string>("");
-  const [q, setQ] = useState("");
+  // ``?client=`` / ``?q=`` seed the filters (the details modal's "Copy link
+  // to this filter", #4250). Read once: typing a filter does not rewrite the
+  // URL, so the link is what the operator copies, not a live mirror.
+  const [urlParams] = useSearchParams();
+  const [q, setQ] = useState(() => urlParams.get("q") ?? "");
   const [qtype, setQtype] = useState<string>("");
-  const [clientIp, setClientIp] = useState<string>("");
+  const [clientIp, setClientIp] = useState<string>(
+    () => urlParams.get("client") ?? "",
+  );
   const [view, setView] = useState<string>("");
   const [rcode, setRcode] = useState<string>("");
 
@@ -1430,6 +1444,7 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
                 key={row.id}
                 row={row}
                 showServer={showServer}
+                sources={sources}
                 onFilterClient={(ip) => setClientIp(ip)}
                 onFilterQname={(name) => setQ(name)}
               />
@@ -1646,10 +1661,14 @@ export function DNSQueryRow({
   showServer = false,
   onFilterClient,
   onFilterQname,
+  sources,
 }: {
   row: DNSQueryLogRow;
   /** Render the Server column (#2120) — the read merged several servers. */
   showServer?: boolean;
+  /** Agent sources, so the details modal can tell which group and driver
+   *  answered the row (#4250). Without it the block actions stay disabled. */
+  sources?: AgentLogSource[];
   onFilterClient?: (ip: string) => void;
   onFilterQname?: (qname: string) => void;
 }) {
@@ -1668,6 +1687,9 @@ export function DNSQueryRow({
           onClose={closeDetails}
           onFilterClient={onFilterClient}
           onFilterQname={onFilterQname}
+          source={sources?.find(
+            (s) => s.server_id === row.server_id && s.server_kind === "dns",
+          )}
         />
       )}
       <span
@@ -2122,12 +2144,16 @@ function DNSQueryDetailModal({
   onClose,
   onFilterClient,
   onFilterQname,
+  source,
 }: {
   row: DNSQueryLogRow;
   onClose: () => void;
   onFilterClient?: (ip: string) => void;
   onFilterQname?: (qname: string) => void;
+  source?: AgentLogSource;
 }) {
+  const triage = useDnsQueryTriage(row, source);
+  const [done, setDone] = useState<TriageDone | null>(null);
   const rcode = row.rcode ?? null;
   const answers = row.answer_count ?? null;
   const result = describeRcode(rcode, answers);
@@ -2136,6 +2162,14 @@ function DNSQueryDetailModal({
     : null;
   return (
     <Modal title="DNS query details" onClose={onClose} wide>
+      {done && (
+        <UndoBanner
+          done={done}
+          canDelete={triage.perms.can("delete", "dns_blocklist")}
+          canWrite={triage.perms.can("write", "dns_blocklist")}
+          onChange={setDone}
+        />
+      )}
       <dl className="grid grid-cols-[110px_1fr] gap-x-4 gap-y-2">
         <DetailField label="Timestamp" mono>
           {formatFullTimestamp(row.ts)}
@@ -2172,6 +2206,8 @@ function DNSQueryDetailModal({
               {result.note}
             </span>
           )}
+          <BlockedByLine triage={triage} />
+          <NotFromListNote triage={triage} rcode={rcode} />
         </DetailField>
         <DetailField label="Answers" mono>
           {answers ?? <Missing />}
@@ -2180,37 +2216,16 @@ function DNSQueryDetailModal({
           {row.flags ?? <Missing />}
         </DetailField>
       </dl>
+      <ClientPanel ip={row.client_ip} />
       <RawLineBlock raw={row.raw} />
-      {((onFilterClient && row.client_ip) || (onFilterQname && row.qname)) && (
-        <div className="mt-4 flex flex-wrap justify-end gap-2">
-          {onFilterClient && row.client_ip && (
-            <button
-              type="button"
-              onClick={() => {
-                onFilterClient(row.client_ip!);
-                onClose();
-              }}
-              className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-xs hover:bg-accent/50"
-            >
-              <Search className="h-3.5 w-3.5" />
-              Filter by client
-            </button>
-          )}
-          {onFilterQname && row.qname && (
-            <button
-              type="button"
-              onClick={() => {
-                onFilterQname(row.qname!);
-                onClose();
-              }}
-              className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-xs hover:bg-accent/50"
-            >
-              <Search className="h-3.5 w-3.5" />
-              Filter by qname
-            </button>
-          )}
-        </div>
-      )}
+      <ActionFooter
+        row={row}
+        triage={triage}
+        onFilterClient={onFilterClient}
+        onFilterQname={onFilterQname}
+        onClose={onClose}
+        onDone={setDone}
+      />
     </Modal>
   );
 }

@@ -1229,7 +1229,7 @@ lists to `nxdomain`, which changes nothing they answer.
 - Per-list enable/disable toggle
 - Allow-list exceptions (whitelist specific domains)
 - Manual domain addition to block list
-- "Test a domain" — check if a domain would be blocked
+- "Test a domain" — `GET /api/v1/dns/blocklists/match?domain=&group_id=&view_id=` (#4250) reports which lists hold an entry or exception covering a name and whether it is blocked for that group / view. A wildcard entry covers its subdomains, an exact entry only itself, and the most specific of entry and exception wins: an exception for `a.example.com` carves it (and what is under it) out of a wildcard entry for `example.com`, which keeps blocking the rest. A manual exception applies to every list assigned to the same group / view, not only the list it was added to. The DNS Queries details modal uses it for **Block domain…**, **Allow domain…** and the "Blocked by" line
 
 ### Scoping — where a list applies (issue #876)
 

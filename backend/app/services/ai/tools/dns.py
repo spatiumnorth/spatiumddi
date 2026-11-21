@@ -39,6 +39,7 @@ from app.services.dns.blocklist_feed_health import feed_sync_state
 from app.services.dns.name_scope import classify_zone_name
 from app.services.dns.tld_registry import effective_registry
 from app.services.dns.zone_apex import served_apex_for_zones
+from app.services.dns_blocklist_match import match_domain
 
 _ZONE_NAME_SCOPES = frozenset({"public", "reserved", "undelegated", "reverse"})
 
@@ -1007,6 +1008,71 @@ async def list_dns_blocklists(
         }
         for r in rows
     ]
+
+
+# ── find_blocklist_matches ────────────────────────────────────────────
+
+
+class FindBlocklistMatchesArgs(BaseModel):
+    domain: str = Field(description="The name to look up, e.g. ads.tracker.example.com.")
+    group_id: str | None = Field(
+        default=None,
+        description="DNS server group UUID the query was served by. Lists assigned to it apply.",
+    )
+    view_id: str | None = Field(
+        default=None,
+        description="DNS view UUID, when the query was served from a view. Lists assigned to it apply.",
+    )
+
+    @field_validator("group_id", "view_id")
+    @classmethod
+    def _uuid(cls, v: str | None) -> str | None:
+        if v is not None:
+            uuid.UUID(v)
+        return v
+
+
+@register_tool(
+    name="find_blocklist_matches",
+    permission=("read", "dns_blocklist"),
+    description=(
+        "Which DNS blocking lists cover one domain name, and is it blocked? "
+        "Looks at the name and each parent suffix: an exact entry covers only "
+        "itself, a wildcard entry covers its subdomains too, and an exception "
+        "carves a name out when it is at least as specific as the entry. "
+        "Returns effective (blocked / allowed / none, over the lists applied to "
+        "group_id / view_id), the matching entries (list, entry domain, wildcard, "
+        "feed or manual, applies_here, excepted) and the matching exceptions. "
+        "Use for 'why is this site blocked?', 'which list blocks "
+        "ads.example.com?' or 'would this name be blocked for the guest view?'."
+    ),
+    args_model=FindBlocklistMatchesArgs,
+    category="dns",
+    module="core.dns",
+)
+async def find_blocklist_matches(
+    db: AsyncSession, user: User, args: FindBlocklistMatchesArgs
+) -> dict[str, Any]:
+    try:
+        res = await match_domain(
+            db,
+            args.domain,
+            group_id=uuid.UUID(args.group_id) if args.group_id else None,
+            view_id=uuid.UUID(args.view_id) if args.view_id else None,
+        )
+    except ValueError:
+        return {"error": "not a blocklist-able name (needs at least two labels)"}
+    return {
+        "domain": res.domain,
+        "effective": res.effective,
+        "matches": [
+            {**vars(m), "list_id": str(m.list_id), "entry_id": str(m.entry_id)} for m in res.matches
+        ],
+        "exceptions": [
+            {**vars(e), "list_id": str(e.list_id), "exception_id": str(e.exception_id)}
+            for e in res.exceptions
+        ],
+    }
 
 
 # ── list_dns_pools ────────────────────────────────────────────────────
