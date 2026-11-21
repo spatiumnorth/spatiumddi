@@ -57,6 +57,10 @@ Where the two disagree about a license, THIS file is authoritative.
 - kube-rbac-proxy (frr-k8s metrics sidecar; only with BGP mode enabled) —
   Apache 2.0 — https://github.com/brancz/kube-rbac-proxy
 - CloudNativePG (PostgreSQL operator) — Apache 2.0 — https://cloudnative-pg.io
+- operator-framework helm-operator (runtime base of the SpatiumDDI Operator image,
+  OperatorHub; opt-in, not part of the default install) — Apache 2.0, on Red Hat
+  UBI 9 layers under Red Hat's redistribution terms —
+  https://github.com/operator-framework/operator-sdk
 - Patroni (bare-metal HA Postgres overlay) — MIT — https://github.com/patroni/patroni
 - HAProxy (Patroni HA overlay) — GPL v2 (+ LGPL exception for libs) —
   https://www.haproxy.org
