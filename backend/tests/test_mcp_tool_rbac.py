@@ -302,6 +302,9 @@ _SESSION_ONLY_TOOLS = {
     "find_retention_settings",
     "find_ssh_settings",
     "find_syslog_settings",
+    # #3361 — GET /locks is session-gated and filters each lockable type by the
+    # caller's read grant; the tool does the same per type.
+    "find_locked_resources",
 }
 
 

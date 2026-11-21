@@ -172,6 +172,18 @@ import {
   MODAL_BACKDROP_CLS,
   useModalDialog,
 } from "@/components/ui/use-draggable-modal";
+import {
+  LockBadge,
+  LockControl,
+  LockDialog,
+  LockedFilterSelect,
+} from "@/components/LockControl";
+import {
+  deleteLockGate,
+  editLockHint,
+  matchesLockedFilter,
+  type LockedFilter,
+} from "@/lib/locks";
 import { HeaderButton } from "@/components/ui/header-button";
 import { HeaderMenu } from "@/components/ui/header-menu";
 import { FilterModePicker } from "@/components/ui/filter-mode-picker";
@@ -5602,6 +5614,7 @@ export function SubnetDetail({
     status: "",
     dns: "",
     pool: "",
+    locked: "",
   });
   // Chip-based tag filter (issue #104 phase 5b). Distinct from
   // ``colFilters.tags`` (freetext substring) so power-users keep
@@ -5637,6 +5650,7 @@ export function SubnetDetail({
       status: "",
       dns: "",
       pool: "",
+      locked: "",
     });
     setFilterModes({});
     setShowFilters(false);
@@ -5854,6 +5868,7 @@ export function SubnetDetail({
           return false;
         if (cf.status && a.status !== cf.status) return false;
         if (cf.dns && ipDnsState(a) !== cf.dns) return false;
+        if (!matchesLockedFilter(a, cf.locked as LockedFilter)) return false;
         return true;
       }),
     [
@@ -6085,6 +6100,8 @@ export function SubnetDetail({
   const [confirmDeleteAddr, setConfirmDeleteAddr] = useState<IPAddress | null>(
     null,
   );
+  // #3361 — the address whose lock / unlock dialog is open.
+  const [lockAddress, setLockAddress] = useState<IPAddress | null>(null);
   const [confirmPurgeAddr, setConfirmPurgeAddr] = useState<IPAddress | null>(
     null,
   );
@@ -6285,6 +6302,17 @@ export function SubnetDetail({
               resourceId={subnet.id}
               label={subnet.network}
             />
+            <LockControl
+              type="subnet"
+              resource={subnet}
+              label={subnet.network}
+              showBadge={false}
+              integrationOwned={!!subnet.integration_owner}
+              onChanged={() => {
+                qc.invalidateQueries({ queryKey: ["subnets"] });
+                qc.invalidateQueries({ queryKey: ["subnet", subnet.id] });
+              }}
+            />
             <HeaderButton
               icon={Pencil}
               onClick={() => setShowEditSubnet(true)}
@@ -6309,6 +6337,7 @@ export function SubnetDetail({
             {subnet.network}
           </span>
           <StatusBadge status={subnet.status} />
+          <LockBadge resource={subnet} />
           {subnet.kind === "multicast" && (
             <span
               className="inline-flex items-center rounded px-2 py-0.5 text-[11px] font-medium uppercase tracking-wider bg-violet-100 text-violet-700 dark:bg-violet-950/30 dark:text-violet-400"
@@ -6917,6 +6946,7 @@ export function SubnetDetail({
                                 status: "",
                                 dns: "",
                                 pool: "",
+                                locked: "",
                               });
                               setFilterModes({});
                             }}
@@ -7007,7 +7037,17 @@ export function SubnetDetail({
                         {/* Network column has no filter input yet — operators
                             can still filter via the per-device pages. */}
                         <td />
-                        <td />
+                        <td className="px-2 py-1">
+                          <LockedFilterSelect
+                            value={colFilters.locked}
+                            onChange={(v) =>
+                              setColFilters((p) => ({
+                                ...p,
+                                locked: v === "all" ? "" : v,
+                              }))
+                            }
+                          />
+                        </td>
                       </tr>
                     )}
                   </thead>
@@ -7237,6 +7277,10 @@ export function SubnetDetail({
                                     {addr.address}
                                   </button>
                                   <CopyButton text={addr.address} />
+                                  <LockBadge
+                                    resource={addr}
+                                    className="ml-1 inline-flex items-center gap-1 rounded bg-amber-100 px-1 py-0.5 align-middle text-[10px] font-medium uppercase text-amber-700 dark:bg-amber-950/30 dark:text-amber-400"
+                                  />
                                 </span>
                               </td>
                               <td className="px-4 py-2">
@@ -7557,6 +7601,7 @@ export function SubnetDetail({
                                         className="rounded p-1 text-muted-foreground hover:text-foreground"
                                         title={`Edit ${addr.address}`}
                                         aria-label={`Edit ${addr.address}`}
+                                        {...editLockHint(addr)}
                                       >
                                         <Pencil className="h-3.5 w-3.5" />
                                       </button>
@@ -7569,9 +7614,12 @@ export function SubnetDetail({
                                         aria-label={`Delete ${addr.address}`}
                                         // #3409 — DELETE /addresses/{id} takes
                                         // delete, not write.
-                                        {...permissionGate(
-                                          permitsDeleteIp(addr.address),
-                                          NEEDS_ADDRESS_DELETE,
+                                        {...deleteLockGate(
+                                          addr,
+                                          permissionGate(
+                                            permitsDeleteIp(addr.address),
+                                            NEEDS_ADDRESS_DELETE,
+                                          ),
                                         )}
                                       >
                                         <Trash2 className="h-3.5 w-3.5" />
@@ -7611,15 +7659,30 @@ export function SubnetDetail({
                                 <ContextMenuSeparator />
                                 <ContextMenuItem
                                   onSelect={() => setEditingAddress(addr)}
+                                  {...editLockHint(addr)}
                                 >
                                   Edit…
                                 </ContextMenuItem>
+                                {/* #3361 — a dynamic-lease mirror is the DHCP
+                                    server's; everything else takes a lock
+                                    behind the `lock` grant. */}
+                                {!addr.auto_from_lease &&
+                                  perms.can("lock", "ip_address", addr.id) && (
+                                    <ContextMenuItem
+                                      onSelect={() => setLockAddress(addr)}
+                                    >
+                                      {addr.lock_level ? "Unlock…" : "Lock…"}
+                                    </ContextMenuItem>
+                                  )}
                                 <ContextMenuItem
                                   destructive
                                   onSelect={() => setConfirmDeleteAddr(addr)}
-                                  {...permissionGate(
-                                    permitsDeleteIp(addr.address),
-                                    NEEDS_ADDRESS_DELETE,
+                                  {...deleteLockGate(
+                                    addr,
+                                    permissionGate(
+                                      permitsDeleteIp(addr.address),
+                                      NEEDS_ADDRESS_DELETE,
+                                    ),
                                   )}
                                 >
                                   Delete…
@@ -7803,6 +7866,16 @@ export function SubnetDetail({
         <EditAddressModal
           address={editingAddress}
           onClose={() => setEditingAddress(null)}
+        />
+      )}
+      {lockAddress && (
+        <LockDialog
+          type="ip_address"
+          id={lockAddress.id}
+          label={lockAddress.address}
+          locked={!!lockAddress.lock_level}
+          onClose={() => setLockAddress(null)}
+          onDone={() => qc.invalidateQueries({ queryKey: ["addresses"] })}
         />
       )}
       {viewingAddress && (
@@ -9470,7 +9543,10 @@ function EditSubnetModalForm({
           </p>
           <button
             onClick={() => setDeleteStep(1)}
-            {...permissionGate(canDeleteSubnet, NEEDS_SUBNET_DELETE)}
+            {...deleteLockGate(
+              subnet,
+              permissionGate(canDeleteSubnet, NEEDS_SUBNET_DELETE),
+            )}
             className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-1.5 text-sm text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
           >
             Delete this subnet…
@@ -12278,7 +12354,10 @@ export function SubnetRow({
         <ContextMenuItem
           destructive
           onSelect={() => onDelete()}
-          {...permissionGate(canDeleteSubnet, NEEDS_SUBNET_DELETE)}
+          {...deleteLockGate(
+            subnet,
+            permissionGate(canDeleteSubnet, NEEDS_SUBNET_DELETE),
+          )}
         >
           Delete…
         </ContextMenuItem>
@@ -13201,7 +13280,10 @@ function EditSpaceModalForm({
           </p>
           <button
             onClick={() => setDeleteStep(1)}
-            {...permissionGate(canDeleteSpace, NEEDS_SPACE_DELETE)}
+            {...deleteLockGate(
+              space,
+              permissionGate(canDeleteSpace, NEEDS_SPACE_DELETE),
+            )}
             className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-1.5 text-sm text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
           >
             Delete this IP space…
@@ -14161,7 +14243,10 @@ function EditBlockModalForm({
           </p>
           <button
             onClick={() => setDeleteStep(1)}
-            {...permissionGate(canDeleteBlock, NEEDS_BLOCK_DELETE)}
+            {...deleteLockGate(
+              block,
+              permissionGate(canDeleteBlock, NEEDS_BLOCK_DELETE),
+            )}
             className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-1.5 text-sm text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
           >
             Delete this block…
@@ -14282,6 +14367,9 @@ export function BlockTreeRow({
   const canEditBlock = perms.can("write", "ip_block", node.block.id);
   const canDeleteBlock = perms.can("delete", "ip_block");
   const canWriteSubnets = perms.can("write", "subnet");
+  const qc = useQueryClient();
+  // #3361 — the block's lock / unlock dialog, from its right-click menu.
+  const [showLockBlock, setShowLockBlock] = useState(false);
   const {
     attributes: dragAttrs,
     listeners: dragListeners,
@@ -14369,6 +14457,10 @@ export function BlockTreeRow({
                 name={node.block.name}
                 className="min-w-0 flex-1 truncate text-[10px] opacity-60 mr-1"
               />
+              <LockBadge
+                resource={node.block}
+                className="inline-flex items-center rounded bg-amber-100 px-1 py-0.5 text-amber-700 dark:bg-amber-950/30 dark:text-amber-400"
+              />
               <CustomerChip customerId={node.block.customer_id} />
               <SiteChip siteId={node.block.site_id} />
               <BgpAdvertisedChip
@@ -14406,13 +14498,31 @@ export function BlockTreeRow({
             <ContextMenuItem
               destructive
               onSelect={() => onDeleteBlock(node.block)}
-              {...permissionGate(canDeleteBlock, NEEDS_BLOCK_DELETE)}
+              {...deleteLockGate(
+                node.block,
+                permissionGate(canDeleteBlock, NEEDS_BLOCK_DELETE),
+              )}
             >
               Delete…
             </ContextMenuItem>
           )}
+          {perms.can("lock", "ip_block", node.block.id) && (
+            <ContextMenuItem onSelect={() => setShowLockBlock(true)}>
+              {node.block.lock_level ? "Unlock…" : "Lock…"}
+            </ContextMenuItem>
+          )}
         </ContextMenuContent>
       </ContextMenu>
+      {showLockBlock && (
+        <LockDialog
+          type="ip_block"
+          id={node.block.id}
+          label={node.block.network}
+          locked={!!node.block.lock_level}
+          onClose={() => setShowLockBlock(false)}
+          onDone={() => qc.invalidateQueries({ queryKey: ["blocks"] })}
+        />
+      )}
 
       {/* Children with vertical tree line. Blocks and subnets are
           interleaved in a single sort by network address so the tree
@@ -14524,6 +14634,7 @@ export function BlockDetailView({
     router: "",
     vlan: "",
     status: "",
+    locked: "",
   });
   const [tagFilters, setTagFilters] = useState<string[]>([]);
   // Subnet-role filter (issue #112 phase 2). Empty Set = "all roles";
@@ -14860,9 +14971,19 @@ export function BlockDetailView({
                     },
                   ]}
                 />
+                <LockControl
+                  type="ip_block"
+                  resource={block}
+                  label={block.network}
+                  showBadge={false}
+                  onChanged={() => {
+                    qc.invalidateQueries({ queryKey: ["blocks"] });
+                  }}
+                />
                 <HeaderButton
                   icon={Pencil}
                   onClick={() => setShowEdit(true)}
+                  {...editLockHint(block)}
                   {...permissionGate(canEditBlock, NEEDS_BLOCK_WRITE)}
                 >
                   Edit
@@ -14905,6 +15026,7 @@ export function BlockDetailView({
             name={block.name}
             className="text-sm text-muted-foreground"
           />
+          <LockBadge resource={block} />
           {block.description && (
             <span className="text-xs text-muted-foreground/70">
               · {block.description}
@@ -15259,6 +15381,8 @@ export function BlockDetailView({
                 // the operator-expected "show only env=prod gear" view.
                 if (hasTagFilter && !matchesAllTagChips(b.tags, tagFilters))
                   return false;
+                if (!matchesLockedFilter(b, blockFilter.locked as LockedFilter))
+                  return false;
                 if (
                   blockFilter.network &&
                   !b.network.includes(blockFilter.network)
@@ -15276,6 +15400,8 @@ export function BlockDetailView({
               if (r.type === "subnet" && r.subnet) {
                 const s = r.subnet;
                 if (hasTagFilter && !matchesAllTagChips(s.tags, tagFilters))
+                  return false;
+                if (!matchesLockedFilter(s, blockFilter.locked as LockedFilter))
                   return false;
                 if (
                   hasRoleFilter &&
@@ -15469,6 +15595,7 @@ export function BlockDetailView({
                               router: "",
                               vlan: "",
                               status: "",
+                              locked: "",
                             })
                           }
                           title="Clear all filters"
@@ -15560,7 +15687,17 @@ export function BlockDetailView({
                       {subnetCfDefs.map((def) => (
                         <td key={def.name} />
                       ))}
-                      <td />
+                      <td className="px-2 py-1">
+                        <LockedFilterSelect
+                          value={blockFilter.locked}
+                          onChange={(v) =>
+                            setBlockFilter((p) => ({
+                              ...p,
+                              locked: v === "all" ? "" : v,
+                            }))
+                          }
+                        />
+                      </td>
                     </tr>
                   )}
                 </thead>
@@ -16080,6 +16217,7 @@ export function SpaceTableView({
     router: "",
     vlan: "",
     status: "",
+    locked: "",
   });
   const [showDnsSync, setShowDnsSync] = useState(false);
   // #2135 — Sync DNS reads and writes the DNS server: hidden with core.dns off.
@@ -16234,6 +16372,8 @@ export function SpaceTableView({
     ? rows.filter((item) => {
         if (item.type === "block" && item.block) {
           const b = item.block;
+          if (!matchesLockedFilter(b, spaceFilter.locked as LockedFilter))
+            return false;
           if (spaceFilter.network && !b.network.includes(spaceFilter.network))
             return false;
           if (
@@ -16246,6 +16386,8 @@ export function SpaceTableView({
         }
         if (item.type === "subnet" && item.subnet) {
           const s = item.subnet;
+          if (!matchesLockedFilter(s, spaceFilter.locked as LockedFilter))
+            return false;
           if (spaceFilter.network && !s.network.includes(spaceFilter.network))
             return false;
           if (
@@ -16373,9 +16515,17 @@ export function SpaceTableView({
             >
               Find Free…
             </HeaderButton>
+            <LockControl
+              type="ip_space"
+              resource={space}
+              label={space.name}
+              showBadge={false}
+              onChanged={() => qc.invalidateQueries({ queryKey: ["spaces"] })}
+            />
             <HeaderButton
               icon={Pencil}
               onClick={() => setShowEditSpace(true)}
+              {...(space.lock_level === "edit" ? editLockHint(space) : {})}
               {...permissionGate(canEditSpace, NEEDS_SPACE_WRITE)}
             >
               Edit Space
@@ -16399,7 +16549,10 @@ export function SpaceTableView({
           </div>
         </div>
         <div>
-          <h2 className="text-base font-semibold">{space.name}</h2>
+          <h2 className="flex items-center gap-2 text-base font-semibold">
+            {space.name}
+            <LockBadge resource={space} />
+          </h2>
           {space.description && (
             <p className="text-xs text-muted-foreground">{space.description}</p>
           )}
@@ -16533,6 +16686,7 @@ export function SpaceTableView({
                             router: "",
                             vlan: "",
                             status: "",
+                            locked: "",
                           })
                         }
                         title="Clear all filters"
@@ -16617,7 +16771,17 @@ export function SpaceTableView({
                     {subnetCfDefs.map((def) => (
                       <td key={def.name} />
                     ))}
-                    <td />
+                    <td className="px-2 py-1">
+                      <LockedFilterSelect
+                        value={spaceFilter.locked}
+                        onChange={(v) =>
+                          setSpaceFilter((f) => ({
+                            ...f,
+                            locked: v === "all" ? "" : v,
+                          }))
+                        }
+                      />
+                    </td>
                   </tr>
                 )}
               </thead>
@@ -17138,6 +17302,8 @@ export function SpaceSection({
     false,
   ); // string = parent block_id
   const [showEditSpace, setShowEditSpace] = useState(false);
+  // #3361 — the space's lock / unlock dialog.
+  const [showLockSpace, setShowLockSpace] = useState(false);
   const [editBlock, setEditBlock] = useState<IPBlock | null>(null);
   const [subnetToDelete, setSubnetToDelete] = useState<Subnet | null>(null);
   const [blockToDelete, setBlockToDelete] = useState<IPBlock | null>(null);
@@ -17434,6 +17600,10 @@ export function SpaceSection({
               >
                 {space.name}
               </span>
+              <LockBadge
+                resource={space}
+                className="inline-flex items-center rounded bg-amber-100 px-1 py-0.5 text-amber-700 dark:bg-amber-950/30 dark:text-amber-400"
+              />
               <CustomerChip customerId={space.customer_id} />
             </button>
           </div>
@@ -17463,6 +17633,11 @@ export function SpaceSection({
           >
             Edit Space…
           </ContextMenuItem>
+          {perms.can("lock", "ip_space", space.id) && (
+            <ContextMenuItem onSelect={() => setShowLockSpace(true)}>
+              {space.lock_level ? "Unlock…" : "Lock…"}
+            </ContextMenuItem>
+          )}
         </ContextMenuContent>
       </ContextMenu>
 
@@ -17625,6 +17800,16 @@ export function SpaceSection({
         />
       )}
 
+      {showLockSpace && (
+        <LockDialog
+          type="ip_space"
+          id={space.id}
+          label={space.name}
+          locked={!!space.lock_level}
+          onClose={() => setShowLockSpace(false)}
+          onDone={() => qc.invalidateQueries({ queryKey: ["spaces"] })}
+        />
+      )}
       {showEditSpace && (
         <EditSpaceModal
           space={space}

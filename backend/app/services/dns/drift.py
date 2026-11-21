@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.drivers.dns import get_driver
 from app.drivers.dns.base import RecordData, TsigKey
 from app.models.dns import DNSRecord, DNSServer, DNSServerZoneState, DNSZone
+from app.services import locks as lock_svc
 from app.services.dns.pull_from_server import (
     _key,
     non_authoritative_reason,
@@ -110,6 +111,25 @@ class DriftRecord:
 
 
 @dataclass
+class LockedRecordDrift:
+    """A locked record whose live value on one server differs from ours (#3361).
+
+    A lock says "this record is frozen at this value", so the one place that
+    says it is not what a server answers with is worth a row of its own, not a
+    line lost in the missing / extra lists. ``live_values`` is what the server
+    holds under the same name and type (empty = it holds no such record).
+    """
+
+    name: str
+    record_type: str
+    value: str
+    lock_level: str
+    locked_by: str | None = None
+    lock_reason: str | None = None
+    live_values: list[str] = field(default_factory=list)
+
+
+@dataclass
 class ServerDrift:
     server_id: str
     server_name: str
@@ -143,6 +163,8 @@ class ServerDrift:
     # unviewed zone, which a transfer may legitimately not return. Internal:
     # read by the classifier, not part of the API.
     missing_view_scoped: int = 0
+    # Locked records this server does not serve as saved (#3361).
+    locked_differs: list[LockedRecordDrift] = field(default_factory=list)
 
     @property
     def drift_count(self) -> int:
@@ -207,6 +229,43 @@ def _to_drift_record(r: RecordData | DNSRecord) -> DriftRecord:
         weight=getattr(r, "weight", None),
         port=getattr(r, "port", None),
     )
+
+
+def _locked_differences(
+    db_by_key: dict[Any, DNSRecord], wire_by_key: dict[Any, RecordData]
+) -> list[LockedRecordDrift]:
+    """The locked records (#3361) of ``db_by_key`` the server does not serve as
+    saved, each with the values the server holds for the same name and type.
+
+    A record that changed value on the server is a missing + extra pair in the
+    lists above, because the identity key includes the value; this pairs them
+    up again for the one kind of record where the pairing is the point.
+    """
+    missing = [(k, r) for k, r in db_by_key.items() if k not in wire_by_key]
+    out: list[LockedRecordDrift] = []
+    for _k, rec in missing:
+        info = lock_svc.active_lock(rec)
+        if info is None:
+            continue
+        live = [
+            w.value
+            for k, w in wire_by_key.items()
+            if k not in db_by_key
+            and (w.name or "@") == (rec.name or "@")
+            and w.record_type == rec.record_type
+        ]
+        out.append(
+            LockedRecordDrift(
+                name=rec.name or "@",
+                record_type=rec.record_type,
+                value=rec.value,
+                lock_level=info.level,
+                locked_by=info.locked_by,
+                lock_reason=info.reason,
+                live_values=live,
+            )
+        )
+    return out
 
 
 # Statuses of a server whose zone was actually read: the diff is meaningful.
@@ -486,6 +545,7 @@ async def compute_zone_drift(
         entry.missing_on_server = [
             _to_drift_record(r) for k, r in db_by_key.items() if k not in wire_by_key
         ]
+        entry.locked_differs = _locked_differences(db_by_key, wire_by_key)
         entry.missing_view_scoped = sum(
             1 for k, r in db_by_key.items() if k not in wire_by_key and r.view_id is not None
         )

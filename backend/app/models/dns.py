@@ -25,7 +25,13 @@ from sqlalchemy import text as sa_text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
-from app.models.base import Base, SoftDeleteMixin, TimestampMixin, UUIDPrimaryKeyMixin
+from app.models.base import (
+    Base,
+    LockMixin,
+    SoftDeleteMixin,
+    TimestampMixin,
+    UUIDPrimaryKeyMixin,
+)
 
 #: Stored default of ``DNSServerOptions.allow_recursion`` (#1817).
 #: Stored default for ``DNSServerOptions.allow_query_cache``. Not rendered
@@ -160,7 +166,7 @@ class DNSServerRuntimeState(Base):
     )
 
 
-class DNSServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+class DNSServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, LockMixin, Base):
     """Logical cluster of DNS servers sharing configuration (e.g. internal-resolvers, external-auth)."""
 
     __tablename__ = "dns_server_group"
@@ -1089,7 +1095,7 @@ class DNSTSIGKey(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     group: Mapped["DNSServerGroup"] = relationship("DNSServerGroup")
 
 
-class DNSView(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+class DNSView(UUIDPrimaryKeyMixin, TimestampMixin, LockMixin, Base):
     """Split-horizon DNS view — different clients see different zone data."""
 
     __tablename__ = "dns_view"
@@ -1173,7 +1179,7 @@ def servable_ttl(ttl: int | None) -> int | None:
     return ttl
 
 
-class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
+class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, LockMixin, Base):
     """DNS zone — authoritative, secondary, stub, or forward."""
 
     __tablename__ = "dns_zone"
@@ -1415,7 +1421,7 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     )
 
 
-class DNSRecord(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
+class DNSRecord(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, LockMixin, Base):
     """Individual DNS resource record within a zone."""
 
     __tablename__ = "dns_record"

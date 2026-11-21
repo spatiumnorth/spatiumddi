@@ -576,6 +576,14 @@ async def commit_subnet_merge(
     want to serialise. Recheck preview under the lock; reject on any
     conflict.
     """
+    from app.services import locks as lock_svc  # noqa: PLC0415
+
+    # #3361 — every source subnet is rewritten into the merged one.
+    await lock_svc.assert_tree_editable(db, "subnet", target)
+    for sibling_id in sibling_subnet_ids:
+        sibling = await db.get(Subnet, sibling_id)
+        if sibling is not None:
+            await lock_svc.assert_tree_editable(db, "subnet", sibling)
     if not await _try_advisory_lock(db, target.id):
         raise MergeError(
             "Another operation is already in progress for this subnet. " "Retry once it completes.",

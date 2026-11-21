@@ -348,6 +348,14 @@ async def move_server_to_group(
     old_group_id = server.group_id
     if old_group_id == target_group.id:
         return None
+    # #3361 — membership is part of a group's operative config: an edit-locked
+    # group neither gives up nor takes in a server.
+    from app.services import locks as lock_svc  # noqa: PLC0415
+
+    source_group = await db.get(DNSServerGroup, old_group_id)
+    if source_group is not None:
+        lock_svc.assert_editable("dns_group", source_group, None)
+    lock_svc.assert_editable("dns_group", target_group, None)
     await lock_server_row(db, server.id)
 
     # ── Refusals ──────────────────────────────────────────────────────

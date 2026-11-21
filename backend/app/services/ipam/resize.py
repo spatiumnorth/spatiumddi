@@ -1155,6 +1155,9 @@ async def commit_subnet_resize(
        on this subnet. Skip agentless (Windows DHCP read-only) drivers.
     8. Update block utilization rollup.
     """
+    from app.services import locks as lock_svc  # noqa: PLC0415
+
+    lock_svc.assert_editable("subnet", subnet, None)  # #3361 — the CIDR is operative
     # Lazy import to avoid the router → service → router cycle.
     from app.api.v1.ipam.router import (
         _sync_dns_record,
@@ -1455,6 +1458,9 @@ async def commit_block_resize(
     side effects at the block level itself — the block is a pure
     containment node.
     """
+    from app.services import locks as lock_svc  # noqa: PLC0415
+
+    lock_svc.assert_editable("ip_block", block, None)  # #3361 — the CIDR is operative
     from app.api.v1.ipam.router import _update_block_utilization
 
     # ``current_user`` is accepted for symmetry with the subnet path and for

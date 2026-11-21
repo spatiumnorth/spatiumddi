@@ -134,6 +134,7 @@ from app.models.dns import (
     dnssec_algorithm_name,
 )
 from app.models.metrics import DNSMetricSample
+from app.services import locks as lock_svc
 from app.services.agents.container_oom import daemon_reported_by
 from app.services.agents.daemon_state import is_not_serving
 from app.services.agents.memory_status import (
@@ -751,7 +752,7 @@ class OptionSupportEntry(BaseModel):
     locked: bool
 
 
-class ServerGroupResponse(BaseModel):
+class ServerGroupResponse(lock_svc.LockState):
     id: uuid.UUID
     name: str
     description: str
@@ -827,6 +828,11 @@ class ServerGroupResponse(BaseModel):
             },
             created_at=g.created_at,
             modified_at=g.modified_at,
+            lock_level=g.lock_level,
+            locked_by=g.locked_by,
+            locked_at=g.locked_at,
+            lock_reason=g.lock_reason,
+            lock_expires_at=g.lock_expires_at,
         )
 
 
@@ -1533,7 +1539,7 @@ class ViewUpdate(BaseModel):
     allow_query_cache: list[str] | None = None
 
 
-class ViewResponse(BaseModel):
+class ViewResponse(lock_svc.LockState):
     id: uuid.UUID
     group_id: uuid.UUID
     name: str
@@ -1894,7 +1900,7 @@ class ZoneNameScopeDetail(BaseModel):
     mdns_conflict: bool = False
 
 
-class ZoneResponse(BaseModel):
+class ZoneResponse(lock_svc.LockState):
     id: uuid.UUID
     group_id: uuid.UUID
     view_id: uuid.UUID | None
@@ -2062,7 +2068,7 @@ class RecordUpdate(BaseModel):
         return validate_record_owner(v, field="record name", allow_classless=True)
 
 
-class RecordResponse(BaseModel):
+class RecordResponse(lock_svc.LockState):
     id: uuid.UUID
     zone_id: uuid.UUID
     view_id: uuid.UUID | None
@@ -2490,6 +2496,7 @@ async def update_group(
             "auto_reverse_zones_at_provider",
         },
     )
+    lock_svc.assert_editable("dns_group", group, changes)  # #3361
     # #1784 — only turning catalog zones ON is refused: turning an
     # unapplied setting OFF is the way out of it, and a re-save of the
     # stored value must keep working.
@@ -2569,6 +2576,7 @@ async def rotate_group_key(
     retried (#1232). The secret is never returned.
     """
     group = await _require_group(group_id, db)
+    lock_svc.assert_group_content_editable(group, lock_svc.GROUP_CONTENT_TSIG_KEYS)  # #3361
     rotate_group_tsig_key(group)
     db.add(
         AuditLog(
@@ -2601,6 +2609,7 @@ async def delete_group(group_id: uuid.UUID, db: DB, current_user: SuperAdmin) ->
     group = await db.get(DNSServerGroup, group_id)
     if not group:
         raise HTTPException(status_code=404, detail="Server group not found")
+    await lock_svc.assert_tree_deletable(db, "dns_group", group)  # #3361
 
     # The ORM-level ``cascade="all, delete-orphan"`` on zones/servers/views will
     # happily wipe a populated group, which is an easy foot-gun — the user can
@@ -2656,6 +2665,7 @@ async def delete_group(group_id: uuid.UUID, db: DB, current_user: SuperAdmin) ->
             .all()
         }
     for z in trashed_zones:
+        lock_svc.assert_deletable("dns_zone", z)  # #3361 — a locked zone in Trash stays
         record_count = (
             await db.execute(
                 select(func.count())
@@ -4825,15 +4835,30 @@ def _refuse_plain_port_forwarders_on_encrypted(
 async def update_options(
     group_id: uuid.UUID, body: ServerOptionsUpdate, db: DB, current_user: SuperAdmin
 ) -> ServerOptionsResponse:
-    await _require_group(group_id, db)
+    group = await _require_group(group_id, db)
     opts = await _load_options(group_id, db)
     stored_opts = opts
+    changes = body.model_dump(exclude_none=True)
+    # #3361 — judged before a missing row is created, against the stored values
+    # (or the column defaults for a group with no row yet).
+    lock_svc.assert_group_content_editable(
+        group,
+        lock_svc.GROUP_CONTENT_OPTIONS,
+        current=opts or _default_options(group_id),
+        changes={
+            **changes,
+            **{
+                f: None
+                for f in body.model_fields_set
+                if getattr(body, f) is None and f not in changes
+            },
+        },
+    )
     if not opts:
         opts = DNSServerOptions(group_id=group_id)
         db.add(opts)
         await db.flush()  # column-default id must exist before the audit row reads it (#2006)
 
-    changes = body.model_dump(exclude_none=True)
     # #1817: a blank allow_recursion means "the default", not "nobody". An
     # empty list would render ``allow-recursion { none; }`` / Technitium
     # ``Deny`` and lock every client out of recursion, which is not what
@@ -4981,7 +5006,8 @@ async def update_options(
 async def add_trust_anchor(
     group_id: uuid.UUID, body: TrustAnchorCreate, db: DB, current_user: SuperAdmin
 ) -> DNSTrustAnchor:
-    await _require_group(group_id, db)
+    group = await _require_group(group_id, db)
+    lock_svc.assert_group_content_editable(group, lock_svc.GROUP_CONTENT_TRUST_ANCHORS)  # #3361
     # #3609: a static root anchor is never right — BIND refuses it under
     # ``auto`` and it breaks at the next root key rollover under ``yes``.
     if is_root_zone(body.zone_name) and not body.is_initial_key:
@@ -5040,7 +5066,8 @@ async def add_trust_anchor(
 async def delete_trust_anchor(
     group_id: uuid.UUID, anchor_id: uuid.UUID, db: DB, current_user: SuperAdmin
 ) -> None:
-    await _require_group(group_id, db)
+    group = await _require_group(group_id, db)
+    lock_svc.assert_group_content_editable(group, lock_svc.GROUP_CONTENT_TRUST_ANCHORS)  # #3361
     result = await db.execute(
         select(DNSTrustAnchor)
         .join(DNSServerOptions)
@@ -5301,7 +5328,8 @@ async def list_acls(group_id: uuid.UUID, db: DB, _: CurrentUser) -> list[DNSAcl]
 async def create_acl(
     group_id: uuid.UUID, body: AclCreate, db: DB, current_user: CurrentUser
 ) -> DNSAcl:
-    await _require_group(group_id, db)
+    group = await _require_group(group_id, db)
+    lock_svc.assert_group_content_editable(group, lock_svc.GROUP_CONTENT_ACLS)  # #3361
 
     acl_names, key_names = await _group_symbol_names(group_id, db)
     try:
@@ -5364,6 +5392,30 @@ async def update_acl(
     current_user: CurrentUser,
 ) -> DNSAcl:
     acl = await _require_acl(group_id, acl_id, db)
+    # #3361 — an ACL of an edit-locked group is frozen, its description aside.
+    # Entries compare as (value, negate, order) lists, so re-sending the
+    # stored ones is not a change.
+    lock_svc.assert_group_content_editable(
+        await _require_group(group_id, db),
+        lock_svc.GROUP_CONTENT_ACLS,
+        current=SimpleNamespace(
+            name=acl.name,
+            description=acl.description,
+            entries=[(e.value, e.negate, e.order) for e in sorted(acl.entries, key=_entry_order)],
+        ),
+        changes={
+            **body.model_dump(exclude_none=True, exclude={"entries"}),
+            **(
+                {
+                    "entries": [
+                        (e.value, e.negate, e.order) for e in sorted(body.entries, key=_entry_order)
+                    ]
+                }
+                if body.entries is not None
+                else {}
+            ),
+        },
+    )
     # Exclude this ACL from the citable set: an entry naming its own ACL is
     # a self-reference, and reporting it as an undefined name points at the
     # field the operator is editing.
@@ -5431,6 +5483,9 @@ async def delete_acl(
     group_id: uuid.UUID, acl_id: uuid.UUID, db: DB, current_user: CurrentUser
 ) -> None:
     acl = await _require_acl(group_id, acl_id, db)
+    lock_svc.assert_group_content_editable(
+        await _require_group(group_id, db), lock_svc.GROUP_CONTENT_ACLS
+    )  # #3361
     await _assert_acl_is_unreferenced(group_id, acl, db, action="delete")
     db.add(
         AuditLog(
@@ -5730,7 +5785,8 @@ async def create_tsig_key(
     current_user: SuperAdmin,
 ) -> TSIGKeyResponse:
     """Create a TSIG key. Secret is returned in the response *exactly once*."""
-    await _require_group(group_id, db)
+    group = await _require_group(group_id, db)
+    lock_svc.assert_group_content_editable(group, lock_svc.GROUP_CONTENT_TSIG_KEYS)  # #3361
     # #1858 — an algorithm a driver in the group cannot use is refused, not
     # installed and left to fail every signed transfer with BADKEY.
     if refusal := tsig_key_refusal(body.algorithm, await _group_driver_names(db, group_id)):
@@ -5795,6 +5851,12 @@ async def update_tsig_key(
         raise HTTPException(status_code=404, detail="TSIG key not found")
     changes = body.model_dump(exclude_unset=True)
     changes.pop("secret", None)  # never a column write; see TSIGKeyUpdate
+    lock_svc.assert_group_content_editable(
+        await _require_group(group_id, db),
+        lock_svc.GROUP_CONTENT_TSIG_KEYS,
+        current=key,
+        changes=changes,
+    )  # #3361
     # #1858 — only a CHANGE of algorithm is refused: re-saving a key the group
     # already holds (the form posts every field) must keep working.
     new_algo = changes.get("algorithm")
@@ -5841,6 +5903,9 @@ async def rotate_tsig_key(
     key = await db.get(DNSTSIGKey, key_id)
     if key is None or key.group_id != group_id:
         raise HTTPException(status_code=404, detail="TSIG key not found")
+    lock_svc.assert_group_content_editable(
+        await _require_group(group_id, db), lock_svc.GROUP_CONTENT_TSIG_KEYS
+    )  # #3361
     plaintext = _generate_tsig_secret(key.algorithm)
     key.secret_encrypted = encrypt_str(plaintext)
     key.last_rotated_at = datetime.now(UTC)
@@ -5871,6 +5936,9 @@ async def delete_tsig_key(
     key = await db.get(DNSTSIGKey, key_id)
     if key is None or key.group_id != group_id:
         raise HTTPException(status_code=404, detail="TSIG key not found")
+    lock_svc.assert_group_content_editable(
+        await _require_group(group_id, db), lock_svc.GROUP_CONTENT_TSIG_KEYS
+    )  # #3361
     await _assert_tsig_key_is_unreferenced(group_id, key, db, action="delete")
     # The update-grant rows cascade with the key (fail-closed, but the
     # operator should hear about it).
@@ -6044,6 +6112,7 @@ async def update_view(
         },
     )
     changes.update(await _validated_view_fields(group_id, body, db))
+    lock_svc.assert_editable("dns_view", view, changes)  # #3361
     before = {k: getattr(view, k, None) for k in changes}
     for k, v in changes.items():
         setattr(view, k, v)
@@ -6101,6 +6170,7 @@ async def delete_view(
     ``acknowledge_blocklist_detach=true`` rather than doing it silently.
     """
     view = await _require_view(group_id, view_id, db)
+    lock_svc.assert_deletable("dns_view", view)  # #3361
     await _assert_view_is_unowned(view, db)
 
     bl_rows = (
@@ -6626,6 +6696,19 @@ class DriftRecordEntry(BaseModel):
     port: int | None = None
 
 
+class LockedDriftEntry(BaseModel):
+    """A locked record the server does not serve as saved (#3361)."""
+
+    name: str
+    record_type: str
+    value: str
+    lock_level: str
+    locked_by: str | None = None
+    lock_reason: str | None = None
+    # What the server holds under the same name and type; empty = nothing.
+    live_values: list[str] = []
+
+
 class ServerDriftEntry(BaseModel):
     server_id: str
     server_name: str
@@ -6642,6 +6725,7 @@ class ServerDriftEntry(BaseModel):
     drift_count: int
     extra_on_server: list[DriftRecordEntry]
     missing_on_server: list[DriftRecordEntry]
+    locked_differs: list[LockedDriftEntry] = []
 
 
 class ZoneDriftResponse(BaseModel):
@@ -6715,6 +6799,18 @@ async def get_zone_drift(
                         port=r.port,
                     )
                     for r in s.missing_on_server
+                ],
+                locked_differs=[
+                    LockedDriftEntry(
+                        name=r.name,
+                        record_type=r.record_type,
+                        value=r.value,
+                        lock_level=r.lock_level,
+                        locked_by=r.locked_by,
+                        lock_reason=r.lock_reason,
+                        live_values=r.live_values,
+                    )
+                    for r in s.locked_differs
                 ],
             )
             for s in report.servers
@@ -7180,6 +7276,7 @@ async def update_zone(
             "tags",
         },
     )
+    lock_svc.assert_editable("dns_zone", zone, changes)  # #3361
     # Secondary / stub zones need at least one master to render loadable
     # BIND9 config (issue #336). Validate against the *effective* state —
     # the new zone_type/masters from this payload OR what's already on the
@@ -7940,6 +8037,7 @@ async def replace_zone_update_acl(
     """
     zone = await _require_zone(group_id, zone_id, db, current_user)
     _reject_if_synthesised_zone(zone, "edit")
+    lock_svc.assert_editable("dns_zone", zone, None)  # #3361 — ACL is zone config
     await _lock_acl_and_check_version(db, zone, body.expected_version)
 
     # #3738 — audit only what changed; a save that changes nothing writes no
@@ -8467,6 +8565,7 @@ async def sign_zone_dnssec(
     immediately.
     """
     zone = await _require_zone(group_id, zone_id, db, current_user)
+    lock_svc.assert_editable("dns_zone", zone, None)  # #3361 — DNSSEC state is zone config
     _reject_if_synthesised_zone(zone, "DNSSEC-sign")
     await _check_driver_gated_operation("dnssec_sign", group_id, db)
     zone.dnssec_enabled = True
@@ -8519,6 +8618,7 @@ async def unsign_zone_dnssec(
     resolvers — this endpoint does NOT walk the parent zone for them.
     """
     zone = await _require_zone(group_id, zone_id, db, current_user)
+    lock_svc.assert_editable("dns_zone", zone, None)  # #3361 — DNSSEC state is zone config
     _reject_if_synthesised_zone(zone, "DNSSEC-unsign")
     await _flip_dnssec_off(db, zone)
     db.add(
@@ -8560,6 +8660,7 @@ async def rollover_zone_dnssec_key(
     key set back on its next sync. The zone must already be signed.
     """
     zone = await _require_zone(group_id, zone_id, db, current_user)
+    lock_svc.assert_editable("dns_zone", zone, None)  # #3361 — DNSSEC state is zone config
     _reject_if_synthesised_zone(zone, "DNSSEC-rollover")
     if not zone.dnssec_enabled:
         raise HTTPException(status_code=409, detail="Zone is not DNSSEC-signed")
@@ -8768,6 +8869,9 @@ async def move_zone_commit(
     # A reconciler-owned zone is not the operator's to re-home — the next
     # sync would recreate it in the group the integration is bound to.
     _reject_if_synthesised_zone(zone, "move")
+    await lock_svc.assert_tree_editable(
+        db, "dns_zone", zone
+    )  # #3361 — a locked zone cannot be moved
     target_group = await _require_group(body.target_group_id, db)
     # The same serviceability guard every create / update runs, applied to
     # the group the zone is landing in: a forwarders-less forward zone on a
@@ -10497,6 +10601,7 @@ async def update_record(
     if not changes:
         record.provider_warning = None  # type: ignore[attr-defined]
         return record
+    lock_svc.assert_editable("dns_record", record, changes)  # #3361
     if set(changes) - {"ttl"}:
         await _require_superadmin_for_lua(
             db, current_user, [record.record_type], what="change a LUA record other than its TTL"
@@ -10694,6 +10799,7 @@ async def delete_record(
         record = await _require_record(group_id, zone_id, record_id, db, lock=True)
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_record(record, "delete")
+    lock_svc.assert_deletable("dns_record", record)  # #3361
 
     # Zone + field snapshot captured before the soft-delete stamp so both paths
     # push the provider retraction with the record's pre-delete values.
@@ -10889,6 +10995,20 @@ async def bulk_delete_records(
             _reject_if_synthesised_record(rec, "delete")
         except HTTPException as exc:
             skipped.append({"record_id": str(rid), "reason": str(exc.detail)})
+            continue
+        # #3361 — a locked record is skipped and named, not a failed batch.
+        locked_hit = lock_svc.skip_delete("dns_record", rec)
+        if locked_hit is not None:
+            skipped.append(
+                {
+                    "record_id": str(rid),
+                    "reason": (
+                        f"locked ({locked_hit.level}) by {locked_hit.locked_by}: "
+                        f"{locked_hit.reason}"
+                    ),
+                    "code": "resource_locked",
+                }
+            )
             continue
         targets.append(rec)
 
@@ -11390,7 +11510,9 @@ async def _diff_zone_file(
     # spreadsheet import runs), or it is left out with the reason.
     await _apply_record_rules_to_import(db, zone, diff)
     apply_cname_rule(diff, existing, replace=replace)
-    diff.skipped = unservable + diff.skipped
+    # #3361 — a locked record is left as it is, and named, not a failed import.
+    locked_notes = lock_svc.withhold_locked_from_diff(diff, existing)
+    diff.skipped = unservable + locked_notes + diff.skipped
     return diff
 
 
@@ -12232,6 +12354,8 @@ async def _plan_sheet_import(
         mode=mode,
         validate=_sheet_row_validator(zone, gated, needs_absolute),
     )
+    # #3361 — a locked record is left as it is and reported under ``skipped``.
+    lock_svc.withhold_locked_from_sheet_plan(plan, sheet_io.RowIssue)
     return fmt, plan, {v.id: v.name for v in views}
 
 
@@ -12564,6 +12688,10 @@ async def _require_server(group_id: uuid.UUID, server_id: uuid.UUID, db: DB) -> 
     if not server:
         raise HTTPException(status_code=404, detail="Server not found")
     return server
+
+
+def _entry_order(e: Any) -> int:
+    return e.order
 
 
 async def _require_acl(group_id: uuid.UUID, acl_id: uuid.UUID, db: DB) -> DNSAcl:

@@ -2412,6 +2412,36 @@ record per zone that survives the override filter. DDNS for DHCP
 leases follows the same path.
 
 
+### Locks (#3361)
+
+Any server group, view, zone or record can be **locked**, which is how a change freeze or an audit hold is
+written down on the object instead of in a wiki page. A lock has a level, a
+required reason, who set it and when, and optionally an expiry (the hook the
+change-window lock of #63 builds on; an expired lock is no lock).
+
+| Level | Effect |
+| --- | --- |
+| `delete` | The object can still be edited, but not deleted, and no parent delete that would remove it goes through. |
+| `edit` | Implies `delete`. Freezes the **operative** fields; annotations (description, tags, custom fields, owner, colour) stay editable. A locked object cannot be renamed, moved or have its type changed. |
+
+Refusals are `423 Locked` with `code: "resource_locked"`; the body names the
+object, the level, who locked it and why. A parent delete (or split, merge,
+move) that would take a locked object with it is refused with the first five
+locked descendants named. Bulk edits and deletes skip the locked rows and list
+each one in the response (`skipped_locked` / `locked`); importers leave a locked
+row as it is and report it under `skipped`. A locked record is never rewritten or removed by the IPAM sync, the zone-file / spreadsheet importers, bulk delete or a zone delete. An edit-locked group neither gives up nor takes in a server, and freezes the config it renders into its servers: its **ACLs** (create, delete, rename, entries), **TSIG keys** (create, rename, algorithm, purpose, rotate, delete, and the group's own key rotation), **trust anchors** (add, delete) and **server options** (any value that actually changes). Annotations stay editable: an ACL's description and a TSIG key's notes; re-sending stored values is not a change. A `delete` lock freezes none of these (it protects only the group's existence), and views and zones carry locks of their own. Blocklist assignments, DNSSEC policies and the group's pools are not covered yet; an edit-locked zone cannot be moved to another group. The config-drift report (Drift tab, #61) lists, per server, each locked record whose live value differs from the saved one (`locked_differs`: the saved value, the lock, and the value or values the server holds under that name and type), so a locked record changed on the host is not one line among many.
+
+Lock and unlock with `PUT /api/v1/locks/{resource_type}/{id}` and
+`POST /api/v1/locks/{resource_type}/{id}/unlock` (a reason in both bodies);
+`GET /api/v1/locks` lists what is locked. Both need `lock` on the type
+([PERMISSIONS.md](../PERMISSIONS.md)). Integration-owned rows (an integration
+mirror, a dynamic-lease mirror) cannot be locked: the integration would
+overwrite them. The Copilot has `find_locked_resources`, and its delete
+proposals are refused on a locked target; it has no way to unlock.
+
+In the UI each server group, view, zone and record shows a padlock (level, who and why in its tooltip) and a Lock / Unlock action behind the `lock` grant, which asks for the reason. Delete is disabled on a locked row with the reason as its tooltip; Edit stays on for an edit lock, since annotations stay editable. The lists that have filters have a Locked filter (all / locked / unlocked).
+The optional **Resource lock removed** alert rule (Alerts → Rules; seeded disabled) opens one event per unlock, naming who removed the lock, what it protected and the reason they gave. Each event resolves by itself after `threshold_days` (default 1). A lock that merely expires does not fire it.
+
 ## 17. GSLB pools (health-checked) + geo / topology-aware steering (issue #530)
 
 DNS **pools** (GSLB-lite) map one DNS name (e.g. `www` →

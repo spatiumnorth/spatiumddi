@@ -328,7 +328,55 @@ export type DdnsHostnamePolicy =
   | "always_generate"
   | "disabled";
 
-export interface IPSpace {
+// Lock state every lockable read model carries (#3361). ``lock_level`` is null
+// for an unlocked object; an expired lock already reads as unlocked.
+export type LockLevel = "edit" | "delete";
+export interface LockFields {
+  lock_level?: LockLevel | null;
+  locked_by?: string | null;
+  locked_at?: string | null;
+  lock_reason?: string | null;
+  lock_expires_at?: string | null;
+}
+
+export type LockableType =
+  | "ip_space"
+  | "ip_block"
+  | "subnet"
+  | "ip_address"
+  | "dns_group"
+  | "dns_view"
+  | "dns_zone"
+  | "dns_record"
+  | "dhcp_scope"
+  | "dhcp_static";
+
+export interface LockEntry {
+  resource_type: LockableType;
+  resource_id: string;
+  display: string;
+  level: LockLevel;
+  locked_by: string | null;
+  locked_at: string | null;
+  reason: string | null;
+  expires_at: string | null;
+}
+
+export const locksApi = {
+  list: (params: { resource_type?: LockableType; level?: LockLevel } = {}) =>
+    api
+      .get<{ items: LockEntry[]; total: number }>("/locks", { params })
+      .then((r) => r.data),
+  lock: (
+    type: LockableType,
+    id: string,
+    body: { level: LockLevel; reason: string; expires_at?: string | null },
+  ) => api.put<LockEntry>(`/locks/${type}/${id}`, body).then((r) => r.data),
+  unlock: (type: LockableType, id: string, reason: string) =>
+    api.post(`/locks/${type}/${id}/unlock`, { reason }),
+};
+
+export interface IPSpace extends LockFields {
   id: string;
   name: string;
   description: string;
@@ -366,7 +414,7 @@ export interface IPSpace {
   modified_at?: string;
 }
 
-export interface IPBlock {
+export interface IPBlock extends LockFields {
   id: string;
   space_id: string;
   parent_block_id: string | null;
@@ -680,7 +728,7 @@ export interface SubnetUtilizationPoint {
   utilization_percent: number;
 }
 
-export interface Subnet {
+export interface Subnet extends LockFields {
   id: string;
   space_id: string;
   block_id: string;
@@ -921,7 +969,7 @@ export const IP_ROLES_SHARED: ReadonlySet<IPRole> = new Set([
   "vrrp",
 ]);
 
-export interface IPAddress {
+export interface IPAddress extends LockFields {
   id: string;
   subnet_id: string;
   address: string;
@@ -5310,7 +5358,7 @@ export interface ZoneMovePreview {
   target_tsig_key_generated?: boolean;
 }
 
-export interface DNSServerGroup {
+export interface DNSServerGroup extends LockFields {
   id: string;
   name: string;
   description: string;
@@ -6025,7 +6073,7 @@ export interface DNSAcl {
   modified_at: string;
 }
 
-export interface DNSView {
+export interface DNSView extends LockFields {
   id: string;
   group_id: string;
   name: string;
@@ -6077,7 +6125,7 @@ export interface TldRegistryInfo {
   snapshot_count: number | null;
 }
 
-export interface DNSZone {
+export interface DNSZone extends LockFields {
   id: string;
   group_id: string;
   view_id: string | null;
@@ -6398,7 +6446,7 @@ export interface Page<T> {
   page_size: number;
 }
 
-export interface DNSRecord {
+export interface DNSRecord extends LockFields {
   id: string;
   zone_id: string;
   view_id: string | null;
@@ -9251,7 +9299,7 @@ export interface DHCPOption {
   value: string | string[];
 }
 
-export interface DHCPScope {
+export interface DHCPScope extends LockFields {
   id: string;
   subnet_id: string;
   // Scopes belong to groups, not individual servers — every member of
@@ -10255,7 +10303,7 @@ export type DHCPStaticAssignmentWrite = Partial<
   >
 > & { tags?: Record<string, unknown> };
 
-export interface DHCPStaticAssignment {
+export interface DHCPStaticAssignment extends LockFields {
   id: string;
   scope_id: string;
   ip_address: string;

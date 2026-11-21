@@ -66,6 +66,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from app.models.auth import User
+from app.services import locks as lock_svc
 from app.services.ai.operations import (
     Operation,
     PreviewResult,
@@ -431,6 +432,12 @@ async def _preview_delete_subnet(
         return PreviewResult(ok=False, detail="Subnet not found")
     # Per-row API-token binding — mirrors the inline handler.
     _enforce_subnet_token_scope(user, args.subnet_id)
+    # #3361 — a locked subnet (or one holding a locked object) is refused at
+    # request time, so no change request is filed for a delete that cannot run.
+    try:
+        await lock_svc.assert_tree_deletable(db, "subnet", subnet)
+    except HTTPException as exc:
+        return PreviewResult(ok=False, detail=lock_svc.refusal_message(exc))
 
     if args.permanent:
         from app.services.e911.delete_guard import (  # noqa: PLC0415
@@ -503,6 +510,7 @@ async def _apply_delete_subnet(
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
     _enforce_subnet_token_scope(user, args.subnet_id)
+    await lock_svc.assert_tree_deletable(db, "subnet", subnet)  # #3361
 
     if not args.permanent:
         # #3744: no lease row, mirror or DDNS record of the scopes' leases is
@@ -751,6 +759,10 @@ async def _preview_delete_block(
     block = await db.get(IPBlock, args.block_id)
     if block is None:
         return PreviewResult(ok=False, detail="IP block not found")
+    try:
+        await lock_svc.assert_tree_deletable(db, "ip_block", block)  # #3361
+    except HTTPException as exc:
+        return PreviewResult(ok=False, detail=lock_svc.refusal_message(exc))
 
     if args.permanent:
         detail = await _block_not_empty_detail(db, args.block_id, block.network)
@@ -787,6 +799,7 @@ async def _apply_delete_block(
     block = await db.get(IPBlock, args.block_id)
     if block is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP block not found")
+    await lock_svc.assert_tree_deletable(db, "ip_block", block)  # #3361
 
     if args.permanent:
         ensure_superadmin(user)
@@ -918,6 +931,10 @@ async def _preview_delete_space(
     space = await db.get(IPSpace, args.space_id)
     if space is None:
         return PreviewResult(ok=False, detail="IP space not found")
+    try:
+        await lock_svc.assert_tree_deletable(db, "ip_space", space)  # #3361
+    except HTTPException as exc:
+        return PreviewResult(ok=False, detail=lock_svc.refusal_message(exc))
 
     if args.permanent:
         detail = await _space_not_empty_detail(db, args.space_id, space.name)
@@ -954,6 +971,7 @@ async def _apply_delete_space(
     space = await db.get(IPSpace, args.space_id)
     if space is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
+    await lock_svc.assert_tree_deletable(db, "ip_space", space)  # #3361
 
     if args.permanent:
         ensure_superadmin(user)
@@ -1050,8 +1068,9 @@ async def _preview_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArg
     try:
         zone = await _require_zone(args.group_id, args.zone_id, db)
         _reject_if_synthesised_zone(zone, "delete")
+        await lock_svc.assert_tree_deletable(db, "dns_zone", zone)  # #3361
     except HTTPException as exc:
-        return PreviewResult(ok=False, detail=str(exc.detail))
+        return PreviewResult(ok=False, detail=lock_svc.refusal_message(exc))
 
     mode = "Permanently delete" if args.permanent else "Soft-delete"
     if args.permanent:
@@ -1111,6 +1130,7 @@ async def _apply_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArgs)
 
     zone = await _require_zone(args.group_id, args.zone_id, db)  # raises 404 if absent
     _reject_if_synthesised_zone(zone, "delete")
+    await lock_svc.assert_tree_deletable(db, "dns_zone", zone)  # #3361
 
     if not args.permanent:
         # #3535: the zone row before its records, as every writer of them takes
@@ -1265,6 +1285,10 @@ async def _preview_delete_scope(
     scope = await db.get(DHCPScope, args.scope_id)
     if scope is None:
         return PreviewResult(ok=False, detail="Scope not found")
+    try:
+        await lock_svc.assert_tree_deletable(db, "dhcp_scope", scope)  # #3361
+    except HTTPException as exc:
+        return PreviewResult(ok=False, detail=lock_svc.refusal_message(exc))
     # #3388 — the apply refuses this; say so before an approval is queued.
     try:
         await refuse_scope_removal_orphaning_classes(db, scope, "delete this scope")
@@ -1456,6 +1480,7 @@ async def _apply_delete_scope(
     scope = await db.get(DHCPScope, args.scope_id)
     if scope is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scope not found")
+    await lock_svc.assert_tree_deletable(db, "dhcp_scope", scope)  # #3361
     # #3388 — refused before any side effect: a phone class this scope keeps
     # rendering may be named by another scope's pool.
     await refuse_scope_removal_orphaning_classes(db, scope, "delete this scope")

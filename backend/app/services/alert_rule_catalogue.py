@@ -323,6 +323,12 @@ _SPECS: list[tuple[str, str, str, list[ParamSpec]]] = [
         "DHCP",
         [_recency(a._WOL_WAKE_FAILED_RECENCY_DAYS, "failures")],
     ),
+    (
+        a.RULE_TYPE_RESOURCE_LOCK_REMOVED,
+        "Resource lock removed",
+        "Security",
+        [_recency(a._RESOURCE_LOCK_REMOVED_RECENCY_DAYS, "unlocks")],
+    ),
     # ── DNS ────────────────────────────────────────────────────────────
     (
         a.RULE_TYPE_DNS_NXDOMAIN_SPIKE,

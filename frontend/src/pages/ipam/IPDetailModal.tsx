@@ -54,6 +54,8 @@ import { SeenDot } from "./SeenDot";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { LockBadge, LockControl } from "@/components/LockControl";
+import { deleteLockGate, editLockHint } from "@/lib/locks";
 import { ListReadError } from "@/components/ui/list-read-error";
 import { RpkiPill } from "@/components/network/bgp-route-table";
 import { FormError } from "@/components/ui/form-error";
@@ -169,6 +171,7 @@ export function IPDetailModal({
 }: IPDetailModalProps) {
   const { dialogProps, titleProps, dialogStyle, dragHandleProps } =
     useModalDialog(onClose);
+  const qc = useQueryClient();
   const dhcpOn = useModuleOn("core.dhcp");
   // #2100 — the NAT badge goes with the ``ipam.nat`` module.
   const natOn = useModuleOn("ipam.nat");
@@ -371,11 +374,28 @@ export function IPDetailModal({
                 </label>
               </div>
             )}
+            {/* #3361 — the padlock and Lock / Unlock, behind the `lock` grant.
+                A dynamic-lease mirror is the DHCP server's, so it takes none.
+                The modal holds a copy of the row, so a change closes it: the
+                list behind it re-reads and shows the new state. */}
+            {!addr.auto_from_lease && (
+              <LockControl
+                type="ip_address"
+                resource={addr}
+                label={addr.address}
+                onChanged={() => {
+                  qc.invalidateQueries({ queryKey: ["addresses"] });
+                  onClose();
+                }}
+              />
+            )}
+            {addr.auto_from_lease && <LockBadge resource={addr} />}
             {canEdit && (
               <button
                 type="button"
                 onClick={onEdit}
                 className="inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs hover:bg-accent"
+                {...editLockHint(addr)}
               >
                 <Pencil className="h-3.5 w-3.5" /> Edit
               </button>
@@ -384,7 +404,8 @@ export function IPDetailModal({
               <button
                 type="button"
                 onClick={onDelete}
-                className="inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs text-destructive hover:bg-destructive/10"
+                className="inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
+                {...deleteLockGate(addr)}
               >
                 <Trash2 className="h-3.5 w-3.5" /> Delete
               </button>

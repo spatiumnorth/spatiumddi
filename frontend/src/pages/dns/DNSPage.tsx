@@ -29,6 +29,7 @@ import {
   Globe,
   Plus,
   Trash2,
+  Unlock,
   Pencil,
   ChevronDown,
   ChevronRight,
@@ -112,6 +113,20 @@ import {
 } from "@/lib/shortcuts";
 import { Pager } from "@/components/ui/pager";
 import { AskAIButton } from "@/components/copilot/AskAIButton";
+import {
+  LockBadge,
+  LockControl,
+  LockDialog,
+  LockedFilterSelect,
+} from "@/components/LockControl";
+import {
+  deleteLockGate,
+  editLockHint,
+  isDeleteBlockedByLock,
+  lockTitle,
+  matchesLockedFilter,
+  type LockedFilter,
+} from "@/lib/locks";
 import { ServicesUsingButton } from "@/components/ServicesUsingButton";
 import { ZoneScopeHint, ZoneScopePill } from "@/components/ZoneScopePill";
 import {
@@ -4495,6 +4510,8 @@ export function ZoneDetailView({
   const navigate = useNavigate();
   const [showAddRecord, setShowAddRecord] = useState(false);
   const [editRecord, setEditRecord] = useState<DNSRecord | null>(null);
+  // #3361 — the record whose lock / unlock dialog is open.
+  const [lockRecord, setLockRecord] = useState<DNSRecord | null>(null);
   const [propagationRecord, setPropagationRecord] = useState<DNSRecord | null>(
     null,
   );
@@ -4508,7 +4525,12 @@ export function ZoneDetailView({
   const [showImport, setShowImport] = useState(false);
   const [showSheetImport, setShowSheetImport] = useState(false);
   const [showRecFilters, setShowRecFilters] = useState(false);
-  const [recFilter, setRecFilter] = useState({ name: "", type: "", value: "" });
+  const [recFilter, setRecFilter] = useState({
+    name: "",
+    type: "",
+    value: "",
+    locked: "",
+  });
   // Server-side pagination + search (#455): a large zone (20k+ records) no
   // longer ships its whole record set per poll. `recordSearch` matches
   // name / fqdn / value / type on the server; the per-column recFilter below
@@ -4903,6 +4925,7 @@ export function ZoneDetailView({
     )
       return false;
     if (recFilter.type && r.record_type !== recFilter.type) return false;
+    if (!matchesLockedFilter(r, recFilter.locked as LockedFilter)) return false;
     if (
       recFilter.value &&
       !r.value.toLowerCase().includes(recFilter.value.toLowerCase())
@@ -4943,6 +4966,7 @@ export function ZoneDetailView({
               scope={zone.name_scope}
               detail={zone.name_scope_detail}
             />
+            <LockBadge resource={zone} />
             <span className="inline-flex items-center rounded border px-1.5 py-0.5 text-xs">
               {zone.zone_type}
             </span>
@@ -5047,6 +5071,14 @@ export function ZoneDetailView({
             kind="dns_zone"
             resourceId={zone.id}
             label={zone.name}
+          />
+          <LockControl
+            type="dns_zone"
+            resource={zone}
+            label={zone.name}
+            showBadge={false}
+            integrationOwned={!!zone.tailscale_tenant_id}
+            onChanged={() => qc.invalidateQueries({ queryKey: ["dns-zones"] })}
           />
           {/* Data ▾ — everything that moves records in or out. A forward
               zone stores no records at all, so this collapses to nothing
@@ -5226,7 +5258,10 @@ export function ZoneDetailView({
                 title: zone.tailscale_tenant_id
                   ? "Delete the Tailscale tenant or unbind its DNS group to release this zone."
                   : undefined,
-                ...permissionGate(can("delete", "dns_zone"), NEEDS_ZONE_DELETE),
+                ...deleteLockGate(
+                  zone,
+                  permissionGate(can("delete", "dns_zone"), NEEDS_ZONE_DELETE),
+                ),
               },
             ]}
           />
@@ -5645,7 +5680,12 @@ export function ZoneDetailView({
                       {hasRecFilter && (
                         <button
                           onClick={() =>
-                            setRecFilter({ name: "", type: "", value: "" })
+                            setRecFilter({
+                              name: "",
+                              type: "",
+                              value: "",
+                              locked: "",
+                            })
                           }
                           title="Clear filters"
                           className="rounded p-0.5 text-primary hover:text-destructive"
@@ -5705,7 +5745,17 @@ export function ZoneDetailView({
                           className="w-full rounded border border-border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
                         />
                       </td>
-                      <td />
+                      <td className="px-2 py-1">
+                        <LockedFilterSelect
+                          value={recFilter.locked}
+                          onChange={(v) =>
+                            setRecFilter((f) => ({
+                              ...f,
+                              locked: v === "all" ? "" : v,
+                            }))
+                          }
+                        />
+                      </td>
                       <td />
                       <td />
                     </tr>
@@ -5778,6 +5828,10 @@ export function ZoneDetailView({
                                 {r.name}
                               </button>
                             )}
+                            <LockBadge
+                              resource={r}
+                              className="ml-2 inline-flex items-center gap-1 rounded bg-amber-100 px-1 py-0.5 align-middle text-[10px] font-medium uppercase text-amber-700 dark:bg-amber-950/30 dark:text-amber-400"
+                            />
                           </td>
                           <td className="py-1.5">
                             <span className="inline-flex items-center gap-1.5">
@@ -5955,12 +6009,24 @@ export function ZoneDetailView({
                             <ContextMenuItem
                               destructive
                               onSelect={() => setConfirmDeleteRecord(r)}
-                              {...permissionGate(
-                                canDeleteRecords,
-                                NEEDS_DNS_DELETE,
-                              )}
+                              disabled={isDeleteBlockedByLock(r)}
+                              title={lockTitle(r) ?? undefined}
+                              {...(isDeleteBlockedByLock(r)
+                                ? {}
+                                : permissionGate(
+                                    canDeleteRecords,
+                                    NEEDS_DNS_DELETE,
+                                  ))}
                             >
                               Delete…
+                            </ContextMenuItem>
+                          </>
+                        )}
+                        {can("lock", "dns_record", r.id) && (
+                          <>
+                            <ContextMenuSeparator />
+                            <ContextMenuItem onSelect={() => setLockRecord(r)}>
+                              {r.lock_level ? "Unlock…" : "Lock…"}
                             </ContextMenuItem>
                           </>
                         )}
@@ -5997,6 +6063,19 @@ export function ZoneDetailView({
           zoneName={zone.name}
           record={editRecord}
           onClose={() => setEditRecord(null)}
+        />
+      )}
+      {lockRecord && (
+        <LockDialog
+          type="dns_record"
+          id={lockRecord.id}
+          label={`${lockRecord.name} ${lockRecord.record_type}`}
+          locked={!!lockRecord.lock_level}
+          onClose={() => setLockRecord(null)}
+          onDone={() => {
+            qc.invalidateQueries({ queryKey: ["dns-records"] });
+            qc.invalidateQueries({ queryKey: ["dns-zones", group.id] });
+          }}
         />
       )}
       {propagationRecord && (
@@ -7020,6 +7099,8 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
   const [editing, setEditing] = useState<DNSView | null>(null);
   const [creating, setCreating] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<DNSView | null>(null);
+  // #3361 — the view whose lock / unlock dialog is open.
+  const [lockView, setLockView] = useState<DNSView | null>(null);
   // #4180 — the read-only detail modal a row click / Enter opens.
   const [detailId, setDetailId] = useState<string | null>(null);
 
@@ -7157,6 +7238,10 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
                     <span className="text-sm font-medium font-mono">
                       {v.name}
                     </span>
+                    <LockBadge
+                      resource={v}
+                      className="ml-2 inline-flex items-center gap-1 rounded bg-amber-100 px-1 py-0.5 align-middle text-[10px] font-medium uppercase text-amber-700 dark:bg-amber-950/30 dark:text-amber-400"
+                    />
                     <span className="ml-2 text-xs text-muted-foreground">
                       order {v.order}
                     </span>
@@ -7175,6 +7260,7 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
                         e.stopPropagation();
                         setEditing(v);
                       }}
+                      {...editLockHint(v)}
                       {...permissionGate(
                         can("write", "dns_group"),
                         NEEDS_GROUP_WRITE,
@@ -7182,6 +7268,20 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
                     >
                       <Pencil className="h-3.5 w-3.5" />
                     </button>
+                    {can("lock", "dns_group", v.id) && (
+                      <button
+                        className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
+                        title={v.lock_level ? "Unlock view…" : "Lock view…"}
+                        aria-label={v.lock_level ? "Unlock view" : "Lock view"}
+                        onClick={() => setLockView(v)}
+                      >
+                        {v.lock_level ? (
+                          <Unlock className="h-3.5 w-3.5" />
+                        ) : (
+                          <Lock className="h-3.5 w-3.5" />
+                        )}
+                      </button>
+                    )}
                     <button
                       className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-destructive disabled:opacity-40"
                       title="Delete view"
@@ -7190,9 +7290,12 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
                         e.stopPropagation();
                         setConfirmDelete(v);
                       }}
-                      {...permissionGate(
-                        can("delete", "dns_group"),
-                        NEEDS_GROUP_DELETE,
+                      {...deleteLockGate(
+                        v,
+                        permissionGate(
+                          can("delete", "dns_group"),
+                          NEEDS_GROUP_DELETE,
+                        ),
                       )}
                     >
                       <Trash2 className="h-3.5 w-3.5" />
@@ -7258,6 +7361,18 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
         />
       )}
 
+      {lockView && (
+        <LockDialog
+          type="dns_view"
+          id={lockView.id}
+          label={lockView.name}
+          locked={!!lockView.lock_level}
+          onClose={() => setLockView(null)}
+          onDone={() =>
+            qc.invalidateQueries({ queryKey: ["dns-views", group.id] })
+          }
+        />
+      )}
       {(creating || editing) && (
         <ViewModal
           groupId={group.id}
@@ -10623,6 +10738,8 @@ export function ZonesTab({
   const [showZoneFilters, setShowZoneFilters] = useState(false);
   const [zoneNameFilter, setZoneNameFilter] = useState("");
   const [zoneTypeFilter, setZoneTypeFilter] = useState("");
+  // #3361 — "" is all, else "locked" / "unlocked".
+  const [zoneLockedFilter, setZoneLockedFilter] = useState("");
   // #986 — "" is all scopes.
   const [zoneScopeFilter, setZoneScopeFilter] = useState<"" | ZoneNameScope>(
     "",
@@ -10658,7 +10775,12 @@ export function ZonesTab({
     queryFn: () => dnsApi.listViews(group.id),
   });
 
-  const hasZoneFilter = !!(zoneNameFilter || zoneTypeFilter || zoneScopeFilter);
+  const hasZoneFilter = !!(
+    zoneNameFilter ||
+    zoneTypeFilter ||
+    zoneScopeFilter ||
+    zoneLockedFilter
+  );
   const filteredZones = hasZoneFilter
     ? zones.filter((z) => {
         if (
@@ -10668,6 +10790,8 @@ export function ZonesTab({
           return false;
         if (zoneTypeFilter && z.zone_type !== zoneTypeFilter) return false;
         if (zoneScopeFilter && z.name_scope !== zoneScopeFilter) return false;
+        if (!matchesLockedFilter(z, zoneLockedFilter as LockedFilter))
+          return false;
         return true;
       })
     : zones;
@@ -10841,6 +10965,10 @@ export function ZonesTab({
                   <span className="font-mono text-xs">
                     {z.name.replace(/\.$/, "")}
                   </span>
+                  <LockBadge
+                    resource={z}
+                    className="inline-flex items-center rounded bg-amber-100 px-1 py-0.5 text-amber-700 dark:bg-amber-950/30 dark:text-amber-400"
+                  />
                   <CustomerChip customerId={z.customer_id} />
                 </span>
               </td>
@@ -11088,12 +11216,18 @@ export function ZonesTab({
             <option value="undelegated">Undelegated</option>
             <option value="reverse">Reverse</option>
           </select>
+          <LockedFilterSelect
+            value={zoneLockedFilter}
+            onChange={(v) => setZoneLockedFilter(v === "all" ? "" : v)}
+            className="rounded border border-border bg-background px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+          />
           {hasZoneFilter && (
             <button
               onClick={() => {
                 setZoneNameFilter("");
                 setZoneTypeFilter("");
                 setZoneScopeFilter("");
+                setZoneLockedFilter("");
               }}
               className="text-xs text-muted-foreground hover:text-foreground"
               title="Clear filters"
@@ -13203,6 +13337,7 @@ function GroupDetailView({
           <div className="flex items-center gap-2 min-w-0">
             <Globe className="h-4 w-4 text-muted-foreground flex-shrink-0" />
             <h2 className="font-semibold text-base truncate">{group.name}</h2>
+            <LockBadge resource={group} />
             <span
               className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium flex-shrink-0 ${typeBadge[group.group_type] ?? "bg-muted text-muted-foreground"}`}
             >
@@ -13245,9 +13380,19 @@ function GroupDetailView({
               <RefreshCw className={cn("h-3 w-3", syncing && "animate-spin")} />
               {syncing ? "Syncing…" : "Sync with Servers"}
             </button>
+            <LockControl
+              type="dns_group"
+              resource={group}
+              label={group.name}
+              showBadge={false}
+              onChanged={() =>
+                qc.invalidateQueries({ queryKey: ["dns-groups"] })
+              }
+            />
             <button
               className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
               onClick={onEdit}
+              {...editLockHint(group)}
               {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
             >
               <Pencil className="h-3 w-3" /> Edit Group
@@ -13255,7 +13400,10 @@ function GroupDetailView({
             <button
               className="flex items-center gap-1 rounded-md border border-destructive/40 px-2 py-1 text-xs text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
               onClick={onDelete}
-              {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
+              {...deleteLockGate(
+                group,
+                permissionGate(isSuperadmin, NEEDS_SUPERADMIN),
+              )}
             >
               <Trash2 className="h-3 w-3" /> Delete Group
             </button>

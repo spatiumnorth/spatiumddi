@@ -6,13 +6,15 @@
 // by design, so keep it in sync with the spec table when new types land.
 
 // 'admin' implies read/write/delete on the type; `approve` only means
-// anything on `change_request`.
+// anything on `change_request`; `lock` (#3361) sets and clears an edit / delete
+// lock on IPAM / DNS / DHCP objects and is not implied by `admin`.
 export const GRANT_ACTIONS = [
   "read",
   "write",
   "delete",
   "admin",
   "approve",
+  "lock",
   "*",
 ] as const;
 

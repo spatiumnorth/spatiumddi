@@ -29,6 +29,7 @@ from app.core.permissions import require_resource_permission
 from app.core.update_nulls import changed_keys, snapshot
 from app.models.dhcp import DHCPPXEProfile, DHCPScope, DHCPServer, DHCPServerGroup
 from app.models.ipam import Subnet
+from app.services import locks as lock_svc
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteScopeArgs
 from app.services.approvals.gate import gate_or_execute
@@ -492,7 +493,7 @@ class ScopeUpdate(BaseModel):
         return _validate_relay_addresses(v)
 
 
-class ScopeResponse(BaseModel):
+class ScopeResponse(lock_svc.LockState):
     id: uuid.UUID
     group_id: uuid.UUID
     subnet_id: uuid.UUID
@@ -590,6 +591,11 @@ def _scope_to_response(scope: DHCPScope) -> ScopeResponse:
         tags=scope.tags or {},
         created_at=scope.created_at,
         modified_at=scope.modified_at,
+        lock_level=scope.lock_level,
+        locked_by=scope.locked_by,
+        locked_at=scope.locked_at,
+        lock_reason=scope.lock_reason,
+        lock_expires_at=scope.lock_expires_at,
     )
 
 
@@ -949,6 +955,7 @@ async def update_scope(
     if "enabled" in changes:
         changes["is_active"] = changes.pop("enabled")
     changes.pop("group_id", None)  # #2479 — equal to the stored group (checked above)
+    lock_svc.assert_editable("dhcp_scope", scope, changes)  # #3361
     # #2499 — judge the MERGED lease triple (stored row under the patch), so a
     # PUT that only sets max_lease_time cannot break an existing scope.
     if {"lease_time", "min_lease_time", "max_lease_time"} & changes.keys():

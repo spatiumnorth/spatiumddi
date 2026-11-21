@@ -13,6 +13,7 @@ import {
 import {
   Cpu,
   HardDrive,
+  Lock,
   Pause,
   Pencil,
   Phone,
@@ -21,8 +22,20 @@ import {
   RefreshCw,
   Server,
   Trash2,
+  Unlock,
   Wifi,
 } from "lucide-react";
+import {
+  LockBadge,
+  LockDialog,
+  LockedFilterSelect,
+} from "@/components/LockControl";
+import {
+  deleteLockGate,
+  editLockHint,
+  matchesLockedFilter,
+  type LockedFilter,
+} from "@/lib/locks";
 import {
   dhcpApi,
   dhcpLeaseHistoryApi,
@@ -1425,6 +1438,8 @@ export function ServerScopesTab({ groupId }: { groupId: string }) {
   // ``dhcp_scope`` (scopes.py).
   const dhcpGate = useDhcpGate();
   const [tagFilters, setTagFilters] = useState<string[]>([]);
+  // #3361 — "" is all, else "locked" / "unlocked".
+  const [scopeLocked, setScopeLocked] = useState("");
   const { data: subnets = [] } = useQuery({
     queryKey: ["subnets"],
     queryFn: () => ipamApi.listSubnets(),
@@ -1471,8 +1486,9 @@ export function ServerScopesTab({ groupId }: { groupId: string }) {
     queryFn: dhcpApi.listGroups,
   });
   const group = groups.find((g) => g.id === groupId);
-  const allScopes: (DHCPScope & { subnet_network?: string })[] =
-    groupScopes.map((sc) => ({
+  const allScopes: (DHCPScope & { subnet_network?: string })[] = groupScopes
+    .filter((sc) => matchesLockedFilter(sc, scopeLocked as LockedFilter))
+    .map((sc) => ({
       ...sc,
       subnet_network: subnetById.get(sc.subnet_id)?.network,
     }));
@@ -1502,11 +1518,20 @@ export function ServerScopesTab({ groupId }: { groupId: string }) {
 
   return (
     <div className="space-y-3">
-      <TagFilterChips
-        value={tagFilters}
-        onChange={setTagFilters}
-        placeholder="Filter scopes by tag — try env or env:prod…"
-      />
+      <div className="flex items-center gap-2">
+        <div className="flex-1">
+          <TagFilterChips
+            value={tagFilters}
+            onChange={setTagFilters}
+            placeholder="Filter scopes by tag — try env or env:prod…"
+          />
+        </div>
+        <LockedFilterSelect
+          value={scopeLocked}
+          onChange={(v) => setScopeLocked(v === "all" ? "" : v)}
+          className="rounded-md border bg-background px-2 py-1 text-xs"
+        />
+      </div>
       <div className="flex items-center justify-between">
         <p className="text-xs text-muted-foreground">
           {groupScopesError != null ? (
@@ -1569,6 +1594,8 @@ export function ServerScopesTab({ groupId }: { groupId: string }) {
                 error={groupScopesError}
                 what="this group's scopes"
               />
+            ) : scopeLocked ? (
+              "No scopes match the lock filter."
             ) : tagFilters.length > 0 && unfilteredCount !== 0 ? (
               "No scopes match the current tag filter."
             ) : (
@@ -1606,6 +1633,10 @@ export function ServerScopesTab({ groupId }: { groupId: string }) {
                         <td className="px-3 py-2">
                           <span className="inline-flex flex-wrap items-center gap-1.5">
                             {sc.name}
+                            <LockBadge
+                              resource={sc}
+                              className="inline-flex items-center rounded bg-amber-100 px-1 py-0.5 text-amber-700 dark:bg-amber-950/30 dark:text-amber-400"
+                            />
                             {group && v6ScopeLacksHa(sc, group) && (
                               <V6NoHaTag
                                 keaMemberCount={group.kea_member_count}
@@ -1674,7 +1705,10 @@ export function ServerScopesTab({ groupId }: { groupId: string }) {
                               className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40"
                               aria-label={`Delete scope ${sc.name}`}
                               title="Delete scope"
-                              {...dhcpGate("delete", "dhcp_scope")}
+                              {...deleteLockGate(
+                                sc,
+                                dhcpGate("delete", "dhcp_scope"),
+                              )}
                             >
                               <Trash2 className="h-3.5 w-3.5" />
                             </button>
@@ -1694,7 +1728,10 @@ export function ServerScopesTab({ groupId }: { groupId: string }) {
                       <ContextMenuItem
                         destructive
                         onSelect={() => setDelScope(sc)}
-                        {...dhcpGate("delete", "dhcp_scope")}
+                        {...deleteLockGate(
+                          sc,
+                          dhcpGate("delete", "dhcp_scope"),
+                        )}
                       >
                         Delete Scope…
                       </ContextMenuItem>
@@ -1907,8 +1944,11 @@ export function ServerPoolsOrStaticsTab({
     },
   );
 
+  // #3361 — the "Locked" filter ("" = all, else "locked" / "unlocked"); it
+  // narrows the reservations only, never the pools.
+  const [staticLocked, setStaticLocked] = useState("");
   const {
-    sorted: staticRows,
+    sorted: sortedStaticRows,
     sort: staticSort,
     toggle: toggleStaticSort,
   } = useTableSort<StaticRow, "scope" | "mac" | "ip" | "hostname">(
@@ -1933,6 +1973,8 @@ export function ServerPoolsOrStaticsTab({
   const [showCreate, setShowCreate] = useState(false);
   const [createScopeId, setCreateScopeId] = useState("");
   const [editStatic, setEditStatic] = useState<StaticRow | null>(null);
+  // #3361 — the reservation whose lock / unlock dialog is open.
+  const [lockStatic, setLockStatic] = useState<StaticRow | null>(null);
   const [delStatic, setDelStatic] = useState<StaticRow | null>(null);
   const createScope =
     allScopes.find((s) => s.id === createScopeId) ?? allScopes[0] ?? null;
@@ -1952,6 +1994,9 @@ export function ServerPoolsOrStaticsTab({
       setDelStatic(null);
     },
   });
+  const staticRows = sortedStaticRows.filter((r) =>
+    r.item ? matchesLockedFilter(r.item, staticLocked as LockedFilter) : true,
+  );
   const canManageStatics =
     kind === "statics" && perms.can("write", "dhcp_static");
   const canDeleteStatics =
@@ -1983,6 +2028,20 @@ export function ServerPoolsOrStaticsTab({
           >
             <Plus className="h-3 w-3" /> New static assignment
           </button>
+        </div>
+      )}
+      {kind === "statics" && rows.length > 0 && (
+        <div className="flex items-center gap-2">
+          <LockedFilterSelect
+            value={staticLocked}
+            onChange={(v) => setStaticLocked(v === "all" ? "" : v)}
+            className="rounded-md border bg-background px-2 py-1 text-xs"
+          />
+          {staticLocked && (
+            <span className="text-xs text-muted-foreground">
+              {staticRows.length} of {rows.length} shown
+            </span>
+          )}
         </div>
       )}
       <div className="rounded-lg border">
@@ -2130,15 +2189,42 @@ export function ServerPoolsOrStaticsTab({
                             {s.mac_address}
                           </td>
                           <td className="px-3 py-2 font-mono text-xs">
-                            {s.ip_address}
+                            <span className="inline-flex items-center gap-1.5">
+                              {s.ip_address}
+                              <LockBadge
+                                resource={s}
+                                className="inline-flex items-center rounded bg-amber-100 px-1 py-0.5 text-amber-700 dark:bg-amber-950/30 dark:text-amber-400"
+                              />
+                            </span>
                           </td>
                           <td className="px-3 py-2">{s.hostname || "—"}</td>
                           <td className="px-3 py-2 text-right whitespace-nowrap">
+                            {perms.can("lock", "dhcp_static", s.id) && (
+                              <button
+                                onClick={() =>
+                                  setLockStatic({ scope, item: s })
+                                }
+                                className="rounded p-1 text-muted-foreground hover:text-foreground"
+                                aria-label={`${s.lock_level ? "Unlock" : "Lock"} static assignment ${s.ip_address}`}
+                                title={
+                                  s.lock_level
+                                    ? "Remove the lock (a reason is required)"
+                                    : "Lock"
+                                }
+                              >
+                                {s.lock_level ? (
+                                  <Unlock className="h-3.5 w-3.5" />
+                                ) : (
+                                  <Lock className="h-3.5 w-3.5" />
+                                )}
+                              </button>
+                            )}
                             <button
                               onClick={() => setEditStatic({ scope, item: s })}
                               className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
                               aria-label={`Edit static assignment ${s.ip_address}`}
                               title="Edit static assignment"
+                              {...editLockHint(s)}
                               {...dhcpGate("write", "dhcp_static")}
                             >
                               <Pencil className="h-3.5 w-3.5" />
@@ -2148,7 +2234,10 @@ export function ServerPoolsOrStaticsTab({
                               className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40"
                               aria-label={`Delete static assignment ${s.ip_address}`}
                               title="Delete static assignment"
-                              {...dhcpGate("delete", "dhcp_static")}
+                              {...deleteLockGate(
+                                s,
+                                dhcpGate("delete", "dhcp_static"),
+                              )}
                             >
                               <Trash2 className="h-3.5 w-3.5" />
                             </button>
@@ -2188,8 +2277,16 @@ export function ServerPoolsOrStaticsTab({
                         {canDeleteStatics && (
                           <ContextMenuItem
                             onSelect={() => setDelStatic({ scope, item: s })}
+                            {...deleteLockGate(s)}
                           >
                             Delete…
+                          </ContextMenuItem>
+                        )}
+                        {perms.can("lock", "dhcp_static", s.id) && (
+                          <ContextMenuItem
+                            onSelect={() => setLockStatic({ scope, item: s })}
+                          >
+                            {s.lock_level ? "Unlock…" : "Lock…"}
                           </ContextMenuItem>
                         )}
                       </ContextMenuContent>
@@ -2201,6 +2298,20 @@ export function ServerPoolsOrStaticsTab({
           </div>
         )}
       </div>
+      {lockStatic && (
+        <LockDialog
+          type="dhcp_static"
+          id={lockStatic.item.id}
+          label={lockStatic.item.ip_address}
+          locked={!!lockStatic.item.lock_level}
+          onClose={() => setLockStatic(null)}
+          onDone={() =>
+            qc.invalidateQueries({
+              queryKey: ["dhcp-statics", lockStatic.scope.id],
+            })
+          }
+        />
+      )}
       {showCreate && createScope && (
         <CreateStaticAssignmentModal
           scope={createScope}

@@ -637,6 +637,15 @@ _WOL_WAKE_FAILED_RECENCY_DAYS = 1
 # Hostnames sampled into the alert message before it collapses to "+N more".
 _WOL_WAKE_FAILED_SAMPLE = 5
 
+# Resource lock removed — issue #3361. Subject = the ``unlock`` audit row, so
+# every unlock is its own event (who, what, and the reason they gave); an
+# unlock is the moment a change freeze or an audit hold stops protecting an
+# object, and the audit row alone is easy to miss. Events age out after
+# ``threshold_days`` (default 1), the same open-while-recent shape as the
+# rogue-device rules.
+RULE_TYPE_RESOURCE_LOCK_REMOVED = "resource_lock_removed"
+_RESOURCE_LOCK_REMOVED_RECENCY_DAYS = 1
+
 # Rogue IPv6 Router-Advertisement detection — issue #524. Subject = ra_router.
 # Fires on ra_observed_router rows classified ``rogue`` (an RA source that
 # isn't on the group's expected-router allowlist), observed within
@@ -811,6 +820,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_ROGUE_DHCP,
         RULE_TYPE_ROGUE_RA,
         RULE_TYPE_WOL_WAKE_FAILED,
+        RULE_TYPE_RESOURCE_LOCK_REMOVED,
         RULE_TYPE_NEW_MAC_SEEN,
         RULE_TYPE_TLS_CERT_EXPIRING,
         RULE_TYPE_TLS_CERT_CHAIN_INVALID,
@@ -2075,6 +2085,54 @@ async def _matching_wol_wake_failed_subjects(
             f"they are seen, or after a clean run."
         )
         matches.append((str(sched.id), sched.name, message))
+    return matches
+
+
+async def _matching_resource_lock_removed_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+) -> list[tuple[str, str, str]]:
+    """One match per ``unlock`` audit row inside the recency window (#3361).
+
+    The subject is the audit row, not the locked object: re-locking and
+    unlocking the same object twice is two removals, each worth a page. The
+    event ages out of the window by itself. The message carries who removed
+    the lock, from what, and the reason the operator gave.
+    """
+    days = (
+        rule.threshold_days
+        if rule.threshold_days is not None
+        else _RESOURCE_LOCK_REMOVED_RECENCY_DAYS
+    )
+    cutoff = datetime.now(UTC) - timedelta(days=max(1, days))
+    rows = (
+        (
+            await db.execute(
+                select(AuditLog)
+                .where(
+                    AuditLog.action == "unlock",
+                    AuditLog.result == "success",
+                    AuditLog.timestamp >= cutoff,
+                )
+                .order_by(AuditLog.timestamp.desc())
+                .limit(_IP_HYGIENE_MAX_EVENTS)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    matches: list[tuple[str, str, str]] = []
+    for r in rows:
+        old = r.old_value or {}
+        new = r.new_value or {}
+        label = f"{r.resource_type} {r.resource_display}"
+        held = f" ({old['level']} lock set by {old['locked_by']})" if old.get("locked_by") else ""
+        reason = new.get("reason") or "no reason recorded"
+        message = (
+            f"{r.user_display_name or 'Someone'} removed the lock on {label}{held}. "
+            f"Reason given: {reason}."
+        )
+        matches.append((str(r.id), label, message))
     return matches
 
 
@@ -7281,6 +7339,47 @@ async def seed_wol_wake_failed_alert_rule() -> None:
         await session.commit()
 
 
+async def seed_resource_lock_removed_alert_rule() -> None:
+    """Seed the singleton ``resource_lock_removed`` rule (#3361), DISABLED by default.
+
+    Like the other opt-in notification rules it ships off and discoverable in
+    the Alerts UI: an unlock is routine on an install that uses locks for
+    ordinary hygiene, and an alert on every one would be noise there. Operators
+    who run change freezes turn it on. Keyed on ``rule_type`` — an operator who
+    enables / renames it is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.rule_type == RULE_TYPE_RESOURCE_LOCK_REMOVED)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name="Resource lock removed",
+                description=(
+                    "Fires on every edit / delete lock removed from an IPAM, DNS "
+                    "or DHCP object, naming who removed it, what it protected "
+                    "and the reason they gave. One event per unlock; each "
+                    "resolves on its own after threshold_days (default "
+                    f"{_RESOURCE_LOCK_REMOVED_RECENCY_DAYS}). A lock that merely "
+                    "expires does not fire it."
+                ),
+                rule_type=RULE_TYPE_RESOURCE_LOCK_REMOVED,
+                threshold_days=_RESOURCE_LOCK_REMOVED_RECENCY_DAYS,
+                severity="warning",
+                enabled=False,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
 async def seed_rogue_ra_alert_rule() -> None:
     """Seed the singleton ``rogue_ra`` rule (issue #524), DISABLED by default.
 
@@ -8517,6 +8616,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 base = await _matching_wol_wake_failed_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]
                 subject_type = "wol_schedule"
+            elif rule.rule_type == RULE_TYPE_RESOURCE_LOCK_REMOVED:
+                base = await _matching_resource_lock_removed_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
+                subject_type = "audit_log"
             elif rule.rule_type == RULE_TYPE_RESTORE_DRILL_FAILED:
                 base = await _matching_restore_drill_failed_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]
