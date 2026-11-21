@@ -84,6 +84,9 @@ services:
       # for heartbeats + lease updates. Expose if the partner is on
       # a different host.
       - "${DHCP_HA_HOST_PORT:-8001}:8000/tcp"
+      # kea-dhcp6's own HA listener (#1258): the v4 port + 1 inside the
+      # container, since the two daemons cannot share one HTTP port.
+      - "${DHCP_HA_V6_HOST_PORT:-8011}:8001/tcp"
     # NET_BIND_SERVICE binds UDP/67; NET_RAW (#365) lets Kea use raw
     # AF_PACKET sockets — the default "direct" socket mode. For a
     # directly-attached LAN switch this to `network_mode: host`; the
@@ -120,6 +123,7 @@ services:
     ports:
       - "${DHCP_HOST_PORT_2:-6768}:67/udp"
       - "${DHCP_HA_HOST_PORT_2:-8002}:8000/tcp"
+      - "${DHCP_HA_V6_HOST_PORT_2:-8012}:8001/tcp"
     cap_add:
       - NET_BIND_SERVICE
       - NET_RAW  # #365 — raw sockets for direct-attached DHCP (see dhcp-kea)

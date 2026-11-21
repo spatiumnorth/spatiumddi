@@ -127,6 +127,14 @@ export function ServerDetailModal({
               HA v4: {server.ha_state}
             </span>
           )}
+          {server.ha_state_v6 && (
+            <span
+              className="rounded bg-blue-500/15 px-1.5 py-0.5 text-[10px] font-medium text-blue-600"
+              title={haPillTitle(server.ha_last_heartbeat_at, "v6")}
+            >
+              HA v6: {server.ha_state_v6}
+            </span>
+          )}
           {server.maintenance_mode && (
             <span
               className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-400"
@@ -340,6 +348,23 @@ function OverviewTab({ server }: { server: DHCPServer }) {
                   server.ha_state === "ready"
                 ? "good"
                 : server.ha_state
+                  ? "warning"
+                  : undefined
+          }
+        />
+        <InfoCard
+          label="HA state (DHCPv6)"
+          value={server.ha_state_v6 ?? "—"}
+          accent={
+            server.ha_state_v6 === "partner-down" ||
+            server.ha_state_v6 === "terminated"
+              ? "bad"
+              : server.ha_state_v6 === "normal" ||
+                  server.ha_state_v6 === "load-balancing" ||
+                  server.ha_state_v6 === "hot-standby" ||
+                  server.ha_state_v6 === "ready"
+                ? "good"
+                : server.ha_state_v6
                   ? "warning"
                   : undefined
           }

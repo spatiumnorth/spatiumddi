@@ -123,7 +123,7 @@ import {
   utilizationBand,
 } from "@/hooks/useUtilizationThresholds";
 import { DHCPTrafficCard, DNSQueryRateCard } from "@/components/MetricsCharts";
-import { HA_V4_ONLY_NOTE } from "@/lib/dhcpHa";
+import { HA_PROTOCOLS_NOTE } from "@/lib/dhcpHa";
 import { activityTone } from "@/lib/activity-tone";
 import {
   isPartialApply,
@@ -2865,10 +2865,10 @@ export function DashboardPage() {
               <>
                 <div
                   className="flex items-center gap-1.5 border-t bg-muted/30 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground"
-                  title={HA_V4_ONLY_NOTE}
+                  title={HA_PROTOCOLS_NOTE}
                 >
                   <Shield className="h-3 w-3" />
-                  HA Pairs · DHCPv4 ({haGroups.length})
+                  HA Pairs ({haGroups.length})
                 </div>
                 <div className="divide-y">
                   {haGroups.map((g) => (
@@ -3520,13 +3520,14 @@ function FailoverRow({ group }: { group: DHCPServerGroup }) {
                 "inline-block h-2 w-2 rounded-full",
                 haStateDotCls(s.ha_state),
               )}
-              title={`${s.name}: ${s.ha_state ?? "unknown"}. ${HA_V4_ONLY_NOTE}`}
+              title={`${s.name}: v4 ${s.ha_state ?? "unknown"}${s.ha_state_v6 ? `, v6 ${s.ha_state_v6}` : ""}. ${HA_PROTOCOLS_NOTE}`}
             />
             <span className="text-muted-foreground">
               {s.name}
               <span className="text-muted-foreground/60">
                 {" · "}
                 {s.ha_state ?? "unknown"}
+                {s.ha_state_v6 ? ` / v6 ${s.ha_state_v6}` : ""}
               </span>
             </span>
           </span>

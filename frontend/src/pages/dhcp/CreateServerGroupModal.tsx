@@ -238,7 +238,7 @@ function ServerGroupModalForm({ group, onClose }: CreateServerGroupModalProps) {
         </Field>
         <Field
           label="Mode"
-          hint="How servers in this group coordinate. HA modes render the Kea libdhcp_ha.so hook when the group has 2 Kea members. HA covers DHCPv4 only: each member serves DHCPv6 scopes on its own."
+          hint="How servers in this group coordinate. HA modes render the Kea libdhcp_ha.so hook when the group has 2 Kea members. DHCPv4 and DHCPv6 each get their own HA relationship (DHCPv6 once every member's agent supports it and the group has an IPv6 scope)."
         >
           <select
             className={inputCls}

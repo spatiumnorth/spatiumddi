@@ -45,3 +45,4 @@ spec:
   ports:
     - { name: dhcp-udp,  port: 67,   protocol: UDP }
     - { name: ctrl-http, port: 8000, protocol: TCP }
+    - { name: ctrl-http-v6, port: 8001, protocol: TCP }

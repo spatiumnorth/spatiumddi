@@ -72,6 +72,10 @@ spec:
             - name: ctrl-http
               containerPort: 8000
               protocol: TCP
+            # #1258 — kea-dhcp6's HA listener (ha_peer_url port + 1).
+            - name: ctrl-http-v6
+              containerPort: 8001
+              protocol: TCP
           resources:
             requests: { cpu: 100m, memory: 128Mi }
             limits:   { cpu: 500m, memory: 512Mi }

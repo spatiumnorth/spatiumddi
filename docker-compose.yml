@@ -446,6 +446,8 @@ services:
       # URL advertised to the partner). Host-side mapped off 8000 so the
       # control plane API keeps :8000.
       - "8001:8000/tcp"
+      # kea-dhcp6's own HA listener (#1258): the v4 port + 1 in-container.
+      - "8011:8001/tcp"
     depends_on:
       api:
         condition: service_started

@@ -198,8 +198,12 @@ HA_STATE_DESCRIPTION = (
     "Kea HA state reported by the DHCPv4 daemon. Null when the server takes part "
     "in no HA relationship (a standalone group, no partner or peer URL, or "
     "sidelined): it is cleared once the server's config carries no HA hook "
-    "(#3241). HA covers DHCPv4 only: DHCPv6 scopes on the group are served by "
-    "each member independently (#1238)."
+    "(#3241). The DHCPv6 daemon's state is ``ha_state_v6`` (#1258)."
+)
+HA_STATE_V6_DESCRIPTION = (
+    "Kea HA state reported by the DHCPv6 daemon (#1258), separate from "
+    "``ha_state``. Null while no DHCPv6 HA is rendered for the server: the "
+    "group serves no IPv6 scope, or a member's agent predates DHCPv6 HA."
 )
 
 
@@ -258,6 +262,7 @@ class ServerResponse(BaseModel):
     # Kea HA state — latest value reported by the agent's periodic
     # ``status-get`` poll. Null for standalone servers (group size < 2).
     ha_state: str | None = Field(default=None, description=HA_STATE_DESCRIPTION)
+    ha_state_v6: str | None = Field(default=None, description=HA_STATE_V6_DESCRIPTION)
     ha_last_heartbeat_at: datetime | None = None
     # Per-server maintenance mode (issue #182).
     maintenance_mode: bool = False
@@ -373,6 +378,7 @@ class ServerResponse(BaseModel):
             ),
             ha_peer_url=s.ha_peer_url or "",
             ha_state=s.ha_state,
+            ha_state_v6=s.ha_state_v6,
             ha_last_heartbeat_at=s.ha_last_heartbeat_at,
             maintenance_mode=s.maintenance_mode,
             maintenance_started_at=s.maintenance_started_at,

@@ -18,10 +18,15 @@ import type { MyPermissions } from "@/lib/api";
 
 const myPermissions = vi.fn<() => Promise<MyPermissions>>();
 // #1238 — the scope's family and its group's Kea member count, per test.
-const fixture = { family: "ipv4", keaMembers: 2 };
+const fixture = { family: "ipv4", keaMembers: 2, v6Ready: false };
 const listGroups = vi.fn(() =>
   Promise.resolve([
-    { id: "grp-1", name: "pair", kea_member_count: fixture.keaMembers },
+    {
+      id: "grp-1",
+      name: "pair",
+      kea_member_count: fixture.keaMembers,
+      ha_v6_ready: fixture.v6Ready,
+    },
   ]),
 );
 
@@ -117,14 +122,15 @@ afterEach(() => {
   vi.clearAllMocks();
   fixture.family = "ipv4";
   fixture.keaMembers = 2;
+  fixture.v6Ready = false;
 });
 
-describe("DHCPSubnetPanel HA coverage (#1238)", () => {
-  it("flags a DHCPv6 scope on a two-Kea group, which HA does not cover", async () => {
+describe("DHCPSubnetPanel HA coverage (#1238, #1258)", () => {
+  it("flags a DHCPv6 scope on a two-Kea group whose DHCPv6 HA is not active", async () => {
     fixture.family = "ipv6";
     await openPanel(grants(["read", "*"]));
     const tag = await screen.findByText("v6: no HA");
-    expect(tag.getAttribute("title")).toContain("HA covers DHCPv4 only");
+    expect(tag.getAttribute("title")).toContain("DHCPv6 HA is not active");
   });
 
   // The negative cases wait for the group list to land, or they would pass
@@ -133,6 +139,14 @@ describe("DHCPSubnetPanel HA coverage (#1238)", () => {
     await waitFor(() => expect(listGroups).toHaveBeenCalled());
     await act(async () => {});
   }
+
+  it("leaves a DHCPv6 scope alone once the group runs DHCPv6 HA", async () => {
+    fixture.family = "ipv6";
+    fixture.v6Ready = true;
+    await openPanel(grants(["read", "*"]));
+    await groupsLoaded();
+    expect(screen.queryByText("v6: no HA")).toBeNull();
+  });
 
   it("leaves a DHCPv4 scope on the same group alone", async () => {
     await openPanel(grants(["read", "*"]));

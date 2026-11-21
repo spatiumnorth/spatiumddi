@@ -1221,6 +1221,14 @@ function GroupServersList({
                           HA v4: {s.ha_state}
                         </span>
                       )}
+                      {s.ha_state_v6 && (
+                        <span
+                          className="inline-flex items-center rounded bg-muted/60 px-1.5 py-0.5 text-[11px] text-muted-foreground"
+                          title={haPillTitle(s.ha_last_heartbeat_at, "v6")}
+                        >
+                          HA v6: {s.ha_state_v6}
+                        </span>
+                      )}
                       {s.maintenance_mode && (
                         <span
                           className="inline-flex items-center rounded bg-amber-500/15 px-1.5 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-400"
@@ -1464,7 +1472,7 @@ export function ServerScopesTab({ groupId }: { groupId: string }) {
   const { data: failover } = useGroupFailover(groupId || undefined);
   const servingById = servingByScopeId(failover);
   const showServing = (failover?.windows_member_count ?? 0) > 0;
-  // #1238 — HA is DHCPv4 only, so a v6 scope on a multi-Kea group is
+  // #1238 / #1258 — a v6 scope on a multi-Kea group without DHCPv6 HA is
   // served uncoordinated by every member. Same cached list the sidebar reads.
   const { data: groups = [] } = useQuery({
     queryKey: ["dhcp-groups"],
@@ -3230,6 +3238,25 @@ function ServerDetailView({
                   )}
                 >
                   HA v4: {server.ha_state}
+                </span>
+              )}
+              {server.ha_state_v6 && (
+                <span
+                  title={haPillTitle(server.ha_last_heartbeat_at, "v6")}
+                  className={cn(
+                    "rounded-full px-2 py-0.5 text-xs font-medium",
+                    server.ha_state_v6 === "partner-down" ||
+                      server.ha_state_v6 === "terminated"
+                      ? "bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300"
+                      : server.ha_state_v6 === "normal" ||
+                          server.ha_state_v6 === "hot-standby" ||
+                          server.ha_state_v6 === "load-balancing" ||
+                          server.ha_state_v6 === "ready"
+                        ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300"
+                        : "bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300",
+                  )}
+                >
+                  HA v6: {server.ha_state_v6}
                 </span>
               )}
               {!server.agent_approved && !server.is_agentless && (

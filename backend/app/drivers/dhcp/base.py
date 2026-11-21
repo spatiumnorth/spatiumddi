@@ -277,7 +277,9 @@ class FailoverConfig:
     channel_name: str
     mode: str  # load-balancing | hot-standby
     this_server_name: str  # name used in the local peer's "this-server-name"
-    peers: tuple[dict[str, Any], ...]  # [{name, url, role, auto-failover}, ...]
+    # [{name, url, role, auto-failover[, url_v6]}, ...]; ``url_v6`` (#1258) is the DHCPv6 HA
+    # listener, present on every peer or none (see ``config_bundle._resolve_failover``).
+    peers: tuple[dict[str, Any], ...]
     heartbeat_delay_ms: int = 2000
     max_response_delay_ms: int = 60000
     max_ack_delay_ms: int = 10000

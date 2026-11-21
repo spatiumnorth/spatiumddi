@@ -197,7 +197,7 @@ from app.services.appliance.var_disk import (
     var_disk_fields,
     var_disk_reading,
 )
-from app.services.dhcp.ha_firewall import dhcp_ha_firewall_inputs
+from app.services.dhcp.ha_firewall import dhcp_ha_firewall_inputs, dhcp_ha_v6_port
 from app.services.host_timezone import canonical_host_timezone
 from app.services.upgrades import shared_tags as upgrade_shared_tags
 from app.services.upgrades.safety import assert_no_upgrade_in_flight
@@ -2100,6 +2100,10 @@ class SupervisorRoleAssignment(BaseModel):
     # None / empty = not in a rendered HA group, and nothing is opened.
     dhcp_ha_port: int | None = None
     dhcp_ha_peer_cidrs: list[str] = Field(default_factory=list)
+    # #1258 — kea-dhcp6's HA listener (``dhcp_ha_port`` + 1), opened to the same
+    # peers. None while the group runs no DHCPv6 HA; a supervisor that predates
+    # the field ignores it and leaves the port closed.
+    dhcp_ha_v6_port: int | None = None
 
 
 class SupervisorHeartbeatResponse(BaseModel):
@@ -3968,6 +3972,7 @@ async def _build_role_assignment(db: DB, row: Appliance) -> SupervisorRoleAssign
             dhcp_network_mode = dhcp_group.network_mode
     # #1167 — the Kea HA listener, when this node's DHCP group is an HA pair.
     dhcp_ha_port, dhcp_ha_peer_cidrs = await dhcp_ha_firewall_inputs(db, row)
+    dhcp_ha_v6 = await dhcp_ha_v6_port(db, row, dhcp_ha_port)
 
     # #170 Wave D follow-up — only ship the bootstrap PSK to
     # supervisors whose appliance has the matching role assigned.
@@ -4001,6 +4006,7 @@ async def _build_role_assignment(db: DB, row: Appliance) -> SupervisorRoleAssign
         dns_encrypted_udp_ports=dns_encrypted_udp_ports,
         dhcp_ha_port=dhcp_ha_port,
         dhcp_ha_peer_cidrs=dhcp_ha_peer_cidrs,
+        dhcp_ha_v6_port=dhcp_ha_v6,
     )
 
 
