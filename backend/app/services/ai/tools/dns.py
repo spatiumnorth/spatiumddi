@@ -571,6 +571,7 @@ async def preview_dns_zone_move(
         "technitium_acl_refusal": plan.technitium_acl_refusal,
         "classless_refusal": plan.classless_refusal,
         "dnssec_policy_refusal": plan.dnssec_policy_refusal,
+        "powerdns_refusal": plan.powerdns_refusal,
         "views_refusal": plan.views_refusal,
         "warnings": plan.warnings,
         "required_acknowledgements": plan.required_acknowledgements,
