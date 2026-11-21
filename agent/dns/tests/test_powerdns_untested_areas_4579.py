@@ -148,22 +148,26 @@ def _zones_json(tmp_path: Path, bundle: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+_TLSA = "3 1 1 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+_SSHFP = "4 2 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+
+# LOC is sent in the form pdns accepts, its size and precisions with two
+# decimals (#4572); BIND9's shorter spelling of the same position is rewritten.
 @pytest.mark.parametrize(
-    ("rtype", "value"),
+    ("rtype", "value", "expected"),
     [
+        ("TLSA", _TLSA, _TLSA),
+        ("SSHFP", _SSHFP, _SSHFP),
         (
-            "TLSA",
-            "3 1 1 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "LOC",
+            "52 22 23.000 N 4 53 32.000 E -2.00m 0.00m 10000m 10m",
+            "52 22 23.000 N 4 53 32.000 E -2.00m 0.00m 10000.00m 10.00m",
         ),
-        (
-            "SSHFP",
-            "4 2 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        ),
-        ("LOC", "52 22 23.000 N 4 53 32.000 E -2.00m 0.00m 10000m 10m"),
     ],
 )
 def test_wire_only_types_reach_pdns_unchanged(
-    tmp_path: Path, rtype: str, value: str
+    tmp_path: Path, rtype: str, value: str, expected: str
 ) -> None:
     bundle = {
         "options": {},
@@ -180,7 +184,7 @@ def test_wire_only_types_reach_pdns_unchanged(
     }
     rs = rrsets[("h.example.com.", rtype)]
     assert rs["ttl"] == 300
-    assert [r["content"] for r in rs["records"]] == [value]
+    assert [r["content"] for r in rs["records"]] == [expected]
 
 
 # ── C9: the catalog zone ──────────────────────────────────────────────────────
