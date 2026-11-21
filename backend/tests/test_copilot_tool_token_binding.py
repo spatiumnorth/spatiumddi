@@ -64,6 +64,8 @@ AUDITED_TOKEN_BINDING_TOOLS = frozenset(
         "ask_yes_no",
         "help_write_permission",
         "maintenance_status",
+        # Sections need a type-wide grant; an instance-bound token gets none (#2143).
+        "get_platform_summary",
     }
 )
 

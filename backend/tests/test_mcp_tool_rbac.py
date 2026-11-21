@@ -302,6 +302,8 @@ _SESSION_ONLY_TOOLS = {
     "find_retention_settings",
     "find_ssh_settings",
     "find_syslog_settings",
+    # GET /api/v1/summary is session-only too; build_summary gates each section (#2143).
+    "get_platform_summary",
 }
 
 
