@@ -933,6 +933,14 @@ postgresql:
     # reaches clusters created before #702. Set false to withhold the
     # privilege — drills then report a clear "role lacks CREATEDB" error.
     appRoleCreateDb: true
+    # Make the application role a member of ``pg_monitor`` (#4610), the
+    # read-only monitoring role. Without it Postgres hides every standby's
+    # state and LSNs from the app's role, so the rolling-upgrade preflight's
+    # replication_lag check and the Cluster screen's streaming check can see
+    # replicas but not verify them. Applied via ``managed.roles`` so it also
+    # reaches existing clusters. Set false to withhold it; both then report
+    # "not verified" instead of a measured result.
+    appRoleMonitor: true
     # Replica count. 3 is the smallest etcd-quorum-friendly default
     # (primary + sync replica + async replica). 5 / 7 for larger
     # clusters. CNPG enforces odd counts implicitly via its leader-
