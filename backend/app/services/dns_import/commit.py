@@ -39,7 +39,7 @@ from app.services.dns.record_ops import (
     record_op_payload,
     resolve_primary_server,
 )
-from app.services.dns.server_move import classless_zone_refusal
+from app.services.dns.server_move import classless_zone_refusal, views_refusal
 from app.services.dns.view_collisions import RenderGuard
 from app.services.dns.zone_apex import apex_name_length_error
 from app.services.dns_import.soa_mailbox import (
@@ -743,6 +743,20 @@ async def commit_import(
             raise ValueError(
                 f"Target view {target_view_id} does not exist in group {target_group_id}"
             )
+        # #4565 — a view-scoped zone lands only where the group's servers
+        # can serve views (the zone create API's rule).
+        drivers = (
+            (
+                await db.execute(
+                    select(DNSServer.driver).where(DNSServer.group_id == target_group_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        refusal = views_refusal(d for d in drivers if d)
+        if refusal is not None:
+            raise ValueError(refusal)
 
     # Re-detect conflicts in case the world moved between preview
     # and commit. The set is keyed by FQDN-with-trailing-dot lower-case.

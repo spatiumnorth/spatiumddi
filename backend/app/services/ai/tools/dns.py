@@ -570,6 +570,7 @@ async def preview_dns_zone_move(
         "forward_transport_refusal": plan.forward_transport_refusal,
         "technitium_acl_refusal": plan.technitium_acl_refusal,
         "classless_refusal": plan.classless_refusal,
+        "views_refusal": plan.views_refusal,
         "warnings": plan.warnings,
         "required_acknowledgements": plan.required_acknowledgements,
     }
