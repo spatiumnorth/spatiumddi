@@ -507,6 +507,8 @@ single-node appliance restarting cluster DNS is a footgun.
 6. Operator accepts the self-signed cert **once** and signs in `admin / admin`, then sets a real password. The cert firstboot minted in step 3 is the only one the operator ever sees: the api's startup bootstrap *adopts* it as the active `appliance_certificate` row rather than generating a rival (#767), so the fingerprint doesn't change mid-boot and the frontend isn't rolled underneath the operator.
 7. (Appliance role, or a Control-plane node enabling DNS/DHCP) Operator approves the appliance from the control plane's `/appliance → Fleet` tab + picks roles. DaemonSet schedules role pods within ~30 s.
 
+**Joining a control plane that runs from the Helm chart** (plain Kubernetes or OpenShift) needs two control-plane settings first, supervisor registration and the agent keys; see [Join an appliance agent node to a Helm or OpenShift control plane](KUBERNETES.md#join-an-appliance-agent-node-to-a-helm-or-openshift-control-plane).
+
 For a step-by-step user-facing version, see the README's
 ["Quick start with the OS appliance ISO" section](https://github.com/spatiumnorth/spatiumddi/blob/main/README.md#quick-start-with-the-os-appliance-iso-recommended).
 
