@@ -404,3 +404,65 @@ async def test_restored_servers_of_the_adopted_appliance_keep_the_live_agent_ide
     assert dhcp["other"].agent_fingerprint == "other-fp" and dhcp["other"].agent_approved is False
     dns = (await db_session.execute(select(DNSServer))).scalar_one()
     assert dns.agent_fingerprint == "live-dns-fp" and dns.pending_approval is False
+
+
+@pytest.mark.asyncio
+async def test_agent_identity_clash_is_reported_not_silent(db_session: AsyncSession) -> None:
+    """The carry runs in a savepoint; a unique agent_id clash must surface as
+    a restore warning, not leave the server waiting for approval unannounced."""
+    live = _appliance("node1")
+    db_session.add_all([live, _ca("LIVE-CA")])
+    await db_session.flush()
+    live_agent = uuid.uuid4()
+    g = DHCPServerGroup(name="g")
+    db_session.add(g)
+    await db_session.flush()
+    db_session.add(
+        DHCPServer(
+            name="node1",
+            driver="kea",
+            host="node1",
+            appliance_id=live.id,
+            server_group_id=g.id,
+            agent_id=live_agent,
+            agent_approved=True,
+            agent_fingerprint="live-fp",
+        )
+    )
+    await db_session.commit()
+    snap = await ident.snapshot(str(settings.database_url))
+    assert snap is not None
+
+    old = _appliance("node1", cert_pem="OLD")
+    await _replay_with(db_session, [old], _ca("ARCHIVE-CA"))
+    await db_session.execute(delete(DHCPServer))
+    await db_session.commit()
+    g2 = DHCPServerGroup(name="g2")
+    db_session.add(g2)
+    await db_session.flush()
+    db_session.add_all(
+        [
+            DHCPServer(
+                name="node1",
+                driver="kea",
+                host="node1",
+                appliance_id=old.id,
+                server_group_id=g2.id,
+                agent_id=uuid.uuid4(),
+                agent_approved=False,
+                agent_fingerprint="archive-fp",
+            ),
+            DHCPServer(
+                name="squatter",
+                driver="kea",
+                host="s",
+                agent_id=live_agent,
+                agent_approved=False,
+                agent_fingerprint="s-fp",
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    out = await ident.adopt(str(settings.database_url), snap)
+    assert any("agent identity" in w and "node1" in w for w in out.warnings)

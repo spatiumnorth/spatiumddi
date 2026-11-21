@@ -172,7 +172,7 @@ _SERVER_CARRY = (
 )
 
 
-async def _carry_agent_identity(conn: Any, snap: IdentitySnapshot, live_ids: set[str]) -> None:
+async def _carry_agent_identity(conn: Any, snap: IdentitySnapshot, live_ids: set[str]) -> list[str]:
     """Put the live agent identity on the restored server rows of an adopted
     appliance (#4677).
 
@@ -185,6 +185,7 @@ async def _carry_agent_identity(conn: Any, snap: IdentitySnapshot, live_ids: set
     the agent's register finds no change. Only those rows: the anti-hijack
     rule in the register handlers is untouched, and a hostname match to some
     other appliance's archive row is never rewritten."""
+    failed: list[str] = []
     for table, attr, flag in _SERVER_CARRY:
         for srv in getattr(snap, attr):
             if str(srv["appliance_id"]) not in live_ids:
@@ -210,6 +211,16 @@ async def _carry_agent_identity(conn: Any, snap: IdentitySnapshot, live_ids: set
                 logger.warning(
                     "backup_restore_agent_identity_carry_failed", table=table, error=str(exc)
                 )
+                failed.append(str(srv["name"]))
+    return failed
+
+
+def _carry_warning(names: list[str]) -> str:
+    return (
+        "Could not keep the agent identity of the server(s) "
+        + ", ".join(sorted(set(names)))
+        + ": its agent may wait for approval after the restore."
+    )
 
 
 async def adopt(db_url: str, snap: IdentitySnapshot) -> AdoptionOutcome:
@@ -286,7 +297,9 @@ async def adopt(db_url: str, snap: IdentitySnapshot) -> AdoptionOutcome:
                 out.refreshed = sorted(str(r[0]) for r in refreshed)
             if not todo:
                 # The same install: the archive carries the running rows.
-                await _carry_agent_identity(conn, snap, kept_ids_now)
+                failed = await _carry_agent_identity(conn, snap, kept_ids_now)
+                if failed:
+                    out.warnings.append(_carry_warning(failed))
                 if out.refreshed or out.ca_replaced:
                     out.warnings.append(_warning([], out))
                 return out
@@ -377,7 +390,9 @@ async def adopt(db_url: str, snap: IdentitySnapshot) -> AdoptionOutcome:
                 await conn.execute(
                     text("DELETE FROM appliance WHERE id = CAST(:i AS uuid)"), {"i": old_id}
                 )
-            await _carry_agent_identity(conn, snap, adopted_ids | kept_ids)
+            failed = await _carry_agent_identity(conn, snap, adopted_ids | kept_ids)
+            if failed:
+                out.warnings.append(_carry_warning(failed))
         out.warnings.append(_warning([str(a["hostname"]) for a in out.adopted], out))
         if out.ca_replaced and out.archive_only:
             out.warnings.append(
