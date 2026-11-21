@@ -333,6 +333,9 @@ REC_CP_RAM_GIB=8
 # a confirm guard on the control-plane choice in ask_role() — makes that
 # accident hard. The very first install actively picks "First node".
 ROLE="appliance"
+# #4551 — set once the operator has actually chosen on the role screen, so
+# ROLE's safe fallback value is not shown as a pre-selected answer.
+ROLE_PICKED=""
 # Installer roles (#272 — collapsed from the old three to two; the
 # old full-stack / frontend-core distinction is now a runtime DNS/DHCP
 # role toggle, not an install choice):
@@ -456,13 +459,17 @@ welcome() {
 This installer will ERASE a target disk and install SpatiumDDI to it.\n\n\
 You'll be asked for:\n\
   - Role (First node / Additional node)\n\
+  - Pre-flight summary of this machine (disks, network, clock)\n\
   - Target disk\n\
   - Hostname\n\
-  - Admin OS user + password (for SSH access)\n\
+  - Admin OS user + password, optional SSH public key\n\
+  - Keyboard layout\n\
   - Network (DHCP or static)\n\
+  - Time source (NTP servers)\n\
   - Timezone\n\
   - k3s pod + service CIDRs (defaults are fine on most LANs)\n\
   - Control-plane URL + 8-digit pairing code (Additional node only)\n\n\
+Licences of the bundled software: /etc/spatiumddi/NOTICE (after install).\n\n\
 Press OK to begin, or Cancel to drop to a shell."
     whiptail --backtitle "$BACKTITLE" --title "Welcome" \
         --yes-button "OK" --no-button "Cancel" \
@@ -628,12 +635,14 @@ preflight() {
     # because of what it breaks LATER and silently: TLS to the control
     # plane fails "certificate not yet valid", and the supervisor's
     # pairing is rejected, both of which read as a networking fault.
-    local now build
+    local now build clock_bad=0
     now=$(date -u +%Y-%m-%d)
     build="$(_iso_build_date)"
     if [ -n "$build" ] && [ "$now" \< "$build" ]; then
         body+="Clock:     $(date -u '+%Y-%m-%d %H:%M UTC')  ← BEFORE this image was built ($build)\n"
         body+="           Fix the RTC or TLS and pairing will fail after the reboot.\n"
+        body+="           You can set the clock on the next screen.\n"
+        clock_bad=1
         warn_count=$((warn_count + 1))
     else
         body+="Clock:     $(date -u '+%Y-%m-%d %H:%M UTC')\n"
@@ -648,6 +657,83 @@ preflight() {
         "$(_whiptail_height "$body\nContinue?" 76)" 76 \
         || return 1
     log "Pre-flight: cpus=$cpus ram=${ram_gb}G disks=$disk_count nics_up=$nic_up warnings=$warn_count"
+    # #4551 — the clock warning used to be a dead end. if/then, not
+    # `[ ] && ...`: a false test as the last statement would return 1 and
+    # the state machine would read it as Back.
+    if [ "$clock_bad" = 1 ]; then
+        _offer_set_clock
+    fi
+    return 0
+}
+
+# #4551 — normalise a typed "YYYY-MM-DD HH:MM" (UTC) for `date -u -s`.
+# Prints the normalised stamp and returns 0, or returns 1 for anything that
+# is not a real date. Seconds are accepted and dropped; GNU date does the
+# calendar check, so 2026-02-30 is refused.
+_parse_clock_input() {
+    local in="$1" out
+    case "$in" in
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\ [0-9][0-9]:[0-9][0-9]|\
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\ [0-9][0-9]:[0-9][0-9]:[0-9][0-9]) ;;
+        *) return 1 ;;
+    esac
+    out=$(date -u -d "$in" '+%Y-%m-%d %H:%M:%S' 2>/dev/null) || return 1
+    printf '%s' "$out"
+}
+
+# #4551 — let the operator set the clock when pre-flight found it behind
+# the image's build date. Sets the system clock and, when there is one, the
+# hardware clock, so the installed system boots with it too. Declining is
+# fine (NTP may still fix it); nothing here blocks the install.
+_offer_set_clock() {
+    whiptail --backtitle "$BACKTITLE" --title "Clock is wrong" \
+        --yes-button "Set it" --no-button "Skip" \
+        --yesno "This machine's clock is behind the date this image was built.\n\nSet the date and time now (UTC)?" 10 66 \
+        || return 0
+    local typed stamp
+    typed="$(date -u '+%Y-%m-%d %H:%M')"
+    while true; do
+        typed=$(whiptail --backtitle "$BACKTITLE" --title "Set date and time (UTC)" \
+            --cancel-button "Skip" \
+            --inputbox "Current UTC date and time, as YYYY-MM-DD HH:MM:" 10 60 -- "$typed" \
+            3>&1 1>&2 2>&3) || return 0
+        if stamp=$(_parse_clock_input "$typed"); then
+            break
+        fi
+        whiptail --backtitle "$BACKTITLE" --title "Not a date" \
+            --msgbox "Use the form YYYY-MM-DD HH:MM, for example 2026-11-20 14:05." 9 66 || true
+    done
+    if date -u -s "$stamp" >/dev/null 2>&1; then
+        log "Clock set by the operator to $stamp UTC"
+        hwclock --systohc --utc >/dev/null 2>&1 \
+            || log "WARN: hwclock --systohc failed (no RTC?); the system clock is set"
+    else
+        log "WARN: could not set the clock to $stamp"
+        whiptail --backtitle "$BACKTITLE" --title "Clock not set" \
+            --msgbox "The clock could not be set. Continue anyway; chrony may correct it once a time source is reachable." 9 66 || true
+    fi
+    return 0
+}
+
+# #4551 — one-shot reachability test of the typed NTP servers: chronyd -Q
+# queries them and exits without touching the clock. Prints chronyd's own
+# verdict; returns 0 when at least one server answered. Skips (returns 0)
+# where chronyd is absent so the screen never blocks on its own test.
+_ntp_probe() {
+    command -v chronyd >/dev/null 2>&1 || return 0
+    local args=() srv out
+    for srv in $1; do
+        args+=("server $srv iburst")
+    done
+    [ "${#args[@]}" -gt 0 ] || return 0
+    # -f /dev/null: the stock chrony.conf names Debian's public pool, which
+    # would answer for a typo'd or unreachable private server and hide it.
+    out=$(timeout 25 chronyd -Q -f /dev/null "${args[@]}" 2>&1) || {
+        printf '%s' "$out" | tail -n 4
+        return 1
+    }
+    printf '%s' "$out" | tail -n 2
+    return 0
 }
 
 # ── Keyboard (issue #995 item 17) ─────────────────────────────────────
@@ -889,6 +975,27 @@ ask_ntp() {
         whiptail --backtitle "$BACKTITLE" --title "Not a server name" \
             --msgbox "These are not hostnames or IP addresses:$bad_ntp"$'\n\n'"Separate several servers with SPACES, not commas." 12 70 || true
         continue
+    fi
+    # #4551 — the check above is characters only; offer to ask the servers.
+    # Optional and skippable, and a failure is a warning, not a block: the
+    # servers may be reachable only from the installed system's network.
+    if [ -n "$ntp_pick" ] && command -v chronyd >/dev/null 2>&1 \
+        && whiptail --backtitle "$BACKTITLE" --title "Test the time source?" \
+            --defaultno --yes-button "Test now" --no-button "Skip" \
+            --yesno "Query $ntp_pick once (about 20 seconds) to check it answers? The clock is not changed." 10 70; then
+        local probe_out probe_rc=0
+        probe_out=$(_ntp_probe "$ntp_pick") || probe_rc=$?
+        if [ "$probe_rc" -ne 0 ]; then
+            if whiptail --backtitle "$BACKTITLE" --title "No answer" \
+                --yes-button "Use anyway" --no-button "Edit" \
+                --yesno "No server answered:\n\n$probe_out\n\nThey may only be reachable from the installed system's network." 14 74; then
+                :
+            else
+                continue
+            fi
+        else
+            log "NTP probe: $ntp_pick answered"
+        fi
     fi
     NTP_SERVERS="$ntp_pick"
     # Empty is a legitimate answer: an air-gapped site with a hardware
@@ -1172,22 +1279,30 @@ ask_role() {
     # the internal ROLE values (``appliance`` / ``control-plane``) that
     # firstboot + the supervisor consume — so downstream is unchanged.
     #
-    # ``add-node`` (appliance) is listed first + default: it's the common
-    # case once a control plane exists, and it's the non-destructive
-    # choice. ``first-node`` (control-plane) creates a NEW, standalone
+    # ``add-node`` (appliance) is listed first and stays ROLE's fallback
+    # value: it's the non-destructive choice. ``first-node`` (control-plane)
+    # creates a NEW, standalone
     # SpatiumDDI (its own DB + cluster), so a wrong pick there is the
     # real footgun — it's guarded by an explicit confirm below. The
     # per-row ON flag reflects $ROLE so backing in preserves the pick.
+    #
+    # #4551 — NOTHING is pre-selected on a first visit. "Additional node"
+    # used to be the default, so a first-time operator pressing Enter was
+    # asked for a control-plane URL and pairing code they do not have.
+    # Backing in still preserves the pick; an Enter with no selection gets
+    # the "Please pick an option" prompt below.
     local first_flag=OFF add_flag=OFF
-    case "$ROLE" in
-        control-plane) first_flag=ON ;;
-        *) add_flag=ON ;;  # appliance (or unset) → default
-    esac
+    if [ -n "$ROLE_PICKED" ]; then
+        case "$ROLE" in
+            control-plane) first_flag=ON ;;
+            appliance) add_flag=ON ;;
+        esac
+    fi
     local pick
     while true; do
         pick=$(whiptail --backtitle "$BACKTITLE" --title "What is this node?" \
             --cancel-button "Back" \
-            --radiolist "Is this your FIRST SpatiumDDI node, or are you adding one to an existing install?\n\n  Additional node  (default)\n    Pairs with an EXISTING SpatiumDDI over an 8-digit code; an\n    admin then approves it and assigns DNS / DHCP roles in the\n    Fleet UI. Can be PROMOTED into the control-plane cluster later\n    — this is how you add control-plane nodes for HA (NOT by\n    installing 'First node' again).\n\n  First node\n    Creates a NEW SpatiumDDI: the control plane (api + database +\n    web UI) + k3s seed. DNS + DHCP stay OFF — enable them per node\n    from the Fleet UI. Pick this for a homelab, a single box, or\n    the seed of a brand-new HA cluster." \
+            --radiolist "Is this your FIRST SpatiumDDI node, or are you adding one to an existing install?\n\n  FIRST INSTALL? Choose \"First node\".\n\n  Additional node\n    Pairs with an EXISTING SpatiumDDI over an 8-digit code; an\n    admin then approves it and assigns DNS / DHCP roles in the\n    Fleet UI. Can be PROMOTED into the control-plane cluster later\n    — this is how you add control-plane nodes for HA (NOT by\n    installing 'First node' again).\n\n  First node\n    Creates a NEW SpatiumDDI: the control plane (api + database +\n    web UI) + k3s seed. DNS + DHCP stay OFF — enable them per node\n    from the Fleet UI. Pick this for a homelab, a single box, or\n    the seed of a brand-new HA cluster." \
             27 84 2 \
             "add-node"   "Additional node — DNS/DHCP agent (promotable)" "$add_flag" \
             "first-node" "First node — new control plane (api+db+UI)" "$first_flag" \
@@ -1199,6 +1314,7 @@ ask_role() {
         case "$pick" in
             add-node)
                 ROLE="appliance"
+                ROLE_PICKED=1
                 break
                 ;;
             first-node)
@@ -1212,11 +1328,12 @@ ask_role() {
                     --yesno "This creates a NEW, standalone SpatiumDDI — its own database and cluster.\n\nIf you are ADDING a node to an existing SpatiumDDI (for HA, or as a DNS / DHCP agent), choose \"Additional node\" instead, then promote it from the Fleet UI.\n\nCreate a new control plane on this box?" \
                     16 76; then
                     ROLE="control-plane"
+                    ROLE_PICKED=1
                     break
                 fi
-                # No → re-show the radio with the safe default pre-selected.
+                # No → re-show the radio with nothing selected.
                 first_flag=OFF
-                add_flag=ON
+                add_flag=OFF
                 continue
                 ;;
         esac
@@ -1324,7 +1441,7 @@ ask_application_config() {
             CONTROL_PLANE_URL=$(whiptail --backtitle "$BACKTITLE" \
                 --title "Control plane URL" \
                 --cancel-button "Back" \
-                --inputbox "Where does this Additional node register?\n\nFormat: https://<control-plane-host>/  — the URL of the SpatiumDDI control plane this supervisor pairs against. The supervisor submits its Ed25519 pubkey here, sits in pending until an admin clicks Approve, then receives a control-plane-CA-signed identity cert.\n\nHA TIP: if the control plane is a multi-node cluster, point this at the MetalLB virtual IP (VIP), NOT a single node's IP — otherwise this appliance loses its control plane whenever that one node is down. Configure the VIP under Appliance -> Network & Host on the control plane.\n\nUse https:// in production; http:// is acceptable for lab installs." \
+                --inputbox "Where does this Additional node register?\n\nFormat: https://<control-plane-host>/  — the address you open the SpatiumDDI web UI on. This node registers there, waits as \"pending\" until an admin approves it under Appliance -> Fleet, then joins.\n\nHA TIP: if the control plane is a multi-node cluster, point this at the MetalLB virtual IP (VIP), NOT a single node's IP — otherwise this appliance loses its control plane whenever that one node is down. Configure the VIP under Appliance -> Network & Host on the control plane.\n\nUse https:// in production; http:// is acceptable for lab installs." \
                 21 78 -- "$default_url" 3>&1 1>&2 2>&3) \
                 || return 1
             # Trim only the ends: an inner space is an error to report,
@@ -2090,6 +2207,27 @@ _apply_kept_answers() {
     return 0
 }
 
+# #4551 — the tail of a disk's serial number as " S/N <tail>", or nothing.
+# The tail, because vendors put the distinguishing digits last and the
+# whole string (40 chars on some NVMe) would not fit the menu row.
+_disk_serial_tag() {
+    local serial
+    serial=$(lsblk -dn -r -o SERIAL "$1" 2>/dev/null | head -n1 | sed -e 's/\\x20//g' -e 's/[[:space:]]//g')
+    [ -n "$serial" ] || return 0
+    printf ' S/N %s' "${serial: -8}"
+}
+
+# #4551 — " [too small]" when SIZE_BYTES is under the A/B layout's floor.
+_disk_small_tag() {
+    local bytes="${1:-0}"
+    case "$bytes" in ''|*[!0-9]*) return 0 ;; esac
+    # 0 = size unknown (blockdev failed): no claim either way.
+    if [ "$bytes" -gt 0 ] && [ "$bytes" -lt $((MIN_DISK_GIB * 1024 * 1024 * 1024)) ]; then
+        printf ' [too small]'
+    fi
+    return 0
+}
+
 pick_disk() {
     log "Step: pick_disk"
     if [ -n "${PRESEED_HAS_DISK:-}" ]; then
@@ -2152,7 +2290,11 @@ pick_disk() {
         # a missing disk; a marked one explains itself.
         hazard=$(_disk_hazard "/dev/$name")
         local suffix=""
-        [ -n "$existing" ] && suffix=" [installed: $existing]"
+        # #4551 — two identical disks must not look identical, and a disk
+        # that will be refused should say so BEFORE it is picked.
+        suffix="$(_disk_serial_tag "/dev/$name")"
+        suffix+="$(_disk_small_tag "$(blockdev --getsize64 "/dev/$name" 2>/dev/null || echo 0)")"
+        [ -n "$existing" ] && suffix+=" [installed: $existing]"
         [ -n "$hazard" ] && suffix="$suffix [UNSUPPORTED]"
         # #999 — a SpatiumDDI mirror member is installable (the arrays are
         # stopped before the wipe) but the operator must be told that
@@ -2223,7 +2365,7 @@ pick_disk() {
     if [ ${#options[@]} -eq 0 ]; then
         log "No installable disks found (lsblk: $(lsblk -dn -o NAME,SIZE,TYPE 2>&1 | tr '\n' ';'))"
         whiptail --backtitle "$BACKTITLE" --title "No disks" \
-            --msgbox "No installable disks found.\n\nAttach a target disk to the VM and reboot." 10 60 \
+            --msgbox "No installable disks found.\n\nAttach a disk (or a virtual disk, on a VM) and reboot the installer." 10 60 \
             || true
         on_cancel "disk picker (no disks present)"
     fi
@@ -2283,7 +2425,7 @@ pick_disk() {
                             20 76 2 \
                             "keep"  "Keep /var and STATE" \
                             "erase" "Erase everything on $TARGET_DISK" \
-                            3>&1 1>&2 2>&3) || continue
+                            3>&1 1>&2 2>&3) || continue 2   # Back = the disk menu, not this one again
                         case "$keepvar_pick" in
                             keep)  KEEP_VAR="yes"; break ;;
                             erase) KEEP_VAR="no";  break ;;
@@ -2368,7 +2510,7 @@ _control_plane_sizing_ok() {
     msg+="Recommended:  ≥ ${REC_CP_DISK_GIB} GiB disk,  ≥ ${REC_CP_RAM_GIB} GiB RAM\n"
     msg+="This machine:  ${disk_gib} GiB disk"
     [ "$ram_kib" -gt 0 ] && msg+=",  ~${ram_gib} GiB RAM"
-    msg+="\n\nIt will INSTALL and boot, but at this size the first boot pulls the full control-plane image set onto /var while the Postgres + Redis volumes also land there — very likely tipping the kubelet's DiskPressure threshold into a pod-eviction / image-GC thrash loop that never converges.\n\n"
+    msg+="\n\nIt will INSTALL and boot, but at this size the control-plane workloads' Postgres + Redis volumes, logs and container runtime state all land on /var — very likely tipping the kubelet's DiskPressure threshold into a pod-eviction / image-GC thrash loop that never converges.\n\n"
     msg+="See \"Recommended sizing\" in the README / docs/deployment/APPLIANCE.md.\n\n"
     msg+="Continue with this disk anyway?"
 
@@ -3207,20 +3349,20 @@ ask_network() {
         # an invalid keyfile. Back (Cancel) on any field still exits the
         # step backward via ``return 1``.
         while true; do
-            NET_IP=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -address" \
+            NET_IP=$(whiptail --backtitle "$BACKTITLE" --title "Static IP - address" \
                 --cancel-button "Back" \
                 --inputbox "IPv4 address (e.g. 192.168.1.10):" 10 60 -- "$NET_IP" 3>&1 1>&2 2>&3) \
                 || return 1
-            NET_PREFIX=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -prefix" \
+            NET_PREFIX=$(whiptail --backtitle "$BACKTITLE" --title "Static IP - prefix" \
                 --cancel-button "Back" \
                 --inputbox "Prefix length (24) or netmask (255.255.255.0):" 10 60 -- "$NET_PREFIX" 3>&1 1>&2 2>&3) \
                 || return 1
             NET_PREFIX=$(_netmask_to_prefix "$NET_PREFIX")
-            NET_GATEWAY=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -gateway" \
+            NET_GATEWAY=$(whiptail --backtitle "$BACKTITLE" --title "Static IP - gateway" \
                 --cancel-button "Back" \
                 --inputbox "Gateway:" 10 60 -- "$NET_GATEWAY" 3>&1 1>&2 2>&3) \
                 || return 1
-            NET_DNS=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -DNS" \
+            NET_DNS=$(whiptail --backtitle "$BACKTITLE" --title "Static IP - DNS" \
                 --cancel-button "Back" \
                 --inputbox "DNS servers (space-separated):" 10 60 -- "$NET_DNS" 3>&1 1>&2 2>&3) \
                 || return 1
@@ -3287,10 +3429,46 @@ ask_network() {
     fi
 }
 
+# #4551 — the region directories under zoneinfo ("America", "Europe", ...),
+# one per line. Only directories that hold zones; the legacy aliases
+# (US/, Etc/, posix/, right/) are left out of the menu but still reachable
+# through "other".
+_tz_regions() {
+    local root="${ZONEINFO_DIR:-/usr/share/zoneinfo}" r
+    for r in Africa America Antarctica Arctic Asia Atlantic Australia Europe Indian Pacific; do
+        [ -d "$root/$r" ] && echo "$r"
+    done
+    return 0
+}
+
+# #4551 — the zones in one region, as names relative to it ("Toronto",
+# "Argentina/Buenos_Aires"), sorted.
+_tz_zones() {
+    local root="${ZONEINFO_DIR:-/usr/share/zoneinfo}"
+    [ -d "$root/$1" ] || return 0
+    (cd "$root/$1" && find . -type f | sed 's|^\./||' | LC_ALL=C sort)
+}
+
+# #4551 — resolve a typed name case-insensitively to the real zone name
+# ("utc" -> "UTC", "america/toronto" -> "America/Toronto"). Prints the name
+# as typed when nothing matches, so _check_field gives its usual error.
+_tz_canonical() {
+    local root="${ZONEINFO_DIR:-/usr/share/zoneinfo}" want="$1" hit
+    case "$want" in *..*|/*|"") printf '%s' "$want"; return 0 ;; esac
+    [ -f "$root/$want" ] && { printf '%s' "$want"; return 0; }
+    hit=$(cd "$root" && find . -type f -ipath "./$want" 2>/dev/null | sed 's|^\./||' | head -n1)
+    printf '%s' "${hit:-$want}"
+}
+
 ask_timezone() {
     log "Step: ask_timezone"
     if [ -n "${PRESEED_HAS_TIMEZONE:-}" ]; then
         log "Preseed: timezone=$TIMEZONE (skipping prompt)"
+        return 2
+    fi
+    # #4551 — an unattended run with no timezone keeps the default.
+    if [ "${FULLY_UNATTENDED:-0}" = "1" ]; then
+        log "Unattended: no timezone preseeded, keeping ${TIMEZONE:-UTC}"
         return 2
     fi
     # #995 item 3 — this was a free-text box with no validation at all,
@@ -3298,13 +3476,45 @@ ask_timezone() {
     # to log a WARN and silently install UTC. An operator who typo'd
     # "Amercia/Toronto" got a box four hours out and no indication why,
     # which then shows up as clock skew in logs and TLS.
-    local tzerr
+    #
+    # #4551 — a region / city menu first, with "other" keeping the typed
+    # name for anything the menus do not list (Etc/GMT+5, a legacy alias).
+    # Typed names are matched case-insensitively, so "utc" works.
+    local tzerr region zone
     while true; do
-        TIMEZONE=$(whiptail --backtitle "$BACKTITLE" --title "Timezone" \
+        local -a ropts=("UTC" "Coordinated Universal Time")
+        while IFS= read -r region; do
+            [ -n "$region" ] && ropts+=("$region" "")
+        done < <(_tz_regions)
+        ropts+=("other" "Type an IANA name")
+        region=$(whiptail --backtitle "$BACKTITLE" --title "Timezone" \
             --cancel-button "Back" \
-            --inputbox "Timezone (IANA name, e.g. America/Toronto, Europe/Berlin, UTC):" \
-            10 70 -- "$TIMEZONE" 3>&1 1>&2 2>&3) \
+            --menu "Choose a region. Current: ${TIMEZONE:-UTC}" \
+            20 60 12 "${ropts[@]}" 3>&1 1>&2 2>&3) \
             || return 1
+        case "$region" in
+            UTC) TIMEZONE="UTC" ;;
+            other)
+                TIMEZONE=$(whiptail --backtitle "$BACKTITLE" --title "Timezone" \
+                    --cancel-button "Back" \
+                    --inputbox "Timezone (IANA name, e.g. America/Toronto, Europe/Berlin, Etc/GMT+5, UTC):" \
+                    10 70 -- "$TIMEZONE" 3>&1 1>&2 2>&3) \
+                    || continue
+                ;;
+            *)
+                local -a zopts=()
+                while IFS= read -r zone; do
+                    [ -n "$zone" ] && zopts+=("$region/$zone" "")
+                done < <(_tz_zones "$region")
+                [ "${#zopts[@]}" -gt 0 ] || continue
+                zone=$(whiptail --backtitle "$BACKTITLE" --title "Timezone - $region" \
+                    --cancel-button "Back" \
+                    --menu "Choose a city or zone." 22 60 14 "${zopts[@]}" \
+                    3>&1 1>&2 2>&3) \
+                    || continue
+                TIMEZONE="$zone"
+                ;;
+        esac
         # ``[ -z "$TIMEZONE" ] && TIMEZONE="UTC"`` as the last statement
         # here would return 1 when TIMEZONE is non-empty (the [ test
         # fails, && short-circuits, the function inherits the [ test's
@@ -3314,11 +3524,12 @@ ask_timezone() {
         if [ -z "$TIMEZONE" ]; then
             TIMEZONE="UTC"
         fi
+        TIMEZONE="$(_tz_canonical "$TIMEZONE")"
         if tzerr=$(_check_field timezone "$TIMEZONE"); then
             break
         fi
         whiptail --backtitle "$BACKTITLE" --title "Unknown timezone" \
-            --msgbox "$tzerr"$'\n\n'"Tip: 'ls /usr/share/zoneinfo' from a shell lists the regions." \
+            --msgbox "$tzerr"$'\n\n'"Pick from the menus, or use \"other\" and type an IANA name such as America/Toronto." \
             13 72 || true
     done
 }
@@ -6642,6 +6853,16 @@ PY
     # console is a first-class install path here (spatium-console@ttyS0),
     # and asking newt for a window taller than the screen is not a
     # cosmetic problem, it fails to draw.
+    # #4551 — say how to log in. The web UI is served with a self-signed
+    # certificate until the operator installs their own, and every browser
+    # warns about it; an Additional node has no web UI to warn about.
+    local done_cert_note=""
+    if [ "$ROLE" != "appliance" ]; then
+        done_cert_note="  Browser:  expect a certificate warning — the web UI starts with a
+            self-signed certificate. Accept it, then replace it under
+            Settings -> Certificates.
+"
+    fi
     local done_body
     done_body="SpatiumDDI is installed on $TARGET_DISK.
 
@@ -6658,9 +6879,13 @@ ${BOOT_LEG_WARNING:+
   NOTE: the $BOOT_LEG_WARNING bootloader did NOT install. This disk boots
   only in $FIRMWARE_MODE mode — see /var/log/spatiumddi/install/.
 }
+How to log in after the reboot:
+  Console:  the first-boot dashboard shows the address and progress.
+  SSH:      ssh ${ADMIN_USER}@${done_addr:-<appliance IP>}
+${done_cert_note}
 Installer logs are kept at /var/log/spatiumddi/install/.
 Your answers are at /var/lib/spatium-state/spatium-preseed.yaml.
-Press OK to reboot."
+Reboot to finish, or choose Other for Power off / a shell."
     if [ -s "$VERIFY_FAIL_FILE" ]; then
         done_body="POST-INSTALL CHECKS FAILED:
 $(cat "$VERIFY_FAIL_FILE")
@@ -6679,9 +6904,40 @@ $done_body"
     # are the last three — the install-log path (#995 item 1's entire
     # deliverable), the answers-file path, and "Press OK to reboot" — and
     # they vanish on exactly the failure path that needs them.
-    whiptail --backtitle "$BACKTITLE" --title "Done" \
-        --scrolltext \
-        --msgbox "$done_body" "$(_whiptail_height "$done_body" 76)" 76 || true
+    #
+    # #4551 — Reboot is still the default (Enter, or ESC as before), but
+    # "Other" offers Power off and a shell, which is what an operator needs
+    # when the post-install checks above failed and rebooting is the wrong
+    # next step. A shell returns to this screen.
+    local done_rc done_action
+    while true; do
+        done_rc=0
+        whiptail --backtitle "$BACKTITLE" --title "Done" \
+            --scrolltext \
+            --yes-button "Reboot" --no-button "Other..." \
+            --yesno "$done_body" "$(_whiptail_height "$done_body" 76)" 76 || done_rc=$?
+        [ "$done_rc" -eq 1 ] || break
+        done_action=$(whiptail --backtitle "$BACKTITLE" --title "Done" \
+            --cancel-button "Back" \
+            --menu "What now?" 13 60 3 \
+            "reboot"   "Reboot into the installed system" \
+            "poweroff" "Power off" \
+            "shell"    "Open a shell (type 'exit' to return here)" \
+            3>&1 1>&2 2>&3) || continue
+        case "$done_action" in
+            reboot) break ;;
+            poweroff)
+                log "Install complete. Powering off at the operator's request."
+                systemctl poweroff
+                exit 0
+                ;;
+            shell)
+                clear
+                echo "Installer shell. The installed system is unmounted; 'exit' returns to the Done screen."
+                /bin/bash --login || true
+                ;;
+        esac
+    done
     else
         log "Fully unattended: install complete on $TARGET_DISK — skipping the interactive Done prompt and rebooting straight into the installed system."
     fi
@@ -6899,18 +7155,33 @@ See $INSTALL_LOG for the expected and actual digests."
 # confirm around whatever prompts still fire.
 compute_unattended() {
     FULLY_UNATTENDED=0
-    [ -n "${PRESEED_HAS_ROLE:-}" ]      || return 0
-    [ -n "${PRESEED_HAS_DISK:-}" ]      || return 0
-    [ -n "${PRESEED_HAS_HOSTNAME:-}" ]  || return 0
-    [ -n "${PRESEED_HAS_PASSWORD:-}" ]  || return 0
-    [ -n "${PRESEED_HAS_NETWORK:-}" ]   || return 0
-    [ -n "${PRESEED_HAS_TIMEZONE:-}" ]  || return 0
-    [ -n "${PRESEED_HAS_K3S:-}" ]       || return 0
-    if [ "$ROLE" = "appliance" ]; then
-        [ -n "${PRESEED_HAS_CONTROL_URL:-}" ]  || return 0
-        [ -n "${PRESEED_HAS_PAIRING_CODE:-}" ] || return 0
-    fi
+    [ -z "$(_unattended_missing)" ] || return 0
     FULLY_UNATTENDED=1
+}
+
+# #4551 — the preseed fields whose absence keeps a run from being fully
+# unattended, one name per line (empty output = nothing missing). A box
+# that waits at Welcome on tty1 with nobody there looks hung; naming the
+# fields lets --check-preseed say exactly what to add.
+_unattended_missing() {
+    [ -n "${PRESEED_HAS_ROLE:-}" ]      || echo "role"
+    [ -n "${PRESEED_HAS_DISK:-}" ]      || echo "target_disk"
+    [ -n "${PRESEED_HAS_HOSTNAME:-}" ]  || echo "hostname"
+    [ -n "${PRESEED_HAS_PASSWORD:-}" ]  || echo "admin password"
+    [ -n "${PRESEED_HAS_NETWORK:-}" ]   || echo "network"
+    # timezone is not listed: UTC is a safe default (ask_timezone skips
+    # itself when unattended), so a preseed that omits it no longer stops at
+    # Welcome. k3s is listed for a control plane only — an Additional node
+    # is never asked (ask_k3s_cidrs), and the default CIDRs of a control
+    # plane could overlap the LAN, which must be a decision, not a default.
+    if [ "$ROLE" != "appliance" ]; then
+        [ -n "${PRESEED_HAS_K3S:-}" ]   || echo "k3s"
+    fi
+    if [ "$ROLE" = "appliance" ]; then
+        [ -n "${PRESEED_HAS_CONTROL_URL:-}" ]  || echo "control-plane URL"
+        [ -n "${PRESEED_HAS_PAIRING_CODE:-}" ] || echo "pairing code"
+    fi
+    return 0
 }
 
 # Halt-loud helper — a preseed that WAS supplied but failed validation
@@ -7040,7 +7311,7 @@ check_preseed() {
         esac
     done <<<"$out"
 
-    local role_display="<interactive>" unattended="no"
+    local role_display="<interactive>" unattended="no" unattended_missing=""
     if [ "$rc" -eq 0 ]; then
         # Load the resolved values + PRESEED_HAS_* markers exactly as
         # load_preseed would, then apply the interactive wizard's rules on
@@ -7085,6 +7356,11 @@ check_preseed() {
         [ -n "${PRESEED_HAS_ROLE:-}" ] && role_display="$ROLE"
         compute_unattended
         [ "$FULLY_UNATTENDED" = "1" ] && unattended="yes"
+        # #4551 — say WHY it will stop at Welcome, rather than leave the
+        # operator to find out on the console.
+        if [ "$FULLY_UNATTENDED" != "1" ]; then
+            unattended_missing="$(_unattended_missing | paste -sd, - | sed 's/,/, /g')"
+        fi
     fi
 
     rm -f "$tmp_env" "$tmp_secret"
@@ -7106,6 +7382,9 @@ check_preseed() {
     fi
 
     echo "OK: $file is a valid spatium preseed (role=$role_display, fully-unattended=$unattended)."
+    if [ -n "$unattended_missing" ]; then
+        echo "NOTE: not fully unattended - the installer will wait for input on the console. Missing: $unattended_missing."
+    fi
     return 0
 }
 

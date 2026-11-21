@@ -2125,6 +2125,48 @@ trigger: release tag push (CalVer up to the bridge, SemVer from 1.0.0)
 > `spatiumddi-firstboot` runs after collecting answers has
 > changed.
 
+### Interactive installer, screen by screen (#4551)
+
+The wizard (`spatium-install`, on tty1 of the ISO) asks, in this order. Every
+screen has **Back**; Cancel at Welcome drops to a shell.
+
+1. **Welcome** — lists the questions below and points at `/etc/spatiumddi/NOTICE`
+   (the licences of the bundled software, present once installed).
+2. **Pre-flight** — CPUs, RAM, disks, network, resolver and clock. A clock
+   behind the date the image was built is flagged, and the next screen lets you
+   **set the date and time** (UTC; it also writes the hardware clock). Without a
+   correct clock, TLS and pairing fail after the reboot.
+3. **Role** — nothing is pre-selected. Choose **First node** for a new
+   SpatiumDDI (homelab, single box, or the seed of an HA cluster); choose
+   **Additional node** to pair with an existing one.
+4. **Target disk** — each row shows size, model, the tail of the serial number
+   (so identical disks can be told apart) and flags: `[too small]` below the
+   32 GiB floor, `[installed: …]`, `[UNSUPPORTED]`. Choosing a disk that already
+   carries an install offers **Keep /var** or **Erase**; Back there returns to the
+   disk list.
+5. **Hostname**, **admin user + password** (optional SSH public key), **keyboard
+   layout**.
+6. **Network** — DHCP or static.
+7. **Time source** — NTP servers, space-separated. The names are checked for
+   valid characters, and **Test now** queries them once (about 20 seconds,
+   `chronyd -Q`; the clock is not changed). A server that does not answer can
+   still be used, since it may only be reachable from the installed system's
+   network. Blank means no time source.
+8. **Timezone** — pick a region, then a city; **other** takes a typed IANA name
+   (case does not matter: `utc`, `america/toronto`).
+9. **k3s CIDRs** (First node only) — the defaults suit most LANs.
+10. **Control-plane URL + pairing code** (Additional node only) — the address
+    you open the control plane's web UI on.
+11. **Confirm**, then the install runs.
+12. **Done** — shows how to log in: the console dashboard on first boot, `ssh
+    <admin-user>@<address>`, and for a First node the web UI (the browser warns
+    about the self-signed certificate until you install your own). **Reboot** is
+    the default; **Other...** offers **Power off** and a **shell**, useful when
+    the post-install checks reported a failure.
+
+Remove the install media before the reboot, or the firmware boots the installer
+again. Serial / IPMI-only installs are not covered here yet (#134).
+
 > **#302 update — k3s CIDR step in the wizard.** The interactive
 > installer (`spatium-install`) now asks for the k3s pod + service
 > CIDRs between the timezone step and the role-config step. Both
@@ -2774,6 +2816,13 @@ fields) and reports every error in one pass. Machine-specific checks
 (target-disk presence, the 32 GiB size floor) downgrade to warnings so
 the same file lints the same everywhere. Exit status: `0` valid, `1`
 invalid, `2` usage error.
+
+A run is **fully unattended** only when the file answers every field the wizard
+would ask: `role`, `target_disk`, `hostname`, the admin password, `network`, and,
+for a First node, `k3s` (an Additional node also needs the control-plane URL and
+pairing code). `timezone` may be omitted (UTC), and an Additional node never needs
+`k3s`. Anything else missing leaves the installer waiting at Welcome on tty1, and
+`--check-preseed` now says so and names the missing fields.
 
 **Secrets.** `admin_password` / `pairing_code` in a plaintext answer
 file is the usual preseed tradeoff. Use `admin_password_hash` (crypt(3),

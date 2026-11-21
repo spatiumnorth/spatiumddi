@@ -21,7 +21,7 @@ SpatiumDDI Appliance — useful commands
 
   sudo spatium-pair
         Re-enter the control-plane URL + pairing code on an
-        Application appliance after install (typo / control-plane
+        Additional node after install (typo / control-plane
         rebuild). Add --reset to also wipe the supervisor's cached
         Ed25519 identity for a fully-fresh pair.
 
