@@ -1216,6 +1216,9 @@ async def _merge_statics(
         .scalars()
         .all()
     )
+    # DUID-only DHCPv6 reservations (#3900) are not on a Windows server and
+    # must never be judged by its (MAC-keyed) wire.
+    existing = [st for st in existing if st.mac_address is not None]
     by_mac = {norm_mac(str(st.mac_address)): st for st in existing}
     cidr = str(wscope.get("subnet_cidr") or "")
 

@@ -67,7 +67,8 @@ class StaticAssignmentDef:
     """A reservation (MAC/client-id → IP) inside a scope."""
 
     ip_address: str
-    mac_address: str
+    # ``None`` for a DUID-only DHCPv6 reservation (#3900).
+    mac_address: str | None
     hostname: str = ""
     client_id: str | None = None
     options_override: dict[str, Any] | None = None

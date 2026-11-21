@@ -819,6 +819,8 @@ backend/alembic/versions/f2b6d4a91c37_dnssec_bind9.py:drop_column:115
 backend/alembic/versions/f2b6d4a91c37_dnssec_bind9.py:drop_constraint_fk:114
 backend/alembic/versions/f2b6d4a91c37_dnssec_bind9.py:drop_table:117
 backend/alembic/versions/f2b6d4a91c37_dnssec_bind9.py:drop_table:119
+backend/alembic/versions/f3a7c1d94e52_dhcp_static_duid_only.py:alter_column_not_null:50
+backend/alembic/versions/f3a7c1d94e52_dhcp_static_duid_only.py:drop_column:44
 backend/alembic/versions/f3a8c2d491e7_password_policy.py:drop_column:132
 backend/alembic/versions/f3a8c2d491e7_password_policy.py:drop_column:133
 backend/alembic/versions/f3a8c2d491e7_password_policy.py:drop_column:134

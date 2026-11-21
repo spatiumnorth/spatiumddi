@@ -352,7 +352,7 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
         statics = tuple(
             StaticAssignmentDef(
                 ip_address=str(s.ip_address),
-                mac_address=str(s.mac_address),
+                mac_address=str(s.mac_address) if s.mac_address is not None else None,
                 hostname=s.hostname or "",
                 client_id=s.client_id,
                 options_override=canonical_domain_options(s.options_override) or None,
