@@ -9800,6 +9800,13 @@ export const dhcpApi = {
       .then((r) => r.data),
   // Fleet-wide, fullest first (#942) — one round trip whose cost does not
   // grow with the number of scopes. Same dynamic-only filter as above.
+  // Free ranges to extend or add to a nearly-full pool (#4489). Read-only.
+  poolExpansionSuggestions: (poolId: string, limit = 5) =>
+    api
+      .get<DHCPPoolExpansion>(`/dhcp/pools/${poolId}/expansion-suggestions`, {
+        params: { limit },
+      })
+      .then((r) => r.data),
   fleetPoolOccupancy: (limit = 10) =>
     api
       .get<DHCPFleetPoolOccupancy>("/dhcp/pools/occupancy", {
@@ -10179,6 +10186,26 @@ export interface DHCPPoolOccupancy {
   percent: number;
   /** Derived from mirrored lease rows, so its freshness follows the last lease pull. */
   computed_at: string;
+}
+
+/** One candidate range for a nearly-full pool (#4489). */
+export interface DHCPPoolExpansionSuggestion {
+  start_ip: string;
+  end_ip: string;
+  size: number;
+  /** extends_* touch the pool (merge into it); separate is a new pool. */
+  kind: "extends_after" | "extends_before" | "separate";
+  resulting_start: string | null;
+  resulting_end: string | null;
+  seen_answering: string[];
+  seen_answering_count: number;
+}
+
+export interface DHCPPoolExpansion {
+  pool_id: string;
+  scope_id: string;
+  subnet: string;
+  suggestions: DHCPPoolExpansionSuggestion[];
 }
 
 /** One row of the fleet-wide occupancy rollup (#942) — a pool plus the

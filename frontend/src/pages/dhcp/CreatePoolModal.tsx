@@ -9,6 +9,9 @@ import { FormError } from "@/components/ui/form-error";
 type CreatePoolModalProps = {
   pool?: DHCPPool;
   scope: DHCPScope;
+  /** #4489 — a suggested range to seed the form with. On an edit it replaces
+   *  the stored range, so saving resizes; nothing is applied until Save. */
+  prefill?: { start_ip: string; end_ip: string };
   onClose: () => void;
 };
 
@@ -34,12 +37,19 @@ export function CreatePoolModal(props: CreatePoolModalProps) {
   return <PoolModalForm {...props} pool={fresh.row} />;
 }
 
-function PoolModalForm({ pool, scope, onClose }: CreatePoolModalProps) {
+function PoolModalForm({
+  pool,
+  scope,
+  prefill,
+  onClose,
+}: CreatePoolModalProps) {
   const qc = useQueryClient();
   const editing = !!pool;
   const [name, setName] = useState(pool?.name ?? "");
-  const [startIp, setStartIp] = useState(pool?.start_ip ?? "");
-  const [endIp, setEndIp] = useState(pool?.end_ip ?? "");
+  const [startIp, setStartIp] = useState(
+    prefill?.start_ip ?? pool?.start_ip ?? "",
+  );
+  const [endIp, setEndIp] = useState(prefill?.end_ip ?? pool?.end_ip ?? "");
   const [poolType, setPoolType] = useState(pool?.pool_type ?? "dynamic");
   const [classRestriction, setClassRestriction] = useState(
     pool?.class_restriction ?? "",

@@ -859,6 +859,54 @@ async def find_dhcp_pool_occupancy(
     return out[: args.limit]
 
 
+class FindDHCPPoolExpansionArgs(BaseModel):
+    pool_id: str = Field(description="UUID of the dynamic IPv4 DHCP pool to extend.")
+    limit: int = Field(default=5, ge=1, le=50)
+
+
+@register_tool(
+    name="find_dhcp_pool_expansion",
+    permission=("read", "dhcp_pool"),
+    description=(
+        "Suggest free address ranges to extend or add to a nearly-full dynamic "
+        "IPv4 DHCP pool: first ranges touching the pool, then the largest other "
+        "free runs in the subnet. Excludes IPAM-allocated addresses, reservations, "
+        "leases, other pools, the gateway and network/broadcast. Each candidate "
+        "carries its size and any address discovery has seen answering. Read-only; "
+        "use the pool-update proposal tool to apply one. Use after "
+        "find_dhcp_pool_occupancy shows a pool near capacity."
+    ),
+    args_model=FindDHCPPoolExpansionArgs,
+    category="dhcp",
+    module="core.dhcp",
+)
+async def find_dhcp_pool_expansion(
+    db: AsyncSession, user: User, args: FindDHCPPoolExpansionArgs
+) -> dict[str, Any]:
+    import ipaddress
+
+    from app.services.dhcp.pool_expansion import suggest_pool_expansion
+
+    pool = await db.get(DHCPPool, uuid.UUID(args.pool_id))
+    if pool is None:
+        return {"error": "Pool not found"}
+    if pool.pool_type != "dynamic":
+        return {"error": f"Only dynamic pools have expansion suggestions; this is {pool.pool_type}"}
+    scope = await db.get(DHCPScope, pool.scope_id)
+    subnet = await db.get(Subnet, scope.subnet_id) if scope is not None else None
+    if scope is None or subnet is None:
+        return {"error": "Pool's scope or subnet not found"}
+    if ipaddress.ip_network(str(subnet.network), strict=False).version != 4:
+        return {"error": "Expansion suggestions are IPv4 only"}
+    found = await suggest_pool_expansion(db, pool, scope, subnet, limit=args.limit)
+    return {
+        "pool_id": str(pool.id),
+        "pool_range": f"{pool.start_ip}-{pool.end_ip}",
+        "subnet": str(subnet.network),
+        "suggestions": [vars(x) for x in found],
+    }
+
+
 # ── find_dhcp_failover_relationships (issue #1110) ────────────────────
 #
 # Deliberately no ``propose_*`` counterpart for the Phase 2 management routes

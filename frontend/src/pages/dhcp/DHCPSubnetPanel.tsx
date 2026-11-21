@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ChevronDown,
   ChevronRight,
+  Lightbulb,
   Pencil,
   Plus,
   Server,
@@ -13,9 +14,11 @@ import {
   dhcpApi,
   formatApiError,
   type DHCPPool,
+  type DHCPPoolExpansionSuggestion,
   type DHCPScope,
 } from "@/lib/api";
 import { zebraBodyCls } from "@/lib/utils";
+import { FormError } from "@/components/ui/form-error";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import {
   APPROVAL_QUEUED_MESSAGE,
@@ -24,7 +27,7 @@ import {
 } from "@/lib/approvalQueue";
 import { CreateScopeModal } from "./CreateScopeModal";
 import { CreatePoolModal } from "./CreatePoolModal";
-import { DeleteConfirmModal, V6NoHaTag } from "./_shared";
+import { DeleteConfirmModal, Modal, V6NoHaTag } from "./_shared";
 import { scopeDeleteCopy } from "@/lib/dhcp-scope-delete";
 import { v6ScopeLacksHa } from "@/lib/dhcpHa";
 import { ScopeServingStrip } from "./WindowsFailoverPanel";
@@ -38,10 +41,94 @@ const NEEDS_SCOPE_DELETE = "Requires delete permission on DHCP scopes";
 const NEEDS_POOL_WRITE = "Requires write permission on DHCP pools";
 const NEEDS_POOL_DELETE = "Requires delete permission on DHCP pools";
 
+// #4489 — read-only candidates for a nearly-full pool. Choosing one opens the
+// ordinary pool dialog pre-filled; nothing changes until the operator saves.
+function SuggestRangeModal({
+  pool,
+  scope,
+  onClose,
+}: {
+  pool: DHCPPool;
+  scope: DHCPScope;
+  onClose: () => void;
+}) {
+  const [picked, setPicked] = useState<DHCPPoolExpansionSuggestion | null>(
+    null,
+  );
+  const { data, isLoading, error } = useQuery({
+    queryKey: ["dhcp-pool-expansion", pool.id],
+    queryFn: () => dhcpApi.poolExpansionSuggestions(pool.id),
+  });
+  if (picked) {
+    const extend = picked.kind !== "separate";
+    return (
+      <CreatePoolModal
+        pool={extend ? pool : undefined}
+        scope={scope}
+        prefill={{
+          start_ip: extend ? picked.resulting_start! : picked.start_ip,
+          end_ip: extend ? picked.resulting_end! : picked.end_ip,
+        }}
+        onClose={onClose}
+      />
+    );
+  }
+  const label = (s: DHCPPoolExpansionSuggestion) =>
+    s.kind === "extends_after"
+      ? "Extend upward"
+      : s.kind === "extends_before"
+        ? "Extend downward"
+        : "Add as a new pool";
+  return (
+    <Modal title="Suggest a range" onClose={onClose}>
+      <div className="space-y-2 text-sm">
+        {isLoading && <p className="text-muted-foreground">Looking…</p>}
+        {error && (
+          <FormError className="text-sm">
+            {formatApiError(error, "Could not compute suggestions")}
+          </FormError>
+        )}
+        {data && data.suggestions.length === 0 && (
+          <p className="text-muted-foreground">
+            No free addresses are left in {data.subnet} outside allocations,
+            reservations and other pools.
+          </p>
+        )}
+        {data?.suggestions.map((s) => (
+          <button
+            key={`${s.start_ip}-${s.end_ip}`}
+            type="button"
+            onClick={() => setPicked(s)}
+            className="flex w-full items-center justify-between rounded-md border px-3 py-2 text-left hover:bg-muted/40"
+          >
+            <span>
+              <span className="font-mono text-xs">
+                {s.start_ip} – {s.end_ip}
+              </span>
+              <span className="ml-2 text-xs text-muted-foreground">
+                {s.size} address{s.size !== 1 ? "es" : ""}
+                {s.seen_answering_count > 0
+                  ? ` · ${s.seen_answering_count} seen answering`
+                  : ""}
+              </span>
+            </span>
+            <span className="text-xs">{label(s)}</span>
+          </button>
+        ))}
+        <p className="text-xs text-muted-foreground">
+          Choosing a range opens the pool form pre-filled; nothing is applied
+          until you save.
+        </p>
+      </div>
+    </Modal>
+  );
+}
+
 function PoolRow({ pool, scope }: { pool: DHCPPool; scope: DHCPScope }) {
   const qc = useQueryClient();
   const perms = usePermissions();
   const [edit, setEdit] = useState(false);
+  const [suggest, setSuggest] = useState(false);
   const [del, setDel] = useState(false);
   const mut = useMutation({
     mutationFn: () => dhcpApi.deletePool(scope.id, pool.id),
@@ -61,6 +148,16 @@ function PoolRow({ pool, scope }: { pool: DHCPPool; scope: DHCPScope }) {
         </span>
       </td>
       <td className="px-3 py-1.5 text-right">
+        {pool.pool_type === "dynamic" && scope.address_family !== "ipv6" && (
+          <button
+            onClick={() => setSuggest(true)}
+            className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-40"
+            title="Suggest a range to extend or add to this pool"
+            aria-label="Suggest a range"
+          >
+            <Lightbulb className="h-3.5 w-3.5" />
+          </button>
+        )}
         <button
           onClick={() => setEdit(true)}
           className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-40"
@@ -88,6 +185,13 @@ function PoolRow({ pool, scope }: { pool: DHCPPool; scope: DHCPScope }) {
           pool={pool}
           scope={scope}
           onClose={() => setEdit(false)}
+        />
+      )}
+      {suggest && (
+        <SuggestRangeModal
+          pool={pool}
+          scope={scope}
+          onClose={() => setSuggest(false)}
         />
       )}
       {del && (

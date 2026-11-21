@@ -28,6 +28,7 @@ from app.services.dhcp.class_refs import (
     known_class_names,
 )
 from app.services.dhcp.option_validation import normalize_options
+from app.services.dhcp.pool_expansion import suggest_pool_expansion
 from app.services.dhcp.pool_occupancy import (
     PoolOccupancy,
     compute_pool_occupancy_batch,
@@ -691,6 +692,71 @@ async def pool_occupancy(pool_id: uuid.UUID, db: DB, _: CurrentUser) -> PoolOccu
         raise HTTPException(status_code=422, detail=_not_applicable(pool.pool_type))
     occ = (await compute_pool_occupancy_batch(db, [pool]))[pool.id]
     return _occupancy_row(pool, occ, datetime.now(UTC))
+
+
+class PoolExpansionSuggestion(BaseModel):
+    start_ip: str
+    end_ip: str
+    size: int
+    #: ``extends_after`` / ``extends_before`` touch the pool; ``separate`` is a
+    #: free run elsewhere in the subnet (a new pool).
+    kind: str
+    resulting_start: str | None = None
+    resulting_end: str | None = None
+    seen_answering: list[str]
+    seen_answering_count: int
+
+
+class PoolExpansionResponse(BaseModel):
+    pool_id: uuid.UUID
+    scope_id: uuid.UUID
+    subnet: str
+    suggestions: list[PoolExpansionSuggestion]
+
+
+@router.get("/pools/{pool_id}/expansion-suggestions", response_model=PoolExpansionResponse)
+async def pool_expansion_suggestions(
+    pool_id: uuid.UUID,
+    db: DB,
+    _: CurrentUser,
+    limit: int = Query(5, ge=1, le=50),
+    min_size: int = Query(1, ge=1),
+) -> PoolExpansionResponse:
+    """Free ranges to extend or add to a nearly-full pool (#4489). Read-only:
+    ranges touching the pool first, then the largest other free runs, none of
+    which hold an IPAM address, reservation, lease, other pool, the gateway,
+    or the network / broadcast address. Applying one is the normal pool
+    create / update."""
+    pool = await db.get(DHCPPool, pool_id)
+    if pool is None:
+        raise HTTPException(status_code=404, detail="Pool not found")
+    if pool.pool_type != _OCCUPANCY_POOL_TYPE:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Expansion suggestions only apply to dynamic address pools; this one is "
+                f"{pool.pool_type!r}."
+            ),
+        )
+    scope = await db.get(DHCPScope, pool.scope_id)
+    subnet = await db.get(Subnet, scope.subnet_id) if scope is not None else None
+    if scope is None or subnet is None:
+        raise HTTPException(status_code=404, detail="Pool's scope or subnet not found")
+    if ipaddress.ip_network(str(subnet.network), strict=False).version != 4:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Expansion suggestions are IPv4 only: a DHCPv6 pool is a slice of a /64 whose "
+                "free space cannot be enumerated meaningfully (SLAAC hosts never register)."
+            ),
+        )
+    found = await suggest_pool_expansion(db, pool, scope, subnet, limit=limit, min_size=min_size)
+    return PoolExpansionResponse(
+        pool_id=pool.id,
+        scope_id=pool.scope_id,
+        subnet=str(subnet.network),
+        suggestions=[PoolExpansionSuggestion(**vars(x)) for x in found],
+    )
 
 
 # ── Fleet-wide occupancy (issue #942) ────────────────────────────────
