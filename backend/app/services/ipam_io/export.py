@@ -22,6 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
+from app.services.custom_field_text import custom_field_json
 from app.services.ipam.host_name import current_fqdn
 
 Format = Literal["csv", "json", "xlsx"]
@@ -40,6 +41,12 @@ SUBNET_COLUMNS = [
     "allocated_ips",
     "utilization_percent",
 ]
+
+# Columns the exporter writes that are derived, not settable: the importer
+# skips them instead of storing them as custom fields (#4289). Kept beside
+# the column lists above so a new computed column is declared once.
+SUBNET_COMPUTED_COLUMNS = frozenset({"total_ips", "allocated_ips", "utilization_percent"})
+ADDRESS_COMPUTED_COLUMNS = frozenset({"last_seen_at"})
 
 # Column order used by the address CSV / XLSX. Matches the field names the
 # subnet-scoped importer recognises so a subnet export with
@@ -226,6 +233,8 @@ def _is_subnet_of(
 # file is opened. Prefix any such value with a single quote so the spreadsheet
 # renders it as literal text — the apostrophe is the canonical,
 # Excel/LibreOffice-recognised escape and stays hidden in the cell display.
+# Header cells take the same escape: a custom-field key is operator-supplied
+# text too, and the importer strips it back off (``unescape_cell``).
 _FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
 
 
@@ -236,7 +245,9 @@ def _sanitize_cell(value: Any) -> Any:
     ``None`` and booleans pass through unchanged so numeric columns
     (``utilization_percent``, ``vlan_id``, …) keep their type in XLSX.
     """
-    if isinstance(value, str) and value.startswith(_FORMULA_TRIGGERS):
+    if isinstance(value, str) and value.lstrip("'").startswith(_FORMULA_TRIGGERS):
+        # Also when apostrophes come first: ``'=lit`` is written ``''=lit``, so
+        # the importer can tell it from an escaped ``=lit`` (#4351).
         return "'" + value
     return value
 
@@ -250,10 +261,36 @@ def _xlsx_number(value: Any) -> Any:
     return value
 
 
+def _cf_cell(value: Any) -> Any:
+    """A custom-field value as a spreadsheet / CSV cell. A list or object (the
+    API stores any JSON) is written as compact JSON text: openpyxl refuses to
+    write one (the XLSX export answered 500) and csv would write a Python repr
+    (#4282). Scalars go through ``_sanitize_cell`` unchanged. The importer reads
+    JSON-looking text back into the same list / object."""
+    if isinstance(value, (list, dict)):
+        return custom_field_json(value)
+    return _sanitize_cell(value)
+
+
 # Public names for the other spreadsheet exporters (the DNS zone records sheet,
 # #2139), so the escape stays one rule rather than a copy per exporter.
 FORMULA_TRIGGERS = _FORMULA_TRIGGERS
 sanitize_cell = _sanitize_cell
+
+
+def unescape_cell(value: Any) -> Any:
+    """Undo the export's formula escape, and nothing more.
+
+    The export writes one more apostrophe in front of any text whose part after
+    its leading apostrophes begins with a formula trigger (``=v`` becomes
+    ``'=v``, ``'=lit`` becomes ``''=lit``). This removes exactly one, so the
+    round trip is exact. Text such as ``'abc`` is never touched, and nothing
+    is ever evaluated: a leading ``=`` is text.
+    """
+    if isinstance(value, str) and value.startswith("'"):
+        if value.lstrip("'").startswith(FORMULA_TRIGGERS):
+            return value[1:]
+    return value
 
 
 # ── Serialisers ────────────────────────────────────────────────────────────────
@@ -270,11 +307,11 @@ def _addresses_to_csv(addresses: list[dict[str, Any]]) -> bytes:
                 cf_keys.append(k)
     headers = ADDRESS_COLUMNS + cf_keys
     writer = csv.DictWriter(buf, fieldnames=headers, extrasaction="ignore")
-    writer.writeheader()
+    writer.writerow({h: _sanitize_cell(h) for h in headers})
     for row in addresses:
         out = {k: _sanitize_cell(row.get(k)) for k in ADDRESS_COLUMNS}
         for k in cf_keys:
-            out[k] = _sanitize_cell((row.get("custom_fields") or {}).get(k))
+            out[k] = _cf_cell((row.get("custom_fields") or {}).get(k))
         writer.writerow(out)
     return buf.getvalue().encode("utf-8")
 
@@ -301,11 +338,11 @@ def _to_csv(bundle: ExportBundle) -> bytes:
                 cf_keys.append(k)
     headers = SUBNET_COLUMNS + cf_keys
     writer = csv.DictWriter(buf, fieldnames=headers, extrasaction="ignore")
-    writer.writeheader()
+    writer.writerow({h: _sanitize_cell(h) for h in headers})
     for row in bundle.subnets:
         out = {k: _sanitize_cell(row.get(k)) for k in SUBNET_COLUMNS}
         for k in cf_keys:
-            out[k] = _sanitize_cell((row.get("custom_fields") or {}).get(k))
+            out[k] = _cf_cell((row.get("custom_fields") or {}).get(k))
         writer.writerow(out)
     return buf.getvalue().encode("utf-8")
 
@@ -341,11 +378,11 @@ def _to_xlsx(bundle: ExportBundle) -> bytes:
                 seen.add(k)
                 cf_keys.append(k)
     headers = SUBNET_COLUMNS + cf_keys
-    ws.append(headers)
+    ws.append([_sanitize_cell(h) for h in headers])
     for row in bundle.subnets:
         base = [_xlsx_number(_sanitize_cell(row.get(k))) for k in SUBNET_COLUMNS]
         cf = row.get("custom_fields") or {}
-        ws.append(base + [_sanitize_cell(cf.get(k)) for k in cf_keys])
+        ws.append(base + [_cf_cell(cf.get(k)) for k in cf_keys])
 
     # Blocks sheet
     blocks_ws = wb.create_sheet("blocks")
@@ -375,11 +412,11 @@ def _to_xlsx(bundle: ExportBundle) -> bytes:
                 if k not in addr_seen:
                     addr_seen.add(k)
                     addr_cf_keys.append(k)
-        addr_ws.append(ADDRESS_COLUMNS + addr_cf_keys)
+        addr_ws.append([_sanitize_cell(h) for h in ADDRESS_COLUMNS + addr_cf_keys])
         for a in bundle.addresses:
             base = [_sanitize_cell(a.get(k)) for k in ADDRESS_COLUMNS]
             cf = a.get("custom_fields") or {}
-            addr_ws.append(base + [_sanitize_cell(cf.get(k)) for k in addr_cf_keys])
+            addr_ws.append(base + [_cf_cell(cf.get(k)) for k in addr_cf_keys])
 
     buf = io.BytesIO()
     wb.save(buf)

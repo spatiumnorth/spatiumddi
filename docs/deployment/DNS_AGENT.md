@@ -505,6 +505,21 @@ only apply it when the container starts as root; under a random uid
 (OpenShift restricted SCC) it logs that it was ignored and the image default
 stays.
 
+### PowerDNS: emptying the server (`PDNS_ALLOW_EMPTY_RETIRE`, #4564)
+
+The PowerDNS agent deletes the zones a bundle drops. When one confirmed
+apply would delete **every** zone the agent manages, it deletes none: it
+logs `powerdns_zone_retire_held_all`, reports a warning on the server row
+(`holding deletion of all N managed zones; the bundle carries none`) and
+leaves its ledger unchanged. This covers an explicit empty zone list as
+well as a bundle that carries none of the managed zones. Normal removal
+resumes by itself once a later bundle carries at least one zone, and
+removing part of the zones is never held. A server managing a single zone
+that the bundle drops counts as "all", so that zone is held too.
+
+To really empty the server, set `PDNS_ALLOW_EMPTY_RETIRE=1` in the PowerDNS
+agent's environment (`1`, `true`, `yes` or `on`). Default: unset.
+
 ### Last-known-good revert (issue #882)
 
 Offline operation covers a *missing* control plane. It does not cover a
@@ -560,6 +575,14 @@ exits during its first start is reported as such instead of as started.
 On restart the agent checks the quarantine before re-applying `current.json`:
 a container that crash-loops must not re-break itself with the bundle that
 broke it.
+
+**Resolver cache ceiling (#4185).** The agent writes `max-cache-size` into
+`options {}`, which BIND applies to each recursive view's own cache. Precedence:
+the server group's `max_cache_size` (carried in the bundle's `options`), then
+the `NAMED_MAX_CACHE_SIZE` env var, then a quarter of the container's memory
+limit split across the recursive views. `unlimited` and `0` are refused by the
+API and ignored by the agent (`bind9_max_cache_size_ignored`). See
+`docs/features/DNS.md` section 8.0 for sizing guidance.
 
 **A bundle the daemon dies on is not re-applied blindly either (#2019).**
 The quarantine only hears of failures the agent survives. A bundle too big
@@ -1052,9 +1075,10 @@ Both must survive restarts → named volumes in Compose / PVCs in K8s.
 
 **One `StatefulSet` per `DNSServer` row** (umbrella chart,
 `charts/spatiumddi/templates/dns-agent.yaml`), not per group. Headless
-`Service` per StatefulSet (ClusterIP=None) plus an externally-exposed
-`Service` of type `LoadBalancer` or `NodePort` for DNS traffic (UDP/TCP
-53). On the appliance chart
+`Service` per StatefulSet (ClusterIP=None) plus a per-server `Service` for
+DNS traffic (UDP/TCP 53), `ClusterIP` by default (#3229) and `LoadBalancer`
+or `NodePort` when you opt in (see
+[Exposing DNS to clients](KUBERNETES.md#exposing-dns-to-clients)). On the appliance chart
 (`charts/spatiumddi-appliance/templates/dns-bind9.yaml`) the same
 service-container runs as a per-role-labelled `DaemonSet` instead.
 

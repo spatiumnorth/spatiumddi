@@ -11,13 +11,13 @@ nothing in the product saying why.
 This module estimates what named will hold and compares it with the memory
 limit the group's agents report (their container's cgroup ``memory.max``, on
 the heartbeat). It warns; it never refuses. The figures are measured on BIND
-9.20.29 (``docs/features/DNS.md`` §2, "What a view costs in memory"):
+9.20.29 and 9.20.30 (``docs/features/DNS.md`` §2, "What a view costs in memory"):
 
 * :data:`BASELINE_BYTES` — named and the agent at idle with one view, the
   ``DNS.md`` §8.0 rule of thumb;
 * :data:`BYTES_PER_RECORD` — about 0.45 kB per record of each zone copy
   named loads (a copy shared through ``in-view`` counts once);
-* :data:`BYTES_PER_RPZ_ENTRY` — about 1.4 kB per RPZ owner name, per view
+* :data:`BYTES_PER_RPZ_ENTRY` — about 1.1 kB per RPZ owner name, per view
   that loads the RPZ zone.
 
 :func:`estimate_bytes` and :func:`assess` are pure; :func:`group_memory_estimate`
@@ -44,6 +44,7 @@ from app.models.dns import (
     DNSView,
     DNSZone,
 )
+from app.services.agents.memory_status import fresh_memory_status
 from app.services.dns.pool_geo import (
     build_geo_steering,
     build_view_descriptors,
@@ -58,9 +59,11 @@ BASELINE_BYTES = 400 * MIB
 #: Per record of each zone copy named loads. Measured: a 200,000-record zone
 #: costs about 86 MiB per copy.
 BYTES_PER_RECORD = 450
-#: Per RPZ owner name per view that loads the zone. Measured: a 100,000-entry
-#: RPZ costs about 135 MiB per view.
-BYTES_PER_RPZ_ENTRY = 1430
+#: Per RPZ owner name per view that loads the zone. Measured on BIND 9.20.30
+#: (jemalloc image, 416,344 owners): 0.97 - 1.04 kB per owner, QA saw about
+#: 0.93 kB (DNS.md §8.0, #4183). 1,100 keeps a margin, because the estimate
+#: ignores the reload peak. 9.20.29 measured 1,430.
+BYTES_PER_RPZ_ENTRY = 1100
 #: Warn when the estimate reaches this share of the limit.
 WARN_FRACTION = 0.8
 #: The DNS pod limit the shipped compose / chart / plain-k8s paths set (2Gi),
@@ -99,6 +102,19 @@ class MemoryAssessment:
 
 
 @dataclass(frozen=True)
+class ServerObservedMemory:
+    """What one BIND9 agent last reported using (#4193), set beside the
+    estimate. Every figure is None when unreported (an older agent)."""
+
+    name: str
+    daemon_rss_bytes: int | None = None
+    used_bytes: int | None = None
+    peak_bytes: int | None = None
+    limit_bytes: int | None = None
+    reported_at: str | None = None
+
+
+@dataclass(frozen=True)
 class GroupMemoryEstimate:
     group_id: uuid.UUID
     views: tuple[str, ...]
@@ -110,6 +126,8 @@ class GroupMemoryEstimate:
     assessment: MemoryAssessment
     limit_server: str | None = None
     unknown_limit_servers: tuple[str, ...] = field(default_factory=tuple)
+    # #4193 — what each BIND9 server actually reports using, beside the estimate.
+    servers: tuple[ServerObservedMemory, ...] = field(default_factory=tuple)
 
     @property
     def message(self) -> str | None:
@@ -371,6 +389,31 @@ async def _limit(db: AsyncSession, group_id: uuid.UUID) -> tuple[int | None, str
     return int(lim), name, unknown
 
 
+async def _observed(db: AsyncSession, group_id: uuid.UUID) -> tuple[ServerObservedMemory, ...]:
+    """The group's BIND9 servers' last reported memory (#4193), by name."""
+    rows = (
+        await db.execute(
+            select(DNSServer.name, DNSServer.memory_status)
+            .where(DNSServer.group_id == group_id, DNSServer.driver == "bind9")
+            .order_by(DNSServer.name)
+        )
+    ).all()
+    out: list[ServerObservedMemory] = []
+    for name, status in rows:
+        s = fresh_memory_status(status) or {}
+        out.append(
+            ServerObservedMemory(
+                name=name,
+                daemon_rss_bytes=s.get("daemon_rss_bytes"),
+                used_bytes=s.get("used_bytes"),
+                peak_bytes=s.get("peak_bytes"),
+                limit_bytes=s.get("limit_bytes"),
+                reported_at=s.get("reported_at"),
+            )
+        )
+    return tuple(out)
+
+
 async def group_memory_estimate(
     db: AsyncSession, group_id: uuid.UUID
 ) -> GroupMemoryEstimate | None:
@@ -413,6 +456,7 @@ async def group_memory_estimate(
         assessment=assess(estimated, limit),
         limit_server=limit_server,
         unknown_limit_servers=tuple(unknown),
+        servers=await _observed(db, group_id),
     )
 
 

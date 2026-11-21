@@ -64,7 +64,6 @@ async def test_record_clear_list_resets_ttl_and_struct_fields(
     await db_session.commit()
     url = f"/api/v1/dns/groups/{grp.id}/zones/{zone.id}/records/{rec.id}"
 
-    # A bare null for priority is still dropped, not a clear.
     r = await client.put(url, json={"ttl": 60}, headers=headers)
     assert r.status_code == 200 and r.json()["ttl"] == 60, r.text
 

@@ -2982,6 +2982,11 @@ export const auditApi = {
     result?: string;
     source_ip?: string;
   }) => api.get<AuditLogPage>("/audit", { params }).then((r) => r.data),
+  /** Every distinct action / resource type the log holds (#4482). */
+  facets: () =>
+    api
+      .get<{ actions: string[]; resource_types: string[] }>("/audit/facets")
+      .then((r) => r.data),
   /** One entry with its old / new values and changed fields (#2009). */
   get: (id: string) =>
     api.get<AuditLogEntry>(`/audit/${id}`).then((r) => r.data),
@@ -3083,6 +3088,10 @@ export interface BackupSection {
   table_count: number;
   volatile: boolean;
   selectable: boolean;
+  /** Tables of OTHER sections a selective restore of this one also
+   *  replaces from the archive (FK cascade, #4333). Absent from an older
+   *  server. */
+  also_restores?: { key: string; label: string; tables: string[] }[];
 }
 
 export interface BackupManifestPreviewResponse {
@@ -3532,6 +3541,9 @@ export const backupTargetsApi = {
         pre_restore_safety_path: string | null;
         selective?: boolean;
         restored_sections?: string[] | null;
+        /** Post-restore advisories, the same list the file path returns
+         *  (cascade-widened tables, DNSSEC re-publish, ...). */
+        warnings?: string[];
       }>(`/backup/targets/${id}/archives/restore`, body)
       .then((r) => r.data),
 };
@@ -5290,6 +5302,7 @@ export interface ZoneMovePreview {
    *  by a Technitium server in the target. Non-null means the commit
    *  refuses — not waivable by acknowledgement. */
   technitium_acl_refusal?: string | null;
+  classless_refusal?: string | null;
   warnings: string[];
   /** Keys the commit will demand: view_widening | dnssec_rollover |
    *  lost_update_grants. */
@@ -5318,6 +5331,9 @@ export interface DNSServerGroup {
    *  cloud DNS driver. Off by default: the provider bills per hosted zone.
    *  Groups on other drivers ignore it. */
   auto_reverse_zones_at_provider?: boolean;
+  /** #4185 — BIND `max-cache-size` for each recursive view's cache of a
+   *  BIND9 group (e.g. `64m`); null = the agent's default. */
+  max_cache_size?: string | null;
   /** Distinct drivers of the servers currently in this group (#934
    *  follow-up). Empty = an empty group, compatible with anything. A group
    *  is single-driver, so one entry is normal; two or more means the group
@@ -5331,12 +5347,53 @@ export interface DNSServerGroup {
    *  driver; says where an existing group falls outside its supported scope
    *  (second server, pools). Empty for every other group. */
   scope_warnings?: string[];
+  /** #4562 — group fields (`is_recursive`) a driver in the group does not
+   *  apply, from the same table as the options response. */
+  unapplied_fields?: Record<string, DNSOptionSupport>;
   /** #3551 — estimated named memory against the agents' limit. Filled by
    *  `getGroup` only (null on the list, and for a group with no BIND9
    *  server); `getMemoryEstimate` returns the same object. */
   memory_estimate?: DNSMemoryEstimate | null;
   created_at: string;
   modified_at: string;
+}
+
+/** #4193 — an agent's actual memory use as last reported on its heartbeat:
+ *  the container's cgroup usage / peak / limit and the resident set of the
+ *  daemon and of the agent. Every figure is optional and `null` / absent means
+ *  not reported (an older agent, an unreadable file), never 0. */
+export interface AgentMemoryStatus {
+  used_bytes?: number | null;
+  peak_bytes?: number | null;
+  limit_bytes?: number | null;
+  daemon_rss_bytes?: number | null;
+  agent_rss_bytes?: number | null;
+  reported_at?: string | null;
+}
+
+/** #4193 — one minute of an agent's memory, for the sparkline. */
+export interface AgentMemoryPoint {
+  ts: string;
+  used_bytes: number | null;
+  peak_bytes: number | null;
+  daemon_rss_bytes: number | null;
+  agent_rss_bytes: number | null;
+}
+
+export interface AgentMemoryHistory {
+  server_id: string;
+  hours: number;
+  points: AgentMemoryPoint[];
+}
+
+/** #4193 — what one BIND9 server reports using, beside the group estimate. */
+export interface DNSMemoryServer {
+  name: string;
+  daemon_rss_bytes: number | null;
+  used_bytes: number | null;
+  peak_bytes: number | null;
+  limit_bytes: number | null;
+  reported_at: string | null;
 }
 
 /** #3551 — one blocklist (RPZ) zone as named loads it. */
@@ -5368,6 +5425,8 @@ export interface DNSMemoryEstimate {
   rpz_bytes: number;
   rpz: DNSMemoryRpzLoad[];
   views: string[];
+  /** #4193 — each BIND9 server's actual reported memory, beside the estimate. */
+  servers?: DNSMemoryServer[];
 }
 
 /** The non-secret WinRM settings stored for a Windows DNS / DHCP server, as
@@ -5790,6 +5849,8 @@ export interface DNSServer {
   config_apply_at: string | null;
   /** #1077 — push spool as last reported; `null` = never reported. */
   spool_status: AgentSpoolStatus | null;
+  /** #4193 — actual memory use as last reported; `null` = never reported. */
+  memory_status?: AgentMemoryStatus | null;
   daemon_status: string | null;
   daemon_reason: string | null;
   daemon_status_since: string | null;
@@ -5805,6 +5866,9 @@ export interface DNSServer {
   duplicate_agent_ip: string | null;
   last_config_etag: string | null;
   pending_approval: boolean;
+  /** A delete was requested and a worker is still removing the server's rows
+   * (#4173). The row shows "Removing…" until it disappears. */
+  removing?: boolean;
   is_primary: boolean;
   /** Per-server maintenance mode (issue #182). When true the control
    * plane skips shipping pending DNSRecordOp rows + suppresses the
@@ -5886,6 +5950,22 @@ export interface DNSServerOptions {
   forwarder_warnings?: string[];
   // #2266: dnssec_validation "yes" with no trust anchor validates nothing.
   dnssec_warnings?: string[];
+  // #4562: the group's slice of the API's per-driver option table. Absent
+  // field = applied by every driver in the group.
+  option_support?: Record<string, DNSOptionSupport>;
+  // Set when a driver in the group applies no option at all.
+  options_unmanaged_note?: string | null;
+  // Stored non-default values a (non-Technitium) driver does not apply.
+  unapplied_warnings?: string[];
+}
+
+/** One row of the per-driver option table for one group (#4562). `locked`:
+ *  not applied and the stored value already does nothing, so disable it. */
+export interface DNSOptionSupport {
+  state: "partial" | "not_applied";
+  drivers: string[];
+  note: string;
+  locked: boolean;
 }
 
 /** A curated public upstream resolver (issue #877). ``tls_hostname`` is the
@@ -6018,7 +6098,7 @@ export interface DNSZone {
   // #1762 — signed on a group with more than one DNS server, each signing
   // with its own keys (validating resolvers SERVFAIL on the mismatch).
   dnssec_multi_signer?: boolean;
-  /** #1783 - signed on a Technitium group; SpatiumDDI won't keep it signed (#1767). */
+  /** Signed on an agentless Technitium API group; SpatiumDDI won't keep it signed. */
   dnssec_unmanaged_warning?: boolean;
   auto_tls_probe?: boolean;
   dnssec_policy_id?: string | null;
@@ -6173,10 +6253,18 @@ export interface DelegationPreview {
   existing_glue_records: DelegationRecord[];
   warnings: string[];
   child_apex_ns_count: number;
+  // The view the parent zone is pinned to; null renders in every view (#4389).
+  parent_view_name?: string | null;
+  // Rows that would sit beside a CNAME in the parent; apply refuses (#4388).
+  cname_conflicts?: string[];
 }
 
 export type DelegationPreviewResponse =
-  | { has_parent: false }
+  | {
+      has_parent: false;
+      reason?: string | null;
+      parent_zone_name?: string | null;
+    }
   | DelegationPreview;
 
 // Zone-template wizard catalog. Templates carry a parameter manifest
@@ -6439,7 +6527,7 @@ export interface ZoneDnssecInfo {
   // #1762 — see Zone.dnssec_multi_signer; signing_servers is the group's count.
   dnssec_multi_signer?: boolean;
   signing_servers?: number;
-  // #1783 - the group runs Technitium; sign / re-sign are refused (#1767).
+  // The group runs the agentless Technitium API driver; sign / re-sign are refused.
   signing_unmanaged?: boolean;
   dnssec_unmanaged_warning?: boolean;
 }
@@ -6467,6 +6555,13 @@ export const dnsApi = {
     api.get<DNSServerGroup[]>("/dns/groups").then((r) => r.data),
   getGroup: (id: string) =>
     api.get<DNSServerGroup>(`/dns/groups/${id}`).then((r) => r.data),
+  // #4193 — per-minute agent memory samples for the server modal's sparkline.
+  getMemoryHistory: (serverId: string, hours = 6) =>
+    api
+      .get<AgentMemoryHistory>(`/dns/servers/${serverId}/memory-history`, {
+        params: { hours },
+      })
+      .then((r) => r.data),
   // #3551 — estimated named memory against the agents' limit.
   getMemoryEstimate: (groupId: string) =>
     api
@@ -7293,6 +7388,8 @@ export interface DNSBlockList {
   /** #3551 — set when a BIND9 group this list is applied to is estimated at
    *  80 % or more of its agents' memory limit. */
   memory_warning?: string | null;
+  /** #4573 — set when a group the list is applied to runs only PowerDNS (no RPZ). */
+  unapplied_warning?: string | null;
 }
 
 export interface DNSBlockListFeedSkipped {
@@ -8872,6 +8969,8 @@ export interface DHCPServer {
   config_apply_at: string | null;
   /** #1077 — push spool as last reported; `null` = never reported. */
   spool_status: AgentSpoolStatus | null;
+  /** #4193 — actual memory use as last reported; `null` = never reported. */
+  memory_status?: AgentMemoryStatus | null;
   daemon_status: string | null;
   daemon_reason: string | null;
   daemon_status_since: string | null;
@@ -9616,6 +9715,13 @@ export const dhcpApi = {
       .get<DHCPServerEventsResponse>(
         `/dhcp/servers/${serverId}/recent-events?limit=${limit}`,
       )
+      .then((r) => r.data),
+  // #4193 — per-minute agent memory samples for the sparkline.
+  getMemoryHistory: (serverId: string, hours = 6) =>
+    api
+      .get<AgentMemoryHistory>(`/dhcp/servers/${serverId}/memory-history`, {
+        params: { hours },
+      })
       .then((r) => r.data),
   getServerRenderedConfig: (serverId: string) =>
     api
@@ -10641,8 +10747,9 @@ export interface AgentLogScopeEcho {
 export interface DNSQueryLogRow {
   id: number;
   ts: string;
-  /** Which server logged it (#2120). */
-  server_id: string;
+  /** Which server logged it (#2120). NULL once the server was deleted
+   * (#4173); `server_name` is then the name it logged under. */
+  server_id: string | null;
   server_name: string;
   client_ip: string | null;
   client_port: number | null;
@@ -10683,8 +10790,9 @@ export interface DNSQueryLogResponse extends AgentLogScopeEcho {
 export interface DHCPActivityLogRow {
   id: number;
   ts: string;
-  /** Which server logged it (#2120). */
-  server_id: string;
+  /** Which server logged it (#2120). NULL once the server was deleted
+   * (#4173); `server_name` is then the name it logged under. */
+  server_id: string | null;
   server_name: string;
   severity: string | null;
   code: string | null;
@@ -10849,6 +10957,8 @@ export interface RPZHitRow {
   id: string;
   ts: string;
   server_id: string | null;
+  /** Name at ingest; the only attribution once the server is deleted (#4173). */
+  server_name?: string | null;
   client_ip: string | null;
   qname: string | null;
   trigger: string;
@@ -12028,6 +12138,30 @@ export const changeRequestsApi = {
     api
       .get<ChangeRequest[]>("/change-requests", { params })
       .then((r) => r.data),
+  // One window plus the number matching the filter (X-Total-Count), so the
+  // admin queue can say how many it did not draw (#4383). ``states`` is sent
+  // as the API's comma list.
+  listPage: (
+    params: Omit<ChangeRequestListParams, "state"> & {
+      states?: ChangeRequestState[];
+    } = {},
+  ) => {
+    const { states, ...rest } = params;
+    return api
+      .get<ChangeRequest[]>("/change-requests", {
+        params: {
+          ...rest,
+          ...(states?.length ? { state: states.join(",") } : {}),
+        },
+      })
+      .then((r) => {
+        const header = Number(r.headers?.["x-total-count"]);
+        return {
+          items: r.data,
+          total: Number.isFinite(header) ? header : r.data.length,
+        };
+      });
+  },
   get: (id: string) =>
     api.get<ChangeRequest>(`/change-requests/${id}`).then((r) => r.data),
   // No dedicated pending-count endpoint server-side — derive the badge from
@@ -12068,7 +12202,7 @@ export const changeRequestsApi = {
   // inline. Return the FULL axios response so callers can route it through
   // ``handleApprovalQueued``; strengthening edits + lock-off return the
   // 200/204 inline path. (See featureModulesApi.toggle for the same shape.)
-  updatePolicy: (id: string, body: ApprovalPolicyWrite) =>
+  updatePolicy: (id: string, body: Partial<ApprovalPolicyWrite>) =>
     api.put<ApprovalPolicy | ChangeRequestQueued>(
       `/change-requests/policies/${id}`,
       body,
@@ -12131,6 +12265,11 @@ export interface ProvisioningRequest {
   // Name of the IPAM template args.template_id names, resolved server-side so
   // viewers without read on IPAM templates still get it (#3649).
   template_name?: string | null;
+  // Whether the caller may approve this row, from the approve endpoint's own
+  // check (#4241); false once the row is no longer pending.
+  can_approve: boolean;
+  // The server's refusal text for a pending row that is not approvable.
+  approve_blocked_reason: string | null;
 }
 
 export interface ProvisioningRequestListParams {
@@ -13621,6 +13760,10 @@ export interface ApplianceRow {
       state: "applying" | "retrying" | "failing";
       attempts: number;
       at: string | null;
+      // The host runner's own verdict for the plane, when it left one
+      // (timezone only today, #4416): e.g. ``unknown_timezone``.
+      reason?: string;
+      requested?: string;
     }
   >;
   // #395 — host-migration reconcile health. Keyed by patch id (e.g.

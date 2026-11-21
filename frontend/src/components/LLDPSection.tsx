@@ -8,6 +8,7 @@ import {
   type LldpProtocol,
   type PlatformSettings,
 } from "@/lib/api";
+import { SettingsRow } from "@/components/SettingsRow";
 import { Toggle } from "@/components/ui/toggle";
 import { cn } from "@/lib/utils";
 
@@ -24,28 +25,6 @@ const ALL_PROTOCOLS: { key: LldpProtocol; label: string }[] = [
   { key: "fdp", label: "FDP (Foundry)" },
   { key: "sonmp", label: "SONMP (Nortel)" },
 ];
-
-function Field({
-  label,
-  description,
-  children,
-}: {
-  label: string;
-  description?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="flex items-start justify-between gap-8 py-3">
-      <div className="max-w-xl">
-        <div className="text-sm font-medium">{label}</div>
-        {description && (
-          <div className="text-xs text-muted-foreground">{description}</div>
-        )}
-      </div>
-      <div className="flex-shrink-0">{children}</div>
-    </div>
-  );
-}
 
 export function LLDPSection({
   values,
@@ -164,7 +143,7 @@ export function LLDPSection({
         </div>
       )}
 
-      <Field
+      <SettingsRow
         label="Enable LLDP"
         description="Run lldpd on the appliance host(s) to advertise this node to upstream switches and discover L2 neighbours. Off by default — when off, the host advertises nothing."
       >
@@ -173,9 +152,9 @@ export function LLDPSection({
           onChange={setEnabled}
           disabled={!isSuperadmin}
         />
-      </Field>
+      </SettingsRow>
 
-      <Field
+      <SettingsRow
         label="Transmit interval (s)"
         description={`How often lldpd sends advertisements. TTL advertised to neighbours = interval × hold = ${ttl}s.`}
       >
@@ -188,9 +167,9 @@ export function LLDPSection({
           disabled={!isSuperadmin}
           className={cn(inputCls, "w-24")}
         />
-      </Field>
+      </SettingsRow>
 
-      <Field
+      <SettingsRow
         label="Transmit hold"
         description="TTL multiplier. The advertised time-to-live is interval × hold; neighbours drop this node that long after the last frame."
       >
@@ -203,9 +182,9 @@ export function LLDPSection({
           disabled={!isSuperadmin}
           className={cn(inputCls, "w-24")}
         />
-      </Field>
+      </SettingsRow>
 
-      <Field
+      <SettingsRow
         label="Also receive"
         description="Enable reception of legacy/vendor neighbour protocols on top of LLDP. Useful when upstream gear only speaks CDP (Cisco) etc."
       >
@@ -222,9 +201,9 @@ export function LLDPSection({
             </label>
           ))}
         </div>
-      </Field>
+      </SettingsRow>
 
-      <Field
+      <SettingsRow
         label="Interface pattern"
         description="lldpd interface allowlist (comma-separated globs; ! excludes). The default excludes docker / k3s vNICs so the appliance never advertises into the overlay network."
       >
@@ -236,9 +215,9 @@ export function LLDPSection({
           disabled={!isSuperadmin}
           className={cn(inputCls, "w-96 max-w-full font-mono")}
         />
-      </Field>
+      </SettingsRow>
 
-      <Field
+      <SettingsRow
         label="Management address pattern"
         description="Which interface / CIDR's IP to advertise as the management address. Empty = let lldpd auto-select the primary routable IP."
       >
@@ -250,9 +229,9 @@ export function LLDPSection({
           disabled={!isSuperadmin}
           className={cn(inputCls, "w-96 max-w-full font-mono")}
         />
-      </Field>
+      </SettingsRow>
 
-      <Field
+      <SettingsRow
         label="System name override"
         description="Advertised system name. Empty = the host's FQDN."
       >
@@ -264,9 +243,9 @@ export function LLDPSection({
           disabled={!isSuperadmin}
           className={cn(inputCls, "w-96 max-w-full")}
         />
-      </Field>
+      </SettingsRow>
 
-      <Field
+      <SettingsRow
         label="System description override"
         description="Advertised system description. Empty = lldpd's default (kernel + OS)."
       >
@@ -278,9 +257,9 @@ export function LLDPSection({
           disabled={!isSuperadmin}
           className={cn(inputCls, "w-96 max-w-full")}
         />
-      </Field>
+      </SettingsRow>
 
-      <Field
+      <SettingsRow
         label="SNMP AgentX (LLDP-MIB)"
         description="Register lldpd as an AgentX subagent of the host snmpd so LLDP-MIB (lldpRemTable) is queryable over SNMP. Only meaningful when SNMP is also enabled. Local socket only — no firewall change."
       >
@@ -289,9 +268,9 @@ export function LLDPSection({
           onChange={setAgentx}
           disabled={!isSuperadmin}
         />
-      </Field>
+      </SettingsRow>
 
-      <Field
+      <SettingsRow
         label="MED location (ELIN)"
         description="LLDP-MED Emergency Location Identification Number advertised to MED endpoints (IP phones) for E911 routing. Digits only; empty = none. Coordinate / civic forms are API-only for now."
       >
@@ -304,7 +283,7 @@ export function LLDPSection({
           disabled={!isSuperadmin}
           className={cn(inputCls, "w-48")}
         />
-      </Field>
+      </SettingsRow>
 
       <div className="mt-4 flex items-center gap-3 border-t pt-4">
         <button
