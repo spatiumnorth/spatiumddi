@@ -34,6 +34,7 @@ from app.core.permissions import is_effective_superadmin
 from app.models.auth import Group, Role, User
 from app.models.auth_provider import AuthProvider
 from app.services.ai.tools.base import register_tool
+from app.services.api_token_revocation import count_live_api_tokens_by_user
 
 
 def _try_uuid(value: str) -> uuid.UUID | None:
@@ -90,7 +91,9 @@ class ListUsersArgs(BaseModel):
         "email, display_name, is_active, is_superadmin, auth_source, "
         "auth_provider (the provider an external account belongs to, or "
         "null), MFA enrollment flag, last_login_at + IP, lockout state, "
-        "and the names of the auth groups they belong to. An external "
+        "the names of the auth groups they belong to, and "
+        "api_token_count (live API tokens, which a password change does not "
+        "revoke). An external "
         "account with a null auth_provider cannot sign in until an admin "
         "links it (#1235). Use for 'who has admin', 'list locked-out "
         "accounts', 'which accounts need linking', or 'who hasn't "
@@ -124,6 +127,7 @@ async def list_users(db: AsyncSession, user: User, args: ListUsersArgs) -> list[
     provider_names = {
         pid: name for pid, name in (await db.execute(select(AuthProvider.id, AuthProvider.name)))
     }
+    token_counts = await count_live_api_tokens_by_user(db)
     return [
         {
             "id": str(r.id),
@@ -142,6 +146,7 @@ async def list_users(db: AsyncSession, user: User, args: ListUsersArgs) -> list[
                 r.failed_login_locked_until.isoformat() if r.failed_login_locked_until else None
             ),
             "groups": sorted(g.name for g in r.groups),
+            "api_token_count": token_counts.get(r.id, 0),
         }
         for r in rows
     ]

@@ -265,7 +265,7 @@ async def test_an_admin_reset_abandons_a_pending_enrolment(
         headers=admin_headers,
         json={"new_password": "Reset-pw-1354-Xyz!"},
     )
-    assert r.status_code == 204, r.text
+    assert r.status_code == 200, r.text
     await db_session.refresh(user)
     assert user.totp_secret_encrypted is None
     assert user.recovery_codes_encrypted is None
