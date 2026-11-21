@@ -734,6 +734,14 @@ RULE_TYPE_DNS_BEACONING = "dns_beaconing_suspected"
 # hashed-CDN / shortlink traffic shares the shape — so it wants an
 # operator who has looked at their own baseline first.
 RULE_TYPE_DNS_DGA = "dns_dga_suspected"
+# ``web_ui_exposed`` (issue #3651) — the install is reachable from outside the
+# operator's networks (a verdict WITH its evidence, never a bare "exposed").
+# One install-wide subject. Severity is per match: warning for exposure alone,
+# critical when the same window carries failed sign-ins or a username spray,
+# info when the operator acknowledged the exposure as intentional (attack
+# evidence still escalates). Seeded ENABLED, but inert until the default-off
+# ``security.web_exposure`` module is on.
+RULE_TYPE_WEB_UI_EXPOSED = "web_ui_exposed"
 # The alerting bar lives in ``dns_threat.aggregate`` next to
 # ``INTERESTING_SCORE`` so the two stay a visible pair rather than
 # drifting apart in separate modules — "worth a look on a dashboard"
@@ -824,6 +832,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_DNS_TUNNELING,
         RULE_TYPE_DNS_BEACONING,
         RULE_TYPE_DNS_DGA,
+        RULE_TYPE_WEB_UI_EXPOSED,
     }
 )
 
@@ -8150,6 +8159,98 @@ async def seed_backup_alert_rules() -> None:
             await session.commit()
 
 
+async def _matching_web_ui_exposed_subjects(
+    db: AsyncSession, rule: AlertRule
+) -> list[tuple[str, str, str, str | None]]:
+    """One install-wide match while the verdict is ``exposed`` (#3651).
+
+    ``threshold_percent`` is reused as the distinct-external-network threshold
+    when set; the window comes from the module's own configuration. The
+    message carries the evidence (networks, counts, first seen, endpoints) but
+    no exact client addresses: alert payloads leave the install by syslog,
+    webhook and SMTP, and the addresses stay behind the superadmin-only
+    drill-down. Redis unreachable means no verdict, so nothing opens and
+    nothing resolves on a counter that cannot be read.
+    """
+    from app.models.settings import PlatformSettings  # noqa: PLC0415
+    from app.services.web_exposure import store  # noqa: PLC0415
+    from app.services.web_exposure.config import config_from_row  # noqa: PLC0415
+    from app.services.web_exposure.verdict import build_verdict  # noqa: PLC0415
+
+    row = (
+        await db.execute(select(PlatformSettings.web_exposure).where(PlatformSettings.id == 1))
+    ).scalar_one_or_none()
+    cfg = config_from_row(row)
+    if rule.threshold_percent is not None and rule.threshold_percent >= 1:
+        cfg = cfg.model_copy(update={"threshold": int(rule.threshold_percent)})
+    data = await store.read_window(cfg.window_hours)
+    if data is None:
+        return await _hold_open_events(db, rule)
+    v = build_verdict(data, cfg, include_addresses=False)
+    if v.verdict != "exposed":
+        return []
+    top = ", ".join(
+        f"{b.bucket} ({b.requests} request(s), last {b.last_seen})" for b in v.buckets[:5]
+    )
+    endpoints = sorted({e for b in v.buckets for e in b.endpoints})[:6]
+    message = (
+        f"This install is reachable from outside your networks. {v.summary} "
+        f"First seen {v.since}. Top sources: {top}. Endpoints reached: "
+        f"{', '.join(endpoints) or 'n/a'}. Fix for this deployment: {v.fix_hint} "
+        "If your own range is public, add it under Settings → Security → Reachability."
+    )
+    return [("install", "Web UI reachability", message, v.severity)]
+
+
+async def _hold_open_events(
+    db: AsyncSession, rule: AlertRule
+) -> list[tuple[str, str, str, str | None]]:
+    """Keep whatever this rule has open when its input cannot be read."""
+    held = await _open_event_severities(db, rule)
+    return [(sid, "Web UI reachability", "", sev) for sid, sev in held.items()]
+
+
+async def seed_web_ui_exposed_alert_rule() -> None:
+    """Seed ``web_ui_exposed`` (#3651), ENABLED.
+
+    Enabled is safe: the matcher reads counters that only exist while the
+    default-off ``security.web_exposure`` module is on, and the evaluator skips
+    the rule entirely while the module is off. Keyed on ``rule_type``; an
+    operator who disables, renames or re-thresholds it is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.rule_type == RULE_TYPE_WEB_UI_EXPOSED)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name="Web UI reachable from outside your networks",
+                description=(
+                    "Fires when requests from outside your networks (not private, "
+                    "CGNAT or ULA space, and not on your trusted-networks list) "
+                    "reach the sign-in screen or the api in numbers that look like "
+                    "the internet rather than a remote admin, or when any outside "
+                    "source fails a sign-in or sends a refused Host header. The "
+                    "event carries the evidence. Warning for reachability, critical "
+                    "when the same window carries failed sign-ins or a username "
+                    "spray. Requires the security.web_exposure module."
+                ),
+                rule_type=RULE_TYPE_WEB_UI_EXPOSED,
+                severity="warning",
+                enabled=True,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
 async def seed_dns_tunneling_alert_rule() -> None:
     """Seed the ``dns_tunneling_suspected`` rule (#699), ENABLED.
 
@@ -8331,6 +8432,7 @@ _RULE_TYPE_MODULE: dict[str, str] = {
     RULE_TYPE_DNS_TUNNELING: "security.dns_threat",
     RULE_TYPE_DNS_BEACONING: "security.dns_threat",
     RULE_TYPE_DNS_DGA: "security.dns_threat",
+    RULE_TYPE_WEB_UI_EXPOSED: "security.web_exposure",
 }
 
 
@@ -8539,6 +8641,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 base = await _matching_dns_dga_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]
                 subject_type = "dns_client"
+            elif rule.rule_type == RULE_TYPE_WEB_UI_EXPOSED:
+                exposed = await _matching_web_ui_exposed_subjects(db, rule)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in exposed]
+                subject_type = "install"
             elif rule.rule_type == RULE_TYPE_NEW_MAC_SEEN:
                 base = await _matching_new_mac_seen_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]

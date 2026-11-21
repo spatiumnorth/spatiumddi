@@ -120,6 +120,7 @@ NO_PERMISSION_DEPENDENCY: dict[str, str] = {
     "/api/v1/tags/values": "unions only the tagged tables the caller may read (_readable_tables)",
     "/api/v1/search": "the search engine filters every result type by the caller's read grant",
     "/api/v1/dashboards/security/summary": "per-panel user_has_permission in the handler",
+    "/api/v1/web-exposure/verdict": "per-tier privilege split in the handler: counts for any signed-in caller, per-network rows for audit / user readers, addresses for superadmins (#3651)",
     "/api/v1/sessions": "superadmin sees all, others their own (checked in the handler)",
     "/api/v1/conformity/checks": "checked in the handler (_require_read)",
     "/api/v1/conformity/export.pdf": "checked in the handler (_require_read)",

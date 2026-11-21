@@ -658,6 +658,23 @@ _SPECS: list[tuple[str, str, str, list[ParamSpec]]] = [
         [],
     ),
     (a.RULE_TYPE_ACME_MANUAL_RENEWAL, "ACME certificate needs manual renewal", "Security", []),
+    (
+        a.RULE_TYPE_WEB_UI_EXPOSED,
+        "Web UI reachable from outside your networks",
+        "Security",
+        [
+            _count(
+                "Distinct outside networks",
+                3,
+                "Outside /24 (IPv6 /48) networks with a login-page load or a 401 that "
+                "make the install count as exposed. Any failed sign-in or refused Host "
+                "header from outside fires regardless. The evaluation window is set "
+                "under Settings → Security → Reachability.",
+                min_=1,
+                max_=1000,
+            )
+        ],
+    ),
 ]
 
 

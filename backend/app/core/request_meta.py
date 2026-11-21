@@ -198,6 +198,8 @@ class LoggingTrustedHostMiddleware(TrustedHostMiddleware):
                 if key == b"host":
                     host = value.decode("latin-1").split(":")[0].lower()
                     break
+            if host and not self._allowed(host):
+                await self._note_refusal(scope, host)
             if (
                 host
                 and host not in self._seen
@@ -215,6 +217,32 @@ class LoggingTrustedHostMiddleware(TrustedHostMiddleware):
                     ),
                 )
         await super().__call__(scope, receive, send)
+
+    async def _note_refusal(self, scope: Any, host: str) -> None:
+        """#3651 — attribute a refused Host to the source bucket. Somebody
+        addressing the install by IP or a name that is not ours is what
+        scanners do and operators rarely do. Counted only for an external
+        source and only while the web-exposure module is on."""
+        try:
+            from app.services.web_exposure import store  # noqa: PLC0415
+            from app.services.web_exposure.classify import (  # noqa: PLC0415
+                bucket_of,
+                classify,
+            )
+            from app.services.web_exposure.config import get_runtime_config  # noqa: PLC0415
+
+            client = scope.get("client")
+            if not client:
+                return
+            rt = await get_runtime_config()
+            if rt.enabled and classify(client[0], rt.trusted) == "external":
+                bucket = bucket_of(client[0])
+                if bucket:
+                    store.record(
+                        bucket, client[0], store.SIGNAL_HOST_REFUSED, path=scope.get("path")
+                    )
+        except Exception:  # noqa: BLE001 — detection never fails a request
+            logger.debug("web_exposure_host_refusal_not_recorded")
 
     def _allowed(self, host: str) -> bool:
         return any(

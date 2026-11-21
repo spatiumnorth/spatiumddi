@@ -186,6 +186,10 @@ class Settings(BaseSettings):
     # set this to their real hostnames. Starlette's TrustedHostMiddleware
     # treats ``["*"]`` as "allow everything".
     trusted_hosts: str = "*"
+    # #3651 — break glass for the web-exposure mitigations. ``off`` disables
+    # every opt-in mitigation (throttle, ban, MFA-from-outside) whatever the
+    # stored settings say, for an operator who cannot reach Settings.
+    web_exposure_mitigations: str = "on"
 
     # #1221 — the TCP peers whose ``X-Real-IP`` / ``X-Forwarded-Proto`` the
     # api believes (comma-separated CIDRs or addresses; ``*`` = any peer).

@@ -259,6 +259,18 @@ SpatiumDDI is built to be delegated without handing over everything:
   is audited). The agent bootstrap keys are not stored encrypted; they are
   values in the control plane's environment (`.env`, Helm values, or
   `/etc/spatiumddi/.env` on the appliance).
+* **Web exposure detection (#3651), off until an operator turns on the
+  `security.web_exposure` module.** It makes **no outbound connection**: no
+  geo database, no reputation feed, nothing sent anywhere. What it *does*
+  keep, locally and only while the module is on, is a bounded record of the
+  networks that reach the install from outside the operator's own: the source
+  /24 (IPv6 /48) as the key, request counts per signal, first and last seen,
+  up to five sample addresses and five request paths per network, and a count
+  of distinct submitted usernames kept as hashes inside a HyperLogLog (never
+  the names). It lives in Redis hourly buckets that expire after eight days,
+  is capped in size, is dropped (never spooled to disk) if Redis is down, and
+  the exact addresses are visible to superadmins only. Alert payloads carry
+  networks and counts, not addresses.
 
 ## 8. Keeping this page true
 

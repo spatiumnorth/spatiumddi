@@ -766,6 +766,19 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         default_enabled=False,
         requires=("core.dns",),
     ),
+    # Security — web exposure detection (#3651). Default-OFF: it keeps a
+    # bounded local record of the addresses that reach the install, which for
+    # remote users is data the product did not previously hold beyond audit /
+    # session rows, so the operator opts in. Passive and entirely local: no
+    # outbound connection, no geo database, no reputation feed. Enabling it
+    # arms no mitigation: every one is a separate default-off setting.
+    ModuleSpec(
+        id="security.web_exposure",
+        label="Web exposure detection",
+        group="Security",
+        description='Answer "is my SpatiumDDI install reachable from the internet?" with a verdict and its evidence: requests reaching the sign-in screen or the api from outside your networks (anything beyond private, CGNAT and ULA space and your own trusted-networks list), which outside networks, how many requests, first and last seen, and which endpoints. Raises one alert and a Security dashboard card. Entirely local: no outbound connection. Default-off: it keeps a bounded record of the (coarse) source networks that reach the install. Enabling this arms nothing on its own: the opt-in responses (a stricter sign-in throttle, a temporary source ban, a second factor required from outside, an appliance Web UI allow-list) are each a separate default-off setting.',
+        default_enabled=False,
+    ),
 )
 
 # Every integration module, mapped to the ``PlatformSettings`` column that
@@ -841,6 +854,13 @@ def invalidate_cache() -> None:
     flipping worker sees the change instantly."""
     global _cache_loaded_at
     _cache_loaded_at = 0.0
+    # #3651 — the web-exposure request hook caches the module state too; the
+    # flip must reach it, or detection lags the toggle by its own TTL.
+    from app.services.web_exposure.config import (  # noqa: PLC0415
+        invalidate_cache as _invalidate_web_exposure,
+    )
+
+    _invalidate_web_exposure()
 
 
 def _resolve_with_parents(
