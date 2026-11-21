@@ -13501,6 +13501,9 @@ export interface PairingCodeCreated {
   max_claims: number | null;
   note: string | null;
   created_at: string;
+  // #4659 — set when the code was minted while appliance registration is
+  // off, so an appliance using it cannot register yet.
+  warning?: string | null;
 }
 
 export interface PairingCodeRow {

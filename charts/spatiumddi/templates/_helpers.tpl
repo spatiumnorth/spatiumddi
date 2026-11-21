@@ -661,6 +661,9 @@ $(REDIS_PASSWORD) reference secrets; everything else is inline.
       name: {{ include "spatiumddi.appSecretName" . }}
       key: metrics-token
       optional: true
+{{- /* #4659 — initial Appliance registration state on a fresh install only. */}}
+- name: INITIAL_SUPERVISOR_REGISTRATION
+  value: {{ ((.Values.supervisorRegistration).initiallyEnabled | default false) | quote }}
 - name: DATABASE_URL
   value: "postgresql+asyncpg://{{ include "spatiumddi.postgresUser" . }}:$(POSTGRES_PASSWORD)@{{ include "spatiumddi.postgresHost" . }}:{{ include "spatiumddi.postgresPort" . }}/{{ include "spatiumddi.postgresDatabase" . }}"
 {{- if eq (include "spatiumddi.redisIsSentinel" .) "true" }}

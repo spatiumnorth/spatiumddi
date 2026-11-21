@@ -454,6 +454,14 @@ class Settings(BaseSettings):
     # Space-separated, because that is the shape the installer prompt
     # collects and writes to STATE.
     initial_ntp_servers: str = ""
+    # #4659 — INITIAL ``platform_settings.supervisor_registration_enabled``
+    # on a fresh install (env ``INITIAL_SUPERVISOR_REGISTRATION``). Read only
+    # when the singleton row is first created, like ``initial_ntp_servers``,
+    # so an operator's later choice in Settings is never reverted. Default
+    # off (#1356, #2798): an install meant to take appliance agent nodes sets
+    # it on from the Compose ``.env`` or the Helm ``supervisorRegistration.
+    # initiallyEnabled`` value.
+    initial_supervisor_registration: bool = False
     appliance_version: str = ""
     appliance_hostname: str = ""
     # The k8s node this api pod runs on, from the downward API
