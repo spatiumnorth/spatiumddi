@@ -173,7 +173,7 @@ packages: they are vendored in `backend/app/static/api-docs/` and pinned in
 
 | Component | License | What it does here |
 |---|---|---|
-| [Python](https://www.python.org/) 3.12 | PSF | Runtime |
+| [Python](https://www.python.org/) 3.14 | PSF | Runtime |
 | [FastAPI](https://fastapi.tiangolo.com/) / [Starlette](https://www.starlette.io/) | MIT / BSD 3-Clause | HTTP framework |
 | [Swagger UI](https://github.com/swagger-api/swagger-ui) 5.34.0, vendored | Apache 2.0 | The interactive API docs at `/api/docs`, served by the api with no CDN |
 | [ReDoc](https://github.com/Redocly/redoc) 2.5.4, vendored | MIT | The reference API docs at `/api/redoc`, served by the api with no CDN |
@@ -185,7 +185,7 @@ packages: they are vendored in `backend/app/static/api-docs/` and pinned in
 | [redis-py](https://github.com/redis/redis-py) + hiredis | MIT | Redis client |
 | [structlog](https://www.structlog.org/) | MIT OR Apache 2.0 | Structured JSON logging |
 | [cryptography](https://cryptography.io/) | Apache 2.0 OR BSD 3-Clause | Fernet secrets at rest, cert handling |
-| [pyOpenSSL](https://www.pyopenssl.org/) | Apache 2.0 | TLS chain capture (stdlib `ssl` cannot on 3.12) |
+| [pyOpenSSL](https://www.pyopenssl.org/) | Apache 2.0 | TLS chain capture (stdlib `ssl` could not before 3.13) |
 | [joserfc](https://jose.authlib.org/) | BSD 3-Clause | JWT issue + verify (access / agent / flow tokens) and OIDC ID-token validation |
 | [bcrypt](https://github.com/pyca/bcrypt) | Apache 2.0 | Local password hashing |
 | [pyotp](https://github.com/pyauth/pyotp) | MIT | TOTP second factor |
@@ -372,7 +372,7 @@ page's whois / traceroute report the missing binary). Dropped from the UBI `dhcp
 | [Alpine Linux](https://alpinelinux.org/) | 3.24 | MIT (+ GPL v2 kernel) | BIND9 / PowerDNS / dnsdist / Kea / Looking Glass agent images, supervisor — **not** Technitium (see below) |
 | [Debian slim](https://www.debian.org/) | trixie / bookworm | DFSG (mixed) | Appliance builder, Technitium agent build stage |
 | [technitium/dns-server](https://hub.docker.com/r/technitium/dns-server) | 15.6.2 (digest-pinned; Ubuntu-based) | GPL v3 | Technitium agent image **runtime** — the one agent image that is not Alpine |
-| [python:3.12-slim](https://www.python.org/) | 3.12 | PSF + Debian | API image |
+| [python:3.14-slim](https://www.python.org/) | 3.14 | PSF + Debian | API image |
 | [node](https://nodejs.org/) | 22-alpine | MIT | Frontend build stage |
 | [nginx](https://nginx.org/) | 1.31.8-alpine | BSD 2-Clause | Frontend runtime |
 | [ASP.NET Core runtime](https://dotnet.microsoft.com/) | 10.0 | MIT | Technitium agent image |

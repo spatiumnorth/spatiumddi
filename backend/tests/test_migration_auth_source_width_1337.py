@@ -46,7 +46,7 @@ def _migration() -> ModuleType:
 
 
 @pytest.fixture
-async def schema() -> AsyncGenerator[tuple[AsyncEngine, str], None]:
+async def schema() -> AsyncGenerator[tuple[AsyncEngine, str]]:
     engine = create_async_engine(os.environ["DATABASE_URL"], poolclass=NullPool)
     name = f"m1337_{uuid.uuid4().hex[:8]}"
     async with engine.begin() as conn:

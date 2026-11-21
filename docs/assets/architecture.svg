@@ -110,7 +110,7 @@
   <g>
     <rect x="66" y="298" width="164" height="172" rx="9" class="card" fill="url(#g-api)"/>
     <text x="148" y="324" text-anchor="middle" class="card-title">API</text>
-    <text x="148" y="344" text-anchor="middle" class="card-sub">FastAPI · Python 3.12</text>
+    <text x="148" y="344" text-anchor="middle" class="card-sub">FastAPI · Python 3.14</text>
     <text x="148" y="362" text-anchor="middle" class="card-sub">async · JWT + RBAC</text>
     <text x="148" y="380" text-anchor="middle" class="card-sub">audit log · REST/OpenAPI</text>
     <text x="148" y="402" text-anchor="middle" class="card-sub-dim">long-poll /config (agents)</text>

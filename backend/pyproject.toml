@@ -8,7 +8,7 @@ packages = ["app"]
 [project]
 name = "spatiumddi"
 version = "0.1.0"
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 dependencies = [
     "fastapi>=0.162.6",
     "uvicorn[standard]>=0.32.0",
@@ -34,7 +34,7 @@ dependencies = [
     "cryptography>=43.0.0",
     # TLS cert monitoring (#118) — get_peer_cert_chain() captures the
     # server-presented chain (leaf + intermediates) for the cert detail
-    # view; stdlib ssl can't on Python 3.12 (get_*_chain is 3.13+).
+    # view; stdlib ssl had no chain getter before 3.13.
     "pyOpenSSL>=24.0.0",
     "ldap3>=2.9.1",
     "python3-saml>=1.16.0",
@@ -124,21 +124,26 @@ dev = [
 
 [tool.ruff]
 line-length = 100
-target-version = "py312"
+target-version = "py314"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP"]
 # E501 is owned by black (also configured at 100 chars). Ruff's E501 fires on
 # long string literals / URLs that black can't wrap, which produces noise
 # without value. N818 (exception suffix) doesn't fit the existing API schema names.
-ignore = ["E501", "N818"]
+# UP037 (unquote annotations) assumes 3.14's lazy annotations, but SQLAlchemy 2.0
+# evaluates a model class's annotations eagerly -- a TYPE_CHECKING-only name left
+# unquoted raises "Could not de-stringify annotation" at import (#2229).
+ignore = ["E501", "N818", "UP037"]
 
 [tool.black]
 line-length = 100
-target-version = ["py312"]
+# py313, not py314: black targeting 3.14 rewrites every `except (A, B):` to the
+# PEP 758 form `except A, B:` (273 sites), which reads as Python 2 and is no gain.
+target-version = ["py313"]
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.14"
 # `strict = true` was aspirational but the codebase has 88 strict-mode
 # violations and 20 default-mode violations (mostly Optional → non-Optional
 # assignment after a None check, name-redef in conditional branches, and a

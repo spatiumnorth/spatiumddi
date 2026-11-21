@@ -39,7 +39,7 @@ from tests.test_dns_agents_config_serve_newest import CONFIG_URL, _agent, _rende
 
 @pytest.fixture
 def fresh_session_per_request() -> Any:
-    async def _get_db() -> AsyncGenerator[AsyncSession, None]:
+    async def _get_db() -> AsyncGenerator[AsyncSession]:
         async with _TestSessionLocal() as session:
             yield session
 

@@ -25,7 +25,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/python-3.12+-green" alt="Python"/>
+  <img src="https://img.shields.io/badge/python-3.14+-green" alt="Python"/>
   <img src="https://img.shields.io/badge/react-18+-61DAFB" alt="React"/>
   <a href="https://github.com/psf/black"><img src="https://img.shields.io/badge/code%20style-black-000000" alt="Code style: black"/></a>
   <a href="https://github.com/astral-sh/ruff"><img src="https://img.shields.io/badge/lint-ruff-FCC21B" alt="Lint: ruff"/></a>
@@ -298,7 +298,7 @@ On the **OS appliance**, a host-side **`spatium-supervisor`** (Ed25519 identity,
 
 The driver abstraction is backend-neutral — services speak to `DNSDriver` / `DHCPDriver`, never to BIND9 / PowerDNS / Technitium / Kea / PowerShell / cloud-SDK specifics.
 
-**Tech stack**: Python 3.12 · FastAPI · SQLAlchemy 2.x (async) · PostgreSQL 16 · Redis 8 · Celery · React 18 · TypeScript · Tailwind · shadcn/ui · pywinrm · dnspython · cloud provider SDKs · Docker · Kubernetes + Helm · k3s (appliance)
+**Tech stack**: Python 3.14 · FastAPI · SQLAlchemy 2.x (async) · PostgreSQL 16 · Redis 8 · Celery · React 18 · TypeScript · Tailwind · shadcn/ui · pywinrm · dnspython · cloud provider SDKs · Docker · Kubernetes + Helm · k3s (appliance)
 
 ---
 

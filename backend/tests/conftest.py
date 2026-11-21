@@ -141,7 +141,7 @@ async def _ensure_worker_database() -> None:
 
 
 @pytest_asyncio.fixture(scope="session", autouse=True)
-async def create_test_schema() -> AsyncGenerator[None, None]:
+async def create_test_schema() -> AsyncGenerator[None]:
     await _ensure_worker_database()
     # Tear down any prior schema with CASCADE so circular FKs don't block the
     # drop (dns_record ↔ ip_address has a cycle that Base.metadata.drop_all
@@ -161,7 +161,7 @@ async def create_test_schema() -> AsyncGenerator[None, None]:
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def _reset_global_caches() -> AsyncGenerator[None, None]:
+async def _reset_global_caches() -> AsyncGenerator[None]:
     """Reset the process-global short-TTL caches around every test.
 
     System maintenance mode (``app.core.maintenance_mode``), feature-
@@ -373,7 +373,7 @@ async def _drain_after_commit_dispatch() -> None:
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def _isolate_db() -> AsyncGenerator[None, None]:
+async def _isolate_db() -> AsyncGenerator[None]:
     """Truncate every table after each test so state doesn't leak.
 
     ``db_session`` alone isn't enough: HTTP tests go through FastAPI
@@ -393,17 +393,17 @@ async def _isolate_db() -> AsyncGenerator[None, None]:
 
 
 @pytest_asyncio.fixture
-async def db_session() -> AsyncGenerator[AsyncSession, None]:
+async def db_session() -> AsyncGenerator[AsyncSession]:
     async with _TestSessionLocal() as session:
         yield session
         await session.rollback()
 
 
 @pytest_asyncio.fixture
-async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
+async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient]:
     """HTTP test client with DB dependency overridden to the test session."""
 
-    async def override_get_db() -> AsyncGenerator[AsyncSession, None]:
+    async def override_get_db() -> AsyncGenerator[AsyncSession]:
         yield db_session
 
     app.dependency_overrides[get_db] = override_get_db
