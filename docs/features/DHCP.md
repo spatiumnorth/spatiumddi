@@ -1048,10 +1048,33 @@ only past a number of packets).
 Two things do not help with *sustained* overload, and it is worth knowing why
 before reaching for them:
 
-* **A bigger socket receive buffer** removes the drops and replaces them with
+* **A big socket receive buffer** removes the drops and replaces them with
   latency. Measured under #952: with 8 MiB of buffer the drops vanish and a
   DORA takes **34 s instead of 1.5 s**, because Kea then works through a
-  backlog answering requests whole retransmit rounds late.
+  backlog answering requests whole retransmit rounds late. A *modest* buffer
+  is a different case, and the one the appliance ships (#4544): Kea never
+  sets `SO_RCVBUF`, so its socket takes `net.core.rmem_default` (212,992
+  bytes stock, a few hundred milliseconds of DHCP arrivals), and a
+  receive-thread stall of that length drops a burst that the packet queue
+  behind it had room for. The appliance sets `net.core.rmem_default` and
+  `rmem_max` to **1 MiB** (`/etc/sysctl.d/60-spatium-net.conf`), which rides
+  out a 1 to 2 second stall and keeps the worst-case added wait under the
+  client's 4 second first retransmit. Do not go higher without measuring.
+  The setting is host-wide, so BIND and other UDP sockets get the same
+  default.
+
+  **Docker Compose and plain Kubernetes** cannot set it from the container:
+  `net.core.*` is not a namespaced sysctl. Set it on the host that runs Kea,
+  then restart the Kea container (only sockets opened afterwards see it):
+
+  ```
+  echo 'net.core.rmem_default = 1048576
+  net.core.rmem_max = 1048576' | sudo tee /etc/sysctl.d/60-spatium-net.conf
+  sudo sysctl --system
+  ```
+
+  Read it back with `ss -uanm 'sport = :67'`: `rb` is the buffer size and `d`
+  is the drop count.
 * **A bigger `packet-queue-size`** does not raise throughput. At 12,000
   relayed pkt/s offered, 64 → 2048 (32x) changed neither throughput nor
   socket drops. That queue sits *behind* the receive thread, and no queue
