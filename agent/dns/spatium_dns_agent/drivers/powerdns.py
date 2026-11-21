@@ -2794,9 +2794,17 @@ class PowerDNSDriver(DriverBase):
                 # and a ``resolver=`` upstream. PowerDNS Authoritative
                 # synthesises A/AAAA at query time by recursing through
                 # the configured resolver: the group's forwarders, or none
-                # and ALIAS off (#1353).
+                # and ALIAS off (#1353). ``outgoing-axfr-expand-alias``
+                # makes AXFR/IXFR carry the expanded A/AAAA instead of the
+                # opaque private-use ALIAS type (65401) that a BIND9 /
+                # Technitium / Windows secondary stores and never answers
+                # (#4575).
                 *(
-                    ["expand-alias=yes", f"resolver={alias_resolver}"]
+                    [
+                        "expand-alias=yes",
+                        f"resolver={alias_resolver}",
+                        "outgoing-axfr-expand-alias=yes",
+                    ]
                     if alias_resolver.strip()
                     else ["expand-alias=no"]
                 ),

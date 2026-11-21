@@ -3942,6 +3942,13 @@ function RecordModalForm({
               required
             />
           )}
+          {type === "LUA" && (
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              LUA records are answered by PowerDNS servers only. A non-PowerDNS
+              secondary receives the record as an opaque type and cannot answer
+              it.
+            </p>
+          )}
           {isSrv && (
             <p className="mt-1 text-[11px] text-muted-foreground">
               Value is the <strong>target host</strong> only — set priority,
