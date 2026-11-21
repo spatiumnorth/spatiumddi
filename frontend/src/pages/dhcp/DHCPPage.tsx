@@ -774,7 +774,10 @@ export function RespondersTab({ groupId }: { groupId: string }) {
         (enable <code>DHCP_ROGUE_PROBE_ENABLED=1</code> on the agent). Unknown
         responders classify <span className="text-rose-600">rogue</span>, and
         fire the Rogue DHCP alert once that rule is enabled (Alerts → Rules; it
-        ships disabled) — acknowledge a known-but-external one to allowlist it.
+        ships disabled)
+        {!ackGate.disabled &&
+          " — acknowledge a known-but-external one to allowlist it"}
+        .
       </p>
       <div className="rounded-lg border overflow-auto">
         <table className="w-full text-sm">
@@ -951,7 +954,10 @@ function RouterAdvertisementsTab({ groupId }: { groupId: string }) {
           RA sniffer (enable <code>DHCP_RA_SNIFFER_ENABLED=1</code> on the
           agent). Unknown routers classify{" "}
           <span className="text-rose-600">rogue</span> and fire the Rogue IPv6
-          router alert — acknowledge an expected one to allowlist it.
+          router alert
+          {!ackGate.disabled &&
+            " — acknowledge an expected one to allowlist it"}
+          .
         </p>
         <div className="rounded-lg border overflow-auto">
           <table className="w-full text-sm">

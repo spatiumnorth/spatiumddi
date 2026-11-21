@@ -190,13 +190,16 @@ export function UnifiControllerDetailPage() {
             >
               Sync Now
             </HeaderButton>
-            <Link
-              to="/unifi"
-              className="inline-flex h-7 items-center gap-1 rounded-md border px-2 text-xs hover:bg-accent"
-              title="Edit on the UniFi list page"
-            >
-              <Pencil className="h-3 w-3" /> Edit
-            </Link>
+            {/* The list page's Edit takes a superadmin (#4588). */}
+            {!superadminGate.disabled && (
+              <Link
+                to="/unifi"
+                className="inline-flex h-7 items-center gap-1 rounded-md border px-2 text-xs hover:bg-accent"
+                title="Edit on the UniFi list page"
+              >
+                <Pencil className="h-3 w-3" /> Edit
+              </Link>
+            )}
           </div>
         </div>
         {testResult && (

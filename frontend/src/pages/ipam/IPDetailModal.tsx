@@ -551,7 +551,7 @@ export function IPDetailModal({
               isDefaultGatewayHostname(addr.hostname) &&
               (hasForwardZone ?? !!addr.forward_zone_id) && (
                 <div className="sm:col-span-2">
-                  <GatewayHostnameNote />
+                  <GatewayHostnameNote canEdit={canEdit} />
                 </div>
               )}
           </div>
