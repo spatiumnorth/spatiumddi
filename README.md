@@ -860,6 +860,7 @@ EOF
 
 - Docker 24+ and Docker Compose v2, **or**
 - Kubernetes with Helm: CI tests the charts on Kubernetes 1.36 with Helm 4 (k3s 1.36 on the appliance); the umbrella chart declares `kubeVersion: >=1.31`, **or**
+  - Red Hat OpenShift 4.22 and 5.0 from SpatiumDDI 1.0.1: listed in the Red Hat Ecosystem Catalog as [Partner Validated](https://catalog.redhat.com/en/software/container-stacks/detail/6af49e43879a2dda6c257559), with Red Hat certified UBI 9 images (see [OpenShift](docs/deployment/KUBERNETES.md#openshift))
 - The SpatiumDDI OS appliance on bare metal or a VM (see [APPLIANCE.md](docs/deployment/APPLIANCE.md)); running directly on a host OS without Docker is planned, not implemented
 
 #### Memory / CPU

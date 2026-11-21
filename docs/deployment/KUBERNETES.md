@@ -78,6 +78,20 @@ that adds the Red Hat UBI 9 images and the certified values profile
 not tested and not supported. Report a problem on a supported version in
 [GitHub Issues](https://github.com/spatiumnorth/spatiumddi/issues).
 
+**Red Hat Ecosystem Catalog**
+
+SpatiumDDI is listed in the Red Hat Ecosystem Catalog as
+[Partner Validated for Red Hat OpenShift](https://catalog.redhat.com/en/software/container-stacks/detail/6af49e43879a2dda6c257559).
+Its four Red Hat Universal Base Image 9 images, the ones the certified values
+profile installs, are Red Hat certified:
+[spatiumddi-api](https://catalog.redhat.com/en/software/containers/spatiumnorth/spatiumddi-api/6afe3a343f920ff278cf212a),
+[spatiumddi-frontend](https://catalog.redhat.com/en/software/containers/spatiumnorth/spatiumddi-frontend/6afe3a3d071e4d6a9cc1d123),
+[dns-bind9](https://catalog.redhat.com/en/software/containers/spatiumnorth/dns-bind9/6afe3a562f24a256f824dc01)
+and
+[dhcp-kea](https://catalog.redhat.com/en/software/containers/spatiumnorth/dhcp-kea/6afe3a6f8bdde86e465f92ea).
+The images carry a `-ubi` tag suffix on GHCR (for example `1.0.1-ubi`). The
+Helm chart itself is not yet a certified chart.
+
 The chart installs on OpenShift under its **default** SecurityContextConstraints:
 the control plane runs under plain `restricted-v2`, with no grant. It is the
 same chart, not a fork. Tested on OpenShift 5.0.0 (Kubernetes 1.36) and
