@@ -3909,7 +3909,14 @@ def pairing_status(env: dict[str, str], role: str, ps_rows: list[dict]) -> tuple
         state = (row.get("State") or "").lower()
         status = (row.get("Status") or "").lower()
         if "exited" in state or "dead" in state or "exited" in status:
-            return ("Pair failed — regenerate code on control plane", "bold red")
+            # #2225 — the control plane's refusal is one generic 403 (it
+            # must not say whether a code exists), so name the likely
+            # causes and the fix rather than a reason it will not tell us.
+            return (
+                "Pair failed: code refused (used, expired or wrong). "
+                "Make a new code on the control plane, then press F8 (Re-pair)",
+                "bold red",
+            )
         break
     return ("Bootstrapping…", "bold yellow")
 

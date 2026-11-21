@@ -57,7 +57,7 @@ from app.api.deps import DB, SuperAdmin
 from app.api.stepup import require_operator_stepup
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.permissions import require_permission
-from app.models.appliance import PairingClaim, PairingCode
+from app.models.appliance import PairingAttempt, PairingClaim, PairingCode
 from app.models.audit import AuditLog
 from app.models.auth import User
 
@@ -141,6 +141,14 @@ class PairingCodeCreated(BaseModel):
     created_at: datetime
 
 
+class PairingClaimInfo(BaseModel):
+    """Who used a code (#2225). ``appliance_id`` is the row the claim created."""
+
+    appliance_id: uuid.UUID
+    hostname: str | None
+    claimed_at: datetime
+
+
 class PairingCodeRow(BaseModel):
     id: uuid.UUID
     code_last_two: str
@@ -150,6 +158,8 @@ class PairingCodeRow(BaseModel):
     expires_at: datetime | None
     max_claims: int | None
     claim_count: int
+    # Newest first, capped at ``_CLAIMS_PER_CODE`` (claim_count is the true total).
+    claims: list[PairingClaimInfo] = []
     revoked_at: datetime | None
     note: str | None
     created_at: datetime
@@ -158,6 +168,33 @@ class PairingCodeRow(BaseModel):
 
 class PairingCodeList(BaseModel):
     codes: list[PairingCodeRow]
+
+
+AttemptReason = Literal[
+    "unknown_code", "revoked", "expired", "already_used", "disabled", "exhausted"
+]
+
+
+class PairingAttemptRow(BaseModel):
+    """One refused join, grouped per (code, hostname, reason) (#2225)."""
+
+    id: uuid.UUID
+    reason: AttemptReason
+    hostname: str
+    source_ip: str | None
+    attempts: int
+    first_attempted_at: datetime
+    last_attempted_at: datetime
+    # Set only when the attempt named a code that exists.
+    pairing_code_id: uuid.UUID | None
+    code_last_two: str | None
+    code_note: str | None
+    # Hostnames that already used the code, for ``already_used`` / ``exhausted``.
+    used_by: list[str] = []
+
+
+class PairingAttemptList(BaseModel):
+    attempts: list[PairingAttemptRow]
 
 
 class PairingCodeRevealRequest(BaseModel):
@@ -200,6 +237,9 @@ def _state_for(row: PairingCode, now: datetime, claim_count: int) -> CodeState:
     if not row.persistent and claim_count > 0:
         return "claimed"
     return "pending"
+
+
+_CLAIMS_PER_CODE = 50
 
 
 async def _get_claim_count(db: DB, code_id: uuid.UUID) -> int:
@@ -361,6 +401,24 @@ async def list_pairing_codes(
         for code_id, count in (await db.execute(cstmt)).all():
             claim_counts[code_id] = int(count)
 
+    claims_by_code: dict[uuid.UUID, list[PairingClaimInfo]] = {}
+    if rows:
+        clstmt = (
+            select(PairingClaim)
+            .where(PairingClaim.pairing_code_id.in_([r.id for r in rows]))
+            .order_by(PairingClaim.claimed_at.desc())
+        )
+        for claim in (await db.execute(clstmt)).scalars():
+            bucket = claims_by_code.setdefault(claim.pairing_code_id, [])
+            if len(bucket) < _CLAIMS_PER_CODE:
+                bucket.append(
+                    PairingClaimInfo(
+                        appliance_id=claim.appliance_id,
+                        hostname=claim.hostname,
+                        claimed_at=claim.claimed_at,
+                    )
+                )
+
     now = datetime.now(UTC)
     out: list[PairingCodeRow] = []
     for row in rows:
@@ -378,6 +436,7 @@ async def list_pairing_codes(
                 expires_at=row.expires_at,
                 max_claims=row.max_claims,
                 claim_count=count,
+                claims=claims_by_code.get(row.id, []),
                 revoked_at=row.revoked_at,
                 note=row.note,
                 created_at=row.created_at,
@@ -385,6 +444,95 @@ async def list_pairing_codes(
             )
         )
     return PairingCodeList(codes=out)
+
+
+# ── Refused join attempts (#2225) ──────────────────────────────────
+
+
+@router.get(
+    "/pairing-attempts",
+    response_model=PairingAttemptList,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="List refused supervisor registrations (superadmin)",
+)
+async def list_pairing_attempts(current_user: SuperAdmin, db: DB) -> PairingAttemptList:
+    """Why a joiner was turned away. The register endpoint's 403 is generic on
+    purpose; the reason is only ever shown here."""
+    rows = (
+        (
+            await db.execute(
+                select(PairingAttempt).order_by(PairingAttempt.last_attempted_at.desc()).limit(200)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    code_ids = {r.pairing_code_id for r in rows if r.pairing_code_id is not None}
+    codes: dict[uuid.UUID, PairingCode] = {}
+    users: dict[uuid.UUID, list[str]] = {}
+    if code_ids:
+        for c in (
+            await db.execute(select(PairingCode).where(PairingCode.id.in_(code_ids)))
+        ).scalars():
+            codes[c.id] = c
+        for cid, host in (
+            await db.execute(
+                select(PairingClaim.pairing_code_id, PairingClaim.hostname)
+                .where(PairingClaim.pairing_code_id.in_(code_ids))
+                .order_by(PairingClaim.claimed_at)
+            )
+        ).all():
+            users.setdefault(cid, []).append(host or "(unnamed)")
+    out = []
+    for r in rows:
+        code = codes.get(r.pairing_code_id) if r.pairing_code_id is not None else None
+        out.append(
+            PairingAttemptRow(
+                id=r.id,
+                reason=r.reason,  # type: ignore[arg-type]
+                hostname=r.hostname,
+                source_ip=r.source_ip,
+                attempts=r.attempts,
+                first_attempted_at=r.first_attempted_at,
+                last_attempted_at=r.last_attempted_at,
+                pairing_code_id=r.pairing_code_id,
+                code_last_two=code.code_last_two if code else None,
+                code_note=code.note if code else None,
+                used_by=(
+                    users.get(r.pairing_code_id, [])[:_CLAIMS_PER_CODE]
+                    if r.pairing_code_id is not None and r.reason in ("already_used", "exhausted")
+                    else []
+                ),
+            )
+        )
+    return PairingAttemptList(attempts=out)
+
+
+@router.delete(
+    "/pairing-attempts/{attempt_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Dismiss a refused-attempt row (superadmin)",
+)
+async def dismiss_pairing_attempt(attempt_id: uuid.UUID, current_user: SuperAdmin, db: DB) -> None:
+    row = await db.get(PairingAttempt, attempt_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Attempt not found.")
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="appliance.pairing_attempt_dismissed",
+            resource_type="pairing_attempt",
+            resource_id=str(row.id),
+            resource_display=row.hostname,
+            result="success",
+            new_value={"reason": row.reason, "attempts": row.attempts},
+        )
+    )
+    await db.delete(row)
+    await db.commit()
 
 
 # ── Revoke ─────────────────────────────────────────────────────────

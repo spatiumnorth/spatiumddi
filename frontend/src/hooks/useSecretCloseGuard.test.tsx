@@ -299,7 +299,7 @@ describe("New pairing code", () => {
     });
     const onClose = vi.fn();
     mount(<GenerateCodeModal onClose={onClose} onCreated={vi.fn()} />);
-    if (persistent) fireEvent.click(screen.getByText("Persistent"));
+    if (persistent) fireEvent.click(screen.getByLabelText(/Unlimited/));
     fireEvent.click(screen.getByRole("button", { name: /Generate/ }));
     await screen.findByText("1234-5678");
     return onClose;

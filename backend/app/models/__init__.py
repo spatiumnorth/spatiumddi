@@ -12,6 +12,7 @@ from app.models.appliance import (
     Appliance,
     ApplianceCA,
     ApplianceCertificate,
+    PairingAttempt,
     PairingClaim,
     PairingCode,
 )
@@ -196,6 +197,7 @@ __all__ = [
     "ERL_RULE_TARGET_COLUMN",
     "E911ResolutionLog",
     "EmergencyResponseLocation",
+    "PairingAttempt",
     "PairingClaim",
     "PairingCode",
     "AVFlowProfile",
