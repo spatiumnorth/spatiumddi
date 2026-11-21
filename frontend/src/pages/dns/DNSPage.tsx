@@ -2753,6 +2753,14 @@ function DnssecCard({
           then.
         </div>
       )}
+      {info.data?.unapplied_warning && (
+        <div
+          role="alert"
+          className="rounded border border-amber-500/40 bg-amber-500/10 p-2 text-xs text-amber-700 dark:text-amber-300"
+        >
+          {info.data.unapplied_warning}
+        </div>
+      )}
       {signingUnmanaged && (
         <div className="rounded border border-amber-500/40 bg-amber-500/10 p-2 text-xs text-amber-700 dark:text-amber-300">
           {enabled
@@ -4307,6 +4315,7 @@ function MoveZoneModal({
       !!preview.technitium_acl_refusal ||
       !!preview.classless_refusal ||
       !!preview.powerdns_refusal ||
+      !!preview.dnssec_policy_refusal ||
       !!preview.views_refusal);
   const canSubmit =
     !!targetGroupId &&
@@ -4391,6 +4400,11 @@ function MoveZoneModal({
             {preview.powerdns_refusal && (
               <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
                 {preview.powerdns_refusal}
+              </div>
+            )}
+            {preview.dnssec_policy_refusal && (
+              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+                {preview.dnssec_policy_refusal}
               </div>
             )}
             {preview.views_refusal && (

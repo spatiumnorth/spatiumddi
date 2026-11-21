@@ -63,6 +63,7 @@ from app.models.dns import (
 from app.services.appliance.cluster_dns_group import cluster_dns_group_refusal
 from app.services.appliance.ownership import owning_appliance_for_dns_server
 from app.services.dns import technitium_api_scope
+from app.services.dns.dnssec_policy_support import group_policy_zone_refusal
 from app.services.dns.dnssec_signers import second_signer_refusal
 from app.services.dns.dnssec_trust import (
     NEEDS_ANCHOR_MESSAGE,
@@ -188,6 +189,16 @@ async def ensure_group_classless_compatible(
             f"Group {group.name!r} holds {classless_zone_refusal({driver}, name)}",
             status_code=422,
         )
+
+
+async def ensure_group_dnssec_policy_compatible(
+    db: AsyncSession, group: DNSServerGroup, driver: str
+) -> None:
+    """Refuse (422) putting a ``driver`` server into a group that holds a zone
+    with a custom DNSSEC policy when that driver ignores policies (#4623)."""
+    msg = await group_policy_zone_refusal(db, group.id, group.name, driver)
+    if msg:
+        raise ServerMoveError(msg, status_code=422)
 
 
 def views_unsupported_drivers(drivers: Iterable[str]) -> list[str]:
@@ -512,6 +523,7 @@ async def move_server_to_group(
     await ensure_group_catalog_compatible(db, target_group, server.driver)
     await ensure_group_views_compatible(db, target_group, server.driver)
     await ensure_group_classless_compatible(db, target_group, server.driver)
+    await ensure_group_dnssec_policy_compatible(db, target_group, server.driver)
     await ensure_group_powerdns_compatible(db, target_group, server.driver)  # #4570
 
     # #1762 — a server joining a group that already has one and holds signed
