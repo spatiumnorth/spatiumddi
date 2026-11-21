@@ -117,6 +117,7 @@ from app.services.mfa import (
 from app.services.mfa_enrol_stepup import EnrolStepup, resolve_enrol_stepup, verify_enrol_stepup
 from app.services.password_policy import (
     PasswordPolicy,
+    history_error,
     is_in_history,
     push_history,
 )
@@ -1091,10 +1092,7 @@ async def change_password(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={
                 "reason": "password_history",
-                "errors": [
-                    f"Password matches one of the last {policy.history_count} "
-                    "passwords; choose a new one."
-                ],
+                "errors": [history_error(policy.history_count)],
             },
         )
 
