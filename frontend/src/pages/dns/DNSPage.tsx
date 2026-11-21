@@ -95,6 +95,7 @@ import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
 import { FreshRowError } from "@/components/FreshRowError";
 import {
   NEEDS_SUPERADMIN,
+  disabledBecause,
   permissionGate,
   usePermissions,
 } from "@/hooks/usePermissions";
@@ -158,6 +159,7 @@ import {
   recordOwnerError,
   zoneKindForName,
 } from "@/lib/dnsNames";
+import { viewsUnsupportedReason } from "@/lib/dns-views";
 import { useTableSort, SortableTh } from "@/lib/useTableSort";
 import {
   ZONE_FORWARD_TRANSPORT_LABELS,
@@ -4263,7 +4265,8 @@ function MoveZoneModal({
       !!preview.forward_transport_refusal ||
       !!preview.technitium_acl_refusal ||
       !!preview.classless_refusal ||
-      !!preview.dnssec_policy_refusal);
+      !!preview.dnssec_policy_refusal ||
+      !!preview.views_refusal);
   const canSubmit =
     !!targetGroupId &&
     !!preview &&
@@ -4347,6 +4350,11 @@ function MoveZoneModal({
             {preview.dnssec_policy_refusal && (
               <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
                 {preview.dnssec_policy_refusal}
+              </div>
+            )}
+            {preview.views_refusal && (
+              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+                {preview.views_refusal}
               </div>
             )}
             {preview.acl_names_lost.length > 0 && (
@@ -7060,10 +7068,10 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
   // a no-op on Windows / PowerDNS / cloud, and Technitium blocks natively
   // with no per-view concept. Saying so here beats an operator scoping a
   // list to a view and waiting for filtering that will never arrive.
-  const nonBindDrivers = Array.from(
-    new Set(servers.filter((s) => s.driver !== "bind9").map((s) => s.driver)),
-  );
   const hasBind = servers.some((s) => s.driver === "bind9");
+  // #4565: only BIND9 serves views, and the API refuses a new one elsewhere.
+  // Views such a group already holds stay listed so they can be removed.
+  const viewsUnsupported = viewsUnsupportedReason(servers.map((s) => s.driver));
 
   const delMut = useMutation({
     // The modal lists the blocking lists scoped to the view, so confirming
@@ -7093,6 +7101,7 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
           onClick={() => {
             setCreating(true);
           }}
+          {...disabledBecause(viewsUnsupported != null, viewsUnsupported ?? "")}
           {...permissionGate(can("write", "dns_group"), NEEDS_GROUP_WRITE)}
         >
           <Plus className="h-3 w-3" /> New View
@@ -7113,11 +7122,14 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
         />
       )}
 
-      {servers.length > 0 && !hasBind && (
-        <div className="mb-3 rounded-md border border-amber-500/40 bg-amber-500/5 p-2 text-xs text-amber-700 dark:text-amber-400">
-          <strong>This group runs no BIND9 server.</strong> Views and
-          view-scoped blocking lists are rendered by the BIND9 driver only — on{" "}
-          {nonBindDrivers.join(" / ")} they are stored but never applied.
+      {viewsUnsupported != null && (
+        <div
+          role="note"
+          className="mb-3 rounded-md border border-amber-500/40 bg-amber-500/5 p-2 text-xs text-amber-700 dark:text-amber-400"
+        >
+          <strong>This group cannot serve views.</strong> {viewsUnsupported}
+          {views.length > 0 &&
+            " The views below were stored before this was refused: a zone that is the same in every view is served to every client, a zone that differs between views serves only the records identical in every view. Remove them."}
         </div>
       )}
 

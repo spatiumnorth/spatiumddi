@@ -5306,6 +5306,9 @@ export interface ZoneMovePreview {
   /** #4623 — the zone's custom DNSSEC policy would land on a PowerDNS group,
    *  which ignores it. Non-null means the commit refuses. */
   dnssec_policy_refusal?: string | null;
+  /** #4565 — the zone or a record of it would keep a view in a target group
+   *  that cannot serve views. Non-null means the commit refuses. */
+  views_refusal?: string | null;
   warnings: string[];
   /** Keys the commit will demand: view_widening | dnssec_rollover |
    *  lost_update_grants. */
@@ -5348,7 +5351,8 @@ export interface DNSServerGroup {
   catalog_unsupported_warning?: string | null;
   /** #1784 — set for a group holding the experimental `technitium_api`
    *  driver; says where an existing group falls outside its supported scope
-   *  (second server, pools). Empty for every other group. */
+   *  (second server, pools). #4565 — also set for a group holding views its
+   *  servers cannot serve. Empty for every other group. */
   scope_warnings?: string[];
   /** #4562 — group fields (`is_recursive`) a driver in the group does not
    *  apply, from the same table as the options response. */
