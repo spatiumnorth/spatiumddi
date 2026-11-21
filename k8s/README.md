@@ -17,7 +17,8 @@ k8s/
 One StatefulSet per DHCP server row, matching the DNS-agent topology.
 
 ```bash
-# Create the agent PSK secret (must match DHCP_AGENT_KEY on the control plane)
+# Create the agent PSK secret (must match DHCP_AGENT_KEY on the control plane,
+# i.e. the `dhcp-agent-key` key of spatiumddi-secrets read by base/api.yaml + worker.yaml, #4648)
 kubectl create secret generic spatium-dhcp-agent-key \
   --from-literal=SPATIUM_AGENT_KEY=$(openssl rand -hex 32) \
   -n spatiumddi

@@ -1017,9 +1017,13 @@ python3 "$ROOT/.github/scripts/chart-shared-env.py" \
     --expect-on api:SLOT_IMAGE_MIRROR_URL --expect-on api:SLOT_IMAGE_MIRROR_SECRET \
     --expect-on worker:SLOT_IMAGE_MIRROR_URL --expect-on worker:SLOT_IMAGE_MIRROR_SECRET \
     --absent beat:SLOT_IMAGE_MIRROR_SECRET \
+    --expect-on api:DNS_AGENT_KEY --expect-on api:DHCP_AGENT_KEY \
+    --expect-on worker:DNS_AGENT_KEY --expect-on worker:DHCP_AGENT_KEY \
     --absent slot-image-mirror:APPLIANCE_MODE \
     --absent slot-image-mirror:SLOT_IMAGE_MIRROR_URL \
     "$OUT/umbrella-shared-env.yaml" || failures=$((failures + 1))
+# #4648 — that render has dnsAgents / dhcpAgents off, yet the api and worker
+# carry both agent keys (an appliance agent node joins with them).
 # Negative control: a worker without the variable must be refused, or the
 # guard above could be passing on a render it cannot read.
 echo "── negative control: a worker missing a shared variable must fail"

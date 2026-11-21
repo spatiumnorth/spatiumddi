@@ -304,8 +304,8 @@ them:
 | `auth.existingSecret` | `secret-key` (and optionally `metrics-token`) |
 | `postgresql.auth.existingSecret` | `password`. With `postgresql.kind: cnpg`, the Secret must be type `kubernetes.io/basic-auth` with both `username` and `password`, because CNPG bootstraps the database user from it |
 | `redis.auth.existingSecret` | `redis-password` (only when `redis.auth.enabled=true`) |
-| `dnsAgents.agentKey.existingSecret` | `DNS_AGENT_KEY` (when `dnsAgents.enabled`) |
-| `dhcpAgents.agentKey.existingSecret` | `SPATIUM_AGENT_KEY` (when `dhcpAgents.enabled`) |
+| `dnsAgents.agentKey.existingSecret` | `DNS_AGENT_KEY` (read by the api and worker even with `dnsAgents.enabled=false`, #4648) |
+| `dhcpAgents.agentKey.existingSecret` | `SPATIUM_AGENT_KEY` (read by the api and worker even with `dhcpAgents.enabled=false`, #4648) |
 
 ## Values reference
 
@@ -385,13 +385,13 @@ subcharts verbatim — any option those charts accept works here. See:
 | `dnsAgents.image.repository` | `ghcr.io/spatiumnorth/dns-bind9` | Default image (BIND9 flavor) |
 | `dnsAgents.flavors.powerdns.repository` | `ghcr.io/spatiumnorth/dns-powerdns` | Per-flavor image override (issue #127) |
 | `dnsAgents.flavors.technitium.repository` | `ghcr.io/spatiumnorth/dns-technitium` | Per-flavor image override |
-| `dnsAgents.agentKey.existingSecret` | `""` | Carries `DNS_AGENT_KEY` (shared between flavors) |
+| `dnsAgents.agentKey.existingSecret` | `""` | Carries `DNS_AGENT_KEY` (shared between flavors). Unset (and no `value`) = the chart generates `<fullname>-agent-keys` once and keeps it across upgrades (#4648); the api and worker always get the key, so appliance agent nodes can join with no in-cluster agents |
 | `dnsAgents.prefixWithFullname` | `false` | #3209 — name the StatefulSet and Services `<fullname>-dns-<flavor>-<name>` instead of `dns-<flavor>-<name>`. Flipping it on a live install recreates the StatefulSet with new PVCs; see [upgrade note](#agent-object-names-3209) |
 | `dnsAgents.storageClass` | `""` | #3206 — StorageClass of both claims (`agent-state`, `dns-state`); unset = cluster default. Per server: `servers[].storageClass`. Setting it on an existing install needs a one-off step: [see below](#adopting-storageclass-on-an-existing-install) |
 | `dnsAgents.servers` | `[]` | One entry → one StatefulSet + Services. `flavor: bind9` (default), `powerdns`, or `technitium` |
 | `dhcpAgents.enabled` | `false` |  |
 | `dhcpAgents.image.repository` | `ghcr.io/spatiumnorth/dhcp-kea` |  |
-| `dhcpAgents.agentKey.existingSecret` | `""` | Carries `SPATIUM_AGENT_KEY` |
+| `dhcpAgents.agentKey.existingSecret` | `""` | Carries `SPATIUM_AGENT_KEY`; unset = chart-generated, as for `dnsAgents.agentKey.existingSecret` (#4648) |
 | `dhcpAgents.prefixWithFullname` | `false` | #3209 — as `dnsAgents.prefixWithFullname`, for the DHCP StatefulSet and Services |
 | `dhcpAgents.upgradeUnstickPods` | `true` | #3907 — a `pre-upgrade` hook deletes a DHCP agent StatefulSet (PVCs kept) holding a pod that is Running but not Ready for 2+ minutes, so Helm recreates it from the new template (needed coming from `2026.10.02-1` or older). Ready pods are never touched; `false` turns the hook off |
 | `dhcpAgents.storageClass` | `""` | #3206 — StorageClass of both claims; per server: `servers[].storageClass`. Setting it on an existing install needs a one-off step: [see below](#adopting-storageclass-on-an-existing-install) |

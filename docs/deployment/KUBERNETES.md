@@ -490,8 +490,19 @@ Getting client traffic to them is different for the two services, and each
 has its own section below: [Exposing DNS to clients](#exposing-dns-to-clients)
 and [Exposing DHCP to clients](#exposing-dhcp-to-clients).
 
-Pre-create the bootstrap PSK Secrets (or use `agentKey.value` inline for lab
-use only):
+The agent keys do not depend on `dnsAgents.enabled` / `dhcpAgents.enabled`
+(#4648): the api and worker always carry `DNS_AGENT_KEY` / `DHCP_AGENT_KEY`, so
+an appliance node can join a Helm control plane as a DNS or DHCP worker with no
+in-cluster agents. When you set neither `existingSecret` nor `value`, the chart
+generates a `<release>-agent-keys` Secret on first install, keeps it across
+upgrades and uninstalls (`helm.sh/resource-policy: keep`), and the in-cluster
+agents read the same Secret. Read the key to give an appliance with
+`kubectl get secret <release>-agent-keys -o jsonpath='{.data.DNS_AGENT_KEY}' | base64 -d`.
+A render with no cluster access (`helm template`, Argo CD / Flux) generates
+nothing, so pin the keys there with the settings below.
+
+To pin the keys, pre-create the bootstrap PSK Secrets (or use `agentKey.value`
+inline for lab use only):
 
 ```bash
 kubectl -n spatiumddi create secret generic spatium-dns-agent-key \
