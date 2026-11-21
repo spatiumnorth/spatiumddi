@@ -84,6 +84,9 @@ spec:
         - name: migrate
           image: {{ include "spatiumddi.image" (merge (dict "imageName" "spatiumddi-api") .) }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # #1250 — full hardening: alembic needs no file capability.
+          securityContext:
+            {{- include "spatiumddi.backendContainerContext" (dict "root" . "full" true) | nindent 12 }}
           command: ["alembic", "upgrade", "head"]
           env:
             {{- include "spatiumddi.commonEnv" . | nindent 12 }}

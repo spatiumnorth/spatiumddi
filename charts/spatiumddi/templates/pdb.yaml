@@ -1,0 +1,42 @@
+{{- /*
+#1250 — PodDisruptionBudgets for the replicated control-plane workloads, so a
+node drain or cluster upgrade cannot evict every replica of the api, the
+worker or the frontend at once.
+
+Two rules keep a PDB from becoming the thing that blocks maintenance (#3204,
+beat.yaml, and cnpg.enablePDB make the same point):
+  * ``maxUnavailable: 1``, never ``minAvailable``. ``minAvailable: 1`` on a
+    one-pod workload allows zero disruptions and a drain hangs on it forever;
+    ``maxUnavailable: 1`` always lets a drain make progress.
+  * rendered only while the workload can have more than one pod. A single pod
+    has nothing for a budget to protect, so the object would be noise.
+The count is the one the Deployment actually runs: with the autoscaler on
+(api) that is its ``minReplicas``, otherwise ``replicas``. Beat is a singleton
+and deliberately has no PDB.
+
+``maxUnavailable`` is a value, so a cluster with a drain-sensitive layout can
+raise it; an integer or a percentage string both pass through.
+*/ -}}
+{{- $apiReplicas := ternary (int .Values.api.autoscaling.minReplicas) (int .Values.api.replicas) (.Values.api.autoscaling.enabled | default false) -}}
+{{- $workloads := list
+      (dict "name" "api" "cfg" .Values.api.podDisruptionBudget "replicas" $apiReplicas)
+      (dict "name" "worker" "cfg" .Values.worker.podDisruptionBudget "replicas" (int .Values.worker.replicas))
+      (dict "name" "frontend" "cfg" .Values.frontend.podDisruptionBudget "replicas" (int .Values.frontend.replicas)) -}}
+{{- range $w := $workloads }}
+{{- $cfg := $w.cfg | default dict }}
+{{- if and (ne (toString $cfg.enabled) "false") (gt (int $w.replicas) 1) }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "spatiumddi.fullname" $ }}-{{ $w.name }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" $w.name) $) | nindent 4 }}
+spec:
+  maxUnavailable: {{ if kindIs "invalid" $cfg.maxUnavailable }}1{{ else }}{{ $cfg.maxUnavailable }}{{ end }}
+  selector:
+    matchLabels:
+      {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $w.name) $) | nindent 6 }}
+{{- end }}
+{{- end }}

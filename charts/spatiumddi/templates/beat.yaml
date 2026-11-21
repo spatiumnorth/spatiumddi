@@ -69,6 +69,9 @@ spec:
         - name: beat
           image: {{ include "spatiumddi.image" (merge (dict "imageName" "spatiumddi-api") .) }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # #1250 — full hardening: beat only enqueues, no file capability.
+          securityContext:
+            {{- include "spatiumddi.backendContainerContext" (dict "root" . "full" true) | nindent 12 }}
           command:
             - celery
             - -A
