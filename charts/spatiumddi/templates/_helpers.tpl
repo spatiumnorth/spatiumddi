@@ -1132,7 +1132,9 @@ volumeClaimTemplates are immutable, so setting dnsAgents/dhcpAgents
 .storageClass (or servers[].storageClass) on an existing install can only be
 applied after the StatefulSet is deleted with --cascade=orphan.
 
-Takes (dict "root" $ "name" <statefulset name> "class" <class this render sets>).
+Takes (dict "root" $ "name" <statefulset name> "class" <class this render sets>
+"found" <dict with "names" and "details" lists to append to>); it never fails
+itself, spatiumddi.checkAgentClaimClasses reports everything at once.
 Fires only when this render SETS a class and the live object has a claim
 template whose class is absent or different. An install that never set a
 class renders no storageClassName and never reaches the comparison. `lookup`
@@ -1149,9 +1151,45 @@ render that changes nothing.
 {{- range $t := (dig "spec" "volumeClaimTemplates" (list) $live) -}}
 {{- $old := dig "spec" "storageClassName" "" $t -}}
 {{- if ne $old $.class -}}
-{{- fail (printf "StatefulSet %q has a %q claim template with storageClassName %s, and this render sets %q. Kubernetes forbids updating a StatefulSet's volumeClaimTemplates, so this upgrade would be refused. Delete the StatefulSet without deleting its pod or PVCs, then upgrade again:\n  kubectl delete sts %s -n %s --cascade=orphan\nExisting PVCs keep their old class; only new claims get %q. See the chart README, \"Adopting storageClass on an existing install\"." $.name (dig "metadata" "name" "?" $t) (ternary "unset" (quote $old) (eq $old "")) $.class $.name $.root.Release.Namespace $.class) -}}
+{{- $_ := set $.found "names" (append (index $.found "names") $.name) -}}
+{{- $_ := set $.found "details" (append (index $.found "details") (printf "StatefulSet %q has a %q claim template with storageClassName %s, and this render sets %q." $.name (dig "metadata" "name" "?" $t) (ternary "unset" (quote $old) (eq $old "")) $.class)) -}}
 {{- end -}}
 {{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Every agent StatefulSet (DNS and DHCP) whose claim class would change, in ONE
+refusal. Called once from dns-agent.yaml, outside its enabled gate, because a
+fail inside the per-server loops names only the first StatefulSet it meets and
+a three-agent install then needs three rounds of upgrade, refuse, delete,
+retry (#4682). Mirrors the object-name and class resolution of the two loops.
+*/}}
+{{- define "spatiumddi.checkAgentClaimClasses" -}}
+{{- $root := . -}}
+{{- $found := dict "names" (list) "details" (list) -}}
+{{- if .Values.dnsAgents.enabled -}}
+{{- range $server := .Values.dnsAgents.servers -}}
+{{- $flavor := $server.flavor | default "bind9" -}}
+{{- $instance := include "spatiumddi.agentObjectName" (dict "root" $root "instance" (printf "dns-%s-%s" $flavor $server.name) "prefix" $root.Values.dnsAgents.prefixWithFullname) -}}
+{{- $class := $server.storageClass | default $root.Values.dnsAgents.storageClass -}}
+{{- include "spatiumddi.checkAgentClaimClass" (dict "root" $root "name" $instance "class" $class "found" $found) -}}
+{{- end -}}
+{{- end -}}
+{{- if .Values.dhcpAgents.enabled -}}
+{{- range $server := .Values.dhcpAgents.servers -}}
+{{- $flavor := $server.flavor | default "kea" -}}
+{{- $instance := include "spatiumddi.agentObjectName" (dict "root" $root "instance" (printf "dhcp-%s-%s" $flavor $server.name) "prefix" $root.Values.dhcpAgents.prefixWithFullname) -}}
+{{- $class := $server.storageClass | default $root.Values.dhcpAgents.storageClass -}}
+{{- include "spatiumddi.checkAgentClaimClass" (dict "root" $root "name" $instance "class" $class "found" $found) -}}
+{{- end -}}
+{{- end -}}
+{{- if index $found "names" -}}
+{{- $cmds := list -}}
+{{- range $n := index $found "names" -}}
+{{- $cmds = append $cmds (printf "  kubectl delete sts %s -n %s --cascade=orphan" $n $root.Release.Namespace) -}}
+{{- end -}}
+{{- fail (printf "%s\nKubernetes forbids updating a StatefulSet's volumeClaimTemplates, so this upgrade would be refused. Delete each of these StatefulSets without deleting its pods or PVCs, then upgrade again:\n%s\nExisting PVCs keep their old class; only new claims get the new one. See the chart README, \"Adopting storageClass on an existing install\"." (join "\n" (index $found "details")) (join "\n" ($cmds | uniq))) -}}
 {{- end -}}
 {{- end -}}
 
