@@ -2694,6 +2694,14 @@ function DnssecCard({
     },
     onError: (e: ApiError) => setError(formatApiError(e, "Unsign failed")),
   });
+  const ackDsMut = useMutation({
+    mutationFn: () => dnsApi.ackZoneDnssecDsChange(groupId, zoneId),
+    onSuccess: () => {
+      setError(null);
+      invalidate();
+    },
+    onError: (e: ApiError) => setError(formatApiError(e, "Acknowledge failed")),
+  });
   const rolloverMut = useMutation({
     mutationFn: (keyTag: number) =>
       dnsApi.rolloverZoneDnssecKey(groupId, zoneId, keyTag),
@@ -2707,6 +2715,7 @@ function DnssecCard({
   const enabled = info.data?.dnssec_enabled ?? initiallyEnabled;
   const dsRecords = info.data?.dnssec_ds_records ?? [];
   const syncedAt = info.data?.dnssec_synced_at ?? null;
+  const dsChangedAt = info.data?.dnssec_ds_changed_at ?? null;
   const keys = info.data?.keys ?? [];
   const multiSigner = info.data?.dnssec_multi_signer ?? false;
   const signingServers = info.data?.signing_servers ?? 0;
@@ -2915,6 +2924,35 @@ function DnssecCard({
             </div>
           ) : (
             <ul className="space-y-1">
+              {/* #4566: the server generated new keys (a zone re-created
+                  after a lost volume or on a replaced node is signed again)
+                  or rolled them, so the parent holds a DS that is going
+                  stale. */}
+              {dsChangedAt && (
+                <li
+                  role="alert"
+                  className="rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-xs text-amber-700 dark:text-amber-300"
+                >
+                  <span className="font-medium">
+                    DS records changed{" "}
+                    <time dateTime={dsChangedAt}>
+                      {new Date(dsChangedAt).toLocaleString()}
+                    </time>
+                    .
+                  </span>{" "}
+                  The server&apos;s keys were regenerated or rolled. Publish the
+                  records below at the parent zone: validating resolvers fail
+                  the zone while the parent holds only the earlier DS.{" "}
+                  <button
+                    type="button"
+                    className="underline"
+                    disabled={ackDsMut.isPending}
+                    onClick={() => ackDsMut.mutate()}
+                  >
+                    I have published it
+                  </button>
+                </li>
+              )}
               {dsRecords.map((ds, idx) => (
                 <li
                   key={idx}
@@ -3012,6 +3050,8 @@ function ZoneModalForm({
   const groupDrivers =
     groupList?.find((g) => g.id === groupId)?.server_drivers ?? [];
   const technitiumApi = groupDrivers.includes("technitium_api");
+  // PowerDNS serves primary and secondary zones only (#4570).
+  const powerdns = groupDrivers.includes("powerdns");
   // #3087 — Type and TTL start from Settings → DNS (Default Zone Type /
   // Default Zone TTL) until the operator changes them. An existing zone
   // shows its own values. The settings read is best-effort: a role that
@@ -3035,7 +3075,7 @@ function ZoneModalForm({
   // stock TTL (above), so a stored default it would refuse is not offered.
   const zoneType =
     pickedZoneType ??
-    (technitiumApi
+    (technitiumApi || powerdns
       ? "primary"
       : (dnsDefaults?.dns_default_zone_type ?? "primary"));
   const setZoneType = setPickedZoneType;
@@ -3321,12 +3361,14 @@ function ZoneModalForm({
               {(!technitiumApi || zoneType === "secondary") && (
                 <option value="secondary">Secondary</option>
               )}
-              {(!technitiumApi || zoneType === "stub") && (
-                <option value="stub">Stub</option>
-              )}
-              {(!technitiumApi || zoneType === "forward") && (
-                <option value="forward">Forward</option>
-              )}
+              {(!technitiumApi || zoneType === "stub") &&
+                (!powerdns || zone?.zone_type === "stub") && (
+                  <option value="stub">Stub</option>
+                )}
+              {(!technitiumApi || zoneType === "forward") &&
+                (!powerdns || zone?.zone_type === "forward") && (
+                  <option value="forward">Forward</option>
+                )}
             </select>
           </Field>
           <Field label="Kind">
@@ -3904,6 +3946,13 @@ function RecordModalForm({
               required
             />
           )}
+          {type === "LUA" && (
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              LUA records are answered by PowerDNS servers only. A non-PowerDNS
+              secondary receives the record as an opaque type and cannot answer
+              it.
+            </p>
+          )}
           {isSrv && (
             <p className="mt-1 text-[11px] text-muted-foreground">
               Value is the <strong>target host</strong> only — set priority,
@@ -4257,6 +4306,7 @@ function MoveZoneModal({
       !!preview.forward_transport_refusal ||
       !!preview.technitium_acl_refusal ||
       !!preview.classless_refusal ||
+      !!preview.powerdns_refusal ||
       !!preview.views_refusal);
   const canSubmit =
     !!targetGroupId &&
@@ -4336,6 +4386,11 @@ function MoveZoneModal({
             {preview.classless_refusal && (
               <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
                 {preview.classless_refusal}
+              </div>
+            )}
+            {preview.powerdns_refusal && (
+              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+                {preview.powerdns_refusal}
               </div>
             )}
             {preview.views_refusal && (
