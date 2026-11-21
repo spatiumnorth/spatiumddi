@@ -11,7 +11,9 @@
 # Two paths still need write access:
 #
 # * /var/lib/spatium-supervisor → identity key + cert + session token
-#   + role-compose.env + role-switch-state. Chowned below.
+#   + role-compose.env + role-switch-state. Chowned below, every start:
+#   that is also what re-owns state written by the old uid 100 / gid 101
+#   (ids that belong to host system accounts) to the dedicated 10001.
 # * /etc/nftables.d → spatium-role.nft drop-in (the only file the
 #   supervisor manages there). Chown the *directory* only; existing
 #   host-managed SNMP / NTP drop-ins keep their canonical ownership.
@@ -25,6 +27,20 @@ set -eu
 
 mkdir -p /var/lib/spatium-supervisor
 chown -R spatium:spatium /var/lib/spatium-supervisor || true
+
+# The trigger directory is shared with the host and with the api pod. Names
+# this supervisor created while it still ran as uid 100 / gid 101 (the old
+# ids, host system accounts) would otherwise stay un-writable for the new
+# uid: the directory is sticky, so it could neither replace nor remove them,
+# and the host trigger guard no longer accepts uid 100. Re-own them here,
+# as root, before the first write — a pod on the old image is gone by now.
+# Files and directories two levels deep only, nothing followed (-P / -h),
+# each chowned by bare name from inside its own directory (-execdir).
+if [ -d /var/lib/spatiumddi-host/release-state ]; then
+    find -P /var/lib/spatiumddi-host/release-state -xdev -maxdepth 2 \
+        \( -type f -o -type d \) -user 100 -group 101 \
+        -execdir chown -h 10001:10001 {} + 2>/dev/null || true
+fi
 
 if [ -d /etc/nftables.d ]; then
     # Issue #239 — only the supervisor (spatium user) writes here.
