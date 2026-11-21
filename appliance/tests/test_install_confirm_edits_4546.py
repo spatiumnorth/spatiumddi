@@ -631,10 +631,10 @@ def _ask_network(tmp_path, entries: list[tuple[str, str]], extra: dict[str, list
         "Network interface": ["0|eth0"],
         "IPv6": ["1|"] * 4,
         "Static network — invalid": ["0|"] * 4,
-        "Static IP -address": [f"0|{e[0]}" for e in entries],
-        "Static IP -prefix": [f"0|{e[1]}" for e in entries],
-        "Static IP -gateway": [f"0|{e[2]}" for e in entries],
-        "Static IP -DNS": [f"0|{e[3]}" for e in entries],
+        "Static IP - address": [f"0|{e[0]}" for e in entries],
+        "Static IP - prefix": [f"0|{e[1]}" for e in entries],
+        "Static IP - gateway": [f"0|{e[2]}" for e in entries],
+        "Static IP - DNS": [f"0|{e[3]}" for e in entries],
     }
     answers.update(extra)
     return run(
