@@ -1353,6 +1353,12 @@ ${API_SIZING_YAML}
         # the node (the frontend stays on the cluster Service). Same value as the supervisor's
         # HelmChartConfig (#1005).
         nodeLocal: true
+      # #4430 — TLS in front of the api (a sidecar serving the web-UI
+      # certificate on 8443), which the supervisors' heartbeats use and verify
+      # against the certificate they pin. Same value as the supervisor's
+      # HelmChartConfig (#1005).
+      tlsListener:
+        enabled: true
       autoscaling:
         enabled: false
       env:

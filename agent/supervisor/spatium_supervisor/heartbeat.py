@@ -155,6 +155,75 @@ _IN_CLUSTER_NODE_LOCAL_URL = (
     "http://spatium-control-spatiumddi-api-local.spatium.svc.cluster.local.:8000"
 )
 
+# #4430 — the same two Services over TLS. The api pod carries a TLS sidecar
+# (``api.tlsListener``) that serves the web-UI certificate on 8443; the
+# supervisor verifies it against the pin ``cp_tls`` already keeps. Plain http
+# above stays only as the upgrade-window fallback and for older supervisors.
+_IN_CLUSTER_NODE_LOCAL_TLS_URL = (
+    "https://spatium-control-spatiumddi-api-local.spatium.svc.cluster.local.:8443"
+)
+_IN_CLUSTER_CONTROL_PLANE_TLS_URL = (
+    "https://spatium-control-spatiumddi-api.spatium.svc.cluster.local.:8443"
+)
+_LOCAL_URLS = (_IN_CLUSTER_NODE_LOCAL_URL, _IN_CLUSTER_NODE_LOCAL_TLS_URL)
+_CLUSTER_TLS_URLS = (_IN_CLUSTER_NODE_LOCAL_TLS_URL, _IN_CLUSTER_CONTROL_PLANE_TLS_URL)
+
+#: Marker (under the state dir's ``tls/``) written by the first heartbeat that
+#: succeeded over the api's TLS listener. It ends the upgrade window for this
+#: node: from then on a failing TLS attempt never falls back to plain http.
+_API_TLS_SEEN = "api-tls-seen"
+#: How long after a TLS attempt found no listener (an api that predates
+#: ``api.tlsListener``) the supervisor stays on plain http before asking again.
+_API_TLS_RETRY_S = 300.0
+
+_api_tls: dict[str, Any] = {"seen": False, "http_until": 0.0}
+
+
+def _api_tls_seen(cfg: SupervisorConfig) -> bool:
+    if _api_tls["seen"]:
+        return True
+    if (Path(getattr(cfg, "state_dir", "/nonexistent")) / "tls" / _API_TLS_SEEN).exists():
+        _api_tls["seen"] = True
+    return bool(_api_tls["seen"])
+
+
+def _api_tls_active(cfg: SupervisorConfig) -> bool:
+    """Whether the in-cluster api is addressed over TLS right now: always once
+    a TLS heartbeat has succeeded, and otherwise unless the last attempt found
+    no listener (the rolling-upgrade window, see ``_API_TLS_RETRY_S``)."""
+    return _api_tls_seen(cfg) or time.monotonic() >= _api_tls["http_until"]
+
+
+def _note_api_tls_ok(cfg: SupervisorConfig) -> None:
+    if _api_tls["seen"]:
+        return
+    _api_tls["seen"] = True
+    try:
+        marker = Path(cfg.state_dir) / "tls" / _API_TLS_SEEN
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("1\n", encoding="ascii")
+    except OSError as exc:
+        log.warning("supervisor.control_plane.api_tls_marker_unwritten", error=str(exc))
+    log.info("supervisor.control_plane.api_tls_active")
+
+
+def _note_api_tls_missing(cfg: SupervisorConfig) -> bool:
+    """A TLS attempt to the in-cluster api could not connect. Inside the upgrade
+    window (no TLS heartbeat has ever succeeded here) the api is taken to predate
+    the listener: stay on plain http for ``_API_TLS_RETRY_S``. Returns whether
+    that applied; after the window it never does."""
+    if _api_tls_seen(cfg):
+        return False
+    _api_tls["http_until"] = time.monotonic() + _API_TLS_RETRY_S
+    log.warning(
+        "supervisor.control_plane.api_tls_unavailable",
+        detail=(
+            "no TLS listener on the api yet (an api from before api.tlsListener, "
+            "i.e. mid rolling upgrade): using plain http node-locally for now"
+        ),
+    )
+    return True
+
 # Connection failures to the node-local Service before the supervisor stops
 # using it, and how long it then waits before trying it again. One is enough:
 # the Service has no endpoint only while this node has no ready api pod.
@@ -173,7 +242,7 @@ def note_local_api_result(url: str, ok: bool) -> None:
     ``ok`` is True for any HTTP answer (even a 5xx: the pod is there) and
     False for a connection-level failure. Calls to any other URL are ignored.
     """
-    if not url.startswith(_IN_CLUSTER_NODE_LOCAL_URL):
+    if not url.startswith(_LOCAL_URLS):
         return
     if ok:
         if _local_api["failures"] >= _LOCAL_API_FAIL_THRESHOLD:
@@ -217,7 +286,8 @@ def _effective_control_plane_url(cfg: SupervisorConfig) -> str:
     """Resolve the heartbeat target.
 
     Cluster members talk to the api pod on their own node through the
-    node-local Service (#3645), so the plain-http hop never leaves the node.
+    node-local Service (#3645), over TLS against the pinned certificate (#4430;
+    plain http only inside the rolling-upgrade window, see ``_api_tls_active``).
     While that node has no ready api pod, they use the configured
     ``CONTROL_PLANE_URL``, which goes over https against the pinned
     certificate (``cp_tls``), never plain http across the node LAN. A
@@ -229,9 +299,12 @@ def _effective_control_plane_url(cfg: SupervisorConfig) -> str:
     """
     if not _is_control_plane_member():
         return cfg.control_plane_url
+    tls = _api_tls_active(cfg)
     if _local_api_usable():
-        return _IN_CLUSTER_NODE_LOCAL_URL
-    fallback = cfg.control_plane_url or _IN_CLUSTER_CONTROL_PLANE_URL
+        return _IN_CLUSTER_NODE_LOCAL_TLS_URL if tls else _IN_CLUSTER_NODE_LOCAL_URL
+    fallback = cfg.control_plane_url or (
+        _IN_CLUSTER_CONTROL_PLANE_TLS_URL if tls else _IN_CLUSTER_CONTROL_PLANE_URL
+    )
     if not _local_api["fallback_logged"]:
         _local_api["fallback_logged"] = True
         log.warning("supervisor.control_plane.node_local_unavailable", fallback=fallback)
@@ -1554,22 +1627,47 @@ def heartbeat_once(
 
     read_timeout = float(hold_s) + 10.0
     resp = None
-    # Two attempts at most: the node-local Service, then (when that had no
-    # answer) the fallback target, in the same call so a node whose api pod is
-    # away loses one connect timeout, not a whole heartbeat interval.
+    # Three attempts at most: the node-local Service over TLS, then (on a node
+    # whose api predates the TLS listener, #4430) the same Service over http,
+    # then (when that had no answer) the fallback target, in the same call so a
+    # node whose api pod is away loses one connect timeout, not a whole
+    # heartbeat interval.
     send = client
     retry_client: httpx.Client | None = None
-    for _attempt in range(2):
+    for _attempt in range(3):
         timeout = httpx.Timeout(read_timeout)
-        if url.startswith(_IN_CLUSTER_NODE_LOCAL_URL):
+        if url.startswith(_LOCAL_URLS):
             timeout = httpx.Timeout(read_timeout, connect=_LOCAL_API_CONNECT_TIMEOUT_S)
         try:
             resp = send.post(url, content=body_bytes, headers=headers, timeout=timeout)
         except httpx.HTTPError as exc:
+            # #4430 — a TLS attempt that could not CONNECT, before any TLS
+            # heartbeat has ever worked here, is an api without the listener
+            # (mid rolling upgrade), not a node without an api pod: retry the
+            # same Service over http and do not count it against the Service.
+            # A verification failure is never that (handled just below).
+            if (
+                url.startswith(_CLUSTER_TLS_URLS)
+                and not cp_tls.is_verification_failure(exc)
+                and not isinstance(exc, httpx.ReadTimeout)
+                and _note_api_tls_missing(cfg)
+            ):
+                log.warning("supervisor.heartbeat.failed", error=str(exc))
+                url = _effective_control_plane_url(cfg).rstrip("/") + url_path
+                if retry_client is not None:
+                    retry_client.close()
+                retry_client = _fallback_client(cfg, url)
+                if retry_client is None:
+                    return None
+                send = retry_client
+                continue
             # A read timeout means an api pod took the request; anything else
             # (refused, connect timeout, no endpoint, DNS) means the node-local
             # Service has none.
-            note_local_api_result(url, isinstance(exc, httpx.ReadTimeout))
+            # (A certificate failure did reach one, #4430: not "down".)
+            note_local_api_result(
+                url, isinstance(exc, httpx.ReadTimeout) or cp_tls.is_verification_failure(exc)
+            )
             # Transient network / DNS / timeout — don't count toward
             # revocation strikes. The control plane is unreachable, not
             # rejecting us; once it comes back the 200 path resumes.
@@ -1578,7 +1676,7 @@ def heartbeat_once(
             # pinned one. Re-pin if its CA vouches for the new one (a rotation),
             # refuse if not (an interception). The next heartbeat uses the result.
             if cp_tls.is_verification_failure(exc):
-                cp_tls.try_repin(cfg.state_dir, _effective_control_plane_url(cfg))
+                cp_tls.try_repin(cfg.state_dir, url)
                 if retry_client is not None:
                     retry_client.close()
                 return None
@@ -1599,6 +1697,8 @@ def heartbeat_once(
             send = retry_client
             continue
         note_local_api_result(url, True)
+        if url.startswith(_CLUSTER_TLS_URLS):
+            _note_api_tls_ok(cfg)
         break
     if retry_client is not None:
         retry_client.close()

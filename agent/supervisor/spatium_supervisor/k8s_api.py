@@ -2874,7 +2874,10 @@ def apply_control_plane_overrides(
             # #2156 — the pool per api pod shrinks as pods are added, so the
             # connections Postgres' limit is sized for are all it can be sent.
             | {"databasePool": api_db_pool(cp_size)}
-            | {"service": {"trafficDistribution": _NODE_LOCAL_API, "nodeLocal": True}},
+            | {"service": {"trafficDistribution": _NODE_LOCAL_API, "nodeLocal": True}}
+            # #4430 — the TLS sidecar the supervisors' heartbeats use; written
+            # with ``service`` and rendered by firstboot too (#1005).
+            | {"tlsListener": {"enabled": True}},
             "frontend": dict(scaled)
             | {
                 "controlPlaneVIP": vip,

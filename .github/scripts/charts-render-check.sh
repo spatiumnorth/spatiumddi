@@ -266,6 +266,7 @@ UMBRELLA_ALL_ON=(
     --set api.serviceControlRBAC.enabled=true
     --set api.upgradeOrchestratorRBAC.enabled=true
     --set api.applianceHostMounts.enabled=true
+    --set api.tlsListener.enabled=true
     --set frontend.tls.enabled=true
     --set redis.auth.enabled=true
 )
@@ -536,6 +537,7 @@ APPLIANCE_CP_HARD=(
     --set frontend.hostNetwork=true
     --set api.service.trafficDistribution=PreferSameNode
     --set api.service.nodeLocal=true
+    --set api.tlsListener.enabled=true
     --set api.autoscaling.enabled=false
 )
 for n in 1 3; do
