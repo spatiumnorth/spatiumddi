@@ -33,7 +33,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import structlog
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.alerts import AlertEvent, AlertRule
@@ -352,16 +352,17 @@ async def emit_upgrade_failed_alert(
     # failure: the earlier event is resolved first, rather than the insert
     # tripping the index and taking the orchestrator's transaction with it.
     now = datetime.now(UTC)
-    await db.execute(
-        update(AlertEvent)
-        .where(
+    stale = await db.execute(
+        select(AlertEvent).where(
             AlertEvent.rule_id == rule.id,
             AlertEvent.subject_type == "system_upgrade_run",
             AlertEvent.subject_id == str(run.id),
             AlertEvent.resolved_at.is_(None),
         )
-        .values(resolved_at=now)
     )
+    for stale_event in stale.scalars().all():
+        # ORM write, not a bulk UPDATE, so ``alert.resolved`` is published (#2145).
+        stale_event.resolved_at = now
     evt = AlertEvent(
         rule_id=rule.id,
         subject_type="system_upgrade_run",
