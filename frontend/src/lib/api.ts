@@ -6527,6 +6527,9 @@ export interface ZoneDnssecInfo {
   dnssec_policy_id: string | null;
   dnssec_ds_records: string[];
   dnssec_synced_at: string | null;
+  // #4566 — when the DS set replaced an earlier one (keys regenerated or
+  // rolled on the server); null for the first DS after signing.
+  dnssec_ds_changed_at?: string | null;
   keys: DNSKeyState[];
   // #1762 — see Zone.dnssec_multi_signer; signing_servers is the group's count.
   dnssec_multi_signer?: boolean;
@@ -6918,6 +6921,12 @@ export const dnsApi = {
   unsignZoneDnssec: (groupId: string, zoneId: string) =>
     api
       .post<DNSZone>(`/dns/groups/${groupId}/zones/${zoneId}/dnssec/unsign`)
+      .then((r) => r.data),
+  ackZoneDnssecDsChange: (groupId: string, zoneId: string) =>
+    api
+      .post<ZoneDnssecInfo>(
+        `/dns/groups/${groupId}/zones/${zoneId}/dnssec/ack-ds-change`,
+      )
       .then((r) => r.data),
   rolloverZoneDnssecKey: (groupId: string, zoneId: string, keyTag: number) =>
     api
