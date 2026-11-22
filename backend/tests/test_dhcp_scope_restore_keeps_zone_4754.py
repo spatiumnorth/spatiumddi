@@ -127,3 +127,58 @@ async def test_restore_falls_back_with_a_warning_when_the_zone_is_gone(
         )
     ).scalar_one()
     assert row.forward_zone_id != zb_id
+
+
+@pytest.mark.asyncio
+async def test_restore_of_a_snapshot_from_an_older_build_and_a_duplicate_extra_zone(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    from app.models.dhcp import DHCPStaticAssignment
+
+    h = {"Authorization": f"Bearer {await _superadmin_token(db_session)}"}
+    subnet, scope, zb, _zc = await _setup(db_session)
+    scope_id, subnet_id, zb_id = scope.id, subnet.id, zb.id
+
+    r = await client.delete(f"/api/v1/dhcp/scopes/{scope_id}", headers=h)
+    assert r.status_code == 204, r.text
+    await db_session.commit()
+    st = (
+        await db_session.execute(
+            select(DHCPStaticAssignment)
+            .where(DHCPStaticAssignment.scope_id == scope_id)
+            .execution_options(include_deleted=True)
+        )
+    ).scalar_one()
+    snap = dict(st.ipam_metadata_snapshot or {})
+    assert snap.get("forward_zone_id") == str(zb_id)
+    # A snapshot a 1.0.1 build wrote has neither zone key.
+    st.ipam_metadata_snapshot = {
+        k: v for k, v in snap.items() if k not in ("forward_zone_id", "extra_zone_ids")
+    } or None
+    await db_session.commit()
+
+    r = await client.post(f"/api/v1/admin/trash/dhcp_scope/{scope_id}/restore", headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["warnings"] == []
+    db_session.expire_all()
+    row = (
+        await db_session.execute(
+            select(IPAddress).where(IPAddress.subnet_id == subnet_id, IPAddress.address == OLD)
+        )
+    ).scalar_one()
+    assert row.forward_zone_id != zb_id  # the subnet's zone, as before this fix
+    assert row.extra_zone_ids == []
+
+    # An extra zone equal to the primary zone is not kept twice.
+    from app.services.dhcp.static_ipam import _restore_zone_binding
+
+    row.forward_zone_id = None
+    await _restore_zone_binding(
+        db_session,
+        row,
+        await db_session.get(type(subnet), subnet_id),
+        {"forward_zone_id": str(zb_id), "extra_zone_ids": [str(zb_id)]},
+        [],
+    )
+    assert row.forward_zone_id == zb_id
+    assert row.extra_zone_ids == []
