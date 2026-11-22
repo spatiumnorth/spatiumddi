@@ -484,3 +484,47 @@ def test_entrypoint_reowns_old_release_state_names_as_root_before_dropping_privi
     assert "-type d" in m.group(0) and "-xdev" in m.group(0)
     assert "-execdir chown -h 10001:10001" in m.group(0)
     assert code.index(m.group(0)[:40]) < code.index("exec su-exec spatium")
+
+
+def _storage_block(root: Path) -> str:
+    """The entrypoint's storage/ request-directory block, pointed at ``root``."""
+    text = _read(SUPERVISOR_ENTRYPOINT)
+    start = text.index("# The storage-action request directory")
+    block = text[start : text.index("\nfi\n", text.index("_sd=", start)) + 4]
+    return block.replace("/var/lib/spatiumddi-host/release-state", str(root))
+
+
+@needs_bash
+@pytest.mark.parametrize("planted", ["missing", "old_755", "symlink"])
+def test_entrypoint_makes_storage_request_dir_writable_by_both_supervisors(
+    tmp_path: Path, planted: str
+) -> None:
+    """After a rollback the previous supervisor (another uid, same host group)
+    must still be able to queue a storage request: the directory is group
+    writable and setgid, and corrected on every start."""
+    root = tmp_path / "release-state"
+    root.mkdir()
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    victim.chmod(0o755)
+    sd = root / "storage"
+    if planted == "old_755":
+        sd.mkdir()
+        sd.chmod(0o755)
+    elif planted == "symlink":
+        sd.symlink_to(victim)
+    stubs = tmp_path / "stubs"
+    stubs.mkdir()
+    # Unprivileged run: record the chown instead of performing it.
+    (stubs / "chown").write_text(f'#!/bin/sh\necho "$@" >> {tmp_path}/chown.log\n')
+    (stubs / "chown").chmod(0o755)
+    script = tmp_path / "blk.sh"
+    script.write_text("set -eu\n" + _storage_block(root))
+    env = {**os.environ, "PATH": f"{stubs}:{os.environ['PATH']}"}
+    subprocess.run(["sh", str(script)], check=True, env=env)
+    assert sd.is_dir() and not sd.is_symlink()
+    mode = stat.S_IMODE(sd.stat().st_mode)
+    assert mode == 0o2770, oct(mode)
+    assert (tmp_path / "chown.log").read_text().split() == [f"{SUPERVISOR_UID}:{HOST_GID}", "."]
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o755
+    assert not (tmp_path / "chown.log").read_text().count(str(victim))
