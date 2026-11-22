@@ -3382,9 +3382,14 @@ schema revision with the one that release was built with:
 When the older release cannot run on the database, the request is
 refused with a 409 whose `detail.code` is `schema_rollback_unsafe`,
 naming both revisions. The Fleet UI shows that as a confirmation. To go
-ahead anyway, resend with `acknowledge_schema_rollback: true`. Only do
-that if you will restore a copy of the database from before the
-upgrade. Data-plane appliances are never checked, because their release
+ahead anyway, resend with `acknowledge_schema_rollback: true`. That is
+**not** a way back to the older release: restoring a pre-upgrade backup
+afterwards is refused (below), because the older release's worker and
+beat would pass their migration wait while the restore is replaying and
+stay up on a schema they do not match, and no DNS change would reach the
+DNS servers again (#4678). The supported way back is to boot the newer
+release again and restore there; the restore migrates the old archive up
+to that release. Data-plane appliances are never checked, because their release
 does not touch the database. Pointing a node at the slot it already
 runs, which commits a trial boot, is not checked either.
 
@@ -3401,6 +3406,18 @@ version against its own head would let the next rollback to it through.
 A release in neither, such as an older nightly, is reported as `unknown`, and the
 switch goes ahead: refusing on "don't know" would block every rollback
 on an install that never recorded anything.
+
+**Restoring while the host and the console are different releases.**
+After an acknowledged rollback the host is booted into the older slot,
+but the newer release's api keeps serving. `POST /api/v1/backup/restore`
+and `POST /api/v1/backup/targets/{id}/archives/restore` answer 409 with
+`detail.code` `restore_refused_mixed_release` in that state, and no
+acknowledgement lifts it. Boot the serving release again from the console
+(`spatium-upgrade-slot set-next-boot` and a reboot), then restore. A
+restore also holds an install-wide lock for its whole replay and migrate;
+the `wait-for-migrate` init container of api, worker and beat keeps
+waiting while it is held, even if the schema already reads their head.
+Pods of a release older than 1.0.1 do not have that check.
 
 **What is not covered.** The trial-boot auto-revert (step 8 above)
 happens on the host with no operator involved, so nothing can refuse
