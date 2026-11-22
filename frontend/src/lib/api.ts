@@ -9898,6 +9898,13 @@ export const dhcpApi = {
     api
       .put<DHCPClientClass>(`/dhcp/client-classes/${classId}`, data)
       .then((r) => r.data),
+  // #54 — stateless preview of an option 82 match_spec; writes nothing.
+  compileClientClassMatch: (match_spec: RelayMatchSpec) =>
+    api
+      .post<CompileMatchResult>("/dhcp/client-classes/compile-match", {
+        match_spec,
+      })
+      .then((r) => r.data),
   deleteClientClass: (_groupId: string, classId: string) =>
     api.delete(`/dhcp/client-classes/${classId}`),
 
@@ -10337,6 +10344,37 @@ export interface RAConfigPreview {
   radvd_conf: string;
 }
 
+// #54 — relay agent (option 82) match. `value` is absent for the existence
+// ops and `offset` is only for `slice`.
+export type RelayMatchOp =
+  | "exists"
+  | "not_exists"
+  | "equals"
+  | "not_equals"
+  | "starts_with"
+  | "ends_with"
+  | "slice";
+
+export interface RelayMatchCondition {
+  sub_option: number;
+  op: RelayMatchOp;
+  encoding: "text" | "hex";
+  value?: string;
+  offset?: number;
+}
+
+export interface RelayMatchSpec {
+  kind: "relay_agent";
+  combine: "all" | "any";
+  conditions: RelayMatchCondition[];
+}
+
+export interface CompileMatchResult {
+  expression: string;
+  warnings: string[];
+  windows: { supported: boolean; reason: string };
+}
+
 export interface DHCPClientClass {
   id: string;
   // Under the group-centric model, classes belong to a server group —
@@ -10345,6 +10383,9 @@ export interface DHCPClientClass {
   name: string;
   description: string;
   match_expression: string;
+  // Structured option 82 match (#54). When set, `match_expression` is the
+  // server-compiled test; null means a hand-written expression.
+  match_spec?: RelayMatchSpec | null;
   // Which Kea daemons the class renders into (#1229). A `dual` class sends
   // each option to whichever family it is valid in.
   address_family: "ipv4" | "ipv6" | "dual";

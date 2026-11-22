@@ -874,6 +874,16 @@ class-restricted pool is NAKed (measured on Kea 3.0.3). Turning these on from
 the class is tracked separately; until it ships, a group that depends on an
 option 82 pool restriction needs both set in its Kea configuration.
 
+**In the UI.** The client class dialog has an Expression / Relay agent
+(option 82) switch. The builder offers the named sub-options (1 circuit-id,
+2 remote-id, 6 subscriber-id, 12 relay-id) or any code from 1 to 255, the
+operators above, a text or hex value, and an all / any combine, with a live
+preview of the compiled Kea test from `compile-match` (the server's refusal is
+shown inline). Switching a saved builder class to Expression asks for
+confirmation and saves it as a hand-written class (`match_spec: null`);
+builder classes carry an "Option 82" badge in the Client Classes tab. A
+Windows-only group refuses the save with the server's 422 message.
+
 The Copilot can read these (`list_dhcp_client_classes` returns `match_spec`,
 `count_dhcp_client_classes`) and stage one with
 `propose_create_dhcp_client_class`; the operator's Apply performs the write

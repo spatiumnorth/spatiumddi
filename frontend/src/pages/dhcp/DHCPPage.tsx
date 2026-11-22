@@ -2302,7 +2302,14 @@ export function ClientClassesTab({ groupId }: { groupId: string }) {
               <tbody className={zebraBodyCls}>
                 {classes.map((c) => (
                   <tr key={c.id} className="border-b last:border-0">
-                    <td className="px-3 py-2 font-medium">{c.name}</td>
+                    <td className="px-3 py-2 font-medium">
+                      {c.name}
+                      {c.match_spec && (
+                        <span className="ml-2 rounded-full border px-1.5 py-0.5 text-[10px] font-normal text-muted-foreground">
+                          Option 82
+                        </span>
+                      )}
+                    </td>
                     <td className="px-3 py-2 text-muted-foreground">
                       {c.description}
                     </td>
