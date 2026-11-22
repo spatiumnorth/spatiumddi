@@ -57,6 +57,7 @@ def _ready_branch() -> str:
 
 STUB = """#!/bin/sh
 d="$(dirname "$0")"
+if [ -f "$d/cost" ]; then echo $(( $(cat "$d/clock") + $(cat "$d/cost") )) > "$d/clock"; fi
 case "$*" in
   *"get deployment"*) n=$(cat "$d/dcalls" 2>/dev/null || echo 0); echo $((n + 1)) > "$d/dcalls"
       if [ "$n" -ge "$(cat "$d/after")" ]; then cat "$d/img_new"; else cat "$d/img_old"; fi ;;
@@ -69,7 +70,18 @@ exit 0
 """
 
 
-def _run(tmp_path, shell, *, after, trial=True, released=1, migrate=None, jobs_gone_after=None):
+def _run(
+    tmp_path,
+    shell,
+    *,
+    after,
+    trial=True,
+    released=1,
+    migrate=None,
+    jobs_gone_after=None,
+    record=False,
+    cost=0,
+):
     """after: k3s calls before the api shows the new tag (99 = never)."""
     k3s = tmp_path / "k3s"
     k3s.write_text(STUB)
@@ -90,6 +102,11 @@ def _run(tmp_path, shell, *, after, trial=True, released=1, migrate=None, jobs_g
     if jobs_gone_after is not None:
         (tmp_path / "jobs_gone_after").write_text(str(jobs_gone_after))
     flag = tmp_path / "flag"
+    if record:
+        flag.write_text("{}")
+    (tmp_path / "clock").write_text("0")
+    if cost:
+        (tmp_path / "cost").write_text(str(cost))
     fns = "\n".join(
         _function(n)
         for n in (
@@ -111,10 +128,12 @@ CONTROL_NOT_CONVERGED_FILE="{flag}"
 CONTROL_CHART_RELEASED={released}
 CONTROL_MIGRATE_SEEN=0
 SPATIUM_HOST_GID=$(id -g)
+CONTROL_STEADY_WAIT_S=3
 uptime_s() {{ echo 0; }}
-sleep() {{ :; }}
+sleep() {{ echo $(( $(cat "{tmp_path}/clock") + $1 )) > "{tmp_path}/clock"; }}
 is_trial_boot() {{ return {0 if trial else 1}; }}
 {fns.replace(K3S, str(k3s))}
+control_now_s() {{ cat "{tmp_path}/clock"; }}
 control_converged_allow_commit
 """
     proc = subprocess.run([shell, "-c", script], capture_output=True, text=True, check=False)
@@ -201,3 +220,37 @@ def test_only_a_live_chart_marks_this_node_as_the_one_to_wait() -> None:
     fn = _function("place_deferred_control_manifest")
     assert "CONTROL_CHART_RELEASED=1" in fn
     assert '[ ! -f "$CONTROL_MANIFEST_HELD" ]' in fn
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_a_steady_boot_waits_for_the_api_and_clears_the_record(tmp_path, shell) -> None:
+    proc, flag, d = _run(tmp_path, shell, after=2, trial=False, record=True)
+    assert proc.returncode == 0, proc.stderr
+    assert "Control chart applied" in proc.stdout
+    assert not flag.exists(), "the record outlived a converged api"
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_a_steady_boot_keeps_the_record_when_the_api_never_converges(tmp_path, shell) -> None:
+    proc, flag, _ = _run(tmp_path, shell, after=99, trial=False, record=True)
+    assert proc.returncode == 0, proc.stderr
+    assert flag.exists()
+    assert "NOT committing" not in proc.stderr
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_a_steady_boot_without_a_record_still_never_waits(tmp_path, shell) -> None:
+    proc, flag, d = _run(tmp_path, shell, after=99, trial=False, record=False)
+    assert proc.returncode == 0, proc.stderr
+    assert int((d / "dcalls").read_text()) == 1, "polled with nothing to clear"
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize("trial", [True, False])
+def test_the_wait_is_measured_against_the_clock(tmp_path, shell, trial) -> None:
+    # Budget 3 s, poll 1 s, every kubectl call costs 2 s: counting polls would
+    # loop three times; the clock says stop after the first.
+    proc, flag, d = _run(tmp_path, shell, after=99, trial=trial, record=True, cost=2)
+    assert proc.returncode == (1 if trial else 0), proc.stderr
+    assert int((d / "dcalls").read_text()) <= 2, "kept polling past the deadline"
+    assert int((d / "clock").read_text()) <= 3 + 1 + 4 * 2
