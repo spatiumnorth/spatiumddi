@@ -433,3 +433,68 @@ async def test_a_nul_in_text_is_a_clean_422_not_a_storage_error(
     r = await client.post(_url(grp), json={"name": "p", "match_spec": spec}, headers=h)
     assert r.status_code == 422
     assert "hex" in str(r.json())
+
+
+# ── a non-Kea server joining a group that holds option 82 classes ────────────
+
+
+async def test_a_windows_server_cannot_join_a_group_with_an_option82_class(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The class API refuses a spec on a Windows-only group; the same rule has to
+    hold when the Windows server arrives after the class (create and move)."""
+    h = await _headers(db_session)
+    grp = await _group(db_session)  # empty: the class is allowed
+    await _create(client, h, grp, match_spec=SPEC)
+    body = {
+        "name": "w1",
+        "driver": "windows_dhcp",
+        "host": "10.9.9.9",
+        "server_group_id": str(grp.id),
+        "windows_credentials": {"username": "u", "password": "p"},
+    }
+    r = await client.post("/api/v1/dhcp/servers", json=body, headers=h)
+    assert r.status_code == 422, r.text
+    assert "option 82" in r.json()["detail"]
+
+    # Move: an existing Windows server in another group cannot be moved in.
+    other = await _group(db_session, "windows_dhcp")
+    srv = (
+        await db_session.execute(select(DHCPServer).where(DHCPServer.server_group_id == other.id))
+    ).scalar_one()
+    r = await client.put(
+        f"/api/v1/dhcp/servers/{srv.id}", json={"server_group_id": str(grp.id)}, headers=h
+    )
+    assert r.status_code == 422, r.text
+    assert "option 82" in r.json()["detail"]
+
+    # A Kea server, and a group with only hand-written classes, are unaffected.
+    kea = {**body, "name": "k1", "driver": "kea"}
+    kea.pop("windows_credentials")
+    assert (await client.post("/api/v1/dhcp/servers", json=kea, headers=h)).status_code == 201
+    plain = await _group(db_session)
+    await _create(client, h, plain, match_expression="pkt4.mac == 0x01")
+    ok = {**body, "name": "w2", "server_group_id": str(plain.id)}
+    r = await client.post("/api/v1/dhcp/servers", json=ok, headers=h)
+    assert "option 82" not in r.text, r.text
+
+
+async def test_no_spec_is_sql_null_not_json_null(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A JSONB ``None`` is stored as the JSON value ``null`` unless the column says
+    ``none_as_null``; ``IS NOT NULL`` (the option 82 filters) then counts every class."""
+    h = await _headers(db_session)
+    grp = await _group(db_session, "kea")
+    await _create(client, h, grp, name="plain", match_expression="pkt4.mac == 0x01")
+    built = await _create(client, h, grp, name="built", match_spec=SPEC)
+    await client.put(
+        f"/api/v1/dhcp/client-classes/{built['id']}", json={"match_spec": None}, headers=h
+    )
+    db_session.expire_all()
+    n = (
+        await db_session.execute(
+            select(DHCPClientClass.id).where(DHCPClientClass.match_spec.is_not(None))
+        )
+    ).all()
+    assert n == []

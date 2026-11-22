@@ -40,7 +40,14 @@ from app.drivers.dhcp.registry import _DRIVERS as _DHCP_DRIVERS
 from app.drivers.dhcp.registry import CLOUD_DHCP_DRIVERS, get_driver
 from app.drivers.dhcp.windows import test_winrm_credentials
 from app.models.audit import AuditLog
-from app.models.dhcp import DHCPConfigOp, DHCPLease, DHCPMACBlock, DHCPScope, DHCPServer
+from app.models.dhcp import (
+    DHCPClientClass,
+    DHCPConfigOp,
+    DHCPLease,
+    DHCPMACBlock,
+    DHCPScope,
+    DHCPServer,
+)
 from app.models.ipam import Subnet
 from app.models.metrics import DHCPMetricSample
 from app.services.agents.container_oom import daemon_reported_by
@@ -588,6 +595,42 @@ async def _assert_no_v6_scopes_for_windows(db: DB, group_id: uuid.UUID | None, d
         )
 
 
+async def _assert_no_relay_classes_for_non_kea(
+    db: DB, group_id: uuid.UUID | None, driver: str
+) -> None:
+    """422 when a non-Kea server would join a group holding option 82 classes (#54).
+
+    The class API refuses an option 82 ``match_spec`` in a group whose servers
+    are all non-Kea; this is the other direction, a Windows or FortiGate server
+    joining (or an existing server being moved into, or re-driven in) a group
+    that already holds one, which would leave a class nothing renders."""
+    if group_id is None or driver == "kea":
+        return
+    names = (
+        (
+            await db.execute(
+                select(DHCPClientClass.name)
+                .where(
+                    DHCPClientClass.group_id == group_id,
+                    DHCPClientClass.match_spec.is_not(None),
+                )
+                .limit(5)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if names:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "This group has client classes built from an option 82 match "
+                f"({', '.join(names)}), which only Kea renders, so a {driver} server could "
+                "not apply them. Delete those classes or use another group."
+            ),
+        )
+
+
 async def _assert_driver_mix_allowed(
     db: DB, group_id: uuid.UUID | None, driver: str, *, exclude_server_id: uuid.UUID | None = None
 ) -> None:
@@ -630,6 +673,7 @@ async def create_server(body: ServerCreate, db: DB, user: SuperAdmin) -> ServerR
     await _assert_driver_mix_allowed(db, body.server_group_id, body.driver)
     await _assert_group_options_servable(db, body.server_group_id, body.driver)
     await _assert_no_v6_scopes_for_windows(db, body.server_group_id, body.driver)
+    await _assert_no_relay_classes_for_non_kea(db, body.server_group_id, body.driver)
     payload = body.model_dump(exclude={"windows_credentials", "cloud_credentials"})
     # Resolve the per-driver default port when the caller omitted it: cloud/REST
     # drivers (FortiGate) speak HTTPS on 443; agent/agentless DHCP daemons use 67.
@@ -733,6 +777,7 @@ async def update_server(
             db, target_group, target_driver, exclude_server_id=s.id
         )
         await _assert_no_v6_scopes_for_windows(db, target_group, target_driver)
+        await _assert_no_relay_classes_for_non_kea(db, target_group, target_driver)
     if target_group != s.server_group_id:
         # #2899 — a cluster node's Kea is behind the MetalLB relay VIP
         # Service; it cannot move into a ``direct`` group while a VIP is set.

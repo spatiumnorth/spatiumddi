@@ -73,6 +73,7 @@ async def move_appliance_dhcp_servers(
     (a preview) the appliance's current roles are the previous ones."""
     from app.api.v1.dhcp.servers import (  # noqa: PLC0415
         _assert_driver_mix_allowed,
+        _assert_no_relay_classes_for_non_kea,
         _assert_no_v6_scopes_for_windows,
     )
     from app.services.dhcp.relay_vip import appliance_join_refusal  # noqa: PLC0415
@@ -98,6 +99,7 @@ async def move_appliance_dhcp_servers(
             db, dhcp_group.id, dserver.driver, exclude_server_id=dserver.id
         )
         await _assert_no_v6_scopes_for_windows(db, dhcp_group.id, dserver.driver)
+        await _assert_no_relay_classes_for_non_kea(db, dhcp_group.id, dserver.driver)
         if dry_run:
             continue
         old_gid: uuid.UUID | None = dserver.server_group_id
