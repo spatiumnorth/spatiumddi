@@ -65,39 +65,52 @@ export function plainErrorComponents(source: string): string[] {
   return out;
 }
 
-// Sites the #4745 widening (rose text, error components) found and that were
-// not fixed with it: per file, how many. A ratchet: it may only shrink. Several
-// are page-level banners rather than dialogs and need a look before a role.
-const KNOWN_UNANNOUNCED: Record<string, number> = {
-  "components/copilot/CopilotDrawer.tsx": 1,
-  "pages/LogsPage.tsx": 1,
-  "pages/RequestsPage.tsx": 1,
-  "pages/admin/ApiTokensPage.tsx": 1,
-  "pages/admin/DNSBLPage.tsx": 1,
-  "pages/admin/UsersPage.tsx": 1,
-  "pages/appliance/CertificatesTab.tsx": 1,
-  "pages/appliance/ClusterOverview.tsx": 1,
-  "pages/appliance/ClusterUpgradeTab.tsx": 8,
-  "pages/appliance/EtcdSnapshotsCard.tsx": 2,
-  "pages/appliance/FleetTab.tsx": 16,
-  "pages/appliance/NetworkTab.tsx": 1,
-  "pages/appliance/PairingTab.tsx": 1,
-  "pages/appliance/UpgradeImagesTable.tsx": 1,
-  "pages/network/BgpFootprintTab.tsx": 1,
-  "pages/network/DeviceDetailView.tsx": 1,
-  "pages/pcap/PacketCapturePage.tsx": 2,
-  "pages/tools/NetworkToolsPage.tsx": 1,
+// Boxes that are stored or passive state, shown on page load rather than in
+// response to something the operator just did. A role="alert" there would be
+// announced on every load (FleetTab and ClusterUpgradeTab render many rows), so
+// they are exempt by name, with the reason. Everything else the scan finds must
+// carry a role (#4765).
+const STANDING_STATE: Record<string, { names: string[]; why: string }> = {
+  "pages/RequestsPage.tsx": {
+    names: ["r.error"],
+    why: "a failed request's stored reason, one per table row",
+  },
+  "pages/appliance/ClusterOverview.tsx": {
+    names: ["probeFailed"],
+    why: "the stored CoreDNS probe result, standing cluster health",
+  },
+  "pages/appliance/EtcdSnapshotsCard.tsx": {
+    names: ["failed && !inFlight"],
+    why: "the stored outcome of the last restore",
+  },
+  "pages/appliance/ClusterUpgradeTab.tsx": {
+    names: [
+      "progress.error",
+      "progress.release_failed",
+      "runError",
+      ".error",
+      "bump.error",
+      "FailureBanner",
+    ],
+    why: "stored upgrade-run progress, per node and per run",
+  },
+  "pages/appliance/FleetTab.tsx": {
+    names: ["PortConflictBanner", "RoleSwitchStateBanner"],
+    why: "a node's standing port-conflict and role-switch state, per row",
+  },
 };
 
 const found = new Map<string, string[]>();
+const exempted = new Map<string, string[]>();
 for (const f of files(SRC)) {
   const rel = relative(SRC, f);
   const text = readFileSync(f, "utf8");
-  const hits = [
-    ...plainRefusalBoxes(text, true),
-    ...plainErrorComponents(text),
-  ];
+  const all = [...plainRefusalBoxes(text, true), ...plainErrorComponents(text)];
+  const skip = STANDING_STATE[rel]?.names ?? [];
+  const hits = all.filter((h) => !skip.includes(h));
   if (hits.length) found.set(rel, hits);
+  const ex = all.filter((h) => skip.includes(h));
+  if (ex.length) exempted.set(rel, ex);
 }
 
 describe("dialog refusals are announced (#3821)", () => {
@@ -132,13 +145,18 @@ describe("dialog refusals are announced (#3821)", () => {
     ).toEqual([]);
   });
 
-  it("no dialog draws a new plain refusal box", () => {
-    const counts = Object.fromEntries(
-      [...found].map(([f, hits]) => [f, hits.length]).sort(),
-    );
+  it("no error or refusal box is drawn without a role", () => {
     expect(
-      counts,
-      "use <FormError> from components/ui/form-error (or role=alert) instead of a plain red box; do not add to KNOWN_UNANNOUNCED",
-    ).toEqual(KNOWN_UNANNOUNCED);
+      Object.fromEntries(found),
+      "use <FormError> from components/ui/form-error (or role=alert) for a refusal; a stored state needs an entry in STANDING_STATE with a reason",
+    ).toEqual({});
+  });
+
+  it("every standing-state exemption still matches a box", () => {
+    for (const [file, { names }] of Object.entries(STANDING_STATE)) {
+      expect(exempted.get(file)?.slice().sort(), file).toEqual(
+        names.slice().sort(),
+      );
+    }
   });
 });

@@ -282,7 +282,9 @@ export function DNSBLPage() {
           </button>
         </div>
         {pinError && (
-          <div className="mb-2 text-xs text-rose-600">{pinError}</div>
+          <div role="alert" className="mb-2 text-xs text-rose-600">
+            {pinError}
+          </div>
         )}
         <ul className="divide-y rounded border text-sm">
           {pinned.length === 0 && (

@@ -1151,7 +1151,10 @@ function TestResultBanner({ result }: { result: NetworkTestConnectionResult }) {
     );
   }
   return (
-    <div className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+    <div
+      role="alert"
+      className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+    >
       <XCircle className="mt-0.5 h-4 w-4 flex-shrink-0" />
       <div className="space-y-0.5">
         <div className="font-medium">

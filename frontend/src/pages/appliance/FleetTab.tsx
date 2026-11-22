@@ -522,7 +522,10 @@ function PromotionProgressModal({
             certificate.
           </p>
         ) : anyFailed ? (
-          <p className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-rose-700 dark:text-rose-300">
+          <p
+            role="alert"
+            className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-rose-700 dark:text-rose-300"
+          >
             A node failed to join — check the Fleet list / supervisor logs. You
             can reload to refresh the view.
           </p>
@@ -723,7 +726,7 @@ function ClusterMembershipModal({
               </p>
             )}
             {promote.error && (
-              <p className="text-xs text-rose-500">
+              <p role="alert" className="text-xs text-rose-500">
                 {formatApiError(promote.error)}
               </p>
             )}
@@ -775,7 +778,7 @@ function ClusterMembershipModal({
               </p>
             )}
             {demote.error && (
-              <p className="text-xs text-rose-500">
+              <p role="alert" className="text-xs text-rose-500">
                 {formatApiError(demote.error)}
               </p>
             )}
@@ -1586,7 +1589,10 @@ export function FleetTab({
               )}
 
               {error ? (
-                <div className="rounded-md border border-rose-500/40 bg-rose-500/10 p-3 text-sm text-rose-700 dark:text-rose-300">
+                <div
+                  role="alert"
+                  className="rounded-md border border-rose-500/40 bg-rose-500/10 p-3 text-sm text-rose-700 dark:text-rose-300"
+                >
                   Failed to load appliances: {formatApiError(error)}
                 </div>
               ) : isLoading ? (
@@ -1911,7 +1917,7 @@ export function FleetTab({
                 cluster…" instead.
               </p>
               {replace.isError && (
-                <p className="mt-2 text-xs text-rose-600">
+                <p role="alert" className="mt-2 text-xs text-rose-600">
                   {formatApiError(replace.error)}
                 </p>
               )}
@@ -1964,7 +1970,7 @@ export function FleetTab({
                 appliance if the node is gone for good.
               </p>
               {clearClusterState.isError && (
-                <p className="mt-2 text-xs text-rose-600">
+                <p role="alert" className="mt-2 text-xs text-rose-600">
                   {formatApiError(clearClusterState.error)}
                 </p>
               )}
@@ -3407,7 +3413,10 @@ function StorageActionModal({
         )}
 
         {error && (
-          <p className="rounded-md border border-rose-500/40 bg-rose-500/10 px-2 py-1.5 text-xs text-rose-700 dark:text-rose-300">
+          <p
+            role="alert"
+            className="rounded-md border border-rose-500/40 bg-rose-500/10 px-2 py-1.5 text-xs text-rose-700 dark:text-rose-300"
+          >
             {error}
           </p>
         )}
@@ -4657,7 +4666,10 @@ export function PodLogsModal({
             Refresh
           </button>
           {logsQuery.error && (
-            <span className="text-[11px] text-rose-700 dark:text-rose-300">
+            <span
+              role="alert"
+              className="text-[11px] text-rose-700 dark:text-rose-300"
+            >
               {formatApiError(logsQuery.error)}
             </span>
           )}
@@ -4756,7 +4768,7 @@ function KubeapiCidrEditorModal({
           className="w-full rounded-md border bg-background px-2 py-1 font-mono text-xs"
         />
         {save.error && (
-          <p className="text-xs text-rose-700 dark:text-rose-300">
+          <p role="alert" className="text-xs text-rose-700 dark:text-rose-300">
             {formatApiError(save.error)}
           </p>
         )}
@@ -4833,7 +4845,7 @@ function RestartWorkloadModal({
           </p>
         )}
         {workloads.error && (
-          <p className="text-xs text-rose-700 dark:text-rose-300">
+          <p role="alert" className="text-xs text-rose-700 dark:text-rose-300">
             {formatApiError(workloads.error)}
           </p>
         )}
@@ -4894,7 +4906,7 @@ function RestartWorkloadModal({
           </div>
         )}
         {restart.error && (
-          <p className="text-xs text-rose-700 dark:text-rose-300">
+          <p role="alert" className="text-xs text-rose-700 dark:text-rose-300">
             {formatApiError(restart.error)}
           </p>
         )}
@@ -5007,7 +5019,10 @@ function RevealKubeconfigModal({
               </button>
             </div>
             {reveal.error && (
-              <p className="text-xs text-rose-700 dark:text-rose-300">
+              <p
+                role="alert"
+                className="text-xs text-rose-700 dark:text-rose-300"
+              >
                 {formatApiError(reveal.error)}
               </p>
             )}
@@ -5396,7 +5411,10 @@ export function ApplianceRoleAssignmentSection({
           </span>
         )}
         {save.error && (
-          <span className="text-xs text-rose-700 dark:text-rose-300">
+          <span
+            role="alert"
+            className="text-xs text-rose-700 dark:text-rose-300"
+          >
             {formatApiError(save.error)}
           </span>
         )}
@@ -6396,7 +6414,10 @@ function ApplianceOsUpgradeSection({
             Reboot host
           </button>
           {reboot.error && (
-            <span className="text-xs text-rose-700 dark:text-rose-300">
+            <span
+              role="alert"
+              className="text-xs text-rose-700 dark:text-rose-300"
+            >
               {formatApiError(reboot.error)}
             </span>
           )}
