@@ -667,7 +667,7 @@ export function GenerateCodeModal({
   );
 }
 
-function GeneratedView({
+export function GeneratedView({
   code,
   onClose,
   onCopied,
@@ -724,6 +724,21 @@ function GeneratedView({
           )}
         </button>
       </div>
+      {code.warning && (
+        <div
+          role="alert"
+          className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-400"
+        >
+          {code.warning}{" "}
+          <button
+            type="button"
+            onClick={onClose}
+            className="font-medium underline"
+          >
+            Go to the registration setting
+          </button>
+        </div>
+      )}
       {code.expires_at && (
         <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
           <Clock className="h-3 w-3" />

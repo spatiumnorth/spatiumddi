@@ -95,6 +95,7 @@ import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
 import { FreshRowError } from "@/components/FreshRowError";
 import {
   NEEDS_SUPERADMIN,
+  disabledBecause,
   permissionGate,
   usePermissions,
 } from "@/hooks/usePermissions";
@@ -158,6 +159,7 @@ import {
   recordOwnerError,
   zoneKindForName,
 } from "@/lib/dnsNames";
+import { viewsUnsupportedReason } from "@/lib/dns-views";
 import { useTableSort, SortableTh } from "@/lib/useTableSort";
 import {
   ZONE_FORWARD_TRANSPORT_LABELS,
@@ -193,6 +195,7 @@ import {
   CHANGE_REQUEST_QUERY_KEY,
   handleApprovalQueued,
 } from "@/lib/approvalQueue";
+import { countNoun } from "@/lib/count-noun";
 
 // #1338 — a read-only user is offered no DNS write it would be refused.
 // Each DNS route needs the HTTP method's action on the type it serves
@@ -2692,6 +2695,14 @@ function DnssecCard({
     },
     onError: (e: ApiError) => setError(formatApiError(e, "Unsign failed")),
   });
+  const ackDsMut = useMutation({
+    mutationFn: () => dnsApi.ackZoneDnssecDsChange(groupId, zoneId),
+    onSuccess: () => {
+      setError(null);
+      invalidate();
+    },
+    onError: (e: ApiError) => setError(formatApiError(e, "Acknowledge failed")),
+  });
   const rolloverMut = useMutation({
     mutationFn: (keyTag: number) =>
       dnsApi.rolloverZoneDnssecKey(groupId, zoneId, keyTag),
@@ -2705,6 +2716,7 @@ function DnssecCard({
   const enabled = info.data?.dnssec_enabled ?? initiallyEnabled;
   const dsRecords = info.data?.dnssec_ds_records ?? [];
   const syncedAt = info.data?.dnssec_synced_at ?? null;
+  const dsChangedAt = info.data?.dnssec_ds_changed_at ?? null;
   const keys = info.data?.keys ?? [];
   const multiSigner = info.data?.dnssec_multi_signer ?? false;
   const signingServers = info.data?.signing_servers ?? 0;
@@ -2732,7 +2744,7 @@ function DnssecCard({
           className="rounded border border-destructive/40 bg-destructive/10 p-2 text-xs text-destructive"
         >
           <span className="font-medium">
-            Signed by {signingServers} servers.
+            Signed by {countNoun(signingServers, "server")}.
           </span>{" "}
           Every server in this group signs the zone with its own keys, so the DS
           below matches at most one of them and validating resolvers get
@@ -2913,6 +2925,35 @@ function DnssecCard({
             </div>
           ) : (
             <ul className="space-y-1">
+              {/* #4566: the server generated new keys (a zone re-created
+                  after a lost volume or on a replaced node is signed again)
+                  or rolled them, so the parent holds a DS that is going
+                  stale. */}
+              {dsChangedAt && (
+                <li
+                  role="alert"
+                  className="rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-xs text-amber-700 dark:text-amber-300"
+                >
+                  <span className="font-medium">
+                    DS records changed{" "}
+                    <time dateTime={dsChangedAt}>
+                      {new Date(dsChangedAt).toLocaleString()}
+                    </time>
+                    .
+                  </span>{" "}
+                  The server&apos;s keys were regenerated or rolled. Publish the
+                  records below at the parent zone: validating resolvers fail
+                  the zone while the parent holds only the earlier DS.{" "}
+                  <button
+                    type="button"
+                    className="underline"
+                    disabled={ackDsMut.isPending}
+                    onClick={() => ackDsMut.mutate()}
+                  >
+                    I have published it
+                  </button>
+                </li>
+              )}
               {dsRecords.map((ds, idx) => (
                 <li
                   key={idx}
@@ -3010,6 +3051,8 @@ function ZoneModalForm({
   const groupDrivers =
     groupList?.find((g) => g.id === groupId)?.server_drivers ?? [];
   const technitiumApi = groupDrivers.includes("technitium_api");
+  // PowerDNS serves primary and secondary zones only (#4570).
+  const powerdns = groupDrivers.includes("powerdns");
   // #3087 — Type and TTL start from Settings → DNS (Default Zone Type /
   // Default Zone TTL) until the operator changes them. An existing zone
   // shows its own values. The settings read is best-effort: a role that
@@ -3033,7 +3076,7 @@ function ZoneModalForm({
   // stock TTL (above), so a stored default it would refuse is not offered.
   const zoneType =
     pickedZoneType ??
-    (technitiumApi
+    (technitiumApi || powerdns
       ? "primary"
       : (dnsDefaults?.dns_default_zone_type ?? "primary"));
   const setZoneType = setPickedZoneType;
@@ -3319,12 +3362,14 @@ function ZoneModalForm({
               {(!technitiumApi || zoneType === "secondary") && (
                 <option value="secondary">Secondary</option>
               )}
-              {(!technitiumApi || zoneType === "stub") && (
-                <option value="stub">Stub</option>
-              )}
-              {(!technitiumApi || zoneType === "forward") && (
-                <option value="forward">Forward</option>
-              )}
+              {(!technitiumApi || zoneType === "stub") &&
+                (!powerdns || zone?.zone_type === "stub") && (
+                  <option value="stub">Stub</option>
+                )}
+              {(!technitiumApi || zoneType === "forward") &&
+                (!powerdns || zone?.zone_type === "forward") && (
+                  <option value="forward">Forward</option>
+                )}
             </select>
           </Field>
           <Field label="Kind">
@@ -3902,6 +3947,13 @@ function RecordModalForm({
               required
             />
           )}
+          {type === "LUA" && (
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              LUA records are answered by PowerDNS servers only. A non-PowerDNS
+              secondary receives the record as an opaque type and cannot answer
+              it.
+            </p>
+          )}
           {isSrv && (
             <p className="mt-1 text-[11px] text-muted-foreground">
               Value is the <strong>target host</strong> only — set priority,
@@ -4254,7 +4306,9 @@ function MoveZoneModal({
       !!preview.tsig_algorithm_refusal ||
       !!preview.forward_transport_refusal ||
       !!preview.technitium_acl_refusal ||
-      !!preview.classless_refusal);
+      !!preview.classless_refusal ||
+      !!preview.powerdns_refusal ||
+      !!preview.views_refusal);
   const canSubmit =
     !!targetGroupId &&
     !!preview &&
@@ -4333,6 +4387,16 @@ function MoveZoneModal({
             {preview.classless_refusal && (
               <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
                 {preview.classless_refusal}
+              </div>
+            )}
+            {preview.powerdns_refusal && (
+              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+                {preview.powerdns_refusal}
+              </div>
+            )}
+            {preview.views_refusal && (
+              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+                {preview.views_refusal}
               </div>
             )}
             {preview.acl_names_lost.length > 0 && (
@@ -6029,14 +6093,14 @@ export function ZoneDetailView({
       )}
       {confirmBulkDelete && (
         <DeleteChoiceModal
-          title={`Delete ${selectedRecords.size} records`}
+          title={`Delete ${countNoun(selectedRecords.size, "record")}`}
           intro={
             <>
               Delete the{" "}
               <span className="font-medium">{selectedRecords.size}</span>{" "}
-              selected records? Moved to Trash, a superadmin can restore them
-              from Administration → Trash. IPAM-managed records are excluded
-              automatically.
+              selected {selectedRecords.size === 1 ? "record" : "records"}?
+              Moved to Trash, a superadmin can restore them from Administration
+              → Trash. IPAM-managed records are excluded automatically.
             </>
           }
           softHeading="Move to Trash (reversible)"
@@ -7046,10 +7110,10 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
   // a no-op on Windows / PowerDNS / cloud, and Technitium blocks natively
   // with no per-view concept. Saying so here beats an operator scoping a
   // list to a view and waiting for filtering that will never arrive.
-  const nonBindDrivers = Array.from(
-    new Set(servers.filter((s) => s.driver !== "bind9").map((s) => s.driver)),
-  );
   const hasBind = servers.some((s) => s.driver === "bind9");
+  // #4565: only BIND9 serves views, and the API refuses a new one elsewhere.
+  // Views such a group already holds stay listed so they can be removed.
+  const viewsUnsupported = viewsUnsupportedReason(servers.map((s) => s.driver));
 
   const delMut = useMutation({
     // The modal lists the blocking lists scoped to the view, so confirming
@@ -7079,6 +7143,7 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
           onClick={() => {
             setCreating(true);
           }}
+          {...disabledBecause(viewsUnsupported != null, viewsUnsupported ?? "")}
           {...permissionGate(can("write", "dns_group"), NEEDS_GROUP_WRITE)}
         >
           <Plus className="h-3 w-3" /> New View
@@ -7099,11 +7164,14 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
         />
       )}
 
-      {servers.length > 0 && !hasBind && (
-        <div className="mb-3 rounded-md border border-amber-500/40 bg-amber-500/5 p-2 text-xs text-amber-700 dark:text-amber-400">
-          <strong>This group runs no BIND9 server.</strong> Views and
-          view-scoped blocking lists are rendered by the BIND9 driver only — on{" "}
-          {nonBindDrivers.join(" / ")} they are stored but never applied.
+      {viewsUnsupported != null && (
+        <div
+          role="note"
+          className="mb-3 rounded-md border border-amber-500/40 bg-amber-500/5 p-2 text-xs text-amber-700 dark:text-amber-400"
+        >
+          <strong>This group cannot serve views.</strong> {viewsUnsupported}
+          {views.length > 0 &&
+            " The views below were stored before this was refused: a zone that is the same in every view is served to every client, a zone that differs between views serves only the records identical in every view. Remove them."}
         </div>
       )}
 
@@ -7226,7 +7294,7 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
                       <span
                         key={b.id}
                         className="inline-flex items-center rounded bg-rose-500/10 px-1.5 py-0.5 text-xs text-rose-600 dark:text-rose-400"
-                        title={`${b.entry_count.toLocaleString()} entries`}
+                        title={countNoun(b.entry_count, "entry", "entries")}
                       >
                         {b.name}
                       </span>
@@ -11309,7 +11377,7 @@ function BlocklistScopeFields({
           nothing. Assign the list to a BIND9 group instead.
         </div>
       )}
-      {nonBind.length > 0 && (
+      {nonBind.length > 0 && !inert && (
         <div className="rounded-md border border-amber-500/40 bg-amber-500/5 p-2 text-xs text-amber-700 dark:text-amber-400">
           This group also runs {nonBind.join(" / ")}, which
           {nonBind.length === 1 ? " does" : " do"} not render RPZ blocking.
@@ -11528,6 +11596,8 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
     },
   });
 
+  // #4624 — why the last Apply (row or bulk) was refused, shown above the lists.
+  const [applyError, setApplyError] = useState<string | null>(null);
   const toggleAssignment = useMutation({
     mutationFn: async ({
       list,
@@ -11543,7 +11613,12 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
           : { remove_server_group_ids: [group.id] },
       );
     },
+    onMutate: () => setApplyError(null),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["dns-blocklists"] }),
+    // #4624 — a refused assignment (a group that cannot apply a blocklist is
+    // a 422) says why; the list stays where it was.
+    onError: (e, { list }) =>
+      setApplyError(`${list.name}: ${formatApiError(e, "Update failed")}`),
   });
 
   const refreshMut = useMutation({
@@ -11572,17 +11647,39 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
       const targets = lists.filter(
         (l) => ids.includes(l.id) && !l.applied_group_ids.includes(group.id),
       );
-      await Promise.allSettled(
+      const results = await Promise.allSettled(
         targets.map((l) =>
           dnsBlocklistApi.updateAssignments(l.id, {
             add_server_group_ids: [group.id],
           }),
         ),
       );
+      return { targets, results };
     },
-    onSuccess: () => {
+    onMutate: () => setApplyError(null),
+    onSuccess: ({ targets, results }) => {
       qc.invalidateQueries({ queryKey: ["dns-blocklists"] });
-      setSelectedIds(new Set());
+      // #4624 — every result is read: a refused list (name + reason) is
+      // reported and stays selected; the lists that did apply are counted.
+      const refused = targets.flatMap((l, i) => {
+        const r = results[i];
+        return r.status === "rejected"
+          ? [`${l.name}: ${formatApiError(r.reason, "Update failed")}`]
+          : [];
+      });
+      const applied = targets.length - refused.length;
+      setSelectedIds(
+        new Set(
+          targets
+            .filter((_, i) => results[i].status === "rejected")
+            .map((l) => l.id),
+        ),
+      );
+      if (refused.length > 0) {
+        setApplyError(
+          `${applied} applied, ${refused.length} refused. ${refused.join("; ")}`,
+        );
+      }
     },
   });
   const bulkDetach = useMutation({
@@ -11724,6 +11821,14 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
           ]),
         )}
       />
+      {applyError && (
+        <p
+          role="alert"
+          className="rounded-md border border-red-500/40 bg-red-500/5 p-2 text-xs text-red-700 dark:text-red-400"
+        >
+          {applyError}
+        </p>
+      )}
       {showCatalog && (
         <BlocklistCatalogModal onClose={() => setShowCatalog(false)} />
       )}
@@ -11853,7 +11958,7 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                   <div
                     key={l.id}
                     className={cn(
-                      "flex items-center gap-2 rounded-md border bg-card px-3 py-2 group hover:bg-accent/30 cursor-pointer",
+                      "flex flex-wrap items-center gap-2 rounded-md border bg-card px-3 py-2 group hover:bg-accent/30 cursor-pointer",
                       isSel && "ring-1 ring-primary/40 bg-primary/5",
                     )}
                     onClick={() => setSelected(l)}
@@ -11915,7 +12020,7 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                       </span>
                     )}
                     <span className="ml-auto text-xs text-muted-foreground">
-                      {l.entry_count} entries
+                      {countNoun(l.entry_count, "entry", "entries")}
                     </span>
                     <div
                       className="flex items-center gap-1"
@@ -11990,6 +12095,16 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                         <Trash2 className="h-3 w-3" />
                       </button>
                     </div>
+                    {/* #4624 — applied here but a group it is applied to has
+                        no server that renders a blocklist. */}
+                    {l.unapplied_warning && appliesHere(l) && (
+                      <span
+                        role="note"
+                        className="basis-full text-xs text-amber-700 dark:text-amber-400"
+                      >
+                        {l.unapplied_warning}
+                      </span>
+                    )}
                   </div>
                 );
               })}
@@ -12682,8 +12797,9 @@ export function BlocklistDetail({
           {/* Each count waits for its own read: a refused, failed or
               unanswered one draws none (#3426). */}
           {[
-            page !== undefined && `${total} entries`,
-            exceptionsData !== undefined && `${exceptions.length} exceptions`,
+            page !== undefined && countNoun(total, "entry", "entries"),
+            exceptionsData !== undefined &&
+              countNoun(exceptions.length, "exception"),
           ]
             .filter(Boolean)
             .join(" · ")}
@@ -12722,6 +12838,12 @@ export function BlocklistDetail({
       {feedSkippedTotal(list) > 0 && (
         <p className="text-xs text-muted-foreground">
           {feedSkippedTitle(list)}
+        </p>
+      )}
+      {/* #4624 — applied, but to a group no server of which renders it. */}
+      {list.unapplied_warning && (
+        <p role="note" className="text-xs text-amber-700 dark:text-amber-400">
+          {list.unapplied_warning}
         </p>
       )}
 

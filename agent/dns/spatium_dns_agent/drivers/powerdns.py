@@ -317,8 +317,126 @@ def _absent_rrsets(
     return out
 
 
-def _render_catalog_zone_payload(catalog: dict[str, Any]) -> dict[str, Any]:
+def _resolve_view_copies(
+    payload: list[dict[str, Any]], views: list[str | None]
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """One payload entry per zone name, and the zones that cannot have one (#4565).
+
+    PowerDNS has no views and holds one zone per name. Under split-horizon
+    the bundle carries a copy of a zone for each view it renders in
+    (``views[i]`` is the view of ``payload[i]``), and reconciling every copy
+    wrote them all into that one zone: the copy reconciled last won, and its
+    sweep removed the others' records, so a record of one view was answered
+    to every client.
+
+    The rule, in bundle order:
+
+    * copies that render the same (a zone no view changes) are one zone, sent
+      once;
+    * copies that differ are reduced to the rrsets every copy agrees on (name,
+      type, TTL and records identical), sent as one zone. A record that exists
+      in one view only, or has a different value in each, is not served to
+      anyone, so no client is answered from another view's data, whatever the
+      zone held before; the reconcile's sweep removes what an earlier merged
+      render left behind. The zone is also named in the second list, one
+      ``"<zone> views: <reason>"`` each, which the apply reports through
+      ``refused_zones()``.
+    """
+    by_name: dict[str, list[int]] = {}
+    for i, entry in enumerate(payload):
+        by_name.setdefault(str(entry["name"]).lower(), []).append(i)
+    kept: list[dict[str, Any]] = []
+    conflicts: list[str] = []
+    for indexes in by_name.values():
+        first = payload[indexes[0]]
+        if all(payload[i] == first for i in indexes[1:]):
+            kept.append(first)
+            continue
+        common = [
+            rrset
+            for rrset in first["rrsets"]
+            if all(rrset in payload[i]["rrsets"] for i in indexes[1:])
+        ]
+        kept.append({**first, "rrsets": common})
+        names = ", ".join(sorted({str(views[i]) for i in indexes if views[i]}))
+        conflicts.append(
+            f"{first['name']} views: this zone differs between views ({names}) and "
+            "PowerDNS has no views, so only the records identical in every view are "
+            "served; remove the views or use a BIND9 group"
+        )
+    return kept, conflicts
+
+
+#: SOA refresh of a catalog zone, seconds. NOTIFY is the fast path; this is
+#: how soon a consumer recovers from one that was lost (#4574).
+_CATALOG_SOA_REFRESH = 300
+
+
+def _catalog_unchanged(current: dict[str, Any], desired: list[dict[str, Any]]) -> bool:
+    """True when the live catalog already holds ``desired``, serial aside.
+
+    The catalog is re-rendered with a fresh timestamp serial on every sync;
+    PATCHing it each time would bump the serial and NOTIFY every consumer
+    each sync (#4574), so an unchanged catalog is left alone.
+    """
+
+    def norm(rrsets: Any) -> set[tuple[str, str, int, frozenset[str]]]:
+        out: set[tuple[str, str, int, frozenset[str]]] = set()
+        for rs in rrsets or []:
+            rtype = str(rs.get("type") or "").upper()
+            contents = {
+                str(r.get("content") or "")
+                for r in rs.get("records") or []
+                if not r.get("disabled")
+            }
+            if rtype == "SOA":
+                contents = {
+                    _soa_with_serial(c, 0) if _soa_parts(c) else c for c in contents
+                }
+            out.add(
+                (
+                    str(rs.get("name") or "").lower().rstrip("."),
+                    rtype,
+                    int(rs.get("ttl") or 0),
+                    frozenset(contents),
+                )
+            )
+        return out
+
+    return norm(current.get("rrsets")) == norm(desired)
+
+
+def _advance_soa_serial(zone: str, desired: list[dict[str, Any]], doc: Any) -> None:
+    """Make the apex SOA in ``desired`` strictly later than the one served.
+
+    A catalog that changed must move its serial, or a consumer comparing
+    serials ignores the NOTIFY (#4574). ``_floor_soa_content`` returns the
+    served SOA when only the serial differs and the clock serial is behind
+    PowerDNS's date-form one, which is no bump at all.
+    """
+    served = _soa_from_zone_doc(doc, zone)
+    if served is None:
+        return
+    have = _soa_serial(served[0])
+    for rs in desired:
+        if rs.get("type") != "SOA" or not rs.get("records"):
+            continue
+        content = rs["records"][0].get("content", "")
+        want = _soa_serial(content)
+        if have is not None and (want is None or not _serial_later(want, have)):
+            rs["records"][0]["content"] = _soa_with_serial(content, (have + 1) % 2**32)
+
+
+def _render_catalog_zone_payload(
+    catalog: dict[str, Any], opts: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Build the zones.json payload entry for an RFC 9432 catalog zone.
+
+    The zone is kind ``Master`` (unless the server options turn NOTIFY off)
+    and carries the server options' also-notify targets: a ``Native`` zone
+    never sends NOTIFY, so a consumer learned of a new or removed member only
+    at the next SOA refresh (#4574). The SOA refresh is short for the same
+    reason: it is the consumer's fallback when a NOTIFY is lost.
 
     PowerDNS accepts the canonical catalog-zone shape verbatim: SOA + NS
     + a ``version`` TXT pinned to ``"2"`` (the only schema PowerDNS
@@ -336,6 +454,8 @@ def _render_catalog_zone_payload(catalog: dict[str, Any]) -> dict[str, Any]:
     if not zname or zname == ".":
         return {"name": "invalid.", "kind": "Native", "rrsets": []}
 
+    opts = opts or {}
+    notify = str(opts.get("notify_enabled") or "yes").strip().lower()
     serial = int(time.time())
     rrsets: list[dict[str, Any]] = [
         {
@@ -344,7 +464,9 @@ def _render_catalog_zone_payload(catalog: dict[str, Any]) -> dict[str, Any]:
             "ttl": 86400,
             "records": [
                 {
-                    "content": (f"invalid. invalid. {serial} 86400 3600 86400 86400"),
+                    "content": (
+                        f"invalid. invalid. {serial} {_CATALOG_SOA_REFRESH} 600 86400 3600"
+                    ),
                     "disabled": False,
                 }
             ],
@@ -389,12 +511,18 @@ def _render_catalog_zone_payload(catalog: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "name": zname,
-        "kind": "Native",
+        "kind": "Native" if notify == "no" else "Master",
+        "also_notify": [str(e) for e in opts.get("also_notify") or []],
+        "catalog": True,
         "serial": serial,
-        # The catalog's serial is the agent's own (a timestamp, bumped by
-        # PowerDNS's SOA-EDIT-API DEFAULT on every change), not the control
-        # plane's: it keeps that rule (#1965).
-        "serial_managed": False,
+        # The catalog's serial is the agent's own (a timestamp), not the
+        # control plane's, but the agent owns it all the same: left to
+        # PowerDNS's SOA-EDIT-API DEFAULT, a PATCH carrying a timestamp lower
+        # than PowerDNS's date-form serial (2026112001) is rewritten to that
+        # date serial, so a membership change within a day never moved the
+        # serial and a consumer that compares serials ignored the NOTIFY
+        # (#4574). Owned, it is floored and bumped in the reconcile.
+        "serial_managed": True,
         "rrsets": rrsets,
     }
 
@@ -405,7 +533,7 @@ def _render_catalog_zone_payload(catalog: dict[str, Any]) -> dict[str, Any]:
 # dnsdist-side paths, not agent-side ones: the agent writes
 # ``<state_dir>/tls/listener.crt``, dnsdist reads
 # ``/agent-state/tls/listener.crt``. Both images create ``spatium`` as
-# uid 101, so the 0600 key the agent writes is readable by dnsdist.
+# uid 10002, so the 0600 key the agent writes is readable by dnsdist.
 DNSDIST_STATE_MOUNT = os.environ.get("DNSDIST_STATE_MOUNT", "/agent-state")
 TLS_DIR_NAME = "tls"
 TLS_CERT_FILENAME = "listener.crt"
@@ -435,6 +563,40 @@ def _pdns_local_address() -> str:
     so IPv4 only has to be undone explicitly (#2307).
     """
     return "0.0.0.0, ::" if _ipv6_available() else "0.0.0.0"
+
+
+def _proxy_protocol_sources() -> list[str]:
+    """Addresses pdns accepts a PROXY protocol header from (#4576).
+
+    Behind the dnsdist front every query arrives from the front's own address,
+    so ``allow-axfr`` / ``ALLOW-DNSUPDATE-FROM`` and the query log see the front
+    instead of the client. The front prepends a PROXY v2 header
+    (``DNSDIST_PROXY_PROTOCOL=1`` on its side) and pdns trusts it ONLY from the
+    addresses in ``PDNS_PROXY_PROTOCOL_FROM`` (comma separated; IP, CIDR, or a
+    hostname such as ``dns-dnsdist`` resolved here). Unset = off: pdns must not
+    expect a header the front is not sending, and the two env vars go together.
+    Anything not listed keeps talking plain DNS, so direct clients still work.
+    """
+    out: list[str] = []
+    for raw in os.environ.get("PDNS_PROXY_PROTOCOL_FROM", "").split(","):
+        item = raw.strip()
+        if not item:
+            continue
+        try:
+            ipaddress.ip_network(item, strict=False)
+            out.append(item)
+            continue
+        except ValueError:
+            pass
+        try:
+            infos = socket.getaddrinfo(item, None, proto=socket.IPPROTO_TCP)
+        except OSError:
+            continue  # not resolvable yet (front not started): leave it out
+        for info in infos:
+            addr = str(info[4][0])
+            if addr not in out:
+                out.append(addr)
+    return out
 
 
 def _dnsdist_cert_paths() -> tuple[str, str]:
@@ -936,6 +1098,10 @@ class PowerDNSDriver(DriverBase):
     #: in, a retry compares the new file with itself and would otherwise
     #: never restart, leaving pdns on the old settings for good.
     _conf_restart_owed: bool = False
+    #: Zones the last ``render`` left out because their copies differ between
+    #: views (#4565), as ``refused_zones()`` entries. Added to the reconcile's
+    #: own refusals once it has run.
+    _view_conflicts: tuple[str, ...] = ()
     #: Set by an apply whose zone reconcile went through, cleared by a retire
     #: pass that left nothing behind (#4564). In memory on purpose: a restart
     #: applies the cached bundle again, which sets it again.
@@ -997,7 +1163,7 @@ class PowerDNSDriver(DriverBase):
         conf_path = new_dir / "pdns.conf"
         # 0600, not write_text: this file embeds ``api-key=`` in cleartext,
         # and that key grants zone CRUD + DNSSEC over the pdns REST API
-        # (#869). ``pdns_server`` and the dnsdist front both run as uid 101,
+        # (#869). ``pdns_server`` and the dnsdist front both run as uid 10002,
         # the same owner, so the owner bit is all either of them needs —
         # what 0600 removes is group/other, i.e. any OTHER uid that can see
         # this path (a differently-run sidecar, a host bind-mount, a future
@@ -1064,6 +1230,8 @@ class PowerDNSDriver(DriverBase):
             k.get("name"): k for k in (bundle.get("tsig_keys") or []) if k.get("name")
         }
         zones_payload = []
+        # The view each payload entry was rendered from (None without views).
+        payload_views: list[str | None] = []
         self._bundle_has_zone_list = isinstance(bundle.get("zones"), list)
         for zone in bundle.get("zones", []) or []:
             zname = (zone.get("name") or "").rstrip(".") + "."
@@ -1267,6 +1435,11 @@ class PowerDNSDriver(DriverBase):
                     "notify_enabled": eff_notify,
                     "also_notify": [str(e) for e in eff_also or []],
                     "serial": zone.get("serial") or 1,
+                    # Signed zone (#4566): the reconciler signs it when
+                    # PowerDNS holds no active key for it. Primary only: a
+                    # secondary serves the signatures it transfers.
+                    "dnssec_enabled": kind in ("Native", "Master")
+                    and bool(zone.get("dnssec_enabled")),
                     # The apex NS a record op restores when it deletes the
                     # zone's last one (#1985); None on a secondary.
                     "default_apex_ns": default_ns,
@@ -1298,6 +1471,30 @@ class PowerDNSDriver(DriverBase):
                     ),
                 }
             )
+            payload_views.append(zone.get("view_name") or None)
+
+        # Views (#4565): PowerDNS has none. The control plane refuses them on
+        # this group; a bundle that carries them anyway (stored before that,
+        # or a server registered into a group that has them) is never merged
+        # into one zone. See ``_resolve_view_copies`` for the rule.
+        zones_payload, conflicts = _resolve_view_copies(zones_payload, payload_views)
+        self._view_conflicts = tuple(conflicts)
+        bundle_views = sorted(
+            {str(v.get("name")) for v in bundle.get("views") or [] if v.get("name")}
+            | {v for v in payload_views if v}
+        )
+        if bundle_views:
+            log.warning(
+                "powerdns_views_unsupported",
+                views=bundle_views[:5],
+                zones_not_reconciled=[c.split(" ", 1)[0] for c in conflicts][:5],
+                hint=(
+                    "PowerDNS authoritative has no views: match-clients are not "
+                    "applied, a zone that is the same in every view is served to "
+                    "every client, and a zone that differs between views serves only the "
+                    "records identical in every view. Remove the views or use a BIND9 group."
+                ),
+            )
 
         # Catalog zones (RFC 9432, Phase 3d). Producer mode renders the
         # catalog itself as a regular zone with the canonical record
@@ -1307,7 +1504,7 @@ class PowerDNSDriver(DriverBase):
         # we'll add in a follow-up — see the warning branch below).
         catalog = bundle.get("catalog") or None
         if catalog and catalog.get("mode") == "producer":
-            catalog_payload = _render_catalog_zone_payload(catalog)
+            catalog_payload = _render_catalog_zone_payload(catalog, opts)
             # Consumers transfer the catalog like any zone, under the
             # server's transfer policy.
             catalog_payload.update(
@@ -1400,7 +1597,7 @@ class PowerDNSDriver(DriverBase):
 
         Written 0600 via O_NOFOLLOW like the BIND9 driver's TSIG key: the
         private key must never exist world-readable, not even between
-        create and chmod. Both images run ``spatium`` as uid 101, so 0600
+        create and chmod. Both images run ``spatium`` as uid 10002, so 0600
         is still readable by the dnsdist process.
 
         Removing the pair when the listeners are off matters — a stale key
@@ -1532,6 +1729,9 @@ class PowerDNSDriver(DriverBase):
         # the timing race fired. A zone whose data PowerDNS refuses does NOT
         # raise: it lands in ``refused_zones()`` for the sync loop to report.
         self._reconcile_zones(api_key, payload)
+        # Zones the render left out over views (#4565) are reported with the
+        # ones PowerDNS refused: same verdict, a partial apply.
+        self._refused_zones = (*self._refused_zones, *self._view_conflicts)
         # Every zone of the bundle was attempted, so the zones it dropped can
         # go — once the control plane confirms this bundle is its current one
         # (``control_plane_confirmed``), never from here: this apply may be
@@ -2176,17 +2376,16 @@ class PowerDNSDriver(DriverBase):
         Empty list means we couldn't extract DS — log-only, not fatal,
         operator can re-trigger sign to retry.
 
-        Idempotent — if keys already exist for the zone, pdns refuses with
-        a 409 / 422 and we treat that as success. Operators expect the
-        result of repeated 'Sign zone' clicks to converge to "signed",
-        not error out.
+        Idempotent — a zone that already has an active key is left as it
+        is and its DS returned. Operators expect the result of repeated
+        'Sign zone' clicks to converge to "signed", not error out.
         """
         headers = {"X-API-Key": api_key, "Content-Type": "application/json"}
         with httpx.Client(timeout=_PDNS_API_TIMEOUT) as client:
             existing = client.get(
                 f"{_PDNS_API_BASE}/zones/{zone}/cryptokeys", headers=headers
             )
-            if existing.status_code == 200 and existing.json():
+            if existing.status_code == 200 and self._has_active_key(existing.json()):
                 # Keys already there — nothing to create. Just rectify
                 # (idempotent) so NSEC/NSEC3 chains stay current. This
                 # covers the "operator clicked twice" case + the
@@ -2194,54 +2393,146 @@ class PowerDNSDriver(DriverBase):
                 self._rectify(client, headers, zone)
                 log.info("powerdns_dnssec_already_signed", zone=zone)
                 return self._extract_ds_records(existing.json())
+            return self._create_signing_keys(client, headers, zone)
 
-            for kind, key_type in (("ksk", "ksk"), ("zsk", "zsk")):
-                # PowerDNS 4.9 picks a sensible default algorithm for
-                # KSK creation when ``algorithm`` is omitted, but the
-                # ZSK default-picker resolves to algorithm -1
-                # (Unallocated) and the API rejects with "Creating an
-                # algorithm -1 (Unallocated/Reserved) key requires the
-                # size (in bits) to be passed." Pin both keys to
-                # ECDSAP256SHA256 (algorithm 13) — RFC 6605, the
-                # current online-signing default in pdns docs — so the
-                # call is portable across KSK/ZSK iterations.
-                resp = client.post(
-                    f"{_PDNS_API_BASE}/zones/{zone}/cryptokeys",
-                    headers=headers,
-                    json={
-                        "keytype": key_type,
-                        "active": True,
-                        "published": True,
-                        "algorithm": "ecdsa256",
-                    },
-                )
-                if resp.status_code >= 400:
-                    raise RuntimeError(
-                        f"PowerDNS create {kind.upper()} for {zone} returned "
-                        f"{resp.status_code}: {resp.text[:200]}"
-                    )
+    @staticmethod
+    def _has_active_key(cryptokeys: Any) -> bool:
+        """Whether the ``cryptokeys`` listing holds a key PowerDNS signs with."""
+        return any(
+            isinstance(k, dict) and k.get("active") for k in (cryptokeys or [])
+        )
 
-            # Note: we deliberately do NOT set the ``PRESIGNED`` zone
-            # metadata for online-signing zones. ``PRESIGNED`` is for
-            # zones signed by an external signer (e.g. via
-            # ``dnssec-signzone``) and loaded as already-signed; for
-            # online signing pdns derives signing intent from the
-            # presence of cryptokeys + active/published flags. Setting
-            # it actually trips the API's metadata-kind filter
-            # ("Unsupported metadata kind 'PRESIGNED'"), and the
-            # resulting warning is misleading. Re-verified against pdns
-            # 5.0.5 while bumping the image in #638: still HTTP 422.
-            self._rectify(client, headers, zone)
-
-            # Re-fetch after creation so we get the freshly-rendered DS
-            # rrset (PowerDNS computes DS from the KSK we just made).
-            after = client.get(
-                f"{_PDNS_API_BASE}/zones/{zone}/cryptokeys", headers=headers
+    def _create_signing_keys(
+        self, client: httpx.Client, headers: dict[str, str], zone: str
+    ) -> list[str]:
+        """Create an active KSK + ZSK, rectify, and return the new DS rrset."""
+        for kind, key_type in (("ksk", "ksk"), ("zsk", "zsk")):
+            # PowerDNS 4.9 picks a sensible default algorithm for
+            # KSK creation when ``algorithm`` is omitted, but the
+            # ZSK default-picker resolves to algorithm -1
+            # (Unallocated) and the API rejects with "Creating an
+            # algorithm -1 (Unallocated/Reserved) key requires the
+            # size (in bits) to be passed." Pin both keys to
+            # ECDSAP256SHA256 (algorithm 13) — RFC 6605, the
+            # current online-signing default in pdns docs — so the
+            # call is portable across KSK/ZSK iterations.
+            resp = client.post(
+                f"{_PDNS_API_BASE}/zones/{zone}/cryptokeys",
+                headers=headers,
+                json={
+                    "keytype": key_type,
+                    "active": True,
+                    "published": True,
+                    "algorithm": "ecdsa256",
+                },
             )
-            log.info("powerdns_dnssec_signed", zone=zone)
-            if after.status_code == 200:
-                return self._extract_ds_records(after.json())
-            return []
+            if resp.status_code >= 400:
+                raise RuntimeError(
+                    f"PowerDNS create {kind.upper()} for {zone} returned "
+                    f"{resp.status_code}: {resp.text[:200]}"
+                )
+
+        # Note: we deliberately do NOT set the ``PRESIGNED`` zone
+        # metadata for online-signing zones. ``PRESIGNED`` is for
+        # zones signed by an external signer (e.g. via
+        # ``dnssec-signzone``) and loaded as already-signed; for
+        # online signing pdns derives signing intent from the
+        # presence of cryptokeys + active/published flags. Setting
+        # it actually trips the API's metadata-kind filter
+        # ("Unsupported metadata kind 'PRESIGNED'"), and the
+        # resulting warning is misleading. Re-verified against pdns
+        # 5.0.5 while bumping the image in #638: still HTTP 422.
+        self._rectify(client, headers, zone)
+
+        # Re-fetch after creation so we get the freshly-rendered DS
+        # rrset (PowerDNS computes DS from the KSK we just made).
+        after = client.get(
+            f"{_PDNS_API_BASE}/zones/{zone}/cryptokeys", headers=headers
+        )
+        log.info("powerdns_dnssec_signed", zone=zone)
+        if after.status_code == 200:
+            return self._extract_ds_records(after.json())
+        return []
+
+    def _reconcile_dnssec(
+        self, client: httpx.Client, headers: dict[str, str], zone: str
+    ) -> str | None:
+        """Sign a zone the bundle flags signed when PowerDNS holds no active
+        key for it (#4566). Returns the problem, or None.
+
+        The one-shot ``dnssec_sign`` op is never re-sent, so a zone re-created
+        after a lost LMDB volume, on a replaced node or on a new server came
+        back unsigned under a DS the control plane still showed. The new keys
+        are this server's own: ``collect_dnssec_state`` reports their DS after
+        the apply, and the operator has to publish it at the parent.
+
+        One-directional, like the Technitium driver's: a zone the bundle does
+        not flag keeps its keys (``dnssec_unsign`` is the operator's explicit
+        action; deleting keys on a missing flag would destroy them on a guess).
+        """
+        try:
+            resp = client.get(f"{_PDNS_API_BASE}/zones/{zone}/cryptokeys", headers=headers)
+            if resp.status_code >= 400:
+                return f"cannot read its keys: HTTP {resp.status_code} {_pdns_error(resp)}"
+            if self._has_active_key(resp.json()):
+                return None
+            log.warning(
+                "powerdns_dnssec_zone_unsigned_signing",
+                zone=zone,
+                detail="flagged signed but PowerDNS held no active key; new keys "
+                "are generated, so the DS at the parent must be replaced",
+            )
+            self._create_signing_keys(client, headers, zone)
+        except (httpx.HTTPError, ValueError, RuntimeError) as exc:
+            log.error("powerdns_dnssec_reconcile_failed", zone=zone, error=str(exc))
+            return str(exc)
+        return None
+
+    # Set by ``collect_dnssec_state`` when a flagged zone's keys could not be
+    # read or are not there yet; the sync loop then looks again soon.
+    dnssec_incomplete = False
+
+    def collect_dnssec_state(self, bundle: dict[str, Any]) -> list[dict[str, Any]]:
+        """The DS rrset of every signed primary zone in ``bundle`` (#4566).
+
+        The sync loop calls this after each structural apply and on its
+        periodic refresh, and POSTs what changed. That is what carries the DS
+        of a zone ``_reconcile_dnssec`` just re-signed to the control plane; it
+        used to learn a DS only from the ``dnssec_sign`` op's result. A zone
+        with no active key or an unreadable key list is left out and
+        ``dnssec_incomplete`` set: an empty DS report would read as "unsigned
+        on purpose" and clear the control plane's copy. ``keys`` is omitted,
+        as in the op's report (the API has no per-key rollover state).
+        """
+        self.dnssec_incomplete = False
+        zones = [
+            (z.get("name") or "").rstrip(".") + "."
+            for z in bundle.get("zones") or []
+            if z.get("dnssec_enabled")
+            and _KIND_BY_ZONE_TYPE.get(str(z.get("type") or "primary").lower()) == "Native"
+        ]
+        out: list[dict[str, Any]] = []
+        if not zones:
+            return out
+        headers = {"X-API-Key": self._load_or_generate_api_key()}
+        with httpx.Client(timeout=_PDNS_API_TIMEOUT) as client:
+            for zone in dict.fromkeys(zones):
+                if zone == ".":
+                    continue
+                try:
+                    resp = client.get(
+                        f"{_PDNS_API_BASE}/zones/{zone}/cryptokeys", headers=headers
+                    )
+                    keys = resp.json() if resp.status_code == 200 else None
+                except (httpx.HTTPError, ValueError) as exc:
+                    log.warning("dnssec_state_collect_failed", zone=zone, error=str(exc))
+                    keys = None
+                ds_records = self._extract_ds_records(keys) if self._has_active_key(keys) else []
+                if not ds_records:
+                    self.dnssec_incomplete = True
+                    continue
+                out.append({"zone_name": zone, "ds_records": ds_records})
+        return out
 
     @staticmethod
     def _extract_ds_records(cryptokeys: list[dict[str, Any]]) -> list[str]:
@@ -2518,6 +2809,7 @@ class PowerDNSDriver(DriverBase):
         # owns the API key while the control plane sees only the
         # placeholder.
         log_queries_value = "yes" if query_log_enabled else "no"
+        proxy_from = _proxy_protocol_sources()
         return "\n".join(
             [
                 "# pdns.conf — generated by SpatiumDDI DNS agent",
@@ -2534,6 +2826,9 @@ class PowerDNSDriver(DriverBase):
                 # and toggling the front is decoupled from pdns's lifecycle.
                 f"local-address={_pdns_local_address()}",
                 "local-port=53",
+                # PROXY protocol from the dnsdist front only (#4576), so the
+                # real client address reaches the ACLs and the query log.
+                *([f"proxy-protocol-from={','.join(proxy_from)}"] if proxy_from else []),
                 "",
                 "api=yes",
                 f"api-key={api_key}",
@@ -2577,9 +2872,17 @@ class PowerDNSDriver(DriverBase):
                 # and a ``resolver=`` upstream. PowerDNS Authoritative
                 # synthesises A/AAAA at query time by recursing through
                 # the configured resolver: the group's forwarders, or none
-                # and ALIAS off (#1353).
+                # and ALIAS off (#1353). ``outgoing-axfr-expand-alias``
+                # makes AXFR/IXFR carry the expanded A/AAAA instead of the
+                # opaque private-use ALIAS type (65401) that a BIND9 /
+                # Technitium / Windows secondary stores and never answers
+                # (#4575).
                 *(
-                    ["expand-alias=yes", f"resolver={alias_resolver}"]
+                    [
+                        "expand-alias=yes",
+                        f"resolver={alias_resolver}",
+                        "outgoing-axfr-expand-alias=yes",
+                    ]
                     if alias_resolver.strip()
                     else ["expand-alias=no"]
                 ),
@@ -2823,6 +3126,7 @@ class PowerDNSDriver(DriverBase):
                             log.error("powerdns_soa_serial_failed", zone=zone_name, error=problem)
                             failures.append(f"{zone_name} soa serial: {problem}")
                             continue
+                    catalog_changed = False
                     rrsets: list[dict[str, Any]] = []
                     if _kind_category(desired_kind) == "secondary":
                         # A secondary's rrsets are the transfer's (#1521):
@@ -2851,7 +3155,15 @@ class PowerDNSDriver(DriverBase):
                                 f"{zone_name} read: HTTP {resp.status_code} {_pdns_error(resp)}"
                             )
                             continue
-                        rrsets.extend(_absent_rrsets(zone_name, desired, current))
+                        if zone_payload.get("catalog") and _catalog_unchanged(current, desired):
+                            # Nothing to publish: no PATCH, so no serial bump
+                            # and no NOTIFY storm (#4574).
+                            desired = []
+                        else:
+                            rrsets.extend(_absent_rrsets(zone_name, desired, current))
+                            if zone_payload.get("catalog"):
+                                catalog_changed = True
+                                _advance_soa_serial(zone_name, desired, current)
                     deleted = len(rrsets)
                     for rs in desired:
                         rrsets.append(
@@ -2895,7 +3207,7 @@ class PowerDNSDriver(DriverBase):
                             deleted=deleted,
                         )
                         if (
-                            serial_changed
+                            (serial_changed or catalog_changed)
                             and soa_landed
                             and _kind_category(desired_kind) == "primary"
                         ):
@@ -2922,6 +3234,13 @@ class PowerDNSDriver(DriverBase):
                 notify_problem = self._apply_notify_settings(client, headers, zone_payload)
                 if notify_problem:
                     failures.append(f"{zone_name} also-notify: {notify_problem}")
+
+                # DNSSEC (#4566): a zone the bundle flags signed is signed
+                # here too, not only by the one-shot ``dnssec_sign`` op.
+                if zone_payload.get("dnssec_enabled"):
+                    dnssec_problem = self._reconcile_dnssec(client, headers, zone_name)
+                    if dnssec_problem:
+                        failures.append(f"{zone_name} DNSSEC: {dnssec_problem}")
 
                 # LUA records are enabled globally via
                 # ``enable-lua-records=yes`` in pdns.conf (see

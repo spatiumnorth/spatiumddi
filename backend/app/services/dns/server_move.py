@@ -33,6 +33,7 @@ here rather than in the router so it can be tested without HTTP.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -47,6 +48,7 @@ from app.core.agent_wake import (
     dns_group_channel,
     dns_server_channel,
 )
+from app.drivers.dns import get_driver
 from app.models.dns import (
     DNSIngestSnapshot,
     DNSRecordOp,
@@ -55,6 +57,7 @@ from app.models.dns import (
     DNSServerOptions,
     DNSServerZoneState,
     DNSTrustAnchor,
+    DNSView,
     DNSZone,
 )
 from app.services.appliance.cluster_dns_group import cluster_dns_group_refusal
@@ -183,6 +186,129 @@ async def ensure_group_classless_compatible(
     if name is not None:
         raise ServerMoveError(
             f"Group {group.name!r} holds {classless_zone_refusal({driver}, name)}",
+            status_code=422,
+        )
+
+
+def views_unsupported_drivers(drivers: Iterable[str]) -> list[str]:
+    """The drivers among *drivers* that cannot serve split-horizon views
+    (#4565), read from each driver's ``capabilities()["views"]``. A name the
+    registry does not know counts as unable."""
+    bad: list[str] = []
+    for name in sorted({d for d in drivers if d}):
+        try:
+            supported = bool(get_driver(name).capabilities().get("views"))
+        except ValueError:
+            supported = False
+        if not supported:
+            bad.append(name)
+    return bad
+
+
+def views_refusal(drivers: Iterable[str]) -> str | None:
+    """Why a group whose servers run *drivers* cannot take a view or anything
+    scoped to one, or None (#4565). A group with no servers passes (a server
+    joining later is checked by :func:`ensure_group_views_compatible`).
+
+    Such a server has no way to answer by client address: the PowerDNS agent
+    was handed one copy of a zone per view and wrote them all into the one
+    zone PowerDNS holds, so a record of one view was answered to every client.
+    """
+    bad = views_unsupported_drivers(drivers)
+    if not bad:
+        return None
+    return (
+        f"Views are not supported on a {', '.join(bad)} server: only BIND9 answers "
+        "by client address (split-horizon). Here a view's zones and records would be "
+        "served to every client. Use a BIND9 group for views."
+    )
+
+
+async def group_view_names(db: AsyncSession, group_id: uuid.UUID) -> list[str]:
+    """The names of a group's views, sorted."""
+    rows = await db.execute(
+        select(DNSView.name).where(DNSView.group_id == group_id).order_by(DNSView.name)
+    )
+    return list(rows.scalars().all())
+
+
+def views_unsupported_message(view_names: Sequence[str], drivers: Iterable[str]) -> str | None:
+    """The warning for a group that already holds views it cannot serve (stored
+    before #4565 refused them, or an agent registered straight into it)."""
+    refusal = views_refusal(drivers)
+    if refusal is None or not view_names:
+        return None
+    shown = ", ".join(view_names[:5]) + (", and more" if len(view_names) > 5 else "")
+    return (
+        f"This group has views ({shown}). {refusal} A zone that is the same in every "
+        "view it renders in is served once, to every client; a zone that differs "
+        "between views serves only the records identical in every view until the views are removed."
+    )
+
+
+async def ensure_group_views_compatible(
+    db: AsyncSession, group: DNSServerGroup, driver: str
+) -> None:
+    """Refuse (422) putting a ``driver`` server into a group that has views
+    when that driver cannot serve them (#4565)."""
+    if not views_unsupported_drivers({driver}):
+        return
+    names = await group_view_names(db, group.id)
+    if names:
+        shown = ", ".join(names[:5]) + (", and more" if len(names) > 5 else "")
+        raise ServerMoveError(
+            f"Group {group.name!r} has views ({shown}). {views_refusal({driver})} "
+            "Remove the views first, or put this server in a group without views.",
+            status_code=422,
+        )
+
+
+# #4570 — PowerDNS Authoritative has no forward-zone type (the agent logs and
+# drops the zone, so clients get REFUSED) and the agent creates a ``stub`` as a
+# full ``Slave``. The driver advertises primary + secondary only; every path
+# that creates or converts a zone checks the group's drivers against this.
+POWERDNS_UNSUPPORTED_ZONE_TYPES = frozenset({"forward", "stub"})
+
+
+def powerdns_zone_type_refusal(drivers: list[str] | set[str], zone_type: str) -> str | None:
+    """Why a ``zone_type`` zone cannot live in a group whose servers run
+    *drivers*, or None (#4570). A group with no servers passes (a PowerDNS
+    server joining later is checked by :func:`ensure_group_powerdns_compatible`)."""
+    if zone_type not in POWERDNS_UNSUPPORTED_ZONE_TYPES or "powerdns" not in drivers:
+        return None
+    return (
+        f"a {zone_type} zone cannot be served by a PowerDNS group: the PowerDNS "
+        "driver supports primary and secondary zones only"
+        + (
+            ", and creates a stub as a full secondary."
+            if zone_type == "stub"
+            else ", so the zone would be accepted and never answer."
+        )
+    )
+
+
+async def ensure_group_powerdns_compatible(
+    db: AsyncSession, group: DNSServerGroup, driver: str
+) -> None:
+    """Refuse (422) putting a PowerDNS server into a group that holds a forward
+    or stub zone (#4570)."""
+    if driver != "powerdns":
+        return
+    row = (
+        await db.execute(
+            select(DNSZone.name, DNSZone.zone_type)
+            .where(
+                DNSZone.group_id == group.id,
+                DNSZone.deleted_at.is_(None),
+                DNSZone.zone_type.in_(sorted(POWERDNS_UNSUPPORTED_ZONE_TYPES)),
+            )
+            .limit(1)
+        )
+    ).first()
+    if row is not None:
+        raise ServerMoveError(
+            f"Group {group.name!r} holds the {row.zone_type} zone {row.name.rstrip('.')!r}, "
+            f"and {powerdns_zone_type_refusal({'powerdns'}, row.zone_type)}",
             status_code=422,
         )
 
@@ -384,7 +510,9 @@ async def move_server_to_group(
         hint=f"move it to a {server.driver}-only group, or an empty one.",
     )
     await ensure_group_catalog_compatible(db, target_group, server.driver)
+    await ensure_group_views_compatible(db, target_group, server.driver)
     await ensure_group_classless_compatible(db, target_group, server.driver)
+    await ensure_group_powerdns_compatible(db, target_group, server.driver)  # #4570
 
     # #1762 — a server joining a group that already has one and holds signed
     # zones would sign them with its own keys. Enabled or not: a disabled

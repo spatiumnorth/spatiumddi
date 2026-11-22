@@ -203,7 +203,8 @@ def test_a_producer_catalog_is_rendered_as_a_zone_with_the_transfer_policy(
     zones = {z["name"]: z for z in _zones_json(tmp_path, bundle)}
     assert set(zones) == {"example.com.", "catalog.spatium.invalid."}
     cat = zones["catalog.spatium.invalid."]
-    assert cat["kind"] == "Native"
+    # #4574 — Master, not Native: a Native zone never sends NOTIFY to consumers.
+    assert cat["kind"] == "Master"
     ptrs = [r for r in cat["rrsets"] if r["type"] == "PTR"]
     assert [p["records"][0]["content"] for p in ptrs] == ["example.com."]
     # Consumers transfer the catalog like any zone: the same transfer ACL as a member.

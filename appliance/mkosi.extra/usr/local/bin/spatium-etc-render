@@ -226,6 +226,28 @@ else
     echo "no role in $CONFIG — leaving existing /etc/spatiumddi/role-config"
 fi
 
+# ── /etc/issue (#4548) ───────────────────────────────────────────────
+# The console banner is rendered from the image's own copy on every boot, so
+# it follows STATE rather than being fixed at build time:
+#  * an additional node (role appliance) serves no web UI, so the web UI
+#    lines are dropped;
+#  * a first node whose web UI password was chosen at install says so
+#    instead of printing admin / admin.
+# No role in STATE (older install) leaves the image banner as it is.
+ISSUE_BASE=/usr/lib/etc.image/issue
+if [ -n "$ROLE_VAL" ] && [ -f "$ISSUE_BASE" ]; then
+    if [ "$ROLE_VAL" = "appliance" ]; then
+        sed -e '/^   Web UI:/d' -e '/^   Web UI login:/d' "$ISSUE_BASE" > /etc/issue.new
+    elif [ "$(get_cfg web_admin_password_set)" = "yes" ]; then
+        sed -e 's|^   Web UI login:.*|   Web UI login:    admin   (the password you set at install)|' \
+            "$ISSUE_BASE" > /etc/issue.new
+    else
+        cp "$ISSUE_BASE" /etc/issue.new
+    fi
+    mv -f /etc/issue.new /etc/issue
+    echo "issue rendered (ROLE=$ROLE_VAL)"
+fi
+
 # #995 item 21 — the [ipv6] section of the static keyfile.
 #
 # ``method=auto`` (RA / SLAAC) unless the operator pinned an address,
