@@ -107,6 +107,7 @@ NO_WAKE: dict[tuple[str, str], str] = {
         ("POST", f"/api/v1/dhcp/import/{src}/preview"): _READONLY
         for src in ("kea", "isc", "windows")
     },
+    ("POST", "/api/v1/dhcp/client-classes/compile-match"): _READONLY,
     ("POST", "/api/v1/e911/erls"): "an ERL no binding points at is in no bundle",
     ("POST", "/api/v1/e911/erls/{erl_id}/validation"): (
         "the provider's verdict; options 99 / 123 do not read it"
