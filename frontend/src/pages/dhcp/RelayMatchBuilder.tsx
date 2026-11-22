@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Plus, Trash2 } from "lucide-react";
 import {
   dhcpApi,
@@ -46,9 +46,14 @@ const isExistence = (op: RelayMatchOp) =>
 export function RelayMatchBuilder({
   value,
   onChange,
+  onCompiled,
 }: {
   value: RelayMatchSpec;
   onChange: (spec: RelayMatchSpec) => void;
+  // Latest compile outcome for a spec (its JSON key); expression is null when
+  // the server refused it. Lets the parent seed a hand-written test from what
+  // the current, possibly unsaved, spec compiles to.
+  onCompiled?: (specKey: string, expression: string | null) => void;
 }) {
   // Rows showing the free sub-option number input, parallel to conditions. A
   // typed 6 must not flip the row back to the named select mid-edit.
@@ -96,6 +101,8 @@ export function RelayMatchBuilder({
 
   // Debounced live preview from the server compiler.
   const specKey = JSON.stringify(value);
+  const onCompiledRef = useRef(onCompiled);
+  onCompiledRef.current = onCompiled;
   useEffect(() => {
     let live = true;
     const t = setTimeout(() => {
@@ -105,11 +112,13 @@ export function RelayMatchBuilder({
           if (!live) return;
           setPreview(r);
           setPreviewError("");
+          onCompiledRef.current?.(specKey, r.expression);
         })
         .catch((e) => {
           if (!live) return;
           setPreview(null);
           setPreviewError(errMsg(e, "Could not compile this match"));
+          onCompiledRef.current?.(specKey, null);
         });
     }, 400);
     return () => {
@@ -264,23 +273,25 @@ export function RelayMatchBuilder({
 
       <div>
         <div className="mb-1 text-xs font-medium">Kea test (preview)</div>
-        {previewError ? (
-          <div role="alert" className="text-xs text-destructive">
-            {previewError}
-          </div>
-        ) : (
-          <pre
-            data-testid="relay-preview"
-            className="overflow-x-auto rounded-md bg-muted/40 p-2 font-mono text-xs whitespace-pre-wrap break-all"
-          >
-            {preview?.expression ?? "…"}
-          </pre>
-        )}
-        {preview?.warnings.map((w, i) => (
-          <p key={i} className="mt-1 text-xs text-amber-600">
-            {w}
-          </p>
-        ))}
+        <div aria-live="polite">
+          {previewError ? (
+            <div role="alert" className="text-xs text-destructive">
+              {previewError}
+            </div>
+          ) : (
+            <pre
+              data-testid="relay-preview"
+              className="overflow-x-auto rounded-md bg-muted/40 p-2 font-mono text-xs whitespace-pre-wrap break-all"
+            >
+              {preview?.expression ?? "…"}
+            </pre>
+          )}
+          {preview?.warnings.map((w, i) => (
+            <p key={i} className="mt-1 text-xs text-amber-600">
+              {w}
+            </p>
+          ))}
+        </div>
       </div>
       <p className="text-xs text-muted-foreground">
         Renewals arrive without a relay in the path, so Kea has to keep each

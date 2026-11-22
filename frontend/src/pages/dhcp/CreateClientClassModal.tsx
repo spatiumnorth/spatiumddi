@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { FormError } from "@/components/ui/form-error";
 import { useFreshRow, changedFields } from "@/hooks/useFreshRow";
 import { FreshRowError } from "@/components/FreshRowError";
@@ -61,6 +61,9 @@ function ClientClassModalForm({
   const [spec, setSpec] = useState<RelayMatchSpec>(
     klass?.match_spec ?? EMPTY_RELAY_SPEC,
   );
+  const compiled = useRef<{ key: string; expression: string | null } | null>(
+    null,
+  );
   const [pendingMode, setPendingMode] = useState<"expression" | "relay" | null>(
     null,
   );
@@ -122,17 +125,30 @@ function ClientClassModalForm({
     const loses =
       m === "expression" ? !!klass?.match_spec : matchExpr.trim() !== "";
     if (loses) setPendingMode(m);
-    else applyMode(m);
+    else void applyMode(m);
   };
-  const applyMode = (m: "expression" | "relay") => {
-    if (m === "relay") {
-      setSpec(klass?.match_spec ?? EMPTY_RELAY_SPEC);
-    } else if (klass?.match_spec) {
-      // Start the hand-written test from what the builder had compiled to.
-      setMatchExpr(klass.match_expression);
+  const applyMode = async (m: "expression" | "relay") => {
+    setPendingMode(null);
+    if (m === "expression" && (klass?.match_spec || matchExpr.trim() === "")) {
+      // Start the hand-written test from what the builder's CURRENT spec
+      // compiles to: the stored text when the spec is untouched, else the
+      // latest successful preview, else a fresh compile. A spec that will not
+      // compile seeds nothing rather than a stale test.
+      const key = JSON.stringify(spec);
+      let seed = "";
+      if (klass?.match_spec && JSON.stringify(klass.match_spec) === key)
+        seed = klass.match_expression;
+      else if (compiled.current?.key === key && compiled.current.expression)
+        seed = compiled.current.expression;
+      else
+        try {
+          seed = (await dhcpApi.compileClientClassMatch(spec)).expression;
+        } catch {
+          // The builder's preview already shows why; nothing to seed.
+        }
+      setMatchExpr(seed);
     }
     setMode(m);
-    setPendingMode(null);
   };
 
   return (
@@ -212,7 +228,13 @@ function ClientClassModalForm({
             ))}
           </div>
           {mode === "relay" ? (
-            <RelayMatchBuilder value={spec} onChange={setSpec} />
+            <RelayMatchBuilder
+              value={spec}
+              onChange={setSpec}
+              onCompiled={(key, expression) => {
+                compiled.current = { key, expression };
+              }}
+            />
           ) : (
             <Field
               label="Match Expression"
@@ -243,7 +265,7 @@ function ClientClassModalForm({
             : "Switching to the builder discards the expression you have written."
         }
         confirmLabel="Switch"
-        onConfirm={() => pendingMode && applyMode(pendingMode)}
+        onConfirm={() => pendingMode && void applyMode(pendingMode)}
         onClose={() => setPendingMode(null)}
       />
     </>

@@ -158,4 +158,55 @@ describe("client class modal mode switch", () => {
     await waitFor(() => expect(updateClass).toHaveBeenCalled());
     expect(updateClass.mock.calls[0][2]).toEqual({ match_spec: null });
   });
+  it("seeds the expression box from the edited spec's compile, not the stored text", async () => {
+    compile.mockImplementation((spec: RelayMatchSpec) =>
+      Promise.resolve({
+        expression: `compiled:${spec.conditions[0].value}`,
+        warnings: [],
+        windows: { supported: false, reason: "" },
+      }),
+    );
+    classes.push(builderClass);
+    wrap(
+      <CreateClientClassModal
+        klass={builderClass}
+        groupId="g1"
+        onClose={() => {}}
+      />,
+    );
+    const value = await screen.findByLabelText("Condition 1 value");
+    fireEvent.change(value, { target: { value: "B" } });
+    await waitFor(() =>
+      expect(screen.getByTestId("relay-preview").textContent).toBe(
+        "compiled:B",
+      ),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Expression" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Switch" }));
+    const box = (await screen.findByLabelText(
+      "Match Expression",
+    )) as HTMLTextAreaElement;
+    await waitFor(() => expect(box.value).toBe("compiled:B"));
+  });
+
+  it("saving a re-opened builder class with no edits sends nothing", async () => {
+    compile.mockResolvedValue({
+      expression: "x",
+      warnings: [],
+      windows: { supported: false, reason: "" },
+    });
+    classes.push(builderClass);
+    wrap(
+      <CreateClientClassModal
+        klass={builderClass}
+        groupId="g1"
+        onClose={() => {}}
+      />,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(screen.queryByText("New Client Class")).toBeNull(),
+    );
+    expect(updateClass).not.toHaveBeenCalled();
+  });
 });
