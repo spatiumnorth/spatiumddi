@@ -180,3 +180,36 @@ async def test_selective_restore_that_misses_sessions_leaves_them_alone(scratch,
     outcome = await _restore(url, archive, monkeypatch, sections=["ipam"])
     assert outcome.sessions_ended is None
     assert await _accepted(url, ids["keep"], ids["keep_raw"], ids["user"]) == (True, True)
+
+
+async def test_sessions_are_ended_before_the_migration_step_runs(scratch, monkeypatch):
+    """A restored row is accepted from the replay's commit until it is revoked,
+    so the revoke must not wait behind the migration, fold and rewrap."""
+    url, archive, ids = scratch
+    seen: dict[str, tuple[bool, bool]] = {}
+    real = restore.maybe_upgrade_after_restore
+
+    async def _spy(**kwargs):
+        seen["gone"] = await _accepted(url, ids["gone"], ids["gone_raw"], ids["user"])
+        seen["keep"] = await _accepted(url, ids["keep"], ids["keep_raw"], ids["user"])
+        return await real(**kwargs)
+
+    monkeypatch.setattr(restore, "maybe_upgrade_after_restore", _spy)
+    await _restore(url, archive, monkeypatch)
+    assert seen == {"gone": (False, False), "keep": (False, False)}
+
+
+async def test_ending_sessions_copes_with_a_table_older_than_the_rotation_columns(scratch):
+    url, _archive_bytes, ids = scratch
+    c = await asyncpg.connect(_dsn(url))
+    try:
+        await c.execute("ALTER TABLE user_session DROP COLUMN rotated_to_id")
+        await c.execute("ALTER TABLE user_session DROP COLUMN rotated_at")
+    finally:
+        await c.close()
+    assert await restore._end_restored_sessions(url) == 2
+    c = await asyncpg.connect(_dsn(url))
+    try:
+        assert await c.fetchval("SELECT count(*) FROM user_session WHERE NOT revoked") == 0
+    finally:
+        await c.close()

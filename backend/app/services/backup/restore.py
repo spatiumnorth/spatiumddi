@@ -1068,9 +1068,12 @@ async def _end_restored_sessions(db_url: str) -> int:
     stand for a successor inside the rotation grace window.
 
     Returns the number of rows revoked. Runs on its own connection, like the
-    other post-replay steps, because the app's pool was disposed.
+    other post-replay steps, because the app's pool was disposed. It runs
+    immediately after the replay, so an older archive's table may lack the
+    rotation columns; those rows are revoked without them.
     """
     from sqlalchemy import text  # noqa: PLC0415
+    from sqlalchemy.exc import ProgrammingError  # noqa: PLC0415
     from sqlalchemy.ext.asyncio import create_async_engine  # noqa: PLC0415
     from sqlalchemy.pool import NullPool  # noqa: PLC0415
 
@@ -1078,14 +1081,21 @@ async def _end_restored_sessions(db_url: str) -> int:
 
     engine = create_async_engine(db_url, poolclass=NullPool, connect_args=task_connect_args())
     try:
-        async with engine.begin() as conn:
-            result = await conn.execute(
-                text(
-                    "UPDATE user_session SET revoked = true, "
-                    "rotated_at = NULL, rotated_to_id = NULL"
+        try:
+            async with engine.begin() as conn:
+                result = await conn.execute(
+                    text(
+                        "UPDATE user_session SET revoked = true, "
+                        "rotated_at = NULL, rotated_to_id = NULL"
+                    )
                 )
-            )
-            return result.rowcount or 0
+                return result.rowcount or 0
+        except ProgrammingError:
+            # An archive older than the rotation columns, before the migration
+            # has added them: there are no markers to clear, only rows to end.
+            async with engine.begin() as conn:
+                result = await conn.execute(text("UPDATE user_session SET revoked = true"))
+                return result.rowcount or 0
     finally:
         await engine.dispose()
 
@@ -1419,6 +1429,25 @@ async def _apply_backup_restore_inner(
             # disk only to read them back cost a full write of the dump.
             await _run_psql(db_bytes, db_url)
 
+    # A restore ends every session, as its notice says (sessions). Right after
+    # the replay commits, before the migration, the fold and the rewrap: a
+    # restored row is accepted from that commit until it is revoked, and those
+    # steps can take minutes. Only when the replay reached ``user_session``: a
+    # selective restore of other sections leaves the live table alone.
+    sessions_ended: int | None = None
+    sessions_warning: str | None = None
+    if restored_tables is None or "user_session" in restored_tables:
+        try:
+            sessions_ended = await _end_restored_sessions(db_url)
+        except Exception as exc:  # noqa: BLE001 — the data is in; say so loudly
+            logger.error("backup_restore_end_sessions_failed", error=str(exc))
+            sessions_ended = -1
+            sessions_warning = (
+                "Could not end the sessions restored from the archive "
+                f"({exc}). Sign-ins from before the restore may still be accepted; "
+                "end them from Administration, Sessions."
+            )
+
     # Phase 6: alembic upgrade-on-restore. The destination DB is now
     # at the source's schema head; if local code expects a newer
     # head, run ``alembic upgrade head`` over the just-restored DB
@@ -1566,21 +1595,8 @@ async def _apply_backup_restore_inner(
                 f"archive ({exc}); they free themselves after 2 hours."
             )
 
-    # A restore ends every session, as its notice says (sessions). Only when
-    # the replay reached ``user_session``: a selective restore of other
-    # sections leaves the live table alone.
-    sessions_ended: int | None = None
-    if restored_tables is None or "user_session" in restored_tables:
-        try:
-            sessions_ended = await _end_restored_sessions(db_url)
-        except Exception as exc:  # noqa: BLE001 — the data is in; say so loudly
-            logger.error("backup_restore_end_sessions_failed", error=str(exc))
-            sessions_ended = -1
-            post_warnings.append(
-                "Could not end the sessions restored from the archive "
-                f"({exc}). Sign-ins from before the restore may still be accepted; "
-                "end them from Administration, Sessions."
-            )
+    if sessions_warning:
+        post_warnings.append(sessions_warning)
 
     # The override is the first thing an operator should read back.
     if schema_override_warning:
