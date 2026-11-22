@@ -53,6 +53,7 @@ import httpx
 import structlog
 
 from .kea_ctrl import KeaCtrlError, send_command
+from .relay_info import relay_agent_info_from_user_context
 from .spool import RETRY, SENT, classify_status
 
 log = structlog.get_logger(__name__)
@@ -108,7 +109,7 @@ def kea_lease_to_event(lease: dict[str, Any]) -> dict[str, Any] | None:
         return None
     hostname = str(lease.get("hostname") or "").strip() or None
     ends_at = _iso(cltt + valid_lft) if cltt else None
-    return {
+    evt: dict[str, Any] = {
         "ip_address": ip,
         "mac_address": mac,
         "hostname": hostname,
@@ -118,6 +119,11 @@ def kea_lease_to_event(lease: dict[str, Any]) -> dict[str, Any] | None:
         "ends_at": ends_at,
         "expires_at": ends_at,
     }
+    # #54 — option 82, sent only when Kea stored it (same rule as the CSV path).
+    rai = relay_agent_info_from_user_context(lease.get("user-context"))
+    if rai:
+        evt["relay_agent_info"] = rai
+    return evt
 
 
 def kea_lease6_to_event(lease: dict[str, Any]) -> dict[str, Any] | None:

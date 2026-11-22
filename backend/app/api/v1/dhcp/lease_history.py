@@ -25,6 +25,7 @@ from sqlalchemy.sql import Select
 
 from app.api.deps import DB, CurrentUser
 from app.api.pagination import MAX_PAGE
+from app.api.v1.dhcp._leases import RelayIdFields, relay_id_condition
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPLeaseHistory, DHCPServer
 
@@ -41,7 +42,7 @@ router = APIRouter(
 VALID_LEASE_HISTORY_STATES = frozenset({"expired", "released", "removed", "superseded"})
 
 
-class LeaseHistoryRow(BaseModel):
+class LeaseHistoryRow(RelayIdFields):
     id: uuid.UUID
     server_id: uuid.UUID
     scope_id: uuid.UUID | None
@@ -79,10 +80,24 @@ def apply_lease_history_filters(
     ip: str | None,
     hostname: str | None,
     lease_state: str | None,
+    relay_circuit_id: str | None = None,
+    relay_remote_id: str | None = None,
 ) -> Select[Any]:
-    """The mac / ip / hostname / state filters, shared with the fleet-wide
-    route in ``leases.py`` (#917) so the two cannot diverge on what a filter
-    means."""
+    """The mac / ip / hostname / state / option-82 filters, shared with the
+    fleet-wide route in ``leases.py`` (#917) so the two cannot diverge on what
+    a filter means."""
+    if relay_circuit_id:
+        base = base.where(
+            relay_id_condition(
+                DHCPLeaseHistory.relay_circuit_id, relay_circuit_id, param="relay_circuit_id"
+            )
+        )
+    if relay_remote_id:
+        base = base.where(
+            relay_id_condition(
+                DHCPLeaseHistory.relay_remote_id, relay_remote_id, param="relay_remote_id"
+            )
+        )
     if mac:
         # MACADDR → text for substring match. Postgres canonicalises to
         # ``aa:bb:cc:dd:ee:ff`` so we lowercase the input first.
@@ -114,6 +129,12 @@ async def list_lease_history(
     ip: str | None = Query(None, description="IP or CIDR — exact / containment match"),
     hostname: str | None = Query(None, description="Hostname substring match"),
     lease_state: str | None = Query(None, description="Filter by lease_state"),
+    relay_circuit_id: str | None = Query(
+        None, description="option-82 circuit-id, hex; exact, or a prefix ending in '*'"
+    ),
+    relay_remote_id: str | None = Query(
+        None, description="option-82 remote-id, hex; exact, or a prefix ending in '*'"
+    ),
     page: int = Query(1, ge=1, le=MAX_PAGE),
     per_page: int = Query(50, ge=1, le=500),
 ) -> LeaseHistoryPage:
@@ -136,7 +157,13 @@ async def list_lease_history(
     base = base.where(DHCPLeaseHistory.expired_at <= until)
 
     base = apply_lease_history_filters(
-        base, mac=mac, ip=ip, hostname=hostname, lease_state=lease_state
+        base,
+        mac=mac,
+        ip=ip,
+        hostname=hostname,
+        lease_state=lease_state,
+        relay_circuit_id=relay_circuit_id,
+        relay_remote_id=relay_remote_id,
     )
 
     total = (await db.execute(select(func.count()).select_from(base.subquery()))).scalar_one()

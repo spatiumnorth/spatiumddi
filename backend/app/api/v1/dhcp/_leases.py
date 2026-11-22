@@ -16,17 +16,53 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, field_validator
+from fastapi import HTTPException
+from pydantic import BaseModel, field_validator, model_validator
 from sqlalchemy import String, cast, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import Select
 
 from app.models.dhcp import DHCPLease
 from app.models.dhcp_fingerprint import DHCPFingerprint
+from app.services.dhcp.relay_agent_info import (
+    decode_sub_options,
+    printable_text,
+    relay_id_clause,
+)
 from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
 
 
-class LeaseResponse(BaseModel):
+class RelaySubOption(BaseModel):
+    """One option-82 sub-option as the relay sent it (#54)."""
+
+    code: int
+    hex: str
+    # The value as text when every byte is printable ASCII, else null.
+    text: str | None = None
+
+
+class RelayIdFields(BaseModel):
+    """Option-82 circuit-id / remote-id on a lease or lease-history row (#54).
+
+    Stored as uppercase hex because the bytes are often binary. ``*_text`` is
+    the same value as text when every byte is printable ASCII, and null
+    otherwise (never a lossy decode). Shared by the lease and lease-history
+    rows so the two cannot render a circuit-id differently.
+    """
+
+    relay_circuit_id: str | None = None
+    relay_remote_id: str | None = None
+    relay_circuit_id_text: str | None = None
+    relay_remote_id_text: str | None = None
+
+    @model_validator(mode="after")
+    def _relay_text(self) -> RelayIdFields:
+        self.relay_circuit_id_text = printable_text(self.relay_circuit_id)
+        self.relay_remote_id_text = printable_text(self.relay_remote_id)
+        return self
+
+
+class LeaseResponse(RelayIdFields):
     id: uuid.UUID
     server_id: uuid.UUID
     scope_id: uuid.UUID | None
@@ -53,8 +89,20 @@ class LeaseResponse(BaseModel):
     device_name: str | None = None
     device_manufacturer: str | None = None
     fingerbank_score: int | None = None
+    # #54 — the whole option-82 body (hex) and its decoded sub-options. Empty
+    # when the lease was not relayed with option 82, or its group records
+    # none; a body that does not parse keeps its hex with an empty list.
+    relay_agent_info: str | None = None
+    relay_sub_options: list[RelaySubOption] = []
 
     model_config = {"from_attributes": True}
+
+    @model_validator(mode="after")
+    def _relay_sub_options(self) -> LeaseResponse:
+        self.relay_sub_options = [
+            RelaySubOption(**sub) for sub in decode_sub_options(self.relay_agent_info)
+        ]
+        return self
 
     # asyncpg decodes INET / MACADDR columns into ipaddress.IPv4Address and
     # netaddr.EUI-like objects. Coerce to str for the wire — this hit our
@@ -65,18 +113,50 @@ class LeaseResponse(BaseModel):
         return str(v) if v is not None else v
 
 
+def relay_id_condition(column: Any, value: str, *, param: str) -> Any:
+    """A circuit-id / remote-id filter (#54): hex, exact, or a prefix when it
+    ends in ``*``. Separators and ``0x`` are ignored. 422 on anything else.
+
+    Shared by the lease and lease-history routes so ``…?relay_circuit_id=``
+    means the same on both.
+    """
+    clause = relay_id_clause(column, value)
+    if clause is None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{param} must be hex (whole bytes, e.g. 0A0B), "
+                f"or a hex prefix ending in '*'; got {value!r}"
+            ),
+        )
+    return clause
+
+
 def apply_lease_filters(
     q: Select[Any],
     *,
     search: str | None,
     state: str | None,
     device_class: str | None,
+    relay_circuit_id: str | None = None,
+    relay_remote_id: str | None = None,
 ) -> Select[Any]:
-    """The ``search`` / ``state`` / ``device_class`` filters, applied once.
+    """The ``search`` / ``state`` / ``device_class`` / option-82 filters,
+    applied once.
 
     ``device_class`` inner-joins the fingerprint table so the page lands on
     matching rows rather than filtering after the slice.
     """
+    if relay_circuit_id:
+        q = q.where(
+            relay_id_condition(
+                DHCPLease.relay_circuit_id, relay_circuit_id, param="relay_circuit_id"
+            )
+        )
+    if relay_remote_id:
+        q = q.where(
+            relay_id_condition(DHCPLease.relay_remote_id, relay_remote_id, param="relay_remote_id")
+        )
     if device_class:
         q = q.join(DHCPFingerprint, DHCPFingerprint.mac_address == DHCPLease.mac_address).where(
             DHCPFingerprint.fingerbank_device_class == device_class

@@ -3,8 +3,9 @@
 Three callers today: the ``pull_leases`` absence-delete branch, the
 ``pull_leases`` MAC-supersede branch (same IP, new MAC), and the
 ``dhcp_lease_cleanup`` time-based expiry sweep. All three share the
-same shape — copy the lease's identifying fields into a new history
-row before the active row goes away.
+same shape — copy the lease's identifying fields (option-82 circuit-id
+and remote-id included, #54) into a new history row before the active
+row goes away.
 
 Idempotency: each call writes one row; callers either delete the
 ``DHCPLease`` row in the same transaction or update it in place. A
@@ -55,6 +56,8 @@ def record_lease_history(
         iaid=lease.iaid,
         hostname=lease.hostname,
         client_id=lease.client_id,
+        relay_circuit_id=lease.relay_circuit_id,
+        relay_remote_id=lease.relay_remote_id,
         started_at=lease.starts_at or lease.last_seen_at,
         expired_at=expired_at,
         lease_state=lease_state,

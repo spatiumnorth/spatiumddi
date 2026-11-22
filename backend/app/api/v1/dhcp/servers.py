@@ -1730,6 +1730,12 @@ async def list_leases(
     search: str | None = Query(None, description="substring over ip / mac / hostname"),
     state: str | None = Query(None, description="exact lease state filter"),
     device_class: str | None = None,
+    relay_circuit_id: str | None = Query(
+        None, description="option-82 circuit-id, hex; exact, or a prefix ending in '*'"
+    ),
+    relay_remote_id: str | None = Query(
+        None, description="option-82 remote-id, hex; exact, or a prefix ending in '*'"
+    ),
     page: int = Query(1, ge=1, le=MAX_PAGE),
     page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
 ) -> Page[LeaseResponse]:
@@ -1740,6 +1746,7 @@ async def list_leases(
     ``search`` matches ip / mac / hostname; ``state`` and ``device_class`` are
     exact filters (the latter joins the fingerprint table so the page lands on
     matching rows). When fingerprinting is off the device fields are blank.
+    ``relay_circuit_id`` / ``relay_remote_id`` match option 82 (#54).
     """
     s = await db.get(DHCPServer, server_id)
     if s is None:
@@ -1749,6 +1756,8 @@ async def list_leases(
         search=search,
         state=state,
         device_class=device_class,
+        relay_circuit_id=relay_circuit_id,
+        relay_remote_id=relay_remote_id,
     ).order_by(DHCPLease.last_seen_at.desc())
     rows, total = await paginate(db, q, page=page, page_size=page_size)
     await enrich_leases(db, rows)

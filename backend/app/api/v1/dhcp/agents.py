@@ -100,6 +100,7 @@ from app.services.dhcp.ipam_mirror import (
 )
 from app.services.dhcp.lease_cleanup import address_still_held
 from app.services.dhcp.normalize import canonical_duid, norm_duid, norm_ip, norm_mac
+from app.services.dhcp.relay_agent_info import circuit_and_remote, normalize_relay_hex
 from app.services.dns.record_ops import purge_trashed_address_records
 from app.services.e911.address_bindings import keep_row_if_bound
 from app.services.ipam.utilization import recount_subnets_and_blocks
@@ -289,6 +290,11 @@ class LeaseEvent(BaseModel):
     starts_at: datetime | None = None
     ends_at: datetime | None = None
     expires_at: datetime | None = None
+    # #54 — the option-82 body Kea stored for the lease, as hex. Optional and
+    # sent only for a relayed lease, so an agent that predates it is
+    # unaffected; an older control plane ignores it, since this model does not
+    # forbid extra keys (only the batch envelope does).
+    relay_agent_info: str | None = None
 
     @field_validator("hostname")
     @classmethod
@@ -301,6 +307,14 @@ class LeaseEvent(BaseModel):
         if v is None:
             return None
         return sanitize_hostname(v) or None
+
+    @field_validator("relay_agent_info", mode="before")
+    @classmethod
+    def _relay_agent_info_hex(cls, v: Any) -> str | None:
+        # Off the wire from a relay, through Kea: anything that is not an
+        # option-82 body is dropped, never a 422 — the lease itself must
+        # still land (same stance as the hostname above).
+        return normalize_relay_hex(v)
 
     @field_validator("duid")
     @classmethod
@@ -321,6 +335,20 @@ class LeaseEvent(BaseModel):
         elif not self.mac_address:
             raise ValueError("a DHCPv4 lease needs a mac_address")
         return self
+
+
+def _relay_columns(raw_hex: str | None) -> dict[str, str | None]:
+    """The ``dhcp_lease`` option-82 columns for one event's body (#54).
+
+    A body whose sub-options do not parse keeps its raw hex, with no
+    circuit-id or remote-id read out of it.
+    """
+    circuit, remote = circuit_and_remote(raw_hex)
+    return {
+        "relay_agent_info": raw_hex,
+        "relay_circuit_id": circuit,
+        "relay_remote_id": remote,
+    }
 
 
 def _utc(value: datetime) -> datetime:
@@ -1676,6 +1704,7 @@ async def agent_lease_events(
                 ends_at=ev.ends_at,
                 expires_at=expires_at,
                 last_seen_at=now,
+                **_relay_columns(ev.relay_agent_info),
                 # #844 — wire the scope FK at ingestion so downstream
                 # consumers (lease cleanup, mirror scoping) never have to
                 # fall back to the space-ambiguous CIDR match.
@@ -1696,6 +1725,12 @@ async def agent_lease_events(
             lease.ends_at = ev.ends_at
             lease.expires_at = expires_at
             lease.last_seen_at = now
+            if ev.relay_agent_info is not None:
+                # #54 — a renewal is unicast straight to the server, without
+                # the relay and so without option 82; Kea keeps what it
+                # stored, and so does this row. Only a new body replaces it.
+                for column, value in _relay_columns(ev.relay_agent_info).items():
+                    setattr(lease, column, value)
             if lease.scope_id is None or lease.scope_id in trashed_scope_ids:
                 # Backfill legacy rows created before scope stamping (#844).
                 # #3733: and a row still naming a scope in the Trash goes to
