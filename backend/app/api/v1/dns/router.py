@@ -452,7 +452,18 @@ _DNS_ROUTE_TYPES: dict[str, tuple[str, ...]] = {
     "POST /groups/{group_id}/zones/{zone_id}/import/spreadsheet/preview": _R,
     "POST /groups/{group_id}/zones/{zone_id}/import/spreadsheet/commit": _R,
 }
-_DNS_GATE = require_route_types(_DNS_ROUTE_TYPES, "/dns")
+# The server-group routes are gated on ``dns_group`` but audit their changes as
+# ``dns_server_group``; a refusal is written under the audited type (#4718) so
+# the Audit Log's Resource filter lists it with the group's changes. Only the
+# routes whose own rows are ``dns_server_group`` are listed: the group's
+# servers, ACLs, views and keys are audited as their own types.
+_DNS_AUDIT_TYPES: dict[str, str] = {
+    "POST /groups": "dns_server_group",
+    "PUT /groups/{group_id}": "dns_server_group",
+    "DELETE /groups/{group_id}": "dns_server_group",
+    "POST /groups/{group_id}/group-tsig-key/rotate": "dns_server_group",
+}
+_DNS_GATE = require_route_types(_DNS_ROUTE_TYPES, "/dns", _DNS_AUDIT_TYPES)
 
 # The upload routes here check the login from the request headers before
 # the multipart body is read (app.api.pre_body_auth, #2780).
