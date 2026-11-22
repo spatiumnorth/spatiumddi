@@ -1890,6 +1890,13 @@ Scheduled Celery beat task: [`app.tasks.dhcp_pull_leases.auto_pull_dhcp_leases`]
 | `dhcp_pull_leases_interval_seconds` | 15 | How often to poll each agentless server, in seconds. Floor is 10 (matching the beat tick). Operators who don't need sub-minute freshness can raise it to 60 / 300 / etc to reduce WinRM load. |
 | `dhcp_pull_leases_last_run_at` | — | Claimed when a pass **starts** (#2262), so a pass slower than the beat tick is not started again while it runs; visible in Settings. |
 
+Two further beat tasks open a session per agentless server and are gated the same way (#4759), both on a 60 s beat tick:
+
+| Setting | Default | Description |
+|---|---|---|
+| `dhcp_health_interval_seconds` | 60 | How often agentless servers (Windows DHCP, FortiGate) get a health probe, 60 to 3600 s. Agent-based servers (Kea) are not governed by it: their status follows the agent heartbeat and is evaluated every minute. |
+| `dhcp_mac_blocks_sync_interval_seconds` | 60 | How often each agentless server's MAC deny list is reconciled, 60 to 3600 s. A server with no active block in its group and none pushed before is skipped with no WinRM round trip; removing the last block still syncs once to clear the filter list. Saving a block in the UI pushes immediately regardless of the interval. |
+
 > **Windows DHCP has no streaming primitive.** The lease audit log (`DhcpSrvLog-<Day>.log`) and `Get-DhcpServerv4Lease` are the only real windows into the running service, and both are pull-based. WinRM itself is request/response — `Get-Content -Wait` does exist in PowerShell but it holds the HTTPS connection open indefinitely and can't flush partial output back through `pywinrm.run_ps`, so true push-style streaming would require an agent process on the DC that POSTs events back to SpatiumDDI. Short-interval polling is the practical upper bound without adding that complexity.
 
 Per poll:

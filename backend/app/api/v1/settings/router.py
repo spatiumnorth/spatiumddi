@@ -166,6 +166,8 @@ class SettingsResponse(BaseModel):
     dhcp_pull_leases_enabled: bool
     dhcp_pull_leases_interval_seconds: int
     dhcp_pull_leases_last_run_at: datetime | None
+    dhcp_health_interval_seconds: int
+    dhcp_mac_blocks_sync_interval_seconds: int
     audit_forward_syslog_enabled: bool
     audit_forward_syslog_host: str
     audit_forward_syslog_port: int
@@ -1061,6 +1063,8 @@ SETTINGS_DELEGATE_WRITABLE: frozenset[str] = frozenset(
         "dns_pull_from_server_interval_minutes",
         "dhcp_pull_leases_enabled",
         "dhcp_pull_leases_interval_seconds",
+        "dhcp_health_interval_seconds",
+        "dhcp_mac_blocks_sync_interval_seconds",
         "dhcp_default_lease_time",
         "dhcp_default_domain_name",
         "dhcp_default_domain_search",
@@ -1122,6 +1126,8 @@ class SettingsUpdate(BaseModel):
     dns_pull_from_server_interval_minutes: int | None = None
     dhcp_pull_leases_enabled: bool | None = None
     dhcp_pull_leases_interval_seconds: int | None = None
+    dhcp_health_interval_seconds: int | None = None
+    dhcp_mac_blocks_sync_interval_seconds: int | None = None
     audit_forward_syslog_enabled: bool | None = None
     audit_forward_syslog_host: str | None = None
     audit_forward_syslog_port: int | None = None
@@ -1826,6 +1832,15 @@ class SettingsUpdate(BaseModel):
         # Beat ticks every 10 s — anything below that can't be honoured.
         if v is not None and v < 10:
             raise ValueError("Must be >= 10 (Celery beat ticks every 10 seconds)")
+        return v
+
+    @field_validator("dhcp_health_interval_seconds", "dhcp_mac_blocks_sync_interval_seconds")
+    @classmethod
+    def validate_dhcp_agentless_seconds(cls, v: int | None) -> int | None:
+        # Beat ticks every 60 s -- a shorter interval can't be honoured.
+        # Cap at 1 h: slower and a dead server would go unnoticed all day.
+        if v is not None and not (60 <= v <= 3600):
+            raise ValueError("Must be between 60 and 3600 seconds")
         return v
 
     @field_validator("domain_whois_interval_hours")
