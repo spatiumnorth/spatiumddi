@@ -62,13 +62,14 @@ case "$*" in
       if [ "$n" -ge "$(cat "$d/after")" ]; then cat "$d/img_new"; else cat "$d/img_old"; fi ;;
   *"get pods"*) n=$(cat "$d/dcalls" 2>/dev/null || echo 0)
       if [ "$n" -ge "$(cat "$d/after")" ]; then cat "$d/pods_new"; else cat "$d/pods_old"; fi ;;
-  *"get jobs"*) cat "$d/jobs" ;;
+  *"get jobs"*) n=$(cat "$d/dcalls" 2>/dev/null || echo 0)
+      if [ -f "$d/jobs_gone_after" ] && [ "$n" -ge "$(cat "$d/jobs_gone_after")" ]; then :; else cat "$d/jobs"; fi ;;
 esac
 exit 0
 """
 
 
-def _run(tmp_path, shell, *, after, trial=True, released=1, migrate=None):
+def _run(tmp_path, shell, *, after, trial=True, released=1, migrate=None, jobs_gone_after=None):
     """after: k3s calls before the api shows the new tag (99 = never)."""
     k3s = tmp_path / "k3s"
     k3s.write_text(STUB)
@@ -86,6 +87,8 @@ def _run(tmp_path, shell, *, after, trial=True, released=1, migrate=None):
     elif migrate == "old":
         jobs = f"{old}|1|\n"
     (tmp_path / "jobs").write_text(jobs)
+    if jobs_gone_after is not None:
+        (tmp_path / "jobs_gone_after").write_text(str(jobs_gone_after))
     flag = tmp_path / "flag"
     fns = "\n".join(
         _function(n)
@@ -106,6 +109,7 @@ CONTROL_CONVERGE_POLL_S=1
 CONTROL_API_DEPLOY=api
 CONTROL_NOT_CONVERGED_FILE="{flag}"
 CONTROL_CHART_RELEASED={released}
+CONTROL_MIGRATE_SEEN=0
 SPATIUM_HOST_GID=$(id -g)
 uptime_s() {{ echo 0; }}
 sleep() {{ :; }}
@@ -157,6 +161,19 @@ def test_timeout_after_a_migrate_run_commits_and_flags(tmp_path, shell) -> None:
     assert "revert to the previous slot is unsafe" in proc.stderr
     rec = json.loads(flag.read_text())
     assert rec["version"] == VER and "did not apply" in rec["detail"] and rec["at"]
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_a_migrate_job_garbage_collected_during_the_wait_still_counts(tmp_path, shell) -> None:
+    # The Job's TTL fires inside the wait: seen early, gone by the timeout.
+    proc, flag, _ = _run(tmp_path, shell, after=99, migrate="succeeded", jobs_gone_after=2)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(flag.read_text())["version"] == VER
+
+
+def test_the_appliance_render_keeps_the_migrate_job_for_an_hour() -> None:
+    text = FIRSTBOOT.read_text(encoding="utf-8")
+    assert "ttlSecondsAfterFinished: 3600" in text
 
 
 @pytest.mark.parametrize("shell", SHELLS)
