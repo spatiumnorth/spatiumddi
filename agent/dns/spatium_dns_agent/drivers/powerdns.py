@@ -39,6 +39,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+import dns.rdata
+import dns.rdataclass
+import dns.rdatatype
 import httpx
 import structlog
 
@@ -160,6 +163,27 @@ def _qualify_last_token(content: str, zone: str | None) -> str:
     return f"{m.group(1)}{_qualify_target(m.group(2), zone)}{m.group(3)}"
 
 
+_LOC_DIRECTION = re.compile(r"(?<=\s)([nsew])(?=\s|$)")
+
+
+def _loc_content(value: str) -> str:
+    """A LOC value in the one spelling PowerDNS accepts (#4572).
+
+    BIND takes ``-2.00m 0.00m 10000m 10m``; PowerDNS refuses anything but
+    its own printed form (``10000.00m 10.00m``) and a refused rrset refuses
+    the whole PATCH carrying it. A wire round trip gives that form, and
+    rounds size / precision to the one-digit-times-power-of-ten the wire
+    holds, as every server does. An unparseable value is sent as typed."""
+    text = value.strip()
+    text = _LOC_DIRECTION.sub(lambda m: m.group(1).upper(), text)
+    try:
+        rdtype = dns.rdatatype.LOC
+        wire = dns.rdata.from_text(dns.rdataclass.IN, rdtype, text).to_wire()
+        return dns.rdata.from_wire(dns.rdataclass.IN, rdtype, wire, 0, len(wire)).to_text()
+    except Exception:  # noqa: BLE001 - dnspython raises several types; send as typed
+        return value
+
+
 def _record_content(rec: dict[str, Any], zone: str | None = None) -> str:
     """Stitch wire-format content for a single record dict.
 
@@ -198,6 +222,8 @@ def _record_content(rec: dict[str, Any], zone: str | None = None) -> str:
         return f"{m.group(1)}{_qualify_target(m.group(2), zone)}{value[m.end():]}"
     if rtype == "NAPTR":
         return _qualify_last_token(value, zone)
+    if rtype == "LOC":
+        return _loc_content(value)
     return value
 
 
