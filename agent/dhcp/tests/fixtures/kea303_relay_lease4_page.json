@@ -1,0 +1,89 @@
+[
+  {
+    "cltt": 1795306689,
+    "fqdn-fwd": false,
+    "fqdn-rev": false,
+    "hostname": "",
+    "hw-address": "02:00:00:00:00:03",
+    "ip-address": "172.31.82.77",
+    "state": 0,
+    "subnet-id": 1,
+    "user-context": {
+      "ISC": {
+        "relay-agent-info": {
+          "remote-id": "DDEEFF010203",
+          "sub-options": "0x01074769312F302F370206DDEEFF010203"
+        }
+      }
+    },
+    "valid-lft": 7200
+  },
+  {
+    "cltt": 1795306689,
+    "fqdn-fwd": false,
+    "fqdn-rev": false,
+    "hostname": "",
+    "hw-address": "02:00:00:00:00:01",
+    "ip-address": "172.31.82.100",
+    "state": 0,
+    "subnet-id": 1,
+    "user-context": {
+      "ISC": {
+        "relay-agent-info": {
+          "remote-id": "AABBCC010203",
+          "sub-options": "0x010A657468302F313A3130300206AABBCC010203"
+        }
+      }
+    },
+    "valid-lft": 7200
+  },
+  {
+    "cltt": 1795306689,
+    "fqdn-fwd": false,
+    "fqdn-rev": false,
+    "hostname": "",
+    "hw-address": "02:00:00:00:00:02",
+    "ip-address": "172.31.82.120",
+    "state": 0,
+    "subnet-id": 1,
+    "user-context": {
+      "ISC": {
+        "relay-agent-info": {
+          "remote-id": "AABBCC010203",
+          "sub-options": "0x010A657468302F323A3130300206AABBCC01020306067375622D3432"
+        }
+      }
+    },
+    "valid-lft": 7200
+  },
+  {
+    "cltt": 1795306689,
+    "fqdn-fwd": false,
+    "fqdn-rev": false,
+    "hostname": "",
+    "hw-address": "02:00:00:00:00:04",
+    "ip-address": "172.31.82.200",
+    "state": 0,
+    "subnet-id": 1,
+    "valid-lft": 7200
+  },
+  {
+    "cltt": 1795306689,
+    "fqdn-fwd": false,
+    "fqdn-rev": false,
+    "hostname": "",
+    "hw-address": "02:00:00:00:00:05",
+    "ip-address": "172.31.82.201",
+    "state": 0,
+    "subnet-id": 1,
+    "user-context": {
+      "ISC": {
+        "relay-agent-info": {
+          "remote-id": "697427732C2278220A",
+          "sub-options": "0x01060004006401070209697427732C2278220A"
+        }
+      }
+    },
+    "valid-lft": 7200
+  }
+]

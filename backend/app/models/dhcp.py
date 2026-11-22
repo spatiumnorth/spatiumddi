@@ -1195,6 +1195,17 @@ class DHCPLease(UUIDPrimaryKeyMixin, Base):
         CheckConstraint(
             "mac_address IS NOT NULL OR duid IS NOT NULL", name="ck_dhcp_lease_identity"
         ),
+        # #54 — "which lease came in on this switch port?"
+        Index(
+            "ix_dhcp_lease_relay_circuit",
+            "relay_circuit_id",
+            postgresql_where=sa_text("relay_circuit_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_dhcp_lease_relay_remote",
+            "relay_remote_id",
+            postgresql_where=sa_text("relay_remote_id IS NOT NULL"),
+        ),
     )
 
     server_id: Mapped[uuid.UUID] = mapped_column(
@@ -1217,6 +1228,16 @@ class DHCPLease(UUIDPrimaryKeyMixin, Base):
     hostname: Mapped[str | None] = mapped_column(String(255), nullable=True)
     client_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     user_class: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Relay agent information, DHCP option 82 (#54), as Kea stored it for
+    # the lease (``store-extended-info``): the whole option body, and its
+    # circuit-id (sub-option 1) and remote-id (sub-option 2). Uppercase hex,
+    # no ``0x`` — a circuit-id is bytes, often binary; the API adds a
+    # printable rendering at read time (``services.dhcp.relay_agent_info``).
+    # NULL when the lease was not relayed with option 82, or the group
+    # records none (Kea stores it only for groups with an option-82 class).
+    relay_agent_info: Mapped[str | None] = mapped_column(String(510), nullable=True)
+    relay_circuit_id: Mapped[str | None] = mapped_column(String(510), nullable=True)
+    relay_remote_id: Mapped[str | None] = mapped_column(String(510), nullable=True)
 
     starts_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -1296,6 +1317,10 @@ class DHCPLeaseHistory(UUIDPrimaryKeyMixin, Base):
     iaid: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     hostname: Mapped[str | None] = mapped_column(String(255), nullable=True)
     client_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Copied from the lease (#54): which switch port / subscriber held the
+    # address, the carrier forensic question. Hex, as on ``dhcp_lease``.
+    relay_circuit_id: Mapped[str | None] = mapped_column(String(510), nullable=True)
+    relay_remote_id: Mapped[str | None] = mapped_column(String(510), nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     expired_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

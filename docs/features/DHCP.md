@@ -1352,6 +1352,9 @@ DHCPLease (not persisted long-term — cached in Redis, written to DB for histor
   starts_at, ends_at, expires_at
   state: enum(active, expired, released, abandoned)
   client_id, user_class
+  relay_agent_info      -- option-82 body Kea stored, hex (#54); NULL when not relayed / not recorded
+  relay_circuit_id      -- its sub-option 1, hex
+  relay_remote_id       -- its sub-option 2, hex
   last_seen_at
 ```
 
@@ -1386,6 +1389,54 @@ different MAC, or got swept on absence-delete — gives operators a
 - Daily prune task (`app.tasks.dhcp_lease_history_prune`) honours
   `PlatformSettings.dhcp_lease_history_retention_days` (default
   90; set to 0 to keep forever).
+- Each row keeps the lease's option-82 circuit-id and remote-id
+  (below), so "which client was on switch port X at 03:12" has an
+  answer after the lease is gone.
+
+### Relay agent information (option 82) on leases (#54)
+
+For a lease that came in through a relay with option 82, the lease row
+records what the relay sent: the whole option body
+(`relay_agent_info`) and its circuit-id (sub-option 1) and remote-id
+(sub-option 2). It is the answer to "what does my switch actually
+send?", which is the first thing to know before writing an option-82
+client class (§4).
+
+- **Where it comes from.** Kea keeps the option-82 body in the lease's
+  user context only when `store-extended-info` is on, and the agent
+  renders that (with `stash-agent-options`) for every group with an
+  option-82 client class. A group without one records nothing: its
+  relayed leases have no relay fields. The agent reads the body from the
+  lease file's `user_context` column (undoing Kea's `&#x2c` CSV
+  escaping) and from the `lease4-get-page` snapshot, and sends it on the
+  existing lease-event wire as an optional `relay_agent_info` field,
+  only for a lease that has one. An agent or control plane from before
+  #54 ignores the field it does not know. DHCPv4 only.
+- **Stored as hex.** Circuit-ids are bytes and often binary (many
+  switches send `00 04 <vlan> <module> <port>`), so every value is kept
+  as uppercase hex. The API adds `relay_circuit_id_text` /
+  `relay_remote_id_text` — the value as text when every byte is
+  printable ASCII, otherwise null, never a lossy decode — and, on the
+  lease, `relay_sub_options`: every sub-option as `{code, hex, text}`.
+- **Renewals keep it.** A renewal is unicast to the server and carries
+  no option 82; the stored values stay until a relayed request brings a
+  new body. A body that does not parse as sub-options is stored raw with
+  no circuit-id / remote-id read out of it; a value that is not hex at
+  all is dropped and the lease still lands.
+- **Searching.** `GET /dhcp/leases`, `GET /dhcp/servers/{id}/leases`
+  and both lease-history routes take `relay_circuit_id=` /
+  `relay_remote_id=`: hex (separators and `0x` ignored), exact, or a
+  prefix when it ends in `*` (`657468302F*` is every circuit-id starting
+  `eth0/`). `GET /dhcp/server-groups/{id}/relay-agent-observations?sub_option=1|2&q=`
+  lists the distinct values the group's leases carry, most-seen first
+  with a lease count, capped at 200; `q` matches typed text or hex on
+  byte boundaries. The copilot's `find_dhcp_leases` and
+  `find_dhcp_lease_history` return and filter the same fields.
+- **Not in the support bundle.** The bundle carries no lease rows, and
+  the ingest logs no relay values.
+- **UI.** Not yet: the lease and lease-history tables do not show these
+  columns, and the client-class builder does not offer the observed
+  values. The API above is what that UI will read.
 
 ---
 

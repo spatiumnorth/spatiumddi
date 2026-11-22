@@ -1,0 +1,6 @@
+address,hwaddr,client_id,valid_lifetime,expire,subnet_id,fqdn_fwd,fqdn_rev,hostname,state,user_context,pool_id
+172.31.82.100,02:00:00:00:00:01,,7200,1795313889,1,0,0,,0,{ "ISC": { "relay-agent-info": { "remote-id": "AABBCC010203"&#x2c "sub-options": "0x010A657468302F313A3130300206AABBCC010203" } } },0
+172.31.82.120,02:00:00:00:00:02,,7200,1795313889,1,0,0,,0,{ "ISC": { "relay-agent-info": { "remote-id": "AABBCC010203"&#x2c "sub-options": "0x010A657468302F323A3130300206AABBCC01020306067375622D3432" } } },0
+172.31.82.77,02:00:00:00:00:03,,7200,1795313889,1,0,0,,0,{ "ISC": { "relay-agent-info": { "remote-id": "DDEEFF010203"&#x2c "sub-options": "0x01074769312F302F370206DDEEFF010203" } } },0
+172.31.82.200,02:00:00:00:00:04,,7200,1795313889,1,0,0,,0,,0
+172.31.82.201,02:00:00:00:00:05,,7200,1795313889,1,0,0,,0,{ "ISC": { "relay-agent-info": { "remote-id": "697427732C2278220A"&#x2c "sub-options": "0x01060004006401070209697427732C2278220A" } } },0

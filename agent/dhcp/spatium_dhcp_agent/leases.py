@@ -19,6 +19,11 @@ Kea memfile CSV format (v4)::
     address,hwaddr,client_id,valid_lifetime,expire,subnet_id,fqdn_fwd,fqdn_rev,
     hostname,state,user_context,hwtype,hwaddr_source,pool_id
 
+(kea-dhcp4 3.0.3 writes twelve columns: the same without ``hwtype`` and
+``hwaddr_source``.)
+``user_context`` carries the relay agent information (option 82) when Kea's
+``store-extended-info`` is on; see :mod:`.relay_info` (#54).
+
 ``state`` values: 0=default (active), 1=declined, 2=expired-reclaimed,
 3=released (Kea 3.0 lease affinity).
 
@@ -60,6 +65,7 @@ from .bootstrap import reauth_generation
 from .config import AgentConfig
 from .lease_snapshot import LeaseSnapshot
 from .push import CPPoster, disabled_spool, drain_for, late_bound
+from .relay_info import relay_agent_info_from_user_context
 from .spool import RETRY, SENT, Shipper, Spool, classify_status
 
 log = structlog.get_logger(__name__)
@@ -171,7 +177,7 @@ def _parse_row(row: list[str]) -> dict[str, Any] | None:
         # as ends_at). The old {ip,mac,ends_at} shape was silently dropped
         # by the server's Pydantic model (leases defaulted to [], HTTP 200),
         # so no Kea lease ever reached IPAM/DDNS.
-        return {
+        evt: dict[str, Any] = {
             "ip_address": ip,
             "mac_address": mac,
             "hostname": hostname,
@@ -182,6 +188,15 @@ def _parse_row(row: list[str]) -> dict[str, Any] | None:
         }
     except (ValueError, IndexError):
         return None
+    # #54 — option 82, from ``user_context``: column 10 in both layouts above
+    # (the 12 columns kea-dhcp4 3.0.3 writes, and the 14-column one). Sent only
+    # when present, so a batch with no relayed lease is byte-identical to one
+    # from an agent that predates the field.
+    if len(row) > 10:
+        rai = relay_agent_info_from_user_context(row[10])
+        if rai:
+            evt["relay_agent_info"] = rai
+    return evt
 
 
 # #3811 — consecutive timed-out / 5xx posts before the control plane counts as

@@ -326,6 +326,8 @@ backend/alembic/versions/b8e3f1c47a92_packet_capture.py:drop_column:110
 backend/alembic/versions/b8e3f1c47a92_packet_capture.py:drop_table:115
 backend/alembic/versions/b8f4c02e7a19_backup_target_write_only.py:drop_column:45
 backend/alembic/versions/b95e2d71f042_appliance_snmp_settings.py:drop_column:95
+backend/alembic/versions/b9b98b65f49c_dhcp_lease_relay_agent_info.py:drop_column:54
+backend/alembic/versions/b9b98b65f49c_dhcp_lease_relay_agent_info.py:drop_column:56
 backend/alembic/versions/b9c3f5e1a8d4_dns_rrl_amplification.py:drop_column:100
 backend/alembic/versions/b9c3f5e1a8d4_dns_rrl_amplification.py:drop_column:101
 backend/alembic/versions/b9c3f5e1a8d4_dns_rrl_amplification.py:drop_column:102

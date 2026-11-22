@@ -23,7 +23,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import cast, func, select
+from pydantic import BaseModel
+from sqlalchemy import cast, func, or_, select
 
 from app.api.deps import DB, CurrentUser
 from app.api.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE, MAX_PAGE_SIZE, Page, paginate
@@ -36,6 +37,12 @@ from app.api.v1.dhcp.lease_history import (
 )
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPLease, DHCPLeaseHistory, DHCPServer, DHCPServerGroup
+from app.services.dhcp.relay_agent_info import (
+    CIRCUIT_ID,
+    printable_text,
+    relay_hex_filter,
+    text_to_relay_hex,
+)
 
 router = APIRouter(
     tags=["dhcp"],
@@ -98,6 +105,12 @@ async def list_all_leases(
     server_id: uuid.UUID | None = Query(None, description="restrict to one DHCP server"),
     group_id: uuid.UUID | None = Query(None, description="restrict to one DHCP server group"),
     scope_id: uuid.UUID | None = Query(None, description="restrict to one scope"),
+    relay_circuit_id: str | None = Query(
+        None, description="option-82 circuit-id, hex; exact, or a prefix ending in '*'"
+    ),
+    relay_remote_id: str | None = Query(
+        None, description="option-82 remote-id, hex; exact, or a prefix ending in '*'"
+    ),
     page: int = Query(1, ge=1, le=MAX_PAGE),
     page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
 ) -> Page[LeaseResponse]:
@@ -112,7 +125,12 @@ async def list_all_leases(
     route returns.
     """
     q = apply_lease_filters(
-        select(DHCPLease), search=search, state=state, device_class=device_class
+        select(DHCPLease),
+        search=search,
+        state=state,
+        device_class=device_class,
+        relay_circuit_id=relay_circuit_id,
+        relay_remote_id=relay_remote_id,
     )
     if server_id is not None:
         q = q.where(DHCPLease.server_id == server_id)
@@ -152,6 +170,12 @@ async def list_all_lease_history(
     lease_state: str | None = Query(None, description="Filter by lease_state"),
     server_id: uuid.UUID | None = Query(None, description="restrict to one DHCP server"),
     group_id: uuid.UUID | None = Query(None, description="restrict to one DHCP server group"),
+    relay_circuit_id: str | None = Query(
+        None, description="option-82 circuit-id, hex; exact, or a prefix ending in '*'"
+    ),
+    relay_remote_id: str | None = Query(
+        None, description="option-82 remote-id, hex; exact, or a prefix ending in '*'"
+    ),
     page: int = Query(1, ge=1, le=MAX_PAGE),
     per_page: int = Query(50, ge=1, le=500),
 ) -> LeaseHistoryPage:
@@ -183,7 +207,13 @@ async def list_all_lease_history(
             base, DHCPLeaseHistory.server_id, await _server_ids_for_group(db, group_id)
         )
     base = apply_lease_history_filters(
-        base, mac=mac, ip=ip, hostname=hostname, lease_state=lease_state
+        base,
+        mac=mac,
+        ip=ip,
+        hostname=hostname,
+        lease_state=lease_state,
+        relay_circuit_id=relay_circuit_id,
+        relay_remote_id=relay_remote_id,
     )
 
     total = (await db.execute(select(func.count()).select_from(base.subquery()))).scalar_one()
@@ -203,6 +233,80 @@ async def list_all_lease_history(
         page=page,
         per_page=per_page,
         items=[LeaseHistoryRow.model_validate(r) for r in rows],
+    )
+
+
+#: Most distinct values one observations call returns.
+RELAY_OBSERVATIONS_LIMIT = 200
+
+
+class RelayObservation(BaseModel):
+    hex: str
+    # The value as text when every byte is printable ASCII, else null.
+    text: str | None = None
+    lease_count: int
+
+
+class RelayObservations(BaseModel):
+    sub_option: int
+    items: list[RelayObservation]
+    # True when more distinct values matched than ``items`` holds.
+    truncated: bool
+
+
+@router.get(
+    "/server-groups/{group_id}/relay-agent-observations",
+    response_model=RelayObservations,
+)
+async def relay_agent_observations(
+    group_id: uuid.UUID,
+    db: DB,
+    _: CurrentUser,
+    sub_option: int = Query(CIRCUIT_ID, ge=1, le=2, description="1 = circuit-id, 2 = remote-id"),
+    q: str | None = Query(
+        None,
+        max_length=255,
+        description="narrow to values containing this text, or this hex",
+    ),
+) -> RelayObservations:
+    """What the relays in front of a group actually send (#54).
+
+    Distinct circuit-ids (``sub_option=1``) or remote-ids (``sub_option=2``)
+    across the leases on record for the group's servers, most-seen first,
+    with how many leases carry each — "what does my switch send?", which is
+    the first thing to know before writing an option-82 class. Capped at
+    ``RELAY_OBSERVATIONS_LIMIT`` values. Only groups whose Kea stores option
+    82 (any group with an option-82 class) have any.
+    """
+    server_ids = await _server_ids_for_group(db, group_id)
+    column = DHCPLease.relay_circuit_id if sub_option == CIRCUIT_ID else DHCPLease.relay_remote_id
+    stmt = (
+        select(column, func.count().label("n"))
+        .where(DHCPLease.server_id.in_(server_ids), column.is_not(None))
+        .group_by(column)
+    )
+    if q and q.strip():
+        # Typed text is searched as its bytes; a valid hex string also as hex.
+        needles = {text_to_relay_hex(q.strip())}
+        parsed = relay_hex_filter(q)
+        if parsed is not None:
+            needles.add(parsed[0])
+        # Anchored to a byte boundary: a plain substring test would match a
+        # needle straddling two bytes. Needles are bare hex, so the pattern
+        # is safe to build by hand.
+        stmt = stmt.where(or_(*(column.regexp_match(f"^(..)*{n}") for n in needles)))
+    rows = (
+        await db.execute(
+            stmt.order_by(func.count().desc(), column).limit(RELAY_OBSERVATIONS_LIMIT + 1)
+        )
+    ).all()
+    return RelayObservations(
+        sub_option=sub_option,
+        items=[
+            RelayObservation(hex=value, text=printable_text(value), lease_count=int(n))
+            for value, n in rows[:RELAY_OBSERVATIONS_LIMIT]
+        ],
+        truncated=len(rows) > RELAY_OBSERVATIONS_LIMIT,
     )
 
 

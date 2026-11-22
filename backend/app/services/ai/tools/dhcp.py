@@ -35,6 +35,7 @@ from app.services.agents.memory_status import fresh_memory_status
 from app.services.ai.tools.base import register_tool
 from app.services.dhcp.device_policy import compile_device_policy
 from app.services.dhcp.normalize import canonical_duid
+from app.services.dhcp.relay_agent_info import printable_text, relay_id_clause
 from app.services.dhcp.stats import STATS_WINDOW_SECONDS, active_lease_count
 from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
 
@@ -201,6 +202,21 @@ class FindDHCPLeasesArgs(BaseModel):
             "are returned."
         ),
     )
+    relay_circuit_id: str | None = Field(
+        default=None,
+        description=(
+            "Filter by DHCP option-82 circuit-id (the switch port a relayed "
+            "client came in on), as HEX: 'eth0/1' is 657468302F31. Exact, or a "
+            "prefix when it ends in '*'."
+        ),
+    )
+    relay_remote_id: str | None = Field(
+        default=None,
+        description=(
+            "Filter by DHCP option-82 remote-id (often the relay's MAC or a "
+            "subscriber id), as HEX. Exact, or a prefix when it ends in '*'."
+        ),
+    )
     limit: int = Field(default=100, ge=1, le=500)
 
 
@@ -212,9 +228,12 @@ class FindDHCPLeasesArgs(BaseModel):
         "DUID, hostname substring, state, or fingerbank device class. "
         "Returns lease metadata (IP / MAC / DUID / IAID / mac_vendor / "
         "device_class / device_name / hostname / state / starts_at / "
-        "ends_at); a DHCPv6 lease usually has a DUID and no MAC. Use "
-        "for questions like 'what's the lease for MAC X?', 'what's "
-        "leased on subnet Y?', or 'show me the phones on this network'."
+        "ends_at, plus the DHCP option-82 relay circuit-id / remote-id as "
+        "hex and as text when printable); a DHCPv6 lease usually has a "
+        "DUID and no MAC. Also filterable by option-82 circuit-id / "
+        "remote-id (hex). Use for questions like 'what's the lease for "
+        "MAC X?', 'what's leased on subnet Y?', 'which client is on "
+        "switch port Z?', or 'show me the phones on this network'."
     ),
     args_model=FindDHCPLeasesArgs,
     category="dhcp",
@@ -249,6 +268,15 @@ async def find_dhcp_leases(
         stmt = stmt.join(
             DHCPFingerprint, DHCPFingerprint.mac_address == DHCPLease.mac_address
         ).where(DHCPFingerprint.fingerbank_device_class == args.device_class)
+    relay_filters = _relay_filter_conditions(
+        args.relay_circuit_id,
+        args.relay_remote_id,
+        DHCPLease.relay_circuit_id,
+        DHCPLease.relay_remote_id,
+    )
+    if isinstance(relay_filters, str):
+        return [{"result": relay_filters}]
+    stmt = stmt.where(*relay_filters)
     stmt = stmt.order_by(DHCPLease.ends_at.desc()).limit(args.limit)
     rows = (await db.execute(stmt)).scalars().all()
     vendors = await bulk_lookup_vendors(db, [str(le.mac_address) for le in rows if le.mac_address])
@@ -287,9 +315,43 @@ async def find_dhcp_leases(
                 "state": le.state,
                 "starts_at": le.starts_at.isoformat() if le.starts_at else None,
                 "ends_at": le.ends_at.isoformat() if le.ends_at else None,
+                **_relay_fields(le),
             }
         )
     return out
+
+
+def _relay_fields(row: Any) -> dict[str, Any]:
+    """Option-82 circuit-id / remote-id of a lease or history row (#54):
+    hex, and text when every byte is printable ASCII."""
+    return {
+        "relay_circuit_id": row.relay_circuit_id,
+        "relay_circuit_id_text": printable_text(row.relay_circuit_id),
+        "relay_remote_id": row.relay_remote_id,
+        "relay_remote_id_text": printable_text(row.relay_remote_id),
+    }
+
+
+def _relay_filter_conditions(
+    circuit: str | None, remote: str | None, circuit_col: Any, remote_col: Any
+) -> list[Any] | str:
+    """WHERE conditions for the option-82 filters, or the message to return
+    when one is not hex (the REST helper would raise a 422 instead)."""
+    conditions: list[Any] = []
+    for name, value, column in (
+        ("relay_circuit_id", circuit, circuit_col),
+        ("relay_remote_id", remote, remote_col),
+    ):
+        if not value:
+            continue
+        clause = relay_id_clause(column, value)
+        if clause is None:
+            return (
+                f"{name} {value!r} is not hex; convert text to the hex of its bytes "
+                "(e.g. 'eth0/1' is 657468302F31), optionally ending in '*' for a prefix"
+            )
+        conditions.append(clause)
+    return conditions
 
 
 class ListServerGroupsArgs(BaseModel):
@@ -1136,6 +1198,21 @@ class FindDHCPLeaseHistoryArgs(BaseModel):
         default=None, description="expired | released | removed | superseded."
     )
     server_id: str | None = Field(default=None, description="Filter to one DHCP server UUID.")
+    relay_circuit_id: str | None = Field(
+        default=None,
+        description=(
+            "Filter by DHCP option-82 circuit-id (the switch port a relayed "
+            "client came in on), as HEX: 'eth0/1' is 657468302F31. Exact, or a "
+            "prefix when it ends in '*'."
+        ),
+    )
+    relay_remote_id: str | None = Field(
+        default=None,
+        description=(
+            "Filter by DHCP option-82 remote-id (often the relay's MAC or a "
+            "subscriber id), as HEX. Exact, or a prefix when it ends in '*'."
+        ),
+    )
     days: int = Field(default=90, ge=1, le=3650, description="Trailing window in days.")
     limit: int = Field(default=50, ge=1, le=500)
 
@@ -1148,8 +1225,9 @@ class FindDHCPLeaseHistoryArgs(BaseModel):
         "EVER had a lease here?', which find_dhcp_leases cannot answer "
         "because it only sees leases that are still active. Use it to place "
         "a device that is now offline, or to find which address a machine "
-        "used to hold. Retention follows "
-        "dhcp_lease_history_retention_days (default 90)."
+        "used to hold, or which client held a switch port (option-82 "
+        "circuit-id / remote-id, hex, returned and filterable). Retention "
+        "follows dhcp_lease_history_retention_days (default 90)."
     ),
     args_model=FindDHCPLeaseHistoryArgs,
     category="dhcp",
@@ -1180,6 +1258,15 @@ async def find_dhcp_lease_history(
             stmt = stmt.where(DHCPLeaseHistory.server_id == str(uuid.UUID(args.server_id.strip())))
         except (ValueError, AttributeError):
             return [{"result": f"{args.server_id!r} is not a server UUID"}]
+    relay_filters = _relay_filter_conditions(
+        args.relay_circuit_id,
+        args.relay_remote_id,
+        DHCPLeaseHistory.relay_circuit_id,
+        DHCPLeaseHistory.relay_remote_id,
+    )
+    if isinstance(relay_filters, str):
+        return [{"result": relay_filters}]
+    stmt = stmt.where(*relay_filters)
     # Shared with the REST route so the two cannot disagree about what a
     # filter means (#917).
     stmt = apply_lease_history_filters(
@@ -1205,6 +1292,7 @@ async def find_dhcp_lease_history(
             "lease_state": r.lease_state,
             "started_at": r.started_at.isoformat() if r.started_at else None,
             "expired_at": r.expired_at.isoformat() if r.expired_at else None,
+            **_relay_fields(r),
         }
         for r in rows
     ]
