@@ -274,6 +274,9 @@ class RestoreOutcomeResponse(BaseModel):
     # caveat — the destination agent regenerates LMDB keys on
     # first sync and produces new DS records.
     warnings: list[str] = []
+    # Sessions that were live when the restore ended them; None when the
+    # restore did not touch the session table, -1 when ending them failed.
+    sessions_ended: int | None = None
 
 
 @router.post("/restore", response_model=RestoreOutcomeResponse)
@@ -509,7 +512,7 @@ async def restore_backup(
     elif migration is not None and migration.state == "unknown":
         note += f" Schema-version skew check skipped: {migration.error or 'unknown reason'}."
 
-    if outcome.sessions_ended:
+    if outcome.sessions_ended is not None and outcome.sessions_ended >= 0:
         note += " Every session was ended; sign in again."
 
     if outcome.pre_restore_path is None:
@@ -533,6 +536,7 @@ async def restore_backup(
         migration=migration_resp,
         rewrap=rewrap_resp,
         warnings=outcome.warnings,
+        sessions_ended=outcome.sessions_ended,
     )
 
 

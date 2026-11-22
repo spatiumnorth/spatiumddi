@@ -139,7 +139,41 @@ async def test_full_restore_ends_a_session_revoked_after_the_archive(scratch, mo
     url, archive, ids = scratch
     outcome = await _restore(url, archive, monkeypatch)
     assert await _accepted(url, ids["gone"], ids["gone_raw"], ids["user"]) == (False, False)
-    assert outcome.sessions_ended == 2
+    assert outcome.sessions_ended == 2  # both rows were live in the archive
+
+
+async def test_sessions_ended_counts_only_the_live_ones(scratch, monkeypatch):
+    """The table holds a revoked row and an expired one besides the live two;
+    every row is still ended, but only the live ones are counted."""
+    url, archive, ids = scratch
+    c = await asyncpg.connect(_dsn(url))
+    try:
+        for name, kw in (("dead", "revoked"), ("old", "expired")):
+            raw = f"{name}-{uuid.uuid4().hex[:6]}"
+            row = _session(ids["user"], raw, revoked=kw == "revoked")
+            if kw == "expired":
+                row.expires_at = datetime.now(UTC) - timedelta(days=1)
+            await c.execute(
+                "INSERT INTO user_session (id, user_id, refresh_token_hash, created_at, "
+                "expires_at, revoked, auth_source) VALUES ($1, $2, $3, $4, $5, $6, 'local')",
+                row.id,
+                ids["user"],
+                row.refresh_token_hash,
+                row.created_at,
+                row.expires_at,
+                row.revoked,
+            )
+        # "gone" was live when the archive was taken and is revoked now: 1 live
+        # row (keep) in the table at the time of the call.
+        assert await c.fetchval("SELECT count(*) FROM user_session") == 4
+    finally:
+        await c.close()
+    assert await restore._end_restored_sessions(url) == 1
+    c = await asyncpg.connect(_dsn(url))
+    try:
+        assert await c.fetchval("SELECT count(*) FROM user_session WHERE NOT revoked") == 0
+    finally:
+        await c.close()
 
 
 async def test_full_restore_ends_a_session_live_at_both_ends(scratch, monkeypatch):
@@ -207,7 +241,8 @@ async def test_ending_sessions_copes_with_a_table_older_than_the_rotation_column
         await c.execute("ALTER TABLE user_session DROP COLUMN rotated_at")
     finally:
         await c.close()
-    assert await restore._end_restored_sessions(url) == 2
+    # the table holds one live row and one revoked row
+    assert await restore._end_restored_sessions(url) == 1
     c = await asyncpg.connect(_dsn(url))
     try:
         assert await c.fetchval("SELECT count(*) FROM user_session WHERE NOT revoked") == 0

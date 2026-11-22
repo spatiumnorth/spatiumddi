@@ -148,8 +148,9 @@ class RestoreOutcome:
     # Backup targets whose ``in_progress`` claim came back inside the
     # archive and was settled (#2097). Empty when none.
     reconciled_backup_targets: list[dict[str, Any]] = field(default_factory=list)
-    # ``user_session`` rows the restore ended (sessions): the archive's copy of
-    # the table replaces the live one, so every row in it was set to revoked.
+    # Sessions the restore ended (sessions): the archive's copy of the table
+    # replaces the live one, every row in it is set to revoked, and this counts
+    # the ones that were live (not revoked, not expired) at that moment.
     # ``None`` when the restore did not reach the table, ``-1`` when ending
     # them failed (a warning says so).
     sessions_ended: int | None = None
@@ -1054,6 +1055,9 @@ _RESTORE_LOCK_HOLDERS_SQL = (
 )
 
 
+_LIVE_SESSIONS_SQL = "SELECT count(*) FROM user_session WHERE NOT revoked AND expires_at > now()"
+
+
 async def _end_restored_sessions(db_url: str) -> int:
     """Revoke every ``user_session`` row the replay brought back.
 
@@ -1067,7 +1071,10 @@ async def _end_restored_sessions(db_url: str) -> int:
     setting, not a session). Rotation markers are cleared too, so no row can
     stand for a successor inside the rotation grace window.
 
-    Returns the number of rows revoked. Runs on its own connection, like the
+    Every row is revoked and cleared, but the number returned counts only the
+    sessions that were live at that moment: not already revoked and not past
+    ``expires_at``. The archive's table also holds rows nobody could use. Runs
+    on its own connection, like the
     other post-replay steps, because the app's pool was disposed. It runs
     immediately after the replay, so an older archive's table may lack the
     rotation columns; those rows are revoked without them.
@@ -1083,19 +1090,21 @@ async def _end_restored_sessions(db_url: str) -> int:
     try:
         try:
             async with engine.begin() as conn:
-                result = await conn.execute(
+                live = await conn.scalar(text(_LIVE_SESSIONS_SQL))
+                await conn.execute(
                     text(
                         "UPDATE user_session SET revoked = true, "
                         "rotated_at = NULL, rotated_to_id = NULL"
                     )
                 )
-                return result.rowcount or 0
+                return int(live or 0)
         except ProgrammingError:
             # An archive older than the rotation columns, before the migration
             # has added them: there are no markers to clear, only rows to end.
             async with engine.begin() as conn:
-                result = await conn.execute(text("UPDATE user_session SET revoked = true"))
-                return result.rowcount or 0
+                live = await conn.scalar(text(_LIVE_SESSIONS_SQL))
+                await conn.execute(text("UPDATE user_session SET revoked = true"))
+                return int(live or 0)
     finally:
         await engine.dispose()
 
