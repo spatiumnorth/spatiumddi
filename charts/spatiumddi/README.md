@@ -319,6 +319,7 @@ them:
 | `image.pullPolicy` | `IfNotPresent` |  |
 | `image.pullSecrets` | `[]` |  |
 | `auth.secretKey` | `""` | Fernet key; auto-generated on first install if empty |
+| `supervisorRegistration.initiallyEnabled` | `false` | Initial state of Appliance registration on a fresh install (#4659); never overrides a later choice. Turn on for an install meant to take appliance agent nodes |
 | `auth.existingSecret` | `""` | BYO secret with key `secret-key` |
 | `fullnameOverride` | `""` |  |
 | `nameOverride` | `""` |  |
@@ -429,8 +430,8 @@ statefulset spec for fields other than ... are forbidden`. This happens even
 when the class you set is the cluster default. Changing a claim's storage size
 (`servers[].storage.*`) is refused for the same reason.
 
-Delete the StatefulSet object **without** its pod or PVCs, then upgrade or sync
-again; the new StatefulSet adopts the running pod and the existing claims:
+Delete **each** affected StatefulSet object (one per agent server, DNS and DHCP)
+**without** its pod or PVCs, then upgrade or sync again; the new StatefulSet adopts the running pod and the existing claims:
 
 ```bash
 kubectl delete sts <name> -n <namespace> --cascade=orphan
@@ -442,8 +443,8 @@ the application. `Replace=true` and `ServerSideApply=true` do not help: the
 field is immutable either way.
 
 On a real `helm install` / `helm upgrade` against a cluster, the chart looks up
-the live StatefulSet and stops with a message carrying this exact command
-before sending anything. `helm template` and Argo CD render without cluster
+the live StatefulSets and stops once, before sending anything, with a message
+listing one such command for every StatefulSet that needs it. `helm template` and Argo CD render without cluster
 access, so they cannot detect it; they print a note in `NOTES.txt` instead.
 
 This does not move any data. Existing PVCs keep the class they were created

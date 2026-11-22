@@ -9,7 +9,7 @@ import {
 } from "@/components/ownership/missingCustomer";
 import { useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ListEmpty } from "@/components/ui/list-read-error";
+import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
 import { ListPlus, Pencil, Plus, RefreshCw, Trash2, X } from "lucide-react";
 
 import { MulticastDomainsTab } from "./MulticastDomainsPage";
@@ -79,10 +79,13 @@ type EditorTab = "general" | "ports" | "memberships";
 export function MulticastGroupModal({
   existing,
   spaces,
+  spacesError,
   onClose,
 }: {
   existing: MulticastGroupRead | null;
   spaces: IPSpace[];
+  /** The spaces read's error: a refused list is not an empty one (#4635). */
+  spacesError?: unknown;
   onClose: () => void;
 }) {
   const own = useOwnershipModules();
@@ -231,6 +234,11 @@ export function MulticastGroupModal({
                 </option>
               ))}
             </select>
+            {!existing && spacesError != null && (
+              <p className="mt-1 text-[11px]">
+                <ListReadError error={spacesError} what="IP spaces" />
+              </p>
+            )}
             {existing && (
               <p className="mt-1 text-[10px] text-muted-foreground">
                 Space is fixed after creation.
@@ -698,9 +706,11 @@ function MembershipRow({
 
 function BulkAllocateModal({
   spaces,
+  spacesError,
   onClose,
 }: {
   spaces: IPSpace[];
+  spacesError?: unknown;
   onClose: () => void;
 }) {
   const qc = useQueryClient();
@@ -797,6 +807,11 @@ function BulkAllocateModal({
                 </option>
               ))}
             </select>
+            {spacesError != null && (
+              <p className="mt-1 text-[11px]">
+                <ListReadError error={spacesError} what="IP spaces" />
+              </p>
+            )}
           </div>
           <div>
             <label className="text-xs font-medium text-muted-foreground">
@@ -1215,6 +1230,7 @@ export function MulticastGroupsPage() {
         <MulticastGroupModal
           existing={null}
           spaces={spacesQ.data ?? []}
+          spacesError={spacesQ.error}
           onClose={() => setShowNew(false)}
         />
       )}
@@ -1229,6 +1245,7 @@ export function MulticastGroupsPage() {
             <MulticastGroupModal
               existing={fresh}
               spaces={spacesQ.data ?? []}
+              spacesError={spacesQ.error}
               onClose={() => setEditing(null)}
             />
           )}
@@ -1237,6 +1254,7 @@ export function MulticastGroupsPage() {
       {showBulk && (
         <BulkAllocateModal
           spaces={spacesQ.data ?? []}
+          spacesError={spacesQ.error}
           onClose={() => setShowBulk(false)}
         />
       )}

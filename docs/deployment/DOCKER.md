@@ -84,6 +84,7 @@ Access the UI at `http://your-host-or-ip:8077/` (or `http://localhost:8077/` if 
 | `DEBUG` | `false` | Enable FastAPI debug mode |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | `15` | JWT access token lifetime |
 | `REFRESH_TOKEN_EXPIRE_DAYS` | `7` | Refresh token lifetime |
+| `PDNS_PROXY_PROTOCOL_FROM` | unset | PowerDNS behind the dnsdist front only: the front's address or the compose network CIDR. Turns on PROXY protocol between the front and pdns so transfer / update ACLs and the query log see the real client. See [DNS drivers 2.7](../drivers/DNS_DRIVERS.md#27-dnsdist-front-for-powerdns-issue-146-phase-2) |
 
 ---
 

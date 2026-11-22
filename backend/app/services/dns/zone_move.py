@@ -66,7 +66,11 @@ from app.services.dns.record_ops import (
     count_queued_zone_ops,
     sweep_zone_ops,
 )
-from app.services.dns.server_move import classless_zone_refusal, views_refusal
+from app.services.dns.server_move import (
+    classless_zone_refusal,
+    powerdns_zone_type_refusal,
+    views_refusal,
+)
 from app.services.dns.technitium_options import allow_query_problem, allow_transfer_problem
 from app.services.dns.tsig import ensure_group_tsig_key, group_key_names
 from app.services.dns.tsig_algorithms import key_refusal
@@ -231,6 +235,8 @@ class ZoneMovePlan:
     #: #4435 — an RFC 2317 classless zone name (``64/26.…``) landing in a group
     #: whose driver cannot serve one. Refused, never waived.
     classless_refusal: str | None = None
+    #: #4570 — a forward / stub zone landing in a PowerDNS group. Refused, never waived.
+    powerdns_refusal: str | None = None
     #: #4565 — the zone or a record of it would keep a view in a target whose
     #: servers cannot serve views (one that held views before they were
     #: refused there). Refused, never waived.
@@ -836,6 +842,10 @@ async def assemble_move_plan(
     if plan.classless_refusal:
         plan.classless_refusal = f"Group {target_group.name!r}: {plan.classless_refusal}"
 
+    # ── A forward / stub zone a PowerDNS target cannot serve (#4570) ──
+    plan.powerdns_refusal = powerdns_zone_type_refusal(plan.target_drivers, zone.zone_type)
+    if plan.powerdns_refusal:
+        plan.powerdns_refusal = f"Group {target_group.name!r}: {plan.powerdns_refusal}"
     # ── A view kept in a target that cannot serve views (#4565, a refusal) ──
     if plan.zone_view_action == "remapped" or plan.records_remapped:
         unservable = views_refusal(plan.target_drivers)
@@ -1137,6 +1147,8 @@ async def commit_move(
         raise ZoneMoveError(plan.forward_transport_refusal, status_code=422)
     if plan.classless_refusal:
         raise ZoneMoveError(plan.classless_refusal, status_code=422)
+    if plan.powerdns_refusal:
+        raise ZoneMoveError(plan.powerdns_refusal, status_code=422)
     if plan.views_refusal:
         raise ZoneMoveError(plan.views_refusal, status_code=422)
     if plan.technitium_acl_refusal:

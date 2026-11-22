@@ -481,6 +481,15 @@ somewhere durable to remember it. See
 [`k8s/service-control/README.md`](service-control/README.md) for the
 scoping rationale.
 
+## Appliance registration (#4659)
+
+Appliance registration is off on a fresh install, so an appliance paired with a
+pairing code idles. To start a fresh install with it on, add
+`INITIAL_SUPERVISOR_REGISTRATION: "true"` to the `env` of the api and worker
+(the Helm chart sets it from `supervisorRegistration.initiallyEnabled`). It is
+read only when the settings row is first created; it never overrides a later
+choice in the UI.
+
 ## Image Tags
 
 All manifests default to `:latest`. Pin to a specific version tag (e.g., `2026.04.13-1`) for production:
