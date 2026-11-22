@@ -620,9 +620,18 @@ async def _record_denial(
     action: str,
     resource_type: str,
     resource_id: str | None,
+    audit_resource_type: str | None = None,
 ) -> None:
-    """Write a `denied` audit row. Best-effort — never raises."""
+    """Write a `denied` audit row. Best-effort — never raises.
+
+    ``audit_resource_type`` (#4718) is the type the refused route's own change
+    rows are written under, when it differs from the permission's
+    ``resource_type`` (``dns_group`` gates what is audited as
+    ``dns_server_group``): the row then lists with them under the Resource
+    filter. ``error_detail`` keeps the permission's own name.
+    """
     note_denial_audited()
+    row_type = audit_resource_type or resource_type
     try:
         db.add(
             AuditLog(
@@ -632,9 +641,9 @@ async def _record_denial(
                 source_ip=get_trusted_client_ip(request),
                 user_agent=clean_user_agent(request.headers.get("user-agent")),
                 action=action,
-                resource_type=resource_type,
+                resource_type=row_type,
                 resource_id=resource_id or "",
-                resource_display=f"{resource_type}:{resource_id or '*'}",
+                resource_display=f"{row_type}:{resource_id or '*'}",
                 result="denied",
                 error_detail=f"permission denied ({action} on {resource_type})",
             )
@@ -922,6 +931,7 @@ def require_resource_permission(
     instance_routes: tuple[str, str, frozenset[str], frozenset[str]] | None = None,
     instance_param: str | None = None,
     prefix: str | None = None,
+    audit_resource_type: str | None = None,
 ) -> Callable[..., Awaitable[User]]:
     """Router-level dependency that enforces permissions by HTTP method.
 
@@ -940,6 +950,11 @@ def require_resource_permission(
     routes naming it in their path, and on the collection route, whose handler
     must narrow its rows (see :func:`_instance_scoped_admit`). ``prefix`` is the
     router's mount point (``/customers``) the route templates are relative to.
+
+    ``audit_resource_type`` (#4718) names the type the router's change rows are
+    audited under, for a router gated on a different permission type (the DHCP
+    server-group routes: gated on ``dhcp_server``, audited as
+    ``dhcp_server_group``), so a refusal lists with the changes.
     """
 
     async def _dep(
@@ -964,7 +979,15 @@ def require_resource_permission(
             )
         ):
             return current_user
-        await _record_denial(db, current_user, request, action, resource_type, None)
+        await _record_denial(
+            db,
+            current_user,
+            request,
+            action,
+            resource_type,
+            None,
+            audit_resource_type=audit_resource_type,
+        )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"Permission denied: need '{action}' on '{resource_type}'",
@@ -1250,7 +1273,9 @@ def require_any_resource_or_scoped(
 
 
 def require_route_types(
-    route_types: dict[str, tuple[str, ...]], prefix: str
+    route_types: dict[str, tuple[str, ...]],
+    prefix: str,
+    audit_types: dict[str, str] | None = None,
 ) -> Callable[..., Awaitable[User]]:
     """Router gate that requires, per route, the method-derived action on
     EVERY type the route serves (#3073).
@@ -1263,6 +1288,11 @@ def require_route_types(
     test walks the route table). Each type is checked with
     :func:`type_level_allows`, so a resource-scoped API token gets
     through on the types its binding covers and the handler narrows it.
+
+    ``audit_types`` (#4718) maps a route key to the resource type that route's
+    change rows are audited under, where that is not the permission's type
+    (``POST /groups``: gated on ``dns_group``, audited as ``dns_server_group``);
+    a refusal on it is written under that type so it lists with the changes.
     """
 
     async def _dep(
@@ -1272,16 +1302,23 @@ def require_route_types(
     ) -> User:
         action = action_for_request(request)
         route = request.scope.get("route")
-        needed = route_types.get(
-            mount_route_key(request.method, getattr(route, "path", "") or "", prefix), ()
-        )
+        key = mount_route_key(request.method, getattr(route, "path", "") or "", prefix)
+        needed = route_types.get(key, ())
         actions = gate_actions(request)
         if needed and all(
             any(type_level_allows(current_user, a, rt) for a in actions) for rt in needed
         ):
             return current_user
         first = needed[0] if needed else "*"
-        await _record_denial(db, current_user, request, action, first, None)
+        await _record_denial(
+            db,
+            current_user,
+            request,
+            action,
+            first,
+            None,
+            audit_resource_type=(audit_types or {}).get(key),
+        )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=(

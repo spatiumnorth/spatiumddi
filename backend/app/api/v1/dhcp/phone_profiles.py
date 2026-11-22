@@ -51,7 +51,9 @@ from app.services.dhcp.voip_options import load_catalog as load_voip_catalog
 
 router = APIRouter(
     tags=["dhcp"],
-    dependencies=[Depends(require_resource_permission("dhcp_scope"))],
+    dependencies=[
+        Depends(require_resource_permission("dhcp_scope", audit_resource_type="dhcp_phone_profile"))
+    ],
 )
 
 
