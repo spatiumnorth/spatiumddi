@@ -6685,7 +6685,7 @@ function ServedApexRows({
 
 // ── Servers Tab ────────────────────────────────────────────────────────────────
 
-function ServersTab({ group }: { group: DNSServerGroup }) {
+export function ServersTab({ group }: { group: DNSServerGroup }) {
   const qc = useQueryClient();
   const navigate = useNavigate();
   const { isSuperadmin } = useDnsGrants();
@@ -7042,8 +7042,18 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
           }
           checkLabel="I understand this deletes the server row, and a running agent will register it again."
           onConfirm={() => del.mutate(confirmDeleteServer)}
-          onClose={() => setConfirmDeleteServer(null)}
+          onClose={() => {
+            setConfirmDeleteServer(null);
+            del.reset();
+          }}
           isPending={del.isPending}
+          // A refused delete (404 when the server is already gone, or a
+          // future 409 guard) leaves this confirm open; say why in it (#4744).
+          error={
+            del.isError
+              ? formatApiError(del.error, "Failed to delete the DNS server")
+              : null
+          }
         />
       )}
     </div>
