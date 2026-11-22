@@ -2604,8 +2604,11 @@ record_control_not_converged() {
     mv -fT "$tmp" "$CONTROL_NOT_CONVERGED_FILE" 2>/dev/null || rm -f "$tmp"
 }
 
-# Wall clock, one place so a test can drive it.
-control_now_s() { date +%s; }
+# Monotonic seconds, one place so a test can drive it. Not `date`: chrony steps
+# the wall clock at boot, which would wipe the wait (forward) or stretch it by
+# the size of the step (backward). Falls back to the wall clock only if
+# /proc/uptime is unreadable.
+control_now_s() { uptime_s 2>/dev/null || date +%s; }
 
 control_converged_allow_commit() {
     local budget deadline now
@@ -2628,7 +2631,8 @@ control_converged_allow_commit() {
         # to clear, so only that boot waits, for a bounded time, and it never
         # fails the boot: the record simply stays if the api does not converge.
         [ -f "$CONTROL_NOT_CONVERGED_FILE" ] || return 0
-        budget=$CONTROL_STEADY_WAIT_S
+        budget=$(control_converge_budget)
+        [ "$budget" -le "$CONTROL_STEADY_WAIT_S" ] || budget=$CONTROL_STEADY_WAIT_S
         echo "Control plane flagged not converged: waiting up to ${budget}s for the api on ${SPATIUMDDI_VERSION} (#4749) …"
     fi
     # Deadline against the clock: the kubectl calls take time the poll count

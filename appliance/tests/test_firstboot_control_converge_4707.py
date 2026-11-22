@@ -254,3 +254,13 @@ def test_the_wait_is_measured_against_the_clock(tmp_path, shell, trial) -> None:
     assert proc.returncode == (1 if trial else 0), proc.stderr
     assert int((d / "dcalls").read_text()) <= 2, "kept polling past the deadline"
     assert int((d / "clock").read_text()) <= 3 + 1 + 4 * 2
+
+
+def test_the_wait_clock_is_monotonic_and_the_steady_wait_is_capped_by_the_unit() -> None:
+    # chrony steps `date` at boot; /proc/uptime does not move with it (#4749).
+    now = next(ln for ln in _lines() if ln.startswith("control_now_s()"))
+    assert "uptime_s" in now
+    assert now.index("uptime_s") < now.index("date +%s")  # wall clock is the fallback only
+    body = _function("control_converged_allow_commit")
+    steady = body.split("is_trial_boot; then")[1].split("else")[1].split("fi\n")[0]
+    assert "control_converge_budget" in steady, "steady wait ignores the unit's remaining time"
