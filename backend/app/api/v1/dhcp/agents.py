@@ -55,6 +55,7 @@ from app.models.dhcp import (
 from app.models.logs import DHCPLogEntry
 from app.models.metrics import DHCPMetricSample
 from app.models.settings import PlatformSettings
+from app.services import log_stream_forward
 from app.services.agents.config_apply import apply_reported_status
 from app.services.agents.container_oom import effective_daemon_report, fresh_role_health
 from app.services.agents.daemon_state import apply_reported_daemon_state
@@ -2877,6 +2878,7 @@ async def agent_log_entries(
     expired_cutoff = now - timedelta(hours=await log_retention_hours(db))
     inserted = 0
     expired = 0
+    new_rows: list[DHCPLogEntry] = []
     for raw in capped:
         parsed = parse_kea_line(raw, fallback_ts=now)
         if parsed is None:
@@ -2884,21 +2886,28 @@ async def agent_log_entries(
         if parsed.ts < expired_cutoff:
             expired += 1
             continue
-        db.add(
-            DHCPLogEntry(
-                server_id=server.id,
-                server_name=server.name,
-                ts=parsed.ts,
-                severity=parsed.severity,
-                code=parsed.code,
-                mac_address=parsed.mac_address,
-                ip_address=parsed.ip_address,
-                transaction_id=parsed.transaction_id,
-                raw=parsed.raw,
-            )
+        row = DHCPLogEntry(
+            server_id=server.id,
+            server_name=server.name,
+            ts=parsed.ts,
+            severity=parsed.severity,
+            code=parsed.code,
+            mac_address=parsed.mac_address,
+            ip_address=parsed.ip_address,
+            transaction_id=parsed.transaction_id,
+            raw=parsed.raw,
         )
+        db.add(row)
+        new_rows.append(row)
         inserted += 1
+    # Built before the commit expires the rows; forwarded after it (#4545).
+    stream_events = (
+        [log_stream_forward.dhcp_event(r, server.server_group_id) for r in new_rows]
+        if new_rows and log_stream_forward.wants(log_stream_forward.DHCP_ACTIVITY_LOG)
+        else []
+    )
     await db.commit()
+    log_stream_forward.submit(stream_events)
     return {"status": "ok", "inserted": inserted, "dropped": dropped, "expired": expired}
 
 
