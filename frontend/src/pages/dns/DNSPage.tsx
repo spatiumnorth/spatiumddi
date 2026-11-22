@@ -11359,11 +11359,12 @@ function BlocklistScopeFields({
     new Set(servers.filter((s) => s.driver !== "bind9").map((s) => s.driver)),
   );
   const nothingSelected = !wholeGroup && picked.size === 0;
-  // #4573 — PowerDNS has no RPZ. A group with no BIND9 / Technitium server
-  // applies nothing, and the server refuses a NEW assignment to it, so the
-  // unchecked boxes are disabled (a stored one can still be unchecked).
+  // #4608 — only BIND9 (RPZ) and agent-managed Technitium render a blocklist
+  // (the backend's `blocklist` driver capability). A group with servers and
+  // none of those applies nothing, and the server refuses a NEW assignment to
+  // it, so the unchecked boxes are disabled (a stored one can be unchecked).
   const inert =
-    servers.some((s) => s.driver === "powerdns") &&
+    servers.length > 0 &&
     !servers.some((s) => s.driver === "bind9" || s.driver === "technitium");
 
   return (
@@ -11373,8 +11374,9 @@ function BlocklistScopeFields({
       </legend>
       {inert && (
         <div className="rounded-md border border-red-500/40 bg-red-500/5 p-2 text-xs text-red-700 dark:text-red-400">
-          This group runs PowerDNS, which has no RPZ, so a blocklist here blocks
-          nothing. Assign the list to a BIND9 group instead.
+          This group runs {nonBind.join(" / ")}, which renders no blocklist, so
+          a blocklist here blocks nothing. Assign the list to a BIND9 group
+          instead.
         </div>
       )}
       {nonBind.length > 0 && !inert && (
