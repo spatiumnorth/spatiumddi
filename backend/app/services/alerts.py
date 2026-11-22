@@ -2858,6 +2858,12 @@ _SEVERITY_ORDER = ("info", "warning", "critical")
 
 _NUM_RE = re.compile(r"\d+(?:\.\d+)?%?")
 
+# #4720 — rules whose message is a running total plus a timestamp. The
+# peak-and-now suffix reads as "[now: 480 / 22]" there (the diff is the
+# changed digits), so the open event's message follows the current reading
+# instead. Severity escalation and delivery are unaffected.
+_MESSAGE_FOLLOWS_READING_RULES = frozenset({RULE_TYPE_LOG_FORWARD_DROPPING})
+
 
 def _message_numbers(message: str) -> tuple[str, list[str]]:
     """Split a message into its digit-free skeleton and its numeric tokens."""
@@ -4271,7 +4277,8 @@ async def _matching_log_forward_dropping_subjects(
             str(t.id),
             t.name,
             f"Forward target '{t.name}' ({t.host}:{t.port} {t.protocol.upper()}) dropped DNS "
-            "query log / DHCP activity log entries because its collector could not keep up: "
+            "query log / DHCP activity log entries, either because its queue was full or because "
+            "sending to its collector failed three times: "
             f"{t.log_stream_dropped_total} dropped in total, the latest at "
             f"{t.log_stream_last_drop_at:%Y-%m-%d %H:%M} UTC. Entries stay in the Logs page "
             "for their retention window; check that the collector is reachable and fast "
@@ -8993,6 +9000,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                         # #3233 — a threshold edit leaves the open event alone,
                         # so restate the threshold in the peak first.
                         peak = _restate_edited_thresholds(peak, message, threshold_idx)
+                        if rule.rule_type in _MESSAGE_FOLLOWS_READING_RULES:
+                            # #4720 — a running total has no "peak" worth
+                            # keeping; the open event just shows the latest.
+                            peak = message
                         composed = _compose_peak_and_now(peak, message)
                         if held:
                             composed = f"{composed} — {held}"

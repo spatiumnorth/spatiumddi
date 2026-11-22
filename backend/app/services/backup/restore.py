@@ -59,6 +59,7 @@ import asyncpg
 import structlog
 
 from app.core.restore_gate import RESTORE_LOCK_HOLDERS_SQL, RESTORE_LOCK_KEY
+from app.services.backup import appliance_identity
 from app.services.backup.archive import (
     BackupArchiveError,
     _pg_env_from_url,
@@ -154,6 +155,8 @@ class RestoreOutcome:
     # ``None`` when the restore did not reach the table, ``-1`` when ending
     # them failed (a warning says so).
     sessions_ended: int | None = None
+    # Appliance rows of this install kept across the restore (#4677).
+    adopted_appliances: list[dict[str, Any]] = field(default_factory=list)
 
 
 async def _terminate_other_db_connections(pg_env: dict[str, str]) -> None:
@@ -1368,6 +1371,16 @@ async def _apply_backup_restore_inner(
     restored_sections: list[str] | None = None
     restored_tables: list[str] | None = None
     cascade_widened: list[str] = []
+    # The appliance registry is replaced by a full restore, and by a selective
+    # one whose TRUNCATE ... CASCADE reaches it. Capture the live rows first
+    # so the running supervisor stays known to the restored database (#4677).
+    identity_snapshot = None
+    identity_snapshot_error: str | None = None
+    try:
+        identity_snapshot = await appliance_identity.snapshot(db_url)
+    except Exception as exc:  # noqa: BLE001 — never block a restore on the capture
+        logger.error("backup_restore_identity_snapshot_failed", error=str(exc))
+        identity_snapshot_error = str(exc)
 
     with tempfile.TemporaryDirectory(prefix="spatium-restore-") as tmpdir:
         if selective:
@@ -1547,6 +1560,26 @@ async def _apply_backup_restore_inner(
             rewrap_outcome.aborted = True
             rewrap_outcome.failures.append({"reason": f"rewrap-aborted: {exc}"})
 
+    # Phase 7b (#4677): put this install's own appliance identity back.
+    adoption = appliance_identity.AdoptionOutcome()
+    if identity_snapshot_error is not None:
+        adoption.warnings.append(
+            "This install's appliance identity could not be read before the restore "
+            f"({identity_snapshot_error}), so it was not kept. The appliance will be refused "
+            "by the control plane until it is paired again."
+        )
+    if identity_snapshot is not None and (
+        restored_tables is None or "appliance" in restored_tables
+    ):
+        try:
+            adoption = await appliance_identity.adopt(db_url, identity_snapshot)
+        except Exception as exc:  # noqa: BLE001 — the data is in
+            logger.error("backup_restore_identity_adopt_failed", error=str(exc))
+            adoption.warnings.append(
+                f"This install's appliance identity could not be kept ({exc}). The appliance "
+                "will be refused by the control plane until it is paired again."
+            )
+
     # Phase 4d (issue #127): scan the restored DB for PowerDNS
     # DNSSEC-enabled zones and surface a registrar-republish
     # advisory. Failure here is non-fatal — the data is in.
@@ -1603,6 +1636,7 @@ async def _apply_backup_restore_inner(
         post_warnings.insert(0, schema_override_warning)
     if fold_warning:
         post_warnings.append(fold_warning)
+    post_warnings.extend(adoption.warnings)
 
     # Say plainly that the restore reached past the ticked sections.
     # An operator who picked "DNS" and finds their IPAM rows reverted
@@ -1668,4 +1702,5 @@ async def _apply_backup_restore_inner(
         warnings=post_warnings,
         reconciled_backup_targets=reconciled,
         sessions_ended=sessions_ended,
+        adopted_appliances=adoption.adopted,
     )

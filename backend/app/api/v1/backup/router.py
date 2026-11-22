@@ -510,6 +510,7 @@ async def restore_backup(
                     "warnings": outcome.warnings,
                     "reconciled_backup_targets": outcome.reconciled_backup_targets,
                     "sessions_ended": outcome.sessions_ended,
+                    "adopted_appliances": outcome.adopted_appliances,
                 },
             )
         )
