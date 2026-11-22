@@ -199,6 +199,12 @@ What the table drives:
 | Update RPZ (blocking), large change | `rndc reload <rpz-zone>` after writing RPZ zone file | Zone-level reload only |
 | **Full daemon restart** | ❌ NEVER for normal operations | Only for: initial install, major version upgrade |
 
+### Record ops under views are applied into the view they name ([#2242](https://github.com/spatiumnorth/spatiumddi/issues/2242))
+
+In a group without views an op is an RFC 2136 update to `127.0.0.1`, signed with the group's loopback key. With views a loopback update lands in whichever view matches the agent's own source address, so the agent instead signs each op with the **update key of the view the op names** (`op["view_name"]`; `views[].update_key` in the bundle, derived by the control plane from the group key under its own label, a separate key from the #920 transfer key). `named` selects the view by `match-clients`, which admits a view's own update key and refuses every other view's; the view's copy of each primary zone grants that key `allow-update` (`grant <key> zonesub ANY` under `update-policy`, so it may write the SOA that carries the serial) and no other view's. The SOA read before and after the update, the apex-NS read, the refused-SOA memory and the apex state an op reconciles are per `(view, zone)`; the reached serial is reported per zone.
+
+The agent says `per-view-ops` in `X-Spatium-Agent-Features` (BIND9 only). Without it the control plane keeps the view-wide re-render, and an agent given an op that names no view, or a view it has no key for, acks it `failed` instead of guessing: the next structural render carries it. Each view loads its own copy of a primary zone while the keys are present (no `in-view` sharing, #3551), because an update to a shared copy would reach every view. DNSSEC-signed zones stay on the re-render path; geo views take ops like any other (#2242). `tests/live_per_view_ops_check.py` drives this against a real `named` in the image build.
+
 ### RPZ zones are updated incrementally ([#4191](https://github.com/spatiumnorth/spatiumddi/issues/4191))
 
 A blocklist refresh used to re-render the RPZ zone and `rndc reload` it, so `named` held the old and the new copy at once: on BIND 9.20 a 350k-name zone went from 315 MB resident to a 484 MB peak for a three-line change, which is what an agent pod's memory limit has to be sized for. When only a few names changed, the BIND9 agent now sends the difference to `named` as RFC 2136 updates instead (315 MB to a 321 MB peak) and does not freeze, reload or thaw the zone.

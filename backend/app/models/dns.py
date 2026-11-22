@@ -356,6 +356,13 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     agent_renders_packed_blocklists: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    # #2242 — this server's BIND9 agent applies a record op into the view the
+    # op names (``per-view-ops`` in ``X-Spatium-Agent-Features``). Only then is
+    # a group with views sent record ops and a structural payload without
+    # records; False for an older agent, which re-renders on every change.
+    agent_per_view_ops: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
 
     # ── #882 last config-apply verdict ────────────────────────────────────
     #
@@ -671,6 +678,10 @@ class DNSRecordOp(UUIDPrimaryKeyMixin, Base):
         nullable=True,
         index=True,
     )
+    # #2242 — the view whose copy of the zone this op is for. A group with
+    # views queues one op per view that renders the zone; NULL in a flat
+    # group and on ops queued before the column existed ("the only copy").
+    view_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     op: Mapped[str] = mapped_column(String(20), nullable=False)  # create | update | delete
     record: Mapped[dict] = mapped_column(JSONB, nullable=False)
     target_serial: Mapped[int | None] = mapped_column(BigInteger, nullable=True)

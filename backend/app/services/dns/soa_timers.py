@@ -45,6 +45,8 @@ logger = structlog.get_logger(__name__)
 AGENT_FEATURES_HEADER = "X-Spatium-Agent-Features"
 FEATURE_SOA_TIMERS = "soa-timers"
 FEATURE_SERVED_SERIALS = "served-serials"
+# #2242 — a BIND9 agent that applies a record op into the view it names.
+FEATURE_PER_VIEW_OPS = "per-view-ops"
 
 # What every BIND9 agent before #1171 wrote into every zone's SOA. Also the
 # zone defaults (``ZONE_DEFAULT_*``), so a zone left at them is shipped the same
@@ -72,6 +74,12 @@ def reports_served_serials(header: str | None) -> bool:
     """The agent reports a secondary / stub zone's served serial, and nothing
     for one it holds no copy of (#3940), rather than the bundle's 0."""
     return FEATURE_SERVED_SERIALS in agent_features(header)
+
+
+def applies_per_view_ops(header: str | None) -> bool:
+    """The agent applies a record op into the view the op names, signed with
+    that view's update key (#2242), so a group with views can ship it ops."""
+    return FEATURE_PER_VIEW_OPS in agent_features(header)
 
 
 def served_soa_timers(zone: Any, group_serves: bool) -> dict[str, int]:
@@ -189,10 +197,12 @@ async def reconcile_soa_timers(db: AsyncSession, group_id: uuid.UUID) -> bool | 
 
 __all__ = [
     "AGENT_FEATURES_HEADER",
+    "FEATURE_PER_VIEW_OPS",
     "FEATURE_SERVED_SERIALS",
     "FEATURE_SOA_TIMERS",
     "LITERAL_SOA_TIMERS",
     "agent_features",
+    "applies_per_view_ops",
     "reconcile_soa_timers",
     "renders_soa_timers",
     "reports_served_serials",

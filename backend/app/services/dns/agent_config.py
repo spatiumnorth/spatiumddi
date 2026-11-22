@@ -109,6 +109,7 @@ from app.services.dns.tsig import (
     transfer_needs_tsig,
     tsig_secret_shape_problem,
     view_transfer_key,
+    view_update_key,
 )
 from app.services.dns_blocklist import (
     build_effective_for_group,
@@ -650,7 +651,8 @@ class RenderedBody:
     present and empty — so a server with nothing pending hashes to exactly
     what it did before. ``has_views`` says whether an ops page is ever
     shipped: under split-horizon records are structural and the queued ops
-    are retired by the render instead (``retire_queued_ops``).
+    are retired by the render instead (``retire_queued_ops``), unless
+    ``per_view_ops`` says the server's agent takes them per view (#2242).
     """
 
     body: dict[str, Any]
@@ -658,6 +660,10 @@ class RenderedBody:
     structural_etag: str
     records: int
     has_views: bool
+    # #2242 — a group with views whose ops ship to this server: its agent
+    # applies an op into the view the op names, so records are not part of the
+    # structural payload and the render does not retire the queued ops.
+    per_view_ops: bool = False
 
 
 @dataclass(frozen=True)
@@ -674,6 +680,8 @@ class EncodedBody:
     has_views: bool
     # #4040 — the blocklist entries went out as packed runs.
     packed_blocklists: bool = False
+    # #2242 — see ``RenderedBody.per_view_ops``.
+    per_view_ops: bool = False
 
 
 #: Blocklist entries read, serialised and hashed per step of the streamed
@@ -716,11 +724,21 @@ class _StreamedZones:
     record: Callable[[Any], dict[str, Any]]
     annotations: dict[int, dict[str, Any]]
     has_views: bool
+    # Whether the structural copies keep their records and serial (#2242):
+    # under views, unless this server takes its record changes as ops.
+    structural_records: bool = False
 
 
-def _zone_structural(zone: dict[str, Any], has_views: bool) -> dict[str, Any]:
-    """A zone copy as the structural payload carries it."""
-    return {k: val for k, val in zone.items() if has_views or k not in _RECORD_DRIVEN_KEYS}
+def _zone_structural(zone: dict[str, Any], keep_records: bool) -> dict[str, Any]:
+    """A zone copy as the structural payload carries it.
+
+    The copy list itself is the zones' PLACEMENT under views: which views hold
+    a copy of which zone. Without ``keep_records`` the copies lose their
+    records and serial but not their ``view_name``, so a record that makes a
+    zone appear in (or vanish from) a view still moves the structural ETag,
+    and a record that does neither does not (#2242).
+    """
+    return {k: val for k, val in zone.items() if keep_records or k not in _RECORD_DRIVEN_KEYS}
 
 
 @dataclass
@@ -735,6 +753,7 @@ class _Assembled:
     has_views: bool
     streamed: list[_StreamedEntries] = field(default_factory=list)
     zones: _StreamedZones | None = None
+    per_view_ops: bool = False
 
 
 def _placeholder() -> str:
@@ -774,6 +793,7 @@ def _finish_whole(assembled: _Assembled) -> RenderedBody:
         structural_etag=structural_etag,
         records=assembled.records,
         has_views=assembled.has_views,
+        per_view_ops=assembled.per_view_ops,
     )
 
 
@@ -1078,9 +1098,9 @@ async def _stream_zones(
                     _join(
                         first,
                         b", ",
-                        json.dumps(_zone_structural(copy, plan.has_views), **_ETAG_JSON).encode(
-                            "utf-8"
-                        ),
+                        json.dumps(
+                            _zone_structural(copy, plan.structural_records), **_ETAG_JSON
+                        ).encode("utf-8"),
                     )
                 )
                 first = False
@@ -1210,6 +1230,7 @@ async def encode_bundle_body(db: AsyncSession, server: DNSServer) -> EncodedBody
         records=records,
         has_views=assembled.has_views,
         packed_blocklists=bool(server.agent_renders_packed_blocklists),
+        per_view_ops=assembled.per_view_ops,
     )
 
 
@@ -1582,6 +1603,23 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
             }
         )
 
+    # #2242 — does this server take its record changes as ops, per view?
+    # Only a BIND9 agent that said so (``per-view-ops``), in a group with views
+    # (operator views or geo steering, #2242 slice 5: ``records_for_view``
+    # decides each view's records for both, and the op fan-out and stamp use
+    # it, so an op's RRset is what the re-render would put in that view). A
+    # signed zone needs its serial read per (view, zone), so it keeps the group
+    # on the re-render path, where records are structural and the queued ops
+    # are retired. And the product's own group key, from which each view's
+    # update key is derived, must exist.
+    per_view_ops = (
+        has_views
+        and server.driver == "bind9"
+        and bool(server.agent_per_view_ops)
+        and group_key is not None
+        and not any(getattr(z, "dnssec_enabled", False) for z in zones)
+    )
+
     # Operator-managed named TSIG keys (DNSTSIGKey rows). These are for
     # external nsupdate clients / AXFR auth — distinct from the legacy
     # auto-generated single key on DNSServerGroup. Both kinds end up in
@@ -1826,6 +1864,14 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
                 "secret": vkey.secret,
                 "algorithm": vkey.algorithm,
             }
+            if per_view_ops:
+                # #2242 — and the one its record ops are signed with.
+                ukey = view_update_key(group_key, view_entry["name"])
+                view_entry["update_key"] = {
+                    "name": ukey.name,
+                    "secret": ukey.secret,
+                    "algorithm": ukey.algorithm,
+                }
     # #899 — ship the entries, not just the name. The agent renders these
     # into ``acl "<name>" { … };`` stanzas; before this the block carried
     # ``{id, name}`` only, so an ACL was inert config and any reference to
@@ -2228,6 +2274,7 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
             record=_rec_dict,
             annotations=annotations,
             has_views=has_views,
+            structural_records=has_views and not per_view_ops,
         )
     elif server.driver == "technitium":
         await _add_master_transfer_keys(db, zone_payload, tsig_keys)
@@ -2260,11 +2307,15 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         "acls": acls_block,
         "tsig_keys": tsig_keys,
         # Records are normally excluded so a record-only change rides the
-        # incremental RFC 2136 path without a full reload. But under
-        # split-horizon (issue #24) the incremental path can't target a
+        # incremental RFC 2136 path without a full reload. Under
+        # split-horizon (issue #24) an update to loopback can't target a
         # view, so records are folded in here — any record/view change then
         # shifts the structural etag and triggers a full, view-correct
-        # re-render. ``view_name`` is always retained either way.
+        # re-render — UNLESS this server's agent signs each op with the key
+        # of the view it names (``per_view_ops``, #2242): then the copies
+        # are kept without their records, so a record that places a zone in
+        # a view still shifts the etag and any other record change is an op.
+        # ``view_name`` is always retained either way.
         #
         # #1373 — ``serial`` is left out with the records, for the same reason:
         # every record change bumps it, so while it was in here (since #430
@@ -2274,7 +2325,7 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         # field of its own (the TTL, the SOA timers, the apex); the serial bump
         # that comes with it is never the only difference.
         "zones_structural": (
-            [_zone_structural(z, has_views) for z in zone_payload]
+            [_zone_structural(z, has_views and not per_view_ops) for z in zone_payload]
             if zones_streamed is None
             else zones_streamed.structural_mark
         ),
@@ -2292,6 +2343,20 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         # be structural (issue #50).
         "tls_cert": tls_cert_block,
     }
+    if per_view_ops and geo.active:
+        # #2242 slice 5 — which view a pool member's record is served in is
+        # decided by the geo plan, not by the record, and a change to the plan
+        # (a member's scope moved to another geo view, a pool gained or lost
+        # its unscoped member so the all-geo fallback toggled, a member went
+        # unreachable) re-files records without writing one, so no op would
+        # carry it. Making the plan structural moves the etag, and the render
+        # then re-applies from the body and retires the ops it covers. Left out
+        # without geo so a plain split-horizon group keeps its etag.
+        structural["geo_plan"] = {
+            "member_view": sorted(geo.member_view.items()),
+            "default_fallback": sorted(geo.default_fallback_members),
+            "unreachable": sorted(geo.unreachable_members),
+        }
     if server.zone_resync_seq:
         # #2281 — this server was re-enabled. While it was disabled it got no
         # record ops, so its daemon still serves the records it had then; the
@@ -2323,6 +2388,7 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         has_views=has_views,
         streamed=streamed,
         zones=zones_streamed,
+        per_view_ops=per_view_ops,
     )
 
 
@@ -2594,6 +2660,10 @@ async def page_pending_ops(
             {
                 "op_id": str(op.id),
                 "zone_name": op.zone_name,
+                # #2242 — the view whose copy of the zone the op is for; an
+                # agent that applies per view signs the update with that
+                # view's key. Absent for an op with no view (flat group).
+                **({"view_name": op.view_name} if op.view_name else {}),
                 "op": op.op,
                 "record": op.record,
                 "target_serial": op.target_serial,
@@ -2695,7 +2765,7 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
     remaining = 0
     if server.maintenance_mode:
         pass
-    elif rendered.has_views:
+    elif rendered.has_views and not rendered.per_view_ops:
         await retire_queued_ops(db, server)
         ops, remaining = await page_pending_ops(db, server, non_record_only=True)
     else:

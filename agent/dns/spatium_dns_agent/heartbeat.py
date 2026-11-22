@@ -114,7 +114,7 @@ class HeartbeatClient:
             base_url=self.cfg.control_plane_url,
             verify=verify,
             timeout=timeout,
-            headers=features.headers(),
+            headers=features.headers(self.cfg.driver),
         )
 
     def _auth_headers(self) -> dict[str, str]:
