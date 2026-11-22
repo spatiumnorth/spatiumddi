@@ -664,3 +664,53 @@ async def test_shutdown_flushes_drops_and_stops_every_task(
         await db_session.execute(select(AuditForwardTarget).where(AuditForwardTarget.id == tid))
     ).scalar_one()
     assert row.log_stream_dropped_total == 3
+
+
+async def test_open_drop_event_follows_the_current_count_and_time_4720(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An open event shows the latest count and drop time, stays one event,
+    and a refresh never notifies again (#4720)."""
+    from app.models.alerts import AlertEvent, AlertRule
+    from app.services import alerts
+
+    sent: list[str] = []
+
+    async def deliver(rule: Any, event: Any, targets: Any) -> tuple[bool, bool, bool]:
+        sent.append(event.message)
+        return (False, False, False)
+
+    monkeypatch.setattr(alerts, "_deliver", deliver)
+    rule = AlertRule(
+        name="drops",
+        rule_type=alerts.RULE_TYPE_LOG_FORWARD_DROPPING,
+        severity="warning",
+        enabled=True,
+    )
+    db_session.add(rule)
+    target = await _add_target(db_session, stream_dns_query_log=True)
+    tid, rule_id = target.id, rule.id
+    target.log_stream_dropped_total = 84
+    target.log_stream_last_drop_at = datetime.now(UTC) - timedelta(minutes=4)
+    await db_session.commit()
+    await alerts.evaluate_all(db_session)
+
+    row = await db_session.get(AuditForwardTarget, tid)
+    assert row is not None
+    row.log_stream_dropped_total = 480
+    row.log_stream_last_drop_at = datetime.now(UTC)
+    await db_session.commit()
+    await alerts.evaluate_all(db_session)
+
+    db_session.expire_all()
+    events = (
+        (await db_session.execute(select(AlertEvent).where(AlertEvent.rule_id == rule_id)))
+        .scalars()
+        .all()
+    )
+    assert len(events) == 1 and events[0].resolved_at is None
+    msg = events[0].message
+    assert "480 dropped in total" in msg and "84 dropped" not in msg
+    assert f"{datetime.now(UTC):%Y-%m-%d %H:%M} UTC" in msg
+    assert "[now:" not in msg
+    assert len(sent) == 1
