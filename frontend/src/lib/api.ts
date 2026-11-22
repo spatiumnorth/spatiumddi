@@ -3081,6 +3081,13 @@ export interface BackupRestoreResponse {
   warnings?: string[];
 }
 
+/** GET /backup/restore/last: the same card the POST returns, read back from
+ *  the restore's audit row after the restore signed the operator out (#4676). */
+export interface LastBackupRestoreResponse extends BackupRestoreResponse {
+  performed_at: string;
+  performed_by: string | null;
+}
+
 export interface BackupSection {
   key: string;
   label: string;
@@ -3204,6 +3211,13 @@ export const backupApi = {
     });
     return res.data;
   },
+
+  /** Outcome of the most recent restore, from its audit row (#4676). 404
+   *  when none has been recorded. */
+  lastRestore: () =>
+    api
+      .get<LastBackupRestoreResponse>("/backup/restore/last")
+      .then((r) => r.data),
 
   /** Backup-section catalog (Phase 2a). Drives the selective-
    *  restore checklist. */

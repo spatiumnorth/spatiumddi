@@ -25,7 +25,7 @@ from typing import Any
 import httpx
 import pytest
 from httpx import AsyncClient
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.v1.backup import targets as targets_route
 from app.core.crypto import encrypt_str
@@ -665,3 +665,41 @@ async def test_restore_from_target_hands_the_archive_to_the_restore(
     assert "stop here" in res.text
     assert received == [b"PK-restore"]
     assert download_spy == [MAX_ARCHIVE_BYTES]
+
+
+@pytest.mark.usefixtures("plain_config")
+async def test_restore_from_target_records_the_outcome_for_the_last_restore_read(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    tmp_path: Path,
+    download_spy: list,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The destination-based restore stores the same note + keys (#4676)."""
+    import app.db as app_db
+    import app.services.backup as backup_pkg
+    from app.services.backup.restore import RestoreOutcome
+
+    async def _fake_restore(_db: Any, **_k: Any) -> Any:
+        return RestoreOutcome(
+            manifest={"hostname": "src"},
+            pre_restore_path=None,
+            secrets_payload_keys=["acme_key"],
+            duration_ms=5,
+        )
+
+    monkeypatch.setattr(backup_pkg, "apply_backup_restore", _fake_restore)
+    monkeypatch.setattr(
+        app_db, "AsyncSessionLocal", async_sessionmaker(db_session.bind, expire_on_commit=False)
+    )
+    hdr = await _superadmin(db_session)
+    target = await _target(db_session, tmp_path)
+    (tmp_path / NAME).write_bytes(b"PK-restore")
+    res = await client.post(
+        f"/api/v1/backup/targets/{target.id}/archives/restore", json=_restore_body(), headers=hdr
+    )
+    assert res.status_code == 200, res.text
+    got = await client.get("/api/v1/backup/restore/last", headers=hdr)
+    assert got.status_code == 200, got.text
+    assert got.json()["secrets_payload_keys"] == ["acme_key"]
+    assert "safety dump was NOT written" in got.json()["note"]
