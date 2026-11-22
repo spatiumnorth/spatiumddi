@@ -1764,7 +1764,8 @@ class DNSSECStateReport(BaseModel):
     ``ds_records`` is the zone-level DS rrset the operator copies into the
     parent registrar verbatim (empty = unsigned). ``keys`` is the optional
     per-key breakdown BIND9 agents report from ``rndc dnssec -status``
-    (issue #49); PowerDNS agents omit it.
+    (issue #49) and PowerDNS agents from ``GET .../cryptokeys`` (#4604).
+    An agent that does not report keys omits the field.
     """
 
     zone_name: str
