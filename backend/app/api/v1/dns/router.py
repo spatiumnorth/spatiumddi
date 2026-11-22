@@ -217,7 +217,11 @@ from app.services.dns.new_object_defaults import (
     default_zone_ttl,
     load_dns_defaults,
 )
-from app.services.dns.powerdns_alias import alias_resolver, group_can_resolve_alias
+from app.services.dns.powerdns_alias import (
+    ALIAS_NO_FORWARDER_MESSAGE,
+    alias_resolver,
+    group_can_resolve_alias,
+)
 from app.services.dns.record_identity import describe_identical, find_identical_record
 from app.services.dns.record_ops import (
     clear_dnssec_key_state,
@@ -13010,12 +13014,7 @@ async def _check_driver_gated_record_type(record_type: str, group_id: uuid.UUID,
         if not await group_can_resolve_alias(db, group_id):
             raise HTTPException(
                 status_code=422,
-                detail=(
-                    "ALIAS records are resolved through the group's forwarders, and this "
-                    "group has none over plain DNS (Do53). Set forwarders under the "
-                    "group's server options first; SpatiumDDI no longer falls back to "
-                    "public resolvers."
-                ),
+                detail=ALIAS_NO_FORWARDER_MESSAGE,
             )
 
 
