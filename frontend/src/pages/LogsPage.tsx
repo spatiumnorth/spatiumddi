@@ -1490,7 +1490,7 @@ function DNSQueryAnalyticsStrip({
         <span className="text-muted-foreground/70">
           {loading
             ? "computing…"
-            : `${total.toLocaleString()} queries in window`}
+            : `${total.toLocaleString()} ${total === 1 ? "query" : "queries"} in window`}
         </span>
       </div>
       <div className={cn("grid grid-cols-1 gap-3", cols)}>

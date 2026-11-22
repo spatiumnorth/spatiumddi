@@ -201,7 +201,7 @@ answered ~5 % of the queries the load generator sent — the control plane
 had failed over, the data plane had nothing to serve with. Assign the DNS
 and DHCP roles on every node you expect to keep serving during a failover.
 
-The installer's **hard disk floor is 32 GiB** for every role (raised from 24 GiB — issue #312: a 24 GiB disk left `/var` only ~7 GiB, and the Control plane's first boot tipped the kubelet DiskPressure threshold into an eviction storm). RAM has a hard floor as well, and the installer does not enforce it: the kubelet sets aside 2 GiB on every node (`kube-reserved` 1 GiB, `system-reserved` 512 MiB and the 512 MiB `memory.available` eviction threshold — #1124) and schedules pods only into what is left. A single-node control plane requests about 1.6 GiB, so it needs **at least 4 GiB of RAM** to start at all, and a DNS / DHCP appliance **at least 3 GiB**; below that the pods stay `Pending` on `Insufficient memory`. The serving roles add their own requests on top of that: BIND and Technitium 256Mi (BIND's is an eighth of its RAM-sized memory limit, so 256Mi up to a ~10 GB node and more above, #2223), Kea, PowerDNS and the looking-glass collector 128Mi each. They are sized above the pods' idle working sets because the kubelet evicts a pod running over its memory request before any pod within its request, whatever the PriorityClasses say (#1828). A single node with the control plane plus the DNS and DHCP roles therefore requests about 2 GiB, which uses up all the allocatable memory a 4 GiB node has. That includes an existing install: a slot upgrade to a release carrying #1124 on a smaller box comes back with nothing schedulable. 8 GiB remains the comfortable recommendation for a control plane. When the operator picks the **Control plane** role on a box below the recommended 40 GiB disk / 8 GiB RAM, `spatium-install` shows a soft sizing warning before proceeding (the lighter Appliance/agent role is fine at the 32 GiB floor and gets no warning). Each control-plane **HA member** sizes the same as a standalone control plane (4 vCPU / 8 GiB) — every member runs a full api / worker / Postgres replica / Redis. SSD is strongly preferred for the etcd + Postgres write path; the installer's disk floor assumes the baked image set lands on the slots, not RAM.
+The installer's **hard disk floor is 32 GiB** for every role (raised from 24 GiB — issue #312: a 24 GiB disk left `/var` only ~7 GiB, and the Control plane's first boot tipped the kubelet DiskPressure threshold into an eviction storm). RAM has a hard floor as well, and the installer does not enforce it: the kubelet sets aside 2 GiB on every node (`kube-reserved` 1 GiB, `system-reserved` 512 MiB and the 512 MiB `memory.available` eviction threshold — #1124) and schedules pods only into what is left. A single-node control plane requests about 1.6 GiB, so it needs **at least 4 GiB of RAM** to start at all, and a DNS / DHCP appliance **at least 3 GiB**; below that the pods stay `Pending` on `Insufficient memory`. The serving roles add their own requests on top of that: BIND and Technitium 256Mi (BIND's is an eighth of its RAM-sized memory limit, so 256Mi up to a ~10 GB node and more above, #2223), Kea, PowerDNS and the looking-glass collector 128Mi each. They are sized above the pods' idle working sets because the kubelet evicts a pod running over its memory request before any pod within its request, whatever the PriorityClasses say (#1828). A single node with the control plane plus the DNS and DHCP roles therefore requests about 2 GiB, which uses up all the allocatable memory a 4 GiB node has. That includes an existing install: a slot upgrade to a release carrying #1124 on a smaller box comes back with nothing schedulable. 8 GiB remains the comfortable recommendation for a control plane. When the operator picks the **Control plane** role on a box below the recommended 40 GiB disk / 8 GiB RAM, `spatium-install` shows a soft sizing warning before proceeding (the lighter Appliance/agent role is fine at the 32 GiB floor and gets no warning). A headless preseed install skips that screen, so the same shortfall is a `WARN:` line in the install log instead of a refusal (#4661). Each control-plane **HA member** sizes the same as a standalone control plane (4 vCPU / 8 GiB) — every member runs a full api / worker / Postgres replica / Redis. SSD is strongly preferred for the etcd + Postgres write path; the installer's disk floor assumes the baked image set lands on the slots, not RAM.
 
 ### Appliance management surfaces (k3s-aware)
 
@@ -284,6 +284,34 @@ what #276 built the render path *for* — surviving a `/var` factory reset —
 and would strand an appliance whose STATE says one thing and whose `/etc`
 overlay says another. STATE stays the single source of truth; the adopt-back
 changes what STATE says rather than who owns the file.
+
+### Reinstall with Keep /var when the address changed (#4591)
+
+"Keep /var and STATE" keeps k3s's datastore, whose etcd member is registered
+under the node's old address. On new hardware, a new VM or a new NIC, DHCP
+usually gives the node another address, and k3s refuses its own member
+(`this server is not a member of the etcd cluster. Found [...]`).
+
+`spatium-etcd-peer-reset` (a `k3s.service` `ExecStartPre`) handles the
+single-node case: when k3s's refusal lists exactly one member, that member is
+this node, and the node is not a joined member, it runs `k3s server
+--cluster-reset` once, as the snapshot restore does, and k3s then starts on
+the new address with the data intact. It logs to the console and to
+`/var/log/spatiumddi/etcd-peer-reset.log`. The first start still fails once
+before the reset (about 15 minutes after boot), then k3s restarts itself;
+`spatiumddi-firstboot` waits for that, up to 25 more minutes, so it completes
+on that boot.
+
+It is detected from k3s's own message because the member list cannot be read
+offline (the db is a bbolt file, no `etcdutl` ships). A control plane with more
+than one etcd member is never reset, since that would orphan the others: a
+member whose address changed there needs its peer address updated or a rejoin
+(Fleet, Replace). The reason is printed on the console and shown in the
+health verdict ("etcd member address changed"); nothing is done automatically.
+It is recognised from the node address `spatiumddi-firstboot` records at each
+good boot (`/var/lib/spatiumddi/etcd-peer-addr`), since an HA member never logs
+k3s's refusal. Pin the address
+(static IP or a DHCP reservation) to avoid all of this.
 
 ### Interface MTU (#1017)
 
@@ -504,8 +532,10 @@ single-node appliance restarting cluster DNS is a footgun.
 3. First-boot: `spatiumddi-firstboot` generates `/etc/spatiumddi/.env` with secrets, bakes the self-signed cert, writes the HelmChart bootstrap manifest, starts k3s.
 4. k3s comes up + imports baked images + helm-controller installs the bootstrap release. 30-90 s for control plane pods to reach Ready; another 15-30 s for migrate Job to complete schema migrations.
 5. Operator browses to `https://<appliance-ip>/`. Until the api is serving, the frontend nginx answers every page with the **"SpatiumDDI is initialising"** page (`frontend/public/_starting.html`, auto-refreshing every 5 s) instead of the SPA shell — `location /` gates on an `auth_request` probe of the api Service, so a cold boot reads as "still coming up" rather than a wall of failed XHRs (#767).
-6. Operator accepts the self-signed cert **once** and signs in `admin / admin`, then sets a real password. The cert firstboot minted in step 3 is the only one the operator ever sees: the api's startup bootstrap *adopts* it as the active `appliance_certificate` row rather than generating a rival (#767), so the fingerprint doesn't change mid-boot and the frontend isn't rolled underneath the operator.
+6. Operator accepts the self-signed cert **once** and signs in. On a first node whose installer collected a web UI password (below) that is `admin` with that password; otherwise it is `admin / admin`, followed by a forced change to a real password. The cert firstboot minted in step 3 is the only one the operator ever sees: the api's startup bootstrap *adopts* it as the active `appliance_certificate` row rather than generating a rival (#767), so the fingerprint doesn't change mid-boot and the frontend isn't rolled underneath the operator.
 7. (Appliance role, or a Control-plane node enabling DNS/DHCP) Operator approves the appliance from the control plane's `/appliance → Fleet` tab + picks roles. DaemonSet schedules role pods within ~30 s.
+
+**Joining a control plane that runs from the Helm chart** (plain Kubernetes or OpenShift) needs two control-plane settings first, supervisor registration and the agent keys; see [Join an appliance agent node to a Helm or OpenShift control plane](KUBERNETES.md#join-an-appliance-agent-node-to-a-helm-or-openshift-control-plane).
 
 For a step-by-step user-facing version, see the README's
 ["Quick start with the OS appliance ISO" section](https://github.com/spatiumnorth/spatiumddi/blob/main/README.md#quick-start-with-the-os-appliance-iso-recommended).
@@ -2861,7 +2891,24 @@ LG_AGENT_KEY, BOOTSTRAP_PAIRING_CODE) on first run, writes the
 bootstrap HelmChart manifest into
 `/var/lib/rancher/k3s/server/manifests/`, and polls
 `http://127.0.0.1:8000/health/live`. Default web-UI login is
-`admin / admin` with `force_password_change=True`.
+`admin / admin` with `force_password_change=True`, unless the install
+set a web UI password (next section).
+
+**Web UI admin password (#4548).** On a first node the installer asks, right after the OS
+password, whether to use that password for the web UI's `admin` account too (default yes) or to
+enter a separate one, under the same checks. Only a bcrypt hash is kept: the installer hashes it
+with `python3-bcrypt`, writes it 0600 to `/var/lib/spatium-state/web-admin-password-hash`,
+`spatiumddi-firstboot` puts it in the `spatium-control-app-keys` Secret as
+`initial-admin-password-hash`, and the chart passes it to the api as `INITIAL_ADMIN_PASSWORD_HASH`.
+The api uses it only when it creates the very first user, with no forced password change, so nobody
+has to be first to the UI. A headless install supplies `web_admin_password_hash` (a bcrypt hash;
+there is no plaintext key) and `spatium-install --check-preseed` reports which login the file
+produces. Without it, and on an install from before this option, the web UI starts on
+`admin / admin` as before. An additional node has no web UI, so the option is not asked there and
+its console banner (`/etc/issue`) omits the web UI lines. The hash never enters the install log,
+the trace log, the exported answers file or a support bundle. Docker Compose and plain Helm installs
+keep `admin / admin` with a forced change, but the same `INITIAL_ADMIN_PASSWORD_HASH` variable works
+there too (Compose `environment:`, Helm `api.env`).
 
 `LG_AGENT_KEY` (the Looking Glass collector's agent key, #576) is
 generated on control-plane roles only. Because it is the first agent
@@ -3335,9 +3382,14 @@ schema revision with the one that release was built with:
 When the older release cannot run on the database, the request is
 refused with a 409 whose `detail.code` is `schema_rollback_unsafe`,
 naming both revisions. The Fleet UI shows that as a confirmation. To go
-ahead anyway, resend with `acknowledge_schema_rollback: true`. Only do
-that if you will restore a copy of the database from before the
-upgrade. Data-plane appliances are never checked, because their release
+ahead anyway, resend with `acknowledge_schema_rollback: true`. That is
+**not** a way back to the older release: restoring a pre-upgrade backup
+afterwards is refused (below), because the older release's worker and
+beat would pass their migration wait while the restore is replaying and
+stay up on a schema they do not match, and no DNS change would reach the
+DNS servers again (#4678). The supported way back is to boot the newer
+release again and restore there; the restore migrates the old archive up
+to that release. Data-plane appliances are never checked, because their release
 does not touch the database. Pointing a node at the slot it already
 runs, which commits a trial boot, is not checked either.
 
@@ -3354,6 +3406,18 @@ version against its own head would let the next rollback to it through.
 A release in neither, such as an older nightly, is reported as `unknown`, and the
 switch goes ahead: refusing on "don't know" would block every rollback
 on an install that never recorded anything.
+
+**Restoring while the host and the console are different releases.**
+After an acknowledged rollback the host is booted into the older slot,
+but the newer release's api keeps serving. `POST /api/v1/backup/restore`
+and `POST /api/v1/backup/targets/{id}/archives/restore` answer 409 with
+`detail.code` `restore_refused_mixed_release` in that state, and no
+acknowledgement lifts it. Boot the serving release again from the console
+(`spatium-upgrade-slot set-next-boot` and a reboot), then restore. A
+restore also holds an install-wide lock for its whole replay and migrate;
+the `wait-for-migrate` init container of api, worker and beat keeps
+waiting while it is held, even if the schema already reads their head.
+Pods of a release older than 1.0.1 do not have that check.
 
 **What is not covered.** The trial-boot auto-revert (step 8 above)
 happens on the host with no operator involved, so nothing can refuse
@@ -3797,7 +3861,12 @@ so a first-time operator never gets stuck looking for the upload.
 3. Picks source (Uploaded or URL — see above).
 4. Clicks **Run preflight**. Verdict surfaces inline as a checklist:
    `inflight_conflict` (or `kubeapi_unreachable` when the API did not answer the
-   lease read, #2779), `replication_lag`, `disk_headroom` (each
+   lease read, #2779), `replication_lag` (a replica visibly not
+   streaming fails; if the app's database role cannot see the replicas'
+   state it warns "could not verify" and the run may proceed. The chart
+   makes the role a member of `pg_monitor` through CNPG's
+   `managed.roles` so the check can measure lag; CNPG reverts a GRANT
+   made by hand, #1445, #4610), `disk_headroom` (each
    node's reported `/var`; a missing or stale report warns; a node
    already on the target stages nothing and is named instead of
    judged), `mirror_disk_headroom` (mirror PVC; skipped if not
@@ -4244,7 +4313,25 @@ the operator installing a CA anywhere:
    `supervisor.tls.pin_refresh_satisfied_by_repin` if a repin got there first.
 3. **Once approved, the first-contact pin is checked.** When the CA arrives,
    the supervisor checks that the certificate it pinned at first contact is on
-   the CA's list, and logs `supervisor.tls.pin_not_vouched` if not.
+   the CA's list, and logs `supervisor.tls.pin_not_vouched` (a warning) if not.
+
+**Control plane behind an OpenShift Route, Kubernetes Ingress or your own
+reverse proxy (#4647).** The certificate the supervisor sees is the router's,
+which the appliance CA has never seen, so no CA list can vouch for it. The
+appliance still pairs and works, the pin is the router's certificate, and the
+`supervisor.tls.pin_not_vouched` warning is expected and harmless there; the
+**Web UI Certificate** fingerprint comparison does not apply (compare with
+`openssl s_client -connect <host>:443 | openssl x509 -noout -fingerprint
+-sha256` instead). The same property means a router certificate rotation is
+not adopted automatically: the supervisor keeps the old pin, heartbeats fail
+verification, and it logs `supervisor.tls.certificate_not_vouched`. To
+re-pin, confirm the new certificate's fingerprint, then on the appliance
+delete `tls/control-plane.pem` under the supervisor state directory
+(`/var/persist/spatium-supervisor/`) and restart `spatium-supervisor`; it
+pins whatever the URL presents next. A router that keeps its certificate
+across renewals (same key) never needs this. Verification is not weakened
+for any other topology: an appliance-to-appliance control plane is still
+rotated only through the CA's signed list.
 
 An `http://` control-plane URL (acceptable for labs, per the installer) is
 probed once with a bare `GET /` to learn the `https://` it redirects to; that
@@ -4302,6 +4389,12 @@ the long ``DNS_AGENT_KEY`` / ``DHCP_AGENT_KEY`` hex string.
 > *before* the first pairing — otherwise
 > ``POST /api/v1/appliance/supervisor/register`` returns 404 and the
 > supervisor idles (#407).
+>
+> To start a fresh install with it on, set `INITIAL_SUPERVISOR_REGISTRATION=true`
+> in the Compose `.env`, or `supervisorRegistration.initiallyEnabled: true` in
+> the Helm values (#4659). It is read only when the settings row is first
+> created and never overrides a later choice. Minting a pairing code while the
+> flag is off returns a `warning` and the UI shows it.
 >
 > The flag refuses **new** pairings only. Appliances already registered
 > keep heartbeating and serving while it is off: `/supervisor/heartbeat`

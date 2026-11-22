@@ -9,7 +9,7 @@ This column carries the held-back role names from the supervisor heartbeat to
 the Fleet UI. ``[]`` means nothing is waiting.
 
 Revision ID: e4a91c7d52b3
-Revises: d8b3f6a1c274
+Revises: e5a2c8d4f7b1
 Create Date: 2026-11-20
 """
 
@@ -21,7 +21,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from alembic import op
 
 revision = "e4a91c7d52b3"
-down_revision = "d8b3f6a1c274"
+down_revision = "e5a2c8d4f7b1"
 branch_labels = None
 depends_on = None
 

@@ -312,20 +312,29 @@ APIToken
 
 ### 2.6 Syslog / Log Forwarding
 
-```
-SyslogTarget
-  id, name
-  protocol: enum(udp, tcp, tcp_tls)
-  host, port
-  format: enum(rfc3164, rfc5424, json)
-  facility: enum(local0..local7, daemon, syslog)
-  severity_filter: enum(debug, info, warning, error, critical)
-  tls_ca_cert: text (nullable)
-  is_enabled: bool
-  applies_to: [enum(api, agent, dhcp, dns, audit)]
-```
+Forwarding is one mechanism, the **forward target** (`audit_forward_target`,
+Settings → Audit Event Forwarding; see [OBSERVABILITY.md §5.1](../OBSERVABILITY.md)).
+A target is a syslog collector (UDP / TCP / TLS, RFC 5424 JSON / CEF / LEEF,
+RFC 3164 or JSON lines), a webhook (generic, Slack, Teams, Discord) or an SMTP
+relay, and several can run at once (for example a local Loki and a remote
+SIEM). Every target carries the audit log and alert events, filtered by
+minimum severity and resource type. A syslog target can additionally opt into:
 
-Multiple syslog targets can be configured simultaneously (e.g., local Loki + remote SIEM).
+- the **DNS query log** (`stream_dns_query_log`), filtered by server group,
+  server, response code and query type, with optional sampling;
+- the **DHCP activity log** (`stream_dhcp_activity_log`), filtered by server
+  group, server and Kea message code.
+
+Both streams are off by default. They forward the entries the DNS and DHCP
+agents already ship to the control plane, so they work the same on every
+install shape, and they are delivered best-effort from a bounded queue that
+can never slow agent ingest (drops are counted and raise the
+`log_forward_dropping` alert). Details: OBSERVABILITY.md §5.1.
+
+Not part of this: the API, worker and agent processes' own diagnostic logs
+(use your platform's log collector, or on the appliance the host syslog
+forwarding of the systemd journal, #156), and the pod log files of the DNS
+and DHCP daemons on the appliance.
 
 ### 2.7 Audit Log and Data Retention
 
@@ -1639,7 +1648,7 @@ _Moved here from the README feature tour (#3410), so the detail stays in the doc
 per-section "wipe back to defaults" surface for superadmins.
 
 - 14 sections mapped from the operator's mental model: IPAM · DNS · DHCP · Migration · Network modeling · Integrations · AI/Copilot · Compliance · Verticals · Tools · Observability logs · Auth+RBAC · Settings+branding · Everything. Per-section confirm phrase (`DESTROY-IPAM` / `DESTROY-DNS` / … / `FACTORY-RESET-ALL`) typed exactly to commit
-- Three dispatch kinds: `truncate` (11 sections — `TRUNCATE TABLE … RESTART IDENTITY` on the tables the section names that nothing outside the wipe references, `DELETE` children-first for the rest, never `CASCADE`, #1835), `auth_rbac` (partial wipe preserving the calling user, every other superadmin, and built-in roles), `settings_reset` (DELETE platform_settings; recreated with model defaults). Tables intentionally untouchable: `alembic_version`, `oui_vendor`, `backup_target`, `feature_module`, `event_outbox`, `internal_error`, `audit_forward_target` — the schema head, OUI cache, recovery path, module toggles, and audit-forward shipping channels survive every reset
+- Three dispatch kinds: `truncate` (11 sections — `TRUNCATE TABLE … RESTART IDENTITY` on the tables the section names that nothing outside the wipe references, `DELETE` children-first for the rest, never `CASCADE`, #1835), `auth_rbac` (partial wipe preserving the calling user, every other superadmin, and built-in roles), `settings_reset` (DELETE platform_settings; recreated with model defaults). Tables intentionally untouchable: `alembic_version`, `oui_vendor`, `backup_target`, `feature_module`, `event_outbox`, `audit_forward_target` — the schema head, OUI cache, recovery path, module toggles, and audit-forward shipping channels survive every reset. Captured errors (`internal_error`) and DNS Threat mutes (`dns_threat_mute`) are not on that list: Observability logs wipes them (#4615). The Auth + RBAC reset also ends every login session, including the caller's.
 - Hard guardrails server-side: superadmin gate · fresh bcrypt password re-check (NOT bearer-token check) · exact-match per-section confirm phrase · refuses 409 when any backup target is mid-run · Redis lock against concurrent resets · 6-hour cooldown · audit anchor written via fresh AsyncSessionLocal post-truncate so the trail of evidence survives an `audit_log` wipe · `system.factory_reset` typed event fans through the existing webhook outbox
 - **Pre-flight backup as warn-only with override** — if no enabled backup target exists, `POST /system/factory-reset/execute` returns 412 unless the operator passes `acknowledge_no_backup=true`. The Backup admin tab surfaces the warning + checkbox up front
 - UI lives as the fourth tab on the Backup admin page (after Manual, Destinations and Restore Drills) — backup snapshots state, factory reset wipes it, two ends of the same lifecycle. Per-section cards in a 2-col grid + red-bordered "Reset everything" card. Modal gates the password field on a green-border phrase match

@@ -207,6 +207,21 @@ def get_driver(server_type: str) -> DNSDriver:
     return cls()
 
 
+def blocklist_capable(server_type: str) -> bool:
+    """Whether a server of this driver renders the DNS blocklists assigned to
+    its group (#4608). The single source of truth: the ``blocklist``
+    capability, which only BIND9 (RPZ) and agent-managed Technitium advertise.
+    PowerDNS, Windows DNS, agentless Technitium and every cloud driver render
+    none, so a list assigned only to them blocks nothing. An unregistered
+    driver name is treated as capable: refusing what we cannot classify would
+    be worse than the warning it avoids.
+    """
+    try:
+        return bool(get_driver(server_type).capabilities().get("blocklist"))
+    except ValueError:
+        return True
+
+
 def register_driver(name: str, driver_cls: type[DNSDriver]) -> None:
     """Register (or override) a driver class by name. Useful for tests."""
     _DRIVERS[name] = driver_cls

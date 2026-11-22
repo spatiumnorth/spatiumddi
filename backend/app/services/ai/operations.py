@@ -53,6 +53,7 @@ from app.models.auth import User
 from app.models.ipam import IP_STATUSES_CREATE_SETTABLE, IPAddress, IPBlock, Subnet
 from app.services.dns.name_targets import absolute_target_error
 from app.services.dns.new_object_defaults import default_zone_ttl
+from app.services.dns.server_move import powerdns_zone_type_refusal
 from app.services.dns.sync_check import ipam_authors_zone
 from app.services.dns.zone_synthesis import unauthored_zone_error
 from app.services.ipam.address_create_rules import (
@@ -3559,6 +3560,10 @@ async def _preview_create_dns_zone(
     )
     if conflict is not None:
         return PreviewResult(ok=False, detail=conflict)
+    # #4570 — the REST create's PowerDNS zone-type refusal.
+    conflict = powerdns_zone_type_refusal(drivers, args.zone_type)
+    if conflict is not None:
+        return PreviewResult(ok=False, detail=conflict)
     if args.dnssec_enabled:
         # #1762 — single-signer rule; read-only here, re-checked under lock
         # at apply.
@@ -3637,6 +3642,10 @@ async def _apply_create_dns_zone(
     conflict = _technitium_api_zone_arg_conflict(
         args, drivers, await _effective_zone_ttl(db, args, grp.id)
     )
+    if conflict is not None:
+        raise ValueError(conflict)
+    # #4570 — re-checked at apply, like the gates above.
+    conflict = powerdns_zone_type_refusal(drivers, args.zone_type)
     if conflict is not None:
         raise ValueError(conflict)
     # #1762 — the single-signer rule the REST create applies, re-checked at
@@ -5017,11 +5026,12 @@ async def _assign_role_catalog_problem(
 ) -> str | None:
     """#1858 — same refusal as the REST role-assign route: a Technitium
     appliance must not be pointed at a DNS group holding a TSIG key
-    Technitium cannot use (hmac-sha224). Only on a change, so a
+    Technitium cannot use (hmac-sha224); #4681 — nor a PowerDNS one at a
+    group holding a forward or stub zone. Only on a change, so a
     pre-existing assignment can still be re-saved."""
     from app.models.dns import DNSServerGroup  # noqa: PLC0415
 
-    if "dns-technitium" not in args.roles:
+    if "dns-technitium" not in args.roles and "dns-powerdns" not in args.roles:
         return None
     if "dns_group_id" in args.model_fields_set:
         try:
@@ -5032,10 +5042,21 @@ async def _assign_role_catalog_problem(
         group_id = row.assigned_dns_group_id
     if group_id is None:
         return None
-    if "dns-technitium" in (row.assigned_roles or []) and group_id == row.assigned_dns_group_id:
-        return None
     group = await db.get(DNSServerGroup, group_id)
     if group is None:
+        return None
+    if "dns-powerdns" in args.roles:
+        # #4681 — an engine change to PowerDNS keeps the group; same refusal
+        # as the REST route (and as adding a PowerDNS server to the group).
+        from app.services.dns.server_move import group_powerdns_refusal  # noqa: PLC0415
+
+        if (
+            "dns-powerdns" not in (row.assigned_roles or [])
+            or group_id != row.assigned_dns_group_id
+        ):
+            return await group_powerdns_refusal(db, group)
+        return None
+    if "dns-technitium" in (row.assigned_roles or []) and group_id == row.assigned_dns_group_id:
         return None
     # #1858 — a key Technitium cannot use.
     from app.services.dns.tsig_algorithms import group_key_refusal  # noqa: PLC0415

@@ -1184,6 +1184,25 @@ async def default_conflict_check(db: AsyncSession, obj: Any) -> str | None:
                 "longer defines. Create it again on the group's ACLs / TSIG keys tab, or "
                 "edit the zone's citation, then restore the zone."
             )
+        # #4708 — PowerDNS has no forward zone and runs a stub as a full
+        # secondary (#4570). A server may join the group while the zone is in
+        # the Trash (the join guard counts live zones only, deliberately: a
+        # trashed zone is not served), so the restore is where it is refused.
+        # Every restore path (single, bulk, view / zone cascade) runs here.
+        from app.models.dns import DNSServer  # noqa: PLC0415
+        from app.services.dns.server_move import powerdns_zone_type_refusal  # noqa: PLC0415
+
+        drivers = set(
+            (await db.execute(select(DNSServer.driver).where(DNSServer.group_id == obj.group_id)))
+            .scalars()
+            .all()
+        )
+        pdns_refusal = powerdns_zone_type_refusal(drivers, obj.zone_type)
+        if pdns_refusal:
+            return (
+                f"Zone {obj.name!r} cannot be restored: {pdns_refusal} "
+                "Move the PowerDNS server out of the group, then restore the zone."
+            )
         # #3855 — the single-signer rule (#1762). A signed zone in the Trash is
         # not counted when a second server joins its group, so the restore must
         # hold it to the same rule the direct sign does, or the group ends up

@@ -19,7 +19,11 @@ queried in plaintext against the operator's stated choice.
 from __future__ import annotations
 
 import ipaddress
+import uuid
 from collections.abc import Iterable
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 
 def alias_resolver(forwarders: Iterable[str] | None, forward_transport: str | None) -> str:
@@ -55,3 +59,19 @@ def alias_resolver(forwarders: Iterable[str] | None, forward_transport: str | No
             continue
         out.append(f"[{addr}]:{number}" if addr.version == 6 else f"{addr}:{number}")
     return ",".join(out)
+
+
+async def group_can_resolve_alias(db: AsyncSession, group_id: uuid.UUID) -> bool:
+    """Whether ``group_id`` has Do53 forwarders to expand an ALIAS through.
+
+    The one check behind the record API's 422 and the importer's drop (#4604),
+    so the two cannot disagree about which groups can serve an ALIAS.
+    """
+    from app.models.dns import DNSServerOptions  # models import drivers: keep it lazy
+
+    opts = (
+        await db.execute(select(DNSServerOptions).where(DNSServerOptions.group_id == group_id))
+    ).scalar_one_or_none()
+    return bool(
+        alias_resolver(getattr(opts, "forwarders", None), getattr(opts, "forward_transport", None))
+    )

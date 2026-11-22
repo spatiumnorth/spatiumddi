@@ -48,10 +48,25 @@ Chart:      {{ .Chart.Name }}-{{ .Chart.Version }} (app {{ .Chart.AppVersion }})
 {{- end }}
 
 {{- if .Values.postgresql.enabled }}
+{{- if eq (.Values.postgresql.kind | default "standalone") "cnpg" }}
 
-5. Postgres password (Bitnami-managed):
+5. Postgres: CloudNativePG cluster {{ include "spatiumddi.fullname" . }}-postgresql
+   (read/write service {{ include "spatiumddi.postgresHost" . }}). Password:
 
-     kubectl -n {{ .Release.Namespace }} get secret {{ .Release.Name }}-postgresql -o jsonpath='{.data.password}' | base64 -d
+     kubectl -n {{ .Release.Namespace }} get secret {{ include "spatiumddi.postgresSecretName" . }} -o jsonpath='{.data.password}' | base64 -d
+{{- else }}
+
+5. Postgres: in-chart StatefulSet {{ include "spatiumddi.postgresHost" . }}. Password:
+
+     kubectl -n {{ .Release.Namespace }} get secret {{ include "spatiumddi.postgresSecretName" . }} -o jsonpath='{.data.password}' | base64 -d
+{{- end }}
+{{- else }}
+
+5. Postgres: external database {{ include "spatiumddi.postgresHost" . }}:{{ include "spatiumddi.postgresPort" . }}.
+   The chart does not manage it. The password it connects with is the
+   `{{ include "spatiumddi.postgresSecretPasswordKey" . }}` key of Secret {{ include "spatiumddi.postgresSecretName" . }}:
+
+     kubectl -n {{ .Release.Namespace }} get secret {{ include "spatiumddi.postgresSecretName" . }} -o jsonpath='{.data.{{ include "spatiumddi.postgresSecretPasswordKey" . }}}' | base64 -d
 {{- end }}
 
 {{- if or .Values.dnsAgents.enabled .Values.dhcpAgents.enabled }}
@@ -95,7 +110,7 @@ Chart:      {{ .Chart.Name }}-{{ .Chart.Version }} (app {{ .Chart.AppVersion }})
 {{- if .Values.dhcpAgents.enabled }}{{ if .Values.dhcpAgents.storageClass }}{{ $scSet = true }}{{ end }}{{ range .Values.dhcpAgents.servers }}{{ if .storageClass }}{{ $scSet = true }}{{ end }}{{ end }}{{ end }}
 {{- if $scSet }}
 
-Note: a storageClass on an existing agent StatefulSet cannot be updated in place (Kubernetes forbids it). On an upgrade or Argo CD sync that fails, delete the StatefulSet with --cascade=orphan and sync again; see "Adopting storageClass on an existing install" in the chart README.
+Note: a storageClass on an existing agent StatefulSet cannot be updated in place (Kubernetes forbids it). On an upgrade or Argo CD sync that fails, delete each agent StatefulSet (one per server) with --cascade=orphan and sync again; see "Adopting storageClass on an existing install" in the chart README.
 {{- end }}
 
 Docs: https://www.spatiumddi.com/

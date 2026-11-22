@@ -14,7 +14,12 @@
 
 import { useState } from "react";
 import { useCredentialReask } from "@/hooks/useCredentialReask";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { Check, Pencil, Play, Plus, Send, Trash2, X } from "lucide-react";
 
 import { Modal } from "@/components/ui/modal";
@@ -22,9 +27,12 @@ import { FreshRowError } from "@/components/FreshRowError";
 import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
 import { ListReadError } from "@/components/ui/list-read-error";
 import {
+  dhcpApi,
+  dnsApi,
   settingsApi,
   type AuditForwardFormat,
   type AuditForwardKind,
+  type AuditForwardLogFilterKey,
   type AuditForwardProtocol,
   type AuditForwardSeverity,
   type AuditForwardTarget,
@@ -92,6 +100,10 @@ const EMPTY: AuditForwardTargetWrite = {
   smtp_reply_to: "",
   min_severity: null,
   resource_types: null,
+  stream_dns_query_log: false,
+  stream_dhcp_activity_log: false,
+  log_stream_filters: null,
+  dns_query_sample_percent: 100,
 };
 
 function targetToBody(t: AuditForwardTarget): AuditForwardTargetWrite {
@@ -122,6 +134,10 @@ function targetToBody(t: AuditForwardTarget): AuditForwardTargetWrite {
     smtp_reply_to: t.smtp_reply_to,
     min_severity: t.min_severity,
     resource_types: t.resource_types,
+    stream_dns_query_log: t.stream_dns_query_log,
+    stream_dhcp_activity_log: t.stream_dhcp_activity_log,
+    log_stream_filters: t.log_stream_filters,
+    dns_query_sample_percent: t.dns_query_sample_percent,
   };
 }
 
@@ -315,6 +331,30 @@ export function AuditForwardTargets({
                     </td>
                     <td className="whitespace-nowrap px-3 py-2 text-muted-foreground">
                       {filter}
+                      {(t.stream_dns_query_log ||
+                        t.stream_dhcp_activity_log) && (
+                        <div className="text-[11px]">
+                          streams:{" "}
+                          {[
+                            t.stream_dns_query_log ? "DNS queries" : null,
+                            t.stream_dhcp_activity_log ? "DHCP activity" : null,
+                          ]
+                            .filter(Boolean)
+                            .join(", ")}
+                          {t.log_stream_dropped_total > 0 && (
+                            <span
+                              className="ml-1 text-amber-600 dark:text-amber-400"
+                              title={
+                                t.log_stream_last_drop_at
+                                  ? `Last drop ${t.log_stream_last_drop_at}`
+                                  : undefined
+                              }
+                            >
+                              · {t.log_stream_dropped_total} dropped
+                            </span>
+                          )}
+                        </div>
+                      )}
                     </td>
                     <td className="whitespace-nowrap px-3 py-2">
                       {t.enabled ? (
@@ -1064,6 +1104,8 @@ function TargetModal({
           </label>
         </div>
 
+        {isSyslog && <LogStreamsSection form={form} setForm={setForm} />}
+
         <div className="flex justify-end gap-2 border-t pt-3">
           <button
             onClick={onClose}
@@ -1086,5 +1128,240 @@ function TargetModal({
         </div>
       </div>
     </Modal>
+  );
+}
+
+const STREAM_FORMATS: AuditForwardFormat[] = [
+  "rfc5424_json",
+  "rfc3164",
+  "json_lines",
+];
+
+function splitList(text: string): string[] {
+  return text
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function CheckList({
+  label,
+  options,
+  selected,
+  onChange,
+}: {
+  label: string;
+  options: { id: string; name: string }[];
+  selected: string[];
+  onChange: (next: string[]) => void;
+}) {
+  if (options.length === 0) return null;
+  return (
+    <div className="block">
+      <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+        {label}
+      </div>
+      <div className="max-h-24 space-y-0.5 overflow-y-auto rounded-md border p-1.5">
+        {options.map((o) => (
+          <label key={o.id} className="flex items-center gap-1.5 text-xs">
+            <input
+              type="checkbox"
+              checked={selected.includes(o.id)}
+              onChange={(e) =>
+                onChange(
+                  e.target.checked
+                    ? [...selected, o.id]
+                    : selected.filter((x) => x !== o.id),
+                )
+              }
+            />
+            {o.name}
+          </label>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * #4545 — opt a syslog target into the DNS query log and the DHCP activity
+ * log, and narrow what it receives. Both streams are off by default: a query
+ * log is high-volume and names clients.
+ */
+function LogStreamsSection({
+  form,
+  setForm,
+}: {
+  form: AuditForwardTargetWrite;
+  setForm: (f: AuditForwardTargetWrite) => void;
+}) {
+  const formatOk = STREAM_FORMATS.includes(form.format);
+  const filters = form.log_stream_filters ?? {};
+  const setFilter = (key: AuditForwardLogFilterKey, values: string[]) => {
+    const next = { ...filters };
+    if (values.length > 0) next[key] = values;
+    else delete next[key];
+    setForm({
+      ...form,
+      log_stream_filters: Object.keys(next).length > 0 ? next : null,
+    });
+  };
+  const dnsGroups = useQuery({
+    queryKey: ["dns-groups"],
+    queryFn: dnsApi.listGroups,
+    enabled: !!form.stream_dns_query_log,
+  });
+  const dnsServers = useQueries({
+    queries: (dnsGroups.data ?? []).map((g) => ({
+      queryKey: ["dns-group-servers", g.id],
+      queryFn: () => dnsApi.listServers(g.id),
+    })),
+  });
+  const dhcpGroups = useQuery({
+    queryKey: ["dhcp-groups"],
+    queryFn: dhcpApi.listGroups,
+    enabled: !!form.stream_dhcp_activity_log,
+  });
+  const dhcpServers = useQuery({
+    queryKey: ["dhcp-servers-all"],
+    queryFn: () => dhcpApi.listServers(),
+    enabled: !!form.stream_dhcp_activity_log,
+  });
+  const get = (k: AuditForwardLogFilterKey) => filters[k] ?? [];
+
+  return (
+    <div className="space-y-3 border-t pt-3" data-testid="log-streams">
+      <div className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+        Log streams
+      </div>
+      <p className="text-xs text-muted-foreground">
+        Also forward the logs the DNS and DHCP agents ship to the control plane,
+        one event per query or message. Off by default: query logs are
+        high-volume and carry client addresses. Delivery is best-effort and
+        never slows the agents; if the collector falls behind, entries are
+        dropped and counted (shown in the Filter column and raised by the{" "}
+        <code>log_forward_dropping</code> alert).
+        {!formatOk &&
+          " Streams need the RFC 5424 + JSON, RFC 3164 or JSON lines format."}
+      </p>
+      <label className="flex items-center gap-2 text-xs">
+        <input
+          type="checkbox"
+          disabled={!formatOk}
+          checked={!!form.stream_dns_query_log}
+          onChange={(e) =>
+            setForm({ ...form, stream_dns_query_log: e.target.checked })
+          }
+        />
+        Forward the DNS query log
+      </label>
+      {form.stream_dns_query_log && formatOk && (
+        <div className="grid grid-cols-2 gap-3 rounded-md border p-2">
+          <CheckList
+            label="DNS server groups (none = all)"
+            options={dnsGroups.data ?? []}
+            selected={get("dns_server_group_ids")}
+            onChange={(v) => setFilter("dns_server_group_ids", v)}
+          />
+          <CheckList
+            label="DNS servers (none = all)"
+            options={dnsServers.flatMap((q) => q.data ?? [])}
+            selected={get("dns_server_ids")}
+            onChange={(v) => setFilter("dns_server_ids", v)}
+          />
+          <label className="block">
+            <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+              Response codes
+            </div>
+            <input
+              className={inputCls}
+              value={get("dns_rcodes").join(",")}
+              onChange={(e) =>
+                setFilter("dns_rcodes", splitList(e.target.value))
+              }
+              placeholder="NXDOMAIN,SERVFAIL (blank = all)"
+            />
+          </label>
+          <label className="block">
+            <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+              Query types
+            </div>
+            <input
+              className={inputCls}
+              value={get("dns_qtypes").join(",")}
+              onChange={(e) =>
+                setFilter("dns_qtypes", splitList(e.target.value))
+              }
+              placeholder="A,AAAA,TXT (blank = all)"
+            />
+          </label>
+          <label className="block">
+            <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+              Sample (% of queries)
+            </div>
+            <input
+              type="number"
+              min={1}
+              max={100}
+              className={inputCls}
+              value={form.dns_query_sample_percent ?? 100}
+              onChange={(e) =>
+                setForm({
+                  ...form,
+                  dns_query_sample_percent: Math.min(
+                    100,
+                    Math.max(1, Number(e.target.value) || 100),
+                  ),
+                })
+              }
+            />
+          </label>
+          <p className="self-end text-[11px] text-muted-foreground">
+            Response code filters match only queries whose answer was recorded
+            (BIND9 response logging); the rest are not forwarded.
+          </p>
+        </div>
+      )}
+      <label className="flex items-center gap-2 text-xs">
+        <input
+          type="checkbox"
+          disabled={!formatOk}
+          checked={!!form.stream_dhcp_activity_log}
+          onChange={(e) =>
+            setForm({ ...form, stream_dhcp_activity_log: e.target.checked })
+          }
+        />
+        Forward the DHCP activity log
+      </label>
+      {form.stream_dhcp_activity_log && formatOk && (
+        <div className="grid grid-cols-2 gap-3 rounded-md border p-2">
+          <CheckList
+            label="DHCP server groups (none = all)"
+            options={dhcpGroups.data ?? []}
+            selected={get("dhcp_server_group_ids")}
+            onChange={(v) => setFilter("dhcp_server_group_ids", v)}
+          />
+          <CheckList
+            label="DHCP servers (none = all)"
+            options={dhcpServers.data ?? []}
+            selected={get("dhcp_server_ids")}
+            onChange={(v) => setFilter("dhcp_server_ids", v)}
+          />
+          <label className="col-span-2 block">
+            <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+              Message types (Kea log codes)
+            </div>
+            <input
+              className={inputCls}
+              value={get("dhcp_codes").join(",")}
+              onChange={(e) =>
+                setFilter("dhcp_codes", splitList(e.target.value))
+              }
+              placeholder="DHCP4_LEASE_ALLOC,DHCP4_PACKET_DROP_0001 (blank = all)"
+            />
+          </label>
+        </div>
+      )}
+    </div>
   );
 }

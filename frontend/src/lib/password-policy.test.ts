@@ -173,3 +173,14 @@ describe("parsePasswordError", () => {
     }
   });
 });
+
+describe("history note singular (#4612)", () => {
+  it("does not say '1 passwords'", () => {
+    const note = evaluatePolicy(policy({ history_count: 1 }), "x").notes[0];
+    expect(note).toContain("your last password");
+    expect(note).not.toContain("1 passwords");
+    expect(
+      evaluatePolicy(policy({ history_count: 5 }), "x").notes[0],
+    ).toContain("last 5 passwords");
+  });
+});

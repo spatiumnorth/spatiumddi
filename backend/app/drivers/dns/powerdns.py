@@ -21,7 +21,9 @@ Phase 1 scope (this driver):
 Out of scope until Phase 2/3:
 
 * Views (PowerDNS does split-horizon via tags / different zones, the
-  mapping needs cross-design with the BIND views work in #24).
+  mapping needs cross-design with the BIND views work in #24). The API
+  refuses them on a group that runs this driver (#4565), reading
+  ``capabilities()["views"]``.
 * RPZ blocklists (RPZ is a Recursor feature; PowerDNS-Authoritative
   doesn't consume it).
 * Catalog zones (PowerDNS 4.8+ supports them; covered in Phase 3).
@@ -58,6 +60,7 @@ from app.drivers.dns.base import (
     UpdateAclEntry,
     ZoneData,
 )
+from app.services.dns.powerdns_alias import alias_resolver as _alias_resolver
 
 logger = structlog.get_logger(__name__)
 
@@ -142,14 +145,24 @@ def render_pdns_conf(
     api_key: str,
     backend: str = "lmdb",
     lmdb_path: str = "/var/lib/powerdns/pdns.lmdb",
-    listen_address: str = "0.0.0.0",
+    listen_address: str = "0.0.0.0, ::",
     listen_port: int = 53,
     api_listen_address: str = "127.0.0.1",
     api_listen_port: int = 8081,
     log_level: int = 4,
+    query_log_enabled: bool = False,
+    alias_resolver: str = "",
 ) -> str:
-    """Render the ``pdns.conf`` file the agent writes alongside the
+    """Render a TEMPLATE of the ``pdns.conf`` the agent writes alongside the
     PowerDNS daemon.
+
+    The agent's ``_render_conf`` is the real renderer and cannot share this
+    code (separate package and image, #4604). This is the preview behind
+    ``GET /servers/{id}/config``: its fixed values match the agent's, and
+    what only the agent can know differs in a known way: the API key (a
+    placeholder here), ``local-address`` (the agent drops ``::`` on a host
+    without IPv6) and the ALIAS resolver (computed here from the group's
+    forwarders, as the bundle does for the agent).
 
     Pulled out of the driver as a module-level helper so the agent
     can import + call it directly when generating the conf at first
@@ -190,13 +203,17 @@ def render_pdns_conf(
             "webserver-allow-from=127.0.0.1,::1",
             "",
             f"loglevel={log_level}",
-            "log-dns-details=no",
-            "log-dns-queries=no",
+            f"log-dns-details={'yes' if query_log_enabled else 'no'}",
+            f"log-dns-queries={'yes' if query_log_enabled else 'no'}",
             "",
-            "# Disable features Phase 1 doesn't surface yet — operators",
-            "# who turn these on will need the matching control-plane",
-            "# wiring (Phase 2/3).",
-            "expand-alias=no",
+            # ALIAS expansion needs a resolver; with none it is off (#1353).
+            *(
+                ["expand-alias=yes", f"resolver={alias_resolver}"]
+                if alias_resolver.strip()
+                else ["expand-alias=no"]
+            ),
+            # LUA records are enabled globally, as the agent does.
+            "enable-lua-records=yes",
             # No security-status polling: it phones secpoll.powerdns.com
             # with the version, an outbound connection nobody configured
             # (non-negotiable #17, #1353). Mirrors the agent's renderer.
@@ -251,7 +268,16 @@ class PowerDNSDriver(DNSDriver):
         """
         # Placeholder API key in the rendered preview so secrets never
         # reach the control-plane response. Agent's real key is local.
-        return render_pdns_conf(api_key="<agent-generated>")
+        query_log = bool(getattr(options, "query_log_enabled", False))
+        return render_pdns_conf(
+            api_key="<agent-generated>",
+            # The agent raises loglevel to 6 while query logging is on.
+            log_level=6 if query_log else 4,
+            query_log_enabled=query_log,
+            alias_resolver=_alias_resolver(
+                getattr(options, "forwarders", ()), getattr(options, "forward_transport", None)
+            ),
+        )
 
     def render_zone_config(self, zone: ZoneData) -> str:
         """PowerDNS LMDB stores zones in the database, not as

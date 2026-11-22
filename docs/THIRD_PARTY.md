@@ -290,6 +290,7 @@ The bootable image is Debian 13 (trixie), built with
 | [qemu-guest-agent](https://www.qemu.org/) / [open-vm-tools](https://github.com/vmware/open-vm-tools) | GPL v2 / GPL v2 + BSD | Hypervisor integration; both no-op off their platform |
 | [zstd](https://facebook.github.io/zstd/) | BSD 3-Clause / GPL v2 | Image + airgap tarball compression |
 | [jq](https://jqlang.github.io/jq/), [curl](https://curl.se/), less, htop, tcpdump, dnsutils | MIT / curl / GPL / BSD / MPL 2.0 | Operator diagnostics |
+| [pyca/bcrypt](https://github.com/pyca/bcrypt) (python3-bcrypt) | Apache-2.0 | The installer hashes the web UI admin password (#4548) |
 | [Rich](https://github.com/Textualize/rich) + [psutil](https://github.com/giampaolo/psutil) (python3-rich, python3-psutil) | MIT / BSD 3-Clause | The console dashboard on tty1 |
 
 **There is no Docker on the appliance.** It was removed in #183 Phase 7 — the

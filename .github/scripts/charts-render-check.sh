@@ -1086,6 +1086,13 @@ render umbrella-posture-ha "$UMBRELLA" "${UMBRELLA_POSTURE[@]}" "${UMBRELLA_HA[@
 echo "── CNPG WAL budget (umbrella, #2317)"
 python3 "$ROOT/.github/scripts/chart-cnpg-recovery.py" --require-cluster \
     "$OUT/umbrella-ha.yaml" "$OUT/umbrella-posture-ha.yaml" || failures=$((failures + 1))
+# #4610: the app role is in pg_monitor by default, so the rolling-upgrade
+# preflight can read each standby's streaming state and lag.
+echo "── CNPG app role is granted pg_monitor by default (#4610)"
+if ! grep -A3 'inRoles:' "$OUT/umbrella-ha.yaml" | grep -q -- '- pg_monitor'; then
+    echo "   FAIL: the default HA render's CNPG managed role carries no pg_monitor" >&2
+    failures=$((failures + 1))
+fi
 # #3932: a session whose client has gone must not outlive it, or its open
 # transaction holds a migration's ALTER for hours. Both Postgres shapes carry
 # the idle-in-transaction timeout and the TCP keepalives, and a CNPG change of
@@ -1843,6 +1850,27 @@ elif sc_out="$(sc_notes --set dnsAgents.enabled=true --set dnsAgents.agentKey.va
     echo "   FAIL: #3206 NOTES shows the storageClass pointer with none set" >&2; failures=$((failures + 1))
 else
     echo "   ok: #3206 storageClass renders offline; NOTES pointer only when set"
+fi
+
+# #4663 — NOTES.txt described Bitnami-managed Postgres on every release. It
+# must name the Postgres the release uses, and the Secret holding its password.
+echo "── NOTES names the configured Postgres kind (#4663)"
+pn_ok=1
+pn_out="$(sc_notes --set postgresql.kind=cnpg)"
+printf '%s' "$pn_out" | grep -q "CloudNativePG" || pn_ok=0
+printf '%s' "$pn_out" | grep -qi "bitnami" && pn_ok=0
+pn_out="$(sc_notes)"
+printf '%s' "$pn_out" | grep -q "in-chart StatefulSet" || pn_ok=0
+printf '%s' "$pn_out" | grep -qi "bitnami" && pn_ok=0
+pn_out="$(sc_notes --set postgresql.enabled=false --set externalDatabase.host=db.example \
+    --set externalDatabase.existingSecret=extdb)"
+printf '%s' "$pn_out" | grep -q "external database db.example" || pn_ok=0
+printf '%s' "$pn_out" | grep -q "secret extdb " || pn_ok=0
+if [ "$pn_ok" = 1 ]; then
+    echo "   ok: #4663 NOTES matches cnpg / standalone / external"
+else
+    echo "   FAIL: #4663 NOTES does not describe the configured Postgres kind" >&2
+    failures=$((failures + 1))
 fi
 
 # #1550 — no render above sets frontend.controlPlaneVIP, so the

@@ -152,6 +152,15 @@ sharedEnv: []
 # until every node runs the target: a HelmChartConfig pins a scalar, but
 # replaces a list whole. Empty (the default, and every install that is not an
 # appliance) renders no APPLIANCE_VERSION, which the api reads as unknown.
+# #4659 — Appliance registration (``supervisor_registration_enabled``). Off by
+# default (#1356, #2798): an appliance joining with a pairing code cannot
+# register and idles. Set ``initiallyEnabled: true`` on an install meant to
+# take appliance agent nodes. Applied only when the settings row is first
+# created (a fresh install); it never overrides a later choice in
+# Appliance > Pairing or Settings.
+supervisorRegistration:
+  initiallyEnabled: false
+
 applianceVersion: ""
 
 api:
@@ -924,6 +933,14 @@ postgresql:
     # reaches clusters created before #702. Set false to withhold the
     # privilege — drills then report a clear "role lacks CREATEDB" error.
     appRoleCreateDb: true
+    # Make the application role a member of ``pg_monitor`` (#4610), the
+    # read-only monitoring role. Without it Postgres hides every standby's
+    # state and LSNs from the app's role, so the rolling-upgrade preflight's
+    # replication_lag check and the Cluster screen's streaming check can see
+    # replicas but not verify them. Applied via ``managed.roles`` so it also
+    # reaches existing clusters. Set false to withhold it; both then report
+    # "not verified" instead of a measured result.
+    appRoleMonitor: true
     # Replica count. 3 is the smallest etcd-quorum-friendly default
     # (primary + sync replica + async replica). 5 / 7 for larger
     # clusters. CNPG enforces odd counts implicitly via its leader-
