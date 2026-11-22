@@ -59,6 +59,7 @@ from app.models.dns import (
 from app.models.dns_rpz_hit import DNSRPZHit
 from app.models.logs import DNSQueryLogEntry
 from app.models.metrics import DNSMetricSample
+from app.services import log_stream_forward
 from app.services.agents.config_apply import apply_reported_status
 from app.services.agents.container_oom import (
     container_oom_kill,
@@ -1763,7 +1764,8 @@ class DNSSECStateReport(BaseModel):
     ``ds_records`` is the zone-level DS rrset the operator copies into the
     parent registrar verbatim (empty = unsigned). ``keys`` is the optional
     per-key breakdown BIND9 agents report from ``rndc dnssec -status``
-    (issue #49); PowerDNS agents omit it.
+    (issue #49) and PowerDNS agents from ``GET .../cryptokeys`` (#4604).
+    An agent that does not report keys omits the field.
     """
 
     zone_name: str
@@ -2351,6 +2353,9 @@ async def agent_query_log_entries(
     # the overwhelming majority of responses are matched here without
     # touching the database at all.
     pending: dict[tuple[str | None, int | None, str | None, str | None], DNSQueryLogEntry] = {}
+    # Every query row this batch adds, in order: the log stream (#4545)
+    # forwards them once the batch is committed.
+    new_entries: list[DNSQueryLogEntry] = []
     # Responses whose question landed in an EARLIER batch — only possible
     # when the 1000-line cap or the shipper's own batch boundary fell
     # between the two lines. Resolved against the DB after the loop.
@@ -2425,6 +2430,7 @@ async def agent_query_log_entries(
             raw=parsed.raw,
         )
         db.add(entry)
+        new_entries.append(entry)
         if response_capable:
             # Last writer wins: an ephemeral source port is effectively
             # unique per query, but a client that retries the identical
@@ -2434,7 +2440,17 @@ async def agent_query_log_entries(
         inserted += 1
 
     deferred_matched = await _stamp_deferred_responses(db, server.id, deferred)
+    # Built before the commit (which expires the rows), after the in-batch
+    # response correlation, so ``rcode`` is set where this batch knew it. A
+    # response that arrives in a LATER batch stamps the stored row only: the
+    # query was forwarded already, with ``rcode`` null.
+    stream_events = (
+        [log_stream_forward.dns_event(e, server.group_id) for e in new_entries]
+        if new_entries and log_stream_forward.wants(log_stream_forward.DNS_QUERY_LOG)
+        else []
+    )
     await db.commit()
+    log_stream_forward.submit(stream_events)
     return {
         "status": "ok",
         "inserted": inserted,

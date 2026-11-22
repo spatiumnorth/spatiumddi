@@ -201,7 +201,7 @@ answered ~5 % of the queries the load generator sent — the control plane
 had failed over, the data plane had nothing to serve with. Assign the DNS
 and DHCP roles on every node you expect to keep serving during a failover.
 
-The installer's **hard disk floor is 32 GiB** for every role (raised from 24 GiB — issue #312: a 24 GiB disk left `/var` only ~7 GiB, and the Control plane's first boot tipped the kubelet DiskPressure threshold into an eviction storm). RAM has a hard floor as well, and the installer does not enforce it: the kubelet sets aside 2 GiB on every node (`kube-reserved` 1 GiB, `system-reserved` 512 MiB and the 512 MiB `memory.available` eviction threshold — #1124) and schedules pods only into what is left. A single-node control plane requests about 1.6 GiB, so it needs **at least 4 GiB of RAM** to start at all, and a DNS / DHCP appliance **at least 3 GiB**; below that the pods stay `Pending` on `Insufficient memory`. The serving roles add their own requests on top of that: BIND and Technitium 256Mi (BIND's is an eighth of its RAM-sized memory limit, so 256Mi up to a ~10 GB node and more above, #2223), Kea, PowerDNS and the looking-glass collector 128Mi each. They are sized above the pods' idle working sets because the kubelet evicts a pod running over its memory request before any pod within its request, whatever the PriorityClasses say (#1828). A single node with the control plane plus the DNS and DHCP roles therefore requests about 2 GiB, which uses up all the allocatable memory a 4 GiB node has. That includes an existing install: a slot upgrade to a release carrying #1124 on a smaller box comes back with nothing schedulable. 8 GiB remains the comfortable recommendation for a control plane. When the operator picks the **Control plane** role on a box below the recommended 40 GiB disk / 8 GiB RAM, `spatium-install` shows a soft sizing warning before proceeding (the lighter Appliance/agent role is fine at the 32 GiB floor and gets no warning). Each control-plane **HA member** sizes the same as a standalone control plane (4 vCPU / 8 GiB) — every member runs a full api / worker / Postgres replica / Redis. SSD is strongly preferred for the etcd + Postgres write path; the installer's disk floor assumes the baked image set lands on the slots, not RAM.
+The installer's **hard disk floor is 32 GiB** for every role (raised from 24 GiB — issue #312: a 24 GiB disk left `/var` only ~7 GiB, and the Control plane's first boot tipped the kubelet DiskPressure threshold into an eviction storm). RAM has a hard floor as well, and the installer does not enforce it: the kubelet sets aside 2 GiB on every node (`kube-reserved` 1 GiB, `system-reserved` 512 MiB and the 512 MiB `memory.available` eviction threshold — #1124) and schedules pods only into what is left. A single-node control plane requests about 1.6 GiB, so it needs **at least 4 GiB of RAM** to start at all, and a DNS / DHCP appliance **at least 3 GiB**; below that the pods stay `Pending` on `Insufficient memory`. The serving roles add their own requests on top of that: BIND and Technitium 256Mi (BIND's is an eighth of its RAM-sized memory limit, so 256Mi up to a ~10 GB node and more above, #2223), Kea, PowerDNS and the looking-glass collector 128Mi each. They are sized above the pods' idle working sets because the kubelet evicts a pod running over its memory request before any pod within its request, whatever the PriorityClasses say (#1828). A single node with the control plane plus the DNS and DHCP roles therefore requests about 2 GiB, which uses up all the allocatable memory a 4 GiB node has. That includes an existing install: a slot upgrade to a release carrying #1124 on a smaller box comes back with nothing schedulable. 8 GiB remains the comfortable recommendation for a control plane. When the operator picks the **Control plane** role on a box below the recommended 40 GiB disk / 8 GiB RAM, `spatium-install` shows a soft sizing warning before proceeding (the lighter Appliance/agent role is fine at the 32 GiB floor and gets no warning). A headless preseed install skips that screen, so the same shortfall is a `WARN:` line in the install log instead of a refusal (#4661). Each control-plane **HA member** sizes the same as a standalone control plane (4 vCPU / 8 GiB) — every member runs a full api / worker / Postgres replica / Redis. SSD is strongly preferred for the etcd + Postgres write path; the installer's disk floor assumes the baked image set lands on the slots, not RAM.
 
 ### Appliance management surfaces (k3s-aware)
 
@@ -3382,9 +3382,14 @@ schema revision with the one that release was built with:
 When the older release cannot run on the database, the request is
 refused with a 409 whose `detail.code` is `schema_rollback_unsafe`,
 naming both revisions. The Fleet UI shows that as a confirmation. To go
-ahead anyway, resend with `acknowledge_schema_rollback: true`. Only do
-that if you will restore a copy of the database from before the
-upgrade. Data-plane appliances are never checked, because their release
+ahead anyway, resend with `acknowledge_schema_rollback: true`. That is
+**not** a way back to the older release: restoring a pre-upgrade backup
+afterwards is refused (below), because the older release's worker and
+beat would pass their migration wait while the restore is replaying and
+stay up on a schema they do not match, and no DNS change would reach the
+DNS servers again (#4678). The supported way back is to boot the newer
+release again and restore there; the restore migrates the old archive up
+to that release. Data-plane appliances are never checked, because their release
 does not touch the database. Pointing a node at the slot it already
 runs, which commits a trial boot, is not checked either.
 
@@ -3401,6 +3406,18 @@ version against its own head would let the next rollback to it through.
 A release in neither, such as an older nightly, is reported as `unknown`, and the
 switch goes ahead: refusing on "don't know" would block every rollback
 on an install that never recorded anything.
+
+**Restoring while the host and the console are different releases.**
+After an acknowledged rollback the host is booted into the older slot,
+but the newer release's api keeps serving. `POST /api/v1/backup/restore`
+and `POST /api/v1/backup/targets/{id}/archives/restore` answer 409 with
+`detail.code` `restore_refused_mixed_release` in that state, and no
+acknowledgement lifts it. Boot the serving release again from the console
+(`spatium-upgrade-slot set-next-boot` and a reboot), then restore. A
+restore also holds an install-wide lock for its whole replay and migrate;
+the `wait-for-migrate` init container of api, worker and beat keeps
+waiting while it is held, even if the schema already reads their head.
+Pods of a release older than 1.0.1 do not have that check.
 
 **What is not covered.** The trial-boot auto-revert (step 8 above)
 happens on the host with no operator involved, so nothing can refuse

@@ -5325,6 +5325,19 @@ async def update_appliance_roles(
                         status.HTTP_422_UNPROCESSABLE_ENTITY,
                         f"DNS server group {target.name!r}: {key_problem}",
                     )
+    # #4681 — an engine change to PowerDNS keeps the group, so none of the
+    # server-add / move refusals ran; a forward or stub zone in it would be
+    # accepted and never answer. Refused here, not at agent registration: a
+    # running node must not be stranded.
+    if row.assigned_dns_group_id is not None and "dns-powerdns" in (row.assigned_roles or []):
+        if "dns-powerdns" not in prev_dns_roles or row.assigned_dns_group_id != prev_dns_group_id:
+            from app.models.dns import DNSServerGroup
+            from app.services.dns.server_move import group_powerdns_refusal
+
+            pdns_group = await db.get(DNSServerGroup, row.assigned_dns_group_id)
+            if pdns_group is not None:
+                if pdns_problem := await group_powerdns_refusal(db, pdns_group):
+                    raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, pdns_problem)
     if signer_check is not None:
         from app.services.dns.dnssec_signers import second_signer_refusal
 

@@ -26,6 +26,10 @@ import {
   type BackupTargetUpdate,
 } from "@/lib/api";
 import { useCredentialReask } from "@/hooks/useCredentialReask";
+import {
+  clearRestoreInFlight,
+  markRestoreInFlight,
+} from "@/lib/restoreInFlight";
 import { useModalDialog } from "@/components/ui/use-draggable-modal";
 import { ListReadError } from "@/components/ui/list-read-error";
 import { BackupSectionsPicker } from "./BackupSectionsPicker";
@@ -671,14 +675,23 @@ function RestoreFromArchiveModal({
             : "not in a recognised format") +
           " — use Full restore.";
   const restoreMut = useMutation({
-    mutationFn: () =>
-      backupTargetsApi.restoreFromArchive(targetId, {
+    mutationFn: () => {
+      // A restore ends every session: leave the sign-in notice (#4676).
+      markRestoreInFlight();
+      return backupTargetsApi.restoreFromArchive(targetId, {
         filename,
         passphrase,
         confirmation_phrase: confirm,
         sections: mode === "selective" ? sections : null,
-      }),
+      });
+    },
     onSuccess: (data) => onSuccess(data.warnings ?? []),
+    onError: (err: unknown) => {
+      // As BackupPage: only a cut connection (no response) keeps the note.
+      const status = (err as { response?: { status?: number } })?.response
+        ?.status;
+      if (status) clearRestoreInFlight();
+    },
   });
   const restoreWarnings = restoreMut.data?.warnings ?? [];
 

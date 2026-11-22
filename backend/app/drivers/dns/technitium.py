@@ -407,6 +407,8 @@ class TechnitiumDriver(DNSDriver):
             "name": "technitium",
             "views": False,
             "rpz": False,
+            # Applies blocklists through Technitium's own block list, not RPZ.
+            "blocklist": True,
             "dnssec_inline_signing": True,  # #1767: agent reconciles signing state
             "incremental_updates": "rest_api",
             "zone_types": sorted(_SUPPORTED_ZONE_TYPES),

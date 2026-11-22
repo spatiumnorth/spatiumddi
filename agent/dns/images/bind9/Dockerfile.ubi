@@ -36,8 +36,10 @@ ARG JEMALLOC_SHA256=2db82d1e7119df3e71b7640219b6dfe84789bc0537983c3b7ac4f7189aec
 # BIND: Michal Nowak (ISC code-signing key), in ISC's keyblock https://www.isc.org/docs/isc-keyblock.asc
 ARG BIND_SIGNING_FPR=D99CCEAF879747014F038D63182E23579462EFAA
 # libuv: Santiago Gimeno, listed in libuv's README ("GPG key: 612F 0EAD ..."); the key is the
-# blob its git tag pubkey-santigimeno points at (fetched through the GitHub API; the key itself is
-# long expired, which gpg reports but still checks the signature, and the fingerprint is what is pinned)
+# blob its git tag pubkey-santigimeno points at, vendored as libuv-pubkey.asc (#4638: fetching
+# it from api.github.com anonymously 403s on a shared CI runner's rate limit; ``git hash-object``
+# of the file is that blob's id f1beee0c...). The key itself is long expired, which gpg reports
+# but still checks the signature, and the fingerprint is what is pinned.
 ARG LIBUV_SIGNING_FPR=612F0EAD9401622379DF4402F28C3C8DA33C03BE
 # liburcu: the key that signs https://lttng.org/files/urcu/*.asc (fingerprint read off the signature)
 ARG URCU_SIGNING_FPR=2A0B4ED915F2D3FA45F5B16217280A9781186ACF
@@ -52,6 +54,7 @@ ADD https://github.com/krallin/tini/archive/refs/tags/v${TINI_VERSION}.tar.gz ti
 ADD https://downloads.isc.org/isc/bind9/${BIND_VERSION}/bind-${BIND_VERSION}.tar.xz bind.tar.xz
 ADD https://downloads.isc.org/isc/bind9/${BIND_VERSION}/bind-${BIND_VERSION}.tar.xz.asc bind.tar.xz.asc
 ADD https://dist.libuv.org/dist/v${LIBUV_VERSION}/libuv-v${LIBUV_VERSION}.tar.gz.sign libuv.tar.gz.sign
+COPY agent/dns/images/bind9/libuv-pubkey.asc /src/libuv-pubkey.asc
 ADD https://lttng.org/files/urcu/userspace-rcu-${URCU_VERSION}.tar.bz2.asc urcu.tar.bz2.asc
 ADD https://github.com/jemalloc/jemalloc/releases/download/${JEMALLOC_VERSION}/jemalloc-${JEMALLOC_VERSION}.tar.bz2 jemalloc.tar.bz2
 # gpg: a fresh GNUPGHOME per tarball, the project's key fetched over HTTPS, and the
@@ -64,7 +67,7 @@ RUN verify() { \
         || { echo "signature of $4 is not a valid one from $2" >&2; exit 1; }; \
     } \
  && verify https://www.isc.org/docs/isc-keyblock.asc "$BIND_SIGNING_FPR" bind.tar.xz.asc bind.tar.xz \
- && verify "https://api.github.com/repos/libuv/libuv/git/blobs/f1beee0c8b030aec9c2863ebf884f8eb88d9ed6c" "$LIBUV_SIGNING_FPR" libuv.tar.gz.sign libuv.tar.gz \
+ && verify file:///src/libuv-pubkey.asc "$LIBUV_SIGNING_FPR" libuv.tar.gz.sign libuv.tar.gz \
  && verify "https://keys.openpgp.org/vks/v1/by-fingerprint/${URCU_SIGNING_FPR}" "$URCU_SIGNING_FPR" urcu.tar.bz2.asc urcu.tar.bz2
 RUN echo "${JEMALLOC_SHA256}  jemalloc.tar.bz2" | sha256sum -c - \
  && mkdir -p jemalloc && tar -xf jemalloc.tar.bz2 -C jemalloc --strip-components=1

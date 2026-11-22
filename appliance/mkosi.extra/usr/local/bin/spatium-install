@@ -2393,6 +2393,22 @@ _control_plane_sizing_ok() {
     return 1
 }
 
+# #4661 — logged (not prompted) warning when a control-plane install
+# targets a disk under REC_CP_DISK_GIB. The interactive path asks via
+# _control_plane_sizing_ok; this covers the preseed / unattended path,
+# where there is nobody to ask. Never refuses. The agent-only
+# ("appliance") role keeps the MIN_DISK_GIB floor and is not warned.
+_warn_control_plane_disk_size() {
+    [ "$ROLE" = "control-plane" ] || return 0
+    local bytes gib
+    bytes=$(blockdev --getsize64 "$1" 2>/dev/null || echo 0)
+    gib=$((bytes / 1024 / 1024 / 1024))
+    if [ "$bytes" -gt 0 ] && [ "$gib" -lt "$REC_CP_DISK_GIB" ]; then
+        log "WARN: control-plane install on a ${gib} GiB disk, below the recommended ${REC_CP_DISK_GIB} GiB: the first boot is likely to hit kubelet DiskPressure (/var fills while the images and database volumes land). Proceeding."
+    fi
+    return 0
+}
+
 # Issue #276 — partition-layout confirmation. Shows the exact GPT
 # layout that ``do_install`` will create on $TARGET_DISK and forces
 # the operator to tick a confirmation checkbox before proceeding.
@@ -4570,7 +4586,16 @@ _assert_safe_wipe_target() {
         [ -n "$hazard" ] && why="$what $disk is $hazard. Install to the whole disk, or to the multipath map (/dev/mapper/…) rather than one of its paths."
     fi
 
-    [ -z "$why" ] && { log "Pre-wipe guard OK: $disk ($real)"; return 0; }
+    if [ -z "$why" ]; then
+        log "Pre-wipe guard OK: $disk ($real)"
+        # #4661 — the preseed door skips the interactive sizing screen
+        # (_control_plane_sizing_ok), so an unattended first-node install
+        # on a 32 GiB disk went through without a word and then hit
+        # DiskPressure on first boot. Warn, do not refuse: the hard floor
+        # is MIN_DISK_GIB and the operator knowingly chose this size.
+        _warn_control_plane_disk_size "$real"
+        return 0
+    fi
 
     log "Pre-wipe guard REFUSED $disk: $why"
     if [ "$FULLY_UNATTENDED" = "1" ]; then

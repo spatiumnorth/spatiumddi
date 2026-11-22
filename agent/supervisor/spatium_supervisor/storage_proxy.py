@@ -64,10 +64,28 @@ _RESULT_TIMEOUT_S = 60.0
 _RESULT_POLL_S = 0.5
 
 _STATE_SUBDIR = "storage"
+# spatium-host: the group release-state itself is root:<this> 1770.
+_HOST_GID = 2770
 
 
 def _request_dir() -> Path:
     return Path("/var/lib/spatiumddi-host/release-state") / _STATE_SUBDIR
+
+
+def _share_request_dir(req_dir: Path) -> None:
+    """Make the request directory writable by the previous release's supervisor.
+
+    ``mkdir`` leaves it 755 and owned by our primary group, so after a rollback
+    the older supervisor (other uid, same ``spatium-host`` supplementary group)
+    could not queue a request in it. The entrypoint applies the same mode on
+    every start; this covers a directory created while we are running. Best
+    effort: a failure here must not stop a request that can still be queued.
+    """
+    try:
+        os.chown(req_dir, -1, _HOST_GID)
+        os.chmod(req_dir, 0o2770)
+    except OSError:
+        pass  # not ours / group not held; the write below reports the real error
 
 
 def storage_loop_forever(cfg: SupervisorConfig, identity: Identity) -> None:
@@ -160,6 +178,7 @@ def run_action(params: dict[str, Any]) -> dict[str, Any]:
     req_dir = _request_dir()
     try:
         req_dir.mkdir(parents=True, exist_ok=True)
+        _share_request_dir(req_dir)
     except OSError as exc:
         # The host bind mount is missing — this is a non-appliance
         # deployment, or the supervisor is running without it.
