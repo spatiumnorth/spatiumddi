@@ -255,6 +255,10 @@ with `SPATIUM_UPDATE_GOLDEN=1`). `scripts/kea-config-check.sh` loads it with
 `kea-dhcp4 -t` in a Kea image. `build-dhcp-images.yml` runs that against the
 image each PR builds, and `make kea-config-check` builds the image from the
 working tree and does the same (`KEA_IMAGE=<ref>` checks an existing image).
+`build-ubi-images.yml` runs it against the UBI Kea image too (Kea 3.0.5
+built from source), on image changes and on its weekly schedule. The golden
+covers the agent's render only; the backend preview render
+(`KeaDriver.render_config`) is checked by the backend tests, not by Kea.
 
 ### HA coordination
 

@@ -25,6 +25,8 @@ on:
       - ".github/actions/install-trivy/**"
       - ".github/actions/preflight-check/**"
       - ".github/scripts/trivy-gate.sh"
+      # #54 — the script the Kea config check step below runs.
+      - "scripts/kea-config-check.sh"
   schedule:
     - cron: "23 5 * * 1"
   workflow_dispatch:
@@ -97,6 +99,15 @@ jobs:
         env:
           IMG: ghcr.io/spatiumnorth/${{ matrix.image }}:pr-scan-ubi
         run: ${{ matrix.smoke }}
+
+      # #54 — the golden rendered Kea config through this image's kea-dhcp4 -t.
+      # The UBI image builds Kea from source at its own pin, so it can accept or
+      # refuse what the Alpine image does not. This lane runs on image changes
+      # and weekly, not on every agent render change; the Alpine lane
+      # (build-dhcp-images.yml) is the one that gates those.
+      - name: Kea config check (kea-dhcp4 -t on the golden render)
+        if: matrix.image == 'dhcp-kea'
+        run: bash scripts/kea-config-check.sh "ghcr.io/spatiumnorth/${{ matrix.image }}:pr-scan-ubi"
 
       - name: Install Trivy
         uses: ./.github/actions/install-trivy
