@@ -3510,8 +3510,47 @@ No api is needed: firstboot commits the slot as the durable default once
 k3s's `/readyz` answers and every baked image is in containerd, as for an
 upgrade (step 7 above), and the database is left as it is. If that boot
 fails, the next reboot falls back to the older slot, as any trial boot
-does. The only other way out is to restore a pre-upgrade copy of the
-database by hand.
+does. The way back to the older release itself is the reinstall and
+restore below.
+
+### The way back from 1.0.1 to 1.0.0 (#4658)
+
+Upgrading from 1.0.0 to 1.0.1 is supported. Going back is **not** a slot
+rollback. A slot rollback leaves the database on 1.0.1's schema, and a
+restore after an acknowledged rollback is refused (above). The supported
+way back is to reinstall 1.0.0 and restore the backup you took before the
+upgrade:
+
+1. **Before you upgrade, take a backup and keep the archive.** Take a
+   Full backup from Backup, with a passphrase you will still know, and
+   copy the archive off the appliance. Do not use "Exclude secrets": an
+   archive without credentials leaves nobody able to sign in after the
+   restore. Run the backup right before the upgrade. Anything you change
+   after it is not in the archive.
+2. **Reinstall 1.0.0** from its ISO, and finish setup. The install
+   starts empty, with its own admin.
+3. **Restore the archive** on that install, from the web UI (Backup →
+   Restore) or the console: Full restore, the passphrase, and
+   `RESTORE-FROM-BACKUP`. The steps and the checks are the ones in
+   "Restoring a backup onto a fresh install" above. The archive was
+   taken on 1.0.0, so 1.0.0 can restore it.
+
+What to expect:
+
+- **What comes back.** The archive's data: IPAM, DNS, DHCP, settings,
+  users and stored credentials. Anything changed after the backup is
+  gone, and so are leases that were issued after it.
+- **You sign in again.** The restore replaces the user accounts with
+  the archive's. Sign in with the **backup's** accounts and passwords;
+  the password you set on the new install no longer works.
+- **The appliance keeps its place.** The supervisor on a node you
+  reinstalled stays approved and its DNS and DHCP roles keep serving
+  (#4680). Appliances that were in the archive but no longer exist stay
+  in the Fleet list with no heartbeat: delete them there.
+- **Multi-node clusters.** The walk of this path covered reinstalling
+  and restoring on a three-node cluster, and the roles kept serving. It
+  did not cover every layout, so check Fleet and a DNS and DHCP answer
+  on each node after the restore.
 
 ### 5c. Phase 8f fleet upgrade orchestration
 
