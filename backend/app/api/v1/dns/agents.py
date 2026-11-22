@@ -509,6 +509,11 @@ async def agent_register(
     agent_instance: str | None = Header(default=None, alias=AGENT_INSTANCE_HEADER),
 ) -> AgentRegisterResponseV2 | JSONResponse:
     """Bootstrap registration: PSK-authenticated; returns a per-server JWT."""
+    # #4677 — not while a restore is replaying: the fingerprint compared below
+    # would be the archive's (see dhcp/agents.py).
+    from app.core.restore_gate import defer_if_restoring  # noqa: PLC0415
+
+    await defer_if_restoring(db, "registration")
     # #1068 — see the matching guard in dhcp/agents.py. Registration is
     # the one agent call that creates a server row, so without this an
     # agent re-registers moments after the operator empties DNS and

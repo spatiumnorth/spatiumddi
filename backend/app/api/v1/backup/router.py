@@ -422,6 +422,7 @@ async def restore_backup(
                     "allow_newer_schema": allow_newer_schema,
                     "warnings": outcome.warnings,
                     "reconciled_backup_targets": outcome.reconciled_backup_targets,
+                    "adopted_appliances": outcome.adopted_appliances,
                 },
             )
         )
