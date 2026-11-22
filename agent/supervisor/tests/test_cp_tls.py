@@ -385,6 +385,20 @@ def test_a_certificate_the_ca_does_not_vouch_for_is_refused(server, tmp_path: Pa
     assert cp_tls.load_pins(state) == before
 
 
+def test_a_refused_router_rotation_says_how_to_repin(server, tmp_path: Path) -> None:
+    """#4647: behind a router the CA never vouches for the new certificate;
+    the refusal must tell the operator the manual re-pin, not just stop."""
+    state = _pinned(server, tmp_path)
+    ca = _ca()
+    _approve(state, ca)
+    server.use(_leaf("router.example"))
+    server.pin_set = ca.sign_list([_leaf("control-plane.example").sha256])
+    with _capture() as logs:
+        assert cp_tls.try_repin(state, server.url) is False
+    assert [e["event"] for e in logs] == ["supervisor.tls.certificate_not_vouched"]
+    assert "control-plane.pem" in logs[0]["detail"]
+
+
 def test_a_list_signed_by_another_ca_is_refused(server, tmp_path: Path) -> None:
     """An interceptor can sign a list naming its own certificate; it cannot
     sign one with the appliance CA's key."""
@@ -451,7 +465,9 @@ def test_an_intercepted_first_contact_is_reported(server, tmp_path: Path) -> Non
     with _capture() as logs:
         cp_tls.check_pin_vouched_once(state, server.url)
     assert [e["event"] for e in logs] == ["supervisor.tls.pin_not_vouched"]
-    assert logs[0]["log_level"] == "error"
+    assert logs[0]["log_level"] == "warning"
+    # #4647: the line must name the router topology AND the interception case.
+    assert "Route" in logs[0]["detail"] and "intercepted" in logs[0]["detail"]
 
 
 # ── the signed list, on its own ──────────────────────────────────────────────

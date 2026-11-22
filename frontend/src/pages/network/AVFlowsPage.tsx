@@ -842,7 +842,7 @@ function FlowModal({
 
 // ── Reserved-range create / edit ─────────────────────────────────────
 
-function RangeModal({
+export function RangeModal({
   mode,
   range,
   protocols,
@@ -938,6 +938,11 @@ function RangeModal({
                 </option>
               ))}
             </select>
+            {spacesQ.error != null && (
+              <p className="text-[11px]">
+                <ListReadError error={spacesQ.error} what="IP spaces" />
+              </p>
+            )}
           </Field>
         ) : (
           // The backend has no re-home path: a range is scoped to the

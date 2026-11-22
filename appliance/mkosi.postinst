@@ -327,6 +327,7 @@ chmod 0755 "$BUILDROOT/usr/local/bin/spatium-k3s-images"
 # #1215 — k3s.service's ExecStartPre=- that skips the first-boot TLS
 # manifest on an upgraded seed. The ``-`` would swallow a 203/EXEC silently.
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-tls-manifest-skip"
+chmod 0755 "$BUILDROOT/usr/local/bin/spatium-etcd-peer-reset"
 # #395 — host-migration framework: renderer + orchestrator + patch registry.
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-grub-render"
 # #999 Part C2 — keeps the mirror member's ESP in step with the primary's.

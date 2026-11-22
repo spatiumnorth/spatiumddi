@@ -48,6 +48,7 @@ import {
 import { FormError } from "@/components/ui/form-error";
 import { FreshRowError } from "@/components/FreshRowError";
 import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
+import { countNoun } from "@/lib/count-noun";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -845,7 +846,7 @@ export function WebhooksPage() {
                   <span className="mr-3">
                     <strong>Events:</strong>{" "}
                     {s.event_types && s.event_types.length > 0
-                      ? `${s.event_types.length} types`
+                      ? countNoun(s.event_types.length, "type")
                       : "all"}
                   </span>
                   <span className="mr-3">

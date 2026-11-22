@@ -915,7 +915,7 @@ function DeviceModal({
 
 // ── Zone create / edit ───────────────────────────────────────────────
 
-function ZoneModal({
+export function ZoneModal({
   mode,
   zone,
   onClose,
@@ -999,6 +999,11 @@ function ZoneModal({
                 </option>
               ))}
             </select>
+            {subnetsQ.error != null && (
+              <p className="text-[11px]">
+                <ListReadError error={subnetsQ.error} what="subnets" />
+              </p>
+            )}
             <p className="text-[11px] text-muted-foreground">
               One zone per subnet — a second classification of the same subnet
               is refused, because it would make every boundary report ambiguous.
