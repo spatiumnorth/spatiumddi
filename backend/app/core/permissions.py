@@ -1178,6 +1178,7 @@ def require_any_resource_or_scoped(
     scoped_routes: dict[str, frozenset[str]],
     instance_routes: dict[str, tuple[str, str, frozenset[str], frozenset[str]]] | None = None,
     route_types: dict[str, tuple[str, ...]] | None = None,
+    audit_types: dict[str, str] | None = None,
 ) -> Callable[..., Awaitable[User]]:
     """Router gate that also admits instance-scoped delegates.
 
@@ -1208,6 +1209,11 @@ def require_any_resource_or_scoped(
     resource on an allow-list of routes that name that resource in their path
     (see :func:`_instance_scoped_admit`), and on its collection route, whose
     handler narrows the rows.
+
+    ``audit_types`` (#4718) maps a route key to the type that route's change
+    rows are audited under, where that is not the permission's type (the plan
+    routes: gated on ``ip_block``, audited as ``subnet_plan``); a refusal on it
+    is written under that type. Used with ``route_types`` only.
     """
 
     async def _dep(
@@ -1242,7 +1248,15 @@ def require_any_resource_or_scoped(
             return current_user
         if route_types is not None:
             first = needed[0] if needed else "*"
-            await _record_denial(db, current_user, request, action, first, None)
+            await _record_denial(
+                db,
+                current_user,
+                request,
+                action,
+                first,
+                None,
+                audit_resource_type=(audit_types or {}).get(key),
+            )
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=(

@@ -34,6 +34,19 @@ async def _plain_user(db: AsyncSession) -> tuple[User, dict[str, str]]:
     return u, {"Authorization": f"Bearer {create_access_token(str(u.id))}"}
 
 
+def _fill(path: str) -> str:
+    while "{id}" in path:
+        path = path.replace("{id}", str(uuid.uuid4()), 1)
+    return path
+
+
+async def test_audit_type_keys_are_gated_routes() -> None:
+    """A key that matches no gated route would silently do nothing."""
+    from app.api.v1.dns.router import _DNS_AUDIT_TYPES, _DNS_ROUTE_TYPES
+
+    assert set(_DNS_AUDIT_TYPES) <= set(_DNS_ROUTE_TYPES)
+
+
 async def _denied(db: AsyncSession, user: User) -> AuditLog:
     res = await db.execute(
         select(AuditLog).where(AuditLog.user_id == user.id, AuditLog.result == "denied")
@@ -53,6 +66,31 @@ async def _denied(db: AsyncSession, user: User) -> AuditLog:
         ("POST", "/api/v1/dns/groups/{id}/servers", "dns_group", "dns_group"),
         ("POST", "/api/v1/dhcp/server-groups", "dhcp_server_group", "dhcp_server"),
         ("PUT", "/api/v1/dhcp/server-groups/{id}", "dhcp_server_group", "dhcp_server"),
+        ("POST", "/api/v1/dns/groups/{id}/group-tsig-key/rotate", "dns_server_group", "dns_group"),
+        (
+            "POST",
+            "/api/v1/dhcp/groups/{id}/responders/{id}/acknowledge",
+            "dhcp_responder",
+            "dhcp_server",
+        ),
+        (
+            "POST",
+            "/api/v1/dhcp/server-groups/{id}/phone-profiles",
+            "dhcp_phone_profile",
+            "dhcp_scope",
+        ),
+        ("PUT", "/api/v1/dhcp/phone-profiles/{id}", "dhcp_phone_profile", "dhcp_scope"),
+        ("POST", "/api/v1/dhcp/server-groups/{id}/pxe-profiles", "dhcp_pxe_profile", "dhcp_scope"),
+        ("DELETE", "/api/v1/dhcp/pxe-profiles/{id}", "dhcp_pxe_profile", "dhcp_scope"),
+        (
+            "POST",
+            "/api/v1/dhcp/server-groups/{id}/device-policies",
+            "dhcp_device_policy",
+            "dhcp_client_class",
+        ),
+        ("DELETE", "/api/v1/dhcp/device-policies/{id}", "dhcp_device_policy", "dhcp_client_class"),
+        ("POST", "/api/v1/ipam/plans", "subnet_plan", "ip_block"),
+        ("DELETE", "/api/v1/ipam/plans/{id}", "subnet_plan", "ip_block"),
         # A DHCP server route still writes the permission's own type.
         ("POST", "/api/v1/dhcp/servers", "dhcp_server", "dhcp_server"),
     ],
@@ -66,9 +104,7 @@ async def test_denied_row_type(
     permission: str,
 ) -> None:
     user, headers = await _plain_user(db_session)
-    resp = await client.request(
-        method, path.replace("{id}", str(uuid.uuid4())), headers=headers, json={}
-    )
+    resp = await client.request(method, _fill(path), headers=headers, json={})
     assert resp.status_code == 403, resp.text
 
     row = await _denied(db_session, user)
