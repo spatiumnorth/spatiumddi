@@ -414,6 +414,8 @@ export function CopilotDrawer({
   const drawerRef = useRef<HTMLDivElement | null>(null);
   const selectAllRef = useRef<HTMLButtonElement | null>(null);
   const focusSelectAllRef = useRef(false);
+  const cancelBulkRef = useRef<HTMLButtonElement | null>(null);
+  const focusCancelBulkRef = useRef(false);
   const openerRef = useRef<HTMLElement | null | undefined>(undefined);
   if (openerRef.current === undefined) {
     openerRef.current = document.activeElement as HTMLElement | null;
@@ -629,6 +631,10 @@ export function CopilotDrawer({
       focusSelectAllRef.current = false;
       selectAllRef.current?.focus();
     }
+    if (focusCancelBulkRef.current && selectedIds.size > 0) {
+      focusCancelBulkRef.current = false;
+      cancelBulkRef.current?.focus();
+    }
   }, [selectedIds]);
   const bulkDeleteMut = useMutation({
     // No dedicated bulk-delete endpoint — fan out per-id deletes in
@@ -783,6 +789,7 @@ export function CopilotDrawer({
                   <div className="flex items-center gap-2">
                     <button
                       type="button"
+                      ref={cancelBulkRef}
                       onClick={() => {
                         setSelectedIds(new Set());
                         // Cancel leaves with the selection bar; focus lands
@@ -824,6 +831,9 @@ export function CopilotDrawer({
                         (sessionsQ.data ?? []).map((s) => s.id),
                       );
                       setSelectedIds(all);
+                      // Select all leaves with the header it lives in; focus
+                      // lands on the bar's Cancel, which takes its place (#4746).
+                      focusCancelBulkRef.current = all.size > 0;
                     }}
                     className="rounded border px-2 py-0.5 text-muted-foreground hover:bg-accent"
                   >
