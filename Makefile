@@ -4,7 +4,7 @@
         lint-untyped-routes-baseline \
         ci ci-backend-lint ci-frontend-lint ci-frontend-build screenshots \
         docs docs-down docs-verify \
-        trivy \
+        trivy kea-config-check \
         appliance appliance-builder appliance-iso appliance-clean \
         appliance-bake-images appliance-clean-baked-images appliance-dev-iso \
         appliance-baked-iso appliance-baked-iso-cross appliance-verify-arch \
@@ -311,6 +311,22 @@ TRIVY_IMAGES ?= \
 
 trivy:
 	@IMAGE="$(IMAGE)" TRIVY_CACHE="$(TRIVY_CACHE)" bash scripts/trivy-scan.sh $(TRIVY_IMAGES)
+
+# ── Kea config check (#54) ──────────────────────────────────────────────────
+# Load the golden rendered Kea config into the Kea image with `kea-dhcp4 -t`,
+# the same step build-dhcp-images.yml runs on a PR. Builds the image from the
+# working tree; KEA_IMAGE=<ref> checks an existing image instead (for example
+# ghcr.io/spatiumnorth/dhcp-kea:<version>). Regenerate the golden after an
+# intended render change: see agent/dhcp/tests/test_render_kea_relay_retention.py.
+KEA_IMAGE ?=
+
+kea-config-check:
+	@image="$(KEA_IMAGE)"; \
+	if [ -z "$$image" ]; then \
+	  image=spatiumddi-dhcp-kea:config-check; \
+	  docker build -q -f agent/dhcp/images/kea/Dockerfile -t "$$image" . >/dev/null || exit 2; \
+	fi; \
+	bash scripts/kea-config-check.sh "$$image"
 
 # ── OpenAPI contract export (#903) ──────────────────────────────────────────
 #

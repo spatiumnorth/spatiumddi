@@ -122,7 +122,8 @@ The HTTP envelope returned by `GET /api/v1/dhcp/agents/config` is:
     "driver": "kea",
     "roles": [...],
     "server": { "interfaces": ["*"], "dhcp_socket_type": "raw",
-                "kea_thread_pool_size": 1, "kea_packet_logging": true },
+                "kea_thread_pool_size": 1, "kea_packet_logging": true,
+                "relay_info_retention": true },
     "scopes": [
       {
         "subnet_cidr": "10.0.0.0/24",
@@ -195,6 +196,65 @@ just set, which is the same rule `dhcp_socket_type` (#365) and
 and `kea_packet_logging` renders as the `kea-dhcpN.packets` severity
 override alone (nothing when it is on). Full measurements:
 [`DHCP.md` §4c](../features/DHCP.md).
+
+**Relay agent information retention (#54).** When any Dhcp4 client class of
+the group tests the relay agent information option (option 82), the bundle
+sets `ConfigBundle.relay_info_retention`, the wire carries
+`server.relay_info_retention: true`, and `render_kea.py` emits
+`"stash-agent-options": true` and `"store-extended-info": true` at the
+`Dhcp4` top level. Never in `Dhcp6`: `stash-agent-options` is a DHCPv4 key.
+
+A class "tests option 82" when its `match_expression`, with Kea string
+literals blanked, contains `relay4`, `option[82]` or
+`option[dhcp-agent-options]` (`option_validation.relay_info_retention`).
+Hand-written classes count, so a group that already restricted a pool to a
+`relay4` test gets the keys on its first bundle after upgrade: one config
+reload, after which its renewals stop being NAKed. A class built from a
+structured match counts too, because it is stored compiled to
+`match_expression`. `'relay4'` inside a string literal does not count, and
+neither does an IPv6-only class.
+
+Why both keys. A unicast renewal goes straight from the client to the
+server, so the relay never sees it and it carries no option 82. The client
+then no longer matches a `relay4[...]` class, and Kea NAKs a lease from a pool
+restricted to that class. `stash-agent-options` makes Kea act as if the relay
+information from the client's last relayed request were in the renewal, and
+Kea only has that information if `store-extended-info` saved it on the lease.
+Measured on kea-dhcp4 3.0.3, a relayed DORA with circuit-id `eth0/1:100` into
+a pool restricted to `relay4[1].hex == 0x657468302F313A313030`, then a
+unicast DHCPREQUEST without option 82:
+
+| `stash-agent-options` | `store-extended-info` | Unicast renewal |
+|---|---|---|
+| off | off | DHCPNAK |
+| on | off | DHCPNAK |
+| off | on | DHCPNAK |
+| on | on | DHCPACK |
+
+With `store-extended-info` the memfile row's `user_context` column holds
+`{ "ISC": { "relay-agent-info": { "sub-options": "0x010A…" } } }`, and Kea
+keeps the values from the last request that carried option 82.
+
+HA. The hot-standby partner gets that `user_context` with each lease update,
+so it renews a lease the primary issued. Measured on a kea-dhcp4 3.0.3 pair
+rendered by the agent: relayed DORA on the primary, primary stopped, standby
+in `partner-down`, then a unicast renewal to the standby. The result was
+DHCPACK with both keys and DHCPNAK without them.
+
+ETag and upgrades. `relay_info_retention` is hashed into the ETag, and sent
+on the wire, **only when true**, so a group with no option-82 class keeps its
+ETag and its exact wire bundle across the upgrade. An agent older than #54
+ignores the key: classes still match, and unicast renewals from a restricted
+pool are NAKed as before. The Windows DHCP driver ignores it.
+
+**Golden config check.** `agent/dhcp/tests/fixtures/kea_golden_dhcp4.json`
+is what `render_kea` produces for `kea_golden_bundle.json`: relay4 classes,
+pools restricted to them, both retention keys and the HA hook. The agent test
+`test_render_kea_relay_retention.py` fails when the two disagree (regenerate
+with `SPATIUM_UPDATE_GOLDEN=1`). `scripts/kea-config-check.sh` loads it with
+`kea-dhcp4 -t` in a Kea image. `build-dhcp-images.yml` runs that against the
+image each PR builds, and `make kea-config-check` builds the image from the
+working tree and does the same (`KEA_IMAGE=<ref>` checks an existing image).
 
 ### HA coordination
 

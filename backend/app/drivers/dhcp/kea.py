@@ -569,6 +569,18 @@ def _render_pxe_classes(p: PXEClassDef) -> list[dict[str, Any]]:
     return [selector, boot]
 
 
+def _relay_info_retention(bundle: ConfigBundle) -> dict[str, Any]:
+    """``stash-agent-options`` + ``store-extended-info`` for the Dhcp4 preview (#54).
+
+    Both or neither: measured on kea-dhcp4 3.0.3, a unicast renewal from a
+    pool restricted to an option-82 class is NAKed with either key alone.
+    ``{}`` when the group has no such class, so its preview is unchanged.
+    """
+    if not bundle.relay_info_retention:
+        return {}
+    return {"stash-agent-options": True, "store-extended-info": True}
+
+
 def _packet_logging_override(bundle: ConfigBundle, daemon: str) -> dict[str, Any]:
     """The ``kea-dhcpN.packets`` severity override, for the preview (#980).
 
@@ -644,6 +656,7 @@ class KeaDriver(DHCPDriver):
                 # match, so declaration order is precedence.
                 + [_render_device_policy_class(p) for p in bundle.device_policy_classes],
                 "option-data": _render_option_data(bundle.options.options, address_family="ipv4"),
+                **_relay_info_retention(bundle),
                 **_packet_logging_override(bundle, "kea-dhcp4"),
             }
             # #856 — ship definitions for any non-standard option emitted above.

@@ -940,6 +940,15 @@ async def agent_config_longpoll(
                             # silent no-op the lease-cache keys above call out.
                             "kea_thread_pool_size": bundle.kea_thread_pool_size,
                             "kea_packet_logging": bundle.kea_packet_logging,
+                            # #54 — sent only when set, like its ETag input:
+                            # a group with no option-82 class gets the same
+                            # wire bundle as before. The agent renders
+                            # stash-agent-options + store-extended-info.
+                            **(
+                                {"relay_info_retention": True}
+                                if bundle.relay_info_retention
+                                else {}
+                            ),
                         },
                         "scopes": [
                             {

@@ -1,0 +1,156 @@
+{
+  "Dhcp4": {
+    "cache-threshold": 0.0,
+    "calculate-tee-times": true,
+    "client-classes": [
+      {
+        "name": "port-eth0-1-100",
+        "test": "(relay4[1].hex == 0x657468302F313A313030)"
+      },
+      {
+        "name": "switch-aabbcc",
+        "option-data": [
+          {
+            "code": 6,
+            "data": "10.54.0.53",
+            "name": "domain-name-servers",
+            "space": "dhcp4"
+          }
+        ],
+        "test": "(substring(relay4[2].hex, 0, 3) == 0xAABBCC) and not member('port-eth0-1-100')"
+      }
+    ],
+    "control-socket": {
+      "socket-name": "/run/kea/kea4-ctrl-socket",
+      "socket-type": "unix"
+    },
+    "expired-leases-processing": {
+      "flush-reclaimed-timer-wait-time": 25,
+      "hold-reclaimed-time": 3600,
+      "max-reclaim-leases": 100,
+      "max-reclaim-time": 250,
+      "reclaim-timer-wait-time": 10,
+      "unwarned-reclaim-cycles": 5
+    },
+    "hooks-libraries": [
+      {
+        "library": "/usr/lib/kea/hooks/libdhcp_lease_cmds.so"
+      },
+      {
+        "library": "/usr/lib/kea/hooks/libdhcp_ha.so",
+        "parameters": {
+          "high-availability": [
+            {
+              "heartbeat-delay": 10000,
+              "max-ack-delay": 10000,
+              "max-response-delay": 60000,
+              "max-unacked-clients": 5,
+              "mode": "hot-standby",
+              "multi-threading": {
+                "enable-multi-threading": true,
+                "http-client-threads": 4,
+                "http-dedicated-listener": true,
+                "http-listener-threads": 4
+              },
+              "peers": [
+                {
+                  "auto-failover": true,
+                  "name": "kea-1",
+                  "role": "primary",
+                  "url": "http://10.54.0.11:8000/"
+                },
+                {
+                  "auto-failover": true,
+                  "name": "kea-2",
+                  "role": "standby",
+                  "url": "http://10.54.0.12:8000/"
+                }
+              ],
+              "restrict-commands": true,
+              "this-server-name": "kea-1"
+            }
+          ]
+        }
+      }
+    ],
+    "interfaces-config": {
+      "dhcp-socket-type": "udp",
+      "interfaces": [
+        "*"
+      ]
+    },
+    "lease-database": {
+      "lfc-interval": 3600,
+      "name": "/var/lib/kea/kea-leases4.csv",
+      "persist": true,
+      "type": "memfile"
+    },
+    "loggers": [
+      {
+        "name": "kea-dhcp4",
+        "output_options": [
+          {
+            "output": "stdout"
+          },
+          {
+            "flush": true,
+            "maxsize": 50000000,
+            "maxver": 5,
+            "output": "/var/log/kea/kea-dhcp4.log"
+          }
+        ],
+        "severity": "INFO"
+      }
+    ],
+    "multi-threading": {
+      "enable-multi-threading": true,
+      "packet-queue-size": 1024,
+      "thread-pool-size": 1
+    },
+    "stash-agent-options": true,
+    "store-extended-info": true,
+    "subnet4": [
+      {
+        "id": 1412747254,
+        "option-data": [
+          {
+            "code": 3,
+            "data": "10.54.0.1",
+            "name": "routers",
+            "space": "dhcp4"
+          }
+        ],
+        "pools": [
+          {
+            "client-class": "port-eth0-1-100",
+            "pool": "10.54.0.100 - 10.54.0.109"
+          },
+          {
+            "client-class": "switch-aabbcc",
+            "pool": "10.54.0.120 - 10.54.0.129"
+          },
+          {
+            "pool": "10.54.0.200 - 10.54.0.209"
+          }
+        ],
+        "relay": {
+          "ip-addresses": [
+            "10.54.0.1"
+          ]
+        },
+        "reservations": [
+          {
+            "hostname": "cpe-77",
+            "hw-address": "02:00:00:00:54:77",
+            "ip-address": "10.54.0.77"
+          }
+        ],
+        "subnet": "10.54.0.0/24",
+        "valid-lifetime": 3600
+      }
+    ],
+    "t1-percent": 0.5,
+    "t2-percent": 0.875,
+    "valid-lifetime": 3600
+  }
+}

@@ -1,0 +1,78 @@
+{
+  "server": {
+    "interfaces": ["*"],
+    "dhcp_socket_type": "udp",
+    "lease_cache_threshold": 0.0,
+    "lease_cache_max_age": null,
+    "kea_thread_pool_size": 1,
+    "kea_packet_logging": true,
+    "relay_info_retention": true
+  },
+  "global_options": {"lease_time": 3600},
+  "client_classes": [
+    {
+      "name": "port-eth0-1-100",
+      "match_expression": "(relay4[1].hex == 0x657468302F313A313030)",
+      "address_family": "ipv4",
+      "options": {},
+      "options_v4": {},
+      "options_v6": {}
+    },
+    {
+      "name": "switch-aabbcc",
+      "match_expression": "(substring(relay4[2].hex, 0, 3) == 0xAABBCC) and not member('port-eth0-1-100')",
+      "address_family": "ipv4",
+      "options": {"dns-servers": ["10.54.0.53"]},
+      "options_v4": {"dns-servers": ["10.54.0.53"]},
+      "options_v6": {}
+    }
+  ],
+  "scopes": [
+    {
+      "subnet_cidr": "10.54.0.0/24",
+      "address_family": "ipv4",
+      "is_active": true,
+      "lease_time": 3600,
+      "min_lease_time": null,
+      "max_lease_time": null,
+      "lease_cache_threshold": null,
+      "lease_cache_max_age": null,
+      "options": {"routers": ["10.54.0.1"]},
+      "v6_address_mode": "stateful",
+      "relay_addresses": ["10.54.0.1"],
+      "pxe_class_names": [],
+      "pools": [
+        {
+          "start_ip": "10.54.0.100",
+          "end_ip": "10.54.0.109",
+          "pool_type": "dynamic",
+          "class_restriction": "port-eth0-1-100"
+        },
+        {
+          "start_ip": "10.54.0.120",
+          "end_ip": "10.54.0.129",
+          "pool_type": "dynamic",
+          "class_restriction": "switch-aabbcc"
+        },
+        {"start_ip": "10.54.0.200", "end_ip": "10.54.0.209", "pool_type": "dynamic"}
+      ],
+      "statics": [
+        {"ip_address": "10.54.0.77", "mac_address": "02:00:00:00:54:77", "hostname": "cpe-77"}
+      ]
+    }
+  ],
+  "failover": {
+    "channel_id": "00000000-0000-0000-0000-000000000054",
+    "channel_name": "kea-pair",
+    "mode": "hot-standby",
+    "this_server_name": "kea-1",
+    "peers": [
+      {"name": "kea-1", "url": "http://10.54.0.11:8000/", "role": "primary", "auto-failover": true},
+      {"name": "kea-2", "url": "http://10.54.0.12:8000/", "role": "standby", "auto-failover": true}
+    ],
+    "heartbeat_delay_ms": 10000,
+    "max_response_delay_ms": 60000,
+    "max_ack_delay_ms": 10000,
+    "max_unacked_clients": 5
+  }
+}

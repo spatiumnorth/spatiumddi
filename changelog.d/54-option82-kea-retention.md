@@ -1,0 +1,3 @@
+### Fixed
+
+- A DHCP client that leased from a pool restricted to a client class testing option 82 (`relay4[...]`) was refused (DHCPNAK) at every renewal, because the renewal goes straight to the server without the relay and so carries no option 82. A Kea group with such a class now renders `stash-agent-options` and `store-extended-info`, so Kea keeps each client's relay agent information on its lease and renewals keep matching the class, on an HA standby as well. Groups without such a class render exactly as before. A CI step now loads a golden rendered Kea config with `kea-dhcp4 -t` in the built Kea image (`make kea-config-check` locally). (#54)

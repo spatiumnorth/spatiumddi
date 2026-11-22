@@ -52,6 +52,7 @@ SHIPPED: frozenset[str] = frozenset(
         "lease_cache_max_age",  # → "server" block
         "kea_thread_pool_size",  # #980 → "server" block
         "kea_packet_logging",  # #980 → "server" block
+        "relay_info_retention",  # #54 → "server" block, only when True
         "radvd_conf",
         "ra_configs",
     }
