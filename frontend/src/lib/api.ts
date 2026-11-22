@@ -4407,9 +4407,28 @@ export interface AuditForwardTarget {
   smtp_reply_to: string;
   min_severity: AuditForwardSeverity | null;
   resource_types: string[] | null;
+  // #4545 — DNS query log / DHCP activity log streams (syslog targets only).
+  stream_dns_query_log: boolean;
+  stream_dhcp_activity_log: boolean;
+  log_stream_filters: AuditForwardLogFilters | null;
+  dns_query_sample_percent: number;
+  log_stream_dropped_total: number;
+  log_stream_last_drop_at: string | null;
   created_at: string;
   modified_at: string;
 }
+
+export type AuditForwardLogFilterKey =
+  | "dns_server_group_ids"
+  | "dns_server_ids"
+  | "dns_rcodes"
+  | "dns_qtypes"
+  | "dhcp_server_group_ids"
+  | "dhcp_server_ids"
+  | "dhcp_codes";
+export type AuditForwardLogFilters = Partial<
+  Record<AuditForwardLogFilterKey, string[]>
+>;
 
 export interface AuditForwardTargetWrite {
   name: string;
@@ -4438,6 +4457,10 @@ export interface AuditForwardTargetWrite {
   smtp_reply_to?: string;
   min_severity?: AuditForwardSeverity | null;
   resource_types?: string[] | null;
+  stream_dns_query_log?: boolean;
+  stream_dhcp_activity_log?: boolean;
+  log_stream_filters?: AuditForwardLogFilters | null;
+  dns_query_sample_percent?: number;
 }
 
 /** Unauthenticated branding reads (issues #885–#888). Kept separate from

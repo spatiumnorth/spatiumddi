@@ -312,20 +312,29 @@ APIToken
 
 ### 2.6 Syslog / Log Forwarding
 
-```
-SyslogTarget
-  id, name
-  protocol: enum(udp, tcp, tcp_tls)
-  host, port
-  format: enum(rfc3164, rfc5424, json)
-  facility: enum(local0..local7, daemon, syslog)
-  severity_filter: enum(debug, info, warning, error, critical)
-  tls_ca_cert: text (nullable)
-  is_enabled: bool
-  applies_to: [enum(api, agent, dhcp, dns, audit)]
-```
+Forwarding is one mechanism, the **forward target** (`audit_forward_target`,
+Settings → Audit Event Forwarding; see [OBSERVABILITY.md §5.1](../OBSERVABILITY.md)).
+A target is a syslog collector (UDP / TCP / TLS, RFC 5424 JSON / CEF / LEEF,
+RFC 3164 or JSON lines), a webhook (generic, Slack, Teams, Discord) or an SMTP
+relay, and several can run at once (for example a local Loki and a remote
+SIEM). Every target carries the audit log and alert events, filtered by
+minimum severity and resource type. A syslog target can additionally opt into:
 
-Multiple syslog targets can be configured simultaneously (e.g., local Loki + remote SIEM).
+- the **DNS query log** (`stream_dns_query_log`), filtered by server group,
+  server, response code and query type, with optional sampling;
+- the **DHCP activity log** (`stream_dhcp_activity_log`), filtered by server
+  group, server and Kea message code.
+
+Both streams are off by default. They forward the entries the DNS and DHCP
+agents already ship to the control plane, so they work the same on every
+install shape, and they are delivered best-effort from a bounded queue that
+can never slow agent ingest (drops are counted and raise the
+`log_forward_dropping` alert). Details: OBSERVABILITY.md §5.1.
+
+Not part of this: the API, worker and agent processes' own diagnostic logs
+(use your platform's log collector, or on the appliance the host syslog
+forwarding of the systemd journal, #156), and the pod log files of the DNS
+and DHCP daemons on the appliance.
 
 ### 2.7 Audit Log and Data Retention
 

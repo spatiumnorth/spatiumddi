@@ -586,6 +586,62 @@ and the webhook):
   }
   ```
 
+**Log streams: the DNS query log and DHCP activity log (#4545).**
+A syslog target can also opt into two more streams, next to the audit and
+alert events it always carries: `stream_dns_query_log` and
+`stream_dhcp_activity_log`. They forward the entries the DNS and DHCP
+agents already ship to the control plane (the ones the Logs page shows),
+so Docker Compose, Kubernetes and appliance installs get them from one
+setting, with no change on the agents. **Both are off** on every new target
+and on every target that existed before the feature: a query log is
+high-volume and names the clients that asked. The form is under
+**Settings → Audit Event Forwarding → Add / Edit → Log streams**.
+
+- *Per-target filters* (all optional; empty = no filter on that dimension):
+  DNS server groups, DNS servers, response codes (`rcode`), query types
+  (`qtype`); DHCP server groups, DHCP servers, message types (the Kea log
+  code, e.g. `DHCP4_LEASE_ALLOC`). A response-code filter passes only
+  queries whose answer was recorded (BIND9 response logging); an unrecorded
+  `rcode` is unknown and never matches. An answer that reaches the control
+  plane in a *later* batch than its query is stamped on the stored row only:
+  the query was already forwarded, with `rcode` null.
+- *Sampling.* `dns_query_sample_percent` (1-100, default 100) forwards that
+  share of the DNS queries that pass the filters. DHCP is never sampled.
+- *Formats.* `rfc5424_json`, `rfc3164` and `json_lines`: one event per query
+  or DHCP message, carrying the Logs page's fields (`timestamp`,
+  `server_name` / `server_id` / `server_group_id`; for queries `client_ip`,
+  `client_port`, `qname`, `qclass`, `qtype`, `flags`, `view`, `rcode`,
+  `answer_count`; for DHCP `code`, `mac_address`, `ip_address`,
+  `transaction_id`; both carry `raw`). RFC 5424 events use MSGID `DNSQUERY`
+  / `DHCPLOG`; DHCP severity follows Kea's (`WARN` 4, `ERROR` 3, `FATAL` 2).
+  CEF and LEEF define no field mapping for these events, so a target in one
+  of those formats cannot enable a stream (422).
+- *Redaction.* The `raw` log line is passed through the same credential-shaped
+  string redaction as audit payloads (#2015) before it is rendered.
+- *Syslog only.* Webhook, chat and SMTP targets stay audit-and-alert-only:
+  batching query volume into an HTTP receiver, with its own limits and
+  retry semantics, needs a design of its own and is not part of this.
+- *Delivery is decoupled from ingest.* The agent's POST commits its rows,
+  hands the entries to an in-process queue and returns; routing and
+  sending run on background tasks, per target, in batches of 200 (one
+  connection per batch over TCP / TLS, one datagram per event over UDP). A
+  slow or dead collector therefore never slows or fails an agent's ingest.
+- *Bounded memory, counted loss.* Each target holds at most 10,000
+  events; when its collector cannot keep up the oldest queued lines
+  are dropped (a batch that fails three sends in a row is dropped too). Every
+  drop is counted in `spatiumddi_log_stream_dropped_total{stream,target}`
+  (and sends in `spatiumddi_log_stream_sent_total`), and the api writes the
+  count and time onto the target row (`log_stream_dropped_total`,
+  `log_stream_last_drop_at`, shown beside the target). The enabled
+  `log_forward_dropping` alert (§9.1) fires per target that dropped entries
+  in the last 15 minutes. Dropped entries remain on the Logs page for the
+  retention window.
+- *Best effort.* Each api process forwards what it ingested, with no replay
+  across a restart. For at-least-once delivery, forward the agents' own logs
+  with your platform's log collector.
+- *Privacy.* Operator-configured and off by default; see
+  [`PRIVACY.md`](PRIVACY.md).
+
 **Backward compatibility.** The pre-multi-target flat columns on
 `platform_settings` (`audit_forward_syslog_*`, `audit_forward_webhook_*`)
 are preserved and migrated into one `audit_forward_target` row apiece
@@ -1147,6 +1203,7 @@ threat-analytics rules.
 | `dns_agent_duplicate_instance` | Two live DNS agent processes share one server identity (#2044) — usually a cloned VM or a copied agent state directory that kept the same `agent_id`. The control plane serves only the most recent process and answers the other's config polls with `409`; the refused agent keeps serving a configuration that no longer changes while heartbeating normally. Subject is `agent` with a `dns_server:<id>` subject id. Reads the duplicate-episode columns the config long-poll writes when it refuses a poll; no probing. Fires once refusals have gone on for 2 minutes (so an overlapping rollout's old pod, refused once before it exits, does not) and auto-resolves 10 minutes after the last one. A replacement agent, whose predecessor never polls again, is never refused. Warning. Seeded **enabled**, once, by migration `f4c2a8e61b93` (not at startup), so deleting it is final. |
 | `dhcp_agent_duplicate_instance` | Two live DHCP agent processes share one server identity (#3143) — usually a cloned Kea VM or a copied agent state directory that kept the same `agent_id`. Same rules as `dns_agent_duplicate_instance`: the control plane serves only the most recent process and answers the other's config polls and registrations with `409`, mints it no token and never rotates one for it, so the owner's token stays valid; the refused agent keeps Kea on a configuration that no longer changes while heartbeating normally. Subject is `agent` with a `dhcp_server:<id>` subject id. Reads the duplicate-episode columns the long-poll and registration write when they refuse; no probing. Fires once refusals have gone on for 2 minutes and auto-resolves 10 minutes after the last one. Kea HA peers have their own identities and are never refused. Warning. Seeded **enabled**, once, by migration `833ee80c8c6b` (not at startup), so deleting it is final. |
 | `dns_blocklist_feed_stale` | An enabled feed-sourced blocklist whose refresh has not **succeeded** within 3 x its `update_interval_hours` (#2313). Judged from `last_success_at` (`last_synced_at` also moves on failure); a feed that never succeeded is measured from its creation. Servers keep enforcing the entries the list last had. Subject is `dns_blocklist`. **Warning**. Skips manual-only (interval 0) and disabled lists; assignment to a group is not a condition. The message carries a fixed reason, never the stored fetch error or any URL. Auto-resolves on the next good refresh. Seeded **enabled**. |
+| `log_forward_dropping` | A syslog forward target that opted into the DNS query log or DHCP activity log (§5.1, #4545) dropped entries in the last 15 minutes because its collector was slow or unreachable and the target's queue (10,000 events) filled, or a batch failed three sends. Subject is the `audit_forward_target`, one event per target. Reads the counter the api flushed onto the target row (`log_stream_dropped_total`, `log_stream_last_drop_at`); no probing. **Warning**. Auto-resolves 15 minutes after the last drop. Silent on an install with no stream enabled. Seeded **enabled**, once, by migration `e5a2c8d4f7b1` (not at startup), so deleting it is final. |
 | `dns_pool_health_stale` | An enabled DNS pool with at least one enabled member whose health verdict (`last_check_at`) is older than 3 x the pool's check interval (floor 30 s, the health-check task's own cadence) (#2312). Pools **fail open**: a member last seen healthy is still rendered, so a stopped dispatcher leaves a member that died since in the answer set. Subject is `dns_pool`, one event per pool. **Warning**. Auto-resolves when the pool is checked again. Every alert rule is evaluated by the Celery worker, so a stopped worker stops the health checks AND this alert; a stopped worker is reported by the platform health components `celery-workers` / `celery-beat` instead. Seeded **enabled**. |
 | `dnssec_multi_signer` | A DNSSEC-signed zone whose server group has more than one agent DNS server (BIND9 / PowerDNS / Technitium — **disabled servers count**, since a disabled agent still receives and serves the bundle) (#1762). Each server signs with keys it generated, so the zone is served with several DNSKEY sets against the one DS published at the parent, and validating resolvers SERVFAIL on whichever server it does not match. Signing and every operator server-add are refused on such a group; this rule covers what cannot be refused — zones signed before the rule, and an agent that auto-registered (`AGENT_GROUP`) into a signed group. Subject is `dns_zone`. **Critical**. Auto-resolves when the zone is unsigned or the group is back to one server. Seeded **enabled**. |
 | `backup_failed` | The last finished run of an enabled backup target with a schedule failed (#1262). Subject is the **backup target**. Auto-resolves when its next run succeeds. A run in progress neither opens nor resolves it, so a target failing every night holds one event. The message leaves out the run's error text, because driver errors can name hosts, paths or buckets and alert payloads leave the install; the error is on the Backup page and in the audit log. Manual-only and disabled targets are not watched. Severity **warning**. Seeded **enabled**. |
