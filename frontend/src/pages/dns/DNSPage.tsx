@@ -2754,6 +2754,14 @@ function DnssecCard({
           then.
         </div>
       )}
+      {info.data?.unapplied_warning && (
+        <div
+          role="alert"
+          className="rounded border border-amber-500/40 bg-amber-500/10 p-2 text-xs text-amber-700 dark:text-amber-300"
+        >
+          {info.data.unapplied_warning}
+        </div>
+      )}
       {signingUnmanaged && (
         <div className="rounded border border-amber-500/40 bg-amber-500/10 p-2 text-xs text-amber-700 dark:text-amber-300">
           {enabled
@@ -4308,6 +4316,7 @@ function MoveZoneModal({
       !!preview.technitium_acl_refusal ||
       !!preview.classless_refusal ||
       !!preview.powerdns_refusal ||
+      !!preview.dnssec_policy_refusal ||
       !!preview.views_refusal);
   const canSubmit =
     !!targetGroupId &&
@@ -4392,6 +4401,11 @@ function MoveZoneModal({
             {preview.powerdns_refusal && (
               <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
                 {preview.powerdns_refusal}
+              </div>
+            )}
+            {preview.dnssec_policy_refusal && (
+              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+                {preview.dnssec_policy_refusal}
               </div>
             )}
             {preview.views_refusal && (
@@ -11359,11 +11373,12 @@ function BlocklistScopeFields({
     new Set(servers.filter((s) => s.driver !== "bind9").map((s) => s.driver)),
   );
   const nothingSelected = !wholeGroup && picked.size === 0;
-  // #4573 — PowerDNS has no RPZ. A group with no BIND9 / Technitium server
-  // applies nothing, and the server refuses a NEW assignment to it, so the
-  // unchecked boxes are disabled (a stored one can still be unchecked).
+  // #4608 — only BIND9 (RPZ) and agent-managed Technitium render a blocklist
+  // (the backend's `blocklist` driver capability). A group with servers and
+  // none of those applies nothing, and the server refuses a NEW assignment to
+  // it, so the unchecked boxes are disabled (a stored one can be unchecked).
   const inert =
-    servers.some((s) => s.driver === "powerdns") &&
+    servers.length > 0 &&
     !servers.some((s) => s.driver === "bind9" || s.driver === "technitium");
 
   return (
@@ -11373,8 +11388,9 @@ function BlocklistScopeFields({
       </legend>
       {inert && (
         <div className="rounded-md border border-red-500/40 bg-red-500/5 p-2 text-xs text-red-700 dark:text-red-400">
-          This group runs PowerDNS, which has no RPZ, so a blocklist here blocks
-          nothing. Assign the list to a BIND9 group instead.
+          This group runs {nonBind.join(" / ")}, which renders no blocklist, so
+          a blocklist here blocks nothing. Assign the list to a BIND9 group
+          instead.
         </div>
       )}
       {nonBind.length > 0 && !inert && (
@@ -13310,6 +13326,11 @@ function GroupDetailView({
   const tabs = allTabs.filter(
     (t) => !(t.id === "options" && technitiumApiGroup),
   );
+  // #4604 B6 — Sync with Servers reads zones back over a server API; a
+  // PowerDNS agent exposes none, so every zone answers "unsupported".
+  const powerdnsOnlyGroup =
+    (group.server_drivers ?? []).length > 0 &&
+    (group.server_drivers ?? []).every((d) => d === "powerdns");
 
   const typeBadge: Record<string, string> = {
     internal: "bg-blue-500/15 text-blue-600",
@@ -13360,8 +13381,12 @@ function GroupDetailView({
             <button
               className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-50"
               onClick={runGroupSync}
-              disabled={syncing}
-              title="Bi-directional additive sync against every enabled server in this group. Pulls missing zones and records from the servers (imports into SpatiumDDI), and pushes any SpatiumDDI zones / records not yet on the servers."
+              disabled={syncing || powerdnsOnlyGroup}
+              title={
+                powerdnsOnlyGroup
+                  ? "Not supported for PowerDNS groups: the PowerDNS driver cannot read zones back from the server, so every zone would be reported unsupported. SpatiumDDI pushes changes to PowerDNS automatically."
+                  : "Bi-directional additive sync against every enabled server in this group. Pulls missing zones and records from the servers (imports into SpatiumDDI), and pushes any SpatiumDDI zones / records not yet on the servers."
+              }
               {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
             >
               <RefreshCw className={cn("h-3 w-3", syncing && "animate-spin")} />

@@ -63,6 +63,7 @@ from app.models.dns import (
 from app.services.appliance.cluster_dns_group import cluster_dns_group_refusal
 from app.services.appliance.ownership import owning_appliance_for_dns_server
 from app.services.dns import technitium_api_scope
+from app.services.dns.dnssec_policy_support import group_policy_zone_refusal
 from app.services.dns.dnssec_signers import second_signer_refusal
 from app.services.dns.dnssec_trust import (
     NEEDS_ANCHOR_MESSAGE,
@@ -190,6 +191,16 @@ async def ensure_group_classless_compatible(
         )
 
 
+async def ensure_group_dnssec_policy_compatible(
+    db: AsyncSession, group: DNSServerGroup, driver: str
+) -> None:
+    """Refuse (422) putting a ``driver`` server into a group that holds a zone
+    with a custom DNSSEC policy when that driver ignores policies (#4623)."""
+    msg = await group_policy_zone_refusal(db, group.id, group.name, driver)
+    if msg:
+        raise ServerMoveError(msg, status_code=422)
+
+
 def views_unsupported_drivers(drivers: Iterable[str]) -> list[str]:
     """The drivers among *drivers* that cannot serve split-horizon views
     (#4565), read from each driver's ``capabilities()["views"]``. A name the
@@ -287,13 +298,9 @@ def powerdns_zone_type_refusal(drivers: list[str] | set[str], zone_type: str) ->
     )
 
 
-async def ensure_group_powerdns_compatible(
-    db: AsyncSession, group: DNSServerGroup, driver: str
-) -> None:
-    """Refuse (422) putting a PowerDNS server into a group that holds a forward
-    or stub zone (#4570)."""
-    if driver != "powerdns":
-        return
+async def group_powerdns_refusal(db: AsyncSession, group: DNSServerGroup) -> str | None:
+    """Why a PowerDNS server cannot join *group* (it holds a forward or stub
+    zone), or None (#4570). Names the group and the zone."""
     row = (
         await db.execute(
             select(DNSZone.name, DNSZone.zone_type)
@@ -305,12 +312,24 @@ async def ensure_group_powerdns_compatible(
             .limit(1)
         )
     ).first()
-    if row is not None:
-        raise ServerMoveError(
-            f"Group {group.name!r} holds the {row.zone_type} zone {row.name.rstrip('.')!r}, "
-            f"and {powerdns_zone_type_refusal({'powerdns'}, row.zone_type)}",
-            status_code=422,
-        )
+    if row is None:
+        return None
+    return (
+        f"Group {group.name!r} holds the {row.zone_type} zone {row.name.rstrip('.')!r}, "
+        f"and {powerdns_zone_type_refusal({'powerdns'}, row.zone_type)}"
+    )
+
+
+async def ensure_group_powerdns_compatible(
+    db: AsyncSession, group: DNSServerGroup, driver: str
+) -> None:
+    """Refuse (422) putting a PowerDNS server into a group that holds a forward
+    or stub zone (#4570)."""
+    if driver != "powerdns":
+        return
+    message = await group_powerdns_refusal(db, group)
+    if message is not None:
+        raise ServerMoveError(message, status_code=422)
 
 
 async def ensure_group_catalog_compatible(
@@ -512,6 +531,7 @@ async def move_server_to_group(
     await ensure_group_catalog_compatible(db, target_group, server.driver)
     await ensure_group_views_compatible(db, target_group, server.driver)
     await ensure_group_classless_compatible(db, target_group, server.driver)
+    await ensure_group_dnssec_policy_compatible(db, target_group, server.driver)
     await ensure_group_powerdns_compatible(db, target_group, server.driver)  # #4570
 
     # #1762 — a server joining a group that already has one and holds signed

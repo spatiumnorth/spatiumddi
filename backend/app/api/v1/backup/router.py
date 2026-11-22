@@ -17,6 +17,7 @@ prefix.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 import structlog
@@ -276,6 +277,83 @@ class RestoreOutcomeResponse(BaseModel):
     warnings: list[str] = []
 
 
+def _restore_note(outcome: Any) -> str:
+    """The operator-facing summary line(s) of a restore outcome."""
+    migration = outcome.migration
+    rewrap = outcome.rewrap
+    if rewrap is None or rewrap.same_install:
+        note = (
+            "Restore complete. Source archive came from this install — " "no key rewrap was needed."
+        )
+    elif rewrap.failed_rows == 0:
+        rewrapped_total = rewrap.rewrapped_rows + rewrap.rewrapped_jsonb_fields
+        note = (
+            f"Restore complete. Cross-install rewrap re-encrypted "
+            f"{rewrapped_total} secret value{'s' if rewrapped_total != 1 else ''} "
+            f"with this install's SECRET_KEY. All credentials should be "
+            f"usable without manual key copy."
+        )
+    else:
+        rewrapped_total = rewrap.rewrapped_rows + rewrap.rewrapped_jsonb_fields
+        note = (
+            f"Restore complete. Cross-install rewrap re-encrypted "
+            f"{rewrapped_total} secret value{'s' if rewrapped_total != 1 else ''}, "
+            f"but {rewrap.failed_rows} row{'s' if rewrap.failed_rows != 1 else ''} "
+            f"could not be decrypted with either the source or "
+            f"destination key. Those credentials must be re-entered "
+            f"manually — see the failures list below."
+        )
+
+    # Migration commentary is appended after the rewrap copy so
+    # operators see both stages in order on the success screen.
+    if migration is not None and migration.state == "upgraded":
+        n = len(migration.migrations_applied)
+        note += (
+            f" Schema upgraded from {migration.source_head!r} to "
+            f"{migration.local_head!r} ({n} migration{'s' if n != 1 else ''} "
+            f"applied)."
+        )
+    elif migration is not None and migration.state == "auto_recovered":
+        n = len(migration.migrations_applied)
+        note += (
+            f" Schema-version drift detected ({migration.source_head!r} → "
+            f"{migration.local_head!r}) and auto-recovered via "
+            f"`alembic stamp head`: the upgrade stopped on an object that "
+            f"already exists, and every table and column the local head "
+            f"declares was found in the restored schema"
+            + (
+                f" ({n} migration{'s' if n != 1 else ''} committed before the stop)."
+                if n
+                else ", so no migrations actually needed to run."
+            )
+        )
+    elif migration is not None and migration.state == "incompatible_newer":
+        note += (
+            f" WARNING: archive is from a newer release of SpatiumDDI "
+            f"(schema head {migration.source_head!r} is not in this "
+            f"install's chain). Upgrade SpatiumDDI on this destination, "
+            f"then re-run the restore."
+        )
+    elif migration is not None and migration.state == "failed":
+        note += (
+            f" WARNING: alembic upgrade failed after the data load — "
+            f"run `alembic upgrade head` in the api container before relying "
+            f"on this install (the command for each deployment is under "
+            f"§2.9 Backup and Restore in docs/features/SYSTEM_ADMIN.md). Reason: {migration.error}"
+        )
+    elif migration is not None and migration.state == "unknown":
+        note += f" Schema-version skew check skipped: {migration.error or 'unknown reason'}."
+
+    if outcome.pre_restore_path is None:
+        note += (
+            " WARNING: pre-restore safety dump was NOT written "
+            "(no writable /var/lib/spatiumddi/backups path). If you "
+            "need to roll back, the only path is restoring from a "
+            "prior backup."
+        )
+    return note
+
+
 @router.post("/restore", response_model=RestoreOutcomeResponse)
 async def restore_backup(
     db: DB,
@@ -373,6 +451,7 @@ async def restore_backup(
     # AsyncSessionLocal here instead.
     from app.db import AsyncSessionLocal  # noqa: PLC0415
 
+    note = _restore_note(outcome)
     async with AsyncSessionLocal() as fresh:
         fresh.add(
             AuditLog(
@@ -387,6 +466,8 @@ async def restore_backup(
                     "manifest": outcome.manifest,
                     "pre_restore_safety_path": outcome.pre_restore_path,
                     "duration_ms": outcome.duration_ms,
+                    "note": note,
+                    "secrets_payload_keys": outcome.secrets_payload_keys,
                     "migration": (
                         {
                             "state": outcome.migration.state,
@@ -422,6 +503,7 @@ async def restore_backup(
                     "allow_newer_schema": allow_newer_schema,
                     "warnings": outcome.warnings,
                     "reconciled_backup_targets": outcome.reconciled_backup_targets,
+                    "adopted_appliances": outcome.adopted_appliances,
                 },
             )
         )
@@ -452,77 +534,6 @@ async def restore_backup(
             failures=rewrap.failures,
         )
 
-    if rewrap is None or rewrap.same_install:
-        note = (
-            "Restore complete. Source archive came from this install — " "no key rewrap was needed."
-        )
-    elif rewrap.failed_rows == 0:
-        rewrapped_total = rewrap.rewrapped_rows + rewrap.rewrapped_jsonb_fields
-        note = (
-            f"Restore complete. Cross-install rewrap re-encrypted "
-            f"{rewrapped_total} secret value{'s' if rewrapped_total != 1 else ''} "
-            f"with this install's SECRET_KEY. All credentials should be "
-            f"usable without manual key copy."
-        )
-    else:
-        rewrapped_total = rewrap.rewrapped_rows + rewrap.rewrapped_jsonb_fields
-        note = (
-            f"Restore complete. Cross-install rewrap re-encrypted "
-            f"{rewrapped_total} secret value{'s' if rewrapped_total != 1 else ''}, "
-            f"but {rewrap.failed_rows} row{'s' if rewrap.failed_rows != 1 else ''} "
-            f"could not be decrypted with either the source or "
-            f"destination key. Those credentials must be re-entered "
-            f"manually — see the failures list below."
-        )
-
-    # Migration commentary is appended after the rewrap copy so
-    # operators see both stages in order on the success screen.
-    if migration is not None and migration.state == "upgraded":
-        n = len(migration.migrations_applied)
-        note += (
-            f" Schema upgraded from {migration.source_head!r} to "
-            f"{migration.local_head!r} ({n} migration{'s' if n != 1 else ''} "
-            f"applied)."
-        )
-    elif migration is not None and migration.state == "auto_recovered":
-        n = len(migration.migrations_applied)
-        note += (
-            f" Schema-version drift detected ({migration.source_head!r} → "
-            f"{migration.local_head!r}) and auto-recovered via "
-            f"`alembic stamp head`: the upgrade stopped on an object that "
-            f"already exists, and every table and column the local head "
-            f"declares was found in the restored schema"
-            + (
-                f" ({n} migration{'s' if n != 1 else ''} committed before the stop)."
-                if n
-                else ", so no migrations actually needed to run."
-            )
-        )
-    elif migration is not None and migration.state == "incompatible_newer":
-        note += (
-            f" WARNING: archive is from a newer release of SpatiumDDI "
-            f"(schema head {migration.source_head!r} is not in this "
-            f"install's chain). Upgrade SpatiumDDI on this destination, "
-            f"then re-run the restore."
-        )
-    elif migration is not None and migration.state == "failed":
-        note += (
-            f" WARNING: alembic upgrade failed after the data load — "
-            f"run `alembic upgrade head` in the api container before relying "
-            f"on this install (the command for each deployment is under "
-            f"§2.9 Backup and Restore in docs/features/SYSTEM_ADMIN.md). Reason: {migration.error}"
-        )
-    elif migration is not None and migration.state == "unknown":
-        note += f" Schema-version skew check skipped: {migration.error or 'unknown reason'}."
-
-    if outcome.pre_restore_path is None:
-        note += (
-            " WARNING: pre-restore safety dump was NOT written "
-            "(no writable /var/lib/spatiumddi/backups path). If you "
-            "need to roll back, the only path is restoring from a "
-            "prior backup."
-        )
-
     return RestoreOutcomeResponse(
         success=True,
         pre_restore_safety_path=outcome.pre_restore_path,
@@ -536,6 +547,54 @@ async def restore_backup(
         migration=migration_resp,
         rewrap=rewrap_resp,
         warnings=outcome.warnings,
+    )
+
+
+class LastRestoreResponse(RestoreOutcomeResponse):
+    performed_at: datetime
+    performed_by: str | None = None
+
+
+@router.get("/restore/last", response_model=LastRestoreResponse)
+async def last_restore_outcome(db: DB, current_user: SuperAdmin) -> LastRestoreResponse:
+    """The outcome of the most recent restore, read from its audit row.
+
+    A restore replaces the auth tables, which revokes every session,
+    so the browser that applied it is signed out before the
+    ``POST /backup/restore`` response (duration, warnings, the
+    pre-restore safety dump path) can be shown (#4676). The audit row is
+    written after the replay and survives it, so the same outcome is
+    fetchable here after signing in again. 404 when no restore has been
+    recorded.
+    """
+    from sqlalchemy import select  # noqa: PLC0415
+
+    row = (
+        await db.execute(
+            select(AuditLog)
+            .where(AuditLog.action == "backup_restored", AuditLog.result == "success")
+            .order_by(AuditLog.timestamp.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="no restore has been recorded")
+    v: dict[str, Any] = row.new_value or {}
+    return LastRestoreResponse(
+        success=True,
+        pre_restore_safety_path=v.get("pre_restore_safety_path"),
+        duration_ms=v.get("duration_ms") or 0,
+        manifest=v.get("manifest") or {},
+        secrets_payload_keys=v.get("secrets_payload_keys") or [],
+        note=v.get("note") or "Restore complete.",
+        selective=bool(v.get("selective")),
+        restored_sections=v.get("restored_sections"),
+        cascade_widened_tables=v.get("cascade_widened_tables") or [],
+        migration=v.get("migration"),
+        rewrap=v.get("rewrap"),
+        warnings=v.get("warnings") or [],
+        performed_at=row.timestamp,
+        performed_by=row.user_display_name,
     )
 
 

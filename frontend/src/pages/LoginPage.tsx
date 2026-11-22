@@ -2,6 +2,10 @@ import { useEffect, useState, type FormEvent } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useAuth } from "@/hooks/useAuth";
 import { authApi, type PublicAuthProvider } from "@/lib/api";
+import {
+  clearRestoreInFlight,
+  hasRestoreInFlight,
+} from "@/lib/restoreInFlight";
 import { KeyRound, ShieldCheck } from "lucide-react";
 
 import { BrandLogo } from "@/components/BrandLogo";
@@ -84,6 +88,7 @@ export function LoginPage() {
   const initialError = humanizeError(searchParams.get("error"));
 
   const [step, setStep] = useState<Step>({ kind: "password" });
+  const [restoreApplied] = useState(hasRestoreInFlight);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState(initialError);
@@ -146,8 +151,10 @@ export function LoginPage() {
         setRecoveryCode("");
         setMfaMode("code");
       } else if (resp.force_password_change) {
+        clearRestoreInFlight();
         navigate("/change-password");
       } else {
+        clearRestoreInFlight();
         navigate("/dashboard");
       }
     } catch (err) {
@@ -181,6 +188,7 @@ export function LoginPage() {
           ? { code: mfaCode.trim() }
           : { recovery_code: recoveryCode.trim() };
       const resp = await completeMfa(step.challengeToken, body);
+      clearRestoreInFlight();
       if (resp.force_password_change || step.forcePasswordChange) {
         navigate("/change-password");
       } else {
@@ -222,6 +230,17 @@ export function LoginPage() {
                 : "Sign in to your account"}
             </p>
           </div>
+
+          {restoreApplied && (
+            <div
+              role="status"
+              className="rounded-md border border-emerald-500/30 bg-emerald-500/5 px-3 py-2 text-xs text-emerald-700 dark:text-emerald-300"
+            >
+              Restore applied. A restore signs everyone out; sign in again, then
+              open Backup &amp; Restore to see the outcome and the pre-restore
+              safety dump path.
+            </div>
+          )}
 
           {showBanner && (
             <div className="max-h-64 overflow-y-auto rounded-md border bg-muted/40 px-3 py-2 text-xs">
