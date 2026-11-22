@@ -96,15 +96,19 @@ async def groups_without_alias_resolver(
     """
     from app.models.dns import DNSServer  # models import drivers: keep it lazy
 
+    ids = set(group_ids)
+    if not ids:
+        return set()
+    drivers: dict[uuid.UUID, set[str]] = {}
+    for gid, driver in (
+        await db.execute(
+            select(DNSServer.group_id, DNSServer.driver).where(DNSServer.group_id.in_(ids))
+        )
+    ).tuples():
+        if driver:
+            drivers.setdefault(gid, set()).add(driver)
     out: set[uuid.UUID] = set()
-    for group_id in set(group_ids):
-        drivers = {
-            d
-            for d in (
-                await db.execute(select(DNSServer.driver).where(DNSServer.group_id == group_id))
-            ).scalars()
-            if d
-        }
-        if drivers == {"powerdns"} and not await group_can_resolve_alias(db, group_id):
+    for group_id, found in drivers.items():
+        if found == {"powerdns"} and not await group_can_resolve_alias(db, group_id):
             out.add(group_id)
     return out
