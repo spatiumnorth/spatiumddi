@@ -25,6 +25,8 @@ the first ship.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import ipaddress
 import json
@@ -1982,18 +1984,20 @@ class PowerDNSDriver(DriverBase):
         # branch off here rather than building a rrset PATCH.
         if op_kind == "dnssec_sign":
             ds_records = self._dnssec_sign(api_key, zone)
-            return {
-                "dnssec_state": {
-                    "zone_name": zone,
-                    "ds_records": ds_records,
-                }
-            }
+            state: dict[str, Any] = {"zone_name": zone, "ds_records": ds_records}
+            # #4604 — the key table too, so dnssec/info is not empty for a
+            # signed zone. Additive: an older control plane ignores ``keys``.
+            keys = self._keys_report(self._fetch_cryptokeys(api_key, zone))
+            if keys is not None:
+                state["keys"] = keys
+            return {"dnssec_state": state}
         if op_kind == "dnssec_unsign":
             self._dnssec_unsign(api_key, zone)
             return {
                 "dnssec_state": {
                     "zone_name": zone,
                     "ds_records": [],
+                    "keys": [],
                 }
             }
 
@@ -2526,8 +2530,10 @@ class PowerDNSDriver(DriverBase):
         used to learn a DS only from the ``dnssec_sign`` op's result. A zone
         with no active key or an unreadable key list is left out and
         ``dnssec_incomplete`` set: an empty DS report would read as "unsigned
-        on purpose" and clear the control plane's copy. ``keys`` is omitted,
-        as in the op's report (the API has no per-key rollover state).
+        on purpose" and clear the control plane's copy. ``keys`` carries each
+        key's tag, type, algorithm and active / published state (#4604); it is
+        left out when the key list holds nothing parseable, so the control
+        plane keeps its rows. The API has no per-key rollover timing.
         """
         self.dnssec_incomplete = False
         zones = [
@@ -2556,8 +2562,85 @@ class PowerDNSDriver(DriverBase):
                 if not ds_records:
                     self.dnssec_incomplete = True
                     continue
-                out.append({"zone_name": zone, "ds_records": ds_records})
+                state: dict[str, Any] = {"zone_name": zone, "ds_records": ds_records}
+                report = self._keys_report(keys)
+                if report is not None:
+                    state["keys"] = report
+                out.append(state)
         return out
+
+    @staticmethod
+    def _dnskey_tag(dnskey: str) -> int | None:
+        """RFC 4034 appendix B key tag of ``"<flags> <proto> <alg> <base64>"``."""
+        parts = dnskey.split(None, 3)
+        if len(parts) != 4:
+            return None
+        try:
+            rdata = (
+                int(parts[0]).to_bytes(2, "big")
+                + bytes([int(parts[1]), int(parts[2])])
+                + base64.b64decode("".join(parts[3].split()), validate=True)
+            )
+        except (ValueError, binascii.Error, OverflowError):
+            return None
+        acc = sum((b << 8) if i % 2 == 0 else b for i, b in enumerate(rdata))
+        return ((acc & 0xFFFF) + (acc >> 16)) & 0xFFFF
+
+    @classmethod
+    def _extract_keys(cls, cryptokeys: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Per-key rows for the control plane's ``DNSKey`` table, from
+        ``GET .../cryptokeys``. The key tag is computed from the DNSKEY
+        rdata, which the API does not report as a number."""
+        out: list[dict[str, Any]] = []
+        for k in cryptokeys or []:
+            if not isinstance(k, dict):
+                continue
+            dnskey = str(k.get("dnskey") or "")
+            tag = cls._dnskey_tag(dnskey)
+            if tag is None:
+                continue
+            algorithm = int(dnskey.split()[2])
+            key_type = str(k.get("keytype") or "").lower()
+            if key_type not in ("ksk", "zsk", "csk"):
+                key_type = "ksk" if k.get("flags") == 257 else "zsk"
+            ds = [d.strip() for d in k.get("ds") or [] if isinstance(d, str) and d.strip()]
+            out.append(
+                {
+                    "key_tag": tag,
+                    "key_type": key_type,
+                    "algorithm": algorithm,
+                    "state": "active" if k.get("active") else "published",
+                    "ds_records": ds if key_type in ("ksk", "csk") else [],
+                    "timing": {},
+                }
+            )
+        return sorted(out, key=lambda x: (x["key_type"], x["key_tag"]))
+
+    @classmethod
+    def _keys_report(cls, cryptokeys: Any) -> list[dict[str, Any]] | None:
+        """The ``keys`` value of a DNSSEC state report, or None to omit it.
+
+        ``keys`` present replaces the control plane's rows, so an unreadable
+        or unparseable listing must omit it rather than send ``[]``.
+        """
+        if not isinstance(cryptokeys, list):
+            return None
+        keys = cls._extract_keys(cryptokeys)
+        return keys or None
+
+    def _fetch_cryptokeys(self, api_key: str, zone: str) -> list[dict[str, Any]] | None:
+        """``GET .../cryptokeys`` for a zone, or None when it cannot be read."""
+        try:
+            with httpx.Client(timeout=_PDNS_API_TIMEOUT) as client:
+                resp = client.get(
+                    f"{_PDNS_API_BASE}/zones/{zone}/cryptokeys",
+                    headers={"X-API-Key": api_key},
+                )
+            data = resp.json() if resp.status_code == 200 else None
+        except (httpx.HTTPError, ValueError) as exc:
+            log.warning("powerdns_dnssec_keys_read_failed", zone=zone, error=str(exc))
+            return None
+        return data if isinstance(data, list) else None
 
     @staticmethod
     def _extract_ds_records(cryptokeys: list[dict[str, Any]]) -> list[str]:
