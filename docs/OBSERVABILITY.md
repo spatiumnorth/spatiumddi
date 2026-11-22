@@ -798,6 +798,14 @@ report them.
 On a node short of CPU only this one moves, and it is the one the alert
 and the dashboard treat as loss.
 
+The size of that buffer is the kernel's `net.core.rmem_default` (Kea never
+sets its own); the appliance raises it to 1 MiB (#4544), and
+[`DHCP.md`](features/DHCP.md#what-actually-helps) says how to do the same on
+Compose and Kubernetes. Read it on the node with `ss -uanm 'sport = :67'`:
+in the `skmem` field `rb` is the buffer size, `r` the bytes queued right now
+and `d` the cumulative drops, so `r` close to `rb` during a burst is a buffer
+about to overflow.
+
 `queue_evicted` (#2889) is loss as well: DHCPv4 requests Kea read and then
 evicted from its full multi-threading packet queue during a burst. Kea keeps
 no statistic for it, so the agent derives it from DHCPv4 arrivals at Kea's
