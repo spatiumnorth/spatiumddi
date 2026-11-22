@@ -1238,9 +1238,10 @@ function LogStreamsSection({
         Also forward the logs the DNS and DHCP agents ship to the control plane,
         one event per query or message. Off by default: query logs are
         high-volume and carry client addresses. Delivery is best-effort and
-        never slows the agents; if the collector falls behind, entries are
-        dropped and counted (shown in the Filter column and raised by the{" "}
-        <code>log_forward_dropping</code> alert).
+        never slows the agents; entries are dropped and counted when a target's
+        queue is full or when sending a batch fails three times (shown in the
+        Filter column and raised by the <code>log_forward_dropping</code>{" "}
+        alert).
         {!formatOk &&
           " Streams need the RFC 5424 + JSON, RFC 3164 or JSON lines format."}
       </p>

@@ -33,8 +33,10 @@ LOG_FORWARD_DROPPING_RULE_NAME = "Log stream forwarding dropping entries"
 
 LOG_FORWARD_DROPPING_RULE_DESCRIPTION = (
     "Fires for each syslog forward target that dropped DNS query log or "
-    "DHCP activity log entries in the last 15 minutes because its "
-    "collector was slow or unreachable and the target's queue filled. "
+    "DHCP activity log entries in the last 15 minutes, either because "
+    "the target's queue was full (its collector was too slow) or because "
+    "sending a batch failed three times (its collector was unreachable). "
+    "The open event shows the current dropped count and latest drop time. "
     "Auto-resolves 15 minutes after the last drop."
 )
 
