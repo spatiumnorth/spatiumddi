@@ -18,6 +18,7 @@ from app.services.factory_reset.sections import (
     FACTORY_SECTIONS,
     FACTORY_SECTIONS_BY_KEY,
     FactorySection,
+    section_description,
 )
 
 __all__ = [
@@ -29,4 +30,5 @@ __all__ = [
     "FactoryResetOutcome",
     "apply_factory_reset",
     "preview_factory_reset",
+    "section_description",
 ]

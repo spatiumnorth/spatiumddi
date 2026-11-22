@@ -3081,6 +3081,13 @@ export interface BackupRestoreResponse {
   warnings?: string[];
 }
 
+/** GET /backup/restore/last: the same card the POST returns, read back from
+ *  the restore's audit row after the restore signed the operator out (#4676). */
+export interface LastBackupRestoreResponse extends BackupRestoreResponse {
+  performed_at: string;
+  performed_by: string | null;
+}
+
 export interface BackupSection {
   key: string;
   label: string;
@@ -3204,6 +3211,13 @@ export const backupApi = {
     });
     return res.data;
   },
+
+  /** Outcome of the most recent restore, from its audit row (#4676). 404
+   *  when none has been recorded. */
+  lastRestore: () =>
+    api
+      .get<LastBackupRestoreResponse>("/backup/restore/last")
+      .then((r) => r.data),
 
   /** Backup-section catalog (Phase 2a). Drives the selective-
    *  restore checklist. */
@@ -4407,9 +4421,28 @@ export interface AuditForwardTarget {
   smtp_reply_to: string;
   min_severity: AuditForwardSeverity | null;
   resource_types: string[] | null;
+  // #4545 — DNS query log / DHCP activity log streams (syslog targets only).
+  stream_dns_query_log: boolean;
+  stream_dhcp_activity_log: boolean;
+  log_stream_filters: AuditForwardLogFilters | null;
+  dns_query_sample_percent: number;
+  log_stream_dropped_total: number;
+  log_stream_last_drop_at: string | null;
   created_at: string;
   modified_at: string;
 }
+
+export type AuditForwardLogFilterKey =
+  | "dns_server_group_ids"
+  | "dns_server_ids"
+  | "dns_rcodes"
+  | "dns_qtypes"
+  | "dhcp_server_group_ids"
+  | "dhcp_server_ids"
+  | "dhcp_codes";
+export type AuditForwardLogFilters = Partial<
+  Record<AuditForwardLogFilterKey, string[]>
+>;
 
 export interface AuditForwardTargetWrite {
   name: string;
@@ -4438,6 +4471,10 @@ export interface AuditForwardTargetWrite {
   smtp_reply_to?: string;
   min_severity?: AuditForwardSeverity | null;
   resource_types?: string[] | null;
+  stream_dns_query_log?: boolean;
+  stream_dhcp_activity_log?: boolean;
+  log_stream_filters?: AuditForwardLogFilters | null;
+  dns_query_sample_percent?: number;
 }
 
 /** Unauthenticated branding reads (issues #885–#888). Kept separate from
@@ -5305,6 +5342,9 @@ export interface ZoneMovePreview {
   classless_refusal?: string | null;
   /** #4570 — a forward / stub zone landing in a PowerDNS group. Refused. */
   powerdns_refusal?: string | null;
+  /** #4623 — the zone's custom DNSSEC policy would land on a PowerDNS group,
+   *  which ignores it. Non-null means the commit refuses. */
+  dnssec_policy_refusal?: string | null;
   /** #4565 — the zone or a record of it would keep a view in a target group
    *  that cannot serve views. Non-null means the commit refuses. */
   views_refusal?: string | null;
@@ -6539,6 +6579,8 @@ export interface ZoneDnssecInfo {
   // The group runs the agentless Technitium API driver; sign / re-sign are refused.
   signing_unmanaged?: boolean;
   dnssec_unmanaged_warning?: boolean;
+  /** #4623 — a stored custom policy the group's PowerDNS servers ignore. */
+  unapplied_warning?: string | null;
 }
 
 /** A reusable BIND9 dnssec-policy definition (issue #49). */
@@ -7403,7 +7445,8 @@ export interface DNSBlockList {
   /** #3551 — set when a BIND9 group this list is applied to is estimated at
    *  80 % or more of its agents' memory limit. */
   memory_warning?: string | null;
-  /** #4573 — set when a group the list is applied to runs only PowerDNS (no RPZ). */
+  /** #4573 / #4608 — set when a group the list is applied to has no server
+   *  that renders a blocklist (PowerDNS, Windows DNS, cloud DNS). */
   unapplied_warning?: string | null;
 }
 

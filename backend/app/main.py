@@ -708,6 +708,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_dns_pool_health_stale_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("dns_pool_health_stale_alert_rule_seed_skipped", reason=str(exc))
+    # The ``log_forward_dropping`` rule (#4545) is NOT seeded here either: it is
+    # inserted once by migration e5a2c8d4f7b1, so deleting it is final.
     # The ``secret_expiring`` rule (#2138) is NOT seeded here: it is inserted
     # once by migration c8e2a5f71d39, so an operator who deletes it keeps it
     # deleted. A startup seed would re-create it on every restart.
@@ -1097,8 +1099,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     pcap_orphan_task.cancel()
     with suppress(asyncio.CancelledError):
         await pcap_orphan_task
-    from app.services import after_commit_dispatch  # noqa: PLC0415
+    from app.services import after_commit_dispatch, log_stream_forward  # noqa: PLC0415
 
+    await log_stream_forward.shutdown()
     await after_commit_dispatch.shutdown()
     from app.db import dispose_probe_engine  # noqa: PLC0415
 

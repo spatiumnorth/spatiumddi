@@ -1,0 +1,3 @@
+### Fixed
+
+- On a Helm install, an appliance agent node joined as a DNS or DHCP worker never started its role pods unless the chart's own in-cluster agents were enabled, because the chart only gave the api and worker `DNS_AGENT_KEY` / `DHCP_AGENT_KEY` when `dnsAgents.enabled` / `dhcpAgents.enabled` was true. The keys are now always injected; with no `agentKey.existingSecret` or `value` the chart generates them once into `<release>-agent-keys` and keeps them across upgrades, and the in-cluster agents read the same Secret. A render with no cluster access (`helm template`, GitOps) generates nothing, so set `agentKey.existingSecret` there. (#4648)

@@ -41,10 +41,12 @@ by factory reset:
 * ``feature_module`` — module enable/disable flags persist across
   resets so operators don't have to re-enable everything.
 * ``event_outbox`` — in-flight webhook deliveries, not user data.
-* ``internal_error`` — captured exception traces are diagnostic
-  state, not configuration.
 * ``audit_forward_target`` — keep operating the syslog / webhook /
   chat audit forwarders even when audit_log itself is wiped.
+
+``internal_error`` (captured exception traces) and ``dns_threat_mute``
+are NOT in that list: both are wiped by Observability logs, since they
+carry request paths, client IPs and operator names (#699, #4615).
 """
 
 from __future__ import annotations
@@ -430,7 +432,9 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
         key="observability_logs",
         label="Observability logs",
         description=(
-            "Audit log + DNS query log + DHCP activity log. "
+            "Audit log + DNS query log + DHCP activity log, plus the "
+            "DNS threat analytics behind them (client windows, RPZ "
+            "hits, operator mutes) and captured errors. "
             "Separate from audit-forward targets so operators can "
             "wipe the diagnostic logs while keeping the syslog / "
             "webhook forwarders intact. A synthetic "
@@ -459,9 +463,9 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
         description=(
             "All non-admin users, all custom groups, all "
             "non-builtin roles, all API tokens, all auth providers. "
-            "The calling superadmin and built-in roles "
-            "(Superadmin / Viewer / IPAM/DNS/DHCP Editor / Auditor / "
-            "Compliance Editor) are preserved automatically."
+            "Every login session ends, including yours. The calling "
+            "superadmin and the built-in roles ({builtin_roles}) are "
+            "preserved automatically."
         ),
         phrase="DESTROY-AUTH-RBAC",
         kind="auth_rbac",
@@ -492,6 +496,23 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
         kind="everything",
     ),
 )
+
+
+def builtin_role_names() -> list[str]:
+    """Names of the built-in roles the reset keeps — read from the seed
+    (``app.main._BUILTIN_ROLES``) so the catalog text cannot drift from it.
+    Imported lazily: ``app.main`` imports the API layer that imports this.
+    """
+    from app.main import _BUILTIN_ROLES  # noqa: PLC0415
+
+    return list(_BUILTIN_ROLES)
+
+
+def section_description(section: FactorySection) -> str:
+    """The section's operator-facing description, placeholders resolved."""
+    if "{builtin_roles}" in section.description:
+        return section.description.replace("{builtin_roles}", ", ".join(builtin_role_names()))
+    return section.description
 
 
 FACTORY_SECTIONS_BY_KEY: dict[str, FactorySection] = {s.key: s for s in FACTORY_SECTIONS}
