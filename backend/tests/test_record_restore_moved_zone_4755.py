@@ -149,3 +149,49 @@ async def test_restore_of_a_record_in_an_extra_zone_still_works(
     assert d.status_code == 204, d.text
     r = await client.post(f"/api/v1/admin/trash/dns_record/{rows[0]}/restore", headers=headers)
     assert r.status_code == 200, r.text
+
+
+@pytest.mark.asyncio
+async def test_a_subnet_additional_zone_is_not_an_address_publish_zone(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The guard allows the address's own zone and its own ``extra_zone_ids``
+    because those are the only zones the IPAM sync publishes a host into: a zone
+    the subnet lists in ``dns_additional_zone_ids`` is not one, so no record
+    sits there to be restored, and the primary-zone restore still works."""
+    from tests.test_record_restore_renamed_address_4361 import _sid
+
+    headers, grp, zone, ip_id = await _renamed(
+        client, db_session, "10.168.1.0/24", "10.168.0.0/16", "s1"
+    )
+    inherited_id = (await _second_zone(db_session, grp.id)).id
+    sid = str(await _sid(db_session, ip_id))
+    s = await client.put(
+        f"/api/v1/ipam/subnets/{sid}",
+        headers=headers,
+        json={
+            "dns_inherit_settings": False,
+            "dns_group_ids": [str(grp.id)],
+            "dns_zone_id": str(zone.id),
+            "dns_additional_zone_ids": [str(inherited_id)],
+        },
+    )
+    assert s.status_code == 200, s.text
+    u = await client.put(
+        f"/api/v1/ipam/addresses/{ip_id}", headers=headers, json={"hostname": "s1b"}
+    )
+    assert u.status_code == 200, u.text
+    await db_session.rollback()
+    in_extra = (
+        (
+            await db_session.execute(
+                select(DNSRecord.id).where(
+                    DNSRecord.ip_address_id == uuid.UUID(ip_id),
+                    DNSRecord.zone_id == inherited_id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert in_extra == [], "the sync now publishes into a subnet's additional zones"
