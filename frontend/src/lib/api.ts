@@ -5305,6 +5305,9 @@ export interface ZoneMovePreview {
   classless_refusal?: string | null;
   /** #4570 — a forward / stub zone landing in a PowerDNS group. Refused. */
   powerdns_refusal?: string | null;
+  /** #4623 — the zone's custom DNSSEC policy would land on a PowerDNS group,
+   *  which ignores it. Non-null means the commit refuses. */
+  dnssec_policy_refusal?: string | null;
   /** #4565 — the zone or a record of it would keep a view in a target group
    *  that cannot serve views. Non-null means the commit refuses. */
   views_refusal?: string | null;
@@ -6539,6 +6542,8 @@ export interface ZoneDnssecInfo {
   // The group runs the agentless Technitium API driver; sign / re-sign are refused.
   signing_unmanaged?: boolean;
   dnssec_unmanaged_warning?: boolean;
+  /** #4623 — a stored custom policy the group's PowerDNS servers ignore. */
+  unapplied_warning?: string | null;
 }
 
 /** A reusable BIND9 dnssec-policy definition (issue #49). */
