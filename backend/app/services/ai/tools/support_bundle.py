@@ -27,7 +27,7 @@ class SupportBundlePreviewArgs(BaseModel):
         "Use for 'what goes into a support bundle?', 'is my bundle "
         "safe to attach to a GitHub issue?' or 'why is section X "
         "missing?'. Does NOT return the archive — download that from "
-        "System > Support bundle, where the confirm-and-review step is."
+        "Administration → Diagnostics → Support bundle, where the confirm-and-review step is."
     ),
     args_model=SupportBundlePreviewArgs,
     category="system",

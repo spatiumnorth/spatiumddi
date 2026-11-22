@@ -55,6 +55,7 @@ import { useApplianceAdminGate } from "@/hooks/useApplianceAdmin";
 import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
 import { isRefused, pollUnlessRefused } from "@/lib/refusal";
 import { FormError } from "@/components/ui/form-error";
+import { countNoun } from "@/lib/count-noun";
 
 const ROLE_OPTIONS = [
   "dns-bind9",
@@ -1576,7 +1577,9 @@ function EffectiveSection() {
             <span className="rounded bg-muted px-1.5 py-0.5 font-mono">
               {eff.hostname}
             </span>
-            <span className="text-muted-foreground">{totalRules} rules</span>
+            <span className="text-muted-foreground">
+              {countNoun(totalRules, "rule")}
+            </span>
             {eff.drift ? (
               <span className="inline-flex items-center gap-1 rounded bg-amber-500/15 px-1.5 py-0.5 text-amber-600 dark:text-amber-400">
                 <AlertTriangle className="h-3 w-3" /> drift: rendered ≠ applied
