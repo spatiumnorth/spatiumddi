@@ -2583,6 +2583,10 @@ class PowerDNSDriver(DriverBase):
             )
         except (ValueError, binascii.Error, OverflowError):
             return None
+        if int(parts[2]) == 1:
+            # RFC 4034 appendix B.1: RSAMD5's tag is the 2 octets before the
+            # last 2 of the public key, not a checksum.
+            return int.from_bytes(rdata[-3:-1], "big") if len(rdata) >= 3 else None
         acc = sum((b << 8) if i % 2 == 0 else b for i, b in enumerate(rdata))
         return ((acc & 0xFFFF) + (acc >> 16)) & 0xFFFF
 
@@ -2598,7 +2602,9 @@ class PowerDNSDriver(DriverBase):
             dnskey = str(k.get("dnskey") or "")
             tag = cls._dnskey_tag(dnskey)
             if tag is None:
-                continue
+                # One unreadable key makes the list partial; a partial list
+                # would replace real rows, so the caller omits ``keys``.
+                return []
             algorithm = int(dnskey.split()[2])
             key_type = str(k.get("keytype") or "").lower()
             if key_type not in ("ksk", "zsk", "csk"):
@@ -2609,7 +2615,11 @@ class PowerDNSDriver(DriverBase):
                     "key_tag": tag,
                     "key_type": key_type,
                     "algorithm": algorithm,
-                    "state": "active" if k.get("active") else "published",
+                    "state": (
+                        "active"
+                        if k.get("active")
+                        else "published" if k.get("published", True) else "generated"
+                    ),
                     "ds_records": ds if key_type in ("ksk", "csk") else [],
                     "timing": {},
                 }

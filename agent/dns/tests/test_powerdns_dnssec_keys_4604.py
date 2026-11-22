@@ -139,3 +139,29 @@ def test_unparseable_key_list_omits_keys_not_empties_them(
     )
     assert "keys" not in state
     assert state["ds_records"] == ["1 13 2 aa"]
+
+
+def test_rsamd5_tag_is_the_penultimate_octets() -> None:
+    # Algorithm 1 (RFC 4034 appendix B.1): not the checksum. Key bytes
+    # 00 01 .. 12 34 56 -> tag is the two octets before the last one.
+    import base64
+
+    pub = base64.b64encode(bytes([1, 2, 3, 0x12, 0x34, 0x56])).decode()
+    assert PowerDNSDriver._dnskey_tag(f"256 3 1 {pub}") == 0x1234
+
+
+def test_odd_length_rdata_tag() -> None:
+    import base64
+
+    pub = base64.b64encode(bytes([0xAB])).decode()  # rdata = 5 bytes (odd)
+    rdata = bytes([1, 0, 3, 13, 0xAB])
+    acc = sum((b << 8) if i % 2 == 0 else b for i, b in enumerate(rdata))
+    expected = ((acc & 0xFFFF) + (acc >> 16)) & 0xFFFF
+    assert PowerDNSDriver._dnskey_tag(f"256 3 13 {pub}") == expected
+
+
+def test_one_unparseable_key_omits_keys_and_unpublished_is_generated() -> None:
+    good = {"keytype": "zsk", "active": False, "published": False, "dnskey": _RFC_KEY}
+    (row,) = PowerDNSDriver._extract_keys([good])
+    assert row["state"] == "generated"
+    assert PowerDNSDriver._keys_report([good, {"keytype": "ksk", "dnskey": "bad"}]) is None
