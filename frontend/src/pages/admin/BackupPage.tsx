@@ -19,7 +19,7 @@ import {
   type BackupRestoreResponse,
 } from "@/lib/api";
 import {
-  RESTORE_IN_FLIGHT_KEY,
+  markRestoreInFlight,
   clearRestoreInFlight,
 } from "@/lib/restoreInFlight";
 import { BackupSectionsPicker } from "./BackupSectionsPicker";
@@ -316,11 +316,7 @@ function RestoreBackupCard() {
   const restoreMut = useMutation({
     mutationFn: () => {
       if (!file) throw new Error("no archive selected");
-      try {
-        sessionStorage.setItem(RESTORE_IN_FLIGHT_KEY, "1");
-      } catch {
-        // storage blocked: the sign-in page just loses its explanation.
-      }
+      markRestoreInFlight();
       return backupApi.restore(
         file,
         passphrase,
@@ -333,11 +329,12 @@ function RestoreBackupCard() {
       setOutcome(data);
     },
     onError: (err: unknown) => {
-      // 401 / no response is the session loss the restore itself causes;
-      // anything else is a real refusal, so drop the flag.
+      // No response at all is the connection the restore itself cut, so the
+      // note stays. Any answer, a 401 included, means the restore did not run:
+      // a 401 on the POST is a session that ended BEFORE Apply.
       const status = (err as { response?: { status?: number } })?.response
         ?.status;
-      if (status && status !== 401) clearRestoreInFlight();
+      if (status) clearRestoreInFlight();
     },
   });
 

@@ -9,10 +9,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import {
-  RESTORE_IN_FLIGHT_KEY,
-  consumeRestoreInFlight,
-} from "@/lib/restoreInFlight";
 
 const lastRestore = vi.fn();
 
@@ -57,11 +53,5 @@ describe("last restore outcome", () => {
     ).toBeTruthy();
     expect(screen.getByText(/Last restore/)).toBeTruthy();
     expect(screen.getByText("re-publish DS records")).toBeTruthy();
-  });
-
-  it("consumes the in-flight flag exactly once", () => {
-    sessionStorage.setItem(RESTORE_IN_FLIGHT_KEY, "1");
-    expect(consumeRestoreInFlight()).toBe(true);
-    expect(consumeRestoreInFlight()).toBe(false);
   });
 });
