@@ -611,6 +611,8 @@ class BIND9Driver(DNSDriver):
             "name": "bind9",
             "views": True,
             "rpz": True,
+            # Renders the group's blocklists (RPZ) — see blocklist_capable().
+            "blocklist": True,
             # Per-query RCODE via BIND 9.20's ``responselog`` (#914).
             # Advertised as a capability rather than checked by driver
             # name so the query-log ingest never has to know which

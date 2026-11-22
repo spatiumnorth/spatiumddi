@@ -1335,7 +1335,9 @@ dnsAgents:
       repository: ghcr.io/spatiumnorth/dns-technitium
       tag: ""                    # empty → use Chart.appVersion
   # PSK carrying DNS_AGENT_KEY. Prefer `existingSecret`; `value` lives here
-  # only to make lab walk-throughs runnable in one command.
+  # only to make lab walk-throughs runnable in one command. The api + worker
+  # get the key even with `enabled: false` (#4648, appliance agent nodes);
+  # with neither set the chart generates <fullname>-agent-keys and keeps it.
   agentKey:
     existingSecret: ""           # external secret with key DNS_AGENT_KEY
     value: ""
@@ -1442,6 +1444,8 @@ dhcpAgents:
   # Per server: ``servers[].storageClass``. On an existing install see README
   # "Adopting storageClass on an existing install" (orphan-delete the sts first).
   storageClass: ""
+  # Same contract as dnsAgents.agentKey (#4648): injected into the api +
+  # worker as DHCP_AGENT_KEY whether or not `enabled`; unset = generated.
   agentKey:
     existingSecret: ""           # external secret with key SPATIUM_AGENT_KEY
     value: ""

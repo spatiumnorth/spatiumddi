@@ -33,6 +33,7 @@ from app.models.auth import User
 from app.models.dns import DNSRecord, DNSServer, DNSServerGroup, DNSView, DNSZone, servable_ttl
 from app.services.dns.named_conf_validation import split_zone_forwarders
 from app.services.dns.new_object_defaults import load_dns_defaults
+from app.services.dns.powerdns_alias import group_can_resolve_alias
 from app.services.dns.record_ops import (
     enqueue_record_ops_bulk,
     provision_zone_at_agentless_servers,
@@ -63,6 +64,7 @@ from .canonical import (
     ImportSource,
     ZoneConflict,
 )
+from .powerdns import ALIAS_DROPPED_WARNING
 
 logger = structlog.get_logger(__name__)
 
@@ -793,6 +795,10 @@ async def commit_import(
         .all()
     )
     bind9_target = not drivers or "bind9" in drivers
+    # #4604 — a PowerDNS group with no Do53 forwarders answers nothing for an
+    # ALIAS, and the record API refuses one there; the plan is client-supplied,
+    # so drop it here too rather than trust the preview.
+    drop_alias = drivers == {"powerdns"} and not await group_can_resolve_alias(db, target_group_id)
     # The CNAME-rule warnings are recomputed below from the zones as committed.
     warnings = [w for w in preview.warnings if not cname_check.is_cname_warning(w)]
     # #1892 — "replace" swaps an imported apex NS naming a host outside the
@@ -803,6 +809,13 @@ async def commit_import(
     results: list[CommitZoneResult] = []
 
     for parsed in preview.zones:
+        if drop_alias:
+            kept_records = [r for r in parsed.records if r.record_type != "ALIAS"]
+            if len(kept_records) != len(parsed.records):
+                warnings.append(
+                    ALIAS_DROPPED_WARNING.format(count=len(parsed.records) - len(kept_records))
+                )
+                parsed = replace(parsed, records=kept_records)
         if apex_names is not None:
             parsed, change, apex_warning = replace_apex_ns(parsed, apex_names)
             if apex_warning:
