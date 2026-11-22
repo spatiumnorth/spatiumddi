@@ -510,6 +510,11 @@ async def agent_register(
     agent_instance: str | None = Header(default=None, alias=AGENT_INSTANCE_HEADER),
 ) -> AgentRegisterResponseV2 | JSONResponse:
     """Bootstrap registration: PSK-authenticated; returns a per-server JWT."""
+    # #4677 — not while a restore is replaying: the fingerprint compared below
+    # would be the archive's (see dhcp/agents.py).
+    from app.core.restore_gate import defer_if_restoring  # noqa: PLC0415
+
+    await defer_if_restoring(db, "registration")
     # #1068 — see the matching guard in dhcp/agents.py. Registration is
     # the one agent call that creates a server row, so without this an
     # agent re-registers moments after the operator empties DNS and
@@ -1764,7 +1769,8 @@ class DNSSECStateReport(BaseModel):
     ``ds_records`` is the zone-level DS rrset the operator copies into the
     parent registrar verbatim (empty = unsigned). ``keys`` is the optional
     per-key breakdown BIND9 agents report from ``rndc dnssec -status``
-    (issue #49); PowerDNS agents omit it.
+    (issue #49) and PowerDNS agents from ``GET .../cryptokeys`` (#4604).
+    An agent that does not report keys omits the field.
     """
 
     zone_name: str

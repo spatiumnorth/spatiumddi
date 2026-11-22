@@ -780,6 +780,28 @@ _FIREWALL_REFUSAL_SIDECAR = Path(
     "/var/lib/spatiumddi-host/release-state/firewall-refused"
 )
 
+#: #4707 — written by spatiumddi-firstboot when it committed a trial slot
+#: although the control chart never applied (the slot's migrate Job had run, so
+#: a revert was unsafe). Shipped in ``cluster_health`` for the Fleet drilldown.
+_CONTROL_NOT_CONVERGED_FILE = Path(
+    "/var/lib/spatiumddi-host/release-state/control-plane-not-converged"
+)
+
+
+def read_control_plane_not_converged() -> dict[str, str] | None:
+    """The "control plane not converged" record, or None when absent/unreadable."""
+    try:
+        data = json.loads(_CONTROL_NOT_CONVERGED_FILE.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    out = {
+        k: _scrub_text(str(data[k]))[:500] for k in ("version", "at", "detail") if k in data
+    }
+    return out or None
+
+
 # #272 Phase 7b — control-plane cluster join/leave. The join trigger
 # carries the seed's kubeapi URL + join token; the host-side runner
 # (spatium-cluster-join) reconfigures k3s to join the seed as a server
@@ -4923,6 +4945,9 @@ def collect() -> dict[str, object]:
         _network = read_network_state()
         if _network is not None:
             _extra["network"] = _network
+        _not_converged = read_control_plane_not_converged()
+        if _not_converged is not None:
+            _extra["control_plane_not_converged"] = _not_converged
         cluster_health = {**(cluster_health or {}), **_extra}
     k3s_version = read_k3s_version() if is_appliance else None
     kubeconfig = read_kubeconfig() if is_appliance else None

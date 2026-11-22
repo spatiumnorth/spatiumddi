@@ -3081,6 +3081,13 @@ export interface BackupRestoreResponse {
   warnings?: string[];
 }
 
+/** GET /backup/restore/last: the same card the POST returns, read back from
+ *  the restore's audit row after the restore signed the operator out (#4676). */
+export interface LastBackupRestoreResponse extends BackupRestoreResponse {
+  performed_at: string;
+  performed_by: string | null;
+}
+
 export interface BackupSection {
   key: string;
   label: string;
@@ -3204,6 +3211,13 @@ export const backupApi = {
     });
     return res.data;
   },
+
+  /** Outcome of the most recent restore, from its audit row (#4676). 404
+   *  when none has been recorded. */
+  lastRestore: () =>
+    api
+      .get<LastBackupRestoreResponse>("/backup/restore/last")
+      .then((r) => r.data),
 
   /** Backup-section catalog (Phase 2a). Drives the selective-
    *  restore checklist. */
@@ -13846,6 +13860,13 @@ export interface ApplianceRow {
     nodes_ready?: number;
     pods_total?: number;
     pods_by_phase?: Record<string, number>;
+    // #4707 — present when a trial slot was committed although its control
+    // chart never applied (a revert was unsafe: the migrate Job had run).
+    control_plane_not_converged?: {
+      version?: string;
+      at?: string;
+      detail?: string;
+    };
     // #999 Part A — raw md / multipath reading, with NO verdict attached
     // (the appliance row carries that in `storage_findings` below). Typed
     // as the reading rather than as `NodeStorage` on purpose: `findings`
