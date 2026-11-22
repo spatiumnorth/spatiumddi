@@ -161,6 +161,39 @@ async def test_mac_sync_pushes_then_clears_once_after_last_block_removed(
 
 
 @pytest.mark.asyncio
+async def test_mac_sync_follows_a_server_moved_between_groups(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A server never pushed to still syncs when it joins a group that has blocks,
+    and one moved out of a blocked group into an unblocked one is cleared once."""
+    blocked = DHCPServerGroup(name=f"b-{uuid.uuid4().hex[:6]}", description="")
+    free = DHCPServerGroup(name=f"f-{uuid.uuid4().hex[:6]}", description="")
+    db_session.add_all([blocked, free])
+    await db_session.flush()
+    db_session.add(DHCPMACBlock(group_id=blocked.id, mac_address="aa:bb:cc:dd:ee:01"))
+    srv = await _server(db_session, "windows_dhcp", free)
+    await db_session.commit()
+    srv_id, blocked_id, free_id = srv.id, blocked.id, free.id
+    drv = _patch_driver(monkeypatch)
+
+    await dhcp_mac_blocks._run_sync(force=True)
+    assert drv.calls == []  # flag false, nothing applies
+
+    (await db_session.get(DHCPServer, srv_id)).server_group_id = blocked_id  # type: ignore[union-attr]
+    await db_session.commit()
+    await dhcp_mac_blocks._run_sync(force=True)
+    assert len(drv.calls) == 1 and len(drv.calls[0]) == 1  # applies newly: pushed despite flag
+
+    db_session.expire_all()
+    (await db_session.get(DHCPServer, srv_id)).server_group_id = free_id  # type: ignore[union-attr]
+    await db_session.commit()
+    await dhcp_mac_blocks._run_sync(force=True)
+    assert len(drv.calls) == 2 and drv.calls[1] == []  # cleared once on leaving
+    await dhcp_mac_blocks._run_sync(force=True)
+    assert len(drv.calls) == 2
+
+
+@pytest.mark.asyncio
 async def test_mac_sync_honours_interval_and_force(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
