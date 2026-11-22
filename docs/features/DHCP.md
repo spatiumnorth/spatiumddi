@@ -846,7 +846,9 @@ no value an operator types can change the expression or break the config.
 `ipv4`; 422 otherwise). It is rendered by Kea only: a group whose servers are
 all Windows DHCP (or FortiGate) refuses it with a 422, and manage option 82
 policies on the Windows server itself. An empty group is allowed (servers may
-join later), as is a mixed one, where only the Kea members render it. A
+join later), as is a mixed one, where only the Kea members render it. The
+rule holds the other way round: a Windows or FortiGate server cannot join (or be
+moved into) a group that already holds an option 82 class. A
 request carrying both `match_spec` and a `match_expression` that is not what
 `match_spec` compiles to is a 422; send one. On update, `match_spec: null`
 converts the class to a hand-written one and keeps the compiled text as the
