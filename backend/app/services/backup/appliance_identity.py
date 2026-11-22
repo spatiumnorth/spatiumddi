@@ -25,7 +25,11 @@ rewrap (:func:`adopt`):
 
 * the agent identity (fingerprint, id, approval) of the live appliances' DHCP
   and DNS server rows, put on the restored rows of the same appliance, so the
-  agent's next register is not read as a changed fingerprint.
+  agent's next register is not read as a changed fingerprint. A server is the
+  appliance's by ``appliance_id`` or, as the appliance's own agents register
+  with it NULL, by its agent-based row's host being the appliance's hostname.
+  Agent registers are answered 503 while the restore lock is held, so none is
+  judged against a half-restored table.
 
 A restore onto the *same* install finds its own ids in the archive and
 changes nothing. Rows are copied by ``json_populate_recordset`` into the
@@ -131,31 +135,54 @@ async def snapshot(db_url: str) -> IdentitySnapshot | None:
                 r[0]: r[1]
                 for r in (await conn.execute(text("SELECT id::text, name FROM dhcp_server_group")))
             }
-            dhcp_servers = [
-                dict(r._mapping)
-                for r in await conn.execute(
-                    text(
-                        "SELECT name, appliance_id::text AS appliance_id, "
-                        "agent_id::text AS agent_id, agent_fingerprint, agent_approved "
-                        "FROM dhcp_server WHERE agent_fingerprint IS NOT NULL AND appliance_id IN "
-                        "(SELECT id FROM appliance WHERE revoked_at IS NULL)"
-                    )
-                )
-            ]
-            dns_servers = [
-                dict(r._mapping)
-                for r in await conn.execute(
-                    text(
-                        "SELECT name, appliance_id::text AS appliance_id, "
-                        "agent_id::text AS agent_id, agent_fingerprint, pending_approval "
-                        "FROM dns_server WHERE agent_fingerprint IS NOT NULL AND appliance_id IN "
-                        "(SELECT id FROM appliance WHERE revoked_at IS NULL)"
-                    )
-                )
-            ]
+            dhcp_servers = await _live_server_rows(conn, "dhcp_server", "agent_approved", rows)
+            dns_servers = await _live_server_rows(conn, "dns_server", "pending_approval", rows)
         return IdentitySnapshot(ca_json, rows, dns, dhcp, dhcp_servers, dns_servers)
     finally:
         await engine.dispose()
+
+
+async def _live_server_rows(
+    conn: Any, table: str, flag: str, appliances: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """The agent identity of each live appliance's own server rows.
+
+    A server belongs to an appliance by ``appliance_id`` when it is set. On a
+    real appliance it usually is NOT: the local DNS / DHCP agents register
+    like any other and nothing stamps the FK (the walk of #4680 found both
+    rows NULL on both installs). The rule the rest of the control plane uses
+    for such a row (``services/appliance/ownership.py``) applies: an
+    agent-based row (``agent_id`` set) whose normalised ``host`` equals the
+    hostname of exactly one live appliance. ``via`` records which rule matched
+    so the carry applies the same one to the restored row."""
+    from app.services.appliance.ownership import norm_host  # noqa: PLC0415
+
+    live = {str(a["id"]): a for a in appliances}
+    by_host: dict[str, list[str]] = {}
+    for a in appliances:
+        by_host.setdefault(norm_host(str(a["hostname"])), []).append(str(a["id"]))
+    out: list[dict[str, Any]] = []
+    for r in await conn.execute(
+        text(
+            f"SELECT name, host, appliance_id::text AS appliance_id, "  # noqa: S608
+            f"agent_id::text AS agent_id, agent_fingerprint, {flag} "
+            f"FROM {table} WHERE agent_fingerprint IS NOT NULL"
+        )
+    ):
+        row = dict(r._mapping)
+        if row["appliance_id"] in live:
+            row["via"] = "fk"
+        elif row["appliance_id"] is None and row["agent_id"] is not None:
+            owners = by_host.get(norm_host(str(row["host"] or "")), [])
+            if len(owners) != 1:
+                continue
+            row["appliance_id"] = owners[0]
+            row["via"] = "host"
+            row["owner_host"] = norm_host(str(live[owners[0]]["hostname"]))
+        else:
+            continue
+        out.append(row)
+    return out
 
 
 _SERVER_CARRY = (
@@ -191,21 +218,32 @@ async def _carry_agent_identity(conn: Any, snap: IdentitySnapshot, live_ids: set
             if str(srv["appliance_id"]) not in live_ids:
                 continue
             try:
+                # The restored row is the adopted appliance's by the same rule
+                # the live one was: its FK, or (FK NULL) its host being the
+                # appliance's hostname. A same-named row of another host is
+                # some other agent's and stays as the archive had it.
+                owned = "appliance_id = CAST(:app AS uuid)"
+                params: dict[str, Any] = {
+                    "fp": srv["agent_fingerprint"],
+                    "aid": srv["agent_id"],
+                    "flag": srv[flag],
+                    "app": str(srv["appliance_id"]),
+                    "name": srv["name"],
+                }
+                if srv.get("via") == "host":
+                    owned = (
+                        f"({owned} OR (appliance_id IS NULL AND agent_id IS NOT NULL "
+                        "AND lower(rtrim(trim(host), '.')) = :host))"
+                    )
+                    params["host"] = srv["owner_host"]
                 async with conn.begin_nested():
                     await conn.execute(
                         text(
                             f"UPDATE {table} SET agent_fingerprint = :fp, "  # noqa: S608
                             f"agent_id = CAST(:aid AS uuid), {flag} = :flag "
-                            "WHERE appliance_id = CAST(:app AS uuid) "
-                            "AND lower(name) = lower(:name)"
+                            f"WHERE {owned} AND lower(name) = lower(:name)"
                         ),
-                        {
-                            "fp": srv["agent_fingerprint"],
-                            "aid": srv["agent_id"],
-                            "flag": srv[flag],
-                            "app": str(srv["appliance_id"]),
-                            "name": srv["name"],
-                        },
+                        params,
                     )
             except Exception as exc:  # noqa: BLE001 — the agent just registers afresh
                 logger.warning(

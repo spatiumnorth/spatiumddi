@@ -466,3 +466,152 @@ async def test_agent_identity_clash_is_reported_not_silent(db_session: AsyncSess
 
     out = await ident.adopt(str(settings.database_url), snap)
     assert any("agent identity" in w and "node1" in w for w in out.warnings)
+
+
+@pytest.mark.asyncio
+async def test_servers_with_null_appliance_id_keep_the_live_identity(
+    db_session: AsyncSession,
+) -> None:
+    """Round 2 of the #4680 walk: on a real appliance the local agents'
+    server rows have appliance_id NULL on both installs. They belong to the
+    appliance by host == hostname, and only those do."""
+    live = _appliance("node1")
+    db_session.add_all([live, _ca("LIVE-CA")])
+    await db_session.flush()
+    live_agent = uuid.uuid4()
+    dgroup = DHCPServerGroup(name="g")
+    nsgroup = DNSServerGroup(name="ns")
+    db_session.add_all([dgroup, nsgroup])
+    await db_session.flush()
+    db_session.add_all(
+        [
+            DHCPServer(
+                name="node1",
+                driver="kea",
+                host="node1",
+                server_group_id=dgroup.id,
+                agent_id=live_agent,
+                agent_approved=True,
+                agent_fingerprint="live-fp",
+            ),
+            DNSServer(
+                name="node1",
+                driver="bind9",
+                host="NODE1.",
+                group_id=nsgroup.id,
+                agent_id=uuid.uuid4(),
+                agent_fingerprint="live-dns-fp",
+                pending_approval=False,
+            ),
+        ]
+    )
+    await db_session.commit()
+    snap = await ident.snapshot(str(settings.database_url))
+    assert snap is not None
+
+    old = _appliance("node1", cert_pem="OLD")
+    await _replay_with(db_session, [old], _ca("ARCHIVE-CA"))
+    await db_session.execute(delete(DHCPServer))
+    await db_session.execute(delete(DNSServer))
+    await db_session.commit()
+    ng = DNSServerGroup(name="ns")
+    dg2 = DHCPServerGroup(name="g2")
+    db_session.add_all([ng, dg2])
+    await db_session.flush()
+    db_session.add_all(
+        [
+            # The archive's own rows, FK NULL as on every appliance.
+            DHCPServer(
+                name="node1",
+                driver="kea",
+                host="node1",
+                server_group_id=dg2.id,
+                agent_id=uuid.uuid4(),
+                agent_approved=False,
+                agent_fingerprint="archive-fp",
+            ),
+            DNSServer(
+                name="node1",
+                driver="bind9",
+                host="node1",
+                group_id=ng.id,
+                agent_id=uuid.uuid4(),
+                agent_fingerprint="archive-dns-fp",
+                pending_approval=True,
+            ),
+            # A remote agent that shares the NAME but is another host.
+            DHCPServer(
+                name="NODE1",
+                driver="kea",
+                host="remote-host",
+                server_group_id=dg2.id,
+                agent_id=uuid.uuid4(),
+                agent_approved=False,
+                agent_fingerprint="remote-fp",
+            ),
+            DHCPServer(
+                name="other",
+                driver="kea",
+                host="other",
+                agent_id=uuid.uuid4(),
+                agent_approved=False,
+                agent_fingerprint="other-fp",
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    out = await ident.adopt(str(settings.database_url), snap)
+    assert not any("agent identity" in w for w in out.warnings)
+
+    db_session.expire_all()
+    dhcp = {r.host: r for r in (await db_session.execute(select(DHCPServer))).scalars()}
+    assert dhcp["node1"].agent_fingerprint == "live-fp"
+    assert dhcp["node1"].agent_id == live_agent
+    assert dhcp["node1"].agent_approved is True
+    for host, fp in (("remote-host", "remote-fp"), ("other", "other-fp")):
+        assert dhcp[host].agent_fingerprint == fp and dhcp[host].agent_approved is False
+    dns = (await db_session.execute(select(DNSServer))).scalar_one()
+    assert dns.agent_fingerprint == "live-dns-fp" and dns.pending_approval is False
+
+
+@pytest.mark.asyncio
+async def test_unapproved_live_null_fk_server_is_not_approved_by_the_carry(
+    db_session: AsyncSession,
+) -> None:
+    live = _appliance("node1")
+    g = DHCPServerGroup(name="g")
+    db_session.add_all([live, _ca("LIVE-CA"), g])
+    await db_session.flush()
+    db_session.add(
+        DHCPServer(
+            name="node1",
+            driver="kea",
+            host="node1",
+            server_group_id=g.id,
+            agent_id=uuid.uuid4(),
+            agent_approved=False,
+            agent_fingerprint="live-fp",
+        )
+    )
+    await db_session.commit()
+    snap = await ident.snapshot(str(settings.database_url))
+    assert snap is not None
+    old = _appliance("node1", cert_pem="OLD")
+    await _replay_with(db_session, [old], _ca("ARCHIVE-CA"))
+    await db_session.execute(delete(DHCPServer))
+    db_session.add(
+        DHCPServer(
+            name="node1",
+            driver="kea",
+            host="node1",
+            agent_id=uuid.uuid4(),
+            agent_approved=True,
+            agent_fingerprint="archive-fp",
+        )
+    )
+    await db_session.commit()
+    await ident.adopt(str(settings.database_url), snap)
+    db_session.expire_all()
+    row = (await db_session.execute(select(DHCPServer))).scalar_one()
+    assert row.agent_fingerprint == "live-fp" and row.agent_approved is False

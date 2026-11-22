@@ -546,6 +546,11 @@ async def agent_register(
     agent_instance: str | None = Header(default=None, alias=AGENT_INSTANCE_HEADER),
 ) -> AgentRegisterResponse | JSONResponse:
     """Bootstrap registration — PSK → per-server JWT."""
+    # #4677 — not while a restore is replaying: the fingerprint compared below
+    # would be the archive's, and a mismatch un-approves the server.
+    from app.core.restore_gate import defer_if_restoring  # noqa: PLC0415
+
+    await defer_if_restoring(db, "registration")
     # #1068 — registration is the one agent call that CREATES a server
     # row, so it is the one that can undo the refuse-while-populated
     # guard on the core.dhcp toggle: delete the servers, disable the

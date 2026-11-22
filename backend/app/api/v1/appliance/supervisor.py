@@ -8014,6 +8014,13 @@ async def _cert_principal(request: Request, db: AsyncSession, *, body_streamed: 
     try:
         principal = await authenticate_cert(request, db, body_streamed=body_streamed)
     except CertAuthFailed as exc:
+        # #4677 — a restore replaying the registry leaves a moment with no row
+        # for this certificate. Not a verdict on it: 503, and the supervisor
+        # backs off without a strike. A replay (401) stays a refusal.
+        if exc.status_code == status.HTTP_403_FORBIDDEN:
+            from app.core.restore_gate import defer_if_restoring  # noqa: PLC0415
+
+            await defer_if_restoring(db, "the request")
         logger.warning("appliance.k8s_proxy.cert_auth_failed", reason=exc.reason)
         raise HTTPException(exc.status_code, "Invalid appliance client cert.") from exc
     if principal is None:
