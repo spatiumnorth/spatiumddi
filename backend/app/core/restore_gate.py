@@ -62,6 +62,30 @@ async def restore_in_progress(dsn: str) -> bool:
         await conn.close()
 
 
+async def defer_if_restoring(db, what: str) -> None:
+    """Answer 503 + Retry-After while a restore holds the lock (#4677).
+
+    For an endpoint whose answer, or whose write, would be judged against a
+    half-restored table: an agent's register compares its fingerprint with the
+    row the replay just put back, and a cert-authed supervisor poll finds no
+    appliance row. Neither is a verdict on the caller, and the callers retry a
+    503 without re-bootstrapping or counting a strike (only 401 / 404 /
+    a marked 403 do). Fails open: a lock query that cannot be answered must
+    not take the endpoint down.
+    """
+    from fastapi import HTTPException  # noqa: PLC0415
+    from sqlalchemy import text  # noqa: PLC0415
+
+    try:
+        held = bool(await db.scalar(text(f"SELECT EXISTS ({RESTORE_LOCK_HOLDERS_SQL})")))
+    except Exception:  # noqa: BLE001 — fail open, see the docstring
+        held = False
+    if held:
+        raise HTTPException(
+            503, f"A restore is in progress; {what} deferred. Retry.", headers={"Retry-After": "1"}
+        )
+
+
 def main() -> int:
     url = os.environ.get("DATABASE_URL", "")
     if not url:
