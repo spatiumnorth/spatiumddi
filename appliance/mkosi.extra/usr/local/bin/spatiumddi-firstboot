@@ -1342,19 +1342,16 @@ ${API_SIZING_YAML}
       autoscaling:
         enabled: false
       env:
-        # Agent pre-shared keys — the api validates incoming
-        # registrations from DNS / DHCP / Looking Glass agents against
-        # these. Without them the api returns 503 "<X>_AGENT_KEY is not
-        # configured on the control plane" and the role pods crash-loop.
-        # Sourced from /etc/spatiumddi/.env which firstboot stamps
-        # on first boot. LG_AGENT_KEY additionally feeds
-        # settings.lg_agent_key, which the supervisor ships in its
-        # heartbeat role-assignment so the running collector DaemonSet
-        # gets the matching client-side key (issue #576).
-        - name: DNS_AGENT_KEY
-          value: "${DNS_AGENT_KEY_VAL}"
-        - name: DHCP_AGENT_KEY
-          value: "${DHCP_AGENT_KEY_VAL}"
+        # The DNS / DHCP agent pre-shared keys are NOT set here: the chart
+        # injects DNS_AGENT_KEY / DHCP_AGENT_KEY into api AND worker itself
+        # (#4648), from dnsAgents.agentKey.value / dhcpAgents.agentKey.value
+        # below, and a name listed here too is a duplicate env entry that the
+        # k3s helm controller's server-side apply refuses (the api is never
+        # created). One source: /etc/spatiumddi/.env.
+        #
+        # LG_AGENT_KEY feeds settings.lg_agent_key, which the supervisor
+        # ships in its heartbeat role-assignment so the running collector
+        # DaemonSet gets the matching client-side key (issue #576).
         - name: LG_AGENT_KEY
           value: "${LG_AGENT_KEY_VAL}"
       serviceAccount:
@@ -1501,10 +1498,19 @@ ${POSTGRES_PARAMETERS_YAML}
     # DNS / DHCP agents from the umbrella chart are NOT used on the
     # appliance — the appliance chart (templates/dns-bind9.yaml etc.)
     # owns the role pods with hostNetwork + per-role node labels.
+    #
+    # The api validates agent registrations (DNS / DHCP role pods, appliance
+    # agent nodes) against these keys. They are the appliance's own, from
+    # /etc/spatiumddi/.env — the same ones the role pods get — so api,
+    # worker and role pods agree, and a chart upgrade keeps them (#4648).
     dnsAgents:
       enabled: false
+      agentKey:
+        value: "${DNS_AGENT_KEY_VAL}"
     dhcpAgents:
       enabled: false
+      agentKey:
+        value: "${DHCP_AGENT_KEY_VAL}"
 EOF
 }
 

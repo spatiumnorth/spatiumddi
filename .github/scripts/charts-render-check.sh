@@ -182,6 +182,8 @@ render() { # name chart [helm --set args...]
         -cache "$KUBECONFORM_CACHE" \
         "$file" || failures=$((failures + 1))
     python3 "$ROOT/.github/scripts/chart-no-besteffort.py" "$file" || failures=$((failures + 1))
+    # #4648 — a repeated env name renders fine and is refused at apply time.
+    python3 "$ROOT/.github/scripts/chart-env-unique.py" "$file" || failures=$((failures + 1))
     # #1042 — a generated credential Secret must carry resource-policy: keep,
     # checked on the RENDER so a value typo or a false condition cannot hide it.
     python3 "$ROOT/.github/scripts/chart-credential-secrets-kept.py" "$file" \
@@ -1007,7 +1009,9 @@ render umbrella-shared-env "$UMBRELLA" \
     --set sharedEnv[1].name=APPLIANCE_HOSTNAME --set sharedEnv[1].value=node1 \
     --set sharedEnv[2].name=APPLIANCE_HOST_IPS --set sharedEnv[2].value=10.0.0.1 \
     --set sharedEnv[3].name=INITIAL_NTP_SERVERS --set sharedEnv[3].value=ntp.example \
-    --set-string applianceVersion=0.0.0-nightly-20261019+abcdef1
+    --set-string applianceVersion=0.0.0-nightly-20261019+abcdef1 \
+    --set-string dnsAgents.agentKey.value=appliance-dns-key \
+    --set-string dhcpAgents.agentKey.value=appliance-dhcp-key
 echo "── shared env (umbrella, #1826, #2176)"
 python3 "$ROOT/.github/scripts/chart-shared-env.py" \
     --expect VERSION --expect SECRET_KEY --expect DATABASE_URL --expect REDIS_URL \
@@ -1024,6 +1028,43 @@ python3 "$ROOT/.github/scripts/chart-shared-env.py" \
     "$OUT/umbrella-shared-env.yaml" || failures=$((failures + 1))
 # #4648 — that render has dnsAgents / dhcpAgents off, yet the api and worker
 # carry both agent keys (an appliance agent node joins with them).
+# The appliance hands the chart its own keys as agentKey.value (#4648): api
+# and worker read them from the one Secret the value renders, not from an
+# inline api.env copy, and no container lists a name twice.
+echo "── appliance agent keys: one source (#4648)"
+python3 - "$OUT/umbrella-shared-env.yaml" <<'PYEOF' || failures=$((failures + 1))
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+secrets = {d["metadata"]["name"]: d.get("stringData", {}) for d in docs if d["kind"] == "Secret"}
+bad = 0
+for comp in ("api", "worker"):
+    for d in docs:
+        if d["kind"] != "Deployment" or d["metadata"]["labels"].get("app.kubernetes.io/component") != comp:
+            continue
+        c = next(c for c in d["spec"]["template"]["spec"]["containers"] if c["name"] == comp)
+        for name, key, want in (("DNS_AGENT_KEY", "DNS_AGENT_KEY", "appliance-dns-key"),
+                                ("DHCP_AGENT_KEY", "SPATIUM_AGENT_KEY", "appliance-dhcp-key")):
+            ref = [e["valueFrom"]["secretKeyRef"] for e in c["env"] if e["name"] == name]
+            if len(ref) != 1 or secrets.get(ref[0]["name"], {}).get(key) != want:
+                print(f"FAIL: {comp} {name} does not read the appliance's value: {ref}", file=sys.stderr)
+                bad = 1
+sys.exit(bad)
+PYEOF
+python3 "$ROOT/.github/scripts/chart-env-unique.py" "$OUT/umbrella-shared-env.yaml" \
+    || failures=$((failures + 1))
+# Negative control: the appliance's old inline api.env copy must be refused.
+echo "── negative control: a repeated env name must fail"
+# (helm directly, not render(): render() would count the refusal as a failure.)
+helm template dup-env "$UMBRELLA" --kube-version "$K8S_VERSION" \
+    --set api.env[0].name=DNS_AGENT_KEY --set-string api.env[0].value=x \
+    > "$OUT/umbrella-dup-env.yaml"
+dup_out=$(python3 "$ROOT/.github/scripts/chart-env-unique.py" "$OUT/umbrella-dup-env.yaml" 2>&1 || true)
+if ! grep -q "env DNS_AGENT_KEY listed 2 times" <<<"$dup_out"; then
+    echo "   FAIL: chart-env-unique.py did not refuse a duplicated DNS_AGENT_KEY" >&2
+    failures=$((failures + 1))
+else
+    echo "   ok: duplicated env name refused"
+fi
 # Negative control: a worker without the variable must be refused, or the
 # guard above could be passing on a render it cannot read.
 echo "── negative control: a worker missing a shared variable must fail"
