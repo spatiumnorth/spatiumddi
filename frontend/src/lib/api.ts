@@ -13813,6 +13813,13 @@ export interface ApplianceRow {
     nodes_ready?: number;
     pods_total?: number;
     pods_by_phase?: Record<string, number>;
+    // #4707 — present when a trial slot was committed although its control
+    // chart never applied (a revert was unsafe: the migrate Job had run).
+    control_plane_not_converged?: {
+      version?: string;
+      at?: string;
+      detail?: string;
+    };
     // #999 Part A — raw md / multipath reading, with NO verdict attached
     // (the appliance row carries that in `storage_findings` below). Typed
     // as the reading rather than as `NodeStorage` on purpose: `findings`

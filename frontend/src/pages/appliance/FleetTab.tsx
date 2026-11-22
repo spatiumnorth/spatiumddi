@@ -6176,6 +6176,22 @@ function ApplianceOsUpgradeSection({
         </p>
       )}
 
+      {row.cluster_health?.control_plane_not_converged && (
+        <p
+          role="alert"
+          className="mt-3 flex items-start gap-1.5 rounded border border-amber-500/40 bg-amber-500/10 p-2 text-[11px] text-amber-800 dark:text-amber-200"
+        >
+          <AlertCircle className="mt-0.5 h-3 w-3 shrink-0" />
+          <span>
+            <span className="font-medium">Control plane not converged.</span>{" "}
+            {row.cluster_health.control_plane_not_converged.detail ??
+              "The slot was committed before its control chart applied."}{" "}
+            Check <code>k3s kubectl -n kube-system get helmchart</code> on this
+            node.
+          </span>
+        </p>
+      )}
+
       {!isApplianceHost ? (
         <p className="mt-3 text-xs text-muted-foreground">
           OS slot upgrades + host reboot are only available on the SpatiumDDI

@@ -7820,8 +7820,10 @@ async def schedule_appliance_set_default_slot(
     * **Commit a trial boot** — operator booted the trial slot via
       ``/set-next-boot``, validated it, calls this against the
       currently-running slot to make it durable. (``firstboot.service``
-      also does this automatically when ``/health/live`` passes; this
-      endpoint exists for the explicit operator-action case.)
+      also does this automatically once k3s is Ready, the slot's images
+      are in containerd and the control chart has applied (the api runs
+      the slot's image, #4707); this endpoint exists for the explicit
+      operator-action case.)
     * **Durable revert** — operator wants to go back to the previous
       slot for good (not just one boot). Calls this against the
       previous slot."""

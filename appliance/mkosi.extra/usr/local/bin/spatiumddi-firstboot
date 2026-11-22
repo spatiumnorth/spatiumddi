@@ -7,7 +7,9 @@
 # pod on the local k3s). On every boot: reconciles SPATIUMDDI_VERSION
 # + APPLIANCE_VERSION in .env (so a slot upgrade picks up the new
 # tags), refreshes per-slot version sidecar, and (post-trial-boot)
-# commits the active slot as durable once k3s reports Ready.
+# commits the active slot as durable once k3s reports Ready, the slot's images
+# are in containerd and the control chart this boot released has applied (the
+# api runs this slot's image, #4707).
 #
 # No docker. No docker-compose. k3s.service comes up first (After=
 # ordering in spatiumddi-firstboot.service); k3s's helm-controller
@@ -26,6 +28,9 @@ uptime_s() {
     read -r _up _ </proc/uptime && echo "${_up%.*}"
 }
 FIRSTBOOT_T0=$(uptime_s 2>/dev/null || echo 0)
+# #4707 — never re-anchored (FIRSTBOOT_T0 is, after the etcd peer-reset wait):
+# the control-chart wait is sized from when the unit really started.
+FIRSTBOOT_UNIT_T0=$FIRSTBOOT_T0
 
 LOG=/var/log/spatiumddi/firstboot.log
 ENV_FILE=/etc/spatiumddi/.env
@@ -2507,6 +2512,119 @@ slot_images_allow_commit() {
     return 0
 }
 
+# ── #4707 — hold a trial slot's commit until the control chart has applied ───
+# firstboot used to commit as soon as k3s was Ready and the images verified. A
+# control chart that failed to apply (seen live: the helm controller refused
+# the api Deployment) left the upgrade committed in a split state, the api on
+# the previous release and the worker, beat and frontend on this one, with the
+# trial-boot revert already spent.
+#
+# "Applied" is read off what the chart produces: the api Deployment's template
+# carries this slot's image tag AND an api pod that is Ready runs it. The api
+# is the one workload the chart cannot move without applying, and a Ready pod
+# on the new tag is cluster-safe: on a 3-node control plane the other nodes'
+# replicas need not have rolled. Only the node that released the chart waits
+# (CONTROL_CHART_RELEASED): a joined member renders no control chart, and a
+# cluster Rolling Upgrade's held chart is released after this unit ends.
+CONTROL_API_DEPLOY="${SPATIUM_CONTROL_API_DEPLOY:-spatium-control-spatiumddi-api}"
+CONTROL_CONVERGE_TIMEOUT_S=900   # the wait, further capped by what is left of TimeoutStartSec=45min
+CONTROL_CONVERGE_MARGIN_S=120
+CONTROL_CONVERGE_POLL_S="${SPATIUM_CONTROL_CONVERGE_POLL_S:-5}"
+CONTROL_NOT_CONVERGED_FILE=/var/lib/spatiumddi/release-state/control-plane-not-converged
+CONTROL_CHART_RELEASED=0
+
+control_converge_budget() {
+    local now budget
+    now=$(uptime_s 2>/dev/null || echo 0)
+    budget=$((2700 - (now - ${FIRSTBOOT_UNIT_T0:-0}) - CONTROL_CONVERGE_MARGIN_S))
+    [ "$budget" -le "$CONTROL_CONVERGE_TIMEOUT_S" ] || budget=$CONTROL_CONVERGE_TIMEOUT_S
+    [ "$budget" -ge 0 ] || budget=0
+    echo "$budget"
+}
+
+# Success: the api Deployment's template runs this slot's tag and a Ready,
+# non-terminating api pod runs it too.
+control_chart_converged() {
+    local img pods
+    img=$(/usr/local/bin/k3s kubectl --request-timeout=10s -n spatium get deployment "$CONTROL_API_DEPLOY" \
+        -o 'jsonpath={.spec.template.spec.containers[?(@.name=="api")].image}' 2>/dev/null) || return 1
+    case "$img" in *":${SPATIUMDDI_VERSION}") ;; *) return 1 ;; esac
+    pods=$(/usr/local/bin/k3s kubectl --request-timeout=10s -n spatium get pods \
+        -l "app.kubernetes.io/component=api,app.kubernetes.io/instance=spatium-control" \
+        -o 'jsonpath={range .items[*]}{.spec.containers[?(@.name=="api")].image}{"|"}{.status.conditions[?(@.type=="Ready")].status}{"|"}{.metadata.deletionTimestamp}{"\n"}{end}' \
+        2>/dev/null) || return 1
+    printf '%s\n' "$pods" | awk -F'|' -v want=":${SPATIUMDDI_VERSION}" '
+        { n = length($1) - length(want) }
+        n >= 0 && substr($1, n + 1) == want && $2 == "True" && $3 == "" { ok = 1 }
+        END { exit ok ? 0 : 1 }'
+}
+
+# Has this slot's migrate Job run (or is it running)? Then the schema may be
+# newer than the previous release's api understands, and a revert is unsafe.
+control_migrate_ran() {
+    local jobs
+    jobs=$(/usr/local/bin/k3s kubectl --request-timeout=10s -n spatium get jobs \
+        -l "app.kubernetes.io/component=migrate,app.kubernetes.io/instance=spatium-control" \
+        -o 'jsonpath={range .items[*]}{.spec.template.spec.containers[0].image}{"|"}{.status.succeeded}{"|"}{.status.active}{"\n"}{end}' \
+        2>/dev/null) || return 1
+    printf '%s\n' "$jobs" | awk -F'|' -v want=":${SPATIUMDDI_VERSION}" '
+        { n = length($1) - length(want) }
+        n >= 0 && substr($1, n + 1) == want && ($2 + 0 > 0 || $3 + 0 > 0) { ok = 1 }
+        END { exit ok ? 0 : 1 }'
+}
+
+# The "control plane not converged" flag. The supervisor ships it in the
+# heartbeat's cluster_health (control_plane_not_converged) to the Fleet
+# drilldown; the next boot that finds the api converged removes it.
+record_control_not_converged() {
+    local tmp
+    tmp=$(mktemp "${CONTROL_NOT_CONVERGED_FILE}.XXXXXX" 2>/dev/null) || return 0
+    printf '{"version": "%s", "at": "%s", "detail": "%s"}\n' "$SPATIUMDDI_VERSION" \
+        "$(date -Iseconds)" "$1" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+    chmod 0660 "$tmp" 2>/dev/null || true
+    chgrp "${SPATIUM_HOST_GID:-0}" "$tmp" 2>/dev/null || true
+    mv -fT "$tmp" "$CONTROL_NOT_CONVERGED_FILE" 2>/dev/null || rm -f "$tmp"
+}
+
+control_converged_allow_commit() {
+    local budget waited=0
+    if [ "$CONTROL_CHART_RELEASED" != 1 ]; then
+        rm -f "$CONTROL_NOT_CONVERGED_FILE"
+        return 0
+    fi
+    # A steady-state boot has nothing to commit: look once, never delay it.
+    if control_chart_converged; then
+        rm -f "$CONTROL_NOT_CONVERGED_FILE"
+        return 0
+    fi
+    is_trial_boot || return 0
+    budget=$(control_converge_budget)
+    echo "Waiting up to ${budget}s for the control chart to apply (api on ${SPATIUMDDI_VERSION}) before committing this slot (#4707) …"
+    while [ "$waited" -lt "$budget" ]; do
+        sleep "$CONTROL_CONVERGE_POLL_S"
+        waited=$((waited + CONTROL_CONVERGE_POLL_S))
+        if control_chart_converged; then
+            rm -f "$CONTROL_NOT_CONVERGED_FILE"
+            echo "Control chart applied: the api runs ${SPATIUMDDI_VERSION}."
+            return 0
+        fi
+    done
+    echo "ERROR: the control chart did not apply within ${budget}s: the api is not running ${SPATIUMDDI_VERSION}." >&2
+    echo "       Check: k3s kubectl -n kube-system get helmchart spatium-control" >&2
+    if control_migrate_ran; then
+        # The new build's migrate Job has run, so the previous release's api
+        # would face a newer schema: a revert is the unsafe choice.
+        echo "       This slot's migrate Job has run, so a revert to the previous slot is unsafe:" >&2
+        echo "       committing, and flagging the control plane as not converged." >&2
+        record_control_not_converged "The control chart for ${SPATIUMDDI_VERSION} did not apply: the api is still on the previous release while this slot's migrate Job has run. The slot was committed because a revert would put the old api on a newer schema."
+        return 0
+    fi
+    echo "       trial boot: NOT committing this slot; next reboot reverts." >&2
+    echo "       To keep this slot: once the control chart has applied, commit it from" >&2
+    echo "       Fleet (Approve trial, on this node's slot) before the next reboot." >&2
+    return 1
+}
+
 # ── Readiness wait + slot commit ─────────────────────────────────────────────
 # Phase 8c — commit the active slot as the durable default after a
 # successful trial boot. spatium-upgrade-slot set-next-boot writes a
@@ -2541,7 +2659,7 @@ commit_slot_if_healthy() {
         return 0
     fi
     echo "  trial boot detected (booted=$current_slot, durable=${saved:-unset})."
-    echo "  k3s reports Ready — committing $current_slot as the new default."
+    echo "  k3s is Ready and the control chart has applied (or its migrate Job has run) — committing $current_slot as the new default."
     if grub-set-default --boot-directory="$grub_boot_dir" "$current_slot" \
         >> "$LOG" 2>&1; then
         # #3172 — grubenv lives on the ESP, which a mirrored install (#999)
@@ -2927,6 +3045,13 @@ place_deferred_control_manifest() {
         _strip_control_app_secret "$deferred"
     fi
     release_control_manifest
+    # #4707 — this node owns the control chart's rollout only when the chart is
+    # live now: not held back by a cluster Rolling Upgrade (the hold releases
+    # it later, after this unit), and not a joined member's (it renders none).
+    if [ -f "$CONTROL_MANIFEST" ] && [ ! -f "$CONTROL_MANIFEST_HELD" ] \
+            && [ ! -f "$deferred" ]; then
+        CONTROL_CHART_RELEASED=1
+    fi
 }
 
 # Wait for k3s to come up + helm-controller to apply the bootstrap
@@ -3028,6 +3153,8 @@ if [ "$ready" = 1 ]; then
     # manifest placed earlier long ago, and before the commit, which can exit.
     skip_tls_manifest_reapply
     slot_images_allow_commit || exit 1
+    # #4707 — and for the control chart this boot released to apply.
+    control_converged_allow_commit || exit 1
     commit_slot_if_healthy
     # #779 — immediate first verdict on Web UI firewall reachability, so a
     # missing accept rule (#776's failure) is volunteered right here in the

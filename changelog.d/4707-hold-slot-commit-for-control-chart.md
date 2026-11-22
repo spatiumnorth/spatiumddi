@@ -1,0 +1,3 @@
+### Fixed
+
+- Appliance slot upgrade: a trial slot is no longer committed before its control chart has applied. firstboot now holds the commit until the api runs the slot's image. If the chart never applies, a slot whose migrate Job has not run is left uncommitted (a reboot reverts it, and Fleet "Approve trial" keeps it), while one whose migrate Job has run is committed and flagged "Control plane not converged" in the Fleet drilldown, since a revert would put the old api on a newer schema. Stale comments claiming the commit waits for `/health/live` are corrected (#4707).
