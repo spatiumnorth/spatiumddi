@@ -34,6 +34,7 @@ the supervisor.
 from __future__ import annotations
 
 import hashlib
+import json
 import threading
 import time
 import uuid
@@ -1441,6 +1442,11 @@ def heartbeat_once(
         body["role_switch_state"] = last_lifecycle_state
         if last_lifecycle_reason is not None:
             body["role_switch_reason"] = last_lifecycle_reason
+    # #4646 — roles held back for a missing agent key. Only sent once an apply
+    # has recorded the state, so a fresh node leaves the stored value alone.
+    awaiting_key = _read_awaiting_key(cfg.state_dir)
+    if awaiting_key is not None:
+        body["roles_awaiting_key"] = awaiting_key
 
     # #170 Wave E — service-container watchdog. Every
     # ``_WATCHDOG_INTERVAL_S`` we snapshot the running containers and
@@ -2534,6 +2540,8 @@ def _run_role_lifecycle(
         # this one — we've already POSTed). Cache them on disk so a
         # supervisor restart doesn't lose them.
         _persist_lifecycle_state(state_dir, lifecycle.state, lifecycle.reason)
+        if lifecycle.state == "ready":
+            _persist_awaiting_key(state_dir, list(lifecycle.awaiting_key))
         # The runtime set just changed (or attempted to) — invalidate
         # the watchdog cache so the next heartbeat re-probes
         # immediately rather than rendering 5-min-stale health.
@@ -2575,6 +2583,7 @@ def _run_role_lifecycle(
 
 
 _LIFECYCLE_STATE_FILE = "role-switch-state"
+_AWAITING_KEY_FILE = "roles-awaiting-key.json"
 _LAST_APPLY_HASH_FILE = "role-compose.env.hash"
 
 
@@ -2661,6 +2670,32 @@ def _persist_lifecycle_state(state_dir: Path, state: str, reason: str | None) ->
         tmp.replace(path)
     except OSError:
         pass
+
+
+def _persist_awaiting_key(state_dir: Path, roles: list[str]) -> None:
+    """Record the roles the last successful apply held back for a missing
+    agent key (#4646), so every later heartbeat reports them — the apply
+    itself only runs when the role env changes."""
+    path = state_dir / _AWAITING_KEY_FILE
+    try:
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(sorted(roles)), encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        pass
+
+
+def _read_awaiting_key(state_dir: Path) -> list[str] | None:
+    """The persisted held-back roles; ``None`` when no apply has recorded
+    them yet (or the file is unreadable), which the control plane reads as
+    "not reported"."""
+    try:
+        data = json.loads((state_dir / _AWAITING_KEY_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, list):
+        return None
+    return [r for r in data if isinstance(r, str)]
 
 
 def _read_lifecycle_state(state_dir: Path) -> tuple[str | None, str | None]:
