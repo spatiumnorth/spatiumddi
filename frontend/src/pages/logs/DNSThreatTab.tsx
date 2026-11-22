@@ -1066,7 +1066,7 @@ function MuteModal({
         </div>
 
         {save.isError && (
-          <p className="text-xs text-rose-600 dark:text-rose-400">
+          <p role="alert" className="text-xs text-rose-600 dark:text-rose-400">
             {formatApiError(save.error, "Could not mute this client")}
           </p>
         )}
@@ -1130,7 +1130,10 @@ function MutedClientsPanel({
         </p>
       </div>
       {error != null && (
-        <p className="border-b px-4 py-2 text-xs text-rose-600 dark:text-rose-400">
+        <p
+          role="alert"
+          className="border-b px-4 py-2 text-xs text-rose-600 dark:text-rose-400"
+        >
           Could not un-mute: {formatApiError(error)}
         </p>
       )}

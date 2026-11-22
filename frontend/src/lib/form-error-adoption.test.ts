@@ -11,7 +11,7 @@ const SRC = join(__dirname, "..");
 // Conditions that are not a refusal of a save (stored last-run state, field
 // hints, page-level notices).
 const NOT_A_REFUSAL =
-  /last_|fingerbank|error_message|valueError|hostnameErr|errors\.|validationError|pageError|reauthFailed|latest\.|optionsError|syncError|logoError|cr\.error|status === "error"/;
+  /last_|fingerbank|error_message|valueError|hostnameErr|errors\.|validationError|pageError|reauthFailed|latest\.|optionsError|syncError|logoError|cr\.error|status === "error"|run\.error/;
 
 const PLAIN_BOX =
   /\{(?<cond>[^{}\n]*?(?:[eE]rr|[fF]ail|[rR]efus)[^{}\n]*?)\s*&&\s*\(?\s*<(?<tag>[a-z][a-z0-9]*)\s+className="(?<cls>[^"]*)"\s*>(?:(?!<\/?(?:p|div|ul|li|button)\b)[\s\S])*?<\/\k<tag>>/g;
@@ -40,7 +40,7 @@ export function plainRefusalBoxes(source: string, ternary = false): string[] {
   ]) {
     const { cond, cls } = m.groups as { cond: string; cls: string };
     if (NOT_A_REFUSAL.test(cond)) continue;
-    if (!/text-(destructive|red-)/.test(cls)) continue;
+    if (!/text-(destructive|red-|rose-)/.test(cls)) continue;
     if (/\bbg-destructive(?!\/)/.test(cls) || /hover:/.test(cls)) continue;
     if (m[0].includes("role=")) continue;
     out.push(cond.trim());
@@ -48,10 +48,55 @@ export function plainRefusalBoxes(source: string, ternary = false): string[] {
   return out;
 }
 
+// An error component (`function ApplyErrorBanner`) whose box carries no role
+// is the same defect one call site removed: `<ApplyErrorBanner error={e} />`
+// has no className for the scans above to read (#4745).
+const ERROR_COMPONENT =
+  /\nfunction\s+(?<name>[A-Z]\w*(?:Error|Banner|Refusal)\w*)\s*\([\s\S]*?\n\}\n/g;
+
+export function plainErrorComponents(source: string): string[] {
+  const out: string[] = [];
+  for (const m of source.matchAll(ERROR_COMPONENT)) {
+    const body = m[0];
+    if (!/className="[^"]*text-(destructive|red-|rose-)/.test(body)) continue;
+    if (body.includes("role=")) continue;
+    out.push((m.groups as { name: string }).name);
+  }
+  return out;
+}
+
+// Sites the #4745 widening (rose text, error components) found and that were
+// not fixed with it: per file, how many. A ratchet: it may only shrink. Several
+// are page-level banners rather than dialogs and need a look before a role.
+const KNOWN_UNANNOUNCED: Record<string, number> = {
+  "components/copilot/CopilotDrawer.tsx": 1,
+  "pages/LogsPage.tsx": 1,
+  "pages/RequestsPage.tsx": 1,
+  "pages/admin/ApiTokensPage.tsx": 1,
+  "pages/admin/DNSBLPage.tsx": 1,
+  "pages/admin/UsersPage.tsx": 1,
+  "pages/appliance/CertificatesTab.tsx": 1,
+  "pages/appliance/ClusterOverview.tsx": 1,
+  "pages/appliance/ClusterUpgradeTab.tsx": 8,
+  "pages/appliance/EtcdSnapshotsCard.tsx": 2,
+  "pages/appliance/FleetTab.tsx": 16,
+  "pages/appliance/NetworkTab.tsx": 1,
+  "pages/appliance/PairingTab.tsx": 1,
+  "pages/appliance/UpgradeImagesTable.tsx": 1,
+  "pages/network/BgpFootprintTab.tsx": 1,
+  "pages/network/DeviceDetailView.tsx": 1,
+  "pages/pcap/PacketCapturePage.tsx": 2,
+  "pages/tools/NetworkToolsPage.tsx": 1,
+};
+
 const found = new Map<string, string[]>();
 for (const f of files(SRC)) {
   const rel = relative(SRC, f);
-  const hits = plainRefusalBoxes(readFileSync(f, "utf8"), true);
+  const text = readFileSync(f, "utf8");
+  const hits = [
+    ...plainRefusalBoxes(text, true),
+    ...plainErrorComponents(text),
+  ];
   if (hits.length) found.set(rel, hits);
 }
 
@@ -77,10 +122,23 @@ describe("dialog refusals are announced (#3821)", () => {
     ).toEqual([]);
   });
 
-  it("no dialog draws a plain refusal box", () => {
+  it("detects a red rose box and an error component without a role (#4745)", () => {
+    const rose = `function XModal(){ return <Modal>{error && <div className="text-sm text-rose-600">{error}</div>}</Modal>; }`;
+    expect(plainRefusalBoxes(rose)).toEqual(["error"]);
+    const comp = `\nfunction ApplyErrorBanner({ e }) {\n  return <div className="text-destructive">{e}</div>;\n}\n`;
+    expect(plainErrorComponents(comp)).toEqual(["ApplyErrorBanner"]);
     expect(
-      [...found.keys()].sort(),
-      "use <FormError> from components/ui/form-error instead of a plain red <p>/<div>",
+      plainErrorComponents(comp.replace("<div ", '<div role="alert" ')),
     ).toEqual([]);
+  });
+
+  it("no dialog draws a new plain refusal box", () => {
+    const counts = Object.fromEntries(
+      [...found].map(([f, hits]) => [f, hits.length]).sort(),
+    );
+    expect(
+      counts,
+      "use <FormError> from components/ui/form-error (or role=alert) instead of a plain red box; do not add to KNOWN_UNANNOUNCED",
+    ).toEqual(KNOWN_UNANNOUNCED);
   });
 });
