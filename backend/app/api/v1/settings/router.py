@@ -61,6 +61,7 @@ from app.models.settings import (
 )
 from app.services import audit_forward as audit_forward_svc
 from app.services import feature_modules as fm_svc
+from app.services import log_stream_forward
 from app.services.api_token_scopes import token_write
 from app.services.appliance.access import console_only_detail, covers, effective_doors
 from app.services.appliance.apt import (
@@ -3595,6 +3596,18 @@ class AuditTargetBody(BaseModel):
     # filter
     min_severity: str | None = None
     resource_types: list[str] | None = None
+    # log streams (#4545). Syslog targets only; both off unless asked for.
+    stream_dns_query_log: bool = False
+    stream_dhcp_activity_log: bool = False
+    log_stream_filters: dict[str, list[str]] | None = None
+    dns_query_sample_percent: int = Field(default=100, ge=1, le=100)
+
+    @field_validator("log_stream_filters")
+    @classmethod
+    def _valid_log_stream_filters(
+        cls, v: dict[str, list[str]] | None
+    ) -> dict[str, list[str]] | None:
+        return log_stream_forward.normalize_filters(v)
 
     @field_validator("kind")
     @classmethod
@@ -3659,6 +3672,11 @@ class AuditTargetBody(BaseModel):
             smtp_from_address=self.smtp_from_address,
             smtp_to_addresses=self.smtp_to_addresses,
         )
+        _check_log_streams(
+            self.kind,
+            self.format,
+            self.stream_dns_query_log or self.stream_dhcp_activity_log,
+        )
         if self.kind == "webhook":
             # ``url`` is write-only (#1502): ``None`` keeps the stored URL,
             # so only an explicit blank is refused here. A webhook with no
@@ -3666,6 +3684,21 @@ class AuditTargetBody(BaseModel):
             if self.url is not None and not self.url.strip():
                 raise ValueError("url is required for a webhook target")
         return self
+
+
+def _check_log_streams(kind: str, fmt: str, any_stream: bool) -> None:
+    """A log stream needs a syslog target in a format that carries it (#4545)."""
+    if not any_stream:
+        return
+    if kind != "syslog":
+        raise ValueError(
+            "the DNS query log and DHCP activity log can only be forwarded to a syslog target"
+        )
+    if fmt not in log_stream_forward.STREAM_FORMATS:
+        raise ValueError(
+            f"log streams need one of {list(log_stream_forward.STREAM_FORMATS)} "
+            f"as the format, not {fmt!r}"
+        )
 
 
 def _check_kind_config(
@@ -3748,6 +3781,12 @@ class AuditTargetResponse(BaseModel):
     smtp_reply_to: str
     min_severity: str | None
     resource_types: list[str] | None
+    stream_dns_query_log: bool
+    stream_dhcp_activity_log: bool
+    log_stream_filters: dict[str, list[str]] | None
+    dns_query_sample_percent: int
+    log_stream_dropped_total: int
+    log_stream_last_drop_at: datetime | None
     created_at: datetime
     modified_at: datetime
 
@@ -3778,6 +3817,12 @@ def _target_to_response(t: AuditForwardTarget) -> AuditTargetResponse:
         smtp_reply_to=t.smtp_reply_to or "",
         min_severity=t.min_severity,
         resource_types=t.resource_types,
+        stream_dns_query_log=bool(t.stream_dns_query_log),
+        stream_dhcp_activity_log=bool(t.stream_dhcp_activity_log),
+        log_stream_filters=t.log_stream_filters,
+        dns_query_sample_percent=int(t.dns_query_sample_percent or 100),
+        log_stream_dropped_total=int(t.log_stream_dropped_total or 0),
+        log_stream_last_drop_at=t.log_stream_last_drop_at,
         created_at=t.created_at,
         modified_at=t.modified_at,
     )
@@ -3803,9 +3848,19 @@ _AUDIT_PLAIN_FIELDS = (
     "smtp_reply_to",
     "min_severity",
     "resource_types",
+    "stream_dns_query_log",
+    "stream_dhcp_activity_log",
+    "log_stream_filters",
+    "dns_query_sample_percent",
 )
 # Columns that are NULL-able; an explicit null on an update clears them.
-_AUDIT_NULLABLE_FIELDS = {"ca_cert_pem", "smtp_to_addresses", "min_severity", "resource_types"}
+_AUDIT_NULLABLE_FIELDS = {
+    "ca_cert_pem",
+    "smtp_to_addresses",
+    "min_severity",
+    "resource_types",
+    "log_stream_filters",
+}
 
 
 def _apply_body(t: AuditForwardTarget, body: AuditTargetBody) -> None:
@@ -3860,6 +3915,14 @@ def _check_merged_target(t: AuditForwardTarget, body: AuditTargetUpdate) -> None
             smtp_port=int(merged("smtp_port") or 0),
             smtp_from_address=merged("smtp_from_address") or "",
             smtp_to_addresses=list(to_addrs) if to_addrs else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    try:
+        _check_log_streams(
+            kind,
+            merged("format"),
+            bool(merged("stream_dns_query_log") or merged("stream_dhcp_activity_log")),
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -3957,6 +4020,10 @@ def _forward_snapshot(t: AuditForwardTarget) -> dict:
         "smtp_reply_to": t.smtp_reply_to,
         "min_severity": t.min_severity,
         "resource_types": t.resource_types,
+        "stream_dns_query_log": t.stream_dns_query_log,
+        "stream_dhcp_activity_log": t.stream_dhcp_activity_log,
+        "log_stream_filters": t.log_stream_filters,
+        "dns_query_sample_percent": t.dns_query_sample_percent,
     }
 
 
@@ -4007,6 +4074,7 @@ async def create_audit_target(
     try:
         await db.commit()
         targets_cache.invalidate()
+        log_stream_forward.invalidate()
     except Exception as exc:  # noqa: BLE001 — name collisions land here
         await db.rollback()
         raise HTTPException(
@@ -4036,6 +4104,7 @@ async def update_audit_target(
     try:
         await db.commit()
         targets_cache.invalidate()
+        log_stream_forward.invalidate()
     except Exception as exc:  # noqa: BLE001
         await db.rollback()
         raise HTTPException(
@@ -4054,6 +4123,7 @@ async def delete_audit_target(target_id: uuid.UUID, current_user: SuperAdmin, db
     await db.delete(row)
     await db.commit()
     targets_cache.invalidate()
+    log_stream_forward.invalidate()
 
 
 @router.post("/audit-forward-targets/{target_id}/test")

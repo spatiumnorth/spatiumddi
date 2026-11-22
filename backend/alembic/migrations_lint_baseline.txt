@@ -721,6 +721,12 @@ backend/alembic/versions/e5a1c39d78b2_vertical_awareness_modules.py:drop_table:3
 backend/alembic/versions/e5a1c39d78b2_vertical_awareness_modules.py:drop_table:376
 backend/alembic/versions/e5a1c39d78b2_vertical_awareness_modules.py:drop_table:381
 backend/alembic/versions/e5a1c39d78b2_vertical_awareness_modules.py:drop_table:385
+backend/alembic/versions/e5a2c8d4f7b1_audit_forward_target_log_streams.py:drop_column:113
+backend/alembic/versions/e5a2c8d4f7b1_audit_forward_target_log_streams.py:drop_column:114
+backend/alembic/versions/e5a2c8d4f7b1_audit_forward_target_log_streams.py:drop_column:115
+backend/alembic/versions/e5a2c8d4f7b1_audit_forward_target_log_streams.py:drop_column:116
+backend/alembic/versions/e5a2c8d4f7b1_audit_forward_target_log_streams.py:drop_column:117
+backend/alembic/versions/e5a2c8d4f7b1_audit_forward_target_log_streams.py:drop_column:118
 backend/alembic/versions/e5a3f17b2d8c_device_profiling_phase2.py:drop_column:108
 backend/alembic/versions/e5a3f17b2d8c_device_profiling_phase2.py:drop_column:109
 backend/alembic/versions/e5a3f17b2d8c_device_profiling_phase2.py:drop_column:110

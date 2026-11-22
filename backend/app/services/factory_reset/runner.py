@@ -38,9 +38,11 @@ from uuid import UUID
 
 import asyncpg
 import structlog
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.session_idle import only_live_sessions
+from app.models.auth import UserSession
 from app.services.factory_reset.fk_graph import (
     FK_EDGES_SQL,
     FKEdge,
@@ -260,9 +262,27 @@ async def preview_factory_reset(
             await _add_cascade_preview(db, section, preview)
         elif section.kind == "auth_rbac":
             counts = await _auth_rbac_counts(db, calling_user_id)
+            # Same rule as Administration > Sessions (#4615): the rows the
+            # reset deletes include revoked / expired / idle ones that
+            # page never lists.
+            live_sessions = int(
+                (
+                    await db.execute(
+                        await only_live_sessions(
+                            select(func.count()).select_from(UserSession), db, datetime.now(UTC)
+                        )
+                    )
+                ).scalar()
+                or 0
+            )
             preview.table_counts = counts
             preview.affected_rows = sum(counts.values())
             preview.notes.append("calling superadmin + built-in roles preserved")
+            preview.notes.append(
+                "every login session ends, including yours: "
+                f"{live_sessions} live session(s) end "
+                f"({counts['user_session']} stored session row(s) deleted)"
+            )
             if AUTH_RBAC_CASCADE_DEPENDENTS:
                 preview.notes.append(
                     "rows owned by a deleted user go with it: "
@@ -386,6 +406,9 @@ async def _auth_rbac_counts(db: AsyncSession, calling_user_id: UUID) -> dict[str
     counts["group"] = int((await db.execute(text('SELECT COUNT(*) FROM "group"'))).scalar() or 0)
     counts["role"] = int(
         (await db.execute(text("SELECT COUNT(*) FROM role WHERE is_builtin = false"))).scalar() or 0
+    )
+    counts["user_session"] = int(
+        (await db.execute(text("SELECT COUNT(*) FROM user_session"))).scalar() or 0
     )
     counts["api_token"] = int(
         (await db.execute(text("SELECT COUNT(*) FROM api_token"))).scalar() or 0

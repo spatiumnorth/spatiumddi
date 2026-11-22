@@ -57,7 +57,7 @@ from app.models.dns import (
     DNSZone,
     DNSZoneUpdateAcl,
 )
-from app.services.dns import technitium_api_scope
+from app.services.dns import dnssec_policy_support, technitium_api_scope
 from app.services.dns.dnssec_signers import SIGNING_DRIVERS, lock_group, signing_server_count
 from app.services.dns.named_conf_validation import is_name_reference, key_reference
 from app.services.dns.pool_geo import EXTERNAL_IMPORT_SOURCE, build_geo_steering
@@ -235,6 +235,9 @@ class ZoneMovePlan:
     #: #4435 — an RFC 2317 classless zone name (``64/26.…``) landing in a group
     #: whose driver cannot serve one. Refused, never waived.
     classless_refusal: str | None = None
+    #: #4623 — the zone's custom DNSSEC policy would land on a PowerDNS group,
+    #: which signs with fixed settings and ignores it. Refused, never waived.
+    dnssec_policy_refusal: str | None = None
     #: #4570 — a forward / stub zone landing in a PowerDNS group. Refused, never waived.
     powerdns_refusal: str | None = None
     #: #4565 — the zone or a record of it would keep a view in a target whose
@@ -846,6 +849,14 @@ async def assemble_move_plan(
     plan.powerdns_refusal = powerdns_zone_type_refusal(plan.target_drivers, zone.zone_type)
     if plan.powerdns_refusal:
         plan.powerdns_refusal = f"Group {target_group.name!r}: {plan.powerdns_refusal}"
+
+    # ── A custom DNSSEC policy a PowerDNS target would ignore (#4623, a refusal) ──
+    msg = await dnssec_policy_support.move_refusal(
+        db, zone, plan.source_drivers, plan.target_drivers
+    )
+    if msg:
+        plan.dnssec_policy_refusal = f"Group {target_group.name!r}: {msg}"
+
     # ── A view kept in a target that cannot serve views (#4565, a refusal) ──
     if plan.zone_view_action == "remapped" or plan.records_remapped:
         unservable = views_refusal(plan.target_drivers)
@@ -1149,6 +1160,8 @@ async def commit_move(
         raise ZoneMoveError(plan.classless_refusal, status_code=422)
     if plan.powerdns_refusal:
         raise ZoneMoveError(plan.powerdns_refusal, status_code=422)
+    if plan.dnssec_policy_refusal:
+        raise ZoneMoveError(plan.dnssec_policy_refusal, status_code=422)
     if plan.views_refusal:
         raise ZoneMoveError(plan.views_refusal, status_code=422)
     if plan.technitium_acl_refusal:
