@@ -103,6 +103,45 @@ The agent drives Kea by:
 2. Running `kea-dhcp4 -t` / `kea-dhcp6 -t` on the written file to catch validation errors *before* touching the live config. Exit 1 is a rejection; a check that cannot run (missing binary, timeout, crash) fails the apply in the `validate` phase rather than passing it.
 3. Calling `config-reload`, which re-reads the file without dropping in-flight leases.
 
+### Option 82 client-class match (#54)
+
+`DHCPDriver.compile_relay_match(RelayMatchSpec)` turns the neutral spec
+(`drivers/dhcp/base.py`: `RelayMatchCondition` carries bytes, never text) into
+the backend's class test; `relay_match_support` says whether the backend can
+carry it. Kea compiles each condition to one parenthesised term, joined by
+` and ` / ` or ` in the operator's order (`N` the sub-option, `0xH` the
+uppercase hex of the value, `L` its byte length):
+
+| op | Kea term |
+|---|---|
+| exists | `relay4[N].exists` |
+| not_exists | `not relay4[N].exists` |
+| equals | `relay4[N].hex == 0xH` |
+| not_equals | `(relay4[N].exists and not (relay4[N].hex == 0xH))` |
+| starts_with | `substring(relay4[N].hex, 0, L) == 0xH` |
+| ends_with | `substring(relay4[N].hex, -L, all) == 0xH` |
+| slice | `substring(relay4[N].hex, OFFSET, L) == 0xH` |
+
+No operator character reaches the expression: the output is built from
+`[a-z0-9A-F[]().,= -]`. Measured on kea-dhcp4 3.0.3: `relay4[N]` takes a number
+only (`relay4[circuit-id]` is a parse error) in 0-255; `0x` with no digits fails
+the whole config; a `'` in a quoted string cannot be escaped; a missing
+sub-option reads as an empty string. `ends_with` and `slice` were run against a
+live Kea (relayed DORA, pools restricted to the classes): a matching value
+selects the pool, and a different value, a sub-option shorter than the value
+(or than offset plus length) and a request with no option 82 do not match,
+without error. `backend/tests/fixtures/relay_match_golden.json` holds the
+compiled tests; `agent/dhcp/tests/test_relay_match_kea_live.py` runs each
+through `kea-dhcp4 -t` where Kea is installed.
+
+Windows DHCP: `capabilities()["relay_agent_match"]` is `False` and the API
+refuses the spec for a group with no Kea server. `relay_match_support`
+documents the seam for a later write-through: sub-options 1 / 2 / 6 map to
+`Add-DhcpServerv4Policy -CircuitId` / `-RemoteId` / `-SubscriberId`, equals /
+not_equals to `EQ` / `NE`, starts_with / ends_with to a trailing / leading `*`,
+and `combine` to `-Condition AND|OR`. `exists`, `slice` and other
+sub-options have no cmdlet form.
+
 ### Kea 3.0 path restrictions
 
 Kea 3.0 (CVE-2025-32801/2/3) refuses to start if hook libraries, unix control sockets, lease files or log files sit outside its **compiled-in default directories**. Enforcement is a literal string compare of the config path's parent — there is no `realpath()`, so even `/var/run/kea` vs `/run/kea` fails. Alpine builds Kea with `-Dprefix=/usr -Dlocalstatedir=/var -Drunstatedir=/run`, so the enforced defaults are `/usr/lib/kea/hooks`, `/run/kea`, `/var/lib/kea`, `/var/log/kea` — **exactly** SpatiumDDI's existing layout, which is why the 2.6 → 3.0 jump needed no config changes. Do not relocate any of them. Verify with `kea-dhcp4 -W` ("Hooks directory") and `kea-dhcp4 -T <conf>`.

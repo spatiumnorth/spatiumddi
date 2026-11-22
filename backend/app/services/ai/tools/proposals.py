@@ -547,6 +547,7 @@ from app.services.ai.operations_writes import (  # noqa: E402
     CommitDNSImportArgs,
     CommitNetboxImportArgs,
     CreateConformityPolicyArgs,
+    CreateDHCPClientClassArgs,
     CreateMulticastDomainArgs,
     CreateWebhookArgs,
     DeleteMulticastDomainArgs,
@@ -561,6 +562,36 @@ from app.services.ai.operations_writes import (  # noqa: E402
     UpdateSyslogSettingsArgs,
     UpdateWebhookArgs,
 )
+
+# ── propose_create_dhcp_client_class (#54) ────────────────────────────
+
+
+@register_tool(
+    name="propose_create_dhcp_client_class",
+    permission=("write", "dhcp_client_class"),
+    description=(
+        "Prepare a DHCP client class proposal. Operator must click Approve "
+        "to apply. Pass group_id (UUID), name, and EITHER match_spec (the "
+        "structured option 82 / relay agent information match: combine "
+        "all|any plus conditions of sub_option 1-255, op exists / not_exists "
+        "/ equals / not_equals / starts_with / ends_with / slice, and a text "
+        "or hex value) OR match_expression (a Kea test). The preview shows "
+        "the compiled Kea test. A class does not change who gets an address "
+        "until a pool names it. Option 82 is DHCPv4 and Kea only. Use when "
+        "the operator says 'match clients behind switch port eth0/1'."
+    ),
+    args_model=CreateDHCPClientClassArgs,
+    writes=False,
+    category="dhcp",
+    module="core.dhcp",
+)
+async def propose_create_dhcp_client_class(
+    db: AsyncSession, user: User, args: CreateDHCPClientClassArgs
+) -> dict[str, Any]:
+    return await _propose_via(
+        db=db, user=user, operation_name="create_dhcp_client_class", args=args
+    )
+
 
 # ── Conformity (#105 / #106) ──────────────────────────────────────────
 

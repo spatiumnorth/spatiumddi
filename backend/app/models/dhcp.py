@@ -1024,6 +1024,11 @@ class DHCPClientClass(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     match_expression: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # Structured relay-agent (option 82) match (#54). NULL = a hand-written
+    # ``match_expression`` (every row stored before #54). When set, the API
+    # compiles it and overwrites ``match_expression`` in the same write, so
+    # the bundle, the agent and the ETag only ever see the compiled test.
+    match_spec: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
     # Which Kea daemons the class is rendered into (#1229): ``ipv4``,
     # ``ipv6`` or ``dual``. A class used to go into both, and a v4-only test

@@ -2154,6 +2154,134 @@ register(
 
 
 # ══════════════════════════════════════════════════════════════════════
+# create_dhcp_client_class (#54) — structured option 82 match or a Kea test
+# ══════════════════════════════════════════════════════════════════════
+
+
+class CreateDHCPClientClassArgs(BaseModel):
+    """Args for the ``create_dhcp_client_class`` operation.
+
+    Send ``match_spec`` (the option 82 builder) OR ``match_expression`` (a Kea
+    test), not both. Created through the REST handler's own validation, so the
+    class lands exactly as it would from the DHCP page.
+    """
+
+    group_id: str = Field(
+        description="UUID of the DHCP server group the class belongs to (classes are group-wide)."
+    )
+    name: str = Field(description="Class name; unique in the group.")
+    description: str = Field(default="", description="Free-form description.")
+    address_family: Literal["ipv4", "ipv6", "dual"] = Field(
+        default="ipv4", description="Daemons the class renders into. An option 82 match is ipv4."
+    )
+    match_spec: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Structured option 82 (relay agent information) match: "
+            '{"combine": "all"|"any", "conditions": [{"sub_option": 1, '
+            '"op": "equals", "encoding": "text"|"hex", "value": "eth0/1"}]}. '
+            "sub_option is 1-255 (1 circuit-id, 2 remote-id, 6 subscriber-id, 12 relay-id); "
+            "op is one of exists, not_exists, equals, not_equals, starts_with, ends_with, "
+            "slice (slice also takes offset). The server compiles it to the Kea test."
+        ),
+    )
+    match_expression: str = Field(
+        default="", description="A hand-written Kea test; leave empty when match_spec is set."
+    )
+    options: dict[str, Any] = Field(
+        default_factory=dict, description="DHCP option overrides delivered to matching clients."
+    )
+
+    def to_body(self) -> Any:
+        from app.api.v1.dhcp.client_classes import ClientClassCreate  # noqa: PLC0415
+
+        return ClientClassCreate(
+            name=self.name,
+            description=self.description,
+            address_family=self.address_family,
+            match_spec=self.match_spec,  # type: ignore[arg-type]  # validated by the model
+            match_expression=self.match_expression,
+            options=self.options,
+        )
+
+
+async def _validated_class_body(db: AsyncSession, args: CreateDHCPClientClassArgs) -> Any:
+    """The create body after the REST handler's checks, or a ``ValueError``."""
+    from fastapi import HTTPException  # noqa: PLC0415
+    from pydantic import ValidationError  # noqa: PLC0415
+
+    from app.api.v1.dhcp.client_classes import validate_new_class  # noqa: PLC0415
+
+    try:
+        group_id = uuid.UUID(args.group_id)
+    except ValueError as exc:
+        raise ValueError(f"group_id {args.group_id!r} is not a UUID.") from exc
+    try:
+        body = args.to_body()
+    except ValidationError as exc:
+        first = exc.errors()[0]
+        loc = ".".join(str(p) for p in first["loc"])
+        raise ValueError(f"{loc}: {first['msg']}") from exc
+    try:
+        await validate_new_class(db, group_id, body)
+    except HTTPException as exc:
+        raise ValueError(str(exc.detail)) from exc
+    return body
+
+
+async def _preview_create_dhcp_client_class(
+    db: AsyncSession, user: User, args: CreateDHCPClientClassArgs
+) -> PreviewResult:
+    from app.models.dhcp import DHCPServerGroup  # noqa: PLC0415
+
+    try:
+        group = await db.get(DHCPServerGroup, uuid.UUID(args.group_id))
+    except ValueError:
+        return PreviewResult(ok=False, detail=f"group_id {args.group_id!r} is not a UUID.")
+    if group is None:
+        return PreviewResult(ok=False, detail=f"DHCP server group {args.group_id} not found.")
+    try:
+        body = await _validated_class_body(db, args)
+    except ValueError as exc:
+        return PreviewResult(ok=False, detail=str(exc))
+    shown = body.match_expression or "(matches every client)"
+    return PreviewResult(
+        ok=True,
+        detail="ready",
+        preview_text=(
+            f"Create DHCP client class '{body.name}' in group '{group.name}' "
+            f"({body.address_family}) with test: {shown}"
+        ),
+    )
+
+
+async def _apply_create_dhcp_client_class(
+    db: AsyncSession, user: User, args: CreateDHCPClientClassArgs
+) -> dict[str, Any]:
+    from app.api.v1.dhcp.client_classes import create_class  # noqa: PLC0415
+
+    cc = await create_class(uuid.UUID(args.group_id), args.to_body(), db, user)
+    return {
+        "client_class_id": str(cc.id),
+        "name": cc.name,
+        "match_expression": cc.match_expression,
+    }
+
+
+register(
+    Operation(
+        name="create_dhcp_client_class",
+        description="Create a DHCP client class (option 82 match_spec or a Kea test expression).",
+        args_model=CreateDHCPClientClassArgs,
+        preview=_preview_create_dhcp_client_class,
+        apply=_apply_create_dhcp_client_class,
+        category="dhcp",
+        required_permission=("write", "dhcp_client_class"),
+    )
+)
+
+
+# ══════════════════════════════════════════════════════════════════════
 # NetBox IPAM import (commit) — live-pull one-shot migration (#36)
 # ══════════════════════════════════════════════════════════════════════
 #

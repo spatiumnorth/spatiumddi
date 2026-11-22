@@ -428,6 +428,10 @@ CASES: dict[str, Callable[[Seed], Req]] = {
         "/api/v1/av/allocation-preview",
         {"space_id": str(s.space_id), "address_or_cidr": "239.10.0.5", "av_protocol": "dante"},
     ),
+    "/api/v1/dhcp/client-classes/compile-match": lambda s: _json(
+        "/api/v1/dhcp/client-classes/compile-match",
+        {"match_spec": {"conditions": [{"sub_option": 1, "op": "exists"}]}},
+    ),
     "/api/v1/dhcp/import/isc/preview": lambda s: {
         "url": "/api/v1/dhcp/import/isc/preview",
         "files": {"file": ("dhcpd.conf", _ISC, "text/plain")},

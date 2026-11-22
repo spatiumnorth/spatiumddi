@@ -87,6 +87,7 @@ from app.drivers.dhcp.base import (
     ExclusionItem,
     ExclusionResult,
     MACBlockDef,
+    RelayMatchSpec,
     RemoveReservationItem,
     ReservationItem,
     ReservationResult,
@@ -1228,8 +1229,27 @@ Remove-DhcpServerv4ExclusionRange -ScopeId {_ps_literal(scope_id)} `
             max_events=max_events,
         )
 
+    def relay_match_support(self, spec: RelayMatchSpec) -> tuple[bool, str]:
+        """Whether Add-DhcpServerv4Policy could express ``spec`` (#54).
+
+        Not written through in this release (a Windows policy owns IP ranges,
+        options and a lease time at scope level, which is its own feature);
+        this proves the neutral spec maps, so a later write-through has its
+        seam. ``-CircuitId`` / ``-RemoteId`` / ``-SubscriberId`` take EQ / NE
+        with a leading or trailing ``*``; ``exists``, ``slice`` and other
+        sub-options have no cmdlet form.
+        """
+        bad = sorted({c.sub_option for c in spec.conditions if c.sub_option not in (1, 2, 6)})
+        if bad:
+            return (False, f"Windows DHCP policies cover sub-options 1, 2 and 6, not {bad}")
+        ops = sorted({c.op for c in spec.conditions if c.op in ("exists", "not_exists", "slice")})
+        if ops:
+            return (False, f"Windows DHCP policies have no equivalent of {', '.join(ops)}")
+        return (True, "")
+
     def capabilities(self) -> dict[str, Any]:
         return {
+            "relay_agent_match": False,
             # No full-bundle config push (render_config / apply_config /
             # reload / restart stay unimplemented — those aren't how
             # Windows DHCP reconfigures). But individual scope / pool /

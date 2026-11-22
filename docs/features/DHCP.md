@@ -786,6 +786,8 @@ DHCPClientClass
   name: str             -- e.g., "VoIPPhones"
   match_expression: str -- Kea expression
                         -- e.g., "option[60].hex == 'Cisco7960'"
+                        -- compiled from match_spec when that is set
+  match_spec: json|null -- structured option 82 match (#54); NULL = hand-written
   description: str
   address_family: ipv4 | ipv6 | dual   -- which Kea daemons get it (#1229)
 ```
@@ -793,6 +795,89 @@ DHCPClientClass
 Classes are referenced by pool `class_restriction` field. The DHCP driver translates these to server-native syntax.
 
 The reference is by name, and Kea accepts a name it does not define (the pool then matches nobody), so the API guards it (#2285): renaming or deleting a class, or deleting a device policy, is refused with a 409 while a pool in the group (or another class's `member()` test) still names it; a pool naming a class that does not exist is a 422. A dangling restriction that still reaches a bundle is rendered as stored (fail closed, never opened to every client) and logged as `dhcp_pool_restricted_to_undefined_class` when the set of dangling references changes.
+
+### Relay agent (option 82) matching (#54)
+
+A switch or relay that adds DHCP option 82 (RFC 3046, relay agent
+information) tells the server which port a request came in on: the
+circuit ID (sub-option 1) and the remote ID (2), often the subscriber ID (6).
+A class can match on them without anyone writing Kea syntax. Send
+`match_spec` instead of `match_expression`; the API compiles it and stores
+the result in `match_expression` in the same write, so the bundle, the agent
+and the ETag see an ordinary class.
+
+```json
+{
+  "kind": "relay_agent",
+  "combine": "all",
+  "conditions": [
+    {"sub_option": 1, "op": "starts_with", "encoding": "text", "value": "eth0/"},
+    {"sub_option": 2, "op": "equals", "encoding": "hex", "value": "AA:BB:CC:01:02:03"}
+  ]
+}
+```
+
+`combine` is `all` or `any`. Up to 16 conditions, in the order you give them.
+`sub_option` is any number 1-255 (1 circuit-id, 2 remote-id, 6 subscriber-id,
+12 relay-id are the usual ones). `value` is 1-255 bytes, typed as `text`
+(matched as its UTF-8 bytes) or `hex` (`0x`, `:`, `-`, `.` and spaces are
+stripped; an odd number of digits is refused). It is stored normalised: hex
+uppercase with no separators, text as typed.
+
+| `op` | Matches when |
+|---|---|
+| `exists` / `not_exists` | the sub-option is / is not present |
+| `equals` | the sub-option's bytes equal the value |
+| `not_equals` | the sub-option is present **and** differs |
+| `starts_with` / `ends_with` | the value is a prefix / suffix of the sub-option |
+| `slice` | the bytes at `offset` (0-254), as long as the value, equal it |
+
+`not_equals` requires the sub-option to be present because Kea reads a
+missing sub-option as an empty string, so a bare "not equal" would also match
+every client that is not behind a relay. To include those, add a
+`not_exists` condition under `any`. A value shorter than the sub-option's
+tail, or a slice past the end, simply does not match.
+
+Every operand reaches Kea as a number or as a hex literal built from bytes,
+never as a quoted string (Kea has no escape for `'` in a string literal), so
+no value an operator types can change the expression or break the config.
+
+**Rules.** An option 82 match is DHCPv4 only (`address_family` must be
+`ipv4`; 422 otherwise). It is rendered by Kea only: a group whose servers are
+all Windows DHCP (or FortiGate) refuses it with a 422, and manage option 82
+policies on the Windows server itself. An empty group is allowed (servers may
+join later), as is a mixed one, where only the Kea members render it. A
+request carrying both `match_spec` and a `match_expression` that is not what
+`match_spec` compiles to is a 422; send one. On update, `match_spec: null`
+converts the class to a hand-written one and keeps the compiled text as the
+starting expression; an expression-only update of a builder class is a 422
+telling you so.
+
+`POST /api/v1/dhcp/client-classes/compile-match` takes `{"match_spec": ...}`
+and returns `{expression, warnings, windows}` without writing anything (it
+needs only read access); the UI previews with it. `windows.supported` says
+whether a Windows DHCP policy could express the same match; nothing is pushed
+to Windows in this release.
+
+**Pools.** A class steers a pool through its `class_restriction`. Kea does not
+decide the pool by class alone: a pool with no restriction is open to every
+client, so a client matching a class can still be given an address from an
+open pool in the same subnet. To keep a port's clients in one range, restrict
+every pool in the subnet.
+
+**Renewals need more than the class.** A client renews by unicast at half its
+lease time, with no relay in the path, so its renewal carries no option 82
+and a class built on it stops matching. Kea can remember the relay
+information from the first request (`stash-agent-options` together with
+`store-extended-info`); without both, the renewal of a lease that came from a
+class-restricted pool is NAKed (measured on Kea 3.0.3). Turning these on from
+the class is tracked separately; until it ships, a group that depends on an
+option 82 pool restriction needs both set in its Kea configuration.
+
+The Copilot can read these (`list_dhcp_client_classes` returns `match_spec`,
+`count_dhcp_client_classes`) and stage one with
+`propose_create_dhcp_client_class`; the operator's Apply performs the write
+through the same checks as the REST create.
 
 ### Address family (#1229, #1295)
 

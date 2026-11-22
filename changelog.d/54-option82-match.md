@@ -1,0 +1,2 @@
+### Added
+- DHCP client classes can match on relay agent information (option 82): a new structured `match_spec` (sub-option, operator such as equals, starts with, ends with or bytes-at-offset, and a text or hex value) is compiled by the server into the Kea test, with every value emitted as a hex literal. Kea groups only, IPv4 only; Windows DHCP groups refuse it. `POST /dhcp/client-classes/compile-match` previews the result, and the Operator Copilot gains `propose_create_dhcp_client_class` and `count_dhcp_client_classes`. Refs #54.
