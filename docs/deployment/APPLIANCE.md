@@ -3436,6 +3436,33 @@ so a reinstall during the rollback can mint a new `SECRET_KEY` and
 leave every credential encrypted at rest unreadable. If you must go
 back, restore the pre-upgrade backup together with the older release.
 
+**Restoring a backup onto a fresh install (#4677).** This is the way back
+when an appliance is lost and rebuilt, or when you reinstall the older
+release and restore the pre-upgrade backup. The steps:
+
+1. Install the release the backup was taken on, or a newer one (a newer
+   schema than the install knows is refused), and sign in with the install's
+   own admin.
+2. Backup → Restore from file or destination → Full restore, with the
+   passphrase and `RESTORE-FROM-BACKUP`. Keep "Exclude secrets" archives out
+   of this path: they carry no credentials, so nobody can sign in after one.
+3. Sign in with the **backup's** accounts; the install's own admin is gone.
+
+A restore replaces the appliance registry and the internal CA with the
+archive's. Since #4677 the restore keeps the rows of the appliances that
+are alive in this install before the replay (certificate, roles, state),
+puts the install's CA back when the archive's differs, and drops an
+archive row for the same hostname, so the supervisor on this node keeps
+heartbeating and its DNS and DHCP roles keep serving. The restore result
+names what was kept, and the audit entry `backup_restored` carries
+`adopted_appliances`. Group assignments are matched by group name; a node
+whose group the archive lacks has no group until you assign one. Archive
+appliances that exist no more stay in the Fleet list with no heartbeat:
+delete them there. One that does still exist, on another node, has a
+certificate from the archive's CA, so re-key it or pair it again.
+Releases before this fix revoke the appliance about 30 seconds after the
+restore, and nothing in the console brings it back.
+
 **Where SECRET_KEY lives (#1448).** From the release after 2026.10.02-1,
 firstboot keeps `SECRET_KEY` in `spatium-control-app-keys` in the
 `spatium` namespace, a Secret no Helm release owns, and points the
@@ -3485,8 +3512,47 @@ No api is needed: firstboot commits the slot as the durable default once
 k3s's `/readyz` answers and every baked image is in containerd, as for an
 upgrade (step 7 above), and the database is left as it is. If that boot
 fails, the next reboot falls back to the older slot, as any trial boot
-does. The only other way out is to restore a pre-upgrade copy of the
-database by hand.
+does. The way back to the older release itself is the reinstall and
+restore below.
+
+### The way back from 1.0.1 to 1.0.0 (#4658)
+
+Upgrading from 1.0.0 to 1.0.1 is supported. Going back is **not** a slot
+rollback. A slot rollback leaves the database on 1.0.1's schema, and a
+restore after an acknowledged rollback is refused (above). The supported
+way back is to reinstall 1.0.0 and restore the backup you took before the
+upgrade:
+
+1. **Before you upgrade, take a backup and keep the archive.** Take a
+   Full backup from Backup, with a passphrase you will still know, and
+   copy the archive off the appliance. Do not use "Exclude secrets": an
+   archive without credentials leaves nobody able to sign in after the
+   restore. Run the backup right before the upgrade. Anything you change
+   after it is not in the archive.
+2. **Reinstall 1.0.0** from its ISO, and finish setup. The install
+   starts empty, with its own admin.
+3. **Restore the archive** on that install, from the web UI (Backup →
+   Restore) or the console: Full restore, the passphrase, and
+   `RESTORE-FROM-BACKUP`. The steps and the checks are the ones in
+   "Restoring a backup onto a fresh install" above. The archive was
+   taken on 1.0.0, so 1.0.0 can restore it.
+
+What to expect:
+
+- **What comes back.** The archive's data: IPAM, DNS, DHCP, settings,
+  users and stored credentials. Anything changed after the backup is
+  gone, and so are leases that were issued after it.
+- **You sign in again.** The restore replaces the user accounts with
+  the archive's. Sign in with the **backup's** accounts and passwords;
+  the password you set on the new install no longer works.
+- **The appliance keeps its place.** The supervisor on a node you
+  reinstalled stays approved and its DNS and DHCP roles keep serving
+  (#4680). Appliances that were in the archive but no longer exist stay
+  in the Fleet list with no heartbeat: delete them there.
+- **Multi-node clusters.** The walk of this path covered reinstalling
+  and restoring on a three-node cluster, and the roles kept serving. It
+  did not cover every layout, so check Fleet and a DNS and DHCP answer
+  on each node after the restore.
 
 ### 5c. Phase 8f fleet upgrade orchestration
 
