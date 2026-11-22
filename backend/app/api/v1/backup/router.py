@@ -415,6 +415,7 @@ async def restore_backup(
                     "allow_newer_schema": allow_newer_schema,
                     "warnings": outcome.warnings,
                     "reconciled_backup_targets": outcome.reconciled_backup_targets,
+                    "sessions_ended": outcome.sessions_ended,
                 },
             )
         )
@@ -507,6 +508,9 @@ async def restore_backup(
         )
     elif migration is not None and migration.state == "unknown":
         note += f" Schema-version skew check skipped: {migration.error or 'unknown reason'}."
+
+    if outcome.sessions_ended:
+        note += " Every session was ended; sign in again."
 
     if outcome.pre_restore_path is None:
         note += (
