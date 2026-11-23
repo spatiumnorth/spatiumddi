@@ -108,6 +108,7 @@ import {
   type SecurityDashboardSummary,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { countNoun } from "@/lib/count-noun";
 import { includeInUtilization } from "@/lib/utilization";
 import { useSessionState } from "@/lib/useSessionState";
 import { safeLocalStorage } from "@/lib/safeStorage";
@@ -3768,7 +3769,9 @@ function IntegrationsPanel({
                       name={c.name}
                       subtitle={c.api_server_url}
                       meta={
-                        c.node_count != null ? `${c.node_count} nodes` : "—"
+                        c.node_count != null
+                          ? countNoun(c.node_count, "node")
+                          : "—"
                       }
                       lastSyncedAt={c.last_synced_at}
                       lastSyncError={c.last_sync_error}
@@ -3808,7 +3811,7 @@ function IntegrationsPanel({
                       subtitle={h.endpoint}
                       meta={
                         h.container_count != null
-                          ? `${h.container_count} containers`
+                          ? countNoun(h.container_count, "container")
                           : "—"
                       }
                       lastSyncedAt={h.last_synced_at}
@@ -4643,7 +4646,7 @@ function ComplianceKpi({
           ? isRefused(error)
             ? "you may not read subnets"
             : "couldn't load subnets"
-          : `${pct}% of ${total} subnets · click to filter`}
+          : `${pct}% of ${countNoun(total, "subnet")} · click to filter`}
       </p>
     </Link>
   );
@@ -4845,7 +4848,8 @@ export function ConformityPanel() {
               >
                 <p className="text-xs font-semibold">{fw.framework}</p>
                 <p className="text-[11px] text-muted-foreground">
-                  {fw.policies_enabled}/{fw.policies_total} policies enabled
+                  {fw.policies_enabled}/
+                  {countNoun(fw.policies_total, "policy", "policies")} enabled
                 </p>
                 <p
                   className={cn(
@@ -5880,7 +5884,7 @@ function SecurityPanel() {
             {data.api_tokens_expiring_count}
           </p>
           <p className="text-[11px] text-muted-foreground">
-            of {data.api_tokens_total} tokens · within 30 d
+            of {countNoun(data.api_tokens_total, "token")} · within 30 d
           </p>
         </Link>
         <Link
