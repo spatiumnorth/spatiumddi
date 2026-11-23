@@ -41,12 +41,19 @@ def test_no_stamps_is_unknown_not_stale(tmp_path: Path) -> None:
     assert st.apt_update_stale(tmp_path / "ok", tmp_path / "attempt") is False
 
 
-def test_stale_update_overrides_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(st, "read_apt_state", lambda: "synced")
-    monkeypatch.setattr(st, "apt_update_stale", lambda: True)
-    assert st.read_apt_state_with_update() == "update-stale"
-    monkeypatch.setattr(st, "apt_update_stale", lambda: False)
-    assert st.read_apt_state_with_update() == "synced"
-    monkeypatch.setattr(st, "read_apt_state", lambda: None)
-    monkeypatch.setattr(st, "apt_update_stale", lambda: True)
-    assert st.read_apt_state_with_update() is None
+def test_periodic_update_switched_off_is_not_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = tmp_path / "off"
+    marker.write_text("")
+    monkeypatch.setattr(st, "_APT_PERIODIC_OFF_MARKER", marker)
+    ok = _stamp(tmp_path / "ok", 30 * DAY)
+    assert st.apt_update_stale(ok, tmp_path / "attempt") is False
+
+
+def test_collect_sends_stale_as_its_own_field(monkeypatch: pytest.MonkeyPatch) -> None:
+    import inspect
+
+    src = inspect.getsource(st.collect)
+    assert '"apt_update_stale": apt_update_stale()' in src
+    assert '"apt_state": read_apt_state()' in src

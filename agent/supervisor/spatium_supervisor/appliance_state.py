@@ -722,6 +722,9 @@ _APT_UPDATE_SUCCESS_STAMP = Path("/var/lib/spatiumddi-host/release-state/apt-upd
 _APT_UPDATE_ATTEMPT_STAMP = Path("/var/lib/spatiumddi-host/release-state/apt-update-attempt")
 # Longer than apt-daily's one-day cadence plus its randomized delay.
 _APT_UPDATE_STALE_SECONDS = 3 * 24 * 3600
+# Written by spatiumddi-apt-reload while the periodic update is switched off
+# (Settings -> APT -> unattended upgrades off): a stale list is then intended.
+_APT_PERIODIC_OFF_MARKER = Path("/var/lib/spatiumddi-host/release-state/apt-periodic-off")
 # Issue #343 — LLDP / lldpd equivalents. Same shape as SNMP / NTP.
 _LLDP_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/lldp-config-pending")
 _LLDP_HASH_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/lldp-config-hash")
@@ -2946,24 +2949,14 @@ def apt_update_stale(
     (#4800). Sources that cannot be reached leave the apt timers green, so
     security updates silently stop arriving. False when apt has left no stamp
     at all (unknown, not stale)."""
+    if _APT_PERIODIC_OFF_MARKER.exists():
+        return False
     now = time.time() if now is None else now
     try:
         return now - success_stamp.stat().st_mtime > _APT_UPDATE_STALE_SECONDS
     except OSError:
         pass
     return attempt_stamp.exists()
-
-
-def read_apt_state_with_update() -> str | None:
-    """``read_apt_state`` with ``update-stale`` layered on top (#4800): the
-    sidecar only knows the state at the last config apply, not whether the
-    sources are still reachable. A stale ``apt-get update`` wins over every
-    state except ``None`` (non-appliance / unreadable), so an older control
-    plane still sees a value it can store."""
-    state = read_apt_state()
-    if state is None:
-        return None
-    return "update-stale" if apt_update_stale() else state
 
 
 def read_snmpd_running() -> bool | None:
@@ -5051,7 +5044,11 @@ def collect() -> dict[str, object]:
         "ntp_sync_state": read_ntp_sync_state() if is_appliance else None,
         # Issue #155 — APT host-config state from the runner's status
         # sidecar after validate + swap. None on non-appliance deploys.
-        "apt_state": read_apt_state_with_update() if is_appliance else None,
+        "apt_state": read_apt_state() if is_appliance else None,
+        # #4800 — a NEW field (an older control plane ignores it; a new
+        # apt_state value would 422 there). The control plane folds it into
+        # apt_state="update-stale".
+        "apt_update_stale": apt_update_stale() if is_appliance else None,
         # #387 — per-plane host-config apply health (snmp / ntp / lldp /
         # syslog / ssh / resolver / firewall / timezone). Surfaces a
         # stuck apply (the bounded-retry guard is backing it off) so the

@@ -5,17 +5,22 @@
   off for a day so an offline install logs once a day.
 * The release check run at beat start finds no settings row on a fresh
   install; it retries until the row exists instead of waiting for the 24 h tick.
-* The supervisor heartbeat accepts the ``update-stale`` APT state.
+* A stale apt-get update travels in its own heartbeat field, so an older
+  control plane (which 422s an unknown apt_state value) still answers 200.
 """
 
 from __future__ import annotations
 
 import contextlib
+import uuid
 from datetime import timedelta
+from typing import Literal
 
 import httpx
 import pytest
 from celery.exceptions import Retry
+from httpx import AsyncClient
+from pydantic import BaseModel, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.appliance.supervisor import SupervisorHeartbeatRequest
@@ -123,6 +128,57 @@ def test_release_check_does_not_retry_when_disabled(monkeypatch: pytest.MonkeyPa
     assert update_check.check_github_release.run() == {"status": "disabled"}
 
 
-def test_heartbeat_accepts_the_stale_apt_state() -> None:
-    annotation = SupervisorHeartbeatRequest.model_fields["apt_state"].annotation
-    assert "update-stale" in str(annotation)
+# The heartbeat model exactly as release/1.0.1 shipped it (the apt_state
+# Literal without "update-stale", no apt_update_stale field). A supervisor
+# newer than its control plane must still get a 200 from it.
+class _OldHeartbeat(BaseModel):
+    appliance_id: uuid.UUID
+    apt_state: (
+        Literal[
+            "synced",
+            "proxy-failed",
+            "mirror-unreachable",
+            "signature-mismatch",
+            "no-sources",
+            "unmanaged",
+            "unknown",
+        ]
+        | None
+    ) = None
+
+
+def test_new_supervisor_payload_is_accepted_by_the_old_heartbeat_schema() -> None:
+    payload = {"appliance_id": str(uuid.uuid4()), "apt_state": "synced", "apt_update_stale": True}
+    old = _OldHeartbeat.model_validate(payload)  # old control plane: no 422
+    assert old.apt_state == "synced"
+    new = SupervisorHeartbeatRequest.model_validate(payload)
+    assert new.apt_update_stale is True
+    # the value itself must never be sent as an apt_state
+    with pytest.raises(ValidationError):
+        _OldHeartbeat.model_validate(
+            {"appliance_id": str(uuid.uuid4()), "apt_state": "update-stale"}
+        )
+    with pytest.raises(ValidationError):
+        SupervisorHeartbeatRequest.model_validate(
+            {"appliance_id": str(uuid.uuid4()), "apt_state": "update-stale"}
+        )
+
+
+async def test_stale_flag_is_stored_as_update_stale(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    from app.models.appliance import Appliance
+    from tests.test_supervisor_heartbeat_authz import _approved_appliance
+
+    row, token = await _approved_appliance(db_session)
+    url = "/api/v1/appliance/supervisor/heartbeat"
+    base = {"appliance_id": str(row.id), "session_token": token}
+    r = await client.post(url, json={**base, "apt_state": "synced", "apt_update_stale": True})
+    assert r.status_code == 200, r.text
+    await db_session.refresh(row)
+    assert row.apt_state == "update-stale"
+    r = await client.post(url, json={**base, "apt_state": "synced", "apt_update_stale": False})
+    assert r.status_code == 200, r.text
+    await db_session.refresh(row)
+    assert row.apt_state == "synced"
+    assert isinstance(row, Appliance)
