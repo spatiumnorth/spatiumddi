@@ -43,6 +43,7 @@ const mapping = (gid: string, gname: string) => ({
 // The list the page loaded holds the old target; the next read holds the one
 // another session stored.
 let reads = 0;
+let gone = false;
 
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
@@ -53,7 +54,11 @@ vi.mock("@/lib/api", async () => {
       ...actual.authProvidersApi,
       list: async () => [PROVIDER],
       listMappings: async () =>
-        reads++ === 0 ? [mapping("g1", "Viewers")] : [mapping("g2", "Editors")],
+        reads++ === 0
+          ? [mapping("g1", "Viewers")]
+          : gone
+            ? []
+            : [mapping("g2", "Editors")],
       updateMapping: (...a: unknown[]) => updateMapping(...a),
     },
     groupsApi: {
@@ -72,6 +77,7 @@ afterEach(() => {
   cleanup();
   updateMapping.mockReset();
   reads = 0;
+  gone = false;
 });
 
 describe("group mapping Edit", () => {
@@ -102,5 +108,27 @@ describe("group mapping Edit", () => {
     expect(updateMapping).toHaveBeenCalledWith("ap1", "m1", {
       external_group: "ops-team",
     });
+  });
+
+  it("shows an error and does not open when the mapping was deleted", async () => {
+    gone = true;
+    render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <MemoryRouter>
+          <AuthProvidersPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    fireEvent.click(await screen.findByTitle(/Edit/));
+    await screen.findAllByText("Viewers");
+    const rows = await screen.findAllByTitle("Edit");
+    fireEvent.click(rows[rows.length - 1]);
+    await screen.findByText(/may have been deleted/);
+    expect(screen.queryByDisplayValue("ops")).toBeNull();
+    expect(updateMapping).not.toHaveBeenCalled();
   });
 });
