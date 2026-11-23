@@ -3,7 +3,7 @@
 ``scripts/check_nginx_fixed_versions.py`` reads nginx.org's own list of
 affected and fixed versions, because Trivy cannot see nginx.org's Alpine
 packages. Tests run against a saved copy of the page
-(``scripts/testdata/nginx_security_advisories.html``) so they are offline and
+(``scripts/testdata/nginx_fixed_versions_page.html``) so they are offline and
 stable, and cover the failure shape that matters most: a page that cannot be
 fetched or parsed must exit 3, never 0.
 """
@@ -19,7 +19,7 @@ import pytest
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _SCRIPT = _REPO_ROOT / "scripts" / "check_nginx_fixed_versions.py"
-_PAGE = _REPO_ROOT / "scripts" / "testdata" / "nginx_security_advisories.html"
+_PAGE = _REPO_ROOT / "scripts" / "testdata" / "nginx_fixed_versions_page.html"
 
 # The dev container copies only ``backend/``; this runs for real in CI.
 pytestmark = pytest.mark.skipif(

@@ -19,7 +19,7 @@ Exit codes:
   3  the page could not be fetched or parsed, or the pin could not be read.
      Never 0: "could not tell" must not read as "clean" (#1030).
 
-Stdlib only; advisory, run weekly by .github/workflows/trivy-scheduled.yml.
+Stdlib only; informational, run weekly by .github/workflows/trivy-scheduled.yml.
 """
 
 from __future__ import annotations
