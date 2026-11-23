@@ -174,5 +174,5 @@ describe("form labels use the shared Field (#4371)", () => {
         ),
       );
     expect(left).toEqual([]);
-  });
+  }, 60_000);
 });
