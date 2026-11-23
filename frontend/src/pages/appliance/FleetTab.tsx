@@ -2233,7 +2233,9 @@ function AptChip({ row }: { row: ApplianceRow }) {
       ? "APT: synced"
       : status === "unmanaged"
         ? "APT: unmanaged"
-        : `APT: ${status}`;
+        : status === "update-stale"
+          ? "APT: sources unreachable"
+          : `APT: ${status}`;
   return (
     <span
       className={cn(
@@ -2245,7 +2247,9 @@ function AptChip({ row }: { row: ApplianceRow }) {
           ? "Managed apt config applied + apt-get update succeeded on this host"
           : status === "unmanaged"
             ? "SpatiumDDI isn't managing apt — Debian's baked sources are in effect"
-            : "The managed apt config failed to validate/apply on this host"
+            : status === "update-stale"
+              ? "The last apt-get update on this host succeeded more than 3 days ago (or never): the apt sources are unreachable, so security updates are not arriving"
+              : "The managed apt config failed to validate/apply on this host"
       }
     >
       {label}

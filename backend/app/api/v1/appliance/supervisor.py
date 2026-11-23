@@ -1887,6 +1887,8 @@ class SupervisorHeartbeatRequest(BaseModel):
             "no-sources",
             "unmanaged",
             "unknown",
+            # #4800 — the last apt-get update is stale or never succeeded.
+            "update-stale",
         ]
         | None
     ) = None

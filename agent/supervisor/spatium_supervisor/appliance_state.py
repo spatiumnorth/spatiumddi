@@ -714,6 +714,14 @@ _NTP_STATUS_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/ntp-status")
 _APT_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/apt-config-pending")
 _APT_HASH_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/apt-config-hash")
 _APT_STATUS_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/apt-status")
+# #4800 — the last ``apt-get update`` attempt / success. The host's apt timers
+# exit 0 even when the mirrors are unreachable, so this is the only place that
+# failure shows. Touched by the host's 30spatium-update-stamps apt hook (apt's
+# own /var/lib/apt/periodic stamps are not visible from the supervisor).
+_APT_UPDATE_SUCCESS_STAMP = Path("/var/lib/spatiumddi-host/release-state/apt-update-success")
+_APT_UPDATE_ATTEMPT_STAMP = Path("/var/lib/spatiumddi-host/release-state/apt-update-attempt")
+# Longer than apt-daily's one-day cadence plus its randomized delay.
+_APT_UPDATE_STALE_SECONDS = 3 * 24 * 3600
 # Issue #343 — LLDP / lldpd equivalents. Same shape as SNMP / NTP.
 _LLDP_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/lldp-config-pending")
 _LLDP_HASH_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/lldp-config-hash")
@@ -2928,6 +2936,36 @@ def read_apt_state() -> str | None:
     return text if text in valid else None
 
 
+def apt_update_stale(
+    success_stamp: Path = _APT_UPDATE_SUCCESS_STAMP,
+    attempt_stamp: Path = _APT_UPDATE_ATTEMPT_STAMP,
+    now: float | None = None,
+) -> bool:
+    """True when the host's last successful ``apt-get update`` is older than
+    ``_APT_UPDATE_STALE_SECONDS``, or apt attempted one and never succeeded
+    (#4800). Sources that cannot be reached leave the apt timers green, so
+    security updates silently stop arriving. False when apt has left no stamp
+    at all (unknown, not stale)."""
+    now = time.time() if now is None else now
+    try:
+        return now - success_stamp.stat().st_mtime > _APT_UPDATE_STALE_SECONDS
+    except OSError:
+        pass
+    return attempt_stamp.exists()
+
+
+def read_apt_state_with_update() -> str | None:
+    """``read_apt_state`` with ``update-stale`` layered on top (#4800): the
+    sidecar only knows the state at the last config apply, not whether the
+    sources are still reachable. A stale ``apt-get update`` wins over every
+    state except ``None`` (non-appliance / unreadable), so an older control
+    plane still sees a value it can store."""
+    state = read_apt_state()
+    if state is None:
+        return None
+    return "update-stale" if apt_update_stale() else state
+
+
 def read_snmpd_running() -> bool | None:
     """Read snmpd's last-reported status from the sidecar the host-
     side runner writes after each apply. ``True`` = snmpd is running,
@@ -5013,7 +5051,7 @@ def collect() -> dict[str, object]:
         "ntp_sync_state": read_ntp_sync_state() if is_appliance else None,
         # Issue #155 — APT host-config state from the runner's status
         # sidecar after validate + swap. None on non-appliance deploys.
-        "apt_state": read_apt_state() if is_appliance else None,
+        "apt_state": read_apt_state_with_update() if is_appliance else None,
         # #387 — per-plane host-config apply health (snmp / ntp / lldp /
         # syslog / ssh / resolver / firewall / timezone). Surfaces a
         # stuck apply (the bounded-retry guard is backing it off) so the
