@@ -23,8 +23,26 @@
 # skipped, they are k3s's own), IPv4 first and IPv6 only when there is no IPv4,
 # so an IPv6-only install pins its IPv6 address.
 #
+# Service-CIDR route: with no default route the HOST kernel has no route to the
+# service CIDR either, so a hostNetwork pod (the frontend's nginx resolving the
+# api through cluster DNS at 10.43.0.10) or the host itself fails connect() with
+# "Network unreachable" BEFORE kube-proxy's DNAT can apply. So in the same
+# no-default-route case the script also adds ``<service-cidr> dev <iface>
+# scope link proto 198`` (service-cidr from config.yaml.d/spatium-cidrs.yaml,
+# default 10.43.0.0/16; every entry of a dual-stack list). The route is the
+# script's own: ``proto 198`` is how it finds and deletes exactly its entries
+# once a default route exists. It must outlive DHCP renewals and NM
+# reconnects, and a NetworkManager keyfile edit cannot: the installer's keyfile
+# is re-rendered from STATE by spatium-etc-render at every boot (and DHCP-on-
+# any-port has no keyfile at all). So
+# /etc/NetworkManager/dispatcher.d/50-spatium-k3s-service-route re-runs this
+# script with --routes-only on every up / dhcp4-change / dhcp6-change / reapply.
+#
 # Never fails k3s's start (the unit runs it as ExecStartPre=-).
 set -u
+
+ROUTES_ONLY=0
+[ "${1:-}" = "--routes-only" ] && ROUTES_ONLY=1
 
 DROPIN="${SPATIUM_K3S_NODE_IP_DROPIN:-/etc/rancher/k3s/config.yaml.d/spatium-node-ip.yaml}"
 LOG="${SPATIUM_K3S_NODE_IP_LOG:-/var/log/spatiumddi/k3s-node-ip.log}"
@@ -32,6 +50,31 @@ LOG="${SPATIUM_K3S_NODE_IP_LOG:-/var/log/spatiumddi/k3s-node-ip.log}"
 # (``interface-name=`` in its NetworkManager keyfile); on a multi-NIC host that
 # is the interface to pin, not whichever address happens to come first.
 NM_DIR="${SPATIUM_K3S_NODE_IP_NM_DIR:-/etc/NetworkManager/system-connections}"
+CIDRS="${SPATIUM_K3S_NODE_IP_CIDRS:-/etc/rancher/k3s/config.yaml.d/spatium-cidrs.yaml}"
+RTPROTO=198
+
+# Delete only the routes this script added (proto 198).
+del_routes() {
+    for fam in 4 6; do
+        ip "-$fam" route show proto "$RTPROTO" 2>/dev/null | awk '{print $1}' | while read -r dst; do
+            [ -n "$dst" ] && ip "-$fam" route del "$dst" proto "$RTPROTO" 2>/dev/null
+        done
+    done
+}
+
+add_routes() {
+    dev="$1"
+    svc=$(sed -n 's/^service-cidr:[[:space:]]*//p' "$CIDRS" 2>/dev/null | head -1 | tr -d "\"' ")
+    [ -n "$svc" ] || svc="10.43.0.0/16"
+    for c in $(printf '%s' "$svc" | tr ',' ' '); do
+        case "$c" in
+            *:*) ip -6 route replace "$c" dev "$dev" proto "$RTPROTO" 2>/dev/null ;;
+            *.*) ip -4 route replace "$c" dev "$dev" scope link proto "$RTPROTO" 2>/dev/null ;;
+            *) continue ;;
+        esac
+        say "no default route: service route $c dev $dev"
+    done
+}
 
 say() {
     msg="spatium-k3s-node-ip: $*"
@@ -43,7 +86,8 @@ mkdir -p "$(dirname "$LOG")" "$(dirname "$DROPIN")" 2>/dev/null
 
 if [ -n "$(ip -4 route show default 2>/dev/null)" ] \
     || [ -n "$(ip -6 route show default 2>/dev/null)" ]; then
-    rm -f "$DROPIN" 2>/dev/null
+    [ "$ROUTES_ONLY" = 1 ] || rm -f "$DROPIN" 2>/dev/null
+    del_routes
     exit 0
 fi
 
@@ -72,12 +116,15 @@ if [ -z "$found" ] && [ -n "$PREF" ]; then
     [ -n "$found" ] || found=$(pick 6)
 fi
 if [ -z "$found" ]; then
-    rm -f "$DROPIN" 2>/dev/null
+    [ "$ROUTES_ONLY" = 1 ] || rm -f "$DROPIN" 2>/dev/null
     say "no default route and no global address on any interface; leaving k3s to choose (it will fail until the network has an address)"
     exit 0
 fi
 iface=${found%% *}
 addr=${found#* }
+
+add_routes "$iface"
+[ "$ROUTES_ONLY" = 1 ] && exit 0
 
 tmp="$DROPIN.tmp.$$"
 {

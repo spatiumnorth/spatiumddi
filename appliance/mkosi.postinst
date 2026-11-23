@@ -330,6 +330,9 @@ chmod 0755 "$BUILDROOT/usr/local/bin/spatium-tls-manifest-skip"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-etcd-peer-reset"
 # #4801 — k3s.service ExecStartPre=-: pins node-ip when there is no default route.
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-k3s-node-ip"
+# ...and the NM dispatcher hook that keeps the service-CIDR route across DHCP
+# renewals / reconnects (NM refuses a dispatcher script that is not root 0755).
+chmod 0755 "$BUILDROOT/etc/NetworkManager/dispatcher.d/50-spatium-k3s-service-route"
 # #395 — host-migration framework: renderer + orchestrator + patch registry.
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-grub-render"
 # #999 Part C2 — keeps the mirror member's ESP in step with the primary's.
