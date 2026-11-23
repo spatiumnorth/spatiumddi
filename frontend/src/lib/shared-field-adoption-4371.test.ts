@@ -123,7 +123,7 @@ export function repeatedStaticIds(source: string): string[] {
       const id = n.initializer.text;
       seen.set(id, (seen.get(id) ?? 0) + 1);
       let inLoop = false;
-      for (let a = n.parent; a; a = a.parent)
+      for (let a: ts.Node | undefined = n.parent; a; a = a.parent)
         if (
           ts.isCallExpression(a) &&
           /\.(map|flatMap)$/.test(a.expression.getText())
