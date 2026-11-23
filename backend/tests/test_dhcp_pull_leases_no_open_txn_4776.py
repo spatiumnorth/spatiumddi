@@ -136,6 +136,37 @@ async def test_pull_result_dropped_when_server_deleted_mid_pull(
 
 
 @pytest.mark.asyncio
+async def test_pull_result_dropped_when_driver_changed_mid_pull(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-pointed at an agent-based driver while the reads ran: the stale wire
+    data is not written."""
+    srv = await _arm(db_session)
+    srv_id = srv.id
+    sessions = _install_task_sessions(monkeypatch)
+
+    async def _repoint() -> None:
+        async with _TestSessionLocal() as other:
+            row = await other.get(DHCPServer, srv_id)
+            assert row is not None
+            row.driver = "kea"
+            await other.commit()
+
+    monkeypatch.setattr(pl, "get_driver", lambda _n: _Drv(sessions, on_read=_repoint))
+
+    res = await task._run_pull()
+
+    assert res["servers_busy"] == 1 and res["imported"] == 0
+    db_session.expire_all()
+    rows = (
+        (await db_session.execute(select(DHCPLease).where(DHCPLease.server_id == srv_id)))
+        .scalars()
+        .all()
+    )
+    assert rows == []
+
+
+@pytest.mark.asyncio
 async def test_pull_without_release_flag_keeps_its_transaction(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:

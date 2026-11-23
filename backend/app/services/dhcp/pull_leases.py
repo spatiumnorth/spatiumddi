@@ -315,6 +315,7 @@ async def _pull_leases_core(
     # not ``now()`` — the latter is transaction-start time and would drift
     # earlier the longer this transaction runs.
     has_topology = hasattr(driver, "get_scopes")
+    read_driver = server.driver
     snapshot_at = (await db.execute(select(func.clock_timestamp()))).scalar_one()
     if apply and release_txn_for_wire:
         await db.commit()  # releases the pull lock; re-taken below
@@ -356,9 +357,16 @@ async def _pull_leases_core(
             logger.info("dhcp_pull_leases_server_busy", server=str(server.id))
             return result
         # The server may have been deleted while the reads ran.
-        if await db.get(DHCPServer, server.id, populate_existing=True) is None:
+        fresh = await db.get(DHCPServer, server.id, populate_existing=True)
+        if fresh is None:
             result.busy = True
             logger.info("dhcp_pull_leases_server_gone", server=str(server.id))
+            return result
+        # Re-pointed at another driver (or an agent-based one) while the reads
+        # ran: what we hold came from the old one and must not be written.
+        if fresh.driver != read_driver or not is_agentless(fresh.driver):
+            result.busy = True
+            logger.info("dhcp_pull_leases_server_changed", server=str(server.id))
             return result
 
     subnets = await _load_subnet_cache(db)
