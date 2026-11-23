@@ -188,8 +188,11 @@ function NATMappingModalForm({
     >
       <form onSubmit={submit} className="space-y-3 p-4">
         <div>
-          <label className="block text-xs font-medium">Name</label>
+          <label htmlFor="natpage-name" className="block text-xs font-medium">
+            Name
+          </label>
           <input
+            id="natpage-name"
             className="mt-1 w-full rounded-md border bg-background px-2 py-1 text-sm"
             value={name}
             onChange={(e) => setName(e.target.value)}
@@ -198,8 +201,11 @@ function NATMappingModalForm({
           />
         </div>
         <div>
-          <label className="block text-xs font-medium">Kind</label>
+          <label htmlFor="natpage-kind" className="block text-xs font-medium">
+            Kind
+          </label>
           <select
+            id="natpage-kind"
             className="mt-1 w-full rounded-md border bg-background px-2 py-1 text-sm"
             value={kind}
             onChange={(e) => setKind(e.target.value as NATKind)}
@@ -213,8 +219,14 @@ function NATMappingModalForm({
         <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
           {showInternalIp && (
             <div>
-              <label className="block text-xs font-medium">Internal IP</label>
+              <label
+                htmlFor="natpage-internal-ip"
+                className="block text-xs font-medium"
+              >
+                Internal IP
+              </label>
               <input
+                id="natpage-internal-ip"
                 className="mt-1 w-full rounded-md border bg-background px-2 py-1 font-mono text-sm"
                 value={internalIp}
                 onChange={(e) => setInternalIp(e.target.value)}
@@ -224,10 +236,14 @@ function NATMappingModalForm({
           )}
           {showSubnet && (
             <div>
-              <label className="block text-xs font-medium">
+              <label
+                htmlFor="natpage-internal-subnet"
+                className="block text-xs font-medium"
+              >
                 Internal subnet
               </label>
               <select
+                id="natpage-internal-subnet"
                 className="mt-1 w-full rounded-md border bg-background px-2 py-1 text-sm"
                 value={internalSubnetId}
                 onChange={(e) => setInternalSubnetId(e.target.value)}
@@ -242,8 +258,14 @@ function NATMappingModalForm({
             </div>
           )}
           <div>
-            <label className="block text-xs font-medium">External IP</label>
+            <label
+              htmlFor="natpage-external-ip"
+              className="block text-xs font-medium"
+            >
+              External IP
+            </label>
             <input
+              id="natpage-external-ip"
               className="mt-1 w-full rounded-md border bg-background px-2 py-1 font-mono text-sm"
               value={externalIp}
               onChange={(e) => setExternalIp(e.target.value)}
@@ -256,10 +278,14 @@ function NATMappingModalForm({
           <>
             <div className="grid grid-cols-2 gap-2">
               <div>
-                <label className="block text-xs font-medium">
+                <label
+                  htmlFor="natpage-internal-port-start"
+                  className="block text-xs font-medium"
+                >
                   Internal port start
                 </label>
                 <input
+                  id="natpage-internal-port-start"
                   type="number"
                   min={0}
                   max={65535}
@@ -269,10 +295,14 @@ function NATMappingModalForm({
                 />
               </div>
               <div>
-                <label className="block text-xs font-medium">
+                <label
+                  htmlFor="natpage-internal-port-end"
+                  className="block text-xs font-medium"
+                >
                   Internal port end
                 </label>
                 <input
+                  id="natpage-internal-port-end"
                   type="number"
                   min={0}
                   max={65535}
@@ -284,10 +314,14 @@ function NATMappingModalForm({
             </div>
             <div className="grid grid-cols-2 gap-2">
               <div>
-                <label className="block text-xs font-medium">
+                <label
+                  htmlFor="natpage-external-port-start"
+                  className="block text-xs font-medium"
+                >
                   External port start
                 </label>
                 <input
+                  id="natpage-external-port-start"
                   type="number"
                   min={0}
                   max={65535}
@@ -297,10 +331,14 @@ function NATMappingModalForm({
                 />
               </div>
               <div>
-                <label className="block text-xs font-medium">
+                <label
+                  htmlFor="natpage-external-port-end"
+                  className="block text-xs font-medium"
+                >
                   External port end
                 </label>
                 <input
+                  id="natpage-external-port-end"
                   type="number"
                   min={0}
                   max={65535}
@@ -315,8 +353,14 @@ function NATMappingModalForm({
 
         <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
           <div>
-            <label className="block text-xs font-medium">Protocol</label>
+            <label
+              htmlFor="natpage-protocol"
+              className="block text-xs font-medium"
+            >
+              Protocol
+            </label>
             <select
+              id="natpage-protocol"
               className="mt-1 w-full rounded-md border bg-background px-2 py-1 text-sm"
               value={protocol}
               onChange={(e) => setProtocol(e.target.value as NATProtocol)}
@@ -327,10 +371,14 @@ function NATMappingModalForm({
             </select>
           </div>
           <div>
-            <label className="block text-xs font-medium">
+            <label
+              htmlFor="natpage-device-label-free-text"
+              className="block text-xs font-medium"
+            >
               Device label (free text)
             </label>
             <input
+              id="natpage-device-label-free-text"
               className="mt-1 w-full rounded-md border bg-background px-2 py-1 text-sm"
               value={deviceLabel}
               onChange={(e) => setDeviceLabel(e.target.value)}
@@ -340,8 +388,14 @@ function NATMappingModalForm({
         </div>
 
         <div>
-          <label className="block text-xs font-medium">Description</label>
+          <label
+            htmlFor="natpage-description"
+            className="block text-xs font-medium"
+          >
+            Description
+          </label>
           <textarea
+            id="natpage-description"
             className="mt-1 w-full rounded-md border bg-background px-2 py-1 text-sm"
             value={description}
             onChange={(e) => setDescription(e.target.value)}
