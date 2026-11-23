@@ -127,7 +127,10 @@ def last_fetch_failure() -> str | None:
 
 def _failure_kind(exc: Exception) -> str:
     if isinstance(exc, httpx.HTTPStatusError):
-        return "rate_limited" if exc.response.status_code in (403, 429) else "error"
+        code = exc.response.status_code
+        if code in (502, 503, 504):  # a gateway that cannot reach GitHub
+            return "unreachable"
+        return "rate_limited" if code in (403, 429) else "error"
     if isinstance(exc, httpx.RequestError):
         return "unreachable"
     return "error"

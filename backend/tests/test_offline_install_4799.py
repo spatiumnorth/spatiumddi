@@ -19,32 +19,65 @@ from app.services.appliance import diagnostics as diag
 from app.services.appliance import releases as rel
 
 
-def test_self_test_dns_check_passes_offline(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Only the install's own name resolves; every external name fails."""
+class _Reply:
+    def __init__(self, code: int) -> None:
+        self._code = code
 
-    def fake(name: str) -> str:
-        if name == "cp.example.internal":
-            return "10.0.0.5"
-        raise socket.gaierror(-3, "Temporary failure in name resolution")
+    def rcode(self) -> int:
+        return self._code
 
-    monkeypatch.setattr(diag.settings, "appliance_hostname", "cp.example.internal")
-    monkeypatch.setattr(socket, "gethostbyname", fake)
+
+def _resolvers(monkeypatch: pytest.MonkeyPatch, servers: list[str]) -> None:
+    import dns.resolver
+
+    class _R:
+        nameservers = servers
+
+    monkeypatch.setattr(dns.resolver, "Resolver", _R)
+
+
+def test_self_test_dns_check_passes_on_nxdomain(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A resolver that answers NXDOMAIN (offline box) is alive."""
+    import dns.query
+
+    _resolvers(monkeypatch, ["10.0.0.1"])
+    monkeypatch.setattr(dns.query, "udp", lambda q, ip, timeout: _Reply(3))
     check = diag._check_dns_resolves()
     assert check.ok is True
-    assert "cp.example.internal" in check.detail
     assert "external DNS is not tested" in check.detail
 
 
-def test_self_test_dns_check_fails_when_own_name_does_not_resolve(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def fake(name: str) -> str:
-        raise socket.gaierror(-2, "Name or service not known")
+def test_self_test_dns_check_ignores_etc_hosts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """gethostbyname answering from /etc/hosts must not mask a dead resolver."""
+    import dns.query
 
-    monkeypatch.setattr(diag.settings, "appliance_hostname", "cp.example.internal")
-    monkeypatch.setattr(socket, "gethostbyname", fake)
-    check = diag._check_dns_resolves()
-    assert check.ok is False
+    _resolvers(monkeypatch, ["10.0.0.1"])
+    monkeypatch.setattr(socket, "gethostbyname", lambda n: "127.0.0.1")
+
+    def dead(q: object, ip: str, timeout: float) -> object:
+        raise TimeoutError
+
+    monkeypatch.setattr(dns.query, "udp", dead)
+    assert diag._check_dns_resolves().ok is False
+
+
+def test_self_test_dns_check_second_resolver_answers(monkeypatch: pytest.MonkeyPatch) -> None:
+    import dns.query
+
+    _resolvers(monkeypatch, ["10.0.0.1", "10.0.0.2"])
+
+    def udp(q: object, ip: str, timeout: float) -> _Reply:
+        if ip == "10.0.0.1":
+            raise TimeoutError
+        return _Reply(0)
+
+    monkeypatch.setattr(dns.query, "udp", udp)
+    assert diag._check_dns_resolves().ok is True
+
+
+def test_self_test_dns_check_no_nameserver_is_not_a_fault(monkeypatch: pytest.MonkeyPatch) -> None:
+    _resolvers(monkeypatch, [])
+    assert diag._check_dns_resolves().ok is True
 
 
 @pytest.mark.parametrize(
@@ -54,6 +87,10 @@ def test_self_test_dns_check_fails_when_own_name_does_not_resolve(
         ("", None),
         ("HTTP 403", "http"),
         ("HTTP 500", "http"),
+        ("HTTP 502 from api.github.com:443", "unreachable"),
+        ("HTTP 503 from api.github.com:443", "unreachable"),
+        ("HTTP 504 from api.github.com:443", "unreachable"),
+        ("HTTP 5030", "http"),
         ("Unreadable response: Expecting value", "http"),
         ("Could not connect to api.github.com:443: [Errno -3] Temporary failure", "unreachable"),
         ("ReadTimeout (the destination timed out)", "unreachable"),
@@ -106,6 +143,7 @@ def _clean_caches():
         (httpx.Response(403), "rate_limited"),
         (httpx.Response(429), "rate_limited"),
         (httpx.Response(500), "error"),
+        (httpx.Response(502), "unreachable"),
     ],
 )
 async def test_releases_fetch_failure_kind(

@@ -142,7 +142,10 @@ def describe_http_exc(exc: BaseException, *, timeout: float | None = None) -> st
 # Stored in ``latest_check_error`` as ``HTTP <status>`` / ``Unreadable
 # response: ...`` for a failure that reached GitHub; any other text is a
 # DNS / connect / timeout failure, i.e. GitHub is not reachable from here.
-_HTTP_ERROR_RE = re.compile(r"^(HTTP \d+|Unreadable response)")
+# HTTP 502 / 503 / 504 count as unreachable too: a proxy or gateway answers
+# them when it cannot reach the upstream, and GitHub's own outages look the
+# same from here, so neither deserves a permanent warning.
+_HTTP_ERROR_RE = re.compile(r"^(HTTP (?!50[234]\b)\d+|Unreadable response)")
 
 
 def check_error_kind(error: str | None) -> str | None:

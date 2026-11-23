@@ -163,32 +163,55 @@ def run_self_test() -> SelfTestReport:
 
 
 def _check_dns_resolves() -> CheckResult:
-    """The host resolver answers for a name this install owns (#4799).
+    """The configured resolver answers a query (#4799).
 
     This used to resolve ``registry-1.docker.io`` as a stand-in for "host
     DNS works", which can never pass on an install with no route out, so a
-    healthy air-gapped control plane reported FAIL. The control plane's own
-    hostname is something the install owns on every deploy shape (appliance,
-    Compose, Kubernetes), so a failure here is a real resolver fault.
-    Whether *external* names resolve is not tested: an install with no
-    internet is a supported state, and the detail says so rather than
-    leaving the operator to wonder.
+    healthy air-gapped control plane reported FAIL. ``gethostbyname`` on the
+    host's own name is no better: inside a container it is answered from
+    /etc/hosts and never touches DNS. So this asks each nameserver in
+    /etc/resolv.conf directly for the host's own name and counts ANY reply,
+    NXDOMAIN included, as proof the resolver is alive. It FAILs only when
+    no configured nameserver answers at all. No nameserver configured is
+    not a fault on an offline box. Whether *external* names resolve is not
+    tested, and the detail says so.
     """
+    import dns.exception
+    import dns.message
+    import dns.query
+    import dns.rcode
+    import dns.resolver
+
     target = (settings.appliance_hostname or "").strip() or socket.gethostname()
     note = "external DNS is not tested"
     try:
-        ip = socket.gethostbyname(target)
+        servers = list(dns.resolver.Resolver().nameservers)
+    except dns.resolver.NoResolverConfiguration:
+        servers = []
+    if not servers:
         return CheckResult(
             name="DNS resolution",
             ok=True,
-            detail=f"{target} -> {ip} ({note})",
+            detail=f"no nameserver configured in resolv.conf ({note})",
         )
-    except OSError as exc:
-        return CheckResult(
-            name="DNS resolution",
-            ok=False,
-            detail=f"this host's own name {target} -> {exc}",
-        )
+    errors: list[str] = []
+    for server in servers:
+        try:
+            query = dns.message.make_query(target, "A")
+            reply = dns.query.udp(query, str(server), timeout=2.0)
+            rcode = dns.rcode.to_text(reply.rcode())
+            return CheckResult(
+                name="DNS resolution",
+                ok=True,
+                detail=f"resolver {server} answered for {target} ({rcode}; {note})",
+            )
+        except (dns.exception.DNSException, OSError, ValueError) as exc:
+            errors.append(f"{server}: {type(exc).__name__}")
+    return CheckResult(
+        name="DNS resolution",
+        ok=False,
+        detail=f"no configured resolver answered for {target} ({', '.join(errors)})",
+    )
 
 
 def _check_kubeapi_reachable() -> CheckResult:
