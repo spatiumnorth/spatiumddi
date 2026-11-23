@@ -67,6 +67,7 @@ import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ShieldAlert, AlertTriangle } from "lucide-react";
 import { BreakGlassModal } from "./BreakGlassModal";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
@@ -421,6 +422,7 @@ function RequestTable({
   onDecide,
   onCancel,
   emptyText,
+  error,
 }: {
   rows: ChangeRequest[];
   canApprove: boolean;
@@ -430,11 +432,14 @@ function RequestTable({
   onDecide: (cr: ChangeRequest, mode: "approve" | "reject") => void;
   onCancel: (cr: ChangeRequest) => void;
   emptyText: string;
+  error?: unknown;
 }) {
   if (rows.length === 0) {
     return (
       <div className="rounded-md border bg-muted/20 p-6 text-center text-sm text-muted-foreground">
-        {emptyText}
+        <ListEmpty error={error} what="change requests">
+          {emptyText}
+        </ListEmpty>
       </div>
     );
   }
@@ -678,7 +683,11 @@ function PolicyEditor({
 
 function PoliciesTab() {
   const qc = useQueryClient();
-  const { data: policies = [], isLoading } = useQuery({
+  const {
+    data: policies = [],
+    isLoading,
+    error: policiesError,
+  } = useQuery({
     queryKey: ["change-requests", "policies"],
     queryFn: changeRequestsApi.listPolicies,
   });
@@ -749,7 +758,9 @@ function PoliciesTab() {
         <p className="text-xs text-muted-foreground">Loading…</p>
       ) : policies.length === 0 ? (
         <div className="rounded-md border bg-muted/20 p-6 text-center text-sm text-muted-foreground">
-          No approval policies yet.
+          <ListEmpty error={policiesError} what="approval policies">
+            No approval policies yet.
+          </ListEmpty>
         </div>
       ) : (
         <div className="overflow-x-auto rounded-md border">
@@ -1056,6 +1067,7 @@ export function ChangeRequestsPage() {
               onDecide={(cr, mode) => setDecision({ cr, mode })}
               onCancel={setCancelTarget}
               emptyText="Nothing waiting for approval."
+              error={queueQuery.error}
             />
           ))}
         {tab === "queue" && <LoadMore q={queueQuery} noun="pending" />}
@@ -1073,6 +1085,7 @@ export function ChangeRequestsPage() {
               onDecide={(cr, mode) => setDecision({ cr, mode })}
               onCancel={setCancelTarget}
               emptyText="No decided requests yet."
+              error={historyQuery.error}
             />
           ))}
         {tab === "history" && <LoadMore q={historyQuery} noun="decided" />}
