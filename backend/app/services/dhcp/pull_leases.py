@@ -208,6 +208,7 @@ async def pull_leases_from_server(
     *,
     apply: bool = True,
     recount: bool = True,
+    release_txn_for_wire: bool = False,
 ) -> PullLeasesResult:
     """Pull leases, then record the outcome on the server row (#2306).
 
@@ -227,8 +228,15 @@ async def pull_leases_from_server(
     recounts ``result.touched_subnet_ids`` itself after the last pull: the
     recount takes the audit-chain lock and subnet / block row locks until
     commit, and must not hold them through the next server's driver call.
+
+    ``release_txn_for_wire`` (#4776, the scheduled task) commits before the
+    driver reads, so no transaction is open while a WinRM call waits on an
+    unreachable host, and takes the pull lock again afterwards. It commits
+    whatever the caller had pending, so only a caller that wants that sets it.
     """
-    result = await _pull_leases_core(db, server, apply=apply)
+    result = await _pull_leases_core(
+        db, server, apply=apply, release_txn_for_wire=release_txn_for_wire
+    )
     if apply and not result.busy and is_agentless(server.driver):
         if result.errors:
             server.last_sync_error = _summarise_errors(result.errors)
@@ -247,6 +255,7 @@ async def _pull_leases_core(
     server: DHCPServer,
     *,
     apply: bool = True,
+    release_txn_for_wire: bool = False,
 ) -> PullLeasesResult:
     """Poll ``server`` for active leases and reconcile into the DB.
 
@@ -282,34 +291,38 @@ async def _pull_leases_core(
         logger.info("dhcp_pull_leases_server_busy", server=str(server.id))
         return result
 
-    subnets = await _load_subnet_cache(db)
+    # #4776 — every driver read first, with no transaction open when asked
+    # (``release_txn_for_wire``): a WinRM host that answers nothing holds the
+    # call for its whole timeout, and an ``idle in transaction`` session keeps
+    # locks a migration's ALTER TABLE waits behind. The reads are no longer
+    # interleaved with the writes; the pass writes once they are all in hand.
+    #
+    # Stamped BEFORE the wire reads: everything the wire tells us is a
+    # snapshot of the server as of (at latest) this instant, so a DB row an
+    # operator created or edited *after* it is newer than our information
+    # and the merge must not act on it (#620). The WinRM round-trip is
+    # seconds long — long enough for a reservation created in the UI mid-poll
+    # to be absent from the wire we're holding, and absence means delete.
+    #
+    # Read from the DATABASE's clock, not this process's. The guard compares
+    # against ``created_at`` / ``modified_at``, which TimestampMixin fills
+    # with ``func.now()`` — i.e. Postgres's clock. Comparing those to a local
+    # ``datetime.now(UTC)`` is a cross-clock comparison, and on a multi-node
+    # appliance (CNPG on another node, chrony drifting) a DB clock running
+    # ahead by more than the poll interval would make EVERY row look newer
+    # than the snapshot: every reservation skipped, every stale one spared,
+    # the reconciler silently converging on nothing. ``clock_timestamp()``,
+    # not ``now()`` — the latter is transaction-start time and would drift
+    # earlier the longer this transaction runs.
+    has_topology = hasattr(driver, "get_scopes")
+    snapshot_at = (await db.execute(select(func.clock_timestamp()))).scalar_one()
+    if apply and release_txn_for_wire:
+        await db.commit()  # releases the pull lock; re-taken below
 
-    # Phase 1 — topology (scopes + pools + reservations). Optional: only
-    # runs for drivers that expose ``get_scopes``. For each scope whose
-    # CIDR matches a known IPAM subnet, upsert the scope, then diff-merge
-    # its pools and statics against what Windows reports. Scopes whose CIDR
-    # has no matching IPAM subnet are skipped — we intentionally do not
-    # auto-create subnets (that belongs in a separate workflow).
-    if hasattr(driver, "get_scopes"):
-        # Stamped BEFORE the wire read: everything the wire tells us is a
-        # snapshot of the server as of (at latest) this instant, so a DB row an
-        # operator created or edited *after* it is newer than our information
-        # and the merge must not act on it (#620). The WinRM round-trip is
-        # seconds long — long enough for a reservation created in the UI mid-poll
-        # to be absent from the wire we're holding, and absence means delete.
-        #
-        # Read from the DATABASE's clock, not this process's. The guard compares
-        # against ``created_at`` / ``modified_at``, which TimestampMixin fills
-        # with ``func.now()`` — i.e. Postgres's clock. Comparing those to a local
-        # ``datetime.now(UTC)`` is a cross-clock comparison, and on a multi-node
-        # appliance (CNPG on another node, chrony drifting) a DB clock running
-        # ahead by more than the poll interval would make EVERY row look newer
-        # than the snapshot: every reservation skipped, every stale one spared,
-        # the reconciler silently converging on nothing. ``clock_timestamp()``,
-        # not ``now()`` — the latter is transaction-start time and would drift
-        # earlier the longer this transaction runs.
-        snapshot_at = (await db.execute(select(func.clock_timestamp()))).scalar_one()
-        scopes_ok = True
+    wire_scopes: list[dict[str, Any]] = []
+    scopes_ok = True
+    failover: dict[str, Any] | None = None
+    if has_topology:
         try:
             wire_scopes = await driver.get_scopes(server)
         except Exception as exc:  # noqa: BLE001
@@ -321,9 +334,44 @@ async def _pull_leases_core(
                 driver=server.driver,
                 error=str(exc),
             )
-            wire_scopes = []
+        # Skipped when ``get_scopes`` itself failed: the server is almost
+        # certainly unreachable, and a third WinRM call to it would only add
+        # another full timeout to the poll (#1110).
+        if apply and scopes_ok and hasattr(driver, "get_failover_relationships"):
+            try:
+                failover = await driver.get_failover_relationships(server)
+            except Exception as exc:  # noqa: BLE001 — recorded, never fatal to the poll
+                failover = {"ok": False, "error": str(exc), "relationships": []}
+
+    wire: list[dict[str, Any]] = []
+    lease_error: Exception | None = None
+    try:
+        wire = await driver.get_leases(server)
+    except Exception as exc:  # noqa: BLE001 — surface any transport/PS error
+        lease_error = exc
+
+    if apply and release_txn_for_wire:
+        if not await _try_lock_server(db, server):
+            result.busy = True
+            logger.info("dhcp_pull_leases_server_busy", server=str(server.id))
+            return result
+        # The server may have been deleted while the reads ran.
+        if await db.get(DHCPServer, server.id, populate_existing=True) is None:
+            result.busy = True
+            logger.info("dhcp_pull_leases_server_gone", server=str(server.id))
+            return result
+
+    subnets = await _load_subnet_cache(db)
+
+    # Phase 1 — topology (scopes + pools + reservations). Optional: only
+    # runs for drivers that expose ``get_scopes``. For each scope whose
+    # CIDR matches a known IPAM subnet, upsert the scope, then diff-merge
+    # its pools and statics against what Windows reports. Scopes whose CIDR
+    # has no matching IPAM subnet are skipped — we intentionally do not
+    # auto-create subnets (that belongs in a separate workflow).
+    if has_topology:
         observations = await _observe_topology(
-            db, server, driver, wire_scopes, result, apply=apply, scopes_ok=scopes_ok
+            db, server, wire_scopes, failover, result, apply=apply, scopes_ok=scopes_ok
         )
         for wscope in wire_scopes:
             if observations is not None and not _owns_scope(server, wscope, observations, result):
@@ -334,18 +382,16 @@ async def _pull_leases_core(
         # The reservation mirrors' subnets are in ``touched_subnet_ids`` and
         # recounted with the lease mirrors' after the pull, never here: the
         # recount holds the audit-chain lock and subnet / block row locks to
-        # commit, and the lease phase below is another driver call (#3354).
+        # commit (#3354).
 
     # Phase 2 — leases.
-    try:
-        wire = await driver.get_leases(server)
-    except Exception as exc:  # noqa: BLE001 — surface any transport/PS error
-        result.errors.append(f"get_leases failed: {exc}")
+    if lease_error is not None:
+        result.errors.append(f"get_leases failed: {lease_error}")
         logger.warning(
             "dhcp_pull_leases_driver_failed",
             server=str(server.id),
             driver=server.driver,
-            error=str(exc),
+            error=str(lease_error),
         )
         return result
 
@@ -787,8 +833,8 @@ class _Topology:
 async def _observe_topology(
     db: AsyncSession,
     server: DHCPServer,
-    driver: Any,
     wire_scopes: list[dict[str, Any]],
+    failover: dict[str, Any] | None,
     result: PullLeasesResult,
     *,
     apply: bool,
@@ -801,19 +847,16 @@ async def _observe_topology(
     server, or a group with a single Windows member — so the reconcile runs
     exactly as it always has.
 
-    The failover read is skipped when ``get_scopes`` itself failed: the
-    server is almost certainly unreachable, and a third WinRM call to it would
-    only add another full timeout to the poll. Its last-known relationships
-    stay in force.
+    ``failover`` is the driver's relationship read, taken with the other wire
+    reads (#4776); None when it was skipped, which it is when ``get_scopes``
+    itself failed: the server is almost certainly unreachable, and a third
+    WinRM call to it would only add another full timeout to the poll. Its
+    last-known relationships stay in force.
     """
     now = datetime.now(UTC)
     if apply and scopes_ok:
         await record_scope_observation(db, server, wire_scopes, now=now)
-    if apply and scopes_ok and hasattr(driver, "get_failover_relationships"):
-        try:
-            failover = await driver.get_failover_relationships(server)
-        except Exception as exc:  # noqa: BLE001 — recorded, never fatal to the poll
-            failover = {"ok": False, "error": str(exc), "relationships": []}
+    if failover is not None:
         if not failover.get("ok"):
             result.warnings.append(
                 f"could not read failover relationships: {failover.get('error')} — keeping "

@@ -152,7 +152,10 @@ async def _run_pull() -> dict[str, Any]:
                 servers_scanned += 1
                 try:
                     # #3345 — recounted once, after the last server's pull.
-                    result = await pull_leases_from_server(db, server, apply=True, recount=False)
+                    # #4776 — commits before the driver reads, none run in a txn.
+                    result = await pull_leases_from_server(
+                        db, server, apply=True, recount=False, release_txn_for_wire=True
+                    )
                 except Exception as exc:  # noqa: BLE001 — don't let one server poison the run
                     errors.append(f"{server.name}: {exc}")
                     logger.warning(
