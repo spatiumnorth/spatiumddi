@@ -1,5 +1,9 @@
 # OS Appliance Deployment Specification
 
+> **Installing on an isolated network?** See [`AIRGAP.md`](AIRGAP.md): the ISO
+> carries every image, and that page covers the gateway, time source, APT and
+> upgrade steps.
+
 ## Overview
 
 SpatiumDDI can be shipped as a **self-contained OS appliance image** — a bootable image where the OS, all services, and the SpatiumDDI application are pre-installed and pre-configured. This allows deployment without any prior OS or container runtime setup: download, boot, configure via web UI, done.

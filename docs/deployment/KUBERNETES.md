@@ -1302,6 +1302,8 @@ The Kubernetes-specific shape:
 
 ## See also
 
+- [`AIRGAP.md`](AIRGAP.md) — air-gapped installs, including every chart image
+  value an internal-registry mirror must set
 - [`charts/spatiumddi/README.md`](https://github.com/spatiumnorth/spatiumddi/blob/main/charts/spatiumddi/README.md) — full
   values reference, troubleshooting, and a `helm template` dev loop
 - [`k8s/README.md`](https://github.com/spatiumnorth/spatiumddi/blob/main/k8s/README.md) — raw `k8s/base/` manifests, the
