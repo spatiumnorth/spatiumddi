@@ -409,6 +409,29 @@ async def _require_address_writable(
         raise refusal
 
 
+def _static_dhcp_write_refusal(
+    user: User, args: CreateIPAddressArgs
+) -> OperationPermissionError | None:
+    """The reservation-write gate of a ``static_dhcp`` address request (#3646).
+
+    Shared by the apply and the portal's ``can_approve`` (#4789), so the queue
+    offers Approve to exactly the approvers whose press is not refused.
+    """
+    if args.status != "static_dhcp" or not args.mac_address:
+        return None
+    from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
+
+    if user_has_permission(user, "write", "dhcp_static"):
+        return None
+    return OperationPermissionError(
+        "write",
+        "dhcp_static",
+        "The approver has no 'write' permission on DHCP reservations "
+        f"(dhcp_static), so no reservation can be made for {args.address}. "
+        "Another approver who holds it can approve this request.",
+    )
+
+
 async def _address_target_refusal(
     db: AsyncSession, user: User, args: CreateIPAddressArgs
 ) -> OperationPermissionError | None:
@@ -420,7 +443,8 @@ async def _address_target_refusal(
         return None  # the apply refuses it as invalid, for every approver alike
     if subnet is None:
         return None
-    return await _address_write_refusal(db, user, subnet, addr)
+    refusal = await _address_write_refusal(db, user, subnet, addr)
+    return refusal or _static_dhcp_write_refusal(user, args)
 
 
 def expires_at_default() -> datetime:
@@ -869,17 +893,9 @@ async def _apply_create_ip_address(
     # permission error, which leaves the request pending for one who may. A
     # plain ValueError would end it ``failed`` for good over a refusal that is
     # about THIS approver, not the request.
-    if args.status == "static_dhcp" and args.mac_address:
-        from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
-
-        if not user_has_permission(user, "write", "dhcp_static"):
-            raise OperationPermissionError(
-                "write",
-                "dhcp_static",
-                "The approver has no 'write' permission on DHCP reservations "
-                f"(dhcp_static), so no reservation can be made for {args.address}. "
-                "Another approver who holds it can approve this request.",
-            )
+    reservation_refusal = _static_dhcp_write_refusal(user, args)
+    if reservation_refusal is not None:
+        raise reservation_refusal
 
     # #3250 — a static_dhcp request that can get no reservation fails here,
     # before anything is written, rather than ending provisioned without one.
