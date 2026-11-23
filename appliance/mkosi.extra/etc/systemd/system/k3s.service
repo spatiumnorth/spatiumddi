@@ -104,6 +104,12 @@ ExecStartPre=-/usr/local/bin/spatium-tls-manifest-skip
 # single-member etcd registered under the old one, and k3s refuses it. This
 # resets that one-member etcd to the current address (never an HA control
 # plane's). ``-``: never keeps k3s down.
+# #4801 — a network with no default route made k3s exit fatally on its
+# default-route lookup, every 5 s, so first boot never converged. With no
+# route this pins node-ip / flannel-iface from the management interface's
+# current address (a drop-in rewritten at every start, so a DHCP change
+# follows); with a route it does nothing. ``-``: never keeps k3s down.
+ExecStartPre=-/usr/local/bin/spatium-k3s-node-ip
 ExecStartPre=-/usr/local/bin/spatium-etcd-peer-reset
 # #1976 — kubelet graceful node shutdown. KillMode=process (above) is right
 # for a k3s restart: the pods keep running while the kubelet is away. A node
