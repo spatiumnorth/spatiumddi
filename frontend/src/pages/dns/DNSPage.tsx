@@ -12078,7 +12078,7 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                         className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-muted text-muted-foreground"
                         title={feedSkippedTitle(l)}
                       >
-                        {feedSkippedTotal(l)} rules skipped
+                        {countNoun(feedSkippedTotal(l), "rule")} skipped
                       </span>
                     )}
                     <span className="ml-auto text-xs text-muted-foreground">

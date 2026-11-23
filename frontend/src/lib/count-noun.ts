@@ -8,5 +8,17 @@ export function countNoun(
   singular: string,
   plural = `${singular}s`,
 ): string {
-  return `${n} ${n === 1 ? singular : plural}`;
+  return `${n} ${pluralize(n, singular, plural)}`;
+}
+
+/**
+ * Just the noun, for a count the caller formats itself (`toLocaleString()`,
+ * a "3/5" ratio): `${n.toLocaleString()} ${pluralize(n, "route")}` (#4780).
+ */
+export function pluralize(
+  n: number,
+  singular: string,
+  plural = `${singular}s`,
+): string {
+  return n === 1 ? singular : plural;
 }

@@ -1,3 +1,4 @@
+import { countNoun } from "./count-noun";
 /**
  * Presentation helpers for storage redundancy (#999 Part A).
  *
@@ -122,6 +123,6 @@ export function mpathChipLabel(map: {
 }): string {
   const healthy = map.paths_total - map.paths_faulted;
   return map.paths_faulted > 0
-    ? `mpath ${healthy}/${map.paths_total} paths`
-    : `mpath ${map.paths_total}/${map.paths_total} paths`;
+    ? `mpath ${healthy}/${countNoun(map.paths_total, "path")}`
+    : `mpath ${map.paths_total}/${countNoun(map.paths_total, "path")}`;
 }

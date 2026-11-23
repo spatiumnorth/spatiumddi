@@ -1,3 +1,4 @@
+import { countNoun } from "@/lib/count-noun";
 import { Fragment, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
@@ -1541,8 +1542,10 @@ export function FleetTab({
                       </p>
                       <p className="mt-1 text-sm text-muted-foreground">
                         This control plane has{" "}
-                        <strong>{approvedControlPlaneCount} nodes</strong> but
-                        no MetalLB virtual IP (VIP) is configured. Without a
+                        <strong>
+                          {countNoun(approvedControlPlaneCount, "node")}
+                        </strong>{" "}
+                        but no MetalLB virtual IP (VIP) is configured. Without a
                         VIP, operator browsers and every off-cluster DNS / DHCP
                         agent are pinned to a single node&apos;s address — if
                         that node goes down they lose the control plane even
@@ -5503,7 +5506,7 @@ function ApplianceSlotsCell({ row }: { row: ApplianceRow }) {
           className="rounded-full bg-sky-500/10 px-1.5 py-0 font-mono text-[10px] text-sky-700 dark:text-sky-300"
           title={
             row.cluster_health?.kubeapi_ready
-              ? `k3s ready · ${row.cluster_health?.nodes_ready ?? 0}/${row.cluster_health?.nodes_total ?? 0} nodes`
+              ? `k3s ready · ${row.cluster_health?.nodes_ready ?? 0}/${countNoun(row.cluster_health?.nodes_total ?? 0, "node")}`
               : "k3s baked, kubeapi unreachable"
           }
         >

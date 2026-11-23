@@ -1,3 +1,4 @@
+import { countNoun } from "@/lib/count-noun";
 import { useEffect, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import {
@@ -201,7 +202,7 @@ function ResultsTable({
         <div className="border-t bg-muted/20 px-2 py-1.5 text-[11px] text-muted-foreground">
           Queried at {new Date(result.queried_at_ms).toLocaleString()} ·{" "}
           {result.results.filter((r) => r.status === "ok").length} of{" "}
-          {result.results.length} resolvers returned an answer
+          {countNoun(result.results.length, "resolver")} returned an answer
         </div>
       )}
     </div>
