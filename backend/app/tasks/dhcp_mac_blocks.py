@@ -1,10 +1,16 @@
 """Periodic "DHCP MAC block sync" task.
 
-Fires every 60 s from Celery Beat. For every agentless DHCP server
+Fires every 60 s from Celery Beat and gates on
+``PlatformSettings.dhcp_mac_blocks_sync_interval_seconds`` (#4759). For every agentless DHCP server
 (Windows DHCP today), reconciles the server's deny filter list against
 the active MAC blocks on its group. Kea servers don't need this task —
 they pick up blocklist changes through the ConfigBundle + DROP class
 render, not per-object writes.
+
+A server is skipped, with no WinRM round trip, when no block applies to it
+and ``DHCPServer.mac_blocks_pushed`` says nothing was ever pushed. Removing
+the last block still syncs once (the flag is still set), which clears the
+server's filter list and then drops the flag.
 
 The task is idempotent: if the deny-list already matches the desired
 set, the driver issues zero cmdlets and returns ``(0, 0)``. Runs on
@@ -15,7 +21,7 @@ any explicit trigger from the API path.
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
@@ -29,13 +35,15 @@ from app.drivers.dhcp import is_agentless
 from app.drivers.dhcp.base import MACBlockDef
 from app.drivers.dhcp.registry import get_driver
 from app.models.dhcp import DHCPMACBlock, DHCPServer
+from app.models.settings import PlatformSettings
 from app.services.feature_modules import is_module_enabled
+from app.tasks._interval_gate import interval_skip
 from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
 
-async def _run_sync() -> dict[str, Any]:
+async def _run_sync(force: bool = False) -> dict[str, Any]:
     engine = create_async_engine(
         settings.database_url, future=True, connect_args=task_connect_args()
     )
@@ -47,9 +55,16 @@ async def _run_sync() -> dict[str, Any]:
             # do no work (and open no driver connections) when it is.
             if not await is_module_enabled(db, "core.dhcp"):
                 return {"status": "disabled"}
-            servers = list((await db.execute(select(DHCPServer))).scalars().all())
-
             now = datetime.now(UTC)
+            ps = await db.get(PlatformSettings, 1)
+            if ps is not None:
+                interval = timedelta(seconds=max(60, ps.dhcp_mac_blocks_sync_interval_seconds))
+                skip = interval_skip(now, ps.dhcp_mac_blocks_sync_last_run_at, interval)
+                if skip is not None and not force:
+                    return skip
+                ps.dhcp_mac_blocks_sync_last_run_at = now
+                await db.commit()
+            servers = list((await db.execute(select(DHCPServer))).scalars().all())
             by_group: dict[Any, list[MACBlockDef]] = {}
 
             servers_synced = 0
@@ -86,6 +101,10 @@ async def _run_sync() -> dict[str, Any]:
                     ]
 
                 desired = by_group[gid]
+                if not desired and not server.mac_blocks_pushed:
+                    # #4759 — nothing applies and nothing was pushed before:
+                    # reading the filter list over WinRM would find nothing.
+                    continue
                 try:
                     driver = get_driver(server.driver)
                 except ValueError:
@@ -103,6 +122,9 @@ async def _run_sync() -> dict[str, Any]:
                     )
                     continue
 
+                if server.mac_blocks_pushed != bool(desired):
+                    server.mac_blocks_pushed = bool(desired)
+                    await db.commit()
                 servers_synced += 1
                 total_added += added
                 total_removed += removed
@@ -126,9 +148,12 @@ async def _run_sync() -> dict[str, Any]:
     max_retries=2,
 )
 @module_gated("core.dhcp")
-def sync_dhcp_mac_blocks(self: Any) -> dict[str, Any]:  # noqa: ARG001
-    """Beat-fired entrypoint. Runs the async reconciler under asyncio."""
-    return asyncio.run(_run_sync())
+def sync_dhcp_mac_blocks(self: Any, force: bool = False) -> dict[str, Any]:  # noqa: ARG001
+    """Beat-fired entrypoint. Runs the async reconciler under asyncio.
+
+    ``force`` (set by the MAC-block API after a write) bypasses the interval gate.
+    """
+    return asyncio.run(_run_sync(force))
 
 
 __all__ = ["sync_dhcp_mac_blocks"]

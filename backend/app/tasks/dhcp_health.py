@@ -35,8 +35,10 @@ from app.config import settings
 from app.db import task_connect_args
 from app.drivers.dhcp import get_driver, is_agentless
 from app.models.dhcp import DHCPServer
+from app.models.settings import PlatformSettings
 from app.services.agents.daemon_state import forget_stale_ok
 from app.services.feature_modules import is_module_enabled
+from app.tasks._interval_gate import interval_skip
 from app.tasks.module_gate import module_gated
 
 # If agent hasn't heartbeat'd in this long, mark unreachable.
@@ -146,8 +148,23 @@ async def _enqueue_all() -> None:
             # do no work (and open no driver connections) when it is.
             if not await is_module_enabled(db, "core.dhcp"):
                 return
-            result = await db.execute(select(DHCPServer.id))
-            ids = [str(row[0]) for row in result.all()]
+            result = await db.execute(select(DHCPServer.id, DHCPServer.driver))
+            rows = [(str(row[0]), row[1]) for row in result.all()]
+            # #4759 — agent-based servers are judged from the heartbeat they
+            # already sent (no round trip), so they are evaluated on every
+            # tick. Agentless ones cost a WinRM / REST session each and are
+            # gated on the operator's interval.
+            ids = [sid for sid, drv in rows if not is_agentless(drv)]
+            agentless = [sid for sid, drv in rows if is_agentless(drv)]
+            if agentless:
+                ps = await db.get(PlatformSettings, 1)
+                now = datetime.now(UTC)
+                interval = timedelta(seconds=max(60, ps.dhcp_health_interval_seconds if ps else 60))
+                if ps is None or interval_skip(now, ps.dhcp_health_last_run_at, interval) is None:
+                    ids.extend(agentless)
+                    if ps is not None:
+                        ps.dhcp_health_last_run_at = now
+                        await db.commit()
     finally:
         await engine.dispose()
     for sid in ids:
@@ -159,6 +176,8 @@ async def _enqueue_all() -> None:
 def check_all_dhcp_servers_health(self: object) -> None:  # type: ignore[type-arg]
     """Fan-out task — enqueues one health check per registered DHCP server.
 
-    Scheduled every 60s by Celery beat (see app.celery_app).
+    Scheduled every 60s by Celery beat (see app.celery_app). Agent-based
+    servers are enqueued on every tick; agentless servers only once
+    ``PlatformSettings.dhcp_health_interval_seconds`` has elapsed (#4759).
     """
     asyncio.run(_enqueue_all())
