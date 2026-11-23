@@ -97,7 +97,7 @@ command or the profile's containers keep running the old image
 
 Copy every image below to your registry, then point the chart at it. The
 chart renders control-plane images as
-`<image.registry>/<image.repository>/<name>:<tag>` (release 1.0.2 and later
+`<image.registry>/<image.repository>/<name>:<tag>` (release 1.0.1 and later
 append `image.tagSuffix`, empty by default), and the others from their own
 `repository` and `tag`.
 
@@ -122,7 +122,7 @@ Two things sit outside the chart: the CloudNativePG operator, when you use
 mirroring too; and `externalDatabase` / `externalRedis` replace the in-chart
 Postgres and Redis if you already run them inside the site.
 
-**OpenShift and the UBI images (release 1.0.2 and later).** `values-openshift-certified.yaml` sets
+**OpenShift and the UBI images (release 1.0.1 and later).** `values-openshift-certified.yaml` sets
 `global.platform: openshift`, `image.tagSuffix: "-ubi"` (the Red Hat UBI build
 of `spatiumddi-api`, `spatiumddi-frontend`, `dns-bind9` and `dhcp-kea`), and
 points `postgresql.image` and `redis.image` at `registry.redhat.io` with
