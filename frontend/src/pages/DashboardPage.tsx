@@ -4776,9 +4776,13 @@ export function ConformityPanel() {
             {summary?.frameworks.length ?? 0}
           </p>
           <p className="text-[11px] text-muted-foreground">
-            {summary?.frameworks.reduce((s, f) => s + f.policies_enabled, 0) ??
-              0}{" "}
-            policies enabled
+            {countNoun(
+              summary?.frameworks.reduce((s, f) => s + f.policies_enabled, 0) ??
+                0,
+              "policy",
+              "policies",
+            )}{" "}
+            enabled
           </p>
         </div>
         <div className="rounded-lg border bg-card p-4">

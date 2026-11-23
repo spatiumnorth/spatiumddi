@@ -31,27 +31,101 @@ const WORDS =
   "containers|subnets|policies|records|ops|rows|instances|aliases|images|" +
   "scopes|addresses|zones|rules|resolvers|queries|items|matches|chars|" +
   "errors|interfaces|prefixes|routes|routers|events|hosts|speakers";
-const SHAPE = new RegExp(`\\}\\s+(${WORDS})\\b(?!\\s*=)`, "g");
+// `}` (optionally `{" "}` split onto the next line) then a plural word.
+const SHAPE = new RegExp(
+  `(?:\\}[ \\t]+|\\{" "\\}[ \\t]*\\n[ \\t]*)(${WORDS})\\b(?!\\s*=)`,
+  "g",
+);
 
-// "<file>::<matched text>" -> why the count cannot be one.
-const EXEMPT: Record<string, string> = {
-  "pages/ipam/IPAMPage.tsx::} subnets":
-    "/{prefixLen} subnets: prefixLen is a prefix length, not a count",
-  "pages/LogsPage.tsx::} servers": "a kind label, not a count",
-  "pages/appliance/UpgradeImagesTable.tsx::} images":
-    "both sites sit in the not-single branch (rows.length !== 1)",
-  "pages/dns/ZoneDeleteDialogs.tsx::} zones":
-    "the count === 1 branch returns the singular text first",
-  "pages/dns/DNSPage.tsx::} zones":
-    "bulk-delete messages: a queued/failed subset or the not-one branch implies 2 or more",
-  "pages/dns/DNSPage.tsx::} batches":
-    "only shown when records exceed one chunk, so 2 or more batches",
-  "pages/admin/PlatformInsightsPage.tsx::} ops":
-    "a unit in ops/sec, not a count of things",
-  "lib/dnsNames.ts::} characters": "fixed protocol limits (63 / 253)",
-  "lib/password-policy.ts::} passwords":
-    "already in the history_count !== 1 branch",
-};
+// A hit is exempt only when its own line contains `line` (per site, so a new
+// hit in the same file is still caught). `why` says why the count can never
+// be one.
+const EXEMPT: { file: string; word: string; line: string; why: string }[] = [
+  {
+    file: "pages/ipam/IPAMPage.tsx",
+    word: "subnets",
+    line: "/{prefixLen} subnets",
+    why: "prefixLen is a prefix length, not a count",
+  },
+  {
+    file: "pages/LogsPage.tsx",
+    word: "servers",
+    line: "{kind} servers",
+    why: "a kind label, not a count",
+  },
+  {
+    file: "pages/appliance/UpgradeImagesTable.tsx",
+    word: "images",
+    line: "`Delete ${rows.length} images?`",
+    why: "title sits in the single ? ... : branch, so not one",
+  },
+  {
+    file: "pages/appliance/UpgradeImagesTable.tsx",
+    word: "images",
+    line: "`these ${rows.length} images`",
+    why: "the rows.length === 1 branch returns the singular first",
+  },
+  {
+    file: "pages/dns/ZoneDeleteDialogs.tsx",
+    word: "zones",
+    line: "The ${count} zones",
+    why: "the count === 1 branch returns the singular text first",
+  },
+  {
+    file: "pages/dns/DNSPage.tsx",
+    word: "zones",
+    line: '"Stub" : "Secondary"',
+    why: "a zone-type label, not a count",
+  },
+  {
+    file: "pages/dns/DNSPage.tsx",
+    word: "zones",
+    line: "of ${ids.length} zones: ${APPROVAL_QUEUED_MESSAGE}",
+    why: "reached only when queued !== ids.length with queued > 0, so 2 or more",
+  },
+  {
+    file: "pages/dns/DNSPage.tsx",
+    word: "zones",
+    line: "of ${ids.length} zones were not deleted",
+    why: "reached only when failed.length < ids.length, so 2 or more",
+  },
+  {
+    file: "pages/dns/DNSPage.tsx",
+    word: "zones",
+    line: "None of the ${ids.length} zones",
+    why: "the ids.length === 1 branch returns the singular text first",
+  },
+  {
+    file: "pages/dns/DNSPage.tsx",
+    word: "batches",
+    line: "split into ${Math.ceil(",
+    why: "shown only when records exceed one chunk, so 2 or more batches",
+  },
+  {
+    file: "pages/admin/PlatformInsightsPage.tsx",
+    word: "ops",
+    line: "ops/sec",
+    why: "a unit in ops/sec, not a count of things",
+  },
+  {
+    file: "lib/dnsNames.ts",
+    word: "characters",
+    line: "characters`",
+    why: "fixed protocol limits (63 / 253)",
+  },
+  {
+    file: "pages/opnsense/OpnsensePage.tsx",
+    word: "rows",
+    line: "rows.",
+    why: "the word names what a setting creates (reserved rows), no count",
+  },
+  {
+    file: "lib/password-policy.ts",
+    word: "passwords",
+    line: "`${policy.history_count} passwords`",
+    why: "already in the history_count === 1 else-branch",
+  },
+];
 
 function walk(dir: string, out: string[]): string[] {
   for (const name of readdirSync(dir)) {
@@ -63,29 +137,50 @@ function walk(dir: string, out: string[]): string[] {
   return out;
 }
 
-function findFixedPlurals(root: string): Set<string> {
-  const hits = new Set<string>();
-  for (const file of walk(root, [])) {
-    const rel = relative(root, file);
-    for (const line of readFileSync(file, "utf8").split("\n")) {
+type Hit = { file: string; word: string; line: string };
+
+function findFixedPlurals(root: string): Hit[] {
+  const hits: Hit[] = [];
+  for (const full of walk(root, [])) {
+    const file = relative(root, full);
+    const text = readFileSync(full, "utf8");
+    const lines = text.split("\n");
+    for (const m of text.matchAll(SHAPE)) {
+      const wordAt = m.index! + m[0].length - m[1].length;
+      const lineNo = text.slice(0, wordAt).split("\n").length - 1;
+      const line = lines[lineNo];
       const t = line.trim();
       if (t.startsWith("//") || t.startsWith("*") || t.startsWith("/*"))
         continue;
-      for (const m of line.matchAll(SHAPE)) {
-        hits.add(`${rel}::} ${m[1]}`);
-      }
+      hits.push({ file, word: m[1], line });
     }
   }
   return hits;
 }
 
+const isExempt = (h: Hit) =>
+  EXEMPT.some(
+    (e) => e.file === h.file && e.word === h.word && h.line.includes(e.line),
+  );
+
 describe("console copy: a count of one", () => {
   const hits = findFixedPlurals(resolve(__dirname, ".."));
   it("has no count glued to a fixed plural word", () => {
-    expect([...hits].filter((k) => !(k in EXEMPT)).sort()).toEqual([]);
+    expect(
+      hits
+        .filter((h) => !isExempt(h))
+        .map((h) => `${h.file}: ${h.line.trim()}`)
+        .sort(),
+    ).toEqual([]);
   });
   it("keeps no stale exemption", () => {
-    const stale = Object.keys(EXEMPT).filter((e) => !hits.has(e));
+    const stale = EXEMPT.filter(
+      (e) =>
+        !hits.some(
+          (h) =>
+            e.file === h.file && e.word === h.word && h.line.includes(e.line),
+        ),
+    ).map((e) => `${e.file}: ${e.line}`);
     expect(stale).toEqual([]);
   });
 });
