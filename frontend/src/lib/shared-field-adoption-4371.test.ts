@@ -100,6 +100,44 @@ export function unnamedInlineLabels(source: string): number[] {
   return lines;
 }
 
+/** Static `id="..."` strings that cannot be unique at runtime: one written
+ *  twice in a file, or inside a `.map` / `.flatMap` callback (every item of
+ *  the loop gets the same id). Use `useId()` or a keyed id there. */
+export function repeatedStaticIds(source: string): string[] {
+  const sf = ts.createSourceFile(
+    "x.tsx",
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TSX,
+  );
+  const seen = new Map<string, number>();
+  const bad: string[] = [];
+  const visit = (n: ts.Node) => {
+    if (
+      ts.isJsxAttribute(n) &&
+      n.name.getText() === "id" &&
+      n.initializer &&
+      ts.isStringLiteral(n.initializer)
+    ) {
+      const id = n.initializer.text;
+      seen.set(id, (seen.get(id) ?? 0) + 1);
+      let inLoop = false;
+      for (let a = n.parent; a; a = a.parent)
+        if (
+          ts.isCallExpression(a) &&
+          /\.(map|flatMap)$/.test(a.expression.getText())
+        )
+          inLoop = true;
+      if (inLoop) bad.push(`${id} (in a loop)`);
+    }
+    ts.forEachChild(n, visit);
+  };
+  visit(sf);
+  for (const [id, n] of seen) if (n > 1) bad.push(`${id} (x${n})`);
+  return bad;
+}
+
 export function definesOwnField(source: string): boolean {
   return OWN_FIELD.test(source);
 }
@@ -171,6 +209,26 @@ describe("form labels use the shared Field (#4371)", () => {
       .flatMap((f) =>
         unnamedInlineLabels(readFileSync(f, "utf8")).map(
           (line) => `${relative(SRC, f).split(sep).join("/")}:${line}`,
+        ),
+      );
+    expect(left).toEqual([]);
+  }, 60_000);
+
+  it("detects a static id that repeats at runtime (#4778)", () => {
+    const bad = (body: string) =>
+      repeatedStaticIds(`const a = () => (<div>${body}</div>);`).length;
+    expect(bad('<input id="a" /><input id="b" />')).toBe(0);
+    expect(bad('<input id="a" /><input id="a" />')).toBe(1);
+    expect(bad('{xs.map((x) => <input key={x} id="a" />)}')).toBe(1);
+    expect(bad("{xs.map((x) => <input key={x} id={`a-${x}`} />)}")).toBe(0);
+  });
+
+  it("no static id is repeated or written inside a loop (#4778)", () => {
+    const left = files(SRC)
+      .filter((f) => f.endsWith(".tsx"))
+      .flatMap((f) =>
+        repeatedStaticIds(readFileSync(f, "utf8")).map(
+          (id) => `${relative(SRC, f).split(sep).join("/")}: ${id}`,
         ),
       );
     expect(left).toEqual([]);
