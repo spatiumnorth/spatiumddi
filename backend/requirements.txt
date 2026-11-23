@@ -164,7 +164,7 @@ starlette==1.10.0
 structlog==26.1.0
 tacacs-plus==2.6
 truststore==0.10.5
-types-croniter==6.2.4.20261006
+types-croniter==6.2.4.20261118
 types-paramiko==5.1.0.20261030
 typing-extensions==4.16.0
 typing-inspection==0.4.5
