@@ -849,6 +849,20 @@ def _build_discovery_payload(
 # ── Entry point ───────────────────────────────────────────────────────
 
 
+def _fetch_signature(endpoint: CloudEndpoint) -> tuple[Any, ...]:
+    """What the provider pull depends on; a change meanwhile voids its result."""
+    return (
+        endpoint.provider,
+        endpoint.credentials_encrypted,
+        repr(endpoint.provider_config),
+        repr(endpoint.regions),
+        endpoint.mirror_stopped_instances,
+        endpoint.mirror_load_balancers,
+        endpoint.ipam_space_id,
+        endpoint.public_space_id,
+    )
+
+
 async def reconcile_endpoint(db: AsyncSession, endpoint: CloudEndpoint) -> ReconcileSummary:
     summary = ReconcileSummary(ok=False)
     # #2577 — a target whose IP space is in Trash syncs nothing: it would
@@ -874,6 +888,16 @@ async def reconcile_endpoint(db: AsyncSession, endpoint: CloudEndpoint) -> Recon
         await db.commit()
         return summary
 
+    # #4808 — the provider API reads below take as long as the provider takes
+    # (several regions, several pages each). Capture everything they need,
+    # end the read transaction, and fetch with none open: the session used to
+    # sit ``idle in transaction`` for the whole pull. The caller's session
+    # object lives on (autobegin reopens a transaction at the next statement);
+    # only the connection is given back.
+    endpoint_id = endpoint.id
+    include_stopped = endpoint.mirror_stopped_instances
+    include_lbs = endpoint.mirror_load_balancers
+    signature = _fetch_signature(endpoint)
     try:
         connector = get_connector(
             endpoint.provider,
@@ -881,11 +905,19 @@ async def reconcile_endpoint(db: AsyncSession, endpoint: CloudEndpoint) -> Recon
             provider_config=endpoint.provider_config,
             regions=endpoint.regions,
         )
+        await db.commit()
         inv = await connector.fetch_inventory(
-            include_stopped=endpoint.mirror_stopped_instances,
-            include_load_balancers=endpoint.mirror_load_balancers,
+            include_stopped=include_stopped,
+            include_load_balancers=include_lbs,
         )
     except CloudConnectorError as exc:
+        await db.rollback()
+        # A fresh read: the row may have been deleted while the pull ran.
+        reread = await db.get(CloudEndpoint, endpoint_id, populate_existing=True)
+        if reread is None:
+            summary.error = str(exc)
+            return summary
+        endpoint = reread
         summary.error = str(exc)
         endpoint.last_sync_error = summary.error
         endpoint.last_synced_at = datetime.now(UTC)
@@ -894,6 +926,16 @@ async def reconcile_endpoint(db: AsyncSession, endpoint: CloudEndpoint) -> Recon
             "cloud_reconcile_fetch_failed", endpoint=str(endpoint.id), error=summary.error
         )
         return summary
+
+    # Re-read the row after the pull: it may have been deleted, disabled or
+    # re-pointed (credentials, provider, regions, spaces) meanwhile, in which
+    # case the inventory describes something the operator no longer asked for.
+    reread = await db.get(CloudEndpoint, endpoint_id, populate_existing=True)
+    if reread is None or not reread.enabled or _fetch_signature(reread) != signature:
+        logger.info("cloud_reconcile_dropped_changed", endpoint=str(endpoint_id))
+        summary.error = "endpoint changed or was removed during the sync; result discarded"
+        return summary
+    endpoint = reread
 
     summary.provider_account_id = inv.account_id
     summary.network_count = len(inv.networks)
