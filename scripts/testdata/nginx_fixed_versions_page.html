@@ -1,0 +1,176 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">
+<html><head><meta charset="utf-8"><title>nginx security advisories</title><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="../css/style_en.css"></head><body><div id="banner"><div id="banner-content">
+
+NGINX will be at KubeCon North America, November 9–12 in Salt Lake City.
+Visit us at Booth 100! Check out our
+<a href="https://go.f5.net/kubecon-na-blog">blog post</a>
+for more details.
+
+</div></div><div id="main"><div id="menu"><input class="side-menu" type="checkbox" id="side-menu"><label class="hamb" for="side-menu"><span class="hamb-line"></span></label><nav class="nav"><h1><a href="/"><img src="/img/nginx_logo.svg" alt="NGINX" class="lightimage" style="display: block; height: auto;"><div class="darkimageWrapper" style="mso-hide: all; display: none"><img src="/img/nginx_logo_dark.svg" alt="NGINX" class="darkimage" style="display: none;"></div></a></h1><div><ul class="mobilemenu"><li>english<br></li><li><a class="notrans">русский</a></li><li><br></li><li><a href="../news.html">news</a></li><li><a href="./">about</a></li><li><a href="download.html">download</a></li><li>security<br></li><li><a href="docs/">documentation</a></li><li><a href="docs/faq.html">faq</a></li><li><a href="books.html">books</a></li><li><a href="community.html">community</a></li><li><a href="enterprise.html">enterprise</a></li><li><br></li><li><a href="https://community.nginx.org">community forum (new)</a></li><li><a href="https://x.com/nginxorg">x.com</a></li><li><a href="https://blog.nginx.org/">blog</a></li><li><br></li><li><a href="docs/njs/">njs</a></li><li><a href="https://github.com/nginx/kubernetes-ingress">ingress controller</a></li><li><a href="https://github.com/nginx/nginx-gateway-fabric">gateway fabric</a></li></ul></div></nav></div><div id="content"><h2>nginx security advisories</h2><p>
+All nginx security issues should be reported
+via one of the methods listed
+<a href="https://github.com/nginx/nginx/blob/master/SECURITY.md">here</a>.
+</p><p>
+Patches are signed using one of the
+<a href="pgp_keys.html">PGP public keys</a>.
+</p><ul>
+
+<li><p>Excessive CPU usage in TLS 1.3 with ssl_early_data<br>Severity: medium<br><a href="https://my.f5.com/manage/s/article/K000163947">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-132779">CVE-2026-132779</a><br>Not vulnerable: 1.31.10+, 1.30.8+<br>Vulnerable: 1.21.4-1.31.9</p></li>
+
+<li><p>Use-after-free during response processing in resolver<br>Severity: medium<br><a href="https://my.f5.com/manage/s/article/K000163925">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-123634">CVE-2026-123634</a><br>Not vulnerable: 1.31.9+, 1.30.7+<br>Vulnerable: 0.6.18-1.31.8</p></li>
+
+<li><p>Memory corruption in HTTP/2 flow control<br>Severity: <b>major</b><br><a href="https://my.f5.com/manage/s/article/K000163926">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-123007">CVE-2026-123007</a><br>Not vulnerable: 1.31.9+, 1.30.7+<br>Vulnerable: 1.9.5-1.31.8</p></li>
+
+<li><p>Use-after-free in HTTP/3<br>Severity: medium<br><a href="https://my.f5.com/manage/s/article/K000163927">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-121810">CVE-2026-121810</a><br>Not vulnerable: 1.31.9+, 1.30.7+<br>Vulnerable: 1.25.0-1.31.8</p></li>
+
+<li><p>Use-after-free in HTTP/2<br>Severity: medium<br><a href="https://my.f5.com/manage/s/article/K000163928">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-123633">CVE-2026-123633</a><br>Not vulnerable: 1.31.9+, 1.30.7+<br>Vulnerable: 1.19.7-1.31.8</p></li>
+
+<li><p>Infinite loop while reading client request body over TLS 1.3<br>Severity: <b>major</b><br><a href="https://my.f5.com/manage/s/article/K000163930">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-118899">CVE-2026-118899</a><br>Not vulnerable: 1.31.9+, 1.30.7+<br>Vulnerable: 1.13.0-1.31.8</p></li>
+
+<li><p>Use-after-free in mail proxy module<br>Severity: <b>major</b><br><a href="https://my.f5.com/manage/s/article/K000163931">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-113425">CVE-2026-113425</a><br>Not vulnerable: 1.31.9+, 1.30.7+<br>Vulnerable: 0.5.33-1.31.8</p></li>
+
+<li><p>NULL pointer dereference when using PROXY protocol version 2<br>Severity: minor<br><a href="https://my.f5.com/manage/s/article/K000163932">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-120993">CVE-2026-120993</a><br>Not vulnerable: 1.31.9+<br>Vulnerable: 1.31.4-1.31.8</p></li>
+
+<li><p>Buffer overflow when using alias with try_files<br>Severity: minor<br><a href="https://my.f5.com/manage/s/article/K000163933">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-125283">CVE-2026-125283</a><br>Not vulnerable: 1.31.9+, 1.30.7+<br>Vulnerable: 0.9.6-1.31.8</p></li>
+
+<li><p>SNI bypass when using client certificate validation in stream<br>Severity: medium<br><a href="https://my.f5.com/manage/s/article/K000163934">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-120967">CVE-2026-120967</a><br>Not vulnerable: 1.31.9+, 1.30.7+<br>Vulnerable: 1.25.5-1.31.8</p></li>
+
+<li><p>Insufficient validation in stream ssl_preread module<br>Severity: minor<br><a href="https://my.f5.com/manage/s/article/K000163935">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-123640">CVE-2026-123640</a><br>Not vulnerable: 1.31.9+, 1.30.7+<br>Vulnerable: 1.15.2-1.31.8</p></li>
+
+<li><p>Buffer overflow when using alias with rewrite<br>Severity: medium<br><a href="https://my.f5.com/manage/s/article/K000162416">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-15176">CVE-2026-15176</a><br>Not vulnerable: 1.31.7+, 1.30.6+<br>Vulnerable: 0.1.29-1.31.6</p></li>
+
+<li><p>Buffer overflow in script evaluation<br>Severity: medium<br><a href="https://my.f5.com/manage/s/article/K000162607">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-93479">CVE-2026-93479</a><br>Not vulnerable: 1.31.7+, 1.30.6+<br>Vulnerable: 1.31.2-1.31.6, 1.30.0-1.30.5</p></li>
+
+<li><p>Request body injection in HTTP/3<br>Severity: medium<br><a href="https://my.f5.com/manage/s/article/K000162613">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-95101">CVE-2026-95101</a><br>Not vulnerable: 1.31.7+, 1.30.6+<br>Vulnerable: 1.25.0-1.31.6</p></li>
+
+<li><p>Session forgery when using TLS session tickets<br>Severity: medium<br><a href="https://my.f5.com/manage/s/article/K000162606">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-97629">CVE-2026-97629</a><br>Not vulnerable: 1.31.7+, 1.30.6+<br>Vulnerable: 1.23.2-1.31.6</p></li>
+
+<li><p>Use-after-free when using asynchronous file I/O (AIO)<br>Severity: medium<br><a href="https://my.f5.com/manage/s/article/K000162608">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-97205">CVE-2026-97205</a><br>Not vulnerable: 1.31.7+, 1.30.6+<br>Vulnerable: 0.8.11-1.31.6</p></li>
+
+<li><p>Buffer overflow when using ngx_http_v3_module<br>Severity: medium<br><a href="https://my.f5.com/manage/s/article/K000162604">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-90439">CVE-2026-90439</a><br>Not vulnerable: 1.31.6+, 1.30.5+<br>Vulnerable: 1.29.2-1.31.5</p></li>
+
+<li><p>Buffer overflow when using map and regex<br>Severity: <b>major</b><br><a href="https://my.f5.com/manage/s/article/K000162097">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-42533">CVE-2026-42533</a><br>Not vulnerable: 1.31.3+, 1.30.4+<br>Vulnerable: 0.9.6-1.31.2</p></li>
+
+<li><p>Memory disclosure when using ngx_http_slice_module<br>Severity: medium<br><a href="https://my.f5.com/manage/s/article/K000162100">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-60005">CVE-2026-60005</a><br>Not vulnerable: 1.31.3+, 1.30.4+<br>Vulnerable: 1.15.8-1.31.2</p></li>
+
+<li><p>Use-after-free when using ngx_http_ssi_module<br>Severity: medium<br><a href="https://my.f5.com/manage/s/article/K000162098">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-56434">CVE-2026-56434</a><br>Not vulnerable: 1.31.3+, 1.30.4+<br>Vulnerable: 0.8.11-1.31.2</p></li>
+
+<li><p>Use-after-free in HTTP/3<br>Severity: <b>major</b><br><a href="https://my.f5.com/manage/s/article/K000161616">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-42530">CVE-2026-42530</a><br>Not vulnerable: 1.31.2+<br>Vulnerable: 1.31.0-1.31.1</p></li>
+
+<li><p>Buffer overflow in the ngx_http_proxy_v2_module and ngx_http_grpc_module<br>Severity: medium<br><a href="https://my.f5.com/manage/s/article/K000161584">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-42055">CVE-2026-42055</a><br>Not vulnerable: 1.31.2+, 1.30.3+<br>Vulnerable: 1.13.10-1.31.1</p></li>
+
+<li><p>Buffer overread in the ngx_http_charset_module<br>Severity: low<br><a href="https://my.f5.com/manage/s/article/K000161585">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-48142">CVE-2026-48142</a><br>Not vulnerable: 1.31.2+, 1.30.3+<br>Vulnerable: 0.3.50-1.31.1</p></li>
+
+<li><p>Buffer overflow in the ngx_http_rewrite_module<br>Severity: medium<br><a href="https://my.f5.com/manage/s/article/K000161377">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-9256">CVE-2026-9256</a><br>Not vulnerable: 1.31.1+, 1.30.2+<br>Vulnerable: 0.1.17-1.31.0</p></li>
+
+<li><p>HTTP/2 request injection in the ngx_http_proxy_module<br>Severity: medium<br><a href="https://my.f5.com/manage/s/article/K000161131">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-42926">CVE-2026-42926</a><br>Not vulnerable: 1.31.0+, 1.30.1+<br>Vulnerable: 1.29.4-1.30.0</p></li>
+
+<li><p>Buffer overflow in the ngx_http_rewrite_module<br>Severity: medium<br><a href="https://my.f5.com/manage/s/article/K000161019">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-42945">CVE-2026-42945</a><br>Not vulnerable: 1.31.0+, 1.30.1+<br>Vulnerable: 0.6.27-1.30.0</p></li>
+
+<li><p>Buffer overread in the ngx_http_scgi_module and ngx_http_uwsgi_module<br>Severity: medium<br><a href="https://my.f5.com/manage/s/article/K000161027">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-42946">CVE-2026-42946</a><br>Not vulnerable: 1.31.0+, 1.30.1+<br>Vulnerable: 0.8.42-1.30.0</p></li>
+
+<li><p>Buffer overread in the ngx_http_charset_module<br>Severity: low<br><a href="https://my.f5.com/manage/s/article/K000161028">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-42934">CVE-2026-42934</a><br>Not vulnerable: 1.31.0+, 1.30.1+<br>Vulnerable: 0.3.50-1.30.0</p></li>
+
+<li><p>HTTP/3 address spoofing<br>Severity: medium<br><a href="https://my.f5.com/manage/s/article/K000161068">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-40460">CVE-2026-40460</a><br>Not vulnerable: 1.31.0+, 1.30.1+<br>Vulnerable: 1.25.0-1.30.0</p></li>
+
+<li><p>resolver use-after-free in OCSP<br>Severity: medium<br><a href="https://my.f5.com/manage/s/article/K000161021">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-40701">CVE-2026-40701</a><br>Not vulnerable: 1.31.0+, 1.30.1+<br>Vulnerable: 1.19.0-1.30.0</p></li>
+
+<li><p>Buffer overflow in ngx_http_dav_module<br>Severity: medium<br><a href="https://my.f5.com/manage/s/article/K000160382">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-27654">CVE-2026-27654</a><br>Not vulnerable: 1.29.7+, 1.28.3+<br>Vulnerable: 0.5.13-1.29.6</p></li>
+
+<li><p>Buffer overflow in the ngx_http_mp4_module<br>Severity: medium<br><a href="https://my.f5.com/manage/s/article/K000160364">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-27784">CVE-2026-27784</a><br>Not vulnerable: 1.29.7+, 1.28.3+<br>Vulnerable: 1.1.19-1.29.6</p></li>
+
+<li><p>Buffer overflow in the ngx_http_mp4_module<br>Severity: medium<br><a href="https://my.f5.com/manage/s/article/K000160366">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-32647">CVE-2026-32647</a><br>Not vulnerable: 1.29.7+, 1.28.3+<br>Vulnerable: 1.1.19-1.29.6</p></li>
+
+<li><p>NULL pointer dereference while using CRAM-MD5 or APOP<br>Severity: low<br><a href="https://my.f5.com/manage/s/article/K000160383">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-27651">CVE-2026-27651</a><br>Not vulnerable: 1.29.7+, 1.28.3+<br>Vulnerable: 0.5.15-1.29.6</p></li>
+
+<li><p>Injection in auth_http and XCLIENT<br>Severity: medium<br><a href="https://my.f5.com/manage/s/article/K000160367">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-28753">CVE-2026-28753</a><br>Not vulnerable: 1.29.7+, 1.28.3+<br>Vulnerable: 0.6.27-1.29.6</p></li>
+
+<li><p>OCSP result bypass in stream<br>Severity: medium<br><a href="https://my.f5.com/manage/s/article/K000160368">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-28755">CVE-2026-28755</a><br>Not vulnerable: 1.29.7+, 1.28.3+<br>Vulnerable: 1.27.2-1.29.6</p></li>
+
+<li><p>SSL upstream injection<br>Severity: medium<br><a href="https://my.f5.com/manage/s/article/K000159824">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2026-1642">CVE-2026-1642</a><br>Not vulnerable: 1.29.5+, 1.28.2+<br>Vulnerable: 1.3.0-1.29.4</p></li>
+
+<li><p>Buffer overread in the ngx_mail_smtp_module<br>Severity: low<br><a href="https://my.f5.com/manage/s/article/K000152786">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2025-53859">CVE-2025-53859</a><br>Not vulnerable: 1.29.1+<br>Vulnerable: 0.7.22-1.29.0</p></li>
+
+<li><p>SSL session reuse vulnerability<br>Severity: medium<br><a href="https://mailman.nginx.org/pipermail/nginx-announce/2025/NYEUJX7NCBCGJGXDFVXNMAAMJDFSE45G.html">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2025-23419">CVE-2025-23419</a><br>Not vulnerable: 1.27.4+, 1.26.3+<br>Vulnerable: 1.11.4-1.27.3</p></li>
+
+<li><p>Buffer overread in the ngx_http_mp4_module<br>Severity: low<br><a href="https://mailman.nginx.org/pipermail/nginx-announce/2024/UUOCLLONPR6244YQYU65PO5LB7JDYCWM.html">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2024-7347">CVE-2024-7347</a><br>Not vulnerable: 1.27.1+, 1.26.2+<br>Vulnerable: 1.5.13-1.27.0<br><a href="/download/patch.2024.mp4.txt">The patch</a>  <a href="/download/patch.2024.mp4.txt.asc">pgp</a></p></li>
+
+<li><p>Buffer overwrite in HTTP/3<br>Severity: medium<br><a href="https://mailman.nginx.org/pipermail/nginx-announce/2024/GMY32CSHFH6VFTN76HJNX7WNEX4RLHF6.html">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2024-32760">CVE-2024-32760</a><br>Not vulnerable: 1.27.0+, 1.26.1+<br>Vulnerable: 1.25.0-1.25.5, 1.26.0</p></li>
+
+<li><p>Stack overflow and use-after-free in HTTP/3<br>Severity: medium<br><a href="https://mailman.nginx.org/pipermail/nginx-announce/2024/GMY32CSHFH6VFTN76HJNX7WNEX4RLHF6.html">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2024-31079">CVE-2024-31079</a><br>Not vulnerable: 1.27.0+, 1.26.1+<br>Vulnerable: 1.25.0-1.25.5, 1.26.0</p></li>
+
+<li><p>NULL pointer dereference in HTTP/3<br>Severity: medium<br><a href="https://mailman.nginx.org/pipermail/nginx-announce/2024/GMY32CSHFH6VFTN76HJNX7WNEX4RLHF6.html">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2024-35200">CVE-2024-35200</a><br>Not vulnerable: 1.27.0+, 1.26.1+<br>Vulnerable: 1.25.0-1.25.5, 1.26.0</p></li>
+
+<li><p>Memory disclosure in HTTP/3<br>Severity: medium<br><a href="https://mailman.nginx.org/pipermail/nginx-announce/2024/GMY32CSHFH6VFTN76HJNX7WNEX4RLHF6.html">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2024-34161">CVE-2024-34161</a><br>Not vulnerable: 1.27.0+, 1.26.1+<br>Vulnerable: 1.25.0-1.25.5, 1.26.0</p></li>
+
+<li><p>NULL pointer dereference in HTTP/3<br>Severity: <b>major</b><br><a href="https://mailman.nginx.org/pipermail/nginx-announce/2024/NW6MNW34VZ6HDIHH5YFBIJYZJN7FGNAV.html">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2024-24989">CVE-2024-24989</a><br>Not vulnerable: 1.25.4+<br>Vulnerable: 1.25.3</p></li>
+
+<li><p>Use-after-free in HTTP/3<br>Severity: <b>major</b><br><a href="https://mailman.nginx.org/pipermail/nginx-announce/2024/NW6MNW34VZ6HDIHH5YFBIJYZJN7FGNAV.html">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2024-24990">CVE-2024-24990</a><br>Not vulnerable: 1.25.4+<br>Vulnerable: 1.25.0-1.25.3</p></li>
+
+<li><p>Memory corruption in the ngx_http_mp4_module<br>Severity: medium<br><a href="https://mailman.nginx.org/pipermail/nginx-announce/2022/RBRRON6PYBJJM2XIAPQBFBVLR4Q6IHRA.html">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2022-41741">CVE-2022-41741</a><br>Not vulnerable: 1.23.2+, 1.22.1+<br>Vulnerable: 1.1.3-1.23.1, 1.0.7-1.0.15<br><a href="/download/patch.2022.mp4.txt">The patch</a>  <a href="/download/patch.2022.mp4.txt.asc">pgp</a></p></li>
+
+<li><p>Memory disclosure in the ngx_http_mp4_module<br>Severity: medium<br><a href="https://mailman.nginx.org/pipermail/nginx-announce/2022/RBRRON6PYBJJM2XIAPQBFBVLR4Q6IHRA.html">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2022-41742">CVE-2022-41742</a><br>Not vulnerable: 1.23.2+, 1.22.1+<br>Vulnerable: 1.1.3-1.23.1, 1.0.7-1.0.15<br><a href="/download/patch.2022.mp4.txt">The patch</a>  <a href="/download/patch.2022.mp4.txt.asc">pgp</a></p></li>
+
+<li><p>1-byte memory overwrite in resolver<br>Severity: medium<br><a href="https://mailman.nginx.org/pipermail/nginx-announce/2021/000300.html">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2021-23017">CVE-2021-23017</a><br>Not vulnerable: 1.21.0+, 1.20.1+<br>Vulnerable: 0.6.18-1.20.0<br><a href="/download/patch.2021.resolver.txt">The patch</a>  <a href="/download/patch.2021.resolver.txt.asc">pgp</a></p></li>
+
+<li><p>Excessive CPU usage in HTTP/2 with small window updates<br>Severity: medium<br><a href="https://mailman.nginx.org/pipermail/nginx-announce/2019/000249.html">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2019-9511">CVE-2019-9511</a><br>Not vulnerable: 1.17.3+, 1.16.1+<br>Vulnerable: 1.9.5-1.17.2</p></li>
+
+<li><p>Excessive CPU usage in HTTP/2 with priority changes<br>Severity: low<br><a href="https://mailman.nginx.org/pipermail/nginx-announce/2019/000249.html">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2019-9513">CVE-2019-9513</a><br>Not vulnerable: 1.17.3+, 1.16.1+<br>Vulnerable: 1.9.5-1.17.2</p></li>
+
+<li><p>Excessive memory usage in HTTP/2 with zero length headers<br>Severity: low<br><a href="https://mailman.nginx.org/pipermail/nginx-announce/2019/000249.html">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2019-9516">CVE-2019-9516</a><br>Not vulnerable: 1.17.3+, 1.16.1+<br>Vulnerable: 1.9.5-1.17.2</p></li>
+
+<li><p>Excessive memory usage in HTTP/2<br>Severity: low<br><a href="https://mailman.nginx.org/pipermail/nginx-announce/2018/000220.html">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2018-16843">CVE-2018-16843</a><br>Not vulnerable: 1.15.6+, 1.14.1+<br>Vulnerable: 1.9.5-1.15.5</p></li>
+
+<li><p>Excessive CPU usage in HTTP/2<br>Severity: low<br><a href="https://mailman.nginx.org/pipermail/nginx-announce/2018/000220.html">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2018-16844">CVE-2018-16844</a><br>Not vulnerable: 1.15.6+, 1.14.1+<br>Vulnerable: 1.9.5-1.15.5</p></li>
+
+<li><p>Memory disclosure in the ngx_http_mp4_module<br>Severity: medium<br><a href="https://mailman.nginx.org/pipermail/nginx-announce/2018/000221.html">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2018-16845">CVE-2018-16845</a><br>Not vulnerable: 1.15.6+, 1.14.1+<br>Vulnerable: 1.1.3-1.15.5, 1.0.7-1.0.15<br><a href="/download/patch.2018.mp4.txt">The patch</a>  <a href="/download/patch.2018.mp4.txt.asc">pgp</a></p></li>
+
+<li><p>Integer overflow in the range filter<br>Severity: medium<br><a href="https://mailman.nginx.org/pipermail/nginx-announce/2017/000200.html">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2017-7529">CVE-2017-7529</a><br>Not vulnerable: 1.13.3+, 1.12.1+<br>Vulnerable: 0.5.6-1.13.2<br><a href="/download/patch.2017.ranges.txt">The patch</a>  <a href="/download/patch.2017.ranges.txt.asc">pgp</a></p></li>
+
+<li><p>NULL pointer dereference while writing client request body<br>Severity: medium<br><a href="https://mailman.nginx.org/pipermail/nginx-announce/2016/000179.html">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2016-4450">CVE-2016-4450</a><br>Not vulnerable: 1.11.1+, 1.10.1+<br>Vulnerable: 1.3.9-1.11.0<br><a href="/download/patch.2016.write.txt">The patch</a>  <a href="/download/patch.2016.write.txt.asc">pgp</a>  (for 1.9.13-1.11.0)<br><a href="/download/patch.2016.write2.txt">The patch</a>  <a href="/download/patch.2016.write2.txt.asc">pgp</a>  (for 1.3.9-1.9.12)</p></li>
+
+<li><p>Invalid pointer dereference in resolver<br>Severity: medium<br><a href="https://mailman.nginx.org/pipermail/nginx-announce/2016/000169.html">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2016-0742">CVE-2016-0742</a><br>Not vulnerable: 1.9.10+, 1.8.1+<br>Vulnerable: 0.6.18-1.9.9</p></li>
+
+<li><p>Use-after-free during CNAME response processing in resolver<br>Severity: medium<br><a href="https://mailman.nginx.org/pipermail/nginx-announce/2016/000169.html">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2016-0746">CVE-2016-0746</a><br>Not vulnerable: 1.9.10+, 1.8.1+<br>Vulnerable: 0.6.18-1.9.9</p></li>
+
+<li><p>Insufficient limits of CNAME resolution in resolver<br>Severity: medium<br><a href="https://mailman.nginx.org/pipermail/nginx-announce/2016/000169.html">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2016-0747">CVE-2016-0747</a><br>Not vulnerable: 1.9.10+, 1.8.1+<br>Vulnerable: 0.6.18-1.9.9</p></li>
+
+<li><p>SSL session reuse vulnerability<br>Severity: medium<br><a href="https://mailman.nginx.org/pipermail/nginx-announce/2014/000147.html">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2014-3616">CVE-2014-3616</a><br>Not vulnerable: 1.7.5+, 1.6.2+<br>Vulnerable: 0.5.6-1.7.4</p></li>
+
+<li><p>STARTTLS command injection<br>Severity: medium<br><a href="https://mailman.nginx.org/pipermail/nginx-announce/2014/000144.html">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2014-3556">CVE-2014-3556</a><br>Not vulnerable: 1.7.4+, 1.6.1+<br>Vulnerable: 1.5.6-1.7.3<br><a href="/download/patch.2014.starttls.txt">The patch</a>  <a href="/download/patch.2014.starttls.txt.asc">pgp</a></p></li>
+
+<li><p>SPDY heap buffer overflow<br>Severity: <b>major</b><br><a href="https://mailman.nginx.org/pipermail/nginx-announce/2014/000135.html">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2014-0133">CVE-2014-0133</a><br>Not vulnerable: 1.5.12+, 1.4.7+<br>Vulnerable: 1.3.15-1.5.11<br><a href="/download/patch.2014.spdy2.txt">The patch</a>  <a href="/download/patch.2014.spdy2.txt.asc">pgp</a></p></li>
+
+<li><p>SPDY memory corruption<br>Severity: <b>major</b><br><a href="https://mailman.nginx.org/pipermail/nginx-announce/2014/000132.html">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2014-0088">CVE-2014-0088</a><br>Not vulnerable: 1.5.11+<br>Vulnerable: 1.5.10<br><a href="/download/patch.2014.spdy.txt">The patch</a>  <a href="/download/patch.2014.spdy.txt.asc">pgp</a></p></li>
+
+<li><p>Request line parsing vulnerability<br>Severity: medium<br><a href="https://mailman.nginx.org/pipermail/nginx-announce/2013/000125.html">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2013-4547">CVE-2013-4547</a><br>Not vulnerable: 1.5.7+, 1.4.4+<br>Vulnerable: 0.8.41-1.5.6<br><a href="/download/patch.2013.space.txt">The patch</a>  <a href="/download/patch.2013.space.txt.asc">pgp</a></p></li>
+
+<li><p>Memory disclosure with specially crafted HTTP backend responses<br>Severity: medium<br><a href="https://mailman.nginx.org/pipermail/nginx-announce/2013/000114.html">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2013-2070">CVE-2013-2070</a><br>Not vulnerable: 1.5.0+, 1.4.1+, 1.2.9+<br>Vulnerable: 1.1.4-1.2.8, 1.3.9-1.4.0<br><a href="/download/patch.2013.chunked.txt">The patch</a>  <a href="/download/patch.2013.chunked.txt.asc">pgp</a>  (for 1.3.9-1.4.0)<br><a href="/download/patch.2013.proxy.txt">The patch</a>  <a href="/download/patch.2013.proxy.txt.asc">pgp</a>  (for 1.1.4-1.2.8)</p></li>
+
+<li><p>Stack-based buffer overflow with specially crafted request<br>Severity: <b>major</b><br><a href="https://mailman.nginx.org/pipermail/nginx-announce/2013/000112.html">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2013-2028">CVE-2013-2028</a><br>Not vulnerable: 1.5.0+, 1.4.1+<br>Vulnerable: 1.3.9-1.4.0<br><a href="/download/patch.2013.chunked.txt">The patch</a>  <a href="/download/patch.2013.chunked.txt.asc">pgp</a></p></li>
+
+<li><p>Vulnerabilities with Windows directory aliases<br>Severity: medium<br><a href="https://mailman.nginx.org/pipermail/nginx-announce/2012/000086.html">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2011-4963">CVE-2011-4963</a><br>Not vulnerable: 1.3.1+, 1.2.1+<br>Vulnerable: nginx/Windows 0.7.52-1.3.0</p></li>
+
+<li><p>Buffer overflow in the ngx_http_mp4_module<br>Severity: <b>major</b><br><a href="https://mailman.nginx.org/pipermail/nginx-announce/2012/000080.html">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2012-2089">CVE-2012-2089</a><br>Not vulnerable: 1.1.19+, 1.0.15+<br>Vulnerable: 1.1.3-1.1.18, 1.0.7-1.0.14<br><a href="/download/patch.2012.mp4.txt">The patch</a>  <a href="/download/patch.2012.mp4.txt.asc">pgp</a></p></li>
+
+<li><p>Memory disclosure with specially crafted backend responses<br>Severity: <b>major</b><br><a href="https://mailman.nginx.org/pipermail/nginx-announce/2012/000076.html">Advisory</a><br><a href="https://www.cve.org/CVERecord?id=CVE-2012-1180">CVE-2012-1180</a><br>Not vulnerable: 1.1.17+, 1.0.14+<br>Vulnerable: 0.1.0-1.1.16<br><a href="/download/patch.2012.memory.txt">The patch</a>  <a href="/download/patch.2012.memory.txt.asc">pgp</a></p></li>
+
+<li><p>Buffer overflow in resolver<br>Severity: medium<br><a href="https://www.cve.org/CVERecord?id=CVE-2011-4315">CVE-2011-4315</a><br>Not vulnerable: 1.1.8+, 1.0.10+<br>Vulnerable: 0.6.18-1.1.7</p></li>
+
+<li><p>Vulnerabilities with invalid UTF-8 sequence on Windows<br>Severity: <b>major</b><br><a href="https://www.cve.org/CVERecord?id=CVE-2010-2266">CVE-2010-2266</a><br>Not vulnerable: 0.8.41+, 0.7.67+<br>Vulnerable: nginx/Windows 0.7.52-0.8.40</p></li>
+
+<li><p>Vulnerabilities with Windows file default stream<br>Severity: <b>major</b><br><a href="https://www.cve.org/CVERecord?id=CVE-2010-2263">CVE-2010-2263</a><br>Not vulnerable: 0.8.40+, 0.7.66+<br>Vulnerable: nginx/Windows 0.7.52-0.8.39</p></li>
+
+<li><p>Vulnerabilities with Windows 8.3 filename pseudonyms<br>Severity: <b>major</b><br><a href="http://www.coresecurity.com/content/filename-pseudonyms-vulnerabilities">CORE-2010-0121</a><br>Not vulnerable: 0.8.33+, 0.7.65+<br>Vulnerable: nginx/Windows 0.7.52-0.8.32</p></li>
+
+<li><p>An error log data are not sanitized<br>Severity: none<br><a href="https://www.cve.org/CVERecord?id=CVE-2009-4487">CVE-2009-4487</a><br>Not vulnerable: none<br>Vulnerable: all</p></li>
+
+<li><p>The renegotiation vulnerability in SSL protocol<br>Severity: <b>major</b><br><a href="http://www.kb.cert.org/vuls/id/120541">VU#120541</a>  <a href="https://www.cve.org/CVERecord?id=CVE-2009-3555">CVE-2009-3555</a><br>Not vulnerable: 0.8.23+, 0.7.64+<br>Vulnerable: 0.1.0-0.8.22<br><a href="/download/patch.cve-2009-3555.txt">The patch</a>  <a href="/download/patch.cve-2009-3555.txt.asc">pgp</a></p></li>
+
+<li><p>Directory traversal vulnerability<br>Severity: minor<br><a href="https://www.cve.org/CVERecord?id=CVE-2009-3898">CVE-2009-3898</a><br>Not vulnerable: 0.8.17+, 0.7.63+<br>Vulnerable: 0.1.0-0.8.16</p></li>
+
+<li><p>Buffer underflow vulnerability<br>Severity: <b>major</b><br><a href="http://www.kb.cert.org/vuls/id/180065">VU#180065</a>  <a href="https://www.cve.org/CVERecord?id=CVE-2009-2629">CVE-2009-2629</a><br>Not vulnerable: 0.8.15+, 0.7.62+, 0.6.39+, 0.5.38+<br>Vulnerable: 0.1.0-0.8.14<br><a href="/download/patch.180065.txt">The patch</a>  <a href="/download/patch.180065.txt.asc">pgp</a></p></li>
+
+<li><p>Null pointer dereference vulnerability<br>Severity: <b>major</b><br><a href="https://www.cve.org/CVERecord?id=CVE-2009-3896">CVE-2009-3896</a><br>Not vulnerable: 0.8.14+, 0.7.62+, 0.6.39+, 0.5.38+<br>Vulnerable: 0.1.0-0.8.13<br><a href="/download/patch.null.pointer.txt">The patch</a>  <a href="/download/patch.null.pointer.txt.asc">pgp</a></p></li>
+
+</ul></div><div id="footer">© F5, Inc. All rights reserved.</div></div></body></html>

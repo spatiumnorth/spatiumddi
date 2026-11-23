@@ -544,3 +544,52 @@ def test_alpine_cdn_is_an_allowed_host(lint: types.ModuleType) -> None:
     # reads as URL substring sanitisation (it is set membership here).
     assert {"dl-cdn.alpinelinux.org"} <= lint._ALLOWED_HOSTS
     assert lint._GITHUB_API_HOST != "dl-cdn.alpinelinux.org", "the token must never go to the CDN"
+
+
+# ── network_facing (#4816) ───────────────────────────────────────────────────
+
+
+def test_network_facing_is_an_accepted_boolean_key(
+    lint: types.ModuleType, tmp_path: pathlib.Path
+) -> None:
+    def load(value: object) -> None:
+        path = tmp_path / "versions.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "components": {
+                        "x": {
+                            "version": "1",
+                            "network_facing": value,
+                            "pinned_in": [{"path": "f", "match": "{version}"}],
+                        }
+                    }
+                }
+            )
+        )
+        lint.load_manifest(path)
+
+    load(True)
+    with pytest.raises(lint.ManifestError, match="network_facing"):
+        load("false")
+
+
+def test_upstream_table_lists_network_facing_behind_first(lint: types.ModuleType) -> None:
+    def row(name: str, behind: bool, net: bool) -> dict:
+        return {
+            "name": name,
+            "current": "1",
+            "latest": "2",
+            "behind": behind,
+            "hold": None,
+            "error": None,
+            "network_facing": net,
+        }
+
+    table = lint.format_upstream_table([row("a", True, False), row("n", True, True)])
+    head, _, rest = table.partition("### All components")
+    assert head.startswith("### Network-facing components behind upstream")
+    assert "`n`" in head and "`a`" not in head
+    assert "`a`" in rest
+    # Nothing network-facing is behind: no extra section.
+    assert "###" not in lint.format_upstream_table([row("a", True, False), row("n", False, True)])
