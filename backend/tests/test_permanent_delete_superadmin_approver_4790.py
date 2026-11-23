@@ -97,3 +97,72 @@ async def test_apply_refuses_non_superadmin_as_permission_error(
     args = op.args_model(subnet_id=subnet.id, force=True, permanent=True)
     with pytest.raises(OperationPermissionError):
         await op.apply(db_session, user, args)
+
+
+# ── The direct (not queued) path keeps its 403 ────────────────────────────────
+#
+# The routes call ``op.apply`` themselves when nothing queues the request. The
+# apply now raises an ``OperationPermissionError``, which no route translates
+# (a bare ``PermissionError`` is a 500), so the gate refuses first.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module_on", [False, True], ids=["module-off", "module-on-no-policy"])
+async def test_direct_permanent_delete_by_non_superadmin_is_403(
+    client: AsyncClient, db_session: AsyncSession, module_on: bool
+) -> None:
+    from app.models.ipam import IPBlock, IPSpace
+
+    if module_on:
+        await _enable_module(db_session)
+    subnet = await _subnet(db_session)
+    block = await db_session.get(IPBlock, subnet.block_id)
+    space = await db_session.get(IPSpace, subnet.space_id)
+    assert block is not None and space is not None
+    subnet_id, block_id, space_id = subnet.id, block.id, space.id
+    _, token = await _user(
+        db_session,
+        name="editor",
+        permissions=[
+            _DELETE,
+            {"action": "delete", "resource_type": "ip_block"},
+            {"action": "delete", "resource_type": "ip_space"},
+        ],
+    )
+    await db_session.commit()
+    for url in (
+        f"/api/v1/ipam/subnets/{subnet_id}?permanent=true&force=true",
+        f"/api/v1/ipam/blocks/{block_id}?permanent=true",
+        f"/api/v1/ipam/spaces/{space_id}?permanent=true",
+    ):
+        r = await client.delete(url, headers=_auth(token))
+        assert r.status_code == 403, (url, r.status_code, r.text)
+        assert r.json()["detail"] == "Superadmin required", url
+    db_session.expire_all()
+    assert await db_session.get(Subnet, subnet_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_proposal_apply_permanent_delete_by_non_superadmin_is_403(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    from app.models.ai import AIOperationProposal
+    from app.services.ai import operations
+
+    subnet = await _subnet(db_session)
+    subnet_id = subnet.id
+    user, token = await _user(db_session, name="editor", permissions=[_DELETE])
+    row = AIOperationProposal(
+        session_id=None,
+        user_id=user.id,
+        operation="delete_subnet",
+        args={"subnet_id": str(subnet_id), "force": True, "permanent": True},
+        preview_text="p",
+        expires_at=operations.expires_at_default(),
+    )
+    db_session.add(row)
+    await db_session.commit()
+    r = await client.post(f"/api/v1/ai/proposals/{row.id}/apply", headers=_auth(token), json={})
+    assert r.status_code == 403, r.text
+    db_session.expire_all()
+    assert await db_session.get(Subnet, subnet_id) is not None
