@@ -3848,15 +3848,18 @@ async def _preview_create_dhcp_static(
     except ValueError:
         return PreviewResult(ok=False, detail=f"Invalid IP {args.ip_address!r}.")
 
+    # The scope's subnet is not a reference the caller named, so a reader of
+    # the scope alone may not be able to read it: the preview then words its
+    # refusals and its summary without the subnet's network.
+    shows_network = _can_read_target(user, "subnet", subnet.id)
     try:
         net = ipaddress.ip_network(str(subnet.network), strict=False)
     except ValueError:
-        return PreviewResult(ok=False, detail=f"Scope subnet {subnet.network!r} is unparseable.")
+        named = repr(subnet.network) if shows_network else "the scope's subnet"
+        return PreviewResult(ok=False, detail=f"Scope subnet {named} is unparseable.")
     if addr_obj not in net:
-        return PreviewResult(
-            ok=False,
-            detail=(f"IP {args.ip_address} is outside scope subnet {subnet.network}."),
-        )
+        named = f"scope subnet {subnet.network}" if shows_network else "the scope's subnet"
+        return PreviewResult(ok=False, detail=f"IP {args.ip_address} is outside {named}.")
 
     # Conflict probe — do NOT reject in preview; surface as a hint so
     # the operator can decide whether to abort or replace.
@@ -3875,8 +3878,9 @@ async def _preview_create_dhcp_static(
     if existing is not None:
         suffix = " — note: a static for this IP or MAC already exists; apply will fail"
 
+    scope_label = subnet.network if shows_network else scope.id
     parts = [
-        f"Create DHCP static reservation in scope `{scope.name or subnet.network}`",
+        f"Create DHCP static reservation in scope `{scope.name or scope_label}`",
         f"ip={args.ip_address}",
         f"mac={args.mac_address}",
     ]
@@ -3933,7 +3937,7 @@ async def _apply_create_dhcp_static(
     addr_obj = ipaddress.ip_address(args.ip_address)
     net = ipaddress.ip_network(str(subnet.network), strict=False)
     if addr_obj not in net:
-        raise ValueError(f"IP {args.ip_address} is outside scope subnet {subnet.network}.")
+        raise ValueError(f"IP {args.ip_address} is outside the scope's subnet.")
 
     # #2901 — the REST create's conflict check (a MAC already reserved in the
     # group, a malformed IP). Raises a 4xx HTTPException; both callers roll
