@@ -160,6 +160,8 @@ DELEGATE_VALUES: dict[str, Any] = {
     "dns_pull_from_server_interval_minutes": 15,
     "dhcp_pull_leases_enabled": True,
     "dhcp_pull_leases_interval_seconds": 60,
+    "dhcp_health_check_interval_seconds": 300,
+    "dhcp_mac_blocks_sync_interval_seconds": 300,
     "dhcp_default_lease_time": 7200,
     "dhcp_default_domain_name": "example.test",
     "dhcp_default_domain_search": ["example.test"],

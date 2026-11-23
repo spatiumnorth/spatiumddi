@@ -882,7 +882,7 @@ DHCPMACBlock
 | Driver | Enforcement | Update mechanism |
 |---|---|---|
 | Kea | Packets matching the reserved `DROP` client class are silently dropped before allocation. The agent renders active blocks as `hexstring(pkt4.mac, ':') == '…'` OR-clauses inside `DROP.test`. On DHCPv6 scopes the same class is rendered best-effort (#2268), see below. | ConfigBundle — blocklist changes shift the bundle ETag; agent long-poll picks them up and re-renders. |
-| Windows DHCP | Server-level deny filter list (`Add-DhcpServerv4Filter -List Deny`). Deny filter is server-global — every scope on the server enforces it. | 60 s Celery beat task diffs desired-set against `Get-DhcpServerv4Filter -List Deny` and ships one batched PS script per WinRM round trip. |
+| Windows DHCP | Server-level deny filter list (`Add-DhcpServerv4Filter -List Deny`). Deny filter is server-global — every scope on the server enforces it. Celery beat task (every `dhcp_mac_blocks_sync_interval_seconds`, 60 s by default) diffs desired-set against `Get-DhcpServerv4Filter -List Deny` and ships one batched PS script per WinRM round trip. |
 
 **What a MAC block can and cannot catch on DHCPv6.** A DHCPv6 packet has no hardware address field (Kea has no `pkt6.mac`), so the Dhcp6 `DROP` class derives the MAC from what the client sends: the link-layer address inside an Ethernet DUID-LL (type 3) or DUID-LLT (type 1) client-id, and the client link-layer address option (79, RFC 6939) that a first-hop relay may add (checked on both the innermost relay, which is the first hop, and the outermost, so a chain of relays is covered). It does **not** catch a client using DUID-EN or DUID-UUID, a DUID it randomised (many OSes generate a stable but non-MAC-derived DUID), a client that changes DUID, or a relayed packet whose relay adds no option 79. Treat the v6 block as a partial control: for a hard guarantee also block the device at the switch or router. Windows DHCP's deny filter is IPv4-only and does not apply to DHCPv6 scopes.
 
@@ -1866,6 +1866,14 @@ Scheduled Celery beat task: [`app.tasks.dhcp_pull_leases.auto_pull_dhcp_leases`]
 | `dhcp_pull_leases_enabled` | off | Master toggle. |
 | `dhcp_pull_leases_interval_seconds` | 15 | How often to poll each agentless server, in seconds. Floor is 10 (matching the beat tick). Operators who don't need sub-minute freshness can raise it to 60 / 300 / etc to reduce WinRM load. |
 | `dhcp_pull_leases_last_run_at` | — | Claimed when a pass **starts** (#2262), so a pass slower than the beat tick is not started again while it runs; visible in Settings. |
+
+**Health check and MAC block sync cadence (#4759).** Two other beat jobs reach every agentless server: the health sweep (one round trip per server: `Get-DhcpServerVersion` over WinRM on Windows, a REST probe on FortiGate) and the MAC block sync (reads each server's deny filter list, even when nothing changed). Beat fires both every 60 s; each gates on its own setting, in the same Settings section as the lease pull:
+
+| Setting | Default | Description |
+|---|---|---|
+| `dhcp_health_check_interval_seconds` | 60 | How often every DHCP server's health is checked. Floor is 60 (the beat tick). Raise it (e.g. 300) to take the per-minute WinRM / PowerShell session off a Windows DHCP host; server status then updates that much less often. Applies to Kea servers too, whose check only reads the agent heartbeat. |
+| `dhcp_mac_blocks_sync_interval_seconds` | 60 | How often MAC blocks are reconciled onto agentless servers. Floor is 60. A raised interval is also how long a new, edited or expired block can take to reach the server. |
+| `dhcp_health_check_last_run_at` / `dhcp_mac_blocks_sync_last_run_at` | — | Stamped when a pass starts, so a slow pass is not started again by the next tick. |
 
 > **Windows DHCP has no streaming primitive.** The lease audit log (`DhcpSrvLog-<Day>.log`) and `Get-DhcpServerv4Lease` are the only real windows into the running service, and both are pull-based. WinRM itself is request/response — `Get-Content -Wait` does exist in PowerShell but it holds the HTTPS connection open indefinitely and can't flush partial output back through `pywinrm.run_ps`, so true push-style streaming would require an agent process on the DC that POSTs events back to SpatiumDDI. Short-interval polling is the practical upper bound without adding that complexity.
 

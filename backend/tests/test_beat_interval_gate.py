@@ -15,7 +15,14 @@ from typing import Any
 
 import pytest
 
-from app.tasks import dhcp_pull_leases, dns_pull, ipam_dns_sync, reverse_dns
+from app.tasks import (
+    dhcp_health,
+    dhcp_mac_blocks,
+    dhcp_pull_leases,
+    dns_pull,
+    ipam_dns_sync,
+    reverse_dns,
+)
 
 
 class _Reached(Exception):
@@ -116,8 +123,35 @@ CASES = [
         "dhcp_pull_leases_last_run_at",
         {"seconds": 10},
     ),
+    (
+        dhcp_health,
+        dhcp_health._enqueue_all,
+        dict(
+            dhcp_health_check_interval_seconds=60,
+            dhcp_health_check_last_run_at=None,
+        ),
+        "dhcp_health_check_last_run_at",
+        {"seconds": 60},
+    ),
+    (
+        dhcp_mac_blocks,
+        dhcp_mac_blocks._run_sync,
+        dict(
+            dhcp_mac_blocks_sync_interval_seconds=60,
+            dhcp_mac_blocks_sync_last_run_at=None,
+        ),
+        "dhcp_mac_blocks_sync_last_run_at",
+        {"seconds": 60},
+    ),
 ]
-IDS = ["ipam_dns_sync", "dns_pull", "reverse_dns", "dhcp_pull_leases"]
+IDS = [
+    "ipam_dns_sync",
+    "dns_pull",
+    "reverse_dns",
+    "dhcp_pull_leases",
+    "dhcp_health",
+    "dhcp_mac_blocks",
+]
 
 
 @pytest.mark.asyncio
@@ -144,3 +178,69 @@ async def test_run_well_inside_interval_is_still_skipped(
     setattr(ps, stamp, datetime.now(UTC) - timedelta(**interval) / 3)
     _patch(monkeypatch, module, ps)
     assert await _outcome(fn()) == "skipped"
+
+
+# #4759 — the agentless DHCP health sweep and MAC-block sync gate on their
+# own configured interval instead of running on every 60 s beat tick.
+AGENTLESS_JOBS = [
+    (
+        dhcp_health,
+        dhcp_health._enqueue_all,
+        "dhcp_health_check_interval_seconds",
+        "dhcp_health_check_last_run_at",
+    ),
+    (
+        dhcp_mac_blocks,
+        dhcp_mac_blocks._run_sync,
+        "dhcp_mac_blocks_sync_interval_seconds",
+        "dhcp_mac_blocks_sync_last_run_at",
+    ),
+]
+AGENTLESS_IDS = ["dhcp_health", "dhcp_mac_blocks"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module,fn,interval_field,stamp", AGENTLESS_JOBS, ids=AGENTLESS_IDS)
+@pytest.mark.parametrize(
+    "seconds_ago,expected", [(None, "ran"), (120, "skipped"), (299, "ran"), (301, "ran")]
+)
+async def test_agentless_dhcp_job_honours_a_longer_interval(
+    monkeypatch: pytest.MonkeyPatch,
+    module: Any,
+    fn: Any,
+    interval_field: str,
+    stamp: str,
+    seconds_ago: int | None,
+    expected: str,
+) -> None:
+    # 300 s configured: two ticks after the last run is still too early, a run
+    # at (or a jitter short of) five minutes goes ahead.
+    ps = SimpleNamespace(**{interval_field: 300})
+    setattr(ps, stamp, None if seconds_ago is None else _ago(seconds=seconds_ago))
+    _patch(monkeypatch, module, ps)
+    assert await _outcome(fn()) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module,fn,interval_field,stamp", AGENTLESS_JOBS, ids=AGENTLESS_IDS)
+async def test_agentless_dhcp_job_interval_is_floored_to_the_beat_tick(
+    monkeypatch: pytest.MonkeyPatch, module: Any, fn: Any, interval_field: str, stamp: str
+) -> None:
+    # A value below the 60 s tick (only reachable by writing the row directly;
+    # the API refuses it) behaves as 60 s, not as "every tick at any spacing".
+    ps = SimpleNamespace(**{interval_field: 10, stamp: _ago(seconds=30)})
+    _patch(monkeypatch, module, ps)
+    assert await _outcome(fn()) == "skipped"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module,fn,interval_field,stamp", AGENTLESS_JOBS, ids=AGENTLESS_IDS)
+async def test_agentless_dhcp_job_stamps_before_reaching_servers(
+    monkeypatch: pytest.MonkeyPatch, module: Any, fn: Any, interval_field: str, stamp: str
+) -> None:
+    # The stamp is written before the servers are read, so the next tick sees
+    # this run even while it is still in progress.
+    ps = SimpleNamespace(**{interval_field: 300, stamp: None})
+    _patch(monkeypatch, module, ps)
+    assert await _outcome(fn()) == "ran"
+    assert getattr(ps, stamp) is not None

@@ -248,6 +248,8 @@ const SECTION_FIELDS: Record<SectionId, (keyof PlatformSettings)[]> = {
   "dhcp-lease-sync": [
     "dhcp_pull_leases_enabled",
     "dhcp_pull_leases_interval_seconds",
+    "dhcp_health_check_interval_seconds",
+    "dhcp_mac_blocks_sync_interval_seconds",
   ],
   // Managed through the dedicated AuditForwardTargets component, not
   // the flat settings form. Legacy flat columns stay on
@@ -1217,7 +1219,7 @@ const SECTIONS: SectionDef[] = [
     title: "DHCP Lease Sync",
     group: "DHCP",
     description:
-      "Poll agentless DHCP servers (e.g. Windows DHCP, FortiGate) for active leases and mirror them into DHCP + IPAM. Additive only; expiry is handled by the existing lease cleanup sweep.",
+      "Poll agentless DHCP servers (e.g. Windows DHCP, FortiGate) for active leases and mirror them into DHCP + IPAM, and set how often the health check and the MAC block sync reach those servers. Lease sync is additive only; expiry is handled by the existing lease cleanup sweep.",
     keywords: [
       "dhcp",
       "lease",
@@ -1228,6 +1230,9 @@ const SECTIONS: SectionDef[] = [
       "mirror",
       "additive",
       "auto",
+      "health",
+      "mac block",
+      "interval",
     ],
   },
 
@@ -2227,6 +2232,50 @@ export function SettingsPage() {
                         ).toLocaleString()
                       : "never"}
                   </span>
+                </Field>
+                <Field
+                  label="Health Check Interval"
+                  description="How often every DHCP server's health is checked, in seconds. For agentless servers each check is a round trip to the server (a WinRM / PowerShell session on a Windows DHCP host), so raise it (e.g. 300) to take that load off the server; the server's status then updates less often. Beat ticks every 60 s (the floor and the default)."
+                >
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={60}
+                      value={values.dhcp_health_check_interval_seconds ?? 60}
+                      onChange={(e) =>
+                        set(
+                          "dhcp_health_check_interval_seconds",
+                          Number(e.target.value),
+                        )
+                      }
+                      disabled={!canEdit("dhcp_health_check_interval_seconds")}
+                      className={cn(inputCls, "w-24")}
+                    />
+                    <span className="text-xs text-muted-foreground">sec</span>
+                  </div>
+                </Field>
+                <Field
+                  label="MAC Block Sync Interval"
+                  description="How often the MAC block list is reconciled onto agentless DHCP servers, in seconds. Each pass reads every server's deny filter list, even when nothing changed. A raised interval is also how long a new, edited or expired block can take to reach the server. Beat ticks every 60 s (the floor and the default)."
+                >
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={60}
+                      value={values.dhcp_mac_blocks_sync_interval_seconds ?? 60}
+                      onChange={(e) =>
+                        set(
+                          "dhcp_mac_blocks_sync_interval_seconds",
+                          Number(e.target.value),
+                        )
+                      }
+                      disabled={
+                        !canEdit("dhcp_mac_blocks_sync_interval_seconds")
+                      }
+                      className={cn(inputCls, "w-24")}
+                    />
+                    <span className="text-xs text-muted-foreground">sec</span>
+                  </div>
                 </Field>
               </>
             )}

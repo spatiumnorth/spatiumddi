@@ -35,12 +35,19 @@ from app.config import settings
 from app.db import task_connect_args
 from app.drivers.dhcp import get_driver, is_agentless
 from app.models.dhcp import DHCPServer
+from app.models.settings import PlatformSettings
 from app.services.agents.daemon_state import forget_stale_ok
 from app.services.feature_modules import is_module_enabled
+from app.tasks._interval_gate import interval_skip
 from app.tasks.module_gate import module_gated
 
 # If agent hasn't heartbeat'd in this long, mark unreachable.
 AGENT_STALE_AFTER = timedelta(seconds=120)
+
+_SINGLETON_ID = 1
+# Beat fires the sweep every 60 s; a shorter configured interval cannot be
+# honoured, so it is floored here.
+_MIN_INTERVAL = timedelta(seconds=60)
 
 logger = structlog.get_logger(__name__)
 
@@ -135,7 +142,7 @@ def check_dhcp_server_health(self: object, server_id: str) -> None:  # type: ign
         raise self.retry(exc=exc, countdown=30) from exc  # type: ignore[attr-defined]
 
 
-async def _enqueue_all() -> None:
+async def _enqueue_all() -> dict[str, object]:
     engine = create_async_engine(
         settings.database_url, future=True, connect_args=task_connect_args()
     )
@@ -145,20 +152,36 @@ async def _enqueue_all() -> None:
             # #1068 — the DHCP/DNS subsystem can be switched off wholesale;
             # do no work (and open no driver connections) when it is.
             if not await is_module_enabled(db, "core.dhcp"):
-                return
+                return {"status": "disabled"}
+            # #4759 — the operator-configured cadence. Every sweep reaches
+            # every agentless server (a WinRM round trip on Windows DHCP), so
+            # the beat tick alone was too often for some deployments.
+            ps = await db.get(PlatformSettings, _SINGLETON_ID)
+            if ps is not None:
+                now = datetime.now(UTC)
+                interval = max(
+                    _MIN_INTERVAL, timedelta(seconds=ps.dhcp_health_check_interval_seconds)
+                )
+                skip = interval_skip(now, ps.dhcp_health_check_last_run_at, interval)
+                if skip is not None:
+                    return skip
+                ps.dhcp_health_check_last_run_at = now
+                await db.commit()
             result = await db.execute(select(DHCPServer.id))
             ids = [str(row[0]) for row in result.all()]
     finally:
         await engine.dispose()
     for sid in ids:
         check_dhcp_server_health.delay(sid)
+    return {"status": "ok", "enqueued": len(ids)}
 
 
 @celery_app.task(name="app.tasks.dhcp_health.check_all_dhcp_servers_health", bind=True)
 @module_gated("core.dhcp")
-def check_all_dhcp_servers_health(self: object) -> None:  # type: ignore[type-arg]
+def check_all_dhcp_servers_health(self: object) -> dict[str, object]:  # type: ignore[type-arg]
     """Fan-out task — enqueues one health check per registered DHCP server.
 
-    Scheduled every 60s by Celery beat (see app.celery_app).
+    Beat fires it every 60 s (see app.celery_app); it runs only once
+    ``PlatformSettings.dhcp_health_check_interval_seconds`` has elapsed.
     """
-    asyncio.run(_enqueue_all())
+    return asyncio.run(_enqueue_all())

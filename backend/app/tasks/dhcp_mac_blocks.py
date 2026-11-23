@@ -1,21 +1,25 @@
 """Periodic "DHCP MAC block sync" task.
 
-Fires every 60 s from Celery Beat. For every agentless DHCP server
-(Windows DHCP today), reconciles the server's deny filter list against
-the active MAC blocks on its group. Kea servers don't need this task —
+Fires every 60 s from Celery Beat and runs once
+``PlatformSettings.dhcp_mac_blocks_sync_interval_seconds`` has elapsed
+(60 by default, #4759). For every agentless DHCP server (Windows DHCP
+today), reconciles the server's deny filter list against the active MAC
+blocks on its group. Kea servers don't need this task —
 they pick up blocklist changes through the ConfigBundle + DROP class
 render, not per-object writes.
 
 The task is idempotent: if the deny-list already matches the desired
-set, the driver issues zero cmdlets and returns ``(0, 0)``. Runs on
-every tick so expiry transitions and toggle changes propagate without
-any explicit trigger from the API path.
+set, the driver issues zero cmdlets and returns ``(0, 0)`` — but it
+still reads the server's filter list, one WinRM round trip per server.
+Each run picks up expiry transitions and toggle changes without any
+explicit trigger from the API path, so the interval is also how long a
+change can take to reach the server.
 """
 
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
@@ -29,10 +33,17 @@ from app.drivers.dhcp import is_agentless
 from app.drivers.dhcp.base import MACBlockDef
 from app.drivers.dhcp.registry import get_driver
 from app.models.dhcp import DHCPMACBlock, DHCPServer
+from app.models.settings import PlatformSettings
 from app.services.feature_modules import is_module_enabled
+from app.tasks._interval_gate import interval_skip
 from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
+
+_SINGLETON_ID = 1
+# Beat fires the sync every 60 s; a shorter configured interval cannot be
+# honoured, so it is floored here.
+_MIN_INTERVAL = timedelta(seconds=60)
 
 
 async def _run_sync() -> dict[str, Any]:
@@ -47,9 +58,23 @@ async def _run_sync() -> dict[str, Any]:
             # do no work (and open no driver connections) when it is.
             if not await is_module_enabled(db, "core.dhcp"):
                 return {"status": "disabled"}
-            servers = list((await db.execute(select(DHCPServer))).scalars().all())
 
             now = datetime.now(UTC)
+            # #4759 — the operator-configured cadence; the stamp is taken
+            # before the servers are reached so a slow pass is not started
+            # again by the next tick.
+            ps = await db.get(PlatformSettings, _SINGLETON_ID)
+            if ps is not None:
+                interval = max(
+                    _MIN_INTERVAL, timedelta(seconds=ps.dhcp_mac_blocks_sync_interval_seconds)
+                )
+                skip = interval_skip(now, ps.dhcp_mac_blocks_sync_last_run_at, interval)
+                if skip is not None:
+                    return skip
+                ps.dhcp_mac_blocks_sync_last_run_at = now
+                await db.commit()
+
+            servers = list((await db.execute(select(DHCPServer))).scalars().all())
             by_group: dict[Any, list[MACBlockDef]] = {}
 
             servers_synced = 0

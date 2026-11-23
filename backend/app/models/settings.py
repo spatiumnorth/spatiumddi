@@ -341,6 +341,25 @@ class PlatformSettings(Base):
     dhcp_pull_leases_last_run_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # #4759 — cadence of the two other jobs that reach agentless DHCP
+    # servers on every beat tick: the health sweep (one WinRM / REST round
+    # trip per server) and the MAC-block reconcile (reads each server's
+    # deny filter list). Beat still fires every 60 s and the tasks gate on
+    # these, so the default of 60 keeps the historical cadence; raising
+    # them takes that load off the DHCP host (on Windows, a PowerShell
+    # session per call on the domain controller).
+    dhcp_health_check_interval_seconds: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=60
+    )
+    dhcp_health_check_last_run_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    dhcp_mac_blocks_sync_interval_seconds: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=60
+    )
+    dhcp_mac_blocks_sync_last_run_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # DHCP defaults — applied as the initial values when creating a new DHCP scope
     dhcp_default_dns_servers: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
