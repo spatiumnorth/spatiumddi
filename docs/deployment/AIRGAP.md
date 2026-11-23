@@ -97,8 +97,9 @@ command or the profile's containers keep running the old image
 
 Copy every image below to your registry, then point the chart at it. The
 chart renders control-plane images as
-`<image.registry>/<image.repository>/<name>:<tag><image.tagSuffix>`, and
-the others from their own `repository` and `tag`.
+`<image.registry>/<image.repository>/<name>:<tag>` (release 1.0.2 and later
+append `image.tagSuffix`, empty by default), and the others from their own
+`repository` and `tag`.
 
 | What | Value to set | Default |
 |---|---|---|
@@ -121,7 +122,7 @@ Two things sit outside the chart: the CloudNativePG operator, when you use
 mirroring too; and `externalDatabase` / `externalRedis` replace the in-chart
 Postgres and Redis if you already run them inside the site.
 
-**OpenShift and the UBI images.** `values-openshift-certified.yaml` sets
+**OpenShift and the UBI images (release 1.0.2 and later).** `values-openshift-certified.yaml` sets
 `global.platform: openshift`, `image.tagSuffix: "-ubi"` (the Red Hat UBI build
 of `spatiumddi-api`, `spatiumddi-frontend`, `dns-bind9` and `dhcp-kea`), and
 points `postgresql.image` and `redis.image` at `registry.redhat.io` with
@@ -171,15 +172,20 @@ not affected. Pick one:
 
 A fresh isolated install works end to end: login, IPAM, DNS zones and records,
 DHCP scopes, the Fleet and Cluster pages, and support and diagnostics bundles.
-The messages below are normal offline. Some read as faults and are being
-improved in 1.0.2, so describe them as known rather than as breakage.
+The messages below are normal offline. Some read as faults; 1.0.2 work
+([#4799](https://github.com/spatiumnorth/spatiumddi/issues/4799),
+[#4800](https://github.com/spatiumnorth/spatiumddi/issues/4800),
+[#4801](https://github.com/spatiumnorth/spatiumddi/issues/4801)) covers part
+of that, so treat them as known rather than as breakage.
 
 - **Update check failed** chip and banner, until the check is turned off.
-  The wording for an offline site is being improved in 1.0.2
-  ([#4799](https://github.com/spatiumnorth/spatiumddi/issues/4799), [#4800](https://github.com/spatiumnorth/spatiumddi/issues/4800)); turning the check off removes the
-  message today.
-- **No default route** on the appliance: covered in section 2. Fixed in 1.0.2
-  ([#4801](https://github.com/spatiumnorth/spatiumddi/issues/4801)); until then give the network a router address.
+  This is being addressed in 1.0.2
+  ([#4799](https://github.com/spatiumnorth/spatiumddi/issues/4799),
+  [#4800](https://github.com/spatiumnorth/spatiumddi/issues/4800)); turning
+  the check off removes the message today.
+- **No default route** on the appliance: covered in section 2. Being fixed in 1.0.2
+  ([#4801](https://github.com/spatiumnorth/spatiumddi/issues/4801)); until
+  then give the network a router address.
 - **Appliance self-test** (Logs & Diagnostics) reports a DNS resolution
   failure for a public registry name while the other checks pass. It is a
   public-name lookup, not a sign the host is unhealthy.
