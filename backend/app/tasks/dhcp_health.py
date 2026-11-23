@@ -47,6 +47,23 @@ AGENT_STALE_AFTER = timedelta(seconds=120)
 logger = structlog.get_logger(__name__)
 
 
+async def _probe_agentless(server: DHCPServer) -> tuple[bool, str | None]:
+    """The driver round trip for an agentless server, with no session open.
+
+    Any exception from get_driver / health_check is surfaced as unreachable.
+    Returns ``(ok, error)``. A driver that reports a failure as ``(False,
+    message)`` instead of raising (the Windows driver does) has its message
+    returned as the error, so the worker log says why the server is
+    unreachable.
+    """
+    try:
+        driver = get_driver(server.driver)
+        ok, msg = await driver.health_check(server)
+        return ok, None if ok else (msg or "health check failed")
+    except Exception as exc:  # noqa: BLE001 — surface any driver error
+        return False, str(exc)
+
+
 async def _check_health(server_id: uuid.UUID) -> None:
     engine = create_async_engine(
         settings.database_url, future=True, connect_args=task_connect_args()
@@ -78,24 +95,16 @@ async def _check_health(server_id: uuid.UUID) -> None:
                 )
                 return
 
-            if is_agentless(server.driver):
-                # Agentless: ask the driver to round-trip against the server.
-                # Any exception from get_driver / health_check is caught and
-                # surfaced as status="unreachable" — we still stamp the check
-                # timestamp so the dashboard reflects that we did try.
-                try:
-                    driver = get_driver(server.driver)
-                    ok, _msg = await driver.health_check(server)
-                    server.status = "active" if ok else "unreachable"
-                except Exception as exc:  # noqa: BLE001 — surface any driver error
-                    server.status = "unreachable"
-                    logger.warning(
-                        "dhcp_health_driver_probe_failed",
-                        server_id=str(server_id),
-                        driver=server.driver,
-                        host=server.host,
-                        error=str(exc),
-                    )
+            agentless = is_agentless(server.driver)
+            if agentless:
+                # #4775 — end the read transaction before the network call.
+                # A WinRM host that answers nothing holds it open for the whole
+                # timeout, and an ``idle in transaction`` session keeps
+                # AccessShareLock on dhcp_server, which a migration's ALTER
+                # TABLE waits behind. ``expire_on_commit=False`` leaves the row
+                # readable for the driver; the result is written by a fresh
+                # session below.
+                await db.commit()
             else:
                 # Agent-based: trust the heartbeat.
                 last_seen = server.agent_last_seen
@@ -106,17 +115,47 @@ async def _check_health(server_id: uuid.UUID) -> None:
                     # #2961 — no heartbeat, so no current daemon state: the
                     # last ``ok`` is not evidence of anything any more.
                     forget_stale_ok(server)
+                server.last_health_check_at = now
+                await db.commit()
+                logger.info(
+                    "dhcp_health_checked",
+                    server_id=str(server_id),
+                    driver=server.driver,
+                    agentless=False,
+                    status=server.status,
+                    host=server.host,
+                )
+                return
 
-            server.last_health_check_at = now
+        # Agentless: ask the driver to round-trip against the server, with no
+        # session open. We still stamp the check timestamp on failure so the
+        # dashboard reflects that we did try.
+        ok, error = await _probe_agentless(server)
+        if error is not None:
+            logger.warning(
+                "dhcp_health_driver_probe_failed",
+                server_id=str(server_id),
+                driver=server.driver,
+                host=server.host,
+                error=error,
+            )
+
+        async with session_factory() as db:
+            # The server may have been deleted (or the subsystem switched
+            # off) while the probe ran.
+            fresh = await db.get(DHCPServer, server_id)
+            if fresh is None or fresh.maintenance_mode:
+                return
+            fresh.status = "active" if ok else "unreachable"
+            fresh.last_health_check_at = datetime.now(UTC)
             await db.commit()
-
             logger.info(
                 "dhcp_health_checked",
                 server_id=str(server_id),
-                driver=server.driver,
-                agentless=is_agentless(server.driver),
-                status=server.status,
-                host=server.host,
+                driver=fresh.driver,
+                agentless=True,
+                status=fresh.status,
+                host=fresh.host,
             )
     finally:
         await engine.dispose()
