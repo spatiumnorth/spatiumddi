@@ -4256,7 +4256,7 @@ const ACK_LABELS: Record<string, string> = {
     "I understand the listed dynamic-update grants will be deleted, and the clients using them can no longer update this zone.",
 };
 
-function MoveZoneModal({
+export function MoveZoneModal({
   zone,
   onClose,
   onMoved,
@@ -4355,7 +4355,10 @@ function MoveZoneModal({
         {preview && (
           <>
             {preview.name_collision && (
-              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
                 <strong>{preview.target_group_name}</strong> already has a zone
                 named <code>{preview.zone_name}</code> in the view this one
                 would land in. Rename or delete it first.
@@ -4364,7 +4367,10 @@ function MoveZoneModal({
             {/* Blockers no acknowledgement can waive — none leaves a state
                 the operator could inspect and fix afterwards. */}
             {preview.dnssec_unsupported_drivers.length > 0 && (
-              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
                 This zone is DNSSEC-signed and{" "}
                 <strong>{preview.target_group_name}</strong> runs{" "}
                 <code>{preview.dnssec_unsupported_drivers.join(", ")}</code>,
@@ -4374,47 +4380,74 @@ function MoveZoneModal({
               </div>
             )}
             {preview.technitium_api_refusal && (
-              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
                 {preview.technitium_api_refusal}
               </div>
             )}
             {preview.tsig_algorithm_refusal && (
-              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
                 {preview.tsig_algorithm_refusal}
               </div>
             )}
             {preview.forward_transport_refusal && (
-              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
                 {preview.forward_transport_refusal}
               </div>
             )}
             {preview.technitium_acl_refusal && (
-              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
                 {preview.technitium_acl_refusal}
               </div>
             )}
             {preview.classless_refusal && (
-              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
                 {preview.classless_refusal}
               </div>
             )}
             {preview.powerdns_refusal && (
-              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
                 {preview.powerdns_refusal}
               </div>
             )}
             {preview.dnssec_policy_refusal && (
-              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
                 {preview.dnssec_policy_refusal}
               </div>
             )}
             {preview.views_refusal && (
-              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
                 {preview.views_refusal}
               </div>
             )}
             {preview.acl_names_lost.length > 0 && (
-              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
                 This zone names ACL(s){" "}
                 <code>{preview.acl_names_lost.join(", ")}</code> that{" "}
                 <strong>{preview.target_group_name}</strong> does not define.
@@ -4425,7 +4458,10 @@ function MoveZoneModal({
               </div>
             )}
             {preview.key_names_lost.length > 0 && (
-              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
                 This zone names TSIG key(s){" "}
                 <code>{preview.key_names_lost.join(", ")}</code> that{" "}
                 <strong>{preview.target_group_name}</strong> does not define.
@@ -6685,7 +6721,7 @@ function ServedApexRows({
 
 // ── Servers Tab ────────────────────────────────────────────────────────────────
 
-function ServersTab({ group }: { group: DNSServerGroup }) {
+export function ServersTab({ group }: { group: DNSServerGroup }) {
   const qc = useQueryClient();
   const navigate = useNavigate();
   const { isSuperadmin } = useDnsGrants();
@@ -7042,8 +7078,18 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
           }
           checkLabel="I understand this deletes the server row, and a running agent will register it again."
           onConfirm={() => del.mutate(confirmDeleteServer)}
-          onClose={() => setConfirmDeleteServer(null)}
+          onClose={() => {
+            setConfirmDeleteServer(null);
+            del.reset();
+          }}
           isPending={del.isPending}
+          // A refused delete (404 when the server is already gone, or a
+          // future 409 guard) leaves this confirm open; say why in it (#4744).
+          error={
+            del.isError
+              ? formatApiError(del.error, "Failed to delete the DNS server")
+              : null
+          }
         />
       )}
     </div>

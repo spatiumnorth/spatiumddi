@@ -149,6 +149,12 @@ class RestoreOutcome:
     # Backup targets whose ``in_progress`` claim came back inside the
     # archive and was settled (#2097). Empty when none.
     reconciled_backup_targets: list[dict[str, Any]] = field(default_factory=list)
+    # Sessions the restore ended (sessions): the archive's copy of the table
+    # replaces the live one, every row in it is set to revoked, and this counts
+    # the ones that were live (not revoked, not expired) at that moment.
+    # ``None`` when the restore did not reach the table, ``-1`` when ending
+    # them failed (a warning says so).
+    sessions_ended: int | None = None
     # Appliance rows of this install kept across the restore (#4677).
     adopted_appliances: list[dict[str, Any]] = field(default_factory=list)
 
@@ -1043,6 +1049,60 @@ _RESTORE_LOCK_KEY = RESTORE_LOCK_KEY
 _RESTORE_LOCK_HOLDERS_SQL = RESTORE_LOCK_HOLDERS_SQL
 
 
+_LIVE_SESSIONS_SQL = "SELECT count(*) FROM user_session WHERE NOT revoked AND expires_at > now()"
+
+
+async def _end_restored_sessions(db_url: str) -> int:
+    """Revoke every ``user_session`` row the replay brought back.
+
+    The archive's copy of the table replaces the live one, so a session that
+    was revoked after the archive was taken comes back live, and so does every
+    session that was live when the archive was made. A restore ends every
+    session, as its notice says. Access tokens are accepted only while the
+    row their ``jti`` names is live, and a refresh cookie only while the row
+    its hash names is live and not rotated, so revoking the rows covers both;
+    nothing else caches either decision (the idle timeout cache holds a
+    setting, not a session). Rotation markers are cleared too, so no row can
+    stand for a successor inside the rotation grace window.
+
+    Every row is revoked and cleared, but the number returned counts only the
+    sessions that were live at that moment: not already revoked and not past
+    ``expires_at``. The archive's table also holds rows nobody could use. Runs
+    on its own connection, like the
+    other post-replay steps, because the app's pool was disposed. It runs
+    immediately after the replay, so an older archive's table may lack the
+    rotation columns; those rows are revoked without them.
+    """
+    from sqlalchemy import text  # noqa: PLC0415
+    from sqlalchemy.exc import ProgrammingError  # noqa: PLC0415
+    from sqlalchemy.ext.asyncio import create_async_engine  # noqa: PLC0415
+    from sqlalchemy.pool import NullPool  # noqa: PLC0415
+
+    from app.db import task_connect_args  # noqa: PLC0415
+
+    engine = create_async_engine(db_url, poolclass=NullPool, connect_args=task_connect_args())
+    try:
+        try:
+            async with engine.begin() as conn:
+                live = await conn.scalar(text(_LIVE_SESSIONS_SQL))
+                await conn.execute(
+                    text(
+                        "UPDATE user_session SET revoked = true, "
+                        "rotated_at = NULL, rotated_to_id = NULL"
+                    )
+                )
+                return int(live or 0)
+        except ProgrammingError:
+            # An archive older than the rotation columns, before the migration
+            # has added them: there are no markers to clear, only rows to end.
+            async with engine.begin() as conn:
+                live = await conn.scalar(text(_LIVE_SESSIONS_SQL))
+                await conn.execute(text("UPDATE user_session SET revoked = true"))
+                return int(live or 0)
+    finally:
+        await engine.dispose()
+
+
 async def restore_lock_held(db) -> bool:
     """True while a restore holds the install-wide restore lock (#2097).
 
@@ -1382,6 +1442,25 @@ async def _apply_backup_restore_inner(
             # disk only to read them back cost a full write of the dump.
             await _run_psql(db_bytes, db_url)
 
+    # A restore ends every session, as its notice says (sessions). Right after
+    # the replay commits, before the migration, the fold and the rewrap: a
+    # restored row is accepted from that commit until it is revoked, and those
+    # steps can take minutes. Only when the replay reached ``user_session``: a
+    # selective restore of other sections leaves the live table alone.
+    sessions_ended: int | None = None
+    sessions_warning: str | None = None
+    if restored_tables is None or "user_session" in restored_tables:
+        try:
+            sessions_ended = await _end_restored_sessions(db_url)
+        except Exception as exc:  # noqa: BLE001 — the data is in; say so loudly
+            logger.error("backup_restore_end_sessions_failed", error=str(exc))
+            sessions_ended = -1
+            sessions_warning = (
+                "Could not end the sessions restored from the archive "
+                f"({exc}). Sign-ins from before the restore may still be accepted; "
+                "end them from Administration, Sessions."
+            )
+
     # Phase 6: alembic upgrade-on-restore. The destination DB is now
     # at the source's schema head; if local code expects a newer
     # head, run ``alembic upgrade head`` over the just-restored DB
@@ -1549,6 +1628,9 @@ async def _apply_backup_restore_inner(
                 f"archive ({exc}); they free themselves after 2 hours."
             )
 
+    if sessions_warning:
+        post_warnings.append(sessions_warning)
+
     # The override is the first thing an operator should read back.
     if schema_override_warning:
         post_warnings.insert(0, schema_override_warning)
@@ -1619,5 +1701,6 @@ async def _apply_backup_restore_inner(
         rewrap=rewrap_outcome,
         warnings=post_warnings,
         reconciled_backup_targets=reconciled,
+        sessions_ended=sessions_ended,
         adopted_appliances=adoption.adopted,
     )

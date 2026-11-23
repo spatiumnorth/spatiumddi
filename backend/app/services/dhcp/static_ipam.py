@@ -50,6 +50,7 @@ from app.core.mac import canonicalize_mac
 from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.dhcp import DHCPLease, DHCPScope, DHCPStaticAssignment
+from app.models.dns import DNSZone
 from app.models.ipam import IPAddress, Subnet
 from app.services.dhcp.ipam_mirror import (
     insert_ipam_mirror_row,
@@ -94,7 +95,15 @@ _OPERATOR_MIRROR_FIELDS: tuple[str, ...] = (
     "role",
     "reserved_until",
     "decom_date",
+    # The zones the address publishes into (#4754): the restore re-checks them
+    # against the subnet's DNS group before re-applying, see
+    # ``_restore_zone_binding``.
+    "forward_zone_id",
+    "extra_zone_ids",
 )
+
+# Snapshot keys ``_restore_operator_fields`` leaves to ``_restore_zone_binding``.
+_ZONE_SNAPSHOT_FIELDS: frozenset[str] = frozenset({"forward_zone_id", "extra_zone_ids"})
 
 
 def _snapshot_operator_fields(row: IPAddress) -> dict[str, Any] | None:
@@ -110,6 +119,8 @@ def _snapshot_operator_fields(row: IPAddress) -> dict[str, Any] | None:
             continue
         if isinstance(val, uuid.UUID):
             snap[field] = str(val)
+        elif field == "extra_zone_ids":
+            snap[field] = [str(z) for z in val]
         elif isinstance(val, (datetime, date)):
             snap[field] = val.isoformat()
         else:
@@ -120,7 +131,7 @@ def _snapshot_operator_fields(row: IPAddress) -> dict[str, Any] | None:
 def _restore_operator_fields(row: IPAddress, snapshot: dict[str, Any]) -> None:
     """Re-apply a :func:`_snapshot_operator_fields` dict onto a fresh mirror row."""
     for field, val in snapshot.items():
-        if field not in _OPERATOR_MIRROR_FIELDS:
+        if field not in _OPERATOR_MIRROR_FIELDS or field in _ZONE_SNAPSHOT_FIELDS:
             continue
         try:
             if field in ("owner_user_id", "owner_group_id") and isinstance(val, str):
@@ -134,6 +145,55 @@ def _restore_operator_fields(row: IPAddress, snapshot: dict[str, Any]) -> None:
         except (ValueError, TypeError):
             # A malformed snapshot value must never break restore.
             continue
+
+
+async def _restore_zone_binding(
+    db: AsyncSession,
+    row: IPAddress,
+    subnet: Subnet | None,
+    snapshot: dict[str, Any],
+    warnings: list[str] | None,
+) -> None:
+    """Put a re-created mirror row back in the zones it was published into (#4754).
+
+    A zone applies only while it still exists (not deleted, not in the Trash)
+    and is in one of the subnet's effective DNS groups, as the zone select
+    offers only those. One that is not is dropped, with a warning: the row then
+    publishes where an address with no zone of its own does, the subnet's zone.
+    """
+    from app.api.v1.ipam.router import _resolve_effective_dns  # noqa: PLC0415
+
+    raw_ids: list[str] = []
+    fwd = snapshot.get("forward_zone_id")
+    if fwd:
+        raw_ids.append(str(fwd))
+    raw_ids.extend(str(z) for z in snapshot.get("extra_zone_ids") or [])
+    if not raw_ids:
+        return
+    group_ids: set[str] = set()
+    if subnet is not None:
+        group_ids = {str(g) for g in (await _resolve_effective_dns(db, subnet))[0]}
+    ok: dict[str, bool] = {}
+    for raw in raw_ids:
+        if raw in ok:
+            continue
+        try:
+            zone = await db.get(DNSZone, uuid.UUID(raw))
+        except (ValueError, TypeError):
+            zone = None
+        ok[raw] = zone is not None and zone.deleted_at is None and str(zone.group_id) in group_ids
+        if not ok[raw] and warnings is not None:
+            warnings.append(
+                f"{row.address}: its DNS zone {raw} is gone or no longer in the subnet's "
+                "DNS group, so the address is published in the subnet's zone instead"
+            )
+    if fwd and ok[str(fwd)]:
+        row.forward_zone_id = uuid.UUID(str(fwd))
+    row.extra_zone_ids = [
+        str(z)
+        for z in snapshot.get("extra_zone_ids") or []
+        if ok.get(str(z)) and str(z) != str(fwd)
+    ]
 
 
 def _mirror_audit_view(row: IPAddress) -> dict[str, Any]:
@@ -191,6 +251,7 @@ async def upsert_ipam_for_static(
     *,
     action: str = "create",
     user: User | None = None,
+    warnings: list[str] | None = None,
 ) -> None:
     """Create or update the IPAM row mirroring a static DHCP assignment.
 
@@ -277,8 +338,10 @@ async def upsert_ipam_for_static(
     # Restore any operator-authored columns captured when this reservation's
     # mirror was deleted (lossless Trash restore, #630), then clear the
     # snapshot so it can't go stale or re-apply on a later ordinary edit.
+    subnet_row = await db.get(Subnet, scope.subnet_id)
     if st.ipam_metadata_snapshot:
         _restore_operator_fields(row, st.ipam_metadata_snapshot)
+        await _restore_zone_binding(db, row, subnet_row, st.ipam_metadata_snapshot, warnings)
         st.ipam_metadata_snapshot = None
     await db.flush()
     st.ip_address_id = row.id
@@ -291,7 +354,6 @@ async def upsert_ipam_for_static(
     from app.api.v1.ipam.router import _sync_dns_record  # noqa: PLC0415
     from app.services.dns.sync_check import address_own_forward_zone_id  # noqa: PLC0415
 
-    subnet_row = await db.get(Subnet, scope.subnet_id)
     # Run even when the reservation carries no name: the sync then retracts
     # the A / PTR an earlier name published, rather than leaving them served
     # for a name the row no longer carries.
@@ -961,14 +1023,18 @@ async def remove_ipam_for_scope_statics(
     return removed
 
 
-async def remirror_scope_statics(db: AsyncSession, scope: DHCPScope) -> int:
+async def remirror_scope_statics(
+    db: AsyncSession, scope: DHCPScope, warnings: list[str] | None = None
+) -> int:
     """Re-create the IPAM mirror for each of a restored scope's reservations.
 
     Counterpart to ``remove_ipam_for_scope_statics``: soft-deleting a scope now
     deletes its ``static_dhcp`` mirror rows, so a Trash restore has to put them
     back. ``upsert_ipam_for_static`` re-creates the row (status + back-link) and
     re-syncs DNS; its #564 savepoint self-heal reclaims the IP if it was taken
-    during the Trash window (the static is the source of truth). Call AFTER the
+    during the Trash window (the static is the source of truth). A reservation
+    gets back the zones its address was published into; one that no longer
+    applies is reported on ``warnings`` (#4754). Call AFTER the
     batch has been un-stamped so the statics are visible. Returns the count.
     """
     res = await db.execute(
@@ -976,7 +1042,7 @@ async def remirror_scope_statics(db: AsyncSession, scope: DHCPScope) -> int:
     )
     statics = list(res.scalars().all())
     for st in statics:
-        await upsert_ipam_for_static(db, scope, st, action="create")
+        await upsert_ipam_for_static(db, scope, st, action="create", warnings=warnings)
     return len(statics)
 
 

@@ -145,7 +145,9 @@ async def superseded_record_owners(
     restore would bring back a name IPAM gave up, beside the new one. A record
     is superseded when its address (live, not an orphan; those are
     :func:`orphan_record_owners`) now holds a record of the same type and none
-    of them is this one, or when the address has no name any more. Aliases are
+    of them is this one (name, value and zone), or when the address has no name
+    any more. A record whose address moved to another DNS zone is superseded
+    too (#4755), as the live record is in the new zone. Aliases are
     operator-authored and follow no rename; a record riding its zone's own
     batch is reconciled by the zone's restore (#3924). ``record_ids`` or
     ``batch_id`` narrows the read.
@@ -161,6 +163,8 @@ async def superseded_record_owners(
             DNSRecord.ip_address_id,
             IPAddress.address,
             IPAddress.hostname,
+            DNSRecord.zone_id,
+            IPAddress.extra_zone_ids,
         )
         .join(IPAddress, IPAddress.id == DNSRecord.ip_address_id)
         .join(zone, zone.id == DNSRecord.zone_id)
@@ -183,14 +187,15 @@ async def superseded_record_owners(
         return {}
     # One read of every live record of these addresses, however many there are.
     # The soft-delete filter hides trashed rows, so these are the live ones.
-    live: dict[tuple[uuid.UUID, str], set[tuple[str, str]]] = {}
-    for ip_id, rtype, name, value in (
+    live: dict[tuple[uuid.UUID, str], set[tuple[str, str, uuid.UUID]]] = {}
+    for ip_id, rtype, name, value, zid in (
         await db.execute(
             select(
                 DNSRecord.ip_address_id,
                 DNSRecord.record_type,
                 DNSRecord.name,
                 DNSRecord.value,
+                DNSRecord.zone_id,
             ).where(
                 DNSRecord.ip_address_id.in_({c[5] for c in candidates}),
                 DNSRecord.auto_generated.is_(True),
@@ -198,14 +203,22 @@ async def superseded_record_owners(
             )
         )
     ).all():
-        live.setdefault((ip_id, rtype), set()).add((name.lower(), value.lower()))
+        live.setdefault((ip_id, rtype), set()).add((name.lower(), value.lower(), zid))
     out: dict[uuid.UUID, tuple[str, str, str]] = {}
-    for rid, fqdn, rtype, name, value, ip_id, address, hostname in candidates:
+    for rid, fqdn, rtype, name, value, ip_id, address, hostname, zone_id, extras in candidates:
         held = live.get((ip_id, rtype), set())
-        if (held and (name.lower(), value.lower()) not in held) or (
-            not held and not (hostname or "").strip()
-        ):
-            out[rid] = (fqdn, rtype, str(address))
+        key = (name.lower(), value.lower())
+        if held:
+            if (*key, zone_id) in held:
+                continue
+            # Same name and value, but only in another zone: the address moved
+            # zones (#4755), unless this zone is one of its extra zones whose
+            # record the operator deleted.
+            if any(h[:2] == key for h in held) and str(zone_id) in {str(z) for z in extras or []}:
+                continue
+        elif (hostname or "").strip():
+            continue
+        out[rid] = (fqdn, rtype, str(address))
     return out
 
 

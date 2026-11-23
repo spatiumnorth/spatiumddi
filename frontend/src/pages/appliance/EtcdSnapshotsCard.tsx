@@ -216,7 +216,7 @@ export function EtcdSnapshotsCard() {
               />
             </div>
             {restore.isError && (
-              <p className="text-xs text-rose-600">
+              <p role="alert" className="text-xs text-rose-600">
                 {formatApiError(restore.error)}
               </p>
             )}

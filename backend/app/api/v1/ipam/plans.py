@@ -53,7 +53,9 @@ def _subnet_kind(net: ipaddress.IPv4Network | ipaddress.IPv6Network) -> str:
 router = APIRouter(
     prefix="/plans",
     tags=["ipam"],
-    dependencies=[Depends(require_resource_permission("ip_block"))],
+    dependencies=[
+        Depends(require_resource_permission("ip_block", audit_resource_type="subnet_plan"))
+    ],
 )
 
 

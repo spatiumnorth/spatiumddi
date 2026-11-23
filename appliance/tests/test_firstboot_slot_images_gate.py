@@ -104,6 +104,7 @@ place_deferred_tls_manifest() {{ :; }}
 reassert_control_plane_class() {{ :; }}
 place_deferred_control_manifest() {{ :; }}
 skip_tls_manifest_reapply() {{ :; }}
+control_converged_allow_commit() {{ :; }}
 commit_slot_if_healthy() {{ echo committed > "{tmp_path}/committed"; }}
 is_trial_boot() {{ return {0 if trial else 1}; }}
 {real.replace(HELPER, str(helper))}
@@ -148,7 +149,9 @@ def test_the_gate_sits_right_before_the_commit() -> None:
     branch = [ln.strip() for ln in _ready_branch().splitlines()]
     assert "slot_images_allow_commit || exit 1" in branch, "the ready branch has no image gate (#1630)"
     gate = branch.index("slot_images_allow_commit || exit 1")
-    assert branch[gate + 1] == "commit_slot_if_healthy"
+    # #4707 — the control-chart gate sits between the image gate and the commit
+    assert branch[gate + 1 : gate + 2] != ["commit_slot_if_healthy"]
+    assert branch[branch.index("control_converged_allow_commit || exit 1") + 1] == "commit_slot_if_healthy"
     assert branch.index("place_deferred_control_manifest") < gate
 
 
@@ -262,6 +265,7 @@ place_deferred_tls_manifest() {{ :; }}
 reassert_control_plane_class() {{ :; }}
 place_deferred_control_manifest() {{ :; }}
 skip_tls_manifest_reapply() {{ :; }}
+control_converged_allow_commit() {{ :; }}
 commit_slot_if_healthy() {{
     if [ -f "{done}" ]; then echo after; else echo before; fi > "{tmp_path}/committed"
 }}

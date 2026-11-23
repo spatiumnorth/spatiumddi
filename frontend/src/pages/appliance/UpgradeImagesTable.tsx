@@ -951,7 +951,7 @@ function UploadImageModal({
             </span>
           )}
           {upload.error && (
-            <span className="text-rose-700 dark:text-rose-300">
+            <span role="alert" className="text-rose-700 dark:text-rose-300">
               {formatApiError(upload.error)}
             </span>
           )}
