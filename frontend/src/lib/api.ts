@@ -13796,6 +13796,10 @@ export interface ApplianceRow {
   // or null on the first heartbeat / before any role assignment.
   role_switch_state: string | null;
   role_switch_reason: string | null;
+  // #4646 — assigned roles the supervisor did not start because the control
+  // plane has no agent key for them (``dns-bind9``, ``dhcp`` …). Empty =
+  // nothing waiting.
+  roles_awaiting_key?: string[];
   // #170 Wave E — supervisor's service-container watchdog. Free-form
   // map keyed by compose service name (``dns-bind9`` / ``dns-powerdns``
   // / ``dns-technitium`` / ``dhcp-kea``); each value carries the
@@ -13856,6 +13860,13 @@ export interface ApplianceRow {
     nodes_ready?: number;
     pods_total?: number;
     pods_by_phase?: Record<string, number>;
+    // #4707 — present when a trial slot was committed although its control
+    // chart never applied (a revert was unsafe: the migrate Job had run).
+    control_plane_not_converged?: {
+      version?: string;
+      at?: string;
+      detail?: string;
+    };
     // #999 Part A — raw md / multipath reading, with NO verdict attached
     // (the appliance row carries that in `storage_findings` below). Typed
     // as the reading rather than as `NodeStorage` on purpose: `findings`

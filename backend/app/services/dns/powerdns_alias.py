@@ -75,3 +75,40 @@ async def group_can_resolve_alias(db: AsyncSession, group_id: uuid.UUID) -> bool
     return bool(
         alias_resolver(getattr(opts, "forwarders", None), getattr(opts, "forward_transport", None))
     )
+
+
+ALIAS_NO_FORWARDER_MESSAGE = (
+    "ALIAS records are resolved through the group's forwarders, and this "
+    "group has none over plain DNS (Do53). Set forwarders under the "
+    "group's server options first; SpatiumDDI no longer falls back to "
+    "public resolvers."
+)
+
+
+async def groups_without_alias_resolver(
+    db: AsyncSession, group_ids: Iterable[uuid.UUID]
+) -> set[uuid.UUID]:
+    """The groups among ``group_ids`` that run PowerDNS alone and have no Do53 forwarder.
+
+    The record API's ALIAS guard applies to exactly these (a group with no
+    server yet, or a mixed one, is refused or deferred elsewhere), so a Trash
+    restore asks the same question (#4756).
+    """
+    from app.models.dns import DNSServer  # models import drivers: keep it lazy
+
+    ids = set(group_ids)
+    if not ids:
+        return set()
+    drivers: dict[uuid.UUID, set[str]] = {}
+    for gid, driver in (
+        await db.execute(
+            select(DNSServer.group_id, DNSServer.driver).where(DNSServer.group_id.in_(ids))
+        )
+    ).tuples():
+        if driver:
+            drivers.setdefault(gid, set()).add(driver)
+    out: set[uuid.UUID] = set()
+    for group_id, found in drivers.items():
+        if found == {"powerdns"} and not await group_can_resolve_alias(db, group_id):
+            out.add(group_id)
+    return out

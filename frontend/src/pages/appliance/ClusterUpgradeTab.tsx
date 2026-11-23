@@ -566,7 +566,10 @@ function PlanFormPanel() {
       </div>
 
       {planError ? (
-        <div className="mt-3 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-700 dark:text-rose-300">
+        <div
+          role="alert"
+          className="mt-3 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-700 dark:text-rose-300"
+        >
           {planError}
         </div>
       ) : null}
@@ -778,7 +781,10 @@ function ActiveRunPanel({ run }: { run: SystemUpgradeRun }) {
       </header>
 
       {actionError ? (
-        <div className="mt-3 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-700 dark:text-rose-300">
+        <div
+          role="alert"
+          className="mt-3 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-700 dark:text-rose-300"
+        >
           {actionError}
         </div>
       ) : null}

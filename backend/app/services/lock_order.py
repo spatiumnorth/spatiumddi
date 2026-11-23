@@ -870,6 +870,11 @@ async def zone_ids_for_scope_statics(db: AsyncSession, scope_ids: Iterable[Any])
                 extra_zone_ids=list(row.extra_zone_ids or []) if row is not None else [],
             )
             zones |= await _publish_zone_ids(db, ip, subnet, None, subnet_cache, False)
+            # The zones the reservation's address was published into when it was
+            # deleted (#4754): the re-mirror puts it back in them.
+            snap = st.ipam_metadata_snapshot or {}
+            zones.add(_uuid_or_none(snap.get("forward_zone_id")))
+            zones.update(_uuid_or_none(z) for z in snap.get("extra_zone_ids") or [])
     zones.discard(None)
     return zones
 

@@ -880,7 +880,10 @@ function RefreshButton({
 function QueryErrorBanner({ query }: { query: { error: unknown } }) {
   const detail = formatApiError(query.error, String(query.error));
   return (
-    <div className="m-6 rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
+    <div
+      role="alert"
+      className="m-6 rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive"
+    >
       <p className="font-medium">Query failed</p>
       <p className="mt-1 whitespace-pre-wrap break-words text-xs">{detail}</p>
     </div>
