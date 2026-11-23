@@ -1,3 +1,4 @@
+import { pluralize } from "./count-noun";
 /** #3551 — the text of the DNS group memory banner, apart from the
  *  component so it can be tested on its own. */
 import type { DNSMemoryEstimate } from "@/lib/api";
@@ -27,7 +28,8 @@ export function memoryBannerLines(est: DNSMemoryEstimate | null | undefined) {
       perView.size > 1
         ? `Blocklists take about ${fmtBytes(est.rpz_bytes)} of that: each view loads its own copy of the lists it applies (${Array.from(
             perView,
-            ([v, n]) => `${v}: ${n.toLocaleString()} entries`,
+            ([v, n]) =>
+              `${v}: ${n.toLocaleString()} ${pluralize(n, "entry", "entries")}`,
           ).join(", ")}), and BIND cannot share a blocklist between views.`
         : null,
     fix: "Have fewer views draw on the same lists, or raise the DNS pod's memory limit, before named is OOM-killed.",

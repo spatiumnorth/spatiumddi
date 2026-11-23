@@ -1,3 +1,4 @@
+import { countNoun } from "@/lib/count-noun";
 import { Server } from "lucide-react";
 import type { AgentLogSource } from "@/lib/api";
 import {
@@ -44,7 +45,7 @@ export function AgentLogScopePicker({
                 would read the same as the server below it. */}
             {g.id && g.servers.length > 1 && (
               <option value={groupSelection(g.id)}>
-                {g.name} (all {g.servers.length} servers)
+                {g.name} (all {countNoun(g.servers.length, "server")})
               </option>
             )}
             {g.servers.map((s) => (

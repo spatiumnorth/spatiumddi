@@ -23,11 +23,8 @@ const ALLOWED: Record<string, string> = {
     "mounts DeviceFormModal, which reads the device fresh itself (#4370)",
   "pages/network/AsnsPage.tsx":
     "mounts AsnFormModal, which reads the ASN fresh itself (#3114)",
-  "pages/admin/AIPromptsPage.tsx": "not in #4379's list; follow-up",
   "pages/dhcp/DHCPPage.tsx":
     "scope / static / client-class dialogs: not in #4379's list; follow-up",
-  "pages/firewall_feeds/FirewallFeedsPage.tsx":
-    "not in #4379's list; follow-up",
   "pages/appliance/FirewallTab.tsx": "not in #4379's list; follow-up",
 };
 
@@ -55,6 +52,8 @@ const REQUIRED = [
   "pages/admin/DomainsPage.tsx",
   "pages/admin/ChangeRequestsPage.tsx",
   "pages/admin/AlertsPage.tsx",
+  "pages/admin/AIPromptsPage.tsx", // #4777
+  "pages/firewall_feeds/FirewallFeedsPage.tsx", // #4777
   "pages/admin/ConformityPage.tsx",
   "pages/tools/WakeSchedulesPage.tsx",
   "pages/dhcp/WindowsFailoverPanel.tsx", // mounts the WindowsFailoverActions edit

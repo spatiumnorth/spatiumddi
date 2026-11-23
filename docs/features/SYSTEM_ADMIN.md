@@ -1252,6 +1252,7 @@ dhcp_default_lease_time: int (default 86400)
 dns_auto_sync_enabled / dns_auto_sync_interval_minutes / dns_auto_sync_delete_stale
 reverse_dns_enabled / reverse_dns_interval_minutes        -- PTR auto-population (issue #41)
 dhcp_pull_leases_enabled / dhcp_pull_leases_interval_seconds
+dhcp_health_interval_seconds / dhcp_mac_blocks_sync_interval_seconds  -- agentless DHCP probe + MAC-deny sync cadence (issue #4759)
 oui_lookup_enabled / oui_update_interval_hours
 ```
 

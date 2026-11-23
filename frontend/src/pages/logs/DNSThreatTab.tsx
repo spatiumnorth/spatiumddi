@@ -1,3 +1,4 @@
+import { countNoun } from "@/lib/count-noun";
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import {
@@ -837,8 +838,8 @@ function Row({
               ))}
             </ul>
             <p className="mt-2 text-xs text-muted-foreground">
-              Longest label {w.max_label_length} chars · mean entropy{" "}
-              {w.mean_label_entropy.toFixed(2)} bits/char ·{" "}
+              Longest label {countNoun(w.max_label_length, "char")} · mean
+              entropy {w.mean_label_entropy.toFixed(2)} bits/char ·{" "}
               {w.payload_qtype_count} payload-bearing qtypes · seen by{" "}
               {w.server_count} server(s)
             </p>

@@ -357,6 +357,22 @@ class PlatformSettings(Base):
         DateTime(timezone=True), nullable=True
     )
 
+    # #4759 — how often the beat-driven health probe and MAC-deny-list sync
+    # run against AGENTLESS DHCP servers (windows_dhcp, fortigate), each of
+    # which is a WinRM / REST round trip per server. Beat ticks every 60 s;
+    # these gate on it. Agent-based servers (Kea) are unaffected: their status
+    # follows the agent heartbeat and is still evaluated every tick.
+    dhcp_health_interval_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
+    dhcp_health_last_run_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    dhcp_mac_blocks_sync_interval_seconds: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=60
+    )
+    dhcp_mac_blocks_sync_last_run_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     # DHCP defaults — applied as the initial values when creating a new DHCP scope
     dhcp_default_dns_servers: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
     dhcp_default_domain_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
