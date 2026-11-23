@@ -1,3 +1,4 @@
+import { countNoun } from "./count-noun";
 import type { PasswordPolicy } from "@/lib/api";
 
 /**
@@ -49,7 +50,7 @@ export function evaluatePolicy(
   const rules: PolicyRule[] = [
     {
       ok: candidate.length >= policy.min_length,
-      label: `At least ${policy.min_length} characters`,
+      label: `At least ${countNoun(policy.min_length, "character")}`,
     },
   ];
   if (policy.require_uppercase) {

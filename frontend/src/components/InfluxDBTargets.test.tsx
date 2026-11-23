@@ -300,3 +300,13 @@ describe("a refused delete (#3822)", () => {
     expect(api.list.mock.calls.length).toBeGreaterThan(before);
   });
 });
+
+describe("header copy (#4779)", () => {
+  it("says each target receives the metrics selected on it", async () => {
+    mount(BASE);
+    await screen.findByText("grafana");
+    const text = (document.body.textContent ?? "").replace(/\s+/g, " ");
+    expect(text).toMatch(/receives the metrics selected on it/);
+    expect(text).not.toMatch(/receives DNS \+ DHCP counter deltas/);
+  });
+});

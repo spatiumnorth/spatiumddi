@@ -26,6 +26,8 @@ import {
 import { copyToClipboard } from "@/lib/clipboard";
 import { HeaderButton } from "@/components/ui/header-button";
 import { Modal } from "@/components/ui/modal";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import {
   NEEDS_SUPERADMIN,
@@ -281,7 +283,18 @@ export function FirewallFeedsPage() {
           onClose={() => setRotated(null)}
         />
       )}
-      {edit && <EditFeedModal feed={edit} onClose={() => setEdit(null)} />}
+      {edit && (
+        <FreshEdit
+          row={edit}
+          queryKeys={[["firewall-feeds"]]}
+          title="Edit firewall feed"
+          onClose={() => setEdit(null)}
+        >
+          {(fresh) => (
+            <EditFeedModal feed={fresh} onClose={() => setEdit(null)} />
+          )}
+        </FreshEdit>
+      )}
       {reveal && <RevealModal feed={reveal} onClose={() => setReveal(null)} />}
       <ConfirmModal
         open={!!rotate}
@@ -605,7 +618,11 @@ function EditFeedModal({
   const mut = useMutation({
     mutationFn: () => {
       const body: FirewallFeedUpdate = { name, description, enabled };
-      return firewallFeedsApi.update(feed.id, body);
+      // Only what the operator changed against the row read when the dialog
+      // opened (#4777), so a field another client set since is kept.
+      const changed = changedFields(feed, body);
+      if (Object.keys(changed).length === 0) return Promise.resolve(feed);
+      return firewallFeedsApi.update(feed.id, changed);
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["firewall-feeds"] });

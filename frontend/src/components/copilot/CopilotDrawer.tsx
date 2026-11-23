@@ -38,7 +38,7 @@ import {
   type NmapScanRead,
 } from "@/lib/api";
 import { FormError } from "@/components/ui/form-error";
-import { countNoun } from "@/lib/count-noun";
+import { countNoun, pluralize } from "@/lib/count-noun";
 
 /** Render assistant content as Markdown with a curated set of element
  *  overrides tuned for the chat-bubble aesthetic. Used by both the
@@ -1291,7 +1291,7 @@ function MessageFooter({ message }: { message: AIChatMessage }) {
     <div className="mt-1 flex items-center gap-2 text-[10px] text-muted-foreground">
       {totalTokens !== null && (
         <span className="tabular-nums">
-          {totalTokens.toLocaleString()} tokens
+          {totalTokens.toLocaleString()} {pluralize(totalTokens, "token")}
           {tokensIn !== null && tokensOut !== null && (
             <span className="opacity-70">
               {" "}
@@ -2371,11 +2371,13 @@ function UsageChip({ usage }: { usage: import("@/lib/api").AIUsageSnapshot }) {
       <span aria-hidden>·</span>
       {tokenPct !== null ? (
         <ProgressChip
-          label={`${tokens.toLocaleString()} / ${usage.cap_token!.toLocaleString()} tokens`}
+          label={`${tokens.toLocaleString()} / ${usage.cap_token!.toLocaleString()} ${pluralize(usage.cap_token!, "token")}`}
           pct={tokenPct}
         />
       ) : (
-        <span>{tokens.toLocaleString()} tokens</span>
+        <span>
+          {tokens.toLocaleString()} {pluralize(tokens, "token")}
+        </span>
       )}
       {(costNum > 0 || capCostNum != null) && (
         <>
