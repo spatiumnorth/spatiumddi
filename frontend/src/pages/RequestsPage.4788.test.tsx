@@ -11,6 +11,15 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 
+let optionsAnswer: () => Promise<unknown> = () =>
+  Promise.reject(
+    fail(422, [
+      {
+        type: "string_too_long",
+        msg: "String should have at most 200 characters",
+      },
+    ]),
+  );
 const fail = (status: number, detail: unknown) =>
   Object.assign(new Error(`Request failed with status code ${status}`), {
     isAxiosError: true,
@@ -26,15 +35,7 @@ vi.mock("@/lib/api", async () => {
       ...actual.requestsApi,
       listPage: async () => ({ items: [], total: 0 }),
       catalog: async () => Promise.reject(fail(503, "Service unavailable")),
-      resourceOptions: async () =>
-        Promise.reject(
-          fail(422, [
-            {
-              type: "string_too_long",
-              msg: "String should have at most 200 characters",
-            },
-          ]),
-        ),
+      resourceOptions: () => optionsAnswer(),
     },
     changeRequestsApi: {
       ...actual.changeRequestsApi,
@@ -61,8 +62,55 @@ function wrap(ui: React.ReactNode) {
 
 afterEach(cleanup);
 
+describe("the picker tells each answer apart (#4788)", () => {
+  const open = () => {
+    wrap(<ResourcePicker resource="subnet" value="" onChange={() => {}} />);
+    fireEvent.focus(screen.getByPlaceholderText("Type to search…"));
+  };
+
+  it("403 says the reader may not see the options", async () => {
+    optionsAnswer = () => Promise.reject(fail(403, "Permission denied"));
+    open();
+    expect(
+      await screen.findByText(/don't have permission to see the options/),
+    ).toBeTruthy();
+    expect(screen.queryByText("No matches you can read")).toBeNull();
+  });
+
+  it("shows Searching while the read is pending, never No matches", async () => {
+    optionsAnswer = () => new Promise(() => {});
+    open();
+    expect(await screen.findByText("Searching…")).toBeTruthy();
+    expect(screen.queryByText("No matches you can read")).toBeNull();
+  });
+
+  it("an empty answer still says No matches you can read", async () => {
+    optionsAnswer = () => Promise.resolve({ options: [], truncated: false });
+    open();
+    expect(await screen.findByText("No matches you can read")).toBeTruthy();
+    expect(screen.queryByText(/Couldn't load/)).toBeNull();
+  });
+
+  it("a recovered read clears the error", async () => {
+    optionsAnswer = () => Promise.reject(fail(503, "down"));
+    open();
+    expect(await screen.findByText(/Couldn't load the options/)).toBeTruthy();
+    optionsAnswer = () =>
+      Promise.resolve({
+        options: [{ id: "s1", label: "10.0.0.0/24", sublabel: null }],
+        truncated: false,
+      });
+    const input = screen.getByPlaceholderText("Type to search…");
+    fireEvent.change(input, { target: { value: "10" } });
+    expect(await screen.findByText("10.0.0.0/24")).toBeTruthy();
+    expect(screen.queryByText(/Couldn't load/)).toBeNull();
+  });
+});
+
 describe("failed reads are not empty answers (#4788)", () => {
   it("the picker says its read failed and caps the search at 200", async () => {
+    optionsAnswer = () =>
+      Promise.reject(fail(422, [{ type: "string_too_long", msg: "too long" }]));
     wrap(<ResourcePicker resource="subnet" value="" onChange={() => {}} />);
     const input = screen.getByPlaceholderText("Type to search…");
     expect(input.getAttribute("maxlength")).toBe("200");
