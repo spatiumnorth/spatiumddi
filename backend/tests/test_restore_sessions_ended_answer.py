@@ -54,6 +54,7 @@ async def _post_restore(
         data={"passphrase": "x" * 12, "confirmation_phrase": "RESTORE-FROM-BACKUP"},
     )
     assert resp.status_code == 200, resp.text
+    _post_restore.headers = {"Authorization": f"Bearer {create_access_token(str(admin.id))}"}
     return resp.json()
 
 
@@ -91,3 +92,14 @@ async def test_restore_that_missed_the_session_table_has_no_note(
     body = await _post_restore(client, db_session, monkeypatch, None)
     assert body["sessions_ended"] is None
     assert _NOTE not in body["note"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ended", [7, 0, -1, None])
+async def test_last_restore_reports_sessions_ended(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch, ended
+) -> None:
+    posted = await _post_restore(client, db_session, monkeypatch, ended)
+    resp = await client.get("/api/v1/backup/restore/last", headers=_post_restore.headers)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["sessions_ended"] == ended == posted["sessions_ended"]
