@@ -1,4 +1,4 @@
-.PHONY: charts-lint perf-test versions-check versions-upstream docs-drift workflow-shell-check image-upgrade-check changelog changelog-check help up down dev build build-supervisor migrate lint test lint-backend lint-frontend test-backend test-cov test-durations \
+.PHONY: charts-lint perf-test versions-check versions-upstream nginx-fixed-check docs-drift workflow-shell-check image-upgrade-check changelog changelog-check help up down dev build build-supervisor migrate lint test lint-backend lint-frontend test-backend test-cov test-durations \
         openapi \
         lint-untyped-routes \
         lint-untyped-routes-baseline \
@@ -84,6 +84,7 @@ help:
 	@echo "  make versions-check     Assert every pin matches versions.json (part of make ci)"
 	@echo "  make docs-drift         Weekly docs-vs-code drift check (not part of make ci)"
 	@echo "  make versions-upstream  Current-vs-latest table for every pinned component"
+	@echo "  make nginx-fixed-check  Is the pinned nginx in a range nginx.org lists as affected? (needs network)"
 	@echo "  make workflow-shell-check  Refuse \$$? captured after a bare command under set -e"
 	@echo "  make image-upgrade-check   Refuse a shipped image that never upgrades its packages"
 	@echo "  make changelog-check    Validate the changelog.d/ fragments (part of make ci)"
@@ -459,6 +460,14 @@ versions-check:
 
 versions-upstream:
 	@python3 scripts/lint_versions.py --check-upstream
+
+# nginx's own list of affected and fixed versions (#4816). Trivy cannot see
+# nginx.org's Alpine packages, so this is the only check against that list.
+# Exit 1 = the pin is in an affected range, 3 = the page could not be read.
+# Network-bound, so NOT part of `make ci`; the weekly trivy-scheduled workflow
+# runs it.
+nginx-fixed-check:
+	@python3 scripts/check_nginx_fixed_versions.py
 
 # Docs drift (#3414). Do the docs diagrams and pages still match the code:
 # version labels vs versions.json, shipped workloads vs architecture.svg,
