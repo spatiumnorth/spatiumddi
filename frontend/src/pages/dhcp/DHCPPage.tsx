@@ -1,3 +1,4 @@
+import { countNoun } from "@/lib/count-noun";
 import { ListReadError } from "@/components/ui/list-read-error";
 import { ServerDeleteAgentNote } from "@/pages/serverDeleteAgentNote";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -1520,12 +1521,12 @@ export function ServerScopesTab({ groupId }: { groupId: string }) {
             allScopes.length === 1 ? (
               "1 scope matches the tag filter."
             ) : (
-              `${allScopes.length} scopes match the tag filter.`
+              `${countNoun(allScopes.length, "scope")} match the tag filter.`
             )
           ) : unfilteredCount === 1 ? (
             `${allScopes.length} of 1 scope matches the tag filter.`
           ) : (
-            `${allScopes.length} of ${unfilteredCount} scopes match the tag filter.`
+            `${allScopes.length} of ${countNoun(unfilteredCount, "scope")} match the tag filter.`
           )}
         </p>
         <div className="flex items-center gap-2">
@@ -1788,7 +1789,7 @@ function PoolOccupancyCell({
   return (
     <div
       className="flex min-w-[9rem] items-center gap-2"
-      title={`${occ.assigned} of ${occ.total} addresses in use, ${occ.free} free`}
+      title={`${occ.assigned} of ${countNoun(occ.total, "address", "addresses")} in use, ${occ.free} free`}
     >
       <div className="h-1.5 w-16 overflow-hidden rounded-full bg-muted">
         <div
@@ -3152,7 +3153,9 @@ function ServerDetailView({
       ) {
         const scopeBits: string[] = [];
         if (result.scopes_imported)
-          scopeBits.push(`${result.scopes_imported} scopes imported`);
+          scopeBits.push(
+            `${countNoun(result.scopes_imported, "scope")} imported`,
+          );
         if (result.scopes_refreshed)
           scopeBits.push(`${result.scopes_refreshed} refreshed`);
         if (result.scopes_skipped_no_subnet)

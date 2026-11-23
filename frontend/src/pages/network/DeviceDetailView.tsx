@@ -1,3 +1,4 @@
+import { pluralize } from "@/lib/count-noun";
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useParams } from "react-router-dom";
@@ -395,9 +396,10 @@ function OverviewTab({
         />
         <Detail
           label="Counts (last poll)"
-          value={`${device.last_poll_arp_count ?? 0} ARP · ${
-            device.last_poll_interface_count ?? 0
-          } interfaces · ${device.last_poll_fdb_count ?? 0} FDB`}
+          value={`${device.last_poll_arp_count ?? 0} ARP · ${pluralize(
+            device.last_poll_interface_count ?? 0,
+            "interface",
+          )} · ${device.last_poll_fdb_count ?? 0} FDB`}
         />
       </Card>
       {device.last_poll_error && (

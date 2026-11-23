@@ -1,3 +1,4 @@
+import { countNoun } from "@/lib/count-noun";
 import { useMemo, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ListEmpty } from "@/components/ui/list-read-error";
@@ -1376,7 +1377,7 @@ function CalendarsTab() {
     onSuccess: (res) => {
       setBanner(
         res.status === "success"
-          ? `Sync complete — ${res.total} events (${res.added} added, ${res.removed} removed).`
+          ? `Sync complete — ${countNoun(res.total, "event")} (${res.added} added, ${res.removed} removed).`
           : `Sync finished with status "${res.status}"${res.error ? `: ${res.error}` : ""}.`,
       );
       invalidate();
@@ -3377,8 +3378,8 @@ function SendStep({
         once.{" "}
         {preview && preview.wake_count > 50 && (
           <span>
-            This target resolves to {preview.wake_count} hosts — a {staggerMs}ms
-            stagger spreads the wake over ~
+            This target resolves to {countNoun(preview.wake_count, "host")} — a{" "}
+            {staggerMs}ms stagger spreads the wake over ~
             {Math.round((preview.wake_count * staggerMs) / 1000)}s.
           </span>
         )}
@@ -3401,7 +3402,7 @@ function SendStep({
           staggerMs > 0 &&
           staggerMs < preview.suggested_stagger_ms && (
             <span className="mt-1 block">
-              For {preview.wake_count} hosts we suggest at least{" "}
+              For {countNoun(preview.wake_count, "host")} we suggest at least{" "}
               <strong>~{preview.suggested_stagger_ms}ms</strong> between hosts.{" "}
               <button
                 type="button"

@@ -1,3 +1,4 @@
+import { pluralize } from "@/lib/count-noun";
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -1083,7 +1084,8 @@ function StatsTab({ serverId }: { serverId: string }) {
       {analytics.data && (
         <p className="text-[11px] text-muted-foreground">
           Top-N rollups computed against the parsed BIND9 query log (24&nbsp;h
-          retention) — {analytics.data.total_queries.toLocaleString()} queries
+          retention) — {analytics.data.total_queries.toLocaleString()}{" "}
+          {pluralize(analytics.data.total_queries, "query", "queries")}
           in window.
         </p>
       )}

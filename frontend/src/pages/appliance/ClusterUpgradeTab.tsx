@@ -1,3 +1,4 @@
+import { countNoun } from "@/lib/count-noun";
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -793,7 +794,7 @@ function ActiveRunPanel({ run }: { run: SystemUpgradeRun }) {
         <div className="rounded-md border px-2 py-1.5">
           <div className="text-muted-foreground">Progress</div>
           <div className="font-mono">
-            {completedCount} / {planOrder.length} nodes
+            {completedCount} / {countNoun(planOrder.length, "node")}
           </div>
         </div>
         <div className="rounded-md border px-2 py-1.5">

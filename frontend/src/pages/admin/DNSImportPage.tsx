@@ -1,3 +1,4 @@
+import { countNoun } from "@/lib/count-noun";
 import { useEffect, useMemo, useState } from "react";
 import { useLocation } from "react-router-dom";
 import { useMutation, useQuery } from "@tanstack/react-query";
@@ -2007,7 +2008,8 @@ export function PreviewPanel({
                       {conflict ? (
                         <span className="inline-flex items-center gap-1 rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-400">
                           <AlertTriangle className="h-3 w-3" />
-                          conflicts ({conflict.existing_record_count} records)
+                          conflicts (
+                          {countNoun(conflict.existing_record_count, "record")})
                         </span>
                       ) : z.parse_warnings.length > 0 ? (
                         <span className="inline-flex items-center gap-1 rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-400">
