@@ -299,6 +299,46 @@ async def test_cloud_result_dropped_when_endpoint_deleted_mid_fetch(
     assert audit == []
 
 
+@pytest.mark.asyncio
+async def test_cloud_manual_sync_of_disabled_endpoint_still_applies(
+    db_session: AsyncSession,
+) -> None:
+    """ "Sync now" is allowed on a disabled endpoint; the post-fetch re-read must
+    only drop a row that was switched off DURING the pull."""
+    ep = await _endpoint(db_session)
+    ep.enabled = False
+    await db_session.commit()
+
+    class _Conn:
+        async def fetch_inventory(self, **kw: Any) -> CloudInventory:
+            return CloudInventory(account_id="1", networks=[], subnets=[], instances=[])
+
+    with patch.object(reconcile_mod, "get_connector", return_value=_Conn()):
+        summary = await reconcile_mod.reconcile_endpoint(db_session, ep)
+    assert summary.ok, summary.error
+
+
+@pytest.mark.asyncio
+async def test_cloud_enabled_endpoint_disabled_mid_fetch_is_dropped(
+    db_session: AsyncSession,
+) -> None:
+    ep = await _endpoint(db_session)
+    ep_id = ep.id
+
+    class _Conn:
+        async def fetch_inventory(self, **kw: Any) -> CloudInventory:
+            async with _TestSessionLocal() as other:
+                row = await other.get(CloudEndpoint, ep_id)
+                assert row is not None
+                row.enabled = False
+                await other.commit()
+            return CloudInventory(account_id="1", networks=[], subnets=[], instances=[])
+
+    with patch.object(reconcile_mod, "get_connector", return_value=_Conn()):
+        summary = await reconcile_mod.reconcile_endpoint(db_session, ep)
+    assert summary.ok is False
+
+
 # ── scheduled DNS server sync ───────────────────────────────────────────────
 
 

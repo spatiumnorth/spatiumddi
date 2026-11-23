@@ -898,6 +898,9 @@ async def reconcile_endpoint(db: AsyncSession, endpoint: CloudEndpoint) -> Recon
     include_stopped = endpoint.mirror_stopped_instances
     include_lbs = endpoint.mirror_load_balancers
     signature = _fetch_signature(endpoint)
+    # "Sync now" runs on a disabled endpoint too; only a row that was enabled
+    # when the pull began and was switched off meanwhile voids the result.
+    was_enabled = endpoint.enabled
     try:
         connector = get_connector(
             endpoint.provider,
@@ -931,7 +934,11 @@ async def reconcile_endpoint(db: AsyncSession, endpoint: CloudEndpoint) -> Recon
     # re-pointed (credentials, provider, regions, spaces) meanwhile, in which
     # case the inventory describes something the operator no longer asked for.
     reread = await db.get(CloudEndpoint, endpoint_id, populate_existing=True)
-    if reread is None or not reread.enabled or _fetch_signature(reread) != signature:
+    if (
+        reread is None
+        or (was_enabled and not reread.enabled)
+        or _fetch_signature(reread) != signature
+    ):
         logger.info("cloud_reconcile_dropped_changed", endpoint=str(endpoint_id))
         summary.error = "endpoint changed or was removed during the sync; result discarded"
         return summary
