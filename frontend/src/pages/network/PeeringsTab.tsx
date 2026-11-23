@@ -167,10 +167,14 @@ function PeeringFormModal({
         {!isEdit && (
           <>
             <div className="space-y-1">
-              <label className="text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="peerings-tab-counterparty-asn"
+                className="text-xs font-medium text-muted-foreground"
+              >
                 Counterparty ASN
               </label>
               <select
+                id="peerings-tab-counterparty-asn"
                 className={inputCls}
                 value={counterAsnId}
                 onChange={(e) => setCounterAsnId(e.target.value)}
@@ -196,12 +200,16 @@ function PeeringFormModal({
               )}
             </div>
             <div className="space-y-1">
-              <label className="text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="peerings-tab-direction"
+                className="text-xs font-medium text-muted-foreground"
+              >
                 Direction
               </label>
               <div className="flex flex-col gap-1">
                 <label className="flex items-start gap-2 rounded border p-2 text-sm hover:bg-accent cursor-pointer">
                   <input
+                    id="peerings-tab-direction"
                     type="radio"
                     name="direction"
                     checked={thisIsLocal}
@@ -231,7 +239,10 @@ function PeeringFormModal({
           </>
         )}
         <div className="space-y-1">
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="peerings-tab-relationship"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Relationship
           </label>
           <div className="flex flex-col gap-1">
@@ -241,6 +252,7 @@ function PeeringFormModal({
                 className="flex items-start gap-2 rounded border p-2 text-sm hover:bg-accent cursor-pointer"
               >
                 <input
+                  id="peerings-tab-relationship"
                   type="radio"
                   name="relationship"
                   checked={relationship === r}
@@ -261,10 +273,14 @@ function PeeringFormModal({
           </div>
         </div>
         <div className="space-y-1">
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="peerings-tab-description"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Description
           </label>
           <textarea
+            id="peerings-tab-description"
             className={cn(inputCls, "min-h-[60px]")}
             value={description}
             onChange={(e) => setDescription(e.target.value)}

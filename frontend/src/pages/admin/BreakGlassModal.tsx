@@ -125,10 +125,14 @@ export function BreakGlassModal({
         </div>
 
         <div className="space-y-1">
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="break-glass-confirm-with-your-password"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Confirm with your password
           </label>
           <input
+            id="break-glass-confirm-with-your-password"
             type="password"
             autoComplete="current-password"
             className={inputCls}
@@ -143,10 +147,14 @@ export function BreakGlassModal({
         </div>
 
         <div className="space-y-1">
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="break-glass-totp-code-if-your-account-uses"
+            className="text-xs font-medium text-muted-foreground"
+          >
             TOTP code (if your account uses MFA without a local password)
           </label>
           <input
+            id="break-glass-totp-code-if-your-account-uses"
             type="text"
             inputMode="numeric"
             autoComplete="one-time-code"
@@ -158,7 +166,10 @@ export function BreakGlassModal({
         </div>
 
         <div className="space-y-1">
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="break-glass-type-to-confirm"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Type{" "}
             <span className="font-mono font-semibold">
               {BREAK_GLASS_PHRASE}
@@ -166,6 +177,7 @@ export function BreakGlassModal({
             to confirm
           </label>
           <input
+            id="break-glass-type-to-confirm"
             type="text"
             autoCapitalize="characters"
             className={cn(

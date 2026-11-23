@@ -5283,8 +5283,14 @@ export function ApplianceRoleAssignmentSection({
       )}
       {dnsRoleActive && dnsOn && (
         <div className="mt-3">
-          <label className="text-xs text-muted-foreground">DNS group</label>
+          <label
+            htmlFor="fleet-tab-dns-group"
+            className="text-xs text-muted-foreground"
+          >
+            DNS group
+          </label>
           <select
+            id="fleet-tab-dns-group"
             value={dnsGroupId ?? ""}
             onChange={(e) => setDnsGroupId(e.target.value || null)}
             className="mt-1 w-full rounded-md border bg-background px-2 py-1 text-xs"
@@ -5307,8 +5313,14 @@ export function ApplianceRoleAssignmentSection({
       )}
       {dhcpRoleActive && dhcpOn && (
         <div className="mt-3">
-          <label className="text-xs text-muted-foreground">DHCP group</label>
+          <label
+            htmlFor="fleet-tab-dhcp-group"
+            className="text-xs text-muted-foreground"
+          >
+            DHCP group
+          </label>
           <select
+            id="fleet-tab-dhcp-group"
             value={dhcpGroupId ?? ""}
             onChange={(e) => setDhcpGroupId(e.target.value || null)}
             className="mt-1 w-full rounded-md border bg-background px-2 py-1 text-xs"
@@ -5374,10 +5386,14 @@ export function ApplianceRoleAssignmentSection({
             " No per-role ports (idle)."
           )}
         </p>
-        <label className="mt-3 block text-xs text-muted-foreground">
+        <label
+          htmlFor="fleet-tab-operator-override-raw-nft-frag"
+          className="mt-3 block text-xs text-muted-foreground"
+        >
           Operator override (raw nft fragment)
         </label>
         <textarea
+          id="fleet-tab-operator-override-raw-nft-frag"
           value={firewallExtra}
           onChange={(e) => setFirewallExtra(e.target.value)}
           placeholder={`# e.g. allow SNMP from monitoring subnet\n# udp dport 161 ip saddr 10.0.0.0/24 accept`}

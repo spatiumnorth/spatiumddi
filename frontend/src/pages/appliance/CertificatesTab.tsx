@@ -848,10 +848,14 @@ function GenerateCsrModal({
         </div>
 
         <div>
-          <label className="block text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="certificates-tab-key-type"
+            className="block text-xs font-medium text-muted-foreground"
+          >
             Key type
           </label>
           <select
+            id="certificates-tab-key-type"
             value={keyType}
             onChange={(e) => setKeyType(e.target.value as CSRKeyType)}
             className="mt-1 w-full rounded-md border bg-background px-2 py-1.5 text-sm"
@@ -1503,7 +1507,10 @@ function AcmeIssueModal({
         {tab === "account" && (
           <div className="space-y-3">
             <div>
-              <label className="block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="certificates-tab-acme-directory-url"
+                className="block text-xs font-medium text-muted-foreground"
+              >
                 ACME directory URL
                 <span className="text-destructive"> *</span>
               </label>
@@ -1524,6 +1531,7 @@ function AcmeIssueModal({
                 ))}
               </div>
               <input
+                id="certificates-tab-acme-directory-url"
                 type="text"
                 value={directoryUrl}
                 onChange={(e) => setDirectoryUrl(e.target.value)}
@@ -1586,7 +1594,10 @@ function AcmeIssueModal({
 
         {tab === "challenge" && (
           <div className="space-y-2">
-            <label className="block text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="certificates-tab-challenge-type"
+              className="block text-xs font-medium text-muted-foreground"
+            >
               Challenge type
             </label>
             <div className="space-y-1.5">
@@ -1602,6 +1613,7 @@ function AcmeIssueModal({
                   }`}
                 >
                   <input
+                    id="certificates-tab-challenge-type"
                     type="radio"
                     name="acme-challenge"
                     value={opt.value}
@@ -1852,11 +1864,15 @@ function FieldText({
 }) {
   return (
     <div>
-      <label className="block text-xs font-medium text-muted-foreground">
+      <label
+        htmlFor="certificates-tab-field"
+        className="block text-xs font-medium text-muted-foreground"
+      >
         {label}
         {required && <span className="text-destructive"> *</span>}
       </label>
       <input
+        id="certificates-tab-field"
         type="text"
         value={value}
         onChange={(e) => onChange(e.target.value)}
@@ -1890,11 +1906,15 @@ function FieldTextarea({
 }) {
   return (
     <div>
-      <label className="block text-xs font-medium text-muted-foreground">
+      <label
+        htmlFor="certificates-tab-field-2"
+        className="block text-xs font-medium text-muted-foreground"
+      >
         {label}
         {required && <span className="text-destructive"> *</span>}
       </label>
       <textarea
+        id="certificates-tab-field-2"
         value={value}
         onChange={(e) => onChange(e.target.value)}
         required={required}

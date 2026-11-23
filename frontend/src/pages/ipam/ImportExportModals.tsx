@@ -144,10 +144,14 @@ export function ImportModal({
             <>
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="mb-1 block text-xs font-medium">
+                  <label
+                    htmlFor="import-export-modals-target-ip-space"
+                    className="mb-1 block text-xs font-medium"
+                  >
                     Target IP Space
                   </label>
                   <select
+                    id="import-export-modals-target-ip-space"
                     value={spaceId}
                     onChange={(e) => setSpaceId(e.target.value)}
                     className="w-full rounded border bg-background px-2 py-1 text-sm"
@@ -160,10 +164,14 @@ export function ImportModal({
                   </select>
                 </div>
                 <div>
-                  <label className="mb-1 block text-xs font-medium">
+                  <label
+                    htmlFor="import-export-modals-conflict-strategy"
+                    className="mb-1 block text-xs font-medium"
+                  >
                     Conflict strategy
                   </label>
                   <select
+                    id="import-export-modals-conflict-strategy"
                     value={strategy}
                     onChange={(e) =>
                       setStrategy(e.target.value as ImportStrategy)
@@ -178,10 +186,14 @@ export function ImportModal({
               </div>
 
               <div>
-                <label className="mb-1 block text-xs font-medium">
+                <label
+                  htmlFor="import-export-modals-file-csv-json-or-xlsx"
+                  className="mb-1 block text-xs font-medium"
+                >
                   File (CSV, JSON, or XLSX)
                 </label>
                 <input
+                  id="import-export-modals-file-csv-json-or-xlsx"
                   type="file"
                   accept=".csv,.json,.xlsx,text/csv,application/json"
                   onChange={(e) => {
@@ -543,10 +555,14 @@ export function AddressImportModal({
                 </p>
               </div>
               <div>
-                <label className="mb-1 block text-xs font-medium">
+                <label
+                  htmlFor="import-export-modals-conflict-strategy-2"
+                  className="mb-1 block text-xs font-medium"
+                >
                   Conflict strategy
                 </label>
                 <select
+                  id="import-export-modals-conflict-strategy-2"
                   value={strategy}
                   onChange={(e) =>
                     setStrategy(e.target.value as ImportStrategy)
@@ -559,10 +575,14 @@ export function AddressImportModal({
                 </select>
               </div>
               <div>
-                <label className="mb-1 block text-xs font-medium">
+                <label
+                  htmlFor="import-export-modals-file-csv-json-or-xlsx-2"
+                  className="mb-1 block text-xs font-medium"
+                >
                   File (CSV, JSON, or XLSX)
                 </label>
                 <input
+                  id="import-export-modals-file-csv-json-or-xlsx-2"
                   type="file"
                   accept=".csv,.json,.xlsx,text/csv,application/json"
                   onChange={(e) => {

@@ -5,6 +5,7 @@
 // its own `Field` component unless it is listed below with the reason.
 import { readdirSync, readFileSync } from "node:fs";
 import { join, relative, sep } from "node:path";
+import ts from "typescript";
 import { describe, expect, it } from "vitest";
 
 const SRC = join(__dirname, "..");
@@ -34,6 +35,69 @@ function files(dir: string): string[] {
         ? [join(dir, e.name)]
         : [],
   );
+}
+
+const CONTROLS = new Set(["input", "select", "textarea"]);
+
+/** Line numbers of every `<label>` in a TSX source that names no control: it
+ *  has no `htmlFor`, wraps no input / select / textarea and no `{children}`
+ *  slot, sits in no other label, and the next native control after it has no
+ *  `id`, `aria-label` or `aria-labelledby`. */
+export function unnamedInlineLabels(source: string): number[] {
+  const sf = ts.createSourceFile(
+    "x.tsx",
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TSX,
+  );
+  const elements: (ts.JsxElement | ts.JsxSelfClosingElement)[] = [];
+  const visit = (n: ts.Node) => {
+    if (ts.isJsxElement(n) || ts.isJsxSelfClosingElement(n)) elements.push(n);
+    ts.forEachChild(n, visit);
+  };
+  visit(sf);
+  const open = (n: ts.JsxElement | ts.JsxSelfClosingElement) =>
+    ts.isJsxElement(n) ? n.openingElement : n;
+  const tag = (n: ts.JsxElement | ts.JsxSelfClosingElement) =>
+    open(n).tagName.getText();
+  const has = (n: ts.JsxElement | ts.JsxSelfClosingElement, names: string[]) =>
+    open(n).attributes.properties.some(
+      (p) => ts.isJsxAttribute(p) && names.includes(p.name.getText()),
+    );
+  const lines: number[] = [];
+  for (const el of elements) {
+    if (tag(el) !== "label" || !ts.isJsxElement(el) || has(el, ["htmlFor"]))
+      continue;
+    let wraps = false;
+    const scan = (n: ts.Node) => {
+      if (
+        (ts.isJsxElement(n) || ts.isJsxSelfClosingElement(n)) &&
+        CONTROLS.has(tag(n))
+      )
+        wraps = true;
+      // `{children}` is the control a wrapper component receives.
+      if (
+        ts.isJsxExpression(n) &&
+        n.expression &&
+        n.expression.getText() === "children"
+      )
+        wraps = true;
+      ts.forEachChild(n, scan);
+    };
+    scan(el);
+    if (wraps) continue;
+    let inLabel = false;
+    for (let a = el.parent; a; a = a.parent)
+      if (ts.isJsxElement(a) && tag(a) === "label") inLabel = true;
+    if (inLabel) continue;
+    const next = elements.find(
+      (c) => c.getStart() >= el.end && CONTROLS.has(tag(c)),
+    );
+    if (!next || has(next, ["id", "aria-label", "aria-labelledby"])) continue;
+    lines.push(sf.getLineAndCharacterOfPosition(el.getStart()).line + 1);
+  }
+  return lines;
 }
 
 export function definesOwnField(source: string): boolean {
@@ -83,5 +147,32 @@ describe("form labels use the shared Field (#4371)", () => {
       })
       .map(({ rel }) => rel);
     expect(missing).toEqual([]);
+  });
+
+  // #4778: an inline <label> is no Field. A label that names nothing (no
+  // htmlFor, wrapping no control) over a control with no id, aria-label or
+  // aria-labelledby leaves the control announced by its placeholder, or by
+  // nothing. The scan walks the JSX of every file.
+  it("detects an inline label that names nothing (#4778)", () => {
+    const hit = (body: string) =>
+      unnamedInlineLabels(`const a = () => (<div>${body}</div>);`).length;
+    expect(hit("<label>Name</label><input />")).toBe(1);
+    expect(hit('<label htmlFor="x">Name</label><input id="x" />')).toBe(0);
+    expect(hit("<label>Name<input /></label>")).toBe(0);
+    expect(hit('<label>Name</label><select aria-label="Name" />')).toBe(0);
+    expect(hit('<label>Name</label><textarea aria-labelledby="l" />')).toBe(0);
+    expect(hit("<label>{children}</label>")).toBe(0);
+    expect(hit("<label>Name</label><p>no control</p>")).toBe(0);
+  });
+
+  it("no inline label is left naming nothing (#4778)", () => {
+    const left = files(SRC)
+      .filter((f) => f.endsWith(".tsx"))
+      .flatMap((f) =>
+        unnamedInlineLabels(readFileSync(f, "utf8")).map(
+          (line) => `${relative(SRC, f).split(sep).join("/")}:${line}`,
+        ),
+      );
+    expect(left).toEqual([]);
   });
 });

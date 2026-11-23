@@ -136,11 +136,15 @@ function TypeToConfirm({
 }) {
   return (
     <div className="space-y-1">
-      <label className="text-xs font-medium">
+      <label
+        htmlFor="resize-modals-type-the-new-cidr-to-confirm"
+        className="text-xs font-medium"
+      >
         Type the new CIDR to confirm:{" "}
         <span className="font-mono">{expected}</span>
       </label>
       <input
+        id="resize-modals-type-the-new-cidr-to-confirm"
         type="text"
         value={value}
         onChange={(e) => onChange(e.target.value)}
@@ -344,16 +348,28 @@ export function ResizeSubnetModal({
     >
       <div className="grid grid-cols-2 gap-3">
         <div>
-          <label className="mb-1 block text-xs font-medium">Current CIDR</label>
+          <label
+            htmlFor="resize-modals-current-cidr"
+            className="mb-1 block text-xs font-medium"
+          >
+            Current CIDR
+          </label>
           <input
+            id="resize-modals-current-cidr"
             readOnly
             value={subnet.network}
             className="w-full rounded border bg-muted px-2 py-1 font-mono text-sm"
           />
         </div>
         <div>
-          <label className="mb-1 block text-xs font-medium">New CIDR</label>
+          <label
+            htmlFor="resize-modals-new-cidr"
+            className="mb-1 block text-xs font-medium"
+          >
+            New CIDR
+          </label>
           <input
+            id="resize-modals-new-cidr"
             type="text"
             value={newCidr}
             onChange={(e) => {
@@ -687,16 +703,28 @@ export function ResizeBlockModal({
     >
       <div className="grid grid-cols-2 gap-3">
         <div>
-          <label className="mb-1 block text-xs font-medium">Current CIDR</label>
+          <label
+            htmlFor="resize-modals-current-cidr-2"
+            className="mb-1 block text-xs font-medium"
+          >
+            Current CIDR
+          </label>
           <input
+            id="resize-modals-current-cidr-2"
             readOnly
             value={block.network}
             className="w-full rounded border bg-muted px-2 py-1 font-mono text-sm"
           />
         </div>
         <div>
-          <label className="mb-1 block text-xs font-medium">New CIDR</label>
+          <label
+            htmlFor="resize-modals-new-cidr-2"
+            className="mb-1 block text-xs font-medium"
+          >
+            New CIDR
+          </label>
           <input
+            id="resize-modals-new-cidr-2"
             type="text"
             value={newCidr}
             onChange={(e) => {

@@ -393,8 +393,14 @@ export function DNSThreatTab() {
     <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-end gap-3 rounded-lg border bg-card px-4 py-3">
         <div>
-          <label className="mb-1 block text-xs font-medium">Window</label>
+          <label
+            htmlFor="dnsthreat-tab-window"
+            className="mb-1 block text-xs font-medium"
+          >
+            Window
+          </label>
           <select
+            id="dnsthreat-tab-window"
             value={hours}
             onChange={(e) => setHours(Number(e.target.value))}
             className="rounded-md border bg-background px-2 py-1.5 text-sm"
@@ -448,10 +454,14 @@ export function DNSThreatTab() {
         >
           <div className="flex flex-wrap items-end gap-3 rounded-lg border bg-card px-4 py-3">
             <div>
-              <label className="mb-1 block text-xs font-medium">
+              <label
+                htmlFor="dnsthreat-tab-detection"
+                className="mb-1 block text-xs font-medium"
+              >
                 Detection
               </label>
               <select
+                id="dnsthreat-tab-detection"
                 value={detection}
                 onChange={(e) => setDetection(e.target.value as Detection)}
                 className="rounded-md border bg-background px-2 py-1.5 text-sm"
@@ -462,10 +472,14 @@ export function DNSThreatTab() {
               </select>
             </div>
             <div>
-              <label className="mb-1 block text-xs font-medium">
+              <label
+                htmlFor="dnsthreat-tab-minimum-score"
+                className="mb-1 block text-xs font-medium"
+              >
                 Minimum score
               </label>
               <select
+                id="dnsthreat-tab-minimum-score"
                 value={minScore}
                 onChange={(e) => setMinScore(Number(e.target.value))}
                 className="rounded-md border bg-background px-2 py-1.5 text-sm"
@@ -1029,10 +1043,14 @@ function MuteModal({
         </p>
 
         <div>
-          <label className="mb-1 block text-xs font-medium">
+          <label
+            htmlFor="dnsthreat-tab-why-is-this-expected"
+            className="mb-1 block text-xs font-medium"
+          >
             Why is this expected? <span className="text-rose-500">*</span>
           </label>
           <textarea
+            id="dnsthreat-tab-why-is-this-expected"
             value={reason}
             onChange={(e) => setReason(e.target.value)}
             rows={3}
@@ -1046,8 +1064,14 @@ function MuteModal({
         </div>
 
         <div>
-          <label className="mb-1 block text-xs font-medium">Mute for</label>
+          <label
+            htmlFor="dnsthreat-tab-mute-for"
+            className="mb-1 block text-xs font-medium"
+          >
+            Mute for
+          </label>
           <select
+            id="dnsthreat-tab-mute-for"
             value={String(days)}
             onChange={(e) =>
               setDays(

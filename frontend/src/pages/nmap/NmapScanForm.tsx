@@ -127,10 +127,14 @@ export function NmapScanForm({
   return (
     <div className="space-y-3">
       <div>
-        <label className="mb-1 block text-xs font-medium text-muted-foreground">
+        <label
+          htmlFor="nmap-scan-form-target"
+          className="mb-1 block text-xs font-medium text-muted-foreground"
+        >
           Target
         </label>
         <input
+          id="nmap-scan-form-target"
           className={cn(inputCls, "font-mono")}
           value={targetIp}
           onChange={(e) => setTargetIp(e.target.value)}
@@ -145,7 +149,10 @@ export function NmapScanForm({
       </div>
 
       <div>
-        <label className="mb-1 block text-xs font-medium text-muted-foreground">
+        <label
+          htmlFor="nmap-scan-form-preset"
+          className="mb-1 block text-xs font-medium text-muted-foreground"
+        >
           Preset
         </label>
         <div className="grid grid-cols-1 gap-1 sm:grid-cols-2">
@@ -160,6 +167,7 @@ export function NmapScanForm({
               )}
             >
               <input
+                id="nmap-scan-form-preset"
                 type="radio"
                 name="nmap-preset"
                 checked={preset === p.id}
@@ -179,10 +187,14 @@ export function NmapScanForm({
 
       <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
         <div>
-          <label className="mb-1 block text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="nmap-scan-form-port-spec-optional"
+            className="mb-1 block text-xs font-medium text-muted-foreground"
+          >
             Port spec (optional)
           </label>
           <input
+            id="nmap-scan-form-port-spec-optional"
             className={cn(inputCls, "font-mono")}
             value={portSpec}
             onChange={(e) => setPortSpec(e.target.value)}
@@ -190,10 +202,14 @@ export function NmapScanForm({
           />
         </div>
         <div>
-          <label className="mb-1 block text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="nmap-scan-form-extra-args-optional"
+            className="mb-1 block text-xs font-medium text-muted-foreground"
+          >
             Extra args (optional)
           </label>
           <input
+            id="nmap-scan-form-extra-args-optional"
             className={cn(inputCls, "font-mono")}
             value={extraArgs}
             onChange={(e) => setExtraArgs(e.target.value)}

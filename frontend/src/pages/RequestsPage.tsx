@@ -236,10 +236,13 @@ function fieldsFrom(kind: RequestKind): FieldSpec[] {
  * The submitted value is the UUID; the user only ever sees labels.
  */
 export function ResourcePicker({
+  id,
   resource,
   value,
   onChange,
 }: {
+  /** Id for the search input, so a `<label htmlFor>` names it. */
+  id?: string;
   resource: string;
   value: string;
   onChange: (id: string) => void;
@@ -296,6 +299,7 @@ export function ResourcePicker({
       }}
     >
       <input
+        id={id}
         className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm"
         placeholder="Type to search…"
         value={search}
@@ -410,10 +414,14 @@ function NewRequestModal({
     <Modal title="New request" onClose={onClose} wide>
       <div className="space-y-4">
         <div>
-          <label className="mb-1 block text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="requests-what-do-you-need"
+            className="mb-1 block text-xs font-medium text-muted-foreground"
+          >
             What do you need?
           </label>
           <select
+            id="requests-what-do-you-need"
             className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm"
             value={kindId}
             onChange={(e) => {
@@ -440,7 +448,10 @@ function NewRequestModal({
           <div className="grid gap-3 sm:grid-cols-2">
             {fields.map((f) => (
               <div key={f.name} className="min-w-0">
-                <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                <label
+                  htmlFor={`request-field-${f.name}`}
+                  className="mb-1 block text-xs font-medium text-muted-foreground"
+                >
                   {f.title}
                   {f.required ? (
                     <span className="ml-0.5 text-rose-500">*</span>
@@ -448,6 +459,7 @@ function NewRequestModal({
                 </label>
                 {f.resource ? (
                   <ResourcePicker
+                    id={`request-field-${f.name}`}
                     resource={f.resource}
                     value={values[f.name] ?? ""}
                     onChange={(id) =>
@@ -456,6 +468,7 @@ function NewRequestModal({
                   />
                 ) : f.enum ? (
                   <select
+                    id={`request-field-${f.name}`}
                     className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm"
                     value={values[f.name] ?? ""}
                     onChange={(e) =>
@@ -471,6 +484,7 @@ function NewRequestModal({
                   </select>
                 ) : (
                   <input
+                    id={`request-field-${f.name}`}
                     className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm"
                     value={values[f.name] ?? ""}
                     onChange={(e) =>
@@ -489,10 +503,14 @@ function NewRequestModal({
         ) : null}
 
         <div>
-          <label className="mb-1 block text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="requests-why-do-you-need-this"
+            className="mb-1 block text-xs font-medium text-muted-foreground"
+          >
             Why do you need this?
           </label>
           <textarea
+            id="requests-why-do-you-need-this"
             rows={3}
             maxLength={NOTE_MAX}
             className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm"
@@ -668,10 +686,14 @@ function DecisionModal({
           </p>
         ) : null}
         <div>
-          <label className="mb-1 block text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="requests-note-optional"
+            className="mb-1 block text-xs font-medium text-muted-foreground"
+          >
             Note (optional)
           </label>
           <textarea
+            id="requests-note-optional"
             rows={2}
             maxLength={NOTE_MAX}
             className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm"

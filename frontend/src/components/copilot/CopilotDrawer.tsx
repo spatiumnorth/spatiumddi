@@ -1126,10 +1126,14 @@ function EmptyState({ onPick }: { onPick: (text: string) => void }) {
       </div>
       <div className="mt-4 space-y-2">
         <div className="flex items-center gap-2">
-          <label className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+          <label
+            htmlFor="copilot-drawer-examples"
+            className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground"
+          >
             Examples
           </label>
           <select
+            id="copilot-drawer-examples"
             value={groupLabel}
             onChange={(e) => setGroupLabel(e.target.value)}
             className="rounded-md border bg-background px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-ring"

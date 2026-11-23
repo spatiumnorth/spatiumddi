@@ -1486,10 +1486,14 @@ function GroupModalForm({
           )}
           {catalogZonesEnabled && (
             <div className="mt-2">
-              <label className="mb-0.5 block text-xs font-medium">
+              <label
+                htmlFor="dnspage-catalog-zone-name"
+                className="mb-0.5 block text-xs font-medium"
+              >
                 Catalog zone name
               </label>
               <input
+                id="dnspage-catalog-zone-name"
                 className={inputCls}
                 value={catalogZoneName}
                 onChange={(e) => setCatalogZoneName(e.target.value)}
@@ -8490,8 +8494,14 @@ function TSIGKeyModalForm({
     >
       <div className="space-y-3 text-sm">
         <div>
-          <label className="mb-0.5 block text-xs font-medium">Name</label>
+          <label
+            htmlFor="dnspage-name"
+            className="mb-0.5 block text-xs font-medium"
+          >
+            Name
+          </label>
           <input
+            id="dnspage-name"
             type="text"
             value={name}
             onChange={(e) => setName(e.target.value)}
@@ -8504,8 +8514,14 @@ function TSIGKeyModalForm({
           </p>
         </div>
         <div>
-          <label className="mb-0.5 block text-xs font-medium">Algorithm</label>
+          <label
+            htmlFor="dnspage-algorithm"
+            className="mb-0.5 block text-xs font-medium"
+          >
+            Algorithm
+          </label>
           <select
+            id="dnspage-algorithm"
             value={algorithm}
             onChange={(e) => setAlgorithm(e.target.value)}
             className="w-full rounded border bg-background px-2 py-1 text-xs"
@@ -8529,11 +8545,15 @@ function TSIGKeyModalForm({
         </div>
         {!isEdit && (
           <div>
-            <label className="mb-0.5 block text-xs font-medium">
+            <label
+              htmlFor="dnspage-secret-optional"
+              className="mb-0.5 block text-xs font-medium"
+            >
               Secret (optional)
             </label>
             <div className="flex items-center gap-2">
               <input
+                id="dnspage-secret-optional"
                 type="text"
                 value={secret}
                 onChange={(e) => setSecret(e.target.value)}
@@ -8556,10 +8576,14 @@ function TSIGKeyModalForm({
           </div>
         )}
         <div>
-          <label className="mb-0.5 block text-xs font-medium">
+          <label
+            htmlFor="dnspage-purpose-optional"
+            className="mb-0.5 block text-xs font-medium"
+          >
             Purpose (optional)
           </label>
           <input
+            id="dnspage-purpose-optional"
             type="text"
             value={purpose}
             onChange={(e) => setPurpose(e.target.value)}
@@ -8568,8 +8592,14 @@ function TSIGKeyModalForm({
           />
         </div>
         <div>
-          <label className="mb-0.5 block text-xs font-medium">Notes</label>
+          <label
+            htmlFor="dnspage-notes"
+            className="mb-0.5 block text-xs font-medium"
+          >
+            Notes
+          </label>
           <textarea
+            id="dnspage-notes"
             value={notes}
             onChange={(e) => setNotes(e.target.value)}
             rows={2}

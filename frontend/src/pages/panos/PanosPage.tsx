@@ -881,12 +881,16 @@ export function FirewallModal({
         )}
 
         <div className="space-y-2 border-t pt-3">
-          <label className="block text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="panos-authentication"
+            className="block text-xs font-medium text-muted-foreground"
+          >
             Authentication
           </label>
           <div className="flex flex-wrap gap-4 text-sm">
             <label className="flex cursor-pointer items-center gap-2">
               <input
+                id="panos-authentication"
                 type="radio"
                 name="panos-auth-mode"
                 checked={authMode === "api_key"}

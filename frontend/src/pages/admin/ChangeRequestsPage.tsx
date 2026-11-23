@@ -246,10 +246,14 @@ function DecisionModal({
         )}
 
         <div className="space-y-1">
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="change-requests-decision-note"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Decision note {mode === "reject" ? "" : "(optional)"}
           </label>
           <textarea
+            id="change-requests-decision-note"
             className={cn(inputCls, "min-h-[64px] resize-y")}
             maxLength={DECISION_NOTE_MAX}
             value={note}
@@ -563,10 +567,14 @@ function PolicyEditor({
           </p>
         )}
         <div className="space-y-1">
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="change-requests-name"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Name
           </label>
           <input
+            id="change-requests-name"
             className={inputCls}
             value={name}
             disabled={locked}
@@ -575,10 +583,14 @@ function PolicyEditor({
         </div>
         <div className="grid grid-cols-2 gap-3">
           <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="change-requests-resource-type"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Resource type
             </label>
             <input
+              id="change-requests-resource-type"
               className={inputCls}
               value={resourceType}
               disabled={locked}
@@ -587,10 +599,14 @@ function PolicyEditor({
             />
           </div>
           <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="change-requests-action"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Action
             </label>
             <select
+              id="change-requests-action"
               className={inputCls}
               value={action}
               disabled={locked}
@@ -606,10 +622,14 @@ function PolicyEditor({
         </div>
         <div className="grid grid-cols-2 gap-3">
           <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="change-requests-threshold-min-rows"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Threshold (min rows)
             </label>
             <input
+              id="change-requests-threshold-min-rows"
               className={inputCls}
               type="number"
               min={1}
@@ -622,10 +642,14 @@ function PolicyEditor({
             </p>
           </div>
           <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="change-requests-ttl-hours"
+              className="text-xs font-medium text-muted-foreground"
+            >
               TTL (hours)
             </label>
             <input
+              id="change-requests-ttl-hours"
               className={inputCls}
               type="number"
               min={1}

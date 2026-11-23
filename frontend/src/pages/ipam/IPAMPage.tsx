@@ -2080,11 +2080,15 @@ function ClassificationSection({
           </span>
         </label>
         <div className="space-y-1 pt-1">
-          <label className="flex items-center gap-2 text-xs">
+          <label
+            htmlFor="ipampage-field"
+            className="flex items-center gap-2 text-xs"
+          >
             <span className="font-medium">Decommission date</span>
           </label>
           <div className="flex items-center gap-2">
             <input
+              id="ipampage-field"
               type="date"
               value={decomDate}
               onChange={(e) => onDecomDateChange(e.target.value)}
@@ -17877,12 +17881,16 @@ function GlobalIpSearchModal({ onClose }: { onClose: () => void }) {
             className="flex flex-wrap items-end gap-2"
           >
             <div className="min-w-[12rem] flex-1">
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="ipampage-search"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Search (IP · hostname · MAC · description)
               </label>
               <div className="relative">
                 <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground/60" />
                 <input
+                  id="ipampage-search"
                   autoFocus
                   value={qDraft}
                   onChange={(e) => setQDraft(e.target.value)}
@@ -17892,10 +17900,14 @@ function GlobalIpSearchModal({ onClose }: { onClose: () => void }) {
               </div>
             </div>
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="ipampage-status"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Status
               </label>
               <select
+                id="ipampage-status"
                 value={statusDraft}
                 onChange={(e) => setStatusDraft(e.target.value)}
                 className="rounded-md border bg-background px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-ring"

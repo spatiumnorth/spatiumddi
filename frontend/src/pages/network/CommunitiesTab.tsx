@@ -140,7 +140,10 @@ function CommunityFormModal({
         {!isEdit && (
           <>
             <div className="space-y-1">
-              <label className="text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="communities-tab-kind"
+                className="text-xs font-medium text-muted-foreground"
+              >
                 Kind
               </label>
               <div className="flex flex-col gap-1">
@@ -151,6 +154,7 @@ function CommunityFormModal({
                       className="flex items-start gap-2 rounded border p-2 text-sm hover:bg-accent cursor-pointer"
                     >
                       <input
+                        id="communities-tab-kind"
                         type="radio"
                         name="kind"
                         value={k}
@@ -170,11 +174,15 @@ function CommunityFormModal({
               </div>
             </div>
             <div className="space-y-1">
-              <label className="text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="communities-tab-value"
+                className="text-xs font-medium text-muted-foreground"
+              >
                 Value
               </label>
               {kind === "standard" ? (
                 <select
+                  id="communities-tab-value"
                   className={inputCls}
                   value={value}
                   onChange={(e) => setValue(e.target.value)}
@@ -206,10 +214,14 @@ function CommunityFormModal({
           </>
         )}
         <div className="space-y-1">
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="communities-tab-name-operator-friendly-label"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Name (operator-friendly label)
           </label>
           <input
+            id="communities-tab-name-operator-friendly-label"
             className={inputCls}
             value={name}
             onChange={(e) => setName(e.target.value)}
@@ -217,10 +229,14 @@ function CommunityFormModal({
           />
         </div>
         <div className="space-y-1">
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="communities-tab-description"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Description
           </label>
           <textarea
+            id="communities-tab-description"
             className={cn(inputCls, "min-h-[60px]")}
             value={description}
             onChange={(e) => setDescription(e.target.value)}
@@ -229,10 +245,14 @@ function CommunityFormModal({
         </div>
         <div className="grid gap-3 sm:grid-cols-2">
           <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="communities-tab-inbound-action"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Inbound action
             </label>
             <input
+              id="communities-tab-inbound-action"
               className={inputCls}
               value={inboundAction}
               onChange={(e) => setInboundAction(e.target.value)}
@@ -240,10 +260,14 @@ function CommunityFormModal({
             />
           </div>
           <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="communities-tab-outbound-action"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Outbound action
             </label>
             <input
+              id="communities-tab-outbound-action"
               className={inputCls}
               value={outboundAction}
               onChange={(e) => setOutboundAction(e.target.value)}

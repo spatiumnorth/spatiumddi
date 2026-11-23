@@ -484,10 +484,14 @@ export function BulkAllocateModal({
         <>
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="bulk-allocate-range-start"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Range start
               </label>
               <input
+                id="bulk-allocate-range-start"
                 className={cn(inputCls, "font-mono")}
                 value={rangeStart}
                 onChange={(e) => setRangeStart(e.target.value)}
@@ -496,10 +500,14 @@ export function BulkAllocateModal({
               />
             </div>
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="bulk-allocate-range-end"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Range end
               </label>
               <input
+                id="bulk-allocate-range-end"
                 className={cn(inputCls, "font-mono")}
                 value={rangeEnd}
                 onChange={(e) => setRangeEnd(e.target.value)}
@@ -509,10 +517,14 @@ export function BulkAllocateModal({
           </div>
 
           <div>
-            <label className="mb-1 block text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="bulk-allocate-hostname-template"
+              className="mb-1 block text-xs font-medium text-muted-foreground"
+            >
               Hostname template
             </label>
             <input
+              id="bulk-allocate-hostname-template"
               className={cn(inputCls, "font-mono")}
               value={hostnameTemplate}
               onChange={(e) => setHostnameTemplate(e.target.value)}
@@ -532,10 +544,14 @@ export function BulkAllocateModal({
 
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="bulk-allocate-iterator-start"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Iterator start
               </label>
               <input
+                id="bulk-allocate-iterator-start"
                 type="number"
                 className={cn(inputCls, "font-mono")}
                 value={templateStart}
@@ -543,10 +559,14 @@ export function BulkAllocateModal({
               />
             </div>
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="bulk-allocate-status"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Status
               </label>
               <select
+                id="bulk-allocate-status"
                 className={inputCls}
                 value={statusValue}
                 onChange={(e) => setStatusValue(e.target.value)}
@@ -557,10 +577,14 @@ export function BulkAllocateModal({
               </select>
             </div>
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="bulk-allocate-on-collision"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 On collision
               </label>
               <select
+                id="bulk-allocate-on-collision"
                 className={inputCls}
                 value={onCollision}
                 onChange={(e) =>
@@ -574,10 +598,14 @@ export function BulkAllocateModal({
           </div>
 
           <div>
-            <label className="mb-1 block text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="bulk-allocate-description-optional"
+              className="mb-1 block text-xs font-medium text-muted-foreground"
+            >
               Description (optional)
             </label>
             <input
+              id="bulk-allocate-description-optional"
               className={inputCls}
               value={description}
               onChange={(e) => setDescription(e.target.value)}
@@ -597,10 +625,14 @@ export function BulkAllocateModal({
               </label>
               {createDnsRecords && availableZones.length > 0 && (
                 <div className="mt-2">
-                  <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                  <label
+                    htmlFor="bulk-allocate-forward-zone"
+                    className="mb-1 block text-xs font-medium text-muted-foreground"
+                  >
                     Forward zone
                   </label>
                   <select
+                    id="bulk-allocate-forward-zone"
                     className={inputCls}
                     value={dnsZoneId}
                     onChange={(e) => {
