@@ -3699,6 +3699,20 @@ type RecordModalProps = {
   onClose: () => void;
 };
 
+/** A record a DNS pool's health-check pipeline renders: the record API
+ * refuses to edit or delete it (422), so no list offers either (#4391, #4798). */
+const POOL_MANAGED_REASON =
+  "Managed by a DNS pool — edit the pool or its members on the Pools tab";
+function isPoolManagedRecord(r: { pool_member_id?: string | null }): boolean {
+  return !!r.pool_member_id;
+}
+function recordSource(r: {
+  auto_generated: boolean;
+  pool_member_id?: string | null;
+}): "pool" | "auto" | "user" {
+  return isPoolManagedRecord(r) ? "pool" : r.auto_generated ? "auto" : "user";
+}
+
 // Edit reads the record fresh on open (#3077): the row the page holds comes
 // from a cached records page that may predate a Save made a moment ago. It is
 // opened from the zone's records page or the group-wide records list, so both
@@ -5691,7 +5705,9 @@ export function ZoneDetailView({
                     <th className="w-8 py-2 pl-3">
                       {(() => {
                         const manualIds = filtered
-                          .filter((r) => !r.auto_generated && !r.pool_member_id)
+                          .filter(
+                            (r) => !r.auto_generated && !isPoolManagedRecord(r),
+                          )
                           .map((r) => r.id);
                         const allSel =
                           manualIds.length > 0 &&
@@ -5862,7 +5878,7 @@ export function ZoneDetailView({
                         >
                           <td className="w-8 py-1.5 pl-3">
                             {!r.auto_generated &&
-                              !r.pool_member_id &&
+                              !isPoolManagedRecord(r) &&
                               canDeleteRecords && (
                                 <input
                                   type="checkbox"
@@ -5880,7 +5896,7 @@ export function ZoneDetailView({
                           </td>
                           <td className="py-1.5 pl-5 font-mono text-xs font-medium">
                             {r.auto_generated ||
-                            r.pool_member_id ||
+                            isPoolManagedRecord(r) ||
                             !canWriteRecords ? (
                               r.name
                             ) : (
@@ -5919,7 +5935,7 @@ export function ZoneDetailView({
                             {r.priority ?? "—"}
                           </td>
                           <td className="py-1.5 pr-3">
-                            {r.pool_member_id ? (
+                            {isPoolManagedRecord(r) ? (
                               <div className="flex items-center justify-end gap-1">
                                 <span
                                   title="This record is rendered by a DNS pool's health-check pipeline. Manage it from the Pools tab — direct edits are blocked."
@@ -6037,7 +6053,7 @@ export function ZoneDetailView({
                         >
                           Copy Value
                         </ContextMenuItem>
-                        {r.pool_member_id ? (
+                        {isPoolManagedRecord(r) ? (
                           <>
                             <ContextMenuSeparator />
                             <ContextMenuItem
@@ -10329,7 +10345,7 @@ export function RecordsTab({
       }
     }
     if (colFilters.source) {
-      const src = r.auto_generated ? "auto" : "user";
+      const src = recordSource(r);
       if (src !== colFilters.source) return false;
     }
     return true;
@@ -10345,7 +10361,7 @@ export function RecordsTab({
       if (key === "value") return row.value;
       if (key === "ttl") return row.ttl ?? -1;
       if (key === "view") return row.view_name ?? "";
-      if (key === "source") return row.auto_generated ? "auto" : "user";
+      if (key === "source") return recordSource(row);
       return "";
     },
   );
@@ -10431,6 +10447,7 @@ export function RecordsTab({
           <option value="">All</option>
           <option value="user">User</option>
           <option value="auto">Auto (IPAM/DHCP)</option>
+          <option value="pool">DNS pool</option>
         </select>
       );
     }
@@ -10614,7 +10631,14 @@ export function RecordsTab({
                       )}
                     </td>
                     <td className="px-4 py-2">
-                      {rec.auto_generated ? (
+                      {isPoolManagedRecord(rec) ? (
+                        <span
+                          className="inline-flex items-center rounded bg-sky-100 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 dark:bg-sky-900/30 dark:text-sky-400"
+                          title="Managed by a DNS pool"
+                        >
+                          pool
+                        </span>
+                      ) : rec.auto_generated ? (
                         <span
                           className="inline-flex items-center rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-900/30 dark:text-amber-400"
                           title="Auto-managed by IPAM or DHCP"
@@ -10631,12 +10655,16 @@ export function RecordsTab({
                       <div className="flex items-center justify-end gap-1">
                         <button
                           onClick={() => setEditing(rec)}
-                          disabled={rec.auto_generated}
+                          disabled={
+                            rec.auto_generated || isPoolManagedRecord(rec)
+                          }
                           className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-30 disabled:pointer-events-none"
                           title={
-                            rec.auto_generated
-                              ? "Auto-managed — edit the source IP/lease"
-                              : "Edit"
+                            isPoolManagedRecord(rec)
+                              ? POOL_MANAGED_REASON
+                              : rec.auto_generated
+                                ? "Auto-managed — edit the source IP/lease"
+                                : "Edit"
                           }
                           aria-label="Edit"
                           {...permissionGate(canWriteRecords, NEEDS_DNS_WRITE)}
@@ -10645,12 +10673,16 @@ export function RecordsTab({
                         </button>
                         <button
                           onClick={() => setConfirmDelete(rec)}
-                          disabled={rec.auto_generated}
+                          disabled={
+                            rec.auto_generated || isPoolManagedRecord(rec)
+                          }
                           className="rounded p-1 text-muted-foreground hover:text-destructive disabled:opacity-30 disabled:pointer-events-none"
                           title={
-                            rec.auto_generated
-                              ? "Auto-managed — delete the source IP/lease"
-                              : "Delete"
+                            isPoolManagedRecord(rec)
+                              ? POOL_MANAGED_REASON
+                              : rec.auto_generated
+                                ? "Auto-managed — delete the source IP/lease"
+                                : "Delete"
                           }
                           aria-label="Delete"
                           {...permissionGate(
