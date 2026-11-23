@@ -1,3 +1,4 @@
+import { pluralize } from "@/lib/count-noun";
 import { useState } from "react";
 import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -505,7 +506,7 @@ function ProviderEditor({
                 <p className="text-[11px] text-muted-foreground">
                   {form.system_prompt_override &&
                   form.system_prompt_override.length > 0
-                    ? `${form.system_prompt_override.length.toLocaleString()} characters`
+                    ? `${form.system_prompt_override.length.toLocaleString()} ${pluralize(form.system_prompt_override.length, "character")}`
                     : "Empty — Copilot will use the baked-in default."}
                 </p>
                 {defaultPrompt && (

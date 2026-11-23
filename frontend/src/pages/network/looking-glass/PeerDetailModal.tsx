@@ -1,3 +1,4 @@
+import { countNoun, pluralize } from "@/lib/count-noun";
 import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
@@ -327,7 +328,7 @@ export function PeerDetailModal({
               value={
                 peer.import_filter.mode === "accept_all"
                   ? "Accept all"
-                  : `Scoped (${(peer.import_filter.prefixes ?? []).length} prefixes)`
+                  : `Scoped (${countNoun((peer.import_filter.prefixes ?? []).length, "prefix", "prefixes")})`
               }
             />
             <StatRow
@@ -417,7 +418,8 @@ export function PeerDetailModal({
               onClick={() => onViewRoutes(peerId)}
               className="text-xs text-primary hover:underline"
             >
-              View all {rs.active_total.toLocaleString()} routes →
+              View all {rs.active_total.toLocaleString()}{" "}
+              {pluralize(rs.active_total, "route")} →
             </button>
           </div>
 

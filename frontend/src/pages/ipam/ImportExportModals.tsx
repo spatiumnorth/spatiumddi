@@ -1,3 +1,4 @@
+import { countNoun } from "@/lib/count-noun";
 import { useState } from "react";
 import {
   Upload,
@@ -134,8 +135,8 @@ export function ImportModal({
                 <CheckCircle2 className="h-4 w-4" /> Import complete
               </div>
               <ul className="mt-2 text-xs text-green-900 dark:text-green-200 space-y-0.5">
-                <li>Created: {committed.created} subnets</li>
-                <li>Updated: {committed.updated} subnets</li>
+                <li>Created: {countNoun(committed.created, "subnet")}</li>
+                <li>Updated: {countNoun(committed.updated, "subnet")}</li>
                 <li>Skipped: {committed.skipped}</li>
                 <li>Auto-created parent blocks: {committed.blocks}</li>
               </ul>
@@ -514,8 +515,14 @@ export function AddressImportModal({
                 <CheckCircle2 className="h-4 w-4" /> Import complete
               </div>
               <ul className="mt-2 text-xs text-green-900 dark:text-green-200 space-y-0.5">
-                <li>Created: {committed.created} addresses</li>
-                <li>Updated: {committed.updated} addresses</li>
+                <li>
+                  Created:{" "}
+                  {countNoun(committed.created, "address", "addresses")}
+                </li>
+                <li>
+                  Updated:{" "}
+                  {countNoun(committed.updated, "address", "addresses")}
+                </li>
                 <li>Skipped: {committed.skipped}</li>
                 <li>DNS records published: {committed.dns_synced}</li>
                 {committed.errors.length > 0 && (
