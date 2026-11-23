@@ -133,6 +133,19 @@ def _resource_id_from_args(args: BaseModel) -> str | None:
     return None
 
 
+def _refuse_inline_non_superadmin(user: User, operation: Operation, args: BaseModel) -> None:
+    """The route-time 403 for a superadmin step the caller is about to run inline (#4790).
+
+    The apply refuses a non-superadmin with an ``OperationPermissionError`` (so a
+    queued request stays pending), but an inline caller has no spine to translate
+    that, and it would surface as a 500. Refuse here with the route's own 403.
+    """
+    if operation.superadmin_when is not None and operation.superadmin_when(args):
+        from app.api.deps import ensure_superadmin  # noqa: PLC0415
+
+        ensure_superadmin(user)
+
+
 async def gate_or_execute(
     db: AsyncSession,
     user: User,
@@ -150,6 +163,7 @@ async def gate_or_execute(
     # 1. Module off → never gate, never query policies. This is the path
     #    every existing install takes (default-off) → zero behaviour change.
     if not await is_module_enabled(db, MODULE_ID):
+        _refuse_inline_non_superadmin(user, operation, args)
         return None
 
     # 2. Derive the policy lookup keys directly from the operation's
@@ -165,6 +179,7 @@ async def gate_or_execute(
     # 3. Strongest enabled matching policy, or None.
     policy = await match_policy(db, resource_type, action, count)
     if policy is None:
+        _refuse_inline_non_superadmin(user, operation, args)
         return None
 
     # 4. Superadmin bypass — only when the policy explicitly allows it.

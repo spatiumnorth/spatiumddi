@@ -131,6 +131,11 @@ class Operation:
     # inline too. ``tests/test_operation_permission_declared.py`` fails for any
     # operation that sets neither.
     requires_superadmin: bool = False
+    # A superadmin step INSIDE the operation (#4790): given the args, True when
+    # this request needs a superadmin approver (a permanent delete). ``apply``
+    # refuses with the same ``OperationPermissionError`` (so the request stays
+    # pending for a superadmin) and the queue's ``can_approve`` asks it too.
+    superadmin_when: Callable[[Any], bool] | None = None
     # Optional submit-time refusal, run ONLY by the request portal
     # (``submit_request``) after ``preview`` passes. It raises a 4xx
     # ``HTTPException`` for what the REST create would refuse (#2903). Kept
@@ -252,6 +257,33 @@ def enforce_operation_permission(user: User, op: Operation) -> None:
     if any(has_any_grant_for(user, action, rt) for rt in op.scoped_grant_types):
         return
     raise OperationPermissionError(action, resource_type)
+
+
+def superadmin_step_refusal(user: User, what: str) -> OperationPermissionError | None:
+    """Refusal for a superadmin-only step inside an operation (#4790).
+
+    An ``OperationPermissionError``, not the 403 ``ensure_superadmin`` raises:
+    the approvals spine ends a request ``failed`` on an ``HTTPException`` but
+    leaves it pending on this, because the refusal is about THIS approver and a
+    superadmin may still approve it. ``what`` names the step in the words.
+    """
+    from app.core.permissions import is_effective_superadmin  # noqa: PLC0415
+
+    if is_effective_superadmin(user):
+        return None
+    return OperationPermissionError(
+        "superadmin",
+        "change_request",
+        f"{what} needs a superadmin approver; the approver is not a superadmin. "
+        "A superadmin can still approve this request.",
+    )
+
+
+def ensure_superadmin_step(user: User, what: str) -> None:
+    """Raise :func:`superadmin_step_refusal`'s error when it refuses."""
+    refusal = superadmin_step_refusal(user, what)
+    if refusal is not None:
+        raise refusal
 
 
 # ── Target resources: read visibility + per-resource apply gates ───────────
