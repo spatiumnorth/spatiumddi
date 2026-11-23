@@ -1224,6 +1224,7 @@ function MappingsSection({ providerId }: { providerId: string }) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editExternal, setEditExternal] = useState("");
   const [editGroupId, setEditGroupId] = useState("");
+  const [editBase, setEditBase] = useState<AuthGroupMapping | null>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   // #1476 — the save the server answered with "step up first": a mapping
@@ -1314,10 +1315,44 @@ function MappingsSection({ providerId }: { providerId: string }) {
     },
   });
 
-  function beginEdit(m: AuthGroupMapping) {
-    setEditingId(m.id);
-    setEditExternal(m.external_group);
-    setEditGroupId(m.internal_group_id);
+  // Edit reads the mapping when it opens: the row in the list can be stale,
+  // and the Save used to send both fields back, undoing a change made from
+  // another session. Save now sends only what was changed against `editBase`.
+  async function beginEdit(m: AuthGroupMapping) {
+    setError(null);
+    try {
+      const fresh = await refetchRow<AuthGroupMapping>(
+        qc,
+        [["auth-providers", providerId, "mappings"]],
+        m.id,
+      );
+      if (!fresh) {
+        setError("Failed to read the mapping: it may have been deleted.");
+        return;
+      }
+      setEditBase(fresh);
+      setEditingId(fresh.id);
+      setEditExternal(fresh.external_group);
+      setEditGroupId(fresh.internal_group_id);
+    } catch (err) {
+      setError(formatApiError(err, "Failed to read the mapping"));
+    }
+  }
+
+  function saveEdit() {
+    if (!editBase) return;
+    const body = changedFields(
+      {
+        external_group: editBase.external_group,
+        internal_group_id: editBase.internal_group_id,
+      },
+      { external_group: editExternal, internal_group_id: editGroupId },
+    ) as AuthGroupMappingUpdate;
+    if (Object.keys(body).length === 0) {
+      setEditingId(null);
+      return;
+    }
+    updateMut.mutate({ mappingId: editBase.id, body });
   }
 
   return (
@@ -1375,15 +1410,7 @@ function MappingsSection({ providerId }: { providerId: string }) {
                   <td className="px-2 py-1">
                     <div className="flex justify-end gap-1">
                       <button
-                        onClick={() =>
-                          updateMut.mutate({
-                            mappingId: m.id,
-                            body: {
-                              external_group: editExternal,
-                              internal_group_id: editGroupId,
-                            },
-                          })
-                        }
+                        onClick={saveEdit}
                         className="rounded-md bg-primary px-2 py-0.5 text-xs text-primary-foreground"
                         disabled={updateMut.isPending}
                       >
