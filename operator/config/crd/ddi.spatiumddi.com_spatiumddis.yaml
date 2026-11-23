@@ -1,0 +1,45 @@
+# The CRD is deliberately schema-less below ``spec``: a SpatiumDDI resource's
+# spec IS charts/spatiumddi/values.yaml, which is large and changes with the
+# chart, and a hand-copied schema would be a second thing to keep in step with
+# it. The chart does its own validation at render time (``fail`` guards) and
+# the operator reports a render failure on the resource's status.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: spatiumddis.ddi.spatiumddi.com
+spec:
+  group: ddi.spatiumddi.com
+  names:
+    kind: SpatiumDDI
+    listKind: SpatiumDDIList
+    plural: spatiumddis
+    singular: spatiumddi
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: >-
+          SpatiumDDI is one install of the SpatiumDDI control plane (and,
+          optionally, its managed DNS and DHCP agents) in this namespace. Its
+          spec is the values of the SpatiumDDI Helm chart.
+        properties:
+          apiVersion:
+            type: string
+          kind:
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: The SpatiumDDI Helm chart's values.
+            type: object
+            x-kubernetes-preserve-unknown-fields: true
+          status:
+            description: Observed state, written by the operator (Helm release conditions).
+            type: object
+            x-kubernetes-preserve-unknown-fields: true
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

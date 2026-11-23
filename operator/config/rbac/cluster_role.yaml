@@ -1,0 +1,24 @@
+# CLUSTER-scoped permissions (OLM ``clusterPermissions``). Kept to the one
+# thing that cannot be namespaced: the chart creates SecurityContextConstraints
+# on OpenShift (one per agent kind, named <release>-<namespace>-<agent>, so the
+# names are not known ahead of time and ``resourceNames`` cannot narrow this).
+# That is the single privileged grant in this operator and it is inherent to
+# running BIND9 and Kea on OpenShift: the agents bind :53 / :67 and open raw
+# sockets, which no built-in SCC allows. It is also a cluster-admin-level
+# trust: whoever can write SCCs can write a privileged one, or loosen a
+# built-in one. docs/deployment/OPERATOR.md says so. An install that sets
+# ``openshift.scc.create: false`` never uses it (OLM still grants it).
+#
+# No ClusterRole / ClusterRoleBinding rights: the default chart renders none.
+# The appliance-only toggles that do (api.serviceAccount,
+# api.upgradeOrchestratorRBAC, worker.serviceAccount, serviceControlRBAC)
+# render ClusterRoles the operator is deliberately not allowed to create, so
+# they are unsupported under the operator.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: spatiumddi-operator
+rules:
+- apiGroups: [security.openshift.io]
+  resources: [securitycontextconstraints]
+  verbs: [get, list, watch, create, update, patch, delete]

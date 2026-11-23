@@ -4,7 +4,14 @@
 {{- include "spatiumddi.agentNamesUnique" . -}}
 {{- $tag := .Values.dnsAgents.image.tag | default .Chart.AppVersion -}}
 {{- $secretName := .Values.dnsAgents.agentKey.existingSecret | default (printf "%s-dns-agent-key" (include "spatiumddi.fullname" .)) -}}
-{{- if and (not .Values.dnsAgents.agentKey.existingSecret) .Values.dnsAgents.agentKey.value }}
+{{- if and (not .Values.dnsAgents.agentKey.existingSecret) (or .Values.dnsAgents.agentKey.value .Values.dnsAgents.agentKey.generate) }}
+{{- /* agentKey.generate (#3862): no key given, so mint one and keep it across upgrades via lookup (as secret.yaml does). Off by default; the Operator turns it on. */ -}}
+{{- $prevAgentKey := "" -}}
+{{- $existingAgentSecret := lookup "v1" "Secret" .Release.Namespace $secretName -}}
+{{- if and .Values.dnsAgents.agentKey.generate (not .Values.dnsAgents.agentKey.value) $existingAgentSecret }}
+{{- $prevAgentKey = index $existingAgentSecret.data "DNS_AGENT_KEY" | default "" | b64dec -}}
+{{- end }}
+{{- $agentKey := .Values.dnsAgents.agentKey.value | default $prevAgentKey | default (randAlphaNum 48) -}}
 apiVersion: v1
 kind: Secret
 metadata:
@@ -12,9 +19,14 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "spatiumddi.componentLabels" (merge (dict "component" "dns-agent") .) | nindent 4 }}
+  {{- if not .Values.dnsAgents.agentKey.value }}
+  annotations:
+    # A generated key must survive an uninstall/reinstall (#1042), or agents lose their PSK.
+    "helm.sh/resource-policy": keep
+  {{- end }}
 type: Opaque
 stringData:
-  DNS_AGENT_KEY: {{ .Values.dnsAgents.agentKey.value | quote }}
+  DNS_AGENT_KEY: {{ $agentKey | quote }}
 ---
 {{- end }}
 {{- range $server := .Values.dnsAgents.servers }}

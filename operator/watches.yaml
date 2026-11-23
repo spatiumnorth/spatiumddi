@@ -1,0 +1,47 @@
+# One watch: a SpatiumDDI custom resource IS a Helm release of the umbrella
+# chart, and the CR's spec is that chart's values.yaml.
+#
+# ``chart`` points at the copy the Dockerfile vendors from charts/spatiumddi at
+# image build time (and stamps with the release version). There is no second
+# copy of the chart in this directory and there must not be one: it would
+# drift, and every chart fix would then need a second edit here.
+#
+# The release name is the CR's metadata.name, so a CR called ``spatiumddi``
+# renders the same object names as ``helm install spatiumddi``.
+- group: ddi.spatiumddi.com
+  version: v1alpha1
+  kind: SpatiumDDI
+  chart: helm-charts/spatiumddi
+  # helm-operator decides whether to upgrade by dry-running ``helm upgrade``
+  # on every reconcile and comparing that manifest with the deployed one. Two
+  # things in the chart would make the two ALWAYS differ, and so upgrade on
+  # every reconcile (#3862 validation):
+  #
+  #   * ``lookup``. The chart preserves its generated Secrets (SECRET_KEY, the
+  #     PostgreSQL and Redis passwords) by looking up the live ones. Helm only
+  #     runs lookup in a dry-run when the dry-run talks to the server, so the
+  #     default (client) dry-run mints fresh random values every time.
+  #     ``server`` fixes that; the operator's Role covers every lookup the
+  #     chart makes (hack/check_rbac.py asserts it).
+  #   * The migrate Job's name. By default it carries .Release.Revision, which a
+  #     dry-run upgrade always renders one higher than the deployed release.
+  #     Each such upgrade also deletes the previous Job, mid-migration, and the
+  #     delete event triggers the next reconcile: a loop. ``nameByContent``
+  #     names it after a hash of its inputs instead, and keeps it after it
+  #     finishes (no TTL), so it is neither re-created nor re-run until the
+  #     values, the chart or the Kubernetes version change.
+  #
+  # An Operator upgrade carries a new chart version, so the hash changes: a new
+  # migrate Job runs ``alembic upgrade head``, and the api / worker / beat pods
+  # wait for the schema in their wait-for-migrate init containers.
+  dryRunOption: server
+  overrideValues:
+    migrate.nameByContent: "true"
+    # A CR that names no agent key would render no agent-key Secret, and every
+    # pod reading it (agents, api, beat, worker, migrate) would sit in
+    # CreateContainerConfigError while the CR still reported Deployed. Generate
+    # one when the CR gives neither ``value`` nor ``existingSecret``.
+    dnsAgents.agentKey.generate: "true"
+    dhcpAgents.agentKey.generate: "true"
+  reconcilePeriod: 10m
+  watchDependentResources: true
