@@ -41,6 +41,7 @@ import {
 } from "@/lib/api";
 import { usePermissions } from "@/hooks/usePermissions";
 import { cn, zebraBodyCls } from "@/lib/utils";
+import { ListReadError } from "@/components/ui/list-read-error";
 import { Modal } from "@/components/ui/modal";
 import { closePopupOnEscape } from "@/components/ui/use-draggable-modal";
 import { HeaderButton } from "@/components/ui/header-button";
@@ -257,12 +258,13 @@ export function ResourcePicker({
     return () => clearTimeout(t);
   }, [search]);
 
-  const { data, isFetching } = useQuery<ResourceOptionsResponse>({
-    queryKey: ["resource-options", resource, debounced],
-    queryFn: () => requestsApi.resourceOptions(resource, debounced),
-    enabled: open,
-    staleTime: 30_000,
-  });
+  const { data, isFetching, isError, error } =
+    useQuery<ResourceOptionsResponse>({
+      queryKey: ["resource-options", resource, debounced],
+      queryFn: () => requestsApi.resourceOptions(resource, debounced),
+      enabled: open,
+      staleTime: 30_000,
+    });
   const options = data?.options ?? [];
 
   if (value && selectedLabel) {
@@ -302,6 +304,8 @@ export function ResourcePicker({
         id={id}
         className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm"
         placeholder="Type to search…"
+        // The route's `q` takes at most 200 characters and 422s a longer one.
+        maxLength={200}
         value={search}
         onChange={(e) => {
           setSearch(e.target.value);
@@ -314,11 +318,15 @@ export function ResourcePicker({
         <div className="absolute z-50 mt-1 max-h-56 w-full overflow-y-auto rounded-md border border-border bg-background shadow-lg">
           {options.length === 0 ? (
             <div className="px-2 py-1.5 text-xs text-muted-foreground">
-              {isFetching
-                ? "Searching…"
-                : data?.truncated
-                  ? "Large list — keep typing to narrow the search"
-                  : "No matches you can read"}
+              {isFetching ? (
+                "Searching…"
+              ) : isError ? (
+                <ListReadError error={error} what="the options" />
+              ) : data?.truncated ? (
+                "Large list — keep typing to narrow the search"
+              ) : (
+                "No matches you can read"
+              )}
             </div>
           ) : (
             options.map((o) => (
@@ -357,9 +365,12 @@ export function ResourcePicker({
 
 function NewRequestModal({
   kinds,
+  kindsError,
   onClose,
 }: {
   kinds: RequestKind[];
+  /** The request type list's read error, so a failed read is not a bare "Select…". */
+  kindsError?: unknown;
   onClose: () => void;
 }) {
   const qc = useQueryClient();
@@ -437,6 +448,11 @@ function NewRequestModal({
               </option>
             ))}
           </select>
+          {kindsError ? (
+            <p className="mt-1 text-xs">
+              <ListReadError error={kindsError} what="the request types" />
+            </p>
+          ) : null}
           {kind ? (
             <p className="mt-1 text-xs text-muted-foreground">
               {kind.description}
@@ -977,6 +993,7 @@ export default function RequestsPage() {
       {showNew ? (
         <NewRequestModal
           kinds={catalog.data ?? []}
+          kindsError={catalog.error}
           onClose={() => setShowNew(false)}
         />
       ) : null}
