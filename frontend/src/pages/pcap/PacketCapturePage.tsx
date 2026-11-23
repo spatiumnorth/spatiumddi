@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Activity, Download, Loader2, Trash2 } from "lucide-react";
@@ -525,16 +525,14 @@ function NumField({
   onChange: (v: number | "") => void;
   max: number;
 }) {
+  const id = useId();
   return (
     <div>
-      <label
-        htmlFor="packet-capture-field"
-        className="mb-1 block text-xs font-medium"
-      >
+      <label htmlFor={id} className="mb-1 block text-xs font-medium">
         {label}
       </label>
       <input
-        id="packet-capture-field"
+        id={id}
         type="number"
         min={1}
         max={max}

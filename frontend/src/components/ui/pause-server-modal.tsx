@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import { Modal } from "./modal";
 import { FormError } from "@/components/ui/form-error";
 
@@ -32,6 +32,7 @@ export function PauseServerModal({
   isPending?: boolean;
   error?: string | null;
 }) {
+  const reasonId = useId();
   const [reason, setReason] = useState("");
 
   // Reset on remount so a previous pause cycle's text doesn't leak.
@@ -50,17 +51,14 @@ export function PauseServerModal({
           flag itself doesn't dispatch a container stop.
         </div>
         <div className="space-y-1">
-          <label
-            htmlFor="pause-server-reason"
-            className="block text-sm font-medium"
-          >
+          <label htmlFor={reasonId} className="block text-sm font-medium">
             Reason{" "}
             <span className="text-xs font-normal text-muted-foreground">
               (optional, but helpful for the audit trail)
             </span>
           </label>
           <textarea
-            id="pause-server-reason"
+            id={reasonId}
             autoFocus
             rows={3}
             className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-ring"

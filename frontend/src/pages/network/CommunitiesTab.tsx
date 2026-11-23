@@ -140,13 +140,17 @@ function CommunityFormModal({
         {!isEdit && (
           <>
             <div className="space-y-1">
-              <label
-                htmlFor="communities-tab-kind"
+              <span
+                id="communities-tab-kind-label"
                 className="text-xs font-medium text-muted-foreground"
               >
                 Kind
-              </label>
-              <div className="flex flex-col gap-1">
+              </span>
+              <div
+                role="radiogroup"
+                aria-labelledby="communities-tab-kind-label"
+                className="flex flex-col gap-1"
+              >
                 {(["standard", "regular", "large"] as BGPCommunityKind[]).map(
                   (k) => (
                     <label
@@ -154,7 +158,6 @@ function CommunityFormModal({
                       className="flex items-start gap-2 rounded border p-2 text-sm hover:bg-accent cursor-pointer"
                     >
                       <input
-                        id="communities-tab-kind"
                         type="radio"
                         name="kind"
                         value={k}

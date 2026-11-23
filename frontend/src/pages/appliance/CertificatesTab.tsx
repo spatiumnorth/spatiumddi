@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertCircle,
@@ -1594,13 +1594,17 @@ function AcmeIssueModal({
 
         {tab === "challenge" && (
           <div className="space-y-2">
-            <label
-              htmlFor="certificates-tab-challenge-type"
+            <span
+              id="certificates-tab-challenge-type-label"
               className="block text-xs font-medium text-muted-foreground"
             >
               Challenge type
-            </label>
-            <div className="space-y-1.5">
+            </span>
+            <div
+              role="radiogroup"
+              aria-labelledby="certificates-tab-challenge-type-label"
+              className="space-y-1.5"
+            >
               {ACME_CHALLENGE_OPTIONS.map((opt) => (
                 <label
                   key={opt.value}
@@ -1613,7 +1617,6 @@ function AcmeIssueModal({
                   }`}
                 >
                   <input
-                    id="certificates-tab-challenge-type"
                     type="radio"
                     name="acme-challenge"
                     value={opt.value}
@@ -1862,17 +1865,18 @@ function FieldText({
   placeholder?: string;
   hint?: string;
 }) {
+  const id = useId();
   return (
     <div>
       <label
-        htmlFor="certificates-tab-field"
+        htmlFor={id}
         className="block text-xs font-medium text-muted-foreground"
       >
         {label}
         {required && <span className="text-destructive"> *</span>}
       </label>
       <input
-        id="certificates-tab-field"
+        id={id}
         type="text"
         value={value}
         onChange={(e) => onChange(e.target.value)}
@@ -1904,17 +1908,18 @@ function FieldTextarea({
   placeholder?: string;
   hint?: string;
 }) {
+  const id = useId();
   return (
     <div>
       <label
-        htmlFor="certificates-tab-field-2"
+        htmlFor={id}
         className="block text-xs font-medium text-muted-foreground"
       >
         {label}
         {required && <span className="text-destructive"> *</span>}
       </label>
       <textarea
-        id="certificates-tab-field-2"
+        id={id}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         required={required}

@@ -770,10 +770,14 @@ function PortTestTool({ target }: { target?: NetToolTarget }) {
         </div>
       </div>
       <div>
-        <label htmlFor="network-tools-protocol" className={labelCls}>
+        <span id="network-tools-protocol-label" className={labelCls}>
           Protocol
-        </label>
-        <div className="flex gap-2">
+        </span>
+        <div
+          role="radiogroup"
+          aria-labelledby="network-tools-protocol-label"
+          className="flex gap-2"
+        >
           {(["tcp", "udp"] as const).map((p) => (
             <label
               key={p}
@@ -785,7 +789,6 @@ function PortTestTool({ target }: { target?: NetToolTarget }) {
               )}
             >
               <input
-                id="network-tools-protocol"
                 type="radio"
                 name="port-proto"
                 checked={protocol === p}

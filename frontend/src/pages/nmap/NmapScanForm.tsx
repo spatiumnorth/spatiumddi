@@ -149,13 +149,17 @@ export function NmapScanForm({
       </div>
 
       <div>
-        <label
-          htmlFor="nmap-scan-form-preset"
+        <span
+          id="nmap-scan-form-preset-label"
           className="mb-1 block text-xs font-medium text-muted-foreground"
         >
           Preset
-        </label>
-        <div className="grid grid-cols-1 gap-1 sm:grid-cols-2">
+        </span>
+        <div
+          role="radiogroup"
+          aria-labelledby="nmap-scan-form-preset-label"
+          className="grid grid-cols-1 gap-1 sm:grid-cols-2"
+        >
           {PRESETS.map((p) => (
             <label
               key={p.id}
@@ -167,7 +171,6 @@ export function NmapScanForm({
               )}
             >
               <input
-                id="nmap-scan-form-preset"
                 type="radio"
                 name="nmap-preset"
                 checked={preset === p.id}

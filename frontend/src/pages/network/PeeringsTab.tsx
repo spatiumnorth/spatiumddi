@@ -239,20 +239,23 @@ function PeeringFormModal({
           </>
         )}
         <div className="space-y-1">
-          <label
-            htmlFor="peerings-tab-relationship"
+          <span
+            id="peerings-tab-relationship-label"
             className="text-xs font-medium text-muted-foreground"
           >
             Relationship
-          </label>
-          <div className="flex flex-col gap-1">
+          </span>
+          <div
+            role="radiogroup"
+            aria-labelledby="peerings-tab-relationship-label"
+            className="flex flex-col gap-1"
+          >
             {RELATIONSHIPS.map((r) => (
               <label
                 key={r}
                 className="flex items-start gap-2 rounded border p-2 text-sm hover:bg-accent cursor-pointer"
               >
                 <input
-                  id="peerings-tab-relationship"
                   type="radio"
                   name="relationship"
                   checked={relationship === r}

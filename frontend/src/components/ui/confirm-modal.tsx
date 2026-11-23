@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useId, useState, type ReactNode } from "react";
 
 import { cn } from "@/lib/utils";
 
@@ -61,6 +61,7 @@ export function ConfirmModal({
   onConfirm: (password?: string) => void;
   onClose: () => void;
 }) {
+  const passwordId = useId();
   const [checked, setChecked] = useState(false);
   const [password, setPassword] = useState("");
 
@@ -97,14 +98,11 @@ export function ConfirmModal({
         )}
         {requirePassword && (
           <div className="space-y-1">
-            <label
-              htmlFor="confirm-confirm-with-your-password"
-              className="block text-sm font-medium"
-            >
+            <label htmlFor={passwordId} className="block text-sm font-medium">
               Confirm with your password
             </label>
             <input
-              id="confirm-confirm-with-your-password"
+              id={passwordId}
               type="password"
               autoComplete="current-password"
               autoFocus
