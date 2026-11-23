@@ -137,3 +137,24 @@ def describe_http_exc(exc: BaseException, *, timeout: float | None = None) -> st
     if isinstance(exc, httpx.InvalidURL):
         return f"Invalid URL: {_redact(describe_exc(exc))}"
     return _redact(describe_exc(exc))
+
+
+# Stored in ``latest_check_error`` as ``HTTP <status>`` / ``Unreadable
+# response: ...`` for a failure that reached GitHub; any other text is a
+# DNS / connect / timeout failure, i.e. GitHub is not reachable from here.
+_HTTP_ERROR_RE = re.compile(r"^(HTTP \d+|Unreadable response)")
+
+
+def check_error_kind(error: str | None) -> str | None:
+    """``unreachable`` / ``http`` for a stored check error, ``None`` for none (#4799).
+
+    An install with no route out (an air-gapped appliance or Compose stack)
+    is healthy, not faulty, so the UI shows ``unreachable`` as a neutral
+    state and keeps its warning for ``http``: GitHub answered with an error
+    or something unreadable. Derived from the stored text, so no column and
+    rows written by an earlier release classify the same way.
+    """
+    err = (error or "").strip()
+    if not err:
+        return None
+    return "http" if _HTTP_ERROR_RE.match(err) else "unreachable"

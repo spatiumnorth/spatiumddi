@@ -27,6 +27,7 @@ from pydantic import BaseModel
 
 from app.api.deps import DB, OptionalUser
 from app.config import settings
+from app.core.exc_text import check_error_kind
 from app.core.versions import canonical_version
 from app.models.settings import PlatformSettings
 
@@ -80,6 +81,10 @@ class VersionResponse(BaseModel):
     # Most recent error, if any. Null on success or if the check has
     # never run.
     latest_check_error: str | None
+    # "unreachable" (DNS / connect / timeout: no route to GitHub, a normal
+    # state for an air-gapped install) or "http" (GitHub answered with an
+    # error). Null when there is no error. #4799
+    latest_check_error_kind: str | None = None
     # Appliance-mode signal — true when the API runs on the SpatiumDDI
     # OS appliance ISO (set by the appliance compose env). Gates the
     # "Appliance" sidebar entry + /api/v1/appliance/* router family.
@@ -157,5 +162,6 @@ async def get_version(db: DB, current_user: OptionalUser) -> VersionResponse:
         latest_checked_at=ps.latest_checked_at,
         release_check_enabled=ps.github_release_check_enabled,
         latest_check_error=ps.latest_check_error,
+        latest_check_error_kind=check_error_kind(ps.latest_check_error),
         **_appliance_fields(True),
     )

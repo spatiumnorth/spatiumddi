@@ -128,11 +128,14 @@ async def _run_check() -> dict[str, Any]:
                 )
                 return {"status": "http_error", "code": exc.response.status_code}
             except (httpx.RequestError, ValueError) as exc:
-                # RequestError covers DNS / connect / read errors;
-                # ValueError covers JSON-decode issues. Either way we
-                # surface the message so the UI can explain the stale
-                # check.
+                # RequestError covers DNS / connect / read errors (GitHub is
+                # not reachable: kind "unreachable"); ValueError covers
+                # JSON-decode issues (kind "http", see check_error_kind).
+                # Either way we surface the message so the UI can explain the
+                # stale check.
                 reason = describe_http_exc(exc)
+                if not isinstance(exc, httpx.RequestError):
+                    reason = f"Unreadable response: {reason}"
                 ps.latest_check_error = reason[:500]
                 ps.latest_checked_at = now
                 await db.commit()

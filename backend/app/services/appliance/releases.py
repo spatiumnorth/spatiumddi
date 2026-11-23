@@ -24,7 +24,9 @@ the UI's manual-upgrade modal.
 
 Cache: GitHub release listings are public + rate-limited (60 req/h
 unauthenticated). 60-second in-memory cache keeps the page snappy
-without burning the budget.
+without burning the budget. A failed fetch is held for the same 60 s
+(#4799), so an install with no route to GitHub neither waits out the
+timeout nor logs a warning on every page view.
 """
 
 from __future__ import annotations
@@ -109,6 +111,27 @@ class UpgradeImageRelease:
 # fetch.
 _RAW_CACHE: dict[str, tuple[datetime, list[dict]]] = {}
 
+# The last failed fetch (#4799): ``(when, kind)``, kind one of ``unreachable``
+# (DNS / connect / timeout: no route to GitHub, normal for an air-gapped
+# install), ``rate_limited`` (a real 403 / 429) or ``error`` (anything else).
+# Held for the same interval as a success so a page that polls every few
+# seconds neither refetches nor logs the failure on every view.
+_FAIL_CACHE: dict[str, tuple[datetime, str]] = {}
+
+
+def last_fetch_failure() -> str | None:
+    """Kind of the most recent failed fetch, or ``None`` when it succeeded."""
+    failed = _FAIL_CACHE.get("raw")
+    return failed[1] if failed else None
+
+
+def _failure_kind(exc: Exception) -> str:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return "rate_limited" if exc.response.status_code in (403, 429) else "error"
+    if isinstance(exc, httpx.RequestError):
+        return "unreachable"
+    return "error"
+
 
 def release_channel(tag: str, is_prerelease: bool = False) -> str:
     """``nightly`` / ``prerelease`` / ``stable`` for a release tag (#2410).
@@ -183,6 +206,9 @@ async def _fetch_raw_releases() -> list[dict] | None:
     cached = _RAW_CACHE.get("raw")
     if cached and (now - cached[0]).total_seconds() < _CACHE_TTL_SECONDS:
         return cached[1]
+    failed = _FAIL_CACHE.get("raw")
+    if failed and (now - failed[0]).total_seconds() < _CACHE_TTL_SECONDS:
+        return None
 
     url = f"{_GITHUB_API}/repos/{settings.github_repo}/releases"
     headers = {
@@ -202,10 +228,14 @@ async def _fetch_raw_releases() -> list[dict] | None:
             resp.raise_for_status()
             data = resp.json()
     except (httpx.HTTPError, ValueError) as exc:
-        logger.warning("appliance_releases_fetch_failed", error=str(exc))
+        kind = _failure_kind(exc)
+        _FAIL_CACHE["raw"] = (now, kind)
+        logger.warning("appliance_releases_fetch_failed", kind=kind, error=str(exc))
         return None
     if not isinstance(data, list):
+        _FAIL_CACHE["raw"] = (now, "error")
         return None
+    _FAIL_CACHE.pop("raw", None)
     _RAW_CACHE["raw"] = (now, data)
     return data
 
