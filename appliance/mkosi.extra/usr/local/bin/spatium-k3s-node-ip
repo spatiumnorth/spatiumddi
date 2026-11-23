@@ -28,6 +28,10 @@ set -u
 
 DROPIN="${SPATIUM_K3S_NODE_IP_DROPIN:-/etc/rancher/k3s/config.yaml.d/spatium-node-ip.yaml}"
 LOG="${SPATIUM_K3S_NODE_IP_LOG:-/var/log/spatiumddi/k3s-node-ip.log}"
+# The installer binds the management connection to one NIC
+# (``interface-name=`` in its NetworkManager keyfile); on a multi-NIC host that
+# is the interface to pin, not whichever address happens to come first.
+NM_DIR="${SPATIUM_K3S_NODE_IP_NM_DIR:-/etc/NetworkManager/system-connections}"
 
 say() {
     msg="spatium-k3s-node-ip: $*"
@@ -46,7 +50,8 @@ fi
 # "2: eth0    inet 10.0.0.5/24 brd ... scope global eth0" -> "eth0 10.0.0.5"
 pick() {
     fam="$1"
-    ip -o "-$fam" addr show scope global 2>/dev/null | awk -v fam="$fam" '
+    ip -o "-$fam" addr show scope global 2>/dev/null | awk -v fam="$fam" -v want="$PREF" '
+        want != "" && $2 != want { next }
         {
             dev = $2
             if (dev ~ /^(lo|flannel|cni|veth|docker|br-|kube|cali|wg|tun)/) next
@@ -57,8 +62,15 @@ pick() {
         }'
 }
 
+PREF=$(sed -n 's/^interface-name=//p' "$NM_DIR"/10-spatium-*.nmconnection 2>/dev/null | head -1)
 found=$(pick 4)
 [ -n "$found" ] || found=$(pick 6)
+if [ -z "$found" ] && [ -n "$PREF" ]; then
+    # The bound NIC holds no address (yet): fall back to any physical one.
+    PREF=""
+    found=$(pick 4)
+    [ -n "$found" ] || found=$(pick 6)
+fi
 if [ -z "$found" ]; then
     rm -f "$DROPIN" 2>/dev/null
     say "no default route and no global address on any interface; leaving k3s to choose (it will fail until the network has an address)"

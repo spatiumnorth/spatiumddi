@@ -16,7 +16,15 @@ EXTRA = APPLIANCE / "mkosi.extra"
 SCRIPT = EXTRA / "usr" / "local" / "bin" / "spatium-k3s-node-ip"
 
 
-def _run(tmp_path: Path, *, route4: bool = False, route6: bool = False, a4: str = "", a6: str = ""):
+def _run(
+    tmp_path: Path,
+    *,
+    route4: bool = False,
+    route6: bool = False,
+    a4: str = "",
+    a6: str = "",
+    nm_iface: str = "",
+):
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
     ip = bindir / "ip"
@@ -31,11 +39,16 @@ def _run(tmp_path: Path, *, route4: bool = False, route6: bool = False, a4: str 
     )
     ip.chmod(0o755)
     dropin = tmp_path / "spatium-node-ip.yaml"
+    nm = tmp_path / "nm"
+    nm.mkdir(exist_ok=True)
+    if nm_iface:
+        (nm / "10-spatium-dhcp.nmconnection").write_text(f"[connection]\ninterface-name={nm_iface}\n")
     env = {
         **os.environ,
         "PATH": f"{bindir}:{os.environ['PATH']}",
         "SPATIUM_K3S_NODE_IP_DROPIN": str(dropin),
         "SPATIUM_K3S_NODE_IP_LOG": str(tmp_path / "log"),
+        "SPATIUM_K3S_NODE_IP_NM_DIR": str(nm),
     }
     proc = subprocess.run(["sh", str(SCRIPT)], env=env, capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
@@ -102,3 +115,17 @@ def test_chrony_wait_is_masked_and_nothing_needs_it() -> None:
 def test_journal_is_persistent() -> None:
     conf = (EXTRA / "etc/systemd/journald.conf.d/50-spatium-persistent.conf").read_text()
     assert "Storage=persistent" in conf
+
+
+def test_multi_nic_prefers_the_installer_bound_interface(tmp_path: Path) -> None:
+    two = (
+        "2: ens3    inet 10.9.0.5/24 scope global ens3\n"
+        "3: ens4    inet 192.168.50.7/24 scope global ens4\n"
+    )
+    text = _run(tmp_path, a4=two, nm_iface="ens4").read_text()
+    assert "node-ip: 192.168.50.7\n" in text and "flannel-iface: ens4\n" in text
+
+
+def test_bound_interface_without_address_falls_back(tmp_path: Path) -> None:
+    text = _run(tmp_path, a4=V4, nm_iface="ens9").read_text()
+    assert "node-ip: 192.168.50.7\n" in text
