@@ -58,7 +58,9 @@ from app.services.dhcp.option_validation import check_vendor_class_match
 
 router = APIRouter(
     tags=["dhcp"],
-    dependencies=[Depends(require_resource_permission("dhcp_scope"))],
+    dependencies=[
+        Depends(require_resource_permission("dhcp_scope", audit_resource_type="dhcp_pxe_profile"))
+    ],
 )
 
 _VALID_MATCH_KINDS = {"first_stage", "ipxe_chain"}

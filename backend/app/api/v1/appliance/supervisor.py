@@ -1909,6 +1909,11 @@ class SupervisorHeartbeatRequest(BaseModel):
     # None on the first heartbeat / before any role assignment.
     role_switch_state: Literal["idle", "ready", "failed"] | None = None
     role_switch_reason: str | None = None
+    # #4646 — roles assigned to this node that the supervisor held back
+    # because the control plane has no agent key for them. ``[]`` = none;
+    # None / omitted = an older supervisor didn't report, so the stored
+    # value is left untouched.
+    roles_awaiting_key: list[str] | None = Field(default=None, max_length=32)
     # #170 Wave E — service-container watchdog. Free-form dict keyed
     # by compose service name (``dns-bind9`` / ``dns-powerdns`` /
     # ``dns-technitium`` / ``dhcp-kea``); each value carries ``{role, status, since,
@@ -2869,6 +2874,8 @@ async def _supervisor_heartbeat(
             row.role_switch_reason = body.role_switch_reason
         else:
             row.role_switch_reason = None
+    if body.roles_awaiting_key is not None:
+        row.roles_awaiting_key = sorted({r[:64] for r in body.roles_awaiting_key})
     if body.role_health is not None:
         # #170 Wave E — supervisor's per-service watchdog verdict.
         # Overwrite verbatim every tick: empty dict clears stale
@@ -4127,6 +4134,8 @@ class ApplianceRow(BaseModel):
     # compose-lifecycle apply.
     role_switch_state: str | None
     role_switch_reason: str | None
+    # #4646 — roles held back for a missing agent key.
+    roles_awaiting_key: list[str]
     # #170 Wave E — service-container watchdog. Per-service health
     # the supervisor reports every 5 min via heartbeat. Keys are
     # compose service names (``dns-bind9`` / ``dns-powerdns`` /
@@ -4360,6 +4369,7 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         firewall_state=dict(row.firewall_state or {}),
         role_switch_state=row.role_switch_state,
         role_switch_reason=row.role_switch_reason,
+        roles_awaiting_key=list(row.roles_awaiting_key or []),
         role_health=dict(row.role_health or {}),
         host_config_health=dict(row.host_config_health or {}),
         host_migration_health=dict(row.host_migration_health or {}),
@@ -7862,8 +7872,10 @@ async def schedule_appliance_set_default_slot(
     * **Commit a trial boot** — operator booted the trial slot via
       ``/set-next-boot``, validated it, calls this against the
       currently-running slot to make it durable. (``firstboot.service``
-      also does this automatically when ``/health/live`` passes; this
-      endpoint exists for the explicit operator-action case.)
+      also does this automatically once k3s is Ready, the slot's images
+      are in containerd and the control chart has applied (the api runs
+      the slot's image, #4707); this endpoint exists for the explicit
+      operator-action case.)
     * **Durable revert** — operator wants to go back to the previous
       slot for good (not just one boot). Calls this against the
       previous slot."""

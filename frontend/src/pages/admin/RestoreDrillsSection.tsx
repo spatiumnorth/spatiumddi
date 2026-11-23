@@ -363,7 +363,10 @@ export function RestoreDrillsSection() {
         )}
 
         {runDrill.isError && (
-          <div className="border-t px-4 py-2 text-xs text-rose-600 dark:text-rose-400">
+          <div
+            role="alert"
+            className="border-t px-4 py-2 text-xs text-rose-600 dark:text-rose-400"
+          >
             {formatApiError(runDrill.error, "drill failed")}
           </div>
         )}
@@ -608,7 +611,7 @@ function ScheduleDrillForm({
         </div>
 
         {save.isError && (
-          <p className="text-xs text-rose-600 dark:text-rose-400">
+          <p role="alert" className="text-xs text-rose-600 dark:text-rose-400">
             {formatApiError(save.error)}
           </p>
         )}

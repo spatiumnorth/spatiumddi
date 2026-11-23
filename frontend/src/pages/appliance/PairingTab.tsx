@@ -240,7 +240,10 @@ export function PairingTab() {
           </button>
         </div>
         {registrationToggle.isError && (
-          <p className="mt-2 text-xs text-rose-700 dark:text-rose-300">
+          <p
+            role="alert"
+            className="mt-2 text-xs text-rose-700 dark:text-rose-300"
+          >
             {formatApiError(registrationToggle.error)}
           </p>
         )}

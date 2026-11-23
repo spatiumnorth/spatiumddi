@@ -808,7 +808,7 @@ function MetalLBConfigCard() {
             </div>
 
             {save.isError && (
-              <p className="text-xs text-rose-600">
+              <p role="alert" className="text-xs text-rose-600">
                 {formatApiError(save.error)}
               </p>
             )}

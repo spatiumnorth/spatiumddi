@@ -428,6 +428,11 @@ _IPAM_ROUTE_TYPES: dict[str, tuple[str, ...]] = {
     "POST /plans/{plan_id}/apply": _BLOCK,
 }
 
+# The plan routes are gated on ``ip_block`` but audit as ``subnet_plan``; the
+# parent gate refuses first, so it writes the refusal under the audited type
+# (#4718). The plans router's own gate is only reached by a caller this one admits.
+_IPAM_AUDIT_TYPES = {k: "subnet_plan" for k in _IPAM_ROUTE_TYPES if " /plans" in k}
+
 _IPAM_GATE = require_any_resource_or_scoped(
     # Recorded for the route walkers only: ``route_types`` below decides which
     # type-level grant a route takes.
@@ -452,6 +457,7 @@ _IPAM_GATE = require_any_resource_or_scoped(
     },
     # Type-level grants: the route's own type(s), never "any IPAM type" (#3058).
     route_types=_IPAM_ROUTE_TYPES,
+    audit_types=_IPAM_AUDIT_TYPES,
 )
 
 router = APIRouter(dependencies=[Depends(_IPAM_GATE)])
