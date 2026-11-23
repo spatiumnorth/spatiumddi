@@ -601,6 +601,7 @@ async def last_restore_outcome(db: DB, current_user: SuperAdmin) -> LastRestoreR
         migration=v.get("migration"),
         rewrap=v.get("rewrap"),
         warnings=v.get("warnings") or [],
+        sessions_ended=v.get("sessions_ended"),
         performed_at=row.timestamp,
         performed_by=row.user_display_name,
     )
