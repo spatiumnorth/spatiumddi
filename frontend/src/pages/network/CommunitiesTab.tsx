@@ -16,6 +16,10 @@ import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { cn } from "@/lib/utils";
 import { FormError } from "@/components/ui/form-error";
 
+// The Value label names whichever control the kind draws: the standard
+// select or the free-text input. Only one is rendered at a time (#4786).
+const VALUE_ID = "communities-tab-value";
+
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
 
@@ -178,14 +182,14 @@ function CommunityFormModal({
             </div>
             <div className="space-y-1">
               <label
-                htmlFor="communities-tab-value"
+                htmlFor={VALUE_ID}
                 className="text-xs font-medium text-muted-foreground"
               >
                 Value
               </label>
               {kind === "standard" ? (
                 <select
-                  id="communities-tab-value"
+                  id={VALUE_ID}
                   className={inputCls}
                   value={value}
                   onChange={(e) => setValue(e.target.value)}
@@ -199,6 +203,7 @@ function CommunityFormModal({
                 </select>
               ) : (
                 <input
+                  id={VALUE_ID}
                   className={cn(
                     inputCls,
                     valueError && value && "border-destructive",

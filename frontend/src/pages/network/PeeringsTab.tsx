@@ -200,16 +200,19 @@ function PeeringFormModal({
               )}
             </div>
             <div className="space-y-1">
-              <label
-                htmlFor="peerings-tab-direction"
+              <span
+                id="peerings-tab-direction-label"
                 className="text-xs font-medium text-muted-foreground"
               >
                 Direction
-              </label>
-              <div className="flex flex-col gap-1">
+              </span>
+              <div
+                role="radiogroup"
+                aria-labelledby="peerings-tab-direction-label"
+                className="flex flex-col gap-1"
+              >
                 <label className="flex items-start gap-2 rounded border p-2 text-sm hover:bg-accent cursor-pointer">
                   <input
-                    id="peerings-tab-direction"
                     type="radio"
                     name="direction"
                     checked={thisIsLocal}

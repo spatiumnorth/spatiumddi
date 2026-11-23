@@ -142,6 +142,49 @@ export function definesOwnField(source: string): boolean {
   return OWN_FIELD.test(source);
 }
 
+/** Static `htmlFor="..."` values that cannot name a field: one pointing at a
+ *  radio (a group's label must name the group, not its first radio, or a click
+ *  on it changes the choice; use a span + role="radiogroup" +
+ *  aria-labelledby), and one whose id no element in the file carries (#4786). */
+export function misdirectedLabels(source: string): string[] {
+  const sf = ts.createSourceFile(
+    "x.tsx",
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TSX,
+  );
+  const targets: string[] = [];
+  const ids = new Map<string, boolean>(); // id -> is a radio
+  const attr = (attrs: ts.JsxAttributes, name: string) =>
+    attrs.properties.find(
+      (p): p is ts.JsxAttribute =>
+        ts.isJsxAttribute(p) && p.name.getText() === name,
+    );
+  const visit = (n: ts.Node) => {
+    if (ts.isJsxOpeningElement(n) || ts.isJsxSelfClosingElement(n)) {
+      const id = attr(n.attributes, "id");
+      if (id?.initializer && ts.isStringLiteral(id.initializer)) {
+        const type = attr(n.attributes, "type");
+        const radio =
+          n.tagName.getText() === "input" &&
+          !!type?.initializer &&
+          ts.isStringLiteral(type.initializer) &&
+          type.initializer.text === "radio";
+        ids.set(id.initializer.text, radio);
+      }
+      const htmlFor = attr(n.attributes, "htmlFor");
+      if (htmlFor?.initializer && ts.isStringLiteral(htmlFor.initializer))
+        targets.push(htmlFor.initializer.text);
+    }
+    ts.forEachChild(n, visit);
+  };
+  visit(sf);
+  return targets.flatMap((t) =>
+    !ids.has(t) ? [`${t} (no such id)`] : ids.get(t) ? [`${t} (a radio)`] : [],
+  );
+}
+
 describe("form labels use the shared Field (#4371)", () => {
   it("detects a page-local Field", () => {
     expect(definesOwnField("function Field({ label }) {}")).toBe(true);
@@ -229,6 +272,30 @@ describe("form labels use the shared Field (#4371)", () => {
       .flatMap((f) =>
         repeatedStaticIds(readFileSync(f, "utf8")).map(
           (id) => `${relative(SRC, f).split(sep).join("/")}: ${id}`,
+        ),
+      );
+    expect(left).toEqual([]);
+  }, 60_000);
+
+  it("detects a label aimed at a radio or at no id (#4786)", () => {
+    const bad = (body: string) =>
+      misdirectedLabels(`const a = () => (<div>${body}</div>);`);
+    expect(bad('<label htmlFor="a">A</label><input id="a" />')).toEqual([]);
+    expect(
+      bad('<label htmlFor="d">D</label><input id="d" type="radio" />'),
+    ).toEqual(["d (a radio)"]);
+    expect(bad('<label htmlFor="v">V</label><input />')).toEqual([
+      "v (no such id)",
+    ]);
+    expect(bad("<label htmlFor={id}>V</label><input id={id} />")).toEqual([]);
+  });
+
+  it("no label names a single radio or a missing id (#4786)", () => {
+    const left = files(SRC)
+      .filter((f) => f.endsWith(".tsx"))
+      .flatMap((f) =>
+        misdirectedLabels(readFileSync(f, "utf8")).map(
+          (x) => `${relative(SRC, f).split(sep).join("/")}: ${x}`,
         ),
       );
     expect(left).toEqual([]);

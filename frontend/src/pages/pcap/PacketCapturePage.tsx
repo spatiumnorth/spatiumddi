@@ -359,7 +359,11 @@ function CaptureForm({
 
       <div>
         <label
-          htmlFor="packet-capture-interface"
+          htmlFor={
+            ifaceList.length > 0
+              ? "packet-capture-interface"
+              : "packet-capture-interface-name"
+          }
           className="mb-1 block text-xs font-medium"
         >
           Interface
@@ -394,7 +398,9 @@ function CaptureForm({
           // the operator type any NIC (bridges / overlay / VPN that udev
           // didn't name). The host runner validates it against /sys/class/net.
           <input
+            id="packet-capture-interface-name"
             type="text"
+            aria-label={ifaceList.length > 0 ? "Interface name" : undefined}
             value={iface}
             onChange={(e) => setIface(e.target.value)}
             placeholder="e.g. br0, vmbr0, tailscale0, any"
