@@ -1422,6 +1422,7 @@ async def restore_from_archive(
                     "allow_newer_schema": body.allow_newer_schema,
                     "warnings": outcome.warnings,
                     "reconciled_backup_targets": outcome.reconciled_backup_targets,
+                    "sessions_ended": outcome.sessions_ended,
                     "adopted_appliances": outcome.adopted_appliances,
                 },
             )
@@ -1437,6 +1438,7 @@ async def restore_from_archive(
         "selective": outcome.selective,
         "restored_sections": outcome.restored_sections,
         "cascade_widened_tables": outcome.cascade_widened_tables,
+        "sessions_ended": outcome.sessions_ended,
         "migration": (
             {
                 "state": outcome.migration.state,

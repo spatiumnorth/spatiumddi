@@ -412,7 +412,10 @@ function ToolPanel({
 
 function ErrorBanner({ msg }: { msg: string }) {
   return (
-    <p className="rounded-md border border-destructive/40 bg-destructive/5 p-2 text-xs text-destructive">
+    <p
+      role="alert"
+      className="rounded-md border border-destructive/40 bg-destructive/5 p-2 text-xs text-destructive"
+    >
       {msg}
     </p>
   );

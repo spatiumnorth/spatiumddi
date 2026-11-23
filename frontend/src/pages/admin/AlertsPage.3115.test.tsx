@@ -5,7 +5,13 @@
  */
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 
@@ -59,5 +65,20 @@ describe("AlertsPage header (#3115)", () => {
     expect(text).toMatch(/syslog/i);
     expect(text).toMatch(/webhook/i);
     expect(text).toMatch(/email|smtp/i);
+  });
+});
+
+describe("Delivery channels copy (#4779)", () => {
+  it("names the target filters instead of promising every target", async () => {
+    show();
+    // The button is gated until the permissions query resolves.
+    await waitFor(() => {
+      fireEvent.click(screen.getByText("New rule"));
+      expect(screen.getByText("Delivery channels")).toBeTruthy();
+    });
+    const box = screen.getByText("Delivery channels")
+      .parentElement as HTMLElement;
+    const text = (box.textContent ?? "").replace(/\s+/g, " ");
+    expect(text).toMatch(/minimum severity and resource type filters accept/);
   });
 });

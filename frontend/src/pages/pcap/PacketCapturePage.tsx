@@ -726,7 +726,7 @@ export function ResultTab({ captureId }: { captureId: string | null }) {
         </p>
       )}
       {download.isError && (
-        <p className="text-[11px] text-rose-600">
+        <p role="alert" className="text-[11px] text-rose-600">
           {formatApiError(download.error, "Download failed")}
         </p>
       )}
@@ -831,7 +831,7 @@ function HistoryTab({ onSelect }: { onSelect: (c: PcapCaptureRead) => void }) {
         </div>
       )}
       {download.isError && (
-        <p className="text-xs text-rose-600">
+        <p role="alert" className="text-xs text-rose-600">
           {formatApiError(download.error, "Download failed")}
         </p>
       )}
