@@ -213,3 +213,74 @@ async def test_no_ptr_when_only_another_view_holds_the_reverse_zone(
     zs = {"a": await _reverse(db_session, grp, views["a"])}
     got = await _allocate_ptr_zones(client, db_session, grp, fwd, space, block, zs)
     assert got["a"] == [], got
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unpinned_first", [True, False])
+async def test_view_pinned_reverse_zone_beats_unpinned_of_same_name(
+    client: AsyncClient, db_session: AsyncSession, unpinned_first: bool
+) -> None:
+    """An unpinned reverse zone beside one pinned to the forward zone's view:
+    the pinned one takes the PTR whichever row the database lists first."""
+    grp, views, fwd, space, block = await _views_setup(db_session, "b")
+    unpinned = DNSZone(
+        group_id=grp.id,
+        view_id=None,
+        name=REV,
+        zone_type="primary",
+        kind="reverse",
+        primary_ns="ns1.example.",
+        admin_email="admin.example.",
+    )
+    zs: dict[str, DNSZone] = {}
+    if unpinned_first:
+        db_session.add(unpinned)
+        await db_session.flush()
+        zs["none"] = unpinned
+        zs["b"] = await _reverse(db_session, grp, views["b"])
+    else:
+        zs["b"] = await _reverse(db_session, grp, views["b"])
+        db_session.add(unpinned)
+        await db_session.flush()
+        zs["none"] = unpinned
+    got = await _allocate_ptr_zones(client, db_session, grp, fwd, space, block, zs)
+    assert got["none"] == [], got
+    assert ("10", f"h1.{fwd.name}") in got["b"], got
+
+
+def _cand(zone: DNSZone):  # type: ignore[no-untyped-def]
+    from app.services.dns.sync_check import ReverseCandidate
+
+    return ReverseCandidate(zone, None, None, True)
+
+
+@pytest.mark.parametrize("reverse_order", [False, True])
+def test_pick_prefers_own_view_then_unpinned_whatever_the_list_order(reverse_order: bool) -> None:
+    """The tie between same-named reverse zones is decided by the view, not
+    by where the zone sits in the candidate list."""
+    import ipaddress
+    from types import SimpleNamespace
+
+    va, vb = uuid.uuid4(), uuid.uuid4()
+
+    def z(view: uuid.UUID | None) -> DNSZone:
+        return DNSZone(
+            id=uuid.uuid4(),
+            group_id=uuid.uuid4(),
+            view_id=view,
+            name=REV,
+            zone_type="primary",
+            kind="reverse",
+        )
+
+    za, zb, zn = z(va), z(vb), z(None)
+    cands = [_cand(x) for x in (za, zn, zb)]
+    if reverse_order:
+        cands.reverse()
+    from app.services.dns.sync_check import pick_reverse_zone
+
+    subnet = SimpleNamespace(id=uuid.uuid4(), space_id=None, network="10.52.5.0/24")
+    ip = ipaddress.ip_address("10.52.5.10")
+    assert pick_reverse_zone(subnet, ip, cands, vb) is zb  # type: ignore[arg-type]
+    assert pick_reverse_zone(subnet, ip, cands, va) is za  # type: ignore[arg-type]
+    assert pick_reverse_zone(subnet, ip, cands, None) is zn  # type: ignore[arg-type]

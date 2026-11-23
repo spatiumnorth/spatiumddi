@@ -463,7 +463,14 @@ def pick_reverse_zone(
                 "IP space; PTR would leak across tenants (#844)",
             )
             continue
-        if best is None or reverse_owner_key(z) > reverse_owner_key(best):
+        # A zone of the forward zone's own view beats an unpinned one of the
+        # same name (which every view renders), and an unpinned forward zone
+        # takes an unpinned reverse zone first: the pick no longer follows
+        # row order (#4797).
+        if best is None or (reverse_owner_key(z), z.view_id == view_id) > (
+            reverse_owner_key(best),
+            best.view_id == view_id,
+        ):
             best = z
     return best if best is not None and ipam_authors_zone(best) else None
 
