@@ -98,6 +98,10 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     "test_lint_versions.py": "scripts/lint_versions.py",
     "test_lint_docs_drift.py": "scripts/lint_docs_drift.py",
     "test_check_blocklist_catalog.py": "scripts/check_blocklist_catalog.py",
+    "test_check_nginx_fixed_versions.py": (
+        "scripts/check_nginx_fixed_versions.py",
+        "scripts/testdata/nginx_fixed_versions_page.html",
+    ),
     "test_lint_workflow_shell.py": "scripts/lint_workflow_shell.py",
     "test_lint_image_upgrades.py": "scripts/lint_image_upgrades.py",
     "test_release_version_script.py": "scripts/release_version.py",
