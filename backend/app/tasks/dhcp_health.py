@@ -51,12 +51,15 @@ async def _probe_agentless(server: DHCPServer) -> tuple[bool, str | None]:
     """The driver round trip for an agentless server, with no session open.
 
     Any exception from get_driver / health_check is surfaced as unreachable.
-    Returns ``(ok, error)``.
+    Returns ``(ok, error)``. A driver that reports a failure as ``(False,
+    message)`` instead of raising (the Windows driver does) has its message
+    returned as the error, so the worker log says why the server is
+    unreachable.
     """
     try:
         driver = get_driver(server.driver)
-        ok, _msg = await driver.health_check(server)
-        return ok, None
+        ok, msg = await driver.health_check(server)
+        return ok, None if ok else (msg or "health check failed")
     except Exception as exc:  # noqa: BLE001 — surface any driver error
         return False, str(exc)
 

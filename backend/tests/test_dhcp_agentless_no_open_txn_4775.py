@@ -163,3 +163,25 @@ async def test_driver_probe_paths_pass_the_connect_timeout(
     assert kwargs and all(
         k.get("connect_timeout_sec") == _winrm.PROBE_CONNECT_TIMEOUT_SEC for k in kwargs
     )
+
+
+@pytest.mark.asyncio
+async def test_probe_returns_the_drivers_failure_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A driver that reports failure as ``(False, msg)`` instead of raising
+    (the Windows driver does) still gets its reason logged."""
+
+    class _Drv:
+        def __init__(self, result: tuple[bool, str]) -> None:
+            self.result = result
+
+        async def health_check(self, server: Any) -> tuple[bool, str]:
+            return self.result
+
+    srv = DHCPServer(name="s", driver="windows_dhcp", host="192.0.2.1", port=67)
+    down = "windows_dhcp health-check failed: cannot connect to 192.0.2.1:5985 within 10s"
+    monkeypatch.setattr(dhcp_health, "get_driver", lambda _n: _Drv((False, down)))
+    assert await dhcp_health._probe_agentless(srv) == (False, down)
+    monkeypatch.setattr(dhcp_health, "get_driver", lambda _n: _Drv((True, "reachable")))
+    assert await dhcp_health._probe_agentless(srv) == (True, None)
