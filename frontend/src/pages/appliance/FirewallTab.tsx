@@ -704,7 +704,7 @@ function PoliciesSection() {
 
       <div className="flex items-center justify-between">
         <span className="text-xs text-muted-foreground">
-          {policies?.length ?? 0} policies
+          {countNoun(policies?.length ?? 0, "policy", "policies")}
         </span>
         <div className="flex gap-1.5">
           <button
@@ -1312,8 +1312,9 @@ function AliasesSection() {
     <div className="space-y-3">
       <div className="flex items-center justify-between">
         <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
-          <Tags className="h-3.5 w-3.5" /> {aliases?.length ?? 0} aliases —
-          named CIDR / port sets reusable across rules
+          <Tags className="h-3.5 w-3.5" />{" "}
+          {countNoun(aliases?.length ?? 0, "alias", "aliases")} — named CIDR /
+          port sets reusable across rules
         </span>
         <button
           type="button"

@@ -1,3 +1,4 @@
+import { countNoun } from "@/lib/count-noun";
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
@@ -1089,7 +1090,8 @@ function ConformityPanel() {
               >
                 <p className="text-xs font-semibold">{fw.framework}</p>
                 <p className="text-[11px] text-muted-foreground">
-                  {fw.policies_enabled}/{fw.policies_total} policies enabled
+                  {fw.policies_enabled}/
+                  {countNoun(fw.policies_total, "policy", "policies")} enabled
                 </p>
                 <p className="mt-1 text-lg font-bold tabular-nums">
                   {passPct}%

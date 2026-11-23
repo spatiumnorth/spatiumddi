@@ -3920,6 +3920,8 @@ export interface PlatformSettings {
   dhcp_pull_leases_enabled: boolean;
   dhcp_pull_leases_interval_seconds: number;
   dhcp_pull_leases_last_run_at: string | null;
+  dhcp_health_interval_seconds: number;
+  dhcp_mac_blocks_sync_interval_seconds: number;
   audit_forward_syslog_enabled: boolean;
   audit_forward_syslog_host: string;
   audit_forward_syslog_port: number;

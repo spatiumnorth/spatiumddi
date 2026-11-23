@@ -1,3 +1,4 @@
+import { countNoun, pluralize } from "@/lib/count-noun";
 import { useOwnershipModules } from "@/hooks/useOwnershipModules";
 import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { FormError } from "@/components/ui/form-error";
@@ -14663,7 +14664,7 @@ export function BlockDetailView({
         .join("\n");
       setBlockBulkDeleteNotice(queuedNote);
       setBlockBulkDeleteError(
-        `${failures.length} of ${total} items could not be deleted:\n${detail}`,
+        `${failures.length} of ${countNoun(total, "item")} could not be deleted:\n${detail}`,
       );
     },
   });
@@ -16180,7 +16181,7 @@ export function SpaceTableView({
         .join("\n");
       setSpaceBulkDeleteNotice(queuedNote);
       setSpaceBulkDeleteError(
-        `${failures.length} of ${total} items could not be deleted:\n${detail}`,
+        `${failures.length} of ${countNoun(total, "item")} could not be deleted:\n${detail}`,
       );
     },
   });
@@ -17826,7 +17827,7 @@ function GlobalIpSearchModal({ onClose }: { onClose: () => void }) {
       setSelected(new Set(res.ids));
       if (res.capped)
         setSelectAllError(
-          `Selection capped at ${res.ids.length.toLocaleString()} of ${res.total.toLocaleString()} matches (server limit). Narrow the search to act on the rest.`,
+          `Selection capped at ${res.ids.length.toLocaleString()} of ${res.total.toLocaleString()} ${pluralize(res.total, "match", "matches")} (server limit). Narrow the search to act on the rest.`,
         );
     } catch (e) {
       setSelectAllError(formatApiError(e, "Failed to gather matching IPs."));
@@ -17957,7 +17958,7 @@ function GlobalIpSearchModal({ onClose }: { onClose: () => void }) {
                   >
                     {selectingAll
                       ? "Selecting…"
-                      : `Select all ${total.toLocaleString()} matches`}
+                      : `Select all ${total.toLocaleString()} ${pluralize(total, "match", "matches")}`}
                   </button>
                 )}
                 {selected.size > 0 && (

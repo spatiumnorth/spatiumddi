@@ -278,6 +278,12 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     last_health_check_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # #4759 — a MAC deny list has been pushed to this agentless server and
+    # not yet cleared. Lets the periodic sync skip the WinRM round trip when
+    # no block applies and nothing is left to remove.
+    mac_blocks_pushed: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
 
     # Agent bookkeeping (mirrors DNSServer — see docs/deployment/DNS_AGENT.md)
     agent_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)

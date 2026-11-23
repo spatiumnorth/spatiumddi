@@ -1,3 +1,4 @@
+import { countNoun } from "@/lib/count-noun";
 import { useMemo, useState } from "react";
 import { Field } from "@/components/ui/field";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -522,7 +523,8 @@ function FrameworkCard({
         <div>
           <p className="text-sm font-semibold">{framework.framework}</p>
           <p className="text-[11px] text-muted-foreground">
-            {framework.policies_enabled}/{framework.policies_total} policies
+            {framework.policies_enabled}/
+            {countNoun(framework.policies_total, "policy", "policies")}
             enabled
           </p>
         </div>

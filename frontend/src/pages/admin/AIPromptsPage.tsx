@@ -9,6 +9,8 @@ import {
   formatApiError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { usePermissions } from "@/hooks/usePermissions";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { FormError } from "@/components/ui/form-error";
@@ -412,25 +414,38 @@ export function AIPromptsPage() {
         />
       )}
       {editing && (
-        <PromptEditor
-          initial={formFromPrompt(editing)}
-          mode="edit"
-          canShare={canShare}
+        <FreshEdit
+          row={editing}
+          queryKeys={[["ai-prompts"]]}
+          title="Edit AI Prompt"
           onClose={() => setEditing(null)}
-          onSave={(form) =>
-            updateMut.mutate({
-              id: editing.id,
-              body: {
-                name: form.name.trim(),
-                description: form.description.trim(),
-                prompt_text: form.prompt_text,
-                is_shared: form.is_shared,
-              },
-            })
-          }
-          saving={updateMut.isPending}
-          error={error}
-        />
+        >
+          {(fresh) => (
+            <PromptEditor
+              initial={formFromPrompt(fresh)}
+              mode="edit"
+              canShare={canShare}
+              onClose={() => setEditing(null)}
+              onSave={(form) => {
+                // Only what the operator changed against the row read when
+                // the dialog opened (#4777), so another client's edit is kept.
+                const changed = changedFields(formFromPrompt(fresh), {
+                  name: form.name.trim(),
+                  description: form.description.trim(),
+                  prompt_text: form.prompt_text,
+                  is_shared: form.is_shared,
+                });
+                if (Object.keys(changed).length === 0) {
+                  setEditing(null);
+                  return;
+                }
+                updateMut.mutate({ id: fresh.id, body: changed });
+              }}
+              saving={updateMut.isPending}
+              error={error}
+            />
+          )}
+        </FreshEdit>
       )}
       {confirmDelete && (
         <ConfirmDelete
