@@ -94,6 +94,18 @@ async def _run_pull() -> dict[str, Any]:
             if skip is not None:
                 return skip
 
+            # #4776 — one scan at a time. The reads hold no transaction, so
+            # nothing else stops a second scan reading other servers while
+            # this one waits on an unreachable host, and the two together hold
+            # every worker process. Taken BEFORE the interval stamp below, so
+            # a scan turned away as busy leaves the stamp alone and the next
+            # tick after this scan ends can run, instead of waiting a whole
+            # interval more. Released in ``finally`` below.
+            claimed_scan, scan_token = await claim_scan()
+            if not claimed_scan:
+                logger.info("dhcp_pull_leases_pass_busy")
+                return {"status": "skipped", "reason": "pass_busy"}
+
             # #2262 — claim the interval BEFORE pulling, atomically. The stamp
             # used to be written only at the end of the pass, so a pull slower
             # than the 10 s beat tick was started again on every tick while it
@@ -119,16 +131,6 @@ async def _run_pull() -> dict[str, Any]:
             await db.commit()
 
             servers = list((await db.execute(select(DHCPServer))).scalars().all())
-
-            # #4776 — one scan at a time. The reads hold no transaction, so
-            # nothing else stops a second scan reading other servers while
-            # this one waits on an unreachable host, and the two together hold
-            # every worker process. Released in ``finally`` below.
-            agentless = sum(1 for s in servers if is_agentless(s.driver))
-            claimed_scan, scan_token = await claim_scan(agentless)
-            if not claimed_scan:
-                logger.info("dhcp_pull_leases_pass_busy")
-                return {"status": "skipped", "reason": "pass_busy"}
 
             servers_scanned = 0
             servers_busy = 0

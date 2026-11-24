@@ -36,12 +36,15 @@ class _FakeRedis:
         self.store[key] = (val, self.now + px / 1000)
         return True
 
-    async def eval(self, _script: str, _n: int, key: str, token: str) -> int:
+    async def eval(self, script: str, _n: int, key: str, token: str, *args: Any) -> int:
         cur = self.store.get(key)
-        if cur is not None and cur[0] == token:
+        if cur is None or cur[1] <= self.now or cur[0] != token:
+            return 0
+        if "pexpire" in script:
+            self.store[key] = (token, self.now + int(args[0]) / 1000)
+        else:
             del self.store[key]
-            return 1
-        return 0
+        return 1
 
     async def aclose(self) -> None:
         return None
@@ -51,6 +54,7 @@ class _FakeRedis:
 def _fake_redis(monkeypatch: pytest.MonkeyPatch) -> type[_FakeRedis]:
     _FakeRedis.store = {}
     _FakeRedis.now = 0.0
+    pl._RENEWERS.clear()
     monkeypatch.setattr(pl, "make_async_redis", lambda *a, **k: _FakeRedis())
     return _FakeRedis
 
@@ -287,12 +291,12 @@ async def test_stale_claim_from_a_crashed_worker_is_reclaimable(
     srv = await _arm(db_session)
     drv = _Drv([])
     monkeypatch.setattr(pl, "get_driver", lambda _n: drv)
-    await _FakeRedis().set(pl._PASS_CLAIM_PREFIX + str(srv.id), "dead", nx=True, px=300_000)
+    await _FakeRedis().set(pl._PASS_CLAIM_PREFIX + str(srv.id), "dead", nx=True, px=60_000)
 
     busy = await pl.pull_leases_from_server(db_session, srv, apply=True, release_txn_for_wire=True)
     assert busy.busy is True and drv.seen == []
 
-    _FakeRedis.now += 301  # the TTL passes; the crashed worker never released
+    _FakeRedis.now += 61  # the TTL passes; the crashed worker never released
     ok = await pl.pull_leases_from_server(db_session, srv, apply=True, release_txn_for_wire=True)
     assert ok.busy is False and ok.imported == 1
 
@@ -305,7 +309,7 @@ async def test_second_scan_while_first_holds_the_scan_claim_reads_no_server(
     _install_task_sessions(monkeypatch)
     drv = _Drv([])
     monkeypatch.setattr(pl, "get_driver", lambda _n: drv)
-    await _FakeRedis().set(pl._SCAN_CLAIM_KEY, "other-scan", nx=True, px=300_000)
+    await _FakeRedis().set(pl._SCAN_CLAIM_KEY, "other-scan", nx=True, px=60_000)
 
     res = await task._run_pull()
 
@@ -341,18 +345,65 @@ async def test_scan_claim_released_after_an_exception(
 
 
 @pytest.mark.asyncio
-async def test_scan_claim_expiry_scales_with_server_count(
+async def test_scan_claim_is_renewed_while_held_and_lapses_when_its_worker_dies(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    ok, tok = await pl.claim_scan(2)
-    assert ok
-    assert _FakeRedis.store[pl._SCAN_CLAIM_KEY][1] == 300.0  # floor
+    import asyncio
+
+    monkeypatch.setattr(pl, "_CLAIM_RENEW_S", 0.01)
+    ok, tok = await pl.claim_scan()
+    assert ok and tok is not None
+    assert _FakeRedis.store[pl._SCAN_CLAIM_KEY][1] == 60.0
+
+    # A live holder keeps renewing: past the first TTL it still holds.
+    _FakeRedis.now = 50.0
+    await asyncio.sleep(0.05)
+    assert _FakeRedis.store[pl._SCAN_CLAIM_KEY] == (tok, 110.0)
+    again, _ = await pl.claim_scan()
+    assert again is False
+
+    # The worker dies: renewal stops, and the claim lapses a minute later
+    # instead of standing for the length of the whole scan.
+    pl._RENEWERS.pop(tok).cancel()
+    _FakeRedis.now = 111.0
+    taken, tok2 = await pl.claim_scan()
+    assert taken is True
+    await pl.release_scan(tok2)
+    assert _FakeRedis.store == {} and pl._RENEWERS == {}
+
+
+@pytest.mark.asyncio
+async def test_release_stops_the_renewal(monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio
+
+    monkeypatch.setattr(pl, "_CLAIM_RENEW_S", 0.01)
+    ok, tok = await pl.claim_scan()
+    renewer = pl._RENEWERS[tok]  # type: ignore[index]
     await pl.release_scan(tok)
-    ok, tok = await pl.claim_scan(20)
-    assert ok
-    assert _FakeRedis.store[pl._SCAN_CLAIM_KEY][1] == 20 * 60.0  # covers 20 servers
-    await pl.release_scan(tok)
-    assert _FakeRedis.store == {}
+    await asyncio.sleep(0.03)
+    assert renewer.cancelled() and _FakeRedis.store == {}
+
+
+@pytest.mark.asyncio
+async def test_busy_scan_leaves_the_interval_stamp_alone(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _arm(db_session)
+    _install_task_sessions(monkeypatch)
+    drv = _Drv([])
+    monkeypatch.setattr(pl, "get_driver", lambda _n: drv)
+    await _FakeRedis().set(pl._SCAN_CLAIM_KEY, "other-scan", nx=True, px=60_000)
+
+    assert await task._run_pull() == {"status": "skipped", "reason": "pass_busy"}
+
+    async with _TestSessionLocal() as fresh:
+        ps = await fresh.get(PlatformSettings, 1)
+        assert ps is not None and ps.dhcp_pull_leases_last_run_at is None
+
+    # Once the other scan ends, the very next tick runs.
+    del _FakeRedis.store[pl._SCAN_CLAIM_KEY]
+    res = await task._run_pull()
+    assert res["status"] == "ran" and drv.seen != []
 
 
 def test_windows_pull_reads_pass_the_connect_timeout(monkeypatch: pytest.MonkeyPatch) -> None:

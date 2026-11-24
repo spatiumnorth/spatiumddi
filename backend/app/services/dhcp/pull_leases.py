@@ -56,6 +56,7 @@ second run over the same wire state is a no-op (the dedup key is
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import uuid
 from dataclasses import dataclass, field
@@ -199,17 +200,52 @@ async def _try_lock_server(db: AsyncSession, server: DHCPServer) -> bool:
 # second pass of a server still being read answers "busy" instead of tying up
 # another worker process for the length of an unreachable host's timeouts.
 _PASS_CLAIM_PREFIX = "dhcp:pull_leases:pass:"
-# Well above the worst-case pass (three WinRM reads plus the write): a crashed
-# worker's claim expires on its own and never wedges the server.
-_PASS_CLAIM_TTL_MS = 300_000
+# A claim lives for _CLAIM_TTL_MS and its holder renews it every
+# _CLAIM_RENEW_S while the pass runs (the WinRM reads run in threads, so the
+# event loop stays free to renew). A worker killed mid-pass stops renewing, so
+# its claim lapses within a minute instead of wedging the pull for the whole
+# worst-case length of a pass.
+_CLAIM_TTL_MS = 60_000
+_CLAIM_RENEW_S = 20.0
 _PASS_CLAIM_CONNECT_TIMEOUT = 2.0
 _RELEASE_IF_OWNER = (
     "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) end return 0"
 )
+_RENEW_IF_OWNER = (
+    "if redis.call('get', KEYS[1]) == ARGV[1] then "
+    "return redis.call('pexpire', KEYS[1], ARGV[2]) end return 0"
+)
+# token -> the task renewing that claim; cancelled by ``_release_key``.
+_RENEWERS: dict[str, asyncio.Task[None]] = {}
 
 
-async def _claim_key(key: str, ttl_ms: int) -> tuple[bool, str | None]:
-    """Take ``key`` for ``ttl_ms``: ``(claimed, token)``.
+async def _renew_loop(key: str, token: str) -> None:
+    while True:
+        await asyncio.sleep(_CLAIM_RENEW_S)
+        client: Any = None
+        try:
+            client = make_async_redis(
+                settings.redis_url, socket_connect_timeout=_PASS_CLAIM_CONNECT_TIMEOUT
+            )
+            kept = await client.eval(_RENEW_IF_OWNER, 1, key, token, _CLAIM_TTL_MS)
+            if not kept:
+                # Lapsed or taken over: nothing left to renew.
+                logger.warning("dhcp_pull_leases_claim_lost", key=key)
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — retried next tick; the TTL bounds it
+            logger.warning("dhcp_pull_leases_claim_renew_failed", key=key, error=str(exc))
+        finally:
+            if client is not None:
+                try:
+                    await client.aclose()
+                except Exception:  # noqa: BLE001 — closing a client we are done with
+                    pass
+
+
+async def _claim_key(key: str) -> tuple[bool, str | None]:
+    """Take ``key``: ``(claimed, token)``, renewed until ``_release_key``.
 
     ``claimed`` False means another holder has it. Redis unreachable returns
     ``(True, None)``: the write-phase advisory lock still keeps the writes
@@ -221,8 +257,7 @@ async def _claim_key(key: str, ttl_ms: int) -> tuple[bool, str | None]:
         client = make_async_redis(
             settings.redis_url, socket_connect_timeout=_PASS_CLAIM_CONNECT_TIMEOUT
         )
-        got = await client.set(key, token, nx=True, px=ttl_ms)
-        return (True, token) if got else (False, None)
+        got = await client.set(key, token, nx=True, px=_CLAIM_TTL_MS)
     except Exception as exc:  # noqa: BLE001 — fail open, see the docstring
         logger.warning("dhcp_pull_leases_claim_unavailable", error=str(exc))
         return True, None
@@ -232,11 +267,18 @@ async def _claim_key(key: str, ttl_ms: int) -> tuple[bool, str | None]:
                 await client.aclose()
             except Exception:  # noqa: BLE001 — closing a client we are done with
                 pass
+    if not got:
+        return False, None
+    _RENEWERS[token] = asyncio.create_task(_renew_loop(key, token))
+    return True, token
 
 
 async def _release_key(key: str, token: str | None) -> None:
     if token is None:
         return
+    renewer = _RENEWERS.pop(token, None)
+    if renewer is not None:
+        renewer.cancel()
     client: Any = None
     try:
         client = make_async_redis(
@@ -254,7 +296,7 @@ async def _release_key(key: str, token: str | None) -> None:
 
 
 async def _claim_pass(server_id: Any) -> tuple[bool, str | None]:
-    return await _claim_key(_PASS_CLAIM_PREFIX + str(server_id), _PASS_CLAIM_TTL_MS)
+    return await _claim_key(_PASS_CLAIM_PREFIX + str(server_id))
 
 
 async def _release_pass(server_id: Any, token: str | None) -> None:
@@ -263,15 +305,13 @@ async def _release_pass(server_id: Any, token: str | None) -> None:
 
 # #4776 — the claim on the scheduled SCAN as a whole (the task that walks every
 # agentless server). The per-server claim bounds one server; two scans reading
-# different unreachable servers at once still held every worker process. The
-# TTL scales with the servers the scan will read, so it outlives the scan.
+# different unreachable servers at once still held every worker process.
+# Renewed like the per-server claim, so it lasts as long as the scan does.
 _SCAN_CLAIM_KEY = "dhcp:pull_leases:scan"
-_SCAN_CLAIM_PER_SERVER_MS = 60_000
 
 
-async def claim_scan(server_count: int) -> tuple[bool, str | None]:
-    ttl = max(_PASS_CLAIM_TTL_MS, server_count * _SCAN_CLAIM_PER_SERVER_MS)
-    return await _claim_key(_SCAN_CLAIM_KEY, ttl)
+async def claim_scan() -> tuple[bool, str | None]:
+    return await _claim_key(_SCAN_CLAIM_KEY)
 
 
 async def release_scan(token: str | None) -> None:
