@@ -244,8 +244,14 @@ export function FindFreeModal({
         className="grid grid-cols-1 gap-3 rounded border bg-muted/30 p-3 sm:grid-cols-4"
       >
         <div className="space-y-1">
-          <label className="text-xs font-medium">Prefix length</label>
+          <label
+            htmlFor="subnet-ops-modals-prefix-length"
+            className="text-xs font-medium"
+          >
+            Prefix length
+          </label>
           <input
+            id="subnet-ops-modals-prefix-length"
             type="number"
             min={addressFamily === 4 ? 8 : 8}
             max={addressFamily === 4 ? 30 : 126}
@@ -255,8 +261,14 @@ export function FindFreeModal({
           />
         </div>
         <div className="space-y-1">
-          <label className="text-xs font-medium">Family</label>
+          <label
+            htmlFor="subnet-ops-modals-family"
+            className="text-xs font-medium"
+          >
+            Family
+          </label>
           <select
+            id="subnet-ops-modals-family"
             value={addressFamily}
             onChange={(e) => setAddressFamily(Number(e.target.value) as 4 | 6)}
             className="w-full rounded border bg-background px-2 py-1 text-sm"
@@ -266,8 +278,14 @@ export function FindFreeModal({
           </select>
         </div>
         <div className="space-y-1">
-          <label className="text-xs font-medium">Max candidates</label>
+          <label
+            htmlFor="subnet-ops-modals-max-candidates"
+            className="text-xs font-medium"
+          >
+            Max candidates
+          </label>
           <input
+            id="subnet-ops-modals-max-candidates"
             type="number"
             min={1}
             max={100}
@@ -474,8 +492,14 @@ export function SplitSubnetModal({
       </p>
       <div className="grid grid-cols-2 gap-3">
         <div className="space-y-1">
-          <label className="text-xs font-medium">New child prefix length</label>
+          <label
+            htmlFor="subnet-ops-modals-new-child-prefix-length"
+            className="text-xs font-medium"
+          >
+            New child prefix length
+          </label>
           <input
+            id="subnet-ops-modals-new-child-prefix-length"
             type="number"
             min={currentPrefix + 1}
             max={subnet.network.includes(":") ? 126 : 30}
@@ -546,11 +570,15 @@ export function SplitSubnetModal({
 
           {!blocked && (
             <div className="space-y-1">
-              <label className="text-xs font-medium">
+              <label
+                htmlFor="subnet-ops-modals-type-the-parent-cidr-to-confir"
+                className="text-xs font-medium"
+              >
                 Type the parent CIDR to confirm:{" "}
                 <span className="font-mono">{subnet.network}</span>
               </label>
               <input
+                id="subnet-ops-modals-type-the-parent-cidr-to-confir"
                 type="text"
                 value={confirmText}
                 onChange={(e) => setConfirmText(e.target.value)}
@@ -743,11 +771,15 @@ export function MergeSubnetModal({
 
           {!blocked && preview.merged_cidr && (
             <div className="space-y-1">
-              <label className="text-xs font-medium">
+              <label
+                htmlFor="subnet-ops-modals-type-the-merged-cidr-to-confir"
+                className="text-xs font-medium"
+              >
                 Type the merged CIDR to confirm:{" "}
                 <span className="font-mono">{preview.merged_cidr}</span>
               </label>
               <input
+                id="subnet-ops-modals-type-the-merged-cidr-to-confir"
                 type="text"
                 value={confirmText}
                 onChange={(e) => setConfirmText(e.target.value)}

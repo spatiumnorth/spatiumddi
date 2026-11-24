@@ -78,10 +78,14 @@ function PromptEditor({
         )}
 
         <div>
-          <label className="mb-1 block text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="aiprompts-name"
+            className="mb-1 block text-xs font-medium text-muted-foreground"
+          >
             Name
           </label>
           <input
+            id="aiprompts-name"
             value={form.name}
             onChange={(e) => set("name", e.target.value)}
             placeholder="e.g. Daily IPAM triage"
@@ -90,11 +94,15 @@ function PromptEditor({
         </div>
 
         <div>
-          <label className="mb-1 block text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="aiprompts-description"
+            className="mb-1 block text-xs font-medium text-muted-foreground"
+          >
             Description{" "}
             <span className="text-muted-foreground/60">(optional)</span>
           </label>
           <input
+            id="aiprompts-description"
             value={form.description}
             onChange={(e) => set("description", e.target.value)}
             placeholder="What this prompt is for, in one line"
@@ -103,10 +111,14 @@ function PromptEditor({
         </div>
 
         <div>
-          <label className="mb-1 block text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="aiprompts-prompt-text"
+            className="mb-1 block text-xs font-medium text-muted-foreground"
+          >
             Prompt text
           </label>
           <textarea
+            id="aiprompts-prompt-text"
             value={form.prompt_text}
             onChange={(e) => set("prompt_text", e.target.value)}
             placeholder={

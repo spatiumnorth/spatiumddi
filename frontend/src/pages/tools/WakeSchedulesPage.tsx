@@ -1737,8 +1737,11 @@ function CalendarModal({
       <div className="space-y-4">
         <div className="grid gap-3 sm:grid-cols-2">
           <div>
-            <label className={labelCls}>Name</label>
+            <label htmlFor="wake-schedules-name" className={labelCls}>
+              Name
+            </label>
             <input
+              id="wake-schedules-name"
               className={inputCls}
               value={name}
               onChange={(e) => setName(e.target.value)}
@@ -1747,8 +1750,11 @@ function CalendarModal({
             />
           </div>
           <div>
-            <label className={labelCls}>Kind</label>
+            <label htmlFor="wake-schedules-kind" className={labelCls}>
+              Kind
+            </label>
             <select
+              id="wake-schedules-kind"
               className={inputCls}
               value={kind}
               onChange={(e) => setKind(e.target.value as WolCalendarKind)}
@@ -1760,10 +1766,11 @@ function CalendarModal({
         </div>
 
         <div>
-          <label className={labelCls}>
+          <label htmlFor="wake-schedules-field" className={labelCls}>
             {kind === "caldav" ? "CalDAV URL" : "iCal .ics URL"}
           </label>
           <input
+            id="wake-schedules-field"
             className={cn(
               inputCls,
               "font-mono",
@@ -1789,8 +1796,11 @@ function CalendarModal({
         {kind === "caldav" && (
           <div className="grid gap-3 sm:grid-cols-2">
             <div>
-              <label className={labelCls}>Username</label>
+              <label htmlFor="wake-schedules-username" className={labelCls}>
+                Username
+              </label>
               <input
+                id="wake-schedules-username"
                 className={inputCls}
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
@@ -1799,7 +1809,7 @@ function CalendarModal({
               />
             </div>
             <div>
-              <label className={labelCls}>
+              <label htmlFor="wake-schedules-password" className={labelCls}>
                 Password
                 {existing?.password_set && (
                   <span className="ml-1 font-normal text-emerald-600 dark:text-emerald-400">
@@ -1808,6 +1818,7 @@ function CalendarModal({
                 )}
               </label>
               <input
+                id="wake-schedules-password"
                 type="password"
                 className={inputCls}
                 value={password}
@@ -1849,8 +1860,14 @@ function CalendarModal({
 
         <div className="grid gap-3 sm:grid-cols-2">
           <div>
-            <label className={labelCls}>Refresh interval (minutes)</label>
+            <label
+              htmlFor="wake-schedules-refresh-interval-minutes"
+              className={labelCls}
+            >
+              Refresh interval (minutes)
+            </label>
             <input
+              id="wake-schedules-refresh-interval-minutes"
               type="number"
               min={5}
               max={10080}
@@ -2225,8 +2242,11 @@ export function WolScheduleModal({
         {/* Pinned identity fields above the tabs */}
         <div className="grid gap-3 sm:grid-cols-2">
           <div>
-            <label className={labelCls}>Name</label>
+            <label htmlFor="wake-schedules-name-2" className={labelCls}>
+              Name
+            </label>
             <input
+              id="wake-schedules-name-2"
               className={inputCls}
               value={name}
               onChange={(e) => setName(e.target.value)}
@@ -2235,8 +2255,11 @@ export function WolScheduleModal({
             />
           </div>
           <div>
-            <label className={labelCls}>Description</label>
+            <label htmlFor="wake-schedules-description" className={labelCls}>
+              Description
+            </label>
             <input
+              id="wake-schedules-description"
               className={inputCls}
               value={description}
               onChange={(e) => setDescription(e.target.value)}
@@ -2417,8 +2440,11 @@ function TargetStep({
   return (
     <div className="space-y-3">
       <div>
-        <label className={labelCls}>Match hosts</label>
+        <label htmlFor="wake-schedules-match-hosts" className={labelCls}>
+          Match hosts
+        </label>
         <select
+          id="wake-schedules-match-hosts"
           className={inputCls}
           value={mode}
           onChange={(e) => setMode(e.target.value as WolSelectorMode)}
@@ -2436,20 +2462,26 @@ function TargetStep({
 
       {(mode === "address_tags" || mode === "subnet_tags") && (
         <div>
-          <label className={labelCls}>
+          <span className={labelCls}>
             Tags (ANDed — <code>key</code> or <code>key:value</code>)
-          </label>
+          </span>
           <TagFilterChips value={tags} onChange={setTags} />
         </div>
       )}
 
       {mode === "subnet" && (
         <div>
-          <label className={labelCls}>Subnets</label>
+          <span id="wake-schedules-subnets" className={labelCls}>
+            Subnets
+          </span>
           {subnetsQ.isLoading ? (
             <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
           ) : (
-            <div className="max-h-48 space-y-1 overflow-auto rounded-md border p-2">
+            <div
+              role="group"
+              aria-labelledby="wake-schedules-subnets"
+              className="max-h-48 space-y-1 overflow-auto rounded-md border p-2"
+            >
               {(subnetsQ.data ?? [])
                 .filter((s: Subnet) => (s.kind ?? "unicast") === "unicast")
                 .map((s: Subnet) => (
@@ -2549,8 +2581,11 @@ function ScheduleStep({
   return (
     <div className="space-y-3">
       <div>
-        <label className={labelCls}>Recurrence</label>
+        <label htmlFor="wake-schedules-recurrence" className={labelCls}>
+          Recurrence
+        </label>
         <select
+          id="wake-schedules-recurrence"
           className={inputCls}
           value={selectValue}
           onChange={(e) => {
@@ -2571,8 +2606,14 @@ function ScheduleStep({
       </div>
 
       <div>
-        <label className={labelCls}>Cron expression (5-field)</label>
+        <label
+          htmlFor="wake-schedules-cron-expression-5-field"
+          className={labelCls}
+        >
+          Cron expression (5-field)
+        </label>
         <input
+          id="wake-schedules-cron-expression-5-field"
           className={cn(inputCls, "font-mono")}
           value={cron}
           onChange={(e) => setCron(e.target.value)}
@@ -2585,8 +2626,11 @@ function ScheduleStep({
       </div>
 
       <div>
-        <label className={labelCls}>Timezone (IANA)</label>
+        <label htmlFor="wake-schedules-timezone-iana" className={labelCls}>
+          Timezone (IANA)
+        </label>
         <input
+          id="wake-schedules-timezone-iana"
           list="wol-iana-timezones"
           className={cn(
             inputCls,
@@ -2681,9 +2725,15 @@ function HolidayStep({
       </div>
 
       <div>
-        <label className={labelCls}>Blackout dates (holidays)</label>
+        <label
+          htmlFor="wake-schedules-blackout-dates-holidays"
+          className={labelCls}
+        >
+          Blackout dates (holidays)
+        </label>
         <div className="flex items-center gap-2">
           <input
+            id="wake-schedules-blackout-dates-holidays"
             type="date"
             className={inputCls}
             value={draft}
@@ -2723,8 +2773,11 @@ function HolidayStep({
 
       <div className="grid gap-3 sm:grid-cols-2">
         <div>
-          <label className={labelCls}>Term active from</label>
+          <label htmlFor="wake-schedules-term-active-from" className={labelCls}>
+            Term active from
+          </label>
           <input
+            id="wake-schedules-term-active-from"
             type="date"
             className={inputCls}
             value={activeFrom}
@@ -2732,8 +2785,14 @@ function HolidayStep({
           />
         </div>
         <div>
-          <label className={labelCls}>Term active until</label>
+          <label
+            htmlFor="wake-schedules-term-active-until"
+            className={labelCls}
+          >
+            Term active until
+          </label>
           <input
+            id="wake-schedules-term-active-until"
             type="date"
             className={inputCls}
             value={activeUntil}
@@ -2815,8 +2874,11 @@ function CalendarGateSection({
       </div>
 
       <div>
-        <label className={labelCls}>Calendar gate</label>
+        <label htmlFor="wake-schedules-calendar-gate" className={labelCls}>
+          Calendar gate
+        </label>
         <select
+          id="wake-schedules-calendar-gate"
           className={inputCls}
           value={calendarMode}
           onChange={(e) => setCalendarMode(e.target.value as WolCalendarMode)}
@@ -2835,7 +2897,9 @@ function CalendarGateSection({
       {calendarMode !== "none" && (
         <>
           <div>
-            <label className={labelCls}>Calendar subscription</label>
+            <label htmlFor="wake-schedules-calendar" className={labelCls}>
+              Calendar subscription
+            </label>
             {calendarsQ.isLoading ? (
               <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
             ) : calendars.length === 0 ? (
@@ -2845,6 +2909,7 @@ function CalendarGateSection({
               </p>
             ) : (
               <select
+                id="wake-schedules-calendar"
                 className={cn(
                   inputCls,
                   !calendarId && "border-destructive focus:ring-destructive",
@@ -2875,10 +2940,14 @@ function CalendarGateSection({
           </div>
 
           <div>
-            <label className={labelCls}>
+            <label
+              htmlFor="wake-schedules-match-filter-optional-regex-on"
+              className={labelCls}
+            >
               Match filter (optional regex on summary / category)
             </label>
             <input
+              id="wake-schedules-match-filter-optional-regex-on"
               className={cn(
                 inputCls,
                 "font-mono",
@@ -3014,8 +3083,11 @@ function VerifyStep({
         )}
       >
         <div className="sm:col-span-2">
-          <label className={labelCls}>Liveness source</label>
+          <label htmlFor="wake-schedules-liveness-source" className={labelCls}>
+            Liveness source
+          </label>
           <select
+            id="wake-schedules-liveness-source"
             className={inputCls}
             disabled={!verifyEnabled}
             value={verifyMethod}
@@ -3040,8 +3112,14 @@ function VerifyStep({
           )}
         </div>
         <div>
-          <label className={labelCls}>Wait before probing (seconds)</label>
+          <label
+            htmlFor="wake-schedules-wait-before-probing-seconds"
+            className={labelCls}
+          >
+            Wait before probing (seconds)
+          </label>
           <input
+            id="wake-schedules-wait-before-probing-seconds"
             type="number"
             min={5}
             max={3600}
@@ -3066,8 +3144,11 @@ function VerifyStep({
           )}
         </div>
         <div>
-          <label className={labelCls}>Re-wake retries</label>
+          <label htmlFor="wake-schedules-re-wake-retries" className={labelCls}>
+            Re-wake retries
+          </label>
           <input
+            id="wake-schedules-re-wake-retries"
             type="number"
             min={0}
             max={10}
@@ -3258,8 +3339,11 @@ function SendStep({
     <div className="space-y-4">
       {/* Vantage picker — reuses #533's server-vs-appliance concept */}
       <div>
-        <label className={labelCls}>Send from (vantage)</label>
+        <label htmlFor="wake-schedules-send-from-vantage" className={labelCls}>
+          Send from (vantage)
+        </label>
         <select
+          id="wake-schedules-send-from-vantage"
           className={inputCls}
           value={vantageSelection}
           onChange={(e) => {
@@ -3287,8 +3371,11 @@ function SendStep({
 
       <div className="grid gap-3 sm:grid-cols-2">
         <div>
-          <label className={labelCls}>Repeat count</label>
+          <label htmlFor="wake-schedules-repeat-count" className={labelCls}>
+            Repeat count
+          </label>
           <input
+            id="wake-schedules-repeat-count"
             type="number"
             min={1}
             max={10}
@@ -3310,8 +3397,14 @@ function SendStep({
           )}
         </div>
         <div>
-          <label className={labelCls}>Repeat interval (ms)</label>
+          <label
+            htmlFor="wake-schedules-repeat-interval-ms"
+            className={labelCls}
+          >
+            Repeat interval (ms)
+          </label>
           <input
+            id="wake-schedules-repeat-interval-ms"
             type="number"
             min={0}
             max={10000}
@@ -3330,8 +3423,14 @@ function SendStep({
           )}
         </div>
         <div>
-          <label className={labelCls}>Stagger between hosts (ms)</label>
+          <label
+            htmlFor="wake-schedules-stagger-between-hosts-ms"
+            className={labelCls}
+          >
+            Stagger between hosts (ms)
+          </label>
           <input
+            id="wake-schedules-stagger-between-hosts-ms"
             type="number"
             min={0}
             max={60000}
@@ -3349,8 +3448,11 @@ function SendStep({
           )}
         </div>
         <div>
-          <label className={labelCls}>WoL port</label>
+          <label htmlFor="wake-schedules-wol-port" className={labelCls}>
+            WoL port
+          </label>
           <input
+            id="wake-schedules-wol-port"
             type="number"
             min={1}
             max={65535}
@@ -3562,8 +3664,14 @@ set interfaces ethernet eth0 ip enable-directed-broadcast`,
 
           <div className="grid gap-2 sm:grid-cols-2">
             <div>
-              <label className={labelCls}>Sender IP (this vantage)</label>
+              <label
+                htmlFor="wake-schedules-sender-ip-this-vantage"
+                className={labelCls}
+              >
+                Sender IP (this vantage)
+              </label>
               <input
+                id="wake-schedules-sender-ip-this-vantage"
                 className={cn(inputCls, "font-mono")}
                 value={senderIp}
                 onChange={(e) => setSenderIp(e.target.value)}
@@ -3572,8 +3680,14 @@ set interfaces ethernet eth0 ip enable-directed-broadcast`,
             </div>
             {subnets.length > 1 && (
               <div>
-                <label className={labelCls}>Target subnet</label>
+                <label
+                  htmlFor="wake-schedules-target-subnet"
+                  className={labelCls}
+                >
+                  Target subnet
+                </label>
                 <select
+                  id="wake-schedules-target-subnet"
                   className={inputCls}
                   value={subnetIdx}
                   onChange={(e) => setSubnetIdx(Number(e.target.value))}
