@@ -72,6 +72,10 @@ describe("staleReasonText", () => {
     expect(staleReasonText("no-forward-zone")).toMatch(/no forward zone/);
     expect(staleReasonKeepsAddress("ip-deleted")).toBe(false);
   });
+  it("explains cname-at-label and keeps the address", () => {
+    expect(staleReasonText("cname-at-label")).toMatch(/holds a CNAME/);
+    expect(staleReasonKeepsAddress("cname-at-label")).toBe(true);
+  });
   it("falls back to the code for an unknown reason", () => {
     expect(staleReasonText("brand-new")).toContain("brand-new");
   });
