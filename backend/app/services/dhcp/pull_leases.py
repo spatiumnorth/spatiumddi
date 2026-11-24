@@ -208,22 +208,20 @@ _RELEASE_IF_OWNER = (
 )
 
 
-async def _claim_pass(server_id: Any) -> tuple[bool, str | None]:
-    """Claim one whole pass of ``server_id``: ``(claimed, token)``.
+async def _claim_key(key: str, ttl_ms: int) -> tuple[bool, str | None]:
+    """Take ``key`` for ``ttl_ms``: ``(claimed, token)``.
 
-    ``claimed`` False means another pass holds it. Redis unreachable returns
+    ``claimed`` False means another holder has it. Redis unreachable returns
     ``(True, None)``: the write-phase advisory lock still keeps the writes
     serial, and a Redis outage must not stop the pull.
     """
     token = uuid.uuid4().hex
-    client = None
+    client: Any = None
     try:
         client = make_async_redis(
             settings.redis_url, socket_connect_timeout=_PASS_CLAIM_CONNECT_TIMEOUT
         )
-        got = await client.set(
-            _PASS_CLAIM_PREFIX + str(server_id), token, nx=True, px=_PASS_CLAIM_TTL_MS
-        )
+        got = await client.set(key, token, nx=True, px=ttl_ms)
         return (True, token) if got else (False, None)
     except Exception as exc:  # noqa: BLE001 — fail open, see the docstring
         logger.warning("dhcp_pull_leases_claim_unavailable", error=str(exc))
@@ -236,7 +234,7 @@ async def _claim_pass(server_id: Any) -> tuple[bool, str | None]:
                 pass
 
 
-async def _release_pass(server_id: Any, token: str | None) -> None:
+async def _release_key(key: str, token: str | None) -> None:
     if token is None:
         return
     client: Any = None
@@ -244,7 +242,7 @@ async def _release_pass(server_id: Any, token: str | None) -> None:
         client = make_async_redis(
             settings.redis_url, socket_connect_timeout=_PASS_CLAIM_CONNECT_TIMEOUT
         )
-        await client.eval(_RELEASE_IF_OWNER, 1, _PASS_CLAIM_PREFIX + str(server_id), token)
+        await client.eval(_RELEASE_IF_OWNER, 1, key, token)
     except Exception as exc:  # noqa: BLE001 — the TTL expires it
         logger.warning("dhcp_pull_leases_claim_release_failed", error=str(exc))
     finally:
@@ -253,6 +251,31 @@ async def _release_pass(server_id: Any, token: str | None) -> None:
                 await client.aclose()
             except Exception:  # noqa: BLE001 — closing a client we are done with
                 pass
+
+
+async def _claim_pass(server_id: Any) -> tuple[bool, str | None]:
+    return await _claim_key(_PASS_CLAIM_PREFIX + str(server_id), _PASS_CLAIM_TTL_MS)
+
+
+async def _release_pass(server_id: Any, token: str | None) -> None:
+    await _release_key(_PASS_CLAIM_PREFIX + str(server_id), token)
+
+
+# #4776 — the claim on the scheduled SCAN as a whole (the task that walks every
+# agentless server). The per-server claim bounds one server; two scans reading
+# different unreachable servers at once still held every worker process. The
+# TTL scales with the servers the scan will read, so it outlives the scan.
+_SCAN_CLAIM_KEY = "dhcp:pull_leases:scan"
+_SCAN_CLAIM_PER_SERVER_MS = 60_000
+
+
+async def claim_scan(server_count: int) -> tuple[bool, str | None]:
+    ttl = max(_PASS_CLAIM_TTL_MS, server_count * _SCAN_CLAIM_PER_SERVER_MS)
+    return await _claim_key(_SCAN_CLAIM_KEY, ttl)
+
+
+async def release_scan(token: str | None) -> None:
+    await _release_key(_SCAN_CLAIM_KEY, token)
 
 
 _SYNC_ERROR_MAX = 2000

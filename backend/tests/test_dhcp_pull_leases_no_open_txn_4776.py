@@ -297,6 +297,64 @@ async def test_stale_claim_from_a_crashed_worker_is_reclaimable(
     assert ok.busy is False and ok.imported == 1
 
 
+@pytest.mark.asyncio
+async def test_second_scan_while_first_holds_the_scan_claim_reads_no_server(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _arm(db_session)
+    _install_task_sessions(monkeypatch)
+    drv = _Drv([])
+    monkeypatch.setattr(pl, "get_driver", lambda _n: drv)
+    await _FakeRedis().set(pl._SCAN_CLAIM_KEY, "other-scan", nx=True, px=300_000)
+
+    res = await task._run_pull()
+
+    assert res == {"status": "skipped", "reason": "pass_busy"}
+    assert drv.seen == []
+    assert _FakeRedis.store[pl._SCAN_CLAIM_KEY][0] == "other-scan"  # not released by us
+
+
+@pytest.mark.asyncio
+async def test_scan_claim_released_after_an_exception(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _arm(db_session)
+    _install_task_sessions(monkeypatch)
+
+    async def _explode(*a: Any, **k: Any) -> Any:
+        raise RuntimeError("boom")
+
+    import app.services.dhcp.pull_leases as mod
+
+    monkeypatch.setattr(mod, "pull_leases_from_server", _explode)
+    res = await task._run_pull()  # per-server failures are recorded, not raised
+    assert res["status"] == "ran" and _FakeRedis.store == {}
+
+    def _fatal(*a: Any, **k: Any) -> Any:
+        raise RuntimeError("fatal")
+
+    monkeypatch.setattr(task, "is_agentless", _fatal)
+    await _arm(db_session)  # re-opens the interval gate
+    with pytest.raises(RuntimeError):
+        await task._run_pull()
+    assert _FakeRedis.store == {}
+
+
+@pytest.mark.asyncio
+async def test_scan_claim_expiry_scales_with_server_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ok, tok = await pl.claim_scan(2)
+    assert ok
+    assert _FakeRedis.store[pl._SCAN_CLAIM_KEY][1] == 300.0  # floor
+    await pl.release_scan(tok)
+    ok, tok = await pl.claim_scan(20)
+    assert ok
+    assert _FakeRedis.store[pl._SCAN_CLAIM_KEY][1] == 20 * 60.0  # covers 20 servers
+    await pl.release_scan(tok)
+    assert _FakeRedis.store == {}
+
+
 def test_windows_pull_reads_pass_the_connect_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     import asyncio
 

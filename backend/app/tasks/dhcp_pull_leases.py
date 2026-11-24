@@ -60,7 +60,9 @@ async def _run_pull() -> dict[str, Any]:
     # Deferred import — keeps celery-worker startup light and avoids pulling
     # in the API router graph just to register the task.
     from app.services.dhcp.pull_leases import (  # noqa: PLC0415
+        claim_scan,
         pull_leases_from_server,
+        release_scan,
     )
     from app.services.ipam.utilization import (  # noqa: PLC0415
         recount_subnets_and_blocks,
@@ -70,6 +72,7 @@ async def _run_pull() -> dict[str, Any]:
         settings.database_url, future=True, connect_args=task_connect_args()
     )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    scan_token: str | None = None
 
     try:
         async with session_factory() as db:
@@ -116,6 +119,16 @@ async def _run_pull() -> dict[str, Any]:
             await db.commit()
 
             servers = list((await db.execute(select(DHCPServer))).scalars().all())
+
+            # #4776 — one scan at a time. The reads hold no transaction, so
+            # nothing else stops a second scan reading other servers while
+            # this one waits on an unreachable host, and the two together hold
+            # every worker process. Released in ``finally`` below.
+            agentless = sum(1 for s in servers if is_agentless(s.driver))
+            claimed_scan, scan_token = await claim_scan(agentless)
+            if not claimed_scan:
+                logger.info("dhcp_pull_leases_pass_busy")
+                return {"status": "skipped", "reason": "pass_busy"}
 
             servers_scanned = 0
             servers_busy = 0
@@ -300,6 +313,7 @@ async def _run_pull() -> dict[str, Any]:
                 "errors": len(errors),
             }
     finally:
+        await release_scan(scan_token)
         await engine.dispose()
 
 
