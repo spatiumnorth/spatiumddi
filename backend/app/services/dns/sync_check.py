@@ -743,6 +743,20 @@ async def _cloud_reverse_optout_reason(
     return cloud_reverse_optout_message(group.name, driver) if driver else None
 
 
+async def cname_names_in_zone(db: AsyncSession, zone_id: uuid.UUID) -> set[str]:
+    """Lower-cased owner names of the live CNAMEs in a zone, in any view.
+
+    The set form of ``find_cname_conflict`` (the rule ``_sync_dns_record``
+    applies before it writes a PTR, #4796), read once per zone for a drift
+    walk instead of once per address."""
+    rows = await db.execute(
+        select(func.lower(DNSRecord.name)).where(
+            DNSRecord.zone_id == zone_id, func.upper(DNSRecord.record_type) == "CNAME"
+        )
+    )
+    return {n for (n,) in rows.all()}
+
+
 async def compute_subnet_dns_drift(
     db: AsyncSession,
     subnet_id: uuid.UUID,
@@ -775,6 +789,13 @@ async def compute_subnet_dns_drift(
         )
     except ValueError:
         subnet_net = None
+
+    cname_cache: dict[uuid.UUID, set[str]] = {}
+
+    async def _cname_names(zone_id: uuid.UUID) -> set[str]:
+        if zone_id not in cname_cache:
+            cname_cache[zone_id] = await cname_names_in_zone(db, zone_id)
+        return cname_cache[zone_id]
 
     report = DriftReport(
         subnet_id=subnet_id,
@@ -1236,7 +1257,24 @@ async def compute_subnet_dns_drift(
             except ValueError:
                 continue
 
-            if not ip_ptr_records:
+            if exp_label.lower() in await _cname_names(rz.id):
+                # #4796 — a CNAME at the label (RFC 2317) holds no PTR, and
+                # ``_sync_dns_record`` writes none and retracts any it finds
+                # there. So none is expected, and one already there is stale.
+                for r in ip_ptr_records:
+                    report.stale.append(
+                        StaleItem(
+                            record_id=r.id,
+                            record_type="PTR",
+                            zone_id=r.zone_id,
+                            zone_name=rz.name if r.zone_id == rz.id else "",
+                            name=r.name,
+                            value=r.value,
+                            reason="cname-at-label",
+                            ip_id=ip.id,
+                        )
+                    )
+            elif not ip_ptr_records:
                 report.missing.append(
                     MissingItem(
                         ip_id=ip.id,

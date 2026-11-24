@@ -99,7 +99,7 @@ async def _run_sweep() -> dict[str, Any]:
                 else:
                     err_count += 1
                     if summary.error:
-                        errors.append(f"{endpoint.name}: {summary.error}")
+                        errors.append(f"{endpoint_name}: {summary.error}")
 
             return {
                 "status": "ok",
