@@ -27,7 +27,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 IMAGE_TEMPLATE = REPO / "frontend" / "default.conf.template"
 APPLIANCE_TEMPLATE = REPO / "charts" / "spatiumddi" / "templates" / "frontend-tls-config.yaml"
-NGINX_IMAGE = "nginx:1.31.8-alpine"
+NGINX_IMAGE = "nginx:1.31.9-alpine"
 
 CONFIGS = pytest.mark.parametrize(
     "path", [IMAGE_TEMPLATE, APPLIANCE_TEMPLATE], ids=["image-template", "appliance-tls-configmap"]
