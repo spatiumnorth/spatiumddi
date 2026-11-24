@@ -74,6 +74,11 @@ def running_version() -> str:
     return canonical_version(settings.version, settings.app_version)
 
 
+# Fresh-install wait for the settings row: 20 tries, two minutes apart.
+_NO_ROW_RETRIES = 20
+_NO_ROW_RETRY_SECONDS = 120
+
+
 async def _run_check() -> dict[str, Any]:
     engine = create_async_engine(
         settings.database_url, future=True, connect_args=task_connect_args()
@@ -174,8 +179,16 @@ async def _run_check() -> dict[str, Any]:
     max_retries=2,
 )
 def check_github_release(self: Any) -> dict[str, Any]:  # noqa: ARG001
-    """Beat-fired entrypoint. Runs the async checker under asyncio."""
-    return asyncio.run(_run_check())
+    """Beat-fired entrypoint. Runs the async checker under asyncio.
+
+    On a fresh install beat start queues this before the settings row exists
+    (#4800), and the first result would otherwise wait for the 24 h tick. The
+    row appears at first login / settings read, so retry a few times until it
+    does. A switched-off check returns ``disabled`` and is never retried."""
+    result = asyncio.run(_run_check())
+    if result.get("status") == "no_settings_row" and self.request.retries < _NO_ROW_RETRIES:
+        raise self.retry(countdown=_NO_ROW_RETRY_SECONDS, max_retries=_NO_ROW_RETRIES)
+    return result
 
 
 __all__ = ["check_github_release"]

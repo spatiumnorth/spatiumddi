@@ -4285,6 +4285,9 @@ export interface OUIStatus {
   interval_hours: number;
   last_updated_at: string | null;
   vendor_count: number;
+  /** #4800 — newest failed refresh since the last success. */
+  last_error?: string | null;
+  last_error_at?: string | null;
 }
 
 export interface OUITaskStatus {
@@ -13745,8 +13748,9 @@ export interface ApplianceRow {
   resolver_status: string | null;
   /** Issue #155 — per-host APT host-config state the supervisor reported:
    *  "synced" / "proxy-failed" / "mirror-unreachable" / "signature-mismatch"
-   *  / "no-sources" / "unmanaged", or null on non-appliance / pre-#155 /
-   *  never-reported rows. */
+   *  / "no-sources" / "unmanaged", or "update-stale" (#4800: the last
+   *  apt-get update is over 3 days old or never succeeded), or null on
+   *  non-appliance / pre-#155 / never-reported rows. */
   apt_state: string | null;
   desired_appliance_version: string | null;
   desired_slot_image_url: string | null;
