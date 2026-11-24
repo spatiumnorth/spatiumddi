@@ -1146,14 +1146,64 @@ async def restore_zone_records_to_server(
     )
 
 
+@dataclass
+class WireRead:
+    """A zone read from its server: everything :func:`fetch_wire` needs, then
+    what it returned. Built by :func:`prepare_wire_read` (database work) so the
+    read itself (:func:`fetch_wire`) touches no session (#4808)."""
+
+    primary: Any
+    driver: Any
+    keys: list[TsigKey | None]
+    view_name: str | None
+    zone_name: str
+    fallback: dict[str, Any]
+    on_wire: list[RecordData] | None = None
+
+
+async def prepare_wire_read(db: AsyncSession, zone: DNSZone, server: Any | None = None) -> WireRead:
+    """The database half of reading ``zone`` from its server: primary, driver,
+    TSIG key(s) and the fallback address. Raises ``ValueError`` as
+    :func:`_resolve_primary_and_driver` does."""
+    primary, driver, keys, view_name = await _resolve_primary_and_driver(db, zone, server)
+    return WireRead(
+        primary=primary,
+        driver=driver,
+        keys=keys,
+        view_name=view_name,
+        zone_name=zone.name,
+        fallback=await _fallback_kwargs(db, primary),
+    )
+
+
+async def fetch_wire(wire: WireRead) -> None:
+    """The network half: transfer the zone. Uses no session, so the caller can
+    (and the scheduled task does) run it with none open."""
+    wire.on_wire, _key_used = await pull_zone_records_signed(
+        wire.driver,
+        wire.primary,
+        wire.zone_name,
+        wire.keys,
+        view_name=wire.view_name,
+        **wire.fallback,
+    )
+
+
 async def sync_zone_with_server(
     db: AsyncSession,
     zone: DNSZone,
     *,
     apply: bool = True,
     server: Any | None = None,
+    wire: WireRead | None = None,
 ) -> SyncResult:
     """Bi-directional additive sync between DB and the zone's primary server.
+
+    ``wire`` (#4808) is a read already made with :func:`prepare_wire_read` +
+    :func:`fetch_wire`, so the caller could make the network call with no
+    session open and hand the result to a fresh one. Its ``primary`` must be
+    bound to ``db``. Without it the read happens here, on ``db``'s own
+    transaction (the request-scoped callers).
 
     ``server`` (#1697) syncs with that server instead of the primary, so a
     group-level Sync walks each server's own copy rather than the primary's
@@ -1166,16 +1216,11 @@ async def sync_zone_with_server(
     Never deletes. Returns counts for both phases so the UI can surface
     them in one pass.
     """
-    primary, driver, keys, view_name = await _resolve_primary_and_driver(db, zone, server)
-
-    on_wire, _key_used = await pull_zone_records_signed(
-        driver,
-        primary,
-        zone.name,
-        keys,
-        view_name=view_name,
-        **await _fallback_kwargs(db, primary),
-    )
+    if wire is None:
+        wire = await prepare_wire_read(db, zone, server)
+        await fetch_wire(wire)
+    assert wire.on_wire is not None
+    primary, driver, on_wire = wire.primary, wire.driver, wire.on_wire
 
     # Snapshot DB state BEFORE the pull so we can compute the push set
     # against the "old" DB. We still import new rows from the pull into

@@ -1890,6 +1890,12 @@ class SupervisorHeartbeatRequest(BaseModel):
         ]
         | None
     ) = None
+    # #4800 — the host's last ``apt-get update`` is stale or never succeeded.
+    # A separate optional field, NOT a new ``apt_state`` value: a control
+    # plane that predates it ignores an unknown field but would answer 422 to
+    # an unknown Literal, and supervisors and the control plane upgrade at
+    # different times. None = not collected / not stale-capable.
+    apt_update_stale: bool | None = None
     # Issue #347 — LLDP neighbours the local lldpd discovered. ``None`` = not
     # collected (leave the stored set alone); a list (possibly empty) is the
     # authoritative current set the handler upserts + absence-deletes against.
@@ -2849,7 +2855,10 @@ async def _supervisor_heartbeat(
         row.resolver_status = body.resolver_status
     # Issue #155 — applied APT host-config state (per-host). None = not
     # collected (leave the column alone); a value persists.
-    if body.apt_state is not None:
+    if body.apt_update_stale:
+        # #4800 — sources unreachable beats the config-apply state.
+        row.apt_state = "update-stale"
+    elif body.apt_state is not None:
         row.apt_state = body.apt_state
     # Issue #347 — ingest the supervisor's local LLDP neighbours (upsert +
     # absence-delete). None = not collected (leave the set alone).

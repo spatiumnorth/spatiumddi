@@ -174,6 +174,13 @@ PYEOF
         return 0
     fi
     install -m 0644 "$uu_stage/20auto-upgrades" "$AUTO_UPGRADES"
+    # #4800 — tell the supervisor the periodic update is off on purpose, so a
+    # list that stops refreshing is not reported as unreachable sources.
+    if grep -q 'Update-Package-Lists "0"' "$AUTO_UPGRADES"; then
+        printf "" | state_write /var/lib/spatiumddi/release-state/apt-periodic-off || true
+    else
+        rm -f /var/lib/spatiumddi/release-state/apt-periodic-off || true
+    fi
     install -m 0644 "$uu_stage/50unattended-upgrades" "$UNATTENDED_50"
     echo "  ✓ unattended policy applied (20auto-upgrades + 50unattended-upgrades)"
 }

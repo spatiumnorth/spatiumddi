@@ -60,7 +60,9 @@ async def _run_pull() -> dict[str, Any]:
     # Deferred import — keeps celery-worker startup light and avoids pulling
     # in the API router graph just to register the task.
     from app.services.dhcp.pull_leases import (  # noqa: PLC0415
+        claim_scan,
         pull_leases_from_server,
+        release_scan,
     )
     from app.services.ipam.utilization import (  # noqa: PLC0415
         recount_subnets_and_blocks,
@@ -70,6 +72,7 @@ async def _run_pull() -> dict[str, Any]:
         settings.database_url, future=True, connect_args=task_connect_args()
     )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    scan_token: str | None = None
 
     try:
         async with session_factory() as db:
@@ -90,6 +93,18 @@ async def _run_pull() -> dict[str, Any]:
             )
             if skip is not None:
                 return skip
+
+            # #4776 — one scan at a time. The reads hold no transaction, so
+            # nothing else stops a second scan reading other servers while
+            # this one waits on an unreachable host, and the two together hold
+            # every worker process. Taken BEFORE the interval stamp below, so
+            # a scan turned away as busy leaves the stamp alone and the next
+            # tick after this scan ends can run, instead of waiting a whole
+            # interval more. Released in ``finally`` below.
+            claimed_scan, scan_token = await claim_scan()
+            if not claimed_scan:
+                logger.info("dhcp_pull_leases_pass_busy")
+                return {"status": "skipped", "reason": "pass_busy"}
 
             # #2262 — claim the interval BEFORE pulling, atomically. The stamp
             # used to be written only at the end of the pass, so a pull slower
@@ -152,7 +167,10 @@ async def _run_pull() -> dict[str, Any]:
                 servers_scanned += 1
                 try:
                     # #3345 — recounted once, after the last server's pull.
-                    result = await pull_leases_from_server(db, server, apply=True, recount=False)
+                    # #4776 — commits before the driver reads, none run in a txn.
+                    result = await pull_leases_from_server(
+                        db, server, apply=True, recount=False, release_txn_for_wire=True
+                    )
                 except Exception as exc:  # noqa: BLE001 — don't let one server poison the run
                     errors.append(f"{server.name}: {exc}")
                     logger.warning(
@@ -297,6 +315,7 @@ async def _run_pull() -> dict[str, Any]:
                 "errors": len(errors),
             }
     finally:
+        await release_scan(scan_token)
         await engine.dispose()
 
 
