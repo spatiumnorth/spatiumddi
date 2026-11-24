@@ -120,3 +120,56 @@ async def test_resync_retracts_a_ptr_an_earlier_release_wrote_beside_a_cname(
 
     assert await _ptrs(db_session, ip) == []
     assert [r.record_type for r in await _rows_at(db_session, rev, "80")] == ["CNAME"]
+
+
+async def _drift(db: AsyncSession, subnet: Subnet):  # type: ignore[no-untyped-def]
+    from app.services.dns.sync_check import compute_subnet_dns_drift
+
+    return await compute_subnet_dns_drift(db, subnet.id)
+
+
+@pytest.mark.asyncio
+async def test_drift_lists_a_ptr_beside_a_cname_as_stale_and_commit_removes_it(
+    db_session: AsyncSession,
+) -> None:
+    """A PTR an earlier release wrote beside a CNAME is offered for deletion,
+    and committing that preview (as the console does) removes it."""
+    from app.api.v1.ipam.router import DnsSyncCommitRequest, _apply_dns_sync
+
+    subnet, rev = await _fixture(db_session)
+    ip = await _ip(db_session, subnet, "10.81.1.90", "s90")
+    await _sync_dns_record(db_session, ip, subnet)
+    await db_session.flush()
+    (ptr,) = await _ptrs(db_session, ip)
+    await _cname_at_label(db_session, rev, ptr.name)
+
+    report = await _drift(db_session, subnet)
+    assert [(s.record_id, s.reason) for s in report.stale] == [(ptr.id, "cname-at-label")]
+    assert report.missing == [] and report.mismatched == []
+
+    _c, _u, deleted, errors = await _apply_dns_sync(
+        db_session,
+        DnsSyncCommitRequest(delete_stale_record_ids=[ptr.id]),
+        allowed_stale_ids=[s.record_id for s in report.stale],
+        restrict_subnet_id=subnet.id,
+    )
+    await db_session.flush()
+    assert errors == [] and deleted == 1
+    assert await _ptrs(db_session, ip) == []
+    assert [r.record_type for r in await _rows_at(db_session, rev, "90")] == ["CNAME"]
+    after = await _drift(db_session, subnet)
+    assert after.stale == [] and not [m for m in after.missing if m.record_type == "PTR"]
+
+
+@pytest.mark.asyncio
+async def test_drift_does_not_expect_a_ptr_at_a_cname_label(db_session: AsyncSession) -> None:
+    subnet, rev = await _fixture(db_session)
+    await _cname_at_label(db_session, rev, "65")
+    skipped = await _ip(db_session, subnet, "10.81.1.65", "s65")
+    plain = await _ip(db_session, subnet, "10.81.1.66", "s66")
+
+    report = await _drift(db_session, subnet)
+
+    ptr_missing = {m.ip_id for m in report.missing if m.record_type == "PTR"}
+    assert skipped.id not in ptr_missing
+    assert plain.id in ptr_missing  # no regression: a normal missing PTR is listed
