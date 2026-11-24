@@ -20,6 +20,41 @@ from app.tasks import dhcp_pull_leases as task
 from tests.conftest import _TestSessionLocal
 
 
+class _FakeRedis:
+    """Just the calls the pass claim makes; ``now`` is a controllable clock."""
+
+    store: dict[str, tuple[str, float]] = {}
+    now: float = 0.0
+
+    def __init__(self, *a: Any, **k: Any) -> None:
+        pass
+
+    async def set(self, key: str, val: str, nx: bool = False, px: int = 0) -> bool:
+        cur = self.store.get(key)
+        if nx and cur is not None and cur[1] > self.now:
+            return False
+        self.store[key] = (val, self.now + px / 1000)
+        return True
+
+    async def eval(self, _script: str, _n: int, key: str, token: str) -> int:
+        cur = self.store.get(key)
+        if cur is not None and cur[0] == token:
+            del self.store[key]
+            return 1
+        return 0
+
+    async def aclose(self) -> None:
+        return None
+
+
+@pytest.fixture(autouse=True)
+def _fake_redis(monkeypatch: pytest.MonkeyPatch) -> type[_FakeRedis]:
+    _FakeRedis.store = {}
+    _FakeRedis.now = 0.0
+    monkeypatch.setattr(pl, "make_async_redis", lambda *a, **k: _FakeRedis())
+    return _FakeRedis
+
+
 class _FakeEngine:
     async def dispose(self) -> None:
         return None
@@ -180,6 +215,86 @@ async def test_pull_without_release_flag_keeps_its_transaction(
 
     assert result.errors == [] and result.imported == 1
     assert drv.seen == [True, True, True]
+
+
+@pytest.mark.asyncio
+async def test_second_pass_while_first_is_mid_read_answers_busy_and_reads_nothing(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    srv = await _arm(db_session)
+    sessions = _install_task_sessions(monkeypatch)
+    outcomes: list[Any] = []
+
+    async def _overlap() -> None:
+        # The first pass is inside its wire read, holding no transaction.
+        async with _TestSessionLocal() as other:
+            other_srv = await other.get(DHCPServer, srv.id)
+            assert other_srv is not None
+            drv2 = _Drv([])
+            monkeypatch.setattr(pl, "get_driver", lambda _n: drv2)
+            outcomes.append(
+                (
+                    await pl.pull_leases_from_server(
+                        other, other_srv, apply=True, release_txn_for_wire=True
+                    ),
+                    drv2,
+                )
+            )
+            await other.rollback()
+            monkeypatch.setattr(pl, "get_driver", lambda _n: drv1)
+
+    drv1 = _Drv(sessions, on_read=_overlap)
+    monkeypatch.setattr(pl, "get_driver", lambda _n: drv1)
+
+    res = await task._run_pull()
+
+    second, drv2 = outcomes[0]
+    assert second.busy is True and drv2.seen == []
+    assert res["servers_scanned"] == 1 and res["imported"] == 1
+    assert _FakeRedis.store == {}  # released after the pass
+
+
+@pytest.mark.asyncio
+async def test_claim_released_after_a_failed_pass(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    srv = await _arm(db_session)
+
+    class _Boom(_Drv):
+        async def get_leases(self, server: Any) -> list[dict[str, Any]]:
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(pl, "get_driver", lambda _n: _Boom([]))
+
+    # A crash inside the core (not just a driver error) must also release.
+    async def _explode(*a: Any, **k: Any) -> Any:
+        raise RuntimeError("core")
+
+    result = await pl.pull_leases_from_server(
+        db_session, srv, apply=True, release_txn_for_wire=True
+    )
+    assert result.errors and _FakeRedis.store == {}
+    monkeypatch.setattr(pl, "_pull_leases_core", _explode)
+    with pytest.raises(RuntimeError):
+        await pl.pull_leases_from_server(db_session, srv, apply=True, release_txn_for_wire=True)
+    assert _FakeRedis.store == {}
+
+
+@pytest.mark.asyncio
+async def test_stale_claim_from_a_crashed_worker_is_reclaimable(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    srv = await _arm(db_session)
+    drv = _Drv([])
+    monkeypatch.setattr(pl, "get_driver", lambda _n: drv)
+    await _FakeRedis().set(pl._PASS_CLAIM_PREFIX + str(srv.id), "dead", nx=True, px=300_000)
+
+    busy = await pl.pull_leases_from_server(db_session, srv, apply=True, release_txn_for_wire=True)
+    assert busy.busy is True and drv.seen == []
+
+    _FakeRedis.now += 301  # the TTL passes; the crashed worker never released
+    ok = await pl.pull_leases_from_server(db_session, srv, apply=True, release_txn_for_wire=True)
+    assert ok.busy is False and ok.imported == 1
 
 
 def test_windows_pull_reads_pass_the_connect_timeout(monkeypatch: pytest.MonkeyPatch) -> None:

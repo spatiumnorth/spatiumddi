@@ -57,6 +57,7 @@ second run over the same wire state is a no-op (the dedup key is
 from __future__ import annotations
 
 import ipaddress
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -66,7 +67,9 @@ from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.core.dns_names import sanitize_hostname
+from app.core.redis_client import make_async_redis
 from app.drivers.dhcp import get_driver, is_agentless
 from app.models.dhcp import (
     DHCPLease,
@@ -190,6 +193,68 @@ async def _try_lock_server(db: AsyncSession, server: DHCPServer) -> bool:
     )
 
 
+# #4776 — the pass-wide claim. The advisory lock above is transaction-scoped
+# and the scheduled pass commits before its WinRM reads, so it covers only the
+# write phase; this Redis key covers the whole pass, reads included, so a
+# second pass of a server still being read answers "busy" instead of tying up
+# another worker process for the length of an unreachable host's timeouts.
+_PASS_CLAIM_PREFIX = "dhcp:pull_leases:pass:"
+# Well above the worst-case pass (three WinRM reads plus the write): a crashed
+# worker's claim expires on its own and never wedges the server.
+_PASS_CLAIM_TTL_MS = 300_000
+_PASS_CLAIM_CONNECT_TIMEOUT = 2.0
+_RELEASE_IF_OWNER = (
+    "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) end return 0"
+)
+
+
+async def _claim_pass(server_id: Any) -> tuple[bool, str | None]:
+    """Claim one whole pass of ``server_id``: ``(claimed, token)``.
+
+    ``claimed`` False means another pass holds it. Redis unreachable returns
+    ``(True, None)``: the write-phase advisory lock still keeps the writes
+    serial, and a Redis outage must not stop the pull.
+    """
+    token = uuid.uuid4().hex
+    client = None
+    try:
+        client = make_async_redis(
+            settings.redis_url, socket_connect_timeout=_PASS_CLAIM_CONNECT_TIMEOUT
+        )
+        got = await client.set(
+            _PASS_CLAIM_PREFIX + str(server_id), token, nx=True, px=_PASS_CLAIM_TTL_MS
+        )
+        return (True, token) if got else (False, None)
+    except Exception as exc:  # noqa: BLE001 — fail open, see the docstring
+        logger.warning("dhcp_pull_leases_claim_unavailable", error=str(exc))
+        return True, None
+    finally:
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception:  # noqa: BLE001 — closing a client we are done with
+                pass
+
+
+async def _release_pass(server_id: Any, token: str | None) -> None:
+    if token is None:
+        return
+    client: Any = None
+    try:
+        client = make_async_redis(
+            settings.redis_url, socket_connect_timeout=_PASS_CLAIM_CONNECT_TIMEOUT
+        )
+        await client.eval(_RELEASE_IF_OWNER, 1, _PASS_CLAIM_PREFIX + str(server_id), token)
+    except Exception as exc:  # noqa: BLE001 — the TTL expires it
+        logger.warning("dhcp_pull_leases_claim_release_failed", error=str(exc))
+    finally:
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception:  # noqa: BLE001 — closing a client we are done with
+                pass
+
+
 _SYNC_ERROR_MAX = 2000
 _SYNC_ERROR_SHOWN = 3
 
@@ -234,9 +299,22 @@ async def pull_leases_from_server(
     unreachable host, and takes the pull lock again afterwards. It commits
     whatever the caller had pending, so only a caller that wants that sets it.
     """
-    result = await _pull_leases_core(
-        db, server, apply=apply, release_txn_for_wire=release_txn_for_wire
-    )
+    claim_token: str | None = None
+    server_id = server.id
+    if apply and release_txn_for_wire:
+        # #4776 — the reads run with no transaction, so the advisory lock does
+        # not span them; claim the whole pass instead (one pull per server at
+        # a time, reads included).
+        claimed, claim_token = await _claim_pass(server_id)
+        if not claimed:
+            logger.info("dhcp_pull_leases_server_busy", server=str(server_id))
+            return PullLeasesResult(busy=True)
+    try:
+        result = await _pull_leases_core(
+            db, server, apply=apply, release_txn_for_wire=release_txn_for_wire
+        )
+    finally:
+        await _release_pass(server_id, claim_token)
     if apply and not result.busy and is_agentless(server.driver):
         if result.errors:
             server.last_sync_error = _summarise_errors(result.errors)
@@ -285,7 +363,10 @@ async def _pull_leases_core(
 
     # #2262 — one pull per server at a time. Two overlapping pulls both saw a
     # new lease as absent and both inserted it; every later pull then failed
-    # on that address. A dry run writes nothing and needs no lock.
+    # on that address. A dry run writes nothing and needs no lock. This
+    # advisory lock lasts one transaction: with ``release_txn_for_wire`` it
+    # covers the write phase only, and the pass-wide claim
+    # (``_claim_pass``, taken by the caller) covers the reads.
     if apply and not await _try_lock_server(db, server):
         result.busy = True
         logger.info("dhcp_pull_leases_server_busy", server=str(server.id))
