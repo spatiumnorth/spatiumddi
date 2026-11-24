@@ -4285,6 +4285,9 @@ export interface OUIStatus {
   interval_hours: number;
   last_updated_at: string | null;
   vendor_count: number;
+  /** #4800 — newest failed refresh since the last success. */
+  last_error?: string | null;
+  last_error_at?: string | null;
 }
 
 export interface OUITaskStatus {
@@ -12515,6 +12518,9 @@ export interface VersionInfo {
   latest_checked_at: string | null;
   release_check_enabled: boolean;
   latest_check_error: string | null;
+  // "unreachable" = no route to GitHub (DNS / connect / timeout; normal for
+  // an air-gapped install), "http" = GitHub answered with an error. #4799
+  latest_check_error_kind?: "unreachable" | "http" | null;
   // Appliance mode — true when the API runs on the SpatiumDDI OS
   // appliance ISO. Gates the "Appliance" sidebar entry and the
   // /appliance route. Phase 4 (issue #134).
@@ -13105,6 +13111,8 @@ export interface ApplianceRelease {
 export interface ApplianceReleasesResponse {
   installed_version: string;
   releases: ApplianceRelease[];
+  // Why `releases` is empty when the GitHub fetch failed (#4799).
+  fetch_error?: "unreachable" | "rate_limited" | "error" | null;
 }
 
 // #294 — read-only. The old one-click `apply` (+ `log` poll) drove a
@@ -13745,8 +13753,9 @@ export interface ApplianceRow {
   resolver_status: string | null;
   /** Issue #155 — per-host APT host-config state the supervisor reported:
    *  "synced" / "proxy-failed" / "mirror-unreachable" / "signature-mismatch"
-   *  / "no-sources" / "unmanaged", or null on non-appliance / pre-#155 /
-   *  never-reported rows. */
+   *  / "no-sources" / "unmanaged", or "update-stale" (#4800: the last
+   *  apt-get update is over 3 days old or never succeeded), or null on
+   *  non-appliance / pre-#155 / never-reported rows. */
   apt_state: string | null;
   desired_appliance_version: string | null;
   desired_slot_image_url: string | null;

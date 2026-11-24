@@ -3238,6 +3238,9 @@ class OUIStatusResponse(BaseModel):
     interval_hours: int
     last_updated_at: datetime | None
     vendor_count: int
+    # #4800 — the newest failed refresh since the last success, else null.
+    last_error: str | None = None
+    last_error_at: datetime | None = None
 
 
 class OUIRefreshResponse(BaseModel):
@@ -3268,11 +3271,17 @@ class OUITaskStatusResponse(BaseModel):
 async def get_oui_status(current_user: CurrentUser, db: DB) -> OUIStatusResponse:
     ps = await _get_or_create(db)
     count = (await db.execute(select(func.count(OUIVendor.prefix)))).scalar_one()
+    from app.tasks.oui_update import last_failure  # noqa: PLC0415
+
+    failed = await last_failure(db, ps.oui_last_updated_at)
+    nv = (failed.new_value or {}) if failed is not None else {}
     return OUIStatusResponse(
         enabled=ps.oui_lookup_enabled,
         interval_hours=ps.oui_update_interval_hours,
         last_updated_at=ps.oui_last_updated_at,
         vendor_count=int(count),
+        last_error=(nv.get("detail") or nv.get("reason")) if failed is not None else None,
+        last_error_at=failed.timestamp if failed is not None else None,
     )
 
 

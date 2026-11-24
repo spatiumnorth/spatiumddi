@@ -720,6 +720,16 @@ function OUILookupSection({
             ? new Date(status.last_updated_at).toLocaleString()
             : "never"}
         </span>
+        {status?.last_error_at && (
+          <p
+            role="alert"
+            className="mt-1 text-xs text-amber-700 dark:text-amber-400"
+          >
+            Last refresh failed at{" "}
+            {new Date(status.last_error_at).toLocaleString()}:{" "}
+            {status.last_error ?? "unknown error"}
+          </p>
+        )}
       </Field>
       <Field
         label="Vendor Count"

@@ -41,4 +41,37 @@ describe("UpdateCheckError", () => {
     );
     expect(screen.getByRole("status").getAttribute("title")).toContain("boom");
   });
+  it("unreachable renders neutral grey, not the amber warning", () => {
+    const info = {
+      ...base,
+      latest_check_error: "Could not connect to api.github.com:443",
+      latest_check_error_kind: "unreachable" as const,
+    };
+    const { unmount } = render(<UpdateCheckError compact info={info} />);
+    const chip = screen.getByRole("status");
+    expect(chip.textContent).toContain("GitHub unreachable");
+    expect(chip.textContent).not.toContain("check failed");
+    expect(chip.className).not.toContain("amber");
+    expect(chip.getAttribute("title")).toContain("turn the release check off");
+    unmount();
+    render(<UpdateCheckError info={info} />);
+    const banner = screen.getByRole("status");
+    expect(banner.textContent).toContain("GitHub isn't reachable");
+    expect(banner.className).not.toContain("amber");
+  });
+  it("an HTTP error keeps the amber warning", () => {
+    render(
+      <UpdateCheckError
+        compact
+        info={{
+          ...base,
+          latest_check_error: "HTTP 500",
+          latest_check_error_kind: "http",
+        }}
+      />,
+    );
+    const chip = screen.getByRole("status");
+    expect(chip.textContent).toContain("check failed");
+    expect(chip.className).toContain("amber");
+  });
 });
