@@ -501,7 +501,9 @@ class WindowsDHCPReadOnlyDriver(DHCPDriver):
         the upsert service doesn't branch.
         """
         creds = _load_credentials(server)
-        raw = await asyncio.to_thread(_run_ps, server, creds, _PS_LIST_LEASES)
+        raw = await asyncio.to_thread(
+            _run_ps, server, creds, _PS_LIST_LEASES, connect_timeout_sec=PROBE_CONNECT_TIMEOUT_SEC
+        )
         return _parse_leases(raw)
 
     async def get_scopes(self, server: Any) -> list[dict[str, Any]]:
@@ -539,7 +541,9 @@ class WindowsDHCPReadOnlyDriver(DHCPDriver):
         and NOT as "``Get-DhcpServerv4Reservation`` threw" (#620).
         """
         creds = _load_credentials(server)
-        raw = await asyncio.to_thread(_run_ps, server, creds, _PS_LIST_TOPOLOGY)
+        raw = await asyncio.to_thread(
+            _run_ps, server, creds, _PS_LIST_TOPOLOGY, connect_timeout_sec=PROBE_CONNECT_TIMEOUT_SEC
+        )
         return _parse_scopes(raw)
 
     async def get_failover_relationships(self, server: Any) -> dict[str, Any]:
@@ -560,7 +564,9 @@ class WindowsDHCPReadOnlyDriver(DHCPDriver):
         ``get_leases``.
         """
         creds = _load_credentials(server)
-        raw = await asyncio.to_thread(_run_ps, server, creds, _PS_LIST_FAILOVER)
+        raw = await asyncio.to_thread(
+            _run_ps, server, creds, _PS_LIST_FAILOVER, connect_timeout_sec=PROBE_CONNECT_TIMEOUT_SEC
+        )
         return _parse_failover(raw)
 
     async def probe_scopes(self, server: Any, scope_ids: Sequence[str]) -> dict[str, Any]:
