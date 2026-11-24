@@ -432,8 +432,14 @@ export function TrashPage() {
 
         <div className="flex flex-wrap items-center gap-3">
           <div className="flex items-center gap-2">
-            <label className="text-xs text-muted-foreground">Type</label>
+            <label
+              htmlFor="trash-type"
+              className="text-xs text-muted-foreground"
+            >
+              Type
+            </label>
             <select
+              id="trash-type"
               className="rounded-md border bg-background px-2 py-1 text-sm"
               value={filterType}
               onChange={(e) => {
@@ -450,8 +456,14 @@ export function TrashPage() {
             </select>
           </div>
           <div className="flex items-center gap-2">
-            <label className="text-xs text-muted-foreground">Since</label>
+            <label
+              htmlFor="trash-since"
+              className="text-xs text-muted-foreground"
+            >
+              Since
+            </label>
             <input
+              id="trash-since"
               type="datetime-local"
               value={filterSince}
               onChange={(e) => {

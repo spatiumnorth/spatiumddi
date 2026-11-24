@@ -322,10 +322,14 @@ export function NetworkImportModal({ onClose }: { onClose: () => void }) {
         </p>
 
         <div className="flex items-center gap-2">
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="network-import-export-default-community-v1-v2c"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Default community (v1/v2c)
           </label>
           <input
+            id="network-import-export-default-community-v1-v2c"
             type="text"
             value={defaultCommunity}
             onChange={(e) => setDefaultCommunity(e.target.value)}

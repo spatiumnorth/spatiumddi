@@ -485,11 +485,15 @@ function PasswordCodePrompt({
               enter their password; SSO accounts can leave it blank.
             </p>
             <div className="space-y-2">
-              <label className="text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="account-current-password"
+                className="text-xs font-medium text-muted-foreground"
+              >
                 Current password{" "}
                 <span className="font-normal">(local accounts)</span>
               </label>
               <input
+                id="account-current-password"
                 type="password"
                 autoComplete="current-password"
                 value={password}
@@ -498,10 +502,14 @@ function PasswordCodePrompt({
               />
             </div>
             <div className="space-y-2">
-              <label className="text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="account-authenticator-code"
+                className="text-xs font-medium text-muted-foreground"
+              >
                 Authenticator code
               </label>
               <input
+                id="account-authenticator-code"
                 type="text"
                 inputMode="numeric"
                 pattern="[0-9]*"

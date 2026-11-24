@@ -570,10 +570,14 @@ function ScheduleDrillForm({
         </label>
 
         <div>
-          <label className="mb-1 block text-xs font-medium">
+          <label
+            htmlFor="restore-drills-section-drill-schedule"
+            className="mb-1 block text-xs font-medium"
+          >
             Drill schedule
           </label>
           <select
+            id="restore-drills-section-drill-schedule"
             value={
               DRILL_CRON_PRESETS.find((p) => p.value === cron)?.value ??
               "__custom__"
