@@ -569,8 +569,14 @@ function ContainersPanel() {
       )}
       <div className="flex flex-wrap items-center gap-3">
         <div className="flex items-center gap-2">
-          <label className="text-xs text-muted-foreground">Name filter</label>
+          <label
+            htmlFor="platform-insights-name-filter"
+            className="text-xs text-muted-foreground"
+          >
+            Name filter
+          </label>
           <input
+            id="platform-insights-name-filter"
             value={prefix}
             onChange={(e) => setPrefix(e.target.value)}
             placeholder="(empty for all)"

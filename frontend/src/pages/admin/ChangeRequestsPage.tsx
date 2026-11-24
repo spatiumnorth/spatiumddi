@@ -67,6 +67,7 @@ import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ShieldAlert, AlertTriangle } from "lucide-react";
 import { BreakGlassModal } from "./BreakGlassModal";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
@@ -246,10 +247,14 @@ function DecisionModal({
         )}
 
         <div className="space-y-1">
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="change-requests-decision-note"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Decision note {mode === "reject" ? "" : "(optional)"}
           </label>
           <textarea
+            id="change-requests-decision-note"
             className={cn(inputCls, "min-h-[64px] resize-y")}
             maxLength={DECISION_NOTE_MAX}
             value={note}
@@ -421,6 +426,7 @@ function RequestTable({
   onDecide,
   onCancel,
   emptyText,
+  error,
 }: {
   rows: ChangeRequest[];
   canApprove: boolean;
@@ -430,11 +436,14 @@ function RequestTable({
   onDecide: (cr: ChangeRequest, mode: "approve" | "reject") => void;
   onCancel: (cr: ChangeRequest) => void;
   emptyText: string;
+  error?: unknown;
 }) {
   if (rows.length === 0) {
     return (
       <div className="rounded-md border bg-muted/20 p-6 text-center text-sm text-muted-foreground">
-        {emptyText}
+        <ListEmpty error={error} what="change requests">
+          {emptyText}
+        </ListEmpty>
       </div>
     );
   }
@@ -563,10 +572,14 @@ function PolicyEditor({
           </p>
         )}
         <div className="space-y-1">
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="change-requests-name"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Name
           </label>
           <input
+            id="change-requests-name"
             className={inputCls}
             value={name}
             disabled={locked}
@@ -575,10 +588,14 @@ function PolicyEditor({
         </div>
         <div className="grid grid-cols-2 gap-3">
           <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="change-requests-resource-type"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Resource type
             </label>
             <input
+              id="change-requests-resource-type"
               className={inputCls}
               value={resourceType}
               disabled={locked}
@@ -587,10 +604,14 @@ function PolicyEditor({
             />
           </div>
           <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="change-requests-action"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Action
             </label>
             <select
+              id="change-requests-action"
               className={inputCls}
               value={action}
               disabled={locked}
@@ -606,10 +627,14 @@ function PolicyEditor({
         </div>
         <div className="grid grid-cols-2 gap-3">
           <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="change-requests-threshold-min-rows"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Threshold (min rows)
             </label>
             <input
+              id="change-requests-threshold-min-rows"
               className={inputCls}
               type="number"
               min={1}
@@ -622,10 +647,14 @@ function PolicyEditor({
             </p>
           </div>
           <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="change-requests-ttl-hours"
+              className="text-xs font-medium text-muted-foreground"
+            >
               TTL (hours)
             </label>
             <input
+              id="change-requests-ttl-hours"
               className={inputCls}
               type="number"
               min={1}
@@ -678,7 +707,11 @@ function PolicyEditor({
 
 function PoliciesTab() {
   const qc = useQueryClient();
-  const { data: policies = [], isLoading } = useQuery({
+  const {
+    data: policies = [],
+    isLoading,
+    error: policiesError,
+  } = useQuery({
     queryKey: ["change-requests", "policies"],
     queryFn: changeRequestsApi.listPolicies,
   });
@@ -749,7 +782,9 @@ function PoliciesTab() {
         <p className="text-xs text-muted-foreground">Loading…</p>
       ) : policies.length === 0 ? (
         <div className="rounded-md border bg-muted/20 p-6 text-center text-sm text-muted-foreground">
-          No approval policies yet.
+          <ListEmpty error={policiesError} what="approval policies">
+            No approval policies yet.
+          </ListEmpty>
         </div>
       ) : (
         <div className="overflow-x-auto rounded-md border">
@@ -1056,6 +1091,7 @@ export function ChangeRequestsPage() {
               onDecide={(cr, mode) => setDecision({ cr, mode })}
               onCancel={setCancelTarget}
               emptyText="Nothing waiting for approval."
+              error={queueQuery.error}
             />
           ))}
         {tab === "queue" && <LoadMore q={queueQuery} noun="pending" />}
@@ -1073,6 +1109,7 @@ export function ChangeRequestsPage() {
               onDecide={(cr, mode) => setDecision({ cr, mode })}
               onCancel={setCancelTarget}
               emptyText="No decided requests yet."
+              error={historyQuery.error}
             />
           ))}
         {tab === "history" && <LoadMore q={historyQuery} noun="decided" />}

@@ -369,8 +369,14 @@ export function FirewallLogsSection() {
       )}
 
       <div className="flex flex-wrap items-center gap-2">
-        <label className="text-xs text-muted-foreground">Appliance</label>
+        <label
+          htmlFor="firewall-tab-appliance"
+          className="text-xs text-muted-foreground"
+        >
+          Appliance
+        </label>
         <select
+          id="firewall-tab-appliance"
           value={selected}
           onChange={(e) => setSelected(e.target.value)}
           className="rounded-md border bg-background px-2 py-1 text-sm"

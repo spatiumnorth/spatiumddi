@@ -152,10 +152,14 @@ function FieldModal({
           )}
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="custom-fields-resource-type"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Resource Type
               </label>
               <select
+                id="custom-fields-resource-type"
                 value={form.resource_type}
                 onChange={(e) => set("resource_type", e.target.value)}
                 disabled={mode === "edit"}
@@ -169,10 +173,14 @@ function FieldModal({
               </select>
             </div>
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="custom-fields-field-type"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Field Type
               </label>
               <select
+                id="custom-fields-field-type"
                 value={form.field_type}
                 onChange={(e) => set("field_type", e.target.value)}
                 disabled={mode === "edit"}
@@ -189,13 +197,17 @@ function FieldModal({
 
           {mode === "create" && (
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="custom-fields-name"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Name{" "}
                 <span className="text-muted-foreground/60">
                   (lowercase, underscores)
                 </span>
               </label>
               <input
+                id="custom-fields-name"
                 value={form.name}
                 onChange={(e) =>
                   set(
@@ -210,10 +222,14 @@ function FieldModal({
           )}
 
           <div>
-            <label className="mb-1 block text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="custom-fields-label"
+              className="mb-1 block text-xs font-medium text-muted-foreground"
+            >
               Label
             </label>
             <input
+              id="custom-fields-label"
               value={form.label}
               onChange={(e) => set("label", e.target.value)}
               placeholder="e.g. Location Code"
@@ -222,10 +238,14 @@ function FieldModal({
           </div>
 
           <div>
-            <label className="mb-1 block text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="custom-fields-description"
+              className="mb-1 block text-xs font-medium text-muted-foreground"
+            >
               Description
             </label>
             <input
+              id="custom-fields-description"
               value={form.description}
               onChange={(e) => set("description", e.target.value)}
               placeholder="Optional description"
@@ -235,13 +255,17 @@ function FieldModal({
 
           {hasOptions(form.field_type) && (
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="custom-fields-options"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Options{" "}
                 <span className="text-muted-foreground/60">
                   (comma-separated)
                 </span>
               </label>
               <input
+                id="custom-fields-options"
                 value={form.options}
                 onChange={(e) => set("options", e.target.value)}
                 placeholder="Option A, Option B, Option C"
@@ -252,10 +276,14 @@ function FieldModal({
 
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="custom-fields-default-value"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Default Value
               </label>
               <input
+                id="custom-fields-default-value"
                 value={form.default_value}
                 onChange={(e) => set("default_value", e.target.value)}
                 placeholder="Optional"
@@ -263,10 +291,14 @@ function FieldModal({
               />
             </div>
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="custom-fields-display-order"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Display Order
               </label>
               <input
+                id="custom-fields-display-order"
                 type="number"
                 value={form.display_order}
                 onChange={(e) => set("display_order", Number(e.target.value))}

@@ -408,6 +408,7 @@ def pick_reverse_zone(
     subnet: Subnet,
     ip_addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
     candidates: Sequence[ReverseCandidate],
+    view_id: uuid.UUID | None = None,
 ) -> DNSZone | None:
     """The reverse zone IPAM writes ``ip_addr``'s PTR into, or ``None``.
 
@@ -422,6 +423,13 @@ def pick_reverse_zone(
     an OVERLAPPING subnet in another IP space is never adopted (#844): both
     compute the same name, and a bare suffix match would fold two tenants'
     PTRs together.
+
+    ``view_id`` is the view of the forward zone the address's A record is
+    written to (#4797): a group may hold the same reverse zone once per view,
+    and the PTR belongs in the forward zone's view, never another's. Only a
+    zone pinned to that view, or to none, is a candidate; when the view has no
+    reverse zone the result is ``None`` (no PTR) even if another view has one.
+    ``None`` (a forward zone pinned to no view, or none) leaves every view in.
     """
     rev_pointer = ip_addr.reverse_pointer + "."
 
@@ -432,6 +440,8 @@ def pick_reverse_zone(
     best: DNSZone | None = None
     for c in candidates:
         z = c.zone
+        if view_id is not None and z.view_id is not None and z.view_id != view_id:
+            continue
         own = z.linked_subnet_id == subnet.id and z.kind == "reverse"
         if not (own or c.in_group) or not covers(z):
             continue
@@ -453,12 +463,23 @@ def pick_reverse_zone(
                 "IP space; PTR would leak across tenants (#844)",
             )
             continue
-        if best is None or reverse_owner_key(z) > reverse_owner_key(best):
+        # A zone of the forward zone's own view beats an unpinned one of the
+        # same name (which every view renders), and an unpinned forward zone
+        # takes an unpinned reverse zone first: the pick no longer follows
+        # row order (#4797).
+        if best is None or (reverse_owner_key(z), z.view_id == view_id) > (
+            reverse_owner_key(best),
+            best.view_id == view_id,
+        ):
             best = z
     return best if best is not None and ipam_authors_zone(best) else None
 
 
-def _subnet_reverse_zones(subnet: Subnet, candidates: Sequence[ReverseCandidate]) -> list[DNSZone]:
+def _subnet_reverse_zones(
+    subnet: Subnet,
+    candidates: Sequence[ReverseCandidate],
+    view_id: uuid.UUID | None = None,
+) -> list[DNSZone]:
     """Every reverse zone that takes the PTR of at least one of ``subnet``'s
     addresses, in address order (spatiumddi#1840).
 
@@ -480,7 +501,7 @@ def _subnet_reverse_zones(subnet: Subnet, candidates: Sequence[ReverseCandidate]
     out: list[DNSZone] = []
     seen: set[uuid.UUID] = set()
     for start in sorted(starts):
-        z = pick_reverse_zone(subnet, ipaddress.ip_address(start), candidates)
+        z = pick_reverse_zone(subnet, ipaddress.ip_address(start), candidates, view_id)
         if z is not None and z.id not in seen:
             seen.add(z.id)
             out.append(z)
@@ -492,10 +513,11 @@ async def resolve_reverse_zone(
     subnet: Subnet,
     ip_addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
     group_ids: Sequence[object],
+    view_id: uuid.UUID | None = None,
 ) -> DNSZone | None:
     """:func:`pick_reverse_zone` over freshly loaded candidates."""
     cands = await load_reverse_candidates(db, subnet, group_ids)
-    return pick_reverse_zone(subnet, ip_addr, cands)
+    return pick_reverse_zone(subnet, ip_addr, cands, view_id)
 
 
 # ── Drift computation ────────────────────────────────────────────────────────
@@ -742,7 +764,9 @@ async def compute_subnet_dns_drift(
     # the subnet's addresses resolve to.
     rev_group_ids, _ = await _effective_dns(db, subnet)
     rev_cands = await load_reverse_candidates(db, subnet, rev_group_ids)
-    subnet_rev_zones = _subnet_reverse_zones(subnet, rev_cands)
+    subnet_rev_zones = _subnet_reverse_zones(
+        subnet, rev_cands, forward_zone.view_id if forward_zone else None
+    )
     reverse_zone = subnet_rev_zones[0] if subnet_rev_zones else None
     rev_zones_by_id = {c.zone.id: c.zone for c in rev_cands}
     try:
@@ -1194,7 +1218,12 @@ async def compute_subnet_dns_drift(
         # reconciler rewrites every PTR to that broken value instead of
         # deleting them.
         try:
-            rz = pick_reverse_zone(subnet, ipaddress.ip_address(str(ip.address)), rev_cands)
+            rz = pick_reverse_zone(
+                subnet,
+                ipaddress.ip_address(str(ip.address)),
+                rev_cands,
+                ip_zone.view_id if ip_zone else None,
+            )
         except ValueError:
             continue
         if rz and ip_zone and primary_unpublishable:

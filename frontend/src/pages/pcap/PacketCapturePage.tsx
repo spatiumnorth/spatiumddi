@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Activity, Download, Loader2, Trash2 } from "lucide-react";
@@ -332,8 +332,14 @@ function CaptureForm({
       }}
     >
       <div>
-        <label className="mb-1 block text-xs font-medium">Vantage</label>
+        <label
+          htmlFor="packet-capture-vantage"
+          className="mb-1 block text-xs font-medium"
+        >
+          Vantage
+        </label>
         <select
+          id="packet-capture-vantage"
           value={vantage}
           onChange={(e) => {
             setVantage(e.target.value);
@@ -352,9 +358,19 @@ function CaptureForm({
       </div>
 
       <div>
-        <label className="mb-1 block text-xs font-medium">Interface</label>
+        <label
+          htmlFor={
+            ifaceList.length > 0
+              ? "packet-capture-interface"
+              : "packet-capture-interface-name"
+          }
+          className="mb-1 block text-xs font-medium"
+        >
+          Interface
+        </label>
         {ifaceList.length > 0 && (
           <select
+            id="packet-capture-interface"
             value={customIface ? "__other__" : iface}
             onChange={(e) => {
               if (e.target.value === "__other__") {
@@ -382,7 +398,9 @@ function CaptureForm({
           // the operator type any NIC (bridges / overlay / VPN that udev
           // didn't name). The host runner validates it against /sys/class/net.
           <input
+            id="packet-capture-interface-name"
             type="text"
+            aria-label={ifaceList.length > 0 ? "Interface name" : undefined}
             value={iface}
             onChange={(e) => setIface(e.target.value)}
             placeholder="e.g. br0, vmbr0, tailscale0, any"
@@ -401,8 +419,14 @@ function CaptureForm({
       </div>
 
       <div>
-        <label className="mb-1 block text-xs font-medium">BPF filter</label>
+        <label
+          htmlFor="packet-capture-bpf-filter"
+          className="mb-1 block text-xs font-medium"
+        >
+          BPF filter
+        </label>
         <input
+          id="packet-capture-bpf-filter"
           type="text"
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
@@ -507,10 +531,14 @@ function NumField({
   onChange: (v: number | "") => void;
   max: number;
 }) {
+  const id = useId();
   return (
     <div>
-      <label className="mb-1 block text-xs font-medium">{label}</label>
+      <label htmlFor={id} className="mb-1 block text-xs font-medium">
+        {label}
+      </label>
       <input
+        id={id}
         type="number"
         min={1}
         max={max}

@@ -18,7 +18,7 @@ pre-#62 handler when the module is off:
   is preserved in the same order.
 * ``apply()`` / ``preview()`` raise the original handler's HTTP statuses —
   ``HTTPException(404)`` for not-found, ``HTTPException(409)`` for
-  not-empty / conflict, ``HTTPException(403)`` for superadmin-required —
+  not-empty / conflict, ``OperationPermissionError`` for superadmin-required (#4790) —
   CONSISTENTLY across all six ops. (A bare ``ValueError`` here would
   surface as a 500 to the inline caller — fixed.)
 * ``apply()`` does NOT call ``enforce_operation_permission``: the inline
@@ -35,7 +35,8 @@ pre-#62 handler when the module is off:
   were fully ``SuperAdmin``-gated until #1861 opened their soft-delete to
   the resource's ``delete`` permission); ``delete_group`` is still fully
   ``SuperAdmin``-gated at the route, so its ``apply()`` requires superadmin
-  ALWAYS. A failed check raises ``HTTPException(403)``.
+  ALWAYS. A failed check raises ``OperationPermissionError`` (#4790), so the
+  request stays pending for a superadmin approver instead of ending ``failed``.
 * The ``permanent`` / ``force`` flags are frozen into the args model so
   the approved replay takes the *identical* branch the requester intended.
 * Audit ``action`` strings stay exactly as today (``soft_delete`` on the
@@ -69,6 +70,7 @@ from app.models.auth import User
 from app.services.ai.operations import (
     Operation,
     PreviewResult,
+    ensure_superadmin_step,
     get_operation,
     register,
 )
@@ -483,7 +485,6 @@ async def _apply_delete_subnet(
 ) -> dict[str, Any]:
     """Body factored verbatim from ipam/router.py:delete_subnet."""
 
-    from app.api.deps import ensure_superadmin
     from app.api.v1.ipam.router import (
         _audit,
         _enforce_subnet_token_scope,
@@ -575,7 +576,7 @@ async def _apply_delete_subnet(
             await _revoke_residual_subnet_mirrors(db, subnet_id, _revoke_subnet_lease_mirrors)
         return {"subnet_id": str(args.subnet_id), "mode": "soft_delete"}
 
-    ensure_superadmin(user)
+    ensure_superadmin_step(user, "A permanent subnet delete")
 
     # An E911 binding on the subnet or an address in it would go with the
     # cascade; ``force`` skips the non-empty check, never this (#3891).
@@ -703,6 +704,7 @@ _OP_DELETE_SUBNET = Operation(
     preview=_preview_delete_subnet,
     apply=_apply_delete_subnet,
     category="ipam",
+    superadmin_when=lambda a: a.permanent,
     required_permission=("delete", "subnet"),
 )
 register(_OP_DELETE_SUBNET)
@@ -779,7 +781,6 @@ async def _apply_delete_block(
     db: AsyncSession, user: User, args: DeleteBlockArgs
 ) -> dict[str, Any]:
     """Body factored verbatim from ipam/router.py:delete_block."""
-    from app.api.deps import ensure_superadmin
     from app.api.v1.ipam.router import _audit, _update_block_utilization
     from app.models.ipam import IPBlock
     from app.services.soft_delete import apply_soft_delete, collect_soft_delete_batch
@@ -789,7 +790,7 @@ async def _apply_delete_block(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP block not found")
 
     if args.permanent:
-        ensure_superadmin(user)
+        ensure_superadmin_step(user, "A permanent block delete")
         detail = await _block_not_empty_detail(db, args.block_id, block.network)
         if detail is not None:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
@@ -870,6 +871,7 @@ _OP_DELETE_BLOCK = Operation(
     preview=_preview_delete_block,
     apply=_apply_delete_block,
     category="ipam",
+    superadmin_when=lambda a: a.permanent,
     required_permission=("delete", "ip_block"),
 )
 register(_OP_DELETE_BLOCK)
@@ -946,7 +948,6 @@ async def _apply_delete_space(
     db: AsyncSession, user: User, args: DeleteSpaceArgs
 ) -> dict[str, Any]:
     """Body factored verbatim from ipam/router.py:delete_space."""
-    from app.api.deps import ensure_superadmin
     from app.api.v1.ipam.router import _audit
     from app.models.ipam import IPSpace
     from app.services.soft_delete import apply_soft_delete, collect_soft_delete_batch
@@ -956,7 +957,7 @@ async def _apply_delete_space(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
 
     if args.permanent:
-        ensure_superadmin(user)
+        ensure_superadmin_step(user, "A permanent space delete")
         detail = await _space_not_empty_detail(db, args.space_id, space.name)
         if detail is not None:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
@@ -1030,6 +1031,7 @@ _OP_DELETE_SPACE = Operation(
     preview=_preview_delete_space,
     apply=_apply_delete_space,
     category="ipam",
+    superadmin_when=lambda a: a.permanent,
     required_permission=("delete", "ip_space"),
 )
 register(_OP_DELETE_SPACE)
@@ -1091,7 +1093,6 @@ async def _preview_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArg
 
 async def _apply_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArgs) -> dict[str, Any]:
     """Body factored verbatim from dns/router.py:delete_zone."""
-    from app.api.deps import ensure_superadmin
     from app.api.v1.dns.router import (
         _push_zone_to_agentless_servers,
         _reject_if_synthesised_zone,
@@ -1105,9 +1106,9 @@ async def _apply_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArgs)
     # default soft-delete (#1861), and only the permanent branch takes a
     # superadmin, as on the IPAM deletes. The approve path bypasses the route's
     # dependencies, so this is where it is enforced for it. Checked before any
-    # side effect; ensure_superadmin raises HTTPException(403).
+    # side effect; ensure_superadmin_step raises OperationPermissionError (#4790).
     if args.permanent:
-        ensure_superadmin(user)
+        ensure_superadmin_step(user, "A permanent zone delete")
 
     zone = await _require_zone(args.group_id, args.zone_id, db)  # raises 404 if absent
     _reject_if_synthesised_zone(zone, "delete")
@@ -1243,6 +1244,7 @@ _OP_DELETE_ZONE = Operation(
     preview=_preview_delete_zone,
     apply=_apply_delete_zone,
     category="dns",
+    superadmin_when=lambda a: a.permanent,
     required_permission=("delete", "dns_zone"),
 )
 register(_OP_DELETE_ZONE)
@@ -1430,7 +1432,6 @@ async def _apply_delete_scope(
     db: AsyncSession, user: User, args: DeleteScopeArgs
 ) -> dict[str, Any]:
     """Body factored verbatim from dhcp/scopes.py:delete_scope."""
-    from app.api.deps import ensure_superadmin
     from app.api.v1.dhcp._audit import write_audit
     from app.api.v1.dhcp.phone_profiles import refuse_scope_removal_orphaning_classes
     from app.core.agent_wake import collect_wake, dhcp_group_channel, publish_wake
@@ -1444,7 +1445,7 @@ async def _apply_delete_scope(
     # (#1861), the permanent branch superadmin-only, checked before any side
     # effect.
     if args.permanent:
-        ensure_superadmin(user)
+        ensure_superadmin_step(user, "A permanent scope delete")
 
     # #3748 — the scope's gate, exclusive, before any row lock: lease-events
     # batches from both members of an HA pair hold the scope ``FOR KEY SHARE``
@@ -1571,6 +1572,7 @@ _OP_DELETE_SCOPE = Operation(
     preview=_preview_delete_scope,
     apply=_apply_delete_scope,
     category="dhcp",
+    superadmin_when=lambda a: a.permanent,
     required_permission=("delete", "dhcp_scope"),
 )
 register(_OP_DELETE_SCOPE)
@@ -1652,12 +1654,11 @@ async def _apply_delete_group(
     db: AsyncSession, user: User, args: DeleteGroupArgs
 ) -> dict[str, Any]:
     """Body factored verbatim from dhcp/server_groups.py:delete_group."""
-    from app.api.deps import ensure_superadmin
     from app.api.v1.dhcp._audit import write_audit
     from app.models.dhcp import DHCPServer, DHCPServerGroup
 
     # The original DELETE route was fully SuperAdmin-gated (#8).
-    ensure_superadmin(user)
+    ensure_superadmin_step(user, "Deleting a DHCP server group")
 
     g = await db.get(DHCPServerGroup, args.group_id)
     if g is None:
@@ -1820,6 +1821,7 @@ _OP_DELETE_GROUP = Operation(
     category="dhcp",
     # The REST route is SuperAdmin-only; this declares the granular backstop
     # the approver is checked against (a superadmin approver passes via {*,*}).
+    superadmin_when=lambda a: True,
     required_permission=("delete", "dhcp_server_group"),
 )
 register(_OP_DELETE_GROUP)

@@ -59,8 +59,14 @@ export function PropagationCheckModal({
     <Modal title={`Propagation check — ${fqdn}`} onClose={onClose} wide>
       <div className="space-y-4 text-sm">
         <div className="flex items-center gap-3">
-          <label className="text-xs text-muted-foreground">Record type</label>
+          <label
+            htmlFor="propagation-check-record-type"
+            className="text-xs text-muted-foreground"
+          >
+            Record type
+          </label>
           <select
+            id="propagation-check-record-type"
             value={activeType}
             onChange={(e) => setActiveType(e.target.value)}
             className="rounded border bg-background px-2 py-1 text-xs"
