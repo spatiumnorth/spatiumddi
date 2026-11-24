@@ -2815,9 +2815,14 @@ async def _cname_at(
     rtype: str,
     *,
     exclude_id: uuid.UUID | None = None,
+    name: str | None = None,
 ) -> bool:
     """Whether a CNAME (or, for a CNAME, anything) already holds the name an
-    IP's forward record would be written at (#1441).
+    IP's record would be written at (#1441).
+
+    ``name`` defaults to the host name (the forward record); the PTR passes
+    its owner name in the reverse zone (#4796: RFC 2317's classless
+    delegation puts a CNAME at an address's label there).
 
     A name that holds a CNAME holds nothing else (RFC 1034 section 3.6.2,
     RFC 2181 section 10.1). #1381 made the record API refuse such a pair,
@@ -2830,17 +2835,18 @@ async def _cname_at(
     """
     from app.services.dns.cname_conflict import find_cname_conflict  # noqa: PLC0415
 
-    if not ip.hostname:
+    owner = name if name is not None else ip.hostname
+    if not owner:
         return False
     other = await find_cname_conflict(
-        db, zone.id, view_id=None, name=ip.hostname, record_type=rtype, exclude_id=exclude_id
+        db, zone.id, view_id=None, name=owner, record_type=rtype, exclude_id=exclude_id
     )
     if other is None:
         return False
     # #1493 — every DHCP renewal re-runs the sync for such a name, so the
     # warning is logged once per (address, hostname, zone) in this process
     # and at debug after that.
-    key = (str(ip.address), ip.hostname, zone.name)
+    key = (str(ip.address), owner, zone.name)
     log = logger.debug if key in _cname_skip_logged else logger.warning
     _cname_skip_logged[key] = None
     while len(_cname_skip_logged) > _CNAME_SKIP_LOG_MAX:
@@ -2852,7 +2858,7 @@ async def _cname_at(
         zone=zone.name,
         conflicting_record_id=str(other.id),
         conflicting_type=other.record_type,
-        detail=f"{ip.hostname} already holds a {other.record_type}; no {rtype} written",
+        detail=f"{owner} already holds a {other.record_type}; no {rtype} written",
     )
     return True
 
@@ -3879,6 +3885,34 @@ async def _sync_dns_record(
         )
     )
     existing_ptr = result.scalars().all()
+
+    # #4796 — a CNAME at the PTR's name (RFC 2317 puts one at an address's
+    # label in a /24's reverse zone) holds no PTR: the record API refuses
+    # the pair and BIND refuses the zone file. Skip the PTR, as the forward
+    # record is skipped (#1441), and retract one an earlier release wrote
+    # beside it, so a re-sync repairs the zone.
+    if await _cname_at(db, rev_zone, ip, "PTR", name=ptr_name):
+        for record in existing_ptr:
+            if record.id in skip_existing:
+                continue
+            old_zone = (
+                rev_zone if record.zone_id == rev_zone.id else await db.get(DNSZone, record.zone_id)
+            )
+            if old_zone is not None and ipam_authors_zone(old_zone):
+                await _enqueue_dns_op(
+                    db,
+                    old_zone,
+                    "delete",
+                    record.name,
+                    "PTR",
+                    record.value,
+                    record.ttl,
+                    record_id=record.id,
+                )
+            await db.delete(record)
+            if ip.reverse_zone_id == record.zone_id:
+                ip.reverse_zone_id = None
+        return True
 
     if not existing_ptr:
         ptr_twin = await _operator_record_twin(

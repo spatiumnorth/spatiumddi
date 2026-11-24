@@ -65,6 +65,8 @@ const STALE_REASON_TEXT: Record<string, string> = {
     "The address is still in IPAM, but a hostname named exactly 'gateway' gets a PTR and no A/AAAA record, so every subnet's gateway doesn't collide on gateway.<zone>. Rename the host (e.g. 'gw', 'core-rtr1') or keep this record by adding it by hand instead.",
   "no-forward-zone":
     "The subnet has no forward zone now, so there is no domain to build the name from and the record can't be kept in sync.",
+  "cname-at-label":
+    "The reverse zone holds a CNAME at this name (for example a classless RFC 2317 delegation), and a name with a CNAME can hold no other record, so the PTR stops the zone from loading. Deleting it lets the zone load; the CNAME stays.",
 };
 
 /** Plain-words sentence for a stale reason; unknown codes fall back to the code. */
