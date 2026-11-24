@@ -1118,7 +1118,10 @@ async def _check_ip_collisions(
         except ValueError:
             ip_obj = None
         if ip_obj is not None:
-            rev_zone = await _resolve_reverse_zone(db, subnet, ip_obj)
+            fwd_zone = await db.get(DNSZone, forward_zone_id)
+            rev_zone = await _resolve_reverse_zone(
+                db, subnet, ip_obj, fwd_zone.view_id if fwd_zone else None
+            )
             if rev_zone is not None:
                 rev_pointer_full = ip_obj.reverse_pointer + "."
                 rev_zone_name = rev_zone.name.rstrip(".") + "."
@@ -2114,7 +2117,10 @@ async def _pick_next_available_ip(
 
 
 async def _resolve_reverse_zone(
-    db: AsyncSession, subnet: Subnet, ip_addr: ipaddress.IPv4Address | ipaddress.IPv6Address
+    db: AsyncSession,
+    subnet: Subnet,
+    ip_addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    view_id: uuid.UUID | None = None,
 ) -> DNSZone | None:
     """Find the reverse zone covering this IP: a zone linked to the subnet
     that covers it, else the most specific reverse zone in the subnet's
@@ -2125,9 +2131,13 @@ async def _resolve_reverse_zone(
     most-specific-zone rule of #1419) is ``pick_reverse_zone``, shared with
     the drift check so the two cannot disagree about an address's zone. It is
     per ADDRESS: a subnet wider than a /24 spans more than one (#1840).
+
+    ``view_id`` is the view of the forward zone the A record goes into: the
+    PTR stays in that view's reverse zone, and no PTR is written when only
+    another view holds one (#4797).
     """
     effective_group_ids, _, _ = await _resolve_effective_dns(db, subnet)
-    return await resolve_reverse_zone(db, subnet, ip_addr, effective_group_ids)
+    return await resolve_reverse_zone(db, subnet, ip_addr, effective_group_ids, view_id)
 
 
 # When set (inside a ``_batched_dns_ops`` block), ``_enqueue_dns_op`` defers
@@ -3819,7 +3829,9 @@ async def _sync_dns_record(
         ip_obj = ipaddress.ip_address(str(ip.address))
     except ValueError:
         return True
-    rev_zone = await _resolve_reverse_zone(db, subnet, ip_obj)
+    rev_zone = await _resolve_reverse_zone(
+        db, subnet, ip_obj, zone.view_id if zone is not None else None
+    )
     if rev_zone is None:
         # No zone IPAM authors covers this IP — skip the PTR. A PTR in a
         # primary zone is left alone, as before; one a release before #1419

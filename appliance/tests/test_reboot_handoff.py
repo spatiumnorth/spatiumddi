@@ -332,10 +332,14 @@ def _module():
     return mod
 
 
+# The fake kubectl switches the primary after a number of GETs, not after a
+# time, so the handoff budget must be long enough for those GETs on the
+# slowest runner (#4725): a 5 s budget timed out once in CI. A test that wants
+# the budget to run out passes its own short ``handoff_s``.
 def _run(tmp_path: Path, argv: tuple, *, clusters: list | None = None,
          pods: list | None = None, slices: list | None = None, node: dict | None = None,
          no_node: bool = False, wait_s: float = 5.0, short_wait_s: float = 1.0,
-         handoff_s: float = 5.0, cordon_s: float = 5.0, env_extra: dict | None = None,
+         handoff_s: float = 60.0, cordon_s: float = 5.0, env_extra: dict | None = None,
          **state) -> tuple[subprocess.CompletedProcess, dict]:
     fake = tmp_path / "fake_kubectl.py"
     fake.write_text(FAKE_KUBECTL)

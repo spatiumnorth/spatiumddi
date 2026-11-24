@@ -352,9 +352,9 @@ function TokenModal({
       <div className="space-y-4">
         <p className="text-sm text-muted-foreground">{subtitle}</p>
         <div className="space-y-1">
-          <label className="block text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+          <span className="block text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
             Poll URL
-          </label>
+          </span>
           <CopyableValue value={url} />
           <p className="text-[11px] text-muted-foreground">
             Point your FortiGate External Threat Feed (or Cisco SI feed) at this
@@ -362,9 +362,9 @@ function TokenModal({
           </p>
         </div>
         <div className="space-y-1">
-          <label className="block text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+          <span className="block text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
             Token
-          </label>
+          </span>
           <CopyableValue value={result.token} mono />
         </div>
         <div className="flex justify-end">
@@ -472,15 +472,15 @@ function RevealModal({
         ) : (
           <div className="space-y-3">
             <div className="space-y-1">
-              <label className="block text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+              <span className="block text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
                 Poll URL
-              </label>
+              </span>
               <CopyableValue value={fullPollUrl(revealed.poll_path)} />
             </div>
             <div className="space-y-1">
-              <label className="block text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+              <span className="block text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
                 Token
-              </label>
+              </span>
               <CopyableValue value={revealed.token} mono />
             </div>
             <div className="flex justify-end gap-2 pt-1">

@@ -553,6 +553,7 @@ async def _publish_zone_ids(
         _resolve_effective_zone,
         _resolve_reverse_zone,
     )
+    from app.models.dns import DNSZone  # noqa: PLC0415
     from app.services.dns.ddns import (  # noqa: PLC0415
         _resolve_override_zone_id,
         resolve_effective_ddns,
@@ -589,7 +590,9 @@ async def _publish_zone_ids(
         except ValueError:
             addr = None
         if addr is not None:
-            rev = await _resolve_reverse_zone(db, subnet, addr)
+            fwd_id = zone_id or await _resolve_effective_zone(db, subnet) or ip.forward_zone_id
+            fwd = await db.get(DNSZone, fwd_id) if fwd_id else None
+            rev = await _resolve_reverse_zone(db, subnet, addr, fwd.view_id if fwd else None)
             if rev is not None:
                 found.add(rev.id)
     return found

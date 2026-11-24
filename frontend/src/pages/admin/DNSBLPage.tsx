@@ -131,7 +131,10 @@ export function DNSBLPage() {
       <section className="rounded-lg border p-4">
         <h2 className="mb-3 text-sm font-semibold">Sweep settings</h2>
         <div className="space-y-3">
-          <label className="flex items-center justify-between gap-4">
+          <label
+            htmlFor="dnsblpage-field"
+            className="flex items-center justify-between gap-4"
+          >
             <div>
               <div className="text-sm font-medium">Enable daily sweep</div>
               <div className="text-xs text-muted-foreground">
@@ -157,6 +160,7 @@ export function DNSBLPage() {
               </div>
             </div>
             <input
+              id="dnsblpage-field"
               type="number"
               min={6}
               max={168}

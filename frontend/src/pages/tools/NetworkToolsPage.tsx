@@ -349,8 +349,11 @@ function RunFromSelector({
 }) {
   return (
     <div className="rounded-md border border-border bg-muted/30 p-2">
-      <label className={labelCls}>Run from</label>
+      <label htmlFor="network-tools-run-from" className={labelCls}>
+        Run from
+      </label>
       <select
+        id="network-tools-run-from"
         className={inputCls}
         value={value}
         onChange={(e) => onChange(e.target.value)}
@@ -513,8 +516,11 @@ export function CommandTool({
   return (
     <div className="space-y-3">
       <div>
-        <label className={labelCls}>Host</label>
+        <label htmlFor="network-tools-host" className={labelCls}>
+          Host
+        </label>
         <input
+          id="network-tools-host"
           className={cn(inputCls, "font-mono")}
           value={host}
           onChange={(e) => setHost(e.target.value)}
@@ -577,8 +583,11 @@ function DigTool({ target }: { target?: NetToolTarget }) {
     <div className="space-y-3">
       <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
         <div className="sm:col-span-2">
-          <label className={labelCls}>Name</label>
+          <label htmlFor="network-tools-name" className={labelCls}>
+            Name
+          </label>
           <input
+            id="network-tools-name"
             className={cn(inputCls, "font-mono")}
             value={name}
             onChange={(e) => setName(e.target.value)}
@@ -588,8 +597,11 @@ function DigTool({ target }: { target?: NetToolTarget }) {
           />
         </div>
         <div>
-          <label className={labelCls}>Type</label>
+          <label htmlFor="network-tools-type" className={labelCls}>
+            Type
+          </label>
           <select
+            id="network-tools-type"
             className={inputCls}
             value={recordType}
             onChange={(e) => setRecordType(e.target.value)}
@@ -603,8 +615,11 @@ function DigTool({ target }: { target?: NetToolTarget }) {
         </div>
       </div>
       <div>
-        <label className={labelCls}>Resolver (optional)</label>
+        <label htmlFor="network-tools-resolver-optional" className={labelCls}>
+          Resolver (optional)
+        </label>
         <input
+          id="network-tools-resolver-optional"
           className={cn(inputCls, "font-mono")}
           value={server}
           onChange={(e) => setServer(e.target.value)}
@@ -650,8 +665,11 @@ function WhoisTool() {
   return (
     <div className="space-y-3">
       <div>
-        <label className={labelCls}>Query</label>
+        <label htmlFor="network-tools-query" className={labelCls}>
+          Query
+        </label>
         <input
+          id="network-tools-query"
           className={cn(inputCls, "font-mono")}
           value={query}
           onChange={(e) => setQuery(e.target.value)}
@@ -724,8 +742,11 @@ function PortTestTool({ target }: { target?: NetToolTarget }) {
     <div className="space-y-3">
       <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
         <div className="sm:col-span-2">
-          <label className={labelCls}>Host</label>
+          <label htmlFor="network-tools-host-2" className={labelCls}>
+            Host
+          </label>
           <input
+            id="network-tools-host-2"
             className={cn(inputCls, "font-mono")}
             value={host}
             onChange={(e) => setHost(e.target.value)}
@@ -735,8 +756,11 @@ function PortTestTool({ target }: { target?: NetToolTarget }) {
           />
         </div>
         <div>
-          <label className={labelCls}>Port</label>
+          <label htmlFor="network-tools-port" className={labelCls}>
+            Port
+          </label>
           <input
+            id="network-tools-port"
             className={cn(inputCls, "font-mono")}
             value={port}
             onChange={(e) => setPort(e.target.value)}
@@ -746,8 +770,14 @@ function PortTestTool({ target }: { target?: NetToolTarget }) {
         </div>
       </div>
       <div>
-        <label className={labelCls}>Protocol</label>
-        <div className="flex gap-2">
+        <span id="network-tools-protocol-label" className={labelCls}>
+          Protocol
+        </span>
+        <div
+          role="radiogroup"
+          aria-labelledby="network-tools-protocol-label"
+          className="flex gap-2"
+        >
           {(["tcp", "udp"] as const).map((p) => (
             <label
               key={p}
@@ -852,8 +882,11 @@ function TlsCertTool({ target }: { target?: NetToolTarget }) {
     <div className="space-y-3">
       <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
         <div className="sm:col-span-2">
-          <label className={labelCls}>Host</label>
+          <label htmlFor="network-tools-host-3" className={labelCls}>
+            Host
+          </label>
           <input
+            id="network-tools-host-3"
             className={cn(inputCls, "font-mono")}
             value={host}
             onChange={(e) => setHost(e.target.value)}
@@ -863,8 +896,11 @@ function TlsCertTool({ target }: { target?: NetToolTarget }) {
           />
         </div>
         <div>
-          <label className={labelCls}>Port</label>
+          <label htmlFor="network-tools-port-2" className={labelCls}>
+            Port
+          </label>
           <input
+            id="network-tools-port-2"
             className={cn(inputCls, "font-mono")}
             value={port}
             onChange={(e) => setPort(e.target.value)}
@@ -872,8 +908,14 @@ function TlsCertTool({ target }: { target?: NetToolTarget }) {
         </div>
       </div>
       <div>
-        <label className={labelCls}>SNI override (optional)</label>
+        <label
+          htmlFor="network-tools-sni-override-optional"
+          className={labelCls}
+        >
+          SNI override (optional)
+        </label>
         <input
+          id="network-tools-sni-override-optional"
           className={cn(inputCls, "font-mono")}
           value={serverName}
           onChange={(e) => setServerName(e.target.value)}
@@ -1013,8 +1055,11 @@ function PropagationTool() {
     <div className="space-y-3">
       <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
         <div className="sm:col-span-2">
-          <label className={labelCls}>Name</label>
+          <label htmlFor="network-tools-name-2" className={labelCls}>
+            Name
+          </label>
           <input
+            id="network-tools-name-2"
             className={cn(inputCls, "font-mono")}
             value={name}
             onChange={(e) => setName(e.target.value)}
@@ -1024,8 +1069,11 @@ function PropagationTool() {
           />
         </div>
         <div>
-          <label className={labelCls}>Type</label>
+          <label htmlFor="network-tools-type-2" className={labelCls}>
+            Type
+          </label>
           <select
+            id="network-tools-type-2"
             className={inputCls}
             value={recordType}
             onChange={(e) => setRecordType(e.target.value)}
@@ -1116,8 +1164,11 @@ function MacVendorTool() {
   return (
     <div className="space-y-3">
       <div>
-        <label className={labelCls}>MAC addresses</label>
+        <label htmlFor="network-tools-mac-addresses" className={labelCls}>
+          MAC addresses
+        </label>
         <textarea
+          id="network-tools-mac-addresses"
           className={cn(inputCls, "min-h-[5rem] font-mono")}
           value={raw}
           onChange={(e) => setRaw(e.target.value)}
@@ -1208,8 +1259,11 @@ function WolTool({ target }: { target?: NetToolTarget }) {
   return (
     <div className="space-y-3">
       <div>
-        <label className={labelCls}>MAC address</label>
+        <label htmlFor="network-tools-mac-address" className={labelCls}>
+          MAC address
+        </label>
         <input
+          id="network-tools-mac-address"
           className={cn(inputCls, "font-mono")}
           value={mac}
           onChange={(e) => setMac(e.target.value)}
@@ -1218,8 +1272,14 @@ function WolTool({ target }: { target?: NetToolTarget }) {
       </div>
       <div className="grid grid-cols-2 gap-3">
         <div>
-          <label className={labelCls}>Broadcast (optional)</label>
+          <label
+            htmlFor="network-tools-broadcast-optional"
+            className={labelCls}
+          >
+            Broadcast (optional)
+          </label>
           <input
+            id="network-tools-broadcast-optional"
             className={cn(inputCls, "font-mono")}
             value={broadcast}
             onChange={(e) => setBroadcast(e.target.value)}
@@ -1227,8 +1287,11 @@ function WolTool({ target }: { target?: NetToolTarget }) {
           />
         </div>
         <div>
-          <label className={labelCls}>Port</label>
+          <label htmlFor="network-tools-port-3" className={labelCls}>
+            Port
+          </label>
           <input
+            id="network-tools-port-3"
             className={cn(inputCls, "font-mono")}
             type="number"
             min={1}
