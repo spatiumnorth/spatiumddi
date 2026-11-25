@@ -1678,77 +1678,95 @@ export function DashboardPage() {
   const tailscaleEnabled = settings?.integration_tailscale_enabled ?? false;
   const unifiEnabled = settings?.integration_unifi_enabled ?? false;
   const netbirdEnabled = settings?.integration_netbird_enabled ?? false;
-  const { data: k8sClusters = [] } = useQuery<KubernetesCluster[]>({
+  const { data: k8sClusters = [], error: k8sClustersError } = useQuery<
+    KubernetesCluster[]
+  >({
     queryKey: ["kubernetes-clusters"],
     queryFn: kubernetesApi.listClusters,
     enabled: kubernetesEnabled,
     refetchInterval: pollUnlessRefused(30_000),
   });
-  const { data: dockerHosts = [] } = useQuery<DockerHost[]>({
+  const { data: dockerHosts = [], error: dockerHostsError } = useQuery<
+    DockerHost[]
+  >({
     queryKey: ["docker-hosts"],
     queryFn: dockerApi.listHosts,
     enabled: dockerEnabled,
     refetchInterval: pollUnlessRefused(30_000),
   });
-  const { data: tailscaleTenants = [] } = useQuery<TailscaleTenant[]>({
-    queryKey: ["tailscale-tenants"],
-    queryFn: tailscaleApi.listTenants,
-    enabled: tailscaleEnabled,
-  });
-  const { data: netbirdInstances = [] } = useQuery<NetbirdInstance[]>({
-    queryKey: ["netbird-instances"],
-    queryFn: netbirdApi.listInstances,
-    enabled: netbirdEnabled,
-  });
+  const { data: tailscaleTenants = [], error: tailscaleTenantsError } =
+    useQuery<TailscaleTenant[]>({
+      queryKey: ["tailscale-tenants"],
+      queryFn: tailscaleApi.listTenants,
+      enabled: tailscaleEnabled,
+    });
+  const { data: netbirdInstances = [], error: netbirdInstancesError } =
+    useQuery<NetbirdInstance[]>({
+      queryKey: ["netbird-instances"],
+      queryFn: netbirdApi.listInstances,
+      enabled: netbirdEnabled,
+    });
 
-  const { data: proxmoxNodes = [] } = useQuery<ProxmoxNode[]>({
+  const { data: proxmoxNodes = [], error: proxmoxNodesError } = useQuery<
+    ProxmoxNode[]
+  >({
     queryKey: ["proxmox-nodes"],
     queryFn: proxmoxApi.listNodes,
     enabled: proxmoxEnabled,
     refetchInterval: pollUnlessRefused(30_000),
   });
 
-  const { data: opnsenseRouters = [] } = useQuery<OPNsenseRouter[]>({
+  const { data: opnsenseRouters = [], error: opnsenseRoutersError } = useQuery<
+    OPNsenseRouter[]
+  >({
     queryKey: ["opnsense-routers"],
     queryFn: opnsenseApi.listRouters,
     enabled: opnsenseEnabled,
     refetchInterval: pollUnlessRefused(30_000),
   });
 
-  const { data: panosFirewalls = [] } = useQuery<PANOSFirewall[]>({
+  const { data: panosFirewalls = [], error: panosFirewallsError } = useQuery<
+    PANOSFirewall[]
+  >({
     queryKey: ["panos-firewalls"],
     queryFn: panosApi.list,
     enabled: panosEnabled,
     refetchInterval: pollUnlessRefused(30_000),
   });
 
-  const { data: fortinetFirewalls = [] } = useQuery<FortinetFirewall[]>({
-    queryKey: ["fortinet-firewalls"],
-    queryFn: fortinetApi.list,
-    enabled: fortinetEnabled,
-    refetchInterval: pollUnlessRefused(30_000),
-  });
+  const { data: fortinetFirewalls = [], error: fortinetFirewallsError } =
+    useQuery<FortinetFirewall[]>({
+      queryKey: ["fortinet-firewalls"],
+      queryFn: fortinetApi.list,
+      enabled: fortinetEnabled,
+      refetchInterval: pollUnlessRefused(30_000),
+    });
 
-  const { data: merakiOrgs = [] } = useQuery<MerakiOrg[]>({
+  const { data: merakiOrgs = [], error: merakiOrgsError } = useQuery<
+    MerakiOrg[]
+  >({
     queryKey: ["meraki-orgs"],
     queryFn: merakiApi.list,
     enabled: merakiEnabled,
     refetchInterval: pollUnlessRefused(30_000),
   });
 
-  const { data: cloudEndpoints = [] } = useQuery<CloudEndpoint[]>({
+  const { data: cloudEndpoints = [], error: cloudEndpointsError } = useQuery<
+    CloudEndpoint[]
+  >({
     queryKey: ["cloud-endpoints"],
     queryFn: cloudApi.listEndpoints,
     enabled: cloudEnabled,
     refetchInterval: pollUnlessRefused(30_000),
   });
 
-  const { data: unifiControllers = [] } = useQuery<UnifiController[]>({
-    queryKey: ["unifi-controllers"],
-    queryFn: unifiApi.listControllers,
-    enabled: unifiEnabled,
-    refetchInterval: pollUnlessRefused(30_000),
-  });
+  const { data: unifiControllers = [], error: unifiControllersError } =
+    useQuery<UnifiController[]>({
+      queryKey: ["unifi-controllers"],
+      queryFn: unifiApi.listControllers,
+      enabled: unifiEnabled,
+      refetchInterval: pollUnlessRefused(30_000),
+    });
 
   // Platform health — covers api / postgres / redis / celery workers /
   // celery beat. Unlike DNS/DHCP server health (which is user-managed),
@@ -2944,6 +2962,19 @@ export function DashboardPage() {
                 unifiControllers={unifiControllers}
                 netbirdEnabled={netbirdEnabled}
                 netbirdInstances={netbirdInstances}
+                errors={{
+                  k8s: k8sClustersError,
+                  docker: dockerHostsError,
+                  tailscale: tailscaleTenantsError,
+                  netbird: netbirdInstancesError,
+                  proxmox: proxmoxNodesError,
+                  opnsense: opnsenseRoutersError,
+                  panos: panosFirewallsError,
+                  fortinet: fortinetFirewallsError,
+                  meraki: merakiOrgsError,
+                  cloud: cloudEndpointsError,
+                  unifi: unifiControllersError,
+                }}
               />
             </div>
           )}
@@ -3654,6 +3685,7 @@ function IntegrationsPanel({
   unifiControllers,
   netbirdEnabled,
   netbirdInstances,
+  errors = {},
 }: {
   kubernetesEnabled: boolean;
   dockerEnabled: boolean;
@@ -3677,6 +3709,8 @@ function IntegrationsPanel({
   unifiControllers: UnifiController[];
   netbirdEnabled: boolean;
   netbirdInstances: NetbirdInstance[];
+  /** Each list read's error, by column: a refused list is not an empty one (#4855). */
+  errors?: Record<string, unknown>;
 }) {
   const hasK8s = kubernetesEnabled;
   const hasDocker = dockerEnabled;
@@ -3723,8 +3757,9 @@ function IntegrationsPanel({
             Integrations
           </h3>
           <span className="text-[11px] text-muted-foreground">
-            {totalTargets} target
-            {totalTargets === 1 ? "" : "s"}
+            {Object.values(errors).some(Boolean)
+              ? "some not visible to your role"
+              : `${totalTargets} target${totalTargets === 1 ? "" : "s"}`}
           </span>
         </div>
       </div>
@@ -3750,14 +3785,16 @@ function IntegrationsPanel({
               className="flex items-center gap-1.5 bg-muted/30 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground hover:bg-muted/50"
             >
               <Boxes className="h-3 w-3" />
-              Kubernetes ({clusters.length})
+              Kubernetes ({errors.k8s ? "–" : clusters.length})
               <span className="ml-auto text-[10px] text-muted-foreground/70">
                 view all →
               </span>
             </Link>
-            {clusters.length === 0 ? (
+            {clusters.length === 0 || errors.k8s ? (
               <p className="px-4 py-3 text-[11px] italic text-muted-foreground">
-                No clusters registered.
+                <ListEmpty error={errors.k8s} what="clusters">
+                  No clusters registered.
+                </ListEmpty>
               </p>
             ) : (
               <div className="overflow-x-auto">
@@ -3791,14 +3828,16 @@ function IntegrationsPanel({
               className="flex items-center gap-1.5 bg-muted/30 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground hover:bg-muted/50"
             >
               <ContainerIcon className="h-3 w-3" />
-              Docker ({hosts.length})
+              Docker ({errors.docker ? "–" : hosts.length})
               <span className="ml-auto text-[10px] text-muted-foreground/70">
                 view all →
               </span>
             </Link>
-            {hosts.length === 0 ? (
+            {hosts.length === 0 || errors.docker ? (
               <p className="px-4 py-3 text-[11px] italic text-muted-foreground">
-                No hosts registered.
+                <ListEmpty error={errors.docker} what="hosts">
+                  No hosts registered.
+                </ListEmpty>
               </p>
             ) : (
               <div className="overflow-x-auto">
@@ -3832,14 +3871,16 @@ function IntegrationsPanel({
               className="flex items-center gap-1.5 bg-muted/30 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground hover:bg-muted/50"
             >
               <HardDrive className="h-3 w-3" />
-              Proxmox ({proxmoxNodes.length})
+              Proxmox ({errors.proxmox ? "–" : proxmoxNodes.length})
               <span className="ml-auto text-[10px] text-muted-foreground/70">
                 view all →
               </span>
             </Link>
-            {proxmoxNodes.length === 0 ? (
+            {proxmoxNodes.length === 0 || errors.proxmox ? (
               <p className="px-4 py-3 text-[11px] italic text-muted-foreground">
-                No endpoints registered.
+                <ListEmpty error={errors.proxmox} what="endpoints">
+                  No endpoints registered.
+                </ListEmpty>
               </p>
             ) : (
               <div className="overflow-x-auto">
@@ -3875,14 +3916,16 @@ function IntegrationsPanel({
               className="flex items-center gap-1.5 bg-muted/30 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground hover:bg-muted/50"
             >
               <Shield className="h-3 w-3" />
-              OPNsense ({opnsenseRouters.length})
+              OPNsense ({errors.opnsense ? "–" : opnsenseRouters.length})
               <span className="ml-auto text-[10px] text-muted-foreground/70">
                 view all →
               </span>
             </Link>
-            {opnsenseRouters.length === 0 ? (
+            {opnsenseRouters.length === 0 || errors.opnsense ? (
               <p className="px-4 py-3 text-[11px] italic text-muted-foreground">
-                No firewalls registered.
+                <ListEmpty error={errors.opnsense} what="firewalls">
+                  No firewalls registered.
+                </ListEmpty>
               </p>
             ) : (
               <div className="overflow-x-auto">
@@ -3920,14 +3963,16 @@ function IntegrationsPanel({
               className="flex items-center gap-1.5 bg-muted/30 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground hover:bg-muted/50"
             >
               <ShieldAlert className="h-3 w-3" />
-              Palo Alto ({panosFirewalls.length})
+              Palo Alto ({errors.panos ? "–" : panosFirewalls.length})
               <span className="ml-auto text-[10px] text-muted-foreground/70">
                 view all →
               </span>
             </Link>
-            {panosFirewalls.length === 0 ? (
+            {panosFirewalls.length === 0 || errors.panos ? (
               <p className="px-4 py-3 text-[11px] italic text-muted-foreground">
-                No firewalls registered.
+                <ListEmpty error={errors.panos} what="firewalls">
+                  No firewalls registered.
+                </ListEmpty>
               </p>
             ) : (
               <div className="overflow-x-auto">
@@ -3966,14 +4011,16 @@ function IntegrationsPanel({
               className="flex items-center gap-1.5 bg-muted/30 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground hover:bg-muted/50"
             >
               <Flame className="h-3 w-3" />
-              Fortinet ({fortinetFirewalls.length})
+              Fortinet ({errors.fortinet ? "–" : fortinetFirewalls.length})
               <span className="ml-auto text-[10px] text-muted-foreground/70">
                 view all →
               </span>
             </Link>
-            {fortinetFirewalls.length === 0 ? (
+            {fortinetFirewalls.length === 0 || errors.fortinet ? (
               <p className="px-4 py-3 text-[11px] italic text-muted-foreground">
-                No firewalls registered.
+                <ListEmpty error={errors.fortinet} what="firewalls">
+                  No firewalls registered.
+                </ListEmpty>
               </p>
             ) : (
               <div className="overflow-x-auto">
@@ -4010,14 +4057,16 @@ function IntegrationsPanel({
               className="flex items-center gap-1.5 bg-muted/30 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground hover:bg-muted/50"
             >
               <Network className="h-3 w-3" />
-              Meraki ({merakiOrgs.length})
+              Meraki ({errors.meraki ? "–" : merakiOrgs.length})
               <span className="ml-auto text-[10px] text-muted-foreground/70">
                 view all →
               </span>
             </Link>
-            {merakiOrgs.length === 0 ? (
+            {merakiOrgs.length === 0 || errors.meraki ? (
               <p className="px-4 py-3 text-[11px] italic text-muted-foreground">
-                No organizations registered.
+                <ListEmpty error={errors.meraki} what="organizations">
+                  No organizations registered.
+                </ListEmpty>
               </p>
             ) : (
               <div className="overflow-x-auto">
@@ -4054,14 +4103,16 @@ function IntegrationsPanel({
               className="flex items-center gap-1.5 bg-muted/30 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground hover:bg-muted/50"
             >
               <Cloud className="h-3 w-3" />
-              Cloud ({cloudEndpoints.length})
+              Cloud ({errors.cloud ? "–" : cloudEndpoints.length})
               <span className="ml-auto text-[10px] text-muted-foreground/70">
                 view all →
               </span>
             </Link>
-            {cloudEndpoints.length === 0 ? (
+            {cloudEndpoints.length === 0 || errors.cloud ? (
               <p className="px-4 py-3 text-[11px] italic text-muted-foreground">
-                No accounts registered.
+                <ListEmpty error={errors.cloud} what="accounts">
+                  No accounts registered.
+                </ListEmpty>
               </p>
             ) : (
               <div className="overflow-x-auto">
@@ -4101,14 +4152,16 @@ function IntegrationsPanel({
               className="flex items-center gap-1.5 bg-muted/30 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground hover:bg-muted/50"
             >
               <Waypoints className="h-3 w-3" />
-              Tailscale ({tailscaleTenants.length})
+              Tailscale ({errors.tailscale ? "–" : tailscaleTenants.length})
               <span className="ml-auto text-[10px] text-muted-foreground/70">
                 view all →
               </span>
             </Link>
-            {tailscaleTenants.length === 0 ? (
+            {tailscaleTenants.length === 0 || errors.tailscale ? (
               <p className="px-4 py-3 text-[11px] italic text-muted-foreground">
-                No tenants registered.
+                <ListEmpty error={errors.tailscale} what="tenants">
+                  No tenants registered.
+                </ListEmpty>
               </p>
             ) : (
               <div className="overflow-x-auto">
@@ -4153,14 +4206,16 @@ function IntegrationsPanel({
               className="flex items-center gap-1.5 bg-muted/30 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground hover:bg-muted/50"
             >
               <Wifi className="h-3 w-3" />
-              UniFi ({unifiControllers.length})
+              UniFi ({errors.unifi ? "–" : unifiControllers.length})
               <span className="ml-auto text-[10px] text-muted-foreground/70">
                 view all →
               </span>
             </Link>
-            {unifiControllers.length === 0 ? (
+            {unifiControllers.length === 0 || errors.unifi ? (
               <p className="px-4 py-3 text-[11px] italic text-muted-foreground">
-                No controllers registered.
+                <ListEmpty error={errors.unifi} what="controllers">
+                  No controllers registered.
+                </ListEmpty>
               </p>
             ) : (
               <div className="overflow-x-auto">
@@ -4201,14 +4256,16 @@ function IntegrationsPanel({
               className="flex items-center gap-1.5 bg-muted/30 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground hover:bg-muted/50"
             >
               <Bird className="h-3 w-3" />
-              NetBird ({netbirdInstances.length})
+              NetBird ({errors.netbird ? "–" : netbirdInstances.length})
               <span className="ml-auto text-[10px] text-muted-foreground/70">
                 view all →
               </span>
             </Link>
-            {netbirdInstances.length === 0 ? (
+            {netbirdInstances.length === 0 || errors.netbird ? (
               <p className="px-4 py-3 text-[11px] italic text-muted-foreground">
-                No instances registered.
+                <ListEmpty error={errors.netbird} what="instances">
+                  No instances registered.
+                </ListEmpty>
               </p>
             ) : (
               <div className="overflow-x-auto">
@@ -4577,7 +4634,7 @@ function NewDevicesKpi() {
   const { enabled, ready } = useFeatureModules();
   const moduleOn = enabled("security.new_device_watch");
 
-  const { data } = useQuery({
+  const { data, error } = useQuery({
     queryKey: ["new-devices", "summary", "kpi"],
     queryFn: () => newDeviceApi.summary(),
     enabled: ready && moduleOn,
@@ -4597,12 +4654,20 @@ function NewDevicesKpi() {
       <p className="text-[11px] uppercase tracking-wider text-muted-foreground">
         New devices (24h)
       </p>
-      <p className={cn("mt-2 text-3xl font-bold tabular-nums", cls.value)}>
-        {last24h}
-      </p>
-      <p className="text-[11px] text-muted-foreground">
-        {data?.new_count ?? 0} awaiting review · click to triage
-      </p>
+      {error ? (
+        <p className="mt-2 text-[11px]">
+          <ListReadError error={error} what="new devices" />
+        </p>
+      ) : (
+        <>
+          <p className={cn("mt-2 text-3xl font-bold tabular-nums", cls.value)}>
+            {last24h}
+          </p>
+          <p className="text-[11px] text-muted-foreground">
+            {data?.new_count ?? 0} awaiting review · click to triage
+          </p>
+        </>
+      )}
     </Link>
   );
 }
