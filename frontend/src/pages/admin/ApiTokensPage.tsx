@@ -80,6 +80,11 @@ function CreateTokenModal({
     bindResourceId
       ? can(action, bindType, bindResourceId)
       : hasAnyGrantFor(action, bindType);
+  // A level picked before the resource falls back to read when the picked
+  // resource turns out not to allow it, so the select never shows (and the
+  // request never sends) a disabled option.
+  const effectiveBindAction =
+    bindAction !== "read" && !mayBind(bindAction) ? "read" : bindAction;
   const [stepPassword, setStepPassword] = useState("");
   const [stepTotp, setStepTotp] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -107,7 +112,7 @@ function CreateTokenModal({
     bindType !== "none" && bindResourceId
       ? [
           {
-            action: bindAction,
+            action: effectiveBindAction,
             resource_type: bindType,
             resource_id: bindResourceId,
           },
@@ -260,7 +265,7 @@ function CreateTokenModal({
                 <select
                   aria-label="Binding access"
                   className={inputCls}
-                  value={bindAction}
+                  value={effectiveBindAction}
                   onChange={(e) =>
                     setBindAction(e.target.value as "read" | "write" | "admin")
                   }
