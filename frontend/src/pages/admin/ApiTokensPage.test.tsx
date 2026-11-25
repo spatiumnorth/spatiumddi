@@ -319,3 +319,44 @@ describe("New token resource binding access (#4846)", () => {
     expect(opt("admin")).toBe(true);
   });
 });
+
+describe("New token with a binding type and no resource (#4857)", () => {
+  it("holds Create, and Enter does not submit, until a resource is picked or the binding is none", async () => {
+    myPermissions.mockResolvedValue({
+      is_superadmin: false,
+      grants: [{ action: "read", resource_type: "subnet", resource_id: null }],
+    });
+    list.mockResolvedValue([]);
+    create.mockClear();
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <ApiTokensPage />
+      </QueryClientProvider>,
+    );
+    await act(async () => {});
+    fireEvent.click(await screen.findByText("New Token"));
+    fireEvent.change(screen.getByPlaceholderText(/ansible-automation/), {
+      target: { value: "one-subnet" },
+    });
+    const pw = screen.getByLabelText(/Password/);
+    fireEvent.change(pw, { target: { value: "pw" } });
+    const createBtn = screen.getByRole("button", {
+      name: "Create",
+    }) as HTMLButtonElement;
+    expect(createBtn.disabled).toBe(false);
+    fireEvent.change(screen.getByDisplayValue("No resource binding"), {
+      target: { value: "subnet" },
+    });
+    expect(createBtn.disabled).toBe(true);
+    fireEvent.submit(pw.closest("form") as HTMLFormElement);
+    await act(async () => {});
+    expect(create).not.toHaveBeenCalled();
+    fireEvent.change(screen.getByDisplayValue("Subnet"), {
+      target: { value: "none" },
+    });
+    expect(createBtn.disabled).toBe(false);
+  });
+});
