@@ -158,6 +158,7 @@ import {
   parseTtlInput,
   recordOwnerError,
   zoneKindForName,
+  ancestorViewId,
 } from "@/lib/dnsNames";
 import { viewsUnsupportedReason } from "@/lib/dns-views";
 import { useTableSort, SortableTh } from "@/lib/useTableSort";
@@ -3003,6 +3004,10 @@ type ZoneModalProps = {
   views: DNSView[];
   zone?: DNSZone;
   initialName?: string;
+  // The view a new zone opens on. Sub-zone and the tree's "Create zone here"
+  // pass the parent's, so a child of a view-pinned zone stays in that view
+  // unless the operator picks otherwise; "No view" serves a zone in EVERY view.
+  initialViewId?: string | null;
   onClose: () => void;
 };
 
@@ -3033,6 +3038,7 @@ function ZoneModalForm({
   views,
   zone,
   initialName,
+  initialViewId,
   onClose,
 }: ZoneModalProps) {
   const own = useOwnershipModules();
@@ -3108,7 +3114,9 @@ function ZoneModalForm({
   );
   const kind =
     pickedKind ?? (zoneType === "primary" ? zoneKindForName(name) : "forward");
-  const [viewId, setViewId] = useState(zone?.view_id ?? "");
+  const [viewId, setViewId] = useState(
+    zone ? (zone.view_id ?? "") : (initialViewId ?? ""),
+  );
   const [primaryNs, setPrimaryNs] = useState(zone?.primary_ns ?? "");
   const [adminEmail, setAdminEmail] = useState(zone?.admin_email ?? "");
   const [dnssec, setDnssec] = useState(zone?.dnssec_enabled ?? false);
@@ -3483,13 +3491,20 @@ function ZoneModalForm({
           </div>
         )}
         {views.length > 0 && (
-          <Field label="View (optional)">
+          <Field
+            label="View (optional)"
+            hint={
+              viewId
+                ? undefined
+                : "No view: the zone is shared and served to the clients of every view."
+            }
+          >
             <select
               className={inputCls}
               value={viewId}
               onChange={(e) => setViewId(e.target.value)}
             >
-              <option value="">— No view —</option>
+              <option value="">— No view (served in every view) —</option>
               {views.map((v) => (
                 <option key={v.id} value={v.id}>
                   {v.name}
@@ -6237,6 +6252,7 @@ export function ZoneDetailView({
           // Pre-fill with the parent suffix so the operator just types
           // the leading label at the cursor: "sub" + ".example.com".
           initialName={"." + zone.name.replace(/\.$/, "")}
+          initialViewId={zone.view_id}
           onClose={() => setShowAddSubzone(false)}
         />
       )}
@@ -14114,6 +14130,7 @@ export function ZoneTreeRows({
           groupId={groupId}
           views={views}
           initialName={createZoneName}
+          initialViewId={ancestorViewId(createZoneName, zones)}
           onClose={() => setCreateZoneName(null)}
         />
       )}

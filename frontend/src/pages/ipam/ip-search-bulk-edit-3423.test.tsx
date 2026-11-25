@@ -198,7 +198,7 @@ function footer(dialog: HTMLElement) {
 }
 
 const bulkEditDialog = () =>
-  screen.queryByRole("dialog", { name: "Bulk edit 1 IP addresses" });
+  screen.queryByRole("dialog", { name: "Bulk edit 1 IP address" });
 
 describe("the address search's Bulk edit (#3423)", () => {
   it("is not offered to a Viewer, as Delete is not: disabled, with the reason, and it opens nothing", async () => {
@@ -231,7 +231,7 @@ describe("the address search's Bulk edit (#3423)", () => {
     });
     fireEvent.click(bulkEdit(dialog));
     expect(
-      await screen.findByRole("dialog", { name: "Bulk edit 1 IP addresses" }),
+      await screen.findByRole("dialog", { name: "Bulk edit 1 IP address" }),
     ).toBeTruthy();
   });
 
@@ -252,7 +252,7 @@ describe("the address search's Bulk edit (#3423)", () => {
       });
       fireEvent.click(bulkEdit(dialog));
       expect(
-        await screen.findByRole("dialog", { name: "Bulk edit 1 IP addresses" }),
+        await screen.findByRole("dialog", { name: "Bulk edit 1 IP address" }),
       ).toBeTruthy();
     },
   );
