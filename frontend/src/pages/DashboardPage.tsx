@@ -2962,18 +2962,27 @@ export function DashboardPage() {
                 unifiControllers={unifiControllers}
                 netbirdEnabled={netbirdEnabled}
                 netbirdInstances={netbirdInstances}
+                // A failed refetch over rows already read keeps the rows.
                 errors={{
-                  k8s: k8sClustersError,
-                  docker: dockerHostsError,
-                  tailscale: tailscaleTenantsError,
-                  netbird: netbirdInstancesError,
-                  proxmox: proxmoxNodesError,
-                  opnsense: opnsenseRoutersError,
-                  panos: panosFirewallsError,
-                  fortinet: fortinetFirewallsError,
-                  meraki: merakiOrgsError,
-                  cloud: cloudEndpointsError,
-                  unifi: unifiControllersError,
+                  k8s: k8sClusters.length ? null : k8sClustersError,
+                  docker: dockerHosts.length ? null : dockerHostsError,
+                  tailscale: tailscaleTenants.length
+                    ? null
+                    : tailscaleTenantsError,
+                  netbird: netbirdInstances.length
+                    ? null
+                    : netbirdInstancesError,
+                  proxmox: proxmoxNodes.length ? null : proxmoxNodesError,
+                  opnsense: opnsenseRouters.length
+                    ? null
+                    : opnsenseRoutersError,
+                  panos: panosFirewalls.length ? null : panosFirewallsError,
+                  fortinet: fortinetFirewalls.length
+                    ? null
+                    : fortinetFirewallsError,
+                  meraki: merakiOrgs.length ? null : merakiOrgsError,
+                  cloud: cloudEndpoints.length ? null : cloudEndpointsError,
+                  unifi: unifiControllers.length ? null : unifiControllersError,
                 }}
               />
             </div>
@@ -3758,7 +3767,7 @@ function IntegrationsPanel({
           </h3>
           <span className="text-[11px] text-muted-foreground">
             {Object.values(errors).some(Boolean)
-              ? "some not visible to your role"
+              ? "some could not be read"
               : `${totalTargets} target${totalTargets === 1 ? "" : "s"}`}
           </span>
         </div>
@@ -4654,7 +4663,7 @@ function NewDevicesKpi() {
       <p className="text-[11px] uppercase tracking-wider text-muted-foreground">
         New devices (24h)
       </p>
-      {error ? (
+      {error && !data ? (
         <p className="mt-2 text-[11px]">
           <ListReadError error={error} what="new devices" />
         </p>
