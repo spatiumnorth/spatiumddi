@@ -71,9 +71,15 @@ function CreateTokenModal({
   );
   // #4846: offer only the access the caller holds on the picked type; the
   // server stays the authority (a binding never exceeds its creator).
-  const { can } = usePermissions();
+  // Instance-scoped grants count: check the picked resource once there is
+  // one, and any grant of the action on the type before that.
+  const { can, hasAnyGrantFor } = usePermissions();
   const [bindGroupId, setBindGroupId] = useState("");
   const [bindResourceId, setBindResourceId] = useState("");
+  const mayBind = (action: "write" | "admin") =>
+    bindResourceId
+      ? can(action, bindType, bindResourceId)
+      : hasAnyGrantFor(action, bindType);
   const [stepPassword, setStepPassword] = useState("");
   const [stepTotp, setStepTotp] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -260,10 +266,10 @@ function CreateTokenModal({
                   }
                 >
                   <option value="read">read</option>
-                  <option value="write" disabled={!can("write", bindType)}>
+                  <option value="write" disabled={!mayBind("write")}>
                     write
                   </option>
-                  <option value="admin" disabled={!can("admin", bindType)}>
+                  <option value="admin" disabled={!mayBind("admin")}>
                     admin
                   </option>
                 </select>
