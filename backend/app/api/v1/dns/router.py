@@ -217,7 +217,11 @@ from app.services.dns.new_object_defaults import (
     default_zone_ttl,
     load_dns_defaults,
 )
-from app.services.dns.powerdns_alias import alias_resolver, group_can_resolve_alias
+from app.services.dns.powerdns_alias import (
+    ALIAS_NO_FORWARDER_MESSAGE,
+    alias_resolver,
+    group_can_resolve_alias,
+)
 from app.services.dns.record_identity import describe_identical, find_identical_record
 from app.services.dns.record_ops import (
     clear_dnssec_key_state,
@@ -452,7 +456,18 @@ _DNS_ROUTE_TYPES: dict[str, tuple[str, ...]] = {
     "POST /groups/{group_id}/zones/{zone_id}/import/spreadsheet/preview": _R,
     "POST /groups/{group_id}/zones/{zone_id}/import/spreadsheet/commit": _R,
 }
-_DNS_GATE = require_route_types(_DNS_ROUTE_TYPES, "/dns")
+# The server-group routes are gated on ``dns_group`` but audit their changes as
+# ``dns_server_group``; a refusal is written under the audited type (#4718) so
+# the Audit Log's Resource filter lists it with the group's changes. Only the
+# routes whose own rows are ``dns_server_group`` are listed: the group's
+# servers, ACLs, views and keys are audited as their own types.
+_DNS_AUDIT_TYPES: dict[str, str] = {
+    "POST /groups": "dns_server_group",
+    "PUT /groups/{group_id}": "dns_server_group",
+    "DELETE /groups/{group_id}": "dns_server_group",
+    "POST /groups/{group_id}/group-tsig-key/rotate": "dns_server_group",
+}
+_DNS_GATE = require_route_types(_DNS_ROUTE_TYPES, "/dns", _DNS_AUDIT_TYPES)
 
 # The upload routes here check the login from the request headers before
 # the multipart body is read (app.api.pre_body_auth, #2780).
@@ -12999,12 +13014,7 @@ async def _check_driver_gated_record_type(record_type: str, group_id: uuid.UUID,
         if not await group_can_resolve_alias(db, group_id):
             raise HTTPException(
                 status_code=422,
-                detail=(
-                    "ALIAS records are resolved through the group's forwarders, and this "
-                    "group has none over plain DNS (Do53). Set forwarders under the "
-                    "group's server options first; SpatiumDDI no longer falls back to "
-                    "public resolvers."
-                ),
+                detail=ALIAS_NO_FORWARDER_MESSAGE,
             )
 
 

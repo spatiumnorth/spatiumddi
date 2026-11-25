@@ -1,3 +1,4 @@
+import { countNoun, pluralize } from "@/lib/count-noun";
 import type { AgentSpoolStatus } from "@/lib/api";
 import {
   formatAge,
@@ -41,7 +42,7 @@ export function SpoolChip({
       if (age) bits.push(`oldest ${age} ago`);
       if (s.trimmed_entries_total > 0)
         bits.push(
-          `${s.trimmed_entries_total} batches / ${formatBytes(s.trimmed_bytes_total)} trimmed since agent state was created`,
+          `${countNoun(s.trimmed_entries_total, "batch", "batches")} / ${formatBytes(s.trimmed_bytes_total)} trimmed since agent state was created`,
         );
       return `• ${name}: ${bits.join(", ")}`;
     });
@@ -73,7 +74,7 @@ export function SpoolChip({
     const age = formatLag(state.lagSeconds);
     const title = [
       "This agent is behind on delivering events to the control plane. They are held in the agent's memory or still unread in Kea's lease file, so nothing is queued on disk yet. Nothing is lost; the agent catches up once the control plane keeps pace.",
-      `\n\n${state.estimated > 0 ? "about " : ""}${formatCount(state.events)} events waiting`,
+      `\n\n${state.estimated > 0 ? "about " : ""}${formatCount(state.events)} ${pluralize(state.events, "event")} waiting`,
       state.estimated > 0
         ? ` (${formatCount(state.estimated)} estimated from the unread lease file)`
         : "",
@@ -88,7 +89,7 @@ export function SpoolChip({
         title={title}
       >
         Behind {age}: {state.estimated > 0 ? "~" : ""}
-        {formatCount(state.events)} events
+        {formatCount(state.events)} {pluralize(state.events, "event")}
       </span>
     );
   }
@@ -96,7 +97,7 @@ export function SpoolChip({
   const age = formatAge(state.oldestAt);
   const title = [
     "The control plane was unreachable and this agent queued what it could not deliver. It is replaying the backlog in order, with the original timestamps, so charts and logs for the gap will fill in.",
-    `\n\n${state.entries} batches, ${formatBytes(state.bytes)} of ${formatBytes(status.cap_bytes)} cap`,
+    `\n\n${countNoun(state.entries, "batch", "batches")}, ${formatBytes(state.bytes)} of ${formatBytes(status.cap_bytes)} cap`,
     age ? `, oldest queued ${age} ago` : "",
     perStream.length ? `\n\n${perStream.join("\n")}` : "",
   ].join("");

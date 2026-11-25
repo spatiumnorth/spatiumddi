@@ -781,28 +781,12 @@ async def _check_health(server_id: uuid.UUID) -> None:
             health_detail: str | None = None
 
             if is_agentless(server.driver):
-                # Agentless drivers have no heartbeat — the control plane has
-                # to do the poking. Cloud drivers and ``technitium_api`` check
-                # the API they are driven through (``health_check`` on
-                # ``CloudDNSDriverBase``, #1455); ``windows_dns`` doesn't
-                # implement one yet and falls back to the raw SOA probe.
-                try:
-                    driver = get_driver(server.driver)
-                    health_check = getattr(driver, "health_check", None)
-                    if callable(health_check):
-                        ok, health_detail = await health_check(server)
-                    else:
-                        ok = await _probe_server_soa(server.host, server.port)
-                    new_status = "active" if ok else "unreachable"
-                except Exception as exc:  # noqa: BLE001 — surface any driver error
-                    new_status = "unreachable"
-                    logger.warning(
-                        "dns_health_driver_probe_failed",
-                        server_id=str(server_id),
-                        driver=server.driver,
-                        host=server.host,
-                        error=str(exc),
-                    )
+                # #4808 — end the read transaction before the network call: a
+                # host that answers nothing would hold it open (``idle in
+                # transaction``) for the whole probe timeout. The row stays
+                # readable (``expire_on_commit=False``); the result is written
+                # by a fresh session below.
+                await db.commit()
             else:
                 # Agent-based (#2314): judge freshness by ``last_seen_at``,
                 # which only the agent's heartbeat writes. The task's own
@@ -814,6 +798,8 @@ async def _check_health(server_id: uuid.UUID) -> None:
                 # has never reported in.
                 last_seen = server.last_seen_at
                 if last_seen is None:
+                    # The SOA probe is a (bounded) network call too.
+                    await db.commit()
                     reachable = await _probe_server_soa(server.host, server.port)
                     new_status = "active" if reachable else "unreachable"
                 elif (now - last_seen) <= AGENT_STALE_AFTER:
@@ -821,18 +807,68 @@ async def _check_health(server_id: uuid.UUID) -> None:
                 else:
                     new_status = "unreachable"
                     forget_stale_ok(server)  # #2961
+                if last_seen is not None:
+                    server.status = new_status
+                    server.last_health_check_at = now
+                    await db.commit()
+                    logger.info(
+                        "dns_health_checked",
+                        server_id=str(server_id),
+                        driver=server.driver,
+                        agentless=False,
+                        status=new_status,
+                        host=server.host,
+                        detail=None,
+                    )
+                    return
 
-            server.status = new_status
-            server.last_health_check_at = now
+        # Agentless, or an agent that never reported in: probe with no
+        # session open, then write the result in a fresh one.
+        if is_agentless(server.driver):
+            # Agentless drivers have no heartbeat — the control plane has
+            # to do the poking. Cloud drivers and ``technitium_api`` check
+            # the API they are driven through (``health_check`` on
+            # ``CloudDNSDriverBase``, #1455); ``windows_dns`` doesn't
+            # implement one yet and falls back to the raw SOA probe.
+            try:
+                driver = get_driver(server.driver)
+                health_check = getattr(driver, "health_check", None)
+                if callable(health_check):
+                    ok, health_detail = await health_check(server)
+                else:
+                    ok = await _probe_server_soa(server.host, server.port)
+                new_status = "active" if ok else "unreachable"
+            except Exception as exc:  # noqa: BLE001 — surface any driver error
+                new_status = "unreachable"
+                logger.warning(
+                    "dns_health_driver_probe_failed",
+                    server_id=str(server_id),
+                    driver=server.driver,
+                    host=server.host,
+                    error=str(exc),
+                )
+
+        async with session_factory() as db:
+            # Deleted, disabled or paused while the probe ran: drop the result.
+            fresh = await db.get(DNSServer, server_id)
+            if fresh is None or not fresh.is_enabled or fresh.maintenance_mode:
+                return
+            if not is_agentless(fresh.driver):
+                # Never-reported agent: a heartbeat that landed during the
+                # probe is the better evidence, so it wins.
+                if fresh.last_seen_at is not None:
+                    return
+            fresh.status = new_status
+            fresh.last_health_check_at = datetime.now(UTC)
             await db.commit()
 
             logger.info(
                 "dns_health_checked",
                 server_id=str(server_id),
-                driver=server.driver,
-                agentless=is_agentless(server.driver),
+                driver=fresh.driver,
+                agentless=is_agentless(fresh.driver),
                 status=new_status,
-                host=server.host,
+                host=fresh.host,
                 detail=health_detail,
             )
     finally:

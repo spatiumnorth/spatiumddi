@@ -860,8 +860,14 @@ function UploadImageModal({
       <div className="space-y-3 text-xs">
         <div className="grid gap-2 sm:grid-cols-2">
           <div>
-            <label className="text-muted-foreground">.raw.xz file</label>
+            <label
+              htmlFor="upgrade-images-table-raw-xz-file"
+              className="text-muted-foreground"
+            >
+              .raw.xz file
+            </label>
             <input
+              id="upgrade-images-table-raw-xz-file"
               type="file"
               accept=".xz,.raw.xz,application/octet-stream"
               onChange={(e) => setFile(e.target.files?.[0] ?? null)}
@@ -874,8 +880,14 @@ function UploadImageModal({
             )}
           </div>
           <div>
-            <label className="text-muted-foreground">Appliance version</label>
+            <label
+              htmlFor="upgrade-images-table-appliance-version"
+              className="text-muted-foreground"
+            >
+              Appliance version
+            </label>
             <input
+              id="upgrade-images-table-appliance-version"
               value={applianceVersion}
               onChange={(e) => setApplianceVersion(e.target.value)}
               placeholder="e.g. 2026.06.01-1"
@@ -883,8 +895,14 @@ function UploadImageModal({
             />
           </div>
           <div>
-            <label className="text-muted-foreground">Architecture</label>
+            <label
+              htmlFor="upgrade-images-table-architecture"
+              className="text-muted-foreground"
+            >
+              Architecture
+            </label>
             <select
+              id="upgrade-images-table-architecture"
               value={architecture}
               onChange={(e) => setArchitecture(e.target.value)}
               className="mt-1 w-full rounded-md border bg-background px-2 py-1"
@@ -906,8 +924,14 @@ function UploadImageModal({
             </p>
           </div>
           <div className="sm:col-span-2">
-            <label className="text-muted-foreground">SHA-256 (hex)</label>
+            <label
+              htmlFor="upgrade-images-table-sha-256-hex"
+              className="text-muted-foreground"
+            >
+              SHA-256 (hex)
+            </label>
             <input
+              id="upgrade-images-table-sha-256-hex"
               value={sha256}
               onChange={(e) => setSha256(e.target.value)}
               placeholder="paste from the .sha256 sidecar (64 lowercase hex chars)"
@@ -915,8 +939,14 @@ function UploadImageModal({
             />
           </div>
           <div className="sm:col-span-2">
-            <label className="text-muted-foreground">Notes (optional)</label>
+            <label
+              htmlFor="upgrade-images-table-notes-optional"
+              className="text-muted-foreground"
+            >
+              Notes (optional)
+            </label>
             <input
+              id="upgrade-images-table-notes-optional"
               value={notes}
               onChange={(e) => setNotes(e.target.value)}
               placeholder="e.g. RC1 — verified by ops on 2026-06-01"
@@ -951,7 +981,7 @@ function UploadImageModal({
             </span>
           )}
           {upload.error && (
-            <span className="text-rose-700 dark:text-rose-300">
+            <span role="alert" className="text-rose-700 dark:text-rose-300">
               {formatApiError(upload.error)}
             </span>
           )}

@@ -3920,6 +3920,8 @@ export interface PlatformSettings {
   dhcp_pull_leases_enabled: boolean;
   dhcp_pull_leases_interval_seconds: number;
   dhcp_pull_leases_last_run_at: string | null;
+  dhcp_health_interval_seconds: number;
+  dhcp_mac_blocks_sync_interval_seconds: number;
   audit_forward_syslog_enabled: boolean;
   audit_forward_syslog_host: string;
   audit_forward_syslog_port: number;
@@ -4283,6 +4285,9 @@ export interface OUIStatus {
   interval_hours: number;
   last_updated_at: string | null;
   vendor_count: number;
+  /** #4800 — newest failed refresh since the last success. */
+  last_error?: string | null;
+  last_error_at?: string | null;
 }
 
 export interface OUITaskStatus {
@@ -12513,6 +12518,9 @@ export interface VersionInfo {
   latest_checked_at: string | null;
   release_check_enabled: boolean;
   latest_check_error: string | null;
+  // "unreachable" = no route to GitHub (DNS / connect / timeout; normal for
+  // an air-gapped install), "http" = GitHub answered with an error. #4799
+  latest_check_error_kind?: "unreachable" | "http" | null;
   // Appliance mode — true when the API runs on the SpatiumDDI OS
   // appliance ISO. Gates the "Appliance" sidebar entry and the
   // /appliance route. Phase 4 (issue #134).
@@ -13103,6 +13111,8 @@ export interface ApplianceRelease {
 export interface ApplianceReleasesResponse {
   installed_version: string;
   releases: ApplianceRelease[];
+  // Why `releases` is empty when the GitHub fetch failed (#4799).
+  fetch_error?: "unreachable" | "rate_limited" | "error" | null;
 }
 
 // #294 — read-only. The old one-click `apply` (+ `log` poll) drove a
@@ -13743,8 +13753,9 @@ export interface ApplianceRow {
   resolver_status: string | null;
   /** Issue #155 — per-host APT host-config state the supervisor reported:
    *  "synced" / "proxy-failed" / "mirror-unreachable" / "signature-mismatch"
-   *  / "no-sources" / "unmanaged", or null on non-appliance / pre-#155 /
-   *  never-reported rows. */
+   *  / "no-sources" / "unmanaged", or "update-stale" (#4800: the last
+   *  apt-get update is over 3 days old or never succeeded), or null on
+   *  non-appliance / pre-#155 / never-reported rows. */
   apt_state: string | null;
   desired_appliance_version: string | null;
   desired_slot_image_url: string | null;
@@ -13796,6 +13807,10 @@ export interface ApplianceRow {
   // or null on the first heartbeat / before any role assignment.
   role_switch_state: string | null;
   role_switch_reason: string | null;
+  // #4646 — assigned roles the supervisor did not start because the control
+  // plane has no agent key for them (``dns-bind9``, ``dhcp`` …). Empty =
+  // nothing waiting.
+  roles_awaiting_key?: string[];
   // #170 Wave E — supervisor's service-container watchdog. Free-form
   // map keyed by compose service name (``dns-bind9`` / ``dns-powerdns``
   // / ``dns-technitium`` / ``dhcp-kea``); each value carries the
@@ -13856,6 +13871,13 @@ export interface ApplianceRow {
     nodes_ready?: number;
     pods_total?: number;
     pods_by_phase?: Record<string, number>;
+    // #4707 — present when a trial slot was committed although its control
+    // chart never applied (a revert was unsafe: the migrate Job had run).
+    control_plane_not_converged?: {
+      version?: string;
+      at?: string;
+      detail?: string;
+    };
     // #999 Part A — raw md / multipath reading, with NO verdict attached
     // (the appliance row carries that in `storage_findings` below). Typed
     // as the reading rather than as `NodeStorage` on purpose: `findings`

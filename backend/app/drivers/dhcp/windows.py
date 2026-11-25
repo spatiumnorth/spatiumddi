@@ -74,6 +74,7 @@ import structlog
 from app.core.crypto import decrypt_dict
 from app.drivers._winrm import (
     MAX_ENCODED_COMMAND,
+    PROBE_CONNECT_TIMEOUT_SEC,
     WinRMCommandTooLong,
     encoded_command_len,
     ps_single_quote,
@@ -500,7 +501,9 @@ class WindowsDHCPReadOnlyDriver(DHCPDriver):
         the upsert service doesn't branch.
         """
         creds = _load_credentials(server)
-        raw = await asyncio.to_thread(_run_ps, server, creds, _PS_LIST_LEASES)
+        raw = await asyncio.to_thread(
+            _run_ps, server, creds, _PS_LIST_LEASES, connect_timeout_sec=PROBE_CONNECT_TIMEOUT_SEC
+        )
         return _parse_leases(raw)
 
     async def get_scopes(self, server: Any) -> list[dict[str, Any]]:
@@ -538,7 +541,9 @@ class WindowsDHCPReadOnlyDriver(DHCPDriver):
         and NOT as "``Get-DhcpServerv4Reservation`` threw" (#620).
         """
         creds = _load_credentials(server)
-        raw = await asyncio.to_thread(_run_ps, server, creds, _PS_LIST_TOPOLOGY)
+        raw = await asyncio.to_thread(
+            _run_ps, server, creds, _PS_LIST_TOPOLOGY, connect_timeout_sec=PROBE_CONNECT_TIMEOUT_SEC
+        )
         return _parse_scopes(raw)
 
     async def get_failover_relationships(self, server: Any) -> dict[str, Any]:
@@ -559,7 +564,9 @@ class WindowsDHCPReadOnlyDriver(DHCPDriver):
         ``get_leases``.
         """
         creds = _load_credentials(server)
-        raw = await asyncio.to_thread(_run_ps, server, creds, _PS_LIST_FAILOVER)
+        raw = await asyncio.to_thread(
+            _run_ps, server, creds, _PS_LIST_FAILOVER, connect_timeout_sec=PROBE_CONNECT_TIMEOUT_SEC
+        )
         return _parse_failover(raw)
 
     async def probe_scopes(self, server: Any, scope_ids: Sequence[str]) -> dict[str, Any]:
@@ -1093,6 +1100,7 @@ Remove-DhcpServerv4ExclusionRange -ScopeId {_ps_literal(scope_id)} `
             "Get-DhcpServerv4Filter -List Deny | "
             "Select-Object @{N='mac';E={$_.MacAddress}}, Description | "
             "ConvertTo-Json -Compress",
+            connect_timeout_sec=PROBE_CONNECT_TIMEOUT_SEC,
         )
         existing_set: set[str] = set()
         text = (existing_raw or "").strip()
@@ -1144,7 +1152,11 @@ Remove-DhcpServerv4ExclusionRange -ScopeId {_ps_literal(scope_id)} `
         try:
             creds = _load_credentials(server)
             out = await asyncio.to_thread(
-                _run_ps, server, creds, "(Get-DhcpServerVersion).ToString()"
+                _run_ps,
+                server,
+                creds,
+                "(Get-DhcpServerVersion).ToString()",
+                connect_timeout_sec=PROBE_CONNECT_TIMEOUT_SEC,
             )
             return True, f"windows_dhcp reachable ({out.strip()})"
         except Exception as exc:  # noqa: BLE001 — surface any WinRM error
@@ -1284,14 +1296,27 @@ def _load_credentials(server: Any) -> dict[str, Any]:
     return decrypt_dict(blob)
 
 
-def _run_ps(server: Any, creds: dict[str, Any], script: str) -> str:
+def _run_ps(
+    server: Any,
+    creds: dict[str, Any],
+    script: str,
+    *,
+    connect_timeout_sec: float | None = None,
+) -> str:
     """Run a PowerShell script on the Windows DHCP server over WinRM.
 
     Thin wrapper over the shared :func:`app.drivers._winrm.run_ps`
     chokepoint (transport/TLS/timeout/size-budget). Blocking — call via
-    ``asyncio.to_thread``.
+    ``asyncio.to_thread``. ``connect_timeout_sec`` bounds the connect for the
+    unattended probes (#4775).
     """
-    return _winrm_run_ps(getattr(server, "host", ""), creds, script, op_label="dhcp")
+    return _winrm_run_ps(
+        getattr(server, "host", ""),
+        creds,
+        script,
+        op_label="dhcp",
+        connect_timeout_sec=connect_timeout_sec,
+    )
 
 
 def _parse_leases(raw: str) -> list[dict[str, Any]]:

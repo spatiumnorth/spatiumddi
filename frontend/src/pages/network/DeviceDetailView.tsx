@@ -1,3 +1,4 @@
+import { countNoun } from "@/lib/count-noun";
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useParams } from "react-router-dom";
@@ -395,9 +396,10 @@ function OverviewTab({
         />
         <Detail
           label="Counts (last poll)"
-          value={`${device.last_poll_arp_count ?? 0} ARP · ${
-            device.last_poll_interface_count ?? 0
-          } interfaces · ${device.last_poll_fdb_count ?? 0} FDB`}
+          value={`${device.last_poll_arp_count ?? 0} ARP · ${countNoun(
+            device.last_poll_interface_count ?? 0,
+            "interface",
+          )} · ${device.last_poll_fdb_count ?? 0} FDB`}
         />
       </Card>
       {device.last_poll_error && (
@@ -1151,7 +1153,10 @@ function TestResultBanner({ result }: { result: NetworkTestConnectionResult }) {
     );
   }
   return (
-    <div className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+    <div
+      role="alert"
+      className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+    >
       <XCircle className="mt-0.5 h-4 w-4 flex-shrink-0" />
       <div className="space-y-0.5">
         <div className="font-medium">

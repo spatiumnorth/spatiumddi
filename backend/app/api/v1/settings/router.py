@@ -166,6 +166,8 @@ class SettingsResponse(BaseModel):
     dhcp_pull_leases_enabled: bool
     dhcp_pull_leases_interval_seconds: int
     dhcp_pull_leases_last_run_at: datetime | None
+    dhcp_health_interval_seconds: int
+    dhcp_mac_blocks_sync_interval_seconds: int
     audit_forward_syslog_enabled: bool
     audit_forward_syslog_host: str
     audit_forward_syslog_port: int
@@ -1061,6 +1063,8 @@ SETTINGS_DELEGATE_WRITABLE: frozenset[str] = frozenset(
         "dns_pull_from_server_interval_minutes",
         "dhcp_pull_leases_enabled",
         "dhcp_pull_leases_interval_seconds",
+        "dhcp_health_interval_seconds",
+        "dhcp_mac_blocks_sync_interval_seconds",
         "dhcp_default_lease_time",
         "dhcp_default_domain_name",
         "dhcp_default_domain_search",
@@ -1122,6 +1126,8 @@ class SettingsUpdate(BaseModel):
     dns_pull_from_server_interval_minutes: int | None = None
     dhcp_pull_leases_enabled: bool | None = None
     dhcp_pull_leases_interval_seconds: int | None = None
+    dhcp_health_interval_seconds: int | None = None
+    dhcp_mac_blocks_sync_interval_seconds: int | None = None
     audit_forward_syslog_enabled: bool | None = None
     audit_forward_syslog_host: str | None = None
     audit_forward_syslog_port: int | None = None
@@ -1826,6 +1832,15 @@ class SettingsUpdate(BaseModel):
         # Beat ticks every 10 s — anything below that can't be honoured.
         if v is not None and v < 10:
             raise ValueError("Must be >= 10 (Celery beat ticks every 10 seconds)")
+        return v
+
+    @field_validator("dhcp_health_interval_seconds", "dhcp_mac_blocks_sync_interval_seconds")
+    @classmethod
+    def validate_dhcp_agentless_seconds(cls, v: int | None) -> int | None:
+        # Beat ticks every 60 s -- a shorter interval can't be honoured.
+        # Cap at 1 h: slower and a dead server would go unnoticed all day.
+        if v is not None and not (60 <= v <= 3600):
+            raise ValueError("Must be between 60 and 3600 seconds")
         return v
 
     @field_validator("domain_whois_interval_hours")
@@ -3223,6 +3238,9 @@ class OUIStatusResponse(BaseModel):
     interval_hours: int
     last_updated_at: datetime | None
     vendor_count: int
+    # #4800 — the newest failed refresh since the last success, else null.
+    last_error: str | None = None
+    last_error_at: datetime | None = None
 
 
 class OUIRefreshResponse(BaseModel):
@@ -3253,11 +3271,17 @@ class OUITaskStatusResponse(BaseModel):
 async def get_oui_status(current_user: CurrentUser, db: DB) -> OUIStatusResponse:
     ps = await _get_or_create(db)
     count = (await db.execute(select(func.count(OUIVendor.prefix)))).scalar_one()
+    from app.tasks.oui_update import last_failure  # noqa: PLC0415
+
+    failed = await last_failure(db, ps.oui_last_updated_at)
+    nv = (failed.new_value or {}) if failed is not None else {}
     return OUIStatusResponse(
         enabled=ps.oui_lookup_enabled,
         interval_hours=ps.oui_update_interval_hours,
         last_updated_at=ps.oui_last_updated_at,
         vendor_count=int(count),
+        last_error=(nv.get("detail") or nv.get("reason")) if failed is not None else None,
+        last_error_at=failed.timestamp if failed is not None else None,
     )
 
 

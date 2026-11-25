@@ -1,3 +1,4 @@
+import { countNoun } from "@/lib/count-noun";
 import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -288,7 +289,7 @@ function VipChangeNoticeModal({
           <span className="text-xs text-muted-foreground">
             MetalLB:{" "}
             {ready
-              ? `VIP active (${speakersReady}/${speakersTotal} speakers ready)`
+              ? `VIP active (${speakersReady}/${countNoun(speakersTotal, "speaker")} ready)`
               : "converging…"}
           </span>
         </div>
@@ -530,7 +531,7 @@ function MetalLBConfigCard() {
                 <strong>Active</strong> — VIP{" "}
                 <span className="font-mono">{data.control_plane_vip}</span> is
                 served by MetalLB (controller ready, {speakersReady}/
-                {speakersTotal} speakers ready).
+                {countNoun(speakersTotal, "speaker")} ready).
               </>
             ) : (
               <>
@@ -808,7 +809,7 @@ function MetalLBConfigCard() {
             </div>
 
             {save.isError && (
-              <p className="text-xs text-rose-600">
+              <p role="alert" className="text-xs text-rose-600">
                 {formatApiError(save.error)}
               </p>
             )}

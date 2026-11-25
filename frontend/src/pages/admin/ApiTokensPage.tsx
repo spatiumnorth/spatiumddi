@@ -645,7 +645,10 @@ export function RevealTokenModal({
             token and create a new one.
           </div>
           {copyFailed && (
-            <div className="rounded-md border border-rose-500/40 bg-rose-500/5 px-3 py-2 text-xs text-rose-700 dark:text-rose-300">
+            <div
+              role="alert"
+              className="rounded-md border border-rose-500/40 bg-rose-500/5 px-3 py-2 text-xs text-rose-700 dark:text-rose-300"
+            >
               Automatic copy failed (browser blocked the clipboard API — usually
               because the page is served over plain HTTP on a non-localhost
               host). The token is now visible below — select it manually and

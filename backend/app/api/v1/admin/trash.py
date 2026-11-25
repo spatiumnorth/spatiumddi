@@ -114,6 +114,10 @@ class RestoreResponse(BaseModel):
     # Trash (#2732): moved into that subnet's batch, one entry per subnet. They
     # come back when the subnet is restored and go if it is purged.
     held_back: list[RestoreConflict] = []
+    # What the restore could not bring back exactly as it was and did not refuse
+    # over (#4754): a reservation whose DNS zone is gone is published in its
+    # subnet's zone instead.
+    warnings: list[str] = []
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -741,6 +745,7 @@ async def restore_row(
     # would be N serial bumps and, on an agentless driver, N WinRM round trips
     # inside one request — the cost the bulk-delete route exists to avoid.
     records_by_zone: dict[uuid.UUID, list[DNSRecord]] = {}
+    restore_warnings: list[str] = []
     # #3503: the audit rows are added last, after every serial bump below. Their
     # flush takes the audit-chain lock, and a zone row written after that waits
     # for a record create on the zone that holds the row and waits for the lock.
@@ -753,7 +758,7 @@ async def restore_row(
             # re-asserting status + back-link + DNS. Leases need no restore work:
             # push_scope_restore re-creates the device scope and the next poll
             # re-populates them.
-            await remirror_scope_statics(db, obj)
+            await remirror_scope_statics(db, obj, restore_warnings)
         elif isinstance(obj, DNSRecord) and obj.zone_id not in restored_zone_ids:
             records_by_zone.setdefault(obj.zone_id, []).append(obj)
         audit_rows.append(
@@ -908,6 +913,7 @@ async def restore_row(
         restored=result.total,
         skipped=[RestoreConflict(**c) for c in conflicts],
         held_back=[RestoreConflict(**c) for c in result.held_back],
+        warnings=restore_warnings,
     )
 
 

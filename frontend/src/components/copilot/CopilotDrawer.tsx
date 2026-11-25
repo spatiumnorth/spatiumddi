@@ -38,7 +38,7 @@ import {
   type NmapScanRead,
 } from "@/lib/api";
 import { FormError } from "@/components/ui/form-error";
-import { countNoun } from "@/lib/count-noun";
+import { countNoun, pluralize } from "@/lib/count-noun";
 
 /** Render assistant content as Markdown with a curated set of element
  *  overrides tuned for the chat-bubble aesthetic. Used by both the
@@ -414,6 +414,13 @@ export function CopilotDrawer({
   const drawerRef = useRef<HTMLDivElement | null>(null);
   const selectAllRef = useRef<HTMLButtonElement | null>(null);
   const focusSelectAllRef = useRef(false);
+  const cancelBulkRef = useRef<HTMLButtonElement | null>(null);
+  const focusCancelBulkRef = useRef(false);
+  const newChatRef = useRef<HTMLButtonElement | null>(null);
+  // Set when a history control that removes itself (a row's Delete or
+  // Archive, the bar's Delete, Delete all) is used; the effect below hands
+  // focus to a successor in the drawer once the row/bar is gone (#4746).
+  const rescueFocusRef = useRef(false);
   const openerRef = useRef<HTMLElement | null | undefined>(undefined);
   if (openerRef.current === undefined) {
     openerRef.current = document.activeElement as HTMLElement | null;
@@ -599,6 +606,9 @@ export function CopilotDrawer({
 
   const archiveMut = useMutation({
     mutationFn: (id: string) => aiApi.updateSession(id, { archived: true }),
+    onError: () => {
+      rescueFocusRef.current = false;
+    },
     onSuccess: (_, id) => {
       qc.invalidateQueries({ queryKey: ["ai-sessions"] });
       if (id === activeSessionId) {
@@ -609,6 +619,9 @@ export function CopilotDrawer({
 
   const deleteMut = useMutation({
     mutationFn: (id: string) => aiApi.deleteSession(id),
+    onError: () => {
+      rescueFocusRef.current = false;
+    },
     onSuccess: (_, id) => {
       qc.invalidateQueries({ queryKey: ["ai-sessions"] });
       // Cascade-delete on ai_chat_message drops the row's tokens
@@ -629,13 +642,36 @@ export function CopilotDrawer({
       focusSelectAllRef.current = false;
       selectAllRef.current?.focus();
     }
+    if (focusCancelBulkRef.current && selectedIds.size > 0) {
+      focusCancelBulkRef.current = false;
+      cancelBulkRef.current?.focus();
+    }
   }, [selectedIds]);
+  useEffect(() => {
+    if (!rescueFocusRef.current) return;
+    const el = document.activeElement;
+    const lost =
+      !el || el === document.body || !drawerRef.current?.contains(el);
+    if (lost) {
+      (
+        selectAllRef.current ??
+        cancelBulkRef.current ??
+        newChatRef.current
+      )?.focus();
+    }
+    // Stay armed until the list refetch lands: a bulk delete empties the
+    // selection before the rows go, and the successor may leave with them.
+    if (!sessionsQ.isFetching) rescueFocusRef.current = false;
+  }, [sessionsQ.data, sessionsQ.isFetching, selectedIds]);
   const bulkDeleteMut = useMutation({
     // No dedicated bulk-delete endpoint — fan out per-id deletes in
     // parallel. Practical chat-history sizes (single-digit to low-100s)
     // are well within what the API can handle.
     mutationFn: async (ids: string[]) => {
       await Promise.all(ids.map((id) => aiApi.deleteSession(id)));
+    },
+    onError: () => {
+      rescueFocusRef.current = false;
     },
     onSuccess: (_, ids) => {
       qc.invalidateQueries({ queryKey: ["ai-sessions"] });
@@ -734,6 +770,7 @@ export function CopilotDrawer({
         <div className="flex shrink-0 items-center gap-1">
           <button
             type="button"
+            ref={newChatRef}
             onClick={() => setActiveSessionId(null)}
             title="New chat"
             className="inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent"
@@ -783,6 +820,7 @@ export function CopilotDrawer({
                   <div className="flex items-center gap-2">
                     <button
                       type="button"
+                      ref={cancelBulkRef}
                       onClick={() => {
                         setSelectedIds(new Set());
                         // Cancel leaves with the selection bar; focus lands
@@ -803,6 +841,7 @@ export function CopilotDrawer({
                             `Delete ${ids.length} chat${ids.length === 1 ? "" : "s"}? This cannot be undone.`,
                           )
                         ) {
+                          rescueFocusRef.current = true;
                           bulkDeleteMut.mutate(ids);
                         }
                       }}
@@ -824,6 +863,9 @@ export function CopilotDrawer({
                         (sessionsQ.data ?? []).map((s) => s.id),
                       );
                       setSelectedIds(all);
+                      // Select all leaves with the header it lives in; focus
+                      // lands on the bar's Cancel, which takes its place (#4746).
+                      focusCancelBulkRef.current = all.size > 0;
                     }}
                     className="rounded border px-2 py-0.5 text-muted-foreground hover:bg-accent"
                   >
@@ -840,6 +882,7 @@ export function CopilotDrawer({
                           `Delete ${ids.length === 1 ? "" : "all "}${countNoun(ids.length, "chat")}? This cannot be undone.`,
                         )
                       ) {
+                        rescueFocusRef.current = true;
                         bulkDeleteMut.mutate(ids);
                       }
                     }}
@@ -863,8 +906,14 @@ export function CopilotDrawer({
                 setShowHistory(false);
               }}
               onRename={(name) => renameMut.mutate({ id: s.id, name })}
-              onArchive={() => archiveMut.mutate(s.id)}
-              onDelete={() => deleteMut.mutate(s.id)}
+              onArchive={() => {
+                rescueFocusRef.current = true;
+                archiveMut.mutate(s.id);
+              }}
+              onDelete={() => {
+                rescueFocusRef.current = true;
+                deleteMut.mutate(s.id);
+              }}
             />
           ))}
         </div>
@@ -1077,10 +1126,14 @@ function EmptyState({ onPick }: { onPick: (text: string) => void }) {
       </div>
       <div className="mt-4 space-y-2">
         <div className="flex items-center gap-2">
-          <label className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+          <label
+            htmlFor="copilot-drawer-examples"
+            className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground"
+          >
             Examples
           </label>
           <select
+            id="copilot-drawer-examples"
             value={groupLabel}
             onChange={(e) => setGroupLabel(e.target.value)}
             className="rounded-md border bg-background px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-ring"
@@ -1242,7 +1295,7 @@ function MessageFooter({ message }: { message: AIChatMessage }) {
     <div className="mt-1 flex items-center gap-2 text-[10px] text-muted-foreground">
       {totalTokens !== null && (
         <span className="tabular-nums">
-          {totalTokens.toLocaleString()} tokens
+          {totalTokens.toLocaleString()} {pluralize(totalTokens, "token")}
           {tokensIn !== null && tokensOut !== null && (
             <span className="opacity-70">
               {" "}
@@ -1790,7 +1843,10 @@ function StreamErrorBlock({
   // and the optimistic echo (operator gave up on the turn).
   return (
     <div className="mb-3 flex justify-start">
-      <div className="max-w-[85%] rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+      <div
+        role="alert"
+        className="max-w-[85%] rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+      >
         <div className="mb-1 font-medium">Stream failed</div>
         <div className="mb-2 break-words text-xs opacity-90">{error}</div>
         <div className="flex gap-2">
@@ -2319,11 +2375,13 @@ function UsageChip({ usage }: { usage: import("@/lib/api").AIUsageSnapshot }) {
       <span aria-hidden>·</span>
       {tokenPct !== null ? (
         <ProgressChip
-          label={`${tokens.toLocaleString()} / ${usage.cap_token!.toLocaleString()} tokens`}
+          label={`${tokens.toLocaleString()} / ${usage.cap_token!.toLocaleString()} ${pluralize(usage.cap_token!, "token")}`}
           pct={tokenPct}
         />
       ) : (
-        <span>{tokens.toLocaleString()} tokens</span>
+        <span>
+          {tokens.toLocaleString()} {pluralize(tokens, "token")}
+        </span>
       )}
       {(costNum > 0 || capCostNum != null) && (
         <>

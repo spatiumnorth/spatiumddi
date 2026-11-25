@@ -1486,10 +1486,14 @@ function GroupModalForm({
           )}
           {catalogZonesEnabled && (
             <div className="mt-2">
-              <label className="mb-0.5 block text-xs font-medium">
+              <label
+                htmlFor="dnspage-catalog-zone-name"
+                className="mb-0.5 block text-xs font-medium"
+              >
                 Catalog zone name
               </label>
               <input
+                id="dnspage-catalog-zone-name"
                 className={inputCls}
                 value={catalogZoneName}
                 onChange={(e) => setCatalogZoneName(e.target.value)}
@@ -3699,6 +3703,20 @@ type RecordModalProps = {
   onClose: () => void;
 };
 
+/** A record a DNS pool's health-check pipeline renders: the record API
+ * refuses to edit or delete it (422), so no list offers either (#4391, #4798). */
+const POOL_MANAGED_REASON =
+  "Managed by a DNS pool — edit the pool or its members on the Pools tab";
+function isPoolManagedRecord(r: { pool_member_id?: string | null }): boolean {
+  return !!r.pool_member_id;
+}
+function recordSource(r: {
+  auto_generated: boolean;
+  pool_member_id?: string | null;
+}): "pool" | "auto" | "user" {
+  return isPoolManagedRecord(r) ? "pool" : r.auto_generated ? "auto" : "user";
+}
+
 // Edit reads the record fresh on open (#3077): the row the page holds comes
 // from a cached records page that may predate a Save made a moment ago. It is
 // opened from the zone's records page or the group-wide records list, so both
@@ -4256,7 +4274,7 @@ const ACK_LABELS: Record<string, string> = {
     "I understand the listed dynamic-update grants will be deleted, and the clients using them can no longer update this zone.",
 };
 
-function MoveZoneModal({
+export function MoveZoneModal({
   zone,
   onClose,
   onMoved,
@@ -4355,7 +4373,10 @@ function MoveZoneModal({
         {preview && (
           <>
             {preview.name_collision && (
-              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
                 <strong>{preview.target_group_name}</strong> already has a zone
                 named <code>{preview.zone_name}</code> in the view this one
                 would land in. Rename or delete it first.
@@ -4364,7 +4385,10 @@ function MoveZoneModal({
             {/* Blockers no acknowledgement can waive — none leaves a state
                 the operator could inspect and fix afterwards. */}
             {preview.dnssec_unsupported_drivers.length > 0 && (
-              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
                 This zone is DNSSEC-signed and{" "}
                 <strong>{preview.target_group_name}</strong> runs{" "}
                 <code>{preview.dnssec_unsupported_drivers.join(", ")}</code>,
@@ -4374,47 +4398,74 @@ function MoveZoneModal({
               </div>
             )}
             {preview.technitium_api_refusal && (
-              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
                 {preview.technitium_api_refusal}
               </div>
             )}
             {preview.tsig_algorithm_refusal && (
-              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
                 {preview.tsig_algorithm_refusal}
               </div>
             )}
             {preview.forward_transport_refusal && (
-              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
                 {preview.forward_transport_refusal}
               </div>
             )}
             {preview.technitium_acl_refusal && (
-              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
                 {preview.technitium_acl_refusal}
               </div>
             )}
             {preview.classless_refusal && (
-              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
                 {preview.classless_refusal}
               </div>
             )}
             {preview.powerdns_refusal && (
-              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
                 {preview.powerdns_refusal}
               </div>
             )}
             {preview.dnssec_policy_refusal && (
-              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
                 {preview.dnssec_policy_refusal}
               </div>
             )}
             {preview.views_refusal && (
-              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
                 {preview.views_refusal}
               </div>
             )}
             {preview.acl_names_lost.length > 0 && (
-              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
                 This zone names ACL(s){" "}
                 <code>{preview.acl_names_lost.join(", ")}</code> that{" "}
                 <strong>{preview.target_group_name}</strong> does not define.
@@ -4425,7 +4476,10 @@ function MoveZoneModal({
               </div>
             )}
             {preview.key_names_lost.length > 0 && (
-              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
                 This zone names TSIG key(s){" "}
                 <code>{preview.key_names_lost.join(", ")}</code> that{" "}
                 <strong>{preview.target_group_name}</strong> does not define.
@@ -5655,7 +5709,9 @@ export function ZoneDetailView({
                     <th className="w-8 py-2 pl-3">
                       {(() => {
                         const manualIds = filtered
-                          .filter((r) => !r.auto_generated && !r.pool_member_id)
+                          .filter(
+                            (r) => !r.auto_generated && !isPoolManagedRecord(r),
+                          )
                           .map((r) => r.id);
                         const allSel =
                           manualIds.length > 0 &&
@@ -5826,7 +5882,7 @@ export function ZoneDetailView({
                         >
                           <td className="w-8 py-1.5 pl-3">
                             {!r.auto_generated &&
-                              !r.pool_member_id &&
+                              !isPoolManagedRecord(r) &&
                               canDeleteRecords && (
                                 <input
                                   type="checkbox"
@@ -5844,7 +5900,7 @@ export function ZoneDetailView({
                           </td>
                           <td className="py-1.5 pl-5 font-mono text-xs font-medium">
                             {r.auto_generated ||
-                            r.pool_member_id ||
+                            isPoolManagedRecord(r) ||
                             !canWriteRecords ? (
                               r.name
                             ) : (
@@ -5883,7 +5939,7 @@ export function ZoneDetailView({
                             {r.priority ?? "—"}
                           </td>
                           <td className="py-1.5 pr-3">
-                            {r.pool_member_id ? (
+                            {isPoolManagedRecord(r) ? (
                               <div className="flex items-center justify-end gap-1">
                                 <span
                                   title="This record is rendered by a DNS pool's health-check pipeline. Manage it from the Pools tab — direct edits are blocked."
@@ -6001,7 +6057,7 @@ export function ZoneDetailView({
                         >
                           Copy Value
                         </ContextMenuItem>
-                        {r.pool_member_id ? (
+                        {isPoolManagedRecord(r) ? (
                           <>
                             <ContextMenuSeparator />
                             <ContextMenuItem
@@ -6685,7 +6741,7 @@ function ServedApexRows({
 
 // ── Servers Tab ────────────────────────────────────────────────────────────────
 
-function ServersTab({ group }: { group: DNSServerGroup }) {
+export function ServersTab({ group }: { group: DNSServerGroup }) {
   const qc = useQueryClient();
   const navigate = useNavigate();
   const { isSuperadmin } = useDnsGrants();
@@ -7042,8 +7098,18 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
           }
           checkLabel="I understand this deletes the server row, and a running agent will register it again."
           onConfirm={() => del.mutate(confirmDeleteServer)}
-          onClose={() => setConfirmDeleteServer(null)}
+          onClose={() => {
+            setConfirmDeleteServer(null);
+            del.reset();
+          }}
           isPending={del.isPending}
+          // A refused delete (404 when the server is already gone, or a
+          // future 409 guard) leaves this confirm open; say why in it (#4744).
+          error={
+            del.isError
+              ? formatApiError(del.error, "Failed to delete the DNS server")
+              : null
+          }
         />
       )}
     </div>
@@ -8444,8 +8510,14 @@ function TSIGKeyModalForm({
     >
       <div className="space-y-3 text-sm">
         <div>
-          <label className="mb-0.5 block text-xs font-medium">Name</label>
+          <label
+            htmlFor="dnspage-name"
+            className="mb-0.5 block text-xs font-medium"
+          >
+            Name
+          </label>
           <input
+            id="dnspage-name"
             type="text"
             value={name}
             onChange={(e) => setName(e.target.value)}
@@ -8458,8 +8530,14 @@ function TSIGKeyModalForm({
           </p>
         </div>
         <div>
-          <label className="mb-0.5 block text-xs font-medium">Algorithm</label>
+          <label
+            htmlFor="dnspage-algorithm"
+            className="mb-0.5 block text-xs font-medium"
+          >
+            Algorithm
+          </label>
           <select
+            id="dnspage-algorithm"
             value={algorithm}
             onChange={(e) => setAlgorithm(e.target.value)}
             className="w-full rounded border bg-background px-2 py-1 text-xs"
@@ -8483,11 +8561,15 @@ function TSIGKeyModalForm({
         </div>
         {!isEdit && (
           <div>
-            <label className="mb-0.5 block text-xs font-medium">
+            <label
+              htmlFor="dnspage-secret-optional"
+              className="mb-0.5 block text-xs font-medium"
+            >
               Secret (optional)
             </label>
             <div className="flex items-center gap-2">
               <input
+                id="dnspage-secret-optional"
                 type="text"
                 value={secret}
                 onChange={(e) => setSecret(e.target.value)}
@@ -8510,10 +8592,14 @@ function TSIGKeyModalForm({
           </div>
         )}
         <div>
-          <label className="mb-0.5 block text-xs font-medium">
+          <label
+            htmlFor="dnspage-purpose-optional"
+            className="mb-0.5 block text-xs font-medium"
+          >
             Purpose (optional)
           </label>
           <input
+            id="dnspage-purpose-optional"
             type="text"
             value={purpose}
             onChange={(e) => setPurpose(e.target.value)}
@@ -8522,8 +8608,14 @@ function TSIGKeyModalForm({
           />
         </div>
         <div>
-          <label className="mb-0.5 block text-xs font-medium">Notes</label>
+          <label
+            htmlFor="dnspage-notes"
+            className="mb-0.5 block text-xs font-medium"
+          >
+            Notes
+          </label>
           <textarea
+            id="dnspage-notes"
             value={notes}
             onChange={(e) => setNotes(e.target.value)}
             rows={2}
@@ -10283,7 +10375,7 @@ export function RecordsTab({
       }
     }
     if (colFilters.source) {
-      const src = r.auto_generated ? "auto" : "user";
+      const src = recordSource(r);
       if (src !== colFilters.source) return false;
     }
     return true;
@@ -10299,7 +10391,7 @@ export function RecordsTab({
       if (key === "value") return row.value;
       if (key === "ttl") return row.ttl ?? -1;
       if (key === "view") return row.view_name ?? "";
-      if (key === "source") return row.auto_generated ? "auto" : "user";
+      if (key === "source") return recordSource(row);
       return "";
     },
   );
@@ -10385,6 +10477,7 @@ export function RecordsTab({
           <option value="">All</option>
           <option value="user">User</option>
           <option value="auto">Auto (IPAM/DHCP)</option>
+          <option value="pool">DNS pool</option>
         </select>
       );
     }
@@ -10568,7 +10661,14 @@ export function RecordsTab({
                       )}
                     </td>
                     <td className="px-4 py-2">
-                      {rec.auto_generated ? (
+                      {isPoolManagedRecord(rec) ? (
+                        <span
+                          className="inline-flex items-center rounded bg-sky-100 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 dark:bg-sky-900/30 dark:text-sky-400"
+                          title="Managed by a DNS pool"
+                        >
+                          pool
+                        </span>
+                      ) : rec.auto_generated ? (
                         <span
                           className="inline-flex items-center rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-900/30 dark:text-amber-400"
                           title="Auto-managed by IPAM or DHCP"
@@ -10585,12 +10685,16 @@ export function RecordsTab({
                       <div className="flex items-center justify-end gap-1">
                         <button
                           onClick={() => setEditing(rec)}
-                          disabled={rec.auto_generated}
+                          disabled={
+                            rec.auto_generated || isPoolManagedRecord(rec)
+                          }
                           className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-30 disabled:pointer-events-none"
                           title={
-                            rec.auto_generated
-                              ? "Auto-managed — edit the source IP/lease"
-                              : "Edit"
+                            isPoolManagedRecord(rec)
+                              ? POOL_MANAGED_REASON
+                              : rec.auto_generated
+                                ? "Auto-managed — edit the source IP/lease"
+                                : "Edit"
                           }
                           aria-label="Edit"
                           {...permissionGate(canWriteRecords, NEEDS_DNS_WRITE)}
@@ -10599,12 +10703,16 @@ export function RecordsTab({
                         </button>
                         <button
                           onClick={() => setConfirmDelete(rec)}
-                          disabled={rec.auto_generated}
+                          disabled={
+                            rec.auto_generated || isPoolManagedRecord(rec)
+                          }
                           className="rounded p-1 text-muted-foreground hover:text-destructive disabled:opacity-30 disabled:pointer-events-none"
                           title={
-                            rec.auto_generated
-                              ? "Auto-managed — delete the source IP/lease"
-                              : "Delete"
+                            isPoolManagedRecord(rec)
+                              ? POOL_MANAGED_REASON
+                              : rec.auto_generated
+                                ? "Auto-managed — delete the source IP/lease"
+                                : "Delete"
                           }
                           aria-label="Delete"
                           {...permissionGate(
@@ -12032,7 +12140,7 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                         className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-muted text-muted-foreground"
                         title={feedSkippedTitle(l)}
                       >
-                        {feedSkippedTotal(l)} rules skipped
+                        {countNoun(feedSkippedTotal(l), "rule")} skipped
                       </span>
                     )}
                     <span className="ml-auto text-xs text-muted-foreground">

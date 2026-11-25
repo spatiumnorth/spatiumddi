@@ -38,7 +38,7 @@ class SupportBundlePreviewArgs(BaseModel):
     # it is on.
     default_enabled=False,
     # On an appliance the preview runs the self-test, which resolves
-    # ``registry-1.docker.io`` through the host's resolver (#3302).
+    # the host's own name through the host's resolver (#3302, #4799).
     outbound=True,
 )
 async def get_support_bundle_preview(

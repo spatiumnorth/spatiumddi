@@ -550,7 +550,7 @@ function DeliveriesPanel({ subId }: { subId: string }) {
           Recent deliveries
         </span>
         <span className="text-[11px] text-muted-foreground">
-          {isFetching ? "refreshing…" : `${rows.length} rows`}
+          {isFetching ? "refreshing…" : countNoun(rows.length, "row")}
         </span>
       </div>
       {rows.length === 0 ? (

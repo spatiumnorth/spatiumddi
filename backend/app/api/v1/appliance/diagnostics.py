@@ -102,8 +102,8 @@ async def post_self_test() -> dict:
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="Download a diagnostic bundle (zip)",
 )
-# The bundle runs the self-test, whose DNS check resolves
-# ``registry-1.docker.io`` through the host's resolver (#3302).
+# The bundle runs the self-test, whose DNS check resolves the host's own
+# name through the host's resolver (#3302, #4799).
 @token_outbound
 async def get_bundle(db: DB, user: CurrentUser):
     """Returns a zip with logs, container output, system info, and

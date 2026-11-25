@@ -125,10 +125,14 @@ function QuickCreateSpaceModal({
     <Modal title="New IP Space" onClose={onClose}>
       <form onSubmit={submit} className="space-y-3">
         <div className="space-y-1">
-          <label className="block text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="space-picker-name"
+            className="block text-xs font-medium text-muted-foreground"
+          >
             Name
           </label>
           <input
+            id="space-picker-name"
             className={selectCls}
             value={name}
             onChange={(e) => setName(e.target.value)}
@@ -138,10 +142,14 @@ function QuickCreateSpaceModal({
           />
         </div>
         <div className="space-y-1">
-          <label className="block text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="space-picker-description"
+            className="block text-xs font-medium text-muted-foreground"
+          >
             Description
           </label>
           <input
+            id="space-picker-description"
             className={selectCls}
             value={description}
             onChange={(e) => setDescription(e.target.value)}
@@ -149,9 +157,9 @@ function QuickCreateSpaceModal({
           />
         </div>
         <div className="space-y-1">
-          <label className="block text-xs font-medium text-muted-foreground">
+          <span className="block text-xs font-medium text-muted-foreground">
             Color
-          </label>
+          </span>
           <SwatchPicker value={color} onChange={setColor} />
         </div>
         <p className="text-[11px] text-muted-foreground/70">

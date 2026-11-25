@@ -178,11 +178,11 @@ export function InfluxDBTargets({ isSuperadmin }: { isSuperadmin: boolean }) {
     <div className="space-y-3">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="max-w-2xl text-xs text-muted-foreground">
-          Each enabled target receives DNS + DHCP counter deltas and, if
-          selected, point-in-time IPAM utilization and per-scope lease gauges,
-          as InfluxDB line protocol. Counter deltas carry the 60&nbsp;s agent
-          bucket's own timestamp — that bucket, not the push interval, is the
-          resolution floor.
+          Each enabled target receives the metrics selected on it — DNS and DHCP
+          counter deltas, point-in-time IPAM utilization and per-scope lease
+          gauges — as InfluxDB line protocol. Counter deltas carry the 60&nbsp;s
+          agent bucket's own timestamp — that bucket, not the push interval, is
+          the resolution floor.
         </div>
         {isSuperadmin && (
           <button

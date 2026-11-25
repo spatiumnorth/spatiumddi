@@ -1,3 +1,4 @@
+import { countNoun } from "@/lib/count-noun";
 import { useState } from "react";
 import {
   Upload,
@@ -134,8 +135,8 @@ export function ImportModal({
                 <CheckCircle2 className="h-4 w-4" /> Import complete
               </div>
               <ul className="mt-2 text-xs text-green-900 dark:text-green-200 space-y-0.5">
-                <li>Created: {committed.created} subnets</li>
-                <li>Updated: {committed.updated} subnets</li>
+                <li>Created: {countNoun(committed.created, "subnet")}</li>
+                <li>Updated: {countNoun(committed.updated, "subnet")}</li>
                 <li>Skipped: {committed.skipped}</li>
                 <li>Auto-created parent blocks: {committed.blocks}</li>
               </ul>
@@ -144,10 +145,14 @@ export function ImportModal({
             <>
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="mb-1 block text-xs font-medium">
+                  <label
+                    htmlFor="import-export-modals-target-ip-space"
+                    className="mb-1 block text-xs font-medium"
+                  >
                     Target IP Space
                   </label>
                   <select
+                    id="import-export-modals-target-ip-space"
                     value={spaceId}
                     onChange={(e) => setSpaceId(e.target.value)}
                     className="w-full rounded border bg-background px-2 py-1 text-sm"
@@ -160,10 +165,14 @@ export function ImportModal({
                   </select>
                 </div>
                 <div>
-                  <label className="mb-1 block text-xs font-medium">
+                  <label
+                    htmlFor="import-export-modals-conflict-strategy"
+                    className="mb-1 block text-xs font-medium"
+                  >
                     Conflict strategy
                   </label>
                   <select
+                    id="import-export-modals-conflict-strategy"
                     value={strategy}
                     onChange={(e) =>
                       setStrategy(e.target.value as ImportStrategy)
@@ -178,10 +187,14 @@ export function ImportModal({
               </div>
 
               <div>
-                <label className="mb-1 block text-xs font-medium">
+                <label
+                  htmlFor="import-export-modals-file-csv-json-or-xlsx"
+                  className="mb-1 block text-xs font-medium"
+                >
                   File (CSV, JSON, or XLSX)
                 </label>
                 <input
+                  id="import-export-modals-file-csv-json-or-xlsx"
                   type="file"
                   accept=".csv,.json,.xlsx,text/csv,application/json"
                   onChange={(e) => {
@@ -514,8 +527,14 @@ export function AddressImportModal({
                 <CheckCircle2 className="h-4 w-4" /> Import complete
               </div>
               <ul className="mt-2 text-xs text-green-900 dark:text-green-200 space-y-0.5">
-                <li>Created: {committed.created} addresses</li>
-                <li>Updated: {committed.updated} addresses</li>
+                <li>
+                  Created:{" "}
+                  {countNoun(committed.created, "address", "addresses")}
+                </li>
+                <li>
+                  Updated:{" "}
+                  {countNoun(committed.updated, "address", "addresses")}
+                </li>
                 <li>Skipped: {committed.skipped}</li>
                 <li>DNS records published: {committed.dns_synced}</li>
                 {committed.errors.length > 0 && (
@@ -543,10 +562,14 @@ export function AddressImportModal({
                 </p>
               </div>
               <div>
-                <label className="mb-1 block text-xs font-medium">
+                <label
+                  htmlFor="import-export-modals-conflict-strategy-2"
+                  className="mb-1 block text-xs font-medium"
+                >
                   Conflict strategy
                 </label>
                 <select
+                  id="import-export-modals-conflict-strategy-2"
                   value={strategy}
                   onChange={(e) =>
                     setStrategy(e.target.value as ImportStrategy)
@@ -559,10 +582,14 @@ export function AddressImportModal({
                 </select>
               </div>
               <div>
-                <label className="mb-1 block text-xs font-medium">
+                <label
+                  htmlFor="import-export-modals-file-csv-json-or-xlsx-2"
+                  className="mb-1 block text-xs font-medium"
+                >
                   File (CSV, JSON, or XLSX)
                 </label>
                 <input
+                  id="import-export-modals-file-csv-json-or-xlsx-2"
                   type="file"
                   accept=".csv,.json,.xlsx,text/csv,application/json"
                   onChange={(e) => {

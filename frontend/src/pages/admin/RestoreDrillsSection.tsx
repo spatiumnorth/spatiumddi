@@ -363,7 +363,10 @@ export function RestoreDrillsSection() {
         )}
 
         {runDrill.isError && (
-          <div className="border-t px-4 py-2 text-xs text-rose-600 dark:text-rose-400">
+          <div
+            role="alert"
+            className="border-t px-4 py-2 text-xs text-rose-600 dark:text-rose-400"
+          >
             {formatApiError(runDrill.error, "drill failed")}
           </div>
         )}
@@ -567,10 +570,14 @@ function ScheduleDrillForm({
         </label>
 
         <div>
-          <label className="mb-1 block text-xs font-medium">
+          <label
+            htmlFor="restore-drills-section-drill-schedule"
+            className="mb-1 block text-xs font-medium"
+          >
             Drill schedule
           </label>
           <select
+            id="restore-drills-section-drill-schedule"
             value={
               DRILL_CRON_PRESETS.find((p) => p.value === cron)?.value ??
               "__custom__"
@@ -608,7 +615,7 @@ function ScheduleDrillForm({
         </div>
 
         {save.isError && (
-          <p className="text-xs text-rose-600 dark:text-rose-400">
+          <p role="alert" className="text-xs text-rose-600 dark:text-rose-400">
             {formatApiError(save.error)}
           </p>
         )}
