@@ -288,3 +288,34 @@ describe("Delete API Token refusal (#3822)", () => {
     await waitFor(() => expect(list.mock.calls.length).toBeGreaterThan(calls));
   });
 });
+
+describe("New token resource binding access (#4846)", () => {
+  it("starts at read and disables access the user does not hold", async () => {
+    myPermissions.mockResolvedValue({
+      is_superadmin: false,
+      grants: [{ action: "read", resource_type: "subnet", resource_id: null }],
+    });
+    list.mockResolvedValue([]);
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <ApiTokensPage />
+      </QueryClientProvider>,
+    );
+    await act(async () => {});
+    fireEvent.click(await screen.findByText("New Token"));
+    fireEvent.change(screen.getByDisplayValue("No resource binding"), {
+      target: { value: "subnet" },
+    });
+    const sel = screen.getByLabelText("Binding access") as HTMLSelectElement;
+    expect(sel.value).toBe("read");
+    const opt = (v: string) =>
+      (Array.from(sel.options).find((o) => o.value === v) as HTMLOptionElement)
+        .disabled;
+    expect(opt("read")).toBe(false);
+    expect(opt("write")).toBe(true);
+    expect(opt("admin")).toBe(true);
+  });
+});

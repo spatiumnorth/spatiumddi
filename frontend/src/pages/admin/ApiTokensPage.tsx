@@ -67,10 +67,24 @@ function CreateTokenModal({
     "none",
   );
   const [bindAction, setBindAction] = useState<"read" | "write" | "admin">(
-    "write",
+    "read",
   );
+  // #4846: offer only the access the caller holds on the picked type; the
+  // server stays the authority (a binding never exceeds its creator).
+  // Instance-scoped grants count: check the picked resource once there is
+  // one, and any grant of the action on the type before that.
+  const { can, hasAnyGrantFor } = usePermissions();
   const [bindGroupId, setBindGroupId] = useState("");
   const [bindResourceId, setBindResourceId] = useState("");
+  const mayBind = (action: "write" | "admin") =>
+    bindResourceId
+      ? can(action, bindType, bindResourceId)
+      : hasAnyGrantFor(action, bindType);
+  // A level picked before the resource falls back to read when the picked
+  // resource turns out not to allow it, so the select never shows (and the
+  // request never sends) a disabled option.
+  const effectiveBindAction =
+    bindAction !== "read" && !mayBind(bindAction) ? "read" : bindAction;
   const [stepPassword, setStepPassword] = useState("");
   const [stepTotp, setStepTotp] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -98,7 +112,7 @@ function CreateTokenModal({
     bindType !== "none" && bindResourceId
       ? [
           {
-            action: bindAction,
+            action: effectiveBindAction,
             resource_type: bindType,
             resource_id: bindResourceId,
           },
@@ -236,6 +250,7 @@ function CreateTokenModal({
                 value={bindType}
                 onChange={(e) => {
                   setBindType(e.target.value as "none" | "subnet" | "dns_zone");
+                  setBindAction("read");
                   setBindResourceId("");
                   setBindGroupId("");
                 }}
@@ -250,14 +265,18 @@ function CreateTokenModal({
                 <select
                   aria-label="Binding access"
                   className={inputCls}
-                  value={bindAction}
+                  value={effectiveBindAction}
                   onChange={(e) =>
                     setBindAction(e.target.value as "read" | "write" | "admin")
                   }
                 >
                   <option value="read">read</option>
-                  <option value="write">write</option>
-                  <option value="admin">admin</option>
+                  <option value="write" disabled={!mayBind("write")}>
+                    write
+                  </option>
+                  <option value="admin" disabled={!mayBind("admin")}>
+                    admin
+                  </option>
                 </select>
               )}
               {bindType === "subnet" && (
