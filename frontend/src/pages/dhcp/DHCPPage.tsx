@@ -3165,13 +3165,17 @@ function ServerDetailView({
         // Counts are changes, not totals: the scope reconciler diff-merges, so
         // an unchanged pool / reservation is not touched and not counted.
         if (result.pools_synced)
-          scopeBits.push(`${result.pools_synced} pools changed`);
+          scopeBits.push(`${countNoun(result.pools_synced, "pool")} changed`);
         if (result.pools_removed)
-          scopeBits.push(`${result.pools_removed} pools removed`);
+          scopeBits.push(`${countNoun(result.pools_removed, "pool")} removed`);
         if (result.statics_synced)
-          scopeBits.push(`${result.statics_synced} reservations changed`);
+          scopeBits.push(
+            `${countNoun(result.statics_synced, "reservation")} changed`,
+          );
         if (result.statics_removed)
-          scopeBits.push(`${result.statics_removed} reservations removed`);
+          scopeBits.push(
+            `${countNoun(result.statics_removed, "reservation")} removed`,
+          );
         // #1110 — shared with another Windows member that imports them.
         if (result.scopes_deferred)
           scopeBits.push(
@@ -3179,7 +3183,7 @@ function ServerDetailView({
           );
         parts.push(scopeBits.join(" / "));
       }
-      parts.push(`${result.server_leases} leases on wire`);
+      parts.push(`${countNoun(result.server_leases, "lease")} on wire`);
       if (result.imported) parts.push(`${result.imported} imported`);
       if (result.refreshed) parts.push(`${result.refreshed} refreshed`);
       if (result.ipam_created || result.ipam_refreshed)

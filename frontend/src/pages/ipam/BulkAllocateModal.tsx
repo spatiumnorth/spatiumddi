@@ -14,6 +14,7 @@
  * operator types so they see the rendered hostnames before posting.
  */
 
+import { countNoun, pluralize } from "@/lib/count-noun";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { useEffect, useMemo, useState } from "react";
 import {
@@ -461,7 +462,9 @@ export function BulkAllocateModal({
           ) : (
             <CheckCircle2 className="h-4 w-4" />
           )}
-          {previewData ? `Allocate ${previewData.will_create} IPs` : "Allocate"}
+          {previewData
+            ? `Allocate ${countNoun(previewData.will_create, "IP")}`
+            : "Allocate"}
         </button>
       </>
     ) : (
@@ -670,7 +673,8 @@ export function BulkAllocateModal({
           {livePreview && (
             <div className="rounded-md border bg-muted/20 p-3">
               <div className="mb-1 text-xs font-medium text-muted-foreground">
-                Preview ({livePreview.total} IPs total)
+                Preview ({livePreview.total}{" "}
+                {pluralize(livePreview.total, "IP")} total)
               </div>
               <table className="w-full text-xs font-mono">
                 <tbody>
