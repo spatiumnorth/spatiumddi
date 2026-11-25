@@ -26,6 +26,7 @@ import {
   formatApiError,
 } from "@/lib/api";
 import { ReauthFields } from "@/components/ReauthFields";
+import { ListReadError } from "@/components/ui/list-read-error";
 import { copyToClipboard } from "@/lib/clipboard";
 import {
   buildEnrolmentUri,
@@ -301,6 +302,13 @@ function CreateTokenModal({
                   ))}
                 </select>
               )}
+              {bindType === "subnet" && subnetsQ.isError && (
+                <ListReadError
+                  error={subnetsQ.error}
+                  what="subnets"
+                  className="text-xs"
+                />
+              )}
               {bindType === "dns_zone" && (
                 <>
                   <select
@@ -319,6 +327,21 @@ function CreateTokenModal({
                       </option>
                     ))}
                   </select>
+                  {/* #4858: a refused read is not an empty list. */}
+                  {dnsGroupsQ.isError && (
+                    <ListReadError
+                      error={dnsGroupsQ.error}
+                      what="DNS groups"
+                      className="text-xs"
+                    />
+                  )}
+                  {bindGroupId && zonesQ.isError && (
+                    <ListReadError
+                      error={zonesQ.error}
+                      what="DNS zones"
+                      className="text-xs"
+                    />
+                  )}
                   {bindGroupId && (
                     <select
                       aria-label="DNS zone to bind"
@@ -371,6 +394,11 @@ function CreateTokenModal({
               (!stepPassword && !stepTotp) ||
               bindingIncomplete ||
               mut.isPending
+            }
+            title={
+              bindingIncomplete
+                ? "Pick the resource to bind, or choose No resource binding"
+                : undefined
             }
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >

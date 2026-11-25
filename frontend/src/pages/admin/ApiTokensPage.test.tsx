@@ -22,6 +22,7 @@ const list = vi.fn();
 const update = vi.fn();
 const create = vi.fn();
 const myPermissions = vi.fn();
+const listSubnets = vi.fn();
 
 vi.mock("@/lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api")>();
@@ -29,6 +30,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
     ...actual,
     apiTokensApi: { ...actual.apiTokensApi, list, update, create },
     authApi: { ...actual.authApi, myPermissions },
+    ipamApi: { ...actual.ipamApi, listSubnets },
   };
 });
 
@@ -358,5 +360,34 @@ describe("New token with a binding type and no resource (#4857)", () => {
       target: { value: "none" },
     });
     expect(createBtn.disabled).toBe(false);
+  });
+});
+
+describe("New token binding picker whose list was refused (#4858)", () => {
+  it("says the list could not be read, and why Create is held", async () => {
+    myPermissions.mockResolvedValue({ is_superadmin: false, grants: [] });
+    list.mockResolvedValue([]);
+    listSubnets.mockRejectedValue({
+      response: { status: 403, data: { detail: "Forbidden" } },
+    });
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <ApiTokensPage />
+      </QueryClientProvider>,
+    );
+    await act(async () => {});
+    fireEvent.click(await screen.findByText("New Token"));
+    fireEvent.change(screen.getByDisplayValue("No resource binding"), {
+      target: { value: "subnet" },
+    });
+    await screen.findByText("You don't have permission to see subnets.");
+    const createBtn = screen.getByRole("button", {
+      name: "Create",
+    }) as HTMLButtonElement;
+    expect(createBtn.disabled).toBe(true);
+    expect(createBtn.title).toMatch(/Pick the resource to bind/);
   });
 });
