@@ -5240,7 +5240,7 @@ async def update_appliance_roles(
                 raise HTTPException(
                     status.HTTP_422_UNPROCESSABLE_ENTITY,
                     "Cannot assign the 'dhcp' role: the DHCP module (core.dhcp) is "
-                    "disabled. Enable it under Administration > Features & "
+                    "disabled. Enable it under Features & "
                     "Integrations, or remove the role.",
                 )
         # #2135 — the same refusal for a DNS role while ``core.dns`` is off.
@@ -5260,7 +5260,7 @@ async def update_appliance_roles(
                 raise HTTPException(
                     status.HTTP_422_UNPROCESSABLE_ENTITY,
                     f"Cannot assign the {new_dns_roles[0]!r} role: the DNS module "
-                    "(core.dns) is disabled. Enable it under Administration > "
+                    "(core.dns) is disabled. Enable it under "
                     "Features & Integrations, or remove the role.",
                 )
         # Capability gate. Each requested role must be backed by the
