@@ -529,6 +529,11 @@ async def commit_subnet_split(
       9. Bump DHCP config bundles for affected agent-based servers.
       10. Delete the parent (last — references must be clear).
     """
+    from app.services import locks as lock_svc  # noqa: PLC0415
+
+    # #3361 — the parent is replaced and its addresses, scopes and
+    # reservations re-bound to the children.
+    await lock_svc.assert_tree_editable(db, "subnet", subnet)
     if not await _try_advisory_lock(db, subnet.id):
         raise SplitError(
             "Another operation is already in progress for this subnet. " "Retry once it completes.",

@@ -116,6 +116,7 @@ NO_PERMISSION_DEPENDENCY: dict[str, str] = {
     "/api/v1/bgp/prefix/origin": "public RIPEstat / PeeringDB data, no install data",
     "/api/v1/bgp/prefix/routing-history": "public RIPEstat / PeeringDB data, no install data",
     # ── checked in the handler ──────────────────────────────────────────
+    "/api/v1/locks": "filters every type by the caller's read grant (list_locks)",
     "/api/v1/tags/keys": "unions only the tagged tables the caller may read (_readable_tables)",
     "/api/v1/tags/values": "unions only the tagged tables the caller may read (_readable_tables)",
     "/api/v1/search": "the search engine filters every result type by the caller's read grant",

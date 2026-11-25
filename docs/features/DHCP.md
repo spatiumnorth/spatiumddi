@@ -2103,6 +2103,36 @@ rule here has been surfaced to an operator, not just silently logged.
   to the server group — every member renders the same classes. `409` at
   `backend/app/api/v1/dhcp/client_classes.py`.
 
+### Locks (#3361)
+
+Any scope or static reservation can be **locked**, which is how a change freeze or an audit hold is
+written down on the object instead of in a wiki page. A lock has a level, a
+required reason, who set it and when, and optionally an expiry (the hook the
+change-window lock of #63 builds on; an expired lock is no lock).
+
+| Level | Effect |
+| --- | --- |
+| `delete` | The object can still be edited, but not deleted, and no parent delete that would remove it goes through. |
+| `edit` | Implies `delete`. Freezes the **operative** fields; annotations (description, tags, custom fields, owner, colour) stay editable. A locked object cannot be renamed, moved or have its type changed. |
+
+Refusals are `423 Locked` with `code: "resource_locked"`; the body names the
+object, the level, who locked it and why. A parent delete (or split, merge,
+move) that would take a locked object with it is refused with the first five
+locked descendants named. Bulk edits and deletes skip the locked rows and list
+each one in the response (`skipped_locked` / `locked`); importers leave a locked
+row as it is and report it under `skipped`. An edit-locked scope also freezes its pools (its ranges); a locked reservation is not rewritten by the IPAM address it is linked to. The other direction holds too: an edit-locked IP address that mirrors a reservation refuses the reservation's own edit of hostname / MAC / address and its delete (a `delete` lock on the address does not, because the reservation's edit does not remove the address), naming the address.
+
+Lock and unlock with `PUT /api/v1/locks/{resource_type}/{id}` and
+`POST /api/v1/locks/{resource_type}/{id}/unlock` (a reason in both bodies);
+`GET /api/v1/locks` lists what is locked. Both need `lock` on the type
+([PERMISSIONS.md](../PERMISSIONS.md)). Integration-owned rows (an integration
+mirror, a dynamic-lease mirror) cannot be locked: the integration would
+overwrite them. The Copilot has `find_locked_resources`, and its delete
+proposals are refused on a locked target; it has no way to unlock.
+
+In the UI each scope and static reservation shows a padlock (level, who and why in its tooltip) and a Lock / Unlock action behind the `lock` grant, which asks for the reason. Delete is disabled on a locked row with the reason as its tooltip; Edit stays on for an edit lock, since annotations stay editable. The lists that have filters have a Locked filter (all / locked / unlocked).
+The optional **Resource lock removed** alert rule (Alerts → Rules; seeded disabled) opens one event per unlock, naming who removed the lock, what it protected and the reason they gave.
+
 ## 17. Passive DHCP Fingerprinting (Phase 2 device profiling)
 
 Auto-populate "what is this thing?" for every DHCP-leasing client by

@@ -58,6 +58,7 @@ from app.api.v1.groups.time_bound_grants import router as time_bound_grants_rout
 from app.api.v1.ipam.integration_space_audit import router as integration_space_audit_router
 from app.api.v1.ipam.router import router as ipam_router
 from app.api.v1.kubernetes import router as kubernetes_router
+from app.api.v1.locks import router as locks_router
 from app.api.v1.logs import logs_router
 from app.api.v1.looking_glass.agents import router as looking_glass_agents_router
 from app.api.v1.looking_glass.router import router as looking_glass_router
@@ -129,6 +130,7 @@ api_v1_router.include_router(
 api_v1_router.include_router(postgres_router, prefix="/admin", tags=["admin-postgres"])
 api_v1_router.include_router(redis_admin_router, prefix="/admin", tags=["admin-redis"])
 api_v1_router.include_router(trash_router, prefix="/admin", tags=["admin-trash"])
+api_v1_router.include_router(locks_router, prefix="/locks", tags=["locks"])
 api_v1_router.include_router(alerts_router, prefix="/alerts", tags=["alerts"])
 api_v1_router.include_router(ansible_router, prefix="/ansible", tags=["ansible"])
 api_v1_router.include_router(api_tokens_router, prefix="/api-tokens", tags=["api-tokens"])

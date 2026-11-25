@@ -28,6 +28,8 @@ import { DeleteConfirmModal, V6NoHaTag } from "./_shared";
 import { scopeDeleteCopy } from "@/lib/dhcp-scope-delete";
 import { v6ScopeLacksHa } from "@/lib/dhcpHa";
 import { ScopeServingStrip } from "./WindowsFailoverPanel";
+import { LockBadge, LockControl } from "@/components/LockControl";
+import { isDeleteBlockedByLock, lockTitle } from "@/lib/locks";
 
 // #1155 — the scope and pool writes, each on the check the server makes:
 // the DHCP scope and pool routers map POST / PUT to write and DELETE to
@@ -183,6 +185,7 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
               {group && v6ScopeLacksHa(scope, group) && (
                 <V6NoHaTag keaMemberCount={group.kea_member_count} />
               )}
+              <LockBadge resource={scope} />
             </div>
             <p className="text-xs text-muted-foreground">
               Lease {scope.lease_time}s
@@ -210,15 +213,27 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
           >
             <Pencil className="h-3.5 w-3.5" />
           </button>
+          <LockControl
+            type="dhcp_scope"
+            resource={scope}
+            label={scope.name || `Scope ${scope.id.slice(0, 8)}`}
+            showBadge={false}
+            onChanged={() => {
+              qc.invalidateQueries({ queryKey: ["dhcp-scopes-subnet"] });
+              qc.invalidateQueries({ queryKey: ["dhcp-scopes"] });
+            }}
+          />
           <button
             onClick={() => setDeleteScope(true)}
             className="rounded p-1 text-muted-foreground hover:text-destructive disabled:opacity-40"
-            title="Delete scope"
+            title={lockTitle(scope) ?? "Delete scope"}
             aria-label="Delete scope"
-            {...permissionGate(
-              perms.can("delete", "dhcp_scope"),
-              NEEDS_SCOPE_DELETE,
-            )}
+            {...(isDeleteBlockedByLock(scope)
+              ? { disabled: true }
+              : permissionGate(
+                  perms.can("delete", "dhcp_scope"),
+                  NEEDS_SCOPE_DELETE,
+                ))}
           >
             <Trash2 className="h-3.5 w-3.5" />
           </button>

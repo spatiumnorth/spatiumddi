@@ -21,6 +21,7 @@ from app.core.update_nulls import changed_keys, resolve_update_changes, snapshot
 from app.models.dhcp import DHCPClientClass, DHCPLease, DHCPPool, DHCPScope, DHCPServerGroup
 from app.models.dhcp_device_policy import DHCPDevicePolicy
 from app.models.ipam import IPAddress, Subnet
+from app.services import locks as lock_svc
 from app.services.dhcp.class_refs import (
     generated_class_problem,
     is_builtin_or_generated,
@@ -401,6 +402,8 @@ async def create_pool(
     scope = await db.get(DHCPScope, scope_id)
     if scope is None:
         raise HTTPException(status_code=404, detail="Scope not found")
+    # #3361 — a scope's pools are its operative ranges: an edit lock freezes them.
+    lock_svc.assert_editable("dhcp_scope", scope, None)
     if body.options_override:
         body.options_override = normalize_options(body.options_override)
         await validate_dhcp_options(
@@ -477,6 +480,10 @@ async def update_pool(
     pool = await db.get(DHCPPool, pool_id)
     if pool is None:
         raise HTTPException(status_code=404, detail="Pool not found")
+    # #3361 — see create_pool.
+    pool_scope = await db.get(DHCPScope, pool.scope_id)
+    if pool_scope is not None:
+        lock_svc.assert_editable("dhcp_scope", pool_scope, None)
     # Snapshot the old range BEFORE mutating, so we can remove the old
     # exclusion from Windows if it shifted.
     prev_start = str(pool.start_ip)
@@ -580,6 +587,7 @@ async def delete_pool(pool_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
         raise HTTPException(status_code=404, detail="Pool not found")
     scope = await db.get(DHCPScope, pool.scope_id)
     if scope is not None:
+        lock_svc.assert_editable("dhcp_scope", scope, None)  # #3361 — see create_pool
         collect_wake(dhcp_group_channel(scope.group_id))
     await push_pool_change(db, pool, action="delete")
     write_audit(

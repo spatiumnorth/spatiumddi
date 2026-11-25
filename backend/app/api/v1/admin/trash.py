@@ -31,6 +31,7 @@ from app.models.ipam import IPBlock, IPSpace, Subnet
 from app.models.network_service import NetworkService
 from app.models.overlay import OverlayNetwork
 from app.models.ownership import Customer
+from app.services import locks as lock_svc
 from app.services.dhcp.lease_cleanup import delete_leases_for_scope
 from app.services.dhcp.static_ipam import (
     remirror_scope_statics,
@@ -1000,6 +1001,10 @@ async def permanent_delete_from_trash(
     target = (await db.execute(stmt)).scalar_one_or_none()
     if target is None:
         raise HTTPException(status_code=404, detail="Soft-deleted row not found")
+    # #3361 — a locked row cannot be soft-deleted, so none should be in the
+    # Trash; one locked some other way is not purged.
+    if type in lock_svc.SPECS:
+        lock_svc.assert_deletable(type, target)
 
     if isinstance(target, DNSRecord):
         orphan_address = (await withdrawn_alias_owners(db, [target.id])).get(target.id)

@@ -43,6 +43,7 @@ from app.models.ipam import (
     IPSpace,
     Subnet,
 )
+from app.services import locks as lock_svc
 from app.services.ipam.address_create_rules import boundary_address_refusal
 from app.services.ipam.resize import _total_ips
 from app.services.ipam.subnet_placeholders import (
@@ -426,7 +427,33 @@ async def preview_import(
             "gateway": str(existing.gateway) if existing.gateway else None,
         }
         diff_details = {"old": old_snapshot, "new": {**row, "network": canonical}}
-        if strategy == "overwrite":
+        locked_hit = (
+            lock_svc.skip_edit(
+                "subnet",
+                existing,
+                {
+                    "name": name,
+                    "vlan_id": row.get("vlan_id"),
+                    "vxlan_id": row.get("vxlan_id"),
+                    "gateway": _gw,
+                },
+            )
+            if strategy == "overwrite"
+            else None
+        )
+        if locked_hit is not None:
+            # #3361 — a locked subnet is left as it is and reported, not a failed import.
+            preview.conflicts.append(
+                DiffRow(
+                    kind="subnet",
+                    action="skip",
+                    network=canonical,
+                    name=existing.name,
+                    reason=f"Locked ({locked_hit.level}) by {locked_hit.locked_by}: {locked_hit.reason}",
+                    details=diff_details,
+                )
+            )
+        elif strategy == "overwrite":
             gw_target_error = await _overwrite_gateway_problem(db, existing, canonical, _gw)
             if gw_target_error is not None:
                 preview.errors.append(
@@ -582,6 +609,21 @@ async def commit_import(
                 result_obj.skipped += 1
                 continue
             if strategy == "overwrite":
+                if (
+                    lock_svc.skip_edit(
+                        "subnet",
+                        existing,
+                        {
+                            "name": name,
+                            "vlan_id": vlan_id,
+                            "vxlan_id": vxlan_id,
+                            "gateway": gateway,
+                        },
+                    )
+                    is not None
+                ):
+                    result_obj.skipped += 1  # #3361 — locked: left as it is
+                    continue
                 gw_target_error = await _overwrite_gateway_problem(db, existing, canonical, gateway)
                 if gw_target_error is not None:
                     result_obj.errors.append(gw_target_error)

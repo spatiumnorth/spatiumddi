@@ -35,7 +35,9 @@ router = APIRouter()
 # resource (#62); the builtin Change Approver role holds it, so a clone of that
 # role must be saveable (#1631). tests/test_role_actions_1631.py pins this set
 # against every action the builtin roles and the permission checks use.
-_VALID_ACTIONS = {"read", "write", "delete", "admin", "approve", "*"}
+# ``lock`` (#3361) sets and clears an edit / delete lock on a resource type;
+# like ``approve`` it is not implied by ``admin``.
+_VALID_ACTIONS = {"read", "write", "delete", "admin", "approve", "lock", "*"}
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
