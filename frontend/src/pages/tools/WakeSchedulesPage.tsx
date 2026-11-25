@@ -1,7 +1,7 @@
 import { countNoun } from "@/lib/count-noun";
 import { useMemo, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ListEmpty } from "@/components/ui/list-read-error";
+import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
 import {
   ArrowDownCircle,
   ArrowUpCircle,
@@ -2907,6 +2907,10 @@ function CalendarGateSection({
             </label>
             {calendarsQ.isLoading ? (
               <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+            ) : calendarsQ.isError ? (
+              <p className="rounded-md border border-dashed px-3 py-2 text-[11px]">
+                <ListReadError error={calendarsQ.error} what="calendars" />
+              </p>
             ) : calendars.length === 0 ? (
               <p className="rounded-md border border-dashed px-3 py-2 text-[11px] text-muted-foreground">
                 No calendars subscribed yet. Add one on the{" "}
