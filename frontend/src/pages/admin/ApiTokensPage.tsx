@@ -67,8 +67,11 @@ function CreateTokenModal({
     "none",
   );
   const [bindAction, setBindAction] = useState<"read" | "write" | "admin">(
-    "write",
+    "read",
   );
+  // #4846: offer only the access the caller holds on the picked type; the
+  // server stays the authority (a binding never exceeds its creator).
+  const { can } = usePermissions();
   const [bindGroupId, setBindGroupId] = useState("");
   const [bindResourceId, setBindResourceId] = useState("");
   const [stepPassword, setStepPassword] = useState("");
@@ -236,6 +239,7 @@ function CreateTokenModal({
                 value={bindType}
                 onChange={(e) => {
                   setBindType(e.target.value as "none" | "subnet" | "dns_zone");
+                  setBindAction("read");
                   setBindResourceId("");
                   setBindGroupId("");
                 }}
@@ -256,8 +260,12 @@ function CreateTokenModal({
                   }
                 >
                   <option value="read">read</option>
-                  <option value="write">write</option>
-                  <option value="admin">admin</option>
+                  <option value="write" disabled={!can("write", bindType)}>
+                    write
+                  </option>
+                  <option value="admin" disabled={!can("admin", bindType)}>
+                    admin
+                  </option>
                 </select>
               )}
               {bindType === "subnet" && (
