@@ -16,6 +16,7 @@
  *   user has no false sense that they can force-commit.
  */
 
+import { countNoun } from "@/lib/count-noun";
 import { useMemo, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, AlertTriangle, CheckCircle2, X } from "lucide-react";
@@ -482,7 +483,7 @@ export function ResizeSubnetModal({
                 <span className="text-muted-foreground">DHCP scopes:</span>{" "}
                 {preview.affected_dhcp_scopes}
                 {preview.affected_dhcp_scopes > 0
-                  ? ` (${preview.affected_dhcp_pools} pools, ${preview.affected_dhcp_static_assignments} statics)`
+                  ? ` (${countNoun(preview.affected_dhcp_pools, "pool")}, ${countNoun(preview.affected_dhcp_static_assignments, "static")})`
                   : ""}
               </div>
               <div>
