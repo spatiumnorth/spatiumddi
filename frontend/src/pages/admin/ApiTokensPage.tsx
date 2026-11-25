@@ -119,6 +119,11 @@ function CreateTokenModal({
         ]
       : [];
 
+  // #4857: a binding type with nothing picked would send no grant, and a
+  // token with no grant carries its owner's whole permissions. Hold Create
+  // until the resource is picked (or the binding is set back to none).
+  const bindingIncomplete = bindType !== "none" && !bindResourceId;
+
   const mut = useMutation({
     mutationFn: () =>
       apiTokensApi.create({
@@ -146,6 +151,7 @@ function CreateTokenModal({
       <form
         onSubmit={(e) => {
           e.preventDefault();
+          if (bindingIncomplete) return;
           setError(null);
           mut.mutate();
         }}
@@ -360,7 +366,12 @@ function CreateTokenModal({
           </button>
           <button
             type="submit"
-            disabled={!name || (!stepPassword && !stepTotp) || mut.isPending}
+            disabled={
+              !name ||
+              (!stepPassword && !stepTotp) ||
+              bindingIncomplete ||
+              mut.isPending
+            }
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {mut.isPending ? "Creating…" : "Create"}
