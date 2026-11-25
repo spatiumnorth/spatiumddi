@@ -19,9 +19,12 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 logger = structlog.get_logger(__name__)
 
-# Strip C0 controls + DEL. Newlines/tabs in particular enable log forging
-# when the value is later written to a text log.
-_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+# Strip C0 controls, DEL and the C1 range. Newlines/tabs in particular let a
+# value fake a line break when it is later written to a text log; C1 matters
+# too: U+0085 (NEL) is a line break to Unicode-aware readers (str.splitlines)
+# and U+009B (CSI) opens a terminal control sequence. Headers are decoded as
+# latin-1, so a raw 0x85 byte arrives here as U+0085.
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 # Matches the user_agent / audit columns (String(500)). Truncate well
 # inside that so a multi-byte tail can't overflow the column.
