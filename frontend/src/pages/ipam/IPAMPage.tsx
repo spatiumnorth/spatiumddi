@@ -11755,7 +11755,10 @@ export function BulkEditAddressesModal({
     editReservedUntil;
 
   return (
-    <Modal title={`Bulk edit ${ipIds.length} IP addresses`} onClose={onClose}>
+    <Modal
+      title={`Bulk edit ${countNoun(ipIds.length, "IP address", "IP addresses")}`}
+      onClose={onClose}
+    >
       <div className="space-y-3">
         <p className="text-xs text-muted-foreground">
           Only fields you tick will be touched. Tags and custom fields are
@@ -11948,7 +11951,8 @@ export function BulkEditAddressesModal({
                 {replaceAllTags ? (
                   <>
                     Selected IPs currently have {existingTagKeys.size} distinct
-                    tag keys — any key not listed below will be removed.
+                    tag {pluralize(existingTagKeys.size, "key")} — any key not
+                    listed below will be removed.
                   </>
                 ) : (
                   <>
@@ -12068,7 +12072,10 @@ export function BulkDeleteAddressesModal({
   });
 
   return (
-    <Modal title={`Delete ${ipIds.length} IP addresses`} onClose={onClose}>
+    <Modal
+      title={`Delete ${countNoun(ipIds.length, "IP address", "IP addresses")}`}
+      onClose={onClose}
+    >
       <div className="space-y-3">
         <p className="text-sm">
           {permanent ? (
