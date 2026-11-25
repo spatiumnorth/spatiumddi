@@ -10888,14 +10888,18 @@ function NatSubnetPanel({ subnetId }: { subnetId: string }) {
   );
 }
 
-function NatMappingsForIpModal({
+export function NatMappingsForIpModal({
   ip,
   onClose,
 }: {
   ip: IPAddress;
   onClose: () => void;
 }) {
-  const { data = [], isLoading } = useQuery({
+  const {
+    data = [],
+    isLoading,
+    error,
+  } = useQuery({
     queryKey: ["nat-by-ip", ip.id],
     queryFn: () => natApi.byIp(ip.id),
   });
@@ -10904,6 +10908,11 @@ function NatMappingsForIpModal({
       <div className="space-y-3">
         {isLoading ? (
           <p className="text-sm text-muted-foreground">Loading…</p>
+        ) : error ? (
+          // A refused read is not an empty list (#4853).
+          <p className="text-sm">
+            <ListReadError error={error} what="this IP's NAT mappings" />
+          </p>
         ) : (
           <NatRowsTable
             rows={data}
