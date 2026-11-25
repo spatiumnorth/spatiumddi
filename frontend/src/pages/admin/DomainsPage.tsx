@@ -1,3 +1,4 @@
+import { countNoun } from "@/lib/count-noun";
 import { useOwnershipModules } from "@/hooks/useOwnershipModules";
 import { ListEmpty } from "@/components/ui/list-read-error";
 import { useMemo, useState } from "react";
@@ -84,7 +85,11 @@ function ExpiryBadge({ expiresAt }: { expiresAt: string | null }) {
           "rounded px-2 py-0.5 text-[11px] font-medium tabular-nums",
           cls,
         )}
-        title={`Expires in ${days} days`}
+        title={
+          days < 0
+            ? `Expired ${countNoun(Math.abs(days), "day")} ago`
+            : `Expires in ${countNoun(days, "day")}`
+        }
       >
         {label}
       </span>
