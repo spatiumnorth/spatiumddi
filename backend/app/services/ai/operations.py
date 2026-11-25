@@ -5022,7 +5022,7 @@ async def _assign_role_dhcp_module_problem(
         return None
     return (
         "Cannot assign the 'dhcp' role: the DHCP module (core.dhcp) is "
-        "disabled. Enable it under Administration > Features & "
+        "disabled. Enable it under Features & "
         "Integrations, or remove the role."
     )
 
@@ -5041,7 +5041,7 @@ async def _assign_role_dns_module_problem(
         return None
     return (
         f"Cannot assign the {added[0]!r} role: the DNS module (core.dns) is "
-        "disabled. Enable it under Administration > Features & "
+        "disabled. Enable it under Features & "
         "Integrations, or remove the role."
     )
 
