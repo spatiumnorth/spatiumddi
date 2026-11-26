@@ -50,7 +50,7 @@ from app.core.mac import canonicalize_mac
 from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.dhcp import DHCPLease, DHCPScope, DHCPStaticAssignment
-from app.models.dns import DNSZone
+from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPAddress, Subnet
 from app.services.dhcp.ipam_mirror import (
     insert_ipam_mirror_row,
@@ -774,16 +774,17 @@ async def remove_ipam_for_static(
     collects every removed row's subnet, and recounts them once with
     ``recount_subnets_and_blocks`` (#3354). Returns the number of rows removed.
 
-    ``keep_bound`` leaves a row an E911 ``ip`` binding names exactly as it is, still
-    ``static_dhcp`` with its binding active (#4286): a scope going to the Trash is
-    not an end for the address, and the restore finds the row where it was. Without
-    it such a row is kept as a free address with the binding deactivated (#3964).
+    ``keep_bound`` leaves a row that something hangs off exactly as it is (see
+    ``_row_kept_through_trash``): an E911 ``ip`` binding (#4286), a DNS alias or an OT
+    descriptor (#4870). A scope going to the Trash is not an end for the address, and
+    the restore finds the row where it was. Without it an E911-bound row is kept as a
+    free address with the binding deactivated (#3964).
     """
     res = await db.execute(select(IPAddress).where(IPAddress.static_assignment_id == str(st.id)))
     removed = 0
     audits: list[AuditLog] = []
     for row in res.scalars().all():
-        if keep_bound and await bound_ip_ids(db, [row.id]):
+        if keep_bound and await _row_kept_through_trash(db, row.id):
             continue
         if touched_subnets is not None:
             touched_subnets.add(row.subnet_id)
@@ -791,6 +792,27 @@ async def remove_ipam_for_static(
         removed += 1
     db.add_all(audits)
     return removed
+
+
+async def _row_kept_through_trash(db: AsyncSession, ip_id: uuid.UUID) -> bool:
+    """Does anything hang off this address that a delete-and-recreate would lose?
+
+    An E911 ``ip`` binding (#4286), a DNS alias (``ip_alias`` records are deleted
+    outright with the row) or an OT descriptor (``ON DELETE CASCADE``) (#4870).
+    """
+    from app.models.ot import OTDevice  # noqa: PLC0415
+
+    if await bound_ip_ids(db, [ip_id]):
+        return True
+    alias = await db.execute(
+        select(DNSRecord.id)
+        .where(DNSRecord.ip_address_id == ip_id, DNSRecord.ip_alias.is_(True))
+        .limit(1)
+    )
+    if alias.first() is not None:
+        return True
+    ot = await db.execute(select(OTDevice.id).where(OTDevice.ip_address_id == ip_id).limit(1))
+    return ot.first() is not None
 
 
 async def _delete_mirror_row(
@@ -936,7 +958,7 @@ async def sweep_orphaned_static_mirrors(db: AsyncSession, *, limit: int = 500) -
         # reservation is in the Trash, not gone, and its restore re-adopts the row.
         if (
             static_id is not None
-            and await bound_ip_ids(db, [row.id])
+            and await _row_kept_through_trash(db, row.id)
             and await _load_reservation_any(db, row.static_assignment_id) is not None
         ):
             continue
