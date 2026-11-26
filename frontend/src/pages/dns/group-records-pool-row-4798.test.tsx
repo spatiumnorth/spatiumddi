@@ -184,4 +184,18 @@ describe("group Records tab, a pool row (#4798)", { timeout: 30_000 }, () => {
       expect(b.disabled).toBe(false);
     }
   });
+
+  it("carries the reason on a wrapper that takes the pointer (#4820)", async () => {
+    await open();
+    const row = rowOf("192.0.2.50");
+    for (const id of ["rec-edit-reason", "rec-delete-reason"]) {
+      const w = row.querySelector(`[data-testid="${id}"]`) as HTMLElement;
+      expect(w.title).toMatch(/Managed by a DNS pool/);
+    }
+    const free = rowOf("192.0.2.51");
+    expect(
+      (free.querySelector('[data-testid="rec-edit-reason"]') as HTMLElement)
+        .title,
+    ).toBe("");
+  });
 });
