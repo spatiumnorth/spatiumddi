@@ -2447,7 +2447,7 @@ Superseded by #170 (still functional for in-field installs, deprecated for new o
 <a id="issue-21"></a>
 #### **Windows DNS — Path B (WinRM + PowerShell)** (#21)
 
-- ✅ [**Windows DNS — Path B (WinRM + PowerShell)**](https://github.com/spatiumnorth/spatiumddi/issues/21) — shipped: agentless WinRM + PowerShell path in `backend/app/drivers/dns/windows.py` (enabled per-server when `DNSServer.credentials_encrypted` is set) drives zone CRUD (`Add-DnsServerPrimaryZone` / `Remove-...`), an AXFR-free record pull (`Get-DnsServerResourceRecord`), and server-level probes over the `DnsServer` module. Record-level writes still ride RFC 2136 to avoid the PowerShell-per-record cost. Remaining literal-scope items — zone *edit* via `Set-DnsServerZone`, server-level option writes, DNS view config, GSS-TSIG for "Secure only" AD zones — were re-homed to [#444](https://github.com/spatiumnorth/spatiumddi/issues/444) (open). See [`docs/features/DNS.md`](docs/features/DNS.md) §13.
+- ✅ [**Windows DNS — Path B (WinRM + PowerShell)**](https://github.com/spatiumnorth/spatiumddi/issues/21) — shipped: agentless WinRM + PowerShell path in `backend/app/drivers/dns/windows.py` (enabled per-server when `DNSServer.credentials_encrypted` is set) drives zone CRUD (`Add-DnsServerPrimaryZone` / `Remove-...`), an AXFR-free record pull (`Get-DnsServerResourceRecord`), and server-level probes over the `DnsServer` module. Record-level writes still ride RFC 2136 to avoid the PowerShell-per-record cost. Remaining literal-scope items — zone *edit* via `Set-DnsServerZone`, server-level option writes, DNS view config, GSS-TSIG for "Secure only" AD zones — were re-homed to [#444](https://github.com/spatiumnorth/spatiumddi/issues/444) (open). See [`docs/features/DNS.md`](features/DNS.md) §13.
 
 <a id="issue-22"></a>
 #### **Windows DHCP — Path B (WinRM + PowerShell, full CRUD)** (#22)
@@ -2462,7 +2462,7 @@ Superseded by #170 (still functional for in-field installs, deprecated for new o
 <a id="issue-24"></a>
 #### **DNS Views — end-to-end split-horizon wiring** (#24)
 
-- ✅ [**DNS Views — end-to-end split-horizon wiring**](https://github.com/spatiumnorth/spatiumddi/issues/24) — shipped `2026.06.04-1`: the BIND9 agent now emits one `view "<name>" { match-clients …; }` block per view with per-view zone files (`view_id IS NULL` records render into every view). Storage + CRUD + record-form picker had shipped earlier. Full body in [`docs/SHIPPED.md`](docs/SHIPPED.md).
+- ✅ [**DNS Views — end-to-end split-horizon wiring**](https://github.com/spatiumnorth/spatiumddi/issues/24) — shipped `2026.06.04-1`: the BIND9 agent now emits one `view "<name>" { match-clients …; }` block per view with per-view zone files (`view_id IS NULL` records render into every view). Storage + CRUD + record-form picker had shipped earlier. Full body in [`docs/SHIPPED.md`](SHIPPED.md).
 
 <a id="issue-28"></a>
 #### **ACME embedded client — certs for SpatiumDDI's own services** (#28)
@@ -2472,17 +2472,17 @@ Superseded by #170 (still functional for in-field installs, deprecated for new o
 <a id="issue-129"></a>
 #### **DHCP configuration importer — ISC DHCP, Kea, Windows DHCP** (#129)
 
-- ✅ [**DHCP configuration importer — ISC DHCP, Kea, Windows DHCP**](https://github.com/spatiumnorth/spatiumddi/issues/129) — shipped `2026.06.04-1`: one-shot import-to-evaluate (sister to the DNS importer #128) behind one canonical IR + preview → commit pipeline — Kea JSON-with-comments upload, Windows live-pull (reuses the Path A driver), ISC `dhcpd.conf` parse. Provenance columns via migration `c7f1a3e58b94`. See [`docs/features/MIGRATION.md`](docs/features/MIGRATION.md).
+- ✅ [**DHCP configuration importer — ISC DHCP, Kea, Windows DHCP**](https://github.com/spatiumnorth/spatiumddi/issues/129) — shipped `2026.06.04-1`: one-shot import-to-evaluate (sister to the DNS importer #128) behind one canonical IR + preview → commit pipeline — Kea JSON-with-comments upload, Windows live-pull (reuses the Path A driver), ISC `dhcpd.conf` parse. Provenance columns via migration `c7f1a3e58b94`. See [`docs/features/MIGRATION.md`](features/MIGRATION.md).
 
 <a id="issue-756"></a>
 #### **Windows → SpatiumDDI cutover (guided migration)** (#756)
 
-- ✅ [**Windows → SpatiumDDI cutover (guided migration)**](https://github.com/spatiumnorth/spatiumddi/issues/756) — shipped `2026.08.12-1`: the half the #128 / #129 importers stop short of. **Not a fifth importer** — it creates no zones, scopes, pools or records; its only writes are TTL reductions on a zone SpatiumDDI already owns, reservations synthesised from live Windows leases, and `is_active` on a managed scope. Unit of work is a `cutover_plan` holding independent `cutover_item`s (one zone or one scope), each cut over and rolled back on its own — no big-bang step. Four phases: **parity** (diff vs live Windows, classified by *why* the sides differ — `value_mismatch` / `drifted_since_import` / `never_imported` / `intentionally_diverged`; CAA/TLSA/SSHFP are `not_compared` because a Path-B pull can't emit them, and an unparseable response is `unverified`, never "everything diverged"), **parallel run** (replay query-log traffic at both sides, RD=0, IP literal not hostname), **the switch** (TTL pre-flight snapshot/restore, DHCP lease→reservation handover, deactivate-Windows-before-activate-managed with compensating rollback sealed inside the transaction), **decommission checklist** (15 items, 3 advisory-evaluated, none auto-ticked). Plus a markdown runbook carrying the Windows-side PowerShell we deliberately don't run. **Load-bearing refusal:** an AD-integrated zone with "Secure only" dynamic updates is a hard block `force` cannot bypass (GSS-TSIG unimplemented — #444), failing closed. Behind the default-on `migration.cutover` module (group Tools), **superadmin on every endpoint**; router `/api/v1/migration/cutover`; 4 MCP tools (`find_cutover_parity_check` default-off — live WinRM pull). Migration `a4f1c93d7e28`. See [`docs/features/MIGRATION.md`](docs/features/MIGRATION.md). **Deferred:** auto-approve of parity warnings, and a non-Windows (BIND9 / ISC) cutover source.
+- ✅ [**Windows → SpatiumDDI cutover (guided migration)**](https://github.com/spatiumnorth/spatiumddi/issues/756) — shipped `2026.08.12-1`: the half the #128 / #129 importers stop short of. **Not a fifth importer** — it creates no zones, scopes, pools or records; its only writes are TTL reductions on a zone SpatiumDDI already owns, reservations synthesised from live Windows leases, and `is_active` on a managed scope. Unit of work is a `cutover_plan` holding independent `cutover_item`s (one zone or one scope), each cut over and rolled back on its own — no big-bang step. Four phases: **parity** (diff vs live Windows, classified by *why* the sides differ — `value_mismatch` / `drifted_since_import` / `never_imported` / `intentionally_diverged`; CAA/TLSA/SSHFP are `not_compared` because a Path-B pull can't emit them, and an unparseable response is `unverified`, never "everything diverged"), **parallel run** (replay query-log traffic at both sides, RD=0, IP literal not hostname), **the switch** (TTL pre-flight snapshot/restore, DHCP lease→reservation handover, deactivate-Windows-before-activate-managed with compensating rollback sealed inside the transaction), **decommission checklist** (15 items, 3 advisory-evaluated, none auto-ticked). Plus a markdown runbook carrying the Windows-side PowerShell we deliberately don't run. **Load-bearing refusal:** an AD-integrated zone with "Secure only" dynamic updates is a hard block `force` cannot bypass (GSS-TSIG unimplemented — #444), failing closed. Behind the default-on `migration.cutover` module (group Tools), **superadmin on every endpoint**; router `/api/v1/migration/cutover`; 4 MCP tools (`find_cutover_parity_check` default-off — live WinRM pull). Migration `a4f1c93d7e28`. See [`docs/features/MIGRATION.md`](features/MIGRATION.md). **Deferred:** auto-approve of parity warnings, and a non-Windows (BIND9 / ISC) cutover source.
 
 <a id="issue-810"></a>
 #### **Technitium — agentless driver for an install the operator already runs** (#810)
 
-- ✅ [**Technitium — agentless driver for an install the operator already runs**](https://github.com/spatiumnorth/spatiumddi/issues/810) — shipped `2026.08.12-1`: new `technitium_api` driver (`backend/app/drivers/dns/technitium_api.py`), agentless like Windows Path B: operator pastes an API URL + permanent bearer token, control plane drives Technitium's HTTP API directly, nothing deployed. Coexists with the agent-managed `technitium` (a group is single-driver). **No migration** — credentials ride the existing `DNSServer.credentials_encrypted`. Zone + record CRUD and topology pull only; DNSSEC / forwarders / blocklists stay agent-managed and `technitium_api` is deliberately absent from `_DRIVER_GATED_OPERATIONS["dnssec_sign"]`. Also extracted the rdata translation both drivers and the #744 importer need into `app/services/technitium/rdata.py` (the agent keeps a third copy it can't share — separate package), and replaced two inline `windows_dns or CLOUD_DNS_DRIVERS` topology gates with `TOPOLOGY_PULL_DRIVERS` / `supports_topology_pull()`. See [`docs/drivers/DNS_DRIVERS.md` §4C](docs/drivers/DNS_DRIVERS.md). **Deferred:** query-log polling (#742's shape, easier here than on the agent path), Technitium's DHCP API as a DHCP driver, and clustering awareness.
+- ✅ [**Technitium — agentless driver for an install the operator already runs**](https://github.com/spatiumnorth/spatiumddi/issues/810) — shipped `2026.08.12-1`: new `technitium_api` driver (`backend/app/drivers/dns/technitium_api.py`), agentless like Windows Path B: operator pastes an API URL + permanent bearer token, control plane drives Technitium's HTTP API directly, nothing deployed. Coexists with the agent-managed `technitium` (a group is single-driver). **No migration** — credentials ride the existing `DNSServer.credentials_encrypted`. Zone + record CRUD and topology pull only; DNSSEC / forwarders / blocklists stay agent-managed and `technitium_api` is deliberately absent from `_DRIVER_GATED_OPERATIONS["dnssec_sign"]`. Also extracted the rdata translation both drivers and the #744 importer need into `app/services/technitium/rdata.py` (the agent keeps a third copy it can't share — separate package), and replaced two inline `windows_dns or CLOUD_DNS_DRIVERS` topology gates with `TOPOLOGY_PULL_DRIVERS` / `supports_topology_pull()`. See [`docs/drivers/DNS_DRIVERS.md` §4C](drivers/DNS_DRIVERS.md). **Deferred:** query-log polling (#742's shape, easier here than on the agent path), Technitium's DHCP API as a DHCP driver, and clustering awareness.
 
 
 ### Integration roadmap (shipped bodies)
@@ -2807,7 +2807,7 @@ Superseded by #170 (still functional for in-field installs, deprecated for new o
   Sizing consequence of (5), documented in DNS.md: two RPZ records per
   feed entry, so the Family filter's ~596k entries render ~1.2M records.
   1 MCP tool (`list_blocklist_templates`). BIND9-only,
-  and [`docs/features/DNS.md` §8.1](docs/features/DNS.md) is explicit
+  and [`docs/features/DNS.md` §8.1](features/DNS.md) is explicit
   that DNS filtering is bypassable at all.
 
 <a id="issue-876"></a>
@@ -3551,7 +3551,7 @@ Superseded by #170 (still functional for in-field installs, deprecated for new o
   — shipped `2026.10.02-1`: SpatiumDDI has been privacy-first by construction since the first commit
   and said so **nowhere**, so an operator evaluating a platform that will hold
   every hostname, lease and subnet they own had to infer it from the absence of
-  a settings page. Now [`docs/PRIVACY.md`](docs/PRIVACY.md) (short form in the
+  a settings page. Now [`docs/PRIVACY.md`](PRIVACY.md) (short form in the
   README, linked from the docs nav, footer and hero), written from a sweep of
   every outbound connection in the tree rather than from a slogan.
   **The release check stays default-on and is disclosed in the first
@@ -3699,7 +3699,7 @@ Superseded by #170 (still functional for in-field installs, deprecated for new o
   precedence slot is reserved for when they do. There is deliberately **no
   CER-format export**: CER's columns differ between versions, so the civic CSV is
   what you map into its ERL bulk load rather than a format we claim to track. See
-  [`docs/features/E911.md`](docs/features/E911.md).
+  [`docs/features/E911.md`](features/E911.md).
 
 
 ### Future ideas — categorised (added 2026.04.26) — UX polish (shipped bodies)
