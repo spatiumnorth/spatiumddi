@@ -257,6 +257,12 @@ function PreviewTable({ preview }: { preview: ImportPreviewResponse }) {
   ];
   return (
     <div className="space-y-2">
+      {preview.errors.length > 0 && (
+        <FormError>
+          {preview.errors.length} error{preview.errors.length === 1 ? "" : "s"}{" "}
+          — commit disabled. First: {preview.errors[0].reason || "see the list"}
+        </FormError>
+      )}
       <div className="flex flex-wrap gap-2 text-xs">
         <Badge color="green" label={`${preview.summary.creates} create`} />
         <Badge color="blue" label={`${preview.summary.updates} update`} />
@@ -538,7 +544,10 @@ export function AddressImportModal({
                 <li>Skipped: {committed.skipped}</li>
                 <li>DNS records published: {committed.dns_synced}</li>
                 {committed.errors.length > 0 && (
-                  <li className="mt-1 text-amber-700 dark:text-amber-400">
+                  <li
+                    role="alert"
+                    className="mt-1 text-amber-700 dark:text-amber-400"
+                  >
                     {committed.errors.length} non-fatal error
                     {committed.errors.length === 1 ? "" : "s"} — first:{" "}
                     {committed.errors[0]}

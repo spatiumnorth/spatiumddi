@@ -8278,7 +8278,7 @@ export function DnsSyncModal({
                     </div>
                   )}
                   {result.errors.length > 0 && (
-                    <div className="mt-1 text-destructive">
+                    <div role="alert" className="mt-1 text-destructive">
                       {result.errors.length} error
                       {result.errors.length === 1 ? "" : "s"}:{" "}
                       {result.errors.join("; ")}
