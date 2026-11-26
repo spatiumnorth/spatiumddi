@@ -182,7 +182,9 @@ def _mirrors_torn_down_first(root: Any, batch: Any) -> Any:
     reverse zone the delete trashes, so the preview's count of that zone's
     records leaves them out too (spatiumddi#3511)."""
     from app.models.dhcp import DHCPLease, DHCPScope, DHCPStaticAssignment  # noqa: PLC0415
+    from app.models.dns import DNSRecord  # noqa: PLC0415
     from app.models.ipam import IPAddress, Subnet  # noqa: PLC0415
+    from app.models.ot import OTDevice  # noqa: PLC0415
 
     # Uncorrelated, so Postgres builds each set once per statement and probes
     # it per address (a hashed SubPlan), and costs it that way. A correlated
@@ -220,6 +222,15 @@ def _mirrors_torn_down_first(root: Any, batch: Any) -> Any:
         and_(
             IPAddress.static_assignment_id.is_not(None),
             IPAddress.static_assignment_id.in_(reservations),
+            # A reservation's row a DNS alias or an OT descriptor hangs off is kept
+            # through the Trash (#4870), so its records are not withdrawn here: they
+            # ride the batch and the restore brings them back.
+            IPAddress.id.not_in(
+                select(DNSRecord.ip_address_id).where(
+                    DNSRecord.ip_alias.is_(True), DNSRecord.ip_address_id.is_not(None)
+                )
+            ),
+            IPAddress.id.not_in(select(OTDevice.ip_address_id)),
         ),
     ]
     if isinstance(root, Subnet):
@@ -405,8 +416,13 @@ async def _subnet_not_empty_detail(db: AsyncSession, subnet_id: UUID) -> str | N
             )
         )
     ).scalar_one()
+    # Trashed scopes count: the FK cascade takes them with no audit row (#4871).
     scope_count = (
-        await db.execute(select(func.count(DHCPScope.id)).where(DHCPScope.subnet_id == subnet_id))
+        await db.execute(
+            select(func.count(DHCPScope.id))
+            .where(DHCPScope.subnet_id == subnet_id)
+            .execution_options(include_deleted=True)
+        )
     ).scalar_one()
     if not (user_ip_count or scope_count):
         return None
@@ -417,7 +433,8 @@ async def _subnet_not_empty_detail(db: AsyncSession, subnet_id: UUID) -> str | N
         parts.append(f"{scope_count} DHCP scope" + ("s" if scope_count != 1 else ""))
     return (
         f"Subnet is not empty: {', '.join(parts)}. "
-        "Delete the contents first, or retry with force=true to cascade."
+        "Delete the contents first (scopes in the Trash count: restore or empty them), "
+        "or retry with force=true to cascade."
     )
 
 
@@ -459,7 +476,9 @@ async def _preview_delete_subnet(
         # catches a subnet that gained IPs/scopes since it was requested.
         scope_count = (
             await db.execute(
-                select(func.count(DHCPScope.id)).where(DHCPScope.subnet_id == args.subnet_id)
+                select(func.count(DHCPScope.id))
+                .where(DHCPScope.subnet_id == args.subnet_id)
+                .execution_options(include_deleted=True)
             )
         ).scalar_one()
         ip_count = (
@@ -596,6 +615,21 @@ async def _apply_delete_subnet(
         .scalars()
         .all()
     )
+    # Scopes already in the Trash go by the FK cascade, which runs no Python:
+    # one audit row each, as the Trash's own purge writes (#1957, #4871).
+    trashed_scopes = (
+        (
+            await db.execute(
+                select(DHCPScope)
+                .where(DHCPScope.subnet_id == args.subnet_id, DHCPScope.deleted_at.is_not(None))
+                .execution_options(include_deleted=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for tsc in trashed_scopes:
+        db.add(_audit(user, "delete", "dhcp_scope", str(tsc.id), tsc.name))
     agent_servers_to_refresh: dict[uuid.UUID, DHCPServer] = {}
     # Recounted with the block below, never per scope: a recount holds its
     # locks to commit, through the next scope's push (#3354).
@@ -719,17 +753,26 @@ class DeleteBlockArgs(BaseModel):
 
 
 async def _block_not_empty_detail(db: AsyncSession, block_id: UUID, network: Any) -> str | None:
-    """Shared non-empty check for block permanent-delete (#17)."""
+    """Shared non-empty check for block permanent-delete (#17).
+
+    Children in the Trash count: the FK cascade would take them silently (#4871).
+    """
     from app.models.ipam import IPBlock, Subnet
 
     subnet_count = (
         await db.execute(
-            select(func.count()).select_from(Subnet).where(Subnet.block_id == block_id)
+            select(func.count())
+            .select_from(Subnet)
+            .where(Subnet.block_id == block_id)
+            .execution_options(include_deleted=True)
         )
     ).scalar_one()
     child_block_count = (
         await db.execute(
-            select(func.count()).select_from(IPBlock).where(IPBlock.parent_block_id == block_id)
+            select(func.count())
+            .select_from(IPBlock)
+            .where(IPBlock.parent_block_id == block_id)
+            .execution_options(include_deleted=True)
         )
     ).scalar_one()
     if not (subnet_count or child_block_count):
@@ -741,7 +784,8 @@ async def _block_not_empty_detail(db: AsyncSession, block_id: UUID, network: Any
         parts.append(f"{subnet_count} subnet(s)")
     return (
         f"Block {network} still contains {' and '.join(parts)}. "
-        "Delete or move them before deleting the block."
+        "Delete or move them before deleting the block (rows in the Trash count: "
+        "restore them or empty the Trash first)."
     )
 
 
@@ -886,17 +930,26 @@ class DeleteSpaceArgs(BaseModel):
 
 
 async def _space_not_empty_detail(db: AsyncSession, space_id: UUID, name: str) -> str | None:
-    """Shared non-empty check for space permanent-delete (#17)."""
+    """Shared non-empty check for space permanent-delete (#17).
+
+    Blocks and subnets in the Trash count (#4871).
+    """
     from app.models.ipam import IPBlock, Subnet
 
     subnet_count = (
         await db.execute(
-            select(func.count()).select_from(Subnet).where(Subnet.space_id == space_id)
+            select(func.count())
+            .select_from(Subnet)
+            .where(Subnet.space_id == space_id)
+            .execution_options(include_deleted=True)
         )
     ).scalar_one()
     block_count = (
         await db.execute(
-            select(func.count()).select_from(IPBlock).where(IPBlock.space_id == space_id)
+            select(func.count())
+            .select_from(IPBlock)
+            .where(IPBlock.space_id == space_id)
+            .execution_options(include_deleted=True)
         )
     ).scalar_one()
     if not (subnet_count or block_count):
@@ -908,7 +961,8 @@ async def _space_not_empty_detail(db: AsyncSession, space_id: UUID, name: str) -
         parts.append(f"{subnet_count} subnet(s)")
     return (
         f"IP space {name!r} still contains {' and '.join(parts)}. "
-        "Delete or move them before deleting the space."
+        "Delete or move them before deleting the space (rows in the Trash count: "
+        "restore them or empty the Trash first)."
     )
 
 
@@ -1967,6 +2021,92 @@ _OP_CREATE_NETWORK_BLOCK = Operation(
 register(_OP_CREATE_NETWORK_BLOCK)
 
 
+# ── purge_trashed_<type> ───────────────────────────────────────────────────
+#
+# The Trash's "Delete permanently" (``DELETE /admin/trash/{type}/{id}``) is a
+# permanent delete of a row that is already soft-deleted, so it takes the same
+# ``delete`` policy as the object's own permanent delete. One operation per
+# covered type, because the gate keys the policy on the operation's single
+# ``required_permission`` pair. All five share one body, the endpoint's own.
+
+PURGE_TRASHED_TYPES: dict[str, str] = {
+    "subnet": "subnet",
+    "ip_block": "block",
+    "ip_space": "space",
+    "dns_zone": "zone",
+    "dhcp_scope": "scope",
+}
+PURGE_TRASHED_OPERATIONS: dict[str, str] = {t: f"purge_trashed_{t}" for t in PURGE_TRASHED_TYPES}
+
+
+class PurgeTrashedArgs(BaseModel):
+    row_id: UUID
+
+
+def _purge_trashed_preview(trash_type: str) -> Any:
+    async def _preview(db: AsyncSession, user: User, args: PurgeTrashedArgs) -> PreviewResult:
+        from app.api.v1.admin.trash import (  # noqa: PLC0415
+            _find_trashed,
+            _row_label,
+            _trashed_ipam_subtree,
+        )
+
+        try:
+            target = await _find_trashed(db, trash_type, args.row_id)
+        except HTTPException as exc:
+            return PreviewResult(ok=False, detail=str(exc.detail))
+        text = (
+            f"Permanently delete trashed {PURGE_TRASHED_TYPES[trash_type]} "
+            f"`{_row_label(target)}` from the Trash"
+        )
+        if trash_type in ("ip_block", "ip_space"):
+            # Counts move as the subtree grows, so the approve-time drift check
+            # catches a Trash that gained rows under it since the request.
+            blocks, subnets = await _trashed_ipam_subtree(db, target)
+            text += (
+                f"; also removes {len(subnets)} subnet(s) and "
+                f"{max(len(blocks) - (1 if trash_type == 'ip_block' else 0), 0)} block(s) under it"
+            )
+        return PreviewResult(ok=True, detail="ready", preview_text=text + "; it cannot be restored")
+
+    return _preview
+
+
+def _purge_trashed_apply(trash_type: str) -> Any:
+    async def _apply(db: AsyncSession, user: User, args: PurgeTrashedArgs) -> dict[str, Any]:
+        from app.api.v1.admin.trash import purge_trashed_row  # noqa: PLC0415
+
+        # The Trash endpoint is superadmin-only; the approve path does not run its
+        # dependency, so the step is enforced here (#4790).
+        ensure_superadmin_step(user, f"A permanent {PURGE_TRASHED_TYPES[trash_type]} delete")
+        kept = await purge_trashed_row(db, user, trash_type, args.row_id)
+        return {"row_id": str(args.row_id), "mode": "purge", "provider_copies_kept": kept}
+
+    return _apply
+
+
+for _trash_type, _op_name in PURGE_TRASHED_OPERATIONS.items():
+    register(
+        Operation(
+            name=_op_name,
+            description=(
+                f"Permanently delete a trashed {PURGE_TRASHED_TYPES[_trash_type]} "
+                "(the Trash's Delete permanently)."
+            ),
+            args_model=PurgeTrashedArgs,
+            preview=_purge_trashed_preview(_trash_type),
+            apply=_purge_trashed_apply(_trash_type),
+            category=(
+                "ipam"
+                if _trash_type in ("subnet", "ip_block", "ip_space")
+                else "dhcp" if _trash_type == "dhcp_scope" else "dns"
+            ),
+            superadmin_when=lambda a: True,
+            required_permission=("delete", _trash_type),
+        )
+    )
+
+
 # Registry-completeness anchor for the startup assertion (sibling slice):
 # every operation name the seeded policies reference must exist here.
 RISKY_OPERATION_NAMES: frozenset[str] = frozenset(
@@ -1978,6 +2118,7 @@ RISKY_OPERATION_NAMES: frozenset[str] = frozenset(
         "delete_scope",
         "delete_group",
         "create_network_block",
+        *PURGE_TRASHED_OPERATIONS.values(),
     }
 )
 

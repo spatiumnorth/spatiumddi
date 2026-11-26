@@ -1,3 +1,4 @@
+import { armRemovalFocus } from "@/components/ui/focus-return";
 import { FreshEdit } from "@/components/FreshEdit";
 import { cloneElement, isValidElement, useId, useState } from "react";
 import {
@@ -689,7 +690,10 @@ export function AlertsPage() {
                         />
                         {!ev.resolved_at && (
                           <button
-                            onClick={() => resolve.mutate(ev.id)}
+                            onClick={() => {
+                              armRemovalFocus();
+                              resolve.mutate(ev.id);
+                            }}
                             className="rounded border px-2 py-0.5 text-[11px] hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
                             {...superadminGate}
                           >

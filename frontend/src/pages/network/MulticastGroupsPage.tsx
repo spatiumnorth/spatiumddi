@@ -1,3 +1,4 @@
+import { armRemovalFocus } from "@/components/ui/focus-return";
 import { FreshEdit } from "@/components/FreshEdit";
 import { changedFields } from "@/hooks/useFreshRow";
 import { useOwnershipModules } from "@/hooks/useOwnershipModules";
@@ -531,7 +532,10 @@ export function PortsTab({ groupId }: { groupId: string }) {
               <PortRow
                 key={p.id}
                 row={p}
-                onDelete={() => remove.mutate(p.id)}
+                onDelete={() => {
+                  armRemovalFocus();
+                  remove.mutate(p.id);
+                }}
               />
             ))}
           </tbody>
@@ -636,6 +640,7 @@ function MembershipsTab({ groupId }: { groupId: string }) {
             }}
           />
           <select
+            aria-label="Role"
             className={inputCls}
             value={role}
             onChange={(e) => setRole(e.target.value as MulticastMembershipRole)}
@@ -695,7 +700,10 @@ function MembershipsTab({ groupId }: { groupId: string }) {
               <MembershipRow
                 key={m.id}
                 row={m}
-                onDelete={() => remove.mutate(m.id)}
+                onDelete={() => {
+                  armRemovalFocus();
+                  remove.mutate(m.id);
+                }}
               />
             ))}
           </tbody>

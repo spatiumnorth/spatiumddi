@@ -4760,14 +4760,18 @@ function KubeapiCidrEditorModal({
       onClose={onClose}
     >
       <div className="space-y-3 text-sm">
-        <p className="text-xs text-muted-foreground">
+        <label
+          htmlFor="fleet-kubeapi-source-ranges"
+          className="block text-xs text-muted-foreground"
+        >
           One CIDR or IP per line. Each entry opens this appliance's tcp/6443
           kubeapi port to that source range — bypassing the supervisor's mTLS
           proxy for sub-millisecond local-network <code>kubectl</code>. Leave
           empty for proxy-only (the recommended posture; kubeapi stays on
           127.0.0.1 and only the supervisor's outbound channel can drive it).
-        </p>
+        </label>
         <textarea
+          id="fleet-kubeapi-source-ranges"
           value={text}
           onChange={(e) => setText(e.target.value)}
           rows={6}

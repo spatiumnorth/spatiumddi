@@ -297,7 +297,7 @@ advertised — each origin ASN and community clickable back into SpatiumDDI.
   surface. The two features share only the UI concept of "a peer address + ASN"
   — zero code (the Sessions tab's Add-peer modal offers a one-directional,
   UI-only prefill button sourced from a configured MetalLB BGP peer, nothing
-  more). Configured from Fleet → Network & Host (`MetalLBConfigCard`'s
+  more). Configured from Appliance → Network & Host (`MetalLBConfigCard`'s
   "BGP mode" disclosure) — see `backend/app/models/settings.py`'s
   `metallb_bgp_enabled` / `metallb_bgp_peers` / `metallb_bgp_advertisements`
   columns and `charts/spatiumddi-metallb/values.yaml`'s `bgp:` + `frr-k8s:`

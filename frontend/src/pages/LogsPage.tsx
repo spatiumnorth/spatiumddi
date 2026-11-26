@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { handOffFocusOnRemove } from "@/components/ui/focus-return";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { isAxiosError } from "axios";
 import { ListEmpty } from "@/components/ui/list-read-error";
@@ -539,7 +540,10 @@ function EventLogTab({ sources }: { sources: LogSource[] }) {
           {since && (
             <button
               type="button"
-              onClick={() => setSince("")}
+              onClick={(e) => {
+                handOffFocusOnRemove(e.currentTarget);
+                setSince("");
+              }}
               title="Clear since filter"
               className="rounded text-[11px] text-muted-foreground hover:text-foreground"
             >
@@ -1350,7 +1354,10 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
           {since && (
             <button
               type="button"
-              onClick={() => setSince("")}
+              onClick={(e) => {
+                handOffFocusOnRemove(e.currentTarget);
+                setSince("");
+              }}
               title="Clear"
               className="rounded p-0.5 text-muted-foreground hover:text-foreground"
             >
@@ -1845,7 +1852,10 @@ function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
           {since && (
             <button
               type="button"
-              onClick={() => setSince("")}
+              onClick={(e) => {
+                handOffFocusOnRemove(e.currentTarget);
+                setSince("");
+              }}
               title="Clear"
               className="rounded p-0.5 text-muted-foreground hover:text-foreground"
             >
