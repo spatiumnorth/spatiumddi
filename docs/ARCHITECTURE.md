@@ -400,7 +400,7 @@ Fleet tab in `/appliance`:
 - **MetalLB L2 control-plane VIP** — one stable UI/API address that
   floats across replicas, shipped in its own `metallb-system` namespace
   ([`../charts/spatiumddi-metallb/`](https://github.com/spatiumnorth/spatiumddi/tree/main/charts/spatiumddi-metallb)).
-  The operator sets the pool + VIP from Fleet → Network & Host.
+  The operator sets the pool + VIP from Appliance → Network & Host.
 
 Beat/migrate/audit-chain are singleton-tolerant, and one shared Web UI
 TLS cert is served across replicas. Per-role node-label gating

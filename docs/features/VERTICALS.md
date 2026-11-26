@@ -18,7 +18,7 @@ segmentation-documentation layer, and conformity rules over both. Each is a
 togglable feature module in the Network group, and all four ship **disabled**
 ([#1069](https://github.com/spatiumnorth/spatiumddi/issues/1069)) — a registry
 means nothing until the site populates it, and a hospital wants DICOM where
-nobody else wants the sidebar entries. Turn one on under Settings → Features,
+nobody else wants the sidebar entries. Turn one on under Features & Integrations,
 which lists all four with their descriptions whether or not they are enabled.
 Enabling one arms nothing: these are registries, with no probing anywhere.
 

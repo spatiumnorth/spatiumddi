@@ -156,7 +156,7 @@ server {
 Then set `FRONTEND_TRUSTED_PROXY_CIDRS` in `.env` to the address the proxy
 connects from (a proxy on the Docker host itself usually arrives from the
 compose network's gateway, e.g. `172.18.0.1`; the frontend's access log shows
-it) and set **Settings > General > External URL** to the public `https://`
+it) and set **Settings → Application → Branding & URL → External URL** to the public `https://`
 URL. Without the first the frontend nginx overwrites the proxy's
 `X-Forwarded-Proto` and client address, so every user shares one login
 throttle bucket and SSO callbacks are built as `http://`.
