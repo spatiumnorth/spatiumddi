@@ -67,9 +67,13 @@ LOCK=/run/spatiumddi-chrony-reload.lock
 NFT_DROPIN=/etc/nftables.d/50-spatium-ntp.nft
 
 mkdir -p "$LOG_DIR" "$(dirname "$HASH_SIDECAR")" "$(dirname "$NFT_DROPIN")"
-exec >> "$LOG" 2>&1
-echo
-echo "[$(date -Iseconds)] === spatiumddi-chrony-reload fired ==="
+# --status-only (#4825, run by the sync-status timer every minute) only
+# refreshes the sync-state sidecar; keep it out of the apply log.
+if [ "${1:-}" != "--status-only" ]; then
+    exec >> "$LOG" 2>&1
+    echo
+    echo "[$(date -Iseconds)] === spatiumddi-chrony-reload fired ==="
+fi
 
 
 nft_reload() {
@@ -112,6 +116,12 @@ update_sync_status() {
     esac
 }
 
+# #4825 — the sync state was captured only when a config was applied, so a
+# chrony that synced (or lost sync) afterwards stayed stale on the NTP tab.
+if [ "${1:-}" = "--status-only" ]; then
+    update_sync_status
+    exit 0
+fi
 
 if [ ! -f "$TRIGGER" ]; then
     echo "  no trigger file at $TRIGGER, nothing to do"

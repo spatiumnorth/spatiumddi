@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodically refresh the chrony sync-state sidecar (issue #4825)
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/4825
+ConditionKernelCommandLine=!boot=live
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=1min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

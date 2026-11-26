@@ -57,6 +57,7 @@ for unit in chrony.service ssh.service \
             spatiumddi-snmp-reload.path \
             spatiumddi-apt-reload.path \
             spatiumddi-chrony-reload.path \
+            spatiumddi-chrony-status.timer \
             spatiumddi-lldp-reload.path \
             spatiumddi-syslog-reload.path \
             spatiumddi-ssh-reload.path \
@@ -393,6 +394,8 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-image-unpack.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-chrony-reload"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-chrony-reload.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-chrony-reload.service"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-chrony-status.timer"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-chrony-status.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-lldp-reload"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-lldp-reload.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-lldp-reload.service"
