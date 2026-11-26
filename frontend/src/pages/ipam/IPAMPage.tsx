@@ -3915,9 +3915,9 @@ export function AddAddressModal({
   );
   // The pick is not final while zones are still on their way or the subnet's
   // DNS is being re-read over a cached copy: Allocate waits (#3080).
-  const zonesPending =
-    dnsOn &&
-    ((effectiveFetching && effectiveDns !== undefined) || !zonesSettled);
+  // The first read counts too: until it lands there are no zones to pick and
+  // no primary, and "needs a DNS zone" would be a guess (#4860).
+  const zonesPending = dnsOn && (effectiveFetching || !zonesSettled);
   useEffect(() => {
     if (dnsZoneTouched || availableZones.length === 0) return;
     const target =
@@ -4439,7 +4439,7 @@ export function AddAddressModal({
                 <span className="font-mono">{hostname || "<hostname>"}</span>; A
                 records point to the IP. Withdrawn while the IP is an orphan and
                 back when it is restored; deleted when the IP is purged.
-                {!publishZoneId && (
+                {!publishZoneId && !zonesPending && (
                   <span className="ml-1 text-amber-600">
                     Requires a DNS zone on this subnet.
                   </span>
