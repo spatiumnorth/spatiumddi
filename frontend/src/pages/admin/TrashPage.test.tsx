@@ -736,4 +736,23 @@ describe("the dialogs announce what happened (#3525)", () => {
     await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());
     expect(screen.getByRole("alert").textContent).toMatch(/Still referenced/);
   });
+
+  it("says when Delete permanently is queued for approval", async () => {
+    list.mockResolvedValue({ items: [entry(1)], total: 1 });
+    permanentDelete.mockResolvedValue({
+      status: 202,
+      data: { change_request_id: "cr-1", status: "pending" },
+    });
+    renderPage();
+    fireEvent.click(await screen.findByText("Delete"));
+    const buttons = await screen.findAllByRole("button", {
+      name: "Delete permanently",
+    });
+    fireEvent.click(buttons[buttons.length - 1]);
+    await screen.findByText(/Submitted for approval/);
+    expect(
+      screen.queryAllByRole("button", { name: "Delete permanently" }).length,
+    ).toBe(buttons.length - 1);
+    expect(screen.getByRole("button", { name: "Close" })).toBeTruthy();
+  });
 });

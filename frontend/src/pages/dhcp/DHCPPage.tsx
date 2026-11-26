@@ -1,3 +1,4 @@
+import { armRemovalFocus } from "@/components/ui/focus-return";
 import { countNoun } from "@/lib/count-noun";
 import { ListReadError } from "@/components/ui/list-read-error";
 import { ServerDeleteAgentNote } from "@/pages/serverDeleteAgentNote";
@@ -819,7 +820,10 @@ export function RespondersTab({ groupId }: { groupId: string }) {
                 <td className="px-3 py-1.5 text-right">
                   {r.classification === "rogue" && (
                     <button
-                      onClick={() => ack.mutate(r.id)}
+                      onClick={() => {
+                        armRemovalFocus();
+                        ack.mutate(r.id);
+                      }}
                       disabled={ack.isPending}
                       className="rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
                       {...ackGate}
@@ -1001,7 +1005,10 @@ function RouterAdvertisementsTab({ groupId }: { groupId: string }) {
                   <td className="px-3 py-1.5 text-right">
                     {r.classification === "rogue" && (
                       <button
-                        onClick={() => ack.mutate(r.id)}
+                        onClick={() => {
+                          armRemovalFocus();
+                          ack.mutate(r.id);
+                        }}
                         disabled={ack.isPending}
                         className="rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
                         {...ackGate}

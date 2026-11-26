@@ -46,7 +46,10 @@ import { FormError } from "@/components/ui/form-error";
 function ConflictList({ conflicts }: { conflicts: ResizeConflict[] }) {
   if (conflicts.length === 0) return null;
   return (
-    <div className="rounded border border-red-300 bg-red-50 p-3 dark:border-red-900 dark:bg-red-900/20">
+    <div
+      role="alert"
+      className="rounded border border-red-300 bg-red-50 p-3 dark:border-red-900 dark:bg-red-900/20"
+    >
       <div className="mb-1 flex items-center gap-2 text-sm font-medium text-red-900 dark:text-red-200">
         <AlertCircle className="h-4 w-4" />
         {conflicts.length} conflict{conflicts.length === 1 ? "" : "s"} — commit

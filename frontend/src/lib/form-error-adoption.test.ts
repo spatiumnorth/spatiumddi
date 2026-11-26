@@ -11,7 +11,7 @@ const SRC = join(__dirname, "..");
 // Conditions that are not a refusal of a save (stored last-run state, field
 // hints, page-level notices).
 const NOT_A_REFUSAL =
-  /last_|fingerbank|error_message|valueError|hostnameErr|errors\.|validationError|pageError|reauthFailed|latest\.|optionsError|syncError|logoError|cr\.error|status === "error"|run\.error/;
+  /last_|fingerbank|error_message|valueError|hostnameErr|(?<![\w.])errors\.|validationError|pageError|reauthFailed|latest\.|optionsError|syncError|logoError|cr\.error|status === "error"|run\.error/;
 
 const PLAIN_BOX =
   /\{(?<cond>[^{}\n]*?(?:[eE]rr|[fF]ail|[rR]efus)[^{}\n]*?)\s*&&\s*\(?\s*<(?<tag>[a-z][a-z0-9]*)\s+className="(?<cls>[^"]*)"\s*>(?:(?!<\/?(?:p|div|ul|li|button)\b)[\s\S])*?<\/\k<tag>>/g;
@@ -52,7 +52,7 @@ export function plainRefusalBoxes(source: string, ternary = false): string[] {
 // is the same defect one call site removed: `<ApplyErrorBanner error={e} />`
 // has no className for the scans above to read (#4745).
 const ERROR_COMPONENT =
-  /\nfunction\s+(?<name>[A-Z]\w*(?:Error|Banner|Refusal)\w*)\s*\([\s\S]*?\n\}\n/g;
+  /\nfunction\s+(?<name>[A-Z]\w*(?:Error|Banner|Refusal)\w*|(?:[A-Z]\w*)?Conflict\w*)\s*\([\s\S]*?\n\}\n/g;
 
 export function plainErrorComponents(source: string): string[] {
   const out: string[] = [];
@@ -143,6 +143,18 @@ describe("dialog refusals are announced (#3821)", () => {
     expect(
       plainErrorComponents(comp.replace("<div ", '<div role="alert" ')),
     ).toEqual([]);
+  });
+
+  it("detects a response's error list and a conflict list without a role (#4832)", () => {
+    const list = `function XModal(){ return <Modal>{result.errors.length > 0 && (<div className="mt-1 text-destructive">{result.errors.join("; ")}</div>)}</Modal>; }`;
+    expect(plainRefusalBoxes(list)).toEqual(["result.errors.length > 0"]);
+    expect(
+      plainRefusalBoxes(list.replace("<div ", '<div role="alert" ')),
+    ).toEqual([]);
+    const hint = `function XModal(){ return <Modal>{errors.name && <p className="text-destructive">{errors.name}</p>}</Modal>; }`;
+    expect(plainRefusalBoxes(hint)).toEqual([]);
+    const comp = `\nfunction ConflictList({ c }) {\n  return <div className="text-red-900">{c}</div>;\n}\n`;
+    expect(plainErrorComponents(comp)).toEqual(["ConflictList"]);
   });
 
   it("no error or refusal box is drawn without a role", () => {

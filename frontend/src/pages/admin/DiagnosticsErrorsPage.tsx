@@ -1,3 +1,4 @@
+import { armRemovalFocus } from "@/components/ui/focus-return";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -267,9 +268,15 @@ export function DiagnosticsErrorsPage() {
                     onToggleExpand={() =>
                       setExpandedId(expandedId === row.id ? null : row.id)
                     }
-                    onAck={() => ackMut.mutate(row.id)}
+                    onAck={() => {
+                      armRemovalFocus();
+                      ackMut.mutate(row.id);
+                    }}
                     onSuppress={() => suppressMut.mutate(row.id)}
-                    onDelete={() => deleteMut.mutate(row.id)}
+                    onDelete={() => {
+                      armRemovalFocus();
+                      deleteMut.mutate(row.id);
+                    }}
                     pendingAck={ackMut.isPending && ackMut.variables === row.id}
                     pendingSuppress={
                       suppressMut.isPending && suppressMut.variables === row.id
