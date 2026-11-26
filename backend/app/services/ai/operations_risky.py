@@ -416,8 +416,13 @@ async def _subnet_not_empty_detail(db: AsyncSession, subnet_id: UUID) -> str | N
             )
         )
     ).scalar_one()
+    # Trashed scopes count: the FK cascade takes them with no audit row (#4871).
     scope_count = (
-        await db.execute(select(func.count(DHCPScope.id)).where(DHCPScope.subnet_id == subnet_id))
+        await db.execute(
+            select(func.count(DHCPScope.id))
+            .where(DHCPScope.subnet_id == subnet_id)
+            .execution_options(include_deleted=True)
+        )
     ).scalar_one()
     if not (user_ip_count or scope_count):
         return None
@@ -428,7 +433,8 @@ async def _subnet_not_empty_detail(db: AsyncSession, subnet_id: UUID) -> str | N
         parts.append(f"{scope_count} DHCP scope" + ("s" if scope_count != 1 else ""))
     return (
         f"Subnet is not empty: {', '.join(parts)}. "
-        "Delete the contents first, or retry with force=true to cascade."
+        "Delete the contents first (scopes in the Trash count: restore or empty them), "
+        "or retry with force=true to cascade."
     )
 
 
@@ -470,7 +476,9 @@ async def _preview_delete_subnet(
         # catches a subnet that gained IPs/scopes since it was requested.
         scope_count = (
             await db.execute(
-                select(func.count(DHCPScope.id)).where(DHCPScope.subnet_id == args.subnet_id)
+                select(func.count(DHCPScope.id))
+                .where(DHCPScope.subnet_id == args.subnet_id)
+                .execution_options(include_deleted=True)
             )
         ).scalar_one()
         ip_count = (
@@ -607,6 +615,21 @@ async def _apply_delete_subnet(
         .scalars()
         .all()
     )
+    # Scopes already in the Trash go by the FK cascade, which runs no Python:
+    # one audit row each, as the Trash's own purge writes (#1957, #4871).
+    trashed_scopes = (
+        (
+            await db.execute(
+                select(DHCPScope)
+                .where(DHCPScope.subnet_id == args.subnet_id, DHCPScope.deleted_at.is_not(None))
+                .execution_options(include_deleted=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for tsc in trashed_scopes:
+        db.add(_audit(user, "delete", "dhcp_scope", str(tsc.id), tsc.name))
     agent_servers_to_refresh: dict[uuid.UUID, DHCPServer] = {}
     # Recounted with the block below, never per scope: a recount holds its
     # locks to commit, through the next scope's push (#3354).
@@ -730,17 +753,26 @@ class DeleteBlockArgs(BaseModel):
 
 
 async def _block_not_empty_detail(db: AsyncSession, block_id: UUID, network: Any) -> str | None:
-    """Shared non-empty check for block permanent-delete (#17)."""
+    """Shared non-empty check for block permanent-delete (#17).
+
+    Children in the Trash count: the FK cascade would take them silently (#4871).
+    """
     from app.models.ipam import IPBlock, Subnet
 
     subnet_count = (
         await db.execute(
-            select(func.count()).select_from(Subnet).where(Subnet.block_id == block_id)
+            select(func.count())
+            .select_from(Subnet)
+            .where(Subnet.block_id == block_id)
+            .execution_options(include_deleted=True)
         )
     ).scalar_one()
     child_block_count = (
         await db.execute(
-            select(func.count()).select_from(IPBlock).where(IPBlock.parent_block_id == block_id)
+            select(func.count())
+            .select_from(IPBlock)
+            .where(IPBlock.parent_block_id == block_id)
+            .execution_options(include_deleted=True)
         )
     ).scalar_one()
     if not (subnet_count or child_block_count):
@@ -752,7 +784,8 @@ async def _block_not_empty_detail(db: AsyncSession, block_id: UUID, network: Any
         parts.append(f"{subnet_count} subnet(s)")
     return (
         f"Block {network} still contains {' and '.join(parts)}. "
-        "Delete or move them before deleting the block."
+        "Delete or move them before deleting the block (rows in the Trash count: "
+        "restore them or empty the Trash first)."
     )
 
 
@@ -897,17 +930,26 @@ class DeleteSpaceArgs(BaseModel):
 
 
 async def _space_not_empty_detail(db: AsyncSession, space_id: UUID, name: str) -> str | None:
-    """Shared non-empty check for space permanent-delete (#17)."""
+    """Shared non-empty check for space permanent-delete (#17).
+
+    Blocks and subnets in the Trash count (#4871).
+    """
     from app.models.ipam import IPBlock, Subnet
 
     subnet_count = (
         await db.execute(
-            select(func.count()).select_from(Subnet).where(Subnet.space_id == space_id)
+            select(func.count())
+            .select_from(Subnet)
+            .where(Subnet.space_id == space_id)
+            .execution_options(include_deleted=True)
         )
     ).scalar_one()
     block_count = (
         await db.execute(
-            select(func.count()).select_from(IPBlock).where(IPBlock.space_id == space_id)
+            select(func.count())
+            .select_from(IPBlock)
+            .where(IPBlock.space_id == space_id)
+            .execution_options(include_deleted=True)
         )
     ).scalar_one()
     if not (subnet_count or block_count):
@@ -919,7 +961,8 @@ async def _space_not_empty_detail(db: AsyncSession, space_id: UUID, name: str) -
         parts.append(f"{subnet_count} subnet(s)")
     return (
         f"IP space {name!r} still contains {' and '.join(parts)}. "
-        "Delete or move them before deleting the space."
+        "Delete or move them before deleting the space (rows in the Trash count: "
+        "restore them or empty the Trash first)."
     )
 
 
