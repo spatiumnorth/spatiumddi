@@ -128,8 +128,9 @@ def _days(label: str, default: int | None, hint: str, *, min_: int = 1) -> Param
 
 
 _EXPIRY_HINT = (
-    "Soft fire at threshold; severity escalates to warning at threshold/4 and "
-    "critical at threshold/12 (e.g. 30 → 7.5 → 2.5 d)."
+    "Fires at the rule's Severity from the threshold; rises to warning at "
+    "threshold/4 and critical at threshold/12 if the Severity is lower "
+    "(e.g. 30 → 7.5 → 2.5 d)."
 )
 
 
