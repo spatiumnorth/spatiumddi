@@ -1,3 +1,4 @@
+import { armRemovalFocus } from "@/components/ui/focus-return";
 import { useOwnershipModules } from "@/hooks/useOwnershipModules";
 import { ServerDeleteAgentNote } from "@/pages/serverDeleteAgentNote";
 import { useState, useEffect, useMemo, useRef, type ReactNode } from "react";
@@ -13202,7 +13203,10 @@ export function BlocklistDetail({
                       )}
                       <button
                         className="text-muted-foreground hover:text-destructive"
-                        onClick={() => deleteEntry.mutate(e.id)}
+                        onClick={() => {
+                          armRemovalFocus();
+                          deleteEntry.mutate(e.id);
+                        }}
                         title={
                           e.source === "manual"
                             ? "Remove entry"
@@ -13335,7 +13339,10 @@ export function BlocklistDetail({
                       </button>
                       <button
                         className="text-muted-foreground hover:text-destructive"
-                        onClick={() => deleteException.mutate(ex.id)}
+                        onClick={() => {
+                          armRemovalFocus();
+                          deleteException.mutate(ex.id);
+                        }}
                         title="Remove exception"
                         aria-label="Remove exception"
                         {...permissionGate(

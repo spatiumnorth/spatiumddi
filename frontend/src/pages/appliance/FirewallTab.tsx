@@ -6,6 +6,7 @@
 // tab itself is gated in AppliancePage on the appliance.firewall feature
 // module — #14's NavItem clause is satisfied by tab-level gating because the
 // firewall family lives under the always-visible /appliance parent.
+import { armRemovalFocus } from "@/components/ui/focus-return";
 import {
   useEffect,
   useMemo,
@@ -1358,7 +1359,10 @@ function AliasesSection() {
                     <button
                       type="button"
                       disabled={a.is_builtin}
-                      onClick={() => del.mutate(a.id)}
+                      onClick={() => {
+                        armRemovalFocus();
+                        del.mutate(a.id);
+                      }}
                       aria-label={`Delete alias ${a.name}`}
                       title="Delete alias"
                       className="rounded-md border px-2 py-1 text-xs text-destructive hover:bg-destructive/10 disabled:opacity-40"

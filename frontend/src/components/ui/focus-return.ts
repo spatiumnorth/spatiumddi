@@ -147,3 +147,18 @@ export function returnFocus(
     focusSuccessor(successors);
   }
 }
+
+/**
+ * Call from a row's own control that deletes (or acknowledges, snoozes, ...)
+ * with no confirm dialog, just before the mutation starts (#4864). The
+ * control goes when the list is read again without it, and with it keyboard
+ * focus; this arms the same watcher a dialog close does, so focus lands on
+ * the next row's same control, the previous one's, the list, then the
+ * heading, never the page body. A pointer press that left focus on the body
+ * arms nothing.
+ */
+export function armRemovalFocus(): void {
+  const from = document.activeElement;
+  if (!(from instanceof HTMLElement) || from === document.body) return;
+  returnFocus([from], captureSuccessors(from));
+}
