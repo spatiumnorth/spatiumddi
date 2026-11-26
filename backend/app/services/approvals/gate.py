@@ -126,7 +126,7 @@ def _resource_id_from_args(args: BaseModel) -> str | None:
     data = args.model_dump(mode="json")
     # Prefer the operation's own target id over a secondary (e.g. delete_zone
     # carries both group_id and zone_id — zone_id is the real target).
-    for key in ("zone_id", "scope_id", "subnet_id", "block_id", "space_id", "group_id"):
+    for key in ("zone_id", "scope_id", "subnet_id", "block_id", "space_id", "group_id", "row_id"):
         val = data.get(key)
         if val is not None:
             return str(val)
