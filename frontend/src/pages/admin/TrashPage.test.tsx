@@ -497,6 +497,28 @@ describe("the list (#1961, #1962)", () => {
     );
   });
 
+  it("reads the list again each time the page opens (#4872)", async () => {
+    list.mockResolvedValue({
+      items: [entry(1)],
+      total: 1,
+      limit: 100,
+      offset: 0,
+    });
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 30_000 } },
+    });
+    const ui = (
+      <QueryClientProvider client={qc}>
+        <TrashPage />
+      </QueryClientProvider>
+    );
+    const first = render(ui);
+    await waitFor(() => expect(list).toHaveBeenCalledTimes(1));
+    first.unmount();
+    render(ui);
+    await waitFor(() => expect(list).toHaveBeenCalledTimes(2));
+  });
+
   it("steps back when the page it is on empties", async () => {
     let total = 105;
     list.mockImplementation((p: { offset?: number }) =>
