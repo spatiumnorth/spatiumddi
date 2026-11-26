@@ -347,7 +347,7 @@ in the UI, so do them in this order.
 2. **Turn on supervisor registration.** `supervisor_registration_enabled` is
    **off** on a Helm control plane. While it is off the supervisor logs
    `supervisor_registration_enabled=false` and idles, and nothing appears in
-   Fleet. Turn it on under **Appliance → Pairing → Enable registration**, or:
+   Fleet. Turn it on under **Appliance → Fleet → Pairing codes → Enable registration**, or:
 
    ```bash
    curl -sk -X PUT https://<host>/api/v1/settings \
