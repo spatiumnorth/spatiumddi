@@ -1,4 +1,6 @@
+import { armRemovalFocus } from "@/components/ui/focus-return";
 import { useOwnershipModules } from "@/hooks/useOwnershipModules";
+import { handOffFocusOnRemove } from "@/components/ui/focus-return";
 import { ServerDeleteAgentNote } from "@/pages/serverDeleteAgentNote";
 import { useState, useEffect, useMemo, useRef, type ReactNode } from "react";
 import { useSharedSessionSet } from "./zoneTreeState";
@@ -5640,7 +5642,10 @@ export function ZoneDetailView({
           </span>
           <div className="flex items-center gap-2">
             <button
-              onClick={() => setSelectedRecords(new Set())}
+              onClick={(e) => {
+                handOffFocusOnRemove(e.currentTarget);
+                setSelectedRecords(new Set());
+              }}
               className="rounded-md border px-2 py-1 hover:bg-muted"
             >
               Clear
@@ -7773,9 +7778,12 @@ function ViewModalForm({ groupId, view, onClose }: ViewModalProps) {
 
         <div>
           <div className="mb-1 flex items-center justify-between">
-            <span className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="dns-view-match-clients"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Match clients (one per line; prefix ! to negate)
-            </span>
+            </label>
             <button
               type="button"
               className="flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] hover:bg-accent"
@@ -7785,6 +7793,7 @@ function ViewModalForm({ groupId, view, onClose }: ViewModalProps) {
             </button>
           </div>
           <textarea
+            id="dns-view-match-clients"
             value={matchClients}
             onChange={(e) => setMatchClients(e.target.value)}
             className="w-full rounded border bg-background px-2 py-1 font-mono text-xs resize-none h-24 focus:outline-none focus:ring-1 focus:ring-ring"
@@ -7805,6 +7814,7 @@ function ViewModalForm({ groupId, view, onClose }: ViewModalProps) {
           </summary>
           <div className="mt-2">
             <textarea
+              aria-label="Match destinations (advanced)"
               value={matchDestinations}
               onChange={(e) => setMatchDestinations(e.target.value)}
               className="w-full rounded border bg-background px-2 py-1 font-mono text-xs resize-none h-16 focus:outline-none focus:ring-1 focus:ring-ring"
@@ -11251,7 +11261,10 @@ export function ZonesTab({
                 <Trash2 className="h-3 w-3" /> Delete {selected.size}
               </button>
               <button
-                onClick={() => setSelected(new Set())}
+                onClick={(e) => {
+                  handOffFocusOnRemove(e.currentTarget);
+                  setSelected(new Set());
+                }}
                 className="rounded-md border px-2 py-1 text-xs hover:bg-accent"
               >
                 Clear
@@ -12033,7 +12046,10 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
           </span>
           <div className="flex items-center gap-2">
             <button
-              onClick={() => setSelectedIds(new Set())}
+              onClick={(e) => {
+                handOffFocusOnRemove(e.currentTarget);
+                setSelectedIds(new Set());
+              }}
               className="rounded border px-2 py-1 hover:bg-muted/30"
             >
               Clear
@@ -13202,7 +13218,10 @@ export function BlocklistDetail({
                       )}
                       <button
                         className="text-muted-foreground hover:text-destructive"
-                        onClick={() => deleteEntry.mutate(e.id)}
+                        onClick={() => {
+                          armRemovalFocus();
+                          deleteEntry.mutate(e.id);
+                        }}
                         title={
                           e.source === "manual"
                             ? "Remove entry"
@@ -13335,7 +13354,10 @@ export function BlocklistDetail({
                       </button>
                       <button
                         className="text-muted-foreground hover:text-destructive"
-                        onClick={() => deleteException.mutate(ex.id)}
+                        onClick={() => {
+                          armRemovalFocus();
+                          deleteException.mutate(ex.id);
+                        }}
                         title="Remove exception"
                         aria-label="Remove exception"
                         {...permissionGate(
@@ -13377,10 +13399,14 @@ export function BlocklistDetail({
               bulkAdd.mutate();
             }}
           >
-            <p className="text-xs text-muted-foreground">
+            <label
+              htmlFor="dns-bulk-domains"
+              className="block text-xs text-muted-foreground"
+            >
               One domain per line. Duplicates and invalid entries are skipped.
-            </p>
+            </label>
             <textarea
+              id="dns-bulk-domains"
               className={`${inputCls} font-mono text-xs`}
               rows={12}
               value={bulkText}

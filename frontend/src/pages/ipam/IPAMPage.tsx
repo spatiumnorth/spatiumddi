@@ -1,6 +1,14 @@
 import { countNoun, pluralize } from "@/lib/count-noun";
+import { handOffFocusOnRemove } from "@/components/ui/focus-return";
 import { useOwnershipModules } from "@/hooks/useOwnershipModules";
-import { useState, useEffect, useMemo, useRef, useCallback } from "react";
+import {
+  useState,
+  useEffect,
+  useMemo,
+  useRef,
+  useCallback,
+  useId,
+} from "react";
 import { FormError } from "@/components/ui/form-error";
 import { DHCPSubnetPanel } from "@/pages/dhcp/DHCPSubnetPanel";
 import { CreateScopeModal } from "@/pages/dhcp/CreateScopeModal";
@@ -1271,6 +1279,8 @@ function DnsSettingsSection({
   fallbackSpaceId?: string | null;
   hideInheritToggle?: boolean;
 }) {
+  const dnsGroupSelectId = useId();
+  const primaryZoneSelectId = useId();
   // #1068 — mirror of the DHCP gate below; DNS can be switched off too.
   const { enabled: dnsFeature, ready: dnsFeatureReady } = useFeatureModules();
   const dnsOn = dnsFeatureReady && dnsFeature("core.dns");
@@ -1390,10 +1400,16 @@ function DnsSettingsSection({
             picker visually. The API still stores a list for backwards
             compatibility; we round-trip through a single-element array. */}
         <div>
-          <p className="text-xs text-muted-foreground mb-1">DNS Server Group</p>
+          <label
+            htmlFor={dnsGroupSelectId}
+            className="mb-1 block text-xs text-muted-foreground"
+          >
+            DNS Server Group
+          </label>
           {!canReadGroups ? (
             // Disabled, so the form keeps the stored group (never a clear).
             <select
+              id={dnsGroupSelectId}
               value={displayGroupIds[0] ? "linked" : ""}
               disabled
               title={
@@ -1415,6 +1431,7 @@ function DnsSettingsSection({
             </p>
           ) : (
             <select
+              id={dnsGroupSelectId}
               value={displayGroupIds[0] ?? ""}
               onChange={(e) => {
                 if (inherit) return;
@@ -1440,8 +1457,14 @@ function DnsSettingsSection({
         {/* A stored zone the user may not read: said, not dropped. */}
         {!canReadZones && displayZoneId && (
           <div>
-            <p className="text-xs text-muted-foreground mb-1">Primary Zone</p>
+            <label
+              htmlFor={primaryZoneSelectId}
+              className="mb-1 block text-xs text-muted-foreground"
+            >
+              Primary Zone
+            </label>
             <select
+              id={primaryZoneSelectId}
               value="linked"
               disabled
               title={
@@ -1472,8 +1495,14 @@ function DnsSettingsSection({
         {/* Primary Zone */}
         {availableZones.length > 0 && (
           <div>
-            <p className="text-xs text-muted-foreground mb-1">Primary Zone</p>
+            <label
+              htmlFor={primaryZoneSelectId}
+              className="mb-1 block text-xs text-muted-foreground"
+            >
+              Primary Zone
+            </label>
             <select
+              id={primaryZoneSelectId}
               value={displayZoneId ?? ""}
               onChange={(e) =>
                 !inherit && onZoneIdChange(e.target.value || null)
@@ -1557,6 +1586,7 @@ function DhcpSettingsSection({
   fallbackSpaceId?: string | null;
   hideInheritToggle?: boolean;
 }) {
+  const dhcpGroupSelectId = useId();
   // #1068 — DHCP can be switched off wholesale; these reads 404 then.
   // ``ready`` matters: ``enabled`` answers true while the module set is
   // still loading, so without it each of these fires once on a hard
@@ -1639,12 +1669,16 @@ function DhcpSettingsSection({
 
       <fieldset disabled={inherit} className="space-y-2 disabled:opacity-50">
         <div>
-          <p className="text-xs text-muted-foreground mb-1">
+          <label
+            htmlFor={dhcpGroupSelectId}
+            className="mb-1 block text-xs text-muted-foreground"
+          >
             DHCP Server Group
-          </p>
+          </label>
           {!canReadGroups ? (
             // Disabled, so the form keeps the stored group (never a clear).
             <select
+              id={dhcpGroupSelectId}
               value={displayGroupId ? "linked" : ""}
               disabled
               title={
@@ -1666,6 +1700,7 @@ function DhcpSettingsSection({
             </p>
           ) : (
             <select
+              id={dhcpGroupSelectId}
               value={displayGroupId ?? ""}
               onChange={(e) =>
                 !inherit && onServerGroupIdChange(e.target.value || null)
@@ -3882,7 +3917,7 @@ export function AddAddressModal({
   const zoneQueries = useQueries({
     queries: (zoneGroupIds as string[]).map((gId: string) => ({
       queryKey: ["dns-zones", gId],
-      queryFn: () => dnsApi.listZones(gId),
+      queryFn: () => dnsApi.listZones(gId, undefined, subnetId),
       // Re-read on open as well: the subnet's primary zone may be one created
       // since the cached list was taken, and the pick must not settle on
       // another zone before the list holds it (#4028, as #3078).
@@ -5348,7 +5383,9 @@ export function SubnetDetail({
     queryKey: ["dns-zones", "subnet-detail", subnet.id, subnetDnsGroupIds],
     queryFn: async () => {
       const lists = await Promise.all(
-        subnetDnsGroupIds.map((gid) => dnsApi.listZones(gid)),
+        subnetDnsGroupIds.map((gid) =>
+          dnsApi.listZones(gid, undefined, subnet.id),
+        ),
       );
       return lists.flat();
     },
@@ -6612,7 +6649,10 @@ export function SubnetDetail({
                 Bulk delete
               </button>
               <button
-                onClick={() => setSelectedIpIds(new Set())}
+                onClick={(e) => {
+                  handOffFocusOnRemove(e.currentTarget);
+                  setSelectedIpIds(new Set());
+                }}
                 className="rounded-md p-1 text-muted-foreground hover:text-foreground"
                 title="Clear selection"
               >
@@ -8242,7 +8282,7 @@ export function DnsSyncModal({
                     </div>
                   )}
                   {result.errors.length > 0 && (
-                    <div className="mt-1 text-destructive">
+                    <div role="alert" className="mt-1 text-destructive">
                       {result.errors.length} error
                       {result.errors.length === 1 ? "" : "s"}:{" "}
                       {result.errors.join("; ")}
@@ -10042,7 +10082,7 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
   const zoneQueries = useQueries({
     queries: (zoneGroupIds as string[]).map((gId: string) => ({
       queryKey: ["dns-zones", gId],
-      queryFn: () => dnsApi.listZones(gId),
+      queryFn: () => dnsApi.listZones(gId, undefined, address.subnet_id),
       staleTime: 60_000,
       enabled: dnsOn,
     })),
@@ -10078,7 +10118,7 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
     dnsOn &&
     subnetZonesSettled &&
     !availableZones.some((z: DNSZone) => z.id === storedZoneId);
-  const { data: lookupGroups = [] } = useQuery({
+  const { data: lookupGroups = [], isLoading: lookupGroupsLoading } = useQuery({
     queryKey: ["dns-groups"],
     queryFn: dnsApi.listGroups,
     enabled: storedZoneMissing,
@@ -10092,11 +10132,25 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
       enabled: storedZoneMissing,
     })),
   });
-  const storedExtraZone: DNSZone | undefined = storedZoneMissing
+  const lookedUpZone: DNSZone | undefined = storedZoneMissing
     ? lookupQueries
         .flatMap((q: { data?: DNSZone[] }) => q.data ?? [])
         .find((z: DNSZone) => z.id === storedZoneId)
     : undefined;
+  // #4893 — a role that may write one zone but not read the group's zones
+  // cannot find the stored zone in those lists, and the picker used to fall
+  // back to the writable zone, naming a zone the record is not in. The
+  // row carries only the zone id, so keep the record's own zone as the
+  // current value and call it "not visible to your role" instead of guessing.
+  const lookupSettled =
+    !lookupGroupsLoading &&
+    lookupQueries.every((q: { isLoading: boolean }) => !q.isLoading);
+  const storedZoneHidden = storedZoneMissing && !lookedUpZone;
+  const storedExtraZone: DNSZone | undefined =
+    lookedUpZone ??
+    (storedZoneMissing && lookupSettled
+      ? ({ id: storedZoneId, name: "" } as DNSZone)
+      : undefined);
   const pickerZones: DNSZone[] = storedExtraZone
     ? [...availableZones, storedExtraZone]
     : availableZones;
@@ -10118,7 +10172,7 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
 
   const selectedZone = pickerZones.find((z: DNSZone) => z.id === dnsZoneId);
   const fqdnPreview =
-    hostname && selectedZone
+    hostname && selectedZone && selectedZone.name
       ? `${hostname}.${selectedZone.name.replace(/\.$/, "")}`
       : null;
 
@@ -10349,7 +10403,9 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
             {pickerZones.length === 1 ? (
               <p className="text-xs text-muted-foreground py-1">
                 <Globe2 className="inline h-3 w-3 mr-1" />
-                {pickerZones[0].name.replace(/\.$/, "")}
+                {pickerZones[0].name
+                  ? pickerZones[0].name.replace(/\.$/, "")
+                  : "Zone not visible to your role"}
                 {fqdnPreview && (
                   <span className="ml-2 font-mono text-emerald-600 dark:text-emerald-400">
                     → {fqdnPreview}
@@ -10374,7 +10430,9 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
                   />
                   {storedExtraZone && (
                     <option value={storedExtraZone.id}>
-                      {`${storedExtraZone.name.replace(/\.$/, "")} (current — not among this subnet's zones)`}
+                      {storedZoneHidden
+                        ? "Current zone — not visible to your role"
+                        : `${storedExtraZone.name.replace(/\.$/, "")} (current — not among this subnet's zones)`}
                     </option>
                   )}
                 </select>
@@ -11605,7 +11663,7 @@ export function BulkEditAddressesModal({
   const zoneQueries = useQueries({
     queries: zoneGroupIds.map((gId: string) => ({
       queryKey: ["dns-zones", gId],
-      queryFn: () => dnsApi.listZones(gId),
+      queryFn: () => dnsApi.listZones(gId, undefined, subnetId),
       staleTime: 60_000,
       enabled: dnsOn,
     })),
@@ -14834,7 +14892,12 @@ export function BlockDetailView({
                 >
                   Delete ({selectedCount})
                 </HeaderButton>
-                <HeaderButton onClick={() => setSelected(new Set())}>
+                <HeaderButton
+                  onClick={(e) => {
+                    handOffFocusOnRemove(e.currentTarget);
+                    setSelected(new Set());
+                  }}
+                >
                   Clear
                 </HeaderButton>
               </>
@@ -15242,7 +15305,10 @@ export function BlockDetailView({
           {roleFilters.size > 0 && (
             <button
               type="button"
-              onClick={() => setRoleFilters(new Set())}
+              onClick={(e) => {
+                handOffFocusOnRemove(e.currentTarget);
+                setRoleFilters(new Set());
+              }}
               className="text-[11px] text-muted-foreground hover:text-foreground"
             >
               clear
@@ -18539,7 +18605,14 @@ export function IPAMPage() {
             {treeFilter && (
               <button
                 type="button"
-                onClick={() => setTreeFilter("")}
+                onClick={(e) => {
+                  const box = e.currentTarget.parentElement;
+                  handOffFocusOnRemove(
+                    e.currentTarget,
+                    () => box?.querySelector("input") ?? null,
+                  );
+                  setTreeFilter("");
+                }}
                 aria-label="Clear tree filter"
                 title="Clear filter"
                 className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-0.5 text-muted-foreground/60 hover:text-foreground"

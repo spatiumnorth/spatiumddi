@@ -1,3 +1,4 @@
+import { armRemovalFocus } from "@/components/ui/focus-return";
 import { useCallback, useMemo, useRef } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { BellOff, Combine, Lightbulb, RotateCcw, X } from "lucide-react";
@@ -150,9 +151,18 @@ export function AggregationCandidatesBadge({ blockId }: { blockId: string }) {
                   key={s.candidate_key}
                   candidate={s}
                   canEdit={canEdit}
-                  onSnooze={() => snoozeMut.mutate(s.candidate_key)}
-                  onDismiss={() => dismissMut.mutate(s.candidate_key)}
-                  onClear={() => clearMut.mutate(s.candidate_key)}
+                  onSnooze={() => {
+                    armRemovalFocus();
+                    snoozeMut.mutate(s.candidate_key);
+                  }}
+                  onDismiss={() => {
+                    armRemovalFocus();
+                    dismissMut.mutate(s.candidate_key);
+                  }}
+                  onClear={() => {
+                    armRemovalFocus();
+                    clearMut.mutate(s.candidate_key);
+                  }}
                 />
               ))
             )}

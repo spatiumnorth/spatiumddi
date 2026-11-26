@@ -3,6 +3,7 @@
 // toolbar (the ZonesTab pattern). The air-gap upload lives behind a header
 // button in the shared draggable Modal.
 
+import { handOffFocusOnRemove } from "@/components/ui/focus-return";
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -383,7 +384,10 @@ export function UpgradeImagesTable() {
               )}
               <button
                 type="button"
-                onClick={() => setSelected(new Set())}
+                onClick={(e) => {
+                  handOffFocusOnRemove(e.currentTarget);
+                  setSelected(new Set());
+                }}
                 className="rounded-md border px-2 py-1 hover:bg-accent"
               >
                 Clear

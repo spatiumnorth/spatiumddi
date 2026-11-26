@@ -132,6 +132,7 @@ from app.services.ipam.hygiene import (
     build_hygiene_report,
 )
 from app.services.ipam.live_address import get_live_address, live_subnet_clause
+from app.services.ipam.mac_history import record_mac_history
 from app.services.ipam.orphan_aliases import orphan_alias_batch_id
 from app.services.ipam.probe_policy import resolve_probe_policy
 from app.services.ipam.subnet_boundary import boundary_addresses
@@ -219,6 +220,7 @@ _SUBNET_INSTANCE_ROUTES = (
             "GET /subnets/{subnet_id}/probe-policy",
             "GET /subnets/{subnet_id}/reconciliation",
             "GET /subnets/{subnet_id}/utilization-history",
+            "GET /subnets/{subnet_id}/writable-zones",
         }
     ),
     frozenset({"PUT /subnets/{subnet_id}", "POST /subnets/{subnet_id}/addresses"}),
@@ -335,6 +337,7 @@ _IPAM_ROUTE_TYPES: dict[str, tuple[str, ...]] = {
     "GET /subnets/{subnet_id}/utilization-history": _SUBNET,
     "GET /subnets/{subnet_id}/probe-policy": _SUBNET,
     "GET /subnets/{subnet_id}/effective-dns": _SUBNET,
+    "GET /subnets/{subnet_id}/writable-zones": _SUBNET,
     "GET /subnets/{subnet_id}/effective-ddns": _SUBNET,
     "GET /subnets/{subnet_id}/effective-dhcp": _SUBNET,
     "GET /subnets/{subnet_id}/effective-fields": _SUBNET,
@@ -1252,36 +1255,8 @@ async def _check_public_facing_warnings(
 
 
 async def _record_mac_history(db: AsyncSession, ip_id: uuid.UUID, mac_address: str | None) -> None:
-    """Upsert ``(ip_id, mac)`` in ``ip_mac_history``, bumping ``last_seen``.
-
-    Called from create + update paths whenever the row carries a MAC.
-    The rule is "this IP currently has MAC X" → upsert with
-    ``last_seen = now()``. A MAC change leaves the prior row alone
-    with its earlier ``last_seen``, so the implicit history is the
-    set of distinct rows for the IP. Postgres's MACADDR type
-    normalises common formats so equality compares cleanly.
-
-    No-op when the MAC is missing or doesn't normalise — the IPAM
-    layer already validates MACs on the way in, so a malformed value
-    here would be defensive and we'd rather not poison the history
-    table with garbage.
-    """
-    if not mac_address:
-        return
-    if _normalize_mac(mac_address) is None:
-        return
-    # ``ON CONFLICT`` here is the cleanest path — Postgres-only, but
-    # the rest of the schema is too. Bump last_seen on conflict;
-    # first_seen sticks at its insert-time default.
-    await db.execute(
-        text("""
-            INSERT INTO ip_mac_history (id, ip_address_id, mac_address, first_seen, last_seen)
-            VALUES (gen_random_uuid(), :ip_id, CAST(:mac AS macaddr), now(), now())
-            ON CONFLICT (ip_address_id, mac_address)
-            DO UPDATE SET last_seen = now()
-            """),
-        {"ip_id": str(ip_id), "mac": mac_address},
-    )
+    """Thin alias of :func:`app.services.ipam.mac_history.record_mac_history`."""
+    await record_mac_history(db, ip_id, mac_address)
 
 
 def _enforce_token_scope(user: Any, resource_type: str, resource_id: uuid.UUID) -> None:
@@ -4973,6 +4948,13 @@ class EffectiveDnsResponse(BaseModel):
     inherited_from_block_id: str | None
 
 
+class WritableZoneResponse(BaseModel):
+    id: uuid.UUID
+    name: str
+    group_id: uuid.UUID
+    zone_type: str
+
+
 class EffectiveDdnsResponse(BaseModel):
     """What a subnet's DDNS resolves to, and where it comes from (#2475).
 
@@ -7926,6 +7908,37 @@ async def get_subnet_probe_policy(
         scope=verdict.scope_label or None,
         inherited=verdict.blocked and not subnet.do_not_probe,
     )
+
+
+@router.get("/subnets/{subnet_id}/writable-zones", response_model=list[WritableZoneResponse])
+async def list_subnet_writable_zones(
+    subnet_id: uuid.UUID, current_user: CurrentUser, db: DB, group_id: uuid.UUID | None = None
+) -> list[WritableZoneResponse]:
+    """DNS zones in the subnet's effective DNS groups that the caller may write (#4854).
+
+    A role scoped to one subnet and one zone cannot read ``GET /dns/groups/{id}/zones``
+    (a type-level DNS read), yet ``_assert_scoped_zones`` lets it name that zone. This
+    is the picker's source for such a caller: only zones it holds ``write`` on.
+    """
+    subnet = await db.get(Subnet, subnet_id)
+    if subnet is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    group_ids, _, _ = await _resolve_effective_dns(db, subnet)
+    wanted = {str(g) for g in group_ids}
+    if group_id is not None:
+        wanted &= {str(group_id)}
+    if not wanted:
+        return []
+    rows = await db.execute(
+        select(DNSZone)
+        .where(DNSZone.group_id.in_([uuid.UUID(g) for g in wanted]))
+        .order_by(DNSZone.name)
+    )
+    return [
+        WritableZoneResponse(id=z.id, name=z.name, group_id=z.group_id, zone_type=z.zone_type)
+        for z in rows.scalars().all()
+        if user_has_permission(current_user, "write", "dns_zone", z.id)
+    ]
 
 
 @router.get("/subnets/{subnet_id}/effective-dns", response_model=EffectiveDnsResponse)

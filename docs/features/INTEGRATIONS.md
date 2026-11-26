@@ -250,7 +250,7 @@ Shipped as Option 2 from the original plan (synthetic `DNSZone` materialised by 
 
 ## NetBird (#603)
 
-**Phase status**: 1 shipped (read-only peer mirror) + 2 shipped (synthetic mesh-domain DNS surface). Gated behind the `integrations.netbird` feature module (**default off** — Settings → Features).
+**Phase status**: 1 shipped (read-only peer mirror) + 2 shipped (synthetic mesh-domain DNS surface). Gated behind the `integrations.netbird` feature module (**default off** — Features & Integrations).
 
 NetBird is the Tailscale-shaped sibling — a managed WireGuard mesh overlay with a real REST management API, but self-hostable. One `NetbirdInstance` row per NetBird deployment (a management server + a personal-access token). Unlike Tailscale's fixed `api.tailscale.com` host, the management URL is operator-supplied, and NetBird peers carry a **single IPv4 overlay address** (no IPv6 ULA), so there is one overlay CIDR — not the CGNAT + ULA pair Tailscale mirrors.
 
@@ -322,7 +322,7 @@ Same shape as Tailscale's Phase 2: a synthetic `DNSZone` materialised by the rec
 
 ## UniFi Network Application
 
-**Phase status**: read-only mirror shipped. Gated behind the `integrations.unifi` feature module (**default off** — Settings → Features).
+**Phase status**: read-only mirror shipped. Gated behind the `integrations.unifi` feature module (**default off** — Features & Integrations).
 
 One `UnifiController` row per UniFi Network controller. A controller can be a **local** console (direct HTTPS to `https://<host>:<port>/proxy/network/...`) or a **cloud-hosted** console reached through `api.ui.com` and the cloud-connector path. The reconciler picks the transport from `mode` and constructs the same logical paths underneath.
 
@@ -377,7 +377,7 @@ The reconciler writes a `last_discovery` JSONB snapshot on every successful sync
 
 **Phase status**: Part A shipped (read-only infrastructure mirror). Cloud DNS — the agentless authoritative-DNS driver family for Cloudflare / Route 53 / Azure DNS / Google Cloud DNS — is **Part B** and is *not* part of this integration; it ships through the Add DNS server flow instead (see [DNS.md](DNS.md) and [DNS_DRIVERS.md](../drivers/DNS_DRIVERS.md)).
 
-Gated behind the `integrations.cloud` feature module (**default off** — Settings → Features). One `CloudEndpoint` row per cloud account / subscription set / project set. AWS, Azure, and GCP are wired today; the model reserves the token-only providers (Hetzner / DigitalOcean / Linode / Vultr) for a future phase without a schema change.
+Gated behind the `integrations.cloud` feature module (**default off** — Features & Integrations). One `CloudEndpoint` row per cloud account / subscription set / project set. AWS, Azure, and GCP are wired today; the model reserves the token-only providers (Hetzner / DigitalOcean / Linode / Vultr) for a future phase without a schema change.
 
 Per-endpoint config (`CloudEndpoint` rows):
 
@@ -462,7 +462,7 @@ Mirror rows provenance via the `cloud_endpoint_id` FK on `IPBlock` / `Subnet` / 
 
 ## OPNsense
 
-**Phase status**: read-only mirror shipped. Gated behind the `integrations.opnsense` feature module (**default off** — Settings → Features).
+**Phase status**: read-only mirror shipped. Gated behind the `integrations.opnsense` feature module (**default off** — Features & Integrations).
 
 One `OPNsenseRouter` row points SpatiumDDI at a single OPNsense firewall's REST API. The reconciler mirrors the firewall's interface CIDRs (LAN / OPT* / VLANs) as IPAM subnets and its DHCPv4 leases + static reservations (optionally the ARP table) as IP addresses.
 
@@ -618,6 +618,8 @@ Per-org config: `base_url` (regional shard override), the `org_id`, a Fernet-enc
 Generate a Dashboard API key (**Organization → Settings → Dashboard API access**, or a per-user key), find the organization id (`getOrganizations`), and paste both on the `/meraki` admin page. **Test Connection** (`POST /meraki/orgs/test`) confirms the org + counts its appliance networks. Enforcement needs a *separate* write-scoped key (below).
 
 ---
+
+## Active block sync — write-back enforcement (#601)
 
 > **This is the deliberate exception to the read-only-mirror rule above.** Every other integration in this doc is a one-way `source → IPAM` pull. Active block sync is the opposite direction — `decision → source`, a push reconciler. It exists to close the half-open detect→block loop: rogue-DHCP detection (#370) and new-device watch (#459) can *see* a hostile device, and the DHCP MAC blocklist can starve it of a lease, but a device that **self-assigns a static IP walks right past a DHCP block**. Active block sync pushes a real block at the natural enforcement point instead.
 

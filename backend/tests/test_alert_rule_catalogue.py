@@ -171,6 +171,24 @@ def test_select_params_carry_options_and_integers_do_not() -> None:
             assert bool(p.options) == (p.kind == "select"), (spec.rule_type, p.name)
 
 
+def test_expiry_hint_names_the_severity_floor() -> None:
+    # #4884: the rule's Severity is a floor for the threshold/4 and
+    # threshold/12 escalation, and the editor pre-fills Warning, so a hint
+    # promising a "soft fire" at the threshold was false for a default rule.
+    expiring = [
+        s
+        for s in build_catalogue()
+        if s.params
+        and s.params[0].name == "threshold_days"
+        and "threshold/4" in (s.params[0].hint or "")
+    ]
+    assert len(expiring) == 7
+    for spec in expiring:
+        hint = spec.params[0].hint or ""
+        assert "Soft fire" not in hint, spec.rule_type
+        assert "Severity" in hint, spec.rule_type
+
+
 def test_unadjustable_type_has_no_params() -> None:
     by_type = {s.rule_type: s for s in build_catalogue()}
     assert by_type["ip_free_but_responding"].params[0].name == "threshold_days"

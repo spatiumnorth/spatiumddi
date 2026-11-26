@@ -1,4 +1,5 @@
 import { ListEmpty } from "@/components/ui/list-read-error";
+import { handOffFocusOnRemove } from "@/components/ui/focus-return";
 import { FreshEdit } from "@/components/FreshEdit";
 import { changedFields } from "@/hooks/useFreshRow";
 import { useMemo, useState } from "react";
@@ -1356,7 +1357,10 @@ export function ServicesPage() {
             </span>
             <button
               type="button"
-              onClick={() => setSearchParams({})}
+              onClick={(e) => {
+                handOffFocusOnRemove(e.currentTarget);
+                setSearchParams({});
+              }}
               className="inline-flex shrink-0 items-center gap-1 rounded border px-2 py-1 hover:bg-muted"
             >
               <X className="h-3.5 w-3.5" /> Clear filter
