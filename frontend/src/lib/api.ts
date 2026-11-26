@@ -2846,6 +2846,11 @@ export const aiToolCatalogApi = {
     api
       .put<AIToolCatalog>("/ai/tools/catalog", { enabled })
       .then((r) => r.data),
+  /** Switch only the named tools; the server merges into the stored list. */
+  change: (changes: Record<string, boolean>) =>
+    api
+      .put<AIToolCatalog>("/ai/tools/catalog", { changes })
+      .then((r) => r.data),
 };
 
 // ── Feature modules ──────────────────────────────────────────────────
