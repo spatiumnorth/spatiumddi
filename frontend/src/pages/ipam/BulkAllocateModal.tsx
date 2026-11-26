@@ -42,7 +42,6 @@ import {
   type BulkAllocatePreviewResponse,
   type BulkAllocateRequest,
   type DNSZone,
-  dnsApi,
   formatApiError,
   ipamApi,
   type Subnet,
@@ -245,7 +244,7 @@ export function BulkAllocateModal({
   const zoneQueries = useQueries({
     queries: zoneGroupIds.map((gId) => ({
       queryKey: ["dns-zones", gId],
-      queryFn: () => dnsApi.listZones(gId),
+      queryFn: () => ipamApi.listPickableZones(subnet.id, gId),
       // Re-read on open too: the primary may be a zone created since the
       // cached list was taken (#4028, as #3078).
       staleTime: 0,

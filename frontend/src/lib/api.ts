@@ -1691,6 +1691,20 @@ export const ipamApi = {
     api
       .get<EffectiveDns>(`/ipam/subnets/${subnetId}/effective-dns`)
       .then((r) => r.data),
+  // #4854 — the zones a subnet's picker offers. A caller scoped to one subnet
+  // and one zone is refused the group's zone list (a type-level DNS read), so
+  // on a 403 ask for the zones it may write instead.
+  listPickableZones: (subnetId: string | undefined, groupId: string) =>
+    dnsApi.listZones(groupId).catch((e: unknown) => {
+      const status = (e as { response?: { status?: number } })?.response
+        ?.status;
+      if (status !== 403 || !subnetId) throw e;
+      return api
+        .get<DNSZone[]>(`/ipam/subnets/${subnetId}/writable-zones`, {
+          params: { group_id: groupId },
+        })
+        .then((r) => r.data);
+    }),
   getEffectiveBlockDdns: (blockId: string) =>
     api
       .get<EffectiveDdns>(`/ipam/blocks/${blockId}/effective-ddns`)

@@ -219,6 +219,7 @@ _SUBNET_INSTANCE_ROUTES = (
             "GET /subnets/{subnet_id}/probe-policy",
             "GET /subnets/{subnet_id}/reconciliation",
             "GET /subnets/{subnet_id}/utilization-history",
+            "GET /subnets/{subnet_id}/writable-zones",
         }
     ),
     frozenset({"PUT /subnets/{subnet_id}", "POST /subnets/{subnet_id}/addresses"}),
@@ -335,6 +336,7 @@ _IPAM_ROUTE_TYPES: dict[str, tuple[str, ...]] = {
     "GET /subnets/{subnet_id}/utilization-history": _SUBNET,
     "GET /subnets/{subnet_id}/probe-policy": _SUBNET,
     "GET /subnets/{subnet_id}/effective-dns": _SUBNET,
+    "GET /subnets/{subnet_id}/writable-zones": _SUBNET,
     "GET /subnets/{subnet_id}/effective-ddns": _SUBNET,
     "GET /subnets/{subnet_id}/effective-dhcp": _SUBNET,
     "GET /subnets/{subnet_id}/effective-fields": _SUBNET,
@@ -4973,6 +4975,13 @@ class EffectiveDnsResponse(BaseModel):
     inherited_from_block_id: str | None
 
 
+class WritableZoneResponse(BaseModel):
+    id: uuid.UUID
+    name: str
+    group_id: uuid.UUID
+    zone_type: str
+
+
 class EffectiveDdnsResponse(BaseModel):
     """What a subnet's DDNS resolves to, and where it comes from (#2475).
 
@@ -7926,6 +7935,37 @@ async def get_subnet_probe_policy(
         scope=verdict.scope_label or None,
         inherited=verdict.blocked and not subnet.do_not_probe,
     )
+
+
+@router.get("/subnets/{subnet_id}/writable-zones", response_model=list[WritableZoneResponse])
+async def list_subnet_writable_zones(
+    subnet_id: uuid.UUID, current_user: CurrentUser, db: DB, group_id: uuid.UUID | None = None
+) -> list[WritableZoneResponse]:
+    """DNS zones in the subnet's effective DNS groups that the caller may write (#4854).
+
+    A role scoped to one subnet and one zone cannot read ``GET /dns/groups/{id}/zones``
+    (a type-level DNS read), yet ``_assert_scoped_zones`` lets it name that zone. This
+    is the picker's source for such a caller: only zones it holds ``write`` on.
+    """
+    subnet = await db.get(Subnet, subnet_id)
+    if subnet is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    group_ids, _, _ = await _resolve_effective_dns(db, subnet)
+    wanted = {str(g) for g in group_ids}
+    if group_id is not None:
+        wanted &= {str(group_id)}
+    if not wanted:
+        return []
+    rows = await db.execute(
+        select(DNSZone)
+        .where(DNSZone.group_id.in_([uuid.UUID(g) for g in wanted]))
+        .order_by(DNSZone.name)
+    )
+    return [
+        WritableZoneResponse(id=z.id, name=z.name, group_id=z.group_id, zone_type=z.zone_type)
+        for z in rows.scalars().all()
+        if user_has_permission(current_user, "write", "dns_zone", z.id)
+    ]
 
 
 @router.get("/subnets/{subnet_id}/effective-dns", response_model=EffectiveDnsResponse)
