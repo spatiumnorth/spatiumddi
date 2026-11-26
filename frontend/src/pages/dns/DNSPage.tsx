@@ -1,5 +1,6 @@
 import { armRemovalFocus } from "@/components/ui/focus-return";
 import { useOwnershipModules } from "@/hooks/useOwnershipModules";
+import { handOffFocusOnRemove } from "@/components/ui/focus-return";
 import { ServerDeleteAgentNote } from "@/pages/serverDeleteAgentNote";
 import { useState, useEffect, useMemo, useRef, type ReactNode } from "react";
 import { useSharedSessionSet } from "./zoneTreeState";
@@ -5641,7 +5642,10 @@ export function ZoneDetailView({
           </span>
           <div className="flex items-center gap-2">
             <button
-              onClick={() => setSelectedRecords(new Set())}
+              onClick={(e) => {
+                handOffFocusOnRemove(e.currentTarget);
+                setSelectedRecords(new Set());
+              }}
               className="rounded-md border px-2 py-1 hover:bg-muted"
             >
               Clear
@@ -11257,7 +11261,10 @@ export function ZonesTab({
                 <Trash2 className="h-3 w-3" /> Delete {selected.size}
               </button>
               <button
-                onClick={() => setSelected(new Set())}
+                onClick={(e) => {
+                  handOffFocusOnRemove(e.currentTarget);
+                  setSelected(new Set());
+                }}
                 className="rounded-md border px-2 py-1 text-xs hover:bg-accent"
               >
                 Clear
@@ -12039,7 +12046,10 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
           </span>
           <div className="flex items-center gap-2">
             <button
-              onClick={() => setSelectedIds(new Set())}
+              onClick={(e) => {
+                handOffFocusOnRemove(e.currentTarget);
+                setSelectedIds(new Set());
+              }}
               className="rounded border px-2 py-1 hover:bg-muted/30"
             >
               Clear

@@ -149,6 +149,37 @@ export function returnFocus(
 }
 
 /**
+ * A control that removes itself when pressed (a selection bar's Clear, a
+ * filter's own Clear) hands keyboard focus on instead of leaving it on the
+ * page body (#4862). Call it from the click handler, BEFORE the state setter
+ * that unmounts the control. Focus goes to the nearest table's check box
+ * (its select-all), then the table, then the usual fallbacks; pass
+ * `preferred` to name a better successor (a filter's textbox).
+ */
+export function handOffFocusOnRemove(
+  from: Element | null | undefined,
+  preferred?: FocusSuccessor,
+): void {
+  if (!(from instanceof HTMLElement)) return;
+  // Resolved now: once `from` is gone, so is the bar around it, and walking
+  // up from it would never reach the table.
+  let near: HTMLElement | null = null;
+  let a: HTMLElement | null = from.parentElement;
+  for (let i = 0; a && !near && i < 10; i++, a = a.parentElement) {
+    near =
+      a.querySelector<HTMLElement>(
+        'table input[type="checkbox"], [role="grid"] input[type="checkbox"]',
+      ) ?? a.querySelector<HTMLElement>('table, [role="table"], [role="grid"]');
+    if (a.matches("main, body")) break;
+  }
+  const nearest: FocusSuccessor = () => near;
+  returnFocus(
+    [from],
+    [...(preferred ? [preferred] : []), nearest, ...captureSuccessors(from)],
+  );
+}
+
+/**
  * Call from a row's own control that deletes (or acknowledges, snoozes, ...)
  * with no confirm dialog, just before the mutation starts (#4864). The
  * control goes when the list is read again without it, and with it keyboard

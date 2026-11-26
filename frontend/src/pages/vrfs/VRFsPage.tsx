@@ -1,4 +1,5 @@
 import { useOwnershipModules } from "@/hooks/useOwnershipModules";
+import { handOffFocusOnRemove } from "@/components/ui/focus-return";
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -664,7 +665,10 @@ export function VRFsPage() {
               <Trash2 className="h-3 w-3" /> Delete {selected.size}
             </button>
             <button
-              onClick={() => setSelected(new Set())}
+              onClick={(e) => {
+                handOffFocusOnRemove(e.currentTarget);
+                setSelected(new Set());
+              }}
               className="rounded-md border px-2 py-1 text-xs hover:bg-accent"
             >
               Clear
