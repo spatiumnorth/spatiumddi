@@ -42,6 +42,7 @@ async def test_subnet_refused_while_scope_in_trash(
     )
     assert r.status_code == 409, r.text
     assert "1 DHCP scope" in r.json()["detail"]
+    assert "Trash" in r.json()["detail"]
 
 
 @pytest.mark.asyncio
@@ -71,3 +72,41 @@ async def test_block_and_space_refused_while_child_in_trash(
     r = await client.delete(f"/api/v1/ipam/spaces/{space.id}?permanent=true", headers=h)
     assert r.status_code == 409, r.text
     assert "2 block" in r.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_force_subnet_delete_audits_trashed_scope(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    from sqlalchemy import select
+
+    from app.models.audit import AuditLog
+
+    subnet = await _subnet(db_session)
+    group = DHCPServerGroup(name="g2")
+    db_session.add(group)
+    await db_session.flush()
+    scope = DHCPScope(group_id=group.id, subnet_id=subnet.id, name="sc2", address_family="ipv4")
+    db_session.add(scope)
+    await db_session.flush()
+    scope.deleted_at = datetime.now(UTC)
+    await db_session.commit()
+    scope_id = str(scope.id)
+
+    r = await client.delete(
+        f"/api/v1/ipam/subnets/{subnet.id}?permanent=true&force=true",
+        headers=await _su(db_session),
+    )
+    assert r.status_code == 204, r.text
+    rows = (
+        (
+            await db_session.execute(
+                select(AuditLog).where(
+                    AuditLog.resource_type == "dhcp_scope", AuditLog.resource_id == scope_id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [a.action for a in rows] == ["delete"]
