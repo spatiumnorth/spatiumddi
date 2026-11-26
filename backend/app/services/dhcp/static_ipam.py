@@ -51,7 +51,7 @@ from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.dhcp import DHCPLease, DHCPScope, DHCPStaticAssignment
 from app.models.dns import DNSRecord, DNSZone
-from app.models.ipam import IPAddress, Subnet
+from app.models.ipam import IPAddress, IpMacHistory, Subnet
 from app.services.dhcp.ipam_mirror import (
     insert_ipam_mirror_row,
     lease_hostname_suppressed_subnets,
@@ -798,7 +798,9 @@ async def _row_kept_through_trash(db: AsyncSession, ip_id: uuid.UUID) -> bool:
     """Does anything hang off this address that a delete-and-recreate would lose?
 
     An E911 ``ip`` binding (#4286), a DNS alias (``ip_alias`` records are deleted
-    outright with the row) or an OT descriptor (``ON DELETE CASCADE``) (#4870).
+    outright with the row) or an OT descriptor (``ON DELETE CASCADE``) (#4870), or MAC
+    history (``ip_mac_history`` cascades off the row; its first-seen / classification
+    cannot be rebuilt) (#4913).
     """
     from app.models.ot import OTDevice  # noqa: PLC0415
 
@@ -812,7 +814,12 @@ async def _row_kept_through_trash(db: AsyncSession, ip_id: uuid.UUID) -> bool:
     if alias.first() is not None:
         return True
     ot = await db.execute(select(OTDevice.id).where(OTDevice.ip_address_id == ip_id).limit(1))
-    return ot.first() is not None
+    if ot.first() is not None:
+        return True
+    hist = await db.execute(
+        select(IpMacHistory.id).where(IpMacHistory.ip_address_id == ip_id).limit(1)
+    )
+    return hist.first() is not None
 
 
 async def _delete_mirror_row(
