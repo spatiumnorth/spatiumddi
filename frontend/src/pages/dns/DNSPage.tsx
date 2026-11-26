@@ -10116,6 +10116,17 @@ export function OptionsTab({ groupId }: { groupId: string }) {
               master-only — only send notifies from primary
             </option>
             <option value="no">no — disable zone change notifications</option>
+            {/* #4841: the API also stores primary-only; a stored value the
+                list lacks must show as itself, not as the first choice. */}
+            {!["yes", "explicit", "master-only", "no"].includes(
+              notifyEnabled,
+            ) && (
+              <option value={notifyEnabled}>
+                {notifyEnabled === "primary-only"
+                  ? "primary-only — only send notifies from primary"
+                  : notifyEnabled}
+              </option>
+            )}
           </select>
         </Field>
       </div>
@@ -10229,6 +10240,10 @@ export function OptionsTab({ groupId }: { groupId: string }) {
                 <option value="debug">
                   debug — very verbose; for troubleshooting only
                 </option>
+                {/* #4841: the API also stores dynamic and "debug N". */}
+                {!["info", "debug"].includes(queryLogSeverity) && (
+                  <option value={queryLogSeverity}>{queryLogSeverity}</option>
+                )}
               </select>
             </Field>
             <p className="text-xs text-muted-foreground">
