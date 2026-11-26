@@ -349,3 +349,31 @@ async def test_non_escalating_rule_open_event_not_re_delivered(
     assert again[0].id == first[0].id
     assert again[0].severity == first_severity
     assert spy.calls == 1  # NO spurious re-delivery for a non-escalating rule
+
+
+async def test_decom_expiring_open_event_follows_current_countdown_4934(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A date moving closer rewrites the whole message; no bare-digit
+    "[now: ...]" suffix is appended (#4934)."""
+    monkeypatch.setattr(alerts_svc, "_deliver", _DeliverSpy())
+    rule = AlertRule(
+        name="Decom expiry",
+        rule_type="decom_expiring",
+        severity="info",
+        threshold_days=30,
+        enabled=True,
+    )
+    db_session.add(rule)
+    subnet = await _make_subnet(db_session, network="10.5.1.0/24", decom_days=29)
+    await db_session.commit()
+    await evaluate_all(db_session)
+
+    await _set_decom(db_session, subnet, days=27)
+    await evaluate_all(db_session)
+    events = await _open_events_for(db_session, rule)
+    assert len(events) == 1
+    msg = events[0].message
+    assert "[now:" not in msg
+    assert "in 27 day(s)" in msg and "in 29 day(s)" not in msg
+    assert (datetime.now(UTC) + timedelta(days=27)).date().isoformat() in msg

@@ -2861,8 +2861,22 @@ _NUM_RE = re.compile(r"\d+(?:\.\d+)?%?")
 # #4720 — rules whose message is a running total plus a timestamp. The
 # peak-and-now suffix reads as "[now: 480 / 22]" there (the diff is the
 # changed digits), so the open event's message follows the current reading
-# instead. Severity escalation and delivery are unaffected.
-_MESSAGE_FOLLOWS_READING_RULES = frozenset({RULE_TYPE_LOG_FORWARD_DROPPING})
+# instead. Severity escalation and delivery are unaffected. #4934 — the same
+# holds for every expiry countdown ("expires in N day(s)", a date): a closer
+# date has no peak worth keeping, and "[now: 3 / 11 / 29]" is unreadable.
+_MESSAGE_FOLLOWS_READING_RULES = frozenset(
+    {
+        RULE_TYPE_LOG_FORWARD_DROPPING,
+        RULE_TYPE_DECOM_EXPIRING,
+        RULE_TYPE_DOMAIN_EXPIRING,
+        RULE_TYPE_TLS_CERT_EXPIRING,
+        RULE_TYPE_CIRCUIT_TERM_EXPIRING,
+        RULE_TYPE_SERVICE_TERM_EXPIRING,
+        RULE_TYPE_K3S_API_CERT_EXPIRING,
+        RULE_TYPE_SECRET_EXPIRING,
+        RULE_TYPE_RPKI_ROA_EXPIRING,
+    }
+)
 
 
 def _message_numbers(message: str) -> tuple[str, list[str]]:
