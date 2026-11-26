@@ -1,4 +1,5 @@
 import { countNoun, pluralize } from "@/lib/count-noun";
+import { handOffFocusOnRemove } from "@/components/ui/focus-return";
 import { useOwnershipModules } from "@/hooks/useOwnershipModules";
 import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { FormError } from "@/components/ui/form-error";
@@ -6614,7 +6615,10 @@ export function SubnetDetail({
                 Bulk delete
               </button>
               <button
-                onClick={() => setSelectedIpIds(new Set())}
+                onClick={(e) => {
+                  handOffFocusOnRemove(e.currentTarget);
+                  setSelectedIpIds(new Set());
+                }}
                 className="rounded-md p-1 text-muted-foreground hover:text-foreground"
                 title="Clear selection"
               >
@@ -14836,7 +14840,12 @@ export function BlockDetailView({
                 >
                   Delete ({selectedCount})
                 </HeaderButton>
-                <HeaderButton onClick={() => setSelected(new Set())}>
+                <HeaderButton
+                  onClick={(e) => {
+                    handOffFocusOnRemove(e.currentTarget);
+                    setSelected(new Set());
+                  }}
+                >
                   Clear
                 </HeaderButton>
               </>
@@ -15244,7 +15253,10 @@ export function BlockDetailView({
           {roleFilters.size > 0 && (
             <button
               type="button"
-              onClick={() => setRoleFilters(new Set())}
+              onClick={(e) => {
+                handOffFocusOnRemove(e.currentTarget);
+                setRoleFilters(new Set());
+              }}
               className="text-[11px] text-muted-foreground hover:text-foreground"
             >
               clear
@@ -18541,7 +18553,14 @@ export function IPAMPage() {
             {treeFilter && (
               <button
                 type="button"
-                onClick={() => setTreeFilter("")}
+                onClick={(e) => {
+                  const box = e.currentTarget.parentElement;
+                  handOffFocusOnRemove(
+                    e.currentTarget,
+                    () => box?.querySelector("input") ?? null,
+                  );
+                  setTreeFilter("");
+                }}
                 aria-label="Clear tree filter"
                 title="Clear filter"
                 className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-0.5 text-muted-foreground/60 hover:text-foreground"
