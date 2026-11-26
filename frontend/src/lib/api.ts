@@ -6924,10 +6924,27 @@ export const dnsApi = {
       .then((r) => r.data),
 
   // Zones
-  listZones: (groupId: string, params?: { tag?: string[] }) =>
+  // #4854 — a picker names the subnet it serves: a caller scoped to one
+  // subnet and one zone is refused the group's zone list (a type-level DNS
+  // read), so on a 403 it is given the zones it may write there instead.
+  listZones: (
+    groupId: string,
+    params?: { tag?: string[] },
+    subnetId?: string,
+  ) =>
     api
       .get<DNSZone[]>(`/dns/groups/${groupId}/zones`, { params })
-      .then((r) => r.data),
+      .then((r) => r.data)
+      .catch((e: unknown) => {
+        const status = (e as { response?: { status?: number } })?.response
+          ?.status;
+        if (status !== 403 || !subnetId) throw e;
+        return api
+          .get<DNSZone[]>(`/ipam/subnets/${subnetId}/writable-zones`, {
+            params: { group_id: groupId },
+          })
+          .then((r) => r.data);
+      }),
   createZone: (groupId: string, data: Partial<DNSZone>) =>
     api.post<DNSZone>(`/dns/groups/${groupId}/zones`, data).then((r) => r.data),
   updateZone: (groupId: string, zoneId: string, data: Partial<DNSZone>) =>
