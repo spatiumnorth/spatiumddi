@@ -3876,7 +3876,7 @@ export function AddAddressModal({
   const zoneQueries = useQueries({
     queries: (zoneGroupIds as string[]).map((gId: string) => ({
       queryKey: ["dns-zones", gId],
-      queryFn: () => ipamApi.listPickableZones(subnetId, gId),
+      queryFn: () => dnsApi.listZones(gId, undefined, subnetId),
       // Re-read on open as well: the subnet's primary zone may be one created
       // since the cached list was taken, and the pick must not settle on
       // another zone before the list holds it (#4028, as #3078).
@@ -5342,7 +5342,9 @@ export function SubnetDetail({
     queryKey: ["dns-zones", "subnet-detail", subnet.id, subnetDnsGroupIds],
     queryFn: async () => {
       const lists = await Promise.all(
-        subnetDnsGroupIds.map((gid) => dnsApi.listZones(gid)),
+        subnetDnsGroupIds.map((gid) =>
+          dnsApi.listZones(gid, undefined, subnet.id),
+        ),
       );
       return lists.flat();
     },
@@ -10036,7 +10038,7 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
   const zoneQueries = useQueries({
     queries: (zoneGroupIds as string[]).map((gId: string) => ({
       queryKey: ["dns-zones", gId],
-      queryFn: () => ipamApi.listPickableZones(address.subnet_id, gId),
+      queryFn: () => dnsApi.listZones(gId, undefined, address.subnet_id),
       staleTime: 60_000,
       enabled: dnsOn,
     })),
@@ -11599,7 +11601,7 @@ export function BulkEditAddressesModal({
   const zoneQueries = useQueries({
     queries: zoneGroupIds.map((gId: string) => ({
       queryKey: ["dns-zones", gId],
-      queryFn: () => ipamApi.listPickableZones(subnetId, gId),
+      queryFn: () => dnsApi.listZones(gId, undefined, subnetId),
       staleTime: 60_000,
       enabled: dnsOn,
     })),
