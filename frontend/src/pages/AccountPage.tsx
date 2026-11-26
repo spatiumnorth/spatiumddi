@@ -402,8 +402,11 @@ function EnrollModal({
             </label>
           </li>
           <li>
-            <p>Enter the 6-digit code from your authenticator to confirm:</p>
+            <label htmlFor="account-totp-confirm-code" className="block">
+              Enter the 6-digit code from your authenticator to confirm:
+            </label>
             <input
+              id="account-totp-confirm-code"
               autoFocus
               type="text"
               inputMode="numeric"
@@ -685,12 +688,16 @@ function EnrolPasswordModal({
           if (password) onSubmit(password);
         }}
       >
-        <p className="text-xs text-muted-foreground">
+        <label
+          htmlFor="account-2fa-setup-password"
+          className="block text-xs text-muted-foreground"
+        >
           {providerName
             ? `Enter your ${providerName} password to set up two-factor authentication. It is checked with ${providerName}, not stored here.`
             : "Enter your current password to set up two-factor authentication."}
-        </p>
+        </label>
         <input
+          id="account-2fa-setup-password"
           type="password"
           autoComplete="current-password"
           autoFocus

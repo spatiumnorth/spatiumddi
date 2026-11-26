@@ -636,6 +636,7 @@ function MembershipsTab({ groupId }: { groupId: string }) {
             }}
           />
           <select
+            aria-label="Role"
             className={inputCls}
             value={role}
             onChange={(e) => setRole(e.target.value as MulticastMembershipRole)}
