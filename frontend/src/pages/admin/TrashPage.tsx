@@ -401,6 +401,9 @@ export function TrashPage() {
   const { data, isLoading, isError, error } = useQuery({
     queryKey: ["trash", params],
     queryFn: () => trashApi.list(params),
+    // A delete on any other page adds a row here without touching this cache
+    // (#4872): read every time the page opens, not only once 30 s have passed.
+    refetchOnMount: "always",
   });
 
   const items = data?.items ?? [];

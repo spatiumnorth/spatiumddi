@@ -10116,6 +10116,17 @@ export function OptionsTab({ groupId }: { groupId: string }) {
               master-only — only send notifies from primary
             </option>
             <option value="no">no — disable zone change notifications</option>
+            {/* #4841: the API also stores primary-only; a stored value the
+                list lacks must show as itself, not as the first choice. */}
+            {!["yes", "explicit", "master-only", "no"].includes(
+              notifyEnabled,
+            ) && (
+              <option value={notifyEnabled}>
+                {notifyEnabled === "primary-only"
+                  ? "primary-only — only send notifies from primary"
+                  : notifyEnabled}
+              </option>
+            )}
           </select>
         </Field>
       </div>
@@ -10229,6 +10240,10 @@ export function OptionsTab({ groupId }: { groupId: string }) {
                 <option value="debug">
                   debug — very verbose; for troubleshooting only
                 </option>
+                {/* #4841: the API also stores dynamic and "debug N". */}
+                {!["info", "debug"].includes(queryLogSeverity) && (
+                  <option value={queryLogSeverity}>{queryLogSeverity}</option>
+                )}
               </select>
             </Field>
             <p className="text-xs text-muted-foreground">
@@ -10699,45 +10714,79 @@ export function RecordsTab({
                     </td>
                     <td className="px-2 py-2 text-right">
                       <div className="flex items-center justify-end gap-1">
-                        <button
-                          onClick={() => setEditing(rec)}
-                          disabled={
-                            rec.auto_generated || isPoolManagedRecord(rec)
-                          }
-                          className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-30 disabled:pointer-events-none"
-                          title={
-                            isPoolManagedRecord(rec)
+                        {(() => {
+                          // A disabled button takes no pointer events, so its
+                          // own title never shows (#4820): the reason also
+                          // rides a wrapping span that does.
+                          const locked =
+                            rec.auto_generated || isPoolManagedRecord(rec);
+                          const editGate = permissionGate(
+                            canWriteRecords,
+                            NEEDS_DNS_WRITE,
+                          );
+                          const delGate = permissionGate(
+                            canDeleteRecords,
+                            NEEDS_DNS_DELETE,
+                          );
+                          const editTitle =
+                            editGate.title ??
+                            (isPoolManagedRecord(rec)
                               ? POOL_MANAGED_REASON
                               : rec.auto_generated
                                 ? "Auto-managed — edit the source IP/lease"
-                                : "Edit"
-                          }
-                          aria-label="Edit"
-                          {...permissionGate(canWriteRecords, NEEDS_DNS_WRITE)}
-                        >
-                          <Pencil className="h-3.5 w-3.5" />
-                        </button>
-                        <button
-                          onClick={() => setConfirmDelete(rec)}
-                          disabled={
-                            rec.auto_generated || isPoolManagedRecord(rec)
-                          }
-                          className="rounded p-1 text-muted-foreground hover:text-destructive disabled:opacity-30 disabled:pointer-events-none"
-                          title={
-                            isPoolManagedRecord(rec)
+                                : "Edit");
+                          const delTitle =
+                            delGate.title ??
+                            (isPoolManagedRecord(rec)
                               ? POOL_MANAGED_REASON
                               : rec.auto_generated
                                 ? "Auto-managed — delete the source IP/lease"
-                                : "Delete"
-                          }
-                          aria-label="Delete"
-                          {...permissionGate(
-                            canDeleteRecords,
-                            NEEDS_DNS_DELETE,
-                          )}
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </button>
+                                : "Delete");
+                          return (
+                            <>
+                              <span
+                                data-testid="rec-edit-reason"
+                                title={
+                                  locked || editGate.disabled
+                                    ? editTitle
+                                    : undefined
+                                }
+                                className="inline-flex"
+                              >
+                                <button
+                                  onClick={() => setEditing(rec)}
+                                  disabled={locked}
+                                  className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-30 disabled:pointer-events-none"
+                                  title={editTitle}
+                                  aria-label="Edit"
+                                  {...editGate}
+                                >
+                                  <Pencil className="h-3.5 w-3.5" />
+                                </button>
+                              </span>
+                              <span
+                                data-testid="rec-delete-reason"
+                                title={
+                                  locked || delGate.disabled
+                                    ? delTitle
+                                    : undefined
+                                }
+                                className="inline-flex"
+                              >
+                                <button
+                                  onClick={() => setConfirmDelete(rec)}
+                                  disabled={locked}
+                                  className="rounded p-1 text-muted-foreground hover:text-destructive disabled:opacity-30 disabled:pointer-events-none"
+                                  title={delTitle}
+                                  aria-label="Delete"
+                                  {...delGate}
+                                >
+                                  <Trash2 className="h-3.5 w-3.5" />
+                                </button>
+                              </span>
+                            </>
+                          );
+                        })()}
                       </div>
                     </td>
                   </tr>
