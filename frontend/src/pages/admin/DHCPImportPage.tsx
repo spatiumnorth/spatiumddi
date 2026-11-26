@@ -1,3 +1,4 @@
+import { pluralize } from "@/lib/count-noun";
 import { useMemo, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import {
@@ -619,15 +620,18 @@ export function PreviewPanel({
             </span>
             <span>·</span>
             <span>
-              <strong>{preview.total_pools}</strong> pools
+              <strong>{preview.total_pools}</strong>{" "}
+              {pluralize(preview.total_pools, "pool")}
             </span>
             <span>·</span>
             <span>
-              <strong>{preview.total_reservations}</strong> reservations
+              <strong>{preview.total_reservations}</strong>{" "}
+              {pluralize(preview.total_reservations, "reservation")}
             </span>
             <span>·</span>
             <span>
-              <strong>{supportedClasses.length}</strong> classes
+              <strong>{supportedClasses.length}</strong>{" "}
+              {pluralize(supportedClasses.length, "class", "classes")}
             </span>
           </div>
         </div>

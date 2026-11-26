@@ -1,4 +1,4 @@
-import { countNoun } from "@/lib/count-noun";
+import { countNoun, pluralize } from "@/lib/count-noun";
 import { useMemo, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
@@ -732,7 +732,8 @@ function ScheduleRow({
           <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
         ) : p ? (
           <span className="text-sm">
-            <span className="font-medium">{p.wake_count}</span> hosts
+            <span className="font-medium">{p.wake_count}</span>{" "}
+            {pluralize(p.wake_count, "host")}
             {p.mac_less_count > 0 && (
               <span className="text-amber-600 dark:text-amber-400">
                 {" "}
@@ -1035,7 +1036,8 @@ function ScheduleDetailModal({
                 <Loader2 className="inline h-3.5 w-3.5 animate-spin" />
               ) : p ? (
                 <>
-                  <span className="font-medium">{p.wake_count}</span> hosts
+                  <span className="font-medium">{p.wake_count}</span>{" "}
+                  {pluralize(p.wake_count, "host")}
                   {p.mac_less_count > 0 && (
                     <span className="text-amber-600 dark:text-amber-400">
                       {" "}
@@ -2541,8 +2543,8 @@ function TargetStep({
           </span>
         ) : preview ? (
           <span>
-            <span className="font-medium">{preview.wake_count}</span> hosts will
-            wake
+            <span className="font-medium">{preview.wake_count}</span>{" "}
+            {pluralize(preview.wake_count, "host")} will wake
             {preview.mac_less_count > 0 && (
               <span className="text-amber-600 dark:text-amber-400">
                 {" "}

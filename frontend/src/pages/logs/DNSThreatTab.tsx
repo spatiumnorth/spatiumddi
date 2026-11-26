@@ -512,8 +512,8 @@ export function DNSThreatTab() {
                 {summary.has_data ? (
                   <>
                     <ShieldCheck className="h-4 w-4" />
-                    {summary.windows_scored} windows · {summary.clients_seen}{" "}
-                    clients scored
+                    {countNoun(summary.windows_scored, "window")} ·{" "}
+                    {countNoun(summary.clients_seen, "client")} scored
                   </>
                 ) : (
                   <>
@@ -726,7 +726,7 @@ function Row({
             <>
               <span className="font-mono">{w.top_parent}</span>
               <span className="ml-1 text-muted-foreground">
-                ({w.top_parent_subdomains} subdomains)
+                ({countNoun(w.top_parent_subdomains, "subdomain")})
               </span>
             </>
           ) : (
@@ -798,8 +798,9 @@ function Row({
                       <li key={c.qname} className="py-0.5 text-xs">
                         <span className="font-mono">{c.qname}</span>
                         <span className="ml-2 text-muted-foreground">
-                          every {c.period_seconds}s · {c.samples} samples ·
-                          variation {(c.cv * 100).toFixed(0)}% · scored{" "}
+                          every {c.period_seconds}s ·{" "}
+                          {countNoun(c.samples, "sample")} · variation{" "}
+                          {(c.cv * 100).toFixed(0)}% · scored{" "}
                           {c.score.toFixed(0)}
                         </span>
                       </li>
