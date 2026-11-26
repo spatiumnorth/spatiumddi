@@ -979,10 +979,14 @@ export function CopilotDrawer({
                 return;
               }
               sendMut.mutate(text);
+              // The error block unmounts with its focused button; hand
+              // focus to the question box, not the page body (#4863).
+              drawerRef.current?.querySelector("textarea")?.focus();
             }}
             onDismiss={() => {
               setStreamingError(null);
               setPendingUserMessage(null);
+              drawerRef.current?.querySelector("textarea")?.focus();
             }}
           />
         )}

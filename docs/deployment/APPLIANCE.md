@@ -38,7 +38,7 @@ mkosi bakes everything the appliance needs to come up fully air-gapped:
 - **Helm chart tarballs** at `/usr/lib/spatiumddi/charts/`. The appliance chart drives Appliance installs (and the supervisor on the Control plane); the umbrella chart drives the Control plane. Built at release time + signed.
 - **bash-completion + `k` alias** for kubectl — operator SSHing in for triage drops straight into a usable shell.
 
-A fresh appliance boot never reaches out to ghcr.io or any external registry. The first time it does is when an operator explicitly applies a new release through `/appliance → OS Versions` or `/appliance → Releases`.
+A fresh appliance boot never reaches out to ghcr.io or any external registry. The first time it does is when an operator explicitly applies a new release through `/appliance → Fleet` (an appliance's row under Appliances, Rolling Upgrade, or Upgrade images).
 
 ### HelmChart CRs
 
@@ -212,7 +212,7 @@ The `/appliance` section in the SpatiumDDI UI talks to k3s directly via the api 
 - **Logs & Diagnostics → Self-test**. Five-check battery: external DNS resolution, kubeapi reachability via the ServiceAccount, every spatium pod's health (Running + healthy / Succeeded Jobs OK), informational DHCP + DNS role presence (OK when not assigned).
 - **Log text needs `admin` on `appliance`**. The host log viewer, a pod's logs (one-shot and streamed) and the Cluster live log pane take `admin` on `appliance`, the same permission as the diagnostic bundle, because a log line can carry whatever a process printed. A role with only `read` on `appliance` keeps the pod list, the cluster health view and the self-test, and the console does not draw the log panes for it. A running log stream re-checks the permission, so cutting a role back to `read` ends it. Every line is passed through the same credential sweep as the bundle before it is sent.
 - **Diagnostic bundle**. Per-pod log tails (last 500 lines via kubeapi) + host logs + system info + redacted env, zipped for support tickets. Environment values appear only for known non-secret settings (every other variable is listed with its value replaced), and every file is swept for credential-shaped values such as keys, tokens and passwords embedded in URLs. That sweep is best effort, so review the bundle before sharing it.
-- **OS Versions**. Atomic A/B slot upgrades — same machinery as pre-#183 (Phase 8); the slot raw.xz carries a complete rootfs with k3s + baked images + chart tarballs. A slot upgrade is also an effective container upgrade because images are baked. For an upgrade scheduled from an imported/uploaded image (#199), the download is **verified by the stored sha256** (the integrity guarantee), which lets the host runner relax TLS cert-verify *only* for the appliance's own self-served URL behind the self-signed web cert — external public-CA URLs stay fully verified (#386). The Fleet drilldown shows a **live per-phase progress stepper** (download % → verify → write → bootloader → reboot-pending) with an expandable `slot-upgrade.log` tail and an honest failure card, and a stuck apply re-fires once per distinct desired-state rather than looping (#386). Uploaded/imported image bytes are persisted on a host-path mount so they survive an api restart (#386).
+- **Fleet → Upgrade images**. Atomic A/B slot upgrades — same machinery as pre-#183 (Phase 8); the slot raw.xz carries a complete rootfs with k3s + baked images + chart tarballs. A slot upgrade is also an effective container upgrade because images are baked. For an upgrade scheduled from an imported/uploaded image (#199), the download is **verified by the stored sha256** (the integrity guarantee), which lets the host runner relax TLS cert-verify *only* for the appliance's own self-served URL behind the self-signed web cert — external public-CA URLs stay fully verified (#386). The Fleet drilldown shows a **live per-phase progress stepper** (download % → verify → write → bootloader → reboot-pending) with an expandable `slot-upgrade.log` tail and an honest failure card, and a stuck apply re-fires once per distinct desired-state rather than looping (#386). Uploaded/imported image bytes are persisted on a host-path mount so they survive an api restart (#386).
 
 The api pod's ServiceAccount keeps minimal RBAC: namespace-scoped pods + pods/log read, the specific `spatium-appliance-tls` Secret patch, and the frontend Deployment annotation patch. The only cluster-scoped grant is **read-only** `nodes` + `nodes/proxy [get]` (added in #402) so the Cluster Overview dashboard can read per-node kubelet stats. Nothing destructive.
 
@@ -1469,7 +1469,7 @@ trigger-file → `spatium-firewall-reload` plane. Full design + risk register:
 
 **Dark by default — two independent gates.** Nothing here touches a node until
 *both* are on:
-1. the `appliance.firewall` **feature module** (Settings → Features; the
+1. the `appliance.firewall` **feature module** (Features & Integrations; the
    `/appliance/firewall/*` API 404s when off), and
 2. the `platform_settings.firewall_enabled` **enforcement master switch**
    (default off). While off, the supervisor keeps rendering in-pod (the #5
@@ -4000,7 +4000,7 @@ so a first-time operator never gets stuck looking for the upload.
    mixed-version window and patches the control chart's `image.tag`
    at the end as before.
 9. Run flips to `state='succeeded'` (or `failed` / `halted` /
-   `aborted`). Lease is released. The OS Versions tab shows the new
+   `aborted`). Lease is released. The Fleet tab shows the new
    default slot on every node.
 
 **The shared image tags (#1710).** A cluster shares three k3s
@@ -4138,7 +4138,7 @@ it is not available and the console is the only vantage.
 restore has to be performed by the k3s binary you intend to keep
 running, and the pre-upgrade snapshot was written by the older one:
 
-1. Revert the slot: **OS Versions → set the previous slot as default**,
+1. Revert the slot: **Fleet → the appliance's row → set the previous slot as default**,
    or from the console `spatiumddi-slot-rollback`, then reboot.
 2. The node comes up on the older k3s against a datastore the newer one
    wrote. Expect k3s to be unhealthy here — that is the state you are
@@ -4481,7 +4481,7 @@ and nothing is torn down: the node keeps serving its last applied roles.
 For a control plane that predates the header, the supervisor also accepts
 the two 403 details it answered for the same refusals.
 
-1. On the control plane, open **Appliance → Pairing**.
+1. On the control plane, open **Appliance → Fleet → Pairing codes**.
 2. Click **New pairing code**. Codes are now kind-agnostic (the
    per-role ``deployment_kind`` coupling was dropped under #170
    Wave A3 — roles are assigned post-approval from the Fleet tab,

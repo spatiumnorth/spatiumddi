@@ -13,7 +13,7 @@ Three sibling importers share one design — a per-source parser feeding
 a shared canonical intermediate representation (IR), then a
 source-agnostic two-phase **preview → commit** pipeline. Each lives
 behind a togglable feature module so operators who don't need the
-surface can hide it (Settings → Features).
+surface can hide it (Features & Integrations).
 
 The fourth column below is **not** an importer. The Windows cutover
 (#756) picks up where they stop — the estate is already in
@@ -376,7 +376,7 @@ SpatiumDDI already owns, reservations synthesised from live Windows
 leases, and the `is_active` flag on a managed scope.
 
 Behind the `migration.cutover` feature module, which ships **disabled**
-(Settings → Features, group **Tools**) — unlike the three importers, which
+(Features & Integrations, group **Tools**) — unlike the three importers, which
 stay on because a fresh install is exactly when an estate gets imported. A
 cutover is the far end of that journey: it happens after a parity check and a
 parallel run, only on installs leaving Windows
