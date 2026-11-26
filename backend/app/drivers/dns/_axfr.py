@@ -76,6 +76,26 @@ def resolve_server_address(host: str, port: int, *, what: str) -> list[str]:
     return addrs
 
 
+def send_rfc2136_update(update: Any, addr: str, port: int, *, what: str) -> None:
+    """Send an RFC 2136 UPDATE over TCP and raise unless the server said NOERROR.
+
+    ``dns.query.tcp`` returns the server's reply and raises only on transport
+    errors, so a REFUSED / NOTAUTH / SERVFAIL reply used to be discarded and
+    the write counted as applied (#4939). Blocking: call via
+    ``asyncio.to_thread``. A RuntimeError so the callers' existing failure
+    paths (provider_warning, push_errors, op retry) take it.
+    """
+    import dns.query  # noqa: PLC0415
+    import dns.rcode  # noqa: PLC0415
+
+    reply = dns.query.tcp(update, addr, port=port, timeout=10)
+    rcode = reply.rcode()
+    if rcode != dns.rcode.NOERROR:
+        raise RuntimeError(
+            f"{what} at {addr}:{port} was rejected by the server: {dns.rcode.to_text(rcode)}."
+        )
+
+
 def _hint(exc: BaseException, port: int) -> str:
     """Return a next-step hint matched to *why* the transfer failed.
 
