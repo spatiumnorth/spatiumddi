@@ -977,7 +977,9 @@ async def _find_trashed(db: Any, type: str, row_id: uuid.UUID) -> Any:
     )
     target = (await db.execute(stmt)).scalar_one_or_none()
     if target is None:
-        raise HTTPException(status_code=404, detail="Soft-deleted row not found")
+        raise HTTPException(
+            status_code=404, detail="Not in the Trash: the row was restored or already purged"
+        )
     return target
 
 

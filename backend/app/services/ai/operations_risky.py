@@ -2042,7 +2042,11 @@ for _trash_type, _op_name in PURGE_TRASHED_OPERATIONS.items():
             args_model=PurgeTrashedArgs,
             preview=_purge_trashed_preview(_trash_type),
             apply=_purge_trashed_apply(_trash_type),
-            category="ipam" if _trash_type in ("subnet", "ip_block", "ip_space") else "dns",
+            category=(
+                "ipam"
+                if _trash_type in ("subnet", "ip_block", "ip_space")
+                else "dhcp" if _trash_type == "dhcp_scope" else "dns"
+            ),
             superadmin_when=lambda a: True,
             required_permission=("delete", _trash_type),
         )
