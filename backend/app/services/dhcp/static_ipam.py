@@ -43,7 +43,8 @@ from datetime import UTC, date, datetime
 from typing import Any
 
 import structlog
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.mac import canonicalize_mac
@@ -103,6 +104,10 @@ _OPERATOR_MIRROR_FIELDS: tuple[str, ...] = (
     "extra_zone_ids",
 )
 
+# Snapshot key holding the address's ``ip_mac_history`` rows (#4913); not an
+# ``ip_address`` column, so ``_restore_operator_fields`` ignores it.
+_MAC_HISTORY_KEY = "mac_history"
+
 # Snapshot keys ``_restore_operator_fields`` leaves to ``_restore_zone_binding``.
 _ZONE_SNAPSHOT_FIELDS: frozenset[str] = frozenset({"forward_zone_id", "extra_zone_ids"})
 
@@ -145,6 +150,83 @@ def _restore_operator_fields(row: IPAddress, snapshot: dict[str, Any]) -> None:
                 setattr(row, field, val)
         except (ValueError, TypeError):
             # A malformed snapshot value must never break restore.
+            continue
+
+
+async def _snapshot_mac_history(db: AsyncSession, row: IPAddress) -> list[dict[str, Any]]:
+    """The address's ``ip_mac_history`` rows as JSON-safe dicts (#4913).
+
+    The table cascades off the address row, and a restore re-creates the row, so
+    without this the history of every MAC the reservation's address was given
+    (its first-seen, last-seen and classification) goes with the Trash round trip.
+    """
+    res = await db.execute(
+        select(IpMacHistory)
+        .where(IpMacHistory.ip_address_id == row.id)
+        .order_by(IpMacHistory.first_seen, IpMacHistory.id)
+    )
+    return [
+        {
+            "mac_address": str(h.mac_address),
+            "first_seen": h.first_seen.isoformat(),
+            "last_seen": h.last_seen.isoformat(),
+            "classification": h.classification,
+            "source": h.source,
+            "is_randomized": h.is_randomized,
+            "acknowledged_at": h.acknowledged_at.isoformat() if h.acknowledged_at else None,
+            "acknowledged_by_user_id": (
+                str(h.acknowledged_by_user_id) if h.acknowledged_by_user_id else None
+            ),
+        }
+        for h in res.scalars().all()
+    ]
+
+
+async def _restore_mac_history(
+    db: AsyncSession, ip_id: uuid.UUID, entries: list[dict[str, Any]]
+) -> None:
+    """Put a :func:`_snapshot_mac_history` list back on the re-created address.
+
+    Upserts, because the restore has just recorded the reservation's current MAC
+    with fresh timestamps: the snapshot's ``first_seen`` / ``last_seen`` win.
+    A malformed entry is skipped; it must never break the restore.
+    """
+    for e in entries:
+        try:
+            params = {
+                "ip_id": str(ip_id),
+                "mac": str(e["mac_address"]),
+                "first_seen": datetime.fromisoformat(e["first_seen"]),
+                "last_seen": datetime.fromisoformat(e["last_seen"]),
+                "classification": e.get("classification") or "new",
+                "source": e.get("source") or "sweep",
+                "is_randomized": bool(e.get("is_randomized")),
+                "ack_at": (
+                    datetime.fromisoformat(e["acknowledged_at"])
+                    if e.get("acknowledged_at")
+                    else None
+                ),
+                "ack_by": e.get("acknowledged_by_user_id"),
+            }
+            async with db.begin_nested():
+                await db.execute(
+                    text("""
+                        INSERT INTO ip_mac_history (id, ip_address_id, mac_address, first_seen,
+                            last_seen, classification, source, is_randomized, acknowledged_at,
+                            acknowledged_by_user_id)
+                        VALUES (gen_random_uuid(), :ip_id, CAST(:mac AS macaddr), :first_seen,
+                            :last_seen, :classification, :source, :is_randomized, :ack_at,
+                            (SELECT id FROM "user" WHERE id = CAST(:ack_by AS uuid)))
+                        ON CONFLICT (ip_address_id, mac_address) DO UPDATE SET
+                            first_seen = EXCLUDED.first_seen, last_seen = EXCLUDED.last_seen,
+                            classification = EXCLUDED.classification, source = EXCLUDED.source,
+                            is_randomized = EXCLUDED.is_randomized,
+                            acknowledged_at = EXCLUDED.acknowledged_at,
+                            acknowledged_by_user_id = EXCLUDED.acknowledged_by_user_id
+                        """),
+                    params,
+                )
+        except (KeyError, ValueError, TypeError, DBAPIError):
             continue
 
 
@@ -345,6 +427,9 @@ async def upsert_ipam_for_static(
     subnet_row = await db.get(Subnet, scope.subnet_id)
     if st.ipam_metadata_snapshot:
         _restore_operator_fields(row, st.ipam_metadata_snapshot)
+        await _restore_mac_history(
+            db, row.id, st.ipam_metadata_snapshot.get(_MAC_HISTORY_KEY) or []
+        )
         await _restore_zone_binding(db, row, subnet_row, st.ipam_metadata_snapshot, warnings)
         st.ipam_metadata_snapshot = None
     await db.flush()
@@ -802,9 +887,7 @@ async def _row_kept_through_trash(db: AsyncSession, ip_id: uuid.UUID) -> bool:
     """Does anything hang off this address that a delete-and-recreate would lose?
 
     An E911 ``ip`` binding (#4286), a DNS alias (``ip_alias`` records are deleted
-    outright with the row) or an OT descriptor (``ON DELETE CASCADE``) (#4870), or MAC
-    history (``ip_mac_history`` cascades off the row; its first-seen / classification
-    cannot be rebuilt) (#4913).
+    outright with the row) or an OT descriptor (``ON DELETE CASCADE``) (#4870).
     """
     from app.models.ot import OTDevice  # noqa: PLC0415
 
@@ -818,12 +901,7 @@ async def _row_kept_through_trash(db: AsyncSession, ip_id: uuid.UUID) -> bool:
     if alias.first() is not None:
         return True
     ot = await db.execute(select(OTDevice.id).where(OTDevice.ip_address_id == ip_id).limit(1))
-    if ot.first() is not None:
-        return True
-    hist = await db.execute(
-        select(IpMacHistory.id).where(IpMacHistory.ip_address_id == ip_id).limit(1)
-    )
-    return hist.first() is not None
+    return ot.first() is not None
 
 
 async def _delete_mirror_row(
@@ -850,6 +928,10 @@ async def _delete_mirror_row(
         # reservation before we hard-delete the mirror, so a Trash restore is
         # lossless (#630). The last mirror row wins — there is realistically one.
         snapshot = _snapshot_operator_fields(row)
+        # ...and the MAC history, which cascades off the row (#4913).
+        history = await _snapshot_mac_history(db, row)
+        if history:
+            snapshot = {**(snapshot or {}), _MAC_HISTORY_KEY: history}
         if snapshot is not None:
             st.ipam_metadata_snapshot = snapshot
         # Clear the forward FK before the delete so the ORM's in-memory ``st``
