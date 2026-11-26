@@ -4439,7 +4439,10 @@ def _apply_influx_body(t: InfluxDBTarget, body: InfluxDBTargetBody) -> list[str]
     from app.core.crypto import encrypt_str
 
     sent = body.model_fields_set if isinstance(body, InfluxDBTargetUpdate) else None
-    old_version = t.version
+    stored_before = {
+        "password": t.password_encrypted is not None,
+        "token": t.token_encrypted is not None,
+    }
     for field in _INFLUX_PLAIN_FIELDS:
         if sent is not None and field not in sent:
             continue
@@ -4462,15 +4465,18 @@ def _apply_influx_body(t: InfluxDBTarget, body: InfluxDBTargetBody) -> list[str]
     elif body.clear_token and t.token_encrypted:
         t.token_encrypted = None
         secret_changes.append("token_cleared")
-    # A version switch between v1 and v2/v3 drops the secret the new version
-    # does not use: its form neither shows nor clears it (#4889).
-    if old_version and _influx_secret_name(old_version) != _influx_secret_name(t.version):
-        if t.version == "v1" and t.token_encrypted:
-            t.token_encrypted = None
-            secret_changes.append("token_cleared")
-        elif t.version != "v1" and t.password_encrypted:
-            t.password_encrypted = None
-            secret_changes.append("password_cleared")
+    # A target never keeps the secret its version does not use (#4889): its
+    # form neither shows nor clears it, and the URL-change check only asks for
+    # the one in use. Dropped on every create and update, so a version switch,
+    # a create that carried both, and a row saved before this fix all end up
+    # holding one secret at most.
+    unused = "token" if _influx_secret_name(t.version) == "password" else "password"
+    if f"{unused}_set" in secret_changes:
+        secret_changes.remove(f"{unused}_set")
+    if getattr(t, f"{unused}_encrypted") is not None:
+        setattr(t, f"{unused}_encrypted", None)
+        if stored_before[unused] and f"{unused}_cleared" not in secret_changes:
+            secret_changes.append(f"{unused}_cleared")
     return secret_changes
 
 
