@@ -929,7 +929,13 @@ function CustomFieldsSection({
                           ? "— Select —"
                           : "— None —"}
                     </option>
-                    {def.options.map((opt) => (
+                    {/* A stored value the admin later removed from the options
+                        gets a choice of its own, else the browser shows the
+                        empty choice or the first option (#4840). */}
+                    {withStoredValue(
+                      def.options,
+                      val === "" ? null : String(val),
+                    ).map((opt) => (
                       <option key={opt} value={opt}>
                         {opt}
                       </option>
