@@ -1615,6 +1615,9 @@ export function DashboardPage() {
       staleTime: 30_000,
     })),
   });
+  // A per-group read that failed with nothing cached has no rows to count:
+  // its group's zones / servers are unknown, not none (#4887).
+  const zoneReadError = zoneQueries.find((q) => q.error && !q.data)?.error;
   const totalZones = zoneQueries.reduce(
     (sum, q) => sum + (q.data?.length ?? 0),
     0,
@@ -1627,6 +1630,9 @@ export function DashboardPage() {
     })),
   });
   const allDnsServers: DNSServer[] = serverQueries.flatMap((q) => q.data ?? []);
+  const dnsServerReadError = serverQueries.find(
+    (q) => q.error && !q.data,
+  )?.error;
 
   // DHCP
   const { data: dhcpServers = [], error: dhcpServersError } = useQuery<
@@ -1931,7 +1937,8 @@ export function DashboardPage() {
   // The same for the faces that count one read's rows (#3234): the value is
   // a dash and the sub-line says why, never a zero.
   const subnetsWhy = subnetsError ? unreadableWhy(subnetsError) : undefined;
-  const zonesWhy = dnsGroupsError ? unreadableWhy(dnsGroupsError) : undefined;
+  const zonesReadError = dnsGroupsError ?? zoneReadError;
+  const zonesWhy = zonesReadError ? unreadableWhy(zonesReadError) : undefined;
   const serversWhy =
     dnsGroupsError || dhcpServersError
       ? unreadableWhy(dnsGroupsError ?? dhcpServersError)
@@ -2396,7 +2403,7 @@ export function DashboardPage() {
                 to="/ipam"
               />
             )}
-            {!dnsGroupsError && (
+            {!zonesReadError && (
               <InventoryStat
                 value={totalZones}
                 label="DNS zones"
@@ -2784,8 +2791,10 @@ export function DashboardPage() {
                   DNS Servers ({allDnsServers.length})
                 </h3>
                 <span className="text-[11px] text-muted-foreground">
-                  {totalZones} zone{totalZones === 1 ? "" : "s"} ·{" "}
-                  {dnsGroups.length} group{dnsGroups.length === 1 ? "" : "s"}
+                  {zonesWhy
+                    ? "zones unavailable"
+                    : `${totalZones} zone${totalZones === 1 ? "" : "s"}`}{" "}
+                  · {dnsGroups.length} group{dnsGroups.length === 1 ? "" : "s"}
                 </span>
               </div>
             </div>
@@ -2819,9 +2828,12 @@ export function DashboardPage() {
         {tab === "dns" && dnsOn && allDnsServers.length === 0 && (
           <div className="rounded-lg border border-dashed p-10 text-center">
             <Globe2 className="mx-auto mb-3 h-10 w-10 text-muted-foreground/30" />
-            {dnsGroupsError ? (
+            {dnsGroupsError || dnsServerReadError ? (
               <p className="text-sm text-muted-foreground">
-                <ListReadError error={dnsGroupsError} what="DNS servers" />
+                <ListReadError
+                  error={dnsGroupsError ?? dnsServerReadError}
+                  what="DNS servers"
+                />
               </p>
             ) : (
               <>
