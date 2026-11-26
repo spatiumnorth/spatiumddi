@@ -22,6 +22,7 @@ import {
   markRestoreInFlight,
   clearRestoreInFlight,
 } from "@/lib/restoreInFlight";
+import { FormError } from "@/components/ui/form-error";
 import { BackupSectionsPicker } from "./BackupSectionsPicker";
 import { BackupTargetsSection } from "./BackupTargetsSection";
 import { FactoryResetSection } from "./FactoryResetSection";
@@ -430,9 +431,9 @@ function RestoreBackupCard() {
           </div>
         )}
         {previewError && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
             {previewError}
-          </div>
+          </FormError>
         )}
         {preview && <ManifestPreview preview={preview} />}
 
@@ -445,10 +446,10 @@ function RestoreBackupCard() {
           />
         )}
         {restoreRefused && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
             This archive cannot be restored:{" "}
             {preview?.restore_refusal ?? "the restore refuses it"}
-          </div>
+          </FormError>
         )}
         {selectiveBlockedByPlainFormat && (
           <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
