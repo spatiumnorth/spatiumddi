@@ -560,10 +560,14 @@ function MetalLBConfigCard() {
               Enable MetalLB + control-plane VIP
             </label>
             <div className="flex flex-col gap-1">
-              <span className="text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="net-cp-vip"
+                className="text-xs font-medium text-muted-foreground"
+              >
                 Control-plane VIP
-              </span>
+              </label>
               <input
+                id="net-cp-vip"
                 value={vip}
                 onChange={(e) => {
                   setVip(e.target.value);
@@ -611,10 +615,14 @@ function MetalLBConfigCard() {
                     need a pool wide enough to hold them alongside the
                     control-plane VIP. Empty = the hostNetwork data plane. */}
                   <div className="flex flex-col gap-1">
-                    <span className="text-xs font-medium text-muted-foreground">
+                    <label
+                      htmlFor="net-dns-vip"
+                      className="text-xs font-medium text-muted-foreground"
+                    >
                       DNS resolver VIP (:53) — optional
-                    </span>
+                    </label>
                     <input
+                      id="net-dns-vip"
                       value={dnsVip}
                       onChange={(e) => {
                         setDnsVip(e.target.value);
@@ -632,10 +640,14 @@ function MetalLBConfigCard() {
                     </span>
                   </div>
                   <div className="flex flex-col gap-1">
-                    <span className="text-xs font-medium text-muted-foreground">
+                    <label
+                      htmlFor="net-dhcp-relay-vip"
+                      className="text-xs font-medium text-muted-foreground"
+                    >
                       DHCP relay VIP (:67) — optional
-                    </span>
+                    </label>
                     <input
+                      id="net-dhcp-relay-vip"
                       value={dhcpRelayVip}
                       onChange={(e) => {
                         setDhcpRelayVip(e.target.value);
@@ -711,10 +723,14 @@ function MetalLBConfigCard() {
                         className="grid grid-cols-1 gap-2 rounded-md border p-2 sm:grid-cols-[2fr_1fr_1fr_auto]"
                       >
                         <div className="flex flex-col gap-1">
-                          <span className="text-[11px] text-muted-foreground">
+                          <label
+                            htmlFor={`net-bgp-peer-address-${i}`}
+                            className="text-[11px] text-muted-foreground"
+                          >
                             Peer address
-                          </span>
+                          </label>
                           <input
+                            id={`net-bgp-peer-address-${i}`}
                             value={peer.peer_address}
                             onChange={(e) => {
                               const next = [...bgpPeers];
@@ -730,10 +746,14 @@ function MetalLBConfigCard() {
                           />
                         </div>
                         <div className="flex flex-col gap-1">
-                          <span className="text-[11px] text-muted-foreground">
+                          <label
+                            htmlFor={`net-bgp-peer-asn-${i}`}
+                            className="text-[11px] text-muted-foreground"
+                          >
                             Peer ASN
-                          </span>
+                          </label>
                           <input
+                            id={`net-bgp-peer-asn-${i}`}
                             value={peer.peer_asn}
                             onChange={(e) => {
                               const next = [...bgpPeers];
@@ -749,10 +769,14 @@ function MetalLBConfigCard() {
                           />
                         </div>
                         <div className="flex flex-col gap-1">
-                          <span className="text-[11px] text-muted-foreground">
+                          <label
+                            htmlFor={`net-bgp-my-asn-${i}`}
+                            className="text-[11px] text-muted-foreground"
+                          >
                             My ASN
-                          </span>
+                          </label>
                           <input
+                            id={`net-bgp-my-asn-${i}`}
                             value={peer.my_asn}
                             onChange={(e) => {
                               const next = [...bgpPeers];

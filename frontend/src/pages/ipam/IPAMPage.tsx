@@ -1,7 +1,14 @@
 import { countNoun, pluralize } from "@/lib/count-noun";
 import { handOffFocusOnRemove } from "@/components/ui/focus-return";
 import { useOwnershipModules } from "@/hooks/useOwnershipModules";
-import { useState, useEffect, useMemo, useRef, useCallback } from "react";
+import {
+  useState,
+  useEffect,
+  useMemo,
+  useRef,
+  useCallback,
+  useId,
+} from "react";
 import { FormError } from "@/components/ui/form-error";
 import { DHCPSubnetPanel } from "@/pages/dhcp/DHCPSubnetPanel";
 import { CreateScopeModal } from "@/pages/dhcp/CreateScopeModal";
@@ -1272,6 +1279,8 @@ function DnsSettingsSection({
   fallbackSpaceId?: string | null;
   hideInheritToggle?: boolean;
 }) {
+  const dnsGroupSelectId = useId();
+  const primaryZoneSelectId = useId();
   // #1068 — mirror of the DHCP gate below; DNS can be switched off too.
   const { enabled: dnsFeature, ready: dnsFeatureReady } = useFeatureModules();
   const dnsOn = dnsFeatureReady && dnsFeature("core.dns");
@@ -1391,10 +1400,16 @@ function DnsSettingsSection({
             picker visually. The API still stores a list for backwards
             compatibility; we round-trip through a single-element array. */}
         <div>
-          <p className="text-xs text-muted-foreground mb-1">DNS Server Group</p>
+          <label
+            htmlFor={dnsGroupSelectId}
+            className="mb-1 block text-xs text-muted-foreground"
+          >
+            DNS Server Group
+          </label>
           {!canReadGroups ? (
             // Disabled, so the form keeps the stored group (never a clear).
             <select
+              id={dnsGroupSelectId}
               value={displayGroupIds[0] ? "linked" : ""}
               disabled
               title={
@@ -1416,6 +1431,7 @@ function DnsSettingsSection({
             </p>
           ) : (
             <select
+              id={dnsGroupSelectId}
               value={displayGroupIds[0] ?? ""}
               onChange={(e) => {
                 if (inherit) return;
@@ -1441,8 +1457,14 @@ function DnsSettingsSection({
         {/* A stored zone the user may not read: said, not dropped. */}
         {!canReadZones && displayZoneId && (
           <div>
-            <p className="text-xs text-muted-foreground mb-1">Primary Zone</p>
+            <label
+              htmlFor={primaryZoneSelectId}
+              className="mb-1 block text-xs text-muted-foreground"
+            >
+              Primary Zone
+            </label>
             <select
+              id={primaryZoneSelectId}
               value="linked"
               disabled
               title={
@@ -1473,8 +1495,14 @@ function DnsSettingsSection({
         {/* Primary Zone */}
         {availableZones.length > 0 && (
           <div>
-            <p className="text-xs text-muted-foreground mb-1">Primary Zone</p>
+            <label
+              htmlFor={primaryZoneSelectId}
+              className="mb-1 block text-xs text-muted-foreground"
+            >
+              Primary Zone
+            </label>
             <select
+              id={primaryZoneSelectId}
               value={displayZoneId ?? ""}
               onChange={(e) =>
                 !inherit && onZoneIdChange(e.target.value || null)
@@ -1558,6 +1586,7 @@ function DhcpSettingsSection({
   fallbackSpaceId?: string | null;
   hideInheritToggle?: boolean;
 }) {
+  const dhcpGroupSelectId = useId();
   // #1068 — DHCP can be switched off wholesale; these reads 404 then.
   // ``ready`` matters: ``enabled`` answers true while the module set is
   // still loading, so without it each of these fires once on a hard
@@ -1640,12 +1669,16 @@ function DhcpSettingsSection({
 
       <fieldset disabled={inherit} className="space-y-2 disabled:opacity-50">
         <div>
-          <p className="text-xs text-muted-foreground mb-1">
+          <label
+            htmlFor={dhcpGroupSelectId}
+            className="mb-1 block text-xs text-muted-foreground"
+          >
             DHCP Server Group
-          </p>
+          </label>
           {!canReadGroups ? (
             // Disabled, so the form keeps the stored group (never a clear).
             <select
+              id={dhcpGroupSelectId}
               value={displayGroupId ? "linked" : ""}
               disabled
               title={
@@ -1667,6 +1700,7 @@ function DhcpSettingsSection({
             </p>
           ) : (
             <select
+              id={dhcpGroupSelectId}
               value={displayGroupId ?? ""}
               onChange={(e) =>
                 !inherit && onServerGroupIdChange(e.target.value || null)
@@ -8248,7 +8282,7 @@ export function DnsSyncModal({
                     </div>
                   )}
                   {result.errors.length > 0 && (
-                    <div className="mt-1 text-destructive">
+                    <div role="alert" className="mt-1 text-destructive">
                       {result.errors.length} error
                       {result.errors.length === 1 ? "" : "s"}:{" "}
                       {result.errors.join("; ")}

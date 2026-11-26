@@ -2021,6 +2021,92 @@ _OP_CREATE_NETWORK_BLOCK = Operation(
 register(_OP_CREATE_NETWORK_BLOCK)
 
 
+# ── purge_trashed_<type> ───────────────────────────────────────────────────
+#
+# The Trash's "Delete permanently" (``DELETE /admin/trash/{type}/{id}``) is a
+# permanent delete of a row that is already soft-deleted, so it takes the same
+# ``delete`` policy as the object's own permanent delete. One operation per
+# covered type, because the gate keys the policy on the operation's single
+# ``required_permission`` pair. All five share one body, the endpoint's own.
+
+PURGE_TRASHED_TYPES: dict[str, str] = {
+    "subnet": "subnet",
+    "ip_block": "block",
+    "ip_space": "space",
+    "dns_zone": "zone",
+    "dhcp_scope": "scope",
+}
+PURGE_TRASHED_OPERATIONS: dict[str, str] = {t: f"purge_trashed_{t}" for t in PURGE_TRASHED_TYPES}
+
+
+class PurgeTrashedArgs(BaseModel):
+    row_id: UUID
+
+
+def _purge_trashed_preview(trash_type: str) -> Any:
+    async def _preview(db: AsyncSession, user: User, args: PurgeTrashedArgs) -> PreviewResult:
+        from app.api.v1.admin.trash import (  # noqa: PLC0415
+            _find_trashed,
+            _row_label,
+            _trashed_ipam_subtree,
+        )
+
+        try:
+            target = await _find_trashed(db, trash_type, args.row_id)
+        except HTTPException as exc:
+            return PreviewResult(ok=False, detail=str(exc.detail))
+        text = (
+            f"Permanently delete trashed {PURGE_TRASHED_TYPES[trash_type]} "
+            f"`{_row_label(target)}` from the Trash"
+        )
+        if trash_type in ("ip_block", "ip_space"):
+            # Counts move as the subtree grows, so the approve-time drift check
+            # catches a Trash that gained rows under it since the request.
+            blocks, subnets = await _trashed_ipam_subtree(db, target)
+            text += (
+                f"; also removes {len(subnets)} subnet(s) and "
+                f"{max(len(blocks) - (1 if trash_type == 'ip_block' else 0), 0)} block(s) under it"
+            )
+        return PreviewResult(ok=True, detail="ready", preview_text=text + "; it cannot be restored")
+
+    return _preview
+
+
+def _purge_trashed_apply(trash_type: str) -> Any:
+    async def _apply(db: AsyncSession, user: User, args: PurgeTrashedArgs) -> dict[str, Any]:
+        from app.api.v1.admin.trash import purge_trashed_row  # noqa: PLC0415
+
+        # The Trash endpoint is superadmin-only; the approve path does not run its
+        # dependency, so the step is enforced here (#4790).
+        ensure_superadmin_step(user, f"A permanent {PURGE_TRASHED_TYPES[trash_type]} delete")
+        kept = await purge_trashed_row(db, user, trash_type, args.row_id)
+        return {"row_id": str(args.row_id), "mode": "purge", "provider_copies_kept": kept}
+
+    return _apply
+
+
+for _trash_type, _op_name in PURGE_TRASHED_OPERATIONS.items():
+    register(
+        Operation(
+            name=_op_name,
+            description=(
+                f"Permanently delete a trashed {PURGE_TRASHED_TYPES[_trash_type]} "
+                "(the Trash's Delete permanently)."
+            ),
+            args_model=PurgeTrashedArgs,
+            preview=_purge_trashed_preview(_trash_type),
+            apply=_purge_trashed_apply(_trash_type),
+            category=(
+                "ipam"
+                if _trash_type in ("subnet", "ip_block", "ip_space")
+                else "dhcp" if _trash_type == "dhcp_scope" else "dns"
+            ),
+            superadmin_when=lambda a: True,
+            required_permission=("delete", _trash_type),
+        )
+    )
+
+
 # Registry-completeness anchor for the startup assertion (sibling slice):
 # every operation name the seeded policies reference must exist here.
 RISKY_OPERATION_NAMES: frozenset[str] = frozenset(
@@ -2032,6 +2118,7 @@ RISKY_OPERATION_NAMES: frozenset[str] = frozenset(
         "delete_scope",
         "delete_group",
         "create_network_block",
+        *PURGE_TRASHED_OPERATIONS.values(),
     }
 )
 
