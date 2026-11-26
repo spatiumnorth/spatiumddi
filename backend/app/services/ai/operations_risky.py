@@ -182,7 +182,9 @@ def _mirrors_torn_down_first(root: Any, batch: Any) -> Any:
     reverse zone the delete trashes, so the preview's count of that zone's
     records leaves them out too (spatiumddi#3511)."""
     from app.models.dhcp import DHCPLease, DHCPScope, DHCPStaticAssignment  # noqa: PLC0415
+    from app.models.dns import DNSRecord  # noqa: PLC0415
     from app.models.ipam import IPAddress, Subnet  # noqa: PLC0415
+    from app.models.ot import OTDevice  # noqa: PLC0415
 
     # Uncorrelated, so Postgres builds each set once per statement and probes
     # it per address (a hashed SubPlan), and costs it that way. A correlated
@@ -220,6 +222,15 @@ def _mirrors_torn_down_first(root: Any, batch: Any) -> Any:
         and_(
             IPAddress.static_assignment_id.is_not(None),
             IPAddress.static_assignment_id.in_(reservations),
+            # A reservation's row a DNS alias or an OT descriptor hangs off is kept
+            # through the Trash (#4870), so its records are not withdrawn here: they
+            # ride the batch and the restore brings them back.
+            IPAddress.id.not_in(
+                select(DNSRecord.ip_address_id).where(
+                    DNSRecord.ip_alias.is_(True), DNSRecord.ip_address_id.is_not(None)
+                )
+            ),
+            IPAddress.id.not_in(select(OTDevice.ip_address_id)),
         ),
     ]
     if isinstance(root, Subnet):
