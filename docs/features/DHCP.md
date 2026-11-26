@@ -59,7 +59,7 @@ namespace on supervisor-managed appliances — a directly-attached server
 typically wants `network_mode: host` **and** `dhcp_socket_mode: direct`.
 
 **Behind the MetalLB DHCP relay VIP, a group must be `relay` (#2899).**
-The relay VIP (`dhcp_relay_vip`, Fleet → Network → MetalLB → Advanced) is a
+The relay VIP (`dhcp_relay_vip`, Appliance → Network & Host → MetalLB → Advanced) is a
 LoadBalancer Service over every Kea pod in the appliance cluster, with
 `externalTrafficPolicy: Cluster`. kube-proxy on the node announcing the VIP
 keeps about one relay flow in N on that node's own Kea. In `direct` mode
@@ -2414,7 +2414,7 @@ SpatiumDDI ships DHCPv6 via Kea, but Kea does not emit ICMPv6 Router
 Advertisements. This feature lets the DHCP agent run **radvd** from
 config rendered by the control plane, and passively watches the segment
 for **rogue RAs**. Both live behind the `ipv6.router_advertisements` feature module, which
-ships **disabled** (Settings → Features): it is the one DHCP-adjacent surface
+ships **disabled** (Features & Integrations): it is the one DHCP-adjacent surface
 that ends in something transmitted onto the wire, and a v4-only install has no
 use for it ([#1069](https://github.com/spatiumnorth/spatiumddi/issues/1069)).
 

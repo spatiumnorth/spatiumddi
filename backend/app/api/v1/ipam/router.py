@@ -132,6 +132,7 @@ from app.services.ipam.hygiene import (
     build_hygiene_report,
 )
 from app.services.ipam.live_address import get_live_address, live_subnet_clause
+from app.services.ipam.mac_history import record_mac_history
 from app.services.ipam.orphan_aliases import orphan_alias_batch_id
 from app.services.ipam.probe_policy import resolve_probe_policy
 from app.services.ipam.subnet_boundary import boundary_addresses
@@ -1254,36 +1255,8 @@ async def _check_public_facing_warnings(
 
 
 async def _record_mac_history(db: AsyncSession, ip_id: uuid.UUID, mac_address: str | None) -> None:
-    """Upsert ``(ip_id, mac)`` in ``ip_mac_history``, bumping ``last_seen``.
-
-    Called from create + update paths whenever the row carries a MAC.
-    The rule is "this IP currently has MAC X" → upsert with
-    ``last_seen = now()``. A MAC change leaves the prior row alone
-    with its earlier ``last_seen``, so the implicit history is the
-    set of distinct rows for the IP. Postgres's MACADDR type
-    normalises common formats so equality compares cleanly.
-
-    No-op when the MAC is missing or doesn't normalise — the IPAM
-    layer already validates MACs on the way in, so a malformed value
-    here would be defensive and we'd rather not poison the history
-    table with garbage.
-    """
-    if not mac_address:
-        return
-    if _normalize_mac(mac_address) is None:
-        return
-    # ``ON CONFLICT`` here is the cleanest path — Postgres-only, but
-    # the rest of the schema is too. Bump last_seen on conflict;
-    # first_seen sticks at its insert-time default.
-    await db.execute(
-        text("""
-            INSERT INTO ip_mac_history (id, ip_address_id, mac_address, first_seen, last_seen)
-            VALUES (gen_random_uuid(), :ip_id, CAST(:mac AS macaddr), now(), now())
-            ON CONFLICT (ip_address_id, mac_address)
-            DO UPDATE SET last_seen = now()
-            """),
-        {"ip_id": str(ip_id), "mac": mac_address},
-    )
+    """Thin alias of :func:`app.services.ipam.mac_history.record_mac_history`."""
+    await record_mac_history(db, ip_id, mac_address)
 
 
 def _enforce_token_scope(user: Any, resource_type: str, resource_id: uuid.UUID) -> None:

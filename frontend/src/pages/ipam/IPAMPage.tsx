@@ -10118,7 +10118,7 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
     dnsOn &&
     subnetZonesSettled &&
     !availableZones.some((z: DNSZone) => z.id === storedZoneId);
-  const { data: lookupGroups = [] } = useQuery({
+  const { data: lookupGroups = [], isLoading: lookupGroupsLoading } = useQuery({
     queryKey: ["dns-groups"],
     queryFn: dnsApi.listGroups,
     enabled: storedZoneMissing,
@@ -10132,11 +10132,25 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
       enabled: storedZoneMissing,
     })),
   });
-  const storedExtraZone: DNSZone | undefined = storedZoneMissing
+  const lookedUpZone: DNSZone | undefined = storedZoneMissing
     ? lookupQueries
         .flatMap((q: { data?: DNSZone[] }) => q.data ?? [])
         .find((z: DNSZone) => z.id === storedZoneId)
     : undefined;
+  // #4893 — a role that may write one zone but not read the group's zones
+  // cannot find the stored zone in those lists, and the picker used to fall
+  // back to the writable zone, naming a zone the record is not in. The
+  // row carries only the zone id, so keep the record's own zone as the
+  // current value and call it "not visible to your role" instead of guessing.
+  const lookupSettled =
+    !lookupGroupsLoading &&
+    lookupQueries.every((q: { isLoading: boolean }) => !q.isLoading);
+  const storedZoneHidden = storedZoneMissing && !lookedUpZone;
+  const storedExtraZone: DNSZone | undefined =
+    lookedUpZone ??
+    (storedZoneMissing && lookupSettled
+      ? ({ id: storedZoneId, name: "" } as DNSZone)
+      : undefined);
   const pickerZones: DNSZone[] = storedExtraZone
     ? [...availableZones, storedExtraZone]
     : availableZones;
@@ -10158,7 +10172,7 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
 
   const selectedZone = pickerZones.find((z: DNSZone) => z.id === dnsZoneId);
   const fqdnPreview =
-    hostname && selectedZone
+    hostname && selectedZone && selectedZone.name
       ? `${hostname}.${selectedZone.name.replace(/\.$/, "")}`
       : null;
 
@@ -10389,7 +10403,9 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
             {pickerZones.length === 1 ? (
               <p className="text-xs text-muted-foreground py-1">
                 <Globe2 className="inline h-3 w-3 mr-1" />
-                {pickerZones[0].name.replace(/\.$/, "")}
+                {pickerZones[0].name
+                  ? pickerZones[0].name.replace(/\.$/, "")
+                  : "Zone not visible to your role"}
                 {fqdnPreview && (
                   <span className="ml-2 font-mono text-emerald-600 dark:text-emerald-400">
                     → {fqdnPreview}
@@ -10414,7 +10430,9 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
                   />
                   {storedExtraZone && (
                     <option value={storedExtraZone.id}>
-                      {`${storedExtraZone.name.replace(/\.$/, "")} (current — not among this subnet's zones)`}
+                      {storedZoneHidden
+                        ? "Current zone — not visible to your role"
+                        : `${storedExtraZone.name.replace(/\.$/, "")} (current — not among this subnet's zones)`}
                     </option>
                   )}
                 </select>

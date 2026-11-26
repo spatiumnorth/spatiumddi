@@ -59,6 +59,7 @@ from app.services.dhcp.ipam_mirror import (
 from app.services.dhcp.lease_cleanup import _load_subnet_cache, _resolve_lease_subnet_id
 from app.services.dns.record_ops import purge_trashed_address_records
 from app.services.e911.address_bindings import bound_ip_ids, carry_ip_bindings, keep_row_if_bound
+from app.services.ipam.mac_history import record_mac_history
 from app.services.ipam.utilization import recount_subnets_and_blocks
 
 logger = structlog.get_logger(__name__)
@@ -324,6 +325,9 @@ async def upsert_ipam_for_static(
     # and the DNS sync below retracts what an earlier name published.
     row.hostname = (st.hostname or "").strip()
     row.mac_address = str(st.mac_address)
+    # The MAC history dialog promises every MAC the address was given, and a
+    # reservation gives one (#4848).
+    await record_mac_history(db, row.id, row.mac_address)
     row.status = "static_dhcp"
     row.static_assignment_id = str(st.id)
     # A row taken over here may be a lease's mirror: the address a client
