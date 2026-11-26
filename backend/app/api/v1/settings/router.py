@@ -4421,6 +4421,11 @@ _INFLUX_PLAIN_FIELDS = (
 )
 
 
+def _influx_secret_name(version: str) -> str:
+    """The credential a version authenticates with: v1 a password, v2/v3 a token."""
+    return "password" if version == "v1" else "token"
+
+
 def _apply_influx_body(t: InfluxDBTarget, body: InfluxDBTargetBody) -> list[str]:
     """Apply ``body`` to ``t``; return which secrets were set or cleared.
 
@@ -4434,6 +4439,7 @@ def _apply_influx_body(t: InfluxDBTarget, body: InfluxDBTargetBody) -> list[str]
     from app.core.crypto import encrypt_str
 
     sent = body.model_fields_set if isinstance(body, InfluxDBTargetUpdate) else None
+    old_version = t.version
     for field in _INFLUX_PLAIN_FIELDS:
         if sent is not None and field not in sent:
             continue
@@ -4456,6 +4462,15 @@ def _apply_influx_body(t: InfluxDBTarget, body: InfluxDBTargetBody) -> list[str]
     elif body.clear_token and t.token_encrypted:
         t.token_encrypted = None
         secret_changes.append("token_cleared")
+    # A version switch between v1 and v2/v3 drops the secret the new version
+    # does not use: its form neither shows nor clears it (#4889).
+    if old_version and _influx_secret_name(old_version) != _influx_secret_name(t.version):
+        if t.version == "v1" and t.token_encrypted:
+            t.token_encrypted = None
+            secret_changes.append("token_cleared")
+        elif t.version != "v1" and t.password_encrypted:
+            t.password_encrypted = None
+            secret_changes.append("password_cleared")
     return secret_changes
 
 
@@ -4583,11 +4598,22 @@ async def update_influxdb_target(
         sent_fields["password"] = ""
     if body.clear_token:
         sent_fields["token"] = ""
+    # A switch between v1 and v2/v3 drops the other version's secret (#4889),
+    # so only the secret the target ends up using has to be re-entered.
+    new_version = sent_fields.get("version") or row.version
+    kept = _influx_secret_name(new_version)
     require_secret_with_destination_change(
         row,
         sent_fields,
         destination=("url",),
-        secrets={"password": row.password_encrypted, "token": row.token_encrypted},
+        secrets={
+            name: stored
+            for name, stored in (
+                ("password", row.password_encrypted),
+                ("token", row.token_encrypted),
+            )
+            if name == kept
+        },
         # A blank never clears here (only the flag does), so it keeps the stored
         # value and is not a re-entry.
         blank_keeps=[
