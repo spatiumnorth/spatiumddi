@@ -643,7 +643,9 @@ function PolicyEditor({
               onChange={(e) => setMinCount(e.target.value)}
             />
             <p className="text-[11px] text-muted-foreground/80">
-              Blank = require approval regardless of count. A single delete counts as 1 row, so a threshold above 1 only applies to bulk operations.
+              Blank = require approval regardless of count. A single delete
+              counts as 1 row, so a threshold above 1 only applies to bulk
+              operations.
             </p>
           </div>
           <div className="space-y-1">
