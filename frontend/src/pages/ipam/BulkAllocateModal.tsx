@@ -274,9 +274,9 @@ export function BulkAllocateModal({
   const zonesSettled = zoneQueries.every((q) => !q.isLoading && !q.isFetching);
   // Zones still on their way, or the subnet's DNS being re-read over a cached
   // copy: the pick is not final yet, so Preview waits (#3080).
-  const zonesPending =
-    dnsOn &&
-    ((effectiveFetching && effectiveDns !== undefined) || !zonesSettled);
+  // The first read counts too: until it lands there are no zones to pick and
+  // no primary, and "needs a DNS zone" would be a guess (#4860).
+  const zonesPending = dnsOn && (effectiveFetching || !zonesSettled);
   useEffect(() => {
     if (dnsZoneTouched || availableZones.length === 0) return;
     const target =

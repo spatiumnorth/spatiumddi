@@ -929,7 +929,13 @@ function CustomFieldsSection({
                           ? "— Select —"
                           : "— None —"}
                     </option>
-                    {def.options.map((opt) => (
+                    {/* A stored value the admin later removed from the options
+                        gets a choice of its own, else the browser shows the
+                        empty choice or the first option (#4840). */}
+                    {withStoredValue(
+                      def.options,
+                      val === "" ? null : String(val),
+                    ).map((opt) => (
                       <option key={opt} value={opt}>
                         {opt}
                       </option>
@@ -3915,9 +3921,9 @@ export function AddAddressModal({
   );
   // The pick is not final while zones are still on their way or the subnet's
   // DNS is being re-read over a cached copy: Allocate waits (#3080).
-  const zonesPending =
-    dnsOn &&
-    ((effectiveFetching && effectiveDns !== undefined) || !zonesSettled);
+  // The first read counts too: until it lands there are no zones to pick and
+  // no primary, and "needs a DNS zone" would be a guess (#4860).
+  const zonesPending = dnsOn && (effectiveFetching || !zonesSettled);
   useEffect(() => {
     if (dnsZoneTouched || availableZones.length === 0) return;
     const target =
@@ -4439,7 +4445,7 @@ export function AddAddressModal({
                 <span className="font-mono">{hostname || "<hostname>"}</span>; A
                 records point to the IP. Withdrawn while the IP is an orphan and
                 back when it is restored; deleted when the IP is purged.
-                {!publishZoneId && (
+                {!publishZoneId && !zonesPending && (
                   <span className="ml-1 text-amber-600">
                     Requires a DNS zone on this subnet.
                   </span>
@@ -10888,14 +10894,18 @@ function NatSubnetPanel({ subnetId }: { subnetId: string }) {
   );
 }
 
-function NatMappingsForIpModal({
+export function NatMappingsForIpModal({
   ip,
   onClose,
 }: {
   ip: IPAddress;
   onClose: () => void;
 }) {
-  const { data = [], isLoading } = useQuery({
+  const {
+    data = [],
+    isLoading,
+    error,
+  } = useQuery({
     queryKey: ["nat-by-ip", ip.id],
     queryFn: () => natApi.byIp(ip.id),
   });
@@ -10904,6 +10914,11 @@ function NatMappingsForIpModal({
       <div className="space-y-3">
         {isLoading ? (
           <p className="text-sm text-muted-foreground">Loading…</p>
+        ) : error ? (
+          // A refused read is not an empty list (#4853).
+          <p className="text-sm">
+            <ListReadError error={error} what="this IP's NAT mappings" />
+          </p>
         ) : (
           <NatRowsTable
             rows={data}
