@@ -15,7 +15,15 @@
      here. The canonical org site is the target regardless of which of the two
      Pages sites this page is being served from. -->
 <meta property="og:image" content="{{ site.url }}/assets/screenshots/dashboard.png">
-<meta property="og:url" content="{{ site.url }}{{ page.url }}">
+<!-- One URL per page (Google: "Duplicate without user-selected canonical").
+     GitHub Pages answers both /X and /X.html, the in-page links point at
+     .html, the sitemap at the extensionless form, and the project site mirrors
+     it all under /spatiumddi/. The canonical is the org site's extensionless
+     URL, the form sitemap.xml lists. -->
+{%- assign canonical_path = page.url | remove: "index.html" -%}
+{%- if canonical_path contains ".html" -%}{%- assign canonical_path = canonical_path | remove: ".html" -%}{%- endif %}
+<link rel="canonical" href="{{ site.url }}{{ canonical_path }}">
+<meta property="og:url" content="{{ site.url }}{{ canonical_path }}">
 <meta name="twitter:card" content="summary_large_image">
 
 <!-- Applied before first paint so an explicitly-chosen theme does not flash

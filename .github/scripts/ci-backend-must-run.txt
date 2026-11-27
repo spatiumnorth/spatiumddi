@@ -236,3 +236,8 @@ docker-compose.dev.yml
 # test_host_timezone_4416.py (#4416) checks the frontend's host time zone alias
 # table mirrors the backend's, so editing that table must run it.
 frontend/src/lib/hostTimezones.ts
+
+# test_alembic_heads_script.py loads the forward-merge workflow's Alembic
+# head check (release-forward-merge.yml), which decides whether a merge of one
+# release branch into the next left two migration heads.
+.github/scripts/alembic_heads.py

@@ -54,7 +54,15 @@ class ManifestError(Exception):
 #: Exhaustive key sets. Anything outside them is a typo, and a typo in this
 #: file is a guard that silently stops guarding -- see load_manifest.
 _MANIFEST_KEYS = {"$comment", "components", "holds"}
-_COMPONENT_KEYS = {"version", "digest", "pinned_in", "upstream", "hold", "note"}
+_COMPONENT_KEYS = {
+    "version",
+    "digest",
+    "pinned_in",
+    "upstream",
+    "hold",
+    "note",
+    "network_facing",
+}
 _SITE_KEYS = {"path", "match", "count"}
 
 
@@ -93,6 +101,11 @@ def load_manifest(path: pathlib.Path) -> dict[str, Any]:
                 f"component {name!r} has unknown key(s): {sorted(unknown)} "
                 f"(allowed: {sorted(_COMPONENT_KEYS)})"
             )
+        # ``network_facing`` picks the components the upstream report lists
+        # first (#4816). A string "false" is truthy, so refuse anything that
+        # is not a real boolean rather than let it flag the wrong set.
+        if "network_facing" in entry and not isinstance(entry["network_facing"], bool):
+            raise ManifestError(f"component {name!r}: network_facing must be true or false")
         version = entry.get("version")
         if not isinstance(version, str) or not version.strip():
             raise ManifestError(f"component {name!r} has no version")
@@ -430,6 +443,7 @@ def check_upstream(manifest: dict[str, Any], token: str | None) -> list[dict[str
             "name": name,
             "current": entry["version"],
             "hold": entry.get("hold"),
+            "network_facing": bool(entry.get("network_facing")),
             "latest": None,
             "error": None,
             "behind": False,
@@ -467,7 +481,7 @@ def check_upstream(manifest: dict[str, Any], token: str | None) -> list[dict[str
     return rows
 
 
-def format_upstream_table(rows: list[dict[str, Any]]) -> str:
+def _table(rows: list[dict[str, Any]]) -> str:
     out = ["| Component | Pinned | Latest upstream | Status |", "|---|---|---|---|"]
     for row in rows:
         if row["error"]:
@@ -487,6 +501,21 @@ def format_upstream_table(rows: list[dict[str, Any]]) -> str:
             latest = row["latest"]
         out.append(f"| `{row['name']}` | `{row['current']}` | `{latest}` | {status} |")
     return "\n".join(out)
+
+
+def format_upstream_table(rows: list[dict[str, Any]]) -> str:
+    """The full table, led by its own section for network-facing components
+    that are behind (#4816): a lag on a component that answers on the network
+    should be seen the week it happens, not found in the general list."""
+    front = [r for r in rows if r.get("network_facing") and r["behind"]]
+    if not front:
+        return _table(rows)
+    return (
+        "### Network-facing components behind upstream\n\n"
+        + _table(front)
+        + "\n\n### All components\n\n"
+        + _table(rows)
+    )
 
 
 # ── entry point ──────────────────────────────────────────────────────────────
@@ -559,9 +588,10 @@ def main(argv: list[str] | None = None) -> int:
         # failed and reports the fleet current -- the reason this line exists.
         # ``failed`` is what makes "we could not tell" distinguishable from
         # "nothing is behind"; they must never collapse into one verdict.
+        net = [r for r in rows if r.get("network_facing") and r["behind"]]
         print(
             f"RESULT behind={len(behind)} held={len(held)} "
-            f"failed={len(failed)} total={len(rows)}"
+            f"failed={len(failed)} total={len(rows)} network_behind={len(net)}"
         )
         # Advisory by design: a hold is not a failure, and neither is a
         # transient network error on a weekly informational job.

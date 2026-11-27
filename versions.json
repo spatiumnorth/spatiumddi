@@ -275,6 +275,7 @@
     },
 
     "nginx": {
+      "network_facing": true,
       "version": "1.31.9-alpine",
       "pinned_in": [
         { "path": "frontend/Dockerfile", "match": "FROM nginx:{version}", "count": 1 },
@@ -315,6 +316,7 @@
     },
 
     "postgres": {
+      "network_facing": true,
       "version": "16-alpine",
       "pinned_in": [
         { "path": "docker-compose.yml", "match": "image: postgres:{version}", "count": 1 },
@@ -522,6 +524,7 @@
       "note": "Bumped 3.23 -> 3.24 in #1037, which discharged the hold #975 corrected. It carried the agents Python 3.12 -> 3.14.7 (NOT 3.13, which the dependabot.yml comment claimed for a year) plus pdns 5.0.5 -> 5.0.7, dnsdist -> 2.0.8 and bind -> 9.20.27; Kea stays 3.0.3. The Python move is the sharp part: the agent is installed into /usr/local/lib/python<X.Y>/site-packages and found only via PYTHONPATH, so a base bump without a matching PYTHONPATH builds a clean image that CrashLoopBackOffs with ModuleNotFoundError (#672). PYTHONPATH now interpolates the PYTHON_VERSION arg -- which was declared and referenced by NOTHING in four of these images until #1037 -- and each image asserts `import <agent>` at build time, so a mismatch is a failed build rather than a failed pod. Dependabot still ignores Alpine minors: the next move is a deliberate task for the same reason, not a bot bump."
     },
     "bind": {
+      "network_facing": true,
       "version": "9.20.29-r0",
       "pinned_in": [
         { "path": "agent/dns/images/bind9/Dockerfile", "match": "'bind>={version}' 'bind-tools>={version}'", "count": 1 },
@@ -532,6 +535,7 @@
       "note": "Alpine-packaged daemon (#1240). The Dockerfile pins a FLOOR (`>=`), not an exact version: `apk add` takes whatever the Alpine index ships at or above it, and the nightly rebuilds the package layer daily (APK_SNAPSHOT). The floor is the version to raise when a CVE lands -- it is also what busts a cached `apk add` layer -- and the upstream check (kind alpine-package, on the branch of the `alpine` component) reports when Alpine ships a newer build, including an -rN rebuild. Raised 9.20.26-r0 -> 9.20.29-r0 for seven HIGH remote-DoS CVEs (#1218); the released 2026.09.04-1 image carried 9.20.26 because nothing reported the drift."
     },
     "pdns": {
+      "network_facing": true,
       "version": "5.0.7-r0",
       "pinned_in": [
         { "path": "agent/dns/images/powerdns/Dockerfile", "match": "'pdns>={version}'", "count": 1 },
@@ -550,6 +554,7 @@
       "note": "Alpine-packaged daemon (#1240). The Dockerfile pins a FLOOR (`>=`), not an exact version: `apk add` takes whatever the Alpine index ships at or above it, and the nightly rebuilds the package layer daily (APK_SNAPSHOT). The floor is the version to raise when a CVE lands -- it is also what busts a cached `apk add` layer -- and the upstream check (kind alpine-package, on the branch of the `alpine` component) reports when Alpine ships a newer build, including an -rN rebuild."
     },
     "kea": {
+      "network_facing": true,
       "version": "3.0.3-r0",
       "pinned_in": [
         { "path": "agent/dhcp/images/kea/Dockerfile", "match": "'kea>={version}'", "count": 1 },

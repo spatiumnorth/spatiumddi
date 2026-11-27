@@ -5,6 +5,9 @@
 > diagrams, sizing tips, and a "you have X → start with
 > topology Y" picker.
 
+> **No internet on the host?** See [`AIRGAP.md`](AIRGAP.md) for loading the
+> images from a tar and for what to turn off.
+
 ## Prerequisites
 
 - Docker Engine 25+ and Docker Compose v2.20+

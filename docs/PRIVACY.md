@@ -181,6 +181,8 @@ container's system resolver; its entrypoint now writes an empty
 
 ## 4. Air-gapped operation
 
+For the step-by-step install, see [`deployment/AIRGAP.md`](deployment/AIRGAP.md).
+
 Every feature works with all of the above blocked. Builds before #1353
 were the exception: a PowerDNS server group needed a route to `1.1.1.1` /
 `8.8.8.8` to start (§3.5). This is not a claim about the happy path — it is non-negotiable #5 in the project's

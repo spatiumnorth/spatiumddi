@@ -15,7 +15,7 @@
   <a href="https://github.com/spatiumnorth/spatiumddi/security/code-scanning"><img src="https://img.shields.io/badge/security-CodeQL-1f6feb" alt="CodeQL"/></a>
   <a href="https://github.com/spatiumnorth/spatiumddi/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"/></a>
   <a href="https://www.spatiumddi.com"><img src="https://img.shields.io/badge/docs-spatiumddi.com-informational" alt="Docs"/></a>
-  <img src="https://img.shields.io/badge/status-release%20candidate-blue" alt="Status"/>
+  <img src="https://img.shields.io/badge/status-stable-brightgreen" alt="Status"/>
 </p>
 
 <p align="center">
