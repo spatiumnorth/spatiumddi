@@ -563,3 +563,33 @@ def test_default_fallback_to_slot_a() -> None:
     """When both next_entry and saved_entry are unset, default falls back to slot_a."""
     out = _render()
     assert 'if [ -z "${default}" ]; then set default=slot_a; fi' in out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# #4954 — the persisted machine-id rides the kernel cmdline, so journald does
+# not open a second /var/log/journal/<dmi-uuid> directory on an upgraded slot.
+# ─────────────────────────────────────────────────────────────────────────────
+
+MACHINE_ID = "0123456789abcdef0123456789abcdef"
+
+
+def test_machine_id_on_every_linux_line() -> None:
+    out = _render(extra_args=["--machine-id", MACHINE_ID])
+    linux = [ln for ln in out.splitlines() if ln.lstrip().startswith("linux ")]
+    assert len(linux) == 4
+    for ln in linux:
+        assert f"rw systemd.machine_id={MACHINE_ID} " in ln
+
+
+def test_no_machine_id_when_absent_or_invalid() -> None:
+    for extra in ([], ["--machine-id", "not-an-id"], ["--machine-id", "0" * 32]):
+        assert "systemd.machine_id" not in _render(extra_args=extra)
+
+
+def test_host_patch_003_reruns_the_renderer() -> None:
+    """#4954: boxes that already ran 001 need a NEW patch to re-render."""
+    patch = RENDERER.parent.parent.parent / "lib" / "spatiumddi" / "host-patches" / "003-grub-machine-id.sh"
+    text = patch.read_text()
+    assert "exec /usr/local/bin/spatium-grub-render" in text
+    assert "set -eu" in text
+    assert patch.stat().st_mode & 0o111
