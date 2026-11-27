@@ -375,17 +375,32 @@ async def load_reverse_candidates(
     db: AsyncSession, subnet: Subnet, group_ids: Sequence[object]
 ) -> list[ReverseCandidate]:
     """Every zone that could own a reverse name of ``subnet``'s addresses:
-    the zones linked to the subnet, plus the reverse-owner zones of its
-    effective DNS group(s). Load once per subnet and :func:`pick_reverse_zone`
+    the zones linked to the subnet that sit in its effective DNS group(s),
+    plus the reverse-owner zones of those groups. Load once per subnet and :func:`pick_reverse_zone`
     per address (spatiumddi#1840: a subnet wider than a /24 can span more than
     one zone, so the zone is a property of the ADDRESS, not of the subnet)."""
     out: dict[uuid.UUID, ReverseCandidate] = {}
+    # A zone linked to the subnet counts only while it sits in one of the
+    # subnet's effective groups (its group list, or the group of its effective
+    # forward zone): a zone left linked to the subnet in a group it is not
+    # bound to takes no PTR.
+    own_groups = set(stored_uuid_list(group_ids))
+    _, forward_zone_id = await _effective_dns(db, subnet)
+    if forward_zone_id is not None:
+        forward_group = (
+            await db.execute(select(DNSZone.group_id).where(DNSZone.id == forward_zone_id))
+        ).scalar_one_or_none()
+        if forward_group is not None:
+            own_groups.add(forward_group)
     linked = (
         await db.execute(
-            select(DNSZone).where(
+            select(DNSZone)
+            .where(
                 DNSZone.linked_subnet_id == subnet.id,
                 DNSZone.kind == "reverse",
+                DNSZone.group_id.in_(own_groups),
             )
+            .order_by(DNSZone.name, DNSZone.id)
         )
     ).scalars()
     for z in linked:
