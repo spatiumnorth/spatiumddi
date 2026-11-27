@@ -293,3 +293,26 @@ async def test_find_tool_refuses_a_wildcard_read(db_session: AsyncSession) -> No
     g, _ = await _user(db_session, [{"action": "read", "resource_type": "e911_resolution_log"}])
     await db_session.refresh(g, ["groups"])
     assert await _call(db_session, g, "count_e911_resolutions", {}) == {"count": 4}
+
+
+async def test_date_filters_accept_naive_and_reject_garbage(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A timestamp typed without a zone is read as UTC; a malformed one is a 422.
+    Neither may reach the database as a naive datetime (a 500 on timestamptz)."""
+    await _seed(db_session)
+    _, h = await _user(db_session, None, superadmin=True)
+    naive = (datetime.now(UTC) - timedelta(minutes=12)).replace(tzinfo=None).isoformat()
+    for path in (URL, f"{URL}/export.csv"):
+        for key in ("since", "until"):
+            r = await client.get(path, params={key: naive}, headers=h)
+            assert r.status_code == 200, (path, key, r.text)
+            r = await client.get(path, params={key: "last tuesday"}, headers=h)
+            assert r.status_code == 422, (path, key, r.text)
+    body = (await client.get(URL, params={"since": naive}, headers=h)).json()
+    assert body["total"] == 2
+    bad_id = await client.get(URL, params={"actor_id": "nope"}, headers=h)
+    assert bad_id.status_code == 422
+    assert (await client.get(URL, params={"limit": 0}, headers=h)).status_code == 422
+    assert (await client.get(URL, params={"limit": 501}, headers=h)).status_code == 422
+    assert (await client.get(URL, params={"offset": -1}, headers=h)).status_code == 422
