@@ -27,6 +27,7 @@ Where the two disagree about a license, THIS file is authoritative.
 - newt / whiptail (install wizard dialogs) — LGPL v2 — https://pagure.io/newt
 - gdisk / parted / dosfstools / e2fsprogs — GPL v2 / GPL v3 — (Debian)
 - mdadm / multipath-tools / kpartx / lvm2 — GPL v2 (mdadm, kpartx) / LGPL v2.1 + GPL v2 (multipath-tools, lvm2) — (Debian)
+- smartmontools (smartctl; per-disk SMART / wear, #4731) — GPL v2 or later — https://www.smartmontools.org
 - exfatprogs — GPL v2 — https://github.com/exfatprogs/exfatprogs
 - rsync — GPL v3 — https://rsync.samba.org
 - qemu-guest-agent — GPL v2 — https://www.qemu.org
