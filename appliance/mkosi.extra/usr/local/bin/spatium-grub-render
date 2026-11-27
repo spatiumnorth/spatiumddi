@@ -294,15 +294,24 @@ def render_text(uuid_a: str, uuid_b: str,
     — in the heredoc they are `\\${...}`-escaped; here we just write the plain
     strings (there is no shell to fight). UUIDs + version-label titles are
     substituted. The four menuentries are emitted in order: --id=slot_a,
-    --id=slot_b, --id=slot_a_verbose, --id=rescue.
+    --id=slot_b, --id=verbose, --id=rescue (the last two follow the
+    default entry's slot at boot, #4961).
     """
     # #4954: pin the persisted machine-id on every cmdline (see live_machine_id).
     # Invalid / absent -> nothing emitted, the pre-#4954 behaviour.
     mid = f" systemd.machine_id={machine_id}" if _valid_machine_id(machine_id) else ""
     title_a = _title(ver_a, "(slot A)")
     title_b = _title(ver_b, "(slot B)")
-    title_a_verbose = _title(ver_a, "(slot A, verbose boot)")
-    title_rescue = _title(ver_a, "(rescue / single-user)")
+    # #4961: the verbose + recovery entries follow the ACTIVE slot, i.e. the one
+    # the default entry points at. That is only known at BOOT (grubenv's
+    # saved_entry, or the one-shot next_entry of a trial boot, both folded into
+    # ${default} above), and `spatium-upgrade-slot commit` / rollback flip it
+    # without re-rendering -- so a render-time choice would go stale. The
+    # decision is therefore emitted as grub syntax (sp_act_*), not made here.
+    title_verbose_a = _title(ver_a, "(slot A, verbose boot)")
+    title_verbose_b = _title(ver_b, "(slot B, verbose boot)")
+    title_rescue_a = _title(ver_a, "(slot A, recovery)")
+    title_rescue_b = _title(ver_b, "(slot B, recovery)")
 
     lines = [
         "# SpatiumDDI A/B boot config (Phase 8c, issue #138).",
@@ -330,6 +339,18 @@ def render_text(uuid_a: str, uuid_b: str,
         '    set default="${saved_entry}"',
         "fi",
         'if [ -z "${default}" ]; then set default=slot_a; fi',
+        "",
+        "# #4961: slot the verbose + recovery entries boot = the default entry's slot",
+        "# (slot_b -> B; slot_a, unset or anything unrecognised -> A, fail-safe).",
+        'if [ "${default}" = "slot_b" ]; then',
+        f"    set sp_act_uuid={uuid_b}",
+        f'    set sp_act_title_verbose="{title_verbose_b}"',
+        f'    set sp_act_title_rescue="{title_rescue_b}"',
+        "else",
+        f"    set sp_act_uuid={uuid_a}",
+        f'    set sp_act_title_verbose="{title_verbose_a}"',
+        f'    set sp_act_title_rescue="{title_rescue_a}"',
+        "fi",
         "",
         render_verbose_block(),
         "",
@@ -378,22 +399,26 @@ def render_text(uuid_a: str, uuid_b: str,
         "    initrd /boot/initrd.img",
         "}",
         "",
-        f'menuentry "{title_a_verbose}" --id=slot_a_verbose {{',
-        "    # Drops loglevel + audit too. Use when you need to capture every",
-        "    # kernel message for a bug report. Also passes spatium-console=off",
+        'menuentry "${sp_act_title_verbose}" --id=verbose {',
+        "    # Boots the ACTIVE slot (#4961; formerly --id=slot_a_verbose, which always",
+        "    # booted slot A). Drops loglevel + audit too. Use when you need to capture",
+        "    # every kernel message for a bug report. Also passes spatium-console=off",
         "    # so getty@tty1 wins tty1 (no dashboard overpainting the log).",
-        f"    search --no-floppy --fs-uuid --set=root {uuid_a}",
-        f"    linux /boot/vmlinuz root=UUID={uuid_a} rw{mid} \\",
+        "    search --no-floppy --fs-uuid --set=root ${sp_act_uuid}",
+        f"    linux /boot/vmlinuz root=UUID=${{sp_act_uuid}} rw{mid} \\",
         "        spatium-console=off \\",
         "        console=tty0 console=ttyS0,115200n8",
         "    initrd /boot/initrd.img",
         "}",
         "",
-        f'menuentry "{title_rescue}" --id=rescue {{',
-        "    # Boots slot_a into rescue.target — single-user, root shell only,",
-        "    # no k3s, no getty@tty1.",
-        f"    search --no-floppy --fs-uuid --set=root {uuid_a}",
-        f"    linux /boot/vmlinuz root=UUID={uuid_a} rw{mid} \\",
+        'menuentry "${sp_act_title_rescue}" --id=rescue {',
+        "    # Boots the ACTIVE slot (#4961) into rescue.target, no k3s, no getty@tty1.",
+        "    # Root is locked on the appliance, so rescue.target cannot open a shell:",
+        '    # it prints "Cannot open access to console, the root account is locked."',
+        "    # and carries on to the normal target. This is a minimal-services boot",
+        "    # that ends in a regular boot, not a root shell.",
+        "    search --no-floppy --fs-uuid --set=root ${sp_act_uuid}",
+        f"    linux /boot/vmlinuz root=UUID=${{sp_act_uuid}} rw{mid} \\",
         "        console=tty0 console=ttyS0,115200n8 systemd.unit=rescue.target",
         "    initrd /boot/initrd.img",
         "}",

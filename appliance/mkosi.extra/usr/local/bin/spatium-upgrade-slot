@@ -1692,8 +1692,8 @@ def _patch_grub_cfg_slot_uuid(partlabel: str, new_uuid: str,
         return head + new_body + tail
 
     # Patch EVERY menuentry for this slot, not just the first (#551): the
-    # slot has more than one entry (``--id=slot_a``, ``--id=slot_a_verbose``,
-    # the rescue entry), all keyed off the same partition. count=1 left the
+    # slot has more than one entry (``--id=slot_a``, plus ``--id=slot_a_verbose`` on
+    # older renders and the rescue entry), all keyed off the same partition. count=1 left the
     # verbose + rescue entries pointing at the pre-upgrade UUID → unbootable
     # when the fallback path (no spatium-grub-render) runs. The block_re is
     # anchored to slot_id so the OTHER slot's entries are never touched.
