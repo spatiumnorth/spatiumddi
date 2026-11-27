@@ -62,7 +62,9 @@ async def _sync_one_zone(
     ``idle in transaction``. Now a read-only session resolves the primary and
     key and commits, the transfer runs with none open, and a fresh session
     re-reads the zone and primary and applies the result, dropping it when
-    either was deleted, disabled or re-pointed meanwhile.
+    either was deleted, disabled or re-pointed meanwhile. The push phase
+    commits what the pull wrote (and the serial) just before its provider
+    call, so that call holds no transaction either.
 
     Returns ``(SyncResult, primary)``, or ``None`` when the zone is skipped.
     """
@@ -86,7 +88,7 @@ async def _sync_one_zone(
         if primary is None or not primary.is_enabled or _primary_signature(primary) != signature:
             return None
         wire.primary = primary  # bound to this session for the apply
-        result = await sync_zone_with_server(db, zone, apply=True, wire=wire)
+        result = await sync_zone_with_server(db, zone, apply=True, wire=wire, before_send=db.commit)
         await db.commit()
         return result, primary
 

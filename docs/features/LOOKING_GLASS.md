@@ -11,10 +11,10 @@ accepts their routing table, and turns the live Adj-RIB-In into an operator surf
 where every prefix, origin ASN, and BGP community is a clickable link back into
 IPAM / the ASN catalog / the community catalog.
 
-> **Documentation is in progress.** The receive-only invariant, the collector
-> architecture, and the router/firewall peering examples below are current for the
-> Phase 1+2 cut; the full data-model / API / UI reference lands as later phases
-> ship (see `CLAUDE.md`'s roadmap and issue #566 for status).
+> **Documentation is incomplete.** The receive-only invariant, the collector
+> architecture, and the router/firewall peering examples below are current. This
+> page does not yet carry a full data-model / API / UI reference, nor a section
+> for the Query tab, the IPAM chips or the `bgp_lg_*` alert rules.
 
 ---
 
@@ -314,8 +314,12 @@ advertised — each origin ASN and community clickable back into SpatiumDDI.
 - Routes grid: searchable/filterable RIB browser with origin-ASN links, AS-path,
   community-catalog rendering, and RPKI status computed at ingest.
 
-Deferred to later phases: IPAM prefix-match linkage (subnet/block/space chips,
-IP reverse-lookup), the Query tab (`show route` / AS-path regex / community
-filter), ping/traceroute from the collector's vantage point, `bgp_lg_*` alert
-rules + a Dashboard health card, and VPNv4/VPNv6 + multicast address-family
-support. See the issue and its linked implementation plan for the full phasing.
+Also shipped, and not yet described in detail here: IPAM prefix-match linkage
+(a chip on subnet and block rows, subnet / block panels and an IP lookup in the
+address dialog; there is no space-level chip), the Query tab (`show route`,
+`show route regexp`, `show route community`) with ping / traceroute from a
+collector's vantage point, six `bgp_lg_*` alert rules (seeded disabled) and a
+Dashboard health card.
+
+Deferred: VPNv4/VPNv6 and multicast address-family support (the collector
+accepts `ipv4-unicast` and `ipv6-unicast` only).

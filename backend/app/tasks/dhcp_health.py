@@ -176,6 +176,31 @@ def check_dhcp_server_health(self: object, server_id: str) -> None:  # type: ign
         raise self.retry(exc=exc, countdown=30) from exc  # type: ignore[attr-defined]
 
 
+async def _check_many(server_ids: list[uuid.UUID]) -> None:
+    """Check agentless servers concurrently inside one worker process (#4829).
+
+    Each probe spends its connect bound (10 s) on a host that answers nothing,
+    so N dead servers as N queued tasks hold a worker process for N x 10 s and
+    the event outbox and sweeps behind them wait. Gathered, the batch costs
+    one bound. One probe failing never stops the others.
+    """
+    results = await asyncio.gather(
+        *(_check_health(sid) for sid in server_ids), return_exceptions=True
+    )
+    for sid, res in zip(server_ids, results, strict=True):
+        if isinstance(res, BaseException):
+            logger.warning("dhcp_health_check_error", server_id=str(sid), error=str(res))
+
+
+@celery_app.task(
+    name="app.tasks.dhcp_health.check_agentless_dhcp_servers_health",
+    acks_late=True,
+)
+def check_agentless_dhcp_servers_health(server_ids: list[str]) -> None:
+    """Idempotent batch health check for agentless servers (#4829)."""
+    asyncio.run(_check_many([uuid.UUID(s) for s in server_ids]))
+
+
 async def _enqueue_all() -> None:
     engine = create_async_engine(
         settings.database_url, future=True, connect_args=task_connect_args()
@@ -195,12 +220,13 @@ async def _enqueue_all() -> None:
             # gated on the operator's interval.
             ids = [sid for sid, drv in rows if not is_agentless(drv)]
             agentless = [sid for sid, drv in rows if is_agentless(drv)]
+            due_agentless: list[str] = []
             if agentless:
                 ps = await db.get(PlatformSettings, 1)
                 now = datetime.now(UTC)
                 interval = timedelta(seconds=max(60, ps.dhcp_health_interval_seconds if ps else 60))
                 if ps is None or interval_skip(now, ps.dhcp_health_last_run_at, interval) is None:
-                    ids.extend(agentless)
+                    due_agentless = agentless
                     if ps is not None:
                         ps.dhcp_health_last_run_at = now
                         await db.commit()
@@ -208,6 +234,9 @@ async def _enqueue_all() -> None:
         await engine.dispose()
     for sid in ids:
         check_dhcp_server_health.delay(sid)
+    # #4829 — one task for every due agentless server, probed concurrently.
+    if due_agentless:
+        check_agentless_dhcp_servers_health.delay(due_agentless)
 
 
 @celery_app.task(name="app.tasks.dhcp_health.check_all_dhcp_servers_health", bind=True)
