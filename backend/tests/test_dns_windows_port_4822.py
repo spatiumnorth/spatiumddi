@@ -82,7 +82,10 @@ async def test_rfc2136_update_uses_dns_port(monkeypatch: pytest.MonkeyPatch) -> 
 
     def fake_tcp(msg: Any, where: str, **kw: Any) -> object:
         seen["port"] = kw.get("port")
-        return object()
+        import dns.message
+
+        # A server's NOERROR reply: the update path reads its rcode (#4939).
+        return dns.message.make_response(msg)
 
     monkeypatch.setattr(dns.query, "tcp", fake_tcp)
     change = RecordChange(
