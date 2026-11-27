@@ -78,6 +78,7 @@ export function BlockSyncPage() {
   const [reconcilePreview, setReconcilePreview] = useState<{
     target: BlockTarget;
     diff: BlockTargetDiff | null;
+    error?: string | null;
   } | null>(null);
   const [liftTarget, setLiftTarget] = useState<NetworkBlock | null>(null);
   const [pageError, setPageError] = useState<string | null>(null);
@@ -118,22 +119,29 @@ export function BlockSyncPage() {
       target: BlockTarget;
       preview: boolean;
     }) => blockSyncApi.reconcile(target.target_kind, target.target_id, preview),
-    onError: (e) => setPageError(errMsg(e, "Reconcile failed")),
+    // The Reconcile dialog is modal and covers the page banner, so while it
+    // is open the failure is drawn inside it (#4949).
+    onError: (e) => {
+      const msg = errMsg(e, "Reconcile failed");
+      setReconcilePreview((cur) => (cur ? { ...cur, error: msg } : cur));
+      setPageError(msg);
+    },
   });
 
   function previewReconcile(target: BlockTarget) {
     setPageError(null);
-    setReconcilePreview({ target, diff: null });
+    setReconcilePreview({ target, diff: null, error: null });
     reconcileMut.mutate(
       { target, preview: true },
       {
-        onSuccess: (diff) => setReconcilePreview({ target, diff }),
+        onSuccess: (diff) => setReconcilePreview({ target, diff, error: null }),
       },
     );
   }
 
   function pushReconcile(target: BlockTarget) {
     setPageError(null);
+    setReconcilePreview((cur) => (cur ? { ...cur, error: null } : cur));
     reconcileMut.mutate(
       { target, preview: false },
       {
@@ -496,7 +504,9 @@ export function BlockSyncPage() {
         <ReconcilePreviewModal
           target={reconcilePreview.target}
           diff={reconcilePreview.diff}
+          error={reconcilePreview.error ?? null}
           loading={reconcileMut.isPending}
+          onRetry={() => previewReconcile(reconcilePreview.target)}
           onClose={() => setReconcilePreview(null)}
           onConfirm={() => pushReconcile(reconcilePreview.target)}
         />
@@ -1217,13 +1227,17 @@ function NewBlockModal({
 function ReconcilePreviewModal({
   target,
   diff,
+  error,
   loading,
+  onRetry,
   onClose,
   onConfirm,
 }: {
   target: BlockTarget;
   diff: BlockTargetDiff | null;
+  error: string | null;
   loading: boolean;
+  onRetry: () => void;
   onClose: () => void;
   onConfirm: () => void;
 }) {
@@ -1235,7 +1249,9 @@ function ReconcilePreviewModal({
           converges. Review the diff below before pushing.
         </p>
         <div className="rounded-md border p-3 text-xs">
-          {diff === null ? (
+          {error && diff === null ? (
+            <FormError className="text-destructive">{error}</FormError>
+          ) : diff === null ? (
             <p className="text-muted-foreground">Reading device…</p>
           ) : diff.error ? (
             <p role="alert" className="text-destructive">
@@ -1270,6 +1286,9 @@ function ReconcilePreviewModal({
             </div>
           )}
         </div>
+        {error && diff !== null && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
         <div className="flex justify-end gap-2">
           <button
             type="button"
@@ -1278,9 +1297,23 @@ function ReconcilePreviewModal({
           >
             Cancel
           </button>
+          {error && diff === null && (
+            <button
+              type="button"
+              onClick={onRetry}
+              className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
+            >
+              Retry preview
+            </button>
+          )}
           <button
             type="button"
             onClick={onConfirm}
+            title={
+              error && diff === null
+                ? "The device could not be read — retry the preview first"
+                : undefined
+            }
             disabled={loading || diff === null || !!diff?.error}
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
