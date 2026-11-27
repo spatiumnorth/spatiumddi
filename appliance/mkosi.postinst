@@ -551,6 +551,12 @@ install -d -m 0755 "$BUILDROOT/etc/nftables.d"
 # supervisor heartbeat (ntp_sync_state) and shown on the NTP page instead.
 ln -sfn /dev/null "$BUILDROOT/etc/systemd/system/chrony-wait.service"
 
+# #4951 — mask Debian's chronyd-restricted.service. The package presets it
+# enabled and it Conflicts= with chrony.service, so it won the boot and the
+# appliance's own chrony.service (enabled above; the unit the chrony-reload
+# apply path reloads) never ran. Masking leaves chrony.service the daemon.
+ln -sfn /dev/null "$BUILDROOT/etc/systemd/system/chronyd-restricted.service"
+
 # Persistent systemd journal. The mere existence of /var/log/journal
 # flips systemd-journald from volatile (in-memory) to persistent.
 # Mode 2755 + group systemd-journal is what systemd expects.
