@@ -150,11 +150,31 @@ async def test_concurrent_push_is_retried(remote: Path, monkeypatch):
     assert len(await d.list_archives(config=cfg)) == 2
 
 
-async def test_connection_pushes_scratch_ref_and_cleans_up(remote: Path):
+async def test_connection_on_empty_repo_leaves_no_scratch_branch(remote: Path):
+    # An empty repository's first pushed branch becomes its default branch on
+    # Gitea / GitHub / GitLab, and a default branch cannot be deleted: a scratch
+    # branch would stay behind as the default. The probe goes to the real branch.
     d = GitRepoDestination()
     out = await d.test_connection(config=_cfg(remote))
     assert out["ok"] is True, out
-    assert _git(remote, "branch", "--list").strip() == ""  # scratch branch removed
+    assert _git(remote, "branch", "--format=%(refname:short)").split() == ["main"]
+    assert "connection test" in _git(remote, "log", "-1", "--format=%s", "main")
+
+
+async def test_connection_on_populated_repo_pushes_scratch_ref_and_cleans_up(remote: Path):
+    d = GitRepoDestination()
+    await d.write(config=_cfg(remote), filename=_NAME, archive_bytes=b"zip")
+    out = await d.test_connection(config=_cfg(remote))
+    assert out["ok"] is True, out
+    assert _git(remote, "branch", "--format=%(refname:short)").split() == ["main"]
+    assert "scratch" in out["detail"]
+
+
+def test_a_refused_https_token_is_named_not_left_as_a_username_prompt(tmp_path: Path):
+    cfg = {"url": "https://git.example.com/o/r.git", "token": "tok-abc"}
+    run = git_repo._Run(cfg, tmp_path)
+    msg = run.scrub("fatal: could not read Username for 'https://git.example.com': terminal ")
+    assert "refused the access token" in msg and "Username" not in msg
 
 
 async def test_connection_fails_when_push_is_refused(remote: Path):

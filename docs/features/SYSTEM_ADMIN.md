@@ -470,7 +470,9 @@ like every other credential). For an `ssh://` or `user@host:path` URL set
 only the lines you supplied, so there is no way to trust an unknown key. `http://`,
 `file://` and other transports are refused. **Test connection** does a real
 push to a scratch branch and deletes it, so a read-only token fails there and
-not on the first nightly run. A failed push (rejected, denied, host over its size
+not on the first nightly run (on a brand-new empty repository the probe is an
+empty commit on the real branch instead, because a host makes the first pushed
+branch the default and a default branch cannot be deleted). A failed push (rejected, denied, host over its size
 limit) fails the run and the message reaches `last_run_error` with the token and
 URL credentials scrubbed.
 

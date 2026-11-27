@@ -88,6 +88,9 @@ _DEFAULT_MAX_ARCHIVE_MB = 95
 _SCP_LIKE_RE = re.compile(r"^[A-Za-z0-9._-]+@[A-Za-z0-9.\-]+:(?!//)[^\s]+$")
 _BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _SUBDIR_PART_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_AUTH_REFUSED_RE = re.compile(
+    r"could not read (?:Username|Password)|Authentication failed|returned error: 40[13]"
+)
 _NAME_TS_RE = re.compile(r"(\d{8})-(\d{6})")
 _AUTHOR = {
     "GIT_AUTHOR_NAME": "SpatiumDDI backup",
@@ -194,6 +197,14 @@ class _Run:
         for secret in self._secrets:
             text = text.replace(secret, "<redacted>")
         text = text.replace(self.url, safe_url(self.url) if "://" in self.url else "<repository>")
+        if self.kind == "https" and _AUTH_REFUSED_RE.search(text):
+            # git sends the token pre-emptively; when the host answers 401 it
+            # falls back to asking for a username and, with prompts disabled,
+            # says only "could not read Username". That is a refused token.
+            return (
+                "the server refused the access token (revoked, expired, wrong, or without "
+                "access to this repository)"
+            )
         return text.strip()[:600]
 
     def git(self, *args: str, check: bool = True, raw: bool = False) -> _Out:
@@ -559,26 +570,38 @@ class GitRepoDestination(BackupDestination):
             try:
                 with _clone(config) as run:
                     existed = run.fetch()
-                    # A real push, to a scratch branch, so a read-only token or
-                    # deploy key fails here and not on the first nightly run.
+                    # A real push, so a read-only token or deploy key fails
+                    # here and not on the first nightly run. To a scratch
+                    # branch, deleted afterwards -- except on an EMPTY
+                    # repository: its first pushed branch becomes the default
+                    # branch on Gitea / GitHub / GitLab, and a default branch
+                    # cannot be deleted, so a scratch branch would stay behind
+                    # as the repository's default. There the probe is an empty
+                    # root commit on the real branch, which the first backup
+                    # builds on anyway.
                     run.git("commit", "-q", "--allow-empty", "-m", "SpatiumDDI connection test")
-                    proc = run.push(f"HEAD:refs/heads/{scratch}")
+                    target = scratch if existed else _branch(config)
+                    proc = run.push(f"HEAD:refs/heads/{target}")
                     if proc.returncode != 0:
                         return {
                             "ok": False,
-                            "error": f"push to a scratch branch failed: {run.scrub(proc.stderr)}",
+                            "error": f"test push failed: {run.scrub(proc.stderr)}",
                         }
-                    cleanup = run.push(f":refs/heads/{scratch}")
+                    cleanup = run.push(f":refs/heads/{scratch}") if existed else None
             except BackupDestinationError as exc:
                 return {"ok": False, "error": str(exc)}
             except Exception as exc:  # noqa: BLE001
                 return {"ok": False, "error": describe_exc(exc)}
             branch = _branch(config)
-            where = (
-                f"branch {branch!r}"
-                if existed
-                else f"empty repository (branch {branch!r} will be created)"
-            )
+            if cleanup is None:
+                return {
+                    "ok": True,
+                    "detail": (
+                        f"the repository is empty: created branch {branch!r} with an empty "
+                        "commit to prove write access"
+                    ),
+                }
+            where = f"branch {branch!r}"
             detail = f"fetched {where}, pushed a scratch branch and deleted it"
             if cleanup.returncode != 0:
                 detail = (
