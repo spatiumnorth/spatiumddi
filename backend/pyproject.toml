@@ -111,7 +111,7 @@ dev = [
     "ruff>=0.17.5",
     "black>=24.10.0",
     "mypy>=1.13.0",
-    "types-croniter>=3.0.0",
+    "types-croniter>=6.2.4.20261118",
     "types-paramiko>=3.4.0",
     # tests/test_spatium_console.py loads the appliance console host script by
     # path; these are ITS runtime deps, not the API's. Without them the module
