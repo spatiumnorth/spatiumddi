@@ -236,17 +236,31 @@ async def ensure_reverse_zones_for_subnet(
         )
         return []
 
-    # 3. Zones of the set that already exist (one query, not one per name)
-    found = (
-        (
-            await db.execute(
-                select(DNSZone).where(DNSZone.group_id == group.id, DNSZone.name.in_(names))
+    # 3. Zones of the set that already exist (one query, not one per name).
+    # #4941 — a forward zone pinned to a view takes its PTRs only into a
+    # reverse zone of that view or of none (#4797), so a zone of the name
+    # pinned to ANOTHER view of the group is not the subnet's: it neither
+    # stands in for it nor is it returned, and the one made below is pinned
+    # to the forward zone's view (the (group, view, name) key lets both exist).
+    view_id = await _forward_view_id(db, subnet, dns_zone_id, group.id)
+    found = [
+        z
+        for z in (
+            (
+                await db.execute(
+                    select(DNSZone).where(DNSZone.group_id == group.id, DNSZone.name.in_(names))
+                )
             )
+            .scalars()
+            .all()
         )
-        .scalars()
-        .all()
-    )
-    by_name = {z.name: z for z in found}
+        if view_id is None or z.view_id is None or z.view_id == view_id
+    ]
+    # Same-view zone beats an unpinned one of the name; never row order.
+    found.sort(key=lambda z: z.view_id != view_id)
+    by_name: dict[str, DNSZone] = {}
+    for z in found:
+        by_name.setdefault(z.name, z)
     if found and any(n not in by_name for n in names):
         # #3503 — a zone created below is audited, and that audit row's flush
         # takes the audit-chain lock. The caller's PTR may then go into one of
@@ -283,7 +297,9 @@ async def ensure_reverse_zones_for_subnet(
     for name in names:
         if optout_driver is not None and name not in by_name:
             continue
-        zone = await _ensure_zone_named(db, subnet, group, name, by_name.get(name), current_user)
+        zone = await _ensure_zone_named(
+            db, subnet, group, name, by_name.get(name), current_user, view_id
+        )
         if zone is not None:
             out.append(zone)
     if any(z.name not in by_name for z in out):
@@ -294,6 +310,24 @@ async def ensure_reverse_zones_for_subnet(
         # bundle-dirty render, which wakes its own servers).
         collect_wake(dns_group_channel(group.id))
     return out
+
+
+async def _forward_view_id(
+    db: AsyncSession,
+    subnet: Subnet,
+    dns_zone_id: uuid.UUID | None,
+    group_id: uuid.UUID,
+) -> uuid.UUID | None:
+    """The view of the subnet's forward zone, when that zone is in ``group_id``
+    (#4941): the view its reverse zone must be pinned to. ``None`` when the
+    subnet has no forward zone of its own, or it is pinned to no view."""
+    zone_id = getattr(subnet, "dns_zone_id", None) or dns_zone_id
+    if zone_id is None:
+        return None
+    zone = await db.get(DNSZone, zone_id)
+    if zone is None or zone.group_id != group_id:
+        return None
+    return zone.view_id
 
 
 async def ensure_reverse_zone_for_subnet(
@@ -325,6 +359,7 @@ async def _ensure_zone_named(
     reverse_name: str,
     existing: DNSZone | None,
     current_user: User | None,
+    view_id: uuid.UUID | None = None,
 ) -> DNSZone | None:
     """Idempotently ensure ONE reverse zone of ``subnet``'s set exists.
     ``existing`` is the zone of that name already in the group, if any."""
@@ -402,6 +437,7 @@ async def _ensure_zone_named(
     # 4. Create the reverse zone
     zone = DNSZone(
         group_id=group.id,
+        view_id=view_id,
         name=reverse_name,
         zone_type="primary",
         kind="reverse",

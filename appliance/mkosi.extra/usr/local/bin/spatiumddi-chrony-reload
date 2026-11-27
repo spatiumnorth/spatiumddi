@@ -67,9 +67,13 @@ LOCK=/run/spatiumddi-chrony-reload.lock
 NFT_DROPIN=/etc/nftables.d/50-spatium-ntp.nft
 
 mkdir -p "$LOG_DIR" "$(dirname "$HASH_SIDECAR")" "$(dirname "$NFT_DROPIN")"
-exec >> "$LOG" 2>&1
-echo
-echo "[$(date -Iseconds)] === spatiumddi-chrony-reload fired ==="
+# --status-only (#4825, run by the sync-status timer every minute) only
+# refreshes the sync-state sidecar; keep it out of the apply log.
+if [ "${1:-}" != "--status-only" ]; then
+    exec >> "$LOG" 2>&1
+    echo
+    echo "[$(date -Iseconds)] === spatiumddi-chrony-reload fired ==="
+fi
 
 
 nft_reload() {
@@ -97,8 +101,21 @@ update_sync_status() {
     #   Normal               — synchronised
     #   Insert/Delete second — synchronised (leap pending)
     #   Not synchronised     — unsynchronised
-    local leap
-    leap=$(chronyc -h 127.0.0.1 tracking 2>/dev/null | awk -F': *' '/^Leap status/ {print $2}')
+    local leap="" out host
+    # Read over chronyd's Unix command socket first (root can use it against
+    # either daemon), then UDP 127.0.0.1. The daemon running after a boot can
+    # be chronyd-restricted.service (-U: no IPv4/IPv6 command socket), where
+    # the 127.0.0.1 read gets "506 Cannot talk to daemon". A failed read is
+    # "unknown", never a failed run: set -e/pipefail must not end the script.
+    for host in "" 127.0.0.1; do
+        if [ -n "$host" ]; then
+            out=$(chronyc -h "$host" tracking 2>/dev/null) || out=""
+        else
+            out=$(chronyc tracking 2>/dev/null) || out=""
+        fi
+        leap=$(printf '%s\n' "$out" | awk -F': *' '/^Leap status/ {print $2}') || leap=""
+        [ -n "$leap" ] && break
+    done
     case "$leap" in
         "Normal"|"Insert second"|"Delete second")
             echo "synchronized" | state_write "$STATUS_SIDECAR"
@@ -112,6 +129,12 @@ update_sync_status() {
     esac
 }
 
+# #4825 — the sync state was captured only when a config was applied, so a
+# chrony that synced (or lost sync) afterwards stayed stale on the NTP tab.
+if [ "${1:-}" = "--status-only" ]; then
+    update_sync_status
+    exit 0
+fi
 
 if [ ! -f "$TRIGGER" ]; then
     echo "  no trigger file at $TRIGGER, nothing to do"

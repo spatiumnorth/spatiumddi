@@ -403,7 +403,10 @@ function OverviewTab({
         />
       </Card>
       {device.last_poll_error && (
-        <div className="lg:col-span-2 rounded-md border border-destructive/40 bg-destructive/10 p-4 text-xs text-destructive">
+        <div
+          role="alert"
+          className="lg:col-span-2 rounded-md border border-destructive/40 bg-destructive/10 p-4 text-xs text-destructive"
+        >
           <div className="mb-1 inline-flex items-center gap-1.5 font-semibold">
             <AlertTriangle className="h-3.5 w-3.5" /> Last poll error
           </div>
