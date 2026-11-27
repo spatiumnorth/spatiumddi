@@ -115,7 +115,7 @@ function transportReask(
 ): string {
   const weaker = transportLevel(kind, edited) < transportLevel(kind, stored);
   const keys =
-    kind === "scp" &&
+    (kind === "scp" || kind === "git") &&
     String(edited.known_hosts ?? "") !== String(stored?.known_hosts ?? "");
   return weaker || keys ? "changed" : "";
 }
@@ -130,6 +130,7 @@ const NUMERIC_CONFIG_FIELDS = new Set([
   "uid",
   "gid",
   "timeout_s",
+  "max_archive_mb",
 ]);
 
 function typedConfig(config: Record<string, string>): Record<string, unknown> {

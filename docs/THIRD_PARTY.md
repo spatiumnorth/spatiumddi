@@ -315,6 +315,7 @@ sandboxed argv builder, never a shell string.
 | [PostgreSQL client 16](https://www.postgresql.org/) | PostgreSQL License | `pg_dump` / `pg_restore` for backup + restore |
 | [xmlsec1](https://www.aleksey.com/xmlsec/) (libxmlsec1-openssl) | MIT | SAML assertion signature verification |
 | [libnfs](https://github.com/sahlberg/libnfs) (libnfs14) | LGPL v2.1 | `nfs` backup destination ([#971](https://github.com/spatiumnorth/spatiumddi/issues/971)) |
+| [Git](https://git-scm.com/) (git) + [OpenSSH](https://www.openssh.com/) client (openssh-client) | GPL v2 / BSD-style | `git` backup destination ([#3211](https://github.com/spatiumnorth/spatiumddi/issues/3211)) — run as subprocesses, not linked |
 
 **libnfs is LGPL and dynamically linked, deliberately.** The `nfs` backup
 destination binds `libnfs.so.14` through `ctypes` at runtime — no compilation, no

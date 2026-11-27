@@ -91,6 +91,9 @@ WORKDIR /app
 # ``libnfs-dev`` and no compile step in the builder stage. Dynamic
 # linking is also what keeps the LGPL-2.1 obligation to the simple case;
 # see docs/THIRD_PARTY.md and the root NOTICE.
+# git + openssh-client back the ``git`` backup destination (#3211): the
+# driver runs the git binary as a subprocess (GPL-2.0, executed not linked;
+# see docs/THIRD_PARTY.md and the root NOTICE).
 # Add the official PostgreSQL apt repo so we can pin
 # ``postgresql-client-16`` (Debian trixie's default repos only carry
 # client-17). We need the client major to match the postgres SERVER
@@ -147,6 +150,8 @@ RUN echo "apt snapshot ${APT_SNAPSHOT}" >/dev/null \
     libcap2-bin \
     postgresql-client-16 \
     libnfs14 \
+    git \
+    openssh-client \
     && setcap cap_net_raw,cap_net_bind_service+eip /usr/bin/nmap \
     # issue #59 — grant tcpdump CAP_NET_RAW so the non-root app user can
     # capture (server vantage). cap_net_admin is NOT granted; we run

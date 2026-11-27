@@ -444,7 +444,7 @@ The passphrase is **not** the destination's auth credential — every destinatio
 
 #### Destination kinds
 
-All ten destination kinds register in the same driver registry; the UI's destination picker reflects on `GET /backup/targets/kinds` so adding a new kind requires no frontend changes.
+All eleven destination kinds register in the same driver registry; the UI's destination picker reflects on `GET /backup/targets/kinds` so adding a new kind requires no frontend changes.
 
 | Kind | Tier | Notes |
 |---|---|---|
@@ -458,6 +458,35 @@ All ten destination kinds register in the same driver registry; the UI's destina
 | `webdav` | 3 | WebDAV servers (Nextcloud, ownCloud, Apache `mod_dav`, IIS WebDAV, any RFC 4918 server) over `httpx` PUT / GET / PROPFIND / DELETE — no SDK dependency |
 | `nfs` | 2 | NFSv4 (default) / NFSv3 exports — a NAS (Synology / TrueNAS / QNAP) or a Linux file server. Speaks NFS in **userspace** via `libnfs`, so no kernel mount and no `CAP_SYS_ADMIN`; works identically on compose, Kubernetes and the appliance |
 | `https_put` | 3 | Any receiver that takes a `PUT` or `POST` — Artifactory / Nexus generic repositories, a presigned S3 URL, an internal receiver. **Write-only by construction**: no listing, no delete, no restore-from-destination, no drill |
+| `git` | 3 | A git repository you already run (Gitea, GitLab, GitHub, any server) — each run commits the archive as `<subdirectory>/<filename>` and pushes it, so the commit log is the backup history. HTTPS token **or** SSH deploy key; for SSH the host key is pinned to a `known_hosts` you supply and an unknown key is always refused. Restore-from-destination, drills and retention work. **The history only grows** — see below |
+
+**Git repository destination (#3211).** Create the repository first (private),
+then add a destination of kind `git`. For an `https://` URL set `token` (a
+token with write access; sent as a request header handed to git through its
+environment, never on a command line or in the clone, and stored Fernet-encrypted
+like every other credential). For an `ssh://` or `user@host:path` URL set
+`ssh_private_key` (a deploy key with write access and no passphrase) and
+`known_hosts`; the connection is made with `StrictHostKeyChecking=yes` against
+only the lines you supplied, so there is no way to trust an unknown key. `http://`,
+`file://` and other transports are refused. **Test connection** does a real
+push to a scratch branch and deletes it, so a read-only token fails there and
+not on the first nightly run. A failed push (rejected, denied, host over its size
+limit) fails the run and the message reaches `last_run_error` with the token and
+URL credentials scrubbed.
+
+Three properties differ from every other destination, and the form says so:
+
+* **The history only grows.** Archives are compressed, so git cannot delta them
+  and every run adds its full size to the repository permanently. Retention
+  removes old archives in a *new commit*, which frees nothing; reclaiming space
+  needs a history rewrite on the server, which SpatiumDDI never does.
+* **Pushed history cannot be recalled.** The archive holds the whole database; only its
+  `secrets.enc` is wrapped by the backup passphrase (every target has one). Use a private
+  repository, and treat a leak of the repository as a leak of every archive pushed to it.
+* **Size limit, no LFS.** An archive over `max_archive_mb` (default 95) is refused before
+  anything is pushed. GitHub rejects a file over 100 MB; Git LFS is not supported. Raise the
+  setting for a self-hosted server whose limit you control. TLS is always verified, so a
+  server with a private CA certificate must be reachable with the image's trust store.
 
 **Two export options decide whether NFS works at all.** SpatiumDDI's control
 plane runs as a non-root user with no `CAP_NET_BIND_SERVICE`, so it connects
@@ -1725,7 +1754,7 @@ accidental deletes are recoverable; the `Delete` button moves rows to a holding 
 full-system snapshot with passphrase-wrapped secrets and 10 destination kinds.
 
 - **Format** — single `.zip` archive carrying `manifest.json` (app version, schema head, hostname, dump format), `database.dump` (custom-format `pg_dump`), `secrets.enc` (PBKDF2-HMAC-SHA256 + AES-256-GCM envelope wrapping the install's `SECRET_KEY`), and `README.txt`. The operator passphrase NEVER lands on disk or in the API logs
-- **Ten destination kinds** — `local_volume` (filesystem path mounted as a docker / k8s volume), `s3` (AWS + S3-compatible: MinIO, Wasabi, Backblaze B2, Cloudflare R2 — via `endpoint_url`), `scp` (SFTP with password OR PEM private key, three host-key check modes), `azure_blob` (shared-key OR connection-string), `smb` (NTLM with optional domain + SMB3 encryption), `ftp` (plain ftp / ftps_explicit / ftps_implicit + passive/active + verify_tls toggle), `gcs` (service-account JSON key), `webdav` (Nextcloud / ownCloud / mod_dav / IIS WebDAV via PUT/GET/PROPFIND/DELETE — no SDK dep), `nfs` (an NFSv4 or v3 export, spoken in userspace — no kernel mount, so it works on the appliance too), `https_put` (PUT or POST to an HTTPS receiver — Artifactory / Nexus generic repositories, a presigned URL — with none / bearer / basic / header auth; write-only, so no listing, restore-from-destination or drill). Same `BackupDestination` ABC + module registry; the kind picker reflects on `GET /backup/targets/kinds` so adding a new driver requires no frontend changes
+- **Eleven destination kinds** — `local_volume` (filesystem path mounted as a docker / k8s volume), `s3` (AWS + S3-compatible: MinIO, Wasabi, Backblaze B2, Cloudflare R2 — via `endpoint_url`), `scp` (SFTP with password OR PEM private key, three host-key check modes), `azure_blob` (shared-key OR connection-string), `smb` (NTLM with optional domain + SMB3 encryption), `ftp` (plain ftp / ftps_explicit / ftps_implicit + passive/active + verify_tls toggle), `gcs` (service-account JSON key), `webdav` (Nextcloud / ownCloud / mod_dav / IIS WebDAV via PUT/GET/PROPFIND/DELETE — no SDK dep), `nfs` (an NFSv4 or v3 export, spoken in userspace — no kernel mount, so it works on the appliance too), `https_put` (PUT or POST to an HTTPS receiver — Artifactory / Nexus generic repositories, a presigned URL — with none / bearer / basic / header auth; write-only, so no listing, restore-from-destination or drill), `git` (a commit + push per run to a repository over an HTTPS token or an SSH deploy key with a pinned host key; #3211). Same `BackupDestination` ABC + module registry; the kind picker reflects on `GET /backup/targets/kinds` so adding a new driver requires no frontend changes
 - **Scheduled cron + retention** — 5-field UTC cron with friendly presets (hourly / 6h / 12h / daily 02:00 / 04:00 / weekly Sun 03:00 / monthly 1st 03:00) + custom; retention as `keep_last_n` OR `keep_for_days`; per-target last-run state surfaced inline; 60s beat sweep with `last_run_status='in_progress'` per-target mutex
 - **Selective restore** — operators tick which sections to restore (IPAM only / DNS only / etc.) on both upload-restore and restore-from-destination flows. 21-section catalog mapping all 142 schema tables; volatile sections (DHCP leases, DNS query log, DHCP activity log, nmap scan history, metric samples) skipped by default. TRUNCATE … RESTART IDENTITY CASCADE + `pg_restore --data-only --table=…` in one transaction, with the closure's foreign keys set aside and checked on the way back, so it needs no superuser (#1693); `platform_internal` (alembic_version + oui_vendor) always rides along
 - **Cross-install secret rewrap** — restoring onto an install with a different `SECRET_KEY` rewraps every Fernet-encrypted column (22 columns across 16 tables + the `backup_target.config` JSONB blob). Same-install restores short-circuit. Closes the manual `SECRET_KEY` copy step that Phase 1 needed
