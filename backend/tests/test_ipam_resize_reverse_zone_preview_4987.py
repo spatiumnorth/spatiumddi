@@ -108,7 +108,8 @@ async def test_existing_zone_listed_existing_and_only_the_new_one_created(
     assert sorted(z.name for z in await _group_zone_rows(db_session, gid)) == [Z0, Z1]
     # Not this issue: a resize that finds one zone in place and makes the next
     # locks the existing row after the resize's audit row (#3503's order), which
-    # the autouse guard flags. Reported separately; cleared so this test checks
+    # the autouse guard flags. Tracked in #4995 (remove this clear with its fix);
+    # cleared so this test checks
     # only what it is about.
     from tests import _audit_lock_order_guard as guard
 
