@@ -2982,6 +2982,20 @@ def _severity_rank(severity: str) -> int:
     return {"info": 0, "warning": 1, "critical": 2}.get(severity, 1)
 
 
+def _event_severity(rule_severity: str, override: str | None) -> str:
+    """The severity ``evaluate_all`` opens / escalates an event at (#4883).
+
+    The rule's Severity is a *floor* for every rule type: a matcher that
+    carries its own level (a ramp, a fixed ``warning``) can raise the event
+    above it but never below, so a rule set to Critical always opens
+    critical. Every open / escalate in the evaluator goes through here, so a
+    new rule type cannot ignore the operator's Severity.
+    """
+    if override is None:
+        return rule_severity
+    return override if _severity_rank(override) > _severity_rank(rule_severity) else rule_severity
+
+
 def _escalate_severity_for_expiring(
     base_severity: str,
     *,
@@ -8514,7 +8528,8 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
             # severity_override). Threshold-style rules pass
             # severity_override=None so the rule's own severity
             # applies; ``domain_expiring`` overrides per-row based on
-            # how close the actual expiry is.
+            # how close the actual expiry is. The rule's severity is
+            # always the floor (``_event_severity``, #4883).
             matches: list[tuple[str, str, str, str | None]] = []
             subject_type = ""
 
@@ -8965,7 +8980,7 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                     # 60 s notification spam). Non-escalating rules pass a
                     # stable severity, so the rank compare never trips and
                     # they're left untouched.
-                    new_severity = severity_override or rule.severity
+                    new_severity = _event_severity(rule.severity, severity_override)
                     # #3930 — the subject was renamed since the event opened.
                     # Follow it: the display, and the old name inside the
                     # stored message and peak (the peak is compared with the
@@ -9030,7 +9045,7 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                     subject_type=subject_type,
                     subject_id=subject_id,
                     subject_display=display,
-                    severity=severity_override or rule.severity,
+                    severity=_event_severity(rule.severity, severity_override),
                     message=message,
                     fired_at=now,
                 )

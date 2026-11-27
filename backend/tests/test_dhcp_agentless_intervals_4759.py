@@ -86,14 +86,21 @@ async def test_health_fanout_gates_agentless_but_not_agent_servers(
         dhcp_health.check_dhcp_server_health, "delay", lambda sid: enqueued.append(sid)
     )
 
+    batches: list[list[str]] = []
+    monkeypatch.setattr(
+        dhcp_health.check_agentless_dhcp_servers_health, "delay", lambda ids: batches.append(ids)
+    )
+
     await dhcp_health._enqueue_all()
     assert enqueued == [str(kea.id)]  # agentless one waits for its 600 s interval
+    assert batches == []
 
     # Interval elapsed: both are checked, and the stamp moves.
     await _ps(db_session, dhcp_health_last_run_at=datetime.now(UTC) - timedelta(seconds=601))
     enqueued.clear()
     await dhcp_health._enqueue_all()
-    assert sorted(enqueued) == sorted([str(kea.id), str(win.id)])
+    assert enqueued == [str(kea.id)]
+    assert batches == [[str(win.id)]]  # #4829 — agentless go out as one batch
     db_session.expire_all()
     ps = await db_session.get(PlatformSettings, 1)
     assert ps is not None and datetime.now(UTC) - ps.dhcp_health_last_run_at < timedelta(seconds=30)

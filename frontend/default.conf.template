@@ -77,6 +77,14 @@ map "$spatium_proxy_trusted:$http_x_forwarded_proto" $spatium_forwarded_proto {
     "~*^1:http" http;
 }
 
+# The console policy is a map, not a ``set``: a ``set`` runs in the rewrite
+# phase, so nginx's own 400 for a request whose headers it cannot parse
+# (before that phase) went out with an empty policy and logged an
+# uninitialized-variable warning (#4839). A map evaluates when read.
+map "" $spatium_csp {
+    default "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'";
+}
+
 server {
     listen ${SPATIUM_HTTP_PORT};
     ${SPATIUM_LISTEN6_80}
@@ -120,7 +128,6 @@ ${SPATIUM_REAL_IP_FROM}
     #   * frame-ancestors 'none'— clickjacking defence (pairs with
     #                             X-Frame-Options: DENY for old browsers).
     #   * base-uri / form-action / object-src locked down.
-    set $spatium_csp "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'";
     # /api/redoc's policy (#1157): the one above plus the two things ReDoc
     # needs on that page only. See ``location = /api/redoc``.
     set $spatium_redoc_csp "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://cdn.redoc.ly; font-src 'self'; connect-src 'self'; worker-src blob:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'";

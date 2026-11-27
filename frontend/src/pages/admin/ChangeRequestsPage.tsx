@@ -42,7 +42,6 @@ import {
   XCircle,
 } from "lucide-react";
 import {
-  APPROVAL_POLICY_ACTIONS,
   type ApprovalPolicy,
   type ApprovalPolicyWrite,
   type ChangeRequest,
@@ -479,6 +478,13 @@ function RequestTable({
   );
 }
 
+// The server's own bounds for ``ttl_hours``.
+const TTL_HOURS_MAX = 8760;
+const ttlInBounds = (t: string) => {
+  const n = Number(t.trim());
+  return Number.isInteger(n) && n >= 1 && n <= TTL_HOURS_MAX;
+};
+
 // ── Policy editor ───────────────────────────────────────────────────────────
 
 function PolicyEditor({
@@ -511,6 +517,22 @@ function PolicyEditor({
   );
   const [error, setError] = useState<string | null>(null);
 
+  // Offer only what the server gates (#4910). A policy already saved with an
+  // action outside the list (or the list not loaded yet) still shows its own.
+  const gateable = useQuery({
+    queryKey: ["change-requests", "policies", "gateable"],
+    queryFn: () => changeRequestsApi.gateablePairs(),
+  });
+  const actionOptions = [
+    ...new Set([
+      ...(gateable.data ?? []).map((p) => p.action),
+      ...(existing ? [existing.action] : ["delete"]),
+    ]),
+  ];
+  const resourceTypeHint = [
+    ...new Set((gateable.data ?? []).map((p) => p.resource_type)),
+  ].join(" / ");
+
   const mutation = useMutation<
     // createPolicy returns the unwrapped row; updatePolicy returns the full
     // axios response so the #62 lock's 202 envelope is observable. Both shapes
@@ -528,7 +550,7 @@ function PolicyEditor({
         min_count: minCount.trim() === "" ? null : Number(minCount),
         enabled,
         applies_to_superadmin: appliesToSuperadmin,
-        ttl_hours: Number(ttlHours) || 168,
+        ttl_hours: Number(ttlHours),
       };
       // createPolicy already returns the unwrapped row; updatePolicy returns
       // the full axios response so the #62 self-governance lock's 202
@@ -599,7 +621,7 @@ function PolicyEditor({
               className={inputCls}
               value={resourceType}
               disabled={locked}
-              placeholder="subnet / dns_zone / *"
+              placeholder={resourceTypeHint || "subnet / dns_zone"}
               onChange={(e) => setResourceType(e.target.value)}
             />
           </div>
@@ -617,7 +639,7 @@ function PolicyEditor({
               disabled={locked}
               onChange={(e) => setAction(e.target.value)}
             >
-              {APPROVAL_POLICY_ACTIONS.map((a) => (
+              {actionOptions.map((a) => (
                 <option key={a} value={a}>
                   {a}
                 </option>
@@ -643,7 +665,9 @@ function PolicyEditor({
               onChange={(e) => setMinCount(e.target.value)}
             />
             <p className="text-[11px] text-muted-foreground/80">
-              Blank = require approval regardless of count.
+              Blank = require approval regardless of count. A single delete
+              counts as 1 row, so a threshold above 1 only applies to bulk
+              operations.
             </p>
           </div>
           <div className="space-y-1">
@@ -658,9 +682,13 @@ function PolicyEditor({
               className={inputCls}
               type="number"
               min={1}
+              max={TTL_HOURS_MAX}
               value={ttlHours}
               onChange={(e) => setTtlHours(e.target.value)}
             />
+            <p className="text-[11px] text-muted-foreground/80">
+              How long a queued request stays open, 1 to {TTL_HOURS_MAX} hours.
+            </p>
           </div>
         </div>
         <label className="flex items-center gap-2 text-sm">
@@ -694,6 +722,13 @@ function PolicyEditor({
             disabled={mutation.isPending}
             onClick={() => {
               setError(null);
+              // Never swap a TTL the server would refuse for a default (#4911).
+              if (!/^\d+$/.test(ttlHours.trim()) || !ttlInBounds(ttlHours)) {
+                setError(
+                  `TTL must be a whole number of hours from 1 to ${TTL_HOURS_MAX}.`,
+                );
+                return;
+              }
               mutation.mutate();
             }}
           >
@@ -1043,9 +1078,9 @@ export function ChangeRequestsPage() {
               <GitPullRequest className="h-5 w-5" /> Change Requests
             </h1>
             <p className="max-w-2xl text-xs text-muted-foreground">
-              Risky operations (deletes, bulk changes, factory reset) that a
-              policy queued for a second eligible operator. A requester can't
-              approve their own request — a different operator holding{" "}
+              Risky operations (deletes and block sync) that a policy queued for
+              a second eligible operator. A requester can't approve their own
+              request — a different operator holding{" "}
               <span className="font-mono">approve,change_request</span> plus the
               operation's own permission approves, and it executes under the
               approver's identity after a stale-state re-check.
