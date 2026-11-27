@@ -1,3 +1,0 @@
-### Fixed
-
-- A DNS server group no longer accepts an option its driver does not apply. Recursion, validation, query ACL and rate-limit options on a PowerDNS group, the dnsdist front on a BIND9 group, query logging on a Technitium group, and every group option on a Windows DNS, hosted-provider or agentless Technitium group used to save and then do nothing; a change to one is now refused with a message naming the option and the driver, while an untouched Save and turning an option off or back to its default keep working. The options page disables those controls with a note naming the driver, shows one line in place of the form where the driver applies no option, and no longer says query logs come "from BIND" on other drivers (#4562).
