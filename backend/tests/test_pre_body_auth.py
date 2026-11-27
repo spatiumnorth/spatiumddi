@@ -467,6 +467,7 @@ async def _post_json(
         "/api/v1/dhcp/import/windows/preview",
         "/api/v1/ipam/import/preview-json",
         "/api/v1/ipam/import/netbox/commit",
+        "/api/v1/ipam/import/phpipam/commit",
     ],
 )
 async def test_import_json_route_without_credentials_is_refused_unparsed(

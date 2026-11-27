@@ -16,7 +16,9 @@ Differences from the DNS importer this clones:
 
 * ``ConflictAction`` is ``skip | overwrite`` (no ``rename`` — NetBox
   entities are CIDR / rd / name-keyed and can't be renamed).
-* The plan ``source`` is the single value ``"netbox"``.
+* The plan ``source`` is ``"netbox"`` here (the schemas are shared with the
+  phpIPAM importer, #4734, whose endpoint takes ``"phpipam"``; each endpoint
+  refuses the other's plan).
 * **No ``wake_publishing``** — NetBox seeds IPAM rows only and touches no
   DNS / DHCP agent config bundle, so there's no agent long-poll to wake.
 """
@@ -40,6 +42,7 @@ from app.services.netbox_import import (
     ImportedAddress,
     ImportedBlock,
     ImportedCustomer,
+    ImportedCustomField,
     ImportedSite,
     ImportedSpace,
     ImportedSubnet,
@@ -191,9 +194,19 @@ class ImportedAddressOut(BaseModel):
     description: str = ""
     subnet_cidr: str | None = None
     space_name: str | None = None
+    mac_address: str | None = None
     custom_fields: dict[str, Any] = Field(default_factory=dict)
     tags: dict[str, Any] = Field(default_factory=dict)
     netbox_id: int | None = None
+
+
+class ImportedCustomFieldOut(BaseModel):
+    resource_type: str
+    name: str
+    label: str
+    field_type: str = "text"
+    options: list[str] | None = None
+    source_name: str = ""
 
 
 class EntityConflictOut(BaseModel):
@@ -212,7 +225,7 @@ class PreviewOut(BaseModel):
     is the per-entity-type rollup for the preview UI.
     """
 
-    source: Literal["netbox"]
+    source: Literal["netbox", "phpipam"]
     customers: list[ImportedCustomerOut] = Field(default_factory=list)
     sites: list[ImportedSiteOut] = Field(default_factory=list)
     vrfs: list[ImportedVRFOut] = Field(default_factory=list)
@@ -221,6 +234,7 @@ class PreviewOut(BaseModel):
     blocks: list[ImportedBlockOut] = Field(default_factory=list)
     subnets: list[ImportedSubnetOut] = Field(default_factory=list)
     addresses: list[ImportedAddressOut] = Field(default_factory=list)
+    custom_field_defs: list[ImportedCustomFieldOut] = Field(default_factory=list)
     conflicts: list[EntityConflictOut] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     counts: dict[str, int] = Field(default_factory=dict)
@@ -278,6 +292,7 @@ class CommitOut(BaseModel):
     blocks_created: int
     subnets_created: int
     addresses_created: int
+    custom_fields_created: int = 0
     # Cross-kind action rollups.
     total_created: int
     total_overwrote: int
@@ -300,6 +315,7 @@ def _preview_to_pydantic(p: ImportPreview) -> PreviewOut:
         blocks=[ImportedBlockOut(**b.__dict__) for b in p.blocks],
         subnets=[ImportedSubnetOut(**sub.__dict__) for sub in p.subnets],
         addresses=[ImportedAddressOut(**a.__dict__) for a in p.addresses],
+        custom_field_defs=[ImportedCustomFieldOut(**d.__dict__) for d in p.custom_field_defs],
         conflicts=[
             EntityConflictOut(
                 kind=c.kind,
@@ -333,6 +349,7 @@ def _preview_from_pydantic(o: PreviewOut) -> ImportPreview:
         blocks=[ImportedBlock(**b.model_dump()) for b in o.blocks],
         subnets=[ImportedSubnet(**sub.model_dump()) for sub in o.subnets],
         addresses=[ImportedAddress(**a.model_dump()) for a in o.addresses],
+        custom_field_defs=[ImportedCustomField(**d.model_dump()) for d in o.custom_field_defs],
         conflicts=[
             EntityConflict(
                 kind=c.kind,
@@ -371,6 +388,7 @@ def _commit_result_to_pydantic(r: CommitResult) -> CommitOut:
         blocks_created=r.blocks_created,
         subnets_created=r.subnets_created,
         addresses_created=r.addresses_created,
+        custom_fields_created=r.custom_fields_created,
         total_created=r.total_created,
         total_overwrote=r.total_overwrote,
         total_skipped=r.total_skipped,

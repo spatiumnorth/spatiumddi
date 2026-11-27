@@ -9,7 +9,7 @@
 > a running read-only mirror are served by the Windows DNS / Windows
 > DHCP Path A drivers and the integration shelf instead.
 
-Three sibling importers share one design — a per-source parser feeding
+Three sibling importers (plus the phpIPAM sibling of the NetBox one, below) share one design — a per-source parser feeding
 a shared canonical intermediate representation (IR), then a
 source-agnostic two-phase **preview → commit** pipeline. Each lives
 behind a togglable feature module so operators who don't need the
@@ -359,6 +359,103 @@ hard-blocked). The surface is superadmin-only; the feature module
 `ipam.import.netbox` is **default-on** (importers are default-on for
 discovery per non-negotiable #13/#14 — only continuous integration
 *mirrors* default off).
+
+---
+
+## phpIPAM → IPAM importer (#4734)
+
+The NetBox importer's sibling for phpIPAM, and the same kind of tool: a
+one-shot **migration**, no `phpipam_target` row, no beat sweep, no
+absence-delete. It reads a live phpIPAM through its REST API and builds
+native IPAM rows through the **same canonical IR and the same commit
+pipeline** as the NetBox importer, so preview, conflict handling,
+audit, provenance and re-run behave identically. The reader is
+`backend/app/services/phpipam_import/`; the router is
+`/api/v1/ipam/import/phpipam/`; the feature module is
+`ipam.import.phpipam` (default-on, like the other day-one importers).
+There is no UI page yet — drive it through the REST API or the Copilot
+tools (`find_phpipam_import_preview`, `propose_commit_phpipam_import`).
+TeemIP is out of scope.
+
+### What it imports
+
+| phpIPAM source | → SpatiumDDI |
+|---|---|
+| `/sections/` | `IPSpace`, one per section (see *Spaces* below) |
+| `/vrf/` | `VRF` (name / rd / description) |
+| `/sections/{id}/subnets/` | `IPBlock` (a subnet that encloses another) **or** `Subnet` (a leaf); folders are skipped |
+| `/subnets/{id}/addresses/` | `IPAddress`: hostname + FQDN, description (+ note), MAC, `is_gateway` → role `gateway`, state → status |
+| `/vlan/` | `VLAN` under a synthesized router; a subnet's `vlanId` links to it |
+| `/{subnets,addresses}/custom_fields/` | `CustomFieldDefinition` (typed: text / number / boolean / date / select) plus the values on each row |
+
+Address **state** goes through the `/tools/tags/` table: *Reserved* →
+`reserved`, a deprecated / decommissioned tag → `deprecated`, anything
+else (Used, Offline, DHCP, custom) → `allocated`. The integration-owned
+`dhcp` status is never produced. The source's own state name, the
+owner and a MAC that is not a MAC are kept in `custom_fields`
+(`phpipam_state`, `phpipam_owner`, `phpipam_mac`).
+
+### Spaces
+
+- **`per_section`** (default) — one `IPSpace` per phpIPAM section.
+  An `IPSpace` has one VRF, so a section whose subnets sit in more than
+  one VRF (or in a VRF and out of any) is split: the VRF-less subnets
+  stay in `<section>`, the others go to `<section> / <vrf>`, which links
+  that VRF. Overlapping CIDRs in different VRFs therefore stay apart.
+  Nested sections are flattened (the preview says how many).
+- **`single`** — everything into one operator-chosen `target_space_id`.
+  Preview warns, and commit refuses with 422, when it is missing.
+
+### What does not map (the preview says so)
+
+Folders; nested-section parentage; VLAN domains (VLANs from every
+domain go under one router, so a VID used in two domains is imported
+once); VLAN and VRF custom fields (SpatiumDDI has no custom fields on
+those rows); devices, locations, circuits, NAT, scan / ping / DNS
+settings; an address in a container subnet that falls in none of its
+leaf subnets; a duplicate CIDR in one space; a VID outside 1–4094.
+Each lands in `warnings` rather than being dropped silently.
+
+### Flow, safety and idempotency
+
+1. **Test connection** (`POST …/test-connection`) authenticates and
+   returns the section / VRF / VLAN counts.
+2. **Preview** (`POST …/preview`) pulls, maps and flags conflicts.
+   **It never writes** and writes no audit row. `filters`
+   (`section_ids`, `family`, `within_include`) slice a large install.
+3. **Commit** (`POST …/commit`) takes the unmodified preview as `plan`.
+   Conflicts are re-detected against current state and **default to
+   skip**; `overwrite` is chosen per conflict key and never replaces a
+   custom-field definition. Each entity writes in its own savepoint with
+   one audit row (`import_source=phpipam`, `phpipam_id`). A re-run is a
+   no-op. A plan stamped `netbox` is refused by this endpoint (400) and
+   the reverse.
+
+Every created row carries `import_source="phpipam"`, `imported_at`, and
+the phpIPAM id in `custom_fields["phpipam_id"]` (the IR field is still
+called `netbox_id`, the #36 wire name).
+
+**Trash.** Nothing is imported into, or parented under, a space, block
+or subnet in the Trash, and a trashed row is neither a conflict nor a
+match: the import creates a fresh live row beside it. A `target_space_id`
+in the Trash is refused (422).
+
+### Connection and credentials
+
+`base_url` (the site root; `/api` and `/api/<app_id>` are stripped),
+`app_id`, and **either** the API app's `token` (the *SSL with app code
+token* security mode) **or** `username` + `password` (exchanged once for
+a session token) travel in the request body, are used for that request
+and are **never stored, logged or echoed**. The phpIPAM API must have
+`mod_rewrite` enabled (`/api/<app_id>/…` URLs). **TLS is verified;**
+`verify_tls=false` is an explicit opt-out that logs a warning on every
+connect. A redirect is never followed, so the credential cannot be
+sent to another host. phpIPAM has no pagination, so a pull is bounded
+by a 64 MiB response cap, the 25 000 prefix + address ceiling, and a
+per-subnet address pull; over the ceiling the preview refuses and asks
+for a narrower filter. The surface is superadmin-only; the URL is
+operator-typed and documented in `docs/PRIVACY.md` (off until you run a
+preview). An advisory SSRF guard logs the resolved address.
 
 ---
 

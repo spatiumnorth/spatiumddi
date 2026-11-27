@@ -546,6 +546,7 @@ from app.services.ai.operations_writes import (  # noqa: E402
     CommitDHCPImportArgs,
     CommitDNSImportArgs,
     CommitNetboxImportArgs,
+    CommitPhpipamImportArgs,
     CreateConformityPolicyArgs,
     CreateMulticastDomainArgs,
     CreateWebhookArgs,
@@ -941,6 +942,32 @@ async def propose_commit_netbox_import(
     db: AsyncSession, user: User, args: CommitNetboxImportArgs
 ) -> dict[str, Any]:
     return await _propose_via(db=db, user=user, operation_name="commit_netbox_import", args=args)
+
+
+# ── phpIPAM IPAM import — live-pull one-shot commit (#4734) ───────────
+
+
+@register_tool(
+    name="propose_commit_phpipam_import",
+    permission="superadmin",
+    description=(
+        "Prepare a one-shot phpIPAM import into IPAM. Pass base_url + app_id + "
+        "token (or username + password) (+ verify_tls, space_strategy "
+        "'per_section'/'single', optional target_space_id and scope filters "
+        "section_ids / family / within_include). Preview shows entity counts "
+        "(conflicts are SKIPPED on apply); operator clicks Approve to commit. "
+        "Superadmin; makes an off-prem pull and creates IPAM rows."
+    ),
+    args_model=CommitPhpipamImportArgs,
+    writes=False,
+    category="ipam",
+    default_enabled=False,
+    module="ipam.import.phpipam",
+)
+async def propose_commit_phpipam_import(
+    db: AsyncSession, user: User, args: CommitPhpipamImportArgs
+) -> dict[str, Any]:
+    return await _propose_via(db=db, user=user, operation_name="commit_phpipam_import", args=args)
 
 
 # ── New-device watch proposals (issue #459) ──────────────────────────────────

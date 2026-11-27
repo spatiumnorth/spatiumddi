@@ -79,6 +79,7 @@ from app.api.v1.ownership import (
 )
 from app.api.v1.panos import router as panos_router
 from app.api.v1.pcap import router as pcap_router
+from app.api.v1.phpipam_import.router import router as phpipam_import_router
 from app.api.v1.proxmox import router as proxmox_router
 from app.api.v1.reports import router as reports_router
 from app.api.v1.requests import router as requests_router
@@ -438,6 +439,14 @@ api_v1_router.include_router(
     # no agent long-poll to wake (contrast dns_import / dhcp_import which
     # DO carry wake_publishing).
     dependencies=[Depends(require_module("ipam.import.netbox"))],
+)
+api_v1_router.include_router(
+    phpipam_import_router,
+    prefix="/ipam/import/phpipam",
+    tags=["phpipam-import"],
+    # 404 when the module is off. NO wake_publishing: phpIPAM, like NetBox,
+    # seeds IPAM rows only and touches no DNS / DHCP agent config bundle.
+    dependencies=[Depends(require_module("ipam.import.phpipam"))],
 )
 api_v1_router.include_router(
     network_router,

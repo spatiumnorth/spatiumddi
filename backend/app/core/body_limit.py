@@ -107,7 +107,7 @@ ALLOWANCES: tuple[Allowance, ...] = (
         r"/api/v1/ipam/import/.+",
         25 * MIB + _FORM_OVERHEAD,
         "IPAM imports: a 25 MiB CSV / JSON / XLSX file (io_router _MAX_UPLOAD_BYTES), "
-        "and the NetBox preview sent back to commit.",
+        "and the NetBox / phpIPAM preview sent back to commit.",
     ),
     _allow(
         "POST",

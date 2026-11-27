@@ -24,9 +24,11 @@ from app.services.ai.operations_writes import (
     CommitDHCPImportArgs,
     CommitDNSImportArgs,
     CommitNetboxImportArgs,
+    CommitPhpipamImportArgs,
     _dhcp_import_pull,
     _dns_import_pull,
     _netbox_import_pull,
+    _phpipam_import_pull,
 )
 from app.services.ai.tools.base import register_tool
 
@@ -184,4 +186,55 @@ async def find_netbox_import_preview(
             for s in preview.subnets[:100]
         ],
         "warnings": list(preview.warnings)[:20],
+    }
+
+
+@register_tool(
+    name="find_phpipam_import_preview",
+    outbound=True,
+    outbound_scope="ipam:write",
+    permission="superadmin",
+    description=(
+        "Preview what a one-shot phpIPAM import would bring into IPAM without "
+        "importing anything. Pass base_url + app_id + token (or username + "
+        "password) (+ verify_tls, space_strategy 'per_section'/'single', "
+        "optional target_space_id and filters section_ids / family / "
+        "within_include). Returns counts of spaces / VRFs / blocks / subnets / "
+        "addresses / VLANs / custom fields + per-entity conflicts and the "
+        "warnings for what will not map. Use before propose_commit_phpipam_import. "
+        "Superadmin; makes an off-prem pull."
+    ),
+    args_model=CommitPhpipamImportArgs,
+    category="ipam",
+    default_enabled=False,
+    module="ipam.import.phpipam",
+)
+async def find_phpipam_import_preview(
+    db: AsyncSession, user: User, args: CommitPhpipamImportArgs
+) -> dict[str, Any]:
+    gate = _superadmin_gate(user)
+    if gate is not None:
+        return gate
+    try:
+        preview = await _phpipam_import_pull(db, args)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    return {
+        "source": preview.source,
+        "vrf_count": len(preview.vrfs),
+        "space_count": len(preview.spaces),
+        "vlan_count": len(preview.vlans),
+        "block_count": len(preview.blocks),
+        "subnet_count": len(preview.subnets),
+        "address_count": len(preview.addresses),
+        "custom_field_count": len(preview.custom_field_defs),
+        "conflict_count": len(preview.conflicts),
+        "conflicts": [
+            {"kind": c.kind, "key": c.key, "reason": c.reason} for c in preview.conflicts[:100]
+        ],
+        "subnets": [
+            {"network": s.network, "kind": s.kind, "space_name": s.space_name}
+            for s in preview.subnets[:100]
+        ],
+        "warnings": list(preview.warnings)[:50],
     }

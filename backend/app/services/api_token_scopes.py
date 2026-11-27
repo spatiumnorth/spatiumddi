@@ -232,6 +232,7 @@ OPERATION_WRITE_SCOPE: dict[str, str] = {
             "delete_block",
             "delete_space",
             "commit_netbox_import",
+            "commit_phpipam_import",
             "create_multicast_group",
             "allocate_multicast_groups",
             "create_multicast_domain",
