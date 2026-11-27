@@ -113,7 +113,10 @@ _MAX_ERROR = 2000
 # 18 (#4594): every BIND9 bundle's options carry ``query_log_severity``,
 #   ``query_log_print_category`` and ``query_log_print_severity``. The ETag
 #   moves once at the upgrade for every group.
-RENDERER_REVISION = 18
+# 19 (#3567): every bundle's options carry ``recursive_clients``,
+#   ``serve_stale_enabled``, ``stale_answer_ttl`` and ``max_stale_ttl``. The
+#   ETag moves once at the upgrade for every group.
+RENDERER_REVISION = 19
 
 
 def _serves(revision: int | None) -> bool:

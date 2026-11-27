@@ -160,6 +160,12 @@ PINNED_DIGESTS: dict[int, dict[str, str]] = {
         "plain": "87c823765ab7406e0f444b12b69d76a9e39189ffd6320860712e1d384313f3ed",
         "views": "8c24562300c855fbfa2640d462021514fbdb9a30df8bb85c9ea99ea4a4930a53",
     },
+    # #3567: the bundle options gain recursive_clients, serve_stale_enabled,
+    # stale_answer_ttl and max_stale_ttl.
+    19: {
+        "plain": "cd9566fad7b5c887701f82063e3a704b9ea3d2e438608d6f36288c2fe1383587",
+        "views": "4d3114d90cdd5cd076d1c484c1b848c84049abbe1de78bcd0e39620d063e2142",
+    },
 }
 
 
