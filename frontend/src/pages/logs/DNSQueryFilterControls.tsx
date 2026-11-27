@@ -130,8 +130,8 @@ export function ExportControl({
       {result?.truncated && (
         <span role="status" className="text-[11px] text-amber-600">
           Export capped at {result.rowCap.toLocaleString()}{" "}
-          {pluralize(result.rowCap, "row")} (newest first)
-          — narrow the filter or time window for the rest.
+          {pluralize(result.rowCap, "row")} (newest first) — narrow the filter
+          or time window for the rest.
         </span>
       )}
       {error && (
