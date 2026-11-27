@@ -13719,6 +13719,11 @@ export function SyncWithServersResultModal({
   serverCount?: number;
   onClose: () => void;
 }) {
+  // Zones whose own sync failed, across every server (#4953).
+  const failedZones = (result?.items ?? []).reduce(
+    (n, srv) => n + (srv.result?.items ?? []).filter((it) => it.error).length,
+    0,
+  );
   return (
     <Modal title={`Sync result — ${group.name}`} onClose={onClose} wide>
       <div className="space-y-3 text-sm">
@@ -13788,6 +13793,11 @@ export function SyncWithServersResultModal({
                 />
               )}
               <SyncStat
+                label="Zones failed"
+                value={failedZones}
+                accent={failedZones ? "bad" : undefined}
+              />
+              <SyncStat
                 label="Push errors"
                 value={result.total_push_errors}
                 accent={result.total_push_errors ? "bad" : undefined}
@@ -13819,7 +13829,7 @@ export function SyncWithServersResultModal({
                   (srv.result?.zones_imported?.length ?? 0) > 0 ||
                   (srv.result?.zones_push_to_server_errors?.length ?? 0) > 0 ||
                   (srv.result?.items ?? []).some(
-                    (it) => (it.push_errors?.length ?? 0) > 0,
+                    (it) => (it.push_errors?.length ?? 0) > 0 || !!it.error,
                   )
                 }
               >
@@ -13839,7 +13849,11 @@ export function SyncWithServersResultModal({
                     {srv.error
                       ? "failed"
                       : srv.result
-                        ? `${srv.result.zones_attempted} zone${srv.result.zones_attempted === 1 ? "" : "s"}`
+                        ? `${srv.result.zones_attempted} zone${srv.result.zones_attempted === 1 ? "" : "s"}${
+                            srv.result.items.some((it) => it.error)
+                              ? `, ${srv.result.items.filter((it) => it.error).length} failed`
+                              : ""
+                          }`
                         : "—"}
                   </span>
                 </summary>
